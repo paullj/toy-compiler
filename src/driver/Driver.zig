@@ -165,7 +165,7 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     }
     if (tree == null) {
         var diag: ?Parser.Diagnostic = null;
-        if (try Parser.parse(gpa, result.tokens, &diag)) |t| {
+        if (try Parser.parse(gpa, result.tokens, result.source, &diag)) |t| {
             tree = t;
             const blob = try Ast.pack(gpa, t);
             defer gpa.free(blob);
@@ -272,6 +272,7 @@ const Frozen = struct {
     resolutions: []const Resolve.Resolution,
     node_types: []const Typecheck.Type,
     layouts: []const Typecheck.Layout,
+    enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
     fn_nodes: []const Ast.Index,
     entry_fn: u32,
@@ -341,6 +342,7 @@ pub fn lowerProgram(
         .resolutions = r.resolve.?.resolutions,
         .node_types = r.typecheck.?.node_types,
         .layouts = r.typecheck.?.layouts,
+        .enum_layouts = r.typecheck.?.enum_layouts,
         .names = names,
         .fn_nodes = fn_nodes.items,
         .entry_fn = main_sym,
@@ -395,6 +397,7 @@ fn lowerProgramSerial(gpa: std.mem.Allocator, frozen: *const Frozen) !LowerProgr
         frozen.resolutions,
         frozen.node_types,
         frozen.layouts,
+        frozen.enum_layouts,
         frozen.names,
         frozen.fn_nodes,
         frozen.entry_fn,
@@ -542,6 +545,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, s
         frozen.resolutions,
         frozen.node_types,
         frozen.layouts,
+        frozen.enum_layouts,
         frozen.names,
         fn_decl,
         sym,
@@ -632,6 +636,24 @@ fn walkCalls(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out:
         .field_init => try walkCalls(gpa, frozen, n.lhs, out),
         .field_access => try walkCalls(gpa, frozen, n.lhs, out),
         .struct_decl => {},
+        // M10: order must MIRROR Fingerprint.walk (the callee_sigs sequence must
+        // line up). Calls hide in payload exprs and arm bodies; patterns and
+        // decls carry no calls.
+        .enum_decl, .enum_variant_unit, .enum_variant_tuple, .enum_variant_struct => {},
+        .enum_init_unit, .pattern_variant, .pattern_wildcard, .pattern_binding, .pattern_literal, .pattern_or => {},
+        .enum_init_tuple => for (Ast.rangeSlice(tree, n.rhs)) |a| try walkCalls(gpa, frozen, a, out),
+        .enum_init_struct => for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkCalls(gpa, frozen, fi, out),
+        .match_expr => {
+            try walkCalls(gpa, frozen, n.lhs, out); // scrutinee
+            for (Ast.rangeSlice(tree, n.rhs)) |arm| try walkCalls(gpa, frozen, arm, out);
+        },
+        // guard before body — must mirror Fingerprint.walk's order so the
+        // positional callee_sigs sequence lines up.
+        .match_arm => {
+            const h = Ast.armHeaderAt(tree, n.rhs);
+            if (h.guard != Ast.none) try walkCalls(gpa, frozen, h.guard, out);
+            try walkCalls(gpa, frozen, h.body, out);
+        },
         .program => {},
     }
 }
@@ -701,6 +723,19 @@ fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, ou
         },
         .field_init => try walkTouched(gpa, frozen, n.lhs, out),
         .field_access => try walkTouched(gpa, frozen, n.lhs, out),
+        // M10: a variant construction touches its enum (folded on the node above)
+        // and the payload values; a match touches the scrutinee + each arm body.
+        .enum_init_tuple => for (Ast.rangeSlice(tree, n.rhs)) |a| try walkTouched(gpa, frozen, a, out),
+        .enum_init_struct => for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkTouched(gpa, frozen, fi, out),
+        .match_expr => {
+            try walkTouched(gpa, frozen, n.lhs, out);
+            for (Ast.rangeSlice(tree, n.rhs)) |arm| try walkTouched(gpa, frozen, arm, out);
+        },
+        .match_arm => {
+            const h = Ast.armHeaderAt(tree, n.rhs);
+            if (h.guard != Ast.none) try walkTouched(gpa, frozen, h.guard, out);
+            try walkTouched(gpa, frozen, h.body, out);
+        },
         else => {},
     }
 }
@@ -720,19 +755,29 @@ fn typeRefToType(frozen: *const Frozen, type_node: Ast.Index) Typecheck.Type {
     for (frozen.layouts, 0..) |l, id| {
         if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));
     }
+    for (frozen.enum_layouts, 0..) |e, id| {
+        if (std.mem.eql(u8, e.name, name)) return Typecheck.Type.enumT(@intCast(id));
+    }
     return Typecheck.Type.unit;
 }
 
 /// Append a `TouchedType` for `ty`, building the struct layout descriptor bytes.
 fn appendTouched(gpa: std.mem.Allocator, frozen: *const Frozen, ty: Typecheck.Type, out: *std.ArrayList(Fingerprint.TouchedType)) !void {
-    if (ty.kind != .@"struct") {
-        try out.append(gpa, .{ .kind = ty.kind });
+    if (ty.kind == .@"struct") {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(gpa);
+        try structLayoutBytes(gpa, frozen, ty.struct_id, &buf);
+        try out.append(gpa, .{ .kind = .@"struct", .layout = try buf.toOwnedSlice(gpa) });
         return;
     }
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    try structLayoutBytes(gpa, frozen, ty.struct_id, &buf);
-    try out.append(gpa, .{ .kind = .@"struct", .layout = try buf.toOwnedSlice(gpa) });
+    if (ty.kind == .@"enum") {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(gpa);
+        try enumLayoutBytes(gpa, frozen, ty.enum_id, &buf);
+        try out.append(gpa, .{ .kind = .@"enum", .layout = try buf.toOwnedSlice(gpa) });
+        return;
+    }
+    try out.append(gpa, .{ .kind = ty.kind });
 }
 
 /// Index-free struct layout descriptor: name + per-field (name, kind, offset),
@@ -753,6 +798,51 @@ fn structLayoutBytes(gpa: std.mem.Allocator, frozen: *const Frozen, id: u32, buf
     var sz: [8]u8 = undefined;
     std.mem.writeInt(u32, sz[0..4], l.size, .little);
     std.mem.writeInt(u32, sz[4..8], l.@"align", .little);
+    try buf.appendSlice(gpa, &sz);
+}
+
+/// Index-free enum layout descriptor: name + tag_size + payload_off + per-variant
+/// (name + form byte + per payload field (name + kind + payload-local offset,
+/// recursing nested struct/enum)) + size + align. Editing any variant/payload
+/// flips the bytes, recompiling every using fn (M10 cache soundness).
+fn enumLayoutBytes(gpa: std.mem.Allocator, frozen: *const Frozen, id: u32, buf: *std.ArrayList(u8)) !void {
+    const e = frozen.enum_layouts[id];
+    try buf.appendSlice(gpa, e.name);
+    try buf.append(gpa, 0);
+    var hdr: [8]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], e.tag_size, .little);
+    std.mem.writeInt(u32, hdr[4..8], e.payload_off, .little);
+    try buf.appendSlice(gpa, &hdr);
+    for (e.variants) |v| {
+        try buf.appendSlice(gpa, v.name);
+        try buf.append(gpa, 0);
+        try buf.append(gpa, @intFromEnum(v.form));
+        if (v.form == .@"struct") {
+            for (v.field_names, v.field_types, v.offsets) |fn_, fty, off| {
+                try buf.appendSlice(gpa, fn_);
+                try buf.append(gpa, 0);
+                try buf.append(gpa, @intFromEnum(fty.kind));
+                var ob: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ob, off, .little);
+                try buf.appendSlice(gpa, &ob);
+                if (fty.kind == .@"struct") try structLayoutBytes(gpa, frozen, fty.struct_id, buf);
+                if (fty.kind == .@"enum") try enumLayoutBytes(gpa, frozen, fty.enum_id, buf);
+            }
+        } else {
+            // A tuple variant has no field names; fold its payload types/offsets.
+            for (v.field_types, v.offsets) |fty, off| {
+                try buf.append(gpa, @intFromEnum(fty.kind));
+                var ob: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ob, off, .little);
+                try buf.appendSlice(gpa, &ob);
+                if (fty.kind == .@"struct") try structLayoutBytes(gpa, frozen, fty.struct_id, buf);
+                if (fty.kind == .@"enum") try enumLayoutBytes(gpa, frozen, fty.enum_id, buf);
+            }
+        }
+    }
+    var sz: [8]u8 = undefined;
+    std.mem.writeInt(u32, sz[0..4], e.size, .little);
+    std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
     try buf.appendSlice(gpa, &sz);
 }
 
@@ -1267,6 +1357,92 @@ test "integration: emitted binary runs with the right exit code" {
         // A LARGE struct from a loop break, bound to a local (struct break-value
         // must copy full bytes, not just x0/x1). break V3{40,1,1} → 42.
         .{ .src = "struct V3 { a: int, b: int, c: int }\nfn main() -> int {\n i := 0\n v := loop {\n i = i + 1\n if i == 3 { break V3 { a: 40, b: 1, c: 1 } }\n }\n return v.a + v.b + v.c\n}\n", .name = "struct_loop_break_big", .expect = 42 },
+        // M10 enums — each RUN proves an enum capability a byte assert can't.
+        // (e1) all three variant forms, qualified + inferred, match binding tuple +
+        // struct payloads + unit + a value-bound match. Circle(5)=25, Rect{3,4}=12,
+        // Empty=0 → 37.
+        .{ .src = "enum Shape { Empty, Circle(int), Rect { w: int, h: int } }\nfn area(s: Shape) -> int { match s { .Circle(r) -> r * r, .Rect { w, h } -> w * h, .Empty -> 0 } }\nfn main() -> int {\n c := Shape.Circle(5)\n r := Shape.Rect { w: 3, h: 4 }\n return area(c) + area(r) + area(.Empty)\n}\n", .name = "enum_shape", .expect = 37 },
+        // (e2) a wildcard arm. A 4-variant enum, match .B + `_`. B → 7.
+        .{ .src = "enum E { A, B, C, D }\nfn f(e: E) -> int { match e { .B -> 7, _ -> 0 } }\nfn main() -> int {\n return f(E.B)\n}\n", .name = "enum_wildcard", .expect = 7 },
+        // (e3) a small enum passed BY VALUE and RETURNED by value (reg pair). The
+        // callee returns the same variant; round-trips C(42) → 42.
+        .{ .src = "enum E { C(int), N }\nfn echo(e: E) -> E { e }\nfn main() -> int {\n x := echo(E.C(42))\n return match x { .C(r) -> r, .N -> 0 }\n}\n", .name = "enum_byvalue_small", .expect = 42 },
+        // (e4) a >16B enum (struct variant 3 ints + 8B tag = 32B) passed + returned
+        // via the indirect/x8 path; sum of fields. A{10,20,30} → 60.
+        .{ .src = "enum Big { A { p: int, q: int, r: int }, B(int) }\nfn echo(b: Big) -> Big { b }\nfn main() -> int {\n x := echo(Big.A { p: 10, q: 20, r: 30 })\n return match x { .A { p, q, r } -> p + q + r, .B(n) -> n }\n}\n", .name = "enum_byvalue_big", .expect = 60 },
+        // (e5) COPY semantics: a callee binds (by value) its enum param's payload;
+        // the caller's value is unchanged. callee reads C(5)→5, caller still C(5)→5,
+        // 5 + 5 = 10. (M10 enums have no field-store; the by-value bind is the copy.)
+        .{ .src = "enum E { C(int) }\nfn peek(e: E) -> int { match e { .C(r) -> r } }\nfn main() -> int {\n e := E.C(5)\n a := peek(e)\n b := match e { .C(r) -> r }\n return a + b\n}\n", .name = "enum_copy", .expect = 10 },
+        // (e6) match as a value bound to a LOCAL and as a fn's TRAILING expression.
+        // f's body IS the match; x binds a match. C(20) → 20, then +22 = 42.
+        .{ .src = "enum E { C(int), N }\nfn f(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }\nfn main() -> int {\n x := match E.C(20) { .C(r) -> r, .N -> 0 }\n return f(E.C(22)) + x\n}\n", .name = "enum_match_expr", .expect = 42 },
+        // (e7) FRAME-SIZING / SIGBUS canary: a variant constructed as a deep 3rd call
+        // arg whose payload is a deeply-nested binary. add3(10,20,C(1+(2+(3+(4+(5+6))))))
+        // → area uses the payload = 21; 10+20+21 = 51... but here we sum the payload
+        // directly: add3(10,20, <Circle payload via match>) = 10+20+ (1+2+3+4+5+6)=51.
+        .{ .src = "enum E { C(int), N }\nfn add3(a: int, b: int, c: int) -> int { return a + b + c }\nfn pay(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }\nfn main() -> int {\n return add3(10, 20, pay(.C(1 + (2 + (3 + (4 + (5 + 6)))))))\n}\n", .name = "enum_deeparg", .expect = 51 },
+        // (e8) FRAME-SIZING: a >16B enum temp constructed as a deep call arg. The
+        // large-variant construction is the 2nd arg (indirect). sum(36, A{1,2,3})=42.
+        .{ .src = "enum Big { A { p: int, q: int, r: int }, B(int) }\nfn sum(x: int, b: Big) -> int { x + match b { .A { p, q, r } -> p + q + r, .B(n) -> n } }\nfn main() -> int {\n return sum(36, Big.A { p: 1, q: 2, r: 3 })\n}\n", .name = "enum_big_deeparg", .expect = 42 },
+        // (e9) FRAME-SIZING: a match as a deep call sub-operand with nested arm
+        // temps. add3(10,20, match B(6) { .B(r) -> 1+(2+(3+r)), ... }) = 10+20+12 = 42.
+        .{ .src = "enum E { A(int), B(int) }\nfn add3(a: int, b: int, c: int) -> int { return a + b + c }\nfn main() -> int {\n return add3(10, 20, match E.B(6) { .A(r) -> r, .B(r) -> 1 + (2 + (3 + r)) })\n}\n", .name = "enum_match_deeparg", .expect = 42 },
+        // (e10) a match RETURNING a large enum via the sret path (trailing expr):
+        // remap a small enum to a large one. C → A{10,20,12} sum 42.
+        .{ .src = "enum Sel { C, D }\nenum Big { A { p: int, q: int, r: int }, B(int) }\nfn pick(s: Sel) -> Big { match s { .C -> Big.A { p: 10, q: 20, r: 12 }, .D -> Big.B(0) } }\nfn main() -> int {\n x := pick(Sel.C)\n return match x { .A { p, q, r } -> p + q + r, .B(v) -> v }\n}\n", .name = "enum_match_sret", .expect = 42 },
+        // (e11) FRAME-SIZING REGRESSION: an aggregate-RETURNING call passed DIRECTLY
+        // as an aggregate ARG to another call — f(g(...)). genCallInner pre-advances
+        // the depth past a struct/enum arg's own span BEFORE materializing it, so the
+        // inner call's sret temp lowers one span deeper; measureExpr's .call arm must
+        // measure that aggregate arg's interior at d+span (NOT d) or the inner spill
+        // overruns the frame onto saved x29/x30 → SIGBUS at ret. >16B enum: echo is
+        // identity, consume sums fields. consume(echo(A{10,20,30})) = 60.
+        .{ .src = "enum Big { A { p: int, q: int, r: int }, B(int) }\nfn echo(b: Big) -> Big { b }\nfn consume(b: Big) -> int { match b { .A { p, q, r } -> p + q + r, .B(n) -> n } }\nfn main() -> int {\n return consume(echo(Big.A { p: 10, q: 20, r: 30 }))\n}\n", .name = "enum_big_call_in_arg", .expect = 60 },
+        // (e12) same shape, <=16B enum (reg-pair ABI), QUALIFIED: pick(id(E.C(42)))=42.
+        .{ .src = "enum E { C(int), N }\nfn id(e: E) -> E { e }\nfn pick(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }\nfn main() -> int {\n return pick(id(E.C(42)))\n}\n", .name = "enum_small_call_in_arg", .expect = 42 },
+        // (e13) same, <=16B enum, INFERRED .C(42): the inner CALL result is the agg
+        // arg, so inferred-vs-qualified does not change framing. pick(id(.C(42)))=42.
+        .{ .src = "enum E { C(int), N }\nfn id(e: E) -> E { e }\nfn pick(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }\nfn main() -> int {\n return pick(id(.C(42)))\n}\n", .name = "enum_small_call_in_arg_inferred", .expect = 42 },
+        // (e14) PRE-EXISTING M9 STRUCT widening of the same defect: a >16B struct
+        // returned by a call passed as the struct arg of another call. echo identity,
+        // consume sums. consume(echo(Big{10,20,30,40})) = 100.
+        .{ .src = "struct Big { p: int, q: int, r: int, s: int }\nfn echo(b: Big) -> Big { b }\nfn consume(b: Big) -> int { b.p + b.q + b.r + b.s }\nfn main() -> int {\n return consume(echo(Big { p: 10, q: 20, r: 30, s: 40 }))\n}\n", .name = "struct_big_call_in_arg", .expect = 100 },
+        // M11 match enrichment.
+        // (m1) int literal match + wildcard. f(1)=20.
+        .{ .src = "fn f(n: int) -> int { match n { 0 -> 10, 1 -> 20, _ -> 99 } }\nfn main() -> int { return f(1) }\n", .name = "match_int", .expect = 20 },
+        // (m1b) int literal match falls to wildcard. f(7)=99.
+        .{ .src = "fn f(n: int) -> int { match n { 0 -> 10, 1 -> 20, _ -> 99 } }\nfn main() -> int { return f(7) }\n", .name = "match_int_wild", .expect = 99 },
+        // (m2) bool match, no `_`. f via x==1 → true → 1.
+        .{ .src = "fn f(b: bool) -> int { match b { true -> 1, false -> 0 } }\nfn main() -> int { return f(1 == 1) }\n", .name = "match_bool", .expect = 1 },
+        // (m3) nested literal taken over a broader binding BY ORDER. C(0)→100.
+        .{ .src = "enum E { C(int), N }\nfn f(e: E) -> int { match e { .C(0) -> 100, .C(r) -> r, .N -> 0 } }\nfn main() -> int { return f(E.C(0)) }\n", .name = "match_nested_zero", .expect = 100 },
+        // (m3b) same match, the broader arm wins for a non-zero payload. C(5)→5.
+        .{ .src = "enum E { C(int), N }\nfn f(e: E) -> int { match e { .C(0) -> 100, .C(r) -> r, .N -> 0 } }\nfn main() -> int { return f(E.C(5)) }\n", .name = "match_nested_bind", .expect = 5 },
+        // (m4) nested ENUM pattern binds x two levels deep. Outer(Inner(7))→7.
+        .{ .src = "enum In { V(int) }\nenum Out { O(In), Z }\nfn f(o: Out) -> int { match o { .O(.V(x)) -> x, .Z -> 0 } }\nfn main() -> int { return f(Out.O(In.V(7))) }\n", .name = "match_nested_enum", .expect = 7 },
+        // (m5) or-pattern with no bindings. A|B → 1, C → 2. A→1.
+        .{ .src = "enum E { A, B, C }\nfn f(e: E) -> int { match e { .A | .B -> 1, .C -> 2 } }\nfn main() -> int { return f(E.A) }\n", .name = "match_or_empty", .expect = 1 },
+        // (m6) or-pattern with a SHARED binding. A(7)|B(7)→7; here B(9)→9.
+        .{ .src = "enum E { A(int), B(int), N }\nfn f(e: E) -> int { match e { .A(x) | .B(x) -> x, .N -> 0 } }\nfn main() -> int { return f(E.B(9)) }\n", .name = "match_or_payload", .expect = 9 },
+        // (m7) guard FALLS THROUGH to a later catch-all when false. n=5 → 2.
+        .{ .src = "fn f(n: int) -> int { match n { _ if n > 10 -> 1, _ -> 2 } }\nfn main() -> int { return f(5) }\n", .name = "match_guard_false", .expect = 2 },
+        // (m7b) guard TRUE takes the guarded arm. n=20 → 1.
+        .{ .src = "fn f(n: int) -> int { match n { _ if n > 10 -> 1, _ -> 2 } }\nfn main() -> int { return f(20) }\n", .name = "match_guard_true", .expect = 1 },
+        // (m8) first-match-wins with an overlapping guarded arm BEFORE the same
+        // pattern unguarded. n=3 (not >10) falls to the second `_`. → 7.
+        .{ .src = "fn f(n: int) -> int { match n { _ if n > 10 -> 1, _ -> 7 } }\nfn main() -> int { return f(3) }\n", .name = "match_first_wins", .expect = 7 },
+        // (m9) a dense int match (0,1,2,3,_) → compare-chain dispatch. f(2)=22.
+        .{ .src = "fn f(n: int) -> int { match n { 0 -> 20, 1 -> 21, 2 -> 22, 3 -> 23, _ -> 0 } }\nfn main() -> int { return f(2) }\n", .name = "match_dense", .expect = 22 },
+        // (m10) FRAME canary: a guard with a deeply-nested sub-expression. The
+        // guard 1+(2+(3+(4+(5+6)))) = 21 > r(=5) is TRUE → 1.
+        .{ .src = "enum E { C(int), N }\nfn f(e: E) -> int { match e { .C(r) if (1 + (2 + (3 + (4 + (5 + 6))))) > r -> 1, _ -> 0 } }\nfn main() -> int { return f(E.C(5)) }\n", .name = "match_guard_nested", .expect = 1 },
+        // (m11) FRAME canary: a guarded/nested match as a deep call arg. add3(10,20,
+        // match B(6) { .B(r) if r > 0 -> 1+(2+(3+r)), ... }) = 10+20+12 = 42.
+        .{ .src = "enum E { A(int), B(int) }\nfn add3(a: int, b: int, c: int) -> int { return a + b + c }\nfn main() -> int {\n return add3(10, 20, match E.B(6) { .B(r) if r > 0 -> 1 + (2 + (3 + r)), _ -> 0 })\n}\n", .name = "match_guard_deeparg", .expect = 42 },
+        // (m12) FRAME canary: f(g(...)) where the inner match returns a >16B enum
+        // via sret with a guarded arm, the outer sums it. pick guarded by s→true.
+        .{ .src = "enum Sel { C, D }\nenum Big { A { p: int, q: int, r: int }, B(int) }\nfn pick(s: Sel) -> Big { match s { .C if 3 > 1 -> Big.A { p: 10, q: 20, r: 12 }, _ -> Big.B(0) } }\nfn consume(b: Big) -> int { match b { .A { p, q, r } -> p + q + r, .B(v) -> v } }\nfn main() -> int {\n return consume(pick(Sel.C))\n}\n", .name = "match_guard_sret_arg", .expect = 42 },
     };
 
     for (cases, 0..) |c, i| {
@@ -1731,6 +1907,220 @@ test "M9 cache soundness: a struct touched ONLY via a param/return type folds it
     defer r3.deinit(gpa);
     defer lp3.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
+}
+
+test "M10 cache soundness: editing an enum's variants recompiles every fn that touches it; verify passes [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // `area` matches Shape; `main` constructs Shape; `other` does NOT touch it.
+    const v1 = "enum Shape { C(int), R { w: int, h: int } }\nfn area(s: Shape) -> int { match s { .C(r) -> r, .R { w, h } -> w * h } }\nfn other() -> int { 5 }\nfn main() -> int {\n s := Shape.R { w: 6, h: 7 }\n return area(s) + other() - 5\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Add a field to the R variant (a LAYOUT change crossing the 16B↔24B ABI
+    // boundary for Shape). area + main TOUCH Shape → MUST recompile; other stays.
+    const v2 = "enum Shape { C(int), R { w: int, h: int, d: int } }\nfn area(s: Shape) -> int { match s { .C(r) -> r, .R { w, h, d } -> w * h * d } }\nfn other() -> int { 5 }\nfn main() -> int {\n s := Shape.R { w: 6, h: 7, d: 1 }\n return area(s) + other() - 5\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp2.codegen_compiled); // area + main
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached); // other
+
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp3.codegen_cached);
+}
+
+test "M10 cache soundness: an enum touched ONLY via a param type folds its layout across the 16B<->24B ABI boundary [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // `consume` touches E ONLY via its param TYPE (its body never matches/reads it).
+    // E starts 16B (tag + one int → reg-pair ABI).
+    const v1 = "enum E { A(int), B }\nfn consume(e: E) -> int { return 7 }\nfn main() -> int {\n e := E.B\n return consume(e)\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+
+    // Grow the A payload to a 3-int struct variant → E becomes 32B (indirect ABI).
+    // `consume` reads no field, but its PARAM ABI changed — it MUST recompile.
+    const v2 = "enum E { A { p: int, q: int, r: int }, B }\nfn consume(e: E) -> int { return 7 }\nfn main() -> int {\n e := E.B\n return consume(e)\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp2.codegen_compiled); // both touch E
+    try testing.expectEqual(@as(usize, 0), lp2.codegen_cached);
+
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
+}
+
+test "M10 errors: non-exhaustive/unknown variant/arity/type; recursive enum; uninferable .V" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-m10-err";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const cases = [_][]const u8{
+        "enum S { A, B }\nfn f(s: S) -> int { match s { .A -> 1 } }\nfn main() -> int { return f(S.A) }\n", // non-exhaustive
+        "enum S { A, B }\nfn main() -> int { x := S.Nope\n return 0 }\n", // unknown variant
+        "enum S { C(int) }\nfn main() -> int { x := S.C(1, 2)\n return 0 }\n", // wrong arity
+        "enum S { C(int) }\nfn main() -> int { x := S.C(true)\n return 0 }\n", // wrong payload type
+        "enum R { A(R), B }\nfn main() -> int { return 0 }\n", // directly-recursive enum
+        "enum A { X(B), Y }\nenum B { Z(A), W }\nfn main() -> int { return 0 }\n", // indirect-recursive
+        "enum S { A }\nfn main() -> int { x := .A\n return 0 }\n", // inferred .V, no expected type
+    };
+    for (cases, 0..) |src, i| {
+        const path = std.fmt.allocPrint(gpa, "{s}/e{d}.toy", .{ dir_name, i }) catch unreachable;
+        defer gpa.free(path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(?anyerror, error.TypeError), r.err);
+        try testing.expect(r.typecheck != null);
+        try testing.expect(r.typecheck.?.diags.len > 0);
+    }
+}
+
+test "M11 errors: non-exhaustive int/bool; guarded-only/partial-nested variant; inconsistent or-bindings; non-bool guard [iv]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-m11-err";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const cases = [_][]const u8{
+        "fn f(n: int) -> int { match n { 0 -> 1, 1 -> 2 } }\nfn main() -> int { return f(0) }\n", // int, no `_`
+        "fn f(b: bool) -> int { match b { true -> 1 } }\nfn main() -> int { return f(1 == 1) }\n", // bool missing false
+        "enum E { C(int), N }\nfn f(e: E) -> int { match e { .C(r) if r > 0 -> 1, .N -> 0 } }\nfn main() -> int { return f(E.N) }\n", // C covered only by a guarded arm
+        "enum E { C(int), N }\nfn f(e: E) -> int { match e { .C(0) -> 1, .N -> 0 } }\nfn main() -> int { return f(E.N) }\n", // C covered only by a partial nested pattern
+        "enum E { A(int), B(int) }\nfn f(e: E) -> int { match e { .A(x) | .B(y) -> 1 } }\nfn main() -> int { return f(E.A(1)) }\n", // or-pattern: different names
+        "enum E { A(int), B }\nfn f(e: E) -> int { match e { .A(x) | .B -> 1 } }\nfn main() -> int { return f(E.B) }\n", // or-pattern: one binds, one doesn't
+        "fn f(n: int) -> int { match n { _ if n -> 1, _ -> 0 } }\nfn main() -> int { return f(0) }\n", // guard not bool
+    };
+    for (cases, 0..) |src, i| {
+        const path = std.fmt.allocPrint(gpa, "{s}/e{d}.toy", .{ dir_name, i }) catch unreachable;
+        defer gpa.free(path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(?anyerror, error.TypeError), r.err);
+        try testing.expect(r.typecheck != null);
+        try testing.expect(r.typecheck.?.diags.len > 0);
+    }
+}
+
+test "M11 cache soundness: editing a literal/guard recompiles only that fn; verify byte-identical [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // `f` matches; `other` is a sibling that must stay cached across edits.
+    const v1 = "fn f(n: int) -> int { match n { 0 -> 1, _ -> 2 } }\nfn other() -> int { 5 }\nfn main() -> int {\n return f(0) + other() - 5\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Edit the literal VALUE 0→1: f's pattern AST changes → f recompiles; other cached.
+    const v2 = "fn f(n: int) -> int { match n { 1 -> 1, _ -> 2 } }\nfn other() -> int { 5 }\nfn main() -> int {\n return f(0) + other() - 5\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled); // f
+    try testing.expectEqual(@as(usize, 2), lp2.codegen_cached); // other + main
+
+    // Add a GUARD to f's first arm → f recompiles again; other stays cached.
+    const v3 = "fn f(n: int) -> int { match n { 1 if n > 0 -> 1, _ -> 2 } }\nfn other() -> int { 5 }\nfn main() -> int {\n return f(0) + other() - 5\n}\n";
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v3, .normal, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp3.codegen_compiled); // f
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
+
+    // Verify: re-lower every fn against the cache; all bytes identical.
+    var r4: FileResult = undefined;
+    var lp4 = try checkAndLower(gpa, io, cache, path, v3, .verify, &r4);
+    defer r4.deinit(gpa);
+    defer lp4.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp4.codegen_cached);
 }
 
 test "M9 errors: missing/unknown/mismatched fields; positional construction; recursive struct" {

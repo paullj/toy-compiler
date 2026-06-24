@@ -1,0 +1,11 @@
+# Feature: a small enum passed BY VALUE to a fn (copy) and returned by value.
+# expect: exit 42
+# echo returns its param unchanged; the round trip preserves C(42).
+enum E { C(int), N }
+
+fn echo(e: E) -> E { e }
+
+fn main() -> int {
+  x := echo(E.C(42))
+  return match x { .C(r) -> r, .N -> 0 }
+}

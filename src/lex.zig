@@ -137,7 +137,7 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         '<' => if (l.eat('=')) .lt_eq else .lt,
         '>' => if (l.eat('=')) .gt_eq else .gt,
         '&' => if (l.eat('&')) .amp_amp else .invalid,
-        '|' => if (l.eat('|')) .pipe_pipe else .invalid,
+        '|' => if (l.eat('|')) .pipe_pipe else .pipe,
         '(' => .l_paren,
         ')' => .r_paren,
         '{' => .l_brace,
@@ -197,9 +197,10 @@ test "logical && and || are two-char operators" {
     try expectTags("a && b || c", &.{ .identifier, .amp_amp, .identifier, .pipe_pipe, .identifier, .eof });
 }
 
-test "lone & or | is invalid" {
+test "lone & is invalid; lone | is a pattern separator" {
     try expectTags("&", &.{ .invalid, .eof });
-    try expectTags("|", &.{ .invalid, .eof });
+    try expectTags("|", &.{ .pipe, .eof });
+    try expectTags("||", &.{ .pipe_pipe, .eof });
 }
 
 test "short declaration with hash comment and string" {

@@ -1,0 +1,14 @@
+# Feature: a variant covered only by a guarded arm is non-exhaustive.
+# expect: compile-error "missing variant"
+enum E { C(int), N }
+
+fn f(e: E) -> int {
+  match e {
+    .C(r) if r > 0 -> 1,
+    .N -> 0
+  }
+}
+
+fn main() -> int {
+  return f(E.N)
+}

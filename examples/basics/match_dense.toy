@@ -1,0 +1,16 @@
+# Feature: a dense int match (0,1,2,3,_) — compare-chain dispatch.
+# expect: exit 22
+# n = 2.
+fn f(n: int) -> int {
+  match n {
+    0 -> 20,
+    1 -> 21,
+    2 -> 22,
+    3 -> 23,
+    _ -> 0
+  }
+}
+
+fn main() -> int {
+  return f(2)
+}

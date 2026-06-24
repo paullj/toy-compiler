@@ -1,0 +1,16 @@
+# Feature: a nested enum pattern binds a value two levels deep.
+# expect: exit 7
+# Out.O(In.V(7)) -> matches .O(.V(x)) with x = 7.
+enum In { V(int) }
+enum Out { O(In), Z }
+
+fn f(o: Out) -> int {
+  match o {
+    .O(.V(x)) -> x,
+    .Z -> 0
+  }
+}
+
+fn main() -> int {
+  return f(Out.O(In.V(7)))
+}

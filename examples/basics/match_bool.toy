@@ -1,0 +1,13 @@
+# Feature: a bool match with both cases (true/false) and no wildcard.
+# expect: exit 1
+# 1 == 1 is true.
+fn f(b: bool) -> int {
+  match b {
+    true -> 1,
+    false -> 0
+  }
+}
+
+fn main() -> int {
+  return f(1 == 1)
+}

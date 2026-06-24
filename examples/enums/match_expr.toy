@@ -1,0 +1,11 @@
+# Feature: match as an expression bound to a local AND as a fn's trailing expr.
+# expect: exit 42
+# f's body IS the match (trailing expr); x binds a match. 22 + 20 = 42.
+enum E { C(int), N }
+
+fn f(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }
+
+fn main() -> int {
+  x := match E.C(20) { .C(r) -> r, .N -> 0 }
+  return f(E.C(22)) + x
+}

@@ -1,0 +1,15 @@
+# Feature: a >16B enum (struct variant, 3 ints + 8B tag = 32B) passed AND
+# returned via the indirect / x8 sret path.
+# expect: exit 60
+# A{10,20,30} round-trips through echo; 10 + 20 + 30 = 60.
+enum Big {
+  A { p: int, q: int, r: int },
+  B(int)
+}
+
+fn echo(b: Big) -> Big { b }
+
+fn main() -> int {
+  x := echo(Big.A { p: 10, q: 20, r: 30 })
+  return match x { .A { p, q, r } -> p + q + r, .B(n) -> n }
+}

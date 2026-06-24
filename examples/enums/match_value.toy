@@ -1,0 +1,22 @@
+# Feature: match binding tuple + struct payloads, a unit variant, and a `_`
+# wildcard arm.
+# expect: exit 12
+# A 4-variant enum; matching .Pair{3,4} -> 12, others via wildcard.
+enum Cell {
+  Empty,
+  One(int),
+  Pair { a: int, b: int },
+  Triple(int, int, int)
+}
+
+fn value(c: Cell) -> int {
+  match c {
+    .Pair { a, b } -> a * b,
+    .One(x) -> x,
+    _ -> 0
+  }
+}
+
+fn main() -> int {
+  return value(Cell.Pair { a: 3, b: 4 })
+}

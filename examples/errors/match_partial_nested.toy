@@ -1,0 +1,15 @@
+# Feature: a variant covered only by a partial nested pattern (.C(0)) is
+# non-exhaustive — .C(0) does NOT cover .C.
+# expect: compile-error "missing variant"
+enum E { C(int), N }
+
+fn f(e: E) -> int {
+  match e {
+    .C(0) -> 1,
+    .N -> 0
+  }
+}
+
+fn main() -> int {
+  return f(E.N)
+}

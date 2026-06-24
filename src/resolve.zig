@@ -102,6 +102,11 @@ fn_map: std.StringHashMapUnmanaged(u32),
 /// must NOT also flag it as undeclared (a double diagnostic).
 struct_names: std.StringHashMapUnmanaged(void),
 
+/// Enum type names. A bare enum-named identifier (the `N` in a qualified
+/// `N.V` / `N.V(...)`) resolves quietly to `.unresolved` — Typecheck
+/// reinterprets it as variant construction, so Resolve must not flag it.
+enum_names: std.StringHashMapUnmanaged(void),
+
 /// Per-function lexical state (reset for each function).
 scopes: std.ArrayList(Scope),
 locals: std.ArrayList(Local),
@@ -128,6 +133,7 @@ pub fn resolve(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, so
         .fns = .empty,
         .fn_map = .empty,
         .struct_names = .empty,
+        .enum_names = .empty,
         .scopes = .empty,
         .locals = .empty,
         .slot_next = 0,
@@ -138,6 +144,7 @@ pub fn resolve(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, so
         r.fns.deinit(gpa);
         r.fn_map.deinit(gpa);
         r.struct_names.deinit(gpa);
+        r.enum_names.deinit(gpa);
         for (r.scopes.items) |*s| s.names.deinit(gpa);
         r.scopes.deinit(gpa);
         r.locals.deinit(gpa);
@@ -173,6 +180,10 @@ fn run(r: *Resolve) !void {
         const decl = r.tree.nodes[fn_idx];
         if (decl.tag == .struct_decl) {
             try r.struct_names.put(r.gpa, r.nameText(decl.main_token), {});
+            continue;
+        }
+        if (decl.tag == .enum_decl) {
+            try r.enum_names.put(r.gpa, r.nameText(decl.main_token), {});
             continue;
         }
         if (decl.tag != .fn_decl) continue;
@@ -334,6 +345,7 @@ fn resolveExpr(r: *Resolve, node_idx: Ast.Index) error{OutOfMemory}!void {
                 // type-name in a position Resolve doesn't bind, or a positional
                 // `Point(...)` callee that Typecheck diagnoses specifically).
                 if (r.struct_names.contains(r.nameText(n.main_token))) return;
+                if (r.enum_names.contains(r.nameText(n.main_token))) return;
                 try r.emitFmt(
                     r.tokens[n.main_token].start,
                     "undeclared identifier '{s}'",
@@ -358,6 +370,14 @@ fn resolveExpr(r: *Resolve, node_idx: Ast.Index) error{OutOfMemory}!void {
             for (Ast.rangeSlice(r.tree, n.rhs)) |fi| try r.resolveExpr(r.tree.nodes[fi].lhs);
         },
         .field_access => try r.resolveExpr(n.lhs),
+        // M10: variant construction. A unit `.V`/`N.V` binds no value names (the
+        // type-name leaf, when present, is the enum type — resolved quietly). A
+        // tuple/struct form resolves each payload arg / field-init VALUE (the
+        // struct form mirrors struct_init: the field-init's lhs is the value).
+        .enum_init_unit => {},
+        .enum_init_tuple => for (Ast.rangeSlice(r.tree, n.rhs)) |a| try r.resolveExpr(a),
+        .enum_init_struct => for (Ast.rangeSlice(r.tree, n.rhs)) |fi| try r.resolveExpr(r.tree.nodes[fi].lhs),
+        .match_expr => try r.resolveMatch(node_idx),
         // A block / if used in VALUE position must still resolve inner names.
         .literal_unit => {},
         .block => try r.resolveBlock(node_idx),
@@ -404,6 +424,82 @@ fn resolveLabeled(r: *Resolve, idx: Ast.Index) error{OutOfMemory}!void {
         else => {},
     }
     _ = r.label_stack.pop();
+}
+
+/// Resolve a `match scrut { pat -> body, ... }`. The scrutinee resolves in the
+/// enclosing scope; each arm opens a fresh scope, declares its pattern bindings
+/// (writing each `.local` slot onto the `pattern_binding` node, mirroring the
+/// for-var pattern), resolves the arm body, then pops.
+fn resolveMatch(r: *Resolve, node_idx: Ast.Index) error{OutOfMemory}!void {
+    const n = r.tree.nodes[node_idx];
+    try r.resolveExpr(n.lhs); // scrutinee
+    for (Ast.rangeSlice(r.tree, n.rhs)) |arm_idx| {
+        const arm = r.tree.nodes[arm_idx];
+        try r.pushScope();
+        try r.declarePattern(arm.lhs);
+        const h = Ast.armHeaderAt(r.tree, arm.rhs);
+        if (h.guard != Ast.none) try r.resolveExpr(h.guard); // guard sees bindings
+        try r.resolveExpr(h.body);
+        r.popScope();
+    }
+}
+
+/// Recursively declare a pattern's bindings into the current scope. A
+/// `pattern_binding` declares its name (and recurses into a struct-field
+/// sub-pattern); `pattern_variant` recurses into each payload child;
+/// `pattern_or` declares the first alt and reuses its slots for later alts'
+/// same-named bindings (so `A(x) | B(x)` share one slot — codegen relies on it).
+fn declarePattern(r: *Resolve, pat_idx: Ast.Index) error{OutOfMemory}!void {
+    if (pat_idx == Ast.none) return;
+    const pat = r.tree.nodes[pat_idx];
+    switch (pat.tag) {
+        .pattern_wildcard, .pattern_literal => {},
+        .pattern_binding => {
+            const slot = try r.declare(pat.main_token, "redeclaration of '{s}'");
+            if (slot) |s| r.resolutions[pat_idx] = .{ .local = s };
+            if (pat.rhs != Ast.none) try r.declarePattern(pat.rhs);
+        },
+        .pattern_variant => {
+            if (pat.rhs != Ast.none)
+                for (Ast.rangeSlice(r.tree, pat.rhs)) |c| try r.declarePattern(c);
+        },
+        .pattern_or => {
+            const alts = Ast.rangeSlice(r.tree, pat.lhs);
+            if (alts.len == 0) return;
+            try r.declarePattern(alts[0]); // first alt: fresh slots
+            for (alts[1..]) |alt| try r.bindOrAltToFirst(alt);
+        },
+        else => {},
+    }
+}
+
+/// Resolve a later or-pattern alternative's bindings: reuse the slot of the
+/// same-named binding already declared by the first alternative when present,
+/// else declare a fresh one (a name-set mismatch the typechecker then rejects).
+fn bindOrAltToFirst(r: *Resolve, pat_idx: Ast.Index) error{OutOfMemory}!void {
+    if (pat_idx == Ast.none) return;
+    const pat = r.tree.nodes[pat_idx];
+    switch (pat.tag) {
+        .pattern_wildcard, .pattern_literal => {},
+        .pattern_binding => {
+            const existing = r.lookupName(pat.main_token);
+            if (existing == .local) {
+                r.resolutions[pat_idx] = existing;
+            } else {
+                const slot = try r.declare(pat.main_token, "redeclaration of '{s}'");
+                if (slot) |s| r.resolutions[pat_idx] = .{ .local = s };
+            }
+            if (pat.rhs != Ast.none) try r.bindOrAltToFirst(pat.rhs);
+        },
+        .pattern_variant => {
+            if (pat.rhs != Ast.none)
+                for (Ast.rangeSlice(r.tree, pat.rhs)) |c| try r.bindOrAltToFirst(c);
+        },
+        .pattern_or => {
+            for (Ast.rangeSlice(r.tree, pat.lhs)) |alt| try r.bindOrAltToFirst(alt);
+        },
+        else => {},
+    }
 }
 
 /// Resolve a `break @L`/`continue @L` target: scan the label stack innermost-first
@@ -500,7 +596,7 @@ fn parseSource(gpa: std.mem.Allocator, source: []const u8) !Parsed {
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
     var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     return .{ .tokens = tokens, .tree = tree, .source = source };
 }
 

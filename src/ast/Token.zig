@@ -39,6 +39,8 @@ pub const Tag = enum(u8) {
     kw_in,
     kw_break,
     kw_continue,
+    kw_enum,
+    kw_match,
 
     // punctuation / operators
     plus,
@@ -55,6 +57,8 @@ pub const Tag = enum(u8) {
     gt_eq,
     amp_amp,
     pipe_pipe,
+    /// `|` — the or-pattern separator in pattern position (not a general operator).
+    pipe,
     l_paren,
     r_paren,
     l_brace,
@@ -88,6 +92,8 @@ pub const Tag = enum(u8) {
             .kw_in => "in",
             .kw_break => "break",
             .kw_continue => "continue",
+            .kw_enum => "enum",
+            .kw_match => "match",
             .plus => "+",
             .minus => "-",
             .star => "*",
@@ -102,6 +108,7 @@ pub const Tag = enum(u8) {
             .gt_eq => ">=",
             .amp_amp => "&&",
             .pipe_pipe => "||",
+            .pipe => "|",
             .l_paren => "(",
             .r_paren => ")",
             .l_brace => "{",
@@ -133,4 +140,6 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "in", .kw_in },
     .{ "break", .kw_break },
     .{ "continue", .kw_continue },
+    .{ "enum", .kw_enum },
+    .{ "match", .kw_match },
 });

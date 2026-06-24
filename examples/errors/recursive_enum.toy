@@ -1,0 +1,5 @@
+# Feature: SHOULD FAIL — a directly-recursive enum has infinite size.
+# expect: compile-error "recursive type 'R' has infinite size"
+# Variant A holds an R by value, which would require infinite storage.
+enum R { A(R), B }
+fn main() -> int { return 0 }

@@ -1,0 +1,16 @@
+# Feature: a nested literal pattern taken over a broader binding BY ORDER.
+# expect: exit 100
+# .C(0) is listed first, so C(0) -> 100 (not the .C(r) arm).
+enum E { C(int), N }
+
+fn f(e: E) -> int {
+  match e {
+    .C(0) -> 100,
+    .C(r) -> r,
+    .N -> 0
+  }
+}
+
+fn main() -> int {
+  return f(E.C(0))
+}

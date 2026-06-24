@@ -1,0 +1,8 @@
+# Feature: SHOULD FAIL — a match missing a variant (and no `_`) is rejected.
+# expect: compile-error "non-exhaustive match: missing variant 'B'"
+# The match covers .A but not .B, and has no wildcard.
+enum S { A, B }
+fn f(s: S) -> int {
+  match s { .A -> 1 }
+}
+fn main() -> int { return f(S.A) }

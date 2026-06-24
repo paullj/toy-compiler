@@ -1,0 +1,8 @@
+# Feature: SHOULD FAIL — constructing a variant the enum does not declare.
+# expect: compile-error "has no variant 'Nope'"
+# Shape declares Empty/Circle, not Nope.
+enum Shape { Empty, Circle(int) }
+fn main() -> int {
+  x := Shape.Nope
+  return 0
+}

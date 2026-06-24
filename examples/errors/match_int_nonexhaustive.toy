@@ -1,0 +1,12 @@
+# Feature: an int match without a `_` is non-exhaustive (infinite domain).
+# expect: compile-error "int match requires '_'"
+fn f(n: int) -> int {
+  match n {
+    0 -> 1,
+    1 -> 2
+  }
+}
+
+fn main() -> int {
+  return f(0)
+}

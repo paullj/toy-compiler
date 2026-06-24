@@ -98,6 +98,10 @@ node_types: []const Typecheck.Type,
 /// from this so a struct local/temp gets exactly its layout size; the ABI walks
 /// classify by the struct's byte size. Pure: read-only frozen input.
 layouts: []const Typecheck.Layout,
+/// The enum table (M10): one layout per enum id, threaded read-only. An enum
+/// temp/local is sized by its layout; the ABI classifies by byte size, exactly
+/// like a struct. Pure: read-only frozen input.
+enum_layouts: []const Typecheck.EnumLayout,
 /// Index → stable symbol name, for every user fn (source order) plus the
 /// synthetic `print` builtin at index user_fn_count. Precomputed once and shared
 /// read-only across the parallel jobs. Used to name a call's `.func` target.
@@ -219,6 +223,7 @@ pub fn lower(
     resolutions: []const Resolution,
     node_types: []const Typecheck.Type,
     layouts: []const Typecheck.Layout,
+    enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
     fn_decl: Ast.Index,
     sym: Link.SymName,
@@ -235,6 +240,7 @@ pub fn lower(
         .resolutions = resolutions,
         .node_types = node_types,
         .layouts = layouts,
+        .enum_layouts = enum_layouts,
         .names = names,
         .code = .empty,
         .relocs = .empty,
@@ -310,6 +316,7 @@ pub fn lowerPrint(gpa: std.mem.Allocator, out_listing: ?*std.ArrayList(u8)) erro
         .resolutions = &.{},
         .node_types = &.{},
         .layouts = &.{},
+        .enum_layouts = &.{},
         .names = &.{},
         .code = .empty,
         .relocs = .empty,
@@ -360,6 +367,7 @@ pub fn generateProgram(
     resolutions: []const Resolution,
     node_types: []const Typecheck.Type,
     layouts: []const Typecheck.Layout,
+    enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
     fn_nodes: []const Ast.Index,
     entry_fn: u32,
@@ -391,6 +399,7 @@ pub fn generateProgram(
             resolutions,
             node_types,
             layouts,
+            enum_layouts,
             names,
             fn_idx,
             names[sym],
@@ -458,7 +467,7 @@ fn lowerFn(cg: *Codegen, fn_idx: Ast.Index, is_entry: bool) error{OutOfMemory}!v
     // incoming x8 (the body's calls clobber x8), then write the result through it.
     cg.ret_type = cg.fnReturnType(proto);
     cg.sret_off = NO_SRET;
-    if (cg.ret_type.kind == .@"struct" and abiClass(cg.typeSize(cg.ret_type)) == .indirect) {
+    if (isAggregate(cg.ret_type) and abiClass(cg.typeSize(cg.ret_type)) == .indirect) {
         cg.sret_off = cg.out_base + cg.locals_bytes;
         cg.locals_bytes += 8;
     }
@@ -515,7 +524,7 @@ fn lowerFn(cg: *Codegen, fn_idx: Ast.Index, is_entry: bool) error{OutOfMemory}!v
             const pty = cg.paramType(proto, slot);
             const off = cg.localOff(slot);
             const size = cg.typeSize(pty);
-            const is_agg = (pty.kind == .str or pty.kind == .@"struct");
+            const is_agg = isAggregate(pty);
             if (is_agg and abiClass(size) == .indirect) {
                 // A pointer to the caller's copy: dereference and copy bytes in.
                 if (ngrn < 8) {
@@ -706,8 +715,8 @@ fn lowerStmt(cg: *Codegen, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                         try cg.genStrExpr(stmt.lhs); // ptr→x0, len→x1
                         try cg.storeStrSlot(slot);
                     },
-                    .@"struct" => {
-                        // `q := <struct expr>` copies all bytes into the slot region.
+                    .@"struct", .@"enum" => {
+                        // `q := <aggregate expr>` copies all bytes into the slot.
                         try cg.genStructTo(stmt.lhs, Aarch64.SP, cg.localOff(slot));
                     },
                     else => {
@@ -725,7 +734,7 @@ fn lowerStmt(cg: *Codegen, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                         try cg.genStrExpr(stmt.rhs);
                         try cg.storeStrSlot(cg.localSlot(stmt.lhs));
                     },
-                    .@"struct" => {
+                    .@"struct", .@"enum" => {
                         try cg.genStructTo(stmt.rhs, Aarch64.SP, cg.localOff(cg.localSlot(stmt.lhs)));
                     },
                     else => {
@@ -780,12 +789,12 @@ fn lowerReturn(cg: *Codegen, stmt: Ast.Node) error{OutOfMemory}!void {
     if (stmt.lhs != Ast.none) {
         switch (cg.node_types[stmt.lhs].kind) {
             .str => try cg.genStrExpr(stmt.lhs),
-            .@"struct" => {
+            .@"struct", .@"enum" => {
                 const size = cg.typeSize(cg.node_types[stmt.lhs]);
                 if (abiClass(size) == .indirect) {
                     try cg.genStructToSret(stmt.lhs); // write through the saved caller buffer
                 } else {
-                    try cg.genStructExprPair(stmt.lhs); // small struct → (x0[,x1])
+                    try cg.genStructExprPair(stmt.lhs); // small aggregate → (x0[,x1])
                 }
             },
             else => try cg.genExpr(stmt.lhs), // result in x0
@@ -806,7 +815,7 @@ fn lowerFieldStore(cg: *Codegen, place_idx: Ast.Index, value_idx: Ast.Index) err
             try cg.emitFmt(Aarch64.strSp(0, off), "str x0, [sp, #{d}]", .{off});
             try cg.emitFmt(Aarch64.strSp(1, off + 8), "str x1, [sp, #{d}]", .{off + 8});
         },
-        .@"struct" => try cg.genStructTo(value_idx, Aarch64.SP, off),
+        .@"struct", .@"enum" => try cg.genStructTo(value_idx, Aarch64.SP, off),
         else => {
             try cg.genExpr(value_idx);
             try cg.emitFmt(Aarch64.strSp(0, off), "str x0, [sp, #{d}]", .{off});
@@ -849,6 +858,21 @@ fn lowerIf(cg: *Codegen, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 fn genExpr(cg: *Codegen, node_idx: Ast.Index) error{OutOfMemory}!void {
     if (node_idx == Ast.none) return;
     const n = cg.tree.nodes[node_idx];
+    // M10: an enum-valued node in value position is a small aggregate (reg pair).
+    // Variant construction (inferred enum_init_*, or qualified `N.V`/`N.V(...)`
+    // reusing field_access/call) and a match are produced via the aggregate path.
+    if (cg.node_types[node_idx].kind == .@"enum") {
+        switch (n.tag) {
+            .enum_init_unit, .enum_init_tuple, .enum_init_struct, .field_access, .match_expr => return cg.genStructExprPair(node_idx),
+            // A qualified `N.V(...)` arrives as `.call` but is construction, not a
+            // real call; an enum-RETURNING real call also lands its result in the
+            // reg pair, so genStructExprPair (via genStructToSp) does the right
+            // thing for both (genStructToSp routes the qualified ctor to
+            // genVariantInit and a real call to genCallStructResult/genCall).
+            .call => return cg.genStructExprPair(node_idx),
+            else => {},
+        }
+    }
     switch (n.tag) {
         .literal_number => {
             const v = cg.parseInt(n.main_token) orelse {
@@ -860,7 +884,7 @@ fn genExpr(cg: *Codegen, node_idx: Ast.Index) error{OutOfMemory}!void {
         .identifier => {
             switch (cg.node_types[node_idx].kind) {
                 .str => try cg.genStrExpr(node_idx), // ptr→x0, len→x1
-                .@"struct" => try cg.genStructExprPair(node_idx), // small struct → (x0[,x1])
+                .@"struct", .@"enum" => try cg.genStructExprPair(node_idx), // small aggregate → (x0[,x1])
                 else => {
                     const slot = cg.localSlot(node_idx);
                     try cg.emitFmt(Aarch64.ldrSp(0, cg.localOff(slot)), "ldr x0, [sp, #{d}]", .{cg.localOff(slot)});
@@ -904,6 +928,9 @@ fn genExpr(cg: *Codegen, node_idx: Ast.Index) error{OutOfMemory}!void {
         .if_stmt => try cg.lowerIfValue(node_idx, false),
         .loop_expr => try cg.lowerLoopValue(node_idx, false, null),
         .labeled => try cg.lowerLabeledValue(node_idx, false),
+        // A scalar/bool-valued match (an enum/str result is handled by the
+        // enum-guard above / genStrExpr below).
+        .match_expr => try cg.lowerMatch(node_idx, false),
         else => try cg.unsupported(n.main_token, "expression unsupported in codegen"),
     }
 }
@@ -943,10 +970,10 @@ fn genCallInner(cg: *Codegen, node_idx: Ast.Index, n: Ast.Node, sret_reg: ?u32, 
                 try cg.emitFmt(Aarch64.strSp(0, off), "str x0, [sp, #{d}]", .{off});
                 try cg.emitFmt(Aarch64.strSp(1, off + 8), "str x1, [sp, #{d}]", .{off + 8});
             },
-            .@"struct" => {
+            .@"struct", .@"enum" => {
                 // Advance past THIS arg's own temp span BEFORE materializing it, so a
-                // nested call inside a field initializer (genStructInit evaluates field
-                // values at cg.depth) spills past these bytes, not onto them.
+                // nested call inside a field/payload initializer (evaluated at cg.depth)
+                // spills past these bytes, not onto them.
                 cg.depth += cg.tempSlots(ty);
                 try cg.genStructTo(arg, Aarch64.SP, off); // full bytes into the temp span
                 cg.depth -= cg.tempSlots(ty);
@@ -969,7 +996,7 @@ fn genCallInner(cg: *Codegen, node_idx: Ast.Index, n: Ast.Node, sret_reg: ?u32, 
             const off = temp_offs[i];
             const ty = cg.node_types[arg];
             const size = cg.typeSize(ty);
-            const is_agg = (ty.kind == .str or ty.kind == .@"struct");
+            const is_agg = isAggregate(ty);
             if (is_agg and abiClass(size) == .indirect) {
                 // Pass a pointer to the temp copy.
                 if (ngrn < 8) {
@@ -1082,6 +1109,7 @@ fn genStrExpr(cg: *Codegen, node_idx: Ast.Index) error{OutOfMemory}!void {
             try cg.emitFmt(Aarch64.ldrSp(1, off + 8), "ldr x1, [sp, #{d}]", .{off + 8});
         },
         .if_stmt => try cg.lowerIfValue(node_idx, true),
+        .match_expr => try cg.lowerMatch(node_idx, true),
         .block => try cg.lowerBlockValue(node_idx, true),
         .loop_expr => try cg.lowerLoopValue(node_idx, true, null),
         .labeled => try cg.lowerLabeledValue(node_idx, true),
@@ -1181,6 +1209,27 @@ fn genStructToSp(cg: *Codegen, node_idx: Ast.Index, dst_off: u32) error{OutOfMem
     const ty = cg.node_types[node_idx];
     const size = cg.typeSize(ty);
     const dst_reg = Aarch64.SP;
+    // M10: a variant construction (inferred enum_init_*, or a qualified `N.V` /
+    // `N.V(...)` that typecheck classified as enum-valued — arriving as
+    // field_access / call) builds a tagged-union value. A match dispatches into
+    // the destination. Detect by tag (inferred forms) or by enum-valued node type
+    // (qualified forms reusing call/field_access).
+    switch (n.tag) {
+        .enum_init_unit, .enum_init_tuple, .enum_init_struct => return cg.genVariantInit(node_idx, dst_reg, dst_off),
+        .match_expr => return cg.genMatchTo(node_idx, dst_off),
+        else => {},
+    }
+    if (ty.kind == .@"enum") {
+        switch (n.tag) {
+            // Qualified `N.V(...)` (tuple) arrives as `.call` whose CALLEE is a
+            // field_access over the enum type-name (a real enum-returning call has
+            // an identifier callee → fall through to the .call arm below).
+            .call => if (cg.tree.nodes[n.lhs].tag == .field_access) return cg.genVariantInit(node_idx, dst_reg, dst_off),
+            // Qualified `N.V` (unit) arrives as a non-local field_access.
+            .field_access => if (!cg.isLocalRootedPlace(node_idx)) return cg.genVariantInit(node_idx, dst_reg, dst_off),
+            else => {},
+        }
+    }
     switch (n.tag) {
         .struct_init => try cg.genStructInit(node_idx, dst_reg, dst_off),
         // M9: a struct produced by a value-control-flow expression. Lower each arm's
@@ -1213,7 +1262,7 @@ fn genStructToSp(cg: *Codegen, node_idx: Ast.Index, dst_off: u32) error{OutOfMem
                 if (size > 8) try cg.emitFmt(Aarch64.strRegUoff(1, dst_reg, dst_off + 8), "str x1, [x{d}, #{d}]", .{ dst_reg, dst_off + 8 });
             }
         },
-        else => try cg.unsupported(n.main_token, "struct expression unsupported in codegen"),
+        else => try cg.unsupported(n.main_token, "aggregate expression unsupported in codegen"),
     }
 }
 
@@ -1340,12 +1389,287 @@ fn genStructInit(cg: *Codegen, node_idx: Ast.Index, dst_reg: u32, dst_off: u32) 
                 try cg.emitFmt(Aarch64.strRegUoff(0, dst_reg, dst_off + foff), "str x0, [x{d}, #{d}]", .{ dst_reg, dst_off + foff });
                 try cg.emitFmt(Aarch64.strRegUoff(1, dst_reg, dst_off + foff + 8), "str x1, [x{d}, #{d}]", .{ dst_reg, dst_off + foff + 8 });
             },
-            .@"struct" => try cg.genStructTo(fi.lhs, dst_reg, dst_off + foff),
+            .@"struct", .@"enum" => try cg.genStructTo(fi.lhs, dst_reg, dst_off + foff),
             else => {
                 try cg.genExpr(fi.lhs); // scalar → x0
                 try cg.emitFmt(Aarch64.strRegUoff(0, dst_reg, dst_off + foff), "str x0, [x{d}, #{d}]", .{ dst_reg, dst_off + foff });
             },
         }
+    }
+}
+
+// ---- enum (value tagged-union) codegen (M10) -------------------------------
+
+/// Decoded view of a variant-construction node, normalizing inferred enum_init_*
+/// and qualified `N.V`/`N.V(...)` (field_access/call) into one shape.
+const VariantCtor = struct {
+    vtok: u32, // variant-name token
+    payload: Ast.Index, // Range header over arg/field-init nodes, or none
+    is_struct_form: bool, // payload is field_init nodes (vs positional args)
+};
+
+fn decodeVariantCtor(cg: *Codegen, node_idx: Ast.Index) VariantCtor {
+    const n = cg.tree.nodes[node_idx];
+    return switch (n.tag) {
+        .enum_init_unit => .{ .vtok = n.main_token, .payload = Ast.none, .is_struct_form = false },
+        .enum_init_tuple => .{ .vtok = n.main_token, .payload = n.rhs, .is_struct_form = false },
+        .enum_init_struct => .{ .vtok = n.main_token, .payload = n.rhs, .is_struct_form = true },
+        // Qualified `N.V` arrives as field_access: variant = field token, no payload.
+        .field_access => .{ .vtok = n.main_token, .payload = Ast.none, .is_struct_form = false },
+        // Qualified `N.V(args)` arrives as call: callee field_access's field token
+        // is the variant; args are positional.
+        .call => .{ .vtok = cg.tree.nodes[n.lhs].main_token, .payload = n.rhs, .is_struct_form = false },
+        else => unreachable,
+    };
+}
+
+/// Build a variant value into [dst_reg + dst_off]: store the tag at offset 0, then
+/// the payload at `payload_off + variant.offsets[i]`. Caller-saved-dest safety: if
+/// `dst_reg` is not SP, materialize via an sp temp first (payload exprs may `bl`).
+fn genVariantInit(cg: *Codegen, node_idx: Ast.Index, dst_reg: u32, dst_off: u32) error{OutOfMemory}!void {
+    const ty = cg.node_types[node_idx];
+    const size = cg.typeSize(ty);
+    if (dst_reg != Aarch64.SP) {
+        const temp = cg.tempOff(cg.depth);
+        const saved = cg.depth;
+        cg.depth += cg.tempSlots(ty);
+        try cg.genVariantInit(node_idx, Aarch64.SP, temp);
+        cg.depth = saved;
+        try cg.copyStructBytes(dst_reg, dst_off, Aarch64.SP, temp, size);
+        return;
+    }
+    const e = cg.enum_layouts[cg.enumIdOf(node_idx)];
+    const ctor = cg.decodeVariantCtor(node_idx);
+    const vname = cg.tokens[ctor.vtok].text(cg.source);
+    var vi: u32 = 0;
+    for (e.variants, 0..) |v, i| {
+        if (std.mem.eql(u8, v.name, vname)) {
+            vi = @intCast(i);
+            break;
+        }
+    }
+    const variant = e.variants[vi];
+    // 1) TAG at offset 0.
+    try cg.emitImm64(0, @intCast(vi));
+    try cg.emitFmt(Aarch64.strSp(0, dst_off), "str x0, [sp, #{d}]", .{dst_off});
+    // 2) PAYLOAD at payload_off + per-element offset.
+    if (ctor.payload == Ast.none) return;
+    const elems = Ast.rangeSlice(cg.tree, ctor.payload);
+    for (elems, 0..) |elem_idx, i| {
+        const value: Ast.Index = if (ctor.is_struct_form) cg.tree.nodes[elem_idx].lhs else elem_idx;
+        // A struct-form field-init may be reordered vs declaration; map by name.
+        const fi_off: u32 = if (ctor.is_struct_form) blk: {
+            const fname = cg.tokens[cg.tree.nodes[elem_idx].main_token].text(cg.source);
+            for (variant.field_names, 0..) |dn, j| {
+                if (std.mem.eql(u8, dn, fname)) break :blk variant.offsets[j];
+            }
+            break :blk variant.offsets[i];
+        } else variant.offsets[i];
+        const abs_off = dst_off + e.payload_off + fi_off;
+        const fty = variant.field_types[if (ctor.is_struct_form) blk2: {
+            const fname = cg.tokens[cg.tree.nodes[elem_idx].main_token].text(cg.source);
+            for (variant.field_names, 0..) |dn, j| {
+                if (std.mem.eql(u8, dn, fname)) break :blk2 j;
+            }
+            break :blk2 i;
+        } else i];
+        switch (fty.kind) {
+            .str => {
+                try cg.genStrExpr(value); // ptr→x0, len→x1
+                try cg.emitFmt(Aarch64.strSp(0, abs_off), "str x0, [sp, #{d}]", .{abs_off});
+                try cg.emitFmt(Aarch64.strSp(1, abs_off + 8), "str x1, [sp, #{d}]", .{abs_off + 8});
+            },
+            .@"struct", .@"enum" => try cg.genStructTo(value, Aarch64.SP, abs_off),
+            else => {
+                try cg.genExpr(value); // scalar → x0
+                try cg.emitFmt(Aarch64.strSp(0, abs_off), "str x0, [sp, #{d}]", .{abs_off});
+            },
+        }
+    }
+}
+
+/// Lower a `match` whose result is a scalar/str/small aggregate into x0[,x1] (or,
+/// for an aggregate, via a temp). Reuses genMatchTo, then loads the temp.
+fn lowerMatch(cg: *Codegen, node_idx: Ast.Index, want_str: bool) error{OutOfMemory}!void {
+    const ty = cg.node_types[node_idx];
+    if (ty.kind == .@"struct" or ty.kind == .@"enum") {
+        try cg.genStructExprPair(node_idx); // routes through genMatchTo via genStructTo
+        return;
+    }
+    const result_off = cg.tempOff(cg.depth);
+    const saved = cg.depth;
+    cg.depth += 1; // the result slot
+    try cg.genMatchScalarTo(node_idx, result_off, want_str);
+    cg.depth = saved;
+    try cg.emitFmt(Aarch64.ldrSp(0, result_off), "ldr x0, [sp, #{d}]", .{result_off});
+    if (want_str) try cg.emitFmt(Aarch64.ldrSp(1, result_off + 8), "ldr x1, [sp, #{d}]", .{result_off + 8});
+}
+
+/// Dispatch on the scrutinee tag and lower the matching arm's body into the ONE
+/// sp-relative result slot at `dst_off`. For an aggregate result, arm bodies are
+/// produced via genStructToSp; for a scalar/str, via genValue + store.
+fn genMatchTo(cg: *Codegen, node_idx: Ast.Index, dst_off: u32) error{OutOfMemory}!void {
+    try cg.genMatchImpl(node_idx, dst_off, false, true);
+}
+
+fn genMatchScalarTo(cg: *Codegen, node_idx: Ast.Index, dst_off: u32, want_str: bool) error{OutOfMemory}!void {
+    try cg.genMatchImpl(node_idx, dst_off, want_str, false);
+}
+
+/// Shared match lowering. Spills the scrutinee to a temp, reads its tag, then a
+/// linear tag-compare-and-branch chain dispatches to each arm. Each arm binds its
+/// payload BY VALUE and lowers its body into [sp+dst_off]; arms join at `lend`.
+/// `is_agg` routes the body through genStructToSp (else genValue+store).
+fn genMatchImpl(cg: *Codegen, node_idx: Ast.Index, dst_off: u32, want_str: bool, is_agg: bool) error{OutOfMemory}!void {
+    const n = cg.tree.nodes[node_idx];
+    const scrut_ty = cg.node_types[n.lhs];
+    // Only an enum scrutinee has a tag layout; an int/bool scrut spills a scalar
+    // whose value IS the comparand (testPattern reads it lazily).
+    const e: ?Typecheck.EnumLayout = if (scrut_ty.kind == .@"enum") cg.enum_layouts[scrut_ty.enum_id] else null;
+
+    // Spill the scrutinee into a temp at the current depth; the arm bodies lower
+    // ONE span deeper (the result slot at dst_off is the caller's, not a temp).
+    const scrut_off = cg.tempOff(cg.depth);
+    const saved = cg.depth;
+    cg.depth += cg.tempSlots(scrut_ty);
+    try cg.genStructToSp(n.lhs, scrut_off);
+
+    const arms = Ast.rangeSlice(cg.tree, n.rhs);
+    const lend = try cg.newLabel();
+    for (arms) |arm_idx| {
+        const arm = cg.tree.nodes[arm_idx];
+        const h = Ast.armHeaderAt(cg.tree, arm.rhs);
+        // `lnext` is where a mismatch (or a failed guard) jumps — the next arm.
+        // dense discriminant: compare-chain dispatch.
+        const lnext = try cg.newLabel();
+        try cg.testPattern(arm.lhs, scrut_off, scrut_ty, e, lnext);
+        // Guard (after the pattern structurally matched): true falls through to the
+        // body, false → lnext = next arm (first-match-wins + guard fall-through).
+        if (h.guard != Ast.none) try cg.genCond(h.guard, FALL, lnext);
+        // Lower the arm body into the result slot.
+        if (is_agg) {
+            try cg.genStructToSp(h.body, dst_off);
+        } else {
+            const k = cg.node_types[h.body].kind;
+            const two_word = want_str or k == .@"struct" or k == .@"enum";
+            try cg.genValue(h.body, want_str);
+            try cg.emitFmt(Aarch64.strSp(0, dst_off), "str x0, [sp, #{d}]", .{dst_off});
+            if (two_word) try cg.emitFmt(Aarch64.strSp(1, dst_off + 8), "str x1, [sp, #{d}]", .{dst_off + 8});
+        }
+        try cg.emitBranchToLabel(Aarch64.b(0), lend, .imm26, "b Lend");
+        cg.placeLabel(lnext);
+    }
+    cg.placeLabel(lend);
+    cg.depth = saved;
+}
+
+/// Recursively test a pattern against the value at [sp+val_off] of type `val_ty`,
+/// branching to `fail` on a mismatch and binding the matched leaves BY VALUE. For
+/// an enum value `e_opt` is its layout (else null). All tests are IN PLACE — no
+/// extra temp — so the frame walkers size only guards, not the pattern tests.
+fn testPattern(cg: *Codegen, pat_idx: Ast.Index, val_off: u32, val_ty: Typecheck.Type, e_opt: ?Typecheck.EnumLayout, fail: LabelId) error{OutOfMemory}!void {
+    const pat = cg.tree.nodes[pat_idx];
+    switch (pat.tag) {
+        .pattern_wildcard => {},
+        .pattern_binding => {
+            if (pat.rhs == Ast.none) {
+                try cg.copyValue(val_off, val_ty, pat_idx);
+            } else {
+                try cg.testPattern(pat.rhs, val_off, val_ty, e_opt, fail);
+            }
+        },
+        .pattern_literal => {
+            const text = cg.tokens[pat.main_token].text(cg.source);
+            const lit: i64 = if (cg.tokens[pat.main_token].tag == .number)
+                parseIntLit(text)
+            else if (std.mem.eql(u8, text, "true")) 1 else 0;
+            try cg.emitFmt(Aarch64.ldrSp(9, val_off), "ldr x9, [sp, #{d}]", .{val_off});
+            try cg.emitImm64(10, lit);
+            try cg.emit(Aarch64.cmpReg(9, 10), "cmp x9, x10");
+            try cg.emitBranchToLabel(Aarch64.bCond(.ne, 0), fail, .imm19, "b.ne Lnext");
+        },
+        .pattern_or => {
+            const alts = Ast.rangeSlice(cg.tree, pat.lhs);
+            const lbody = try cg.newLabel();
+            for (alts, 0..) |alt, i| {
+                if (i + 1 == alts.len) {
+                    // Last alt: a mismatch is the whole or-pattern's failure.
+                    try cg.testPattern(alt, val_off, val_ty, e_opt, fail);
+                } else {
+                    const lalt = try cg.newLabel();
+                    try cg.testPattern(alt, val_off, val_ty, e_opt, lalt);
+                    try cg.emitBranchToLabel(Aarch64.b(0), lbody, .imm26, "b Lbody");
+                    cg.placeLabel(lalt);
+                }
+            }
+            cg.placeLabel(lbody);
+        },
+        .pattern_variant => {
+            const e = e_opt.?;
+            const vname = cg.tokens[pat.main_token].text(cg.source);
+            var vi: u32 = 0;
+            for (e.variants, 0..) |v, i| {
+                if (std.mem.eql(u8, v.name, vname)) {
+                    vi = @intCast(i);
+                    break;
+                }
+            }
+            // Compare the tag (at offset 0 of the value).
+            try cg.emitFmt(Aarch64.ldrSp(9, val_off), "ldr x9, [sp, #{d}]", .{val_off});
+            try cg.emitImm64(10, @intCast(vi));
+            try cg.emit(Aarch64.cmpReg(9, 10), "cmp x9, x10");
+            try cg.emitBranchToLabel(Aarch64.bCond(.ne, 0), fail, .imm19, "b.ne Lnext");
+            // Recurse into payload sub-patterns IN PLACE.
+            if (pat.rhs != Ast.none) {
+                const variant = e.variants[vi];
+                const binders = Ast.rangeSlice(cg.tree, pat.rhs);
+                for (binders, 0..) |b_idx, i| {
+                    const b = cg.tree.nodes[b_idx];
+                    const fi: usize = if (variant.form == .@"struct") blk: {
+                        const src_name = if (b.lhs != Ast.none) cg.tokens[cg.tree.nodes[b.lhs].main_token].text(cg.source) else cg.tokens[b.main_token].text(cg.source);
+                        for (variant.field_names, 0..) |dn, j| {
+                            if (std.mem.eql(u8, dn, src_name)) break :blk j;
+                        }
+                        break :blk i;
+                    } else i;
+                    const child_off = val_off + e.payload_off + variant.offsets[fi];
+                    const fty = variant.field_types[fi];
+                    const child_e: ?Typecheck.EnumLayout = if (fty.kind == .@"enum") cg.enum_layouts[fty.enum_id] else null;
+                    try cg.testPattern(b_idx, child_off, fty, child_e, fail);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// Parse a (possibly `_`-separated) decimal int literal as written in source.
+fn parseIntLit(text: []const u8) i64 {
+    var v: i64 = 0;
+    for (text) |c| {
+        if (c == '_') continue;
+        v = v * 10 + @as(i64, c - '0');
+    }
+    return v;
+}
+
+/// Copy the value at [sp+src_off] of type `ty` BY VALUE into the local slot bound
+/// by the `pattern_binding` node `bind_idx` (a no-op if it has no `.local`).
+fn copyValue(cg: *Codegen, src_off: u32, ty: Typecheck.Type, bind_idx: Ast.Index) error{OutOfMemory}!void {
+    if (cg.resolutions[bind_idx] != .local) return;
+    const dst = cg.localOff(cg.resolutions[bind_idx].local);
+    switch (ty.kind) {
+        .str => {
+            try cg.emitFmt(Aarch64.ldrSp(0, src_off), "ldr x0, [sp, #{d}]", .{src_off});
+            try cg.emitFmt(Aarch64.ldrSp(1, src_off + 8), "ldr x1, [sp, #{d}]", .{src_off + 8});
+            try cg.emitFmt(Aarch64.strSp(0, dst), "str x0, [sp, #{d}]", .{dst});
+            try cg.emitFmt(Aarch64.strSp(1, dst + 8), "str x1, [sp, #{d}]", .{dst + 8});
+        },
+        .@"struct", .@"enum" => try cg.copyStructBytes(Aarch64.SP, dst, Aarch64.SP, src_off, cg.typeSize(ty)),
+        else => {
+            try cg.emitFmt(Aarch64.ldrSp(0, src_off), "ldr x0, [sp, #{d}]", .{src_off});
+            try cg.emitFmt(Aarch64.strSp(0, dst), "str x0, [sp, #{d}]", .{dst});
+        },
     }
 }
 
@@ -1367,7 +1691,8 @@ fn genStructExprPair(cg: *Codegen, node_idx: Ast.Index) error{OutOfMemory}!void 
 /// expression to the reg-pair producer; a str (or `want_str`) to genStrExpr; a
 /// scalar to genExpr. Unifies the value sinks (return/break/block-value/loop).
 fn genValue(cg: *Codegen, node_idx: Ast.Index, want_str: bool) error{OutOfMemory}!void {
-    if (cg.node_types[node_idx].kind == .@"struct") {
+    const k = cg.node_types[node_idx].kind;
+    if (k == .@"struct" or k == .@"enum") {
         try cg.genStructExprPair(node_idx);
     } else if (want_str) {
         try cg.genStrExpr(node_idx);
@@ -1381,7 +1706,7 @@ fn genValue(cg: *Codegen, node_idx: Ast.Index, want_str: bool) error{OutOfMemory
 /// read directly; rvalue bases materialize first.
 fn genFieldAccessScalar(cg: *Codegen, node_idx: Ast.Index) error{OutOfMemory}!void {
     const ty = cg.node_types[node_idx];
-    if (ty.kind == .@"struct") {
+    if (ty.kind == .@"struct" or ty.kind == .@"enum") {
         try cg.genStructExprPair(node_idx);
         return;
     }
@@ -1444,11 +1769,10 @@ fn lowerBlockValueSret(cg: *Codegen, block_idx: Ast.Index) error{OutOfMemory}!vo
         // value-if/block/loop/large-call body is handled, and no `bl` clobbers the
         // buffer pointer) then copies into [x8].
         try cg.genStructToSret(cg.tree.nodes[last].lhs);
-    } else if (lt == .if_stmt or lt == .block or lt == .loop_expr or lt == .labeled) {
+    } else if (lt == .if_stmt or lt == .block or lt == .loop_expr or lt == .labeled or lt == .match_expr) {
         // A trailing value-producing control-flow expression (NOT wrapped in an
-        // expr_stmt by the parser) is the fn's struct result — route it through
-        // sret. Fixes the value-if-body sret hole (was lowered as a bare statement,
-        // never writing x8).
+        // expr_stmt by the parser) is the fn's aggregate result — route it through
+        // sret. (Covers a large-enum match as a fn's trailing expression too.)
         try cg.genStructToSret(last);
     } else {
         try cg.lowerStmt(last); // a trailing `return` writes through x8 itself
@@ -1483,6 +1807,9 @@ fn fnReturnType(cg: *const Codegen, proto: Ast.FnProto) Typecheck.Type {
     if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
     for (cg.layouts, 0..) |l, id| {
         if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));
+    }
+    for (cg.enum_layouts, 0..) |e, id| {
+        if (std.mem.eql(u8, e.name, name)) return Typecheck.Type.enumT(@intCast(id));
     }
     return Typecheck.Type.int;
 }
@@ -1599,7 +1926,8 @@ fn lowerBlockValueInto(cg: *Codegen, block_idx: Ast.Index, want_str: bool, resul
     const last = stmts[stmts.len - 1];
     if (cg.tree.nodes[last].tag == .expr_stmt) {
         const e = cg.tree.nodes[last].lhs;
-        const two_word = want_str or cg.node_types[e].kind == .@"struct";
+        const k = cg.node_types[e].kind;
+        const two_word = want_str or k == .@"struct" or k == .@"enum";
         try cg.genValue(e, want_str);
         try cg.emitFmt(Aarch64.strSp(0, result_off), "str x0, [sp, #{d}]", .{result_off});
         if (two_word) try cg.emitFmt(Aarch64.strSp(1, result_off + 8), "str x1, [sp, #{d}]", .{result_off + 8});
@@ -1903,8 +2231,16 @@ fn typeSize(cg: *const Codegen, ty: Typecheck.Type) u32 {
         .int, .bool => 8,
         .str => 16,
         .@"struct" => cg.layouts[ty.struct_id].size,
+        .@"enum" => cg.enum_layouts[ty.enum_id].size,
         else => 0,
     };
+}
+
+/// Whether a type is a value AGGREGATE (str / struct / enum) — passed in a reg
+/// pair (<=16B) or indirect+x8 (>16B), copied by bytes. Generalizes the M9
+/// str/struct predicate by one enum case (the ABI is size-driven, not forked).
+fn isAggregate(ty: Typecheck.Type) bool {
+    return ty.kind == .str or ty.kind == .@"struct" or ty.kind == .@"enum";
 }
 
 /// Natural alignment of a type (8 for scalars/str; a struct's max field align).
@@ -1912,8 +2248,14 @@ fn typeAlign(cg: *const Codegen, ty: Typecheck.Type) u32 {
     return switch (ty.kind) {
         .int, .bool, .str => 8,
         .@"struct" => cg.layouts[ty.struct_id].@"align",
+        .@"enum" => cg.enum_layouts[ty.enum_id].@"align",
         else => 1,
     };
+}
+
+/// The enum id of an enum-typed node (asserts it is an enum type).
+fn enumIdOf(cg: *const Codegen, node_idx: Ast.Index) u32 {
+    return cg.node_types[node_idx].enum_id;
 }
 
 /// AAPCS64 aggregate class: <=16 bytes passes in a register pair; >16 indirect.
@@ -1962,9 +2304,12 @@ fn paramType(cg: *const Codegen, proto: Ast.FnProto, slot: u32) Typecheck.Type {
     const name = cg.tokens[tok].text(cg.source);
     if (std.mem.eql(u8, name, "str")) return Typecheck.Type.str;
     if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.@"bool";
-    // A struct param: find its layout by name (the struct table is order-stable).
+    // A struct/enum param: find its layout by name (tables are order-stable).
     for (cg.layouts, 0..) |l, id| {
         if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));
+    }
+    for (cg.enum_layouts, 0..) |e, id| {
+        if (std.mem.eql(u8, e.name, name)) return Typecheck.Type.enumT(@intCast(id));
     }
     return Typecheck.Type.int;
 }
@@ -2008,11 +2353,78 @@ fn findLocalSlotType(cg: *Codegen, block_idx: Ast.Index, slot: u32, out: *Typech
 /// `findLocalSlotType`, so a local declared inside an arm is sized correctly.
 fn findLocalSlotTypeExpr(cg: *Codegen, node_idx: Ast.Index, slot: u32, out: *Typecheck.Type) void {
     if (node_idx == Ast.none) return;
-    switch (cg.tree.nodes[node_idx].tag) {
+    const n = cg.tree.nodes[node_idx];
+    switch (n.tag) {
         .block => cg.findLocalSlotType(node_idx, slot, out),
         .if_stmt => cg.findLocalSlotTypeStmt(node_idx, slot, out),
         .loop_expr => cg.findLocalSlotType(cg.tree.nodes[node_idx].lhs, slot, out),
         .labeled => cg.findLocalSlotTypeLabeled(node_idx, slot, out),
+        // M10: a variant payload value may itself contain a value-block declaring
+        // locals; a match's scrutinee/arm bodies do too, plus its pattern bindings.
+        .enum_init_tuple => for (Ast.rangeSlice(cg.tree, n.rhs)) |a| cg.findLocalSlotTypeExpr(a, slot, out),
+        .enum_init_struct => for (Ast.rangeSlice(cg.tree, n.rhs)) |fi| cg.findLocalSlotTypeExpr(cg.tree.nodes[fi].lhs, slot, out),
+        .match_expr => cg.findLocalSlotTypeMatch(node_idx, slot, out),
+        else => {},
+    }
+}
+
+/// Resolve a match's pattern-binding slot to its payload field type, and descend
+/// the scrutinee + arm bodies for nested value-block locals.
+fn findLocalSlotTypeMatch(cg: *Codegen, node_idx: Ast.Index, slot: u32, out: *Typecheck.Type) void {
+    const n = cg.tree.nodes[node_idx];
+    cg.findLocalSlotTypeExpr(n.lhs, slot, out);
+    const scrut_ty = cg.node_types[n.lhs];
+    for (Ast.rangeSlice(cg.tree, n.rhs)) |arm_idx| {
+        const arm = cg.tree.nodes[arm_idx];
+        cg.findLocalSlotTypePattern(arm.lhs, scrut_ty, slot, out);
+        const h = Ast.armHeaderAt(cg.tree, arm.rhs);
+        if (h.guard != Ast.none) cg.findLocalSlotTypeExpr(h.guard, slot, out);
+        cg.findLocalSlotTypeExpr(h.body, slot, out);
+    }
+}
+
+/// Resolve `slot`'s type through a pattern's binding leaves: a bind-whole leaf has
+/// the position's type `val_ty`; a struct-field/nested sub-pattern descends with
+/// the field type; a variant recurses positionally/by-name; an or-pattern walks
+/// all alts (same-slot bindings agree by construction).
+fn findLocalSlotTypePattern(cg: *Codegen, pat_idx: Ast.Index, val_ty: Typecheck.Type, slot: u32, out: *Typecheck.Type) void {
+    if (pat_idx == Ast.none) return;
+    const pat = cg.tree.nodes[pat_idx];
+    switch (pat.tag) {
+        .pattern_binding => {
+            if (pat.rhs == Ast.none) {
+                const res = cg.resolutions[pat_idx];
+                if (res == .local and res.local == slot) out.* = val_ty;
+            } else {
+                cg.findLocalSlotTypePattern(pat.rhs, val_ty, slot, out);
+            }
+        },
+        .pattern_or => for (Ast.rangeSlice(cg.tree, pat.lhs)) |a| cg.findLocalSlotTypePattern(a, val_ty, slot, out),
+        .pattern_variant => {
+            if (pat.rhs == Ast.none or val_ty.kind != .@"enum") return;
+            const layout = cg.enum_layouts[val_ty.enum_id];
+            const vname = cg.tokens[pat.main_token].text(cg.source);
+            var variant: ?Typecheck.VariantLayout = null;
+            for (layout.variants) |v| {
+                if (std.mem.eql(u8, v.name, vname)) {
+                    variant = v;
+                    break;
+                }
+            }
+            const vl = variant orelse return;
+            const binders = Ast.rangeSlice(cg.tree, pat.rhs);
+            for (binders, 0..) |b_idx, i| {
+                const b = cg.tree.nodes[b_idx];
+                const fi: usize = if (vl.field_names.len > 0) blk: {
+                    const src = if (b.lhs != Ast.none) cg.tokens[cg.tree.nodes[b.lhs].main_token].text(cg.source) else cg.tokens[b.main_token].text(cg.source);
+                    for (vl.field_names, 0..) |dn, j| {
+                        if (std.mem.eql(u8, dn, src)) break :blk j;
+                    }
+                    break :blk i;
+                } else i;
+                if (fi < vl.field_types.len) cg.findLocalSlotTypePattern(b_idx, vl.field_types[fi], slot, out);
+            }
+        },
         else => {},
     }
 }
@@ -2069,7 +2481,7 @@ fn buildSlotTable(cg: *Codegen, fn_idx: Ast.Index, nparams: u32) error{OutOfMemo
         // slots stay 8-aligned; struct align is <=8 today). Scalars 8, str 16.
         const sz: u32 = switch (ty.kind) {
             .str => 16,
-            .@"struct" => roundUp8(cg.typeSize(ty)),
+            .@"struct", .@"enum" => roundUp8(cg.typeSize(ty)),
             else => 8,
         };
         running = roundUp8(running);
@@ -2184,6 +2596,45 @@ fn collectSlotsExpr(cg: *Codegen, node_idx: Ast.Index, max_slot: *i64) void {
         // reference locals (e.g. punning `P { x }` → identifier `x`).
         .struct_init => for (Ast.rangeSlice(cg.tree, n.rhs)) |fi| cg.collectSlotsExpr(cg.tree.nodes[fi].lhs, max_slot),
         .field_access => cg.collectSlotsExpr(n.lhs, max_slot),
+        // M10: variant construction payload values may reference locals (punning),
+        // and a qualified `N.V(...)` arriving as a `.call` is handled by the `.call`
+        // arm above. A match's scrutinee + each arm body (and pattern bindings) all
+        // declare/reference slots.
+        .enum_init_tuple => for (Ast.rangeSlice(cg.tree, n.rhs)) |a| cg.collectSlotsExpr(a, max_slot),
+        .enum_init_struct => for (Ast.rangeSlice(cg.tree, n.rhs)) |fi| cg.collectSlotsExpr(cg.tree.nodes[fi].lhs, max_slot),
+        .enum_init_unit => {},
+        .match_expr => cg.collectSlotsMatch(node_idx, max_slot),
+        else => {},
+    }
+}
+
+/// Collect slots in a match: the scrutinee, each arm's pattern bindings (their
+/// `.local` slots), and each arm body.
+fn collectSlotsMatch(cg: *Codegen, node_idx: Ast.Index, max_slot: *i64) void {
+    const n = cg.tree.nodes[node_idx];
+    cg.collectSlotsExpr(n.lhs, max_slot);
+    for (Ast.rangeSlice(cg.tree, n.rhs)) |arm_idx| {
+        const arm = cg.tree.nodes[arm_idx];
+        cg.collectSlotsPattern(arm.lhs, max_slot);
+        const h = Ast.armHeaderAt(cg.tree, arm.rhs);
+        if (h.guard != Ast.none) cg.collectSlotsExpr(h.guard, max_slot);
+        cg.collectSlotsExpr(h.body, max_slot);
+    }
+}
+
+/// Note every binding-leaf slot in a pattern (through variant/or/struct-field
+/// sub-patterns), so a nested-pattern binding is sized into the frame.
+fn collectSlotsPattern(cg: *Codegen, pat_idx: Ast.Index, max_slot: *i64) void {
+    if (pat_idx == Ast.none) return;
+    const pat = cg.tree.nodes[pat_idx];
+    switch (pat.tag) {
+        .pattern_binding => {
+            cg.noteSlot(pat_idx, max_slot);
+            if (pat.rhs != Ast.none) cg.collectSlotsPattern(pat.rhs, max_slot);
+        },
+        .pattern_variant => if (pat.rhs != Ast.none)
+            for (Ast.rangeSlice(cg.tree, pat.rhs)) |c| cg.collectSlotsPattern(c, max_slot),
+        .pattern_or => for (Ast.rangeSlice(cg.tree, pat.lhs)) |a| cg.collectSlotsPattern(a, max_slot),
         else => {},
     }
 }
@@ -2292,7 +2743,7 @@ fn measureOutgoingExpr(cg: *Codegen, node_idx: Ast.Index, max_bytes: *u32) void 
             for (args) |arg| {
                 const ty = cg.node_types[arg];
                 const size = cg.typeSize(ty);
-                const is_agg = (ty.kind == .str or ty.kind == .@"struct");
+                const is_agg = isAggregate(ty);
                 if (is_agg and abiClass(size) == .indirect) {
                     if (ngrn < 8) ngrn += 1 else nsaa += 8;
                 } else if (is_agg) {
@@ -2323,6 +2774,17 @@ fn measureOutgoingExpr(cg: *Codegen, node_idx: Ast.Index, max_bytes: *u32) void 
             for (Ast.rangeSlice(cg.tree, n.rhs)) |fi| cg.measureOutgoingExpr(cg.tree.nodes[fi].lhs, max_bytes);
         },
         .field_access => cg.measureOutgoingExpr(n.lhs, max_bytes),
+        // M10: a call may hide in a variant payload value or a match arm body.
+        .enum_init_tuple => for (Ast.rangeSlice(cg.tree, n.rhs)) |a| cg.measureOutgoingExpr(a, max_bytes),
+        .enum_init_struct => for (Ast.rangeSlice(cg.tree, n.rhs)) |fi| cg.measureOutgoingExpr(cg.tree.nodes[fi].lhs, max_bytes),
+        .match_expr => {
+            cg.measureOutgoingExpr(n.lhs, max_bytes);
+            for (Ast.rangeSlice(cg.tree, n.rhs)) |arm| {
+                const h = Ast.armHeaderAt(cg.tree, cg.tree.nodes[arm].rhs);
+                if (h.guard != Ast.none) cg.measureOutgoingExpr(h.guard, max_bytes);
+                cg.measureOutgoingExpr(h.body, max_bytes);
+            }
+        },
         else => {},
     }
 }
@@ -2426,7 +2888,11 @@ fn measureExpr(cg: *Codegen, node_idx: Ast.Index, depth: u32) void {
     // OVER-reserves, which is safe.)
     switch (n.tag) {
         .if_stmt, .block, .loop_expr, .labeled => {
-            if (cg.node_types[node_idx].kind == .@"struct") {
+            // A struct OR enum-valued control-flow expr is materialized into a temp
+            // span via genStructToSp; arms size one span deeper. (A str-valued one
+            // uses the lowerIfValue/want_str path → falls through to the arms below.)
+            const k = cg.node_types[node_idx].kind;
+            if (k == .@"struct" or k == .@"enum") {
                 const span = cg.tempSlots(cg.node_types[node_idx]);
                 cg.bumpTempSlots(depth + span);
                 cg.measureStructCtrlArms(node_idx, depth + span);
@@ -2454,9 +2920,17 @@ fn measureExpr(cg: *Codegen, node_idx: Ast.Index, depth: u32) void {
             const args = Ast.rangeSlice(cg.tree, n.rhs);
             var d = depth;
             for (args) |arg| {
-                const span = cg.tempSlots(cg.node_types[arg]);
+                const ty = cg.node_types[arg];
+                const span = cg.tempSlots(ty);
                 cg.bumpTempSlots(d + span); // the arg's temp span ends at d+span
-                cg.measureExpr(arg, d); // the arg expression's interior spills at d
+                // genCallInner pre-advances cg.depth by THIS arg's own span BEFORE
+                // materializing a struct/enum arg (genStructTo), so a nested call
+                // inside such an aggregate arg's initializer lowers at d+span, not d.
+                // Scalar/str args run at the base depth, so measure them at d. Mirror
+                // EXACTLY — measuring an aggregate arg's interior at d under-counts
+                // and the inner spill overruns the frame onto saved x29/x30 (SIGBUS).
+                const interior_depth = if (ty.kind == .@"struct" or ty.kind == .@"enum") d + span else d;
+                cg.measureExpr(arg, interior_depth);
                 d += span;
             }
         },
@@ -2536,12 +3010,19 @@ fn measureExpr(cg: *Codegen, node_idx: Ast.Index, depth: u32) void {
         // reg-pair sink (genStructExprPair / genFieldAccessScalar materialize it
         // into a temp span at `depth` — e.g. `return o.i` where `i` is a struct).
         .field_access => {
-            if (!cg.isLocalRootedPlace(node_idx)) {
+            // M10: a non-local `field_access` over an enum type-name is a qualified
+            // UNIT variant construction (genVariantInit into a temp span at `depth`),
+            // NOT an rvalue field read. Size it like a construction.
+            if (cg.node_types[node_idx].kind == .@"enum" and !cg.isLocalRootedPlace(node_idx)) {
+                cg.bumpTempSlots(depth + cg.tempSlots(cg.node_types[node_idx]));
+            } else if (!cg.isLocalRootedPlace(node_idx)) {
                 const base_ty = cg.node_types[n.lhs];
                 cg.bumpTempSlots(depth + cg.tempSlots(base_ty));
                 cg.measureExpr(n.lhs, depth);
-            } else if (cg.node_types[node_idx].kind == .@"struct") {
-                cg.bumpTempSlots(depth + cg.tempSlots(cg.node_types[node_idx]));
+            } else {
+                const k = cg.node_types[node_idx].kind;
+                if (k == .@"struct" or k == .@"enum")
+                    cg.bumpTempSlots(depth + cg.tempSlots(cg.node_types[node_idx]));
             }
         },
         // A bare struct-typed identifier in a reg-pair value sink (e.g. `return p`,
@@ -2549,8 +3030,43 @@ fn measureExpr(cg: *Codegen, node_idx: Ast.Index, depth: u32) void {
         // small-struct local) is materialized into a temp span at `depth` by
         // genStructExprPair. Reserve it or the return-copy store overruns the frame.
         .identifier => {
-            if (cg.node_types[node_idx].kind == .@"struct")
+            const k = cg.node_types[node_idx].kind;
+            if (k == .@"struct" or k == .@"enum")
                 cg.bumpTempSlots(depth + cg.tempSlots(cg.node_types[node_idx]));
+        },
+        // M10 (SIGBUS-critical): a variant construction in value position is
+        // materialized into a temp span at `depth` (genVariantInit / genStructTo),
+        // mirroring `.struct_init`. The payload values are evaluated AFTER the tag
+        // store at `depth + tempSlots(self)`.
+        .enum_init_tuple, .enum_init_struct => {
+            const self_ty = cg.node_types[node_idx];
+            const span = cg.tempSlots(self_ty);
+            cg.bumpTempSlots(depth + span);
+            for (Ast.rangeSlice(cg.tree, n.rhs)) |elem| {
+                const value = if (cg.tree.nodes[elem].tag == .field_init) cg.tree.nodes[elem].lhs else elem;
+                cg.measureExpr(value, depth + span);
+            }
+        },
+        .enum_init_unit => {
+            cg.bumpTempSlots(depth + cg.tempSlots(cg.node_types[node_idx]));
+        },
+        // M10 (SIGBUS-critical): a match result slot is the caller's [sp+depth..);
+        // genMatchImpl spills the scrutinee at `depth + result_span` and lowers each
+        // arm body ONE span past that. Mirror exactly: reserve the result span, the
+        // scrutinee span, then size the scrutinee + arm bodies at the body depth.
+        .match_expr => {
+            const result_span = cg.tempSlots(cg.node_types[node_idx]);
+            const scrut_span = cg.tempSlots(cg.node_types[n.lhs]);
+            const body_depth = depth + result_span + scrut_span;
+            cg.bumpTempSlots(depth + result_span + scrut_span);
+            cg.measureExpr(n.lhs, depth + result_span);
+            for (Ast.rangeSlice(cg.tree, n.rhs)) |arm| {
+                const h = Ast.armHeaderAt(cg.tree, cg.tree.nodes[arm].rhs);
+                // A guard evaluates in the body context; nested-pattern tests are
+                // IN PLACE (no temp). Size both the guard and the body at body_depth.
+                if (h.guard != Ast.none) cg.measureExpr(h.guard, body_depth);
+                cg.measureExpr(h.body, body_depth);
+            }
         },
         else => {}, // leaf: value goes to x0, occupies no temp slot itself
     }
@@ -2776,7 +3292,7 @@ fn lowerAll(source: []const u8, want_listing: bool) !Lowered {
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
     var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     errdefer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
@@ -2801,7 +3317,7 @@ fn lowerAll(source: []const u8, want_listing: bool) !Lowered {
         for (names) |nm| gpa.free(nm.name);
         gpa.free(names);
     }
-    const result = try generateProgram(gpa, tree, tokens, source, res.resolutions, tc.node_types, tc.layouts, names, fn_nodes, entry_fn, want_listing);
+    const result = try generateProgram(gpa, tree, tokens, source, res.resolutions, tc.node_types, tc.layouts, tc.enum_layouts, names, fn_nodes, entry_fn, want_listing);
     return .{ .tokens = tokens, .tree = tree, .resolve = res, .typecheck = tc, .result = result, .source = source, .names = names, .entry_name = "main" };
 }
 
@@ -3189,6 +3705,7 @@ test "decodeStringLiteral decodes escapes and strips quotes" {
         .resolutions = &.{},
         .node_types = &.{},
         .layouts = &.{},
+        .enum_layouts = &.{},
         .names = &.{},
         .code = .empty,
         .relocs = .empty,
@@ -3239,6 +3756,7 @@ test "decodeStringLiteral rejects an unknown escape with one diagnostic" {
         .resolutions = &.{},
         .node_types = &.{},
         .layouts = &.{},
+        .enum_layouts = &.{},
         .names = &.{},
         .code = .empty,
         .relocs = .empty,

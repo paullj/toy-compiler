@@ -1,0 +1,14 @@
+# Feature: an int literal match with a wildcard catch-all.
+# expect: exit 20
+# n = 1 takes the second literal arm.
+fn f(n: int) -> int {
+  match n {
+    0 -> 10,
+    1 -> 20,
+    _ -> 99
+  }
+}
+
+fn main() -> int {
+  return f(1)
+}

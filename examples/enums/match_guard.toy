@@ -1,0 +1,13 @@
+# Feature: a guard that FALLS THROUGH to a later arm when the cond is false.
+# expect: exit 2
+# n = 5 is not > 10, so the guarded arm is skipped and `_` -> 2 wins.
+fn f(n: int) -> int {
+  match n {
+    _ if n > 10 -> 1,
+    _ -> 2
+  }
+}
+
+fn main() -> int {
+  return f(5)
+}

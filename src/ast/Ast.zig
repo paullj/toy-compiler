@@ -147,6 +147,71 @@ pub const Node = extern struct {
         /// `p.a.b`). `rhs` is `none`. Also the lhs of a field place-store
         /// (reusing `.assign`).
         field_access,
+
+        // ---- M10: enums + match (appended last; ordinals frozen) -----------
+
+        /// `enum N { ... }`. `main_token` is the enum name. `lhs` is the `extra`
+        /// header of a `Range` over variant nodes (in declaration order).
+        /// `rhs` is `none`.
+        enum_decl,
+        /// A unit variant `Empty` in an enum decl. `main_token` is the variant
+        /// name. `lhs`/`rhs` are `none`.
+        enum_variant_unit,
+        /// A tuple variant `Circle(int)` / `Line(int, int)`. `main_token` is the
+        /// variant name. `lhs` is the `extra` header of a `Range` over type-ref
+        /// nodes (positional payload types). `rhs` is `none`.
+        enum_variant_tuple,
+        /// A struct variant `Rect { w: int, h: int }`. `main_token` is the
+        /// variant name. `lhs` is the `extra` header of a `Range` over `param`
+        /// field nodes (REUSE). `rhs` is `none`.
+        enum_variant_struct,
+        /// Unit-variant construction `.Empty` or `N.Empty`. `main_token` is the
+        /// variant-name ident. `lhs` is the type-name `identifier` node for a
+        /// qualified `N.Empty`, or `Ast.none` for inferred `.Empty`. `rhs` none.
+        enum_init_unit,
+        /// Tuple-variant construction `.Circle(5)` / `N.Circle(5)`. `main_token`
+        /// is the variant-name ident. `lhs` is the type-name ident OR `none`
+        /// (inferred). `rhs` is the `extra` header of a `Range` over arg exprs.
+        enum_init_tuple,
+        /// Struct-variant construction `.Rect { w: 3, h: 4 }`. `main_token` is
+        /// the variant-name ident. `lhs` is the type-name ident OR `none`. `rhs`
+        /// is the `extra` header of a `Range` over `field_init` nodes (REUSE).
+        enum_init_struct,
+        /// `match scrut { arm, ... }`. `main_token` is the `match` keyword.
+        /// `lhs` is the scrutinee expression. `rhs` is the `extra` header of a
+        /// `Range` over `match_arm` nodes.
+        match_expr,
+        /// One match arm `pat [if guard] -> body`. `main_token` is the `->`.
+        /// `lhs` is the pattern node. `rhs` is the `extra` header of a 2-cell
+        /// `{guard, body}`: `guard` is the guard cond expr node or `none`
+        /// (unguarded); `body` is the arm body expr (decode via `armHeaderAt`).
+        match_arm,
+        /// A variant pattern `.V` / `N.V` (optionally binding/matching payload).
+        /// `main_token` is the variant-name ident. `lhs` is the type-name ident
+        /// for a qualified `N.V`, or `none` for inferred `.V`. `rhs` is the
+        /// `extra` header of a `Range` over arbitrary sub-pattern nodes (bindings,
+        /// literals, wildcards, nested variants, or-patterns), or `none`.
+        pattern_variant,
+        /// The wildcard pattern `_`. `main_token` is the `_` ident. `lhs`/`rhs`
+        /// are `none`.
+        pattern_wildcard,
+        /// A payload binding inside a `pattern_variant`. `main_token` is the
+        /// bound local name. `lhs` is the source-field `identifier` node for a
+        /// struct rename `field: alias` (then `main_token` is the alias), or
+        /// `none` for a tuple-positional / struct-pun binding. `rhs` is an
+        /// optional sub-pattern matched against the field/element (`.Rect { w: 0 }`
+        /// or a nested pattern), or `none` to bind the whole value (M10 leaf bind).
+        pattern_binding,
+
+        // ---- M11: literal + or patterns (appended last; ordinals frozen) ----
+
+        /// An int/bool literal pattern. `main_token` is the number/`true`/`false`
+        /// token; matched against the scrutinee by equality. `lhs`/`rhs` are `none`.
+        pattern_literal,
+        /// An or-pattern `A | B | ...`. `main_token` is the first alt's first token.
+        /// `lhs` is the `extra` header of a `Range` over >=2 alternative pattern
+        /// nodes; `rhs` is `none`. All alts must bind the same names/types.
+        pattern_or,
     };
 };
 
@@ -199,6 +264,11 @@ pub fn forHeaderAt(tree: Tree, header: u32) struct { lo: Index, hi: Index } {
     return .{ .lo = tree.extra[header], .hi = tree.extra[header + 1] };
 }
 
+/// Decode the 2-cell `match_arm` header at `header`: `{guard, body}`.
+pub fn armHeaderAt(tree: Tree, header: u32) struct { guard: Index, body: Index } {
+    return .{ .guard = tree.extra[header], .body = tree.extra[header + 1] };
+}
+
 /// Decode the `FnProto` header at `header`.
 pub fn protoAt(tree: Tree, header: u32) FnProto {
     const ps = tree.extra[header + 1];
@@ -217,7 +287,7 @@ pub const parse_magic: u32 = 0x544f5950;
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
     magic: u32,
-    version: u32 = 1,
+    version: u32 = 3,
     node_count: u32,
     extra_count: u32,
 };
@@ -247,7 +317,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 1) return null;
+    if (hdr.magic != parse_magic or hdr.version != 3) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4;
@@ -442,6 +512,123 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeAll("(. ");
             try renderNode(out, tree, tokens, source, n.lhs);
             try out.print(" {s})", .{tok_text});
+        },
+        .enum_decl => {
+            try out.print("(enum {s}", .{tok_text});
+            for (rangeSlice(tree, n.lhs)) |v| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, v);
+            }
+            try out.writeByte(')');
+        },
+        .enum_variant_unit => try out.print("(variant.unit {s})", .{tok_text}),
+        .enum_variant_tuple => {
+            try out.print("(variant.tuple {s}", .{tok_text});
+            for (rangeSlice(tree, n.lhs)) |ty| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, ty);
+            }
+            try out.writeByte(')');
+        },
+        .enum_variant_struct => {
+            try out.print("(variant.struct {s}", .{tok_text});
+            for (rangeSlice(tree, n.lhs)) |f| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, f);
+            }
+            try out.writeByte(')');
+        },
+        .enum_init_unit => {
+            try out.writeAll("(enew.unit");
+            if (n.lhs != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, n.lhs);
+            }
+            try out.print(" {s})", .{tok_text});
+        },
+        .enum_init_tuple => {
+            try out.writeAll("(enew.tuple");
+            if (n.lhs != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, n.lhs);
+            }
+            try out.print(" {s}", .{tok_text});
+            for (rangeSlice(tree, n.rhs)) |a| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, a);
+            }
+            try out.writeByte(')');
+        },
+        .enum_init_struct => {
+            try out.writeAll("(enew.struct");
+            if (n.lhs != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, n.lhs);
+            }
+            try out.print(" {s}", .{tok_text});
+            for (rangeSlice(tree, n.rhs)) |fi| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, fi);
+            }
+            try out.writeByte(')');
+        },
+        .match_expr => {
+            try out.writeAll("(match ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            for (rangeSlice(tree, n.rhs)) |arm| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, arm);
+            }
+            try out.writeByte(')');
+        },
+        .match_arm => {
+            const h = armHeaderAt(tree, n.rhs);
+            try out.writeAll("(arm ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            if (h.guard != none) {
+                try out.writeAll(" if ");
+                try renderNode(out, tree, tokens, source, h.guard);
+            }
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, h.body);
+            try out.writeByte(')');
+        },
+        .pattern_variant => {
+            try out.writeAll("(pvar");
+            if (n.lhs != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, n.lhs);
+            }
+            try out.print(" {s}", .{tok_text});
+            if (n.rhs != none) {
+                for (rangeSlice(tree, n.rhs)) |b| {
+                    try out.writeByte(' ');
+                    try renderNode(out, tree, tokens, source, b);
+                }
+            }
+            try out.writeByte(')');
+        },
+        .pattern_wildcard => try out.writeAll("(_)"),
+        .pattern_binding => {
+            try out.print("(bind {s}", .{tok_text});
+            if (n.lhs != none) {
+                try out.writeAll(" from ");
+                try renderNode(out, tree, tokens, source, n.lhs);
+            }
+            if (n.rhs != none) {
+                try out.writeAll(" = ");
+                try renderNode(out, tree, tokens, source, n.rhs);
+            }
+            try out.writeByte(')');
+        },
+        .pattern_literal => try out.print("(lit {s})", .{tok_text}),
+        .pattern_or => {
+            try out.writeAll("(por");
+            for (rangeSlice(tree, n.lhs)) |a| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, a);
+            }
+            try out.writeByte(')');
         },
     }
 }

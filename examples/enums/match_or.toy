@@ -1,0 +1,15 @@
+# Feature: an or-pattern with a shared payload binding.
+# expect: exit 9
+# .A(x) | .B(x) bind the same x; B(9) -> 9.
+enum E { A(int), B(int), N }
+
+fn f(e: E) -> int {
+  match e {
+    .A(x) | .B(x) -> x,
+    .N -> 0
+  }
+}
+
+fn main() -> int {
+  return f(E.B(9))
+}

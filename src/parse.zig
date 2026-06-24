@@ -31,6 +31,9 @@ const Parser = @This();
 
 gpa: std.mem.Allocator,
 tokens: []const Token,
+/// Source bytes, for the rare token-TEXT check the parser needs (the `_`
+/// wildcard pattern). Most of the parser works on token tags alone.
+src: []const u8,
 /// Cursor into `tokens`.
 index: u32,
 nodes: std.ArrayList(Node),
@@ -51,10 +54,11 @@ const Error = error{ OutOfMemory, ParseFailed };
 
 /// Parse a whole file into a `Tree`. On success returns the owned tree (root is
 /// the last node, a `.program`). On a parse error returns null and fills `diag`.
-pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
+pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
     var p: Parser = .{
         .gpa = gpa,
         .tokens = tokens,
+        .src = source,
         .index = 0,
         .nodes = .empty,
         .extra = .empty,
@@ -89,12 +93,13 @@ fn parseProgram(p: *Parser) Error!Ast.Tree {
         const decl = switch (p.peek().tag) {
             .kw_fn => try p.parseFnDecl(),
             .kw_struct => try p.parseStructDecl(),
-            else => return p.fail(p.peek(), "expected a function or struct declaration"),
+            .kw_enum => try p.parseEnumDecl(),
+            else => return p.fail(p.peek(), "expected a function, struct, or enum declaration"),
         };
         try decls.append(p.gpa, decl);
         while (p.peek().tag == .newline) p.advance();
     }
-    try p.expect(.eof, "expected a function or struct declaration or end of input");
+    try p.expect(.eof, "expected a function, struct, or enum declaration or end of input");
 
     const header = try p.addRange(decls.items);
     _ = try p.addNode(.{ .tag = .program, .main_token = 0, .lhs = header, .rhs = Ast.none });
@@ -167,6 +172,220 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
 
     const header = try p.addRange(fields.items);
     return p.addNode(.{ .tag = .struct_decl, .main_token = name_tok, .lhs = header, .rhs = Ast.none });
+}
+
+/// `enum N { Empty, Circle(int), Rect { w: int, h: int } }`. Variants are
+/// comma-separated, newlines insignificant inside `{}`. Three forms: unit,
+/// tuple (positional payload types), struct (named `param` fields).
+fn parseEnumDecl(p: *Parser) Error!Ast.Index {
+    try p.expect(.kw_enum, "expected 'enum'");
+    const name_tok = p.index;
+    try p.expect(.identifier, "expected an enum name");
+    try p.expect(.l_brace, "expected '{' after enum name");
+
+    var variants: std.ArrayList(Ast.Index) = .empty;
+    defer variants.deinit(p.gpa);
+    while (true) {
+        while (p.peek().tag == .newline) p.advance();
+        if (p.peek().tag == .r_brace) break;
+        const vname = p.index;
+        try p.expect(.identifier, "expected a variant name");
+        var variant: Ast.Index = undefined;
+        switch (p.peek().tag) {
+            .l_paren => {
+                p.advance(); // (
+                var types: std.ArrayList(Ast.Index) = .empty;
+                defer types.deinit(p.gpa);
+                while (p.peek().tag != .r_paren) {
+                    try types.append(p.gpa, try p.parseType());
+                    if (p.peek().tag == .comma) p.advance() else break;
+                }
+                try p.expect(.r_paren, "expected ')' to close a tuple variant");
+                const header = try p.addRange(types.items);
+                variant = try p.addNode(.{ .tag = .enum_variant_tuple, .main_token = vname, .lhs = header, .rhs = Ast.none });
+            },
+            .l_brace => {
+                const saved_nb = p.no_block;
+                p.no_block = false;
+                defer p.no_block = saved_nb;
+                p.advance(); // {
+                var fields: std.ArrayList(Ast.Index) = .empty;
+                defer fields.deinit(p.gpa);
+                while (true) {
+                    while (p.peek().tag == .newline) p.advance();
+                    if (p.peek().tag == .r_brace) break;
+                    const field_name = p.index;
+                    try p.expect(.identifier, "expected a field name");
+                    try p.expect(.colon, "expected ':' after field name");
+                    const type_node = try p.parseType();
+                    const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
+                    try fields.append(p.gpa, field);
+                    if (p.peek().tag == .comma) p.advance();
+                }
+                try p.expect(.r_brace, "expected '}' to close a struct variant");
+                const header = try p.addRange(fields.items);
+                variant = try p.addNode(.{ .tag = .enum_variant_struct, .main_token = vname, .lhs = header, .rhs = Ast.none });
+            },
+            else => variant = try p.addNode(.{ .tag = .enum_variant_unit, .main_token = vname, .lhs = Ast.none, .rhs = Ast.none }),
+        }
+        try variants.append(p.gpa, variant);
+        if (p.peek().tag == .comma) p.advance();
+    }
+    try p.expect(.r_brace, "expected '}' to close enum body");
+
+    const header = try p.addRange(variants.items);
+    return p.addNode(.{ .tag = .enum_decl, .main_token = name_tok, .lhs = header, .rhs = Ast.none });
+}
+
+/// `match scrut { pat -> body, ... }`. Scrutinee parsed in `no_block` (so a bare
+/// `match x { ... }` reads `x`, the `{` opening the arm list). Arms are comma-
+/// separated, newlines insignificant inside `{}`.
+fn parseMatch(p: *Parser) Error!Ast.Index {
+    const match_tok = p.index;
+    p.advance(); // match
+    const saved_nb = p.no_block;
+    p.no_block = true;
+    const scrut = try p.parseExpr(0);
+    p.no_block = false;
+    try p.expect(.l_brace, "expected '{' to open a match");
+
+    var arms: std.ArrayList(Ast.Index) = .empty;
+    defer arms.deinit(p.gpa);
+    while (true) {
+        while (p.peek().tag == .newline) p.advance();
+        if (p.peek().tag == .r_brace) break;
+        const pat = try p.parsePattern();
+        var guard: Ast.Index = Ast.none;
+        if (p.peek().tag == .kw_if) {
+            p.advance();
+            const g_nb = p.no_block;
+            p.no_block = true; // stop the guard cond before `->`/`{`
+            guard = try p.parseExpr(0);
+            p.no_block = g_nb;
+        }
+        const arrow = p.index;
+        try p.expect(.arrow, "expected '->' after a match pattern");
+        const body = try p.parseExpr(0);
+        const arm_hdr = try p.addExtra(&.{ guard, body });
+        const arm = try p.addNode(.{ .tag = .match_arm, .main_token = arrow, .lhs = pat, .rhs = arm_hdr });
+        try arms.append(p.gpa, arm);
+        if (p.peek().tag == .comma) p.advance();
+    }
+    try p.expect(.r_brace, "expected '}' to close match");
+    p.no_block = saved_nb;
+
+    const header = try p.addRange(arms.items);
+    return p.addNode(.{ .tag = .match_expr, .main_token = match_tok, .lhs = scrut, .rhs = header });
+}
+
+/// A match pattern, with or-alternatives: `subpat ('|' subpat)*`. Emits a
+/// `pattern_or` only when there are >=2 alternatives; otherwise the bare subpat.
+fn parsePattern(p: *Parser) Error!Ast.Index {
+    const first = try p.parseSubPattern();
+    if (p.peek().tag != .pipe) return first;
+    var alts: std.ArrayList(Ast.Index) = .empty;
+    defer alts.deinit(p.gpa);
+    const first_tok = p.nodes.items[first].main_token;
+    try alts.append(p.gpa, first);
+    while (p.peek().tag == .pipe) {
+        p.advance(); // |
+        try alts.append(p.gpa, try p.parseSubPattern());
+    }
+    const hdr = try p.addRange(alts.items);
+    return p.addNode(.{ .tag = .pattern_or, .main_token = first_tok, .lhs = hdr, .rhs = Ast.none });
+}
+
+/// A single (non-or) pattern: `_` (wildcard), an int/bool literal, a bare
+/// identifier binding, or `.V`/`N.V` (variant) with optional payload sub-patterns.
+/// Tuple payloads `.V(p, ...)` and struct payloads `.V { f, f: alias, f: subpat }`
+/// each hold arbitrary sub-patterns (recursive via `parsePattern`).
+fn parseSubPattern(p: *Parser) Error!Ast.Index {
+    const tok = p.peek();
+    // Literal patterns: int / true / false.
+    if (tok.tag == .number or tok.tag == .kw_true or tok.tag == .kw_false) {
+        const lt = p.index;
+        p.advance();
+        return p.addNode(.{ .tag = .pattern_literal, .main_token = lt, .lhs = Ast.none, .rhs = Ast.none });
+    }
+    if (tok.tag == .identifier and std.mem.eql(u8, tok.text(p.src), "_")) {
+        const wt = p.index;
+        p.advance();
+        return p.addNode(.{ .tag = .pattern_wildcard, .main_token = wt, .lhs = Ast.none, .rhs = Ast.none });
+    }
+    var type_name: Ast.Index = Ast.none;
+    if (tok.tag == .identifier) {
+        // A bare identifier NOT followed by `.` is a whole-value binding.
+        if (p.peek2().tag != .dot) {
+            const bt = p.index;
+            p.advance();
+            return p.addNode(.{ .tag = .pattern_binding, .main_token = bt, .lhs = Ast.none, .rhs = Ast.none });
+        }
+        // Qualified `N.V`: build the type-name leaf, then expect `.V`.
+        type_name = try p.leaf(.identifier, p.index);
+        try p.expect(.dot, "expected '.' after an enum type name in a pattern");
+    } else {
+        try p.expect(.dot, "expected a variant pattern ('.V' or '_')");
+    }
+    const vname = p.index;
+    try p.expect(.identifier, "expected a variant name in a pattern");
+    var binders: Ast.Index = Ast.none;
+    switch (p.peek().tag) {
+        .l_paren => {
+            p.advance(); // (
+            var binds: std.ArrayList(Ast.Index) = .empty;
+            defer binds.deinit(p.gpa);
+            while (p.peek().tag != .r_paren) {
+                // Each tuple element is an arbitrary sub-pattern (literal, binding,
+                // wildcard, nested variant, or-pattern).
+                try binds.append(p.gpa, try p.parsePattern());
+                if (p.peek().tag == .comma) p.advance() else break;
+            }
+            try p.expect(.r_paren, "expected ')' to close a tuple pattern");
+            binders = try p.addRange(binds.items);
+        },
+        .l_brace => {
+            const saved_nb = p.no_block;
+            p.no_block = false;
+            defer p.no_block = saved_nb;
+            p.advance(); // {
+            var binds: std.ArrayList(Ast.Index) = .empty;
+            defer binds.deinit(p.gpa);
+            while (true) {
+                while (p.peek().tag == .newline) p.advance();
+                if (p.peek().tag == .r_brace) break;
+                const field_tok = p.index;
+                try p.expect(.identifier, "expected a field name in a struct pattern");
+                var bind: Ast.Index = undefined;
+                if (p.peek().tag == .colon) {
+                    p.advance(); // :
+                    // `field: alias` (rename to a bare ident) vs `field: subpat`
+                    // (a literal/`.`/`_`/nested pattern matched against the field).
+                    // A bare identifier NOT opening a payload is the M10 rename alias.
+                    const after = p.peek();
+                    const is_alias = after.tag == .identifier and
+                        !std.mem.eql(u8, after.text(p.src), "_") and
+                        p.peek2().tag != .dot;
+                    const src_ident = try p.addNode(.{ .tag = .identifier, .main_token = field_tok, .lhs = Ast.none, .rhs = Ast.none });
+                    if (is_alias) {
+                        const alias_tok = p.index;
+                        p.advance();
+                        bind = try p.addNode(.{ .tag = .pattern_binding, .main_token = alias_tok, .lhs = src_ident, .rhs = Ast.none });
+                    } else {
+                        const subpat = try p.parsePattern();
+                        bind = try p.addNode(.{ .tag = .pattern_binding, .main_token = field_tok, .lhs = src_ident, .rhs = subpat });
+                    }
+                } else {
+                    bind = try p.addNode(.{ .tag = .pattern_binding, .main_token = field_tok, .lhs = Ast.none, .rhs = Ast.none });
+                }
+                try binds.append(p.gpa, bind);
+                if (p.peek().tag == .comma) p.advance();
+            }
+            try p.expect(.r_brace, "expected '}' to close a struct pattern");
+            binders = try p.addRange(binds.items);
+        },
+        else => {},
+    }
+    return p.addNode(.{ .tag = .pattern_variant, .main_token = vname, .lhs = type_name, .rhs = binders });
 }
 
 /// `Name { x: 1, y: 2 }` (or punning `Name { x, y }`). `name_ident` is the
@@ -498,6 +717,20 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             if (p.no_block) return p.fail(tok, "expected an expression");
             return p.parseLabeled(); // a labeled loop/block as a value expression
         },
+        // Inferred variant construction `.V` in a type-known position. At an
+        // expression START (no receiver) a leading `.` is a variant; `parsePostfix`
+        // then upgrades it to a tuple/struct form if `(`/`{` follows. (A postfix
+        // `.field` is handled in parsePostfix, after an operand.)
+        .dot => {
+            p.advance(); // .
+            const name = p.index;
+            try p.expect(.identifier, "expected a variant name after '.'");
+            return p.addNode(.{ .tag = .enum_init_unit, .main_token = name, .lhs = Ast.none, .rhs = Ast.none });
+        },
+        .kw_match => {
+            if (p.no_block) return p.fail(tok, "expected an expression");
+            return p.parseMatch(); // a match as a value expression
+        },
         else => return p.fail(tok, "expected an expression"),
     }
 }
@@ -508,20 +741,99 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
     var lhs = lhs0;
     while (true) {
         switch (p.peek().tag) {
-            .l_paren => lhs = try p.parseCall(lhs),
+            .l_paren => {
+                // An inferred `.V` followed by `(args)` is a tuple-variant
+                // construction; rebuild it in place (keep main_token / lhs=none).
+                if (p.nodes.items[lhs].tag == .enum_init_unit and p.nodes.items[lhs].lhs == Ast.none) {
+                    const rebuilt = try p.upgradeTupleInit(lhs, Ast.none);
+                    lhs = rebuilt;
+                } else {
+                    lhs = try p.parseCall(lhs);
+                }
+            },
             // `.field` access. `..` is a separate token, so `0..5` is unaffected.
             .dot => lhs = try p.parseFieldAccess(lhs),
-            // `Name { ... }` struct literal — only when blocks are allowed (so an
-            // `if c { ... }` condition reads `c` not `c{...}`) and `lhs` is a bare
-            // name. The call/group `( )` reset `no_block`, so `f(P{x:1})` works.
+            // `Name { ... }` literal / variant construction — only when blocks are
+            // allowed and `lhs` is a bare name (struct), an inferred `.V`
+            // (struct-variant), or a `field_access` (qualified `N.V`). The call/
+            // group `( )` reset `no_block`, so `f(P{x:1})` works.
             .l_brace => {
-                if (p.no_block or p.nodes.items[lhs].tag != .identifier) break;
-                lhs = try p.parseStructLiteral(lhs);
+                if (p.no_block) break;
+                const ltag = p.nodes.items[lhs].tag;
+                switch (ltag) {
+                    .identifier => lhs = try p.parseStructLiteral(lhs),
+                    .enum_init_unit => if (p.nodes.items[lhs].lhs == Ast.none) {
+                        lhs = try p.upgradeStructInit(lhs, Ast.none);
+                    } else break,
+                    // Qualified `N.V { ... }`: the type-name is the field_access's
+                    // receiver and the variant is its field token.
+                    .field_access => lhs = try p.upgradeStructInit(lhs, lhs),
+                    else => break,
+                }
             },
             else => break,
         }
     }
     return lhs;
+}
+
+/// Parse `(args)` onto a variant construction, producing an `enum_init_tuple`.
+/// `node` is the `enum_init_unit` (inferred) to rebuild in place, or — for a
+/// qualified `N.V(...)` — a `field_access` whose receiver is the type name and
+/// whose field token is the variant. `type_name` is `none` for inferred.
+fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast.Index {
+    p.advance(); // (
+    var args: std.ArrayList(Ast.Index) = .empty;
+    defer args.deinit(p.gpa);
+    const saved_nb = p.no_block;
+    p.no_block = false;
+    defer p.no_block = saved_nb;
+    while (p.peek().tag != .r_paren) {
+        try args.append(p.gpa, try p.parseExpr(0));
+        if (p.peek().tag == .comma) p.advance() else break;
+    }
+    try p.expect(.r_paren, "expected ')' to close a variant construction");
+    const header = try p.addRange(args.items);
+    const vtok = p.nodes.items[node].main_token;
+    p.nodes.items[node] = .{ .tag = .enum_init_tuple, .main_token = vtok, .lhs = type_name, .rhs = header };
+    return node;
+}
+
+/// Parse `{ field: value, ... }` onto a variant construction, producing an
+/// `enum_init_struct`. `node` is the `enum_init_unit` (inferred) or the
+/// `field_access` (qualified `N.V`) to rebuild. `type_name` is `none` (inferred)
+/// or the type-name node (for qualified, the field_access's receiver).
+fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!Ast.Index {
+    // For a qualified `N.V`, the node is the field_access: variant = its field
+    // token, type-name = its receiver.
+    const vtok = p.nodes.items[node].main_token;
+    const type_name: Ast.Index = if (qualified == Ast.none) Ast.none else p.nodes.items[node].lhs;
+    p.advance(); // {
+    const saved_nb = p.no_block;
+    p.no_block = false;
+    defer p.no_block = saved_nb;
+    var inits: std.ArrayList(Ast.Index) = .empty;
+    defer inits.deinit(p.gpa);
+    while (true) {
+        while (p.peek().tag == .newline) p.advance();
+        if (p.peek().tag == .r_brace) break;
+        const field_tok = p.index;
+        try p.expect(.identifier, "expected a field name");
+        var value: Ast.Index = undefined;
+        if (p.peek().tag == .colon) {
+            p.advance(); // :
+            value = try p.parseExpr(0);
+        } else {
+            value = try p.addNode(.{ .tag = .identifier, .main_token = field_tok, .lhs = Ast.none, .rhs = Ast.none });
+        }
+        const fi = try p.addNode(.{ .tag = .field_init, .main_token = field_tok, .lhs = value, .rhs = Ast.none });
+        try inits.append(p.gpa, fi);
+        if (p.peek().tag == .comma) p.advance();
+    }
+    try p.expect(.r_brace, "expected '}' to close a variant construction");
+    const header = try p.addRange(inits.items);
+    p.nodes.items[node] = .{ .tag = .enum_init_struct, .main_token = vtok, .lhs = type_name, .rhs = header };
+    return node;
 }
 
 fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
@@ -627,10 +939,11 @@ const Lexer = @import("lex.zig");
 /// Test-only: parse a single bare expression (the pre-M0 grammar) into a Tree,
 /// so the expression-core tests below keep asserting on raw expressions without
 /// the program/fn scaffolding.
-fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
+fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
     var p: Parser = .{
         .gpa = gpa,
         .tokens = tokens,
+        .src = source,
         .index = 0,
         .nodes = .empty,
         .extra = .empty,
@@ -671,7 +984,7 @@ fn expectSexpr(source: []const u8, want: []const u8) !void {
     defer gpa.free(tokens);
 
     var diag: ?Diagnostic = null;
-    const tree = (try parseExprOnly(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try parseExprOnly(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     defer freeTree(gpa, tree);
 
     var buf: [256]u8 = undefined;
@@ -687,7 +1000,7 @@ fn expectProgram(source: []const u8, want: []const u8) !void {
     defer gpa.free(tokens);
 
     var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     defer freeTree(gpa, tree);
 
     var buf: [1024]u8 = undefined;
@@ -724,10 +1037,11 @@ test "trailing newline terminator is allowed" {
 
 test "parse error reports an offset and leaves a diagnostic" {
     const gpa = testing.allocator;
-    const tokens = try Lexer.tokenize(gpa, "1 +");
+    const source = "1 +";
+    const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     var diag: ?Diagnostic = null;
-    const result = try parseExprOnly(gpa, tokens, &diag);
+    const result = try parseExprOnly(gpa, tokens, source, &diag);
     try testing.expect(result == null);
     try testing.expect(diag != null);
     try testing.expectEqualStrings("expected an expression", diag.?.message);
@@ -769,10 +1083,11 @@ test "nested call precedence" {
 
 test "root is program and children precede parents" {
     const gpa = testing.allocator;
-    const tokens = try Lexer.tokenize(gpa, "fn add(a: int, b: int) -> int {\n return a + b\n}\n");
+    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     defer freeTree(gpa, tree);
 
     try testing.expectEqual(Node.Tag.program, tree.nodes[Ast.root(tree.nodes)].tag);
@@ -967,10 +1282,11 @@ test "bare break and labeled break/continue render" {
 
 test "label without a following construct is a parse error" {
     const gpa = testing.allocator;
-    const tokens = try Lexer.tokenize(gpa, "fn f() {\n @x 1\n}\n");
+    const source = "fn f() {\n @x 1\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     var diag: ?Diagnostic = null;
-    const result = try parse(gpa, tokens, &diag);
+    const result = try parse(gpa, tokens, source, &diag);
     try testing.expect(result == null);
     try testing.expect(diag != null);
 }
@@ -1047,12 +1363,70 @@ test "struct literal as a call argument (call reopens block context)" {
     );
 }
 
-test "struct program pack/unpack byte round-trip" {
+// enums + match (M10)
+
+test "enum declaration with all three variant forms parses" {
+    try expectProgram(
+        "enum Shape { Empty, Circle(int), Rect { w: int, h: int } }\n",
+        "(program (enum Shape (variant.unit Empty) (variant.tuple Circle int) (variant.struct Rect (param w int) (param h int))))",
+    );
+}
+
+test "qualified and inferred variant construction parse" {
+    // A qualified `N.V(...)` stays a `.call` over a field_access (typecheck/codegen
+    // reinterpret it); inferred `.V` gets a dedicated enum_init_unit node.
+    try expectProgram(
+        "fn f() -> int { c := Shape.Circle(5)\n e := .Empty\n 0 }\n",
+        "(program (fn f () int (block (:= c (call (. Shape Circle) 5)) (:= e (enew.unit Empty)) 0)))",
+    );
+}
+
+test "qualified struct-variant construction parses (upgraded from field_access {)" {
+    try expectProgram(
+        "fn f() -> int { r := Shape.Rect { w: 3, h: 4 }\n 0 }\n",
+        "(program (fn f () int (block (:= r (enew.struct Shape Rect (field w 3) (field h 4))) 0)))",
+    );
+}
+
+test "match with tuple/struct/unit/wildcard arms parses" {
+    try expectProgram(
+        "fn f(s: Shape) -> int { match s { .Circle(r) -> r, .Rect { w, h } -> w, .Empty -> 0, _ -> 1 } }\n",
+        "(program (fn f ((param s Shape)) int (block (match s (arm (pvar Circle (bind r)) r) (arm (pvar Rect (bind w) (bind h)) w) (arm (pvar Empty) 0) (arm (_) 1)))))",
+    );
+}
+
+test "struct-rename pattern binding parses" {
+    try expectProgram(
+        "fn f(s: Shape) -> int { match s { .Rect { w: a, h: b } -> a } }\n",
+        "(program (fn f ((param s Shape)) int (block (match s (arm (pvar Rect (bind a from w) (bind b from h)) a)))))",
+    );
+}
+
+test "enum program pack/unpack byte round-trip" {
     const gpa = testing.allocator;
-    const tokens = try Lexer.tokenize(gpa, "struct Point { x: int, y: int }\nfn f() -> int { p := Point { x: 1, y: 2 }\n p.x }\n");
+    const source = "enum Shape { Empty, Circle(int), Rect { w: int, h: int } }\nfn area(s: Shape) -> int { match s { .Circle(r) -> r, .Rect { w, h } -> w, .Empty -> 0 } }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    defer freeTree(gpa, tree);
+
+    const blob = try Ast.pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try Ast.unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer freeTree(gpa, got);
+
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, tree.extra, got.extra);
+}
+
+test "struct program pack/unpack byte round-trip" {
+    const gpa = testing.allocator;
+    const source = "struct Point { x: int, y: int }\nfn f() -> int { p := Point { x: 1, y: 2 }\n p.x }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var diag: ?Diagnostic = null;
+    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     defer freeTree(gpa, tree);
 
     const blob = try Ast.pack(gpa, tree);
@@ -1066,10 +1440,11 @@ test "struct program pack/unpack byte round-trip" {
 
 test "program pack/unpack byte round-trip" {
     const gpa = testing.allocator;
-    const tokens = try Lexer.tokenize(gpa, "fn add(a: int, b: int) -> int {\n return a + b\n}\n");
+    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     defer freeTree(gpa, tree);
 
     const blob = try Ast.pack(gpa, tree);

@@ -53,7 +53,7 @@ pub const TouchedType = struct {
 
 /// Bumped when the in-memory layout encoding of any type changes, so a stale blob
 /// from a prior layout is invalidated.
-const type_layout_version: u8 = 2;
+const type_layout_version: u8 = 3;
 
 const seed: u64 = 0x46_50_52_4e; // "FPRN"
 
@@ -95,7 +95,7 @@ pub fn fingerprint(
     updateU32(&h, @intCast(touched.len));
     for (touched) |ty| {
         h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version });
-        if (ty.kind == .@"struct") updateLeaf(&h, ty.layout);
+        if (ty.kind == .@"struct" or ty.kind == .@"enum") updateLeaf(&h, ty.layout);
     }
 
     return h.final();
@@ -238,6 +238,88 @@ fn walk(h: *std.hash.Wyhash, tree: Ast.Tree, tokens: []const Token, source: []co
             updateLeaf(h, leaf); // field name
             walk(h, tree, tokens, source, n.lhs); // receiver
         },
+        // M10 enums: the decl folds the enum SPELLING (name + per-variant
+        // form/payload); the resolved LAYOUT enters via touched-types (c).
+        .enum_decl => {
+            updateLeaf(h, leaf); // enum name
+            const variants = Ast.rangeSlice(tree, n.lhs);
+            updateU32(h, @intCast(variants.len));
+            for (variants) |v| walk(h, tree, tokens, source, v);
+        },
+        .enum_variant_unit => updateLeaf(h, leaf), // variant name
+        .enum_variant_tuple => {
+            updateLeaf(h, leaf); // variant name
+            const types = Ast.rangeSlice(tree, n.lhs);
+            updateU32(h, @intCast(types.len));
+            for (types) |ty| walk(h, tree, tokens, source, ty);
+        },
+        .enum_variant_struct => {
+            updateLeaf(h, leaf); // variant name
+            const fields = Ast.rangeSlice(tree, n.lhs);
+            updateU32(h, @intCast(fields.len));
+            for (fields) |f| walk(h, tree, tokens, source, f);
+        },
+        // Variant construction: a sentinel distinguishes inferred `.V` from
+        // qualified `N.V` (load-bearing — they lower differently), then the
+        // variant name, then the payload args.
+        .enum_init_unit => {
+            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)}); // inferred vs qualified
+            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs); // type name
+            updateLeaf(h, leaf); // variant name
+        },
+        .enum_init_tuple => {
+            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)});
+            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs);
+            updateLeaf(h, leaf);
+            const args = Ast.rangeSlice(tree, n.rhs);
+            updateU32(h, @intCast(args.len));
+            for (args) |a| walk(h, tree, tokens, source, a);
+        },
+        .enum_init_struct => {
+            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)});
+            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs);
+            updateLeaf(h, leaf);
+            const inits = Ast.rangeSlice(tree, n.rhs);
+            updateU32(h, @intCast(inits.len));
+            for (inits) |fi| walk(h, tree, tokens, source, fi);
+        },
+        .match_expr => {
+            walk(h, tree, tokens, source, n.lhs); // scrutinee
+            const arms = Ast.rangeSlice(tree, n.rhs);
+            updateU32(h, @intCast(arms.len));
+            for (arms) |arm| walk(h, tree, tokens, source, arm);
+        },
+        .match_arm => {
+            walk(h, tree, tokens, source, n.lhs); // pattern
+            const ah = Ast.armHeaderAt(tree, n.rhs);
+            h.update(&[_]u8{@intFromBool(ah.guard != Ast.none)}); // guard sentinel
+            if (ah.guard != Ast.none) walk(h, tree, tokens, source, ah.guard);
+            walk(h, tree, tokens, source, ah.body); // body
+        },
+        .pattern_variant => {
+            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)}); // inferred vs qualified
+            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs); // type name
+            updateLeaf(h, leaf); // variant name
+            const binders = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(tree, n.rhs);
+            updateU32(h, @intCast(binders.len));
+            for (binders) |b| walk(h, tree, tokens, source, b);
+        },
+        .pattern_wildcard => {}, // the tag byte (folded above) IS its content
+        .pattern_binding => {
+            updateLeaf(h, leaf); // bound name
+            h.update(&[_]u8{@intFromBool(n.lhs != Ast.none)}); // rename vs pun
+            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs); // source field
+            h.update(&[_]u8{@intFromBool(n.rhs != Ast.none)}); // has sub-pattern
+            if (n.rhs != Ast.none) walk(h, tree, tokens, source, n.rhs); // sub-pattern
+        },
+        // M11: literal value spelling IS its content; an or-pattern folds its
+        // arity then each alt in order (order-sensitive, not XOR).
+        .pattern_literal => updateLeaf(h, leaf),
+        .pattern_or => {
+            const alts = Ast.rangeSlice(tree, n.lhs);
+            updateU32(h, @intCast(alts.len));
+            for (alts) |a| walk(h, tree, tokens, source, a);
+        },
     }
 }
 
@@ -269,7 +351,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
     var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     return .{ .tokens = tokens, .tree = tree, .source = source };
 }
 
@@ -487,4 +569,94 @@ test "a fn NOT touching a struct is unaffected by an unrelated touched-struct fo
     // each is a pure function of its OWN inputs — recomputing `without` matches.
     try testing.expectEqual(without, fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}));
     try testing.expect(with != without);
+}
+
+// ---- enum layout + variant/match spelling fold (M10) ----
+
+test "variant spelling in a fn body folds into the body walk" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "enum S { A, B }\nfn f() -> S { return S.A }\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "enum S { A, B }\nfn f() -> S { return S.B }\n");
+    defer b.deinit(gpa);
+    // f is fn 1; constructing a different variant flips the body walk.
+    try testing.expect(fp(&a, 1) != fp(&b, 1));
+}
+
+test "qualified N.V differs from inferred .V in the body walk" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "enum S { A, B }\nfn f(s: S) -> S { match s { .A -> S.B, .B -> S.A } }\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "enum S { A, B }\nfn f(s: S) -> S { match s { .A -> .B, .B -> .A } }\n");
+    defer b.deinit(gpa);
+    try testing.expect(fp(&a, 1) != fp(&b, 1));
+}
+
+test "match arm spelling folds (different variant binding name)" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "enum S { C(int) }\nfn f(s: S) -> int { match s { .C(r) -> r } }\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "enum S { C(int) }\nfn f(s: S) -> int { match s { .C(q) -> q } }\n");
+    defer b.deinit(gpa);
+    try testing.expect(fp(&a, 1) != fp(&b, 1));
+}
+
+test "touched enum layout folds in: a variant-layout edit flips the hash" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const v1 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00tag" }};
+    const v2 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00TAG-changed" }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2);
+    try testing.expect(h1 != h2);
+}
+
+test "touched enum layout: identical layout hashes identically (cache hit)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const v = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00same" }};
+    const v2 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00same" }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2);
+    try testing.expectEqual(h1, h2);
+}
+
+test "M11: a match literal-value edit flips the hash" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "fn f(n: int) -> int {\n match n { 0 -> 1, _ -> 2 }\n}\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "fn f(n: int) -> int {\n match n { 1 -> 1, _ -> 2 }\n}\n");
+    defer b.deinit(gpa);
+    try testing.expect(fp(&a, 0) != fp(&b, 0));
+}
+
+test "M11: adding a guard flips the hash (guard sentinel)" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "fn f(n: int) -> int {\n match n { 0 -> 1, _ -> 2 }\n}\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "fn f(n: int) -> int {\n match n { 0 if n > 0 -> 1, _ -> 2 }\n}\n");
+    defer b.deinit(gpa);
+    try testing.expect(fp(&a, 0) != fp(&b, 0));
+}
+
+test "M11: reordering or-pattern alternatives flips the hash (order-sensitive)" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "enum E { A, B, C }\nfn f(e: E) -> int {\n match e { .A | .B -> 1, .C -> 2 }\n}\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "enum E { A, B, C }\nfn f(e: E) -> int {\n match e { .B | .A -> 1, .C -> 2 }\n}\n");
+    defer b.deinit(gpa);
+    try testing.expect(fp(&a, 1) != fp(&b, 1));
+}
+
+test "M11: adding a nested sub-pattern flips the hash" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "enum E { C(int), N }\nfn f(e: E) -> int {\n match e { .C(r) -> r, .N -> 0 }\n}\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "enum E { C(int), N }\nfn f(e: E) -> int {\n match e { .C(0) -> 1, .C(r) -> r, .N -> 0 }\n}\n");
+    defer b.deinit(gpa);
+    try testing.expect(fp(&a, 1) != fp(&b, 1));
 }

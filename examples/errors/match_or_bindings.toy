@@ -1,0 +1,13 @@
+# Feature: or-pattern alternatives that bind different names are rejected.
+# expect: compile-error "or-pattern alternatives must bind the same"
+enum E { A(int), B(int) }
+
+fn f(e: E) -> int {
+  match e {
+    .A(x) | .B(y) -> 1
+  }
+}
+
+fn main() -> int {
+  return f(E.A(1))
+}
