@@ -1,0 +1,17 @@
+# Feature: SHOULD FAIL - a nested variant pattern that covers only ONE inner
+# variant does not make the outer variant exhaustive. (Soundness: a type-less
+# irrefutability check wrongly treated `.Out(.V(x))` as total and accepted this,
+# then fell through to garbage at runtime on `Out(W)`.)
+# expect: compile-error "non-exhaustive match"
+enum Inner { V(int), W }
+enum Outer { Out(Inner) }
+
+fn f(o: Outer) -> int {
+  match o {
+    .Out(.V(x)) -> x
+  }
+}
+
+fn main() -> int {
+  return f(Outer.Out(Inner.W))
+}

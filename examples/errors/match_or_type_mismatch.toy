@@ -1,0 +1,17 @@
+# Feature: SHOULD FAIL - or-pattern alternatives binding the SAME name at
+# DIFFERENT types are rejected. (Soundness: the alternatives share one binding
+# slot, so the slot type alone hides the divergence; it must be caught from each
+# binding's matched field type. `x` is int in `.A`, bool in `.B`.)
+# expect: compile-error "or-pattern alternatives must bind the same"
+enum E { A(int), B(bool) }
+
+fn f(e: E) -> int {
+  match e {
+    .A(x) | .B(x) -> 1,
+    _ -> 0
+  }
+}
+
+fn main() -> int {
+  return f(E.A(7))
+}

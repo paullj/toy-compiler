@@ -812,10 +812,10 @@ fn matchDiverges(t: *const Typecheck, node_idx: Ast.Index) bool {
         const pat = t.tree.nodes[arm.lhs];
         if (pat.tag == .pattern_wildcard) {
             has_wildcard = true;
-        } else if (pat.tag == .pattern_variant and t.allIrrefutable(arm.lhs)) {
+        } else if (pat.tag == .pattern_variant) {
             const vname = t.nameText(pat.main_token);
             for (e.variants, 0..) |v, i| {
-                if (i < seen.len and std.mem.eql(u8, v.name, vname)) seen[i] = true;
+                if (i < seen.len and std.mem.eql(u8, v.name, vname) and t.variantPayloadIrrefutable(arm.lhs, v)) seen[i] = true;
             }
         }
     }
@@ -1467,26 +1467,86 @@ fn typeOfMatch(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemor
     return result;
 }
 
-/// Whether a pattern is irrefutable (matches any value of its position): wildcard,
-/// a bind-whole, or a variant/or whose children are all irrefutable. A literal is
-/// refutable. Used to gate enum variant coverage: `.C(0)` does NOT cover `.C`.
-fn allIrrefutable(t: *const Typecheck, pat_idx: Ast.Index) bool {
+/// Whether `pat` matches EVERY value of type `ty` (covers the whole position): a
+/// wildcard, a bind-whole, a SINGLE-variant enum's variant whose payload is fully
+/// covered, or an or-pattern that jointly covers `ty`. A literal is refutable, and
+/// — crucially — a variant pattern is REFUTABLE against a MULTI-variant enum (`.V`
+/// does not match `.W`). Type-aware on purpose: a type-less version wrongly treats
+/// `.Out(.V(x))` as total and accepts a non-exhaustive match (runtime fall-through).
+fn irrefutable(t: *const Typecheck, pat_idx: Ast.Index, ty: Type) bool {
+    if (ty.kind == .invalid) return true; // poison already reported; don't cascade a spurious miss
     const pat = t.tree.nodes[pat_idx];
     return switch (pat.tag) {
         .pattern_wildcard => true,
-        .pattern_binding => pat.rhs == Ast.none or t.allIrrefutable(pat.rhs),
+        .pattern_binding => pat.rhs == Ast.none or t.irrefutable(pat.rhs, ty),
         .pattern_literal => false,
         .pattern_variant => blk: {
-            if (pat.rhs == Ast.none) break :blk true;
-            for (Ast.rangeSlice(t.tree, pat.rhs)) |c| if (!t.allIrrefutable(c)) break :blk false;
-            break :blk true;
+            // Total only when the enum has exactly ONE variant (the tag test cannot
+            // fail) AND that variant's payload is fully covered. Against a
+            // multi-variant enum a single `.V` is refutable.
+            if (ty.kind != .@"enum") break :blk false;
+            const e = t.enums.items[ty.enum_id];
+            if (e.variants.len != 1) break :blk false;
+            break :blk t.variantPayloadIrrefutable(pat_idx, e.variants[0]);
         },
-        .pattern_or => blk: {
-            for (Ast.rangeSlice(t.tree, pat.lhs)) |a| if (!t.allIrrefutable(a)) break :blk false;
-            break :blk true;
-        },
+        .pattern_or => t.orCoversType(pat_idx, ty),
         else => false,
     };
+}
+
+/// Whether a variant pattern `.V(payload)`'s payload sub-patterns are each
+/// irrefutable against their field types — i.e. the arm fully handles variant V.
+/// `.V(_)` / `.V(x)` cover V; `.V(0)` and `.V(.W(x))` over a multi-variant inner
+/// enum do NOT. Omitted struct fields are implicitly wildcards (irrefutable).
+fn variantPayloadIrrefutable(t: *const Typecheck, pat_idx: Ast.Index, variant: VariantSym) bool {
+    const pat = t.tree.nodes[pat_idx];
+    const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(t.tree, pat.rhs);
+    switch (variant.form) {
+        .unit => return binders.len == 0,
+        .tuple => {
+            if (binders.len != variant.field_types.len) return false;
+            for (binders, variant.field_types) |b, fty| if (!t.irrefutable(b, fty)) return false;
+            return true;
+        },
+        .@"struct" => {
+            for (binders) |b_idx| {
+                const b = t.tree.nodes[b_idx];
+                const src = if (b.lhs != Ast.none) t.nameText(t.tree.nodes[b.lhs].main_token) else t.nameText(b.main_token);
+                var fty: Type = .invalid;
+                for (variant.field_names, 0..) |dn, j| if (std.mem.eql(u8, dn, src)) {
+                    fty = variant.field_types[j];
+                    break;
+                };
+                if (!t.irrefutable(b_idx, fty)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+/// Whether an or-pattern jointly covers every value of `ty`: a single irrefutable
+/// alternative covers it, or (for an enum) the alternatives' covered variants union
+/// to all of them. Conservatively false otherwise — sound: under-claiming coverage
+/// only rejects a genuinely-exhaustive match, never accepts a non-exhaustive one.
+fn orCoversType(t: *const Typecheck, or_idx: Ast.Index, ty: Type) bool {
+    const alts = Ast.rangeSlice(t.tree, t.tree.nodes[or_idx].lhs);
+    for (alts) |a| if (t.irrefutable(a, ty)) return true;
+    if (ty.kind == .@"enum") {
+        const e = t.enums.items[ty.enum_id];
+        var seen = [_]bool{false} ** 64;
+        if (e.variants.len > seen.len) return false;
+        for (alts) |a| {
+            const ap = t.tree.nodes[a];
+            if (ap.tag != .pattern_variant) continue;
+            const vname = t.nameText(ap.main_token);
+            for (e.variants, 0..) |v, i| {
+                if (std.mem.eql(u8, v.name, vname) and t.variantPayloadIrrefutable(a, v)) seen[i] = true;
+            }
+        }
+        for (e.variants, 0..) |_, i| if (!seen[i]) return false;
+        return true;
+    }
+    return false;
 }
 
 /// Whether an arm body (an expression node) diverges (control never falls past
@@ -1509,6 +1569,11 @@ fn checkPattern(t: *Typecheck, pat_idx: Ast.Index, expected: Type, cov: *Cov, ha
             has_wildcard.* = true;
         },
         .pattern_binding => {
+            // Record the type this binding matched AGAINST on its own node. The
+            // binding's slot is SHARED across or-pattern alternatives (Resolve), so
+            // the slot type is overwritten and can't reveal a `.A(x) | .B(x)` type
+            // divergence; the per-node matched type can (read by `collectBindings`).
+            t.node_types[pat_idx] = expected;
             if (pat.rhs == Ast.none) {
                 // Bind-whole: type by value; a top-level bare binding is irrefutable.
                 if (t.resolutions[pat_idx] == .local) try t.setSlot(t.resolutions[pat_idx].local, expected);
@@ -1572,8 +1637,10 @@ fn checkVariantPattern(t: *Typecheck, pat_idx: Ast.Index, expected: Type, cov: *
         }
     }
     const variant = if (vi) |i| blk: {
-        // Coverage only when this arm counts AND the pattern is fully irrefutable.
-        if (count_cov and t.allIrrefutable(pat_idx)) cov.@"enum"[i] = true;
+        // Cover variant i only when this arm counts AND variant i's payload is fully
+        // matched (`.V(_)`/`.V(x)` cover it; `.V(0)` or `.V(.W(x))` over a multi-variant
+        // inner enum do not — caught by the type-aware payload check).
+        if (count_cov and t.variantPayloadIrrefutable(pat_idx, e.variants[i])) cov.@"enum"[i] = true;
         break :blk e.variants[i];
     } else {
         try t.emitFmt(t.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
@@ -1661,7 +1728,10 @@ fn collectBindings(t: *Typecheck, pat_idx: Ast.Index, out: *std.StringHashMapUnm
     switch (pat.tag) {
         .pattern_binding => {
             const name = t.nameText(pat.main_token);
-            const ty: Type = if (t.resolutions[pat_idx] == .local) t.slotType(t.resolutions[pat_idx].local) else .invalid;
+            // The PER-NODE matched type (set in checkPattern), NOT the shared slot
+            // type — so two alternatives binding the same name at different field
+            // types are seen as different and rejected.
+            const ty: Type = t.node_types[pat_idx];
             try out.put(t.gpa, name, ty);
             if (pat.rhs != Ast.none) try t.collectBindings(pat.rhs, out);
         },
