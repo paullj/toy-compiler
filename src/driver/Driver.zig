@@ -19,7 +19,9 @@ const Ast = @import("../ast/Ast.zig");
 const Cache = @import("Cache.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
-const Codegen = @import("../codegen/Codegen.zig");
+const CodegenIr = @import("../codegen/CodegenIr.zig");
+const Ir = @import("../ir/Ir.zig");
+const lower = @import("../lower.zig");
 const Fingerprint = @import("Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
@@ -46,23 +48,24 @@ pub const Emit = enum {
     lex,
     parse,
     check,
-    /// Dump the generated AArch64 assembly for the whole program (`--emit asm`).
-    /// Runs the full front-end (resolve + typecheck) like `check`, then lowers
-    /// every function. (Named `assembly`, not `asm`, since `asm` is a Zig keyword.)
-    assembly,
 
-    /// The deepest cached phase this emit level needs. `check`/`assembly` build on
-    /// the parse artifact, so they cache through `parse`.
+    /// Dump the target-independent IR for the whole program (`--emit ir`). Runs
+    /// the full front-end (resolve + typecheck) like `check`, then lowers every
+    /// function via the `lower` stage and renders the IR text.
+    ir,
+
+    /// The deepest cached phase this emit level needs. `check`/`ir` build on the
+    /// parse artifact, so they cache through `parse`.
     fn cachePhase(emit: Emit) Cache.Phase {
         return switch (emit) {
             .lex => .lex,
-            .parse, .check, .assembly => .parse,
+            .parse, .check, .ir => .parse,
         };
     }
 
-    /// `assembly` needs the same in-memory front-end as `check`.
+    /// `ir` needs the same in-memory front-end as `check`.
     fn runsCheck(emit: Emit) bool {
-        return emit == .check or emit == .assembly;
+        return emit == .check or emit == .ir;
     }
 };
 
@@ -197,7 +200,7 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     if (tc.diags.len > 0) result.err = error.TypeError;
 }
 
-// ---- code emission (the `-o` / `--emit asm` paths) -------------------------
+// ---- code emission (the `-o` path) -----------------------------------------
 
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
@@ -208,15 +211,13 @@ pub const EmitError = struct {
 };
 
 /// The linked whole-program lowering: the joined `__text` blob, `main`'s resolved
-/// entry offset within it, the optional asm listing, and any codegen diagnostics
-/// (the caller checks `diags.len` and prints them, matching the prior contract).
-/// `owned_msgs` are the heap-allocated diagnostic messages. Caller frees via
-/// `deinit`.
+/// entry offset within it, and any codegen diagnostics (the caller checks
+/// `diags.len` and prints them, matching the prior contract). `owned_msgs` are the
+/// heap-allocated diagnostic messages. Caller frees via `deinit`.
 pub const LinkedProgram = struct {
     text: []u8,
     entry_off: u32,
-    listing: ?[]u8,
-    diags: []Codegen.Diagnostic,
+    diags: []CodegenIr.Diagnostic,
     owned_msgs: [][]u8,
     /// Interned `__cstring` bytes (M2). Owned; empty for string-free programs.
     cstrings: []u8 = &.{},
@@ -233,7 +234,6 @@ pub const LinkedProgram = struct {
 
     pub fn deinit(self: *LinkedProgram, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
-        if (self.listing) |l| gpa.free(l);
         gpa.free(self.diags);
         for (self.owned_msgs) |m| gpa.free(m);
         gpa.free(self.owned_msgs);
@@ -283,16 +283,14 @@ const Frozen = struct {
 /// cache), then run the serial relink tail: intern strings, lay the functions
 /// out in one `__text` blob with `main` as entry, and rebase cross-segment
 /// relocs. Locates the `fn_decl` named `main`. The file must already be `checked`
-/// with no front-end errors. `want_listing` routes through the serial asm path.
-/// Caller owns the returned `LinkedProgram` on success.
+/// with no front-end errors. Caller owns the returned `LinkedProgram` on success.
 pub fn lowerProgram(
     gpa: std.mem.Allocator,
     io: Io,
     cache: Cache,
     target: []const u8,
     r: *const FileResult,
-    mode: Codegen.Mode,
-    want_listing: bool,
+    mode: CodegenIr.Mode,
 ) !LowerProgramResult {
     const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
     const prog = r.nodes[Ast.root(r.nodes)];
@@ -349,9 +347,6 @@ pub fn lowerProgram(
         .sigs = r.typecheck.?.sigs,
     };
 
-    // The asm-listing path stays a thin serial loop (a listing dump needs no
-    // fingerprint/cache); it shares `Codegen.generateProgram`.
-    if (want_listing) return lowerProgramSerial(gpa, &frozen);
 
     // --- parallel per-fn fan-out ---
     const slots = try gpa.alloc(FnSlot, fn_nodes.items.len);
@@ -386,64 +381,70 @@ pub fn lowerProgram(
     return relink(gpa, slots, names, main_sym, compiled, cached_n);
 }
 
-/// Serial `--emit asm` path: lower all fns + the print body, returning either a
-/// diagnostics-carrying LinkedProgram or a fully-linked one. No cache.
-fn lowerProgramSerial(gpa: std.mem.Allocator, frozen: *const Frozen) !LowerProgramResult {
-    var pr = try Codegen.generateProgram(
-        gpa,
-        frozen.tree,
-        frozen.tokens,
-        frozen.source,
-        frozen.resolutions,
-        frozen.node_types,
-        frozen.layouts,
-        frozen.enum_layouts,
-        frozen.names,
-        frozen.fn_nodes,
-        frozen.entry_fn,
-        true,
-    );
+/// What `renderProgramIr` produced: either the rendered IR text (caller frees)
+/// or one `EmitError`.
+pub const IrResult = union(enum) {
+    ok: []u8,
+    err: EmitError,
+};
 
-    if (pr.diags.len > 0) {
-        for (pr.fns) |*f| f.deinit(gpa);
-        gpa.free(pr.fns);
-        defer {
-            gpa.free(pr.diags);
-            for (pr.owned_msgs) |m| gpa.free(m);
-            gpa.free(pr.owned_msgs);
+/// `--emit ir`: run the `lower` stage (Ast→Ir) over every function and render
+/// the deterministic IR text. No cache, no codegen — a front-end dump. The file
+/// must already be `checked` with no front-end errors.
+/// Caller owns the returned text on success.
+pub fn renderProgramIr(gpa: std.mem.Allocator, r: *const FileResult) !IrResult {
+    const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
+    const prog = r.nodes[Ast.root(r.nodes)];
+    std.debug.assert(prog.tag == .program);
+
+    var fn_nodes: std.ArrayList(Ast.Index) = .empty;
+    defer fn_nodes.deinit(gpa);
+    var entry_fn: ?u32 = null;
+    for (Ast.rangeSlice(tree, prog.lhs)) |fn_idx| {
+        const decl = r.nodes[fn_idx];
+        if (decl.tag != .fn_decl) continue;
+        if (entry_fn == null and std.mem.eql(u8, r.tokens[decl.main_token].text(r.source), "main")) {
+            entry_fn = @intCast(fn_nodes.items.len);
         }
-        return .{ .ok = .{
-            .text = &.{},
-            .entry_off = 0,
-            .listing = pr.listing,
-            .diags = try gpa.dupe(Codegen.Diagnostic, pr.diags),
-            .owned_msgs = try dupeOwnedMsgs(gpa, pr.owned_msgs),
-        } };
+        try fn_nodes.append(gpa, fn_idx);
     }
 
-    // Hand the fns to the tail; keep the listing/diags from `pr`.
-    var lp = linkAndTail(gpa, pr.fns, frozen.names, frozen.entry_fn) catch |e| switch (e) {
-        error.CallTargetTooFar => {
-            pr.deinit(gpa);
-            return .{ .err = .{ .message = "call target out of range for M1 codegen", .byte_offset = null } };
-        },
-        else => |err| {
-            pr.deinit(gpa);
-            return err;
-        },
-    };
-    // `pr.fns` was consumed by linkAndTail (it freed each FnCode); free the rest.
-    gpa.free(pr.fns);
-    lp.listing = pr.listing;
-    lp.diags = pr.diags;
-    lp.owned_msgs = pr.owned_msgs;
-    return .{ .ok = lp };
-}
+    const names = try buildNames(gpa, tree, r.tokens, r.source, fn_nodes.items);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
 
-fn dupeOwnedMsgs(gpa: std.mem.Allocator, msgs: [][]u8) ![][]u8 {
-    const out = try gpa.alloc([]u8, msgs.len);
-    for (msgs, 0..) |m, i| out[i] = try gpa.dupe(u8, m);
-    return out;
+    const in = lower.Inputs{
+        .tree = tree,
+        .tokens = r.tokens,
+        .source = r.source,
+        .resolutions = r.resolve.?.resolutions,
+        .node_types = r.typecheck.?.node_types,
+        .layouts = r.typecheck.?.layouts,
+        .enum_layouts = r.typecheck.?.enum_layouts,
+        .names = names,
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+
+    // Lowering diagnostics are collected but not surfaced through this textual
+    // dump path (its purpose is the deterministic IR golden surface); a later
+    // stage wires lower diagnostics into the driver's failure path.
+    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    for (fn_nodes.items, 0..) |fn_decl, i| {
+        const is_entry = if (entry_fn) |e| e == i else false;
+        var func = try lower.lowerFn(gpa, in, fn_decl, names[i], is_entry, &diags);
+        defer func.deinit(gpa);
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        if (i + 1 != fn_nodes.items.len) try aw.writer.writeAll("\n");
+    }
+
+    var list = aw.toArrayList();
+    return .{ .ok = try list.toOwnedSlice(gpa) };
 }
 
 /// One per-function codegen job: fingerprint → cache hit (with optional VERIFY)
@@ -453,7 +454,7 @@ fn fnJob(
     io: Io,
     cache: Cache,
     target: []const u8,
-    mode: Codegen.Mode,
+    mode: CodegenIr.Mode,
     frozen: *const Frozen,
     idx: usize,
     slot: *FnSlot,
@@ -468,7 +469,7 @@ fn fnJobInner(
     io: Io,
     cache: Cache,
     target: []const u8,
-    mode: Codegen.Mode,
+    mode: CodegenIr.Mode,
     frozen: *const Frozen,
     idx: usize,
     slot: *FnSlot,
@@ -493,24 +494,44 @@ fn fnJobInner(
     const sym = frozen.names[idx];
     const is_entry = idx == frozen.entry_fn;
 
+    if (mode == .verify) {
+        // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh
+        // and assert its packed FnCode bytes are byte-identical to a reference:
+        //   * cache HIT  -> compare against the stored blob (cache soundness).
+        //   * cache MISS -> compare against a SECOND fresh lowering (determinism).
+        // Either way the assertion runs unconditionally — it is NOT gated on a
+        // primed cache, so it can never silently no-op (the dead-gate bug, where
+        // `--force` skipped the cache-read branch and thus the assert entirely).
+        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+        errdefer fresh.deinit(gpa);
+        const fb = try Link.pack(gpa, fresh);
+        defer gpa.free(fb);
+
+        var was_cached = false;
+        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+            defer gpa.free(blob);
+            std.debug.assert(std.mem.eql(u8, fb, blob));
+            was_cached = true;
+        } else {
+            // Cold: no reference blob to compare against, so lower a second time
+            // and assert the two fresh lowerings agree (pure determinism).
+            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+            defer fresh2.deinit(gpa);
+            const fb2 = try Link.pack(gpa, fresh2);
+            defer gpa.free(fb2);
+            std.debug.assert(std.mem.eql(u8, fb, fb2));
+            // Populate the cache so subsequent fns/runs see a primed entry.
+            cache.put(u8, io, key, idx, fb) catch {};
+        }
+        slot.* = .{ .fc = fresh, .cached = was_cached };
+        return;
+    }
+
     if (mode != .force) {
         if (cache.get(u8, gpa, io, key) catch null) |blob| {
             defer gpa.free(blob);
             if (Link.unpack(gpa, blob) catch null) |fc| {
-                // VERIFY mode runs fallible work (re-lower + pack) before the slot
-                // takes ownership at the bottom; guard `fc` so an OOM there frees
-                // it instead of leaking. Disarmed once `slot.*` owns it.
-                var fc_mut = fc;
-                errdefer fc_mut.deinit(gpa);
-                if (mode == .verify) {
-                    // Re-lower and assert byte-identical to the cached blob. [C11]
-                    var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
-                    defer fresh.deinit(gpa);
-                    const fb = try Link.pack(gpa, fresh);
-                    defer gpa.free(fb);
-                    std.debug.assert(std.mem.eql(u8, fb, blob));
-                }
-                slot.* = .{ .fc = fc_mut, .cached = true };
+                slot.* = .{ .fc = fc, .cached = true };
                 return;
             }
         }
@@ -525,38 +546,34 @@ fn fnJobInner(
     slot.* = .{ .fc = fc, .cached = false };
 }
 
-/// Lower one function with throwaway diag sinks (a job-local diagnostic still
-/// fails the build at relink, surfaced via the FnCode being absent). Used by the
-/// parallel path; diagnostics are rare (the front-end already validated) and a
-/// per-fn diag is collected by the serial path for asm.
+/// Lower one function (Ast→Ir→FnCode) with a throwaway diag sink (a job-local
+/// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
+/// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
+/// is freed here, keeping the codegen cache ONE-TIER ([C8]).
 fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool) !Link.FnCode {
-    var diags: std.ArrayList(Codegen.Diagnostic) = .empty;
+    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
-    var owned: std.ArrayList([]u8) = .empty;
-    defer {
-        for (owned.items) |m| gpa.free(m);
-        owned.deinit(gpa);
-    }
-    const fc = try Codegen.lower(
-        gpa,
-        frozen.tree,
-        frozen.tokens,
-        frozen.source,
-        frozen.resolutions,
-        frozen.node_types,
-        frozen.layouts,
-        frozen.enum_layouts,
-        frozen.names,
-        fn_decl,
-        sym,
-        is_entry,
-        &diags,
-        &owned,
-        null,
-    );
-    // A codegen diagnostic on the parallel path means an unsupported construct
-    // slipped past the front-end; surface it as an error so the build fails
-    // cleanly rather than emitting a half-lowered function.
+
+    const in: lower.Inputs = .{
+        .tree = frozen.tree,
+        .tokens = frozen.tokens,
+        .source = frozen.source,
+        .resolutions = frozen.resolutions,
+        .node_types = frozen.node_types,
+        .layouts = frozen.layouts,
+        .enum_layouts = frozen.enum_layouts,
+        .names = frozen.names,
+    };
+    var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
+    defer irf.deinit(gpa);
+    // A lower diagnostic (an unsupported/not-yet-lowered construct) fails the build
+    // before we emit a partial FnCode.
+    if (diags.items.len > 0) return error.CodegenDiagnostic;
+
+    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, is_entry, &diags);
+    // A codegen diagnostic means an unsupported construct slipped past the
+    // front-end; surface it as an error so the build fails cleanly rather than
+    // emitting a half-lowered function.
     if (diags.items.len > 0) {
         var tmp = fc;
         tmp.deinit(gpa);
@@ -743,7 +760,7 @@ fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, ou
 /// Resolve a DECLARED type-ref node (a param/return type annotation) to a Type by
 /// name, using the struct table. Builtins map to their scalar/str kinds; a struct
 /// name resolves to its `struct_id`; anything else (incl. `()`) → unit. Mirrors
-/// Codegen.fnReturnType/paramType so the fingerprint folds the SAME layout codegen
+/// `lower`'s type-ref resolution so the fingerprint folds the SAME layout codegen
 /// will use, independent of node_types (which Typecheck never sets here).
 fn typeRefToType(frozen: *const Frozen, type_node: Ast.Index) Typecheck.Type {
     const n = frozen.tree.nodes[type_node];
@@ -878,7 +895,7 @@ fn relink(
         error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .byte_offset = null } },
         else => |err| return err,
     };
-    lp.diags = try gpa.alloc(Codegen.Diagnostic, 0);
+    lp.diags = try gpa.alloc(CodegenIr.Diagnostic, 0);
     lp.owned_msgs = try gpa.alloc([]u8, 0);
     lp.codegen_compiled = compiled;
     lp.codegen_cached = cached_n;
@@ -888,13 +905,12 @@ fn relink(
 /// Shared back half of both paths: append the print body if referenced, intern
 /// strings deterministically, rewrite `.cstr` targets, then `Link.link`. CONSUMES
 /// `fns` (frees each FnCode and any appended print body). Returns a LinkedProgram
-/// with `listing`/`diags`/`owned_msgs` left empty for the caller to fill.
+/// with `diags`/`owned_msgs` left empty for the caller to fill.
 fn linkAndTail(gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32) !LinkedProgram {
     const lk = try link.linkProgram(gpa, fns, names[entry_fn]);
     return LinkedProgram{
         .text = lk.text,
         .entry_off = lk.entry_off,
-        .listing = null,
         .diags = &.{},
         .owned_msgs = &.{},
         .cstrings = lk.cstrings,
@@ -1078,7 +1094,7 @@ test "lowerProgram reports missing main and lowers a simple main" {
         try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 0);
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
         switch (lowered) {
             .err => |e| try testing.expect(e.byte_offset == null),
             .ok => |*lp| {
@@ -1098,7 +1114,7 @@ test "lowerProgram reports missing main and lowers a simple main" {
         try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 1);
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
         switch (lowered) {
             .err => return error.TestUnexpectedResult,
             .ok => |*lp| {
@@ -1455,7 +1471,7 @@ test "integration: emitted binary runs with the right exit code" {
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
 
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
         const lp = switch (lowered) {
             .ok => |*ok| ok,
             .err => return error.TestUnexpectedResult,
@@ -1530,7 +1546,7 @@ test "integration: print writes the expected bytes to stdout" {
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
 
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
         const lp = switch (lowered) {
             .ok => |*ok| ok,
             .err => return error.TestUnexpectedResult,
@@ -1575,14 +1591,14 @@ fn checkAndLower(
     cache: Cache,
     path: []const u8,
     src: []const u8,
-    mode: Codegen.Mode,
+    mode: CodegenIr.Mode,
     r_out: *FileResult,
 ) !LinkedProgram {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
     r_out.* = .{ .path = path };
     try pipeline(gpa, io, cache, .check, "aarch64-macos", r_out, 0);
     try testing.expect(r_out.err == null);
-    const lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", r_out, mode, false);
+    const lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", r_out, mode);
     return switch (lowered) {
         .ok => |ok| ok,
         .err => error.TestUnexpectedResult,

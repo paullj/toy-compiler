@@ -30,8 +30,10 @@ pub const Phase = enum(u8) {
     /// Resolve + typecheck. A pipeline *level* only in M0 (run in-memory, not
     /// stored), but ordered after `parse` so `@intFromEnum` gates the pipeline.
     check,
-    /// Per-function lowering (M5). Cached by a transitive content fingerprint, not
-    /// a source hash, and target-sensitive (the blob is aarch64 machine code).
+    /// Per-function lowering (M5+; M12 Ast→Ir→aarch64). Cached by a transitive
+    /// content fingerprint, not a source hash, and target-sensitive (the blob is
+    /// aarch64 machine code). The IR is built INSIDE this query and never cached
+    /// separately — the cache stays ONE-TIER ([C8]).
     codegen,
 
     /// Whether results for this phase depend on the compilation target. Target

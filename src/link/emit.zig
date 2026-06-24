@@ -29,7 +29,7 @@ const Io = std.Io;
 const Link = @import("Link.zig");
 const MachO = @import("MachO.zig");
 const CodeSign = @import("CodeSign.zig");
-const Codegen = @import("../codegen/Codegen.zig");
+const CodegenIr = @import("../codegen/CodegenIr.zig");
 const sym = @import("../symbols/Sym.zig");
 
 /// Emission options. `identifier` is the code-signing identity (the output
@@ -93,7 +93,7 @@ pub fn linkProgram(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymNam
         moved += 1;
     }
     if (uses_write) {
-        const pf = try Codegen.lowerPrint(gpa, null);
+        const pf = try CodegenIr.lowerPrint(gpa);
         try all.append(gpa, pf);
     }
 

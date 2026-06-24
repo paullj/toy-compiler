@@ -7,8 +7,8 @@
 //! on-disk cache, and prints a summary. `--dump` prints the artifact of the emit
 //! phase: tokens for `lex`, the AST S-expression for `parse`, and the AST plus a
 //! per-function signature summary for `check` (name resolution + typecheck).
-//! `-o` and `--emit asm` carry on through codegen → link → sign, all hung off
-//! this same driver.
+//! `-o` carries on through lower → codegen → link → sign, all hung off this same
+//! driver; `--emit ir` dumps the target-independent IR text.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,7 +19,7 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 const Driver = toyc.Driver;
 const Ast = toyc.Ast;
-const Codegen = toyc.Codegen;
+const CodegenIr = toyc.CodegenIr;
 const version = toyc.version;
 
 pub fn main(init: std.process.Init) !void {
@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var target: []const u8 = "native";
     var out_path: ?[]const u8 = null;
     var codegen_stats = false;
-    var mode: Codegen.Mode = .normal;
+    var mode: CodegenIr.Mode = .normal;
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
 
@@ -53,17 +53,17 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--force")) {
             mode = .force;
         } else if (std.mem.eql(u8, arg, "--emit")) {
-            const v = args.next() orelse return argError(out, "--emit requires a value (lex|parse|check|asm)");
+            const v = args.next() orelse return argError(out, "--emit requires a value (lex|parse|check|ir)");
             if (std.mem.eql(u8, v, "lex")) {
                 emit = .lex;
             } else if (std.mem.eql(u8, v, "parse")) {
                 emit = .parse;
             } else if (std.mem.eql(u8, v, "check")) {
                 emit = .check;
-            } else if (std.mem.eql(u8, v, "asm")) {
-                emit = .assembly;
+            } else if (std.mem.eql(u8, v, "ir")) {
+                emit = .ir;
             } else {
-                return argError(out, "--emit must be 'lex', 'parse', 'check', or 'asm'");
+                return argError(out, "--emit must be 'lex', 'parse', 'check', or 'ir'");
             }
         } else if (std.mem.eql(u8, arg, "-o")) {
             out_path = args.next() orelse return argError(out, "-o requires an output path");
@@ -78,8 +78,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (paths.items.len == 0) {
-        // Asking to emit (-o / --emit asm) with no input is an error, not usage.
-        if (out_path != null or emit == .assembly) {
+        // Asking to emit (`-o`) with no input is an error, not usage.
+        if (out_path != null) {
             try argError(out, "no input file");
             std.process.exit(1);
         }
@@ -87,8 +87,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Code emission (`-o` or `--emit asm`) is locked to aarch64-macos in M1.
-    if ((out_path != null or emit == .assembly) and !isAarch64Macos(target)) {
+    // Code emission (`-o`) is locked to aarch64-macos in M1.
+    if (out_path != null and !isAarch64Macos(target)) {
         try argError(out, "code emission only supports aarch64-macos in M1");
         std.process.exit(1);
     }
@@ -98,9 +98,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(try emitExecutable(gpa, io, out, target, paths.items, path, mode, codegen_stats));
     }
 
-    // `--emit asm`: print the generated assembly listing for `main`; no file out.
-    if (emit == .assembly) {
-        std.process.exit(try emitAsm(gpa, io, out, target, paths.items));
+    // `--emit ir`: print the target-independent IR for the whole program.
+    if (emit == .ir) {
+        std.process.exit(try emitIr(gpa, io, out, target, paths.items));
     }
 
     const results = try Driver.run(gpa, io, emit, target, paths.items);
@@ -146,7 +146,7 @@ fn emitExecutable(
     target: []const u8,
     paths: []const []const u8,
     out_path: []const u8,
-    mode: Codegen.Mode,
+    mode: CodegenIr.Mode,
     codegen_stats: bool,
 ) !u8 {
     if (paths.len != 1) {
@@ -171,7 +171,7 @@ fn emitExecutable(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var lowered = try Driver.lowerProgram(gpa, io, cache, target, r, mode, false);
+    var lowered = try Driver.lowerProgram(gpa, io, cache, target, r, mode);
     switch (lowered) {
         .err => |e| {
             try printEmitError(out, r, e);
@@ -217,10 +217,10 @@ fn emitExecutable(
     }
 }
 
-/// `--emit asm`: lower the whole program and print its assembly listing to
-/// stdout (one `_<name>:` block per function; calls render as `bl _<fn>`).
-/// Returns the process exit code (0 success, 1 on any failure).
-fn emitAsm(
+
+/// `--emit ir`: run the front-end + the `lower` stage over every function and
+/// print the deterministic IR text to stdout. Returns the process exit code.
+fn emitIr(
     gpa: std.mem.Allocator,
     io: Io,
     out: *Io.Writer,
@@ -228,11 +228,11 @@ fn emitAsm(
     paths: []const []const u8,
 ) !u8 {
     if (paths.len != 1) {
-        try argError(out, "--emit asm takes exactly one input file");
+        try argError(out, "--emit ir takes exactly one input file");
         return 1;
     }
 
-    const results = try Driver.run(gpa, io, .assembly, target, paths);
+    const results = try Driver.run(gpa, io, .ir, target, paths);
     defer {
         for (results) |*r| r.deinit(gpa);
         gpa.free(results);
@@ -245,25 +245,15 @@ fn emitAsm(
         return 1;
     }
 
-    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
-    var lowered = try Driver.lowerProgram(gpa, io, cache, target, r, .normal, true);
-    switch (lowered) {
+    switch (try Driver.renderProgramIr(gpa, r)) {
         .err => |e| {
             try printEmitError(out, r, e);
             try out.flush();
             return 1;
         },
-        .ok => |*lp| {
-            defer lp.deinit(gpa);
-            if (lp.diags.len > 0) {
-                for (lp.diags) |d| {
-                    try printEmitError(out, r, .{ .message = d.message, .byte_offset = d.byte_offset });
-                }
-                try out.flush();
-                return 1;
-            }
-            if (lp.listing) |listing| try out.writeAll(listing);
+        .ok => |text| {
+            defer gpa.free(text);
+            try out.writeAll(text);
             try out.flush();
             return 0;
         },
@@ -303,7 +293,7 @@ fn usage(out: *Io.Writer) !void {
         \\toyc {s} — toy compiler (lexer + parser + name resolution + typecheck)
         \\
         \\usage: toyc [options] <file...>
-        \\  --emit lex|parse|check|asm  how far to run the pipeline (default: parse)
+        \\  --emit lex|parse|check|ir  how far to run the pipeline (default: parse)
         \\  -o <path>         emit a signed, runnable executable (aarch64-macos only)
         \\  --dump            print the emit phase's artifact (tokens, or the AST)
         \\  --target <triple> compilation target (default: native)
@@ -418,9 +408,9 @@ fn dumpArtifact(out: *Io.Writer, r: Driver.FileResult, emit: Driver.Emit) !void 
         },
         // Check dump: the AST plus a per-function signature summary with the
         // inferred return type, then a tally of diagnostics (0 when clean).
-        // `assembly` shares the front-end with `check`; its artifact (the asm
-        // listing) is printed by `emitAsm`, not the table dumper.
-        .check, .assembly => {
+        // `ir` shares the front-end with `check`; its artifact (the IR text) is
+        // printed by `emitIr`, not the table dumper.
+        .check, .ir => {
             try out.writeAll("    ");
             try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra }, r.tokens, r.source);
             try out.writeByte('\n');
