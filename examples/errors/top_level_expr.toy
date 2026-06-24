@@ -1,0 +1,5 @@
+# Feature: SHOULD FAIL — top-level expressions are not allowed.
+# expect: compile-error "expected a function or struct declaration"
+# A file's top level may only contain `fn` and `struct` declarations, so a bare
+# expression here is rejected by the parser.
+1 + 2 * 3 - -4 == 5

@@ -1,0 +1,6 @@
+[tools]
+zig = "latest"
+
+[tasks.run]
+description = "Build and run the toyc CLI (args after the task name are passed through)"
+run = "zig build run --"

@@ -1,0 +1,10 @@
+# Feature: a field place-store (`p.x = v`) followed by a read-back.
+# expect: exit 99
+# p starts {7, 1}; storing 99 into p.x and reading it back yields 99.
+struct P { x: int, y: int }
+
+fn main() -> int {
+    p := P { x: 7, y: 1 }
+    p.x = 99
+    return p.x
+}

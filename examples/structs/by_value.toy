@@ -1,0 +1,16 @@
+# Feature: structs pass BY VALUE — the callee's mutation doesn't touch the caller.
+# expect: exit 7
+# bump sets its own copy's q.x to 1000 and returns it, but main returns p.x,
+# which is still 7.
+struct P { x: int, y: int }
+
+fn bump(q: P) -> int {
+    q.x = 1000
+    return q.x
+}
+
+fn main() -> int {
+    p := P { x: 7, y: 0 }
+    z := bump(p)
+    return p.x
+}

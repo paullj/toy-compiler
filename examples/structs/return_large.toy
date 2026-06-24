@@ -1,0 +1,15 @@
+# Feature: pass AND return a >16B struct by value via the indirect (x8 sret) ABI.
+# expect: exit 7
+# add1 bumps a: {1,2,3} -> {2,2,3}; sum = 2 + 2 + 3 = 7.
+struct V3 { a: int, b: int, c: int }
+
+fn add1(v: V3) -> V3 {
+    v.a = v.a + 1
+    return v
+}
+
+fn main() -> int {
+    p := V3 { a: 1, b: 2, c: 3 }
+    q := add1(p)
+    return q.a + q.b + q.c
+}

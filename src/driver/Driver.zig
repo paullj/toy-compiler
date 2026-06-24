@@ -1,0 +1,1971 @@
+//! Compilation driver: runs the pipeline (lex → parse → check) over many files
+//! in parallel.
+//!
+//! One job per file is dispatched onto the `Io` runtime's worker threads, so a
+//! build with N files uses up to N cores. Each job runs the pipeline up to
+//! `emit` for its file — read, then a cache-or-run step per phase — and writes
+//! only into its own result slot, so no locking is needed. The on-disk phases
+//! (lex, parse) memoize through the content cache, keyed by `Cache.Phase`. The
+//! `check` level (name resolution + typecheck) runs in-memory and is not cached
+//! yet, so it always re-runs on top of the cached parse artifact.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const Io = std.Io;
+const Token = @import("../ast/Token.zig").Token;
+const Lexer = @import("../lex.zig");
+const Parser = @import("../parse.zig");
+const Ast = @import("../ast/Ast.zig");
+const Cache = @import("Cache.zig");
+const Resolve = @import("../resolve.zig");
+const Typecheck = @import("../types.zig");
+const Codegen = @import("../codegen/Codegen.zig");
+const Fingerprint = @import("Fingerprint.zig");
+const Link = @import("../link/Link.zig");
+const link = @import("../link/emit.zig");
+const version = @import("../version.zig");
+
+pub const cache_root = ".toy-cache";
+
+/// The buffer size `openCache` needs for `dir_buf`.
+pub const cache_dir_buf_len = cache_root.len + 1 + version.stamp_max;
+
+/// Open the per-compiler cache directory (`.toy-cache/<stamp>/`). `dir_buf` must
+/// outlive the returned `Cache` (it borrows the formatted path). Used by the CLI
+/// to share one cache across `Driver.run` (front-end) and `lowerProgram` (codegen).
+pub fn openCache(io: Io, dir_buf: []u8) !Cache {
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    return Cache.init(io, dir);
+}
+
+/// How far to run the pipeline. Distinct from `Cache.Phase`: `lex`/`parse` are
+/// cached on disk, but `check` (name resolution, and later typecheck) is an
+/// in-memory level only — it has no cache phase of its own yet.
+pub const Emit = enum {
+    lex,
+    parse,
+    check,
+    /// Dump the generated AArch64 assembly for the whole program (`--emit asm`).
+    /// Runs the full front-end (resolve + typecheck) like `check`, then lowers
+    /// every function. (Named `assembly`, not `asm`, since `asm` is a Zig keyword.)
+    assembly,
+
+    /// The deepest cached phase this emit level needs. `check`/`assembly` build on
+    /// the parse artifact, so they cache through `parse`.
+    fn cachePhase(emit: Emit) Cache.Phase {
+        return switch (emit) {
+            .lex => .lex,
+            .parse, .check, .assembly => .parse,
+        };
+    }
+
+    /// `assembly` needs the same in-memory front-end as `check`.
+    fn runsCheck(emit: Emit) bool {
+        return emit == .check or emit == .assembly;
+    }
+};
+
+/// Result of running the pipeline on one file. Owns its `source`, `tokens`, and
+/// `nodes`.
+pub const FileResult = struct {
+    path: []const u8,
+    source: []u8 = &.{},
+    tokens: []Token = &.{},
+    nodes: []Ast.Node = &.{},
+    /// Variable-arity child runs paired with `nodes` (see `Ast`). Owned.
+    extra: []u32 = &.{},
+    /// Whether each phase's result was loaded from cache rather than recomputed.
+    tokens_cached: bool = false,
+    nodes_cached: bool = false,
+    /// True once the parse phase ran (or hit cache) for this file.
+    parsed: bool = false,
+    /// True once name resolution ran for this file (emit == .check).
+    checked: bool = false,
+    err: ?anyerror = null,
+    /// On a parse error, where and what.
+    diag: ?Parser.Diagnostic = null,
+    /// Name-resolution result (emit == .check). Owned; freed in deinit.
+    resolve: ?Resolve.Result = null,
+    /// Type-check result (emit == .check, run only if resolve was clean). Owned.
+    typecheck: ?Typecheck.Result = null,
+
+    pub fn deinit(r: *FileResult, gpa: std.mem.Allocator) void {
+        gpa.free(r.source);
+        gpa.free(r.tokens);
+        gpa.free(r.nodes);
+        gpa.free(r.extra);
+        if (r.resolve) |*res| res.deinit(gpa);
+        if (r.typecheck) |*tc| tc.deinit(gpa);
+        r.* = undefined;
+    }
+};
+
+/// Run the pipeline (up to `emit`) over every path for `target`. Returns one
+/// `FileResult` per input (same order); per-file failures are reported in
+/// `FileResult.err`, not as a hard error. Caller owns the slice and must
+/// `deinit` each result.
+pub fn run(gpa: std.mem.Allocator, io: Io, emit: Emit, target: []const u8, paths: []const []const u8) ![]FileResult {
+    // Cache is namespaced by compiler identity: .toy-cache/<stamp>/. The buffer
+    // lives on this stack frame, which outlives every job (we await below).
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const results = try gpa.alloc(FileResult, paths.len);
+    for (results, paths) |*r, path| r.* = .{ .path = path };
+
+    var group: Io.Group = .init;
+    for (results, 0..) |_, i| {
+        // Prefer true concurrency; if the runtime can't provide it, run inline.
+        group.concurrent(io, job, .{ gpa, io, cache, emit, target, &results[i], i }) catch
+            job(gpa, io, cache, emit, target, &results[i], i);
+    }
+    group.await(io) catch {};
+
+    return results;
+}
+
+fn job(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []const u8, result: *FileResult, index: usize) void {
+    pipeline(gpa, io, cache, emit, target, result, index) catch |err| {
+        result.err = err;
+    };
+}
+
+fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []const u8, result: *FileResult, index: usize) !void {
+    const cache_phase = emit.cachePhase();
+    result.source = try Io.Dir.cwd().readFileAlloc(io, result.path, gpa, .unlimited);
+
+    // --- lex ---
+    const lex_key = Cache.Key.fromSource(.lex, target, result.source);
+    if (try cache.get(Token, gpa, io, lex_key)) |tokens| {
+        result.tokens = tokens;
+        result.tokens_cached = true;
+    } else {
+        result.tokens = try Lexer.tokenize(gpa, result.source);
+        cache.put(Token, io, lex_key, index, result.tokens) catch {};
+    }
+
+    if (@intFromEnum(cache_phase) < @intFromEnum(Cache.Phase.parse)) return;
+
+    // --- parse ---
+    // The parse output is a Tree (nodes + extra). We pack both into one flat
+    // []u8 blob and store/load it through the existing generic byte cache;
+    // Ast.unpack validates a hit and treats a corrupt/foreign blob as a miss.
+    result.parsed = true;
+    const parse_key = Cache.Key.fromSource(.parse, target, result.source);
+    var tree: ?Ast.Tree = null;
+    if (try cache.get(u8, gpa, io, parse_key)) |bytes| {
+        defer gpa.free(bytes);
+        if (try Ast.unpack(gpa, bytes)) |t| {
+            tree = t;
+            result.nodes_cached = true;
+        }
+    }
+    if (tree == null) {
+        var diag: ?Parser.Diagnostic = null;
+        if (try Parser.parse(gpa, result.tokens, &diag)) |t| {
+            tree = t;
+            const blob = try Ast.pack(gpa, t);
+            defer gpa.free(blob);
+            cache.put(u8, io, parse_key, index, blob) catch {};
+        } else {
+            result.diag = diag;
+            result.err = error.ParseError;
+            return;
+        }
+    }
+    result.nodes = tree.?.nodes;
+    result.extra = tree.?.extra;
+
+    if (!emit.runsCheck()) return;
+
+    // --- check: name resolution then typecheck (in-memory only; uncached). ---
+    result.checked = true;
+    const tree_view: Ast.Tree = .{ .nodes = result.nodes, .extra = result.extra };
+    const res = try Resolve.resolve(gpa, tree_view, result.tokens, result.source);
+    result.resolve = res;
+    if (res.diags.len > 0) {
+        // A name error would poison every dependent type; don't typecheck.
+        result.err = error.ResolveError;
+        return;
+    }
+
+    const tc = try Typecheck.check(gpa, tree_view, result.tokens, result.source, res.resolutions);
+    result.typecheck = tc;
+    if (tc.diags.len > 0) result.err = error.TypeError;
+}
+
+// ---- code emission (the `-o` / `--emit asm` paths) -------------------------
+
+/// A user-facing failure while emitting code: a message plus the source byte
+/// offset to render as `line:col` (or `null` for whole-file errors). The driver
+/// returns these to `main`, which renders them and exits non-zero.
+pub const EmitError = struct {
+    message: []const u8,
+    byte_offset: ?u32,
+};
+
+/// The linked whole-program lowering: the joined `__text` blob, `main`'s resolved
+/// entry offset within it, the optional asm listing, and any codegen diagnostics
+/// (the caller checks `diags.len` and prints them, matching the prior contract).
+/// `owned_msgs` are the heap-allocated diagnostic messages. Caller frees via
+/// `deinit`.
+pub const LinkedProgram = struct {
+    text: []u8,
+    entry_off: u32,
+    listing: ?[]u8,
+    diags: []Codegen.Diagnostic,
+    owned_msgs: [][]u8,
+    /// Interned `__cstring` bytes (M2). Owned; empty for string-free programs.
+    cstrings: []u8 = &.{},
+    /// Cross-segment relocs (adrp/add/ldr to __cstring/__got) rebased to absolute
+    /// __text offsets, patched by `Link.applyDataRelocs` after MachO assigns
+    /// vmaddrs. Owned; empty for M1/M3 programs.
+    data_relocs: []Link.Reloc = &.{},
+    /// Whether the program calls `print` (→ one `_write` import).
+    uses_write: bool = false,
+    /// M5 incremental counters: how many functions were freshly lowered vs served
+    /// from the codegen cache this build. Surfaced via `--codegen-stats`.
+    codegen_compiled: usize = 0,
+    codegen_cached: usize = 0,
+
+    pub fn deinit(self: *LinkedProgram, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        if (self.listing) |l| gpa.free(l);
+        gpa.free(self.diags);
+        for (self.owned_msgs) |m| gpa.free(m);
+        gpa.free(self.owned_msgs);
+        gpa.free(self.cstrings);
+        // `.import` data-reloc targets carry an owned name copy (the source
+        // FnCodes were freed by the relink tail); `.cstr` targets are offsets.
+        for (self.data_relocs) |rl| switch (rl.target) {
+            .import => |s| gpa.free(s.name),
+            .func, .cstr => {},
+        };
+        gpa.free(self.data_relocs);
+        self.* = undefined;
+    }
+};
+
+/// What `lowerProgram` produced for a single, already type-checked file: either a
+/// linked program (caller frees) or one `EmitError`.
+pub const LowerProgramResult = union(enum) {
+    ok: LinkedProgram,
+    err: EmitError,
+};
+
+/// One parallel codegen job's slot. Each job owns exactly one slot (no locks).
+const FnSlot = struct {
+    fc: ?Link.FnCode = null,
+    cached: bool = false,
+    err: ?anyerror = null,
+};
+
+/// Frozen, read-only inputs shared by every codegen job (thread-safe: nothing
+/// here is mutated during the fan-out).
+const Frozen = struct {
+    tree: Ast.Tree,
+    tokens: []const Token,
+    source: []const u8,
+    resolutions: []const Resolve.Resolution,
+    node_types: []const Typecheck.Type,
+    layouts: []const Typecheck.Layout,
+    names: []const Link.SymName,
+    fn_nodes: []const Ast.Index,
+    entry_fn: u32,
+    sigs: []const Fingerprint.Sig,
+};
+
+/// Lower EVERY function in the file (in parallel, memoized through the codegen
+/// cache), then run the serial relink tail: intern strings, lay the functions
+/// out in one `__text` blob with `main` as entry, and rebase cross-segment
+/// relocs. Locates the `fn_decl` named `main`. The file must already be `checked`
+/// with no front-end errors. `want_listing` routes through the serial asm path.
+/// Caller owns the returned `LinkedProgram` on success.
+pub fn lowerProgram(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    r: *const FileResult,
+    mode: Codegen.Mode,
+    want_listing: bool,
+) !LowerProgramResult {
+    const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
+    const prog = r.nodes[Ast.root(r.nodes)];
+    std.debug.assert(prog.tag == .program);
+
+    // Collect every function in source order; the index is the resolver/codegen
+    // symbol id. Find `main`'s position to use as the entry.
+    var fn_nodes: std.ArrayList(Ast.Index) = .empty;
+    defer fn_nodes.deinit(gpa);
+    var entry_fn: ?u32 = null;
+    for (Ast.rangeSlice(tree, prog.lhs)) |fn_idx| {
+        const decl = r.nodes[fn_idx];
+        if (decl.tag != .fn_decl) continue;
+        if (entry_fn == null and std.mem.eql(u8, r.tokens[decl.main_token].text(r.source), "main")) {
+            entry_fn = @intCast(fn_nodes.items.len);
+        }
+        try fn_nodes.append(gpa, fn_idx);
+    }
+
+    const main_sym = entry_fn orelse return .{ .err = .{
+        .message = "-o requires a function named 'main'",
+        .byte_offset = null,
+    } };
+
+    // Parameters on main are unsupported (Codegen also guards this, but the driver
+    // gives the cleaner up-front message at main's name token).
+    const main_decl = r.nodes[fn_nodes.items[main_sym]];
+    const main_proto = Ast.protoAt(tree, main_decl.lhs);
+    if (main_proto.params.len > 0) {
+        return .{ .err = .{
+            .message = "parameters on main unsupported in M1 codegen",
+            .byte_offset = r.tokens[main_decl.main_token].start,
+        } };
+    }
+
+    // Build the index→SymName table once (user fns by spelling, print at the end).
+    const names = try buildNames(gpa, tree, r.tokens, r.source, fn_nodes.items);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+
+    const frozen = Frozen{
+        .tree = tree,
+        .tokens = r.tokens,
+        .source = r.source,
+        .resolutions = r.resolve.?.resolutions,
+        .node_types = r.typecheck.?.node_types,
+        .layouts = r.typecheck.?.layouts,
+        .names = names,
+        .fn_nodes = fn_nodes.items,
+        .entry_fn = main_sym,
+        .sigs = r.typecheck.?.sigs,
+    };
+
+    // The asm-listing path stays a thin serial loop (a listing dump needs no
+    // fingerprint/cache); it shares `Codegen.generateProgram`.
+    if (want_listing) return lowerProgramSerial(gpa, &frozen);
+
+    // --- parallel per-fn fan-out ---
+    const slots = try gpa.alloc(FnSlot, fn_nodes.items.len);
+    defer gpa.free(slots);
+    for (slots) |*s| s.* = .{};
+
+    var group: Io.Group = .init;
+    for (fn_nodes.items, 0..) |_, i| {
+        group.concurrent(io, fnJob, .{ gpa, io, cache, target, mode, &frozen, i, &slots[i] }) catch
+            fnJob(gpa, io, cache, target, mode, &frozen, i, &slots[i]);
+    }
+    group.await(io) catch {};
+
+    // Collect: on any job error, free everything lowered so far and propagate.
+    var first_err: ?anyerror = null;
+    for (slots) |s| if (s.err) |e| {
+        if (first_err == null) first_err = e;
+    };
+    if (first_err) |e| {
+        for (slots) |*s| if (s.fc) |*fc| fc.deinit(gpa);
+        return e;
+    }
+
+    var compiled: usize = 0;
+    var cached_n: usize = 0;
+    for (slots) |s| if (s.cached) {
+        cached_n += 1;
+    } else {
+        compiled += 1;
+    };
+
+    return relink(gpa, slots, names, main_sym, compiled, cached_n);
+}
+
+/// Serial `--emit asm` path: lower all fns + the print body, returning either a
+/// diagnostics-carrying LinkedProgram or a fully-linked one. No cache.
+fn lowerProgramSerial(gpa: std.mem.Allocator, frozen: *const Frozen) !LowerProgramResult {
+    var pr = try Codegen.generateProgram(
+        gpa,
+        frozen.tree,
+        frozen.tokens,
+        frozen.source,
+        frozen.resolutions,
+        frozen.node_types,
+        frozen.layouts,
+        frozen.names,
+        frozen.fn_nodes,
+        frozen.entry_fn,
+        true,
+    );
+
+    if (pr.diags.len > 0) {
+        for (pr.fns) |*f| f.deinit(gpa);
+        gpa.free(pr.fns);
+        defer {
+            gpa.free(pr.diags);
+            for (pr.owned_msgs) |m| gpa.free(m);
+            gpa.free(pr.owned_msgs);
+        }
+        return .{ .ok = .{
+            .text = &.{},
+            .entry_off = 0,
+            .listing = pr.listing,
+            .diags = try gpa.dupe(Codegen.Diagnostic, pr.diags),
+            .owned_msgs = try dupeOwnedMsgs(gpa, pr.owned_msgs),
+        } };
+    }
+
+    // Hand the fns to the tail; keep the listing/diags from `pr`.
+    var lp = linkAndTail(gpa, pr.fns, frozen.names, frozen.entry_fn) catch |e| switch (e) {
+        error.CallTargetTooFar => {
+            pr.deinit(gpa);
+            return .{ .err = .{ .message = "call target out of range for M1 codegen", .byte_offset = null } };
+        },
+        else => |err| {
+            pr.deinit(gpa);
+            return err;
+        },
+    };
+    // `pr.fns` was consumed by linkAndTail (it freed each FnCode); free the rest.
+    gpa.free(pr.fns);
+    lp.listing = pr.listing;
+    lp.diags = pr.diags;
+    lp.owned_msgs = pr.owned_msgs;
+    return .{ .ok = lp };
+}
+
+fn dupeOwnedMsgs(gpa: std.mem.Allocator, msgs: [][]u8) ![][]u8 {
+    const out = try gpa.alloc([]u8, msgs.len);
+    for (msgs, 0..) |m, i| out[i] = try gpa.dupe(u8, m);
+    return out;
+}
+
+/// One per-function codegen job: fingerprint → cache hit (with optional VERIFY)
+/// or fresh lower → cache store. Writes only its own `slot` (no locks).
+fn fnJob(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    mode: Codegen.Mode,
+    frozen: *const Frozen,
+    idx: usize,
+    slot: *FnSlot,
+) void {
+    fnJobInner(gpa, io, cache, target, mode, frozen, idx, slot) catch |e| {
+        slot.err = e;
+    };
+}
+
+fn fnJobInner(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    mode: Codegen.Mode,
+    frozen: *const Frozen,
+    idx: usize,
+    slot: *FnSlot,
+) !void {
+    const fn_decl = frozen.fn_nodes[idx];
+
+    // Gather this fn's callee sigs (in walk order) and touched types for the
+    // fingerprint. The walk order is the body's call order; `collectCalleeSigs`
+    // mirrors `Fingerprint`'s walk so the supplied order matches.
+    var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
+    defer callee_sigs.deinit(gpa);
+    try walkCalls(gpa, frozen, fn_decl, &callee_sigs);
+    var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
+    defer {
+        freeTouched(gpa, touched.items);
+        touched.deinit(gpa);
+    }
+    try walkTouched(gpa, frozen, fn_decl, &touched);
+
+    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
+    const key = Cache.Key.fromFingerprint(.codegen, target, fp);
+    const sym = frozen.names[idx];
+    const is_entry = idx == frozen.entry_fn;
+
+    if (mode != .force) {
+        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+            defer gpa.free(blob);
+            if (Link.unpack(gpa, blob) catch null) |fc| {
+                // VERIFY mode runs fallible work (re-lower + pack) before the slot
+                // takes ownership at the bottom; guard `fc` so an OOM there frees
+                // it instead of leaking. Disarmed once `slot.*` owns it.
+                var fc_mut = fc;
+                errdefer fc_mut.deinit(gpa);
+                if (mode == .verify) {
+                    // Re-lower and assert byte-identical to the cached blob. [C11]
+                    var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+                    defer fresh.deinit(gpa);
+                    const fb = try Link.pack(gpa, fresh);
+                    defer gpa.free(fb);
+                    std.debug.assert(std.mem.eql(u8, fb, blob));
+                }
+                slot.* = .{ .fc = fc_mut, .cached = true };
+                return;
+            }
+        }
+    }
+
+    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+    errdefer fc.deinit(gpa);
+    if (Link.pack(gpa, fc) catch null) |b| {
+        defer gpa.free(b);
+        cache.put(u8, io, key, idx, b) catch {};
+    }
+    slot.* = .{ .fc = fc, .cached = false };
+}
+
+/// Lower one function with throwaway diag sinks (a job-local diagnostic still
+/// fails the build at relink, surfaced via the FnCode being absent). Used by the
+/// parallel path; diagnostics are rare (the front-end already validated) and a
+/// per-fn diag is collected by the serial path for asm.
+fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool) !Link.FnCode {
+    var diags: std.ArrayList(Codegen.Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |m| gpa.free(m);
+        owned.deinit(gpa);
+    }
+    const fc = try Codegen.lower(
+        gpa,
+        frozen.tree,
+        frozen.tokens,
+        frozen.source,
+        frozen.resolutions,
+        frozen.node_types,
+        frozen.layouts,
+        frozen.names,
+        fn_decl,
+        sym,
+        is_entry,
+        &diags,
+        &owned,
+        null,
+    );
+    // A codegen diagnostic on the parallel path means an unsupported construct
+    // slipped past the front-end; surface it as an error so the build fails
+    // cleanly rather than emitting a half-lowered function.
+    if (diags.items.len > 0) {
+        var tmp = fc;
+        tmp.deinit(gpa);
+        return error.CodegenDiagnostic;
+    }
+    return fc;
+}
+
+/// Collect the signatures of every function this fn calls, in body walk order
+/// (matching `Fingerprint`'s walk) so the fingerprint's (b) component lines up.
+fn walkCalls(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out: *std.ArrayList(Fingerprint.Sig)) !void {
+    if (idx == Ast.none) return;
+    const tree = frozen.tree;
+    const n = tree.nodes[idx];
+    switch (n.tag) {
+        .literal_number, .literal_string, .literal_bool, .identifier, .literal_unit => {},
+        .unary => try walkCalls(gpa, frozen, n.lhs, out),
+        .binary => {
+            try walkCalls(gpa, frozen, n.lhs, out);
+            try walkCalls(gpa, frozen, n.rhs, out);
+        },
+        .call => {
+            // The callee leaf is the lhs identifier; recurse it first (matches the
+            // Fingerprint walk), then record the callee identity+sig, then the args.
+            try walkCalls(gpa, frozen, n.lhs, out);
+            const res = frozen.resolutions[n.lhs];
+            // `res.func` indexes BOTH `names` (the resolved SymName{kind,name}, what
+            // the .func reloc target carries) and `sigs` (params/ret). Fold the full
+            // identity so a builtin↔user_fn shadow switch flips the caller's hash. [Cx]
+            if (res == .func and res.func < frozen.sigs.len and res.func < frozen.names.len) {
+                const sig = frozen.sigs[res.func];
+                const nm = frozen.names[res.func];
+                try out.append(gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+            }
+            for (Ast.rangeSlice(tree, n.rhs)) |a| try walkCalls(gpa, frozen, a, out);
+        },
+        .var_decl => try walkCalls(gpa, frozen, n.lhs, out),
+        .assign => {
+            try walkCalls(gpa, frozen, n.lhs, out);
+            try walkCalls(gpa, frozen, n.rhs, out);
+        },
+        .return_stmt => if (n.lhs != Ast.none) try walkCalls(gpa, frozen, n.lhs, out),
+        .expr_stmt => try walkCalls(gpa, frozen, n.lhs, out),
+        .block => for (Ast.rangeSlice(tree, n.lhs)) |s| try walkCalls(gpa, frozen, s, out),
+        .param => try walkCalls(gpa, frozen, n.lhs, out),
+        .fn_decl => {
+            const proto = Ast.protoAt(tree, n.lhs);
+            for (proto.params) |p| try walkCalls(gpa, frozen, p, out);
+            if (proto.ret_type != Ast.none) try walkCalls(gpa, frozen, proto.ret_type, out);
+            try walkCalls(gpa, frozen, n.rhs, out);
+        },
+        .while_stmt => {
+            try walkCalls(gpa, frozen, n.lhs, out);
+            try walkCalls(gpa, frozen, n.rhs, out);
+        },
+        .if_stmt => {
+            try walkCalls(gpa, frozen, n.lhs, out);
+            const head = Ast.ifHeaderAt(tree, n.rhs);
+            try walkCalls(gpa, frozen, head.then_block, out);
+            if (head.else_node != Ast.none) try walkCalls(gpa, frozen, head.else_node, out);
+        },
+        .loop_expr => try walkCalls(gpa, frozen, n.lhs, out),
+        .for_stmt => {
+            const head = Ast.forHeaderAt(tree, n.rhs);
+            try walkCalls(gpa, frozen, head.lo, out);
+            try walkCalls(gpa, frozen, head.hi, out);
+            try walkCalls(gpa, frozen, n.lhs, out);
+        },
+        .break_stmt => if (n.lhs != Ast.none) try walkCalls(gpa, frozen, n.lhs, out),
+        .continue_stmt => {},
+        .labeled => try walkCalls(gpa, frozen, n.lhs, out),
+        // M9: order must match Fingerprint.walk (type-name lhs + inits; field recv).
+        .struct_init => {
+            try walkCalls(gpa, frozen, n.lhs, out);
+            for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkCalls(gpa, frozen, fi, out);
+        },
+        .field_init => try walkCalls(gpa, frozen, n.lhs, out),
+        .field_access => try walkCalls(gpa, frozen, n.lhs, out),
+        .struct_decl => {},
+        .program => {},
+    }
+}
+
+/// Collect the types this fn touches (the node types under its subtree, in walk
+/// order), each as a `TouchedType` carrying — for a struct — an index-free layout
+/// descriptor so a struct field-layout edit flips every using fn's hash (M9). The
+/// fold is what makes the M5 "touched type layouts" hook REAL. Caller frees each
+/// `layout` slice (see `freeTouched`).
+fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out: *std.ArrayList(Fingerprint.TouchedType)) !void {
+    if (idx == Ast.none) return;
+    const tree = frozen.tree;
+    const n = tree.nodes[idx];
+    if (idx < frozen.node_types.len) try appendTouched(gpa, frozen, frozen.node_types[idx], out);
+    switch (n.tag) {
+        .unary, .var_decl, .expr_stmt, .param => try walkTouched(gpa, frozen, n.lhs, out),
+        .binary, .assign, .while_stmt => {
+            try walkTouched(gpa, frozen, n.lhs, out);
+            try walkTouched(gpa, frozen, n.rhs, out);
+        },
+        .call => {
+            try walkTouched(gpa, frozen, n.lhs, out);
+            for (Ast.rangeSlice(tree, n.rhs)) |a| try walkTouched(gpa, frozen, a, out);
+        },
+        .return_stmt => if (n.lhs != Ast.none) try walkTouched(gpa, frozen, n.lhs, out),
+        .block => for (Ast.rangeSlice(tree, n.lhs)) |s| try walkTouched(gpa, frozen, s, out),
+        .fn_decl => {
+            const proto = Ast.protoAt(tree, n.lhs);
+            // Fold the DECLARED type of each param and the return type. Typecheck
+            // pass A never records node_types on the param/ret type-ref nodes (they
+            // stay .invalid), so the generic walk below would miss a struct touched
+            // ONLY via a param/return type. Resolve the type-ref by name against the
+            // struct table and fold its layout — closing the param/ret-only
+            // stale-hit hole (M9 cache soundness: fold EVERY struct a fn touches,
+            // including params and return, so an ABI-boundary edit recompiles it).
+            for (proto.params) |p| {
+                const pty_node = tree.nodes[p].lhs;
+                if (pty_node != Ast.none) try appendTouched(gpa, frozen, typeRefToType(frozen, pty_node), out);
+                try walkTouched(gpa, frozen, p, out);
+            }
+            if (proto.ret_type != Ast.none) {
+                try appendTouched(gpa, frozen, typeRefToType(frozen, proto.ret_type), out);
+                try walkTouched(gpa, frozen, proto.ret_type, out);
+            }
+            try walkTouched(gpa, frozen, n.rhs, out);
+        },
+        .if_stmt => {
+            try walkTouched(gpa, frozen, n.lhs, out);
+            const head = Ast.ifHeaderAt(tree, n.rhs);
+            try walkTouched(gpa, frozen, head.then_block, out);
+            if (head.else_node != Ast.none) try walkTouched(gpa, frozen, head.else_node, out);
+        },
+        .loop_expr => try walkTouched(gpa, frozen, n.lhs, out),
+        .for_stmt => {
+            const head = Ast.forHeaderAt(tree, n.rhs);
+            try walkTouched(gpa, frozen, head.lo, out);
+            try walkTouched(gpa, frozen, head.hi, out);
+            try walkTouched(gpa, frozen, n.lhs, out);
+        },
+        .break_stmt => if (n.lhs != Ast.none) try walkTouched(gpa, frozen, n.lhs, out),
+        .labeled => try walkTouched(gpa, frozen, n.lhs, out),
+        // M9: a struct construction touches its type (recorded on the node above)
+        // and the field-init values; a field access touches the receiver.
+        .struct_init => {
+            try walkTouched(gpa, frozen, n.lhs, out);
+            for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkTouched(gpa, frozen, fi, out);
+        },
+        .field_init => try walkTouched(gpa, frozen, n.lhs, out),
+        .field_access => try walkTouched(gpa, frozen, n.lhs, out),
+        else => {},
+    }
+}
+
+/// Resolve a DECLARED type-ref node (a param/return type annotation) to a Type by
+/// name, using the struct table. Builtins map to their scalar/str kinds; a struct
+/// name resolves to its `struct_id`; anything else (incl. `()`) → unit. Mirrors
+/// Codegen.fnReturnType/paramType so the fingerprint folds the SAME layout codegen
+/// will use, independent of node_types (which Typecheck never sets here).
+fn typeRefToType(frozen: *const Frozen, type_node: Ast.Index) Typecheck.Type {
+    const n = frozen.tree.nodes[type_node];
+    if (n.tag == .literal_unit) return Typecheck.Type.unit;
+    const name = frozen.tokens[n.main_token].text(frozen.source);
+    if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
+    if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.@"bool";
+    if (std.mem.eql(u8, name, "str")) return Typecheck.Type.str;
+    for (frozen.layouts, 0..) |l, id| {
+        if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));
+    }
+    return Typecheck.Type.unit;
+}
+
+/// Append a `TouchedType` for `ty`, building the struct layout descriptor bytes.
+fn appendTouched(gpa: std.mem.Allocator, frozen: *const Frozen, ty: Typecheck.Type, out: *std.ArrayList(Fingerprint.TouchedType)) !void {
+    if (ty.kind != .@"struct") {
+        try out.append(gpa, .{ .kind = ty.kind });
+        return;
+    }
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try structLayoutBytes(gpa, frozen, ty.struct_id, &buf);
+    try out.append(gpa, .{ .kind = .@"struct", .layout = try buf.toOwnedSlice(gpa) });
+}
+
+/// Index-free struct layout descriptor: name + per-field (name, kind, offset),
+/// recursing nested structs, + size + align. Editing any of these flips the bytes.
+fn structLayoutBytes(gpa: std.mem.Allocator, frozen: *const Frozen, id: u32, buf: *std.ArrayList(u8)) !void {
+    const l = frozen.layouts[id];
+    try buf.appendSlice(gpa, l.name);
+    try buf.append(gpa, 0);
+    for (l.field_names, l.field_types, l.offsets) |fn_, fty, off| {
+        try buf.appendSlice(gpa, fn_);
+        try buf.append(gpa, 0);
+        try buf.append(gpa, @intFromEnum(fty.kind));
+        var ob: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ob, off, .little);
+        try buf.appendSlice(gpa, &ob);
+        if (fty.kind == .@"struct") try structLayoutBytes(gpa, frozen, fty.struct_id, buf);
+    }
+    var sz: [8]u8 = undefined;
+    std.mem.writeInt(u32, sz[0..4], l.size, .little);
+    std.mem.writeInt(u32, sz[4..8], l.@"align", .little);
+    try buf.appendSlice(gpa, &sz);
+}
+
+/// Free the layout slices owned by a `walkTouched` result.
+fn freeTouched(gpa: std.mem.Allocator, items: []const Fingerprint.TouchedType) void {
+    for (items) |t| if (t.layout.len > 0) gpa.free(t.layout);
+}
+
+/// The SERIAL relink tail (every build, uncached): derive `uses_write`, append
+/// the print body, intern strings program-wide (deterministic: fn source order
+/// then in-fn literal order), rewrite `.cstr` hashes to offsets, then link and
+/// rebase cross-segment relocs. `slots` is consumed (each FnCode freed). [C8]
+fn relink(
+    gpa: std.mem.Allocator,
+    slots: []FnSlot,
+    names: []const Link.SymName,
+    entry_fn: u32,
+    compiled: usize,
+    cached_n: usize,
+) !LowerProgramResult {
+    // Gather the lowered fns into a contiguous slice in source order. `linkAndTail`
+    // CONSUMES the elements (frees each FnCode on every path), so we only free the
+    // backing array here, never its elements.
+    var fns: std.ArrayList(Link.FnCode) = .empty;
+    defer fns.deinit(gpa);
+    for (slots) |*s| {
+        try fns.append(gpa, s.fc.?);
+        s.fc = null; // ownership moved into `fns`, then into linkAndTail
+    }
+
+    var lp = linkAndTail(gpa, fns.items, names, entry_fn) catch |e| switch (e) {
+        error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range for M1 codegen", .byte_offset = null } },
+        error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .byte_offset = null } },
+        else => |err| return err,
+    };
+    lp.diags = try gpa.alloc(Codegen.Diagnostic, 0);
+    lp.owned_msgs = try gpa.alloc([]u8, 0);
+    lp.codegen_compiled = compiled;
+    lp.codegen_cached = cached_n;
+    return .{ .ok = lp };
+}
+
+/// Shared back half of both paths: append the print body if referenced, intern
+/// strings deterministically, rewrite `.cstr` targets, then `Link.link`. CONSUMES
+/// `fns` (frees each FnCode and any appended print body). Returns a LinkedProgram
+/// with `listing`/`diags`/`owned_msgs` left empty for the caller to fill.
+fn linkAndTail(gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32) !LinkedProgram {
+    const lk = try link.linkProgram(gpa, fns, names[entry_fn]);
+    return LinkedProgram{
+        .text = lk.text,
+        .entry_off = lk.entry_off,
+        .listing = null,
+        .diags = &.{},
+        .owned_msgs = &.{},
+        .cstrings = lk.cstrings,
+        .data_relocs = lk.data_relocs,
+        .uses_write = lk.uses_write,
+    };
+}
+
+/// Build the index→SymName table: user fns named by their source spelling, plus
+/// the synthetic `print` builtin at user_fn_count. Caller owns the names.
+fn buildNames(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, source: []const u8, fn_nodes: []const Ast.Index) ![]Link.SymName {
+    const names = try gpa.alloc(Link.SymName, fn_nodes.len + 1);
+    var built: usize = 0;
+    errdefer {
+        for (names[0..built]) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (fn_nodes, 0..) |fn_idx, i| {
+        const nm = tokens[tree.nodes[fn_idx].main_token].text(source);
+        names[i] = .{ .kind = .user_fn, .name = try gpa.dupe(u8, nm) };
+        built += 1;
+    }
+    names[fn_nodes.len] = .{ .kind = .builtin, .name = try gpa.dupe(u8, "print") };
+    return names;
+}
+
+/// Build the fully signed, runnable Mach-O image for `code`. Thin pass-through to
+/// the single backend boundary (`link.assembleAndSign`), which owns the
+/// order-sensitive assemble → applyDataRelocs → sign-last pipeline. Kept so the
+/// asm path and the byte-identity tests call it on `LinkedProgram` fields.
+/// Caller owns the returned bytes and writes them mode 0o755.
+pub fn buildImage(
+    gpa: std.mem.Allocator,
+    identifier: []const u8,
+    code: []const u8,
+    entry_off: u32,
+    cstrings: []const u8,
+    data_relocs: []const Link.Reloc,
+    uses_write: bool,
+) ![]u8 {
+    return link.assembleAndSign(gpa, identifier, code, entry_off, cstrings, data_relocs, uses_write);
+}
+
+// ---- tests -----------------------------------------------------------------
+
+const testing = std.testing;
+
+test "cold then warm parse: 2nd run hits cache and renders identically" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Write a source file into a unique temp dir so we don't disturb the repo.
+    const dir_name = ".toyc-test-driver";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // A source unlikely to collide with any real run's cache entry, so the
+    // first pipeline pass is genuinely a cold miss.
+    const src = "fn drv_cold_warm_zzq(a: int, b: int) -> int {\n return a + b\n}\n";
+    const path = dir_name ++ "/p.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    // Ensure a genuinely cold start: drop any prior parse entry for this source.
+    {
+        const key = Cache.Key.fromSource(.parse, "native", src);
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const epath = std.fmt.bufPrint(&pbuf, "{s}/{x:0>16}", .{ dir, key.digest() }) catch unreachable;
+        Io.Dir.cwd().deleteFile(io, epath) catch {};
+    }
+
+    var first: FileResult = .{ .path = path };
+    try pipeline(gpa, io, cache, .parse, "native", &first, 0);
+    defer first.deinit(gpa);
+    try testing.expect(!first.nodes_cached);
+
+    var second: FileResult = .{ .path = path };
+    try pipeline(gpa, io, cache, .parse, "native", &second, 1);
+    defer second.deinit(gpa);
+    try testing.expect(second.nodes_cached);
+
+    // Both renders must match.
+    var b1: [256]u8 = undefined;
+    var w1 = std.Io.Writer.fixed(&b1);
+    try Ast.render(&w1, .{ .nodes = first.nodes, .extra = first.extra }, first.tokens, first.source);
+    var b2: [256]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&b2);
+    try Ast.render(&w2, .{ .nodes = second.nodes, .extra = second.extra }, second.tokens, second.source);
+    try testing.expectEqualStrings(w1.buffered(), w2.buffered());
+}
+
+test "emit=check on a clean program resolves with no diagnostics" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-check-ok";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
+    const path = dir_name ++ "/p.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    var r: FileResult = .{ .path = path };
+    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    defer r.deinit(gpa);
+
+    try testing.expect(r.checked);
+    try testing.expect(r.err == null);
+    try testing.expect(r.resolve != null);
+    try testing.expectEqual(@as(usize, 0), r.resolve.?.diags.len);
+}
+
+test "emit=check on a bad program reports a resolve error" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-check-bad";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f() {\n y := undefined_name\n return\n}\n";
+    const path = dir_name ++ "/p.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    var r: FileResult = .{ .path = path };
+    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    defer r.deinit(gpa);
+
+    try testing.expect(r.checked);
+    try testing.expectEqual(@as(?anyerror, error.ResolveError), r.err);
+    try testing.expect(r.resolve != null);
+    try testing.expect(r.resolve.?.diags.len > 0);
+}
+
+test "lowerProgram reports missing main and lowers a simple main" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-lower";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    // No `main` -> a clear error, no codegen.
+    {
+        const src = "fn helper() -> int {\n return 1\n}\n";
+        const path = dir_name ++ "/nomain.toy";
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 0);
+        defer r.deinit(gpa);
+        try testing.expect(r.err == null);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        switch (lowered) {
+            .err => |e| try testing.expect(e.byte_offset == null),
+            .ok => |*lp| {
+                lp.deinit(gpa);
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+
+    // A simple `main` lowers and links to a non-empty, word-aligned __text blob
+    // with `main` at offset 0 (it is the only function).
+    {
+        const src = "fn main() -> int {\n x := 40\n y := 2\n return x + y\n}\n";
+        const path = dir_name ++ "/main.toy";
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 1);
+        defer r.deinit(gpa);
+        try testing.expect(r.err == null);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        switch (lowered) {
+            .err => return error.TestUnexpectedResult,
+            .ok => |*lp| {
+                defer lp.deinit(gpa);
+                try testing.expectEqual(@as(usize, 0), lp.diags.len);
+                try testing.expect(lp.text.len > 0);
+                try testing.expectEqual(@as(usize, 0), lp.text.len % 4);
+                try testing.expectEqual(@as(u32, 0), lp.entry_off);
+            },
+        }
+    }
+}
+
+// End-to-end on the real OS: compile a `main`, write a signed 0o755 executable,
+// run it, and assert the masked exit code. Gated to this host because only here
+// can we exec what we produced. Proves the whole back-end (Codegen + MachO +
+// CodeSign) yields a binary the kernel accepts and runs.
+test "integration: emitted binary runs with the right exit code" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Unique per-process scratch dir. `zig build` runs the two test executables
+    // (module + exe) in parallel and BOTH include this test, so a fixed dir name
+    // races (one process's deleteTree vs the other's writeFile -> FileNotFound).
+    // tmpDir gives each run a random-named, auto-cleaned dir under .zig-cache/tmp.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_name_buf: [64]u8 = undefined;
+    const dir_name = std.fmt.bufPrint(&dir_name_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const Case = struct { src: []const u8, name: []const u8, expect: u8 };
+    const cases = [_]Case{
+        .{ .src = "fn main() -> int {\n x := 40\n y := 2\n return x + y\n}\n", .name = "add", .expect = 42 },
+        // 300 & 0xFF == 44: dyld's start glue masks main's return to a byte.
+        .{ .src = "fn main() -> int {\n return 300\n}\n", .name = "big", .expect = 44 },
+        // M3 multi-function cases — each exercises a back-end capability that a
+        // unit assert can't catch: a wrong ABI/alignment/reloc/entry-offset bug
+        // still faults or returns the wrong code when actually executed.
+        // A forward call into a helper.
+        .{ .src = "fn addfn(a: int, b: int) -> int {\n return a + b\n}\nfn main() -> int {\n return addfn(40, 2)\n}\n", .name = "call", .expect = 42 },
+        // `main` is NOT first: nonzero entry_off + a backward bl to `helper`.
+        .{ .src = "fn main() -> int {\n return helper()\n}\nfn helper() -> int {\n return 7\n}\n", .name = "mainfirst", .expect = 7 },
+        // Nested call: id(40)'s result must be spilled before id(2) runs, else the
+        // first arg is clobbered. Proves eval-to-temps-then-marshal.
+        .{ .src = "fn id(x: int) -> int {\n return x\n}\nfn add2(a: int, b: int) -> int {\n return a + b\n}\nfn main() -> int {\n return add2(id(40), id(2))\n}\n", .name = "nested", .expect = 42 },
+        // > 8 args: a 10-int-param sum called with 1..10 → 55. Proves the outgoing
+        // region + the incoming-stack-arg ldrFp copy + sp 16-alignment at the call
+        // (a misaligned sp would fault on the kernel's alignment check).
+        .{ .src = "fn sum10(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int, j: int) -> int {\n return a + b + c + d + e + f + g + h + i + j\n}\nfn main() -> int {\n return sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)\n}\n", .name = "tenargs", .expect = 55 },
+        // A void call as an expression statement: result discarded, then return 5.
+        .{ .src = "fn noop() {\n return\n}\nfn main() -> int {\n noop()\n return 5\n}\n", .name = "voidcall", .expect = 5 },
+        // M4 control flow — each RUN proves a back-end capability a byte assert
+        // can't: a wrong b.cond sense, a sign-flipped branch offset, an un-backpatched
+        // placeholder, or a missing frame-walk arm only shows when actually executed.
+        // if true-arm taken.
+        .{ .src = "fn main() -> int {\n if 3 > 2 {\n return 7\n }\n return 0\n}\n", .name = "if_true", .expect = 7 },
+        // if false → else taken (flip the operands of the above).
+        .{ .src = "fn main() -> int {\n if 2 > 3 {\n return 7\n } else {\n return 9\n }\n}\n", .name = "if_else", .expect = 9 },
+        // SIGNED-condition canary: -3 < 0 must use a SIGNED b.lt/b.ge (an unsigned
+        // b.lo would treat -3 as a huge unsigned and take the wrong branch).
+        .{ .src = "fn main() -> int {\n if -3 < 0 {\n return 1\n }\n return 0\n}\n", .name = "signed", .expect = 1 },
+        // else-if 3-way ladder, middle arm taken (nested if_stmt as else-node).
+        .{ .src = "fn main() -> int {\n x := 2\n if x == 1 {\n return 10\n } else if x == 2 {\n return 20\n } else {\n return 30\n }\n}\n", .name = "elseif", .expect = 20 },
+        // while loop summing 0..4 = 10. The BACKWARD branch must have a correct,
+        // sign-extended negative offset or the program hangs / faults instead of
+        // returning 10. (Runs to completion below: a hang would fail the test.)
+        .{ .src = "fn main() -> int {\n i := 0\n s := 0\n while i < 5 {\n s = s + i\n i = i + 1\n }\n return s\n}\n", .name = "while_sum", .expect = 10 },
+        // Nested if inside a while: count how many of 0..9 are >= 5 → 5.
+        .{ .src = "fn main() -> int {\n i := 0\n c := 0\n while i < 10 {\n if i >= 5 {\n c = c + 1\n }\n i = i + 1\n }\n return c\n}\n", .name = "nested", .expect = 5 },
+        // && short-circuit as a VALUE materialized to 0/1: (1<2)&&(3<2) is false → 0.
+        .{ .src = "fn main() -> int {\n b := (1 < 2) && (3 < 2)\n if b {\n return 1\n }\n return 0\n}\n", .name = "and_val", .expect = 0 },
+        // || short-circuit value: (1<2)||(3<2) is true → 1.
+        .{ .src = "fn main() -> int {\n b := (1 < 2) || (3 < 2)\n if b {\n return 1\n }\n return 0\n}\n", .name = "or_val", .expect = 1 },
+        // && short-circuit OBSERVABLE: the rhs is a call that would set a flag; with
+        // a false lhs it must NOT run. Here lhs false ⇒ helper() not called ⇒ 0.
+        .{ .src = "fn helper() -> int {\n return 1\n}\nfn main() -> int {\n if (1 > 2) && (helper() == 1) {\n return 99\n }\n return 0\n}\n", .name = "and_short", .expect = 0 },
+        // An early return inside a branch, with code AFTER the if (return-continues:
+        // the then-arm's inline epilogue must not stop codegen of the trailing return).
+        .{ .src = "fn main() -> int {\n x := 5\n if x > 0 {\n return 42\n }\n return 7\n}\n", .name = "early_ret", .expect = 42 },
+        // Recursive factorial, now TERMINATING via an if base case: 5! = 120.
+        .{ .src = "fn fact(n: int) -> int {\n if n <= 1 {\n return 1\n }\n return n * fact(n - 1)\n}\nfn main() -> int {\n return fact(5)\n}\n", .name = "fact", .expect = 120 },
+        // fib(10) = 55: return-continues + intra-fn backpatch + recursive calls all
+        // at once. 55 & 0xFF == 55.
+        .{ .src = "fn fib(n: int) -> int {\n if n < 2 {\n return n\n }\n return fib(n - 1) + fib(n - 2)\n}\nfn main() -> int {\n return fib(10)\n}\n", .name = "fib", .expect = 55 },
+        // M6 expression orientation — each RUN proves the value-merge/trailing-expr
+        // lowering with an actual exit code.
+        // value-if, then-arm taken.
+        .{ .src = "fn main() -> int {\n c := 1\n x := if c > 0 { 7 } else { 9 }\n return x\n}\n", .name = "ifval_then", .expect = 7 },
+        // value-if, else-arm taken.
+        .{ .src = "fn main() -> int {\n c := 0\n x := if c > 0 { 7 } else { 9 }\n return x\n}\n", .name = "ifval_else", .expect = 9 },
+        // a fn body that is JUST a trailing expression (no return) → 42.
+        .{ .src = "fn answer() -> int { 41 + 1 }\nfn main() -> int {\n return answer()\n}\n", .name = "trailing", .expect = 42 },
+        // a bare block expression → 2.
+        .{ .src = "fn main() -> int {\n x := { a := 1\n a + 1 }\n return x\n}\n", .name = "blockval", .expect = 2 },
+        // a unit-returning fn (explicit `-> ()`), called for effect.
+        .{ .src = "fn noop() -> () {\n }\nfn main() -> int {\n noop()\n return 5\n}\n", .name = "unitret", .expect = 5 },
+        // an if-expr as a function argument → 3.
+        .{ .src = "fn id(x: int) -> int { x }\nfn main() -> int {\n return id(if 1 < 2 { 3 } else { 4 })\n}\n", .name = "ifval_arg", .expect = 3 },
+        // a nested if-expr inside another if-arm → 8.
+        .{ .src = "fn main() -> int {\n return if 1 < 2 { if 3 > 4 { 0 } else { 8 } } else { 5 }\n}\n", .name = "ifval_nested", .expect = 8 },
+        // a value-if where the then-arm diverges (returns on all paths): the live
+        // else-arm value reaches the join → 8.
+        .{ .src = "fn f(n: int) -> int {\n y := if n < 0 { return 0 } else { 8 }\n return y\n}\nfn main() -> int {\n return f(5)\n}\n", .name = "ifval_div", .expect = 8 },
+        // FRAME-SIZING REGRESSION: a value-if as the 3rd call arg whose arm has a
+        // depth-3 nested binary. The arm lowers at the INHERITED temp depth, so its
+        // internal spills must be sized from there — sizing from 0 under-counts the
+        // frame and the top spill lands on the saved x30/LR slot → SIGBUS in this
+        // non-leaf fn (compute). add3(10,20, 1+(2+(3+(4+(5+6))))) = 51.
+        .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute(k: int) -> int {\n return add3(10, 20, if k > 0 { 1 + (2 + (3 + (4 + (5 + 6)))) } else { 0 })\n}\nfn main() -> int {\n return compute(1)\n}\n", .name = "ifval_deeparg", .expect = 51 },
+        // Same regression via a BARE-BLOCK expr as the deep 3rd arg.
+        .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute(k: int) -> int {\n return add3(10, 20, { 1 + (2 + (3 + (4 + (5 + 6)))) })\n}\nfn main() -> int {\n return compute(1)\n}\n", .name = "blockval_deeparg", .expect = 51 },
+        // a str-returning fn whose body is a value-if, consumed through a CALL → its
+        // (ptr,len) must reach the caller in (x0,x1) and feed `print`. Exits 0.
+        .{ .src = "fn pick(b: int) -> str {\n if b > 0 { \"yes\" } else { \"no\" }\n}\nfn main() -> int {\n print(pick(1))\n return 0\n}\n", .name = "strret_call", .expect = 0 },
+        // ENTRY-EPILOGUE REGRESSION: a non-unit `main` whose body is a TRAILING value
+        // expression (no explicit return) lands its value in x0 at the fall-through
+        // epilogue — the entry's `movz x0,#0` must NOT clobber it (only a UNIT entry
+        // forces 0). Trailing if-value → 7.
+        .{ .src = "fn main() -> int {\n if 1 > 0 { 7 } else { 8 }\n}\n", .name = "trailing_main_if", .expect = 7 },
+        // Trailing bare-block value as the non-unit main body → 15.
+        .{ .src = "fn main() -> int {\n {\n a := 10\n a + 5\n }\n}\n", .name = "trailing_main_block", .expect = 15 },
+
+        // M7 loops — each RUN is a HANG-CANARY: a wrong/sign-flipped back-edge would
+        // hang or fault instead of returning, so a completed run with the right exit
+        // code proves the loop terminated.
+        // value-loop yielding via break-value: i goes 0..5, breaks 5*10 = 50.
+        .{ .src = "fn main() -> int {\n i := 0\n v := loop {\n if i >= 5 { break i * 10 }\n i = i + 1\n }\n return v\n}\n", .name = "loopval", .expect = 50 },
+        // while with an early break: sum 0,1,2 then break at i==3 → 3.
+        .{ .src = "fn main() -> int {\n i := 0\n s := 0\n while i < 100 {\n if i == 3 { break }\n s = s + i\n i = i + 1\n }\n return s\n}\n", .name = "while_break", .expect = 3 },
+        // while with a continue: advance i FIRST, skip adding when i==2.
+        // 1 + 3 + 4 + 5 = 13.
+        .{ .src = "fn main() -> int {\n i := 0\n s := 0\n while i < 5 {\n i = i + 1\n if i == 2 { continue }\n s = s + i\n }\n return s\n}\n", .name = "while_cont", .expect = 13 },
+        // for over a half-open range [1,5): 1+2+3+4 = 10.
+        .{ .src = "fn main() -> int {\n s := 0\n for i in 1..5 {\n s = s + i\n }\n return s\n}\n", .name = "for_sum", .expect = 10 },
+        // for with continue (hits the increment so it still terminates): skip i==2.
+        // 0+1+3+4 = 8.
+        .{ .src = "fn main() -> int {\n s := 0\n for i in 0..5 {\n if i == 2 { continue }\n s = s + i\n }\n return s\n}\n", .name = "for_cont", .expect = 8 },
+        // nested loops: a bare break hits the INNERMOST loop only. Inner adds 1 then
+        // breaks at j==1, per each of 3 outer iters → 3.
+        .{ .src = "fn main() -> int {\n s := 0\n for i in 0..3 {\n for j in 0..3 {\n if j == 1 { break }\n s = s + 1\n }\n }\n return s\n}\n", .name = "nested_break", .expect = 3 },
+        // nested loops: a continue hits the INNERMOST loop. Inner skips j==1 → adds at
+        // j=0 and j=2 → 2 per outer, 3 outers → 6.
+        .{ .src = "fn main() -> int {\n s := 0\n for i in 0..3 {\n for j in 0..3 {\n if j == 1 { continue }\n s = s + 1\n }\n }\n return s\n}\n", .name = "nested_cont", .expect = 6 },
+        // a break-less `loop` typed `never`, used where a value is expected: the loop
+        // only `return`s. f returns 7 once ready(i) holds.
+        .{ .src = "fn ready(n: int) -> bool {\n return n >= 3\n}\nfn f() -> int {\n i := 0\n loop {\n if ready(i) { return 7 }\n i = i + 1\n }\n}\nfn main() -> int {\n return f()\n}\n", .name = "never_loop", .expect = 7 },
+        // FRAME-SIZING / SIGBUS canary: a value-loop as a deep call argument whose
+        // break-value is a depth-5 nested binary. The loop result slot + body must be
+        // sized from the inherited temp depth or the spill overruns onto saved x29/x30.
+        // add3(10,20, loop{ break 1+(2+(3+(4+(5+6)))) }) = 10+20+21 = 51.
+        .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute() -> int {\n return add3(10, 20, loop { break 1 + (2 + (3 + (4 + (5 + 6)))) })\n}\nfn main() -> int {\n return compute()\n}\n", .name = "loopval_deeparg", .expect = 51 },
+        // back-edge sign canary: a tight count to 42 then break 42.
+        .{ .src = "fn main() -> int {\n i := 0\n v := loop {\n if i >= 42 { break i }\n i = i + 1\n }\n return v\n}\n", .name = "loop_canary", .expect = 42 },
+
+        // M8 labels & multi-level exits — each RUN is a HANG-CANARY (a wrong outer
+        // back-edge/target would hang or fault). LABEL-RESOLUTION canaries too: a
+        // break/continue hitting the WRONG (innermost vs named) context miscompiles
+        // to a visibly wrong exit code.
+        // (1) break a VALUE out of an OUTER loop from inside an INNER for-loop. j==4
+        // → break @outer 4*10 = 40 (exits BOTH loops). A wrong target would loop.
+        .{ .src = "fn main() -> int {\n @outer loop {\n for j in 0..10 {\n if j == 4 { break @outer j * 10 }\n }\n }\n}\n", .name = "break_outer", .expect = 40 },
+        // (2) labeled BARE BLOCK expression with early exits. a=false,b=true → 2.
+        .{ .src = "fn main() -> int {\n a := false\n b := true\n x := @calc {\n if a { break @calc 1 }\n if b { break @calc 2 }\n 3\n }\n x\n}\n", .name = "labeledblock", .expect = 2 },
+        // (2b) labeled bare block where NO break fires → the trailing expr (3).
+        .{ .src = "fn main() -> int {\n a := false\n b := false\n @calc {\n if a { break @calc 1 }\n if b { break @calc 2 }\n 3\n }\n}\n", .name = "labeledblock_fall", .expect = 3 },
+        // (3) `continue @outer` from an inner loop skips to the outer's next iter.
+        // On j==3 continue @outer; each outer iter adds 3 (j=0,1,2) → 3 outers → 9.
+        .{ .src = "fn main() -> int {\n s := 0\n @outer for i in 0..3 {\n for j in 0..10 {\n if j == 3 { continue @outer }\n s = s + 1\n }\n }\n s\n}\n", .name = "continue_outer", .expect = 9 },
+        // (4) bare break/continue STILL hit the INNERMOST loop under a labeled outer
+        // (M7 unchanged): inner `for` adds 1 then bare-breaks at j==1 → 1 per outer,
+        // 3 outers → 3 (the bare break must NOT escape to @outer).
+        .{ .src = "fn main() -> int {\n s := 0\n @outer loop {\n for i in 0..3 {\n for j in 0..3 {\n if j == 1 { break }\n s = s + 1\n }\n }\n break @outer s\n }\n}\n", .name = "bare_inner_under_labeled", .expect = 3 },
+        // (5) FRAME-SIZING / SIGBUS canary: a labeled bare block as a deep call arg
+        // whose break-value is a depth-5 nested binary. The block result slot + body
+        // must be sized from the inherited temp depth (lowerLabeledBlock body@depth+1)
+        // or the spill overruns onto saved x29/x30. add3(10,20,@blk{break @blk ...})=51.
+        .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute() -> int {\n return add3(10, 20, @blk { break @blk 1 + (2 + (3 + (4 + (5 + 6)))) })\n}\nfn main() -> int {\n return compute()\n}\n", .name = "labeledblock_deeparg", .expect = 51 },
+        // (5b) deep break @outer value as the SIGBUS canary on a labeled loop too.
+        .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute() -> int {\n return add3(10, 20, @lp loop { break @lp 1 + (2 + (3 + (4 + (5 + 6)))) })\n}\nfn main() -> int {\n return compute()\n}\n", .name = "break_outer_deeparg", .expect = 51 },
+        // (6) str-typed result canary: a labeled bare block yielding a str (16-byte
+        // result slot + x0/x1) consumed by `print`. Exits 0; proves the fat-value
+        // store/load through the labeled-block result slot.
+        .{ .src = "fn greet(s: str) -> str {\n s\n}\nfn main() -> int {\n print(@blk { break @blk greet(\"hi\") })\n return 0\n}\n", .name = "labeledblock_str", .expect = 0 },
+
+        // M9 structs — each RUN proves a back-end capability (layout/ABI/copy) that
+        // a byte assert can't: a wrong field offset, ABI class, or missed copy
+        // silently corrupts data or faults only when actually executed.
+        // (1) construct + read two fields → 42.
+        .{ .src = "struct P { x: int, y: int }\nfn main() -> int {\n p := P { x: 40, y: 2 }\n return p.x + p.y\n}\n", .name = "struct_read", .expect = 42 },
+        // (2) field punning → 42.
+        .{ .src = "struct P { x: int, y: int }\nfn main() -> int {\n x := 40\n y := 2\n p := P { x, y }\n return p.x + p.y\n}\n", .name = "struct_pun", .expect = 42 },
+        // (3) field place-store then read-back → 99.
+        .{ .src = "struct P { x: int, y: int }\nfn main() -> int {\n p := P { x: 7, y: 1 }\n p.x = 99\n return p.x\n}\n", .name = "struct_mut", .expect = 99 },
+        // (4) COPY semantics (small struct): pass by value, callee mutates its param,
+        // the caller's copy is UNCHANGED → 7. A missed copy would read 1000.
+        .{ .src = "struct P { x: int, y: int }\nfn bump(q: P) -> int {\n q.x = 1000\n return q.x\n}\nfn main() -> int {\n p := P { x: 7, y: 0 }\n z := bump(p)\n return p.x\n}\n", .name = "struct_copy", .expect = 7 },
+        // (5) return a small (<=16B) struct by value → 42 (reg-pair return path).
+        .{ .src = "struct P { x: int, y: int }\nfn make() -> P {\n return P { x: 40, y: 2 }\n}\nfn main() -> int {\n p := make()\n return p.x + p.y\n}\n", .name = "struct_ret_small", .expect = 42 },
+        // (6) a >16B struct (3 ints) passed AND returned via x8 sret. add1 bumps a:
+        // {1,2,3}→{2,2,3} sum 7. Proves the indirect arg + x8 sret paths.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn add1(v: V3) -> V3 {\n v.a = v.a + 1\n return v\n}\nfn main() -> int {\n p := V3 { a: 1, b: 2, c: 3 }\n q := add1(p)\n return q.a + q.b + q.c\n}\n", .name = "struct_big", .expect = 7 },
+        // (7) COPY semantics (large struct): callee mutates its >16B param, caller
+        // unchanged → 6. A missed indirect-arg copy would corrupt the caller.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn bump(v: V3) -> int {\n v.a = 1000\n return v.a\n}\nfn main() -> int {\n p := V3 { a: 1, b: 2, c: 3 }\n z := bump(p)\n return p.a + p.b + p.c\n}\n", .name = "struct_big_copy", .expect = 6 },
+        // (8) a free function computing over a struct (area) → 42.
+        .{ .src = "struct Rect { w: int, h: int }\nfn area(r: Rect) -> int { r.w * r.h }\nfn main() -> int {\n r := Rect { w: 6, h: 7 }\n return area(r)\n}\n", .name = "struct_area", .expect = 42 },
+        // (9) nested struct field access o.i.v → 42.
+        .{ .src = "struct Inner { v: int }\nstruct Outer { i: Inner, w: int }\nfn main() -> int {\n o := Outer { i: Inner { v: 40 }, w: 2 }\n return o.i.v + o.w\n}\n", .name = "struct_nested", .expect = 42 },
+        // (10) FRAME-SIZING / SIGBUS canary: a small struct literal as the deep 3rd
+        // call arg. use3(1,2,P{3,4})+32 = 42. The struct temp span must be sized.
+        .{ .src = "struct P { x: int, y: int }\nfn use3(a: int, b: int, p: P) -> int { a + b + p.x + p.y }\nfn main() -> int {\n return use3(1, 2, P { x: 3, y: 4 }) + 32\n}\n", .name = "struct_deeparg", .expect = 42 },
+        // (11) SIGBUS canary: a >16B struct temp as a deep arg. sum(36,V3{1,2,3})=42.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn sum(x: int, v: V3) -> int { x + v.a + v.b + v.c }\nfn main() -> int {\n return sum(36, V3 { a: 1, b: 2, c: 3 })\n}\n", .name = "struct_big_deeparg", .expect = 42 },
+        // (12) SIGBUS canary: nested field access (o.i.v) as a deep call arg → 42.
+        .{ .src = "struct Inner { v: int }\nstruct Outer { i: Inner, w: int }\nfn id(a: int, b: int, c: int) -> int { a + b + c }\nfn main() -> int {\n o := Outer { i: Inner { v: 30 }, w: 2 }\n return id(o.i.v, o.w, 10)\n}\n", .name = "struct_fieldarg", .expect = 42 },
+        // M9 SIGBUS regression (frame undersizing): RETURN a SMALL struct whose
+        // source is a bare param identifier (`return p`) — genStructExprPair spills
+        // a temp at cg.depth that measureExpr's .identifier arm must reserve, else
+        // the return-copy store lands on saved x29/x30 → SIGBUS. id(P{40,2})=42.
+        .{ .src = "struct P { x: int, y: int }\nfn id(p: P) -> P {\n return p\n}\nfn main() -> int {\n p := P { x: 40, y: 2 }\n q := id(p)\n return q.x + q.y\n}\n", .name = "struct_ret_ident", .expect = 42 },
+        // Same, trailing-expr form (`fn id(p:P) -> P { p }`).
+        .{ .src = "struct P { x: int, y: int }\nfn id(p: P) -> P { p }\nfn main() -> int {\n p := P { x: 40, y: 2 }\n q := id(p)\n return q.x + q.y\n}\n", .name = "struct_ret_ident_trailing", .expect = 42 },
+        // Return a LOCAL-rooted SMALL struct FIELD (`return o.i`, i a substruct):
+        // the local-rooted .field_access arm of measureExpr must reserve the
+        // reg-pair temp when the field itself is a struct. geti(Outer).a+.b = 42.
+        .{ .src = "struct Inner { a: int, b: int }\nstruct Outer { i: Inner, z: int }\nfn geti(o: Outer) -> Inner {\n return o.i\n}\nfn main() -> int {\n o := Outer { i: Inner { a: 40, b: 2 }, z: 99 }\n r := geti(o)\n return r.a + r.b\n}\n", .name = "struct_ret_subfield", .expect = 42 },
+        // M9 sret regression: a >16B struct returned via a VALUE-IF body (not an
+        // expr_stmt) must be written through x8 — was lowered as a statement-if and
+        // x8 left unwritten (garbage). make(1)={10,20,30}, sum = 60.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn make(c: int) -> V3 {\n if c == 1 { V3 { a: 10, b: 20, c: 30 } } else { V3 { a: 1, b: 1, c: 1 } }\n}\nfn main() -> int {\n p := make(1)\n return p.a + p.b + p.c\n}\n", .name = "struct_sret_valueif", .expect = 60 },
+        // M9 miscompile regression: a struct literal as a call arg whose field init
+        // is itself a CALL — the field value must spill PAST the struct's own temp
+        // bytes (not onto x). area(Point{40, id(2)}) = 42.
+        .{ .src = "struct Point { x: int, y: int }\nfn id(n: int) -> int { return n }\nfn area(p: Point) -> int { p.x + p.y }\nfn main() -> int {\n return area(Point { x: 40, y: id(2) })\n}\n", .name = "struct_arg_callinit", .expect = 42 },
+        // M9 SIGSEGV regression: a >16B struct returned, a field init calls a 9-arg
+        // fn (whose arg marshal dirties x9) — the sret dest pointer must NOT be held
+        // in caller-saved x9 across the bl. val(1..9)=45, mk()={45,1,1}, sum = 47.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn val(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int {\n return a + b + c + d + e + f + g + h + i\n}\nfn mk() -> V3 {\n return V3 { a: val(1,2,3,4,5,6,7,8,9), b: 1, c: 1 }\n}\nfn main() -> int {\n q := mk()\n return q.a + q.b + q.c\n}\n", .name = "struct_sret_x9", .expect = 47 },
+        // M9 coverage regression: a SMALL struct produced by a value-if, BOUND to a
+        // local (a non-return sink) — was hard-rejected "struct expression
+        // unsupported in codegen". P{10,20} → 30.
+        .{ .src = "struct P { x: int, y: int }\nfn main() -> int {\n c := 1\n p := if c == 1 { P { x: 10, y: 20 } } else { P { x: 1, y: 1 } }\n return p.x + p.y\n}\n", .name = "struct_valueif_bind", .expect = 30 },
+        // Same for a LARGE struct bound from a value-if. V3{10,20,30} → 60.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn main() -> int {\n c := 1\n p := if c == 1 { V3 { a: 10, b: 20, c: 30 } } else { V3 { a: 1, b: 1, c: 1 } }\n return p.a + p.b + p.c\n}\n", .name = "struct_valueif_bind_big", .expect = 60 },
+        // A struct from a labeled-block break, bound to a local. break @blk P{40,2}.
+        .{ .src = "struct P { x: int, y: int }\nfn main() -> int {\n p := @blk { break @blk P { x: 40, y: 2 } }\n return p.x + p.y\n}\n", .name = "struct_labeledblock_break", .expect = 42 },
+        // A LARGE struct from a loop break, bound to a local (struct break-value
+        // must copy full bytes, not just x0/x1). break V3{40,1,1} → 42.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nfn main() -> int {\n i := 0\n v := loop {\n i = i + 1\n if i == 3 { break V3 { a: 40, b: 1, c: 1 } }\n }\n return v.a + v.b + v.c\n}\n", .name = "struct_loop_break_big", .expect = 42 },
+    };
+
+    for (cases, 0..) |c, i| {
+        const src_path = std.fmt.allocPrint(gpa, "{s}/{s}.toy", .{ dir_name, c.name }) catch unreachable;
+        defer gpa.free(src_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = c.src });
+
+        var r: FileResult = .{ .path = src_path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expect(r.err == null);
+
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        const lp = switch (lowered) {
+            .ok => |*ok| ok,
+            .err => return error.TestUnexpectedResult,
+        };
+        defer lp.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), lp.diags.len);
+
+        const image = try buildImage(gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        defer gpa.free(image);
+
+        const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
+        defer gpa.free(out_path);
+        {
+            const perms: Io.File.Permissions = .fromMode(0o755);
+            var f = try Io.Dir.cwd().createFile(io, out_path, .{ .permissions = perms });
+            defer f.close(io);
+            try f.writeStreamingAll(io, image);
+            try f.setPermissions(io, perms);
+        }
+
+        // The signature we embedded must satisfy the system verifier, otherwise
+        // the kernel would refuse to exec it below. Check it explicitly so a
+        // signing regression fails here with a clear cause rather than as a
+        // mysterious spawn error.
+        const abs = try Io.Dir.cwd().realPathFileAlloc(io, out_path, gpa);
+        defer gpa.free(abs);
+        {
+            var cs = try std.process.spawn(io, .{ .argv = &.{ "codesign", "-v", abs } });
+            const cs_term = try cs.wait(io);
+            try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cs_term);
+        }
+
+        // Spawn the executable by absolute path and check its exit code.
+        var child = try std.process.spawn(io, .{ .argv = &.{abs} });
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = c.expect }, term);
+    }
+}
+
+test "integration: print writes the expected bytes to stdout" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_name_buf: [64]u8 = undefined;
+    const dir_name = std.fmt.bufPrint(&dir_name_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const Case = struct { src: []const u8, name: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "fn main() {\n print(\"hello world\\n\")\n}\n", .name = "hw", .want = "hello world\n" },
+        // A str local + a second literal: two distinct cstrings + a 16-byte slot.
+        .{ .src = "fn main() {\n print(\"AB\")\n s := \"CD\\n\"\n print(s)\n}\n", .name = "two", .want = "ABCD\n" },
+    };
+
+    for (cases, 0..) |c, i| {
+        const src_path = std.fmt.allocPrint(gpa, "{s}/{s}.toy", .{ dir_name, c.name }) catch unreachable;
+        defer gpa.free(src_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = c.src });
+
+        var r: FileResult = .{ .path = src_path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expect(r.err == null);
+
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, false);
+        const lp = switch (lowered) {
+            .ok => |*ok| ok,
+            .err => return error.TestUnexpectedResult,
+        };
+        defer lp.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), lp.diags.len);
+
+        const image = try buildImage(gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        defer gpa.free(image);
+
+        const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
+        defer gpa.free(out_path);
+        {
+            const perms: Io.File.Permissions = .fromMode(0o755);
+            var f = try Io.Dir.cwd().createFile(io, out_path, .{ .permissions = perms });
+            defer f.close(io);
+            try f.writeStreamingAll(io, image);
+            try f.setPermissions(io, perms);
+        }
+
+        const abs = try Io.Dir.cwd().realPathFileAlloc(io, out_path, gpa);
+        defer gpa.free(abs);
+
+        // Spawn capturing stdout; read to EOF (child closes it on exit), then reap.
+        var child = try std.process.spawn(io, .{ .argv = &.{abs}, .stdout = .pipe });
+        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        const got = try rdr.interface.allocRemaining(gpa, .limited(4096));
+        defer gpa.free(got);
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+        try testing.expectEqualStrings(c.want, got);
+    }
+}
+
+// ---- M5 incremental + parallel codegen tests -------------------------------
+
+/// Lower `src` (written to `path`) through the codegen cache in `cache`, then
+/// return the linked program. Caller owns the result (deinit) and `r` (deinit).
+fn checkAndLower(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    path: []const u8,
+    src: []const u8,
+    mode: Codegen.Mode,
+    r_out: *FileResult,
+) !LinkedProgram {
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+    r_out.* = .{ .path = path };
+    try pipeline(gpa, io, cache, .check, "aarch64-macos", r_out, 0);
+    try testing.expect(r_out.err == null);
+    const lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", r_out, mode, false);
+    return switch (lowered) {
+        .ok => |ok| ok,
+        .err => error.TestUnexpectedResult,
+    };
+}
+
+test "M5 edit-one-fn: only the edited fn recompiles; callers unaffected by a body change [iii]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // 2 fns: add + main calling it. Cold build: both compiled, none cached.
+    const v1 = "fn add(a: int, b: int) -> int {\n return a + b\n}\nfn main() -> int {\n return add(40, 2)\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Edit ONLY add's body (a+b -> a+b+0); main's source + signature unchanged.
+    // main's fingerprint folds add's SIGNATURE only, so main is NOT recompiled.
+    const v2 = "fn add(a: int, b: int) -> int {\n return a + b + 0\n}\nfn main() -> int {\n return add(40, 2)\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    // Exactly one fn recompiles (add); main is a cache hit. [C1]
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
+
+    // Now change add's SIGNATURE (add a 3rd param). main calls add, so its
+    // fingerprint folds add's sig → main MUST also recompile.
+    const v3 = "fn add(a: int, b: int, c: int) -> int {\n return a + b\n}\nfn main() -> int {\n return add(40, 2, 0)\n}\n";
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v3, .normal, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    // main's call-arg count also changed here, so main recompiles regardless; the
+    // point proven by v1->v2 is the body-change isolation. Both recompile now.
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp3.codegen_cached);
+}
+
+test "M5 verify-mode: re-lowering every fn matches the cached blob [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    const src = "fn add(a: int, b: int) -> int {\n return a + b\n}\nfn main() -> int {\n return add(40, 2)\n}\n";
+    // Cold build to populate the cache.
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, src, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+
+    // VERIFY: every cache hit is re-lowered and asserted byte-identical to its
+    // cached blob. A mismatch would panic (std.debug.assert) inside the job.
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, src, .verify, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp2.codegen_cached);
+}
+
+test "M6 cache soundness: editing a value-if fn recompiles only it; verify passes [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // g uses a value-if + bare-block expr; main calls g. Cold build: both compiled.
+    const v1 = "fn g(n: int) -> int {\n x := { a := if n < 0 { 1 } else { 2 }\n a + 1 }\n return x\n}\nfn main() -> int {\n return g(5)\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Edit ONLY g's then-arm value (1 -> 3). main's sig/source unchanged, so main
+    // is a cache hit; only g recompiles. An unwalked new tag would be a stale hit,
+    // failing compiled==1 (it would falsely cache g).
+    const v2 = "fn g(n: int) -> int {\n x := { a := if n < 0 { 3 } else { 2 }\n a + 1 }\n return x\n}\nfn main() -> int {\n return g(5)\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
+
+    // VERIFY: re-lower every cache hit and assert byte-identical to the cached blob.
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
+}
+
+test "M7 cache soundness: editing a loop/for/break fn recompiles only it; verify passes [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // g uses a for-loop AND a value-loop with a break-constant; main calls g.
+    const v1 = "fn g(n: int) -> int {\n s := 0\n for i in 0..n {\n s = s + i\n }\n v := loop {\n break 7\n }\n return s + v\n}\nfn main() -> int {\n return g(3)\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Edit ONLY g's break constant (7 -> 9). main is a cache hit; only g recompiles.
+    // A new tag missing from the fingerprint/walkers would be a stale hit (compiled==0).
+    const v2 = "fn g(n: int) -> int {\n s := 0\n for i in 0..n {\n s = s + i\n }\n v := loop {\n break 9\n }\n return s + v\n}\nfn main() -> int {\n return g(3)\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
+
+    // VERIFY: re-lower every cache hit and assert byte-identical to the cached blob.
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
+}
+
+test "M8 cache soundness: editing a labeled/break fn recompiles only it; verify passes [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // g uses a labeled value-loop with a `break @L` constant; main calls g.
+    const v1 = "fn g() -> int {\n @L loop {\n break @L 7\n }\n}\nfn main() -> int {\n return g()\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Edit ONLY g's break value (7 -> 9). main is a cache hit; only g recompiles.
+    // The new label/break tags must be fingerprint-reachable AND walkTouched must
+    // descend the labeled wrapper, else g would be a STALE HIT (compiled==0).
+    const v2 = "fn g() -> int {\n @L loop {\n break @L 9\n }\n}\nfn main() -> int {\n return g()\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
+
+    // Edit ONLY the label NAME used by the break-target (@L -> @M). The break still
+    // targets the (renamed) enclosing loop, so the program is equivalent; but the
+    // folded label text differs, so g recompiles (the conservative, sound choice).
+    const v3 = "fn g() -> int {\n @M loop {\n break @M 9\n }\n}\nfn main() -> int {\n return g()\n}\n";
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v3, .normal, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp3.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp3.codegen_cached);
+
+    // VERIFY: re-lower every cache hit and assert byte-identical to the cached blob.
+    var r4: FileResult = undefined;
+    var lp4 = try checkAndLower(gpa, io, cache, path, v3, .verify, &r4);
+    defer r4.deinit(gpa);
+    defer lp4.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp4.codegen_cached);
+}
+
+test "M9 cache soundness: editing a struct's fields recompiles every fn that touches it; verify passes [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // `area` touches Point (param); `main` constructs Point; `other` does NOT.
+    const v1 = "struct Point { x: int }\nfn area(p: Point) -> int { p.x }\nfn other() -> int { 5 }\nfn main() -> int {\n p := Point { x: 42 }\n return area(p) + other() - 5\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Add a field to Point (a LAYOUT change). The bodies of area/other/main are
+    // byte-identical, but area+main TOUCH Point, so they MUST recompile (a stale
+    // hit would miscompile against the old 8-byte layout). `other` stays cached.
+    // This is the M5 "touched type layouts" hook made REAL.
+    const v2 = "struct Point { x: int, y: int }\nfn area(p: Point) -> int { p.x }\nfn other() -> int { 5 }\nfn main() -> int {\n p := Point { x: 42, y: 0 }\n return area(p) + other() - 5\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp2.codegen_compiled); // area + main
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached); // other
+
+    // VERIFY: re-lower every cache hit and assert byte-identical to the cached blob.
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp3.codegen_cached);
+}
+
+test "M9 cache soundness: a struct touched ONLY via a param/return type folds its layout (no stale hit across the ABI boundary) [v]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // `consume` touches Box ONLY via its param TYPE (its body never reads a field,
+    // so no body node carries the struct type). Box starts 16B (reg-pair ABI).
+    const v1 = "struct Box { a: int, b: int }\nfn consume(p: Box) -> int { return 7 }\nfn main() -> int {\n b := Box { a: 1, b: 2 }\n return consume(b)\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+
+    // Add a 3rd field (16B reg-pair -> 24B INDIRECT, an ABI-class change). `consume`
+    // touches Box only via its param type, so its fingerprint MUST fold the layout
+    // (the param/ret-only fold in walkTouched). A stale hit here would bake in the
+    // wrong ABI. Both consume + main recompile.
+    const v2 = "struct Box { a: int, b: int, c: int }\nfn consume(p: Box) -> int { return 7 }\nfn main() -> int {\n b := Box { a: 1, b: 2, c: 3 }\n return consume(b)\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp2.codegen_compiled); // consume + main, NOT a stale hit
+    try testing.expectEqual(@as(usize, 0), lp2.codegen_cached);
+
+    // VERIFY: re-lower every cache hit and assert byte-identical (no stale blob).
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
+}
+
+test "M9 errors: missing/unknown/mismatched fields; positional construction; recursive struct" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-m9-err";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    // All these are caught in Typecheck (after Resolve), so each is a TypeError.
+    const cases = [_][]const u8{
+        "struct P { x: int, y: int }\nfn main() -> int { p := P { x: 1 }\n return p.x }\n", // missing field
+        "struct P { x: int }\nfn main() -> int { p := P { x: 1, z: 2 }\n return p.x }\n", // unknown field (init)
+        "struct P { x: int }\nfn main() -> int { p := P { x: 1 }\n return p.q }\n", // unknown field (access)
+        "struct P { x: int }\nfn main() -> int { p := P { x: true }\n return p.x }\n", // field type mismatch
+        "struct P { x: int }\nfn main() -> int { p := P(1)\n return p.x }\n", // positional construction
+        "struct R { r: R }\nfn main() -> int { return 0 }\n", // directly-recursive struct
+        // A bare struct NAME used as a value (not P{...}/P(...)) — Resolve quietly
+        // skips struct-named idents, so Typecheck must report it (else it escapes to
+        // a codegen `unreachable`). Both the var-init and field-access-base subcases.
+        "struct P { x: int }\nfn main() -> int { q := P\n return 7 }\n", // struct name as value
+        "struct P { x: int }\nfn main() -> int { return P.x }\n", // struct-name field-access base
+        // A struct named after a builtin scalar/str type (permanently unreachable).
+        "struct int { x: int }\nfn main() -> int { return 0 }\n", // shadows builtin
+        // An empty struct (size-0 aggregate — an ABI/codegen hazard).
+        "struct E {}\nfn main() -> int { return 0 }\n", // empty struct
+    };
+    for (cases, 0..) |src, i| {
+        const path = std.fmt.allocPrint(gpa, "{s}/e{d}.toy", .{ dir_name, i }) catch unreachable;
+        defer gpa.free(path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(?anyerror, error.TypeError), r.err);
+        try testing.expect(r.typecheck != null);
+        try testing.expect(r.typecheck.?.diags.len > 0);
+    }
+}
+
+test "M8 errors: undefined/duplicate labels (Resolve); continue-block & value-break-while (Type); bad label prefix (Parse)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-m8-err";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const ErrCase = struct { src: []const u8, want: anyerror };
+    // The pipeline short-circuits Resolve (ResolveError) BEFORE Typecheck
+    // (TypeError) BEFORE codegen; the surface (label-prefix) failure is a ParseError.
+    const cases = [_]ErrCase{
+        // ResolveError: break/continue to an undefined/out-of-scope label.
+        .{ .src = "fn f() -> int {\n @o loop { break @undef 1 }\n}\n", .want = error.ResolveError },
+        .{ .src = "fn f() {\n @o loop { continue @undef }\n return\n}\n", .want = error.ResolveError },
+        // ResolveError: a break to a label that is out of scope (closed already).
+        .{ .src = "fn f() {\n @a loop { break }\n @b while true { break @a }\n return\n}\n", .want = error.ResolveError },
+        // ResolveError: a duplicate label in scope.
+        .{ .src = "fn f() {\n @x loop { @x loop { break } }\n return\n}\n", .want = error.ResolveError },
+        // TypeError: `continue @blk` where @blk labels a bare block (not a loop).
+        .{ .src = "fn f() {\n @blk { continue @blk }\n return\n}\n", .want = error.TypeError },
+        // TypeError: `break @w 5` where @w labels a while (a `()` loop).
+        .{ .src = "fn f() {\n @w while true { break @w 5 }\n return\n}\n", .want = error.TypeError },
+        // TypeError: `break @ff 5` where @ff labels a for (a `()` loop).
+        .{ .src = "fn f() {\n @ff for i in 0..3 { break @ff 5 }\n return\n}\n", .want = error.TypeError },
+        // ParseError: a label prefixing a non-block-like construct.
+        .{ .src = "fn f() {\n @x 1\n return\n}\n", .want = error.ParseError },
+    };
+    for (cases, 0..) |c, i| {
+        const path = std.fmt.allocPrint(gpa, "{s}/e{d}.toy", .{ dir_name, i }) catch unreachable;
+        defer gpa.free(path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c.src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(?anyerror, c.want), r.err);
+        if (c.want == error.ResolveError) {
+            try testing.expect(r.resolve != null);
+            try testing.expect(r.resolve.?.diags.len > 0);
+        } else if (c.want == error.TypeError) {
+            try testing.expect(r.typecheck != null);
+            try testing.expect(r.typecheck.?.diags.len > 0);
+        }
+    }
+}
+
+test "M7 error: break/continue outside a loop and break-value in while/for are rejected" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toyc-test-driver-m7-err";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    // The outside-loop and break-value checks live in Typecheck, so each is a TypeError.
+    const cases = [_][]const u8{
+        "fn f() {\n break\n return\n}\n", // break outside a loop
+        "fn f() {\n continue\n return\n}\n", // continue outside a loop
+        "fn f() {\n while true { break 5 }\n return\n}\n", // value-break in a while
+        "fn f() {\n for i in 0..5 { break i }\n return\n}\n", // value-break in a for
+    };
+    for (cases, 0..) |src, i| {
+        const path = std.fmt.allocPrint(gpa, "{s}/e{d}.toy", .{ dir_name, i }) catch unreachable;
+        defer gpa.free(path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+        var r: FileResult = .{ .path = path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(?anyerror, error.TypeError), r.err);
+        try testing.expect(r.typecheck != null);
+        try testing.expect(r.typecheck.?.diags.len > 0);
+    }
+}
+
+test "M5 byte-identical: a warm build equals a from-scratch (.force) build [iv]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    const src = "fn add(a: int, b: int) -> int {\n return a + b\n}\nfn main() -> int {\n return add(40, 2)\n}\n";
+
+    // Warm (populate, then read back from cache).
+    {
+        var r0: FileResult = undefined;
+        var lp0 = try checkAndLower(gpa, io, cache, path, src, .normal, &r0);
+        r0.deinit(gpa);
+        lp0.deinit(gpa);
+    }
+    var rw: FileResult = undefined;
+    var warm = try checkAndLower(gpa, io, cache, path, src, .normal, &rw);
+    defer rw.deinit(gpa);
+    defer warm.deinit(gpa);
+    const warm_img = try buildImage(gpa, "p", warm.text, warm.entry_off, warm.cstrings, warm.data_relocs, warm.uses_write);
+    defer gpa.free(warm_img);
+
+    // From scratch (ignore the cache).
+    var rf: FileResult = undefined;
+    var fresh = try checkAndLower(gpa, io, cache, path, src, .force, &rf);
+    defer rf.deinit(gpa);
+    defer fresh.deinit(gpa);
+    const fresh_img = try buildImage(gpa, "p", fresh.text, fresh.entry_off, fresh.cstrings, fresh.data_relocs, fresh.uses_write);
+    defer gpa.free(fresh_img);
+
+    try testing.expectEqualSlices(u8, fresh_img, warm_img);
+}
+
+test "M5 reorder: swapping fn order is all cache hits and keeps correct linkage [vi]" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // [main, helper] then [helper, main] — bodies identical, order swapped.
+    const a = "fn main() -> int {\n return helper()\n}\nfn helper() -> int {\n return 7\n}\n";
+    const b = "fn helper() -> int {\n return 7\n}\nfn main() -> int {\n return helper()\n}\n";
+
+    var ra: FileResult = undefined;
+    var lpa = try checkAndLower(gpa, io, cache, path, a, .normal, &ra);
+    defer ra.deinit(gpa);
+    defer lpa.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lpa.codegen_compiled);
+
+    // Reordered build: same fingerprints (position-independent) → all cache hits.
+    var rb: FileResult = undefined;
+    var lpb = try checkAndLower(gpa, io, cache, path, b, .normal, &rb);
+    defer rb.deinit(gpa);
+    defer lpb.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lpb.codegen_cached);
+    try testing.expectEqual(@as(usize, 0), lpb.codegen_compiled);
+
+    // The reordered binary still links correctly (call resolves by name): build
+    // it and run it — must exit 7. (macOS/aarch64 only.)
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return;
+    const image = try buildImage(gpa, "p", lpb.text, lpb.entry_off, lpb.cstrings, lpb.data_relocs, lpb.uses_write);
+    defer gpa.free(image);
+    const out_path = std.fmt.allocPrint(gpa, "{s}/p", .{src_dir}) catch unreachable;
+    defer gpa.free(out_path);
+    {
+        const perms: Io.File.Permissions = .fromMode(0o755);
+        var f = try Io.Dir.cwd().createFile(io, out_path, .{ .permissions = perms });
+        defer f.close(io);
+        try f.writeStreamingAll(io, image);
+        try f.setPermissions(io, perms);
+    }
+    const abs = try Io.Dir.cwd().realPathFileAlloc(io, out_path, gpa);
+    defer gpa.free(abs);
+    var child = try std.process.spawn(io, .{ .argv = &.{abs} });
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 7 }, term);
+}

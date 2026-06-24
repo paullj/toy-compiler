@@ -1,0 +1,13 @@
+# Feature: declare a struct, construct it, read fields, compute over it.
+# expect: exit 42
+# area(p) reads p.x and p.y from a by-value Point param: 6 * 7 = 42.
+struct Point { x: int, y: int }
+
+fn area(p: Point) -> int {
+    p.x * p.y
+}
+
+fn main() -> int {
+    p := Point { x: 6, y: 7 }
+    return area(p)
+}

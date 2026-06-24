@@ -1,0 +1,8 @@
+# Feature: a `{ ... }` block is an expression; its trailing expr is its value.
+# expect: exit 2
+# The inner block binds a := 1 and yields `a + 1` = 2, bound to x.
+fn main() -> int {
+  x := { a := 1
+  a + 1 }
+  return x
+}

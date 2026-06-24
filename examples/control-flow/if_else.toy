@@ -1,0 +1,14 @@
+# Feature: if / else if / else as a statement.
+# expect: exit 9
+# Maps the sign of x to an exit code: 7 (positive), 8 (zero), 9 (negative).
+# Here x = -3, so the final `else` returns 9.
+fn main() -> int {
+    x := -3
+    if x > 0 {
+        return 7
+    } else if x == 0 {
+        return 8
+    } else {
+        return 9
+    }
+}

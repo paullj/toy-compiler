@@ -1,0 +1,9 @@
+# Feature: main's int return becomes the process exit code.
+# expect: exit 42
+# The tracer-bullet demo. dyld's start glue masks the return to a byte (& 0xFF),
+# so `./prog; echo $?` prints 42.
+fn main() -> int {
+    x := 40
+    y := 2
+    return x + y
+}

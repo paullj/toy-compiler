@@ -1,0 +1,17 @@
+# Feature: `continue @outer` from an inner loop advances the OUTER loop.
+# expect: exit 9
+# Outer i in 0..3; inner j in 0..10. Each outer iteration adds 1 for j=0,1,2,
+# then on j == 3 `continue @outer` abandons the rest of the inner loop and
+# advances i. So 3 adds per outer iteration * 3 outer iterations = 9.
+fn main() -> int {
+    s := 0
+    @outer for i in 0..3 {
+        for j in 0..10 {
+            if j == 3 {
+                continue @outer
+            }
+            s = s + 1
+        }
+    }
+    s
+}

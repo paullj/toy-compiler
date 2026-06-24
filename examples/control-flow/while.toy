@@ -1,0 +1,12 @@
+# Feature: a `while` loop.
+# expect: exit 45
+# Sums 0 + 1 + ... + 9 = 45; the backward branch reruns the condition each pass.
+fn main() -> int {
+    i := 0
+    sum := 0
+    while i < 10 {
+        sum = sum + i
+        i = i + 1
+    }
+    return sum
+}

@@ -1,0 +1,18 @@
+# Feature: literal forms — digit separators, bool, string literal, and comments.
+# expect: exit 0
+# Exercises `1_000` (underscore separators), `true`, a `str` literal, and a
+# trailing comment. Nothing is printed; main falls through to exit 0.
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() {
+    x := 1_000
+    ok := true
+
+    if x >= 10 {
+        x = add(x, 2)
+    }
+    # a trailing comment
+    msg := "hello world"
+}

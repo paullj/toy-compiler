@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — referencing a name that was never declared.
+# expect: compile-error "undeclared identifier 'y'"
+# `y` is never bound, so name resolution reports an undeclared identifier.
+fn main() -> int {
+  return y
+}

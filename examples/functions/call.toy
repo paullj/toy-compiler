@@ -1,0 +1,10 @@
+# Feature: calling a function with arguments.
+# expect: exit 42
+# main calls add(40, 2); the result becomes the exit code.
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() -> int {
+    return add(40, 2)
+}

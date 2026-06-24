@@ -1,0 +1,7 @@
+# Feature: a function body's trailing expression is the return value (no `return`).
+# expect: exit 42
+# `answer` has no `return`; its trailing `41 + 1` is returned implicitly.
+fn answer() -> int { 41 + 1 }
+fn main() -> int {
+  return answer()
+}

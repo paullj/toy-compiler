@@ -1,0 +1,5 @@
+# Feature: SHOULD FAIL — a block opened with `{` must be closed with `}`.
+# expect: compile-error "expected '}' to close block"
+# main's body is never closed; the parser hits end-of-file expecting `}`.
+fn main() -> int {
+  return 1

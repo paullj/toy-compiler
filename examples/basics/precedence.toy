@@ -1,0 +1,6 @@
+# Feature: arithmetic operator precedence and unary minus.
+# expect: exit 11
+# `*` binds tighter than `+`/`-`; unary `-` applies to its operand: 1 + (2*3) - (-4) = 11.
+fn main() -> int {
+    return 1 + 2 * 3 - -4
+}

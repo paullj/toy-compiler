@@ -1,0 +1,513 @@
+//! A flat, index-based AST.
+//!
+//! Nodes live in a single `[]Node` and reference their children by `u32` index
+//! rather than by pointer. This is the same data-oriented layout Zig's own
+//! compiler uses, and it buys us two things for free:
+//!
+//!   * **Cacheable.** A `[]Node` is a flat array of fixed-size values, so it
+//!     serializes to (and loads from) the content cache exactly like `[]Token`
+//!     — no pointer fix-ups, no bespoke (de)serializer.
+//!   * **Parallel.** Each file parses into its own array on its own thread; the
+//!     arrays never reference each other.
+//!
+//! Variable-arity children (a call's arguments, a block's statements, a
+//! function's parameters) cannot fit in a `Node`'s two fixed slots, so they live
+//! in a parallel `extra: []u32` side array — the same "extra_data" trick the Zig
+//! compiler uses. A `Node` then stores an *index into `extra`* of a small header
+//! describing a contiguous run of child node indices (see `Range`/`FnProto`).
+//! Both arrays together form a `Tree`, and both serialize trivially.
+//!
+//! By construction the parser emits child nodes before their parents, and the
+//! synthetic `program` node is appended last, so the **root is always the last
+//! node** in the array (see `root`).
+
+const std = @import("std");
+const Token = @import("Token.zig").Token;
+
+/// Index into the node array. `none` marks an absent child (e.g. a leaf's
+/// operands, or a bare `return`'s missing expression).
+pub const Index = u32;
+pub const none: Index = std.math.maxInt(Index);
+
+pub const Node = extern struct {
+    tag: Tag,
+    /// Index into the token array of the token that best represents this node:
+    /// the operator for `unary`/`binary`, the name/literal token otherwise, the
+    /// `(`/`{` for `call`/`block`, the function name for `fn_decl`.
+    main_token: u32,
+    /// Child node indices, OR an index into `extra` of a range/proto header.
+    /// Meaning depends on `tag`; `none` when unused.
+    lhs: Index,
+    rhs: Index,
+
+    pub const Tag = enum(u8) {
+        /// Integer literal. `main_token` is the number.
+        literal_number,
+        /// String literal. `main_token` is the string (quotes included).
+        literal_string,
+        /// `true` / `false`. `main_token` is the keyword.
+        literal_bool,
+        /// A name. `main_token` is the identifier.
+        identifier,
+        /// Prefix `op operand`. `main_token` is the operator; `lhs` is operand.
+        unary,
+        /// `lhs op rhs`. `main_token` is the operator.
+        binary,
+
+        // Appended below; the six above keep their ordinals (Tag is enum(u8) and
+        // nodes are memcpy'd to/from the cache, so reordering breaks old blobs).
+
+        /// Postfix `callee(args...)`. `main_token` is `(`. `lhs` is the callee
+        /// expression node. `rhs` is the `extra` header of an args `Range`.
+        call,
+        /// `name := expr`. `main_token` is the name identifier. `lhs` is the
+        /// initializer expression. `rhs` is `none`.
+        var_decl,
+        /// `name = expr`. `main_token` is the name identifier. `lhs` is the
+        /// target (an `identifier` node). `rhs` is the value expression.
+        assign,
+        /// `return expr?`. `main_token` is `return`. `lhs` is the expression or
+        /// `none` (bare return). `rhs` is `none`.
+        return_stmt,
+        /// An expression used as a statement. `main_token` is the expression's
+        /// first token. `lhs` is the inner expression. `rhs` is `none`.
+        expr_stmt,
+        /// `{ stmts }`. `main_token` is `{`. `lhs` is the `extra` header of a
+        /// statements `Range`. `rhs` is `none`.
+        block,
+        /// `name: Type`. `main_token` is the param name. `lhs` is the type-ref
+        /// (an `identifier` node naming the type). `rhs` is `none`.
+        param,
+        /// `fn name(params) -> Ret { block }`. `main_token` is the name
+        /// identifier. `lhs` is the `extra` header of a `FnProto`. `rhs` is the
+        /// block node.
+        fn_decl,
+        /// The whole file: a sequence of function declarations. `main_token` is
+        /// unused (0). `lhs` is the `extra` header of a fns `Range`. `rhs` is
+        /// `none`.
+        program,
+
+        /// `while cond { body }`. `main_token` is `while`. `lhs` is the condition
+        /// expression. `rhs` is the body `block` node.
+        while_stmt,
+        /// `if cond { then } [else (block|if)]`. `main_token` is `if`. `lhs` is
+        /// the condition expression. `rhs` is the `extra` index of a 2-cell
+        /// header `{then_block, else_node}`: `else_node` is a `block` node, a
+        /// nested `if_stmt` node (for `else if`), or `Ast.none` (no else).
+        if_stmt,
+
+        /// The unit value `()` AND the unit type-ref `()`. A zero-sized leaf:
+        /// `main_token` is the `(`; `lhs`/`rhs` are `none`. In value position it
+        /// materializes to nothing; in type position it denotes the unit type.
+        literal_unit,
+
+        /// `loop { body }`. `main_token` is `loop`. `lhs` is the body `block`.
+        /// `rhs` is `none`. A VALUE expression; its type is the merge of all
+        /// `break <expr>` sites (or `never` when there is no value-break),
+        /// modeled downstream in Typecheck.
+        loop_expr,
+        /// `for ident in lo..hi { body }`. `main_token` is the loop-var ident.
+        /// `lhs` is the body `block`. `rhs` is the `extra` index of a 2-cell
+        /// header `{lo, hi}`. Half-open `[lo, hi)`. A `()` statement.
+        for_stmt,
+        /// `break expr?`. `main_token` is `break`. `lhs` is the value expression
+        /// or `none` (bare break). `rhs` overloads as a label TOKEN index: the
+        /// identifier token after `@` for `break @name`, or `none`. This is
+        /// the one node where `rhs` names a *token*, not a child node — break/
+        /// continue have no node-child in `rhs`, so the slot is free.
+        break_stmt,
+        /// `continue`. `main_token` is `continue`. `lhs` is `none`. `rhs` overloads
+        /// as a label TOKEN index (the identifier after `@`) for `continue @name`,
+        /// or `none`. Like `break_stmt`, `rhs` names a *token*, not a node.
+        continue_stmt,
+
+        /// `@name <inner>`: a label prefixed onto a loop/while/for/bare-block.
+        /// `main_token` is the identifier token after `@` (the label text, no
+        /// `@`). `lhs` is the inner construct node (`loop_expr`, `while_stmt`,
+        /// `for_stmt`, or `block`). `rhs` is `none`. A transparent wrapper for
+        /// typing/codegen; its value (when the inner is value-yielding) is the
+        /// inner's value merged with every `break @name <expr>` site.
+        labeled,
+
+        /// `struct Name { x: int, y: int }`. `main_token` is the struct name
+        /// identifier. `lhs` is the `extra` header of a `Range` over `param`
+        /// field nodes (in declaration order). `rhs` is `none`.
+        struct_decl,
+        /// `Name { x: 1, y: 2 }`. `main_token` is the `{`. `lhs` is the
+        /// type-name `identifier` node. `rhs` is the `extra` header of a `Range`
+        /// over `field_init` nodes.
+        struct_init,
+        /// A field initializer inside a `struct_init`: `name: value`, or the
+        /// punning shorthand `name` (which synthesizes a real `identifier` leaf
+        /// on the field token as `lhs`). `main_token` is the field-name ident.
+        /// `lhs` is the value expression (never `none`). `rhs` is `none`.
+        field_init,
+        /// Field access `recv.field`. `main_token` is the field-name ident
+        /// (after the `.`). `lhs` is the receiver expression (nests for
+        /// `p.a.b`). `rhs` is `none`. Also the lhs of a field place-store
+        /// (reusing `.assign`).
+        field_access,
+    };
+};
+
+comptime {
+    // The `extra` array is `[]u32`; pack/unpack memcpy these arrays as bytes, so
+    // `Node` must be a whole number of 4-byte words and no more aligned.
+    std.debug.assert(@sizeOf(Node) % 4 == 0);
+    std.debug.assert(@alignOf(Node) <= 4);
+}
+
+/// A parse result: the node array plus its `extra` side array. Both are owned
+/// together and (de)serialize together via `pack`/`unpack`.
+pub const Tree = struct {
+    nodes: []Node,
+    extra: []u32,
+};
+
+/// A contiguous run of child node indices stored in `extra`, described by a
+/// two-cell header `{start, len}`. The header cell index is what a `Node`
+/// stores; the run lives at `extra[start .. start + len]`.
+pub const Range = struct { start: u32, len: u32 };
+
+/// A function's signature, decoded from a fixed 3-cell `FnProto` header in
+/// `extra`: `{ret_type_node, params_start, params_len}`.
+pub const FnProto = struct {
+    /// type-ref node naming the return type, or `none` for unit `()`.
+    ret_type: Index,
+    /// `param` node indices, in source order.
+    params: []const Index,
+};
+
+/// Decode the `{start, len}` range header at `header`.
+pub fn rangeAt(tree: Tree, header: u32) Range {
+    return .{ .start = tree.extra[header], .len = tree.extra[header + 1] };
+}
+
+/// The slice of child node indices described by the range header at `header`.
+pub fn rangeSlice(tree: Tree, header: u32) []const Index {
+    const r = rangeAt(tree, header);
+    return tree.extra[r.start .. r.start + r.len]; // u32 == Index
+}
+
+/// Decode the 2-cell `if_stmt` header at `header`: `{then_block, else_node}`.
+pub fn ifHeaderAt(tree: Tree, header: u32) struct { then_block: Index, else_node: Index } {
+    return .{ .then_block = tree.extra[header], .else_node = tree.extra[header + 1] };
+}
+
+/// Decode the 2-cell `for_stmt` range header at `header`: `{lo, hi}`.
+pub fn forHeaderAt(tree: Tree, header: u32) struct { lo: Index, hi: Index } {
+    return .{ .lo = tree.extra[header], .hi = tree.extra[header + 1] };
+}
+
+/// Decode the `FnProto` header at `header`.
+pub fn protoAt(tree: Tree, header: u32) FnProto {
+    const ps = tree.extra[header + 1];
+    const pl = tree.extra[header + 2];
+    return .{ .ret_type = tree.extra[header], .params = tree.extra[ps .. ps + pl] };
+}
+
+/// The root (top-level) node of a non-empty tree — by construction the last.
+pub fn root(nodes: []const Node) Index {
+    return @intCast(nodes.len - 1);
+}
+
+/// "TOYP" — a magic so a foreign/corrupt blob is treated as a cache miss.
+pub const parse_magic: u32 = 0x544f5950;
+
+/// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
+pub const ParseHeader = extern struct {
+    magic: u32,
+    version: u32 = 1,
+    node_count: u32,
+    extra_count: u32,
+};
+
+/// Pack a `Tree` into one flat byte blob: header, then nodes, then extra.
+pub fn pack(gpa: std.mem.Allocator, tree: Tree) ![]u8 {
+    const total = @sizeOf(ParseHeader) + tree.nodes.len * @sizeOf(Node) + tree.extra.len * 4;
+    const buf = try gpa.alloc(u8, total);
+    const hdr = ParseHeader{
+        .magic = parse_magic,
+        .node_count = @intCast(tree.nodes.len),
+        .extra_count = @intCast(tree.extra.len),
+    };
+    @memcpy(buf[0..@sizeOf(ParseHeader)], std.mem.asBytes(&hdr));
+    var off: usize = @sizeOf(ParseHeader);
+    const nb = std.mem.sliceAsBytes(tree.nodes);
+    @memcpy(buf[off .. off + nb.len], nb);
+    off += nb.len;
+    const eb = std.mem.sliceAsBytes(tree.extra);
+    @memcpy(buf[off .. off + eb.len], eb);
+    return buf;
+}
+
+/// Unpack a blob produced by `pack`. Returns null on any mismatch (corrupt or
+/// foreign blob) so the caller treats it as a cache miss. Caller owns the Tree.
+pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
+    if (bytes.len < @sizeOf(ParseHeader)) return null;
+    var hdr: ParseHeader = undefined;
+    @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
+    if (hdr.magic != parse_magic or hdr.version != 1) return null;
+    const need = @sizeOf(ParseHeader) +
+        @as(usize, hdr.node_count) * @sizeOf(Node) +
+        @as(usize, hdr.extra_count) * 4;
+    if (bytes.len != need) return null;
+
+    const nodes = try gpa.alloc(Node, hdr.node_count);
+    errdefer gpa.free(nodes);
+    const extra = try gpa.alloc(u32, hdr.extra_count);
+
+    var off: usize = @sizeOf(ParseHeader);
+    @memcpy(std.mem.sliceAsBytes(nodes), bytes[off .. off + hdr.node_count * @sizeOf(Node)]);
+    off += hdr.node_count * @sizeOf(Node);
+    @memcpy(std.mem.sliceAsBytes(extra), bytes[off .. off + hdr.extra_count * 4]);
+    return Tree{ .nodes = nodes, .extra = extra };
+}
+
+/// Write the whole program (rooted at the last node) as an S-expression.
+pub fn render(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8) !void {
+    if (tree.nodes.len == 0) return;
+    try renderNode(out, tree, tokens, source, root(tree.nodes));
+}
+
+fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8, idx: Index) !void {
+    const nodes = tree.nodes;
+    const n = nodes[idx];
+    const tok_text = tokens[n.main_token].text(source);
+    switch (n.tag) {
+        .literal_number, .literal_string, .literal_bool, .identifier => try out.writeAll(tok_text),
+        .literal_unit => try out.writeAll("()"),
+        .unary => {
+            try out.print("({s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .binary => {
+            try out.print("({s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
+        .call => {
+            try out.writeAll("(call ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            for (rangeSlice(tree, n.rhs)) |arg| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, arg);
+            }
+            try out.writeByte(')');
+        },
+        .var_decl => {
+            try out.print("(:= {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .assign => {
+            try out.writeAll("(= ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
+        .return_stmt => {
+            if (n.lhs == none) {
+                try out.writeAll("(return)");
+            } else {
+                try out.writeAll("(return ");
+                try renderNode(out, tree, tokens, source, n.lhs);
+                try out.writeByte(')');
+            }
+        },
+        // An expression statement is a transparent wrapper: render the inner expr.
+        .expr_stmt => try renderNode(out, tree, tokens, source, n.lhs),
+        .block => {
+            try out.writeAll("(block");
+            for (rangeSlice(tree, n.lhs)) |stmt| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, stmt);
+            }
+            try out.writeByte(')');
+        },
+        .param => {
+            try out.print("(param {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .fn_decl => {
+            const proto = protoAt(tree, n.lhs);
+            try out.print("(fn {s} (", .{tok_text});
+            for (proto.params, 0..) |pidx, i| {
+                if (i != 0) try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, pidx);
+            }
+            try out.writeAll(") ");
+            if (proto.ret_type == none) {
+                try out.writeByte('_');
+            } else {
+                try renderNode(out, tree, tokens, source, proto.ret_type);
+            }
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
+        .program => {
+            try out.writeAll("(program");
+            for (rangeSlice(tree, n.lhs)) |fn_idx| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, fn_idx);
+            }
+            try out.writeByte(')');
+        },
+        .while_stmt => {
+            try out.writeAll("(while ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
+        .if_stmt => {
+            const h = ifHeaderAt(tree, n.rhs);
+            try out.writeAll("(if ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, h.then_block);
+            if (h.else_node != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, h.else_node);
+            }
+            try out.writeByte(')');
+        },
+        .loop_expr => {
+            try out.writeAll("(loop ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .for_stmt => {
+            const h = forHeaderAt(tree, n.rhs);
+            try out.print("(for {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, h.lo);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, h.hi);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .break_stmt => {
+            try out.writeAll("(break");
+            if (n.rhs != none) {
+                try out.print(" @{s}", .{tokens[n.rhs].text(source)});
+            }
+            if (n.lhs != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, n.lhs);
+            }
+            try out.writeByte(')');
+        },
+        .continue_stmt => {
+            try out.writeAll("(continue");
+            if (n.rhs != none) {
+                try out.print(" @{s}", .{tokens[n.rhs].text(source)});
+            }
+            try out.writeByte(')');
+        },
+        .labeled => {
+            try out.print("(label {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .struct_decl => {
+            try out.print("(struct {s}", .{tok_text});
+            for (rangeSlice(tree, n.lhs)) |field| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, field);
+            }
+            try out.writeByte(')');
+        },
+        .struct_init => {
+            try out.writeAll("(new ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            for (rangeSlice(tree, n.rhs)) |fi| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, fi);
+            }
+            try out.writeByte(')');
+        },
+        .field_init => {
+            try out.print("(field {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .field_access => {
+            try out.writeAll("(. ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.print(" {s})", .{tok_text});
+        },
+    }
+}
+
+const testing = std.testing;
+
+test "rangeSlice and protoAt accessors round-trip on a hand-built tree" {
+    // Build extra for: a fn with two params (param nodes 0,1), ret_type node 2.
+    // extra layout:
+    //   [0]=0,[1]=1            params run (param node indices 0,1)
+    //   [2]=0,[3]=2            Range header {start=0, len=2}
+    //   [4]=2,[5]=0,[6]=2      FnProto {ret_type=2, params_start=0, params_len=2}
+    var extra = [_]u32{ 0, 1, 0, 2, 2, 0, 2 };
+    var nodes = [_]Node{
+        .{ .tag = .param, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .param, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .block, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .fn_decl, .main_token = 0, .lhs = 4, .rhs = 3 },
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+
+    const params = rangeSlice(tree, 2);
+    try testing.expectEqual(@as(usize, 2), params.len);
+    try testing.expectEqual(@as(Index, 0), params[0]);
+    try testing.expectEqual(@as(Index, 1), params[1]);
+
+    const proto = protoAt(tree, 4);
+    try testing.expectEqual(@as(Index, 2), proto.ret_type);
+    try testing.expectEqual(@as(usize, 2), proto.params.len);
+    try testing.expectEqual(@as(Index, 1), proto.params[1]);
+}
+
+test "pack/unpack byte round-trip" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = 0, .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, tree.extra, got.extra);
+}
+
+test "renders the unit literal" {
+    var nodes = [_]Node{
+        .{ .tag = .literal_unit, .main_token = 0, .lhs = none, .rhs = none },
+    };
+    var extra = [_]u32{};
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    var buf: [16]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderNode(&w, tree, &.{Token{ .tag = .l_paren, .start = 0, .end = 1 }}, "()", 0);
+    try testing.expectEqualStrings("()", w.buffered());
+}
+
+test "unpack rejects a foreign blob" {
+    const gpa = testing.allocator;
+    try testing.expect((try unpack(gpa, "not a tree")) == null);
+    try testing.expect((try unpack(gpa, &.{})) == null);
+}

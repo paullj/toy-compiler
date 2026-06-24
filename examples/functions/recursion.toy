@@ -1,0 +1,13 @@
+# Feature: recursion, bottoming out via an `if n < 2` base case.
+# expect: exit 55
+# fib(10) = 55. The base case is what makes the recursion terminate.
+fn fib(n: int) -> int {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() -> int {
+    return fib(10)
+}

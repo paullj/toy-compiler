@@ -1,0 +1,11 @@
+# Feature: short-circuit `&&` / `||`, used both as a value and as an if-condition.
+# expect: exit 1
+# (1 < 2) && (3 > 2) is true, so `both` is true; `both || (5 < 0)` is also true,
+# so the if is taken and main returns 1.
+fn main() -> int {
+    both := (1 < 2) && (3 > 2)
+    if both || (5 < 0) {
+        return 1
+    }
+    return 0
+}

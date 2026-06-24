@@ -1,0 +1,14 @@
+# Feature: a bare `break` targets the innermost loop only.
+# expect: exit 3
+# The inner loop adds 1 at j=0 then breaks at j==1, once per each of 3 outer
+# iterations -> 3. The outer loop is unaffected by the inner break.
+fn main() -> int {
+  s := 0
+  for i in 0..3 {
+    for j in 0..3 {
+      if j == 1 { break }
+      s = s + 1
+    }
+  }
+  return s
+}

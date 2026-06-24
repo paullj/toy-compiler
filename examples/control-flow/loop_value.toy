@@ -1,0 +1,11 @@
+# Feature: `loop` as a value-yielding expression via `break <expr>`.
+# expect: exit 50
+# i counts 0..5; once i reaches 5 the loop breaks with i * 10 = 50.
+fn main() -> int {
+  i := 0
+  v := loop {
+    if i >= 5 { break i * 10 }
+    i = i + 1
+  }
+  return v
+}

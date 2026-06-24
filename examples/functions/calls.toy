@@ -1,0 +1,19 @@
+# Feature: nested calls and forward references (callees declared after main).
+# expect: exit 42
+# add(square(6), double(3)) = add(36, 6) = 42. Functions resolve regardless of
+# declaration order.
+fn main() -> int {
+    return add(square(6), double(3))
+}
+
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn square(n: int) -> int {
+    return n * n
+}
+
+fn double(n: int) -> int {
+    return add(n, n)
+}

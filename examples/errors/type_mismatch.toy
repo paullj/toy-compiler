@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — return value type must match the declared return type.
+# expect: compile-error "return type bool does not match declared int"
+# main is declared `-> int` but returns a bool; the typechecker rejects it.
+fn main() -> int {
+  return true
+}

@@ -1,0 +1,547 @@
+//! Pure aarch64 (AArch64 / ARM64) instruction-word emitter.
+//!
+//! WHY: all the bit-twiddling needed to turn a mnemonic into a 32-bit machine
+//! word lives here, behind named functions, so `Codegen` and the unit tests
+//! never hand-encode an instruction. Every helper is a pure function (no IO, no
+//! allocation) returning the little-endian-on-disk `u32` word; callers serialize
+//! with `std.mem.writeInt(u32, buf, word, .little)`.
+//!
+//! Each expected word in the tests below was cross-checked against the real
+//! assembler on this host: write the mnemonics to a `.s` file, `as -arch arm64`,
+//! then `objdump -d` — the disassembly's hex column is the ground truth the
+//! tests assert (see the comments next to each constant/function).
+//!
+//! Scope is the M1 subset only: movz/movk (+ an i64 materializer), reg/reg moves,
+//! add/sub (reg and imm12), mul, sdiv, neg, the frame stp/ldp pair, ldr/str
+//! unsigned-offset against sp, sp add/sub, bl, ret, and svc.
+
+const std = @import("std");
+
+/// Register numbers. In most data-processing encodings 31 means the zero
+/// register (XZR); in load/store and add/sub-immediate the same field 31 means
+/// the stack pointer (SP). The two share an encoding slot — context decides.
+pub const Reg = enum(u5) {
+    x0 = 0,
+    x1 = 1,
+    x2 = 2,
+    x3 = 3,
+    x4 = 4,
+    x5 = 5,
+    x16 = 16,
+    fp = 29, // x29, frame pointer
+    lr = 30, // x30, link register
+    // 31 is SP or XZR depending on the instruction.
+    sp = 31,
+    _,
+
+    pub inline fn num(self: Reg) u32 {
+        return @intFromEnum(self);
+    }
+};
+
+pub const XZR: u32 = 31;
+pub const SP: u32 = 31;
+pub const FP: u32 = 29;
+pub const LR: u32 = 30;
+
+// --- Move-wide immediates --------------------------------------------------
+
+/// movz rd, #imm16, lsl #(hw*16) — load a 16-bit immediate into a lane, zeroing
+/// the rest. `hw` selects the lane (0..3). movz x0,#40 → 0xD2800500.
+pub fn movz(rd: u32, imm16: u16, hw: u2) u32 {
+    return 0xD2800000 | (@as(u32, hw) << 21) | (@as(u32, imm16) << 5) | rd;
+}
+
+/// movk rd, #imm16, lsl #(hw*16) — overwrite a 16-bit lane, keeping the others.
+/// movk x0,#0x1234,lsl#16 → 0xF2A24680.
+pub fn movk(rd: u32, imm16: u16, hw: u2) u32 {
+    return 0xF2800000 | (@as(u32, hw) << 21) | (@as(u32, imm16) << 5) | rd;
+}
+
+// --- Add / sub immediate (imm12, unshifted) --------------------------------
+
+/// add rd, rn, #imm12. With rd/rn = SP this is the sp adjust. add sp,sp,#16 →
+/// 0x910043FF.
+pub fn addImm(rd: u32, rn: u32, imm12: u12) u32 {
+    return 0x91000000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
+}
+
+/// sub rd, rn, #imm12. sub sp,sp,#16 → 0xD10043FF.
+pub fn subImm(rd: u32, rn: u32, imm12: u12) u32 {
+    return 0xD1000000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
+}
+
+// --- Add / sub / mul / sdiv (register, shifted-register form, no shift) -----
+
+/// add rd, rn, rm. add x0,x0,x1 → 0x8B010000.
+pub fn addReg(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x8B000000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// sub rd, rn, rm. sub x5,x0,x1 → 0xCB010005.
+pub fn subReg(rd: u32, rn: u32, rm: u32) u32 {
+    return 0xCB000000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// mul rd, rn, rm (alias of madd with the accumulator = XZR). mul x2,x0,x1 →
+/// 0x9B017C02.
+pub fn mul(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x9B007C00 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// sdiv rd, rn, rm (signed division; arm64 sdiv by 0 yields 0, no trap). sdiv
+/// x3,x0,x1 → 0x9AC10C03.
+pub fn sdiv(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x9AC00C00 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// neg rd, rm — alias of `sub rd, xzr, rm`. neg x4,x0 → 0xCB0003E4.
+pub fn neg(rd: u32, rm: u32) u32 {
+    return subReg(rd, XZR, rm);
+}
+
+// --- Load / store, unsigned-offset, base = SP ------------------------------
+
+/// str rt, [sp, #byteOff] — 64-bit store; byteOff must be a multiple of 8 (the
+/// encoded imm12 is the scaled word index). str x0,[sp,#8] → 0xF90007E0.
+pub fn strSp(rt: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    const scaled: u32 = byteOff / 8;
+    return 0xF9000000 | (scaled << 10) | (SP << 5) | rt;
+}
+
+/// ldr rt, [sp, #byteOff] — 64-bit load; byteOff multiple of 8. ldr x1,[sp,#8]
+/// → 0xF94007E1.
+pub fn ldrSp(rt: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    const scaled: u32 = byteOff / 8;
+    return 0xF9400000 | (scaled << 10) | (SP << 5) | rt;
+}
+
+// --- Load / store, unsigned-offset, base = FP (x29) ------------------------
+
+/// ldr rt, [x29, #byteOff] — 64-bit load; base is FP(29). byteOff multiple of 8.
+/// Used to read incoming stack arguments (the (8+k)th param at [x29,#16+k*8]).
+/// ldr x9,[x29,#16] → 0xF9400BA9.
+pub fn ldrFp(rt: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    const scaled: u32 = byteOff / 8;
+    return 0xF9400000 | (scaled << 10) | (FP << 5) | rt;
+}
+
+/// str rt, [x29, #byteOff] — symmetric 64-bit store against FP. str x9,[x29,#0]
+/// → 0xF90003A9. (Kept for symmetry; M3 only needs `ldrFp`.)
+pub fn strFp(rt: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    const scaled: u32 = byteOff / 8;
+    return 0xF9000000 | (scaled << 10) | (FP << 5) | rt;
+}
+
+// --- Branch / system -------------------------------------------------------
+
+/// bl #(imm26 words) — branch-and-link, PC-relative by a signed *word* offset
+/// (the raw imm26 field). The linker patches the placeholder `bl #0` with
+/// imm26 = (target_off − site_off) / 4 for each `.call26` relocation.
+/// bl #0 → 0x94000000.
+pub fn bl(imm26: i26) u32 {
+    const bits: u32 = @as(u26, @bitCast(imm26));
+    return 0x94000000 | bits;
+}
+
+/// svc #imm16 — supervisor call (syscall trap). svc #0x80 → 0xD4001001.
+pub fn svc(imm16: u16) u32 {
+    return 0xD4000001 | (@as(u32, imm16) << 5);
+}
+
+// --- PC-relative data addressing + indirect call (M2) -----------------------
+//
+// These four encoders are how M2 reaches data the linker only sizes at the very
+// end: a string in `__cstring` and the `_write` slot in `__got`. `adrp` forms a
+// 4 KiB-page-relative base, `addImm` adds the in-page byte offset (for a cstring
+// literal address), `ldrRegUoff` loads the GOT slot, and `blr` calls it. The
+// `page_delta`/offset placeholders are 0 at emit time; the post-vmaddr pass
+// (`Link.applyDataRelocs`, via the `patch*` helpers below) rewrites them once
+// MachO assigns the final segment vmaddrs. Each word was assembler-verified on
+// this host (see the tests).
+
+/// adrp rd, #(page_delta pages) — form the address of a 4 KiB *page* PC-relative
+/// by a signed 21-bit page count (units of 4096, NOT 0x4000). The placeholder
+/// emit uses page_delta = 0. adrp x8,0 → 0x90000008; adrp x16,4 → 0x90000030.
+pub fn adrp(rd: u32, page_delta: i21) u32 {
+    const u: u21 = @bitCast(page_delta);
+    return 0x90000000 | ((@as(u32, u) & 3) << 29) | (((@as(u32, u) >> 2) & 0x7FFFF) << 5) | rd;
+}
+
+/// ldr rt, [rn, #byteOff] — 64-bit load, unsigned scaled offset, arbitrary base
+/// register `rn`. byteOff must be a multiple of 8. ldr x16,[x16] → 0xF9400210;
+/// ldr x16,[x16,#0x18] → 0xF9400E10.
+pub fn ldrRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    const scaled: u32 = byteOff / 8;
+    return 0xF9400000 | (scaled << 10) | (rn << 5) | rt;
+}
+
+/// str rt, [rn, #byteOff] — 64-bit store, unsigned scaled offset, arbitrary base
+/// register `rn`. byteOff must be a multiple of 8. str x0,[x8] → 0xF9000100;
+/// str x1,[x8,#8] → 0xF9000501. Symmetric to `ldrRegUoff`; used for the
+/// indirect/x8 sret store-through-pointer and struct byte-copies (M9).
+pub fn strRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    const scaled: u32 = byteOff / 8;
+    return 0xF9000000 | (scaled << 10) | (rn << 5) | rt;
+}
+
+/// blr rn — indirect branch-and-link through a register. blr x16 → 0xD63F0200.
+pub fn blr(rn: u32) u32 {
+    return 0xD63F0000 | (rn << 5);
+}
+
+/// mov rd, rm — register move (alias of `orr rd, xzr, rm`). mov x2,x1 →
+/// 0xAA0103E2; mov x1,x0 → 0xAA0003E1.
+pub fn movReg(rd: u32, rm: u32) u32 {
+    return 0xAA0003E0 | (rm << 16) | rd;
+}
+
+// --- In-place patchers for the post-vmaddr relocation pass ------------------
+//
+// The placeholder words carry the destination register(s) in their low fields;
+// these recover those and re-encode with the resolved page delta / offset, so
+// the patch needs no separate record of which register the emitter chose.
+
+/// Re-encode an `adrp` placeholder with the resolved page delta, keeping its rd.
+pub fn patchAdrp(word: u32, page_delta: i21) u32 {
+    const rd: u32 = word & 0x1F;
+    return adrp(rd, page_delta);
+}
+
+/// Re-encode an `add (imm12)` placeholder with the resolved low-12 offset,
+/// keeping its rd/rn.
+pub fn patchAddImm12(word: u32, imm12: u12) u32 {
+    const rd: u32 = word & 0x1F;
+    const rn: u32 = (word >> 5) & 0x1F;
+    return addImm(rd, rn, imm12);
+}
+
+/// Re-encode an `ldr (unsigned-offset)` placeholder with the resolved byte
+/// offset, keeping its rt/rn.
+pub fn patchLdrUoff(word: u32, byteOff: u32) u32 {
+    const rt: u32 = word & 0x1F;
+    const rn: u32 = (word >> 5) & 0x1F;
+    return ldrRegUoff(rt, rn, byteOff);
+}
+
+// --- Compare + condition codes + branches (M4 control flow) ----------------
+//
+// WHY: M4 needs to test values and jump. Comparisons set NZCV via SUBS-to-XZR
+// (`cmp`), a condition turns NZCV into 0/1 (`cset`) in VALUE context or steers a
+// `b.cond`/`cbz`/`cbnz` in CONTROL context, and `b` is the unconditional jump.
+// Branch targets are intra-function byte offsets resolved by Codegen backpatch
+// (NOT relocations): the imm field is (target_byte − site_byte)/4, two's
+// complement, so a `#0` placeholder is emitted then rewritten by the patchers.
+// Every word below was assembler-verified on this host (see the tests).
+
+/// AArch64 condition codes. Only the ones M4 needs: equality (eq/ne) and the
+/// SIGNED magnitude comparisons (ge/lt/gt/le) — our ints are i64, so we must use
+/// the signed forms, NOT the unsigned hs/lo/hi/ls. Values are the 4-bit cond
+/// field encoding (e.g. b.cond carries cond in bits[3:0]).
+pub const Cond = enum(u4) {
+    eq = 0x0, // equal (Z==1)
+    ne = 0x1, // not equal (Z==0)
+    ge = 0xA, // signed >=
+    lt = 0xB, // signed <
+    gt = 0xC, // signed >
+    le = 0xD, // signed <=
+};
+
+/// Logical negation of a condition (swaps the branch sense). Used by genCond to
+/// branch on the inverse, and by `cset` which physically encodes the inverted
+/// condition (CSINC reads the inverse).
+pub fn invert(c: Cond) Cond {
+    return switch (c) {
+        .eq => .ne,
+        .ne => .eq,
+        .lt => .ge,
+        .ge => .lt,
+        .gt => .le,
+        .le => .gt,
+    };
+}
+
+/// cmp rn, rm — alias of SUBS XZR, Xn, Xm (subtract, set flags, discard result).
+/// cmp x1,x0 → 0xEB00003F; cmp x0,x1 → 0xEB01001F.
+pub fn cmpReg(rn: u32, rm: u32) u32 {
+    return 0xEB000000 | (rm << 16) | (rn << 5) | XZR;
+}
+
+/// cmp rn, #imm12 — alias of SUBS XZR, Xn, #imm12 (unshifted). cmp x0,#5 →
+/// 0xF100141F; cmp x0,#0 → 0xF100001F; cmp x1,#0 → 0xF100003F.
+pub fn cmpImm(rn: u32, imm12: u12) u32 {
+    return 0xF1000000 | (@as(u32, imm12) << 10) | (rn << 5) | XZR;
+}
+
+/// cset rd, cond — alias of CSINC Xd, XZR, XZR, invert(cond): set rd to 1 if the
+/// condition holds, else 0. The encoding stores the INVERTED condition in
+/// bits[15:12] (CSINC increments the false-source when the inverse holds).
+/// cset x0,eq → 0x9A9F17E0; cset x0,lt → 0x9A9FA7E0; cset x2,lt → 0x9A9FA7E2.
+pub fn cset(rd: u32, c: Cond) u32 {
+    return 0x9A9F07E0 | (@as(u32, @intFromEnum(invert(c))) << 12) | rd;
+}
+
+/// b.cond #(imm19 words) — conditional branch, PC-relative signed word offset in
+/// bits[23:5], cond in bits[3:0] (no inversion). Placeholder uses imm19 = 0.
+/// b.eq #0 → 0x54000000; b.eq #+2 → 0x54000040; b.lt #-2 → 0x54FFFFCB.
+pub fn bCond(c: Cond, imm19: i19) u32 {
+    return 0x54000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | @as(u32, @intFromEnum(c));
+}
+
+/// cbz rt, #(imm19 words) — branch if rt == 0; imm19 in bits[23:5], rt in
+/// bits[4:0]. cbz x0,#0 → 0xB4000000; cbz x0,#+2 → 0xB4000040; cbz x1,#-2 →
+/// 0xB4FFFFC1.
+pub fn cbz(rt: u32, imm19: i19) u32 {
+    return 0xB4000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | rt;
+}
+
+/// cbnz rt, #(imm19 words) — branch if rt != 0. cbnz x0,#0 → 0xB5000000;
+/// cbnz x0,#-4 → 0xB5FFFF80.
+pub fn cbnz(rt: u32, imm19: i19) u32 {
+    return 0xB5000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | rt;
+}
+
+/// b #(imm26 words) — unconditional branch, PC-relative signed word offset in
+/// bits[25:0]. b #0 → 0x14000000; b #+2 → 0x14000002; b #-2 → 0x17FFFFFE.
+pub fn b(imm26: i26) u32 {
+    return 0x14000000 | @as(u32, @as(u26, @bitCast(imm26)));
+}
+
+// --- In-place patchers for intra-function branch backpatch ------------------
+//
+// Emit a branch with a #0 placeholder, record its site + target label, then
+// rewrite only the imm field once the label's byte offset is known. The opcode
+// + identity (cond for b.cond, rt for cbz/cbnz) is preserved. For b.cond and
+// cbz/cbnz the mask 0xFF00001F keeps the top byte (0x54/0xB4/0xB5) and the low 5
+// bits (cond ⊂ low4, or rt = low5) while clearing the imm19 field at bits[23:5].
+
+/// Rewrite a b.cond placeholder's imm19, keeping opcode + cond. Round-trips:
+/// patchBCond(bCond(.eq,0), 2) → 0x54000040.
+pub fn patchBCond(word: u32, imm19: i19) u32 {
+    return (word & 0xFF00001F) | (@as(u32, @as(u19, @bitCast(imm19))) << 5);
+}
+
+/// Rewrite a cbz/cbnz placeholder's imm19, keeping opcode + rt. Round-trips:
+/// patchCbz(cbz(0,0), -4) → 0xB4FFFF80.
+pub fn patchCbz(word: u32, imm19: i19) u32 {
+    return (word & 0xFF00001F) | (@as(u32, @as(u19, @bitCast(imm19))) << 5);
+}
+
+/// Rewrite a `b` placeholder's imm26 (full opcode is fixed). Round-trips:
+/// patchB(b(0), -2) → 0x17FFFFFE.
+pub fn patchB(word: u32, imm26: i26) u32 {
+    _ = word;
+    return b(imm26);
+}
+
+// --- Frame save/restore + ret (fixed words; FP/LR pair against SP) ----------
+
+/// stp x29, x30, [sp, #-16]! — pre-index store of the FP/LR pair; opens the
+/// frame in one instruction. → 0xA9BF7BFD.
+pub const stpFpLrPre: u32 = 0xA9BF7BFD;
+
+/// mov x29, sp (add x29, sp, #0) — set the frame pointer. → 0x910003FD.
+pub const movFpSp: u32 = 0x910003FD;
+
+/// ldp x29, x30, [sp], #16 — post-index load of the FP/LR pair; closes the
+/// frame. → 0xA8C17BFD.
+pub const ldpFpLrPost: u32 = 0xA8C17BFD;
+
+/// ret (returns to x30). → 0xD65F03C0.
+pub const ret: u32 = 0xD65F03C0;
+
+// --- i64 materialization ----------------------------------------------------
+
+/// Materialize an arbitrary i64 `value` into register `rd` using the minimal
+/// movz + movk sequence, writing the words (little-endian) into `out` starting
+/// at `*len` and advancing it. At most 4 words. value 0 → a single
+/// `movz rd, #0`. Negative values work via their two's-complement lanes (e.g.
+/// -1 = 0xFFFF_FFFF_FFFF_FFFF → movz #0xffff then movk #0xffff in lanes 1..3).
+pub fn movImm64(out: []u8, len: *usize, rd: u32, value: i64) void {
+    const u: u64 = @bitCast(value);
+
+    // First lane via movz (zeroes the upper lanes), then movk the rest.
+    const lane0: u16 = @truncate(u);
+    writeWord(out, len, movz(rd, lane0, 0));
+
+    var hw: u2 = 1;
+    while (true) : (hw += 1) {
+        const lane: u16 = @truncate(u >> (@as(u6, hw) * 16));
+        if (lane != 0) writeWord(out, len, movk(rd, lane, hw));
+        if (hw == 3) break;
+    }
+}
+
+inline fn writeWord(out: []u8, len: *usize, word: u32) void {
+    std.mem.writeInt(u32, out[len.*..][0..4], word, .little);
+    len.* += 4;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — each expected word is the objdump hex for the matching mnemonic,
+// assembled on this host with `as -arch arm64` (see the file doc comment).
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "move-wide immediates" {
+    try testing.expectEqual(@as(u32, 0xD2800500), movz(0, 40, 0)); // movz x0,#40
+    try testing.expectEqual(@as(u32, 0xD2800030), movz(16, 1, 0)); // movz x16,#1
+    try testing.expectEqual(@as(u32, 0xF2A24680), movk(0, 0x1234, 1)); // movk x0,#0x1234,lsl#16
+    try testing.expectEqual(@as(u32, 0xF2BFFFE0), movk(0, 0xFFFF, 1));
+    try testing.expectEqual(@as(u32, 0xF2DFFFE0), movk(0, 0xFFFF, 2));
+    try testing.expectEqual(@as(u32, 0xF2FFFFE0), movk(0, 0xFFFF, 3));
+}
+
+test "add/sub immediate" {
+    try testing.expectEqual(@as(u32, 0x910043FF), addImm(SP, SP, 16)); // add sp,sp,#16
+    try testing.expectEqual(@as(u32, 0xD10043FF), subImm(SP, SP, 16)); // sub sp,sp,#16
+}
+
+test "data-processing register" {
+    try testing.expectEqual(@as(u32, 0x8B010000), addReg(0, 0, 1)); // add x0,x0,x1
+    try testing.expectEqual(@as(u32, 0xCB010005), subReg(5, 0, 1)); // sub x5,x0,x1
+    try testing.expectEqual(@as(u32, 0xCB010000), subReg(0, 0, 1)); // sub x0,x0,x1
+    try testing.expectEqual(@as(u32, 0x9B017C02), mul(2, 0, 1)); // mul x2,x0,x1
+    try testing.expectEqual(@as(u32, 0x9B017C00), mul(0, 0, 1)); // mul x0,x0,x1
+    try testing.expectEqual(@as(u32, 0x9AC10C03), sdiv(3, 0, 1)); // sdiv x3,x0,x1
+    try testing.expectEqual(@as(u32, 0x9AC10C00), sdiv(0, 0, 1)); // sdiv x0,x0,x1
+    try testing.expectEqual(@as(u32, 0xCB0003E4), neg(4, 0)); // neg x4,x0
+    try testing.expectEqual(@as(u32, 0xCB0003E0), neg(0, 0)); // neg x0,x0
+}
+
+test "load/store sp-relative" {
+    try testing.expectEqual(@as(u32, 0xF90007E0), strSp(0, 8)); // str x0,[sp,#8]
+    try testing.expectEqual(@as(u32, 0xF90003E0), strSp(0, 0)); // str x0,[sp,#0]
+    try testing.expectEqual(@as(u32, 0xF94007E0), ldrSp(0, 8)); // ldr x0,[sp,#8]
+    try testing.expectEqual(@as(u32, 0xF94007E1), ldrSp(1, 8)); // ldr x1,[sp,#8]
+}
+
+test "load/store fp-relative" {
+    try testing.expectEqual(@as(u32, 0xF9400BA9), ldrFp(9, 16)); // ldr x9,[x29,#16]
+    try testing.expectEqual(@as(u32, 0xF9400FA9), ldrFp(9, 24)); // ldr x9,[x29,#24]
+    try testing.expectEqual(@as(u32, 0xF90003A9), strFp(9, 0)); // str x9,[x29,#0] (objdump-verified)
+}
+
+test "branch/system and frame constants" {
+    try testing.expectEqual(@as(u32, 0xD4001001), svc(0x80)); // svc #0x80
+    try testing.expectEqual(@as(u32, 0x94000000), bl(0)); // bl #0
+    try testing.expectEqual(@as(u32, 0xA9BF7BFD), stpFpLrPre);
+    try testing.expectEqual(@as(u32, 0x910003FD), movFpSp);
+    try testing.expectEqual(@as(u32, 0xA8C17BFD), ldpFpLrPost);
+    try testing.expectEqual(@as(u32, 0xD65F03C0), ret);
+}
+
+test "pc-relative data addressing + indirect call (M2)" {
+    try testing.expectEqual(@as(u32, 0x90000008), adrp(8, 0)); // adrp x8, 0
+    try testing.expectEqual(@as(u32, 0x90000010), adrp(16, 0)); // adrp x16, 0
+    try testing.expectEqual(@as(u32, 0x90000030), adrp(16, 4)); // adrp x16, +4 pages
+    try testing.expectEqual(@as(u32, 0xF9400210), ldrRegUoff(16, 16, 0)); // ldr x16,[x16]
+    try testing.expectEqual(@as(u32, 0xF9400E10), ldrRegUoff(16, 16, 0x18)); // ldr x16,[x16,#0x18]
+    try testing.expectEqual(@as(u32, 0xD63F0200), blr(16)); // blr x16
+    try testing.expectEqual(@as(u32, 0xAA0103E2), movReg(2, 1)); // mov x2, x1
+    try testing.expectEqual(@as(u32, 0xAA0003E1), movReg(1, 0)); // mov x1, x0
+}
+
+test "str via arbitrary base register (M9 indirect/x8 sret + struct copy)" {
+    try testing.expectEqual(@as(u32, 0xF9000100), strRegUoff(0, 8, 0)); // str x0, [x8]
+    try testing.expectEqual(@as(u32, 0xF9000501), strRegUoff(1, 8, 8)); // str x1, [x8, #8]
+    try testing.expectEqual(@as(u32, 0xF9000909), strRegUoff(9, 8, 16)); // str x9, [x8, #16]
+}
+
+test "in-place patchers preserve register fields and resolve immediates" {
+    // adrp x8,0 placeholder → adrp x8,0 (delta 0) stays 0x90000008.
+    try testing.expectEqual(@as(u32, 0x90000008), patchAdrp(adrp(8, 0), 0));
+    // adrp x16,0 placeholder patched to +4 pages → 0x90000030 (rd preserved).
+    try testing.expectEqual(@as(u32, 0x90000030), patchAdrp(adrp(16, 0), 4));
+    // add x8,x8,#0 placeholder patched to #0x4b0 → 0x9112c108 (rd/rn preserved).
+    try testing.expectEqual(@as(u32, 0x9112C108), patchAddImm12(addImm(8, 8, 0), 0x4b0));
+    // ldr x16,[x16,#0] placeholder patched to offset 0 → 0xf9400210 (rt/rn kept).
+    try testing.expectEqual(@as(u32, 0xF9400210), patchLdrUoff(ldrRegUoff(16, 16, 0), 0));
+    try testing.expectEqual(@as(u32, 0xF9400E10), patchLdrUoff(ldrRegUoff(16, 16, 0), 0x18));
+}
+
+test "compare + condition codes" {
+    try testing.expectEqual(@as(u32, 0xEB00003F), cmpReg(1, 0)); // cmp x1,x0
+    try testing.expectEqual(@as(u32, 0xEB01001F), cmpReg(0, 1)); // cmp x0,x1
+    try testing.expectEqual(@as(u32, 0xF100141F), cmpImm(0, 5)); // cmp x0,#5
+    try testing.expectEqual(@as(u32, 0xF100001F), cmpImm(0, 0)); // cmp x0,#0
+    try testing.expectEqual(@as(u32, 0xF100003F), cmpImm(1, 0)); // cmp x1,#0
+
+    try testing.expectEqual(@as(u32, 0x9A9F17E0), cset(0, .eq)); // cset x0,eq
+    try testing.expectEqual(@as(u32, 0x9A9F07E0), cset(0, .ne)); // cset x0,ne
+    try testing.expectEqual(@as(u32, 0x9A9FA7E0), cset(0, .lt)); // cset x0,lt
+    try testing.expectEqual(@as(u32, 0x9A9FC7E0), cset(0, .le)); // cset x0,le
+    try testing.expectEqual(@as(u32, 0x9A9FD7E0), cset(0, .gt)); // cset x0,gt
+    try testing.expectEqual(@as(u32, 0x9A9FB7E0), cset(0, .ge)); // cset x0,ge
+    try testing.expectEqual(@as(u32, 0x9A9FA7E2), cset(2, .lt)); // cset x2,lt
+
+    try testing.expectEqual(Cond.ge, invert(.lt));
+    try testing.expectEqual(Cond.ne, invert(.eq));
+    try testing.expectEqual(Cond.le, invert(.gt));
+    try testing.expectEqual(Cond.eq, invert(.ne));
+    try testing.expectEqual(Cond.lt, invert(.ge));
+    try testing.expectEqual(Cond.gt, invert(.le));
+}
+
+test "conditional + unconditional branches" {
+    try testing.expectEqual(@as(u32, 0x54000000), bCond(.eq, 0)); // b.eq .+0
+    try testing.expectEqual(@as(u32, 0x54000040), bCond(.eq, 2)); // b.eq .+8
+    try testing.expectEqual(@as(u32, 0x54FFFFCB), bCond(.lt, -2)); // b.lt .-8
+    try testing.expectEqual(@as(u32, 0x54FFFF8B), bCond(.lt, -4)); // b.lt .-16
+    try testing.expectEqual(@as(u32, 0x54FFFFC1), bCond(.ne, -2)); // b.ne .-8
+
+    try testing.expectEqual(@as(u32, 0xB4000000), cbz(0, 0)); // cbz x0,.+0
+    try testing.expectEqual(@as(u32, 0xB4000040), cbz(0, 2)); // cbz x0,.+8
+    try testing.expectEqual(@as(u32, 0xB4000080), cbz(0, 4)); // cbz x0,.+16
+    try testing.expectEqual(@as(u32, 0xB4FFFFC1), cbz(1, -2)); // cbz x1,.-8
+    try testing.expectEqual(@as(u32, 0xB5000000), cbnz(0, 0)); // cbnz x0,.+0
+    try testing.expectEqual(@as(u32, 0xB5FFFF80), cbnz(0, -4)); // cbnz x0,.-16
+
+    try testing.expectEqual(@as(u32, 0x14000000), b(0)); // b .+0
+    try testing.expectEqual(@as(u32, 0x14000002), b(2)); // b .+8
+    try testing.expectEqual(@as(u32, 0x17FFFFFE), b(-2)); // b .-8
+    try testing.expectEqual(@as(u32, 0x14000004), b(4)); // b .+16
+    try testing.expectEqual(@as(u32, 0x17FFFFFC), b(-4)); // b .-16
+}
+
+test "branch patchers preserve opcode + identity" {
+    try testing.expectEqual(@as(u32, 0x54000040), patchBCond(bCond(.eq, 0), 2)); // keep .eq, set +2
+    try testing.expectEqual(@as(u32, 0x54FFFFCB), patchBCond(bCond(.lt, 0), -2)); // keep .lt, set -2
+    try testing.expectEqual(@as(u32, 0xB4FFFF80), patchCbz(cbz(0, 0), -4)); // keep cbz x0, set -4
+    try testing.expectEqual(@as(u32, 0xB5FFFF80), patchCbz(cbnz(0, 0), -4)); // keep cbnz x0, set -4
+    try testing.expectEqual(@as(u32, 0x17FFFFFE), patchB(b(0), -2)); // b -2
+    try testing.expectEqual(@as(u32, 0x14000004), patchB(b(0), 4)); // b +4
+}
+
+test "movImm64 round-trips" {
+    const cases = [_]i64{ 0, 40, -1, std.math.minInt(i64), @bitCast(@as(u64, 0xFFFFFFFFFFFFFFFF)) };
+    for (cases) |value| {
+        var buf: [16]u8 = undefined;
+        var len: usize = 0;
+        movImm64(&buf, &len, 3, value);
+        try testing.expect(len % 4 == 0);
+        try testing.expect(len >= 4 and len <= 16);
+
+        // Decode the emitted movz/movk lanes back into a u64 and compare.
+        var reg: u64 = 0;
+        var i: usize = 0;
+        while (i < len) : (i += 4) {
+            const w = std.mem.readInt(u32, buf[i..][0..4], .little);
+            try testing.expectEqual(@as(u32, 3), w & 0x1F); // rd == x3
+            const hw: u6 = @intCast((w >> 21) & 0x3);
+            const imm16: u64 = (w >> 5) & 0xFFFF;
+            const is_movz = (w & 0xFF800000) == 0xD2800000;
+            const is_movk = (w & 0xFF800000) == 0xF2800000;
+            try testing.expect(is_movz or is_movk);
+            reg |= imm16 << (hw * 16);
+        }
+        try testing.expectEqual(@as(u64, @bitCast(value)), reg);
+    }
+}

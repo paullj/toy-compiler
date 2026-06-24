@@ -1,0 +1,9 @@
+# Feature: the unit type `()` as an explicit return type.
+# expect: exit 0
+# `noop` returns `()` (no value); main calls it and exits 0.
+fn noop() -> () {
+}
+fn main() -> int {
+  noop()
+  return 0
+}

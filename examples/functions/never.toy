@@ -1,0 +1,17 @@
+# Feature: a break-less `loop` has type `never` (the bottom type).
+# expect: exit 7
+# A `loop` that never falls through can stand where any value is expected, so `f`
+# type-checks without a trailing value. It loops until ready(i), then returns 7.
+fn ready(n: int) -> bool {
+  return n >= 3
+}
+fn f() -> int {
+  i := 0
+  loop {
+    if ready(i) { return 7 }
+    i = i + 1
+  }
+}
+fn main() -> int {
+  return f()
+}

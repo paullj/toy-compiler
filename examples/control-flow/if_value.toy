@@ -1,0 +1,10 @@
+# Feature: `if` as an expression (both arms yield a value).
+# expect: exit 0
+# classify(-5): n < 0 is true, so the if yields 0, returned as the exit code.
+fn classify(n: int) -> int {
+  x := if n < 0 { 0 } else { 1 }
+  return x
+}
+fn main() -> int {
+  return classify(-5)
+}

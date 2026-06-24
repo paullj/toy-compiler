@@ -1,0 +1,14 @@
+# Feature: a labeled bare block as an expression with early exits.
+# expect: exit 2
+# `@calc { ... }` yields 1 if a, 2 if b, else the trailing 3. Here a=false,
+# b=true, so `break @calc 2` makes the block's value 2.
+fn main() -> int {
+    a := false
+    b := true
+    x := @calc {
+        if a { break @calc 1 }
+        if b { break @calc 2 }
+        3
+    }
+    x
+}

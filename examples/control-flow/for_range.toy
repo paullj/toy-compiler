@@ -1,0 +1,10 @@
+# Feature: `for` over a half-open integer range.
+# expect: exit 10
+# `for i in a..b` iterates [a, b) — a inclusive, b exclusive. Sums 1+2+3+4 = 10.
+fn main() -> int {
+  s := 0
+  for i in 1..5 {
+    s = s + i
+  }
+  return s
+}

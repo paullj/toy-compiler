@@ -1,0 +1,15 @@
+# Feature: return a small (<=16B) struct by value via the register-pair ABI path.
+# expect: exit 42
+# id(p) copies its param into the return registers; the caller reads the copy:
+# 40 + 2 = 42.
+struct P { x: int, y: int }
+
+fn id(p: P) -> P {
+    return p
+}
+
+fn main() -> int {
+    p := P { x: 40, y: 2 }
+    q := id(p)
+    return q.x + q.y
+}

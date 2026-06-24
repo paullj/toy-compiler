@@ -1,0 +1,14 @@
+# Feature: a struct produced by a value-`if`, bound to a local, then fields read.
+# expect: exit 60
+# pick(1) takes the first arm yielding V3{10,20,30}; sum = 60. Works for both the
+# small (reg-pair) and large (sret) return paths.
+struct V3 { a: int, b: int, c: int }
+
+fn pick(c: int) -> V3 {
+    if c == 1 { V3 { a: 10, b: 20, c: 30 } } else { V3 { a: 1, b: 1, c: 1 } }
+}
+
+fn main() -> int {
+    p := pick(1)
+    return p.a + p.b + p.c
+}
