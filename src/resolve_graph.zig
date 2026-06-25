@@ -798,7 +798,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
 const testing = std.testing;
 const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
-const Cache = @import("driver/Cache.zig");
+const Cache = @import("query/Cache.zig");
 const Io = std.Io;
 
 const FixtureFile = struct { path: []const u8, source: []const u8 };

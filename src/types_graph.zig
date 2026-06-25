@@ -150,7 +150,7 @@ fn importTarget(graph: *const Graph.Graph, m: *const Graph.Module, decl: Ast.Nod
 // ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
-const Cache = @import("driver/Cache.zig");
+const Cache = @import("query/Cache.zig");
 const Io = std.Io;
 
 const FixtureFile = struct { path: []const u8, source: []const u8 };

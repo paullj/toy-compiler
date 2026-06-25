@@ -19,10 +19,9 @@
 const std = @import("std");
 const Io = std.Io;
 const Token = @import("../ast/Token.zig").Token;
-const Lexer = @import("../lex.zig");
-const Parser = @import("../parse.zig");
 const Ast = @import("../ast/Ast.zig");
-const Cache = @import("Cache.zig");
+const Cache = @import("../query/Cache.zig");
+const Engine = @import("../query/Engine.zig");
 
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
@@ -325,44 +324,31 @@ const Discoverer = struct {
             });
         };
 
+        // Module discovery routes lex/parse through the same query engine as the
+        // per-file pipeline, but with discovery's SWALLOW read policy (a failed
+        // cache read is a plain miss, `tmp_tag` = module id). Front-end queries
+        // ignore the engine's force/verify mode.
+        const engine = Engine.init(d.cache, .normal);
+
         // --- lex (cached) ---
-        const lex_key = Cache.Key.fromSource(.lex, d.target, source);
-        var tokens: []Token = undefined;
-        if (d.cache.get(Token, d.gpa, d.io, lex_key) catch null) |t| {
-            tokens = t;
-        } else {
-            tokens = try Lexer.tokenize(d.gpa, source);
-            d.cache.put(Token, d.io, lex_key, id, tokens) catch {};
-        }
+        const lexed = try engine.lex(d.gpa, d.io, d.target, source, id, true);
+        const tokens = lexed.value;
 
         // --- parse (cached) ---
-        const parse_key = Cache.Key.fromSource(.parse, d.target, source);
-        var tree: ?Ast.Tree = null;
-        if (d.cache.get(u8, d.gpa, d.io, parse_key) catch null) |bytes| {
-            defer d.gpa.free(bytes);
-            if (Ast.unpack(d.gpa, bytes) catch null) |t| tree = t;
+        const parsed = try engine.parse(d.gpa, d.io, d.target, source, tokens, id, true);
+        if (parsed.tree == null) {
+            const s = &d.slots.items[id];
+            s.source = source;
+            s.tokens = tokens;
+            s.loaded = true;
+            return d.fail(.{
+                .kind = .parse,
+                .message = if (parsed.diag) |dg| try d.gpa.dupe(u8, dg.message) else try d.gpa.dupe(u8, "parse error"),
+                .module = id,
+                .byte_offset = if (parsed.diag) |dg| dg.byte_offset else null,
+            });
         }
-        if (tree == null) {
-            var diag: ?Parser.Diagnostic = null;
-            if (try Parser.parse(d.gpa, tokens, source, &diag)) |t| {
-                tree = t;
-                if (Ast.pack(d.gpa, t) catch null) |blob| {
-                    defer d.gpa.free(blob);
-                    d.cache.put(u8, d.io, parse_key, id, blob) catch {};
-                }
-            } else {
-                const s = &d.slots.items[id];
-                s.source = source;
-                s.tokens = tokens;
-                s.loaded = true;
-                return d.fail(.{
-                    .kind = .parse,
-                    .message = if (diag) |dg| try d.gpa.dupe(u8, dg.message) else try d.gpa.dupe(u8, "parse error"),
-                    .module = id,
-                    .byte_offset = if (diag) |dg| dg.byte_offset else null,
-                });
-            }
-        }
+        const tree: ?Ast.Tree = parsed.tree;
 
         const s = &d.slots.items[id];
         s.source = source;

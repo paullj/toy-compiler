@@ -13,10 +13,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const Token = @import("../ast/Token.zig").Token;
-const Lexer = @import("../lex.zig");
 const Parser = @import("../parse.zig");
 const Ast = @import("../ast/Ast.zig");
-const Cache = @import("Cache.zig");
+const Cache = @import("../query/Cache.zig");
+const Engine = @import("../query/Engine.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
 const Graph = @import("Graph.zig");
@@ -26,7 +26,7 @@ const CodegenIr = @import("../codegen/CodegenIr.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
-const Fingerprint = @import("Fingerprint.zig");
+const Fingerprint = @import("../query/Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
 const version = @import("../version.zig");
@@ -127,13 +127,25 @@ pub fn run(gpa: std.mem.Allocator, io: Io, emit: Emit, target: []const u8, paths
     const results = try gpa.alloc(FileResult, paths.len);
     for (results, paths) |*r, path| r.* = .{ .path = path };
 
-    var group: Io.Group = .init;
-    for (results, 0..) |_, i| {
-        // Prefer true concurrency; if the runtime can't provide it, run inline.
-        group.concurrent(io, job, .{ gpa, io, cache, emit, target, &results[i], i }) catch
-            job(gpa, io, cache, emit, target, &results[i], i);
-    }
-    group.await(io) catch {};
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        io: Io,
+        cache: Cache,
+        emit: Emit,
+        target: []const u8,
+        results: []FileResult,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(job)) {
+            return .{ c.gpa, c.io, c.cache, c.emit, c.target, &c.results[i], i };
+        }
+    };
+    Engine.fanOut(io, results.len, job, Ctx{
+        .gpa = gpa,
+        .io = io,
+        .cache = cache,
+        .emit = emit,
+        .target = target,
+        .results = results,
+    });
 
     return results;
 }
@@ -148,15 +160,11 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     const cache_phase = emit.cachePhase();
     result.source = try Io.Dir.cwd().readFileAlloc(io, result.path, gpa, .unlimited);
 
-    // --- lex ---
-    const lex_key = Cache.Key.fromSource(.lex, target, result.source);
-    if (try cache.get(Token, gpa, io, lex_key)) |tokens| {
-        result.tokens = tokens;
-        result.tokens_cached = true;
-    } else {
-        result.tokens = try Lexer.tokenize(gpa, result.source);
-        cache.put(Token, io, lex_key, index, result.tokens) catch {};
-    }
+    // --- lex --- (routed through the query engine, the M15 seam)
+    const engine = Engine.init(cache, .normal);
+    const lexed = try engine.lex(gpa, io, target, result.source, index, false);
+    result.tokens = lexed.value;
+    result.tokens_cached = lexed.cached;
 
     if (@intFromEnum(cache_phase) < @intFromEnum(Cache.Phase.parse)) return;
 
@@ -165,31 +173,16 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     // []u8 blob and store/load it through the existing generic byte cache;
     // Ast.unpack validates a hit and treats a corrupt/foreign blob as a miss.
     result.parsed = true;
-    const parse_key = Cache.Key.fromSource(.parse, target, result.source);
-    var tree: ?Ast.Tree = null;
-    if (try cache.get(u8, gpa, io, parse_key)) |bytes| {
-        defer gpa.free(bytes);
-        if (try Ast.unpack(gpa, bytes)) |t| {
-            tree = t;
-            result.nodes_cached = true;
-        }
-    }
-    if (tree == null) {
-        var diag: ?Parser.Diagnostic = null;
-        if (try Parser.parse(gpa, result.tokens, result.source, &diag)) |t| {
-            tree = t;
-            const blob = try Ast.pack(gpa, t);
-            defer gpa.free(blob);
-            cache.put(u8, io, parse_key, index, blob) catch {};
-        } else {
-            result.diag = diag;
-            result.err = error.ParseError;
-            return;
-        }
-    }
-    result.nodes = tree.?.nodes;
-    result.extra = tree.?.extra;
-    result.pub_bits = tree.?.pub_bits;
+    const parsed = try engine.parse(gpa, io, target, result.source, result.tokens, index, false);
+    const tree = parsed.tree orelse {
+        result.diag = parsed.diag;
+        result.err = error.ParseError;
+        return;
+    };
+    result.nodes_cached = parsed.cached;
+    result.nodes = tree.nodes;
+    result.extra = tree.extra;
+    result.pub_bits = tree.pub_bits;
 
     if (!emit.runsCheck()) return;
 
@@ -210,33 +203,6 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
 }
 
 // ---- code emission (the `-o` path) -----------------------------------------
-
-/// Hash the opt config's fixed wire byte into a u64 to xor into the codegen
-/// fingerprint. Wyhash for good distribution; deterministic (the byte is a fixed
-/// packed struct with a 0 pad). The ONLY place opt level enters the cache key.
-fn optMix(cfg: Opt.Config) u64 {
-    return std.hash.Wyhash.hash(0x4f_50_54_4d, &[_]u8{cfg.bits()}); // "OPTM"
-}
-
-/// Mix a function's OWN emitted `SymName{kind,name}` into the codegen cache key.
-///
-/// WHY (M14, [Cx] cache soundness): the fingerprint folds a fn's body and its
-/// CALLEES' identities, but NOT the fn's own internal name — and a leaf fn (no
-/// callees) with identical source produces an identical fingerprint regardless of
-/// the name it is emitted under. In M14 the SAME `fn add` body is emitted bare
-/// (`add`) single-file but module-qualified (`m.add`) in a graph build; that name
-/// IS baked into the cached `FnCode.sym` (and into every caller's reloc target).
-/// Without folding it, a graph build would serve a single-file build's cached
-/// blob carrying the WRONG (bare) sym → `error.UnresolvedSymbol` at link, or worse
-/// a cross-module stale-name miscompile. Folding the own name keys each emitted
-/// identity to its own cache slot. Deterministic; the only other key input beside
-/// the pure fingerprint and `optMix`.
-fn symMix(sym: Link.SymName) u64 {
-    var h = std.hash.Wyhash.init(0x53_59_4d_4e); // "SYMN"
-    h.update(&[_]u8{@intFromEnum(sym.kind)});
-    h.update(sym.name);
-    return h.final();
-}
 
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
@@ -410,12 +376,27 @@ pub fn lowerProgram(
     defer gpa.free(slots);
     for (slots) |*s| s.* = .{};
 
-    var group: Io.Group = .init;
-    for (fn_nodes.items, 0..) |_, i| {
-        group.concurrent(io, fnJob, .{ gpa, io, cache, target, mode, &frozen, i, &slots[i] }) catch
-            fnJob(gpa, io, cache, target, mode, &frozen, i, &slots[i]);
-    }
-    group.await(io) catch {};
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        io: Io,
+        cache: Cache,
+        target: []const u8,
+        mode: CodegenIr.Mode,
+        frozen: *const Frozen,
+        slots: []FnSlot,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(fnJob)) {
+            return .{ c.gpa, c.io, c.cache, c.target, c.mode, c.frozen, i, &c.slots[i] };
+        }
+    };
+    Engine.fanOut(io, fn_nodes.items.len, fnJob, Ctx{
+        .gpa = gpa,
+        .io = io,
+        .cache = cache,
+        .target = target,
+        .mode = mode,
+        .frozen = &frozen,
+        .slots = slots,
+    });
 
     // Collect: on any job error, free everything lowered so far and propagate.
     var first_err: ?anyerror = null;
@@ -546,441 +527,11 @@ fn fnJobInner(
     slot: *FnSlot,
 ) !void {
     const fn_decl = frozen.fn_nodes[idx];
-
-    // Gather this fn's callee sigs (in walk order) and touched types for the
-    // fingerprint. The walk order is the body's call order; `collectCalleeSigs`
-    // mirrors `Fingerprint`'s walk so the supplied order matches.
-    var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
-    defer callee_sigs.deinit(gpa);
-    try walkCalls(gpa, frozen, fn_decl, &callee_sigs);
-    var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
-    defer {
-        freeTouched(gpa, touched.items);
-        touched.deinit(gpa);
-    }
-    const my_sig: ?Fingerprint.Sig = if (idx < frozen.sigs.len) frozen.sigs[idx] else null;
-    try walkTouchedSig(gpa, frozen, fn_decl, my_sig, &touched);
-
-    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
-    // Mix the opt config into the codegen key (the cached blob IS the OPTIMIZED
-    // machine code), so O0/O1 land on different entries — toggling -O can never
-    // serve a stale blob. Fingerprint stays a PURE source hash; this xor is the
-    // only place opt level enters the key. Deterministic (fixed packed byte).
     const sym = frozen.names[idx];
     const is_entry = idx == frozen.entry_fn;
-    const key = Cache.Key.fromFingerprint(.codegen, target, fp ^ optMix(frozen.opt) ^ symMix(sym));
-
-    if (mode == .verify) {
-        // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh
-        // and assert its packed FnCode bytes are byte-identical to a reference:
-        //   * cache HIT  -> compare against the stored blob (cache soundness).
-        //   * cache MISS -> compare against a SECOND fresh lowering (determinism).
-        // Either way the assertion runs unconditionally — it is NOT gated on a
-        // primed cache, so it can never silently no-op (the dead-gate bug, where
-        // `--force` skipped the cache-read branch and thus the assert entirely).
-        var opt_out: OptOut = .{};
-        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
-        errdefer fresh.deinit(gpa);
-        const fb = try Link.pack(gpa, fresh);
-        defer gpa.free(fb);
-
-        var was_cached = false;
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
-            defer gpa.free(blob);
-            std.debug.assert(std.mem.eql(u8, fb, blob));
-            was_cached = true;
-        } else {
-            // Cold: no reference blob to compare against, so lower a second time
-            // and assert the two fresh lowerings agree (pure determinism).
-            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, null);
-            defer fresh2.deinit(gpa);
-            const fb2 = try Link.pack(gpa, fresh2);
-            defer gpa.free(fb2);
-            std.debug.assert(std.mem.eql(u8, fb, fb2));
-            // Populate the cache so subsequent fns/runs see a primed entry.
-            cache.put(u8, io, key, idx, fb) catch {};
-        }
-        // A verify build re-lowers fresh, so it has honest opt stats even on a
-        // cache hit (was_cached==true). Record them.
-        slot.* = .{ .fc = fresh, .cached = was_cached, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
-        return;
-    }
-
-    if (mode != .force) {
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
-            defer gpa.free(blob);
-            if (Link.unpack(gpa, blob) catch null) |fc| {
-                slot.* = .{ .fc = fc, .cached = true };
-                return;
-            }
-        }
-    }
-
-    var opt_out: OptOut = .{};
-    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
-    errdefer fc.deinit(gpa);
-    if (Link.pack(gpa, fc) catch null) |b| {
-        defer gpa.free(b);
-        cache.put(u8, io, key, idx, b) catch {};
-    }
-    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
-}
-
-/// Dual-metric output of a fresh `lowerOne`: the summed opt counters for this fn
-/// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
-const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
-
-/// Lower one function (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a job-local
-/// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
-/// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
-/// is freed here, keeping the codegen cache ONE-TIER ([C8]). The M13 opt stage runs
-/// in-place on `irf` between lower and codegen; `opt_out` (when non-null) receives
-/// the per-fn dual-metric numbers.
-fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, sig: ?Fingerprint.Sig, opt_out: ?*OptOut) !Link.FnCode {
-    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-
-    const in: lower.Inputs = .{
-        .tree = frozen.tree,
-        .tokens = frozen.tokens,
-        .source = frozen.source,
-        .resolutions = frozen.resolutions,
-        .node_types = frozen.node_types,
-        .layouts = frozen.layouts,
-        .enum_layouts = frozen.enum_layouts,
-        .names = frozen.names,
-        .sig = sig,
-    };
-    var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
-    defer irf.deinit(gpa);
-    // A lower diagnostic (an unsupported/not-yet-lowered construct) fails the build
-    // before we emit a partial FnCode.
-    if (diags.items.len > 0) return error.CodegenDiagnostic;
-
-    // M13: run the opt stage in-place on the IR between lower and codegen. Stays
-    // ONE-TIER ([C8]) — the IR never escapes this query. With no passes enabled
-    // this is a pure no-op (the scaffold O0==O1 gate).
-    var opt_st: Opt.Stats = .{};
-    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
-    if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
-
-    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, is_entry, &diags);
-    // A codegen diagnostic means an unsupported construct slipped past the
-    // front-end; surface it as an error so the build fails cleanly rather than
-    // emitting a half-lowered function.
-    if (diags.items.len > 0) {
-        var tmp = fc;
-        tmp.deinit(gpa);
-        return error.CodegenDiagnostic;
-    }
-    return fc;
-}
-
-/// Collect the signatures of every function this fn calls, in body walk order
-/// (matching `Fingerprint`'s walk) so the fingerprint's (b) component lines up.
-fn walkCalls(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out: *std.ArrayList(Fingerprint.Sig)) !void {
-    if (idx == Ast.none) return;
-    const tree = frozen.tree;
-    const n = tree.nodes[idx];
-    switch (n.tag) {
-        .literal_number, .literal_string, .literal_bool, .identifier, .literal_unit => {},
-        .unary => try walkCalls(gpa, frozen, n.lhs, out),
-        .binary => {
-            try walkCalls(gpa, frozen, n.lhs, out);
-            try walkCalls(gpa, frozen, n.rhs, out);
-        },
-        .call => {
-            // The callee leaf is the lhs identifier; recurse it first (matches the
-            // Fingerprint walk), then record the callee identity+sig, then the args.
-            try walkCalls(gpa, frozen, n.lhs, out);
-            const res = frozen.resolutions[n.lhs];
-            // `res.func` indexes BOTH `names` (the resolved SymName{kind,name}, what
-            // the .func reloc target carries) and `sigs` (params/ret). Fold the full
-            // identity so a builtin↔user_fn shadow switch flips the caller's hash. [Cx]
-            if (res == .func and res.func < frozen.sigs.len and res.func < frozen.names.len) {
-                const sig = frozen.sigs[res.func];
-                const nm = frozen.names[res.func];
-                try out.append(gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
-            }
-            for (Ast.rangeSlice(tree, n.rhs)) |a| try walkCalls(gpa, frozen, a, out);
-        },
-        .var_decl => try walkCalls(gpa, frozen, n.lhs, out),
-        .assign => {
-            try walkCalls(gpa, frozen, n.lhs, out);
-            try walkCalls(gpa, frozen, n.rhs, out);
-        },
-        .return_stmt => if (n.lhs != Ast.none) try walkCalls(gpa, frozen, n.lhs, out),
-        .expr_stmt => try walkCalls(gpa, frozen, n.lhs, out),
-        .block => for (Ast.rangeSlice(tree, n.lhs)) |s| try walkCalls(gpa, frozen, s, out),
-        .param => try walkCalls(gpa, frozen, n.lhs, out),
-        .fn_decl => {
-            const proto = Ast.protoAt(tree, n.lhs);
-            for (proto.params) |p| try walkCalls(gpa, frozen, p, out);
-            if (proto.ret_type != Ast.none) try walkCalls(gpa, frozen, proto.ret_type, out);
-            try walkCalls(gpa, frozen, n.rhs, out);
-        },
-        .while_stmt => {
-            try walkCalls(gpa, frozen, n.lhs, out);
-            try walkCalls(gpa, frozen, n.rhs, out);
-        },
-        .if_stmt => {
-            try walkCalls(gpa, frozen, n.lhs, out);
-            const head = Ast.ifHeaderAt(tree, n.rhs);
-            try walkCalls(gpa, frozen, head.then_block, out);
-            if (head.else_node != Ast.none) try walkCalls(gpa, frozen, head.else_node, out);
-        },
-        .loop_expr => try walkCalls(gpa, frozen, n.lhs, out),
-        .for_stmt => {
-            const head = Ast.forHeaderAt(tree, n.rhs);
-            try walkCalls(gpa, frozen, head.lo, out);
-            try walkCalls(gpa, frozen, head.hi, out);
-            try walkCalls(gpa, frozen, n.lhs, out);
-        },
-        .break_stmt => if (n.lhs != Ast.none) try walkCalls(gpa, frozen, n.lhs, out),
-        .continue_stmt => {},
-        .labeled => try walkCalls(gpa, frozen, n.lhs, out),
-        // M9: order must match Fingerprint.walk (type-name lhs + inits; field recv).
-        .struct_init => {
-            try walkCalls(gpa, frozen, n.lhs, out);
-            for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkCalls(gpa, frozen, fi, out);
-        },
-        .field_init => try walkCalls(gpa, frozen, n.lhs, out),
-        .field_access => try walkCalls(gpa, frozen, n.lhs, out),
-        .struct_decl => {},
-        // M10: order must MIRROR Fingerprint.walk (the callee_sigs sequence must
-        // line up). Calls hide in payload exprs and arm bodies; patterns and
-        // decls carry no calls.
-        .enum_decl, .enum_variant_unit, .enum_variant_tuple, .enum_variant_struct => {},
-        .enum_init_unit, .pattern_variant, .pattern_wildcard, .pattern_binding, .pattern_literal, .pattern_or => {},
-        .enum_init_tuple => for (Ast.rangeSlice(tree, n.rhs)) |a| try walkCalls(gpa, frozen, a, out),
-        .enum_init_struct => for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkCalls(gpa, frozen, fi, out),
-        .match_expr => {
-            try walkCalls(gpa, frozen, n.lhs, out); // scrutinee
-            for (Ast.rangeSlice(tree, n.rhs)) |arm| try walkCalls(gpa, frozen, arm, out);
-        },
-        // guard before body — must mirror Fingerprint.walk's order so the
-        // positional callee_sigs sequence lines up.
-        .match_arm => {
-            const h = Ast.armHeaderAt(tree, n.rhs);
-            if (h.guard != Ast.none) try walkCalls(gpa, frozen, h.guard, out);
-            try walkCalls(gpa, frozen, h.body, out);
-        },
-        // Top-level decls; never reached inside a fn-body walk.
-        .program, .import_decl => {},
-    }
-}
-
-/// Collect the types this fn touches (the node types under its subtree, in walk
-/// order), each as a `TouchedType` carrying — for a struct — an index-free layout
-/// descriptor so a struct field-layout edit flips every using fn's hash (M9). The
-/// fold is what makes the M5 "touched type layouts" hook REAL. Caller frees each
-/// `layout` slice (see `freeTouched`).
-fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
-    return walkTouchedSig(gpa, frozen, idx, null, out);
-}
-
-/// `walkTouched` with the OWNING fn's signature threaded in (so the fn_decl case
-/// folds the ABI-correct param/return types). `fn_sig` is the fn's typecheck Sig
-/// (`frozen.sigs[idx]` single-file / `gf.sigs[gid]` graph) when known; null
-/// elsewhere. The sig's `params`/`ret` carry the GLOBAL struct/enum ids the
-/// typechecker resolved — including a CROSS-MODULE qualified type-ref `b: rect.Rect`
-/// (a `field_access` in type position) which `typeRefToType`'s bare-name scan would
-/// otherwise mis-resolve to the FIRST same-named type in the program-wide layout
-/// table (the cross-module M9 / TOP-RISK-#1 hole). Folding the sig types makes a
-/// pub-type LAYOUT edit reach EXACTLY the importers that name it. [design 10]
-fn walkTouchedSig(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, fn_sig: ?Fingerprint.Sig, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
-    if (idx == Ast.none) return;
-    const tree = frozen.tree;
-    const n = tree.nodes[idx];
-    if (idx < frozen.node_types.len) try appendTouched(gpa, frozen, frozen.node_types[idx], out);
-    switch (n.tag) {
-        .unary, .var_decl, .expr_stmt, .param => try walkTouched(gpa, frozen, n.lhs, out),
-        .binary, .assign, .while_stmt => {
-            try walkTouched(gpa, frozen, n.lhs, out);
-            try walkTouched(gpa, frozen, n.rhs, out);
-        },
-        .call => {
-            try walkTouched(gpa, frozen, n.lhs, out);
-            for (Ast.rangeSlice(tree, n.rhs)) |a| try walkTouched(gpa, frozen, a, out);
-        },
-        .return_stmt => if (n.lhs != Ast.none) try walkTouched(gpa, frozen, n.lhs, out),
-        .block => for (Ast.rangeSlice(tree, n.lhs)) |s| try walkTouched(gpa, frozen, s, out),
-        .fn_decl => {
-            const proto = Ast.protoAt(tree, n.lhs);
-            // Fold the DECLARED type of each param and the return type. Typecheck
-            // pass A never records node_types on the param/ret type-ref nodes (they
-            // stay .invalid), so the generic walk below would miss a struct touched
-            // ONLY via a param/return type. Resolve the type-ref by name against the
-            // struct table and fold its layout — closing the param/ret-only
-            // stale-hit hole (M9 cache soundness: fold EVERY struct a fn touches,
-            // including params and return, so an ABI-boundary edit recompiles it).
-            for (proto.params, 0..) |p, i| {
-                const pty_node = tree.nodes[p].lhs;
-                if (pty_node != Ast.none) {
-                    // Prefer the typecheck-resolved sig type (carries the right
-                    // GLOBAL id, incl. a cross-module qualified `mod.Type`); fall
-                    // back to the bare-name re-resolution when no sig is threaded.
-                    const pty = if (fn_sig) |s| (if (i < s.params.len) s.params[i] else typeRefToType(frozen, pty_node)) else typeRefToType(frozen, pty_node);
-                    try appendTouched(gpa, frozen, pty, out);
-                }
-                try walkTouched(gpa, frozen, p, out);
-            }
-            if (proto.ret_type != Ast.none) {
-                const rty = if (fn_sig) |s| s.ret else typeRefToType(frozen, proto.ret_type);
-                try appendTouched(gpa, frozen, rty, out);
-                try walkTouched(gpa, frozen, proto.ret_type, out);
-            }
-            try walkTouched(gpa, frozen, n.rhs, out);
-        },
-        .if_stmt => {
-            try walkTouched(gpa, frozen, n.lhs, out);
-            const head = Ast.ifHeaderAt(tree, n.rhs);
-            try walkTouched(gpa, frozen, head.then_block, out);
-            if (head.else_node != Ast.none) try walkTouched(gpa, frozen, head.else_node, out);
-        },
-        .loop_expr => try walkTouched(gpa, frozen, n.lhs, out),
-        .for_stmt => {
-            const head = Ast.forHeaderAt(tree, n.rhs);
-            try walkTouched(gpa, frozen, head.lo, out);
-            try walkTouched(gpa, frozen, head.hi, out);
-            try walkTouched(gpa, frozen, n.lhs, out);
-        },
-        .break_stmt => if (n.lhs != Ast.none) try walkTouched(gpa, frozen, n.lhs, out),
-        .labeled => try walkTouched(gpa, frozen, n.lhs, out),
-        // M9: a struct construction touches its type (recorded on the node above)
-        // and the field-init values; a field access touches the receiver.
-        .struct_init => {
-            try walkTouched(gpa, frozen, n.lhs, out);
-            for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkTouched(gpa, frozen, fi, out);
-        },
-        .field_init => try walkTouched(gpa, frozen, n.lhs, out),
-        .field_access => try walkTouched(gpa, frozen, n.lhs, out),
-        // M10: a variant construction touches its enum (folded on the node above)
-        // and the payload values; a match touches the scrutinee + each arm body.
-        .enum_init_tuple => for (Ast.rangeSlice(tree, n.rhs)) |a| try walkTouched(gpa, frozen, a, out),
-        .enum_init_struct => for (Ast.rangeSlice(tree, n.rhs)) |fi| try walkTouched(gpa, frozen, fi, out),
-        .match_expr => {
-            try walkTouched(gpa, frozen, n.lhs, out);
-            for (Ast.rangeSlice(tree, n.rhs)) |arm| try walkTouched(gpa, frozen, arm, out);
-        },
-        .match_arm => {
-            const h = Ast.armHeaderAt(tree, n.rhs);
-            if (h.guard != Ast.none) try walkTouched(gpa, frozen, h.guard, out);
-            try walkTouched(gpa, frozen, h.body, out);
-        },
-        else => {},
-    }
-}
-
-/// Resolve a DECLARED type-ref node (a param/return type annotation) to a Type by
-/// name, using the struct table. Builtins map to their scalar/str kinds; a struct
-/// name resolves to its `struct_id`; anything else (incl. `()`) → unit. Mirrors
-/// `lower`'s type-ref resolution so the fingerprint folds the SAME layout codegen
-/// will use, independent of node_types (which Typecheck never sets here).
-fn typeRefToType(frozen: *const Frozen, type_node: Ast.Index) Typecheck.Type {
-    const n = frozen.tree.nodes[type_node];
-    if (n.tag == .literal_unit) return Typecheck.Type.unit;
-    const name = frozen.tokens[n.main_token].text(frozen.source);
-    if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
-    if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.@"bool";
-    if (std.mem.eql(u8, name, "str")) return Typecheck.Type.str;
-    for (frozen.layouts, 0..) |l, id| {
-        if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));
-    }
-    for (frozen.enum_layouts, 0..) |e, id| {
-        if (std.mem.eql(u8, e.name, name)) return Typecheck.Type.enumT(@intCast(id));
-    }
-    return Typecheck.Type.unit;
-}
-
-/// Append a `TouchedType` for `ty`, building the struct layout descriptor bytes.
-fn appendTouched(gpa: std.mem.Allocator, frozen: *const Frozen, ty: Typecheck.Type, out: *std.ArrayList(Fingerprint.TouchedType)) !void {
-    if (ty.kind == .@"struct") {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(gpa);
-        try structLayoutBytes(gpa, frozen, ty.struct_id, &buf);
-        try out.append(gpa, .{ .kind = .@"struct", .layout = try buf.toOwnedSlice(gpa) });
-        return;
-    }
-    if (ty.kind == .@"enum") {
-        var buf: std.ArrayList(u8) = .empty;
-        errdefer buf.deinit(gpa);
-        try enumLayoutBytes(gpa, frozen, ty.enum_id, &buf);
-        try out.append(gpa, .{ .kind = .@"enum", .layout = try buf.toOwnedSlice(gpa) });
-        return;
-    }
-    try out.append(gpa, .{ .kind = ty.kind });
-}
-
-/// Index-free struct layout descriptor: name + per-field (name, kind, offset),
-/// recursing nested structs, + size + align. Editing any of these flips the bytes.
-fn structLayoutBytes(gpa: std.mem.Allocator, frozen: *const Frozen, id: u32, buf: *std.ArrayList(u8)) !void {
-    const l = frozen.layouts[id];
-    try buf.appendSlice(gpa, l.name);
-    try buf.append(gpa, 0);
-    for (l.field_names, l.field_types, l.offsets) |fn_, fty, off| {
-        try buf.appendSlice(gpa, fn_);
-        try buf.append(gpa, 0);
-        try buf.append(gpa, @intFromEnum(fty.kind));
-        var ob: [4]u8 = undefined;
-        std.mem.writeInt(u32, &ob, off, .little);
-        try buf.appendSlice(gpa, &ob);
-        if (fty.kind == .@"struct") try structLayoutBytes(gpa, frozen, fty.struct_id, buf);
-    }
-    var sz: [8]u8 = undefined;
-    std.mem.writeInt(u32, sz[0..4], l.size, .little);
-    std.mem.writeInt(u32, sz[4..8], l.@"align", .little);
-    try buf.appendSlice(gpa, &sz);
-}
-
-/// Index-free enum layout descriptor: name + tag_size + payload_off + per-variant
-/// (name + form byte + per payload field (name + kind + payload-local offset,
-/// recursing nested struct/enum)) + size + align. Editing any variant/payload
-/// flips the bytes, recompiling every using fn (M10 cache soundness).
-fn enumLayoutBytes(gpa: std.mem.Allocator, frozen: *const Frozen, id: u32, buf: *std.ArrayList(u8)) !void {
-    const e = frozen.enum_layouts[id];
-    try buf.appendSlice(gpa, e.name);
-    try buf.append(gpa, 0);
-    var hdr: [8]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], e.tag_size, .little);
-    std.mem.writeInt(u32, hdr[4..8], e.payload_off, .little);
-    try buf.appendSlice(gpa, &hdr);
-    for (e.variants) |v| {
-        try buf.appendSlice(gpa, v.name);
-        try buf.append(gpa, 0);
-        try buf.append(gpa, @intFromEnum(v.form));
-        if (v.form == .@"struct") {
-            for (v.field_names, v.field_types, v.offsets) |fn_, fty, off| {
-                try buf.appendSlice(gpa, fn_);
-                try buf.append(gpa, 0);
-                try buf.append(gpa, @intFromEnum(fty.kind));
-                var ob: [4]u8 = undefined;
-                std.mem.writeInt(u32, &ob, off, .little);
-                try buf.appendSlice(gpa, &ob);
-                if (fty.kind == .@"struct") try structLayoutBytes(gpa, frozen, fty.struct_id, buf);
-                if (fty.kind == .@"enum") try enumLayoutBytes(gpa, frozen, fty.enum_id, buf);
-            }
-        } else {
-            // A tuple variant has no field names; fold its payload types/offsets.
-            for (v.field_types, v.offsets) |fty, off| {
-                try buf.append(gpa, @intFromEnum(fty.kind));
-                var ob: [4]u8 = undefined;
-                std.mem.writeInt(u32, &ob, off, .little);
-                try buf.appendSlice(gpa, &ob);
-                if (fty.kind == .@"struct") try structLayoutBytes(gpa, frozen, fty.struct_id, buf);
-                if (fty.kind == .@"enum") try enumLayoutBytes(gpa, frozen, fty.enum_id, buf);
-            }
-        }
-    }
-    var sz: [8]u8 = undefined;
-    std.mem.writeInt(u32, sz[0..4], e.size, .little);
-    std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
-    try buf.appendSlice(gpa, &sz);
-}
-
-/// Free the layout slices owned by a `walkTouched` result.
-fn freeTouched(gpa: std.mem.Allocator, items: []const Fingerprint.TouchedType) void {
-    for (items) |t| if (t.layout.len > 0) gpa.free(t.layout);
+    const my_sig: ?Fingerprint.Sig = if (idx < frozen.sigs.len) frozen.sigs[idx] else null;
+    const engine = Engine.init(cache, mode);
+    try engine.codegen(gpa, io, target, frozen, fn_decl, sym, is_entry, my_sig, idx, slot);
 }
 
 /// The SERIAL relink tail (every build, uncached): derive `uses_write`, append
@@ -1225,12 +776,27 @@ pub fn lowerGraphProgram(
     defer gpa.free(slots);
     for (slots) |*s| s.* = .{};
 
-    var group: Io.Group = .init;
-    for (fn_decls.items, 0..) |_, i| {
-        group.concurrent(io, graphFnJob, .{ gpa, io, cache, target, mode, &gf, i, &slots[i] }) catch
-            graphFnJob(gpa, io, cache, target, mode, &gf, i, &slots[i]);
-    }
-    group.await(io) catch {};
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        io: Io,
+        cache: Cache,
+        target: []const u8,
+        mode: CodegenIr.Mode,
+        gf: *const GraphFrozen,
+        slots: []FnSlot,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(graphFnJob)) {
+            return .{ c.gpa, c.io, c.cache, c.target, c.mode, c.gf, i, &c.slots[i] };
+        }
+    };
+    Engine.fanOut(io, fn_decls.items.len, graphFnJob, Ctx{
+        .gpa = gpa,
+        .io = io,
+        .cache = cache,
+        .target = target,
+        .mode = mode,
+        .gf = &gf,
+        .slots = slots,
+    });
 
     var first_err: ?anyerror = null;
     for (slots) |s| if (s.err) |e| {
@@ -1306,67 +872,19 @@ fn graphFnJobInner(
     const gid = gf.lower_ids[lower_i];
     const sym = gf.names[gid];
     const is_entry = gid == gf.entry_id;
-
-    var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
-    defer callee_sigs.deinit(gpa);
-    try walkCalls(gpa, &frozen, fn_decl, &callee_sigs);
-    var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
-    defer {
-        freeTouched(gpa, touched.items);
-        touched.deinit(gpa);
-    }
     // Thread this fn's typecheck sig (program-wide, indexed by global id) so the
     // fn_decl param/return fold uses the ABI-correct GLOBAL type ids — including a
     // CROSS-MODULE qualified `b: rect.Rect`. A bare-name re-resolution would mis-pick
     // the first same-named type in the merged layout table, missing a pub-type
     // layout edit at the importer (cross-module M9 / TOP-RISK-#1 hole). [design 10]
     const my_sig: ?Fingerprint.Sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
-    try walkTouchedSig(gpa, &frozen, fn_decl, my_sig, &touched);
 
-    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
-    const key = Cache.Key.fromFingerprint(.codegen, target, fp ^ optMix(gf.opt) ^ symMix(sym));
-
-    if (mode == .verify) {
-        var opt_out: OptOut = .{};
-        var fresh = try lowerOne(gpa, &frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
-        errdefer fresh.deinit(gpa);
-        const fb = try Link.pack(gpa, fresh);
-        defer gpa.free(fb);
-        var was_cached = false;
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
-            defer gpa.free(blob);
-            std.debug.assert(std.mem.eql(u8, fb, blob));
-            was_cached = true;
-        } else {
-            var fresh2 = try lowerOne(gpa, &frozen, fn_decl, sym, is_entry, my_sig, null);
-            defer fresh2.deinit(gpa);
-            const fb2 = try Link.pack(gpa, fresh2);
-            defer gpa.free(fb2);
-            std.debug.assert(std.mem.eql(u8, fb, fb2));
-            cache.put(u8, io, key, lower_i, fb) catch {};
-        }
-        slot.* = .{ .fc = fresh, .cached = was_cached, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
-        return;
-    }
-
-    if (mode != .force) {
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
-            defer gpa.free(blob);
-            if (Link.unpack(gpa, blob) catch null) |fc| {
-                slot.* = .{ .fc = fc, .cached = true };
-                return;
-            }
-        }
-    }
-
-    var opt_out: OptOut = .{};
-    var fc = try lowerOne(gpa, &frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
-    errdefer fc.deinit(gpa);
-    if (Link.pack(gpa, fc) catch null) |b| {
-        defer gpa.free(b);
-        cache.put(u8, io, key, lower_i, b) catch {};
-    }
-    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+    // SAME engine codegen query as the single-file `fnJobInner`: the cross-module
+    // callee identity + touched layouts ride in through the program-wide
+    // `names`/`sigs`/`layouts` of this fn's `frozen` view, so the fingerprint folds
+    // a qualified callee distinctly with NO engine change. tmp_tag = `lower_i`.
+    const engine = Engine.init(cache, mode);
+    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, slot);
 }
 
 /// Build the program-wide index→SymName table for a graph build: one entry per
