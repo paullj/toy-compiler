@@ -1,0 +1,3 @@
+# Other half of the cycle: b imports a, which imports b.
+import a
+pub fn g() -> int { a.f() }

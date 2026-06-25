@@ -1,0 +1,8 @@
+# Feature: referencing a NON-pub decl across a module boundary is an error,
+# rendered at the importer's call site against the importer's source.
+# expect: compile-error "not exported by module 'secret'"
+import secret
+
+fn main() -> int {
+    secret.hidden()
+}

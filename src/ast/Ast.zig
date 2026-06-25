@@ -212,6 +212,20 @@ pub const Node = extern struct {
         /// `lhs` is the `extra` header of a `Range` over >=2 alternative pattern
         /// nodes; `rhs` is `none`. All alts must bind the same names/types.
         pattern_or,
+
+        // ---- M14: module imports (appended last; ordinals frozen) -----------
+
+        /// `import a/b/c [as alias]`. `main_token` is the LAST path-segment
+        /// identifier token (`c`) — the namespace this import binds by default.
+        /// `lhs` is the `extra` header of a `Range` over the path-segment TOKEN
+        /// indices (`a`,`b`,`c`, in order) — NOT node indices; the resolver
+        /// rebuilds the `/`-joined module path and the qualified symbol prefix
+        /// from them. `rhs` is the alias identifier TOKEN index for `as alias`,
+        /// or `Ast.none` for no alias. Like `break_stmt`, `rhs` (and the `lhs`
+        /// range contents) name *tokens*, not child nodes, so an `import_decl`
+        /// has no node children and the children-before-parents invariant is
+        /// vacuously satisfied.
+        import_decl,
     };
 };
 
@@ -224,10 +238,31 @@ comptime {
 
 /// A parse result: the node array plus its `extra` side array. Both are owned
 /// together and (de)serialize together via `pack`/`unpack`.
+///
+/// `pub_bits` is a packed bitset (one bit per node index) marking which decl
+/// nodes carry the `pub` modifier (M14 export visibility). It is memcpy-trivial
+/// like `nodes`/`extra` and round-trips through `pack`/`unpack`. It defaults to
+/// the empty slice so the many partial `Tree` views built across the driver
+/// (`.{ .nodes = ..., .extra = ... }`) keep compiling; `isPub` treats an absent
+/// or short bitset as "not pub", so an empty bitset means no exports.
 pub const Tree = struct {
     nodes: []Node,
     extra: []u32,
+    pub_bits: []const u32 = &.{},
+
+    /// Whether the decl node at `idx` carries `pub`. Out-of-range (or an empty
+    /// bitset) reads as `false`.
+    pub fn isPub(tree: Tree, idx: Index) bool {
+        const word = idx >> 5;
+        if (word >= tree.pub_bits.len) return false;
+        return (tree.pub_bits[word] >> @intCast(idx & 31)) & 1 != 0;
+    }
 };
+
+/// The number of `u32` words needed to hold one bit per node.
+pub fn pubBitsLen(node_count: usize) usize {
+    return (node_count + 31) >> 5;
+}
 
 /// A contiguous run of child node indices stored in `extra`, described by a
 /// two-cell header `{start, len}`. The header cell index is what a `Node`
@@ -287,19 +322,28 @@ pub const parse_magic: u32 = 0x544f5950;
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
     magic: u32,
-    version: u32 = 3,
+    /// Bumped to 4 in M14 to add the trailing `pub_bits` section; older v3 blobs
+    /// (no `pub_bits`) miss cleanly via the version check in `unpack`.
+    version: u32 = 4,
     node_count: u32,
     extra_count: u32,
+    /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
+    pub_words: u32,
 };
 
-/// Pack a `Tree` into one flat byte blob: header, then nodes, then extra.
+/// Pack a `Tree` into one flat byte blob: header, then nodes, then extra, then
+/// the `pub_bits` bitset.
 pub fn pack(gpa: std.mem.Allocator, tree: Tree) ![]u8 {
-    const total = @sizeOf(ParseHeader) + tree.nodes.len * @sizeOf(Node) + tree.extra.len * 4;
+    const total = @sizeOf(ParseHeader) +
+        tree.nodes.len * @sizeOf(Node) +
+        tree.extra.len * 4 +
+        tree.pub_bits.len * 4;
     const buf = try gpa.alloc(u8, total);
     const hdr = ParseHeader{
         .magic = parse_magic,
         .node_count = @intCast(tree.nodes.len),
         .extra_count = @intCast(tree.extra.len),
+        .pub_words = @intCast(tree.pub_bits.len),
     };
     @memcpy(buf[0..@sizeOf(ParseHeader)], std.mem.asBytes(&hdr));
     var off: usize = @sizeOf(ParseHeader);
@@ -308,6 +352,9 @@ pub fn pack(gpa: std.mem.Allocator, tree: Tree) ![]u8 {
     off += nb.len;
     const eb = std.mem.sliceAsBytes(tree.extra);
     @memcpy(buf[off .. off + eb.len], eb);
+    off += eb.len;
+    const pb = std.mem.sliceAsBytes(tree.pub_bits);
+    @memcpy(buf[off .. off + pb.len], pb);
     return buf;
 }
 
@@ -317,21 +364,26 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 3) return null;
+    if (hdr.magic != parse_magic or hdr.version != 4) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
-        @as(usize, hdr.extra_count) * 4;
+        @as(usize, hdr.extra_count) * 4 +
+        @as(usize, hdr.pub_words) * 4;
     if (bytes.len != need) return null;
 
     const nodes = try gpa.alloc(Node, hdr.node_count);
     errdefer gpa.free(nodes);
     const extra = try gpa.alloc(u32, hdr.extra_count);
+    errdefer gpa.free(extra);
+    const pub_bits = try gpa.alloc(u32, hdr.pub_words);
 
     var off: usize = @sizeOf(ParseHeader);
     @memcpy(std.mem.sliceAsBytes(nodes), bytes[off .. off + hdr.node_count * @sizeOf(Node)]);
     off += hdr.node_count * @sizeOf(Node);
     @memcpy(std.mem.sliceAsBytes(extra), bytes[off .. off + hdr.extra_count * 4]);
-    return Tree{ .nodes = nodes, .extra = extra };
+    off += hdr.extra_count * 4;
+    @memcpy(std.mem.sliceAsBytes(pub_bits), bytes[off .. off + hdr.pub_words * 4]);
+    return Tree{ .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
 }
 
 /// Write the whole program (rooted at the last node) as an S-expression.
@@ -423,9 +475,29 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .program => {
             try out.writeAll("(program");
-            for (rangeSlice(tree, n.lhs)) |fn_idx| {
+            for (rangeSlice(tree, n.lhs)) |decl_idx| {
                 try out.writeByte(' ');
-                try renderNode(out, tree, tokens, source, fn_idx);
+                // A `pub` decl renders as `(pub <decl>)` so the visibility surface
+                // is visible in the S-expression (and asserted by parse tests).
+                if (tree.isPub(decl_idx)) {
+                    try out.writeAll("(pub ");
+                    try renderNode(out, tree, tokens, source, decl_idx);
+                    try out.writeByte(')');
+                } else {
+                    try renderNode(out, tree, tokens, source, decl_idx);
+                }
+            }
+            try out.writeByte(')');
+        },
+        .import_decl => {
+            try out.writeAll("(import");
+            // Path segments are TOKEN indices in the range; render them `/`-joined.
+            for (rangeSlice(tree, n.lhs), 0..) |seg_tok, i| {
+                try out.writeByte(if (i == 0) ' ' else '/');
+                try out.writeAll(tokens[seg_tok].text(source));
+            }
+            if (n.rhs != none) {
+                try out.print(" as {s}", .{tokens[n.rhs].text(source)});
             }
             try out.writeByte(')');
         },

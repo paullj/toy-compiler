@@ -183,7 +183,8 @@ fn walk(h: *std.hash.Wyhash, tree: Ast.Tree, tokens: []const Token, source: []co
             h.update(&[_]u8{@intFromBool(head.else_node != Ast.none)});
             if (head.else_node != Ast.none) walk(h, tree, tokens, source, head.else_node);
         },
-        .program => {}, // never a fingerprint root
+        // Never a fingerprint root / never reached inside a fn-body walk.
+        .program, .import_decl => {},
         // Zero-sized leaf: the tag byte (folded before the switch) IS its content,
         // so it is structurally distinct from any other node. Reached as a value
         // literal and as a `()` type-ref (under param/fn_decl ret).

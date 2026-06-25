@@ -80,7 +80,11 @@ while IFS= read -r src; do
   fi
 
   [ "$ok" -eq 1 ] && { echo "  ok: $rel (correct, deterministic)"; pass=$((pass + 1)); }
-done < <(find "$root/examples" -name '*.toy' | sort)
+# Skip examples/modules/ — those are MULTI-module programs (a directory whose entry
+# is main.toy, the rest reached via imports); they compile only through their entry,
+# so they have their own harness (examples/modules/check.sh). Compiling a module
+# sub-file standalone here would spuriously fail (no main / unresolved imports).
+done < <(find "$root/examples" -name '*.toy' -not -path '*/modules/*' | sort)
 
 echo "---"
 echo "$pass passed, $fail failed"

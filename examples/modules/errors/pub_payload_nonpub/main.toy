@@ -1,0 +1,9 @@
+# Feature: a `pub` enum variant PAYLOAD naming a non-pub type leaks that type
+# across the module boundary (an importer can match `.Has(x)` but cannot name
+# `Inner`) — rejected, same as a pub struct field. Locked design item #4.
+# expect: compile-error "exposes non-pub type"
+import lib
+
+fn main() -> int {
+    lib.ok()
+}

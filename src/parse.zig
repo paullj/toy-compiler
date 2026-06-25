@@ -37,6 +37,9 @@ src: []const u8,
 /// Cursor into `tokens`.
 index: u32,
 nodes: std.ArrayList(Node),
+/// Node indices of top-level decls that carried a `pub` modifier (M14). Packed
+/// into the `Tree.pub_bits` bitset after the `.program` node is appended.
+pub_decls: std.ArrayList(Ast.Index),
 /// Variable-arity child runs and range/proto headers (the "extra_data" side
 /// array). See `Ast` for the encoding.
 extra: std.ArrayList(u32),
@@ -62,6 +65,7 @@ pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, 
         .index = 0,
         .nodes = .empty,
         .extra = .empty,
+        .pub_decls = .empty,
         .diag = null,
     };
     return p.parseProgram() catch |err| switch (err) {
@@ -80,6 +84,7 @@ pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, 
 fn deinit(p: *Parser) void {
     p.nodes.deinit(p.gpa);
     p.extra.deinit(p.gpa);
+    p.pub_decls.deinit(p.gpa);
 }
 
 // ---- program / declarations ------------------------------------------------
@@ -90,23 +95,84 @@ fn parseProgram(p: *Parser) Error!Ast.Tree {
 
     while (p.peek().tag == .newline) p.advance();
     while (p.peek().tag != .eof) {
+        // `import` decls have no `pub` modifier (imports are not re-exported).
+        if (p.peek().tag == .kw_import) {
+            try decls.append(p.gpa, try p.parseImport());
+            while (p.peek().tag == .newline) p.advance();
+            continue;
+        }
+        // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
+        const is_pub = p.peek().tag == .kw_pub;
+        if (is_pub) p.advance();
         const decl = switch (p.peek().tag) {
             .kw_fn => try p.parseFnDecl(),
             .kw_struct => try p.parseStructDecl(),
             .kw_enum => try p.parseEnumDecl(),
-            else => return p.fail(p.peek(), "expected a function, struct, or enum declaration"),
+            else => return p.fail(p.peek(), if (is_pub)
+                "expected a function, struct, or enum declaration after 'pub'"
+            else
+                "expected a function, struct, enum, or import declaration"),
         };
+        if (is_pub) try p.pub_decls.append(p.gpa, decl);
         try decls.append(p.gpa, decl);
         while (p.peek().tag == .newline) p.advance();
     }
-    try p.expect(.eof, "expected a function, struct, or enum declaration or end of input");
+    try p.expect(.eof, "expected a declaration or end of input");
 
     const header = try p.addRange(decls.items);
     _ = try p.addNode(.{ .tag = .program, .main_token = 0, .lhs = header, .rhs = Ast.none });
-    return Ast.Tree{
-        .nodes = try p.nodes.toOwnedSlice(p.gpa),
-        .extra = try p.extra.toOwnedSlice(p.gpa),
-    };
+
+    const nodes = try p.nodes.toOwnedSlice(p.gpa);
+    errdefer p.gpa.free(nodes);
+    const extra = try p.extra.toOwnedSlice(p.gpa);
+    errdefer p.gpa.free(extra);
+    const pub_bits = try p.buildPubBits(nodes.len);
+    // The pub-decl scratch list is fully consumed into `pub_bits`; release it on
+    // the success path (the error paths go through `p.deinit`).
+    p.pub_decls.deinit(p.gpa);
+    return Ast.Tree{ .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
+}
+
+/// Materialize the `pub_bits` bitset from the collected `pub_decls` node indices.
+/// Returns an empty slice when nothing is exported (the common single-file case),
+/// so non-module programs pay nothing.
+fn buildPubBits(p: *Parser, node_count: usize) Error![]u32 {
+    if (p.pub_decls.items.len == 0) return &.{};
+    const words = Ast.pubBitsLen(node_count);
+    const bits = try p.gpa.alloc(u32, words);
+    @memset(bits, 0);
+    for (p.pub_decls.items) |idx| {
+        bits[idx >> 5] |= @as(u32, 1) << @intCast(idx & 31);
+    }
+    return bits;
+}
+
+/// `import a/b/c [as alias]`. Path segments are `/`-separated identifiers. The
+/// node stores the segment TOKEN indices (a `Range` in `extra`) and the alias
+/// token (or `Ast.none`); `main_token` is the last segment (the default bind).
+/// `/` appears ONLY here; `.` only in access — so there is no parse ambiguity.
+fn parseImport(p: *Parser) Error!Ast.Index {
+    try p.expect(.kw_import, "expected 'import'");
+    var segs: std.ArrayList(u32) = .empty;
+    defer segs.deinit(p.gpa);
+    const first = p.index;
+    try p.expect(.identifier, "expected a module path after 'import'");
+    try segs.append(p.gpa, first);
+    while (p.peek().tag == .slash) {
+        p.advance(); // /
+        const seg = p.index;
+        try p.expect(.identifier, "expected a path segment after '/'");
+        try segs.append(p.gpa, seg);
+    }
+    var alias: Ast.Index = Ast.none;
+    if (p.peek().tag == .kw_as) {
+        p.advance(); // as
+        alias = p.index;
+        try p.expect(.identifier, "expected an alias name after 'as'");
+    }
+    const last_seg = segs.items[segs.items.len - 1];
+    const header = try p.addRange(segs.items);
+    return p.addNode(.{ .tag = .import_decl, .main_token = last_seg, .lhs = header, .rhs = alias });
 }
 
 fn parseFnDecl(p: *Parser) Error!Ast.Index {
@@ -431,8 +497,12 @@ fn parseFieldAccess(p: *Parser, recv: Ast.Index) Error!Ast.Index {
     return p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = recv, .rhs = Ast.none });
 }
 
-/// A type reference is written as an identifier (e.g. `int`, `bool`, `str`), or
-/// the unit type `()`.
+/// A type reference is written as an identifier (e.g. `int`, `bool`, `str`), the
+/// unit type `()`, or a module-qualified type `mod.Type` (M14). A qualified type
+/// reuses the `field_access` node: receiver = the module-name `identifier` leaf,
+/// `main_token` = the type-name ident after `.`. The resolver disambiguates this
+/// from value field access by its type position. `/` never appears in a type —
+/// only `.` — so this stays unambiguous with the `import` path grammar.
 fn parseType(p: *Parser) Error!Ast.Index {
     if (p.peek().tag == .l_paren and p.peek2().tag == .r_paren) {
         const at = p.index;
@@ -442,7 +512,17 @@ fn parseType(p: *Parser) Error!Ast.Index {
     }
     const at = p.index;
     try p.expect(.identifier, "expected a type name");
-    return p.addNode(.{ .tag = .identifier, .main_token = at, .lhs = Ast.none, .rhs = Ast.none });
+    var ty = try p.addNode(.{ .tag = .identifier, .main_token = at, .lhs = Ast.none, .rhs = Ast.none });
+    // A `.ident` chain qualifies the type by its owning module (`mod.Type`). The
+    // chain nests left like value field access, so a deeper `a.b.C` is supported
+    // structurally (the resolver decides what is legal).
+    while (p.peek().tag == .dot) {
+        p.advance(); // .
+        const field_tok = p.index;
+        try p.expect(.identifier, "expected a type name after '.'");
+        ty = try p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = ty, .rhs = Ast.none });
+    }
+    return ty;
 }
 
 fn parseBlock(p: *Parser) Error!Ast.Index {
@@ -947,6 +1027,7 @@ fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const 
         .index = 0,
         .nodes = .empty,
         .extra = .empty,
+        .pub_decls = .empty,
         .diag = null,
     };
     const run = struct {
@@ -976,6 +1057,7 @@ fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const 
 fn freeTree(gpa: std.mem.Allocator, tree: Ast.Tree) void {
     gpa.free(tree.nodes);
     gpa.free(tree.extra);
+    if (tree.pub_bits.len != 0) gpa.free(@constCast(tree.pub_bits));
 }
 
 fn expectSexpr(source: []const u8, want: []const u8) !void {
@@ -1436,6 +1518,142 @@ test "struct program pack/unpack byte round-trip" {
 
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
     try testing.expectEqualSlices(u32, tree.extra, got.extra);
+}
+
+// M14: imports, pub, qualified access/types
+
+test "import binds the last path segment" {
+    try expectProgram(
+        "import geometry/rect\nfn main() {}\n",
+        "(program (import geometry/rect) (fn main () _ (block)))",
+    );
+}
+
+test "single-segment import parses" {
+    try expectProgram(
+        "import util\nfn main() {}\n",
+        "(program (import util) (fn main () _ (block)))",
+    );
+}
+
+test "import with alias parses" {
+    try expectProgram(
+        "import geometry/rect as r\nfn main() {}\n",
+        "(program (import geometry/rect as r) (fn main () _ (block)))",
+    );
+}
+
+test "deep import path parses" {
+    try expectProgram(
+        "import a/b/c/d\nfn main() {}\n",
+        "(program (import a/b/c/d) (fn main () _ (block)))",
+    );
+}
+
+test "pub fn renders with a pub wrapper" {
+    try expectProgram(
+        "pub fn area() -> int { 0 }\n",
+        "(program (pub (fn area () int (block 0))))",
+    );
+}
+
+test "pub struct and pub enum parse" {
+    try expectProgram(
+        "pub struct Rect { w: int, h: int }\npub enum Shape { Empty }\n",
+        "(program (pub (struct Rect (param w int) (param h int))) (pub (enum Shape (variant.unit Empty))))",
+    );
+}
+
+test "non-pub decl stays bare among pub decls" {
+    try expectProgram(
+        "pub fn a() -> int { 0 }\nfn b() -> int { 1 }\n",
+        "(program (pub (fn a () int (block 0))) (fn b () int (block 1)))",
+    );
+}
+
+test "qualified member call parses via field_access" {
+    // `rect.area()` is a call whose callee is a field_access (module member).
+    try expectProgram(
+        "fn main() -> int { rect.area() }\n",
+        "(program (fn main () int (block (call (. rect area)))))",
+    );
+}
+
+test "qualified type in a param parses via field_access" {
+    try expectProgram(
+        "fn f(r: rect.Rect) -> int { 0 }\n",
+        "(program (fn f ((param r (. rect Rect))) int (block 0)))",
+    );
+}
+
+test "qualified type as a return type parses" {
+    try expectProgram(
+        "fn make() -> rect.Rect { Point { x: 1 } }\n",
+        "(program (fn make () (. rect Rect) (block (new Point (field x 1)))))",
+    );
+}
+
+test "qualified type in a struct field parses" {
+    try expectProgram(
+        "struct Scene { r: rect.Rect }\n",
+        "(program (struct Scene (param r (. rect Rect))))",
+    );
+}
+
+test "module-qualified variant construction parses (3-level field_access)" {
+    // `m.Color.Red` — receiver field_access (m.Color) carries the variant tail.
+    try expectProgram(
+        "fn f() -> int { c := m.Color.Red\n 0 }\n",
+        "(program (fn f () int (block (:= c (. (. m Color) Red)) 0)))",
+    );
+}
+
+test "pub modifier requires a declaration" {
+    const gpa = testing.allocator;
+    const source = "pub import a/b\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var diag: ?Diagnostic = null;
+    const result = try parse(gpa, tokens, source, &diag);
+    try testing.expect(result == null);
+    try testing.expect(diag != null);
+}
+
+test "import path missing a segment after slash is an error" {
+    const gpa = testing.allocator;
+    const source = "import a/\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var diag: ?Diagnostic = null;
+    const result = try parse(gpa, tokens, source, &diag);
+    try testing.expect(result == null);
+    try testing.expect(diag != null);
+}
+
+test "import pack/unpack byte round-trip carries pub_bits" {
+    const gpa = testing.allocator;
+    const source = "import geometry/rect as r\npub fn area() -> int { 0 }\nfn helper() -> int { 1 }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var diag: ?Diagnostic = null;
+    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    defer freeTree(gpa, tree);
+
+    // Exactly the `area` fn_decl node is pub; `helper` is not.
+    var pub_count: usize = 0;
+    for (tree.nodes, 0..) |node, i| {
+        if (node.tag == .fn_decl and tree.isPub(@intCast(i))) pub_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), pub_count);
+
+    const blob = try Ast.pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try Ast.unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer freeTree(gpa, got);
+
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, tree.extra, got.extra);
+    try testing.expectEqualSlices(u32, tree.pub_bits, got.pub_bits);
 }
 
 test "program pack/unpack byte round-trip" {

@@ -1,5 +1,5 @@
 # Feature: SHOULD FAIL — top-level expressions are not allowed.
-# expect: compile-error "expected a function, struct, or enum declaration"
-# A file's top level may only contain `fn`, `struct`, and `enum` declarations, so
-# a bare expression here is rejected by the parser.
+# expect: compile-error "expected a function, struct, enum, or import declaration"
+# A file's top level may only contain `fn`, `struct`, `enum`, and `import`
+# declarations, so a bare expression here is rejected by the parser.
 1 + 2 * 3 - -4 == 5

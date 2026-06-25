@@ -1,0 +1,19 @@
+# Feature: a module that itself imports another (`geometry/vec`) and re-exports a
+# pub type built ON TOP of a cross-module type — `Rect.origin` is a `vec.Vec`.
+# `scale` is PRIVATE (no `pub`): it is callable here but not from an importer.
+import geometry/vec
+
+# A qualified type (`vec.Vec`) in a pub field forces `vec.Vec` to be pub too,
+# else an importer naming `Rect` could not name the field's type.
+pub struct Rect { origin: vec.Vec, w: int, h: int }
+
+pub fn make(x: int, y: int, w: int, h: int) -> Rect {
+    Rect { origin: vec.new(x, y), w: w, h: h }
+}
+
+pub fn area(r: Rect) -> int {
+    scale(r.w) * r.h
+}
+
+# Private helper: a body change here invalidates only this fn, never importers.
+fn scale(n: int) -> int { n }

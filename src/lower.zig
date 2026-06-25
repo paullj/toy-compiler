@@ -33,6 +33,7 @@ const Resolve = @import("resolve.zig");
 const Typecheck = @import("types.zig");
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
+const Sig = @import("symbols/Sig.zig").Sig;
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 /// The read-only front-end inputs a lowering needs. Mirrors the slice of
@@ -47,6 +48,18 @@ pub const Inputs = struct {
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
+    /// This fn's typecheck-resolved signature (param/return `Type`s carrying the
+    /// ABI-correct GLOBAL struct/enum ids), or `null` in single-file table mode.
+    ///
+    /// In graph mode two modules may each declare a same-named `struct Point` with
+    /// DISTINCT global layout ids/sizes. `typeFromRef`'s bare-name first-match scan
+    /// cannot tell them apart, so a fn naming its OWN `Point` could be lowered with
+    /// the wrong layout — taking the <=16B reg-pair vs >16B sret ABI decision on the
+    /// wrong size and miscompiling/hanging. When present, this sig is the ABI-
+    /// deciding source for struct/enum param/return types (it already carries the
+    /// owning module's id, including a qualified cross-module `b: rect.Rect` resolved
+    /// by `Typecheck.typeFromQualified`); `typeFromRef` is only the fallback.
+    sig: ?Sig = null,
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -449,10 +462,15 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
         .binary => return try lowerBinary(b, node_idx, n),
         .call => {
             // A qualified tuple-variant construction `N.V(args)` arrives as a
-            // `.call` whose CALLEE is a field_access over the enum type-name (a
-            // real enum-returning call has an IDENTIFIER callee). Route the former
-            // to variant construction; the latter to a normal call.
-            if (ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access) {
+            // `.call` whose CALLEE is a field_access over the enum type-name. A
+            // cross-module enum-RETURNING call `mod.fn(args)` has the SAME shape,
+            // so the two are distinguished by the callee's resolution: a real call
+            // binds its field_access callee to a `.func`; a variant constructor's
+            // receiver binds to a type and the callee stays unresolved. (Without
+            // this guard a `mod.fn(args)` returning an enum is mis-routed to
+            // variant construction → infinite recursion / wrong-layout inline.)
+            const callee_is_func = b.in.resolutions[n.lhs] == .func;
+            if (ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access and !callee_is_func) {
                 return try aggregateValue(b, node_idx, ty);
             }
             return try lowerCall(b, node_idx, n);
@@ -686,7 +704,16 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
             }
         },
         .call => {
-            if (ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access) {
+            // A qualified `N.V(args)` enum CONSTRUCTION and a cross-module CALL
+            // returning an enum `mod.fn(args)` both parse as a `.call` over a
+            // `field_access` callee. They are distinguished by the callee's
+            // RESOLUTION: a real call's field_access binds to a `.func` (the
+            // resolver/typecheck resolved it to a fn id); a variant constructor's
+            // receiver binds to a type and the callee field_access stays unresolved.
+            // Misclassifying a cross-module enum-returning call as construction
+            // inlines a (wrong-layout) variant and drops the call → miscompile.
+            const callee_is_func = b.in.resolutions[n.lhs] == .func;
+            if (ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access and !callee_is_func) {
                 try lowerEnumInitInto(b, expr, dst_ptr, ty);
             } else {
                 try copyAggInto(b, expr, dst_ptr, ty);
@@ -1620,6 +1647,11 @@ fn localSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMe
 fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
     if (proto.ret_type == Ast.none) return Typecheck.Type.unit;
     if (in.tree.nodes[proto.ret_type].tag == .literal_unit) return Typecheck.Type.unit;
+    // Prefer the typecheck-resolved sig for aggregates: it carries the GLOBAL
+    // struct/enum id (incl. a cross-module qualified `mod.Type`), so the ABI
+    // decision is taken on the correct layout. `typeFromRef`'s bare-name scan
+    // can alias two modules' same-named distinct types — never on the ABI path.
+    if (in.sig) |s| if (s.ret.kind == .@"struct" or s.ret.kind == .@"enum") return s.ret;
     return typeFromRef(in, proto.ret_type);
 }
 
@@ -1627,6 +1659,12 @@ fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
 /// its type-ref token spelling.
 fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
     const param_node = proto.params[slot];
+    // Prefer the typecheck-resolved sig for aggregates (correct GLOBAL id, incl.
+    // cross-module qualified types) so the param ABI decision is ABI-correct.
+    if (in.sig) |s| if (slot < s.params.len) {
+        const pt = s.params[slot];
+        if (pt.kind == .@"struct" or pt.kind == .@"enum") return pt;
+    };
     if (param_node < in.node_types.len) {
         const t = in.node_types[param_node];
         if (t.kind != .invalid) return t;

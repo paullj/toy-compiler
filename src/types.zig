@@ -179,12 +179,93 @@ pub const Result = struct {
     }
 };
 
+// ---- M14 graph typecheck (program-wide layout + cross-module check) --------
+
+/// One module's parsed + resolved inputs for the graph typecheck.
+pub const GraphModuleInput = struct {
+    tree: Ast.Tree,
+    tokens: []const Token,
+    source: []const u8,
+    resolutions: []const Resolution,
+    /// Import namespace name → imported module id, owned by the caller.
+    namespaces: std.StringHashMapUnmanaged(u32),
+};
+
+/// A global function descriptor (parallel to the resolver's global fn table).
+/// `decl_node == Ast.none` is the synthetic bodyless `print`.
+pub const GraphFnInput = struct {
+    decl_node: Ast.Index,
+    /// Owning module id; ignored when `decl_node == Ast.none`.
+    module: u32,
+    /// Whether this fn is `pub` (drives the pub-signature-coherence check).
+    is_pub: bool,
+    /// Module-qualified symbol name (used in the coherence diagnostic).
+    name: []const u8,
+};
+
+/// The whole-graph typecheck output. Caller owns it; free with `deinitGraph`.
+/// `node_types` is per-module; `layouts`/`enum_layouts`/`sigs` are PROGRAM-WIDE
+/// (global ids), exactly as the lowering stage's Frozen needs.
+pub const GraphResult = struct {
+    /// One `[]Type` per module (parallel to that module's node array).
+    node_types: [][]Type,
+    /// Diagnostics tagged with their owning module id.
+    diags: []GraphDiagnostic,
+    owned_msgs: [][]u8,
+    /// One Sig per GLOBAL fn id (parallel to the resolver's global fn table).
+    sigs: []Sig,
+    /// Program-wide struct table (one Layout per global struct id).
+    layouts: []Layout,
+    /// Program-wide enum table (one EnumLayout per global enum id).
+    enum_layouts: []EnumLayout,
+
+    pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
+        for (self.node_types) |nt| gpa.free(nt);
+        gpa.free(self.node_types);
+        gpa.free(self.diags);
+        for (self.owned_msgs) |m| gpa.free(m);
+        gpa.free(self.owned_msgs);
+        for (self.sigs) |s| gpa.free(@constCast(s.params));
+        gpa.free(self.sigs);
+        for (self.layouts) |l| {
+            gpa.free(l.name);
+            for (l.field_names) |fn_| gpa.free(fn_);
+            gpa.free(l.field_names);
+            gpa.free(l.field_types);
+            gpa.free(l.offsets);
+        }
+        gpa.free(self.layouts);
+        for (self.enum_layouts) |e| {
+            gpa.free(e.name);
+            for (e.variants) |v| {
+                for (v.field_names) |fn_| gpa.free(fn_);
+                gpa.free(v.field_names);
+                gpa.free(v.field_types);
+                gpa.free(v.offsets);
+            }
+            gpa.free(e.variants);
+        }
+        gpa.free(self.enum_layouts);
+        self.* = undefined;
+    }
+};
+
+/// A typecheck diagnostic that knows which module's source it points into.
+pub const GraphDiagnostic = struct {
+    module: u32,
+    byte_offset: u32,
+    message: []const u8,
+};
+
 /// A top-level function's signature, decoded once up front so calls can be
 /// checked against it (and forward references work).
 const FnSym = struct {
     decl_node: Ast.Index,
     params: []Type,
     ret: Type,
+    /// Owning module id (graph mode). 0 in single-file mode. The check loops
+    /// switch the active tree/tokens/source to this module before checking.
+    mod: u32 = 0,
 };
 
 /// A struct's resolved symbol: its decl node, name, and (after layout) per-field
@@ -201,6 +282,10 @@ const StructSym = struct {
     @"align": u32 = 1,
     state: LayoutState = .unseen,
     poisoned: bool = false,
+    /// Owning module id (graph mode); 0 single-file. Layout switches to it.
+    mod: u32 = 0,
+    /// Whether the struct decl is `pub` (graph mode; pub-signature coherence).
+    pub_export: bool = false,
 };
 
 /// One variant in the scratch enum table (during layout). `field_names`/`name`
@@ -228,6 +313,10 @@ const EnumSym = struct {
     @"align": u32 = 8,
     state: LayoutState = .unseen,
     poisoned: bool = false,
+    /// Owning module id (graph mode); 0 single-file. Layout switches to it.
+    mod: u32 = 0,
+    /// Whether the enum decl is `pub` (graph mode; pub-signature coherence).
+    pub_export: bool = false,
 };
 
 /// Natural size/align of a scalar/str type (struct sizes come from the table).
@@ -276,6 +365,13 @@ resolutions: []const Resolution,
 node_types: []Type,
 diags: std.ArrayList(Diagnostic),
 owned_msgs: std.ArrayList([]u8),
+/// Graph mode only: the owning module id for each entry in `diags` (parallel).
+/// Lets the orchestrator render each cross-module diagnostic against the right
+/// source. Empty in single-file mode.
+diag_mods: std.ArrayList(u32) = .empty,
+/// Graph mode only: per-module node_types slices. `gphSelect` redirects the
+/// active `node_types` to the selected module's slice. Null single-file.
+gph_node_types: ?[][]Type = null,
 
 /// Function table, parallel to `Resolve`'s `func` indices: the resolver assigns
 /// function indices in source order, and so do we (Pass A below).
@@ -299,6 +395,83 @@ enum_map: std.StringHashMapUnmanaged(u32),
 /// fn arg/return, assign target, or match-arm body). Saved/restored around the
 /// node it flows into; consumed ONLY by an inferred `enum_init_*` (lhs == none).
 expected: ?Type = null,
+
+/// M14 graph context. `null` for the single-file `check` path (everything below
+/// is local). When set (the `types_graph` orchestrator drives one shared
+/// `Typecheck` across the whole module graph), the `structs`/`enums`/`fns`
+/// tables are PROGRAM-WIDE (global ids), and `struct_map`/`enum_map` hold the
+/// CURRENT module's bare-name → global-id bindings (swapped per module). The
+/// context resolves a qualified `mod.Type` / `mod.Enum` receiver to the owning
+/// module's tables. Pre-collect + layout happen once; only Pass B runs per fn.
+graph: ?*GraphCtx = null,
+
+/// The active module being type-checked / laid out (graph mode). Single-file
+/// leaves it 0. Used to pick the import-namespace table for qualified receivers.
+graph_mod: u32 = 0,
+
+/// The graph context the orchestrator hands the shared `Typecheck`. It owns the
+/// per-module bare-name maps + the import namespaces; `Typecheck` borrows it.
+pub const GraphCtx = struct {
+    /// One entry per module (index = graph module id). MUTABLE: type registration
+    /// fills each module's `struct_ids`/`enum_ids` in place (a put that grows
+    /// reallocs the map header, which must be reflected in the ctx, not a copy).
+    mods: []ModuleCtx,
+
+    pub const ModuleCtx = struct {
+        /// Per-module tree view (selected as the active tree when checking/laying
+        /// out a decl owned by this module).
+        tree: Ast.Tree,
+        tokens: []const Token,
+        source: []const u8,
+        /// This module's resolution array (parallel to its node array).
+        resolutions: []const Resolution,
+        /// Bare struct name → GLOBAL struct id (this module's own decls only).
+        struct_ids: std.StringHashMapUnmanaged(u32) = .empty,
+        /// Bare enum name → GLOBAL enum id.
+        enum_ids: std.StringHashMapUnmanaged(u32) = .empty,
+        /// Import namespace name → imported module id (graph module id).
+        namespaces: std.StringHashMapUnmanaged(u32) = .empty,
+    };
+
+    /// Resolve an import namespace receiver name in module `mod` to the imported
+    /// module's id, or null if the name is not a namespace there.
+    fn namespaceOfIn(c: *const GraphCtx, mod: u32, recv_name: []const u8) ?u32 {
+        return c.mods[mod].namespaces.get(recv_name);
+    }
+};
+
+/// Switch the active tree/tokens/source/resolutions + bare-name maps to module
+/// `mod` (graph mode). Returns the previous active module so the caller can
+/// restore it (layout recursion crosses module boundaries). No-op single-file.
+fn gphSelect(t: *Typecheck, mod: u32) u32 {
+    const prev = t.graph_mod;
+    const g = t.graph orelse return prev;
+    const mc = &g.mods[mod];
+    t.tree = mc.tree;
+    t.tokens = mc.tokens;
+    t.source = mc.source;
+    t.resolutions = mc.resolutions;
+    // The active bare-name maps are read via `activeStructMap`/`activeEnumMap`,
+    // which dereference ctx.mods[graph_mod] directly (the maps live in the ctx, so
+    // a `put` that grows is reflected — copying the map struct into `t` would
+    // strand reallocations on a stale header).
+    if (t.gph_node_types) |nts| t.node_types = nts[mod];
+    t.graph_mod = mod;
+    return prev;
+}
+
+/// The active bare-name → global-struct-id map: the current module's table in
+/// graph mode, else the single-file `struct_map`.
+fn activeStructMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
+    if (t.graph) |g| return &g.mods[t.graph_mod].struct_ids;
+    return &t.struct_map;
+}
+
+/// The active bare-name → global-enum-id map (per active module in graph mode).
+fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
+    if (t.graph) |g| return &g.mods[t.graph_mod].enum_ids;
+    return &t.enum_map;
+}
 
 /// Typecheck a resolved tree. Caller owns the returned `Result`.
 pub fn check(
@@ -492,6 +665,361 @@ pub fn check(
     };
 }
 
+/// Whole-graph typecheck (M14). Builds ONE program-wide layout table (global
+/// struct/enum ids assigned in module-id then decl order — same-named types in
+/// different modules are DISTINCT ids), resolves qualified `mod.Type` refs to the
+/// owning module's id, checks every fn body cross-module against the resolver's
+/// GLOBAL fn table, and enforces pub-signature coherence (a pub fn may not name a
+/// non-pub type in its param/return). `mods` is parallel to the module graph;
+/// `fns` is parallel to the resolver's global fn table (`print` last, bodyless).
+/// Caller owns the returned `GraphResult`.
+pub fn checkGraph(
+    gpa: std.mem.Allocator,
+    ctx: *GraphCtx,
+    mods: []const GraphModuleInput,
+    fns: []const GraphFnInput,
+) !GraphResult {
+    // Per-module node_types (parallel to each module's node array).
+    const node_types = try gpa.alloc([]Type, mods.len);
+    var nt_built: usize = 0;
+    errdefer {
+        for (node_types[0..nt_built]) |nt| gpa.free(nt);
+        gpa.free(node_types);
+    }
+    for (mods, 0..) |m, i| {
+        const nt = try gpa.alloc(Type, m.tree.nodes.len);
+        @memset(nt, .invalid);
+        node_types[i] = nt;
+        nt_built += 1;
+    }
+
+    var t: Typecheck = .{
+        .gpa = gpa,
+        // Active views start on module 0; gphSelect swaps them per decl.
+        .tree = if (mods.len != 0) mods[0].tree else .{ .nodes = &.{}, .extra = &.{} },
+        .tokens = if (mods.len != 0) mods[0].tokens else &.{},
+        .source = if (mods.len != 0) mods[0].source else &.{},
+        .resolutions = if (mods.len != 0) mods[0].resolutions else &.{},
+        .node_types = if (mods.len != 0) node_types[0] else &.{},
+        .diags = .empty,
+        .owned_msgs = .empty,
+        .fns = .empty,
+        .slot_types = .empty,
+        .cur_ret = .unit,
+        .loop_stack = .empty,
+        .structs = .empty,
+        .struct_map = .empty, // unused in graph mode (per-module maps live in ctx)
+        .enums = .empty,
+        .enum_map = .empty,
+        .graph = ctx,
+    };
+    defer {
+        for (t.fns.items) |f| gpa.free(f.params);
+        t.fns.deinit(gpa);
+        t.slot_types.deinit(gpa);
+        t.loop_stack.deinit(gpa);
+        for (t.enums.items) |e| {
+            for (e.variants) |v| {
+                gpa.free(v.field_names);
+                gpa.free(v.field_types);
+                gpa.free(v.offsets);
+            }
+            gpa.free(e.variants);
+        }
+        t.enums.deinit(gpa);
+        // In graph mode the bare-name maps live in the ctx (accessed via
+        // activeStructMap/activeEnumMap); `t.struct_map`/`t.enum_map` stay the
+        // empty init maps (own nothing) — deinit is a safe no-op. The CALLER owns
+        // and frees the ctx maps.
+        t.struct_map.deinit(gpa);
+        t.enum_map.deinit(gpa);
+        for (t.structs.items) |s| {
+            gpa.free(s.field_names);
+            gpa.free(s.field_types);
+            gpa.free(s.offsets);
+        }
+        t.structs.deinit(gpa);
+        t.diag_mods.deinit(gpa);
+    }
+    errdefer {
+        t.diags.deinit(gpa);
+        for (t.owned_msgs.items) |m| gpa.free(m);
+        t.owned_msgs.deinit(gpa);
+    }
+
+    // Point node_types at the active module's slice as we switch modules. The
+    // Typecheck writes through t.node_types; redirect it in gphSelect-like fashion
+    // by wiring each module's slice here (checkFn/layout set t via the ctx tree but
+    // node_types is not part of ctx, so set it alongside graph_mod transitions).
+    t.gph_node_types = node_types;
+
+    try t.runGraph(mods, fns);
+
+    // ---- snapshot: sigs (qualified names from `fns`) ----
+    const sigs = try gpa.alloc(Sig, t.fns.items.len);
+    errdefer gpa.free(sigs);
+    var sigs_built: usize = 0;
+    errdefer for (sigs[0..sigs_built]) |s| gpa.free(@constCast(s.params));
+    for (t.fns.items, 0..) |f, i| {
+        const kind: symbols.SymKind = if (f.decl_node == Ast.none) .builtin else .user_fn;
+        const name = if (i < fns.len) fns[i].name else "print";
+        sigs[i] = .{ .kind = kind, .name = name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
+        sigs_built += 1;
+    }
+
+    // ---- snapshot: layouts + enum_layouts (program-wide) ----
+    const layouts = try snapshotLayouts(gpa, t.structs.items);
+    errdefer freeLayouts(gpa, layouts);
+    const enum_layouts = try snapshotEnumLayouts(gpa, t.enums.items);
+    errdefer freeEnumLayouts(gpa, enum_layouts);
+
+    // ---- snapshot: diagnostics tagged with their owning module ----
+    const diags = try gpa.alloc(GraphDiagnostic, t.diags.items.len);
+    errdefer gpa.free(diags);
+    for (t.diags.items, 0..) |d, i| {
+        diags[i] = .{
+            .module = if (i < t.diag_mods.items.len) t.diag_mods.items[i] else 0,
+            .byte_offset = d.byte_offset,
+            .message = d.message,
+        };
+    }
+    // Free the diags ArrayList backing buffer (messages are kept alive via
+    // owned_msgs, transferred to the result below). Reset to empty so the top
+    // errdefer's `t.diags.deinit` stays a safe no-op if a later step fails.
+    t.diags.deinit(gpa);
+    t.diags = .empty;
+
+    return GraphResult{
+        .node_types = node_types,
+        .diags = diags,
+        .owned_msgs = try t.owned_msgs.toOwnedSlice(gpa),
+        .sigs = sigs,
+        .layouts = layouts,
+        .enum_layouts = enum_layouts,
+    };
+}
+
+/// The graph driver: register all types globally, lay them out, decode all fn
+/// sigs, check pub-signature coherence, then check every fn body.
+fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnInput) !void {
+    // Phase 0: register every module's struct + enum names into ONE global id
+    // space, deterministically (module-id order, then decl order). Structs first
+    // across ALL modules, then enums, so the id spaces are independent + stable.
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod);
+        if (t.tree.nodes.len == 0) continue;
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
+        if (prog.tag != .program) continue;
+        try t.registerStructs(Ast.rangeSlice(t.tree, prog.lhs), mod);
+    }
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod);
+        if (t.tree.nodes.len == 0) continue;
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
+        if (prog.tag != .program) continue;
+        try t.registerEnums(Ast.rangeSlice(t.tree, prog.lhs), mod);
+    }
+
+    // Phase 0b: lay out every struct then every enum (global id order). Each
+    // layoutStruct/layoutEnum switches to its owning module; nested/qualified
+    // referents recurse cross-module and restore the active module on return.
+    for (0..t.structs.items.len) |id| try t.layoutStruct(@intCast(id));
+    for (0..t.enums.items.len) |id| try t.layoutEnum(@intCast(id));
+
+    // Phase A: decode every fn signature into the GLOBAL fn table, in the exact
+    // order of `fns` (parallel to the resolver's global fn ids), so `.func` ids
+    // index this table directly. The synthetic bodyless `print` is one of them.
+    for (fns) |gf| {
+        if (gf.decl_node == Ast.none) {
+            try t.appendPrint();
+        } else {
+            _ = t.gphSelect(gf.module);
+            try t.decodeFnSig(gf.decl_node, gf.module);
+        }
+    }
+
+    // Phase A2: pub-signature coherence. A `pub` fn that names a NON-pub type in a
+    // param/return position is an error (an importer could not name that type).
+    try t.checkPubSignatures(fns);
+
+    // Phase B: check each fn body in its owning module (skip bodyless `print`).
+    for (t.fns.items) |f| {
+        if (f.decl_node == Ast.none) continue;
+        try t.checkFn(f);
+    }
+}
+
+/// A `pub` fn must not expose a non-`pub` type: if any param/return type resolves
+/// to a struct/enum whose decl is not `pub`, an importer naming the fn could not
+/// name the type. Diagnose against the owning module + the offending type-ref.
+fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
+    for (fns, 0..) |gf, i| {
+        if (gf.decl_node == Ast.none or !gf.is_pub) continue;
+        _ = t.gphSelect(gf.module);
+        const f = t.fns.items[i];
+        const decl = t.tree.nodes[f.decl_node];
+        const proto = Ast.protoAt(t.tree, decl.lhs);
+        for (proto.params, f.params) |param_idx, pty| {
+            try t.checkPubType(pty, t.tree.nodes[param_idx].main_token, "function", gf.name);
+        }
+        if (proto.ret_type != Ast.none)
+            try t.checkPubType(f.ret, t.tree.nodes[proto.ret_type].main_token, "function", gf.name);
+    }
+
+    // A `pub` struct FIELD or `pub` enum variant PAYLOAD that names a non-pub type
+    // leaks it across the boundary exactly as a fn param/return would (an importer
+    // can read the field / destructure the variant but cannot name the type) — locked
+    // design item #4: "a pub signature naming a type forces that type pub" applies to
+    // FIELD types too. Per-type checking makes this transitive: a pub type embedded in
+    // another pub type is itself checked.
+    for (t.structs.items) |s| {
+        if (s.decl_node == Ast.none or !s.pub_export or s.poisoned) continue;
+        _ = t.gphSelect(s.mod);
+        const field_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[s.decl_node].lhs);
+        for (s.field_types, 0..) |fty, fi| {
+            const at = if (fi < field_nodes.len) t.tree.nodes[field_nodes[fi]].main_token else t.tree.nodes[s.decl_node].main_token;
+            try t.checkPubType(fty, at, "struct", s.name);
+        }
+    }
+    for (t.enums.items) |e| {
+        if (e.decl_node == Ast.none or !e.pub_export or e.poisoned) continue;
+        _ = t.gphSelect(e.mod);
+        const variant_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[e.decl_node].lhs);
+        for (e.variants, 0..) |v, vi| {
+            const at = if (vi < variant_nodes.len) t.tree.nodes[variant_nodes[vi]].main_token else t.tree.nodes[e.decl_node].main_token;
+            for (v.field_types) |fty| {
+                try t.checkPubType(fty, at, "enum", e.name);
+            }
+        }
+    }
+}
+
+/// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
+/// `owner_kind`/`owner_name` describe the exposing decl ("function" `lib.make`,
+/// "struct" `lib.Outer`, "enum" `lib.E`).
+fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, owner_name: []const u8) !void {
+    if (t.graph == null) return;
+    const non_pub = switch (ty.kind) {
+        .@"struct" => !t.structs.items[ty.struct_id].pub_export,
+        .@"enum" => !t.enums.items[ty.enum_id].pub_export,
+        else => false,
+    };
+    if (non_pub)
+        try t.emitFmt(t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+}
+
+// ---- shared snapshot helpers (used by check + checkGraph) ------------------
+
+fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]Layout {
+    const layouts = try gpa.alloc(Layout, structs.len);
+    var built: usize = 0;
+    errdefer {
+        freeLayouts(gpa, layouts[0..built]);
+        gpa.free(layouts);
+    }
+    for (structs, 0..) |s, i| {
+        const fnames = try gpa.alloc([]const u8, s.field_names.len);
+        var dn: usize = 0;
+        errdefer {
+            for (fnames[0..dn]) |x| gpa.free(x);
+            gpa.free(fnames);
+        }
+        for (s.field_names, 0..) |nm, j| {
+            fnames[j] = try gpa.dupe(u8, nm);
+            dn += 1;
+        }
+        layouts[i] = .{
+            .name = try gpa.dupe(u8, s.name),
+            .field_names = @ptrCast(fnames),
+            .field_types = try gpa.dupe(Type, s.field_types),
+            .offsets = try gpa.dupe(u32, s.offsets),
+            .size = s.size,
+            .@"align" = s.@"align",
+        };
+        built += 1;
+    }
+    return layouts;
+}
+
+fn freeLayouts(gpa: std.mem.Allocator, layouts: []const Layout) void {
+    for (layouts) |l| {
+        gpa.free(l.name);
+        for (l.field_names) |fn_| gpa.free(fn_);
+        gpa.free(l.field_names);
+        gpa.free(l.field_types);
+        gpa.free(l.offsets);
+    }
+    gpa.free(layouts);
+}
+
+fn snapshotEnumLayouts(gpa: std.mem.Allocator, enums: []const EnumSym) ![]EnumLayout {
+    const enum_layouts = try gpa.alloc(EnumLayout, enums.len);
+    var built: usize = 0;
+    errdefer {
+        freeEnumLayouts(gpa, enum_layouts[0..built]);
+        gpa.free(enum_layouts);
+    }
+    for (enums, 0..) |e, i| {
+        const variants = try gpa.alloc(VariantLayout, e.variants.len);
+        var vbuilt: usize = 0;
+        errdefer {
+            for (variants[0..vbuilt]) |v| {
+                for (v.field_names) |x| gpa.free(x);
+                gpa.free(v.field_names);
+                gpa.free(v.field_types);
+                gpa.free(v.offsets);
+            }
+            gpa.free(variants);
+        }
+        for (e.variants, 0..) |v, j| {
+            const fnames = try gpa.alloc([]const u8, v.field_names.len);
+            var dn: usize = 0;
+            errdefer {
+                for (fnames[0..dn]) |x| gpa.free(x);
+                gpa.free(fnames);
+            }
+            for (v.field_names, 0..) |nm, k| {
+                fnames[k] = try gpa.dupe(u8, nm);
+                dn += 1;
+            }
+            variants[j] = .{
+                .name = v.name,
+                .form = v.form,
+                .field_names = @ptrCast(fnames),
+                .field_types = try gpa.dupe(Type, v.field_types),
+                .offsets = try gpa.dupe(u32, v.offsets),
+            };
+            vbuilt += 1;
+        }
+        enum_layouts[i] = .{
+            .name = try gpa.dupe(u8, e.name),
+            .variants = variants,
+            .tag_size = e.tag_size,
+            .payload_off = e.payload_off,
+            .size = e.size,
+            .@"align" = e.@"align",
+        };
+        built += 1;
+    }
+    return enum_layouts;
+}
+
+fn freeEnumLayouts(gpa: std.mem.Allocator, enum_layouts: []const EnumLayout) void {
+    for (enum_layouts) |e| {
+        gpa.free(e.name);
+        for (e.variants) |v| {
+            for (v.field_names) |fn_| gpa.free(fn_);
+            gpa.free(v.field_names);
+            gpa.free(v.field_types);
+            gpa.free(v.offsets);
+        }
+        gpa.free(e.variants);
+    }
+    gpa.free(enum_layouts);
+}
+
 fn run(t: *Typecheck) !void {
     if (t.tree.nodes.len == 0) return;
     const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
@@ -499,45 +1027,8 @@ fn run(t: *Typecheck) !void {
 
     const decl_nodes = Ast.rangeSlice(t.tree, prog.lhs);
 
-    // Pass A0a: register every struct name → id (duplicate names diagnosed). Ids
-    // are assigned in declaration order among the struct decls.
-    for (decl_nodes) |decl_idx| {
-        const decl = t.tree.nodes[decl_idx];
-        if (decl.tag != .struct_decl) continue;
-        const name = t.nameText(decl.main_token);
-        // A struct named after a builtin scalar/str type shadows nothing usable
-        // (typeFromNode checks the builtin map FIRST), so reject it rather than
-        // register a permanently-unreachable type.
-        if (type_names.get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
-            continue;
-        }
-        if (t.struct_map.get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
-            continue;
-        }
-        const id: u32 = @intCast(t.structs.items.len);
-        try t.structs.append(t.gpa, .{ .decl_node = decl_idx, .name = name });
-        try t.struct_map.put(t.gpa, name, id);
-    }
-    // Pass A0c: register every enum name → id. One shared type-name namespace:
-    // an enum colliding with a builtin, a struct, or another enum is rejected.
-    for (decl_nodes) |decl_idx| {
-        const decl = t.tree.nodes[decl_idx];
-        if (decl.tag != .enum_decl) continue;
-        const name = t.nameText(decl.main_token);
-        if (type_names.get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "enum '{s}' shadows a builtin type", .{name});
-            continue;
-        }
-        if (t.struct_map.get(name) != null or t.enum_map.get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
-            continue;
-        }
-        const id: u32 = @intCast(t.enums.items.len);
-        try t.enums.append(t.gpa, .{ .decl_node = decl_idx, .name = name });
-        try t.enum_map.put(t.gpa, name, id);
-    }
+    try t.registerStructs(decl_nodes, 0);
+    try t.registerEnums(decl_nodes, 0);
 
     // Pass A0b: lay out each struct (visiting-guard catches recursive cycles).
     // Runs AFTER enum registration so a struct field of an enum type resolves.
@@ -555,30 +1046,14 @@ fn run(t: *Typecheck) !void {
     for (decl_nodes) |fn_idx| {
         const decl = t.tree.nodes[fn_idx];
         if (decl.tag != .fn_decl) continue;
-        const proto = Ast.protoAt(t.tree, decl.lhs);
-        const params = try t.gpa.alloc(Type, proto.params.len);
-        for (proto.params, 0..) |param_idx, i| {
-            const param = t.tree.nodes[param_idx];
-            const pty = t.typeFromNode(param.lhs);
-            if (pty.kind == .unit) {
-                try t.emitFmt(t.byteOf(param.main_token), "parameter '{s}' cannot have type ()", .{t.nameText(param.main_token)});
-                params[i] = .invalid; // poison so call-arg checks don't cascade
-            } else {
-                params[i] = pty;
-            }
-        }
-        const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-        try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .params = params, .ret = ret });
+        try t.decodeFnSig(fn_idx, 0);
     }
 
     // Synthetic `print(str) -> ()` builtin. Appended AFTER the user-fn loop so
     // its index == user_fn_count, matching Resolve's seeding order (which assigns
     // print the same index). `decl_node = Ast.none` flags it as bodyless so
     // checkFn skips it (Pass B). Codegen emits a hand-written body at this sym.
-    {
-        const params = try t.gpa.dupe(Type, &.{.str});
-        try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .params = params, .ret = .unit });
-    }
+    try t.appendPrint();
 
     // Pass B: check each function body (skip the synthetic, bodyless builtins).
     for (t.fns.items) |f| {
@@ -587,7 +1062,84 @@ fn run(t: *Typecheck) !void {
     }
 }
 
+/// Register the struct decls among `decl_nodes` (of the currently-active tree).
+/// `mod` is the owning module id (0 single-file). Global ids are assigned in
+/// append order; per-module duplicate/shadow diagnostics mirror the single-file
+/// rules. The bare name → global id binding goes into the active `struct_map`.
+fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
+    for (decl_nodes) |decl_idx| {
+        const decl = t.tree.nodes[decl_idx];
+        if (decl.tag != .struct_decl) continue;
+        const name = t.nameText(decl.main_token);
+        if (type_names.get(name) != null) {
+            try t.emitFmt(t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
+            continue;
+        }
+        if (t.activeStructMap().get(name) != null) {
+            try t.emitFmt(t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
+            continue;
+        }
+        const id: u32 = @intCast(t.structs.items.len);
+        try t.structs.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx) });
+        try t.activeStructMap().put(t.gpa, name, id);
+    }
+}
+
+/// Register the enum decls among `decl_nodes` (of the currently-active tree).
+/// One shared type-name namespace per module: an enum colliding with a builtin,
+/// a struct, or another enum (in this module) is rejected.
+fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
+    for (decl_nodes) |decl_idx| {
+        const decl = t.tree.nodes[decl_idx];
+        if (decl.tag != .enum_decl) continue;
+        const name = t.nameText(decl.main_token);
+        if (type_names.get(name) != null) {
+            try t.emitFmt(t.byteOf(decl.main_token), "enum '{s}' shadows a builtin type", .{name});
+            continue;
+        }
+        if (t.activeStructMap().get(name) != null or t.activeEnumMap().get(name) != null) {
+            try t.emitFmt(t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
+            continue;
+        }
+        const id: u32 = @intCast(t.enums.items.len);
+        try t.enums.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx) });
+        try t.activeEnumMap().put(t.gpa, name, id);
+    }
+}
+
+/// Decode one fn's signature (param + return types) and append a `FnSym` to the
+/// global fn table. `fn_idx` is a node in the currently-active tree; `mod` its
+/// owning module id. Param/return type-refs resolve via the active maps (and, for
+/// a qualified `mod.Type`, via the graph context).
+fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
+    const decl = t.tree.nodes[fn_idx];
+    const proto = Ast.protoAt(t.tree, decl.lhs);
+    const params = try t.gpa.alloc(Type, proto.params.len);
+    for (proto.params, 0..) |param_idx, i| {
+        const param = t.tree.nodes[param_idx];
+        const pty = t.typeFromNode(param.lhs);
+        if (pty.kind == .unit) {
+            try t.emitFmt(t.byteOf(param.main_token), "parameter '{s}' cannot have type ()", .{t.nameText(param.main_token)});
+            params[i] = .invalid; // poison so call-arg checks don't cascade
+        } else {
+            params[i] = pty;
+        }
+    }
+    const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .params = params, .ret = ret, .mod = mod });
+}
+
+/// Append the synthetic bodyless `print(str) -> ()` builtin to the fn table.
+fn appendPrint(t: *Typecheck) !void {
+    const params = try t.gpa.dupe(Type, &.{.str});
+    try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .params = params, .ret = .unit });
+}
+
 fn checkFn(t: *Typecheck, f: FnSym) !void {
+    // Graph mode: check this fn body in its owning module's tree/resolutions.
+    const prev = t.gphSelect(f.mod);
+    defer _ = t.gphSelect(prev);
+
     const decl = t.tree.nodes[f.decl_node];
     const proto = Ast.protoAt(t.tree, decl.lhs);
 
@@ -1098,11 +1650,18 @@ fn typeOf(t: *Typecheck, node_idx: Ast.Index) error{OutOfMemory}!Type {
                 // positional `Point(...)` callee it diagnoses elsewhere). A BARE
                 // struct name used as a value (`q := P`, `P.x`) reaches here with
                 // no diagnostic — report it so it never escapes to codegen.
-                if (t.struct_map.get(t.nameText(n.main_token)) != null)
+                if (t.activeStructMap().get(t.nameText(n.main_token)) != null)
                     try t.emitFmt(t.byteOf(n.main_token), "type '{s}' is not a value", .{t.nameText(n.main_token)});
                 break :blk Type.invalid;
             },
             .label => Type.invalid, // never on an identifier node (break/continue only)
+            .module => blk: {
+                // A bare imported-namespace name used as a value (`x := mod`):
+                // a module is not a value. (A `mod.member` access never reaches
+                // here — the receiver is consumed by typeOfFieldAccess/Call.)
+                try t.emitFmt(t.byteOf(n.main_token), "module '{s}' is not a value", .{t.nameText(n.main_token)});
+                break :blk Type.invalid;
+            },
         },
         .unary => blk: {
             const operand = try t.typeOf(n.lhs);
@@ -1179,7 +1738,7 @@ fn typeOfStructInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOf
     // always a plain type-name identifier; no enum routing needed.
     _ = node_idx;
     const name = t.nameText(t.tree.nodes[n.lhs].main_token);
-    const id = t.struct_map.get(name) orelse {
+    const id = t.activeStructMap().get(name) orelse {
         for (Ast.rangeSlice(t.tree, n.rhs)) |fi| _ = try t.typeOf(t.tree.nodes[fi].lhs);
         try t.emitFmt(t.byteOf(t.tree.nodes[n.lhs].main_token), "unknown struct type '{s}'", .{name});
         return .invalid;
@@ -1223,14 +1782,38 @@ fn typeOfStructInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOf
     return Type.structT(id);
 }
 
+/// In graph mode, resolve a `mod.Enum` node (an inner `field_access` whose
+/// receiver binds to a `.module`) to the owning module's GLOBAL enum id, or null
+/// if it is not a qualified cross-module enum reference.
+fn qualifiedEnumId(t: *Typecheck, node_idx: Ast.Index) ?u32 {
+    const g = t.graph orelse return null;
+    const n = t.tree.nodes[node_idx];
+    if (n.tag != .field_access) return null;
+    const recv = t.tree.nodes[n.lhs];
+    if (recv.tag != .identifier) return null;
+    if (t.resolutions[n.lhs] != .module) return null;
+    const recv_name = t.nameText(recv.main_token);
+    const target = g.namespaceOfIn(t.graph_mod, recv_name) orelse return null;
+    const member = t.nameText(n.main_token);
+    return g.mods[target].enum_ids.get(member);
+}
+
 /// Type a `recv.field` access. The receiver must be a struct; the field must
 /// exist. Yields the field type. Poison receivers stay silent (already reported).
 fn typeOfFieldAccess(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
     // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
     // identifier (resolved quietly to .unresolved). Treat it as construction.
     const recv = t.tree.nodes[n.lhs];
-    if (recv.tag == .identifier and t.enum_map.get(t.nameText(recv.main_token)) != null) {
+    if (recv.tag == .identifier and t.activeEnumMap().get(t.nameText(recv.main_token)) != null) {
         return t.typeOfEnumInitQualified(node_idx, .unit, n.lhs, n.main_token, Ast.none);
+    }
+    // A 3-level cross-module unit-variant `mod.Enum.Variant`: the receiver of THIS
+    // field_access is the inner `mod.Enum` field_access (graph mode). Resolve the
+    // inner to a global enum id and treat this node as a unit-variant construction.
+    if (t.qualifiedEnumId(n.lhs)) |enum_id| {
+        const ty = try t.checkVariant(enum_id, n.main_token, .unit, Ast.none);
+        t.node_types[node_idx] = ty;
+        return ty;
     }
     const base = try t.typeOf(n.lhs);
     if (base.kind == .invalid) return .invalid;
@@ -1268,7 +1851,7 @@ fn typeOfEnumInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMe
     var enum_id: u32 = undefined;
     if (n.lhs != Ast.none) {
         const tname = t.nameText(t.tree.nodes[n.lhs].main_token);
-        enum_id = t.enum_map.get(tname) orelse {
+        enum_id = t.activeEnumMap().get(tname) orelse {
             try t.typeArgsForEffect(node_form, args);
             try t.emitFmt(t.byteOf(t.tree.nodes[n.lhs].main_token), "'{s}' is not an enum type", .{tname});
             return .invalid;
@@ -1295,7 +1878,7 @@ fn typeOfEnumInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMe
 /// variant-name token; `args` the arg/field-init range (or `none` for unit).
 fn typeOfEnumInitQualified(t: *Typecheck, node_idx: Ast.Index, node_form: InitForm, type_node: Ast.Index, vtok: u32, args: Ast.Index) error{OutOfMemory}!Type {
     const tname = t.nameText(t.tree.nodes[type_node].main_token);
-    const enum_id = t.enum_map.get(tname) orelse return .invalid; // caller checked
+    const enum_id = t.activeEnumMap().get(tname) orelse return .invalid; // caller checked
     const ty = try t.checkVariant(enum_id, vtok, node_form, args);
     t.node_types[node_idx] = ty;
     return ty;
@@ -1621,7 +2204,7 @@ fn checkVariantPattern(t: *Typecheck, pat_idx: Ast.Index, expected: Type, cov: *
     // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
     if (pat.lhs != Ast.none) {
         const tname = t.nameText(t.tree.nodes[pat.lhs].main_token);
-        if (t.enum_map.get(tname)) |qid| {
+        if (t.activeEnumMap().get(tname)) |qid| {
             if (qid != enum_id)
                 try t.emitFmt(t.byteOf(t.tree.nodes[pat.lhs].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
         } else {
@@ -1802,8 +2385,15 @@ fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory
     const callee = t.tree.nodes[n.lhs];
     if (callee.tag == .field_access) {
         const recv = t.tree.nodes[callee.lhs];
-        if (recv.tag == .identifier and t.enum_map.get(t.nameText(recv.main_token)) != null) {
+        if (recv.tag == .identifier and t.activeEnumMap().get(t.nameText(recv.main_token)) != null) {
             return t.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
+        }
+        // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
+        // callee field_access's receiver is the inner `mod.Enum`.
+        if (t.qualifiedEnumId(callee.lhs)) |enum_id| {
+            const ty = try t.checkVariant(enum_id, callee.main_token, .tuple, n.rhs);
+            t.node_types[node_idx] = ty;
+            return ty;
         }
     }
     const callee_res = t.resolutions[n.lhs];
@@ -1816,10 +2406,20 @@ fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory
             // A struct-named callee `Point(1,2)` is positional construction, which
             // we reject — point at named construction instead.
             const cname = t.nameText(t.tree.nodes[n.lhs].main_token);
-            if (t.struct_map.get(cname) != null)
+            if (t.activeStructMap().get(cname) != null)
                 try t.emitFmt(t.byteOf(n.main_token), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
+        } else if (callee_res == .unresolved and t.tree.nodes[n.lhs].tag == .field_access) {
+            // A qualified call `recv.member(...)` whose callee stayed `.unresolved`:
+            // resolve neither bound it to a fn nor reported it (e.g. `recv` is a
+            // top-level fn shadowing an import namespace, so the field-access value
+            // path is taken and left unresolved). Emit a clean diagnostic at the
+            // member token instead of silently poisoning — otherwise the call is
+            // dropped and `-o` later crashes in codegen with no user error.
+            const fa = t.tree.nodes[n.lhs];
+            const member = t.nameText(fa.main_token);
+            try t.emitFmt(t.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
         }
-        // `.unresolved` was already reported by resolve.
+        // Any remaining `.unresolved` was already reported by resolve.
         return .invalid;
     }
     const f = t.fns.items[callee_res.func];
@@ -1840,17 +2440,45 @@ fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory
     return f.ret;
 }
 
-/// Map a type-reference node (an `identifier`, or a `literal_unit` for `()`) to
-/// a `Type`.
+/// Map a type-reference node (an `identifier`, a `literal_unit` for `()`, or in
+/// graph mode a qualified `mod.Type` `field_access`) to a `Type`.
 fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
     if (type_node == Ast.none) return Type.unit;
-    if (t.tree.nodes[type_node].tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
-    const tok = t.tree.nodes[type_node].main_token;
+    const tn = t.tree.nodes[type_node];
+    if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
+    // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
+    // receiver binds to a `.module`. Resolve it against the owning module's tables.
+    if (tn.tag == .field_access) return t.typeFromQualified(type_node, tn);
+    const tok = tn.main_token;
     const name = t.nameText(tok);
     if (type_names.get(name)) |b| return b;
-    if (t.struct_map.get(name)) |id| return Type.structT(id);
-    if (t.enum_map.get(name)) |id| return Type.enumT(id);
+    if (t.activeStructMap().get(name)) |id| return Type.structT(id);
+    if (t.activeEnumMap().get(name)) |id| return Type.enumT(id);
     t.emitFmt(t.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
+    return .invalid;
+}
+
+/// Resolve a qualified `mod.Type` type-reference (a `field_access` in type
+/// position; the receiver binds to a `.module`) to the owning module's GLOBAL
+/// struct/enum id. Graph mode only. Visibility was already enforced by
+/// `resolve_graph`, so a private type here is a defensive `invalid`.
+fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
+    _ = node_idx;
+    const g = t.graph orelse {
+        t.emitFmt(t.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
+        return .invalid;
+    };
+    const recv = t.tree.nodes[n.lhs];
+    if (recv.tag != .identifier) return .invalid;
+    const recv_name = t.nameText(recv.main_token);
+    const target = g.namespaceOfIn(t.graph_mod, recv_name) orelse {
+        t.emitFmt(t.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
+        return .invalid;
+    };
+    const member = t.nameText(n.main_token);
+    if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
+    if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
+    t.emitFmt(t.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
     return .invalid;
 }
 
@@ -1860,6 +2488,11 @@ fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
 fn layoutStruct(t: *Typecheck, id: u32) error{OutOfMemory}!void {
     if (t.structs.items[id].state == .done) return;
     t.structs.items[id].state = .laying;
+
+    // Graph mode: lay this struct out in ITS owning module's tree (a nested/qualified
+    // field type may have switched the active module). Restore on the way out.
+    const prev = t.gphSelect(t.structs.items[id].mod);
+    defer _ = t.gphSelect(prev);
 
     const decl = t.tree.nodes[t.structs.items[id].decl_node];
     const field_nodes = Ast.rangeSlice(t.tree, decl.lhs);
@@ -1947,6 +2580,10 @@ fn layoutReferent(t: *Typecheck, ty: Type, at: u32, requester: []const u8, reque
 fn layoutEnum(t: *Typecheck, id: u32) error{OutOfMemory}!void {
     if (t.enums.items[id].state == .done) return;
     t.enums.items[id].state = .laying;
+
+    // Graph mode: lay this enum out in ITS owning module's tree. Restore on exit.
+    const prev = t.gphSelect(t.enums.items[id].mod);
+    defer _ = t.gphSelect(prev);
 
     const decl = t.tree.nodes[t.enums.items[id].decl_node];
     const variant_nodes = Ast.rangeSlice(t.tree, decl.lhs);
@@ -2081,6 +2718,7 @@ fn byteOf(t: *const Typecheck, tok: u32) u32 {
 /// Record a static-literal diagnostic.
 fn emit(t: *Typecheck, byte_offset: u32, message: []const u8) !void {
     try t.diags.append(t.gpa, .{ .byte_offset = byte_offset, .message = message });
+    if (t.graph != null) try t.diag_mods.append(t.gpa, t.graph_mod);
 }
 
 /// Format a data-bearing message, own the buffer, and record a diagnostic.
@@ -2088,6 +2726,7 @@ fn emitFmt(t: *Typecheck, byte_offset: u32, comptime fmt: []const u8, args: anyt
     const msg = try std.fmt.allocPrint(t.gpa, fmt, args);
     try t.owned_msgs.append(t.gpa, msg);
     try t.diags.append(t.gpa, .{ .byte_offset = byte_offset, .message = msg });
+    if (t.graph != null) try t.diag_mods.append(t.gpa, t.graph_mod);
 }
 
 const testing = std.testing;

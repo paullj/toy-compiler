@@ -1,0 +1,9 @@
+# Feature: two imports sharing a last path segment (`util`) collide on the bound
+# namespace name; without `as` to disambiguate this is an error.
+# expect: compile-error "collides"
+import a/util
+import b/util
+
+fn main() -> int {
+    util.f()
+}

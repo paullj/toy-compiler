@@ -1,0 +1,3 @@
+# Half of an import cycle: a -> b -> a. The import graph must be a DAG.
+import b
+pub fn f() -> int { b.g() }

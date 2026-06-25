@@ -1,0 +1,8 @@
+# Feature: importing a module whose `.toy` file does not exist is an error that
+# names the path it looked for (root = the entry file's directory).
+# expect: compile-error "imported module 'nope/missing' not found"
+import nope/missing
+
+fn main() -> int {
+    0
+}

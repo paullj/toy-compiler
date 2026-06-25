@@ -1,0 +1,16 @@
+# Module `a`: a SMALL (8-byte) `Point` and a payload-less `Status`. Same NAMES as
+# module `b`'s types but DISTINCT nominal types (distinct global layout ids).
+pub struct Point { x: int }
+
+pub fn mk(x: int) -> Point { return Point { x: x } }
+pub fn get(p: Point) -> int { return p.x }
+
+pub enum Status { On, Off }
+
+pub fn pick() -> Status { return Status.Off }
+pub fn tag(s: Status) -> int {
+  match s {
+    .On -> 0,
+    .Off -> 1
+  }
+}

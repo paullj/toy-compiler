@@ -1,0 +1,13 @@
+# Feature: a top-level declaration (here a fn) sharing a name with an import
+# namespace is an ambiguity, not a shadow -- there is no inner scope to
+# disambiguate `util` the fn from `util` the namespace. Rejected at resolve time
+# with a clear `use as` hint (rather than silently letting the fn win and leaving
+# the qualified call unresolved, which previously escaped to a codegen crash).
+# expect: compile-error "collides with a top-level declaration"
+import util
+
+fn util() -> int { return 42 }
+
+fn main() -> int {
+    return util.helper()
+}

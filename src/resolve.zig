@@ -280,6 +280,11 @@ fn resolveStmt(r: *Resolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                     ),
                     .local => {},
                     .label => {}, // unreachable on an assign target; defensive
+                    .module => try r.emitFmt(
+                        r.tokens[target.main_token].start,
+                        "cannot assign to module '{s}'",
+                        .{r.nameText(target.main_token)},
+                    ),
                 }
             }
             try r.resolveExpr(stmt.rhs);

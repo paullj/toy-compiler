@@ -1,0 +1,22 @@
+# Feature: two DIFFERENT modules each declare a same-named type (`Point` struct,
+# `Status` enum) of DIFFERENT size; both are used cross-module by value. This is
+# the cross-module type-identity / ABI regression: same-named types in different
+# modules are DISTINCT nominal types with DISTINCT global layout ids/sizes, so the
+# >16B-by-value (sret / indirect) vs <=16B-reg-pair ABI decision must be taken on
+# each fn's OWN type, not the first same-named entry in the merged layout table.
+# A bare-name first-match in lowering would alias b.Point onto a.Point's 8-byte
+# layout (or vice versa) and miscompile the >16B side -> garbage exit / hang.
+# expect: exit 95
+import a
+import b
+
+fn main() -> int {
+  # a.Point is 8B (reg/return-in-x0); b.Point is 32B (sret). Each fn names its
+  # OWN Point in its signature -> they must resolve to distinct layouts.
+  pa := a.mk(5)         # a.Point { x }
+  pb := b.mk(7)         # b.Point { x, y, z, w } = 7,14,21,28
+  sa := a.pick()        # a.Status.Off  -> 1
+  sb := b.mk_status(2)  # b.Status.Pair(2,2,2,2)
+  # 5 + (7+14+21+28) + 1 + (2+2+2+2) = 5 + 70 + 1 + 8 = 84  ... +11 below
+  return a.get(pa) + b.get(pb) + a.tag(sa) + b.val(sb) + 11
+}

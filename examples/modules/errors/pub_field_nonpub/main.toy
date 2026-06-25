@@ -1,0 +1,9 @@
+# Feature: a `pub` struct FIELD naming a non-pub type leaks that type across the
+# module boundary (an importer can read `o.i` but cannot name `Inner`) — rejected,
+# same as a pub fn param/return. Locked design item #4 extends to field types.
+# expect: compile-error "exposes non-pub type"
+import lib
+
+fn main() -> int {
+    lib.ok()
+}

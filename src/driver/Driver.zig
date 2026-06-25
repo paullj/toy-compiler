@@ -19,6 +19,9 @@ const Ast = @import("../ast/Ast.zig");
 const Cache = @import("Cache.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
+const Graph = @import("Graph.zig");
+const ResolveGraph = @import("../resolve_graph.zig");
+const TypecheckGraph = @import("../types_graph.zig");
 const CodegenIr = @import("../codegen/CodegenIr.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
@@ -79,6 +82,9 @@ pub const FileResult = struct {
     nodes: []Ast.Node = &.{},
     /// Variable-arity child runs paired with `nodes` (see `Ast`). Owned.
     extra: []u32 = &.{},
+    /// `pub` export bitset paired with `nodes` (M14, see `Ast.Tree.pub_bits`).
+    /// Owned; empty for a program with no exports.
+    pub_bits: []const u32 = &.{},
     /// Whether each phase's result was loaded from cache rather than recomputed.
     tokens_cached: bool = false,
     nodes_cached: bool = false,
@@ -99,6 +105,7 @@ pub const FileResult = struct {
         gpa.free(r.tokens);
         gpa.free(r.nodes);
         gpa.free(r.extra);
+        if (r.pub_bits.len != 0) gpa.free(@constCast(r.pub_bits));
         if (r.resolve) |*res| res.deinit(gpa);
         if (r.typecheck) |*tc| tc.deinit(gpa);
         r.* = undefined;
@@ -182,12 +189,13 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     }
     result.nodes = tree.?.nodes;
     result.extra = tree.?.extra;
+    result.pub_bits = tree.?.pub_bits;
 
     if (!emit.runsCheck()) return;
 
     // --- check: name resolution then typecheck (in-memory only; uncached). ---
     result.checked = true;
-    const tree_view: Ast.Tree = .{ .nodes = result.nodes, .extra = result.extra };
+    const tree_view: Ast.Tree = .{ .nodes = result.nodes, .extra = result.extra, .pub_bits = result.pub_bits };
     const res = try Resolve.resolve(gpa, tree_view, result.tokens, result.source);
     result.resolve = res;
     if (res.diags.len > 0) {
@@ -210,12 +218,36 @@ fn optMix(cfg: Opt.Config) u64 {
     return std.hash.Wyhash.hash(0x4f_50_54_4d, &[_]u8{cfg.bits()}); // "OPTM"
 }
 
+/// Mix a function's OWN emitted `SymName{kind,name}` into the codegen cache key.
+///
+/// WHY (M14, [Cx] cache soundness): the fingerprint folds a fn's body and its
+/// CALLEES' identities, but NOT the fn's own internal name — and a leaf fn (no
+/// callees) with identical source produces an identical fingerprint regardless of
+/// the name it is emitted under. In M14 the SAME `fn add` body is emitted bare
+/// (`add`) single-file but module-qualified (`m.add`) in a graph build; that name
+/// IS baked into the cached `FnCode.sym` (and into every caller's reloc target).
+/// Without folding it, a graph build would serve a single-file build's cached
+/// blob carrying the WRONG (bare) sym → `error.UnresolvedSymbol` at link, or worse
+/// a cross-module stale-name miscompile. Folding the own name keys each emitted
+/// identity to its own cache slot. Deterministic; the only other key input beside
+/// the pure fingerprint and `optMix`.
+fn symMix(sym: Link.SymName) u64 {
+    var h = std.hash.Wyhash.init(0x53_59_4d_4e); // "SYMN"
+    h.update(&[_]u8{@intFromEnum(sym.kind)});
+    h.update(sym.name);
+    return h.final();
+}
+
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
 /// returns these to `main`, which renders them and exits non-zero.
 pub const EmitError = struct {
     message: []const u8,
     byte_offset: ?u32,
+    /// Graph builds: the owning module id (index into `Graph.modules`) whose
+    /// source `byte_offset` points into. `null` (single-file path, or a
+    /// whole-program error with no single owner) renders against the entry file.
+    module: ?u32 = null,
 };
 
 /// The linked whole-program lowering: the joined `__text` blob, `main`'s resolved
@@ -472,7 +504,9 @@ pub fn renderProgramIr(gpa: std.mem.Allocator, r: *const FileResult, opt: Opt.Co
 
     for (fn_nodes.items, 0..) |fn_decl, i| {
         const is_entry = if (entry_fn) |e| e == i else false;
-        var func = try lower.lowerFn(gpa, in, fn_decl, names[i], is_entry, &diags);
+        var fn_in = in;
+        fn_in.sig = if (i < r.typecheck.?.sigs.len) r.typecheck.?.sigs[i] else null;
+        var func = try lower.lowerFn(gpa, fn_in, fn_decl, names[i], is_entry, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);
@@ -524,16 +558,17 @@ fn fnJobInner(
         freeTouched(gpa, touched.items);
         touched.deinit(gpa);
     }
-    try walkTouched(gpa, frozen, fn_decl, &touched);
+    const my_sig: ?Fingerprint.Sig = if (idx < frozen.sigs.len) frozen.sigs[idx] else null;
+    try walkTouchedSig(gpa, frozen, fn_decl, my_sig, &touched);
 
     const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
     // Mix the opt config into the codegen key (the cached blob IS the OPTIMIZED
     // machine code), so O0/O1 land on different entries — toggling -O can never
     // serve a stale blob. Fingerprint stays a PURE source hash; this xor is the
     // only place opt level enters the key. Deterministic (fixed packed byte).
-    const key = Cache.Key.fromFingerprint(.codegen, target, fp ^ optMix(frozen.opt));
     const sym = frozen.names[idx];
     const is_entry = idx == frozen.entry_fn;
+    const key = Cache.Key.fromFingerprint(.codegen, target, fp ^ optMix(frozen.opt) ^ symMix(sym));
 
     if (mode == .verify) {
         // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh
@@ -544,7 +579,7 @@ fn fnJobInner(
         // primed cache, so it can never silently no-op (the dead-gate bug, where
         // `--force` skipped the cache-read branch and thus the assert entirely).
         var opt_out: OptOut = .{};
-        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, &opt_out);
+        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
         errdefer fresh.deinit(gpa);
         const fb = try Link.pack(gpa, fresh);
         defer gpa.free(fb);
@@ -557,7 +592,7 @@ fn fnJobInner(
         } else {
             // Cold: no reference blob to compare against, so lower a second time
             // and assert the two fresh lowerings agree (pure determinism).
-            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, null);
+            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, null);
             defer fresh2.deinit(gpa);
             const fb2 = try Link.pack(gpa, fresh2);
             defer gpa.free(fb2);
@@ -582,7 +617,7 @@ fn fnJobInner(
     }
 
     var opt_out: OptOut = .{};
-    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, &opt_out);
+    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
     errdefer fc.deinit(gpa);
     if (Link.pack(gpa, fc) catch null) |b| {
         defer gpa.free(b);
@@ -601,7 +636,7 @@ const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
 /// is freed here, keeping the codegen cache ONE-TIER ([C8]). The M13 opt stage runs
 /// in-place on `irf` between lower and codegen; `opt_out` (when non-null) receives
 /// the per-fn dual-metric numbers.
-fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, opt_out: ?*OptOut) !Link.FnCode {
+fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, sig: ?Fingerprint.Sig, opt_out: ?*OptOut) !Link.FnCode {
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
 
@@ -614,6 +649,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, s
         .layouts = frozen.layouts,
         .enum_layouts = frozen.enum_layouts,
         .names = frozen.names,
+        .sig = sig,
     };
     var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
     defer irf.deinit(gpa);
@@ -729,7 +765,8 @@ fn walkCalls(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out:
             if (h.guard != Ast.none) try walkCalls(gpa, frozen, h.guard, out);
             try walkCalls(gpa, frozen, h.body, out);
         },
-        .program => {},
+        // Top-level decls; never reached inside a fn-body walk.
+        .program, .import_decl => {},
     }
 }
 
@@ -738,7 +775,20 @@ fn walkCalls(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out:
 /// descriptor so a struct field-layout edit flips every using fn's hash (M9). The
 /// fold is what makes the M5 "touched type layouts" hook REAL. Caller frees each
 /// `layout` slice (see `freeTouched`).
-fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out: *std.ArrayList(Fingerprint.TouchedType)) !void {
+fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
+    return walkTouchedSig(gpa, frozen, idx, null, out);
+}
+
+/// `walkTouched` with the OWNING fn's signature threaded in (so the fn_decl case
+/// folds the ABI-correct param/return types). `fn_sig` is the fn's typecheck Sig
+/// (`frozen.sigs[idx]` single-file / `gf.sigs[gid]` graph) when known; null
+/// elsewhere. The sig's `params`/`ret` carry the GLOBAL struct/enum ids the
+/// typechecker resolved — including a CROSS-MODULE qualified type-ref `b: rect.Rect`
+/// (a `field_access` in type position) which `typeRefToType`'s bare-name scan would
+/// otherwise mis-resolve to the FIRST same-named type in the program-wide layout
+/// table (the cross-module M9 / TOP-RISK-#1 hole). Folding the sig types makes a
+/// pub-type LAYOUT edit reach EXACTLY the importers that name it. [design 10]
+fn walkTouchedSig(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, fn_sig: ?Fingerprint.Sig, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
     if (idx == Ast.none) return;
     const tree = frozen.tree;
     const n = tree.nodes[idx];
@@ -764,13 +814,20 @@ fn walkTouched(gpa: std.mem.Allocator, frozen: *const Frozen, idx: Ast.Index, ou
             // struct table and fold its layout — closing the param/ret-only
             // stale-hit hole (M9 cache soundness: fold EVERY struct a fn touches,
             // including params and return, so an ABI-boundary edit recompiles it).
-            for (proto.params) |p| {
+            for (proto.params, 0..) |p, i| {
                 const pty_node = tree.nodes[p].lhs;
-                if (pty_node != Ast.none) try appendTouched(gpa, frozen, typeRefToType(frozen, pty_node), out);
+                if (pty_node != Ast.none) {
+                    // Prefer the typecheck-resolved sig type (carries the right
+                    // GLOBAL id, incl. a cross-module qualified `mod.Type`); fall
+                    // back to the bare-name re-resolution when no sig is threaded.
+                    const pty = if (fn_sig) |s| (if (i < s.params.len) s.params[i] else typeRefToType(frozen, pty_node)) else typeRefToType(frozen, pty_node);
+                    try appendTouched(gpa, frozen, pty, out);
+                }
                 try walkTouched(gpa, frozen, p, out);
             }
             if (proto.ret_type != Ast.none) {
-                try appendTouched(gpa, frozen, typeRefToType(frozen, proto.ret_type), out);
+                const rty = if (fn_sig) |s| s.ret else typeRefToType(frozen, proto.ret_type);
+                try appendTouched(gpa, frozen, rty, out);
                 try walkTouched(gpa, frozen, proto.ret_type, out);
             }
             try walkTouched(gpa, frozen, n.rhs, out);
@@ -1000,6 +1057,386 @@ fn buildNames(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, sou
     }
     names[fn_nodes.len] = .{ .kind = .builtin, .name = try gpa.dupe(u8, "print") };
     return names;
+}
+
+// ---- M14 whole-graph code emission -----------------------------------------
+
+/// Frozen, read-only inputs shared by every codegen job in a WHOLE-GRAPH build.
+/// Per-module arrays (trees/tokens/sources/resolutions/node_types) are indexed by
+/// module id; `layouts`/`enum_layouts`/`names`/`sigs` are PROGRAM-WIDE (one global
+/// id space). `fn_decls`/`fn_modules` are parallel to the global fn id space (one
+/// entry per global fn; `print` excluded — only real fn bodies are lowered). A
+/// codegen job selects its fn's owning module to build a single-fn `Frozen` view,
+/// so `walkCalls`/`walkTouched`/`typeRefToType`/`fingerprint`/`lowerOne` run
+/// UNCHANGED — the only difference from single-file is which module's tree/resolutions
+/// they read. [design 8/10]
+const GraphFrozen = struct {
+    trees: []const Ast.Tree,
+    tokens: []const []const Token,
+    sources: []const []const u8,
+    resolutions: []const []const Resolve.Resolution,
+    node_types: []const []const Typecheck.Type,
+    /// Program-wide tables (global ids).
+    layouts: []const Typecheck.Layout,
+    enum_layouts: []const Typecheck.EnumLayout,
+    /// Program-wide: one SymName per global fn id (qualified user fns, bare `main`,
+    /// `{builtin,"print"}` at the print id). Parallel to `sigs`.
+    names: []const Link.SymName,
+    sigs: []const Fingerprint.Sig,
+    /// The `fn_decl` node for each LOWERABLE global fn (parallel to `lower_ids`).
+    fn_decls: []const Ast.Index,
+    /// The owning module id for each lowerable fn (parallel to `fn_decls`).
+    fn_modules: []const u32,
+    /// Global fn id of each lowerable fn (parallel to `fn_decls`); indexes
+    /// `names`/`sigs`. Excludes `print` (bodyless).
+    lower_ids: []const u32,
+    /// Global fn id of the entry `main` (indexes `names`).
+    entry_id: u32,
+    opt: Opt.Config,
+
+    /// Build the single-fn `Frozen` view a codegen job runs against: this fn's
+    /// owning module's per-module arrays + the program-wide tables. `fn_nodes` is
+    /// a one-element slice (this fn) so `entry_fn`/`names[idx]` index correctly.
+    fn frozenFor(gf: *const GraphFrozen, lower_i: usize, fn_node_buf: *[1]Ast.Index) Frozen {
+        const mod = gf.fn_modules[lower_i];
+        fn_node_buf[0] = gf.fn_decls[lower_i];
+        return .{
+            .tree = gf.trees[mod],
+            .tokens = gf.tokens[mod],
+            .source = gf.sources[mod],
+            .resolutions = gf.resolutions[mod],
+            .node_types = gf.node_types[mod],
+            .layouts = gf.layouts,
+            .enum_layouts = gf.enum_layouts,
+            .names = gf.names,
+            .fn_nodes = fn_node_buf[0..1],
+            // `entry_fn` is only read by the single-file `fnJobInner`; the graph
+            // job computes its own `is_entry` from the global fn id, so this view's
+            // value is inert. Set to the one slot so it can never alias another fn.
+            .entry_fn = 0,
+            .sigs = gf.sigs,
+            .opt = gf.opt,
+        };
+    }
+};
+
+/// Lower EVERY function across the whole module `graph` (in parallel, memoized
+/// through the codegen cache), then run the serial relink tail. The entry `main`
+/// MUST live in the entry module (error otherwise). `res`/`tc` are the whole-graph
+/// resolve/typecheck results (program-wide global ids). Caller owns the returned
+/// `LinkedProgram` on success. [design 5/8]
+pub fn lowerGraphProgram(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    graph: *const Graph.Graph,
+    res: *const ResolveGraph.GraphResult,
+    tc: *const Typecheck.GraphResult,
+    mode: CodegenIr.Mode,
+    opt: Opt.Config,
+) !LowerProgramResult {
+    const n_mods = graph.modules.len;
+
+    // --- per-module Frozen inputs (one Tree view + arrays per module) ---
+    const trees = try gpa.alloc(Ast.Tree, n_mods);
+    defer gpa.free(trees);
+    const toks = try gpa.alloc([]const Token, n_mods);
+    defer gpa.free(toks);
+    const srcs = try gpa.alloc([]const u8, n_mods);
+    defer gpa.free(srcs);
+    const resols = try gpa.alloc([]const Resolve.Resolution, n_mods);
+    defer gpa.free(resols);
+    const ntypes = try gpa.alloc([]const Typecheck.Type, n_mods);
+    defer gpa.free(ntypes);
+    for (graph.modules, 0..) |*m, i| {
+        trees[i] = m.tree();
+        toks[i] = m.tokens;
+        srcs[i] = m.source;
+        resols[i] = res.resolutions[i];
+        ntypes[i] = tc.node_types[i];
+    }
+
+    // --- program-wide SymName table (one per global fn id) ---
+    // Mirrors the resolver's global fn order exactly: a user fn -> {user_fn, its
+    // qualified/bare name from the typecheck sig}; the synthetic bodyless `print`
+    // -> {builtin,"print"}. The qualified name MUST equal the typecheck sig name
+    // so the fingerprint callee fold lines up with the reloc target. [design 8]
+    const names = try buildGraphNames(gpa, res.fns, tc.sigs);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+
+    // --- enumerate lowerable fns (skip the bodyless print) + find entry main ---
+    var fn_decls: std.ArrayList(Ast.Index) = .empty;
+    defer fn_decls.deinit(gpa);
+    var fn_modules: std.ArrayList(u32) = .empty;
+    defer fn_modules.deinit(gpa);
+    var lower_ids: std.ArrayList(u32) = .empty;
+    defer lower_ids.deinit(gpa);
+    var entry_id: ?u32 = null;
+    for (res.fns, 0..) |gf, gid| {
+        if (gf.decl_node == Ast.none) continue; // synthetic print: no body to lower
+        // The entry `main` is the bare {user_fn,"main"} fn in the entry module.
+        if (gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main"))
+            entry_id = @intCast(gid);
+        try fn_decls.append(gpa, gf.decl_node);
+        try fn_modules.append(gpa, gf.module);
+        try lower_ids.append(gpa, @intCast(gid));
+    }
+
+    const eid = entry_id orelse return .{ .err = .{
+        .message = "-o requires a function named 'main' in the entry module",
+        .byte_offset = null,
+    } };
+
+    // Parameters on main are unsupported (codegen also guards; cleaner up front).
+    {
+        const em = &graph.modules[graph.entry_index];
+        const main_decl = em.nodes[res.fns[eid].decl_node];
+        const main_proto = Ast.protoAt(em.tree(), main_decl.lhs);
+        if (main_proto.params.len > 0) return .{ .err = .{
+            .message = "parameters on main unsupported in M1 codegen",
+            .byte_offset = em.tokens[main_decl.main_token].start,
+            .module = graph.entry_index,
+        } };
+    }
+
+    const gf = GraphFrozen{
+        .trees = trees,
+        .tokens = toks,
+        .sources = srcs,
+        .resolutions = resols,
+        .node_types = ntypes,
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sigs = tc.sigs,
+        .fn_decls = fn_decls.items,
+        .fn_modules = fn_modules.items,
+        .lower_ids = lower_ids.items,
+        .entry_id = eid,
+        .opt = opt,
+    };
+
+    // --- parallel per-fn fan-out (one slot per lowerable fn) ---
+    const slots = try gpa.alloc(FnSlot, fn_decls.items.len);
+    defer gpa.free(slots);
+    for (slots) |*s| s.* = .{};
+
+    var group: Io.Group = .init;
+    for (fn_decls.items, 0..) |_, i| {
+        group.concurrent(io, graphFnJob, .{ gpa, io, cache, target, mode, &gf, i, &slots[i] }) catch
+            graphFnJob(gpa, io, cache, target, mode, &gf, i, &slots[i]);
+    }
+    group.await(io) catch {};
+
+    var first_err: ?anyerror = null;
+    for (slots) |s| if (s.err) |e| {
+        if (first_err == null) first_err = e;
+    };
+    if (first_err) |e| {
+        for (slots) |*s| if (s.fc) |*fc| fc.deinit(gpa);
+        return e;
+    }
+
+    var compiled: usize = 0;
+    var cached_n: usize = 0;
+    var opt_stats: Opt.Stats = .{};
+    var ir_instrs: usize = 0;
+    for (slots) |s| {
+        if (s.cached) cached_n += 1 else compiled += 1;
+        opt_stats.add(s.opt_stats);
+        ir_instrs += s.ir_instrs;
+    }
+
+    // The relink entry index is the entry fn's POSITION in the lowered `slots`
+    // (source-order = the lowerable-fn enumeration order), not its global id. Find
+    // it by matching the entry global id in `lower_ids`.
+    var entry_pos: u32 = 0;
+    for (lower_ids.items, 0..) |gid, i| if (gid == eid) {
+        entry_pos = @intCast(i);
+        break;
+    };
+
+    // Build a names slice parallel to the LOWERED fns (relink/link index by
+    // lowered-fn position, not global id). Each lowered fn's name is its global
+    // SymName; borrowed (not owned) — the backing `names` outlives relink here.
+    const lowered_names = try gpa.alloc(Link.SymName, fn_decls.items.len);
+    defer gpa.free(lowered_names);
+    for (lower_ids.items, 0..) |gid, i| lowered_names[i] = names[gid];
+
+    return relink(gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
+}
+
+/// One whole-graph per-fn codegen job: build the single-fn `Frozen` view for this
+/// fn's owning module, then run the SAME fingerprint→cache→lower path as the
+/// single-file `fnJob`. The cross-module callee identity + touched layouts ride
+/// in through the program-wide `names`/`sigs`/`layouts`, so the fingerprint folds
+/// a qualified callee's SymName+sig distinctly with NO engine change. [design 8/10]
+fn graphFnJob(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    mode: CodegenIr.Mode,
+    gf: *const GraphFrozen,
+    lower_i: usize,
+    slot: *FnSlot,
+) void {
+    graphFnJobInner(gpa, io, cache, target, mode, gf, lower_i, slot) catch |e| {
+        slot.err = e;
+    };
+}
+
+fn graphFnJobInner(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    mode: CodegenIr.Mode,
+    gf: *const GraphFrozen,
+    lower_i: usize,
+    slot: *FnSlot,
+) !void {
+    var fn_node_buf: [1]Ast.Index = undefined;
+    const frozen = gf.frozenFor(lower_i, &fn_node_buf);
+    const fn_decl = frozen.fn_nodes[0];
+    const gid = gf.lower_ids[lower_i];
+    const sym = gf.names[gid];
+    const is_entry = gid == gf.entry_id;
+
+    var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
+    defer callee_sigs.deinit(gpa);
+    try walkCalls(gpa, &frozen, fn_decl, &callee_sigs);
+    var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
+    defer {
+        freeTouched(gpa, touched.items);
+        touched.deinit(gpa);
+    }
+    // Thread this fn's typecheck sig (program-wide, indexed by global id) so the
+    // fn_decl param/return fold uses the ABI-correct GLOBAL type ids — including a
+    // CROSS-MODULE qualified `b: rect.Rect`. A bare-name re-resolution would mis-pick
+    // the first same-named type in the merged layout table, missing a pub-type
+    // layout edit at the importer (cross-module M9 / TOP-RISK-#1 hole). [design 10]
+    const my_sig: ?Fingerprint.Sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
+    try walkTouchedSig(gpa, &frozen, fn_decl, my_sig, &touched);
+
+    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
+    const key = Cache.Key.fromFingerprint(.codegen, target, fp ^ optMix(gf.opt) ^ symMix(sym));
+
+    if (mode == .verify) {
+        var opt_out: OptOut = .{};
+        var fresh = try lowerOne(gpa, &frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
+        errdefer fresh.deinit(gpa);
+        const fb = try Link.pack(gpa, fresh);
+        defer gpa.free(fb);
+        var was_cached = false;
+        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+            defer gpa.free(blob);
+            std.debug.assert(std.mem.eql(u8, fb, blob));
+            was_cached = true;
+        } else {
+            var fresh2 = try lowerOne(gpa, &frozen, fn_decl, sym, is_entry, my_sig, null);
+            defer fresh2.deinit(gpa);
+            const fb2 = try Link.pack(gpa, fresh2);
+            defer gpa.free(fb2);
+            std.debug.assert(std.mem.eql(u8, fb, fb2));
+            cache.put(u8, io, key, lower_i, fb) catch {};
+        }
+        slot.* = .{ .fc = fresh, .cached = was_cached, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+        return;
+    }
+
+    if (mode != .force) {
+        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+            defer gpa.free(blob);
+            if (Link.unpack(gpa, blob) catch null) |fc| {
+                slot.* = .{ .fc = fc, .cached = true };
+                return;
+            }
+        }
+    }
+
+    var opt_out: OptOut = .{};
+    var fc = try lowerOne(gpa, &frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
+    errdefer fc.deinit(gpa);
+    if (Link.pack(gpa, fc) catch null) |b| {
+        defer gpa.free(b);
+        cache.put(u8, io, key, lower_i, b) catch {};
+    }
+    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+}
+
+/// Build the program-wide index→SymName table for a graph build: one entry per
+/// global fn id, parallel to `tc.sigs`. A user fn -> {user_fn, sig name} (the
+/// qualified spelling, or bare `main`); the synthetic bodyless `print` ->
+/// {builtin,"print"}. The name MUST equal the sig name so the fingerprint callee
+/// fold matches the reloc target. Caller owns the names.
+fn buildGraphNames(gpa: std.mem.Allocator, fns: []const ResolveGraph.GlobalFn, sigs: []const Fingerprint.Sig) ![]Link.SymName {
+    const names = try gpa.alloc(Link.SymName, fns.len);
+    var built: usize = 0;
+    errdefer {
+        for (names[0..built]) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, sigs[i].name) };
+        built += 1;
+    }
+    return names;
+}
+
+/// `--emit ir` for a whole-graph build: run the `lower` stage over every fn across
+/// the graph and render the deterministic IR text (each fn rendered against its
+/// owning module's tree). Caller owns the returned text on success.
+pub fn renderGraphIr(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *const ResolveGraph.GraphResult,
+    tc: *const Typecheck.GraphResult,
+    opt: Opt.Config,
+) !IrResult {
+    const names = try buildGraphNames(gpa, res.fns, tc.sigs);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    var first = true;
+    for (res.fns, 0..) |gf, gid| {
+        if (gf.decl_node == Ast.none) continue; // skip bodyless print
+        const m = &graph.modules[gf.module];
+        const is_entry = gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main");
+        const in = lower.Inputs{
+            .tree = m.tree(),
+            .tokens = m.tokens,
+            .source = m.source,
+            .resolutions = res.resolutions[gf.module],
+            .node_types = tc.node_types[gf.module],
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = names,
+            .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
+        };
+        var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
+        defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
+        if (!first) try aw.writer.writeAll("\n");
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        first = false;
+    }
+
+    var list = aw.toArrayList();
+    return .{ .ok = try list.toOwnedSlice(gpa) };
 }
 
 /// Build the fully signed, runnable Mach-O image for `code`. Thin pass-through to

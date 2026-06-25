@@ -1,0 +1,7 @@
+# Feature: an import cycle (main -> a -> b -> a) is rejected with the cycle path.
+# expect: compile-error "import cycle detected"
+import a
+
+fn main() -> int {
+    a.f()
+}

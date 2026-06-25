@@ -1,0 +1,5 @@
+# Feature: `print` is a GLOBAL PRELUDE — usable UNQUALIFIED in every module with
+# no import, with the same {builtin,"print"} identity as in the entry module.
+pub fn hello() {
+    print("modules ok\n")
+}

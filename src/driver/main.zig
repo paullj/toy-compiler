@@ -19,6 +19,9 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 const Driver = toyc.Driver;
 const Ast = toyc.Ast;
+const Graph = toyc.Graph;
+const ResolveGraph = toyc.ResolveGraph;
+const TypecheckGraph = toyc.TypecheckGraph;
 const CodegenIr = toyc.CodegenIr;
 const Opt = toyc.Opt;
 const version = toyc.version;
@@ -185,41 +188,54 @@ fn emitExecutable(
     opt: Opt.Config,
     opt_stats: bool,
 ) !u8 {
+    // M14: `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
+    // import graph from it and compiles the whole program.
     if (paths.len != 1) {
-        try argError(out, "-o takes exactly one input file");
-        return 1;
-    }
-
-    const results = try Driver.run(gpa, io, .check, target, paths);
-    defer {
-        for (results) |*r| r.deinit(gpa);
-        gpa.free(results);
-    }
-    const r = &results[0];
-
-    // Front-end errors (read/parse/resolve/type) -> print and fail.
-    if (r.err != null) {
-        _ = try report(out, results, .check, target, false);
-        try out.flush();
+        try argError(out, "-o takes exactly one input file (the entry module)");
         return 1;
     }
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var lowered = try Driver.lowerProgram(gpa, io, cache, target, r, mode, opt);
+    // --- discover the module graph from the entry file ---
+    var graph = try Graph.discover(gpa, io, cache, target, paths[0]);
+    defer graph.deinit(gpa);
+    if (graph.err) |ge| {
+        try printGraphError(out, &graph, ge);
+        try out.flush();
+        return 1;
+    }
+
+    // --- whole-graph name resolution ---
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    if (res.diags.len > 0) {
+        for (res.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        try out.flush();
+        return 1;
+    }
+
+    // --- whole-graph typecheck ---
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res);
+    defer tc.deinit(gpa);
+    if (tc.diags.len > 0) {
+        for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        try out.flush();
+        return 1;
+    }
+
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt);
     switch (lowered) {
         .err => |e| {
-            try printEmitError(out, r, e);
+            try printGraphEmitError(out, &graph, e);
             try out.flush();
             return 1;
         },
         .ok => |*lp| {
             defer lp.deinit(gpa);
             if (lp.diags.len > 0) {
-                for (lp.diags) |d| {
-                    try printEmitError(out, r, .{ .message = d.message, .byte_offset = d.byte_offset });
-                }
+                for (lp.diags) |d| try printGraphEmitError(out, &graph, .{ .message = d.message, .byte_offset = d.byte_offset });
                 try out.flush();
                 return 1;
             }
@@ -277,27 +293,42 @@ fn emitIr(
     paths: []const []const u8,
     opt: Opt.Config,
 ) !u8 {
+    // M14: `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph.
     if (paths.len != 1) {
-        try argError(out, "--emit ir takes exactly one input file");
+        try argError(out, "--emit ir takes exactly one input file (the entry module)");
         return 1;
     }
 
-    const results = try Driver.run(gpa, io, .ir, target, paths);
-    defer {
-        for (results) |*r| r.deinit(gpa);
-        gpa.free(results);
-    }
-    const r = &results[0];
+    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+    const cache = try Driver.openCache(io, &dir_buf);
 
-    if (r.err != null) {
-        _ = try report(out, results, .check, target, false);
+    var graph = try Graph.discover(gpa, io, cache, target, paths[0]);
+    defer graph.deinit(gpa);
+    if (graph.err) |ge| {
+        try printGraphError(out, &graph, ge);
         try out.flush();
         return 1;
     }
 
-    switch (try Driver.renderProgramIr(gpa, r, opt)) {
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    if (res.diags.len > 0) {
+        for (res.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        try out.flush();
+        return 1;
+    }
+
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res);
+    defer tc.deinit(gpa);
+    if (tc.diags.len > 0) {
+        for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        try out.flush();
+        return 1;
+    }
+
+    switch (try Driver.renderGraphIr(gpa, &graph, &res, &tc, opt)) {
         .err => |e| {
-            try printEmitError(out, r, e);
+            try printGraphEmitError(out, &graph, e);
             try out.flush();
             return 1;
         },
@@ -307,6 +338,40 @@ fn emitIr(
             try out.flush();
             return 0;
         },
+    }
+}
+
+/// Render a graph-discovery structural error against the owning module's source
+/// (or the entry path when no module loaded). Appends the cycle/file detail.
+fn printGraphError(out: *Io.Writer, graph: *const Graph.Graph, e: Graph.Error) !void {
+    const path = if (e.module) |m| graph.modules[m].path else if (graph.modules.len > 0) graph.entry().path else "<entry>";
+    const src = if (e.module) |m| graph.modules[m].source else &[_]u8{};
+    if (e.byte_offset) |off| {
+        const loc = lineCol(src, off);
+        try out.print("{s}:{d}:{d}: error: {s}", .{ path, loc.line, loc.col, e.message });
+    } else {
+        try out.print("{s}: error: {s}", .{ path, e.message });
+    }
+    if (e.detail.len > 0) try out.print(" ({s})", .{e.detail});
+    try out.writeByte('\n');
+}
+
+/// Render a cross-module resolve/typecheck diagnostic against its owning module.
+fn printModuleDiag(out: *Io.Writer, graph: *const Graph.Graph, module: u32, byte_offset: u32, message: []const u8) !void {
+    const m = &graph.modules[module];
+    const loc = lineCol(m.source, byte_offset);
+    try out.print("{s}:{d}:{d}: error: {s}\n", .{ m.path, loc.line, loc.col, message });
+}
+
+/// Render a code-emission `EmitError` from a graph build against its owning module
+/// (or the entry module when `module` is null).
+fn printGraphEmitError(out: *Io.Writer, graph: *const Graph.Graph, e: Driver.EmitError) !void {
+    const m = if (e.module) |mi| &graph.modules[mi] else graph.entry();
+    if (e.byte_offset) |off| {
+        const loc = lineCol(m.source, off);
+        try out.print("{s}:{d}:{d}: error: {s}\n", .{ m.path, loc.line, loc.col, e.message });
+    } else {
+        try out.print("{s}: error: {s}\n", .{ m.path, e.message });
     }
 }
 
@@ -457,7 +522,7 @@ fn dumpArtifact(out: *Io.Writer, r: Driver.FileResult, emit: Driver.Emit) !void 
         },
         .parse => {
             try out.writeAll("    ");
-            try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra }, r.tokens, r.source);
+            try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra, .pub_bits = r.pub_bits }, r.tokens, r.source);
             try out.writeByte('\n');
         },
         // Check dump: the AST plus a per-function signature summary with the
@@ -466,7 +531,7 @@ fn dumpArtifact(out: *Io.Writer, r: Driver.FileResult, emit: Driver.Emit) !void 
         // printed by `emitIr`, not the table dumper.
         .check, .ir => {
             try out.writeAll("    ");
-            try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra }, r.tokens, r.source);
+            try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra, .pub_bits = r.pub_bits }, r.tokens, r.source);
             try out.writeByte('\n');
             try dumpCheck(out, r);
         },

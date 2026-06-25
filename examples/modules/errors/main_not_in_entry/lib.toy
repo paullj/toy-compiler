@@ -1,0 +1,3 @@
+# `main` lives HERE, not in the entry module — which is an error: `main` must be
+# in the entry module (the file passed to `-o`).
+pub fn main() -> int { 0 }

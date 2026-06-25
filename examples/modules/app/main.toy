@@ -1,0 +1,18 @@
+# Feature: a multi-module program exercising the whole M14 surface in one entry:
+#   - diamond import: `geometry/vec` reached via both `main` and `geometry/rect`
+#   - alias: `text/banner as msg` binds the namespace to `msg`, not `banner`
+#   - qualified call (`rect.area`), cross-module struct passed BY VALUE
+#   - `print` prelude reached through an imported module
+# expect: exit 43
+# expect: stdout "modules ok\n"
+# area(6x7)=42 plus o.x: o = (0,0)+(1,2) so o.x = 1; 42 + 1 = 43.
+import geometry/rect
+import geometry/vec
+import text/banner as msg
+
+fn main() -> int {
+    msg.hello()
+    r := rect.make(0, 0, 6, 7)
+    o := vec.add(r.origin, vec.new(1, 2))
+    return rect.area(r) + o.x
+}

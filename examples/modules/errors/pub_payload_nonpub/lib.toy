@@ -1,0 +1,6 @@
+# `Inner` is module-private; carrying it in a `pub` enum's variant payload is a leak.
+struct Inner { v: int }
+
+pub enum Wrap { Empty, Has(Inner) }
+
+pub fn ok() -> int { 0 }

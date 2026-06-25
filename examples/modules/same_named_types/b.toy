@@ -1,0 +1,17 @@
+# Module `b`: a LARGE (32-byte, >16B) `Point` and a LARGE-payload `Status`. Same
+# NAMES as module `a`'s types but DISTINCT nominal types. The >16B values exercise
+# the sret / by-value-indirect ABI path; a bare-name layout alias onto a's small
+# types would miscompile (return only x0 / read uninitialized stack -> hang/garbage).
+pub struct Point { x: int, y: int, z: int, w: int }
+
+pub fn mk(x: int) -> Point { return Point { x: x, y: x * 2, z: x * 3, w: x * 4 } }
+pub fn get(p: Point) -> int { return p.x + p.y + p.z + p.w }
+
+pub enum Status { Pair(int, int, int, int) }
+
+pub fn mk_status(n: int) -> Status { return Status.Pair(n, n, n, n) }
+pub fn val(s: Status) -> int {
+  match s {
+    .Pair(a, b, c, d) -> a + b + c + d
+  }
+}

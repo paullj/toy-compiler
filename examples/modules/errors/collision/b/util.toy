@@ -1,0 +1,2 @@
+# The other module whose last path segment is also `util` — colliding namespace.
+pub fn f() -> int { 2 }

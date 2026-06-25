@@ -1,0 +1,3 @@
+# The imported module whose namespace name (`util`) clashes with the entry's
+# top-level `fn util`.
+pub fn helper() -> int { return 7 }

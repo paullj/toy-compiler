@@ -1,0 +1,2 @@
+# One of two modules whose last path segment is `util`.
+pub fn f() -> int { 1 }

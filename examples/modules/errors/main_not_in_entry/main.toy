@@ -1,0 +1,8 @@
+# Feature: the entry module MUST define `main`; defining it only in an imported
+# module is an error.
+# expect: compile-error "main"
+import lib
+
+fn helper() -> int {
+    lib.main()
+}

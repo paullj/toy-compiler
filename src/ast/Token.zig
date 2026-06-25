@@ -77,6 +77,17 @@ pub const Tag = enum(u8) {
     /// `@` label sigil, prefixing a label name on a loop/while/for/block.
     at,
 
+    // ---- M14: module keywords (appended LAST; ordinals of all tags above are
+    // frozen because Tag is enum(u8) and `[]Token` is memcpy'd to/from the
+    // content cache — new variants must extend the end). -----------------------
+
+    /// `import` — begins a module import declaration.
+    kw_import,
+    /// `pub` — exports the declaration that follows (`pub fn`/`pub struct`/`pub enum`).
+    kw_pub,
+    /// `as` — renames an imported namespace (`import a/b as r`).
+    kw_as,
+
     pub fn lexeme(tag: Tag) ?[]const u8 {
         return switch (tag) {
             .kw_fn => "fn",
@@ -94,6 +105,9 @@ pub const Tag = enum(u8) {
             .kw_continue => "continue",
             .kw_enum => "enum",
             .kw_match => "match",
+            .kw_import => "import",
+            .kw_pub => "pub",
+            .kw_as => "as",
             .plus => "+",
             .minus => "-",
             .star => "*",
@@ -142,4 +156,7 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "continue", .kw_continue },
     .{ "enum", .kw_enum },
     .{ "match", .kw_match },
+    .{ "import", .kw_import },
+    .{ "pub", .kw_pub },
+    .{ "as", .kw_as },
 });
