@@ -1,0 +1,11 @@
+# Bench: TARGET PASS = forward (store→load forwarding).
+# expect: exit 10
+# `a:=5; b:=a+a` lowers to store s0,%1 then TWO loads of s0 (one per use of `a`).
+# forward replaces both load results with the stored %1, so the add reads %1,%1
+# directly; both loads + their slot_addrs go dead -> DCE. Metric: loads_forwarded=2,
+# IR instrs + emitted aarch64 instrs both drop.
+fn main() -> int {
+    a := 5
+    b := a + a
+    return b
+}

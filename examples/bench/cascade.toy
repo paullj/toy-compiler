@@ -1,0 +1,17 @@
+# Bench: TARGET = the whole fixpoint cascade (rounds > 1).
+# expect: exit 30
+# `2*3` folds to 6; `6 > 1` icmp folds to bconst true; branch-fold turns the cond_br
+# into an unconditional br and the else block becomes unreachable (dropped). In the
+# taken branch `n := 6*5; m := n; return m` const-folds n=30, then store→load
+# forwards m's load, and DCE prunes the dead loads/values. So fold → fold(icmp) →
+# branch-fold → unreachable-elim → forward → DCE all fire; the manager iterates to a
+# bounded fixpoint (>1 round). Metric: IR + emitted aarch64 instrs both drop.
+fn main() -> int {
+    if 2 * 3 > 1 {
+        n := 6 * 5
+        m := n
+        return m
+    } else {
+        return 0
+    }
+}

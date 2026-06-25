@@ -21,6 +21,7 @@ const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
 const CodegenIr = @import("../codegen/CodegenIr.zig");
 const Ir = @import("../ir/Ir.zig");
+const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
 const Fingerprint = @import("Fingerprint.zig");
 const Link = @import("../link/Link.zig");
@@ -202,6 +203,13 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
 
 // ---- code emission (the `-o` path) -----------------------------------------
 
+/// Hash the opt config's fixed wire byte into a u64 to xor into the codegen
+/// fingerprint. Wyhash for good distribution; deterministic (the byte is a fixed
+/// packed struct with a 0 pad). The ONLY place opt level enters the cache key.
+fn optMix(cfg: Opt.Config) u64 {
+    return std.hash.Wyhash.hash(0x4f_50_54_4d, &[_]u8{cfg.bits()}); // "OPTM"
+}
+
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
 /// returns these to `main`, which renders them and exits non-zero.
@@ -231,6 +239,14 @@ pub const LinkedProgram = struct {
     /// from the codegen cache this build. Surfaced via `--codegen-stats`.
     codegen_compiled: usize = 0,
     codegen_cached: usize = 0,
+    /// M13 dual-metric: summed opt counters over freshly-lowered fns, the total
+    /// IR instruction count after opt, and the emitted aarch64 instruction count
+    /// (text.len/4). No owned slices → deinit unchanged. Cached fns contribute 0
+    /// to opt_stats/ir_instrs (their opt ran on a prior build), so honest
+    /// `--opt-stats` numbers require `--force`.
+    opt_stats: Opt.Stats = .{},
+    ir_instrs: usize = 0,
+    emitted_instrs: usize = 0,
 
     pub fn deinit(self: *LinkedProgram, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
@@ -261,6 +277,10 @@ const FnSlot = struct {
     fc: ?Link.FnCode = null,
     cached: bool = false,
     err: ?anyerror = null,
+    /// M13 dual-metric, set only when the fn is freshly lowered (cached fns
+    /// leave these at 0). Accumulated into the LinkedProgram in the collect loop.
+    opt_stats: Opt.Stats = .{},
+    ir_instrs: usize = 0,
 };
 
 /// Frozen, read-only inputs shared by every codegen job (thread-safe: nothing
@@ -277,6 +297,9 @@ const Frozen = struct {
     fn_nodes: []const Ast.Index,
     entry_fn: u32,
     sigs: []const Fingerprint.Sig,
+    /// M13 opt level / pass selection. Mixed into the codegen cache key so
+    /// toggling `-O` lands on a different entry, and threaded into `lowerOne`.
+    opt: Opt.Config,
 };
 
 /// Lower EVERY function in the file (in parallel, memoized through the codegen
@@ -291,6 +314,7 @@ pub fn lowerProgram(
     target: []const u8,
     r: *const FileResult,
     mode: CodegenIr.Mode,
+    opt: Opt.Config,
 ) !LowerProgramResult {
     const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
     const prog = r.nodes[Ast.root(r.nodes)];
@@ -345,6 +369,7 @@ pub fn lowerProgram(
         .fn_nodes = fn_nodes.items,
         .entry_fn = main_sym,
         .sigs = r.typecheck.?.sigs,
+        .opt = opt,
     };
 
 
@@ -372,13 +397,21 @@ pub fn lowerProgram(
 
     var compiled: usize = 0;
     var cached_n: usize = 0;
-    for (slots) |s| if (s.cached) {
-        cached_n += 1;
-    } else {
-        compiled += 1;
-    };
+    var opt_stats: Opt.Stats = .{};
+    var ir_instrs: usize = 0;
+    for (slots) |s| {
+        if (s.cached) {
+            cached_n += 1;
+        } else {
+            compiled += 1;
+        }
+        // Cached fns leave opt_stats/ir_instrs at 0 (their opt ran on a prior
+        // build); --force re-lowers everything for honest --opt-stats numbers.
+        opt_stats.add(s.opt_stats);
+        ir_instrs += s.ir_instrs;
+    }
 
-    return relink(gpa, slots, names, main_sym, compiled, cached_n);
+    return relink(gpa, slots, names, main_sym, compiled, cached_n, opt_stats, ir_instrs);
 }
 
 /// What `renderProgramIr` produced: either the rendered IR text (caller frees)
@@ -391,8 +424,10 @@ pub const IrResult = union(enum) {
 /// `--emit ir`: run the `lower` stage (Ast→Ir) over every function and render
 /// the deterministic IR text. No cache, no codegen — a front-end dump. The file
 /// must already be `checked` with no front-end errors.
-/// Caller owns the returned text on success.
-pub fn renderProgramIr(gpa: std.mem.Allocator, r: *const FileResult) !IrResult {
+/// Caller owns the returned text on success. `opt` runs the M13 opt stage on
+/// each function before rendering so `--emit ir` shows the OPTIMIZED IR (the
+/// manual IR-count metric surface).
+pub fn renderProgramIr(gpa: std.mem.Allocator, r: *const FileResult, opt: Opt.Config) !IrResult {
     const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
     const prog = r.nodes[Ast.root(r.nodes)];
     std.debug.assert(prog.tag == .program);
@@ -439,6 +474,8 @@ pub fn renderProgramIr(gpa: std.mem.Allocator, r: *const FileResult) !IrResult {
         const is_entry = if (entry_fn) |e| e == i else false;
         var func = try lower.lowerFn(gpa, in, fn_decl, names[i], is_entry, &diags);
         defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
         try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
         if (i + 1 != fn_nodes.items.len) try aw.writer.writeAll("\n");
     }
@@ -490,7 +527,11 @@ fn fnJobInner(
     try walkTouched(gpa, frozen, fn_decl, &touched);
 
     const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
-    const key = Cache.Key.fromFingerprint(.codegen, target, fp);
+    // Mix the opt config into the codegen key (the cached blob IS the OPTIMIZED
+    // machine code), so O0/O1 land on different entries — toggling -O can never
+    // serve a stale blob. Fingerprint stays a PURE source hash; this xor is the
+    // only place opt level enters the key. Deterministic (fixed packed byte).
+    const key = Cache.Key.fromFingerprint(.codegen, target, fp ^ optMix(frozen.opt));
     const sym = frozen.names[idx];
     const is_entry = idx == frozen.entry_fn;
 
@@ -502,7 +543,8 @@ fn fnJobInner(
         // Either way the assertion runs unconditionally — it is NOT gated on a
         // primed cache, so it can never silently no-op (the dead-gate bug, where
         // `--force` skipped the cache-read branch and thus the assert entirely).
-        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+        var opt_out: OptOut = .{};
+        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, &opt_out);
         errdefer fresh.deinit(gpa);
         const fb = try Link.pack(gpa, fresh);
         defer gpa.free(fb);
@@ -515,7 +557,7 @@ fn fnJobInner(
         } else {
             // Cold: no reference blob to compare against, so lower a second time
             // and assert the two fresh lowerings agree (pure determinism).
-            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, null);
             defer fresh2.deinit(gpa);
             const fb2 = try Link.pack(gpa, fresh2);
             defer gpa.free(fb2);
@@ -523,7 +565,9 @@ fn fnJobInner(
             // Populate the cache so subsequent fns/runs see a primed entry.
             cache.put(u8, io, key, idx, fb) catch {};
         }
-        slot.* = .{ .fc = fresh, .cached = was_cached };
+        // A verify build re-lowers fresh, so it has honest opt stats even on a
+        // cache hit (was_cached==true). Record them.
+        slot.* = .{ .fc = fresh, .cached = was_cached, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
         return;
     }
 
@@ -537,20 +581,27 @@ fn fnJobInner(
         }
     }
 
-    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry);
+    var opt_out: OptOut = .{};
+    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, &opt_out);
     errdefer fc.deinit(gpa);
     if (Link.pack(gpa, fc) catch null) |b| {
         defer gpa.free(b);
         cache.put(u8, io, key, idx, b) catch {};
     }
-    slot.* = .{ .fc = fc, .cached = false };
+    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
 }
 
-/// Lower one function (Ast→Ir→FnCode) with a throwaway diag sink (a job-local
+/// Dual-metric output of a fresh `lowerOne`: the summed opt counters for this fn
+/// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
+const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
+
+/// Lower one function (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a job-local
 /// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
 /// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
-/// is freed here, keeping the codegen cache ONE-TIER ([C8]).
-fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool) !Link.FnCode {
+/// is freed here, keeping the codegen cache ONE-TIER ([C8]). The M13 opt stage runs
+/// in-place on `irf` between lower and codegen; `opt_out` (when non-null) receives
+/// the per-fn dual-metric numbers.
+fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, opt_out: ?*OptOut) !Link.FnCode {
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
 
@@ -569,6 +620,13 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: *const Frozen, fn_decl: Ast.Index, s
     // A lower diagnostic (an unsupported/not-yet-lowered construct) fails the build
     // before we emit a partial FnCode.
     if (diags.items.len > 0) return error.CodegenDiagnostic;
+
+    // M13: run the opt stage in-place on the IR between lower and codegen. Stays
+    // ONE-TIER ([C8]) — the IR never escapes this query. With no passes enabled
+    // this is a pure no-op (the scaffold O0==O1 gate).
+    var opt_st: Opt.Stats = .{};
+    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
+    if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
 
     const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, is_entry, &diags);
     // A codegen diagnostic means an unsupported construct slipped past the
@@ -879,6 +937,8 @@ fn relink(
     entry_fn: u32,
     compiled: usize,
     cached_n: usize,
+    opt_stats: Opt.Stats,
+    ir_instrs: usize,
 ) !LowerProgramResult {
     // Gather the lowered fns into a contiguous slice in source order. `linkAndTail`
     // CONSUMES the elements (frees each FnCode on every path), so we only free the
@@ -899,6 +959,11 @@ fn relink(
     lp.owned_msgs = try gpa.alloc([]u8, 0);
     lp.codegen_compiled = compiled;
     lp.codegen_cached = cached_n;
+    lp.opt_stats = opt_stats;
+    lp.ir_instrs = ir_instrs;
+    // Dual-metric machine-code count: aarch64 is fixed-width 4-byte instrs, so
+    // the emitted instruction count is the linked __text length / 4.
+    lp.emitted_instrs = lp.text.len / 4;
     return .{ .ok = lp };
 }
 
@@ -1094,7 +1159,7 @@ test "lowerProgram reports missing main and lowers a simple main" {
         try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 0);
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         switch (lowered) {
             .err => |e| try testing.expect(e.byte_offset == null),
             .ok => |*lp| {
@@ -1114,7 +1179,7 @@ test "lowerProgram reports missing main and lowers a simple main" {
         try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 1);
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         switch (lowered) {
             .err => return error.TestUnexpectedResult,
             .ok => |*lp| {
@@ -1471,7 +1536,7 @@ test "integration: emitted binary runs with the right exit code" {
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
 
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         const lp = switch (lowered) {
             .ok => |*ok| ok,
             .err => return error.TestUnexpectedResult,
@@ -1546,7 +1611,7 @@ test "integration: print writes the expected bytes to stdout" {
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
 
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal);
+        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         const lp = switch (lowered) {
             .ok => |*ok| ok,
             .err => return error.TestUnexpectedResult,
@@ -1598,7 +1663,7 @@ fn checkAndLower(
     r_out.* = .{ .path = path };
     try pipeline(gpa, io, cache, .check, "aarch64-macos", r_out, 0);
     try testing.expect(r_out.err == null);
-    const lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", r_out, mode);
+    const lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", r_out, mode, .O0);
     return switch (lowered) {
         .ok => |ok| ok,
         .err => error.TestUnexpectedResult,

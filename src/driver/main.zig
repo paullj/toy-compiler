@@ -20,6 +20,7 @@ const toyc = @import("toy_compiler");
 const Driver = toyc.Driver;
 const Ast = toyc.Ast;
 const CodegenIr = toyc.CodegenIr;
+const Opt = toyc.Opt;
 const version = toyc.version;
 
 pub fn main(init: std.process.Init) !void {
@@ -38,6 +39,10 @@ pub fn main(init: std.process.Init) !void {
     var out_path: ?[]const u8 = null;
     var codegen_stats = false;
     var mode: CodegenIr.Mode = .normal;
+    // M13 opt level / pass selection. Default -O0 (no opt). Last flag wins,
+    // left-to-right; --opt= / --no-opt= toggle individual passes from current.
+    var opt: Opt.Config = .O0;
+    var opt_stats = false;
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
 
@@ -52,6 +57,26 @@ pub fn main(init: std.process.Init) !void {
             mode = .verify;
         } else if (std.mem.eql(u8, arg, "--force")) {
             mode = .force;
+        } else if (std.mem.eql(u8, arg, "-O0")) {
+            opt = .O0;
+        } else if (std.mem.eql(u8, arg, "-O1")) {
+            opt = .O1;
+        } else if (std.mem.eql(u8, arg, "--opt-stats")) {
+            opt_stats = true;
+        } else if (std.mem.startsWith(u8, arg, "--opt=")) {
+            // Start from level-off, then turn ON each named pass.
+            opt = .O0;
+            var it = std.mem.splitScalar(u8, arg["--opt=".len..], ',');
+            while (it.next()) |name| {
+                if (name.len == 0) return argError(out, "--opt expects a comma-separated pass list (fold,branch,dce,forward)");
+                const p = passByName(name) orelse return argError(out, "--opt: unknown pass (expected fold,branch,dce,forward)");
+                opt.set(p, true);
+            }
+        } else if (std.mem.startsWith(u8, arg, "--no-opt=")) {
+            // Turn the named pass OFF from the current config (e.g. -O1 --no-opt=forward).
+            const name = arg["--no-opt=".len..];
+            const p = passByName(name) orelse return argError(out, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
+            opt.set(p, false);
         } else if (std.mem.eql(u8, arg, "--emit")) {
             const v = args.next() orelse return argError(out, "--emit requires a value (lex|parse|check|ir)");
             if (std.mem.eql(u8, v, "lex")) {
@@ -95,12 +120,12 @@ pub fn main(init: std.process.Init) !void {
 
     // `-o`: lower `main` and write a signed, runnable executable.
     if (out_path) |path| {
-        std.process.exit(try emitExecutable(gpa, io, out, target, paths.items, path, mode, codegen_stats));
+        std.process.exit(try emitExecutable(gpa, io, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (emit == .ir) {
-        std.process.exit(try emitIr(gpa, io, out, target, paths.items));
+        std.process.exit(try emitIr(gpa, io, out, target, paths.items, opt));
     }
 
     const results = try Driver.run(gpa, io, emit, target, paths.items);
@@ -113,6 +138,15 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
     // Signal compilation failure to scripts/CI. (Flush first; exit skips defers.)
     if (failures > 0) std.process.exit(1);
+}
+
+/// Map a `--opt`/`--no-opt` pass name to its `Opt.Pass`, or null if unknown.
+fn passByName(name: []const u8) ?Opt.Pass {
+    if (std.mem.eql(u8, name, "fold")) return .fold;
+    if (std.mem.eql(u8, name, "branch")) return .branch;
+    if (std.mem.eql(u8, name, "dce")) return .dce;
+    if (std.mem.eql(u8, name, "forward")) return .forward;
+    return null;
 }
 
 /// True if `target` names the aarch64-macos triple we can emit for (or `native`,
@@ -148,6 +182,8 @@ fn emitExecutable(
     out_path: []const u8,
     mode: CodegenIr.Mode,
     codegen_stats: bool,
+    opt: Opt.Config,
+    opt_stats: bool,
 ) !u8 {
     if (paths.len != 1) {
         try argError(out, "-o takes exactly one input file");
@@ -171,7 +207,7 @@ fn emitExecutable(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var lowered = try Driver.lowerProgram(gpa, io, cache, target, r, mode);
+    var lowered = try Driver.lowerProgram(gpa, io, cache, target, r, mode, opt);
     switch (lowered) {
         .err => |e| {
             try printEmitError(out, r, e);
@@ -191,6 +227,19 @@ fn emitExecutable(
             // How many fns were freshly lowered vs. served from the codegen cache.
             if (codegen_stats) {
                 try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
+                try out.flush();
+            }
+
+            // M13 dual-metric counters, fixed field order, deterministic. Cached
+            // fns contribute 0 to the opt counters; use --force for honest numbers.
+            if (opt_stats) {
+                const s = lp.opt_stats;
+                try out.print("opt: rounds={d} ir_instrs={d}->{d} emitted_instrs={d}\n", .{
+                    s.rounds, s.ir_instrs_before, lp.ir_instrs, lp.emitted_instrs,
+                });
+                try out.print("  folded={d} branches={d} blocks={d} dced={d} forwarded={d} values_pruned={d}\n", .{
+                    s.consts_folded, s.branches_folded, s.blocks_removed, s.instrs_dced, s.loads_forwarded, s.values_pruned,
+                });
                 try out.flush();
             }
 
@@ -226,6 +275,7 @@ fn emitIr(
     out: *Io.Writer,
     target: []const u8,
     paths: []const []const u8,
+    opt: Opt.Config,
 ) !u8 {
     if (paths.len != 1) {
         try argError(out, "--emit ir takes exactly one input file");
@@ -245,7 +295,7 @@ fn emitIr(
         return 1;
     }
 
-    switch (try Driver.renderProgramIr(gpa, r)) {
+    switch (try Driver.renderProgramIr(gpa, r, opt)) {
         .err => |e| {
             try printEmitError(out, r, e);
             try out.flush();
@@ -300,6 +350,10 @@ fn usage(out: *Io.Writer) !void {
         \\  --codegen-stats   print compiled-vs-cached function counts (with -o)
         \\  --verify          re-lower cached functions and assert they match (with -o)
         \\  --force           ignore the codegen cache; lower every function (with -o)
+        \\  -O0 | -O1         IR optimization level (default -O0; -O1 = all passes)
+        \\  --opt=<list>      enable only these passes (fold,branch,dce,forward)
+        \\  --no-opt=<pass>   disable one pass from the current level (e.g. -O1 --no-opt=forward)
+        \\  --opt-stats       print per-pass opt counters + dual metric (with -o; use --force)
         \\
     , .{version.stamp(&stamp_buf)});
     try out.flush();

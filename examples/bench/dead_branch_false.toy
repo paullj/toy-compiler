@@ -1,0 +1,12 @@
+# Bench: TARGET PASS = branch (branch-fold + unreachable-block elimination).
+# expect: exit 2
+# `if false` folds the cond_br to `br bElse`; the then block (and the lowered
+# `never` merge block) become unreachable and are dropped. Mirror of
+# dead_branch_true for the false-target path.
+fn main() -> int {
+    if false {
+        return 1
+    } else {
+        return 2
+    }
+}

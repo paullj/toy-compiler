@@ -204,6 +204,15 @@ pub const Function = struct {
     }
 };
 
+/// Total straight-line instruction count across all blocks (terminators are
+/// NOT counted — they are a fixed per-block cost). The opt-stage dual metric's
+/// IR-side number; documented to exclude terminators so it is stable to compare.
+pub fn instrCount(func: *const Function) usize {
+    var n: usize = 0;
+    for (func.blocks) |b| n += b.instrs.len;
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // Textual renderer (`--emit ir`) — a deterministic golden-test surface.
 // ---------------------------------------------------------------------------

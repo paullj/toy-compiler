@@ -1,0 +1,10 @@
+# Bench: TARGET PASS = fold (constant folding + propagation).
+# expect: exit 13
+# `2 + 3*4 - 1` is all constants: fold collapses mul=12, add=14, sub=13 into a
+# single iconst chain. Metric: 3 arith instrs (mul/add/sub) become 3 iconsts ->
+# the const-arith IR instruction count holds but the arith ops vanish; combined
+# with later DCE the dead const feeders are pruned. At the fold stage the proof
+# is the disappearance of mul/add/sub from --emit ir at -O1 vs -O0.
+fn main() -> int {
+    return 2 + 3 * 4 - 1
+}

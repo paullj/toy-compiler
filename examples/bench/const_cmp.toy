@@ -1,0 +1,12 @@
+# Bench: TARGET PASS = fold (icmp) + branch cascade (fixpoint).
+# expect: exit 7
+# `3 > 2` is a const icmp -> fold to `bconst true`; that enables branch-fold of
+# the cond_br -> `br bThen`; unreachable-elim drops the else block; DCE prunes the
+# now-dead icmp/iconst feeders. Exercises the fold->branch->dce cascade in >1 round.
+fn main() -> int {
+    if 3 > 2 {
+        return 7
+    } else {
+        return 9
+    }
+}

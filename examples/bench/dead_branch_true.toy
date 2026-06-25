@@ -1,0 +1,13 @@
+# Bench: TARGET PASS = branch (branch-fold + unreachable-block elimination).
+# expect: exit 1
+# `if true` lowers to `%N=bconst true; cond_br %N,bThen,bElse`. branch-fold turns
+# the cond_br into an argless `br bThen`; the else block (and the lowered `never`
+# merge block) become unreachable and are dropped. Metric: -1+ whole block, and
+# the emitted cmp+cbnz+b collapses to a single b -> fewer aarch64 instrs.
+fn main() -> int {
+    if true {
+        return 1
+    } else {
+        return 2
+    }
+}

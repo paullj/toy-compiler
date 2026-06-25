@@ -16,6 +16,7 @@ pub const CodegenIr = @import("codegen/CodegenIr.zig");
 pub const Abi = @import("codegen/abi/Abi.zig");
 pub const FrameLayout = @import("codegen/frame/FrameLayout.zig");
 pub const Ir = @import("ir/Ir.zig");
+pub const Opt = @import("opt/Opt.zig");
 pub const lower = @import("lower.zig");
 pub const Fingerprint = @import("driver/Fingerprint.zig");
 pub const Link = @import("link/Link.zig");
@@ -37,6 +38,7 @@ test {
     _ = Abi;
     _ = FrameLayout;
     _ = Ir;
+    _ = Opt;
     _ = lower;
     _ = Fingerprint;
     _ = Link;
