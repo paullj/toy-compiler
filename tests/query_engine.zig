@@ -1,14 +1,14 @@
-//! R2 BOUNDARY TESTS for the incremental query engine seam.
+//! R2 BOUNDARY TESTS for the incremental query engine seam (integration).
 //!
-//! These are INTEGRATION/boundary tests, not unit tests, so they live in
-//! `src/tests/` rather than inline in `Engine.zig`: each spins up a threaded `Io`
-//! runtime + a temp-dir `Cache` stand-in and exercises the engine end-to-end
-//! against real lex/parse + a real on-disk cache. (The folder is at the top of the
-//! source tree because a Zig module can't `@import` above its root, `src/root.zig`.)
+//! These exercise the engine END-TO-END: each spins up a threaded `Io` runtime + a
+//! temp-dir `Cache` stand-in and drives real lex/parse + a real on-disk cache. They
+//! consume the compiler as a BLACK BOX through `@import("toy_compiler")` (the
+//! published surface), so they live in the repo-root tests/ — not inline in
+//! Engine.zig — and run in their own `toyc-integration-test` binary.
 //!
 //! M15 lifted the distributed query/cache/fingerprint/force-verify/parallel logic
-//! into `Engine` + `Key` + `Cache` + `Fingerprint`. These tests exercise that seam
-//! DIRECTLY (no driver internals), asserting the five boundary behaviours:
+//! into `Engine` + `Key` + `Cache` + `Fingerprint`. These pin the five boundary
+//! behaviours that seam must preserve:
 //!
 //!   * MISS  — a cold key computes and stores.
 //!   * HIT   — a primed key serves the cached value without recomputing.
@@ -22,21 +22,22 @@
 //!
 //! The whole-program force/verify and module-granular invalidation paths are
 //! additionally covered end-to-end by the Driver `[v]`/`[iv]` soundness tests and
-//! the three corpora; these tests pin the engine UNIT contract those build on.
+//! the three corpora; these pin the engine UNIT contract those build on.
 
 const std = @import("std");
 const Io = std.Io;
 const testing = std.testing;
 
-const Engine = @import("../query/Engine.zig");
-const Cache = @import("../query/Cache.zig");
-const Key = @import("../query/Key.zig");
-const Fingerprint = @import("../query/Fingerprint.zig");
-const Token = @import("../ast/Token.zig").Token;
-const Ast = @import("../ast/Ast.zig");
-const Link = @import("../link/Link.zig");
-const Lexer = @import("../lex.zig");
-const Parser = @import("../parse.zig");
+const toyc = @import("toy_compiler");
+const Engine = toyc.QueryEngine;
+const Cache = toyc.Cache;
+const Key = toyc.QueryKey;
+const Fingerprint = toyc.Fingerprint;
+const Token = toyc.token.Token;
+const Ast = toyc.Ast;
+const Link = toyc.Link;
+const Lexer = toyc.Lexer;
+const Parser = toyc.Parser;
 const Sig = Fingerprint.Sig;
 const TouchedType = Fingerprint.TouchedType;
 

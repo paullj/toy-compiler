@@ -73,6 +73,28 @@ pub fn build(b: *std.Build) void {
     const install_mod_tests = b.addInstallArtifact(mod_tests, .{});
     const test_bin_step = b.step("test-bin", "Build the test binary; run ./zig-out/bin/toyc-test directly (avoids the runner hang)");
     test_bin_step.dependOn(&install_mod_tests.step);
+
+    // Integration tests live in the repo-root tests/ and consume the compiler as a
+    // BLACK BOX through the published `toy_compiler` module (src/root.zig's pub
+    // exports) — `@import("toy_compiler")`, never `../` into src/ (a Zig module can't
+    // import above its root). Their own test artifact keeps them out of the unit-test
+    // (toyc-test) binary; src/ stays library + inline unit tests, tests/ is integration.
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "toy_compiler", .module = mod },
+        },
+    });
+    const integration_tests = b.addTest(.{
+        .name = "toyc-integration-test",
+        .root_module = integration_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+    // Same runner-hang workaround: install the integration binary so it runs directly
+    // (`./zig-out/bin/toyc-integration-test`) alongside toyc-test under `test-bin`.
+    test_bin_step.dependOn(&b.addInstallArtifact(integration_tests, .{}).step);
 }
 
 /// Hash every `.zig` file under `src/` (by path + contents, sorted for

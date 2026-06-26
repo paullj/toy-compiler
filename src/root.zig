@@ -57,8 +57,9 @@ test {
     _ = MachO;
     _ = CodeSign;
     _ = link; // discovers emit.zig's boundary test
-    // Cache's digest unit tests are now inline in query/Cache.zig (pulled via `_ = Cache`).
-    // The engine BOUNDARY suite (temp-dir cache + threaded runtime — integration, not
-    // unit) lives in src/tests/, pulled here.
-    _ = @import("tests/query_engine.zig"); // R2 engine boundary tests (hit/miss/force/verify/invalidation)
+    // Inline unit tests live in their modules (pulled via the `_ = X` refs above —
+    // e.g. Cache's digest tests in query/Cache.zig). The engine BOUNDARY suite
+    // (integration: temp-dir cache + threaded runtime) is NOT pulled here — it lives
+    // in the repo-root tests/ and runs in its own `toyc-integration-test` artifact
+    // (see build.zig), consuming the compiler as a black box via @import("toy_compiler").
 }
