@@ -10,6 +10,7 @@ pub const Parser = @import("parse.zig");
 pub const Cache = @import("query/Cache.zig");
 pub const QueryEngine = @import("query/Engine.zig");
 pub const QueryKey = @import("query/Key.zig");
+pub const QueryDag = @import("query/Dag.zig");
 pub const Driver = @import("driver/Driver.zig");
 pub const Graph = @import("driver/Graph.zig");
 pub const Resolve = @import("resolve.zig");
@@ -38,6 +39,7 @@ test {
     _ = Cache;
     _ = QueryEngine;
     _ = QueryKey;
+    _ = QueryDag;
     _ = Driver;
     _ = Graph;
     _ = Resolve;

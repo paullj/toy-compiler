@@ -24,6 +24,7 @@ const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const CodegenIr = toyc.CodegenIr;
 const Opt = toyc.Opt;
+const Dag = toyc.QueryDag;
 const version = toyc.version;
 
 pub fn main(init: std.process.Init) !void {
@@ -46,6 +47,9 @@ pub fn main(init: std.process.Init) !void {
     // left-to-right; --opt= / --no-opt= toggle individual passes from current.
     var opt: Opt.Config = .O0;
     var opt_stats = false;
+    // M16: `--dump-dag` compiles the whole program with the per-build dependency
+    // DAG threaded into every query, then prints the deterministic dump to stdout.
+    var dump_dag = false;
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
 
@@ -66,6 +70,8 @@ pub fn main(init: std.process.Init) !void {
             opt = .O1;
         } else if (std.mem.eql(u8, arg, "--opt-stats")) {
             opt_stats = true;
+        } else if (std.mem.eql(u8, arg, "--dump-dag")) {
+            dump_dag = true;
         } else if (std.mem.startsWith(u8, arg, "--opt=")) {
             // Start from level-off, then turn ON each named pass.
             opt = .O0;
@@ -119,6 +125,17 @@ pub fn main(init: std.process.Init) !void {
     if (out_path != null and !isAarch64Macos(target)) {
         try argError(out, "code emission only supports aarch64-macos in M1");
         std.process.exit(1);
+    }
+
+    // `--dump-dag`: compile the whole program with the per-build dependency DAG
+    // threaded through every query, then print the deterministic dump to stdout.
+    // This is the LIVE proof the recording infra runs in production (anti-dead-code).
+    if (dump_dag) {
+        if (!isAarch64Macos(target)) {
+            try argError(out, "--dump-dag only supports aarch64-macos (it runs codegen)");
+            std.process.exit(1);
+        }
+        std.process.exit(try emitDumpDag(gpa, io, out, target, paths.items, opt));
     }
 
     // `-o`: lower `main` and write a signed, runnable executable.
@@ -217,7 +234,7 @@ fn emitExecutable(
     }
 
     // --- whole-graph typecheck ---
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
         for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
@@ -225,7 +242,7 @@ fn emitExecutable(
         return 1;
     }
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, null);
     switch (lowered) {
         .err => |e| {
             try printGraphEmitError(out, &graph, e);
@@ -318,7 +335,7 @@ fn emitIr(
         return 1;
     }
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
         for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
@@ -339,6 +356,86 @@ fn emitIr(
             return 0;
         },
     }
+}
+
+/// `--dump-dag`: compile the whole program with a per-build dependency `Dag`
+/// threaded through EVERY query (discovery lex/parse + per-fn codegen), then print
+/// the deterministic dump to stdout. This is the LIVE anti-dead-code proof: the
+/// recording infra runs in production, not just in unit tests.
+///
+/// OWNERSHIP: ONE `Dag` value lives on this stack frame and a `*Dag` is threaded
+/// down through `discoverDag` and `lowerGraphProgram`'s graph fan-out. A `*Dag`
+/// (never a value) is what reaches each per-fn job, so every worker's recorded
+/// edges land in the single shared graph (a value field would vanish per-job).
+/// The DAG is purely OBSERVATIONAL — emitted bytes are byte-identical to a normal
+/// build (default builds keep dag=null; only this path opts in).
+fn emitDumpDag(
+    gpa: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    target: []const u8,
+    paths: []const []const u8,
+    opt: Opt.Config,
+) !u8 {
+    if (paths.len != 1) {
+        try argError(out, "--dump-dag takes exactly one input file (the entry module)");
+        return 1;
+    }
+
+    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+    const cache = try Driver.openCache(io, &dir_buf);
+
+    // The single per-build dependency sink; outlives every fan-out await below.
+    var dag: Dag = .init(gpa);
+    defer dag.deinit(gpa);
+
+    // --- discover (lex/parse routed through the dag-threaded engine) ---
+    var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], &dag);
+    defer graph.deinit(gpa);
+    if (graph.err) |ge| {
+        try printGraphError(out, &graph, ge);
+        try out.flush();
+        return 1;
+    }
+
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    if (res.diags.len > 0) {
+        for (res.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        try out.flush();
+        return 1;
+    }
+
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag);
+    defer tc.deinit(gpa);
+    if (tc.diags.len > 0) {
+        for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        try out.flush();
+        return 1;
+    }
+
+    // --- whole-program codegen with the dag threaded into every per-fn job ---
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, .normal, opt, &dag);
+    switch (lowered) {
+        .err => |e| {
+            try printGraphEmitError(out, &graph, e);
+            try out.flush();
+            return 1;
+        },
+        .ok => |*lp| {
+            defer lp.deinit(gpa);
+            if (lp.diags.len > 0) {
+                for (lp.diags) |d| try printGraphEmitError(out, &graph, .{ .message = d.message, .byte_offset = d.byte_offset });
+                try out.flush();
+                return 1;
+            }
+        },
+    }
+
+    // --- emit the deterministic dump ---
+    try dag.dumpDeterministic(gpa, out);
+    try out.flush();
+    return 0;
 }
 
 /// Render a graph-discovery structural error against the owning module's source
@@ -419,6 +516,7 @@ fn usage(out: *Io.Writer) !void {
         \\  --opt=<list>      enable only these passes (fold,branch,dce,forward)
         \\  --no-opt=<pass>   disable one pass from the current level (e.g. -O1 --no-opt=forward)
         \\  --opt-stats       print per-pass opt counters + dual metric (with -o; use --force)
+        \\  --dump-dag        compile the program and print the per-build query DAG (aarch64-macos)
         \\
     , .{version.stamp(&stamp_buf)});
     try out.flush();

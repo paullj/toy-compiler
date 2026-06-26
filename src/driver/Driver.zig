@@ -17,6 +17,7 @@ const Parser = @import("../parse.zig");
 const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
+const Dag = @import("../query/Dag.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
 const Graph = @import("Graph.zig");
@@ -644,6 +645,12 @@ const GraphFrozen = struct {
     /// Global fn id of the entry `main` (indexes `names`).
     entry_id: u32,
     opt: Opt.Config,
+    /// M16: the per-build dependency-recording sink, threaded only by the
+    /// `--dump-dag` path. `null` on every default (`-o`/`run`/`--emit`) build so
+    /// each per-fn codegen job runs through `Engine.init` (dag=null) verbatim —
+    /// the byte-identity guarantee. When non-null each job runs through
+    /// `Engine.initDag` so `query()` records caller->callee codegen edges.
+    dag: ?*Dag = null,
 
     /// Build the single-fn `Frozen` view a codegen job runs against: this fn's
     /// owning module's per-module arrays + the program-wide tables. `fn_nodes` is
@@ -686,6 +693,7 @@ pub fn lowerGraphProgram(
     tc: *const Typecheck.GraphResult,
     mode: CodegenIr.Mode,
     opt: Opt.Config,
+    dag: ?*Dag,
 ) !LowerProgramResult {
     const n_mods = graph.modules.len;
 
@@ -769,6 +777,7 @@ pub fn lowerGraphProgram(
         .lower_ids = lower_ids.items,
         .entry_id = eid,
         .opt = opt,
+        .dag = dag,
     };
 
     // --- parallel per-fn fan-out (one slot per lowerable fn) ---
@@ -883,7 +892,7 @@ fn graphFnJobInner(
     // callee identity + touched layouts ride in through the program-wide
     // `names`/`sigs`/`layouts` of this fn's `frozen` view, so the fingerprint folds
     // a qualified callee distinctly with NO engine change. tmp_tag = `lower_i`.
-    const engine = Engine.init(cache, mode);
+    const engine = if (gf.dag) |dp| Engine.initDag(cache, mode, dp) else Engine.init(cache, mode);
     try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, slot);
 }
 

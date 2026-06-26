@@ -22,6 +22,7 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
+const Dag = @import("../query/Dag.zig");
 
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
@@ -134,11 +135,27 @@ pub fn discover(
     target: []const u8,
     entry_path: []const u8,
 ) !Graph {
+    return discoverDag(gpa, io, cache, target, entry_path, null);
+}
+
+/// Same as `discover`, but threads a borrowed `*Dag` so the lex/parse queries run
+/// during discovery record their nodes/edges into the per-build graph. The default
+/// `discover` passes `null` (verbatim fast path, byte-identical). Only `--dump-dag`
+/// opts in.
+pub fn discoverDag(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    entry_path: []const u8,
+    dag: ?*Dag,
+) !Graph {
     var d: Discoverer = .{
         .gpa = gpa,
         .io = io,
         .cache = cache,
         .target = target,
+        .dag = dag,
         .root = dirname(entry_path),
     };
     defer d.deinit();
@@ -213,6 +230,8 @@ const Discoverer = struct {
     io: Io,
     cache: Cache,
     target: []const u8,
+    /// M16: per-build dependency sink (null on default builds; set by `--dump-dag`).
+    dag: ?*Dag = null,
     /// The root directory (entry file's directory). Borrowed from `entry_path`.
     root: []const u8,
     /// Module slots, indexed by id, in interning order. Entry is id 0.
@@ -328,7 +347,7 @@ const Discoverer = struct {
         // per-file pipeline, but with discovery's SWALLOW read policy (a failed
         // cache read is a plain miss, `tmp_tag` = module id). Front-end queries
         // ignore the engine's force/verify mode.
-        const engine = Engine.init(d.cache, .normal);
+        const engine = if (d.dag) |dp| Engine.initDag(d.cache, .normal, dp) else Engine.init(d.cache, .normal);
 
         // --- lex (cached) ---
         const lexed = try engine.lex(d.gpa, d.io, d.target, source, id, true);

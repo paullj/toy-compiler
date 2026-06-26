@@ -26,6 +26,7 @@ const Ast = @import("ast/Ast.zig");
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
 const Typecheck = @import("types.zig");
+const Dag = @import("query/Dag.zig");
 
 pub const GraphResult = Typecheck.GraphResult;
 pub const GraphDiagnostic = Typecheck.GraphDiagnostic;
@@ -38,6 +39,7 @@ pub fn checkGraph(
     gpa: std.mem.Allocator,
     graph: *const Graph.Graph,
     res: *const ResolveGraph.GraphResult,
+    dag: ?*Dag,
 ) !GraphResult {
     const n = graph.modules.len;
 
@@ -94,7 +96,7 @@ pub fn checkGraph(
         };
     }
 
-    return Typecheck.checkGraph(gpa, &ctx, mods, fns);
+    return Typecheck.checkGraph(gpa, &ctx, mods, fns, dag);
 }
 
 /// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
@@ -194,7 +196,7 @@ fn withCheckedGraph(
     var r = try ResolveGraph.resolveGraph(gpa, &graph);
     defer r.deinit(gpa);
 
-    var tr = try checkGraph(gpa, &graph, &r);
+    var tr = try checkGraph(gpa, &graph, &r, null);
     defer tr.deinit(gpa);
 
     try check(&graph, &r, &tr);

@@ -29,6 +29,7 @@ const Link = @import("../link/Link.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
+const Dag = @import("Dag.zig");
 
 const Engine = @This();
 
@@ -44,8 +45,42 @@ cache: Cache,
 /// ignore it — they are pure source-hash lookups with no re-lower gate.
 mode: Mode = .normal,
 
+/// M16 SPIKE — the OBSERVATIONAL dependency-recording sink. When non-null,
+/// `query()` records a caller->callee edge + the callee's result fingerprint into
+/// this shared `*Dag` (the active-query-stack supplies the caller). BORROWED, never
+/// a value field: the Engine is re-`init`'d per job from a copied cache+mode, so a
+/// value DAG would give each job a private empty graph and the edges would vanish —
+/// a single Dag lives in the driver scope and a `*Dag` is threaded into every job
+/// (mirrors how `Cache` is itself a borrowed dir handle).
+///
+/// When `null` (the default `init`), `query()` is VERBATIM-today: zero overhead,
+/// zero behavior change — the byte-identity guarantee for this milestone.
+dag: ?*Dag = null,
+
 pub fn init(cache: Cache, mode: Mode) Engine {
     return .{ .cache = cache, .mode = mode };
+}
+
+/// Same as `init`, but threads a borrowed `*Dag` so `query()` records dependency
+/// edges. Existing call sites keep using `init` (dag = null) so they compile +
+/// behave unchanged; only the driver scope that owns the per-build `Dag` opts in.
+pub fn initDag(cache: Cache, mode: Mode, dag: *Dag) Engine {
+    return .{ .cache = cache, .mode = mode, .dag = dag };
+}
+
+/// Map a `Cache.Key` to its in-memory DAG `NodeKey`. lex/parse/codegen fold the
+/// Cache.Key digest so DAG nodes align 1:1 with cache identity. (The fine-grained
+/// typecheck nodes — signature/body/type_of/layout — are recorded directly via
+/// `dag.recordEdge` with their global ids in later stages; this spike wires the
+/// engine seam + proves the signature firewall in tests.)
+fn nodeKeyFor(key: Cache.Key) Dag.NodeKey {
+    const kind: Dag.Kind = switch (key.phase) {
+        .lex => .lex,
+        .parse => .parse,
+        .check => .body, // coarse: the M15 single check phase (no fine-grained split yet here)
+        .codegen => .codegen,
+    };
+    return .{ .kind = kind, .id = key.digest() };
 }
 
 /// The result of a single query: the value plus whether it was served from the
@@ -75,8 +110,36 @@ pub fn query(
     comptime swallow_put: bool,
     compute: anytype,
 ) !Result(T) {
+    // FAST PATH: no DAG sink => VERBATIM-today (zero overhead, byte-identical).
+    if (self.dag == null) {
+        const hit: ?[]T = if (swallow_get) (self.cache.get(T, gpa, io, key) catch null) else (try self.cache.get(T, gpa, io, key));
+        if (hit) |h| {
+            return .{ .value = h, .cached = true };
+        }
+        const fresh = try compute.run();
+        if (swallow_put) {
+            self.cache.put(T, io, key, tmp_tag, fresh) catch {};
+        } else {
+            try self.cache.put(T, io, key, tmp_tag, fresh);
+        }
+        return .{ .value = fresh, .cached = false };
+    }
+
+    // OBSERVATIONAL PATH: same get->compute->put, but the active-query-stack
+    // records caller->this edge + this node's result fp. The C call stack IS the
+    // dependency stack: read the current active node as our PARENT, enter ourselves
+    // (so nested query() calls in `compute` see us as their parent), restore on
+    // exit. recordEdge runs UNCONDITIONALLY after the result is obtained — on a HIT
+    // and on a fresh compute alike — so the DAG is identical hit-vs-miss. [C11]
+    const d = self.dag.?;
+    const node = nodeKeyFor(key);
+    const parent = Dag.Active.get();
+    const prev = Dag.Active.enter(node);
+    defer Dag.Active.leave(prev);
+
     const hit: ?[]T = if (swallow_get) (self.cache.get(T, gpa, io, key) catch null) else (try self.cache.get(T, gpa, io, key));
     if (hit) |h| {
+        d.recordEdge(gpa, parent, node, fpOfBytes(T, h));
         return .{ .value = h, .cached = true };
     }
     const fresh = try compute.run();
@@ -85,7 +148,17 @@ pub fn query(
     } else {
         try self.cache.put(T, io, key, tmp_tag, fresh);
     }
+    d.recordEdge(gpa, parent, node, fpOfBytes(T, fresh));
     return .{ .value = fresh, .cached = false };
+}
+
+/// A deterministic content fingerprint of a query RESULT slice for the recorded
+/// DAG. Observational only — it lets the dump show a stable per-node fp that flips
+/// iff the result bytes change. (The codegen path's authoritative content
+/// fingerprint is the `Fingerprint`-derived cache key; this engine-level fold is a
+/// uniform stand-in across result types `T` for the spike's edge recording.)
+fn fpOfBytes(comptime T: type, items: []const T) u64 {
+    return std.hash.Wyhash.hash(0x44_41_47_46, std.mem.sliceAsBytes(items)); // "DAGF"
 }
 
 /// lex query (the M15 proof seam): tokenize `source` for `target`, served from
@@ -144,12 +217,26 @@ pub fn parse(
     const cache = self.cache;
     const key = Key.parse(target, source);
 
+    // OBSERVATIONAL DAG: parse cannot use the generic `query()` (its unpack
+    // validation needs a custom hit path), so it records its node/edge directly.
+    // `enter` makes this parse the Active parent for any nested query in `compute`
+    // (lex during discovery runs separately, but this keeps the seam uniform); the
+    // edge + fp are recorded UNCONDITIONALLY after the result is obtained. No-op +
+    // zero-overhead when dag == null.
+    const node: Dag.NodeKey = .{ .kind = .parse, .id = key.digest() };
+    const dag_parent: ?Dag.NodeKey = if (self.dag != null) Dag.Active.get() else null;
+    const prev: ?Dag.NodeKey = if (self.dag != null) Dag.Active.enter(node) else null;
+    defer if (self.dag != null) Dag.Active.leave(prev);
+
     // --- cache read + validate (a corrupt blob is treated as a miss) ---
     const blob: ?[]u8 = if (swallow_get) (cache.get(u8, gpa, io, key) catch null) else (try cache.get(u8, gpa, io, key));
     if (blob) |bytes| {
         defer gpa.free(bytes);
         const unpacked: ?Ast.Tree = if (swallow_get) (Ast.unpack(gpa, bytes) catch null) else (try Ast.unpack(gpa, bytes));
-        if (unpacked) |t| return .{ .tree = t, .cached = true };
+        if (unpacked) |t| {
+            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, fpOfBytes(u8, bytes));
+            return .{ .tree = t, .cached = true };
+        }
     }
 
     // --- miss: parse fresh, store on success ---
@@ -158,7 +245,8 @@ pub fn parse(
         if (Ast.pack(gpa, t) catch null) |b| {
             defer gpa.free(b);
             cache.put(u8, io, key, tmp_tag, b) catch {};
-        }
+            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, fpOfBytes(u8, b));
+        } else if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, 0);
         return .{ .tree = t, .cached = false };
     }
     return .{ .tree = null, .diag = diag };
@@ -284,6 +372,34 @@ pub fn codegen(
     // and the fn's OWN emitted symbol, target-sensitive. `Key.codegen` is the ONE
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).
     const key = Key.codegen(target, fp, frozen.opt, sym);
+
+    // OBSERVATIONAL DAG: record this fn's codegen node (id = the cache key digest,
+    // aligning with `nodeKeyFor`) + an edge from the active parent, with the fn's
+    // content fingerprint as the node fp. Runs UNCONDITIONALLY (hit == miss) so the
+    // recorded graph is schedule-independent. Each fan-out worker has its OWN
+    // threadlocal Active stack starting at null, so a per-fn codegen job is a ROOT
+    // node here; the shared `*Dag` (spinlock-guarded) collects every worker's node.
+    // No-op + zero-overhead when dag == null (the default verbatim path).
+    if (self.dag) |d| {
+        const node: Dag.NodeKey = .{ .kind = .codegen, .id = key.digest() };
+        const parent = Dag.Active.get();
+        d.recordEdge(gpa, parent, node, fp);
+        // The REAL codegen-level dependency: a caller folds each callee's SIGNATURE
+        // (NOT its body) into its own fingerprint — this is the sig firewall the
+        // later typecheck decomposition makes a first-class query. Record one
+        // `codegen(caller) -> signature(callee)` edge per call site (deduped by
+        // recordEdge), id = a stable fold of the callee's emitted name, fp =
+        // `sigFingerprint` (sig-only). These edges are what make the dump show a
+        // caller->callee structure for a real program; the typecheck stage will
+        // add the body(fn)->signature(fn) edges over the same signature nodes.
+        for (callee_sigs.items) |csig| {
+            const sig_node: Dag.NodeKey = .{
+                .kind = .signature,
+                .id = std.hash.Wyhash.hash(0x53_47_4e_4d, csig.name), // "SGNM"
+            };
+            d.recordEdge(gpa, node, sig_node, Dag.sigFingerprint(csig));
+        }
+    }
 
     if (mode == .verify) {
         // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh

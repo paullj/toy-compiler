@@ -15,4 +15,5 @@
 
 test {
     _ = @import("query_engine.zig");
+    _ = @import("dag_firewall.zig");
 }

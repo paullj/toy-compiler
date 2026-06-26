@@ -30,6 +30,7 @@ const Resolve = @import("resolve.zig");
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const Sig = @import("symbols/Sig.zig").Sig;
 const symbols = @import("symbols/Sym.zig");
+const Dag = @import("query/Dag.zig");
 
 const Typecheck = @This();
 
@@ -409,6 +410,24 @@ graph: ?*GraphCtx = null,
 /// leaves it 0. Used to pick the import-namespace table for qualified receivers.
 graph_mod: u32 = 0,
 
+/// M16 — the OBSERVATIONAL dependency-recording sink. When non-null, the fine-
+/// grained typecheck query projections (`signature`/`body`/`type_of`/`layout`/
+/// `resolve_name`) record their nodes + edges into this shared per-build `*Dag`.
+/// BORROWED; the driver owns the value on the `--dump-dag` stack frame. When
+/// `null` (every default `-o`/`run`/`--emit`/check-table build) EVERY projection
+/// is a no-op (`recDep` early-returns) — the result tables are read unchanged, so
+/// `sigs`/`node_types`/`layouts`/`enum_layouts` are byte-identical and the fast
+/// path stays VERBATIM. The recorded structure is observational: invalidation is
+/// still whole-graph content-fingerprint this milestone.
+dag: ?*Dag = null,
+
+/// Graph-mode: one qualified fn name per global fn id (parallel to `t.fns`), set
+/// from the `GraphFnInput` table before Pass B so the `signature(fn)` node id
+/// folds the IDENTICAL qualified name the codegen callee-sig fold uses (codegen's
+/// `signature` node id is `Wyhash("SGNM", SymName.name)`, and the graph SymName.name
+/// IS `fns[i].name`). Null single-file (the decl-token name is used instead).
+gph_fn_names: ?[]const []const u8 = null,
+
 /// The graph context the orchestrator hands the shared `Typecheck`. It owns the
 /// per-module bare-name maps + the import namespaces; `Typecheck` borrows it.
 pub const GraphCtx = struct {
@@ -678,6 +697,7 @@ pub fn checkGraph(
     ctx: *GraphCtx,
     mods: []const GraphModuleInput,
     fns: []const GraphFnInput,
+    dag: ?*Dag,
 ) !GraphResult {
     // Per-module node_types (parallel to each module's node array).
     const node_types = try gpa.alloc([]Type, mods.len);
@@ -712,6 +732,7 @@ pub fn checkGraph(
         .enums = .empty,
         .enum_map = .empty,
         .graph = ctx,
+        .dag = dag,
     };
     defer {
         for (t.fns.items) |f| gpa.free(f.params);
@@ -752,6 +773,14 @@ pub fn checkGraph(
     // by wiring each module's slice here (checkFn/layout set t via the ctx tree but
     // node_types is not part of ctx, so set it alongside graph_mod transitions).
     t.gph_node_types = node_types;
+
+    // M16: the qualified fn names (parallel to the global fn table) so a
+    // `signature(fn)` node id folds the SAME name as the codegen callee-sig fold.
+    // Borrowed for the duration of the check (the `fns` table outlives runGraph).
+    const fn_names = try gpa.alloc([]const u8, fns.len);
+    defer gpa.free(fn_names);
+    for (fns, 0..) |gf, i| fn_names[i] = gf.name;
+    t.gph_fn_names = fn_names;
 
     try t.runGraph(mods, fns);
 
@@ -845,9 +874,11 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     try t.checkPubSignatures(fns);
 
     // Phase B: check each fn body in its owning module (skip bodyless `print`).
-    for (t.fns.items) |f| {
+    // The loop index IS the global fn id (parallel to the resolver func ids + the
+    // codegen `names`/`sigs`), threaded into `checkFn` for the `body(fid)` node.
+    for (t.fns.items, 0..) |f, i| {
         if (f.decl_node == Ast.none) continue;
-        try t.checkFn(f);
+        try t.checkFn(@intCast(i), f);
     }
 }
 
@@ -858,6 +889,17 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
     for (fns, 0..) |gf, i| {
         if (gf.decl_node == Ast.none or !gf.is_pub) continue;
         _ = t.gphSelect(gf.module);
+        // M16: pub-coherence reads this fn's SIGNATURE (param/ret types) — a
+        // signature(fn) dependency. Enter the fn's body node as the parent so the
+        // recorded edge is body(fn)->signature(fn) (same node as codegen/typeOfCall).
+        var dag_prev: ?Dag.NodeKey = null;
+        var entered = false;
+        if (t.dag != null) {
+            dag_prev = Dag.Active.enter(.{ .kind = .body, .id = @intCast(i) });
+            entered = true;
+            t.recordSignature(@intCast(i));
+        }
+        defer if (entered) Dag.Active.leave(dag_prev);
         const f = t.fns.items[i];
         const decl = t.tree.nodes[f.decl_node];
         const proto = Ast.protoAt(t.tree, decl.lhs);
@@ -1056,9 +1098,11 @@ fn run(t: *Typecheck) !void {
     try t.appendPrint();
 
     // Pass B: check each function body (skip the synthetic, bodyless builtins).
-    for (t.fns.items) |f| {
+    // The loop index IS the global fn id (parallel to the resolver func ids), used
+    // for the `body(fid)` DAG node.
+    for (t.fns.items, 0..) |f, i| {
         if (f.decl_node == Ast.none) continue;
-        try t.checkFn(f);
+        try t.checkFn(@intCast(i), f);
     }
 }
 
@@ -1135,10 +1179,32 @@ fn appendPrint(t: *Typecheck) !void {
     try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .params = params, .ret = .unit });
 }
 
-fn checkFn(t: *Typecheck, f: FnSym) !void {
+fn checkFn(t: *Typecheck, fid: u32, f: FnSym) !void {
     // Graph mode: check this fn body in its owning module's tree/resolutions.
     const prev = t.gphSelect(f.mod);
     defer _ = t.gphSelect(prev);
+
+    // M16: enter this fn's `body(fid)` node as the Active query parent for the
+    // duration of the body check, so every nested signature/type_of/layout/
+    // resolve_name read inside records `body(fid) -> callee`. The body fp is a
+    // body-content fold DISTINCT from the sig fold (so a body edit flips body fp
+    // but leaves the fn's signature fp STABLE — the firewall). No-op + zero
+    // overhead when `dag == null` (the verbatim default path).
+    var dag_prev: ?Dag.NodeKey = null;
+    var entered = false;
+    if (t.dag) |d| {
+        const node: Dag.NodeKey = .{ .kind = .body, .id = fid };
+        // Pass B runs each body at the top of the active stack: the parent is the
+        // saved-before value (null at Pass B top level), so `body(fid)` is a ROOT
+        // node here (its fp is recorded, no spurious self-edge).
+        const parent = Dag.Active.get();
+        dag_prev = Dag.Active.enter(node);
+        entered = true;
+        // Body content fp: a body-content fold DISTINCT from the sig fold; purely
+        // observational (the authoritative codegen fingerprint is the cache key).
+        d.recordEdge(t.gpa, parent, node, t.bodyFp(fid, f));
+    }
+    defer if (entered) Dag.Active.leave(dag_prev);
 
     const decl = t.tree.nodes[f.decl_node];
     const proto = Ast.protoAt(t.tree, decl.lhs);
@@ -1148,6 +1214,21 @@ fn checkFn(t: *Typecheck, f: FnSym) !void {
     t.slot_types.clearRetainingCapacity();
     for (f.params) |pty| try t.slot_types.append(t.gpa, pty);
     t.cur_ret = f.ret;
+
+    // M16: the fn's OWN declared param/return aggregates are a real codegen layout
+    // dependency (Walks.walkTouchedSig folds each proto param + the return type).
+    // recordSignature records this only on signature(fid), and only at caller
+    // call-sites — so an UNCALLED pass-through fn `fn id(p:Point)->Point { p }` whose
+    // body never constructs/accesses the aggregate has a body(fid) fp blind to the
+    // aggregate's layout (an ABI-boundary layout edit would early-cutoff it as
+    // unchanged under M17 = miscompile). Record body(fid)->layout for each param +
+    // the return under the entered body(fid) Active node. No-op for scalars / when
+    // dag == null.
+    if (t.dag != null) {
+        const body_node: Dag.NodeKey = .{ .kind = .body, .id = fid };
+        for (f.params) |pty| t.recordLayoutOf(body_node, pty);
+        t.recordLayoutOf(body_node, f.ret);
+    }
 
     // A function body is a block; a non-unit fn wants its trailing expression to
     // supply the value. A unit fn checks its body in statement context.
@@ -1171,6 +1252,50 @@ fn checkFn(t: *Typecheck, f: FnSym) !void {
         }
     }
     _ = proto;
+}
+
+/// A body-content fingerprint for `body(fid)`, DISTINCT from `signature(fid)`'s
+/// sig-only fold: it folds the body block's SOURCE SPAN (every statement's bytes),
+/// so any body edit flips it while a pure signature edit (param/ret type, with the
+/// body text unchanged) does NOT. Observational only — used so the `--dump-dag`
+/// firewall demo shows a body fp that is stable under a signature-only change and a
+/// signature fp that is stable under a body-only change.
+fn bodyFp(t: *const Typecheck, fid: u32, f: FnSym) u64 {
+    var h = std.hash.Wyhash.init(0x42_4f_44_59); // "BODY"
+    var ib: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ib, fid, .little);
+    h.update(&ib);
+    const decl = t.tree.nodes[f.decl_node];
+    if (decl.rhs != Ast.none) {
+        const body = t.tree.nodes[decl.rhs];
+        // Fold the body block's FULL source span `{ ... }`: scan tokens from the
+        // body's `{` (its main_token), matching braces, to the closing `}`, and
+        // fold that exact source slice. This captures the whole body text (so any
+        // body edit flips the fp) yet excludes the proto (param/ret) tokens, which
+        // sit BEFORE the `{` — the firewall basis (a sig-only edit leaves it
+        // stable). Falls back to the `{` byte alone on a malformed token range.
+        const open = body.main_token;
+        if (open < t.tokens.len and t.tokens[open].tag == .l_brace) {
+            var depth: i32 = 0;
+            var ti: usize = open;
+            var close: usize = open;
+            while (ti < t.tokens.len) : (ti += 1) {
+                switch (t.tokens[ti].tag) {
+                    .l_brace => depth += 1,
+                    .r_brace => {
+                        depth -= 1;
+                        if (depth == 0) {
+                            close = ti;
+                            break;
+                        }
+                    },
+                    else => {},
+                }
+            }
+            h.update(t.source[t.tokens[open].start..t.tokens[close].end]);
+        }
+    }
+    return h.final();
 }
 
 /// Structural definite-return: a block returns on every path iff its last
@@ -1744,6 +1869,7 @@ fn typeOfStructInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOf
         return .invalid;
     };
     const sym = t.structs.items[id];
+    t.recordBodyLayout(Type.structT(id)); // body -> layout(struct): construction reads field offsets (M17)
     const inits = Ast.rangeSlice(t.tree, n.rhs);
 
     // Track which declared fields are supplied (for missing/duplicate checks).
@@ -1822,6 +1948,7 @@ fn typeOfFieldAccess(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutO
         return .invalid;
     }
     const sym = t.structs.items[base.struct_id];
+    t.recordBodyLayout(base); // body -> layout(struct): field access reads the field offset/type (M17)
     const fname = t.nameText(n.main_token);
     for (sym.field_names, 0..) |dn, j| {
         if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
@@ -1901,6 +2028,7 @@ fn typeArgsForEffect(t: *Typecheck, node_form: InitForm, args: Ast.Index) error{
 /// inferred `.V` in a payload resolves). Yields the enum type.
 fn checkVariant(t: *Typecheck, enum_id: u32, vtok: u32, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!Type {
     const e = t.enums.items[enum_id];
+    t.recordBodyLayout(Type.enumT(enum_id)); // body -> layout(enum): construction reads the tag/payload layout (M17)
     const vname = t.nameText(vtok);
     var vi: ?usize = null;
     for (e.variants, 0..) |v, i| {
@@ -2005,6 +2133,10 @@ fn typeOfMatch(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemor
         t.node_types[node_idx] = .invalid;
         return .invalid;
     }
+
+    // body -> layout(enum): codegen reads the scrutinee's variant tags + payload
+    // offsets, a dependency of THIS body (M17). No-op for int/bool scrutinees.
+    t.recordBodyLayout(st);
 
     var seen: []bool = &.{};
     var bool_cov: BoolCov = .{};
@@ -2201,6 +2333,7 @@ fn checkVariantPattern(t: *Typecheck, pat_idx: Ast.Index, expected: Type, cov: *
     }
     const enum_id = expected.enum_id;
     const e = t.enums.items[enum_id];
+    t.recordBodyLayout(expected); // body -> layout(enum): pattern reads variant tags/payloads, incl. NESTED enums (M17)
     // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
     if (pat.lhs != Ast.none) {
         const tname = t.nameText(t.tree.nodes[pat.lhs].main_token);
@@ -2378,6 +2511,240 @@ fn merge(t: *Typecheck, at: u32, a: Type, b: Type) error{OutOfMemory}!Type {
     return .invalid; // mismatch, no coercion
 }
 
+// ===========================================================================
+// M16 — fine-grained typecheck QUERY PROJECTIONS (observational dependency DAG).
+//
+// All of these are PURE READ projections over the already-built tables
+// (`t.fns`/`t.structs`/`t.enums`/`t.node_types`/`t.resolutions`): the whole-graph
+// pass still computes every value exactly once, and these helpers merely READ the
+// table that holds the answer and record a `body(caller) -> <callee node>` edge
+// into the per-build `*Dag`. When `t.dag == null` (every default build) each one
+// early-returns a no-op, so the result is byte-identical and the path is verbatim.
+//
+//   * signature(fn): a CALLER's body depends on `signature(callee)`, NEVER on
+//     body(callee) — the firewall. fp = `Dag.sigFingerprint` (sig-only fold). The
+//     node id matches codegen's `Wyhash("SGNM", name)` so a body(caller)->signature
+//     and a codegen(caller)->signature edge land on the SAME signature node.
+//   * type_of(def): coarse — recorded at the call boundary only; fp folds the Type.
+//   * layout(type): mirrors Walks.structLayoutBytes/enumLayoutBytes EXACTLY, reusing
+//     the .laying/.done guard so a recursive aggregate emits a sentinel, never loops.
+//   * resolve_name(name): coarse firewall; resolve is NOT engine-routed, so the edge
+//     is recorded directly from the typecheck read site. fp folds the Resolution.
+//
+// AUDIT — every CROSS-ITEM read inside a fn body is routed through a projection:
+//   * the callee SIGNATURE read `t.fns.items[callee]` (typeOfCall + checkPubSignatures)
+//     -> recordSignature (body|sig -> signature edge);
+//   * the callee NAME read `t.resolutions[n.lhs]` (typeOfCall) -> recordResolveName
+//     (body -> resolve_name edge);
+//   * the arg/return aggregate layout read (`t.structs`/`t.enums`) -> recordLayoutOf
+//     (sig|type_of -> layout edge);
+//   * the call-boundary inferred types -> recordTypeOf (body -> type_of edge).
+// INTRA-body reads (a `.local` slot type, a label) stay direct — they are not a
+// cross-query dependency and resolve is deliberately COARSE (one node per consumed
+// callee name, deduped). All four helpers no-op when `dag == null`, so the DEFAULT
+// build path is verbatim/byte-identical and these edges exist ONLY under `--dump-dag`.
+// ===========================================================================
+
+/// The stable `signature(fn)` node id for global fn `fid`, folding the SAME name
+/// the codegen callee-sig fold uses (graph: the qualified `gph_fn_names[fid]`;
+/// single-file: the decl-token spelling, with the synthetic bodyless fn = "print").
+/// Must mirror `Engine.codegen`'s `Wyhash(0x53_47_4e_4d, csig.name)` so the typecheck
+/// body->signature edge and the codegen->signature edge share one node.
+fn sigNodeName(t: *const Typecheck, fid: u32) []const u8 {
+    if (t.gph_fn_names) |names| {
+        if (fid < names.len) return names[fid];
+        return "print";
+    }
+    const f = t.fns.items[fid];
+    if (f.decl_node == Ast.none) return "print";
+    return t.nameText(t.tree.nodes[f.decl_node].main_token);
+}
+
+fn sigNodeId(t: *const Typecheck, fid: u32) u64 {
+    return std.hash.Wyhash.hash(0x53_47_4e_4d, t.sigNodeName(fid)); // "SGNM"
+}
+
+/// Record `body(caller) -> signature(fid)` with the sig-only fingerprint. The
+/// CALLER's `body` node is the Active parent (entered in `checkFn`). The sig is
+/// rebuilt from the SAME `t.fns.items[fid]` table the whole-graph pass already
+/// filled (Pass A) — a pure read, no recompute. No-op when `dag == null`.
+fn recordSignature(t: *Typecheck, fid: u32) void {
+    const d = t.dag orelse return;
+    if (fid >= t.fns.items.len) return;
+    const f = t.fns.items[fid];
+    const sig: Sig = .{
+        .kind = if (f.decl_node == Ast.none) .builtin else .user_fn,
+        .name = t.sigNodeName(fid),
+        .params = f.params,
+        .ret = f.ret,
+    };
+    const node: Dag.NodeKey = .{ .kind = .signature, .id = t.sigNodeId(fid) };
+    d.recordEdge(t.gpa, Dag.Active.get(), node, Dag.sigFingerprint(sig));
+    // The signature's aggregate param/return types are layout dependencies of the
+    // signature node (a layout edit to a named aggregate flows to its sig).
+    for (f.params) |p| t.recordLayoutOf(node, p);
+    t.recordLayoutOf(node, f.ret);
+}
+
+/// Record `body(caller) -> resolve_name(name)` for a consumed resolution. Coarse:
+/// one node per resolved symbol, deduped by `recordEdge`. fp folds the Resolution
+/// shape (kind tag + bound id). No-op when `dag == null`.
+fn recordResolveName(t: *Typecheck, res: Resolution) void {
+    const d = t.dag orelse return;
+    var h = std.hash.Wyhash.init(0x52_4e_4d_45); // "RNME"
+    const tag: u8 = @intFromEnum(std.meta.activeTag(res));
+    h.update(&[_]u8{tag});
+    const bound: u32 = switch (res) {
+        .local => |l| l,
+        .func => |fi| fi,
+        else => 0,
+    };
+    var ib: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ib, bound, .little);
+    h.update(&ib);
+    const fp = h.final();
+    const node: Dag.NodeKey = .{ .kind = .resolve_name, .id = fp };
+    d.recordEdge(t.gpa, Dag.Active.get(), node, fp);
+}
+
+/// Record `body(caller) -> type_of(node_idx)` for a typed def/expr at a cross-item
+/// boundary (the call result + each arg). Coarse — recorded ONLY at the call
+/// boundary, not per leaf. fp folds the Type. No-op when `dag == null`.
+fn recordTypeOf(t: *Typecheck, node_idx: Ast.Index, ty: Type) void {
+    const d = t.dag orelse return;
+    var h = std.hash.Wyhash.init(0x54_4f_46_5f); // "TOF_"
+    h.update(&[_]u8{@intFromEnum(ty.kind)});
+    var ib: [8]u8 = undefined;
+    std.mem.writeInt(u32, ib[0..4], ty.struct_id, .little);
+    std.mem.writeInt(u32, ib[4..8], ty.enum_id, .little);
+    h.update(&ib);
+    // node_idx is a MODULE-LOCAL Ast.Index; in graph mode two modules can share an
+    // index, collapsing distinct boundary types to one type_of node (last-writer-wins
+    // fp masks a real type change => M17 miscompile). Fold the current module id into
+    // the node id (mirroring how `body` uses the global fid), so single-file mode
+    // (one module) is unchanged but cross-module nodes stay distinct.
+    const node: Dag.NodeKey = .{ .kind = .type_of, .id = (@as(u64, t.graph_mod) << 32) | node_idx };
+    d.recordEdge(t.gpa, Dag.Active.get(), node, h.final());
+}
+
+/// Record `parent -> layout(type)` when `ty` names an aggregate (struct/enum). fp
+/// mirrors Walks.structLayoutBytes/enumLayoutBytes EXACTLY over the laid-out
+/// `t.structs`/`t.enums` snapshots, so the recorded layout fp flips iff the codegen
+/// layout bytes flip. No-op when `dag == null` or `ty` is a scalar.
+fn recordLayoutOf(t: *Typecheck, parent: Dag.NodeKey, ty: Type) void {
+    const d = t.dag orelse return;
+    switch (ty.kind) {
+        .@"struct" => {
+            const node: Dag.NodeKey = .{ .kind = .layout, .id = ty.struct_id };
+            d.recordEdge(t.gpa, parent, node, t.structLayoutFp(ty.struct_id));
+        },
+        .@"enum" => {
+            // struct ids and enum ids are SEPARATE 0-based sequences; without a kind
+            // tag struct(N) and enum(N) collapse to one layout#N node and recordEdge's
+            // unconditional fp upsert lets the last writer mask the other's layout edit
+            // (invisible change => M17 miscompile). Reserve the high bit for enums.
+            const node: Dag.NodeKey = .{ .kind = .layout, .id = @as(u64, ty.enum_id) | (@as(u64, 1) << 63) };
+            d.recordEdge(t.gpa, parent, node, t.enumLayoutFp(ty.enum_id));
+        },
+        else => {},
+    }
+}
+
+/// Record `body(current) -> layout(ty)` for an aggregate READ inside a function
+/// body (struct construct / field access, enum construct / match / variant
+/// pattern). The body is the Active node. Without this, a layout-only edit to an
+/// aggregate used ONLY in a body (not named in that body's signature) is invisible
+/// to the fine-grained DAG — a stale body/codegen result under M17 (the M16
+/// signature firewall covers signatures only). No-op when `dag == null` (verbatim).
+fn recordBodyLayout(t: *Typecheck, ty: Type) void {
+    if (t.dag == null) return;
+    const parent = Dag.Active.get() orelse return;
+    t.recordLayoutOf(parent, ty);
+}
+
+/// Fold struct `id`'s layout into a u64, mirroring `Walks.structLayoutBytes`
+/// byte-for-byte (name\0 + per-field name\0+kind+offset, recursing nested structs,
+/// + size + align). Folds ONLY a `.done` snapshot; a `.laying`/poisoned child emits
+/// a sentinel and does NOT recurse (the recursive-struct guard — KNOWN BUG a).
+fn structLayoutFp(t: *const Typecheck, id: u32) u64 {
+    var h = std.hash.Wyhash.init(0x4c_41_59_53); // "LAYS"
+    t.foldStructLayout(&h, id);
+    return h.final();
+}
+fn foldStructLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
+    const s = t.structs.items[id];
+    if (s.state != .done or s.poisoned) {
+        h.update("<rec>"); // sentinel: a recursive/poisoned referent (matches guard)
+        return;
+    }
+    h.update(s.name);
+    h.update(&[_]u8{0});
+    for (s.field_names, s.field_types, s.offsets) |fn_, fty, off| {
+        h.update(fn_);
+        h.update(&[_]u8{0});
+        h.update(&[_]u8{@intFromEnum(fty.kind)});
+        var ob: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ob, off, .little);
+        h.update(&ob);
+        if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
+    }
+    var sz: [8]u8 = undefined;
+    std.mem.writeInt(u32, sz[0..4], s.size, .little);
+    std.mem.writeInt(u32, sz[4..8], s.@"align", .little);
+    h.update(&sz);
+}
+
+/// Fold enum `id`'s layout into a u64, mirroring `Walks.enumLayoutBytes`
+/// byte-for-byte. Reuses the `.done`/sentinel guard so a recursive enum never loops.
+fn enumLayoutFp(t: *const Typecheck, id: u32) u64 {
+    var h = std.hash.Wyhash.init(0x4c_41_59_45); // "LAYE"
+    t.foldEnumLayout(&h, id);
+    return h.final();
+}
+fn foldEnumLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
+    const e = t.enums.items[id];
+    if (e.state != .done or e.poisoned) {
+        h.update("<rec>");
+        return;
+    }
+    h.update(e.name);
+    h.update(&[_]u8{0});
+    var hdr: [8]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], e.tag_size, .little);
+    std.mem.writeInt(u32, hdr[4..8], e.payload_off, .little);
+    h.update(&hdr);
+    for (e.variants) |v| {
+        h.update(v.name);
+        h.update(&[_]u8{0});
+        h.update(&[_]u8{@intFromEnum(v.form)});
+        if (v.form == .@"struct") {
+            for (v.field_names, v.field_types, v.offsets) |fn_, fty, off| {
+                h.update(fn_);
+                h.update(&[_]u8{0});
+                h.update(&[_]u8{@intFromEnum(fty.kind)});
+                var ob: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ob, off, .little);
+                h.update(&ob);
+                if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
+                if (fty.kind == .@"enum") t.foldEnumLayout(h, fty.enum_id);
+            }
+        } else {
+            for (v.field_types, v.offsets) |fty, off| {
+                h.update(&[_]u8{@intFromEnum(fty.kind)});
+                var ob: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ob, off, .little);
+                h.update(&ob);
+                if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
+                if (fty.kind == .@"enum") t.foldEnumLayout(h, fty.enum_id);
+            }
+        }
+    }
+    var sz: [8]u8 = undefined;
+    std.mem.writeInt(u32, sz[0..4], e.size, .little);
+    std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
+    h.update(&sz);
+}
+
 fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
     // A qualified tuple-variant construction `N.V(args)` arrives as a `.call`
     // whose callee is a `field_access` over an enum type-name identifier. Route
@@ -2397,6 +2764,8 @@ fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory
         }
     }
     const callee_res = t.resolutions[n.lhs];
+    // M16: a caller's body consumes the callee NAME resolution (cross-item read).
+    t.recordResolveName(callee_res);
     if (callee_res != .func) {
         // Type the args anyway so their own errors surface, then poison.
         for (Ast.rangeSlice(t.tree, n.rhs)) |arg| _ = try t.typeOf(arg);
@@ -2422,6 +2791,12 @@ fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory
         // Any remaining `.unresolved` was already reported by resolve.
         return .invalid;
     }
+    // M16 FIREWALL: this caller's body reads the callee's SIGNATURE (params/ret),
+    // NEVER its body. Route the cross-item `t.fns.items[callee]` read through the
+    // `signature(callee)` query so a body(caller)->signature(callee) edge is recorded
+    // (fp = sig-only fold). A body-only edit to the callee leaves this fp STABLE; a
+    // signature edit FLIPS it — the firewall, proven on a real program.
+    t.recordSignature(callee_res.func);
     const f = t.fns.items[callee_res.func];
     const args = Ast.rangeSlice(t.tree, n.rhs);
     if (args.len != f.params.len) {
@@ -2431,12 +2806,16 @@ fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory
     }
     for (args, f.params, 0..) |arg, pty, i| {
         const at = try t.typeOfExpected(arg, if (pty.kind == .invalid) null else pty);
+        // M16: the arg's inferred type is a cross-boundary `type_of` read.
+        t.recordTypeOf(arg, at);
         // Skip when either side is poison (e.g. a parameter whose type failed to
         // resolve) so we don't cascade a spurious "expected invalid" message.
         if (at.kind != .invalid and pty.kind != .invalid and !Type.eql(at, pty)) {
             try t.emitFmt(t.byteOf(t.tree.nodes[arg].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, t.typeName(pty), t.typeName(at) });
         }
     }
+    // M16: the call result type (the callee's return) is the boundary `type_of`.
+    t.recordTypeOf(node_idx, f.ret);
     return f.ret;
 }
 

@@ -12,6 +12,22 @@
 //! single-file and graph callers can share it — both pass `*const Driver.Frozen`).
 //! NEVER edit either switch independently of `Fingerprint.walk`: the two are
 //! hand-mirrored and any drift silently breaks the [C7] order-sensitive fold.
+//!
+//! M16 BACK-DOOR-READ AUDIT — codegen-level MIRROR sites (deferred to a later
+//! codegen-decompose stage; NOT a gap in the M16 typecheck DAG). The reads below
+//! (`frozen.sigs`/`frozen.names` in `walkCalls`; `frozen.layouts`/`frozen.enum_layouts`
+//! in `typeRefToType`/`structLayoutBytes`/`enumLayoutBytes`) are the CODEGEN-level
+//! mirrors of the typecheck firewall reads — they fold the SAME callee-signature and
+//! touched-type-layout dependencies the typecheck `body->signature`/`body->layout`
+//! edges already record, but at the codegen fingerprint level. The codegen NodeKey is
+//! still COARSE this milestone (Engine.nodeKeyFor maps the single `check` Cache.Phase
+//! and codegen records its own already-computed fingerprint as the node fp), so the
+//! plan's `codegen(fn)->signature(callee)`/`codegen(fn)->layout(type)` edges are NOT
+//! yet recorded — only the typecheck-level edges are. These reads stay DIRECT here
+//! because the fingerprint these walks feed is itself the codegen node's fp; routing
+//! them through `signature(callee)`/`layout(type)` query calls is the deferred
+//! codegen-decompose work. They are SAFE to leave in M16: invalidation is still
+//! content-fingerprint, and the fingerprint folds these dependencies correctly today.
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
