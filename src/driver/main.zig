@@ -225,22 +225,32 @@ fn emitExecutable(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    // M17: when `--query-stats` is set, a single per-build dependency `Dag` lives on
-    // this frame and a `*Dag` is threaded through discovery, typecheck, and the
-    // per-fn codegen fan-out — exactly the `--dump-dag` plumbing, but here the real
-    // executable is still emitted. `dag == null` (the default) keeps every query on
-    // its VERBATIM fast path, so a plain `-o` build is byte-identical. The walk over
-    // this graph is observational (the content cache, not the walk, drives
-    // correctness); it exists to PROVE the early-cutoff in production.
+    // Red-green incremental is the DEFAULT drive: a single per-build dependency `Dag`
+    // lives on this frame and is threaded through discovery, typecheck, and the per-fn
+    // codegen fan-out. The prior on-disk DAG (loaded below) DRIVES codegen reuse — a
+    // fn whose body subtree verifies green is served from the prior blob without
+    // re-deriving its fingerprint; the fresh DAG is persisted after a successful build
+    // for the next one. `--force` bypasses reuse (full rebuild); `--verify` re-lowers
+    // everything and audits each green verdict; `--query-stats` additionally PRINTS the
+    // recompute set. The recorded-edge path is byte-identical to the old verbatim path.
     var dag_storage: Dag = .init(gpa);
     defer dag_storage.deinit(gpa);
-    const dag: ?*Dag = if (query_stats) &dag_storage else null;
+    const dag: ?*Dag = &dag_storage;
+
+    // The program key (entry canonical path + target) names this program's on-disk DAG
+    // artifact for BOTH the prior-DAG load (drive) and the post-build persist.
+    const entry_canon: ?[]u8 = blk: {
+        if (Io.Dir.cwd().realPathFileAlloc(io, paths[0], gpa) catch null) |rp| {
+            defer gpa.free(rp);
+            break :blk gpa.dupe(u8, rp) catch null;
+        }
+        break :blk gpa.dupe(u8, paths[0]) catch null;
+    };
+    defer if (entry_canon) |ec| gpa.free(ec);
+    const prog_key: ?u64 = if (entry_canon) |ec| toyc.Cache.programKey(ec, target) else null;
 
     // --- discover the module graph from the entry file ---
-    var graph = if (dag) |d|
-        try Graph.discoverDag(gpa, io, cache, target, paths[0], d)
-    else
-        try Graph.discover(gpa, io, cache, target, paths[0]);
+    var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], dag.?);
     defer graph.deinit(gpa);
     if (graph.err) |ge| {
         try printGraphError(out, &graph, ge);
@@ -266,7 +276,21 @@ fn emitExecutable(
         return 1;
     }
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag);
+    // Load the prior on-disk DAG BEFORE codegen so the red-green walk can DRIVE codegen
+    // reuse (the verdict decides reuse, not post-hoc observation). A load/parse failure
+    // => `null` => full content-fp rebuild (the FALLBACK-SAFETY invariant — never a
+    // partial/false-green result).
+    var prior_loaded: ?Dag.Loaded = null;
+    defer if (prior_loaded) |*pl| pl.deinit(gpa);
+    if (prog_key) |pk| {
+        if (cache.getDag(gpa, io, pk) catch null) |blob| {
+            defer gpa.free(blob);
+            prior_loaded = Dag.deserialize(gpa, blob) catch null;
+        }
+    }
+    const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
+
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag, prior_ptr);
     switch (lowered) {
         .err => |e| {
             try printGraphEmitError(out, &graph, e);
@@ -287,14 +311,24 @@ fn emitExecutable(
                 try out.flush();
             }
 
-            // M17 `--query-stats`: load the prior on-disk DAG, run the red-green
-            // re-validation walk over the just-recorded graph, report the recompute
-            // set (the cutoff), then persist the fresh DAG for the next build. The
-            // executable is emitted regardless; the walk never changes the bytes.
-            if (dag) |d| {
-                try reportQueryStats(gpa, io, out, cache, target, paths[0], d, lp.codegen_compiled, lp.codegen_cached);
+            // Persist the fresh DAG for the next build's red-green drive. Best-effort:
+            // a serialize/write failure only costs the next build a full re-validation,
+            // never correctness. Done on EVERY successful build (this is what makes the
+            // NEXT build incremental), not just under `--query-stats`.
+            if (prog_key) |pk| if (dag) |d| {
+                if (d.serialize(gpa)) |blob| {
+                    defer gpa.free(blob);
+                    cache.putDag(io, pk, blob) catch {};
+                } else |_| {}
+            };
+
+            // `--query-stats`: print the red-green recompute set (the cutoff) over the
+            // just-recorded graph vs the prior snapshot. Purely diagnostic — the emitted
+            // bytes are identical with or without it.
+            if (query_stats) if (dag) |d| {
+                try reportQueryStats(out, gpa, prior_ptr, d, lp.codegen_compiled, lp.codegen_cached);
                 try out.flush();
-            }
+            };
 
             // M13 dual-metric counters, fixed field order, deterministic. Cached
             // fns contribute 0 to the opt counters; use --force for honest numbers.
@@ -448,7 +482,9 @@ fn emitDumpDag(
     }
 
     // --- whole-program codegen with the dag threaded into every per-fn job ---
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, .normal, opt, &dag);
+    // `--dump-dag` is purely observational: pass `prior=null` so codegen never takes
+    // the green reuse path (the dump shows the freshly-recorded structure).
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, .normal, opt, &dag, null);
     switch (lowered) {
         .err => |e| {
             try printGraphEmitError(out, &graph, e);
@@ -507,58 +543,32 @@ fn emitDumpDag(
 ///     re-lowered). These agree in spirit: a localized edit recompiles a strict
 ///     subset, the rest cut off.
 fn reportQueryStats(
-    gpa: std.mem.Allocator,
-    io: Io,
     out: *Io.Writer,
-    cache: toyc.Cache,
-    target: []const u8,
-    entry_path: []const u8,
+    gpa: std.mem.Allocator,
+    prior: ?*const Dag.Loaded,
     dag: *Dag,
     codegen_compiled: usize,
     codegen_cached: usize,
 ) !void {
-    const entry_canon = blk: {
-        if (Io.Dir.cwd().realPathFileAlloc(io, entry_path, gpa) catch null) |rp| {
-            defer gpa.free(rp);
-            break :blk try gpa.dupe(u8, rp);
-        }
-        break :blk try gpa.dupe(u8, entry_path);
-    };
-    defer gpa.free(entry_canon);
-    const prog_key = toyc.Cache.programKey(entry_canon, target);
-
     const total_nodes = dag.result_fp.count();
-    var reported = false;
 
-    if (cache.getDag(gpa, io, prog_key) catch null) |blob| {
-        defer gpa.free(blob);
-        if (Dag.deserialize(gpa, blob) catch null) |loaded_const| {
-            var loaded = loaded_const;
-            defer loaded.deinit(gpa);
-            const roots = try dag.nodeKeys(gpa);
-            defer gpa.free(roots);
-            var rg = try Dag.RedGreen.init(gpa, &loaded, dag);
-            defer rg.deinit();
-            if (rg.run(roots)) |_| {
-                try out.print("query: red-green recompute={d} cutoff={d} of {d} nodes\n", .{ rg.red_count, rg.green_count, rg.red_count + rg.green_count });
-            } else |e| switch (e) {
-                // A cycle in the prior edges is reported, not fatal — the build
-                // already succeeded and the walk is observational here.
-                error.QueryCycle => try out.writeAll("query: red-green walk found a cycle in the prior DAG (skipped)\n"),
-                else => return e,
-            }
-            reported = true;
+    if (prior) |loaded| {
+        const roots = try dag.nodeKeys(gpa);
+        defer gpa.free(roots);
+        var rg = try Dag.RedGreen.init(gpa, loaded, dag);
+        defer rg.deinit();
+        if (rg.run(roots)) |_| {
+            try out.print("query: red-green recompute={d} cutoff={d} of {d} nodes\n", .{ rg.red_count, rg.green_count, rg.red_count + rg.green_count });
+        } else |e| switch (e) {
+            // A cycle in the prior edges is reported, not fatal — the build already
+            // succeeded and this walk is purely the diagnostic stats reporter.
+            error.QueryCycle => try out.writeAll("query: red-green walk found a cycle in the prior DAG (skipped)\n"),
+            else => return e,
         }
+    } else {
+        try out.print("query: no prior DAG (cold build) -> {d} nodes recorded\n", .{total_nodes});
     }
-    if (!reported) try out.print("query: no prior DAG (cold build) -> {d} nodes recorded\n", .{total_nodes});
     try out.print("query: codegen compiled={d} cached={d}\n", .{ codegen_compiled, codegen_cached });
-
-    // Persist the fresh DAG for the next build. Best-effort: a serialize/write
-    // failure only costs the next build a full re-validation, never correctness.
-    if (dag.serialize(gpa)) |blob| {
-        defer gpa.free(blob);
-        cache.putDag(io, prog_key, blob) catch {};
-    } else |_| {}
 }
 
 /// Round-trip the per-build DAG through the on-disk artifact: LOAD any prior blob,

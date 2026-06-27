@@ -50,6 +50,40 @@ pub fn optMix(cfg: Opt.Config) u64 {
     return std.hash.Wyhash.hash(0x4f_50_54_4d, &[_]u8{cfg.bits()}); // "OPTM"
 }
 
+/// The STABLE codegen DAG-node identity — distinct from `codegen(...).digest()`,
+/// which folds the transitive content fingerprint and so makes a node's identity
+/// its content hash (red-green then isomorphic to a cache hit). This id folds ONLY
+/// a phase tag + the target (target-sensitive) + the opt level + the program-wide
+/// global fn id (`gid`, the `res.fns` index) + whether the fn is the program ENTRY.
+/// `gid` is globally unique across modules (unlike the bare-name signature id), so
+/// this id is unique across (kind=codegen, module, target, opt, is_entry) — the
+/// precondition for keying codegen reuse off stable identity rather than the content fp.
+///
+/// `is_entry` is folded because it is a codegen-root input NOT carried by the fn's
+/// body subtree (`body(gid)`): the entry fn gets a distinct prologue, but renaming a
+/// fn to/from `main` (the only way the entry assignment moves) is normally caught via
+/// the symbol/proto fold in `body(gid)`. Folding it here makes the reuse decision
+/// independent of that argument — an entry flip lands under a DIFFERENT stable id, so
+/// the prior stamp is simply absent and the fn recomputes (RED), never a stale-prologue
+/// false green. Costs nothing on the common path (is_entry is stable per fn).
+///
+/// NOTE: this is NOT the on-disk cache key. `Key.codegen` (content-fp-derived) stays
+/// the cache-entry name so cold-cache bytes are byte-identical; this id only names
+/// the in-memory DAG node the red-green walk decides reuse for.
+pub fn codegenIdentity(target: []const u8, opt: Opt.Config, gid: u32, is_entry: bool) u64 {
+    var h = std.hash.Wyhash.init(0x43_47_49_44); // "CGID"
+    h.update(&[_]u8{@intFromEnum(Phase.codegen)});
+    h.update(target);
+    var ob: [8]u8 = undefined;
+    std.mem.writeInt(u64, &ob, optMix(opt), .little);
+    h.update(&ob);
+    var gb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &gb, gid, .little);
+    h.update(&gb);
+    h.update(&[_]u8{@intFromBool(is_entry)});
+    return h.final();
+}
+
 /// Mix a function's OWN emitted `SymName{kind,name}` into the codegen cache key.
 ///
 /// WHY (M14, [Cx] cache soundness): the fingerprint folds a fn's body and its
@@ -68,4 +102,34 @@ pub fn symMix(sym: Link.SymName) u64 {
     h.update(&[_]u8{@intFromEnum(sym.kind)});
     h.update(sym.name);
     return h.final();
+}
+
+const testing = std.testing;
+
+test "codegenIdentity is unique per (gid, target, opt, is_entry) and ignores content fp" {
+    const o0: Opt.Config = .{};
+    const t_arm = "aarch64-macos";
+    const t_x = "x86_64-macos";
+
+    // Distinct global fn ids => distinct stable node ids (the program-wide-unique
+    // precondition for keying codegen reuse off stable identity).
+    try testing.expect(codegenIdentity(t_arm, o0, 0, false) != codegenIdentity(t_arm, o0, 1, false));
+    try testing.expect(codegenIdentity(t_arm, o0, 5, false) != codegenIdentity(t_arm, o0, 6, false));
+
+    // Same gid, different target => distinct (target-sensitive: a cross-target green
+    // must never reuse the wrong target's blob).
+    try testing.expect(codegenIdentity(t_arm, o0, 3, false) != codegenIdentity(t_x, o0, 3, false));
+
+    // Same gid+target, different opt level => distinct.
+    const o1: Opt.Config = .{ .fold = true };
+    try testing.expect(codegenIdentity(t_arm, o0, 3, false) != codegenIdentity(t_arm, o1, 3, false));
+
+    // Same gid+target+opt, different ENTRY flag => distinct (an entry flip must land
+    // under a different id so the prior stamp is absent and the fn recomputes RED,
+    // never reusing a blob with the wrong prologue).
+    try testing.expect(codegenIdentity(t_arm, o0, 3, false) != codegenIdentity(t_arm, o0, 3, true));
+
+    // Stable for identical inputs (no content-fp dependence: identity is decoupled
+    // from the body bytes — that is the whole point).
+    try testing.expectEqual(codegenIdentity(t_arm, o0, 9, true), codegenIdentity(t_arm, o0, 9, true));
 }

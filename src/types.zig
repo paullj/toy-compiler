@@ -1215,15 +1215,28 @@ fn checkFn(t: *Typecheck, fid: u32, f: FnSym) !void {
     for (f.params) |pty| try t.slot_types.append(t.gpa, pty);
     t.cur_ret = f.ret;
 
-    // M16: the fn's OWN declared param/return aggregates are a real codegen layout
-    // dependency (Walks.walkTouchedSig folds each proto param + the return type).
-    // recordSignature records this only on signature(fid), and only at caller
-    // call-sites — so an UNCALLED pass-through fn `fn id(p:Point)->Point { p }` whose
-    // body never constructs/accesses the aggregate has a body(fid) fp blind to the
-    // aggregate's layout (an ABI-boundary layout edit would early-cutoff it as
-    // unchanged under M17 = miscompile). Record body(fid)->layout for each param +
-    // the return under the entered body(fid) Active node. No-op for scalars / when
-    // dag == null.
+    // The fn's OWN signature (name + arity + EVERY param/return type, scalars
+    // included) is a real codegen dependency: the authoritative codegen fingerprint
+    // folds the emitted SymName + the full proto (Fingerprint.zig sig fold), and a
+    // proto-only edit (scalar param/ret type, arity, reorder, rename) — with the body
+    // brace span byte-identical — changes the emitted bytes (arg registers / frame /
+    // ABI / symbol). bodyFp deliberately excludes the proto (the firewall basis), so
+    // WITHOUT this edge body(fid) verifies green on a proto-only edit and greenReuse
+    // serves the stale blob = MISCOMPILE (no content-fp net on the green path). Record
+    // body(fid)->signature(fid) under the entered body Active node: sigFingerprint
+    // folds name+arity+all param/ret kinds+aggregate ids. A body-only edit leaves
+    // sigFingerprint stable, so the firewall holds. No-op when dag == null.
+    t.recordSignature(fid);
+
+    // ALSO record body(fid)->layout(param)/layout(ret) DIRECTLY for the fn's own
+    // aggregate param/return types. The signature edge above is NOT sufficient for an
+    // aggregate LAYOUT edit: a struct/enum field change leaves the sig FINGERPRINT
+    // stable (it folds the param/ret type IDENTITY, not the layout), so BACKDATING on
+    // signature(fid) reports it unchanged to body(fid) and a pass-through fn
+    // `fn id(p: P) -> P { return p }` (whose body never field-accesses P) verifies
+    // GREEN on an ABI-boundary layout edit = MISCOMPILE (no content-fp net on the green
+    // path). A direct body->layout edge makes the layout a first-class body dep the
+    // walk reddens. Scalars are a no-op in recordLayoutOf; no-op when dag == null.
     if (t.dag != null) {
         const body_node: Dag.NodeKey = .{ .kind = .body, .id = fid };
         for (f.params) |pty| t.recordLayoutOf(body_node, pty);
@@ -1254,12 +1267,25 @@ fn checkFn(t: *Typecheck, fid: u32, f: FnSym) !void {
     _ = proto;
 }
 
-/// A body-content fingerprint for `body(fid)`, DISTINCT from `signature(fid)`'s
-/// sig-only fold: it folds the body block's SOURCE SPAN (every statement's bytes),
-/// so any body edit flips it while a pure signature edit (param/ret type, with the
-/// body text unchanged) does NOT. Observational only — used so the `--dump-dag`
-/// firewall demo shows a body fp that is stable under a signature-only change and a
-/// signature fp that is stable under a body-only change.
+/// The own-codegen fingerprint for `body(fid)`: it folds the fn's ENTIRE declaration
+/// source span — the proto (fn name + every param name/type + return type) AND the
+/// body block — so it flips on ANY edit that changes THIS fn's emitted bytes.
+///
+/// This is the validity oracle for the fn's OWN codegen reuse (Driver.computeReuse
+/// marks codegen green iff body(fid) verifies unchanged, with NO content-fp net on the
+/// green path). So it must be a SUPERSET of everything the authoritative codegen
+/// fingerprint folds about this fn's own decl (Fingerprint.zig fn_decl walk: fn name,
+/// each param name + type-ref text, return type-ref, body). It deliberately folds the
+/// proto TEXT (not just types) because the body binds params by NAME to slots, so a
+/// param REORDER or RENAME — which leaves the body brace span byte-identical yet
+/// changes the emitted slot/register assignment — MUST flip this fp. Folding only the
+/// brace span (the old behaviour) false-greened every proto-only edit = miscompile.
+///
+/// The caller firewall is UNAFFECTED: a caller depends on `signature(callee)` (the
+/// sig-only `Dag.sigFingerprint`, no body, no param names), never on body(callee). A
+/// callee body OR proto edit flips body(callee) (the callee recompiles) but leaves
+/// signature(callee) stable unless the callee's ABI shape changed — so a callee
+/// body-only edit still cuts off its callers.
 fn bodyFp(t: *const Typecheck, fid: u32, f: FnSym) u64 {
     var h = std.hash.Wyhash.init(0x42_4f_44_59); // "BODY"
     var ib: [4]u8 = undefined;
@@ -1268,12 +1294,11 @@ fn bodyFp(t: *const Typecheck, fid: u32, f: FnSym) u64 {
     const decl = t.tree.nodes[f.decl_node];
     if (decl.rhs != Ast.none) {
         const body = t.tree.nodes[decl.rhs];
-        // Fold the body block's FULL source span `{ ... }`: scan tokens from the
-        // body's `{` (its main_token), matching braces, to the closing `}`, and
-        // fold that exact source slice. This captures the whole body text (so any
-        // body edit flips the fp) yet excludes the proto (param/ret) tokens, which
-        // sit BEFORE the `{` — the firewall basis (a sig-only edit leaves it
-        // stable). Falls back to the `{` byte alone on a malformed token range.
+        // Fold the whole decl span: from the fn decl's first token (the proto, which
+        // sits BEFORE the body `{`) through the matching `}` of the body block. Scan
+        // from the body's `{` (main_token) matching braces to find the close, then
+        // fold source[decl_start .. body_close]. Falls back to the brace span alone on
+        // a malformed token range.
         const open = body.main_token;
         if (open < t.tokens.len and t.tokens[open].tag == .l_brace) {
             var depth: i32 = 0;
@@ -1292,7 +1317,8 @@ fn bodyFp(t: *const Typecheck, fid: u32, f: FnSym) u64 {
                     else => {},
                 }
             }
-            h.update(t.source[t.tokens[open].start..t.tokens[close].end]);
+            const decl_start = t.tokens[decl.main_token].start;
+            h.update(t.source[decl_start..t.tokens[close].end]);
         }
     }
     return h.final();
@@ -2560,8 +2586,19 @@ fn sigNodeName(t: *const Typecheck, fid: u32) []const u8 {
     return t.nameText(t.tree.nodes[f.decl_node].main_token);
 }
 
+/// The STABLE `signature(fid)` DAG node id. M16 AUDIT FIX: the historical id was
+/// `Wyhash(name)` — NOT module/target qualified, so two same-named pub fns in
+/// different modules (or a user fn named `print`) collapsed to ONE signature node
+/// and served a wrong sig fp. The content-fp in the codegen cache key MASKED this;
+/// with stable-id keying it is live. `fid` is the program-wide global fn id (the
+/// `res.fns`/`t.fns` index), globally unique across modules, exactly matching how
+/// `body(fid)` is keyed — so a caller's `body -> signature(callee_fid)` edge and the
+/// callee's own `signature(callee_fid)` node always agree, preserving the firewall.
 fn sigNodeId(t: *const Typecheck, fid: u32) u64 {
-    return std.hash.Wyhash.hash(0x53_47_4e_4d, t.sigNodeName(fid)); // "SGNM"
+    _ = t;
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, fid, .little);
+    return std.hash.Wyhash.hash(0x53_47_4e_4d, &b); // "SGNM"
 }
 
 /// Record `body(caller) -> signature(fid)` with the sig-only fingerprint. The
@@ -2603,7 +2640,14 @@ fn recordResolveName(t: *Typecheck, res: Resolution) void {
     std.mem.writeInt(u32, &ib, bound, .little);
     h.update(&ib);
     const fp = h.final();
-    const node: Dag.NodeKey = .{ .kind = .resolve_name, .id = fp };
+    // M16 AUDIT FIX: a module-LOCAL bound id (local/func index) is not unique across
+    // modules — two modules' `local#0` would collapse to one resolve_name node and
+    // serve a wrong-module resolution fp. Fold the current module id into the NODE id
+    // (mirroring recordTypeOf), so single-file mode (one module) is unchanged but
+    // cross-module nodes stay distinct. The fp keeps the resolution-shape content
+    // (no module fold) so an unrelated module renumbering does not spuriously flip it;
+    // distinctness comes from the id, soundness from the fp.
+    const node: Dag.NodeKey = .{ .kind = .resolve_name, .id = (@as(u64, t.graph_mod) << 40) ^ fp };
     d.recordEdge(t.gpa, Dag.Active.get(), node, fp);
 }
 

@@ -16,6 +16,7 @@
 //! fan-out in behind the same seam.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Token = @import("../ast/Token.zig").Token;
 const Lexer = @import("../lex.zig");
@@ -278,6 +279,23 @@ pub fn fanOut(io: Io, n: usize, comptime jobFn: anytype, ctx: anytype) void {
 /// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
 pub const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
 
+/// The per-fn red-green REUSE decision the driver computes single-threaded BEFORE
+/// the fan-out (the walk is not thread-safe) and hands to `codegen`. `green` means
+/// the codegen node + its whole transitive dep closure verified unchanged vs the
+/// prior build, so the prior cached `FnCode` may be served WITHOUT re-deriving the
+/// transitive content fp and WITHOUT the body walk — that skip is the perf win.
+///
+/// `green=false` (the default) is the VERBATIM path: recompute exactly as today.
+/// A green decision is only trusted when an oracle is actually present; a green
+/// node whose on-disk cache blob was evicted falls back to a fresh recompute (a
+/// cache miss on a green node is treated as red — never an error). The recorded
+/// `stamp` is the prior node fp so the green-reused node round-trips an IDENTICAL
+/// fresh DAG (hit == miss recording).
+pub const Reuse = struct {
+    green: bool = false,
+    stamp: u64 = 0,
+};
+
 /// Lower one function (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a job-local
 /// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
 /// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
@@ -349,10 +367,39 @@ pub fn codegen(
     is_entry: bool,
     my_sig: ?Fingerprint.Sig,
     tmp_tag: usize,
+    gid: u32,
+    reuse: ?Reuse,
     slot: anytype,
 ) !void {
     const cache = self.cache;
     const mode = self.mode;
+
+    // The STABLE codegen node identity (target+opt+global fn id), distinct from the
+    // content-fp-derived cache key below. This names the in-memory DAG node the
+    // red-green walk decides reuse for, so a node's identity is NO LONGER its content
+    // hash. Used for BOTH the recorded node and (matching) `nodeKeyFor` alignment.
+    const stable_id = Key.codegenIdentity(target, frozen.opt, gid, is_entry);
+
+    // In a DEBUG build, AUDIT every green verdict instead of trusting the stamp blind
+    // (rustc's -Zincremental-verify-ich model): skip the fast-path shortcut, recompute
+    // the real content fp below, and require it equals the oracle's stamp — a mismatch
+    // is a dependency UNDER-RECORDING bug (a false green that would miscompile). The
+    // recompute is the fp WALK, not a re-lower, and the unchanged fn still cuts off via
+    // the content-fp cache below, so Debug stays incremental while self-checking. A
+    // RELEASE build keeps the full skip (the actual perf win).
+    const debug_audit = builtin.mode == .Debug;
+
+    // GREEN FAST-PATH: the driver's red-green oracle verified this fn's codegen node
+    // + its whole transitive dep closure unchanged vs the prior build. Serve the
+    // prior cached blob WITHOUT re-deriving the transitive fp or the body walk (the
+    // perf win), and STILL record the node + body edge with the prior stamp so the
+    // fresh DAG round-trips identically (hit == miss recording). A cache miss on a
+    // green node falls back to the normal recompute below (never an error). Gated on
+    // an actual oracle + `.normal` mode, so dag==null / force / verify stay verbatim;
+    // skipped under `debug_audit` so the verdict is cross-checked, not trusted.
+    if (mode == .normal and !debug_audit) if (reuse) |rd| if (rd.green) {
+        if (try self.greenReuse(gpa, io, target, stable_id, gid, rd, slot)) return;
+    };
 
     // Gather this fn's callee sigs (in walk order) and touched types for the
     // fingerprint. The walk order is the body's call order; `walkCalls` mirrors
@@ -373,42 +420,33 @@ pub fn codegen(
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).
     const key = Key.codegen(target, fp, frozen.opt, sym);
 
-    // OBSERVATIONAL DAG: record this fn's codegen node (id = the cache key digest,
-    // aligning with `nodeKeyFor`) + an edge from the active parent, with the fn's
-    // content fingerprint as the node fp. Runs UNCONDITIONALLY (hit == miss) so the
-    // recorded graph is schedule-independent. Each fan-out worker has its OWN
-    // threadlocal Active stack starting at null, so a per-fn codegen job is a ROOT
-    // node here; the shared `*Dag` (spinlock-guarded) collects every worker's node.
-    // No-op + zero-overhead when dag == null (the default verbatim path).
-    if (self.dag) |d| {
-        const node: Dag.NodeKey = .{ .kind = .codegen, .id = key.digest() };
-        const parent = Dag.Active.get();
-        d.recordEdge(gpa, parent, node, fp);
-        // The REAL codegen-level dependency: a caller folds each callee's SIGNATURE
-        // (NOT its body) into its own fingerprint — this is the sig firewall the
-        // later typecheck decomposition makes a first-class query. Record one
-        // `codegen(caller) -> signature(callee)` edge per call site (deduped by
-        // recordEdge), id = a stable fold of the callee's emitted name, fp =
-        // `sigFingerprint` (sig-only). These edges are what make the dump show a
-        // caller->callee structure for a real program; the typecheck stage will
-        // add the body(fn)->signature(fn) edges over the same signature nodes.
-        for (callee_sigs.items) |csig| {
-            const sig_node: Dag.NodeKey = .{
-                .kind = .signature,
-                .id = std.hash.Wyhash.hash(0x53_47_4e_4d, csig.name), // "SGNM"
-            };
-            d.recordEdge(gpa, node, sig_node, Dag.sigFingerprint(csig));
-        }
-    }
+    // DEBUG green-verdict audit: the oracle marked this fn green, meaning its content
+    // is unchanged — so the freshly recomputed key input MUST equal the reused stamp.
+    // A mismatch means the dependency closure UNDER-RECORDED and the green path would
+    // have served a stale blob = miscompile. Catch it in Debug/test builds; the sound
+    // content-fp cache lookup below still serves the (genuinely unchanged) blob.
+    if (debug_audit and mode == .normal) if (reuse) |rd| if (rd.green and rd.stamp != key.input) return error.VerifyFalseGreen;
+
+    if (self.dag) |d| recordCodegenNode(d, gpa, stable_id, gid, key.input);
 
     if (mode == .verify) {
-        // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh
-        // and assert its packed FnCode bytes are byte-identical to a reference:
+        // [C11] determinism + cache-soundness + red-green-soundness gate. ALWAYS
+        // re-lower the fn fresh and check its packed FnCode bytes against a reference:
         //   * cache HIT  -> compare against the stored blob (cache soundness).
         //   * cache MISS -> compare against a SECOND fresh lowering (determinism).
-        // Either way the assertion runs unconditionally — it is NOT gated on a
-        // primed cache, so it can never silently no-op (the dead-gate bug, where
-        // `--force` skipped the cache-read branch and thus the assert entirely).
+        // The checks are REAL runtime comparisons that return an error on mismatch —
+        // NOT `std.debug.assert`, which compiles out under ReleaseFast/Small and would
+        // make the whole safety net silently no-op in a release build.
+        //
+        // RED-GREEN cross-check: if the driver's oracle marked this fn GREEN, its
+        // trusted stamp MUST equal the freshly recomputed key input (the content fp the
+        // green path would have reused blind). A mismatch means the dependency closure
+        // UNDER-RECORDED — a false green that would miscompile on the normal path. We
+        // recompute the real fp here (the body walk the green path skips) precisely to
+        // catch that. `--verify` never takes the green skip (the fast-path is gated on
+        // `.normal`), so this is the one mode that re-derives + audits the verdict.
+        if (reuse) |rd| if (rd.green and rd.stamp != key.input) return error.VerifyFalseGreen;
+
         var opt_out: OptOut = .{};
         var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
         errdefer fresh.deinit(gpa);
@@ -418,16 +456,16 @@ pub fn codegen(
         var was_cached = false;
         if (cache.get(u8, gpa, io, key) catch null) |blob| {
             defer gpa.free(blob);
-            std.debug.assert(std.mem.eql(u8, fb, blob));
+            if (!std.mem.eql(u8, fb, blob)) return error.VerifyCacheMismatch;
             was_cached = true;
         } else {
             // Cold: no reference blob to compare against, so lower a second time
-            // and assert the two fresh lowerings agree (pure determinism).
+            // and require the two fresh lowerings agree (pure determinism).
             var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, null);
             defer fresh2.deinit(gpa);
             const fb2 = try Link.pack(gpa, fresh2);
             defer gpa.free(fb2);
-            std.debug.assert(std.mem.eql(u8, fb, fb2));
+            if (!std.mem.eql(u8, fb, fb2)) return error.VerifyNondeterministic;
             // Populate the cache so subsequent fns/runs see a primed entry.
             cache.put(u8, io, key, tmp_tag, fb) catch {};
         }
@@ -455,6 +493,92 @@ pub fn codegen(
         cache.put(u8, io, key, tmp_tag, b) catch {};
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+}
+
+/// Record the codegen DAG node under a STABLE identity plus its complete dependency
+/// CLOSURE. The ONLY edge the codegen root records is `codegen(gid) -> body(gid)`:
+/// the body subtree the typecheck pass recorded (body -> signature(callee) / layout
+/// / type_of / resolve_name) carries every input that affects the emitted bytes, so
+/// the codegen root reaches all of them transitively through this one edge. The sig
+/// firewall is preserved — a caller's codegen reaches a callee's SIGNATURE (not its
+/// body) via codegen(caller) -> body(caller) -> signature(callee). WITHOUT this edge
+/// a body/layout edit recorded under body(gid) never reaches the codegen root and the
+/// node verifies green off its own stamp alone = MISCOMPILE.
+///
+/// `gid` is the SAME global fn id the typecheck pass keyed body(fid) under (checkFn
+/// enters `body` with .id = fid). `stamp` is the WIDENED node fp (fp ^ optMix ^
+/// symMix, target-sensitive via the key) so a green verdict flips iff the emitted
+/// bytes would change. Recording the SAME single edge on every path (normal / hit /
+/// green-reuse) keeps the fresh DAG byte-identical regardless of how the fn was
+/// served (the HIT == MISS invariant the persisted snapshot relies on). [C11]
+fn recordCodegenNode(d: *Dag, gpa: std.mem.Allocator, stable_id: u64, gid: u32, stamp: u64) void {
+    const node: Dag.NodeKey = .{ .kind = .codegen, .id = stable_id };
+    const parent = Dag.Active.get();
+    d.recordEdge(gpa, parent, node, stamp);
+    const body_node: Dag.NodeKey = .{ .kind = .body, .id = gid };
+    d.recordEdge(gpa, node, body_node, d.fingerprintOf(body_node) orelse 0);
+}
+
+/// The GREEN fast-path body: serve the prior cached `FnCode` by reconstructing the
+/// content-fp cache key FROM THE STAMP (no body walk, no `Fingerprint.fingerprint`).
+/// The stamp the prior build recorded for a codegen node IS `fp ^ optMix ^ symMix`,
+/// which is exactly `Key.codegen(...).input`, so `Key.fromFingerprint(.codegen,
+/// target, stamp)` rebuilds the cache key without re-deriving the transitive fp —
+/// THAT skip is the perf win. Returns true if the prior blob was found and reused;
+/// false (cache miss / unpack failure) tells the caller to fall back to a full
+/// recompute (a cache miss on a green node is RED, never an error). On reuse it
+/// records the codegen node + body edge with the prior stamp so the fresh DAG is
+/// byte-identical to a recomputed one.
+fn greenReuse(
+    self: Engine,
+    gpa: std.mem.Allocator,
+    io: Io,
+    target: []const u8,
+    stable_id: u64,
+    gid: u32,
+    rd: Reuse,
+    slot: anytype,
+) !bool {
+    const key = Key.Key.fromFingerprint(.codegen, target, rd.stamp);
+    const blob = (self.cache.get(u8, gpa, io, key) catch null) orelse return false;
+    defer gpa.free(blob);
+    const fc = (Link.unpack(gpa, blob) catch null) orelse return false;
+
+    // Record the IDENTICAL codegen root + body edge a recomputed node would, so the
+    // fresh persisted DAG round-trips byte-identically whether this fn was reused or
+    // recomputed (HIT == MISS == green-reuse). The body subtree itself was already
+    // recorded by the typecheck pass that ran before the fan-out.
+    if (self.dag) |d| recordCodegenNode(d, gpa, stable_id, gid, rd.stamp);
+    slot.* = .{ .fc = fc, .cached = true };
+    return true;
+}
+
+const testing = std.testing;
+
+test "green-reuse cache key is reconstructible from the recorded stamp alone" {
+    // The load-bearing equation for the green fast-path: a codegen node's recorded
+    // STAMP is `fp ^ optMix ^ symMix`, which is EXACTLY `Key.codegen(...).input`. So
+    // `Key.fromFingerprint(.codegen, target, stamp)` rebuilds the on-disk cache key
+    // WITHOUT re-deriving the transitive content fp (the body walk we skip on green).
+    // If this drifts, the green path would look up the wrong cache slot.
+    const target = "aarch64-macos";
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "m.add" };
+    const opt: Opt.Config = .{ .fold = true };
+    const fp: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+    const key = Key.codegen(target, fp, opt, sym);
+    const stamp = fp ^ Key.optMix(opt) ^ Key.symMix(sym);
+    try testing.expectEqual(key.input, stamp);
+
+    const rebuilt = Key.Key.fromFingerprint(.codegen, target, stamp);
+    try testing.expectEqual(key.digest(), rebuilt.digest());
+}
+
+test "Reuse defaults to a non-green (verbatim) decision" {
+    // A zero-valued Reuse must be the safe recompute path, so an unset slot never
+    // triggers a green reuse.
+    const rd: Reuse = .{};
+    try testing.expect(!rd.green);
 }
 
 // Engine boundary tests (hit/miss/force/verify/invalidation + key discrimination)

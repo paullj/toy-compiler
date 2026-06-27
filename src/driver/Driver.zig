@@ -18,6 +18,7 @@ const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
 const Dag = @import("../query/Dag.zig");
+const Key = @import("../query/Key.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
 const Graph = @import("Graph.zig");
@@ -532,7 +533,9 @@ fn fnJobInner(
     const is_entry = idx == frozen.entry_fn;
     const my_sig: ?Fingerprint.Sig = if (idx < frozen.sigs.len) frozen.sigs[idx] else null;
     const engine = Engine.init(cache, mode);
-    try engine.codegen(gpa, io, target, frozen, fn_decl, sym, is_entry, my_sig, idx, slot);
+    // Single-file: the fn index IS its global id; no red-green reuse oracle (the
+    // dag-driven path is graph-only), so `reuse = null` keeps this VERBATIM.
+    try engine.codegen(gpa, io, target, frozen, fn_decl, sym, is_entry, my_sig, idx, @intCast(idx), null, slot);
 }
 
 /// The SERIAL relink tail (every build, uncached): derive `uses_write`, append
@@ -652,6 +655,13 @@ const GraphFrozen = struct {
     /// `Engine.initDag` so `query()` records caller->callee codegen edges.
     dag: ?*Dag = null,
 
+    /// M16/M17: the per-lowerable-fn red-green REUSE decision, computed
+    /// single-threaded BEFORE the fan-out (the walk is not thread-safe) and indexed
+    /// by `lower_i`. Each worker just READS its slot — no shared mutation, so
+    /// determinism is preserved. `null` (the default) means no oracle => every fn
+    /// recomputes verbatim; a non-null slice is only present on the dag-driven path.
+    reuse: ?[]const Engine.Reuse = null,
+
     /// Build the single-fn `Frozen` view a codegen job runs against: this fn's
     /// owning module's per-module arrays + the program-wide tables. `fn_nodes` is
     /// a one-element slice (this fn) so `entry_fn`/`names[idx]` index correctly.
@@ -694,6 +704,7 @@ pub fn lowerGraphProgram(
     mode: CodegenIr.Mode,
     opt: Opt.Config,
     dag: ?*Dag,
+    prior: ?*const Dag.Loaded,
 ) !LowerProgramResult {
     const n_mods = graph.modules.len;
 
@@ -762,6 +773,25 @@ pub fn lowerGraphProgram(
         } };
     }
 
+    // --- red-green REUSE pre-pass (single-threaded, BEFORE the fan-out) ---
+    // The walk is not thread-safe and must run on a fully-recorded fresh body
+    // subtree (resolve/typecheck ran before us and recorded body/signature/layout/
+    // type_of/resolve_name into `dag`). For each lowerable fn we drive the walk from
+    // its `body(gid)` node and mark its codegen GREEN iff body(gid) verifies
+    // unchanged (option b: a codegen node is a pure function of its body subtree, so
+    // body-green => codegen-green WITHOUT recomputing the codegen fingerprint — the
+    // perf win). The decision is materialized into a per-lower_i array each worker
+    // just reads. `null` when there is no dag or no prior snapshot => verbatim.
+    // Computed for `.normal` (to DRIVE green reuse) and for `.verify` (to CROSS-CHECK
+    // each green verdict's stamp against a fresh recompute — the soundness audit). In
+    // `.verify` the green fast-path is never taken; the decisions only feed the check.
+    var reuse_decisions: ?[]Engine.Reuse = null;
+    defer if (reuse_decisions) |rds| gpa.free(rds);
+    if (mode == .normal or mode == .verify) if (dag) |d| if (prior) |pr| {
+        const rds = try computeReuse(gpa, d, pr, target, opt, lower_ids.items, eid);
+        reuse_decisions = rds;
+    };
+
     const gf = GraphFrozen{
         .trees = trees,
         .tokens = toks,
@@ -778,6 +808,7 @@ pub fn lowerGraphProgram(
         .entry_id = eid,
         .opt = opt,
         .dag = dag,
+        .reuse = reuse_decisions,
     };
 
     // --- parallel per-fn fan-out (one slot per lowerable fn) ---
@@ -845,6 +876,59 @@ pub fn lowerGraphProgram(
     return relink(gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
 }
 
+/// Compute the per-lowerable-fn red-green REUSE decision SINGLE-THREADED before the
+/// fan-out. Drives `Dag.RedGreen` over the fresh body subtree (already recorded by
+/// the resolve/typecheck passes) against the `prior` snapshot, then marks a fn's
+/// codegen GREEN iff:
+///   1. its `body(gid)` node verifies UNCHANGED in the walk (so the whole body
+///      subtree — signature/layout/type_of/resolve_name — is green; option b: a
+///      codegen node is a pure function of its body deps, so we never recompute the
+///      codegen fingerprint on the green path), AND
+///   2. the prior DAG carries a codegen node under THIS fn's stable identity (so we
+///      have its prior stamp = the content-fp cache key to reuse the cached blob).
+/// Any walk cycle / missing prior node falls back to RED (recompute) for that fn —
+/// never a false green. The returned array is parallel to `lower_ids` (indexed by
+/// lower_i). Caller owns + frees it.
+fn computeReuse(
+    gpa: std.mem.Allocator,
+    fresh: *Dag,
+    prior: *const Dag.Loaded,
+    target: []const u8,
+    opt: Opt.Config,
+    lower_ids: []const u32,
+    entry_id: u32,
+) ![]Engine.Reuse {
+    const rds = try gpa.alloc(Engine.Reuse, lower_ids.len);
+    errdefer gpa.free(rds);
+    for (rds) |*r| r.* = .{};
+
+    var rg = try Dag.RedGreen.init(gpa, prior, fresh);
+    defer rg.deinit();
+
+    // Drive the walk from each fn's body node. A cycle in the prior edges (should
+    // never happen — the firewall makes the body graph acyclic) means we cannot
+    // trust ANY verdict, so leave every decision RED (the safe full-rebuild fallback).
+    var body_roots: std.ArrayList(Dag.NodeKey) = .empty;
+    defer body_roots.deinit(gpa);
+    for (lower_ids) |gid| try body_roots.append(gpa, .{ .kind = .body, .id = gid });
+    rg.run(body_roots.items) catch return rds; // all-RED fallback on cycle
+
+    for (lower_ids, 0..) |gid, lower_i| {
+        const body_node: Dag.NodeKey = .{ .kind = .body, .id = gid };
+        const verdict = rg.verdictOf(body_node) catch continue; // RED on cycle
+        if (verdict != .green) continue;
+        // The prior codegen node's stamp = the content-fp cache key the green path
+        // reuses. Absent => we cannot reconstruct the cache key => recompute (RED).
+        // `is_entry` MUST match how Engine.codegen recorded the node (it folds the
+        // entry flag into the identity) so the lookup hits the right stamp.
+        const is_entry = gid == entry_id;
+        const stable_id = Key.codegenIdentity(target, opt, gid, is_entry);
+        const stamp = prior.nodeFp(.{ .kind = .codegen, .id = stable_id }) orelse continue;
+        rds[lower_i] = .{ .green = true, .stamp = stamp };
+    }
+    return rds;
+}
+
 /// One whole-graph per-fn codegen job: build the single-fn `Frozen` view for this
 /// fn's owning module, then run the SAME fingerprint→cache→lower path as the
 /// single-file `fnJob`. The cross-module callee identity + touched layouts ride
@@ -893,7 +977,8 @@ fn graphFnJobInner(
     // `names`/`sigs`/`layouts` of this fn's `frozen` view, so the fingerprint folds
     // a qualified callee distinctly with NO engine change. tmp_tag = `lower_i`.
     const engine = if (gf.dag) |dp| Engine.initDag(cache, mode, dp) else Engine.init(cache, mode);
-    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, slot);
+    const reuse: ?Engine.Reuse = if (gf.reuse) |r| r[lower_i] else null;
+    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, gid, reuse, slot);
 }
 
 /// Build the program-wide index→SymName table for a graph build: one entry per
