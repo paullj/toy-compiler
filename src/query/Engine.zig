@@ -234,7 +234,7 @@ pub fn parse(
         defer gpa.free(bytes);
         const unpacked: ?Ast.Tree = if (swallow_get) (Ast.unpack(gpa, bytes) catch null) else (try Ast.unpack(gpa, bytes));
         if (unpacked) |t| {
-            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, fpOfBytes(u8, bytes));
+            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, Ast.contentFp(t));
             return .{ .tree = t, .cached = true };
         }
     }
@@ -245,7 +245,7 @@ pub fn parse(
         if (Ast.pack(gpa, t) catch null) |b| {
             defer gpa.free(b);
             cache.put(u8, io, key, tmp_tag, b) catch {};
-            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, fpOfBytes(u8, b));
+            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, Ast.contentFp(t));
         } else if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, 0);
         return .{ .tree = t, .cached = false };
     }

@@ -50,6 +50,13 @@ pub fn main(init: std.process.Init) !void {
     // M16: `--dump-dag` compiles the whole program with the per-build dependency
     // DAG threaded into every query, then prints the deterministic dump to stdout.
     var dump_dag = false;
+    // M17: `--query-stats` (with `-o`) threads the dependency DAG through the real
+    // executable build, LOADS the prior on-disk DAG, runs the red-green
+    // re-validation walk, and reports the recompute set (the cutoff) to stderr,
+    // then persists the fresh DAG. The emitted bytes are byte-identical to a plain
+    // `-o` build (the content cache, not the walk, drives correctness); the walk is
+    // the live in-production proof of the early-cutoff architecture.
+    var query_stats = false;
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
 
@@ -72,6 +79,8 @@ pub fn main(init: std.process.Init) !void {
             opt_stats = true;
         } else if (std.mem.eql(u8, arg, "--dump-dag")) {
             dump_dag = true;
+        } else if (std.mem.eql(u8, arg, "--query-stats")) {
+            query_stats = true;
         } else if (std.mem.startsWith(u8, arg, "--opt=")) {
             // Start from level-off, then turn ON each named pass.
             opt = .O0;
@@ -140,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
 
     // `-o`: lower `main` and write a signed, runnable executable.
     if (out_path) |path| {
-        std.process.exit(try emitExecutable(gpa, io, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats));
+        std.process.exit(try emitExecutable(gpa, io, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats, query_stats));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -204,6 +213,7 @@ fn emitExecutable(
     codegen_stats: bool,
     opt: Opt.Config,
     opt_stats: bool,
+    query_stats: bool,
 ) !u8 {
     // M14: `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program.
@@ -215,8 +225,22 @@ fn emitExecutable(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
+    // M17: when `--query-stats` is set, a single per-build dependency `Dag` lives on
+    // this frame and a `*Dag` is threaded through discovery, typecheck, and the
+    // per-fn codegen fan-out — exactly the `--dump-dag` plumbing, but here the real
+    // executable is still emitted. `dag == null` (the default) keeps every query on
+    // its VERBATIM fast path, so a plain `-o` build is byte-identical. The walk over
+    // this graph is observational (the content cache, not the walk, drives
+    // correctness); it exists to PROVE the early-cutoff in production.
+    var dag_storage: Dag = .init(gpa);
+    defer dag_storage.deinit(gpa);
+    const dag: ?*Dag = if (query_stats) &dag_storage else null;
+
     // --- discover the module graph from the entry file ---
-    var graph = try Graph.discover(gpa, io, cache, target, paths[0]);
+    var graph = if (dag) |d|
+        try Graph.discoverDag(gpa, io, cache, target, paths[0], d)
+    else
+        try Graph.discover(gpa, io, cache, target, paths[0]);
     defer graph.deinit(gpa);
     if (graph.err) |ge| {
         try printGraphError(out, &graph, ge);
@@ -234,7 +258,7 @@ fn emitExecutable(
     }
 
     // --- whole-graph typecheck ---
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, dag);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
         for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
@@ -242,7 +266,7 @@ fn emitExecutable(
         return 1;
     }
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, null);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag);
     switch (lowered) {
         .err => |e| {
             try printGraphEmitError(out, &graph, e);
@@ -260,6 +284,15 @@ fn emitExecutable(
             // How many fns were freshly lowered vs. served from the codegen cache.
             if (codegen_stats) {
                 try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
+                try out.flush();
+            }
+
+            // M17 `--query-stats`: load the prior on-disk DAG, run the red-green
+            // re-validation walk over the just-recorded graph, report the recompute
+            // set (the cutoff), then persist the fresh DAG for the next build. The
+            // executable is emitted regardless; the walk never changes the bytes.
+            if (dag) |d| {
+                try reportQueryStats(gpa, io, out, cache, target, paths[0], d, lp.codegen_compiled, lp.codegen_cached);
                 try out.flush();
             }
 
@@ -432,10 +465,155 @@ fn emitDumpDag(
         },
     }
 
+    // --- M17 persistence: LOAD the prior DAG (round-trip demo), then WRITE the
+    // fresh one. Purely additive this stage: the artifact is recorded but does
+    // NOT yet drive invalidation, so the dump on stdout is byte-identical to a
+    // build without persistence (the fp-determinism gate diffs stdout). The
+    // load/write status is logged to STDERR so it never perturbs stdout.
+    const entry_canon = blk: {
+        if (Io.Dir.cwd().realPathFileAlloc(io, paths[0], gpa) catch null) |rp| {
+            defer gpa.free(rp);
+            break :blk try gpa.dupe(u8, rp);
+        }
+        break :blk try gpa.dupe(u8, paths[0]);
+    };
+    defer gpa.free(entry_canon);
+    const prog_key = toyc.Cache.programKey(entry_canon, target);
+    persistDag(gpa, io, cache, prog_key, &dag) catch |e| {
+        // Persistence is best-effort scaffolding; a write/load failure must never
+        // fail the build (the fallback is always a full re-validation).
+        std.debug.print("--dump-dag: persistence skipped ({s})\n", .{@errorName(e)});
+    };
+
     // --- emit the deterministic dump ---
     try dag.dumpDeterministic(gpa, out);
     try out.flush();
     return 0;
+}
+
+/// M17 `--query-stats` (with `-o`): the production proof of the early-cutoff
+/// architecture. Load the prior on-disk DAG, run the red-green re-validation walk
+/// over the just-recorded fresh `dag`, report the recompute set (the CUTOFF) and
+/// the codegen cache outcome (the byte-level cutoff that actually drives
+/// correctness), then persist the fresh DAG for the next build. Output is to
+/// STDOUT (an explicit stats request, like `--codegen-stats`); the emitted
+/// executable is byte-identical to a build without this flag.
+///
+/// Two cutoff numbers are reported because they live at two granularities:
+///   * red-green over the recorded query DAG (fine-grained: per signature/body/
+///     type_of/layout/codegen node) — the architecture's recompute set;
+///   * codegen compiled/cached — the byte-level cutoff the content cache delivers
+///     (a fn whose transitive fingerprint is unchanged is served from cache, never
+///     re-lowered). These agree in spirit: a localized edit recompiles a strict
+///     subset, the rest cut off.
+fn reportQueryStats(
+    gpa: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    cache: toyc.Cache,
+    target: []const u8,
+    entry_path: []const u8,
+    dag: *Dag,
+    codegen_compiled: usize,
+    codegen_cached: usize,
+) !void {
+    const entry_canon = blk: {
+        if (Io.Dir.cwd().realPathFileAlloc(io, entry_path, gpa) catch null) |rp| {
+            defer gpa.free(rp);
+            break :blk try gpa.dupe(u8, rp);
+        }
+        break :blk try gpa.dupe(u8, entry_path);
+    };
+    defer gpa.free(entry_canon);
+    const prog_key = toyc.Cache.programKey(entry_canon, target);
+
+    const total_nodes = dag.result_fp.count();
+    var reported = false;
+
+    if (cache.getDag(gpa, io, prog_key) catch null) |blob| {
+        defer gpa.free(blob);
+        if (Dag.deserialize(gpa, blob) catch null) |loaded_const| {
+            var loaded = loaded_const;
+            defer loaded.deinit(gpa);
+            const roots = try dag.nodeKeys(gpa);
+            defer gpa.free(roots);
+            var rg = try Dag.RedGreen.init(gpa, &loaded, dag);
+            defer rg.deinit();
+            if (rg.run(roots)) |_| {
+                try out.print("query: red-green recompute={d} cutoff={d} of {d} nodes\n", .{ rg.red_count, rg.green_count, rg.red_count + rg.green_count });
+            } else |e| switch (e) {
+                // A cycle in the prior edges is reported, not fatal — the build
+                // already succeeded and the walk is observational here.
+                error.QueryCycle => try out.writeAll("query: red-green walk found a cycle in the prior DAG (skipped)\n"),
+                else => return e,
+            }
+            reported = true;
+        }
+    }
+    if (!reported) try out.print("query: no prior DAG (cold build) -> {d} nodes recorded\n", .{total_nodes});
+    try out.print("query: codegen compiled={d} cached={d}\n", .{ codegen_compiled, codegen_cached });
+
+    // Persist the fresh DAG for the next build. Best-effort: a serialize/write
+    // failure only costs the next build a full re-validation, never correctness.
+    if (dag.serialize(gpa)) |blob| {
+        defer gpa.free(blob);
+        cache.putDag(io, prog_key, blob) catch {};
+    } else |_| {}
+}
+
+/// Round-trip the per-build DAG through the on-disk artifact: LOAD any prior blob,
+/// run the RED-GREEN re-validation walk against it (reporting the recompute set —
+/// the cutoff), then WRITE the fresh serialized DAG. Logs to stderr so stdout (the
+/// deterministic dump) stays byte-identical. Errors propagate to the best-effort
+/// caller.
+fn persistDag(gpa: std.mem.Allocator, io: Io, cache: toyc.Cache, prog_key: u64, dag: *Dag) !void {
+    const fresh = try dag.serialize(gpa);
+    defer gpa.free(fresh);
+
+    if (try cache.getDag(gpa, io, prog_key)) |blob| {
+        defer gpa.free(blob);
+        if (try Dag.deserialize(gpa, blob)) |loaded_const| {
+            var loaded = loaded_const;
+            defer loaded.deinit(gpa);
+            std.debug.print(
+                "--dump-dag: loaded prior DAG (rev={d}, {d} nodes, {d} edges); fresh build has {d} nodes\n",
+                .{ loaded.revision, loaded.nodes.len, loaded.edges.len, dag.result_fp.count() },
+            );
+            try reportRedGreen(gpa, &loaded, dag);
+        } else {
+            std.debug.print("--dump-dag: prior DAG present but unparseable -> full re-validation\n", .{});
+        }
+    } else {
+        std.debug.print("--dump-dag: no prior DAG (cold) -> full re-validation\n", .{});
+    }
+
+    try cache.putDag(io, prog_key, fresh);
+}
+
+/// Run the RED-GREEN re-validation walk (`Dag.RedGreen`) over the just-recorded
+/// fresh `dag` against the `prior` build snapshot, demanding every recorded node as
+/// a root so the whole graph is re-validated. Prints the recompute set — the CUTOFF
+/// metric — to stderr (so stdout's deterministic dump is untouched):
+///   `--dump-dag: red-green walk: N red (recompute), M green (cutoff) of T nodes`
+/// A cycle in the prior edges is reported, not fatal (the build already succeeded;
+/// the walk is observational this stage).
+fn reportRedGreen(gpa: std.mem.Allocator, prior: *const Dag.Loaded, dag: *Dag) !void {
+    const roots = try dag.nodeKeys(gpa);
+    defer gpa.free(roots);
+
+    var rg = try Dag.RedGreen.init(gpa, prior, dag);
+    defer rg.deinit();
+    rg.run(roots) catch |e| switch (e) {
+        error.QueryCycle => {
+            std.debug.print("--dump-dag: red-green walk: cycle detected in prior edges (skipped)\n", .{});
+            return;
+        },
+        else => return e,
+    };
+    std.debug.print(
+        "--dump-dag: red-green walk: {d} red (recompute), {d} green (cutoff) of {d} nodes\n",
+        .{ rg.red_count, rg.green_count, rg.red_count + rg.green_count },
+    );
 }
 
 /// Render a graph-discovery structural error against the owning module's source
@@ -517,6 +695,7 @@ fn usage(out: *Io.Writer) !void {
         \\  --no-opt=<pass>   disable one pass from the current level (e.g. -O1 --no-opt=forward)
         \\  --opt-stats       print per-pass opt counters + dual metric (with -o; use --force)
         \\  --dump-dag        compile the program and print the per-build query DAG (aarch64-macos)
+        \\  --query-stats     with -o: red-green recompute set vs the prior build (the cutoff)
         \\
     , .{version.stamp(&stamp_buf)});
     try out.flush();

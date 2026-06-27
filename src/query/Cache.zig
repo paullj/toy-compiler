@@ -147,6 +147,82 @@ fn entryPath(c: Cache, buf: []u8, key: Key) []const u8 {
     return std.fmt.bufPrint(buf, "{s}/{x:0>16}", .{ c.dir, key.digest() }) catch unreachable;
 }
 
+// ---- M17 per-program DAG artifact -----------------------------------------
+// The red-green dependency graph is ONE artifact per build identity, not a
+// content-keyed per-fn entry, so it cannot use `Key`/`entryPath`. It rides in
+// the same per-stamp dir under a fixed name `dag.<program_key>`. The compiler
+// stamp already namespaces the dir by compiler identity, so a compiler change =>
+// fresh dir => no stale DAG (the same guarantee the per-entry cache relies on).
+// It reuses the SAME checksum + temp-file + atomic-rename writer as `put`, so a
+// torn/foreign blob round-trips to a clean miss (the caller falls back to a full
+// re-validation — never a partial/false-green).
+
+/// Fold a build identity (entry canonical path + target) into the per-program
+/// DAG artifact name. Target is folded unconditionally because codegen fps are
+/// target-sensitive, so a per-(entry,target) DAG is the cleanest keying.
+pub fn programKey(entry_canon: []const u8, target: []const u8) u64 {
+    var h = std.hash.Wyhash.init(0x44_41_47_50); // "PGAD"
+    h.update(entry_canon);
+    h.update(&[_]u8{0});
+    h.update(target);
+    return h.final();
+}
+
+fn dagPath(c: Cache, buf: []u8, program_key: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}/dag.{x:0>16}", .{ c.dir, program_key }) catch unreachable;
+}
+
+/// Store the serialized DAG blob under `program_key`. Same `[checksum][payload]`
+/// framing + temp-file + atomic-rename as `put`, so concurrent invocations never
+/// observe a torn artifact.
+pub fn putDag(c: Cache, io: Io, program_key: u64, blob: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = c.dagPath(&buf, program_key);
+    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/dag.{x:0>16}.tmp", .{ c.dir, program_key }) catch return;
+
+    var header: [checksum_len]u8 = undefined;
+    std.mem.writeInt(u64, &header, std.hash.Wyhash.hash(checksum_seed, blob), .little);
+
+    {
+        var file = try Io.Dir.cwd().createFile(io, tmp, .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, &header);
+        try file.writeStreamingAll(io, blob);
+    }
+    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io);
+}
+
+/// Load the serialized DAG blob for `program_key`, or null on a miss (absent or
+/// checksum-corrupt). Caller owns the returned payload bytes and must pass them
+/// to `Dag.deserialize`, which independently re-validates magic/version/size — a
+/// torn or foreign artifact thus fails twice over to a clean full re-validation.
+pub fn getDag(c: Cache, gpa: std.mem.Allocator, io: Io, program_key: u64) !?[]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = c.dagPath(&buf, program_key);
+
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    errdefer gpa.free(bytes);
+
+    if (bytes.len < checksum_len) {
+        gpa.free(bytes);
+        return null;
+    }
+    const stored = std.mem.readInt(u64, bytes[0..checksum_len], .little);
+    const payload = bytes[checksum_len..];
+    if (std.hash.Wyhash.hash(checksum_seed, payload) != stored) {
+        gpa.free(bytes);
+        return null;
+    }
+    // Hand back JUST the payload (drop the checksum header). Move it to the front
+    // so the caller frees one allocation.
+    std.mem.copyForwards(u8, bytes[0..payload.len], payload);
+    return try gpa.realloc(bytes, payload.len);
+}
+
 // ---- tests: cache-key digest semantics ------------------------------------
 // The e2e cold/warm run exercises the on-disk round-trip; these pin down the
 // digest logic in isolation.
@@ -171,4 +247,39 @@ test "lexing is target-independent: target does not change the key" {
     const native = Cache.Key.fromSource(.lex, "native", "fn main() {}");
     const arm = Cache.Key.fromSource(.lex, "aarch64-macos", "fn main() {}");
     try testing.expectEqual(native.digest(), arm.digest());
+}
+
+test "programKey folds entry + target distinctly" {
+    const a = Cache.programKey("/x/main.toy", "aarch64-macos");
+    const same = Cache.programKey("/x/main.toy", "aarch64-macos");
+    try testing.expectEqual(a, same);
+    try testing.expect(a != Cache.programKey("/x/other.toy", "aarch64-macos"));
+    try testing.expect(a != Cache.programKey("/x/main.toy", "native"));
+}
+
+test "putDag/getDag round-trips a blob; absent => null; corruption => null" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-ut-dag";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const cache = try Cache.init(io, dir);
+
+    const key = Cache.programKey("/p/main.toy", "aarch64-macos");
+
+    // Absent => miss.
+    try testing.expect((try cache.getDag(gpa, io, key)) == null);
+
+    const blob = "TDAG-ish payload bytes \x00\x01\x02";
+    try cache.putDag(io, key, blob);
+
+    const got = (try cache.getDag(gpa, io, key)).?;
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, blob, got);
+
+    // A different key is still a miss (no cross-program aliasing).
+    try testing.expect((try cache.getDag(gpa, io, Cache.programKey("/p/other.toy", "aarch64-macos"))) == null);
 }

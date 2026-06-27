@@ -331,6 +331,27 @@ pub const ParseHeader = extern struct {
     pub_words: u32,
 };
 
+/// A padding-free structural fingerprint of a parsed `Tree`. `Node` is an
+/// `extern struct` with 3 uninitialized padding bytes between `tag` and
+/// `main_token`; hashing the packed blob (or `sliceAsBytes(nodes)`) folds that
+/// garbage in, so the fp differs run-to-run on a COLD build. Persisted red-green
+/// compares result fps to decide green-vs-red, so a non-deterministic parse fp is
+/// either a permanent cache miss or a false-green miscompile. This folds ONLY the
+/// semantically-meaningful fields (every field that round-trips through
+/// pack/unpack), keeping the canonical field list co-located with pack/unpack.
+pub fn contentFp(tree: Tree) u64 {
+    var h = std.hash.Wyhash.init(0x44_41_47_46); // "DAGF"
+    for (tree.nodes) |n| {
+        h.update(&[_]u8{@intFromEnum(n.tag)});
+        h.update(std.mem.asBytes(&n.main_token));
+        h.update(std.mem.asBytes(&n.lhs));
+        h.update(std.mem.asBytes(&n.rhs));
+    }
+    h.update(std.mem.sliceAsBytes(tree.extra));
+    h.update(std.mem.sliceAsBytes(tree.pub_bits));
+    return h.final();
+}
+
 /// Pack a `Tree` into one flat byte blob: header, then nodes, then extra, then
 /// the `pub_bits` bitset.
 pub fn pack(gpa: std.mem.Allocator, tree: Tree) ![]u8 {
@@ -769,4 +790,44 @@ test "unpack rejects a foreign blob" {
     const gpa = testing.allocator;
     try testing.expect((try unpack(gpa, "not a tree")) == null);
     try testing.expect((try unpack(gpa, &.{})) == null);
+}
+
+test "contentFp ignores Node padding (cold-build fp determinism foundation)" {
+    // The `Node` extern struct has 3 padding bytes between `tag` and `main_token`
+    // that struct literals leave undefined; on a cold build those carry stack
+    // garbage, so hashing the raw bytes flips the fp run-to-run. `contentFp` folds
+    // only the four semantic fields, so two trees with IDENTICAL fields but DISTINCT
+    // padding must produce the SAME fp — otherwise persisted red-green is inert
+    // (permanent miss) or unsound (false-green). Forge the padding via byte access.
+    var a = [_]Node{
+        .{ .tag = .binary, .main_token = 1, .lhs = 0, .rhs = 2 },
+        .{ .tag = .program, .main_token = 0, .lhs = 0, .rhs = none },
+    };
+    var b = a;
+    // Stamp differing garbage into the padding bytes (offsets 1..3 of each Node).
+    const ab = std.mem.sliceAsBytes(a[0..]);
+    const bb = std.mem.sliceAsBytes(b[0..]);
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) {
+        const base = i * @sizeOf(Node);
+        ab[base + 1] = 0xAA;
+        ab[base + 2] = 0xBB;
+        ab[base + 3] = 0xCC;
+        bb[base + 1] = 0x11;
+        bb[base + 2] = 0x22;
+        bb[base + 3] = 0x33;
+    }
+    var extra = [_]u32{0};
+    const ta = Tree{ .nodes = &a, .extra = &extra };
+    const tb = Tree{ .nodes = &b, .extra = &extra };
+
+    // Raw-byte hashing WOULD differ (padding leaked); contentFp must NOT.
+    try testing.expect(std.hash.Wyhash.hash(0, ab) != std.hash.Wyhash.hash(0, bb));
+    try testing.expectEqual(contentFp(ta), contentFp(tb));
+
+    // And it still discriminates a real field change.
+    var c = a;
+    c[0].main_token = 99;
+    const tc = Tree{ .nodes = &c, .extra = &extra };
+    try testing.expect(contentFp(ta) != contentFp(tc));
 }

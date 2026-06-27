@@ -24,6 +24,7 @@ const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const Dag = toyc.QueryDag;
 const Cache = toyc.Cache;
+const Driver = toyc.Driver;
 
 const FixtureFile = struct { path: []const u8, source: []const u8 };
 
@@ -614,4 +615,384 @@ test "TYPE_OF IDENTITY: two same-shape modules with distinct boundary types use 
             try testing.expect(ac.id != bc.id);
         }
     }
+}
+
+test "RED-GREEN: a body-only edit cuts off the caller (strict-subset recompute on a REAL program)" {
+    // The end-to-end cutoff gate on a recorded whole-graph typecheck: build a PRIOR
+    // DAG, edit ONLY `add`'s body, build a FRESH DAG, then run `Dag.RedGreen` over
+    // the fresh graph against the serialized prior. The firewall (caller -> callee
+    // SIGNATURE, never body) must make `main`/`mul` cut off while `add` re-executes —
+    // a STRICT SUBSET recompute, with green > 0 (liveness).
+    const gpa = testing.allocator;
+    const base = &[_]FixtureFile{.{ .path = "m.toy", .source =
+    \\fn add(a: int, b: int) -> int { return a + b }
+    \\fn mul(a: int, b: int) -> int { return a * b }
+    \\fn main() -> int { return add(mul(2, 3), 4) }
+    \\
+    }};
+    // SAME file/fn names/signatures => identical node ids; only add's BODY differs.
+    const body_edit = &[_]FixtureFile{.{ .path = "m.toy", .source =
+    \\fn add(a: int, b: int) -> int { return a + b + 0 }
+    \\fn mul(a: int, b: int) -> int { return a * b }
+    \\fn main() -> int { return add(mul(2, 3), 4) }
+    \\
+    }};
+
+    var r0 = try record(".toyc-it-rg-base", base, "m.toy");
+    defer r0.deinit();
+    var r1 = try record(".toyc-it-rg-edit", body_edit, "m.toy");
+    defer r1.deinit();
+    try testing.expectEqual(@as(usize, 0), r0.tc.diags.len);
+    try testing.expectEqual(@as(usize, 0), r1.tc.diags.len);
+
+    // The PRIOR snapshot (serialize r0, deserialize a `Loaded`).
+    const blob = try r0.dag.serialize(gpa);
+    defer gpa.free(blob);
+    var prior = (try Dag.deserialize(gpa, blob)).?;
+    defer prior.deinit(gpa);
+
+    // Walk the FRESH (edited) graph against the prior. Demand every recorded node.
+    const roots = try r1.dag.nodeKeys(gpa);
+    defer gpa.free(roots);
+    var rg = try Dag.RedGreen.init(gpa, &prior, &r1.dag);
+    defer rg.deinit();
+    try rg.run(roots);
+
+    // CUTOFF: a strict subset re-executed, and the walk verified some nodes green.
+    try testing.expect(rg.red_count > 0);
+    try testing.expect(rg.green_count > 0);
+    try testing.expect(rg.red_count < rg.red_count + rg.green_count);
+
+    // THE FIREWALL, the index-INDEPENDENT guarantee: add's BODY is RED (its content
+    // changed) while add's SIGNATURE is GREEN (a body edit never touches the proto).
+    // This is what makes a caller — whose codegen fp folds the callee SIGNATURE, not
+    // its body ([C3], index-free) — cut off. NB the callers' typecheck `body` nodes
+    // here ALSO depend on index-derived `type_of` nodes whose ids SHIFT when the edit
+    // inserts Ast nodes, so they are RED in this TYPECHECK-only DAG; the real
+    // body-level caller cutoff lives at the CODEGEN layer (index-free fingerprints),
+    // proven by `--codegen-stats` (incremental compiled=1, full compiled=3) + the
+    // byte-identical soundness cmp in the stage report.
+    const add_id = r1.fnId(".add");
+    try testing.expectEqual(Dag.Verdict.red, try rg.verdictOf(r1.bodyNode(add_id)));
+    try testing.expectEqual(Dag.Verdict.green, try rg.verdictOf(r1.sigNode(add_id)));
+}
+
+test "RED-GREEN: an unedited rebuild of a real program is ALL GREEN (no recompute)" {
+    const gpa = testing.allocator;
+    const files = &[_]FixtureFile{.{ .path = "m.toy", .source =
+    \\fn add(a: int, b: int) -> int { return a + b }
+    \\fn main() -> int { return add(1, 2) }
+    \\
+    }};
+    var r0 = try record(".toyc-it-rg-same0", files, "m.toy");
+    defer r0.deinit();
+    var r1 = try record(".toyc-it-rg-same1", files, "m.toy");
+    defer r1.deinit();
+
+    const blob = try r0.dag.serialize(gpa);
+    defer gpa.free(blob);
+    var prior = (try Dag.deserialize(gpa, blob)).?;
+    defer prior.deinit(gpa);
+
+    const roots = try r1.dag.nodeKeys(gpa);
+    defer gpa.free(roots);
+    var rg = try Dag.RedGreen.init(gpa, &prior, &r1.dag);
+    defer rg.deinit();
+    try rg.run(roots);
+
+    // Nothing changed => zero recompute, all green.
+    try testing.expectEqual(@as(usize, 0), rg.red_count);
+    try testing.expect(rg.green_count > 0);
+}
+
+/// Discover `entry` under a FRESH cache dir (a cold build) with a `*Dag` threaded,
+/// then return the recorded lex+parse node fingerprints keyed by NodeKey. Each call
+/// uses an independent dir + cache + heap so two calls model two separate compiler
+/// processes — the exact thing persisted red-green must round-trip.
+fn coldFrontEndFps(comptime dir_name: []const u8, source: []const u8) !std.AutoHashMapUnmanaged(Dag.NodeKey, u64) {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const full = try std.fmt.bufPrint(&path_buf, "{s}/m.toy", .{dir_name});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = source });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir_name});
+    const cache = try Cache.init(io, cache_dir);
+
+    var dag: Dag = .init(gpa);
+    defer dag.deinit(gpa);
+
+    var graph = try Graph.discoverDag(gpa, io, cache, "native", full, &dag);
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var out: std.AutoHashMapUnmanaged(Dag.NodeKey, u64) = .{};
+    var it = dag.result_fp.iterator();
+    while (it.next()) |e| {
+        if (e.key_ptr.kind == .lex or e.key_ptr.kind == .parse)
+            try out.put(gpa, e.key_ptr.*, e.value_ptr.*);
+    }
+    return out;
+}
+
+test "COLD-BUILD FP DETERMINISM: lex+parse result fps are byte-identical across two cold builds" {
+    // The Stage-0 lead task: two fresh-process cold builds of the same source must
+    // record IDENTICAL lex/parse fps. Before the fix, `Node`/`Token` extern-struct
+    // padding leaked into the hashed bytes, flipping the parse fp run-to-run and
+    // making persisted red-green inert (permanent miss) or unsound (false-green).
+    const source =
+        \\struct Point { x: int, y: int }
+        \\enum Shape { circle(int), square }
+        \\fn area(s: Shape) -> int { return match s { .circle(r) -> r, .square -> 1 } }
+        \\fn main() -> int {
+        \\  p := Point{ x: 1, y: 2 }
+        \\  return area(Shape.circle(p.x))
+        \\}
+        \\
+    ;
+    var a = try coldFrontEndFps(".toyc-it-coldfp-a", source);
+    defer a.deinit(testing.allocator);
+    var b = try coldFrontEndFps(".toyc-it-coldfp-b", source);
+    defer b.deinit(testing.allocator);
+
+    try testing.expect(a.count() > 0);
+    try testing.expectEqual(a.count(), b.count());
+    var it = a.iterator();
+    while (it.next()) |e| {
+        const bv = b.get(e.key_ptr.*) orelse return error.MissingNodeInColdBuildB;
+        try testing.expectEqual(e.value_ptr.*, bv);
+    }
+}
+
+test "M17 PERSISTENCE: a build WRITES the DAG artifact; a fresh process LOADS it and the fps match" {
+    // The Stage-1 round-trip gate: build 1 records a real front-end DAG, serializes
+    // it, and `putDag`s it to disk. Build 2 — an independent heap + a freshly opened
+    // Cache handle, modelling a separate compiler invocation — `getDag`s the blob,
+    // `deserialize`s it, and every persisted lex/parse fp must equal what a fresh
+    // recording of the SAME source produces (the prerequisite for red-green: ids AND
+    // fps round-trip across processes).
+    const gpa = testing.allocator;
+    const source =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn main() -> int { return add(1, 2) }
+        \\
+    ;
+    const dir = ".toyc-it-persist";
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry = try std.fmt.bufPrint(&path_buf, "{s}/m.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry, .data = source });
+
+    var cache_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{dir});
+    const key = Cache.programKey(entry, "native");
+
+    // --- build 1: record, serialize, WRITE the artifact ---
+    {
+        const cache = try Cache.init(io, cache_dir);
+        var dag: Dag = .init(gpa);
+        defer dag.deinit(gpa);
+        var graph = try Graph.discoverDag(gpa, io, cache, "native", entry, &dag);
+        defer graph.deinit(gpa);
+        try testing.expect(graph.err == null);
+
+        // No prior artifact on a cold build.
+        try testing.expect((try cache.getDag(gpa, io, key)) == null);
+
+        const blob = try dag.serialize(gpa);
+        defer gpa.free(blob);
+        try cache.putDag(io, key, blob);
+    }
+
+    // --- build 2: a fresh Cache handle + heap (a separate "process") LOADS it ---
+    {
+        const cache = try Cache.init(io, cache_dir);
+        const blob = (try cache.getDag(gpa, io, key)) orelse return error.ArtifactNotLoaded;
+        defer gpa.free(blob);
+        var loaded = (try Dag.deserialize(gpa, blob)) orelse return error.ArtifactUnparseable;
+        defer loaded.deinit(gpa);
+
+        try testing.expect(loaded.nodes.len > 0);
+
+        // Re-record the same source fresh and assert every persisted lex/parse fp
+        // round-trips identically (the cold-stable-fp prerequisite, now persisted).
+        var dag2: Dag = .init(gpa);
+        defer dag2.deinit(gpa);
+        var graph2 = try Graph.discoverDag(gpa, io, cache, "native", entry, &dag2);
+        defer graph2.deinit(gpa);
+        try testing.expect(graph2.err == null);
+
+        var checked: usize = 0;
+        var it = dag2.result_fp.iterator();
+        while (it.next()) |e| {
+            if (e.key_ptr.kind != .lex and e.key_ptr.kind != .parse) continue;
+            const persisted = loaded.nodeFp(e.key_ptr.*) orelse return error.PersistedNodeMissing;
+            try testing.expectEqual(e.value_ptr.*, persisted);
+            checked += 1;
+        }
+        try testing.expect(checked > 0);
+    }
+}
+
+/// Run the FULL `-o` build pipeline (discover -> resolve -> typecheck -> codegen)
+/// with a `*Dag` threaded through every query — exactly what `--query-stats` does
+/// — over `source` written to `entry` under a SHARED cache dir. Returns the
+/// populated dag (caller deinits) plus the lowering's codegen compiled/cached
+/// counters (the byte-level cutoff). Models one compiler invocation; calling it
+/// twice against the SAME cache_dir models two `-o --query-stats` runs.
+const WireBuild = struct {
+    dag: Dag,
+    compiled: usize,
+    cached: usize,
+    gpa: std.mem.Allocator,
+    fn deinit(self: *WireBuild) void {
+        self.dag.deinit(self.gpa);
+    }
+};
+
+fn wireBuild(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    entry: []const u8,
+    source: []const u8,
+) !WireBuild {
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry, .data = source });
+
+    var dag: Dag = .init(gpa);
+    errdefer dag.deinit(gpa);
+
+    var graph = try Graph.discoverDag(gpa, io, cache, "aarch64-macos", entry, &dag);
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag);
+    defer tc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), tc.diags.len);
+
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag);
+    switch (lowered) {
+        .err => return error.TestUnexpectedResult,
+        .ok => |*lp| {
+            defer lp.deinit(gpa);
+            try testing.expectEqual(@as(usize, 0), lp.diags.len);
+            return .{ .dag = dag, .compiled = lp.codegen_compiled, .cached = lp.codegen_cached, .gpa = gpa };
+        },
+    }
+}
+
+test "M17 WIRE-AND-PROOF: a body edit through the real -o pipeline cuts off the caller (codegen node GREEN), persisted DAG round-trips" {
+    // The end-to-end production proof of `--query-stats`: drive the WHOLE `-o`
+    // pipeline (incl. codegen) with the dag threaded, persist the DAG through the
+    // REAL Cache.programKey/putDag, then a fresh build of a body-edited source
+    // loads it and the red-green walk over the CODEGEN nodes must:
+    //   * mark the edited fn's codegen node RED (its content fingerprint flipped =>
+    //     its node id is new w.r.t. the prior DAG), and
+    //   * keep the caller's codegen node GREEN (its fingerprint folds the callee
+    //     SIGNATURE, not its body — the firewall — so its node id is UNCHANGED and
+    //     present in the prior DAG with the same fp).
+    // The byte-level cutoff is corroborated by `codegen_compiled` from the shared
+    // content cache (the edited build re-lowers exactly 1 fn).
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-it-wire";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry = try std.fmt.bufPrint(&entry_buf, "{s}/m.toy", .{dir});
+    var cache_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{dir});
+    const cache = try Cache.init(io, cache_dir);
+    const prog_key = Cache.programKey(entry, "aarch64-macos");
+
+    const base =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn mul(a: int, b: int) -> int { return a * b }
+        \\fn main() -> int { return add(mul(2, 3), 4) }
+        \\
+    ;
+    // SAME signatures; ONLY mul's body changes.
+    const edited =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn mul(a: int, b: int) -> int { return a * b + 0 }
+        \\fn main() -> int { return add(mul(2, 3), 4) }
+        \\
+    ;
+
+    // --- build 1: cold, record + persist the DAG ---
+    var b0 = try wireBuild(gpa, io, cache, entry, base);
+    defer b0.deinit();
+    try testing.expectEqual(@as(usize, 3), b0.compiled); // cold: all 3 fns lowered
+    try testing.expectEqual(@as(usize, 0), b0.cached);
+
+    const blob0 = try b0.dag.serialize(gpa);
+    defer gpa.free(blob0);
+    try cache.putDag(io, prog_key, blob0);
+
+    // --- build 2: a fresh process loads the prior DAG, body-edits mul ---
+    const prior_blob = (try cache.getDag(gpa, io, prog_key)) orelse return error.ArtifactNotLoaded;
+    defer gpa.free(prior_blob);
+    var prior = (try Dag.deserialize(gpa, prior_blob)) orelse return error.ArtifactUnparseable;
+    defer prior.deinit(gpa);
+
+    var b1 = try wireBuild(gpa, io, cache, entry, edited);
+    defer b1.deinit();
+    // THE BYTE-LEVEL CUTOFF: exactly ONE fn re-lowered (mul); add + main are cache
+    // hits (their content fingerprints are unchanged — the firewall).
+    try testing.expectEqual(@as(usize, 1), b1.compiled);
+    try testing.expectEqual(@as(usize, 2), b1.cached);
+
+    // The red-green walk over the fresh DAG vs the prior: a STRICT SUBSET re-executes
+    // and some nodes verify green (liveness).
+    const roots = try b1.dag.nodeKeys(gpa);
+    defer gpa.free(roots);
+    var rg = try Dag.RedGreen.init(gpa, &prior, &b1.dag);
+    defer rg.deinit();
+    try rg.run(roots);
+    try testing.expect(rg.red_count > 0);
+    try testing.expect(rg.green_count > 0);
+    try testing.expect(rg.red_count < rg.red_count + rg.green_count);
+
+    // THE CODEGEN FIREWALL, the index-free guarantee that drives the byte cutoff:
+    // the caller (main) and the untouched sibling (add) carry UNCHANGED codegen node
+    // ids (their content fingerprints didn't move), so they are present in the prior
+    // DAG with the same fp -> GREEN. The edited fn (mul) has a NEW codegen id -> RED.
+    var green_codegen: usize = 0;
+    var red_codegen: usize = 0;
+    for (roots) |k| {
+        if (k.kind != .codegen) continue;
+        switch (try rg.verdictOf(k)) {
+            .green => green_codegen += 1,
+            .red => red_codegen += 1,
+        }
+    }
+    // At least the two unchanged fns' codegen nodes cut off (GREEN); the edited fn's
+    // codegen node is a fresh id (RED — counted among the recompute set).
+    try testing.expect(green_codegen >= 2);
+    try testing.expect(red_codegen >= 1);
 }

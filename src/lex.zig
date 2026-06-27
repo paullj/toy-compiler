@@ -27,7 +27,16 @@ pub fn tokenize(gpa: std.mem.Allocator, source: []const u8) ![]Token {
     errdefer tokens.deinit(gpa);
     while (true) {
         const tok = lexer.next();
-        try tokens.append(gpa, tok);
+        // Rebuild from a zeroed value: `Token` is an `extern struct` with 3
+        // padding bytes between `tag` and `start`, left undefined by `next`'s
+        // struct literals. That garbage otherwise flows into the cached `[]Token`
+        // blob (and the recorded lex result fp) via `sliceAsBytes`, breaking
+        // cold-build byte/fp determinism.
+        var clean: Token = std.mem.zeroes(Token);
+        clean.tag = tok.tag;
+        clean.start = tok.start;
+        clean.end = tok.end;
+        try tokens.append(gpa, clean);
         if (tok.tag == .eof) break;
     }
     return tokens.toOwnedSlice(gpa);
