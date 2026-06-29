@@ -15,7 +15,9 @@
 //! the ad-hoc flag).
 
 const std = @import("std");
+const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Engine = @import("../query/Engine.zig");
 
 /// CodeDirectory fixed header size through the v0x20400 extension fields, which
 /// is exactly the identifier offset (verified field-by-field against /tmp/ref).
@@ -85,6 +87,7 @@ const BeWriter = struct {
 /// exec-segment limit). The `gpa` parameter is unused — hashing streams directly
 /// over `image` — but is kept to match the planned signature.
 pub fn sign(
+    io: Io,
     gpa: std.mem.Allocator,
     image: []u8,
     identifier: []const u8,
@@ -158,17 +161,48 @@ pub fn sign(
     // The final page may be partial — clamp the end to codeLimit. The hashed
     // bytes (`image[0..codeLimit)`) are final; only this region beyond is being
     // written, so the digests are stable.
-    var slot: u32 = 0;
-    while (slot < n_slots) : (slot += 1) {
-        const start: u32 = slot * PAGE_SIZE;
-        const end: u32 = @min(start + PAGE_SIZE, code_limit);
-        var digest: [HASH_SIZE]u8 = undefined;
-        Sha256.hash(image[start..end], &digest, .{});
-        @memcpy(w.buf[w.pos..][0..HASH_SIZE], &digest);
-        w.pos += HASH_SIZE;
-    }
+    //
+    // PARALLEL per-page Merkle: each slot reads a DISJOINT read-only page
+    // `image[slot*PAGE..min(+PAGE, code_limit))` and writes its 32-byte digest to
+    // the FIXED destination `hash_base + slot*32` chosen by slot INDEX, not the
+    // serial cursor — so the output is byte-identical regardless of dispatch order.
+    // [M18 INDEX-DRIVEN, NOT CURSOR-DRIVEN, DESTINATIONS / SINGLE-WRITER DISJOINT]
+    //
+    // `hash_base` is derived independently of `w.pos`: it equals the writer cursor
+    // at this point (`cd_off + hash_offset`) shifted into absolute image space, so
+    // workers never depend on the serial BeWriter state.
+    const hash_base: u32 = sig_file_off + cd_off + hash_offset;
+    std.debug.assert(hash_base == sig_file_off + @as(u32, @intCast(w.pos)));
+    const Ctx = struct {
+        image: []u8,
+        hash_base: u32,
+        code_limit: u32,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(hashSlotJob)) {
+            return .{ c.image, @as(u32, @intCast(i)), c.hash_base, c.code_limit };
+        }
+    };
+    Engine.fanOut(io, n_slots, hashSlotJob, Ctx{
+        .image = image,
+        .hash_base = hash_base,
+        .code_limit = code_limit,
+    });
+    w.pos += n_slots * HASH_SIZE;
 
     std.debug.assert(w.pos == sig_len);
+}
+
+/// Hash one code page (a `fanOut` job): SHA-256 over the disjoint read-only region
+/// `image[slot*PAGE_SIZE .. min(+PAGE_SIZE, code_limit))` (the partial-final-page
+/// clamp is preserved), writing the 32-byte digest to the FIXED destination
+/// `image[hash_base + slot*HASH_SIZE ..]`. Each slot owns a unique disjoint
+/// digest region and reads only finalized bytes below `code_limit`, so no two
+/// workers touch the same byte and the result is dispatch-order-independent.
+fn hashSlotJob(image: []u8, slot: u32, hash_base: u32, code_limit: u32) void {
+    const start: u32 = slot * PAGE_SIZE;
+    const end: u32 = @min(start + PAGE_SIZE, code_limit);
+    var digest: [HASH_SIZE]u8 = undefined;
+    Sha256.hash(image[start..end], &digest, .{});
+    @memcpy(image[hash_base + slot * HASH_SIZE ..][0..HASH_SIZE], &digest);
 }
 
 const testing = std.testing;
@@ -197,7 +231,11 @@ test "sign writes a parseable SuperBlob + CodeDirectory" {
     for (image[0..sig_off], 0..) |*b, i| b.* = @intCast(i & 0xFF);
     @memset(image[sig_off..], 0);
 
-    try sign(gpa, image, ident, sig_off, text_size);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try sign(io, gpa, image, ident, sig_off, text_size);
 
     const rd32 = struct {
         fn f(img: []const u8, off: usize) u32 {
@@ -251,4 +289,56 @@ test "sign writes a parseable SuperBlob + CodeDirectory" {
     var d4: [32]u8 = undefined;
     Sha256.hash(image[4 * PAGE_SIZE .. sig_off], &d4, .{});
     try testing.expectEqualSlices(u8, &d4, image[hashes + 4 * 32 ..][0..32]);
+}
+
+test "sign: whole image byte-identical at -j1 vs -jN incl. partial final page" {
+    const gpa = testing.allocator;
+
+    // A signature offset that is NOT a multiple of PAGE_SIZE forces a partial final
+    // page (8 full pages + a 137-byte 9th), exercising the @min clamp under both
+    // thread counts. Many code pages so multiple workers can engage at -jN.
+    const sig_off: u32 = 8 * PAGE_SIZE + 137;
+    const ident = "many.pages";
+    const text_size: u32 = 8 * PAGE_SIZE;
+    const sig_len = signatureLen(ident, sig_off);
+
+    const mk = struct {
+        fn f(a: std.mem.Allocator, off: u32, slen: u32) ![]u8 {
+            const img = try a.alloc(u8, off + slen);
+            for (img[0..off], 0..) |*b, i| b.* = @intCast((i *% 31 +% 7) & 0xFF);
+            @memset(img[off..], 0);
+            return img;
+        }
+    }.f;
+
+    const serial = try mk(gpa, sig_off, sig_len);
+    defer gpa.free(serial);
+    const parallel = try mk(gpa, sig_off, sig_len);
+    defer gpa.free(parallel);
+
+    // -j1: a single-worker pool that forces fanOut's inline serial fallback.
+    {
+        var t1 = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+        defer t1.deinit();
+        try sign(t1.io(), gpa, serial, ident, sig_off, text_size);
+    }
+    // -jN: a multi-worker pool that actually fans the page hashes out.
+    {
+        var tn = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
+        defer tn.deinit();
+        try sign(tn.io(), gpa, parallel, ident, sig_off, text_size);
+    }
+
+    // The WHOLE output (image + signature region, every digest incl. the partial
+    // final page) must be bit-for-bit identical regardless of thread count.
+    try testing.expectEqualSlices(u8, serial, parallel);
+
+    // The partial final page's digest specifically must match a direct hash of the
+    // clamped [8*PAGE, sig_off) range under both runs.
+    const n_slots = nCodeSlots(sig_off);
+    try testing.expectEqual(@as(u32, 9), n_slots);
+    const hashes = sig_off + 20 + (88 + @as(u32, ident.len) + 1);
+    var last: [32]u8 = undefined;
+    Sha256.hash(serial[8 * PAGE_SIZE .. sig_off], &last, .{});
+    try testing.expectEqualSlices(u8, &last, serial[hashes + 8 * 32 ..][0..32]);
 }

@@ -221,12 +221,16 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
     // The entry must land inside the code blob (it is `main`'s text offset).
     std.debug.assert(entry_text_off < text_size);
 
-    // Everything in __TEXT must fit in the single 0x4000 page.
-    if (@as(u64, code_file_off) + code.len > PAGE) return error.CodeTooLarge;
+    // __TEXT spans as many 0x4000 pages as the header+cmds+code need. A program
+    // that fits one page yields text_seg_size == PAGE — byte-identical to the
+    // original single-page layout — so existing binaries/tests stay green; larger
+    // programs simply grow __TEXT (and slide __LINKEDIT) by whole pages.
+    const text_end: u64 = @as(u64, code_file_off) + code.len;
+    const text_seg_size: u32 = @intCast(std.mem.alignForward(u64, text_end, PAGE));
 
-    // __LINKEDIT begins at the page boundary: the chained-fixups blob first,
-    // then (16-aligned) the code signature.
-    const linkedit_off: u32 = @intCast(PAGE);
+    // __LINKEDIT begins right after __TEXT (page-aligned): the chained-fixups blob
+    // first, then (16-aligned) the code signature.
+    const linkedit_off: u32 = text_seg_size;
     const fixups_off: u32 = linkedit_off;
     const after_fixups: u32 = fixups_off + @as(u32, CHAINED_FIXUPS_BLOB.len);
     const sig_file_off: u32 = std.mem.alignForward(u32, after_fixups, 16);
@@ -269,9 +273,9 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
     w.put32(TEXT_SEG_CMD_SIZE);
     w.name16("__TEXT");
     w.put64(BASE);
-    w.put64(PAGE); // vmsize: full page
+    w.put64(text_seg_size); // vmsize: whole-page span
     w.put64(0); // fileoff
-    w.put64(PAGE); // filesize: full page
+    w.put64(text_seg_size); // filesize: whole-page span
     w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // maxprot r-x
     w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // initprot r-x
     w.put32(1); // nsects
@@ -292,7 +296,7 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
 
     // --- LC_SEGMENT_64 __LINKEDIT ------------------------------------------
     w.segment("__LINKEDIT", .{
-        .vmaddr = BASE + PAGE,
+        .vmaddr = BASE + linkedit_off,
         // vmsize must cover filesize; round up so it can never be smaller.
         .vmsize = std.mem.alignForward(u32, le_filesize, PAGE),
         .fileoff = linkedit_off,
@@ -397,16 +401,19 @@ fn assembleMulti(
     // adrp page delta from code to a string is small / zero, matching clang).
     const cstring_file_off: u32 = std.mem.alignForward(u32, code_file_off + text_size, 4);
     const cstring_end: u32 = cstring_file_off + @as(u32, @intCast(cstrings.len));
-    // Everything in __TEXT (header + cmds + code + cstrings) must fit one page.
-    if (@as(u64, cstring_end) > PAGE) return error.CodeTooLarge;
+    // __TEXT (header + cmds + code + cstrings) spans whole 0x4000 pages. A program
+    // that fits one page yields text_seg_size == PAGE — byte-identical to the
+    // original single-page layout; larger programs grow __TEXT (and slide the
+    // segments after it) by whole pages.
+    const text_seg_size: u32 = @intCast(std.mem.alignForward(u64, cstring_end, PAGE));
 
-    // __DATA_CONST is the next page; __got holds one 8-byte slot per import.
-    const datac_file_off: u32 = @intCast(PAGE);
+    // __DATA_CONST is the page after __TEXT; __got holds one 8-byte slot per import.
+    const datac_file_off: u32 = text_seg_size;
     const got_size: u32 = @intCast(imports.len * 8);
     std.debug.assert(got_size <= PAGE);
 
     // __LINKEDIT is the page after that: the fixups blob first, then the sig.
-    const linkedit_off: u32 = @intCast(2 * PAGE);
+    const linkedit_off: u32 = text_seg_size + @as(u32, @intCast(PAGE));
     const fixups_off: u32 = linkedit_off;
 
     const fixups_blob = try buildChainedFixups(gpa, imports, datac_file_off, NSEGS_MULTI, DATAC_SEG_INDEX);
@@ -422,8 +429,8 @@ fn assembleMulti(
     // Segment vmaddrs (one page each): __TEXT at BASE, __DATA_CONST one page up,
     // __LINKEDIT two pages up.
     const text_vmaddr: u64 = BASE; // section addr is BASE + file off
-    const datac_vmaddr: u64 = BASE + PAGE;
-    const linkedit_vmaddr: u64 = BASE + 2 * PAGE;
+    const datac_vmaddr: u64 = BASE + datac_file_off;
+    const linkedit_vmaddr: u64 = BASE + linkedit_off;
     const cstring_vmaddr: u64 = BASE + cstring_file_off;
     const got_vmaddr: u64 = datac_vmaddr; // __got is at __DATA_CONST's base
 
@@ -459,9 +466,9 @@ fn assembleMulti(
     w.put32(SEG_CMD_SIZE + 2 * SECT_SIZE);
     w.name16("__TEXT");
     w.put64(text_vmaddr);
-    w.put64(PAGE); // vmsize: full page
+    w.put64(text_seg_size); // vmsize: whole-page span
     w.put64(0); // fileoff
-    w.put64(PAGE); // filesize: full page
+    w.put64(text_seg_size); // filesize: whole-page span
     w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // maxprot r-x
     w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // initprot r-x
     w.put32(2); // nsects: __text + __cstring
@@ -932,12 +939,25 @@ test "nonzero entry_text_off shifts LC_MAIN entryoff" {
     try testing.expectEqual(@as(u64, layout.code_file_off) + 8, main_entryoff.?);
 }
 
-test "code too large is rejected" {
-    // A blob larger than a page minus the headers cannot be laid out.
-    const big = try testing.allocator.alloc(u8, @intCast(PAGE));
-    defer testing.allocator.free(big);
+test "code spanning multiple pages grows __TEXT instead of being rejected" {
+    // A blob larger than a page (once headers are added) used to be rejected; it
+    // now lays __TEXT across as many whole pages as it needs, sliding __LINKEDIT
+    // after it. Verify the segment sizes and that the image is exactly that big.
+    const gpa = testing.allocator;
+    const big = try gpa.alloc(u8, @intCast(PAGE));
+    defer gpa.free(big);
     @memset(big, 0);
-    try testing.expectError(error.CodeTooLarge, assemble(testing.allocator, "stub", big, 0, &.{}, &.{}));
+    // 4-byte-aligned blob so the layout assertions hold (real code is too).
+    std.mem.writeInt(u32, big[0..4], 0xD65F03C0, .little); // ret at entry
+
+    const layout = try assemble(gpa, "stub", big, 0, &.{}, &.{});
+    defer gpa.free(layout.image);
+
+    // header+cmds+PAGE bytes of code spill into a second page -> __TEXT is 2 pages.
+    const text_seg_size = std.mem.alignForward(u64, @as(u64, layout.code_file_off) + big.len, PAGE);
+    try testing.expectEqual(@as(u64, 2 * PAGE), text_seg_size);
+    // __LINKEDIT (hence the whole image) starts after the grown __TEXT.
+    try testing.expect(layout.sig_file_off >= text_seg_size);
 }
 
 // ---------------------------------------------------------------------------

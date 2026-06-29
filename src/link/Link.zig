@@ -16,7 +16,9 @@
 //! `Codegen` can emit `FnCode`/`Reloc` values.
 
 const std = @import("std");
+const Io = std.Io;
 const Aarch64 = @import("../codegen/Aarch64.zig");
+const Engine = @import("../query/Engine.zig");
 
 // The stable symbol identity types now live in the `symbols/` peer data module
 // (so resolve/types/codegen/link all depend on the DATA, not sideways on this
@@ -111,32 +113,88 @@ pub const FnCode = struct {
 
 /// In-session symbol→handle map. Never persisted: the on-disk identity is the
 /// `SymName`; this just gives `link` an `offsets: []u32` it can index by a dense
-/// u32 instead of a string-hash per call site. Handles are assigned by `link`
-/// walking `fns` in SOURCE ORDER, so they are deterministic. The composite
-/// `[kind byte][name]` key keeps `user_fn "f"` ≠ `import "f"`.
+/// u32 instead of a string-hash per call site. The composite `[kind byte][name]`
+/// key keeps `user_fn "f"` ≠ `import "f"`.
+///
+/// HANDLES ARE A STABLE-SORT RANK, NOT ARRIVAL ORDER ([M18 DETERMINISM #1]):
+/// `internAll` assigns each fn's handle as its rank in a stable sort of the fn
+/// set by composite key, ties broken by original source index. This makes the
+/// handle (and therefore every offset/concat/patch keyed by it) a pure function
+/// of the fn SET, independent of how/when the keys were derived — the invariant
+/// that lets the M18 parallel tail intern symbols off the worker threads without
+/// any thread-arrival/pointer/hashmap-iteration order leaking into the output.
 pub const SymInterner = struct {
     map: std.StringHashMapUnmanaged(u32) = .empty,
     count: u32 = 0,
-
-    pub fn intern(si: *SymInterner, gpa: std.mem.Allocator, ref: SymName) !u32 {
-        // The composite key is `[kind byte][name]`; allocate it from the name's
-        // length so an arbitrarily long identifier cannot overflow a fixed buffer.
-        const key = try encodeSym(gpa, ref);
-        errdefer gpa.free(key);
-        if (si.map.get(key)) |h| {
-            gpa.free(key); // already interned; the existing key owns the slot
-            return h;
-        }
-        const h = si.count;
-        try si.map.put(gpa, key, h);
-        si.count += 1;
-        return h;
-    }
 
     pub fn get(si: *const SymInterner, gpa: std.mem.Allocator, ref: SymName) !?u32 {
         const key = try encodeSym(gpa, ref);
         defer gpa.free(key);
         return si.map.get(key);
+    }
+
+    /// Assign EVERY fn in `fns` a dense handle = its rank in a STABLE SORT of the
+    /// set by composite `[kind byte][name]` key, ties broken by original source
+    /// index. Two phases: (A) derive each fn's key (pure, read-only over `fns`),
+    /// (B) stable-sort indices by key then build the key→handle map from the
+    /// sorted order. The map is the only owner of each key (freed by `deinit`).
+    ///
+    /// Determinism: the result is a function of the fn SET alone — never `count`,
+    /// thread-arrival, pointer, or hashmap-iteration order. Re-interning the same
+    /// fns in any input order yields the IDENTICAL handle→name mapping, so every
+    /// downstream consumer keyed by `get(name)` (offsets, concat, call26 deltas,
+    /// entry resolution) produces byte-identical output regardless of order.
+    pub fn internAll(si: *SymInterner, gpa: std.mem.Allocator, fns: []const FnCode) !void {
+        const keys = try gpa.alloc([]u8, fns.len);
+        // Phase A failure: free the keys derived so far, then the spine.
+        var derived: usize = 0;
+        errdefer {
+            for (keys[0..derived]) |k| gpa.free(k);
+            gpa.free(keys);
+        }
+        for (fns, 0..) |f, i| {
+            keys[i] = try encodeSym(gpa, f.sym);
+            derived += 1;
+        }
+        defer gpa.free(keys); // the map dupes ownership of the survivors below
+
+        const order = try gpa.alloc(u32, fns.len);
+        defer gpa.free(order);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+
+        const SortCtx = struct {
+            keys: []const []const u8,
+            // Stable order: composite key bytes, then original source index for ties.
+            fn lessThan(c: @This(), a: u32, b: u32) bool {
+                return switch (std.mem.order(u8, c.keys[a], c.keys[b])) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => a < b,
+                };
+            }
+        };
+        std.mem.sortUnstable(u32, order, SortCtx{ .keys = keys }, SortCtx.lessThan);
+
+        // Build the map in sorted order: handle = rank. The composite key carries
+        // its kind byte, so dedup here would only fire on a genuine duplicate
+        // definition (an upstream error); each distinct fn gets a unique handle.
+        try si.map.ensureTotalCapacity(gpa, @intCast(fns.len));
+        var placed: usize = 0;
+        errdefer {
+            // Free only the keys NOT yet handed to the map (the map owns the rest,
+            // released by `deinit`). `order[placed..]` are the still-unplaced keys.
+            for (order[placed..]) |src| gpa.free(keys[src]);
+        }
+        for (order, 0..) |src, rank| {
+            const gop = si.map.getOrPutAssumeCapacity(keys[src]);
+            if (gop.found_existing) {
+                gpa.free(keys[src]); // duplicate definition: drop the redundant key
+            } else {
+                gop.value_ptr.* = @intCast(rank);
+                si.count += 1;
+            }
+            placed += 1;
+        }
     }
 
     pub fn deinit(si: *SymInterner, gpa: std.mem.Allocator) void {
@@ -175,6 +233,34 @@ pub const Linked = struct {
 /// surface it cleanly rather than truncate-and-miscompile.
 pub const LinkError = error{ CallTargetTooFar, UnresolvedSymbol, NoEntry } || std.mem.Allocator.Error;
 
+/// Assign every fn its __text byte offset by an EXCLUSIVE PREFIX-SUM of code
+/// lengths over SOURCE ORDER, writing each into `offsets` keyed by the fn's stable
+/// handle; returns the total text size. `offsets.len == fns.len` and `si` must
+/// already have interned `fns`.
+///
+/// WHY a standalone scan ([M18 PREFIX-SUM == SERIAL RUNNING SUM]): this is the one
+/// true ordering barrier of the parallel tail (every fn's address depends on the
+/// sum of all earlier ones), so it is factored out as a pure left-to-right scan
+/// that the parallel tail can replace with a real parallel prefix-scan WITHOUT
+/// touching the layout values. The result is byte-for-byte the value the old fused
+/// `offsets[h]=cursor; cursor+=len` running sum produced — the running tally is
+/// `acc`, the offset stored is the EXCLUSIVE prefix (acc BEFORE adding this fn).
+fn prefixSumTextOffsets(
+    gpa: std.mem.Allocator,
+    fns: []const FnCode,
+    si: *const SymInterner,
+    offsets: []u32,
+) !u32 {
+    var acc: u32 = 0;
+    for (fns) |f| {
+        std.debug.assert(f.code.len % 4 == 0);
+        const h = (try si.get(gpa, f.sym)).?; // interned by internAll
+        offsets[h] = acc; // exclusive prefix: bytes laid down before this fn
+        acc += @intCast(f.code.len);
+    }
+    return acc;
+}
+
 /// Lay the independently-lowered functions out contiguously in __text, build the
 /// symbol→offset map, then patch every relocation in place; return the joined
 /// blob and the entry function's resolved offset.
@@ -188,65 +274,125 @@ pub const LinkError = error{ CallTargetTooFar, UnresolvedSymbol, NoEntry } || st
 /// backward (and self/mutual) recursion a non-positive one; both encode directly
 /// via `Aarch64.bl`. Because the delta is intra-module it is fixed at link time
 /// and needs NO runtime relocation under PIE/ASLR.
-pub fn link(gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName) LinkError!Linked {
-    // 1) LAYOUT: assign each function a dense handle (source order) and a text
-    //    offset. The handle replaces the old source-index key; reorder is safe
-    //    because the offset map is keyed by the stable name, not a position.
+pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName) LinkError!Linked {
+    // 1) LAYOUT: assign every fn a dense handle by STABLE SORT of the fn set
+    //    (rank, never arrival/source order — the M18 determinism invariant), then
+    //    walk `fns` in SOURCE ORDER to give each its text offset. Layout STAYS
+    //    source order (cursor walks `fns`), so __text bytes are byte-identical to
+    //    the pre-M18 baseline; only the handle VALUES that key the offset map
+    //    change, and every consumer below keys by `get(f.sym)`, so the bytes the
+    //    name resolves to are unchanged.
+    try si.internAll(gpa, fns);
+
     const offsets = try gpa.alloc(u32, fns.len);
     defer gpa.free(offsets);
 
-    var cursor: u32 = 0;
-    for (fns) |f| {
-        std.debug.assert(f.code.len % 4 == 0);
-        const h = try si.intern(gpa, f.sym);
-        offsets[h] = cursor;
-        cursor += @intCast(f.code.len);
-    }
+    // Text offsets by EXCLUSIVE PREFIX-SUM of code lengths in SOURCE ORDER
+    // ([M18 PREFIX-SUM == SERIAL RUNNING SUM]). `offsets[h]` is the sum of the
+    // code lengths of every fn appearing before fn-h in source order — exactly the
+    // value the old `offsets[h]=cursor; cursor+=len` running sum produced, so
+    // __text stays byte-identical to the pre-M18 baseline. The scan is split into
+    // an explicit length gather + prefix accumulation (instead of one fused cursor
+    // walk) so the address-assignment barrier is a standalone, parallel-scan-ready
+    // pass; the math (a left-to-right running sum over source order) is unchanged,
+    // only WHO computes it.
+    const cursor = try prefixSumTextOffsets(gpa, fns, si, offsets);
 
-    // 2) CONCAT: copy each function's code to its assigned offset.
     const text = try gpa.alloc(u8, cursor);
     errdefer gpa.free(text);
-    for (fns) |f| {
-        const h = (try si.get(gpa, f.sym)).?; // interned in step 1
-        @memcpy(text[offsets[h]..][0..f.code.len], f.code);
-    }
 
-    // 3) PATCH: rewrite each `.call26` site in place (intra-module, PC-relative).
-    //    Cross-segment relocs (adrp/add/ldr against __cstring/__got) cannot be
-    //    patched here — they need final vmaddrs MachO has not assigned yet — so
-    //    rebase their site to the absolute __text offset and collect them.
-    var data_relocs: std.ArrayList(Reloc) = .empty;
-    errdefer data_relocs.deinit(gpa);
-    for (fns) |f| {
-        const fh = (try si.get(gpa, f.sym)).?;
-        for (f.relocs) |rl| {
-            const site_abs: u32 = offsets[fh] + rl.site;
-            switch (rl.kind) {
-                .call26 => {
-                    // A stale-name hit (callee renamed/removed) surfaces here as a
-                    // clean error rather than indexing past the map. [C4]
-                    const th = (try si.get(gpa, rl.target.func)) orelse return error.UnresolvedSymbol;
-                    const target_abs: i64 = @as(i64, offsets[th]) + rl.addend;
-                    const delta: i64 = target_abs - @as(i64, site_abs);
-                    std.debug.assert(@mod(delta, 4) == 0); // BL targets are word-aligned
-                    const imm: i64 = @divExact(delta, 4);
-                    if (imm < -(@as(i64, 1) << 25) or imm > (@as(i64, 1) << 25) - 1) {
-                        return error.CallTargetTooFar;
-                    }
-                    const word = Aarch64.bl(@intCast(imm));
-                    std.mem.writeInt(u32, text[site_abs..][0..4], word, .little);
-                },
-                .adrp_page, .add_lo12, .ldr_lo12 => {
-                    try data_relocs.append(gpa, .{
-                        .site = site_abs,
-                        .target = rl.target,
-                        .kind = rl.kind,
-                        .addend = rl.addend,
-                    });
-                },
-            }
+    // Resolve every fn's handle + every reloc target handle BEFORE the fan-out: the
+    // SymInterner's StringHashMap `get` allocates a scratch key, so it is NOT safe to
+    // call concurrently. Resolving here (single-threaded, source order) makes the
+    // per-fn jobs pure disjoint-region writers over read-only state. `site_h` is the
+    // owning fn's handle; `targets[i]` holds each call26 target's handle in the same
+    // flat order the per-fn loop visits relocs (so the job indexes it by a running
+    // per-fn cursor). A stale call26 target name surfaces as UnresolvedSymbol here,
+    // exactly where the old serial loop raised it. [C4]
+    const site_h = try gpa.alloc(u32, fns.len);
+    defer gpa.free(site_h);
+    var n_call26: usize = 0;
+    for (fns, 0..) |f, i| {
+        site_h[i] = (try si.get(gpa, f.sym)).?;
+        for (f.relocs) |rl| if (rl.kind == .call26) {
+            n_call26 += 1;
+        };
+    }
+    const call_targets = try gpa.alloc(u32, n_call26);
+    defer gpa.free(call_targets);
+    {
+        var k: usize = 0;
+        for (fns) |f| {
+            for (f.relocs) |rl| if (rl.kind == .call26) {
+                call_targets[k] = (try si.get(gpa, rl.target.func)) orelse return error.UnresolvedSymbol;
+                k += 1;
+            };
         }
     }
+    // First-call26-index of each fn, so a job can slice its own targets without
+    // re-scanning earlier fns (exclusive prefix-sum over per-fn call26 counts).
+    const call_base = try gpa.alloc(usize, fns.len);
+    defer gpa.free(call_base);
+    {
+        var acc: usize = 0;
+        for (fns, 0..) |f, i| {
+            call_base[i] = acc;
+            for (f.relocs) |rl| if (rl.kind == .call26) {
+                acc += 1;
+            };
+        }
+    }
+
+    // 2+3) FUSED per-fn COPY + call26 PATCH, run in parallel: each job owns ONLY its
+    //      own disjoint `text[offsets[h]..offsets[h]+len)` region (copy + every
+    //      in-region call26 site), and collects its NON-call26 relocs into its OWN
+    //      slot's local list. No two jobs touch the same byte; `offsets`/`text`/
+    //      `call_targets`/`site_h` are read-only across workers (the only writes are
+    //      to a job's own text region + its own slot). Determinism is by INDEX, not
+    //      arrival: the data_relocs are stable-concatenated in source order below, so
+    //      the slice is byte-identical at any -j ([M18 NO MAP-ITERATION-ORDER]).
+    const jobs = try gpa.alloc(FnLinkSlot, fns.len);
+    defer {
+        for (jobs) |*j| j.relocs.deinit(gpa);
+        gpa.free(jobs);
+    }
+    for (jobs) |*j| j.* = .{};
+
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        fns: []const FnCode,
+        text: []u8,
+        offsets: []const u32,
+        site_h: []const u32,
+        call_targets: []const u32,
+        call_base: []const usize,
+        jobs: []FnLinkSlot,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(fnLinkJob)) {
+            return .{ c.gpa, c.fns, c.text, c.offsets, c.site_h, c.call_targets, c.call_base, i, &c.jobs[i] };
+        }
+    };
+    Engine.fanOut(io, fns.len, fnLinkJob, Ctx{
+        .gpa = gpa,
+        .fns = fns,
+        .text = text,
+        .offsets = offsets,
+        .site_h = site_h,
+        .call_targets = call_targets,
+        .call_base = call_base,
+        .jobs = jobs,
+    });
+
+    // First per-fn error wins (source order), so the reported error is the same one
+    // the old serial loop would have hit first.
+    for (jobs) |j| if (j.err) |e| return e;
+
+    // STABLE-CONCAT the per-fn data_reloc lists in SOURCE ORDER (the `jobs`/`fns`
+    // index), reproducing the exact order the old single shared-append loop produced
+    // — never thread-arrival order. The `.import` name-dup loop downstream observes
+    // this order, so it must be a pure function of the fn set. [M18 determinism]
+    var data_relocs: std.ArrayList(Reloc) = .empty;
+    errdefer data_relocs.deinit(gpa);
+    for (jobs) |j| try data_relocs.appendSlice(gpa, j.relocs.items);
 
     // 4) ENTRY: the entry function's resolved text offset, resolved by name.
     const entry_h = (try si.get(gpa, entry)) orelse return error.NoEntry;
@@ -255,6 +401,68 @@ pub fn link(gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry
         .entry_off = offsets[entry_h],
         .data_relocs = try data_relocs.toOwnedSlice(gpa),
     };
+}
+
+/// One per-fn link job's output: the cross-segment relocs this fn contributed (in
+/// its own in-fn order) plus any error it hit. The job writes ONLY this slot and
+/// its own `text` region; the caller stable-concatenates `relocs` in source order.
+const FnLinkSlot = struct {
+    relocs: std.ArrayList(Reloc) = .empty,
+    err: ?LinkError = null,
+};
+
+/// The per-fn COPY + call26 PATCH unit (a `fanOut` job): copy fn `i`'s code into its
+/// disjoint `text` region, patch every in-region `.call26` site in place (PC-relative
+/// `bl`), and collect its non-call26 relocs (rebased to absolute __text offsets) into
+/// `slot`. Pure over disjoint state: writes only `text[offsets[h]..]` (this fn's) and
+/// `slot`. All symbol handles were resolved single-threaded before the fan-out, so no
+/// `SymInterner.get` (which allocates) runs here.
+fn fnLinkJob(
+    gpa: std.mem.Allocator,
+    fns: []const FnCode,
+    text: []u8,
+    offsets: []const u32,
+    site_h: []const u32,
+    call_targets: []const u32,
+    call_base: []const usize,
+    i: usize,
+    slot: *FnLinkSlot,
+) void {
+    const f = fns[i];
+    const fh = site_h[i];
+    const base = offsets[fh];
+    @memcpy(text[base..][0 .. f.code.len], f.code);
+
+    var call_i: usize = call_base[i];
+    for (f.relocs) |rl| {
+        const site_abs: u32 = base + rl.site;
+        switch (rl.kind) {
+            .call26 => {
+                const th = call_targets[call_i];
+                call_i += 1;
+                const target_abs: i64 = @as(i64, offsets[th]) + rl.addend;
+                const delta: i64 = target_abs - @as(i64, site_abs);
+                std.debug.assert(@mod(delta, 4) == 0); // BL targets are word-aligned
+                const imm: i64 = @divExact(delta, 4);
+                if (imm < -(@as(i64, 1) << 25) or imm > (@as(i64, 1) << 25) - 1) {
+                    if (slot.err == null) slot.err = error.CallTargetTooFar;
+                    continue;
+                }
+                const word = Aarch64.bl(@intCast(imm));
+                std.mem.writeInt(u32, text[site_abs..][0..4], word, .little);
+            },
+            .adrp_page, .add_lo12, .ldr_lo12 => {
+                slot.relocs.append(gpa, .{
+                    .site = site_abs,
+                    .target = rl.target,
+                    .kind = rl.kind,
+                    .addend = rl.addend,
+                }) catch |e| {
+                    if (slot.err == null) slot.err = e;
+                };
+            },
+        }
+    }
 }
 
 /// Patch the cross-segment relocations `link` could not resolve, now that MachO
@@ -267,6 +475,7 @@ pub fn link(gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry
 /// page. Because every segment is page-aligned in the same image, the deltas are
 /// exact at runtime under PIE/ASLR (dyld slides all segments together).
 pub fn applyDataRelocs(
+    io: Io,
     text: []u8,
     data_relocs: []const Reloc,
     text_vmaddr: u64,
@@ -274,30 +483,65 @@ pub fn applyDataRelocs(
     got_vmaddr: u64,
     import_slots: *const std.StringHashMapUnmanaged(u32),
 ) void {
-    for (data_relocs) |rl| {
-        const site_vmaddr: u64 = text_vmaddr + rl.site;
-        const target_vmaddr: u64 = switch (rl.target) {
-            // The relink tail already rewrote the content hash to a blob offset.
-            .cstr => |off| cstring_vmaddr + off,
-            .import => |s| got_vmaddr + @as(u64, import_slots.get(s.name).?) * 8,
-            .func => unreachable, // funcs are patched intra-module by `link`
-        };
-        const word = std.mem.readInt(u32, text[rl.site..][0..4], .little);
-        const patched: u32 = switch (rl.kind) {
-            .adrp_page => blk: {
-                const pages: i64 = @as(i64, @intCast(target_vmaddr >> 12)) -
-                    @as(i64, @intCast(site_vmaddr >> 12));
-                break :blk Aarch64.patchAdrp(word, @intCast(pages));
-            },
-            .add_lo12 => Aarch64.patchAddImm12(word, @intCast(target_vmaddr & 0xFFF)),
-            .ldr_lo12 => blk: {
-                std.debug.assert(target_vmaddr & 7 == 0);
-                break :blk Aarch64.patchLdrUoff(word, @intCast(target_vmaddr & 0xFFF));
-            },
-            .call26 => unreachable, // already patched by `link`
-        };
-        std.mem.writeInt(u32, text[rl.site..][0..4], patched, .little);
-    }
+    // PARALLEL per-reloc PATCH: each reloc patches a UNIQUE disjoint 4-byte site
+    // (`text[rl.site..site+4]`), so the fan-out is a race-free disjoint-region map.
+    // `import_slots`/`text_vmaddr`/etc. are read-only across workers; the output is
+    // independent of dispatch order because each site is written by exactly one
+    // worker. [M18 SINGLE-WRITER DISJOINT REGIONS]
+    const Ctx = struct {
+        text: []u8,
+        data_relocs: []const Reloc,
+        text_vmaddr: u64,
+        cstring_vmaddr: u64,
+        got_vmaddr: u64,
+        import_slots: *const std.StringHashMapUnmanaged(u32),
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(dataRelocJob)) {
+            return .{ c.text, c.data_relocs[i], c.text_vmaddr, c.cstring_vmaddr, c.got_vmaddr, c.import_slots };
+        }
+    };
+    Engine.fanOut(io, data_relocs.len, dataRelocJob, Ctx{
+        .text = text,
+        .data_relocs = data_relocs,
+        .text_vmaddr = text_vmaddr,
+        .cstring_vmaddr = cstring_vmaddr,
+        .got_vmaddr = got_vmaddr,
+        .import_slots = import_slots,
+    });
+}
+
+/// Patch ONE cross-segment reloc's 4-byte site (a `fanOut` job). Reads `text[rl.site]`,
+/// computes the adrp/add/ldr immediate from the target vmaddr, writes it back. Each
+/// job owns a unique disjoint site, so no two jobs touch the same byte.
+fn dataRelocJob(
+    text: []u8,
+    rl: Reloc,
+    text_vmaddr: u64,
+    cstring_vmaddr: u64,
+    got_vmaddr: u64,
+    import_slots: *const std.StringHashMapUnmanaged(u32),
+) void {
+    const site_vmaddr: u64 = text_vmaddr + rl.site;
+    const target_vmaddr: u64 = switch (rl.target) {
+        // The relink tail already rewrote the content hash to a blob offset.
+        .cstr => |off| cstring_vmaddr + off,
+        .import => |s| got_vmaddr + @as(u64, import_slots.get(s.name).?) * 8,
+        .func => unreachable, // funcs are patched intra-module by `link`
+    };
+    const word = std.mem.readInt(u32, text[rl.site..][0..4], .little);
+    const patched: u32 = switch (rl.kind) {
+        .adrp_page => blk: {
+            const pages: i64 = @as(i64, @intCast(target_vmaddr >> 12)) -
+                @as(i64, @intCast(site_vmaddr >> 12));
+            break :blk Aarch64.patchAdrp(word, @intCast(pages));
+        },
+        .add_lo12 => Aarch64.patchAddImm12(word, @intCast(target_vmaddr & 0xFFF)),
+        .ldr_lo12 => blk: {
+            std.debug.assert(target_vmaddr & 7 == 0);
+            break :blk Aarch64.patchLdrUoff(word, @intCast(target_vmaddr & 0xFFF));
+        },
+        .call26 => unreachable, // already patched by `link`
+    };
+    std.mem.writeInt(u32, text[rl.site..][0..4], patched, .little);
 }
 
 // ---- FnCode (de)serialization ----------------------------------------------
@@ -590,11 +834,15 @@ fn freeFns(gpa: std.mem.Allocator, fns: []FnCode) void {
     }
 }
 
-/// Link the test fns with a fresh interner and entry named "f<entry>".
+/// Link the test fns with a fresh interner and entry named "f<entry>". Drives the
+/// fan-out on a serial (`.limited(0)`) pool so the unit tests stay deterministic
+/// and independent of the host's thread count.
 fn linkTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) LinkError!Linked {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
     var si: SymInterner = .{};
     defer si.deinit(gpa);
-    return link(gpa, fns, &si, fname(entry));
+    return link(threaded.io(), gpa, fns, &si, fname(entry));
 }
 
 test "layout offsets follow source order and are contiguous" {
@@ -722,6 +970,127 @@ test "reorder does not corrupt a call: same names, different layout order" {
     }
 }
 
+test "stable-sort handles: shuffled input order yields the identical handle map" {
+    const gpa = testing.allocator;
+    // The SAME fn set, interned in three different source orders. A handle is the
+    // stable-sort RANK of the composite key (ties broken by source index), so the
+    // handle→name mapping is a pure function of the SET — identical across orders,
+    // never arrival/source order. This is the M18 determinism invariant: the
+    // parallel tail can intern off worker threads without any thread-arrival order
+    // leaking into the handles that key every offset/delta.
+    const Fn = struct { kind: SymKind, name: []const u8 };
+    // Names chosen so source order (b,a,c) ≠ sorted order (a,b,c) ≠ name length.
+    const defs = [_]Fn{
+        .{ .kind = .user_fn, .name = "beta" },
+        .{ .kind = .user_fn, .name = "alpha" },
+        .{ .kind = .import, .name = "alpha" }, // same name, different kind ⇒ distinct
+        .{ .kind = .user_fn, .name = "gamma" },
+    };
+
+    const internOrder = struct {
+        fn run(g: std.mem.Allocator, ds: []const Fn, order: []const usize, out: []u32) !void {
+            var fns: [4]FnCode = undefined;
+            var built: usize = 0;
+            errdefer for (fns[0..built]) |*f| g.free(f.code);
+            for (order, 0..) |src, i| {
+                fns[i] = .{
+                    .sym = .{ .kind = ds[src].kind, .name = ds[src].name },
+                    .code = try g.alloc(u8, 4),
+                    .relocs = &.{},
+                    .literals = &.{},
+                };
+                built += 1;
+            }
+            defer for (&fns) |*f| g.free(f.code);
+
+            var si: SymInterner = .{};
+            defer si.deinit(g);
+            try si.internAll(g, &fns);
+            for (ds, 0..) |d, k| out[k] = (try si.get(g, .{ .kind = d.kind, .name = d.name })).?;
+        }
+    }.run;
+
+    var h_src: [4]u32 = undefined; // interned in declaration order
+    var h_rev: [4]u32 = undefined; // reversed
+    var h_mix: [4]u32 = undefined; // arbitrary shuffle
+    try internOrder(gpa, &defs, &.{ 0, 1, 2, 3 }, &h_src);
+    try internOrder(gpa, &defs, &.{ 3, 2, 1, 0 }, &h_rev);
+    try internOrder(gpa, &defs, &.{ 2, 0, 3, 1 }, &h_mix);
+
+    try testing.expectEqual(h_src, h_rev);
+    try testing.expectEqual(h_src, h_mix);
+    // Sorted composite order is: ('f'=user_fn 0)"alpha", ("beta"), ("gamma"),
+    // then ('import' tag)"alpha". So handles by def index {beta,alpha-fn,alpha-import,gamma}:
+    try testing.expectEqual(@as(u32, 1), h_src[0]); // beta  → rank 1
+    try testing.expectEqual(@as(u32, 0), h_src[1]); // alpha (user_fn) → rank 0
+    try testing.expectEqual(@as(u32, 3), h_src[2]); // alpha (import) → rank 3
+    try testing.expectEqual(@as(u32, 2), h_src[3]); // gamma → rank 2
+}
+
+test "prefix-sum text offsets == old cursor accumulation for a randomized length vector" {
+    const gpa = testing.allocator;
+    // The prefix-sum address barrier (prefixSumTextOffsets) MUST reproduce the old
+    // fused `offsets[h]=cursor; cursor+=len` running sum byte-for-byte over a range
+    // of fn-length vectors (incl. zero/large words, shuffled handle vs source order).
+    var prng = std.Random.DefaultPrng.init(0x18_03_5e_ed);
+    const rand = prng.random();
+
+    var trial: usize = 0;
+    while (trial < 64) : (trial += 1) {
+        const n = rand.intRangeAtMost(usize, 1, 32);
+        const lens = try gpa.alloc(usize, n); // words per fn
+        defer gpa.free(lens);
+        for (lens) |*l| l.* = rand.intRangeAtMost(usize, 0, 64);
+
+        // Build fns named by RANDOM distinct ids so the stable-sort handle order
+        // differs from source order — the prefix-sum is keyed by handle, the old
+        // running sum walks source order; both must agree.
+        const fns = try gpa.alloc(FnCode, n);
+        defer {
+            for (fns) |*f| {
+                gpa.free(f.sym.name);
+                gpa.free(f.code);
+            }
+            gpa.free(fns);
+        }
+        for (fns, 0..) |*f, i| {
+            const name = try std.fmt.allocPrint(gpa, "fn_{d}_{d}", .{ rand.int(u32), i });
+            f.* = .{
+                .sym = .{ .kind = .user_fn, .name = name },
+                .code = try gpa.alloc(u8, lens[i] * 4),
+                .relocs = &.{},
+                .literals = &.{},
+            };
+        }
+
+        var si: SymInterner = .{};
+        defer si.deinit(gpa);
+        try si.internAll(gpa, fns);
+
+        // OLD: fused running sum over source order, keyed by handle.
+        const want = try gpa.alloc(u32, n);
+        defer gpa.free(want);
+        {
+            var cursor: u32 = 0;
+            for (fns) |f| {
+                const h = (try si.get(gpa, f.sym)).?;
+                want[h] = cursor;
+                cursor += @intCast(f.code.len);
+            }
+        }
+
+        // NEW: the standalone prefix-sum pass.
+        const got = try gpa.alloc(u32, n);
+        defer gpa.free(got);
+        const total = try prefixSumTextOffsets(gpa, fns, &si, got);
+
+        try testing.expectEqualSlices(u32, want, got);
+        var expect_total: u32 = 0;
+        for (lens) |l| expect_total += @intCast(l * 4);
+        try testing.expectEqual(expect_total, total);
+    }
+}
+
 test "UnresolvedSymbol on a call to a missing name" {
     const gpa = testing.allocator;
     var fns = [_]FnCode{
@@ -790,6 +1159,9 @@ test "applyDataRelocs reproduces clang adrp/add/ldr words" {
     // `link` rebases reloc sites to absolute __text offsets, so set text_vmaddr =
     // clang site for a site-0 reloc and feed each instruction independently.
     const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
     const base: u64 = 0x100000000;
     const cstring_vmaddr: u64 = base + 0x4b0;
     const got_vmaddr: u64 = base + 0x4000;
@@ -804,28 +1176,28 @@ test "applyDataRelocs reproduces clang adrp/add/ldr words" {
         var w: [4]u8 = undefined;
         std.mem.writeInt(u32, &w, Aarch64.adrp(8, 0), .little);
         const r = [_]Reloc{.{ .site = 0, .target = .{ .cstr = 0 }, .kind = .adrp_page }};
-        applyDataRelocs(&w, &r, base + 0x478, cstring_vmaddr, got_vmaddr, &import_slots);
+        applyDataRelocs(io, &w, &r, base + 0x478, cstring_vmaddr, got_vmaddr, &import_slots);
         try testing.expectEqual(@as(u32, 0x90000008), std.mem.readInt(u32, &w, .little));
     }
     {
         var w: [4]u8 = undefined;
         std.mem.writeInt(u32, &w, Aarch64.addImm(8, 8, 0), .little);
         const r = [_]Reloc{.{ .site = 0, .target = .{ .cstr = 0 }, .kind = .add_lo12 }};
-        applyDataRelocs(&w, &r, base + 0x47c, cstring_vmaddr, got_vmaddr, &import_slots);
+        applyDataRelocs(io, &w, &r, base + 0x47c, cstring_vmaddr, got_vmaddr, &import_slots);
         try testing.expectEqual(@as(u32, 0x9112C108), std.mem.readInt(u32, &w, .little));
     }
     {
         var w: [4]u8 = undefined;
         std.mem.writeInt(u32, &w, Aarch64.adrp(16, 0), .little);
         const r = [_]Reloc{.{ .site = 0, .target = .{ .import = .{ .kind = .import, .name = "write" } }, .kind = .adrp_page }};
-        applyDataRelocs(&w, &r, base + 0x4a4, cstring_vmaddr, got_vmaddr, &import_slots);
+        applyDataRelocs(io, &w, &r, base + 0x4a4, cstring_vmaddr, got_vmaddr, &import_slots);
         try testing.expectEqual(@as(u32, 0x90000030), std.mem.readInt(u32, &w, .little));
     }
     {
         var w: [4]u8 = undefined;
         std.mem.writeInt(u32, &w, Aarch64.ldrRegUoff(16, 16, 0), .little);
         const r = [_]Reloc{.{ .site = 0, .target = .{ .import = .{ .kind = .import, .name = "write" } }, .kind = .ldr_lo12 }};
-        applyDataRelocs(&w, &r, base + 0x4a8, cstring_vmaddr, got_vmaddr, &import_slots);
+        applyDataRelocs(io, &w, &r, base + 0x4a8, cstring_vmaddr, got_vmaddr, &import_slots);
         try testing.expectEqual(@as(u32, 0xF9400210), std.mem.readInt(u32, &w, .little));
     }
 }

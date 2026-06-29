@@ -275,6 +275,28 @@ pub fn fanOut(io: Io, n: usize, comptime jobFn: anytype, ctx: anytype) void {
     group.await(io) catch {};
 }
 
+/// `fanOut`'s sibling for the M18 parallel TAIL: dispatch `n` jobs the same way
+/// (true concurrency where the runtime allows, the LOAD-BEARING inline `catch`
+/// fallback otherwise), but each job writes its OWN index's result via the ctx's
+/// out slot rather than a side-effect on a shared `slots` array. Identical dispatch
+/// + determinism contract to `fanOut`: jobs are independent and order-free, and the
+/// caller reads back the per-index results in deterministic index order. `ctx.args(i)`
+/// must yield the exact `ArgsTuple` for job `i` (including its `ctx.slot(i)` out
+/// pointer); this helper imposes no result type — only the uniform dispatch shape.
+///
+/// Stage 1 adds this seam; no tail pass routes through it yet (the tail stays
+/// serial). `.limited(0)` (`-j1`) makes every `concurrent` fail, so this is the
+/// verbatim inline path — the true serial baseline.
+pub fn fanOutResults(io: Io, n: usize, comptime jobFn: anytype, ctx: anytype) void {
+    var group: Io.Group = .init;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const args = ctx.args(i);
+        group.concurrent(io, jobFn, args) catch @call(.auto, jobFn, args);
+    }
+    group.await(io) catch {};
+}
+
 /// Dual-metric output of a fresh `lowerOne`: the summed opt counters for this fn
 /// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
 pub const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
@@ -553,6 +575,105 @@ fn greenReuse(
     return true;
 }
 
+/// The M18 scheduler generalization: an IN-PROGRESS LATCH plus a cross-thread CYCLE
+/// guard for the query memo path. Today each query is computed once per build BY
+/// CONSTRUCTION (each fan-out job owns a disjoint key), so the existing `query()`
+/// path takes no latch. As later stages let the scheduler DEMAND a query that another
+/// worker may already be computing (the parallel tail's shared sub-results), this
+/// latch is the seam that makes a key computed EXACTLY ONCE under concurrency:
+/// concurrent demands of the same key block-or-coalesce onto the single owner's
+/// result instead of each recomputing.
+///
+/// Determinism is preserved because the RESULT of a key is a pure function of the key
+/// (the same compute, same inputs) regardless of which worker wins the race to own
+/// it; the latch only deduplicates work, it never feeds thread-arrival order into an
+/// output. [C11]
+///
+/// CYCLE GUARD: a query that re-enters its OWN in-progress chain (a key demanded
+/// while it is already on this thread's active demand stack) is a dependency cycle.
+/// The query DAG is acyclic BY CONSTRUCTION (the signature firewall keeps recursion
+/// off the body→body path), so a re-entry is a bug, not legitimate recursion. We
+/// return `error.QueryCycle` rather than deadlock — the rustc reentrancy/deadlock
+/// failure mode that blocked their parallel front-end for years. The active stack is
+/// per-thread (`threadlocal`), so a cross-thread re-demand of a key another thread is
+/// computing is NOT a cycle (it waits on the latch); only a SAME-thread re-entry is.
+pub const Latch = struct {
+    pub const Error = error{QueryCycle} || std.mem.Allocator.Error;
+
+    const State = enum { in_progress, done };
+
+    lock_state: std.atomic.Value(bool) = .init(false),
+    /// key -> {in_progress, done}. Present-and-in_progress means some worker owns the
+    /// compute; present-and-done means the result is materialized in the caller's memo.
+    states: std.AutoHashMapUnmanaged(u64, State) = .{},
+
+    /// This THREAD's active demand stack — keys whose compute is running on this
+    /// thread's call stack. A re-demand of any key here is a cycle. Per-thread so a
+    /// cross-thread wait on a shared key is never misread as a cycle.
+    threadlocal var stack: [64]u64 = undefined;
+    threadlocal var depth: usize = 0;
+
+    pub fn init() Latch {
+        return .{};
+    }
+
+    pub fn deinit(self: *Latch, gpa: std.mem.Allocator) void {
+        self.states.deinit(gpa);
+        self.* = undefined;
+    }
+
+    fn lock(self: *Latch) void {
+        while (self.lock_state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlock(self: *Latch) void {
+        self.lock_state.store(false, .release);
+    }
+
+    /// Own `key` exactly once. Returns `.computed` to the single winning owner (who
+    /// must run the work then call `finish`), spins for the owner if another worker is
+    /// mid-compute and returns `.coalesced` once that owner finishes, and returns
+    /// `error.QueryCycle` if `key` re-enters THIS thread's active stack (a re-entrant
+    /// dependency cycle — never a deadlock). The wait is a `spinLoopHint` busy-wait:
+    /// the compute a query owns is short and the latch is taken only when two workers
+    /// genuinely race the SAME key, so spinning beats a blocking Io wait here.
+    pub const Ownership = enum { computed, coalesced };
+
+    pub fn acquire(self: *Latch, gpa: std.mem.Allocator, key: u64) Error!Ownership {
+        for (stack[0..depth]) |k| if (k == key) return error.QueryCycle;
+
+        while (true) {
+            self.lock();
+            const gop = try self.states.getOrPut(gpa, key);
+            if (!gop.found_existing) {
+                // We are the OWNER: mark in_progress, push onto our active stack.
+                gop.value_ptr.* = .in_progress;
+                self.unlock();
+                if (depth < stack.len) {
+                    stack[depth] = key;
+                    depth += 1;
+                }
+                return .computed;
+            }
+            const st = gop.value_ptr.*;
+            self.unlock();
+            if (st == .done) return .coalesced;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Mark `key` done (the owner calls this after computing) and pop it off this
+    /// thread's active stack so subsequent demands coalesce instead of recomputing.
+    pub fn finish(self: *Latch, gpa: std.mem.Allocator, key: u64) void {
+        self.lock();
+        self.states.put(gpa, key, .done) catch {};
+        self.unlock();
+        if (depth > 0 and stack[depth - 1] == key) depth -= 1;
+    }
+};
+
 const testing = std.testing;
 
 test "green-reuse cache key is reconstructible from the recorded stamp alone" {
@@ -579,6 +700,78 @@ test "Reuse defaults to a non-green (verbatim) decision" {
     // triggers a green reuse.
     const rd: Reuse = .{};
     try testing.expect(!rd.green);
+}
+
+test "Latch: two concurrent demands of one key compute it exactly once" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var latch = Latch.init();
+    defer latch.deinit(gpa);
+
+    const N = 8;
+    const key: u64 = 0xC0FFEE;
+
+    const Job = struct {
+        latch: *Latch,
+        gpa: std.mem.Allocator,
+        key: u64,
+        computed: *std.atomic.Value(usize),
+        outcomes: []Latch.Ownership,
+        fn run(latch_p: *Latch, g: std.mem.Allocator, k: u64, computed: *std.atomic.Value(usize), out: *Latch.Ownership) void {
+            const own = latch_p.acquire(g, k) catch unreachable;
+            out.* = own;
+            if (own == .computed) {
+                _ = computed.fetchAdd(1, .monotonic);
+                latch_p.finish(g, k);
+            }
+        }
+    };
+
+    var computed: std.atomic.Value(usize) = .init(0);
+    var outcomes: [N]Latch.Ownership = undefined;
+
+    const Ctx = struct {
+        latch: *Latch,
+        gpa: std.mem.Allocator,
+        key: u64,
+        computed: *std.atomic.Value(usize),
+        outcomes: []Latch.Ownership,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(Job.run)) {
+            return .{ c.latch, c.gpa, c.key, c.computed, &c.outcomes[i] };
+        }
+    };
+    fanOut(io, N, Job.run, Ctx{
+        .latch = &latch,
+        .gpa = gpa,
+        .key = key,
+        .computed = &computed,
+        .outcomes = &outcomes,
+    });
+
+    // EXACTLY ONE worker computed; the rest coalesced onto its result.
+    try testing.expectEqual(@as(usize, 1), computed.load(.monotonic));
+    var n_computed: usize = 0;
+    for (outcomes) |o| if (o == .computed) {
+        n_computed += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), n_computed);
+}
+
+test "Latch: a re-entrant self-demand yields error.QueryCycle, never a hang" {
+    const gpa = testing.allocator;
+    var latch = Latch.init();
+    defer latch.deinit(gpa);
+
+    const key: u64 = 42;
+    // Own the key (pushes it onto this thread's active stack)...
+    try testing.expectEqual(Latch.Ownership.computed, try latch.acquire(gpa, key));
+    // ...then re-demand the SAME key while it is in-progress on this thread: a cycle,
+    // reported as an error rather than spinning forever waiting on ourselves.
+    try testing.expectError(error.QueryCycle, latch.acquire(gpa, key));
+    latch.finish(gpa, key);
 }
 
 // Engine boundary tests (hit/miss/force/verify/invalidation + key discrimination)

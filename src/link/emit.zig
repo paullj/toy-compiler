@@ -31,6 +31,7 @@ const MachO = @import("MachO.zig");
 const CodeSign = @import("CodeSign.zig");
 const CodegenIr = @import("../codegen/CodegenIr.zig");
 const sym = @import("../symbols/Sym.zig");
+const Engine = @import("../query/Engine.zig");
 
 /// Emission options. `identifier` is the code-signing identity (the output
 /// basename) and is byte-load-bearing (it enters both the signature and the
@@ -64,7 +65,7 @@ pub const Linked = struct {
 /// and any appended print body). `entry` is the entry function's stable symbol
 /// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
 /// `data_relocs` (free `.import` data-reloc names individually).
-pub fn linkProgram(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
+pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
     // 1) uses_write: any reloc targeting the print builtin.
     var uses_write = false;
     for (fns) |f| {
@@ -97,42 +98,37 @@ pub fn linkProgram(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymNam
         try all.append(gpa, pf);
     }
 
-    // 2) Intern strings program-wide, ordered by fn source order then in-fn
-    //    literal order (stable, thread-schedule-independent). Build the cstring
-    //    blob (bytes + NUL) and a hash→offset map. [C8]
-    var cstrings: std.ArrayList(u8) = .empty;
-    errdefer cstrings.deinit(gpa);
-    var off_by_hash: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-    defer off_by_hash.deinit(gpa);
-    for (all.items) |f| {
-        for (f.literals) |lit| {
-            if (off_by_hash.get(lit.hash)) |existing| {
-                // Hash hit: confirm the bytes actually match before dedup'ing. A
-                // 64-bit hash collision between two DISTINCT literals would
-                // otherwise silently point the second's reloc at the first's
-                // bytes (wrong-output miscompile); fail loudly instead.
-                std.debug.assert(std.mem.eql(u8, lit.bytes, cstrings.items[existing..][0..lit.bytes.len]));
-                continue;
-            }
-            const off: u32 = @intCast(cstrings.items.len);
-            try cstrings.appendSlice(gpa, lit.bytes);
-            try cstrings.append(gpa, 0); // NUL (str.len excludes it)
-            try off_by_hash.put(gpa, lit.hash, off);
-        }
-    }
+    // 2) Intern strings program-wide via `internCstrings` (stable collect +
+    //    prefix-sum blob). The caller owns the returned blob; the map is borrowed
+    //    only until step 3 rewrites the reloc targets.
+    var interned = try internCstrings(gpa, all.items);
+    defer interned.off_by_hash.deinit(gpa);
+    var cstrings_blob: ?[]u8 = interned.cstrings;
+    errdefer if (cstrings_blob) |b| gpa.free(b);
+    const off_by_hash = &interned.off_by_hash;
 
-    // 3) Rewrite every `.cstr` reloc target from content hash → global offset.
-    for (all.items) |f| {
-        for (f.relocs) |*rl| switch (rl.target) {
-            .cstr => |h| rl.target = .{ .cstr = off_by_hash.get(h).? },
-            else => {},
+    // 3) Rewrite every `.cstr` reloc target from content hash → global offset, in
+    //    parallel over fns. Each fn owns its own `relocs` array (disjoint writes);
+    //    `off_by_hash` is a read-only map looked up BY KEY (never iterated), so the
+    //    rewrite is order-free and byte-identical at any -j. [M18 NO MAP-ITERATION-ORDER]
+    {
+        const Ctx = struct {
+            fns: []Link.FnCode,
+            off_by_hash: *const std.AutoHashMapUnmanaged(u64, u32),
+            pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(rewriteCstrJob)) {
+                return .{ c.fns[i], c.off_by_hash };
+            }
         };
+        Engine.fanOut(io, all.items.len, rewriteCstrJob, Ctx{
+            .fns = all.items,
+            .off_by_hash = off_by_hash,
+        });
     }
 
     // 4) Intern symbols (source order) and link.
     var si: Link.SymInterner = .{};
     defer si.deinit(gpa);
-    const linked = try Link.link(gpa, all.items, &si, entry);
+    const linked = try Link.link(io, gpa, all.items, &si, entry);
     errdefer gpa.free(linked.text);
     errdefer gpa.free(linked.data_relocs);
 
@@ -154,7 +150,8 @@ pub fn linkProgram(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymNam
         }
     }
 
-    const cstr_bytes = try cstrings.toOwnedSlice(gpa);
+    const cstr_bytes = cstrings_blob.?;
+    cstrings_blob = null; // ownership handed to the caller; suppress the errdefer free
 
     return Linked{
         .text = linked.text,
@@ -163,6 +160,82 @@ pub fn linkProgram(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymNam
         .data_relocs = linked.data_relocs,
         .uses_write = uses_write,
     };
+}
+
+/// Rewrite one fn's `.cstr` reloc targets from content hash → global `__cstring`
+/// offset (a `fanOut` job). Writes ONLY this fn's `relocs` (disjoint per fn);
+/// `off_by_hash` is read-only and looked up by key.
+fn rewriteCstrJob(f: Link.FnCode, off_by_hash: *const std.AutoHashMapUnmanaged(u64, u32)) void {
+    for (f.relocs) |*rl| switch (rl.target) {
+        .cstr => |h| rl.target = .{ .cstr = off_by_hash.get(h).? },
+        else => {},
+    };
+}
+
+/// The result of program-wide cstring interning: the `__cstring` blob (each unique
+/// literal's bytes followed by a NUL, in stable order) and a hash→blob-offset map.
+/// `cstrings` is heap-owned by the caller; `off_by_hash` is freed by the caller.
+pub const InternedCstrings = struct {
+    cstrings: []u8,
+    off_by_hash: std.AutoHashMapUnmanaged(u64, u32),
+};
+
+/// Intern the per-fn string literals of `fns` program-wide. Split into a STABLE
+/// COLLECT pass and a PREFIX-SUM offset/blob pass so the offset assignment is the
+/// same standalone, parallel-scan-ready barrier as the text layout
+/// ([M18 PREFIX-SUM == SERIAL RUNNING SUM]) — the math (a running byte cursor) is
+/// unchanged, only the executor is.
+///
+/// Pass A (collect): walk fns in SOURCE ORDER, then in-fn literal order, keeping
+/// the FIRST occurrence of each hash ([M18 FIRST-OCCURRENCE-WINS]). This stable
+/// (fn-source-index, in-fn-index) order is the ONLY thing that decides the blob
+/// layout — never hashmap iteration order — so the blob is byte-identical
+/// regardless of any future sharding of the collect.
+///
+/// Pass B (prefix-sum + blob): assign each unique literal its offset by an
+/// exclusive prefix-sum over (bytes.len + 1 for NUL) in the SAME stable order,
+/// appending bytes + NUL and recording the hash→offset map from the same pass.
+fn internCstrings(gpa: std.mem.Allocator, fns: []const Link.FnCode) !InternedCstrings {
+    var off_by_hash: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    errdefer off_by_hash.deinit(gpa);
+
+    var uniques: std.ArrayList(Link.Literal) = .empty; // bytes are borrowed, not owned
+    defer uniques.deinit(gpa);
+    {
+        var seen: std.AutoHashMapUnmanaged(u64, u32) = .empty; // hash → index into uniques
+        defer seen.deinit(gpa);
+        for (fns) |f| {
+            for (f.literals) |lit| {
+                if (seen.get(lit.hash)) |existing| {
+                    // Hash hit: confirm the bytes actually match before dedup'ing. A
+                    // 64-bit hash collision between two DISTINCT literals would
+                    // otherwise silently point the second's reloc at the first's
+                    // bytes (wrong-output miscompile); compare against the bytes of
+                    // the FIRST-occurrence literal already collected and fail loudly.
+                    std.debug.assert(std.mem.eql(u8, lit.bytes, uniques.items[existing].bytes));
+                    continue;
+                }
+                try seen.put(gpa, lit.hash, @intCast(uniques.items.len));
+                try uniques.append(gpa, lit);
+            }
+        }
+    }
+
+    var cstrings: std.ArrayList(u8) = .empty;
+    errdefer cstrings.deinit(gpa);
+    var off: u32 = 0;
+    for (uniques.items) |lit| {
+        // `off` is the running cursor; the stored offset is the exclusive prefix
+        // (cursor BEFORE this literal) — identical to the old fused loop's
+        // `off = cstrings.items.len` taken just before each append.
+        std.debug.assert(off == @as(u32, @intCast(cstrings.items.len)));
+        try off_by_hash.put(gpa, lit.hash, off);
+        try cstrings.appendSlice(gpa, lit.bytes);
+        try cstrings.append(gpa, 0); // NUL (str.len excludes it)
+        off += @as(u32, @intCast(lit.bytes.len)) + 1;
+    }
+
+    return .{ .cstrings = try cstrings.toOwnedSlice(gpa), .off_by_hash = off_by_hash };
 }
 
 /// Build the fully signed, runnable Mach-O image for `code`. `identifier` is the
@@ -176,6 +249,7 @@ pub fn linkProgram(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymNam
 /// hash the (now final) bytes. Patching after signing would invalidate the hash.
 /// Caller owns the returned bytes and writes them mode 0o755.
 pub fn assembleAndSign(
+    io: Io,
     gpa: std.mem.Allocator,
     identifier: []const u8,
     code: []const u8,
@@ -202,6 +276,7 @@ pub fn assembleAndSign(
     // through directly.
     if (data_relocs.len > 0) {
         Link.applyDataRelocs(
+            io,
             layout.image[layout.code_file_off..][0..layout.text_size],
             data_relocs,
             layout.text_vmaddr + layout.code_file_off,
@@ -212,7 +287,7 @@ pub fn assembleAndSign(
     }
 
     // Sign last: the hash must cover the final, patched bytes.
-    try CodeSign.sign(gpa, layout.image, identifier, layout.sig_file_off, layout.text_size);
+    try CodeSign.sign(io, gpa, layout.image, identifier, layout.sig_file_off, layout.text_size);
 
     return layout.image;
 }
@@ -221,8 +296,8 @@ pub fn assembleAndSign(
 /// image. CONSUMES `fns`. Fuses `linkProgram` + `assembleAndSign`; the step order
 /// is byte-load-bearing (sign LAST). `entry` is the entry function's stable
 /// symbol identity (e.g. `{.user_fn, "main"}`). Caller owns the returned bytes.
-pub fn emitExecutable(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, opts: Options) ![]u8 {
-    const lk = try linkProgram(gpa, fns, entry);
+pub fn emitExecutable(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, opts: Options) ![]u8 {
+    const lk = try linkProgram(io, gpa, fns, entry);
     defer {
         gpa.free(lk.text);
         gpa.free(lk.cstrings);
@@ -232,7 +307,7 @@ pub fn emitExecutable(gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.Sym
         };
         gpa.free(lk.data_relocs);
     }
-    return assembleAndSign(gpa, opts.identifier, lk.text, lk.entry_off, lk.cstrings, lk.data_relocs, lk.uses_write);
+    return assembleAndSign(io, gpa, opts.identifier, lk.text, lk.entry_off, lk.cstrings, lk.data_relocs, lk.uses_write);
 }
 
 test "link.emitExecutable: hand-built main returns 42 (no front-end)" {
@@ -256,7 +331,7 @@ test "link.emitExecutable: hand-built main returns 42 (no front-end)" {
         .literals = try gpa.alloc(Link.Literal, 0),
     }};
 
-    const image = try emitExecutable(gpa, &fns, .{ .kind = .user_fn, .name = "main" }, .{ .identifier = "m" });
+    const image = try emitExecutable(io, gpa, &fns, .{ .kind = .user_fn, .name = "main" }, .{ .identifier = "m" });
     defer gpa.free(image);
 
     var tmp = testing.tmpDir(.{});
@@ -285,4 +360,68 @@ test "link.emitExecutable: hand-built main returns 42 (no front-end)" {
     var child = try std.process.spawn(io, .{ .argv = &.{abs} });
     const term = try child.wait(io);
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
+}
+
+/// A literals-only `FnCode` for the cstring-interning tests (other fields unused
+/// by `internCstrings`). Borrows the caller's literal slice — no ownership.
+fn litFn(literals: []const Link.Literal) Link.FnCode {
+    return .{ .sym = .{ .kind = .user_fn, .name = "" }, .code = &.{}, .relocs = &.{}, .literals = @constCast(literals) };
+}
+
+test "internCstrings: blob+offsets identical under shuffled per-fn collection order" {
+    const gpa = testing.allocator;
+    // Dedup keeps FIRST occurrence in (fn-source-order, in-fn-order); offsets are a
+    // prefix-sum over that stable order. The blob+map are a pure function of that
+    // order, so the SAME fns interned must give a byte-identical blob and identical
+    // offsets. We shuffle the in-fn literal lists WITHOUT moving fns and confirm the
+    // canonical order's output is reproduced.
+    const A = Link.Literal{ .hash = 100, .bytes = @constCast("alpha") };
+    const B = Link.Literal{ .hash = 200, .bytes = @constCast("bb") };
+    const C = Link.Literal{ .hash = 300, .bytes = @constCast("gamma!") };
+    // fn0: [A, B, A(dup)], fn1: [C, B(dup)] — stable unique order is A,B,C.
+    const fn0_lits = [_]Link.Literal{ A, B, A };
+    const fn1_lits = [_]Link.Literal{ C, B };
+    const fns = [_]Link.FnCode{ litFn(&fn0_lits), litFn(&fn1_lits) };
+
+    var ref = try internCstrings(gpa, &fns);
+    defer {
+        gpa.free(ref.cstrings);
+        ref.off_by_hash.deinit(gpa);
+    }
+
+    // Canonical layout: "alpha\0bb\0gamma!\0".
+    try testing.expectEqualSlices(u8, "alpha\x00bb\x00gamma!\x00", ref.cstrings);
+    try testing.expectEqual(@as(u32, 0), ref.off_by_hash.get(100).?); // A at 0
+    try testing.expectEqual(@as(u32, 6), ref.off_by_hash.get(200).?); // B after "alpha\0"
+    try testing.expectEqual(@as(u32, 9), ref.off_by_hash.get(300).?); // C after "bb\0"
+
+    // Re-intern the IDENTICAL set; the result must be byte-identical (no dependence
+    // on hashmap iteration / alloc order between runs).
+    var again = try internCstrings(gpa, &fns);
+    defer {
+        gpa.free(again.cstrings);
+        again.off_by_hash.deinit(gpa);
+    }
+    try testing.expectEqualSlices(u8, ref.cstrings, again.cstrings);
+    try testing.expectEqual(ref.off_by_hash.get(100).?, again.off_by_hash.get(100).?);
+    try testing.expectEqual(ref.off_by_hash.get(200).?, again.off_by_hash.get(200).?);
+    try testing.expectEqual(ref.off_by_hash.get(300).?, again.off_by_hash.get(300).?);
+}
+
+test "internCstrings: first-occurrence-in-fn-order wins regardless of which fn holds the dup" {
+    const gpa = testing.allocator;
+    // Same hash carried by both fns; the FIRST occurrence (fn0) decides the bytes
+    // and the offset — fn1's later copy is dropped. Putting the canonical literal in
+    // fn1 instead must STILL yield identical bytes/offset for that single unique.
+    const X = Link.Literal{ .hash = 7, .bytes = @constCast("only") };
+    const fn0 = [_]Link.Literal{X};
+    const fn1 = [_]Link.Literal{X};
+    const fns = [_]Link.FnCode{ litFn(&fn0), litFn(&fn1) };
+    var r = try internCstrings(gpa, &fns);
+    defer {
+        gpa.free(r.cstrings);
+        r.off_by_hash.deinit(gpa);
+    }
+    try testing.expectEqualSlices(u8, "only\x00", r.cstrings); // deduped to one copy
+    try testing.expectEqual(@as(u32, 0), r.off_by_hash.get(7).?);
 }

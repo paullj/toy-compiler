@@ -426,7 +426,7 @@ pub fn lowerProgram(
         ir_instrs += s.ir_instrs;
     }
 
-    return relink(gpa, slots, names, main_sym, compiled, cached_n, opt_stats, ir_instrs);
+    return relink(io, gpa, slots, names, main_sym, compiled, cached_n, opt_stats, ir_instrs);
 }
 
 /// What `renderProgramIr` produced: either the rendered IR text (caller frees)
@@ -543,6 +543,7 @@ fn fnJobInner(
 /// then in-fn literal order), rewrite `.cstr` hashes to offsets, then link and
 /// rebase cross-segment relocs. `slots` is consumed (each FnCode freed). [C8]
 fn relink(
+    io: Io,
     gpa: std.mem.Allocator,
     slots: []FnSlot,
     names: []const Link.SymName,
@@ -562,7 +563,7 @@ fn relink(
         s.fc = null; // ownership moved into `fns`, then into linkAndTail
     }
 
-    var lp = linkAndTail(gpa, fns.items, names, entry_fn) catch |e| switch (e) {
+    var lp = linkAndTail(io, gpa, fns.items, names, entry_fn) catch |e| switch (e) {
         error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range for M1 codegen", .byte_offset = null } },
         error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .byte_offset = null } },
         else => |err| return err,
@@ -583,8 +584,8 @@ fn relink(
 /// strings deterministically, rewrite `.cstr` targets, then `Link.link`. CONSUMES
 /// `fns` (frees each FnCode and any appended print body). Returns a LinkedProgram
 /// with `diags`/`owned_msgs` left empty for the caller to fill.
-fn linkAndTail(gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32) !LinkedProgram {
-    const lk = try link.linkProgram(gpa, fns, names[entry_fn]);
+fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32) !LinkedProgram {
+    const lk = try link.linkProgram(io, gpa, fns, names[entry_fn]);
     return LinkedProgram{
         .text = lk.text,
         .entry_off = lk.entry_off,
@@ -873,7 +874,7 @@ pub fn lowerGraphProgram(
     defer gpa.free(lowered_names);
     for (lower_ids.items, 0..) |gid, i| lowered_names[i] = names[gid];
 
-    return relink(gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
+    return relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
 }
 
 /// Compute the per-lowerable-fn red-green REUSE decision SINGLE-THREADED before the
@@ -1057,6 +1058,7 @@ pub fn renderGraphIr(
 /// asm path and the byte-identity tests call it on `LinkedProgram` fields.
 /// Caller owns the returned bytes and writes them mode 0o755.
 pub fn buildImage(
+    io: Io,
     gpa: std.mem.Allocator,
     identifier: []const u8,
     code: []const u8,
@@ -1065,7 +1067,7 @@ pub fn buildImage(
     data_relocs: []const Link.Reloc,
     uses_write: bool,
 ) ![]u8 {
-    return link.assembleAndSign(gpa, identifier, code, entry_off, cstrings, data_relocs, uses_write);
+    return link.assembleAndSign(io, gpa, identifier, code, entry_off, cstrings, data_relocs, uses_write);
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -1593,7 +1595,7 @@ test "integration: emitted binary runs with the right exit code" {
         defer lp.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), lp.diags.len);
 
-        const image = try buildImage(gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
         defer gpa.free(image);
 
         const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
@@ -1668,7 +1670,7 @@ test "integration: print writes the expected bytes to stdout" {
         defer lp.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), lp.diags.len);
 
-        const image = try buildImage(gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
         defer gpa.free(image);
 
         const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
@@ -2420,7 +2422,7 @@ test "M5 byte-identical: a warm build equals a from-scratch (.force) build [iv]"
     var warm = try checkAndLower(gpa, io, cache, path, src, .normal, &rw);
     defer rw.deinit(gpa);
     defer warm.deinit(gpa);
-    const warm_img = try buildImage(gpa, "p", warm.text, warm.entry_off, warm.cstrings, warm.data_relocs, warm.uses_write);
+    const warm_img = try buildImage(io, gpa, "p", warm.text, warm.entry_off, warm.cstrings, warm.data_relocs, warm.uses_write);
     defer gpa.free(warm_img);
 
     // From scratch (ignore the cache).
@@ -2428,7 +2430,7 @@ test "M5 byte-identical: a warm build equals a from-scratch (.force) build [iv]"
     var fresh = try checkAndLower(gpa, io, cache, path, src, .force, &rf);
     defer rf.deinit(gpa);
     defer fresh.deinit(gpa);
-    const fresh_img = try buildImage(gpa, "p", fresh.text, fresh.entry_off, fresh.cstrings, fresh.data_relocs, fresh.uses_write);
+    const fresh_img = try buildImage(io, gpa, "p", fresh.text, fresh.entry_off, fresh.cstrings, fresh.data_relocs, fresh.uses_write);
     defer gpa.free(fresh_img);
 
     try testing.expectEqualSlices(u8, fresh_img, warm_img);
@@ -2472,7 +2474,7 @@ test "M5 reorder: swapping fn order is all cache hits and keeps correct linkage 
     // The reordered binary still links correctly (call resolves by name): build
     // it and run it — must exit 7. (macOS/aarch64 only.)
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return;
-    const image = try buildImage(gpa, "p", lpb.text, lpb.entry_off, lpb.cstrings, lpb.data_relocs, lpb.uses_write);
+    const image = try buildImage(io, gpa, "p", lpb.text, lpb.entry_off, lpb.cstrings, lpb.data_relocs, lpb.uses_write);
     defer gpa.free(image);
     const out_path = std.fmt.allocPrint(gpa, "{s}/p", .{src_dir}) catch unreachable;
     defer gpa.free(out_path);

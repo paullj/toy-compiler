@@ -28,7 +28,14 @@ const Dag = toyc.QueryDag;
 const version = toyc.version;
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    // The per-fn codegen fan-out + parallel link tail hammer the allocator from
+    // every worker thread. `std.process.Init.gpa` is a mutex-guarded DebugAllocator
+    // in Debug/ReleaseSafe, so concurrent allocs serialize on one lock and the
+    // parallelism collapses to ~1x regardless of -j. The lock-free per-CPU
+    // `smp_allocator` lets the workers allocate without contending, so -jN actually
+    // scales in EVERY build mode. The allocator choice never affects output bytes
+    // (determinism is structural, not alloc-order dependent), so this is safe.
+    const gpa = std.heap.smp_allocator;
     const io = init.io;
 
     var stdout_buf: [4096]u8 = undefined;
@@ -57,6 +64,13 @@ pub fn main(init: std.process.Init) !void {
     // `-o` build (the content cache, not the walk, drives correctness); the walk is
     // the live in-production proof of the early-cutoff architecture.
     var query_stats = false;
+    // M18: the `-j N` jobs knob. `null` => default (a cpu-based pool, i.e. the
+    // std runtime's `.unlimited` concurrent_limit); `1` => `.limited(0)` (forces
+    // every `fanOut` onto its inline serial fallback — the true serial baseline);
+    // `N>=2` => `.limited(N)` (cap the worker pool at N). The CLI's `init.io` is
+    // fixed at `.unlimited` and not reconfigurable, so the `-o`/`--dump-dag` paths
+    // build their OWN pool from this limit (see emitExecutable / emitDumpDag).
+    var jlimit: Io.Limit = .unlimited;
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
 
@@ -108,6 +122,15 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 return argError(out, "--emit must be 'lex', 'parse', 'check', or 'ir'");
             }
+        } else if (std.mem.eql(u8, arg, "-j")) {
+            const v = args.next() orelse return argError(out, "-j requires a thread count (N>=1)");
+            const n = std.fmt.parseInt(usize, v, 10) catch return argError(out, "-j expects a positive integer");
+            if (n < 1) return argError(out, "-j must be >= 1");
+            // -j1 => .limited(0): `Io.concurrent` then always returns
+            // ConcurrencyUnavailable (Threaded busy_count >= 0 is always true), so
+            // every fanOut takes its verbatim inline serial path — zero workers.
+            // -jN => .limited(N): the pool grows to at most N concurrent workers.
+            jlimit = if (n == 1) .limited(0) else .limited(n);
         } else if (std.mem.eql(u8, arg, "-o")) {
             out_path = args.next() orelse return argError(out, "-o requires an output path");
         } else if (std.mem.eql(u8, arg, "--target")) {
@@ -144,12 +167,12 @@ pub fn main(init: std.process.Init) !void {
             try argError(out, "--dump-dag only supports aarch64-macos (it runs codegen)");
             std.process.exit(1);
         }
-        std.process.exit(try emitDumpDag(gpa, io, out, target, paths.items, opt));
+        std.process.exit(try emitDumpDag(gpa, out, target, paths.items, opt, jlimit));
     }
 
     // `-o`: lower `main` and write a signed, runnable executable.
     if (out_path) |path| {
-        std.process.exit(try emitExecutable(gpa, io, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats, query_stats));
+        std.process.exit(try emitExecutable(gpa, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats, query_stats, jlimit));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -204,7 +227,6 @@ fn basename(path: []const u8) []const u8 {
 /// success, 1 on any failure (front-end errors, no `main`, unsupported node).
 fn emitExecutable(
     gpa: std.mem.Allocator,
-    io: Io,
     out: *Io.Writer,
     target: []const u8,
     paths: []const []const u8,
@@ -214,6 +236,7 @@ fn emitExecutable(
     opt: Opt.Config,
     opt_stats: bool,
     query_stats: bool,
+    jlimit: Io.Limit,
 ) !u8 {
     // M14: `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program.
@@ -221,6 +244,13 @@ fn emitExecutable(
         try argError(out, "-o takes exactly one input file (the entry module)");
         return 1;
     }
+
+    // M18: the `-o` build runs on OUR OWN pool sized by `-j`, not the CLI's fixed
+    // `.unlimited` io. `.limited(0)` (from `-j1`) drives every fanOut serial so the
+    // single-thread build is the byte-identity baseline; `.limited(N)` caps workers.
+    var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
+    defer tail_io.deinit();
+    const io = tail_io.io();
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
@@ -343,7 +373,8 @@ fn emitExecutable(
                 try out.flush();
             }
 
-            const image = Driver.buildImage(
+            const image = try Driver.buildImage(
+                io,
                 gpa,
                 basename(out_path),
                 lp.text,
@@ -351,13 +382,7 @@ fn emitExecutable(
                 lp.cstrings,
                 lp.data_relocs,
                 lp.uses_write,
-            ) catch |err| switch (err) {
-                error.CodeTooLarge => {
-                    try argError(out, "program too large for codegen (code + strings exceed one 16 KB __TEXT page)");
-                    return 1;
-                },
-                else => |e| return e,
-            };
+            );
             defer gpa.free(image);
 
             try writeExecutable(io, out_path, image);
@@ -438,16 +463,22 @@ fn emitIr(
 /// build (default builds keep dag=null; only this path opts in).
 fn emitDumpDag(
     gpa: std.mem.Allocator,
-    io: Io,
     out: *Io.Writer,
     target: []const u8,
     paths: []const []const u8,
     opt: Opt.Config,
+    jlimit: Io.Limit,
 ) !u8 {
     if (paths.len != 1) {
         try argError(out, "--dump-dag takes exactly one input file (the entry module)");
         return 1;
     }
+
+    // M18: same OWN-pool construction as emitExecutable so `-j` governs the
+    // dag-threaded codegen fan-out too (and the dump stays byte-identical at any -j).
+    var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
+    defer tail_io.deinit();
+    const io = tail_io.io();
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
@@ -695,6 +726,7 @@ fn usage(out: *Io.Writer) !void {
         \\usage: toyc [options] <file...>
         \\  --emit lex|parse|check|ir  how far to run the pipeline (default: parse)
         \\  -o <path>         emit a signed, runnable executable (aarch64-macos only)
+        \\  -j <N>            build worker threads (N>=1; -j1 = serial; default cpu-based)
         \\  --dump            print the emit phase's artifact (tokens, or the AST)
         \\  --target <triple> compilation target (default: native)
         \\  --codegen-stats   print compiled-vs-cached function counts (with -o)
