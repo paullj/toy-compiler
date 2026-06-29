@@ -85,6 +85,9 @@ pub fn main(init: std.process.Init) !void {
     // fixed at `.unlimited` and not reconfigurable, so the `-o`/`--dump-dag` paths
     // build their OWN pool from this limit (see emitExecutable / emitDumpDag).
     var jlimit: Io.Limit = .unlimited;
+    // Worker count for the "built with N threads" line: the `-j N` value, or the host
+    // cpu count for the default (`.unlimited`) pool. 0 means "not set → use cpu count".
+    var job_count: usize = 0;
     var paths: std.ArrayList([]const u8) = .empty;
     defer paths.deinit(gpa);
 
@@ -148,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
             // every fanOut takes its verbatim inline serial path — zero workers.
             // -jN => .limited(N): the pool grows to at most N concurrent workers.
             jlimit = if (n == 1) .limited(0) else .limited(n);
+            job_count = n;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             out_path = args.next() orelse return argError(out, "-o/--output requires an output path");
         } else if (std.mem.eql(u8, arg, "--target")) {
@@ -182,6 +186,8 @@ pub fn main(init: std.process.Init) !void {
     // bare invocation builds by default unless an inspection `--emit` was requested.
     const build_exe = !dump_dag and (verb_seen or out_path != null or !emit_explicit);
     const run_after = command == .run;
+    // Worker threads the build will use (for the "built with N threads" line).
+    const threads: usize = if (job_count != 0) job_count else (std.Thread.getCpuCount() catch 1);
     if (build_exe and !isAarch64Macos(target)) {
         try argError(out, "code emission only supports aarch64-macos in M1");
         std.process.exit(1);
@@ -200,7 +206,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, target, paths.items, out_path, run_after, mode, codegen_stats, opt, opt_stats, query_stats, timings, jlimit));
+        std.process.exit(try emitExecutable(gpa, out, target, paths.items, out_path, run_after, mode, codegen_stats, opt, opt_stats, query_stats, timings, jlimit, threads));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -267,17 +273,18 @@ fn defaultOutputPath(io: Io, buf: []u8, entry: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/{s}", .{ build_dir, stemOf(basename(entry)) }) catch unreachable;
 }
 
-/// Print the always-on `built binary in <n> <unit>` line. Single integers for
-/// ns/ms/s; minutes carry a seconds remainder. Units: ns, ms, s, min.
-fn printBuildTime(out: *Io.Writer, ns: u64) !void {
+/// Print the always-on `built with <threads> thread(s) in <n> <unit>` line. Single
+/// integers for ns/ms/s; minutes carry a seconds remainder. Units: ns, ms, s, min.
+fn printBuildTime(out: *Io.Writer, threads: usize, ns: u64) !void {
+    const unit: []const u8 = if (threads == 1) "thread" else "threads";
     if (ns < std.time.ns_per_ms) {
-        try out.print("built binary in {d} ns\n", .{ns});
+        try out.print("built with {d} {s} in {d} ns\n", .{ threads, unit, ns });
     } else if (ns < std.time.ns_per_s) {
-        try out.print("built binary in {d} ms\n", .{ns / std.time.ns_per_ms});
+        try out.print("built with {d} {s} in {d} ms\n", .{ threads, unit, ns / std.time.ns_per_ms });
     } else if (ns < std.time.ns_per_min) {
-        try out.print("built binary in {d} s\n", .{ns / std.time.ns_per_s});
+        try out.print("built with {d} {s} in {d} s\n", .{ threads, unit, ns / std.time.ns_per_s });
     } else {
-        try out.print("built binary in {d} min {d} s\n", .{ ns / std.time.ns_per_min, (ns % std.time.ns_per_min) / std.time.ns_per_s });
+        try out.print("built with {d} {s} in {d} min {d} s\n", .{ threads, unit, ns / std.time.ns_per_min, (ns % std.time.ns_per_min) / std.time.ns_per_s });
     }
 }
 
@@ -407,6 +414,7 @@ fn emitExecutable(
     query_stats: bool,
     timings: bool,
     jlimit: Io.Limit,
+    threads: usize,
 ) !u8 {
     // M14: `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program.
@@ -610,7 +618,7 @@ fn emitExecutable(
             try writeExecutable(io, resolved_out, image);
             ns_image = lapNs(io, timings, &last_ns);
             const elapsed = nowNs(io) - build_start;
-            try printBuildTime(out, if (elapsed > 0) @intCast(elapsed) else 0);
+            try printBuildTime(out, threads, if (elapsed > 0) @intCast(elapsed) else 0);
             try out.flush();
             if (timings) {
                 const sub: LowerSub = .{
