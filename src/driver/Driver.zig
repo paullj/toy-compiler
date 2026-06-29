@@ -793,12 +793,15 @@ pub fn lowerGraphProgram(
     // body-green => codegen-green WITHOUT recomputing the codegen fingerprint — the
     // perf win). The decision is materialized into a per-lower_i array each worker
     // just reads. `null` when there is no dag or no prior snapshot => verbatim.
-    // Computed for `.normal` (to DRIVE green reuse) and for `.verify` (to CROSS-CHECK
-    // each green verdict's stamp against a fresh recompute — the soundness audit). In
-    // `.verify` the green fast-path is never taken; the decisions only feed the check.
+    // Computed for `.verify` ONLY — to CROSS-CHECK each green verdict's stamp against a
+    // fresh recompute (the soundness audit). The `.normal` green fast-path was REMOVED:
+    // this pre-pass is SINGLE-THREADED and cost more than the parallel per-fn fingerprint
+    // it skipped (a fully-cached build ran ~2x slower than `--force`). `.normal` now always
+    // recomputes via the content-fp cache, which delivers the identical cutoff correctly.
+    // `--force` and release builds (`dag == null`) skip this entirely.
     var reuse_decisions: ?[]Engine.Reuse = null;
     defer if (reuse_decisions) |rds| gpa.free(rds);
-    if (mode == .normal or mode == .verify) if (dag) |d| if (prior) |pr| {
+    if (mode == .verify) if (dag) |d| if (prior) |pr| {
         const rds = try computeReuse(gpa, d, pr, target, opt, lower_ids.items, eid);
         reuse_decisions = rds;
     };

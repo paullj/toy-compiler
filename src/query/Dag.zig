@@ -259,12 +259,20 @@ pub const Loaded = struct {
         self.* = undefined;
     }
 
-    /// Look up a node's persisted record (linear; nodes are sorted by (kind,id)
-    /// so this could binary-search, but the corpus is tiny and the walk is not
-    /// hot yet). Test/walk-facing.
+    /// Look up a node's persisted result fp. `nodes` is (kind,id)-sorted by `serialize`,
+    /// so this binary-searches: the red-green walk does one lookup per node + per edge, so
+    /// a linear scan made the whole walk O(N^2) — at 60k nodes a fully-cached build spent
+    /// >10s here. Binary search drops it to O(N log N) with zero extra allocation.
     pub fn nodeFp(self: *const Loaded, key: NodeKey) ?u64 {
-        for (self.nodes) |n| {
-            if (n.key.kind == key.kind and n.key.id == key.id) return n.result_fp;
+        const kk = @intFromEnum(key.kind);
+        var lo: usize = 0;
+        var hi: usize = self.nodes.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const m = self.nodes[mid].key;
+            const mk = @intFromEnum(m.kind);
+            if (mk == kk and m.id == key.id) return self.nodes[mid].result_fp;
+            if (mk < kk or (mk == kk and m.id < key.id)) lo = mid + 1 else hi = mid;
         }
         return null;
     }

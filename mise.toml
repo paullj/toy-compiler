@@ -1,6 +1,10 @@
 [tools]
 zig = "latest"
 
-[tasks.run]
-description = "Build and run the toyc CLI (args after the task name are passed through)"
+[tasks.debug]
+description = "Build and run the toyc CLI in Debug (args after the task name are passed through)"
 run = "zig build run --"
+
+[tasks.release]
+description = "Build and run the toyc CLI in ReleaseFast (args after the task name are passed through)"
+run = "zig build run -Doptimize=ReleaseFast --"

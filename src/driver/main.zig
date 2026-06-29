@@ -11,6 +11,7 @@
 //! driver; `--emit ir` dumps the target-independent IR text.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 // The CLI entry is the exe module's root; it lives in driver/ (the engine), but
 // because a Zig module cannot import files above its root source file, it reaches
@@ -331,17 +332,18 @@ fn emitExecutable(
     // This collapses the 6200×4 per-entry syscalls to ~4 (one create+writev+rename).
     defer pack.flush(io, cache.dir);
 
-    // Red-green incremental is the DEFAULT drive: a single per-build dependency `Dag`
-    // lives on this frame and is threaded through discovery, typecheck, and the per-fn
-    // codegen fan-out. The prior on-disk DAG (loaded below) DRIVES codegen reuse — a
-    // fn whose body subtree verifies green is served from the prior blob without
-    // re-deriving its fingerprint; the fresh DAG is persisted after a successful build
-    // for the next one. `--force` bypasses reuse (full rebuild); `--verify` re-lowers
-    // everything and audits each green verdict; `--query-stats` additionally PRINTS the
-    // recompute set. The recorded-edge path is byte-identical to the old verbatim path.
+    // The per-build dependency `Dag` is a DEBUG-only diagnostic seam. The `.normal`
+    // green-reuse fast-path was removed: its red-green pre-pass walked the whole prior
+    // DAG SERIALLY, which cost more than the parallel per-fn fingerprint it let us skip
+    // (a fully-cached build ran ~2x SLOWER than `--force`). The content-addressed codegen
+    // cache already delivers the correct cutoff on its own, so `.normal`/`--force` no
+    // longer touch the DAG at all. It survives ONLY to feed `--verify`'s green-verdict
+    // audit and `--query-stats` — both dev-time tools — so a RELEASE build records, loads,
+    // and persists NO DAG: `null` threads through every `if (dag)` site as a verbatim
+    // no-op, keeping the production path lean.
     var dag_storage: Dag = .init(gpa);
     defer dag_storage.deinit(gpa);
-    const dag: ?*Dag = &dag_storage;
+    const dag: ?*Dag = if (builtin.mode == .Debug) &dag_storage else null;
 
     // The program key (entry canonical path + target) names this program's on-disk DAG
     // artifact for BOTH the prior-DAG load (drive) and the post-build persist.
@@ -368,7 +370,7 @@ fn emitExecutable(
     var ns_image: u64 = 0;
 
     // --- discover the module graph from the entry file ---
-    var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], dag.?);
+    var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], dag);
     defer graph.deinit(gpa);
     if (graph.err) |ge| {
         try printGraphError(out, &graph, ge);
@@ -403,11 +405,12 @@ fn emitExecutable(
     // partial/false-green result).
     var prior_loaded: ?Dag.Loaded = null;
     defer if (prior_loaded) |*pl| pl.deinit(gpa);
-    // The prior DAG is CONSUMED only by computeReuse (mode .normal/.verify) and
-    // reportQueryStats (--query-stats). On a plain `--force` build it is pure waste,
-    // so skip even the (now in-memory) pack lookup + deserialize. The fresh DAG is
-    // still PERSISTED below for the next build — only the LOAD is gated.
-    if (mode == .normal or mode == .verify or query_stats) if (prog_key) |pk| {
+    // The prior DAG is CONSUMED only by computeReuse (the `.verify` green-verdict audit)
+    // and reportQueryStats (`--query-stats`); `.normal`/`--force` no longer reuse it. It
+    // is also DEBUG-only (`dag == null` in release), so skip even the (in-memory) pack
+    // lookup + deserialize unless a consumer actually needs it. The fresh DAG is still
+    // PERSISTED below (gated on `dag`) for the next build — only the LOAD is gated here.
+    if (dag != null and (mode == .verify or query_stats)) if (prog_key) |pk| {
         if (cache.getDag(gpa, io, pk) catch null) |blob| {
             defer gpa.free(blob);
             prior_loaded = Dag.deserialize(gpa, blob) catch null;
