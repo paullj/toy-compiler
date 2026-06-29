@@ -1,4 +1,4 @@
-//! Type checking over a parsed `Ast.Tree` plus its `Resolve.Result`.
+//! Type checking over a parsed `Ast.Tree` plus its resolution array.
 //!
 //! This is the second semantic pass, run only after name resolution succeeded
 //! (a name error would otherwise poison every type that depends on it). It walks
@@ -72,56 +72,6 @@ const type_names = std.StaticStringMap(Type).initComptime(.{
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 
-/// The pass output. Owned by the caller; free with `deinit`.
-pub const Result = struct {
-    /// One inferred type per AST node (indexed by node index). Only expression
-    /// nodes carry a meaningful value; others stay `.invalid`.
-    node_types: []Type,
-    /// Type diagnostics, in discovery order.
-    diags: []Diagnostic,
-    /// Heap-allocated diagnostic messages (the data-bearing ones); owned so they
-    /// can be freed. Static-literal messages are not in here.
-    owned_msgs: [][]u8,
-    /// One signature per function index (source order; the synthetic `print` at
-    /// index user_fn_count). The codegen fingerprint folds a callee's sig so
-    /// a signature change invalidates its callers. `params` are owned.
-    sigs: []Sig,
-    /// The struct table: one `Layout` per struct id, in declaration order.
-    /// Threaded read-only into Codegen/Fingerprint. Owned.
-    layouts: []Layout,
-    /// The enum table: one `EnumLayout` per enum id, in declaration order. Owned.
-    enum_layouts: []EnumLayout,
-
-    pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
-        gpa.free(self.node_types);
-        gpa.free(self.diags);
-        for (self.owned_msgs) |m| gpa.free(m);
-        gpa.free(self.owned_msgs);
-        for (self.sigs) |s| gpa.free(s.params);
-        gpa.free(self.sigs);
-        for (self.layouts) |l| {
-            gpa.free(l.name);
-            for (l.field_names) |fn_| gpa.free(fn_);
-            gpa.free(l.field_names);
-            gpa.free(l.field_types);
-            gpa.free(l.offsets);
-        }
-        gpa.free(self.layouts);
-        for (self.enum_layouts) |e| {
-            gpa.free(e.name);
-            for (e.variants) |v| {
-                for (v.field_names) |fn_| gpa.free(fn_);
-                gpa.free(v.field_names);
-                gpa.free(v.field_types);
-                gpa.free(v.offsets);
-            }
-            gpa.free(e.variants);
-        }
-        gpa.free(self.enum_layouts);
-        self.* = undefined;
-    }
-};
-
 // ---- M14 graph typecheck (program-wide layout + cross-module check) --------
 
 /// One module's parsed + resolved inputs for the graph typecheck.
@@ -156,6 +106,9 @@ pub const GraphResult = struct {
     diags: []Diagnostic,
     owned_msgs: [][]u8,
     /// One Sig per GLOBAL fn id (parallel to the resolver's global fn table).
+    /// `sigs[i].name` is BORROWED from the resolve `fns[i].name` table; its
+    /// lifetime is tied to the sibling resolve result (they are torn down
+    /// together). NEVER freed through a Sig — `deinit` frees only `sigs[].params`.
     sigs: []Sig,
     /// Program-wide struct table (one Layout per global struct id).
     layouts: []Layout,
@@ -2846,13 +2799,12 @@ const Parser = @import("parse.zig");
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
 const TypecheckGraph = @import("types_graph.zig");
-const Driver = @import("driver/Driver.zig");
 
 const Checked = struct {
     tokens: []Token,
     tree: Ast.Tree,
-    resolve: Resolve.Result,
-    result: Result,
+    resolve: ResolveGraph.GraphResult,
+    result: GraphResult,
     source: []const u8,
 
     fn deinit(self: *Checked, gpa: std.mem.Allocator) void {
@@ -2865,11 +2817,13 @@ const Checked = struct {
 };
 
 /// Resolve + typecheck a source as the trivial one-module graph (the ONE
-/// front-end), then project the whole-graph results back into the single-source
-/// `Resolve.Result`/`Result` carriers — exactly as `Driver.pipeline` does, via the
-/// SAME `Driver.project*` adapters, so the `Checked` shape (and every test that
-/// reads it) is unchanged. `io = null` forces serial Pass-C (deterministic; a
-/// 1-fn graph never spawns anyway).
+/// front-end), returning the whole-graph results WHOLE — exactly the carriers
+/// `Driver.pipeline` stores on a `FileResult`. The resolve result owns the fn-name
+/// strings the typecheck `sigs[].name` borrow; both are torn down together by
+/// `Checked.deinit`. `io = null` forces serial Pass-C (deterministic; a 1-fn graph
+/// never spawns anyway). Program-global fields (`result.diags`/`.sigs`) read
+/// directly; the node-parallel `result.node_types[0]`/`resolve.resolutions[0]` are
+/// the entry module (module 0 IS the file).
 fn checkSource(source: []const u8) !Checked {
     const gpa = testing.allocator;
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2883,12 +2837,9 @@ fn checkSource(source: []const u8) !Checked {
 
     var g = try Graph.single(gpa, "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
     defer g.deinitSingle(gpa);
-    var gr = try ResolveGraph.resolveGraph(gpa, &g);
-    errdefer gr.deinit(gpa);
-    // checkGraph reads `gr`; keep it live until both projections run.
-    var gtc = try TypecheckGraph.checkGraph(gpa, &g, &gr, null, null);
-    const result = Driver.projectTypecheck(gpa, &gtc);
-    const res = Driver.projectResolve(gpa, &gr);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    errdefer res.deinit(gpa);
+    const result = try TypecheckGraph.checkGraph(gpa, &g, &res, null, null);
     return .{ .tokens = tokens, .tree = tree, .resolve = res, .result = result, .source = source };
 }
 
@@ -2964,7 +2915,7 @@ test "typed local x: T = e binds x to the annotation" {
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     for (c.tree.nodes, 0..) |n, i| {
-        if (n.tag == .var_decl and n.rhs != Ast.none) try testing.expectEqual(Type.int, c.result.node_types[i]);
+        if (n.tag == .var_decl and n.rhs != Ast.none) try testing.expectEqual(Type.int, c.result.node_types[0][i]);
     }
 }
 
@@ -3046,7 +2997,7 @@ test "comparison yields bool" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     // The var_decl's bound type is bool.
     for (c.tree.nodes, 0..) |n, i| {
-        if (n.tag == .var_decl) try testing.expectEqual(Type.bool, c.result.node_types[i]);
+        if (n.tag == .var_decl) try testing.expectEqual(Type.bool, c.result.node_types[0][i]);
     }
 }
 
@@ -3174,7 +3125,7 @@ test "&& and || on bool operands yield bool" {
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     for (c.tree.nodes, 0..) |n, i| {
-        if (n.tag == .var_decl) try testing.expectEqual(Type.bool, c.result.node_types[i]);
+        if (n.tag == .var_decl) try testing.expectEqual(Type.bool, c.result.node_types[0][i]);
     }
 }
 
@@ -3185,7 +3136,7 @@ test "string literal types as str" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     // The var_decl's bound type is str.
     for (c.tree.nodes, 0..) |n, i| {
-        if (n.tag == .var_decl) try testing.expectEqual(Type.str, c.result.node_types[i]);
+        if (n.tag == .var_decl) try testing.expectEqual(Type.str, c.result.node_types[0][i]);
     }
 }
 
@@ -3349,7 +3300,7 @@ test "print resolves and typechecks at index user_fn_count" {
     var found = false;
     for (c.tree.nodes) |n| {
         if (n.tag == .call) {
-            const callee_res = c.resolve.resolutions[n.lhs];
+            const callee_res = c.resolve.resolutions[0][n.lhs];
             try testing.expect(callee_res == .func);
             try testing.expectEqual(@as(u32, 1), callee_res.func);
             found = true;
@@ -3557,8 +3508,8 @@ test "node_types carry the struct type with the right id, and a 3-int layout is 
     var found = false;
     for (c.tree.nodes, 0..) |n, i| {
         if (n.tag == .struct_init) {
-            try testing.expectEqual(Kind.@"struct", c.result.node_types[i].kind);
-            try testing.expectEqual(@as(u32, 0), c.result.node_types[i].struct_id);
+            try testing.expectEqual(Kind.@"struct", c.result.node_types[0][i].kind);
+            try testing.expectEqual(@as(u32, 0), c.result.node_types[0][i].struct_id);
             found = true;
         }
     }
@@ -3740,8 +3691,8 @@ test "an enum node carries an @\"enum\" type with the right id" {
     for (c.tree.nodes, 0..) |n, i| {
         if (n.tag == .field_access) {
             // `S.A` (unit variant ref) carries the enum type.
-            if (c.result.node_types[i].kind == .@"enum") {
-                try testing.expectEqual(@as(u32, 0), c.result.node_types[i].enum_id);
+            if (c.result.node_types[0][i].kind == .@"enum") {
+                try testing.expectEqual(@as(u32, 0), c.result.node_types[0][i].enum_id);
                 found = true;
             }
         }

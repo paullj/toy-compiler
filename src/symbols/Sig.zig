@@ -18,6 +18,8 @@ const types = @import("../types.zig");
 /// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [Cx]
 pub const Sig = struct {
     kind: Sym.SymKind,
+    /// BORROWED from the resolve fns table (`GraphResult.fns[i].name`); its
+    /// lifetime is tied to the sibling resolve result. NEVER freed through a Sig.
     name: []const u8,
     params: []const types.Type,
     ret: types.Type,

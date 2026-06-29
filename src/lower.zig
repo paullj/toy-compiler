@@ -1788,17 +1788,16 @@ const testing = std.testing;
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
 const TypecheckGraph = @import("types_graph.zig");
-const Driver = @import("driver/Driver.zig");
 
-/// The single-source front-end result a lower test feeds into `Inputs`: a
-/// name-resolution `Result` + a typecheck `Result`. Built by resolving and
-/// type-checking the source as the trivial one-module graph (the ONE front-end)
-/// and projecting back, via the SAME `Driver.project*` adapters `Driver.pipeline`
-/// uses — so the test reads (`rr.resolutions`, `tc.node_types`/`.layouts`/
-/// `.enum_layouts`) are unchanged.
+/// The front-end results a lower test feeds into `Inputs`: the whole-graph
+/// resolve + typecheck results stored WHOLE (a one-module graph — the ONE
+/// front-end). The resolve result owns the fn-name strings the typecheck
+/// `sigs[].name` borrow; both are torn down together. The node-parallel reads are
+/// the entry module: `resolve.resolutions[0]` / `typecheck.node_types[0]`;
+/// `.layouts`/`.enum_layouts` are program-global.
 const FrontEnd = struct {
-    resolve: Resolve.Result,
-    typecheck: Typecheck.Result,
+    resolve: ResolveGraph.GraphResult,
+    typecheck: Typecheck.GraphResult,
 
     fn deinit(self: *FrontEnd, gpa: std.mem.Allocator) void {
         self.typecheck.deinit(gpa);
@@ -1808,17 +1807,15 @@ const FrontEnd = struct {
 
 /// Resolve + typecheck `src` (already lexed/parsed) as a one-module graph. The
 /// graph BORROWS `tokens`/`tree`/`src` (the caller keeps them alive past the
-/// returned `FrontEnd`), so it is torn down immediately; the projected `Result`s
-/// own their arrays. `io = null` => serial Pass-C (deterministic).
+/// returned `FrontEnd`), so it is torn down immediately; the results own their
+/// arrays. `io = null` => serial Pass-C (deterministic).
 fn frontEnd(gpa: std.mem.Allocator, tokens: []const Token, tree: Ast.Tree, src: []const u8) !FrontEnd {
     var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
     defer g.deinitSingle(gpa);
-    var gr = try ResolveGraph.resolveGraph(gpa, &g);
-    errdefer gr.deinit(gpa);
-    var gtc = try TypecheckGraph.checkGraph(gpa, &g, &gr, null, null);
-    const tc = Driver.projectTypecheck(gpa, &gtc);
-    const rr = Driver.projectResolve(gpa, &gr);
-    return .{ .resolve = rr, .typecheck = tc };
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    errdefer res.deinit(gpa);
+    const tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, null);
+    return .{ .resolve = res, .typecheck = tc };
 }
 
 /// Parse + resolve + typecheck `src`, lower the named fn, render it, and compare
@@ -1864,8 +1861,8 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
         .tokens = tokens,
         .source = src,
-        .resolutions = rr.resolutions,
-        .node_types = tc.node_types,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -1963,8 +1960,8 @@ test "lower-core: while loop with break/continue is well-formed" {
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
         .tokens = tokens,
         .source = src,
-        .resolutions = rr.resolutions,
-        .node_types = tc.node_types,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -2005,8 +2002,8 @@ test "lower-core: out-of-range int literal yields a diagnostic" {
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
         .tokens = tokens,
         .source = src,
-        .resolutions = rr.resolutions,
-        .node_types = tc.node_types,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -2073,8 +2070,8 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
         .tokens = tokens,
         .source = src,
-        .resolutions = rr.resolutions,
-        .node_types = tc.node_types,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,

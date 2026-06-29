@@ -1,15 +1,16 @@
-//! Name-resolution result carrier (the `[]Resolution` parallel to a tree's node
-//! array, plus its diagnostics).
+//! Name-resolution shared types (the `Resolution` value re-export + the
+//! `Diagnostic` shape).
 //!
 //! The resolution PASS itself lives in `resolve_graph.zig`: a lone source file is
 //! resolved as the trivial one-module graph (`Graph.single` → `resolveGraph`), so
-//! there is exactly ONE resolver. This module just owns the single-source `Result`
-//! shape every downstream reader (the driver `FileResult`, `lower`) expects, with
-//! the graph result projected into it (see `Driver.projectResolve`).
+//! there is exactly ONE resolver, whose `ResolveGraph.GraphResult` is consumed
+//! whole everywhere (the driver `FileResult`, `lower`). This module just owns the
+//! peer types those readers spell as `Resolve.Resolution` / `Resolve.Diagnostic`.
 //!
-//! Resolution is lexical and index-based: `resolutions` is a `[]Resolution`
-//! parallel to the node array (only identifier-expression nodes carry a value;
-//! others stay `.unresolved`). The pass never stops at the first error.
+//! Resolution is lexical and index-based: a result's `resolutions` is a
+//! `[]Resolution` parallel to the node array (only identifier-expression nodes
+//! carry a value; others stay `.unresolved`). The pass never stops at the first
+//! error.
 
 const std = @import("std");
 const Token = @import("ast/Token.zig").Token;
@@ -23,26 +24,6 @@ pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 /// A reported problem. Same shape as `Parser.Diagnostic` so the driver/CLI can
 /// render either uniformly (byte offset → line:col).
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
-
-/// The pass output. Owned by the caller; free with `deinit`.
-pub const Result = struct {
-    /// One entry per AST node (indexed by node index). Only identifier-expression
-    /// nodes carry a meaningful value; others stay `.unresolved`.
-    resolutions: []Resolution,
-    /// Resolution diagnostics, in discovery order.
-    diags: []Diagnostic,
-    /// Heap-allocated diagnostic messages (the name-bearing ones); owned so they
-    /// can be freed. Static-literal messages are not in here.
-    owned_msgs: [][]u8,
-
-    pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
-        gpa.free(self.resolutions);
-        gpa.free(self.diags);
-        for (self.owned_msgs) |m| gpa.free(m);
-        gpa.free(self.owned_msgs);
-        self.* = undefined;
-    }
-};
 
 // ---- tests -----------------------------------------------------------------
 

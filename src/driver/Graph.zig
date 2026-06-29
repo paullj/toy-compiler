@@ -217,10 +217,10 @@ pub fn discoverDag(
 /// test's parse arena) owns them and OUTLIVES every result derived from this graph.
 /// This is LOAD-BEARING for correctness, not just an optimization: the typecheck
 /// `EnumLayout` carries its variant `name`s as BORROWED slices into `module.source`
-/// (see `layout/Engine.zig`), so the projected `Typecheck.Result` aliases this
-/// graph's `source`. If `single` duped the source and the graph were freed before
-/// the result is consumed (e.g. `Driver.pipeline`'s `defer graph.deinit` vs the
-/// later `lowerProgram`), every variant name would dangle. Borrowing the caller's
+/// (see `layout/Engine.zig`), so the `Typecheck.GraphResult` aliases this graph's
+/// `source`. If `single` duped the source and the graph were freed before the
+/// result is consumed (e.g. `Driver.pipeline`'s `defer graph.deinit` vs the later
+/// `lowerProgram`), every variant name would dangle. Borrowing the caller's
 /// (longer-lived) source keeps those names valid. Tear down with `deinitSingle`,
 /// which frees ONLY the one-element `modules` spine and never the borrowed fields.
 ///

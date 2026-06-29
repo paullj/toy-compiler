@@ -20,8 +20,8 @@
 //! maps + import namespaces) the type checker borrows; the returned
 //! `types.GraphResult` is owned by the caller. This is the ONE type checker: a
 //! lone source file is checked as the trivial one-module graph (`Graph.single` →
-//! `checkGraph`), its result projected into the single-source `types.Result`
-//! carrier (see `Driver.projectTypecheck`).
+//! `checkGraph`), and its `GraphResult` is consumed WHOLE everywhere (no separate
+//! single-source carrier).
 
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");

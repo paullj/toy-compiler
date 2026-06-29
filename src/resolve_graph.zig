@@ -30,8 +30,9 @@
 //!
 //! This is the ONE name resolver. A lone source file is resolved as the trivial
 //! one-module graph (`Graph.single` → `resolveGraph`); there is no separate
-//! single-file resolver. `resolve.zig` holds only the result-carrier shape that
-//! the graph result is projected into for the single-source callers.
+//! single-file resolver, and the `GraphResult` is consumed WHOLE everywhere (the
+//! driver `FileResult`, `lower`). `resolve.zig` holds only the shared peer types
+//! (`Resolution`/`Diagnostic`) those readers spell as `Resolve.*`.
 
 const std = @import("std");
 const Token = @import("ast/Token.zig").Token;
