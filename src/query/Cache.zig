@@ -5,7 +5,7 @@
 //! Cache key = (compiler identity, phase, target, inputs):
 //!
 //!   * Compiler identity is the *directory* — every entry lives under
-//!     `.toy-cache/<stamp>/` (see `version.zig`). A different compiler build
+//!     `.toy/<stamp>/cache/` (see `version.zig`). A different compiler build
 //!     simply writes to a different subdir, so we never read stale results and
 //!     never need wipe-on-startup logic. Old subdirs can be GC'd lazily.
 //!   * Phase, target, and a hash of the inputs are folded into the per-entry
@@ -78,7 +78,7 @@ pub const Key = struct {
 };
 
 /// The single packed content-addressed object store — ONE file per stamp dir
-/// (`.toy-cache/<stamp>/pack.bin`) replacing the 6200 per-entry files. Mirrors
+/// (`.toy/<stamp>/cache/pack.bin`) replacing the 6200 per-entry files. Mirrors
 /// rustc's single dep-graph file / a ccache manifest / a Bazel CAS: a single-file
 /// object store avoids per-unit directory churn (the renameat/openat storm + the
 /// single-dir inode contention that degrades -j past 4).
@@ -434,7 +434,7 @@ pub const Pack = struct {
     }
 };
 
-/// Per-compiler cache directory, e.g. ".toy-cache/0.0.0-1a2b3c...". Borrowed,
+/// Per-compiler cache directory, e.g. ".toy/0.0.0+1a2b3c.../cache". Borrowed,
 /// must outlive the `Cache` (the driver keeps it on its stack for the run).
 dir: []const u8,
 
@@ -449,7 +449,7 @@ dir: []const u8,
 /// default) is the VERBATIM one-file-per-entry path — byte-identical to before.
 pack: ?*Pack = null,
 
-/// Create the per-stamp cache directory (and the `.toy-cache` root) if needed.
+/// Create the per-stamp cache directory (and the `.toy` root) if needed.
 /// `dir` must already include the compiler stamp.
 pub fn init(io: Io, dir: []const u8) !Cache {
     try Io.Dir.cwd().createDirPath(io, dir);

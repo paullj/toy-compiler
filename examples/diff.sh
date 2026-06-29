@@ -14,7 +14,7 @@
 set -u
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-toyc="$root/zig-out/bin/toyc"
+toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 

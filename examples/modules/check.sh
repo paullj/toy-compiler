@@ -10,7 +10,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 # Resolve the toyc binary without ever invoking `zig build test` (which deadlocks
 # under the --listen runner); build the normal CLI binary if it is missing.
-toyc="$root/zig-out/bin/toyc"
+toyc="$root/zig-out/bin/toy"
 if [ ! -x "$toyc" ]; then
   echo "building toyc..."
   ( cd "$root" && zig build ) || { echo "build failed"; exit 1; }

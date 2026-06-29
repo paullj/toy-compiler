@@ -3,7 +3,7 @@
 //! The cache must never serve results produced by a *different* compiler. We
 //! derive a stamp from `source_digest` — a hash of the compiler's own source —
 //! so any edit (committed or not) lands cache entries in a fresh
-//! `.toy-cache/<stamp>/` subdir and stale results are never read.
+//! `.toy/<stamp>/cache/` subdir and stale results are never read.
 //!
 //! `source_digest` is computed at *build time* by hashing every file under
 //! `src/` (see `sourceDigest` in build.zig) and injected via the
@@ -25,7 +25,7 @@ pub const source_digest: u64 = build_options.source_digest;
 /// The cache stamp: identifies "this exact compiler build". Written into a
 /// buffer (no allocation). Used as the per-compiler cache subdirectory name.
 pub fn stamp(buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}-{x:0>16}", .{ semver, source_digest }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}+{x:0>16}", .{ semver, source_digest }) catch unreachable;
 }
 
 /// Upper bound on the length of `stamp`, for sizing stack buffers.

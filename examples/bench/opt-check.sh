@@ -23,11 +23,11 @@
 # could otherwise serve cross-opt-level garbage.
 #
 # Run from anywhere: resolves the repo root and prefers the prebuilt
-# zig-out/bin/toyc, building it via `mise exec -- zig build` if missing.
+# zig-out/bin/toy, building it via `mise exec -- zig build` if missing.
 set -u
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-toyc="$root/zig-out/bin/toyc"
+toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 

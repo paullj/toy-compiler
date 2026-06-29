@@ -4,7 +4,7 @@
 //! temp-dir `Cache` stand-in and drives real lex/parse + a real on-disk cache. They
 //! consume the compiler as a BLACK BOX through `@import("toy_compiler")` (the
 //! published surface), so they live in the repo-root tests/ — not inline in
-//! Engine.zig — and run in their own `toyc-integration-test` binary.
+//! Engine.zig — and run in their own `toy-integration-test` binary.
 //!
 //! M15 lifted the distributed query/cache/fingerprint/force-verify/parallel logic
 //! into `Engine` + `Key` + `Cache` + `Fingerprint`. These pin the five boundary

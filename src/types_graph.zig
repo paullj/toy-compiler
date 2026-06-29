@@ -240,7 +240,7 @@ test "cross-module call typechecks clean and yields the callee return type" {
             try testing.expectEqual(Typecheck.Kind.int, tr.node_types[entry][call].kind);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-xcall", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-xcall", files, "main.toy", Check.run);
 }
 
 test "same-named structs in two modules get DISTINCT global ids" {
@@ -274,7 +274,7 @@ test "same-named structs in two modules get DISTINCT global ids" {
             try testing.expect(sizes[0] == 16 or sizes[1] == 16); // b.T = 16
         }
     };
-    try withCheckedGraph(".toyc-test-typ-2t", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-2t", files, "main.toy", Check.run);
 }
 
 test "qualified pub type in a signature resolves to the owning module's layout" {
@@ -311,7 +311,7 @@ test "qualified pub type in a signature resolves to the owning module's layout" 
             _ = entry;
         }
     };
-    try withCheckedGraph(".toyc-test-typ-qtype", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-qtype", files, "main.toy", Check.run);
 }
 
 test "pub fn exposing a non-pub return type is a coherence error" {
@@ -350,7 +350,7 @@ test "pub fn exposing a non-pub return type is a coherence error" {
             try testing.expect(std.mem.indexOf(u8, tr.diags[0].message, "Secret") != null);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-coherence", files2, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-coherence", files2, "main.toy", Check.run);
 }
 
 test "a pub fn naming a pub type in its signature is coherent (no error)" {
@@ -373,7 +373,7 @@ test "a pub fn naming a pub type in its signature is coherent (no error)" {
             try testing.expectEqual(@as(usize, 0), tr.diags.len);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-coherent-ok", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-coherent-ok", files, "main.toy", Check.run);
 }
 
 test "cross-module argument type mismatch is reported against the importer" {
@@ -396,7 +396,7 @@ test "cross-module argument type mismatch is reported against the importer" {
             try testing.expect(std.mem.indexOf(u8, tr.diags[0].message, "expected int") != null);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-argmismatch", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-argmismatch", files, "main.toy", Check.run);
 }
 
 test "3-level cross-module mod.Enum.Variant typechecks to the owning enum type" {
@@ -428,7 +428,7 @@ test "3-level cross-module mod.Enum.Variant typechecks to the owning enum type" 
             try testing.expect(saw_enum);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-3level", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-3level", files, "main.toy", Check.run);
 }
 
 test "a cross-module struct field type resolves through a qualified field annotation" {
@@ -465,7 +465,7 @@ test "a cross-module struct field type resolves through a qualified field annota
             try testing.expect(saw_wrap);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-xfield", files, "main.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-xfield", files, "main.toy", Check.run);
 }
 
 test "single-module graph typechecks like the single-file checker" {
@@ -487,7 +487,7 @@ test "single-module graph typechecks like the single-file checker" {
             try testing.expectEqual(@as(u32, 16), tr.layouts[0].size);
         }
     };
-    try withCheckedGraph(".toyc-test-typ-solo", files, "solo.toy", Check.run);
+    try withCheckedGraph(".toy-test-typ-solo", files, "solo.toy", Check.run);
 }
 
 /// S4 PARALLEL == SERIAL: discover+resolve ONCE, then type-check the SAME graph
@@ -521,7 +521,7 @@ test "S4: parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)"
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir = ".toyc-test-typ-s4det";
+    const dir = ".toy-test-typ-s4det";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     try Io.Dir.cwd().createDirPath(io, dir);
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};

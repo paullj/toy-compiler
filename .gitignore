@@ -1,5 +1,5 @@
 zig-out/
 .zig-cache/
-.toy-cache/
+.toy/
 .DS_Store
 temp/

@@ -1,10 +1,23 @@
 [tools]
 zig = "latest"
 
-[tasks.debug]
-description = "Build and run the toyc CLI in Debug (args after the task name are passed through)"
-run = "zig build run --"
+# `<verb>:<mode>`: <verb> is the toy subcommand (build = compile; run = compile +
+# execute), <mode> is the toolchain used to build the toy compiler itself. Pass the
+# input file (and any flags) after the task name, e.g. `mise run run:release main.toy`.
+# These build the compiler then invoke the binary DIRECTLY (not via `zig build run`),
+# so `run`'s exit-code passthrough surfaces cleanly instead of as a zig "build failed".
+[tasks."build:debug"]
+description = "Build the toy compiler (Debug) and `build` the given program"
+run = "zig build && ./zig-out/bin/toy build"
 
-[tasks.release]
-description = "Build and run the toyc CLI in ReleaseFast (args after the task name are passed through)"
-run = "zig build run -Doptimize=ReleaseFast --"
+[tasks."build:release"]
+description = "Build the toy compiler (ReleaseFast) and `build` the given program"
+run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy build"
+
+[tasks."run:debug"]
+description = "Build the toy compiler (Debug) and `run` the given program"
+run = "zig build && ./zig-out/bin/toy run"
+
+[tasks."run:release"]
+description = "Build the toy compiler (ReleaseFast) and `run` the given program"
+run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy run"

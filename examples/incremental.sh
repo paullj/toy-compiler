@@ -23,7 +23,7 @@
 set -u
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
-toyc="$root/zig-out/bin/toyc"
+toyc="$root/zig-out/bin/toy"
 
 echo "building toyc..."
 if command -v zig >/dev/null 2>&1; then zig="zig"

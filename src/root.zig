@@ -68,6 +68,6 @@ test {
     // Inline unit tests live in their modules (pulled via the `_ = X` refs above —
     // e.g. Cache's digest tests in query/Cache.zig). The engine BOUNDARY suite
     // (integration: temp-dir cache + threaded runtime) is NOT pulled here — it lives
-    // in the repo-root tests/ and runs in its own `toyc-integration-test` artifact
+    // in the repo-root tests/ and runs in its own `toy-integration-test` artifact
     // (see build.zig), consuming the compiler as a black box via @import("toy_compiler").
 }

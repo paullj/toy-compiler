@@ -33,17 +33,17 @@ const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
 const version = @import("../version.zig");
 
-pub const cache_root = ".toy-cache";
+pub const cache_root = ".toy";
 
-/// The buffer size `openCache` needs for `dir_buf`.
-pub const cache_dir_buf_len = cache_root.len + 1 + version.stamp_max;
+/// The buffer size the cache `dir_buf` needs: `.toy/<stamp>/cache`.
+pub const cache_dir_buf_len = cache_root.len + 1 + version.stamp_max + "/cache".len;
 
-/// Open the per-compiler cache directory (`.toy-cache/<stamp>/`). `dir_buf` must
+/// Open the per-compiler cache directory (`.toy/<stamp>/cache/`). `dir_buf` must
 /// outlive the returned `Cache` (it borrows the formatted path). Used by the CLI
 /// to share one cache across `Driver.run` (front-end) and `lowerProgram` (codegen).
 pub fn openCache(io: Io, dir_buf: []u8) !Cache {
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     return Cache.init(io, dir);
 }
 
@@ -53,7 +53,7 @@ pub fn openCache(io: Io, dir_buf: []u8) !Cache {
 /// the build and `flush` it after.
 pub fn openCachePack(io: Io, dir_buf: []u8, pack: *Cache.Pack) !Cache {
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     return Cache.initPack(io, dir, pack);
 }
 
@@ -148,11 +148,11 @@ pub const FileResult = struct {
 /// `FileResult.err`, not as a hard error. Caller owns the slice and must
 /// `deinit` each result.
 pub fn run(gpa: std.mem.Allocator, io: Io, emit: Emit, target: []const u8, paths: []const []const u8) ![]FileResult {
-    // Cache is namespaced by compiler identity: .toy-cache/<stamp>/. The buffer
+    // Cache is namespaced by compiler identity: .toy/<stamp>/cache/. The buffer
     // lives on this stack frame, which outlives every job (we await below).
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     const results = try gpa.alloc(FileResult, paths.len);
@@ -1105,7 +1105,7 @@ test "cold then warm parse: 2nd run hits cache and renders identically" {
     const io = threaded.io();
 
     // Write a source file into a unique temp dir so we don't disturb the repo.
-    const dir_name = ".toyc-test-driver";
+    const dir_name = ".toy-test-driver";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -1116,9 +1116,9 @@ test "cold then warm parse: 2nd run hits cache and renders identically" {
     const path = dir_name ++ "/p.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     // Ensure a genuinely cold start: drop any prior parse entry for this source.
@@ -1155,7 +1155,7 @@ test "emit=check on a clean program resolves with no diagnostics" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-check-ok";
+    const dir_name = ".toy-test-driver-check-ok";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -1164,9 +1164,9 @@ test "emit=check on a clean program resolves with no diagnostics" {
     const path = dir_name ++ "/p.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     var r: FileResult = .{ .path = path };
@@ -1185,7 +1185,7 @@ test "emit=check on a bad program reports a resolve error" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-check-bad";
+    const dir_name = ".toy-test-driver-check-bad";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -1194,9 +1194,9 @@ test "emit=check on a bad program reports a resolve error" {
     const path = dir_name ++ "/p.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     var r: FileResult = .{ .path = path };
@@ -1215,14 +1215,14 @@ test "lowerProgram reports missing main and lowers a simple main" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-lower";
+    const dir_name = ".toy-test-driver-lower";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     // No `main` -> a clear error, no codegen.
@@ -1289,9 +1289,9 @@ test "integration: emitted binary runs with the right exit code" {
     var dir_name_buf: [64]u8 = undefined;
     const dir_name = std.fmt.bufPrint(&dir_name_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     const Case = struct { src: []const u8, name: []const u8, expect: u8 };
@@ -1664,9 +1664,9 @@ test "integration: print writes the expected bytes to stdout" {
     var dir_name_buf: [64]u8 = undefined;
     const dir_name = std.fmt.bufPrint(&dir_name_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     const Case = struct { src: []const u8, name: []const u8, want: []const u8 };
@@ -2157,14 +2157,14 @@ test "M10 errors: non-exhaustive/unknown variant/arity/type; recursive enum; uni
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-m10-err";
+    const dir_name = ".toy-test-driver-m10-err";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     const cases = [_][]const u8{
@@ -2195,14 +2195,14 @@ test "M11 errors: non-exhaustive int/bool; guarded-only/partial-nested variant; 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-m11-err";
+    const dir_name = ".toy-test-driver-m11-err";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     const cases = [_][]const u8{
@@ -2285,14 +2285,14 @@ test "M9 errors: missing/unknown/mismatched fields; positional construction; rec
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-m9-err";
+    const dir_name = ".toy-test-driver-m9-err";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     // All these are caught in Typecheck (after Resolve), so each is a TypeError.
@@ -2332,14 +2332,14 @@ test "M8 errors: undefined/duplicate labels (Resolve); continue-block & value-br
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-m8-err";
+    const dir_name = ".toy-test-driver-m8-err";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     const ErrCase = struct { src: []const u8, want: anyerror };
@@ -2386,14 +2386,14 @@ test "M7 error: break/continue outside a loop and break-value in while/for are r
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir_name = ".toyc-test-driver-m7-err";
+    const dir_name = ".toy-test-driver-m7-err";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    var dir_buf: [cache_root.len + 1 + version.stamp_max]u8 = undefined;
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
     var stamp_buf: [version.stamp_max]u8 = undefined;
-    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
     // The outside-loop and break-value checks live in Typecheck, so each is a TypeError.

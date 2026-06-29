@@ -12,7 +12,7 @@
 //!   * the typecheck signature node id RECONCILES with codegen's (`Wyhash("SGNM",
 //!     name)`) so a body->signature and a codegen->signature edge share one node.
 //!
-//! Black box through `@import("toy_compiler")`; runs in `toyc-integration-test`.
+//! Black box through `@import("toy_compiler")`; runs in `toy-integration-test`.
 
 const std = @import("std");
 const Io = std.Io;

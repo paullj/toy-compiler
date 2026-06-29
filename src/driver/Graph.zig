@@ -776,7 +776,7 @@ test "discover: 3-module graph (entry -> two imports, one shared)" {
             try testing.expectEqual(@as(usize, 1), util_count);
         }
     };
-    try withFixture(".toyc-test-graph-3mod", files, "main.toy", Check.run);
+    try withFixture(".toy-test-graph-3mod", files, "main.toy", Check.run);
 }
 
 test "discover: import cycle is rejected with a cycle path" {
@@ -807,7 +807,7 @@ test "discover: import cycle is rejected with a cycle path" {
             try testing.expect(std.mem.indexOf(u8, g.err.?.detail, "->") != null);
         }
     };
-    try withFixture(".toyc-test-graph-cycle", files, "main.toy", Check.run);
+    try withFixture(".toy-test-graph-cycle", files, "main.toy", Check.run);
 }
 
 test "discover: missing import errors cleanly with location" {
@@ -827,7 +827,7 @@ test "discover: missing import errors cleanly with location" {
             try testing.expect(std.mem.indexOf(u8, g.err.?.message, "nope/missing") != null);
         }
     };
-    try withFixture(".toyc-test-graph-missing", files, "main.toy", Check.run);
+    try withFixture(".toy-test-graph-missing", files, "main.toy", Check.run);
 }
 
 test "discover: self-import is a cycle" {
@@ -844,7 +844,7 @@ test "discover: self-import is a cycle" {
             try testing.expectEqual(Error.Kind.cycle, g.err.?.kind);
         }
     };
-    try withFixture(".toyc-test-graph-self", files, "main.toy", Check.run);
+    try withFixture(".toy-test-graph-self", files, "main.toy", Check.run);
 }
 
 test "discover: single entry with no imports" {
@@ -862,7 +862,7 @@ test "discover: single entry with no imports" {
             try testing.expectEqual(@as(usize, 0), g.entry().imports.len);
         }
     };
-    try withFixture(".toyc-test-graph-solo", files, "solo.toy", Check.run);
+    try withFixture(".toy-test-graph-solo", files, "solo.toy", Check.run);
 }
 
 test "single: trivial one-module graph from a parsed source" {

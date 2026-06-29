@@ -889,7 +889,7 @@ test "cross-module call resolves to a global fn with a qualified name" {
             try testing.expect(saw_main);
         }
     };
-    try withResolvedGraph(".toyc-test-res-xmod", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-xmod", files, "main.toy", Check.run);
 }
 
 test "two modules with same-named fn get distinct qualified global ids" {
@@ -922,7 +922,7 @@ test "two modules with same-named fn get distinct qualified global ids" {
             _ = g;
         }
     };
-    try withResolvedGraph(".toyc-test-res-2area", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-2area", files, "main.toy", Check.run);
 }
 
 test "referencing a non-pub fn cross-module is a visibility error" {
@@ -945,7 +945,7 @@ test "referencing a non-pub fn cross-module is a visibility error" {
             try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "secret") != null);
         }
     };
-    try withResolvedGraph(".toyc-test-res-priv", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-priv", files, "main.toy", Check.run);
 }
 
 test "unknown cross-module member errors against the importer" {
@@ -967,7 +967,7 @@ test "unknown cross-module member errors against the importer" {
             try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "no member") != null);
         }
     };
-    try withResolvedGraph(".toyc-test-res-unknown", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-unknown", files, "main.toy", Check.run);
 }
 
 test "namespace collision without `as` is an error; `as` disambiguates" {
@@ -988,7 +988,7 @@ test "namespace collision without `as` is an error; `as` disambiguates" {
             try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "collides") != null);
         }
     };
-    try withResolvedGraph(".toyc-test-res-collide", collide, "main.toy", Collide.run);
+    try withResolvedGraph(".toy-test-res-collide", collide, "main.toy", Collide.run);
 
     const aliased = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
@@ -1006,7 +1006,7 @@ test "namespace collision without `as` is an error; `as` disambiguates" {
             try testing.expectEqual(@as(usize, 0), r.diags.len);
         }
     };
-    try withResolvedGraph(".toyc-test-res-alias", aliased, "main.toy", Aliased.run);
+    try withResolvedGraph(".toy-test-res-alias", aliased, "main.toy", Aliased.run);
 }
 
 test "a local shadows an import namespace (innermost binding wins)" {
@@ -1035,7 +1035,7 @@ test "a local shadows an import namespace (innermost binding wins)" {
             try testing.expect(r.resolutions[entry][recv_idx] == .local);
         }
     };
-    try withResolvedGraph(".toyc-test-res-shadow", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-shadow", files, "main.toy", Check.run);
 }
 
 test "qualified pub type in a signature resolves quietly (no error)" {
@@ -1058,7 +1058,7 @@ test "qualified pub type in a signature resolves quietly (no error)" {
             try testing.expectEqual(@as(usize, 0), r.diags.len);
         }
     };
-    try withResolvedGraph(".toyc-test-res-qtype", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-qtype", files, "main.toy", Check.run);
 }
 
 test "referencing a non-pub type cross-module is a visibility error" {
@@ -1081,7 +1081,7 @@ test "referencing a non-pub type cross-module is a visibility error" {
             try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "not exported") != null);
         }
     };
-    try withResolvedGraph(".toyc-test-res-qtype-priv", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-qtype-priv", files, "main.toy", Check.run);
 }
 
 test "3-level cross-module mod.Enum.Variant binds the inner receiver to .module, no error" {
@@ -1123,7 +1123,7 @@ test "3-level cross-module mod.Enum.Variant binds the inner receiver to .module,
             try testing.expect(inner_recv_is_module);
         }
     };
-    try withResolvedGraph(".toyc-test-res-3level", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-3level", files, "main.toy", Check.run);
 }
 
 test "single-module graph resolves bodies like the single-file resolver" {
@@ -1144,7 +1144,7 @@ test "single-module graph resolves bodies like the single-file resolver" {
             try testing.expect(r.resolutions[entry][callee] == .func);
         }
     };
-    try withResolvedGraph(".toyc-test-res-solo", files, "solo.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-solo", files, "solo.toy", Check.run);
 }
 
 test "print is available unqualified in every module with one shared id" {
@@ -1180,5 +1180,5 @@ test "print is available unqualified in every module with one shared id" {
             }
         }
     };
-    try withResolvedGraph(".toyc-test-res-print", files, "main.toy", Check.run);
+    try withResolvedGraph(".toy-test-res-print", files, "main.toy", Check.run);
 }

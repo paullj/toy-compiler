@@ -48,6 +48,15 @@ pub fn main(init: std.process.Init) !void {
 
     var dump = false;
     var emit: Driver.Emit = .parse;
+    // The DEFAULT action is to BUILD an executable; `--emit` opts into an inspection
+    // mode instead. This tracks whether the user asked for one, so a bare `toyc <file>`
+    // builds (output → the default build dir) rather than printing a report.
+    var emit_explicit = false;
+    // The optional leading subcommand: `build` (compile to an executable, the default)
+    // or `run` (build, then execute the produced binary and report how it ended).
+    const Command = enum { build, run };
+    var command: Command = .build;
+    var verb_seen = false;
     var target: []const u8 = "native";
     var out_path: ?[]const u8 = null;
     var codegen_stats = false;
@@ -117,6 +126,7 @@ pub fn main(init: std.process.Init) !void {
             const p = passByName(name) orelse return argError(out, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
             opt.set(p, false);
         } else if (std.mem.eql(u8, arg, "--emit")) {
+            emit_explicit = true;
             const v = args.next() orelse return argError(out, "--emit requires a value (lex|parse|check|ir)");
             if (std.mem.eql(u8, v, "lex")) {
                 emit = .lex;
@@ -138,13 +148,17 @@ pub fn main(init: std.process.Init) !void {
             // every fanOut takes its verbatim inline serial path — zero workers.
             // -jN => .limited(N): the pool grows to at most N concurrent workers.
             jlimit = if (n == 1) .limited(0) else .limited(n);
-        } else if (std.mem.eql(u8, arg, "-o")) {
-            out_path = args.next() orelse return argError(out, "-o requires an output path");
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            out_path = args.next() orelse return argError(out, "-o/--output requires an output path");
         } else if (std.mem.eql(u8, arg, "--target")) {
             target = args.next() orelse return argError(out, "--target requires a value");
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try usage(out);
             return;
+        } else if (!verb_seen and paths.items.len == 0 and (std.mem.eql(u8, arg, "build") or std.mem.eql(u8, arg, "run"))) {
+            // A leading `build`/`run` verb (first positional only) selects the action.
+            command = if (std.mem.eql(u8, arg, "run")) .run else .build;
+            verb_seen = true;
         } else {
             try paths.append(gpa, arg);
         }
@@ -160,8 +174,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Code emission (`-o`) is locked to aarch64-macos in M1.
-    if (out_path != null and !isAarch64Macos(target)) {
+    // The DEFAULT action is to BUILD a signed executable: a bare `toyc <file>` (and any
+    // `-o`/`--output`) compiles + links a binary, output defaulting to the build dir.
+    // `--emit lex|parse|check|ir` opts into an inspection mode (no binary); `--dump-dag`
+    // is its own path. Executable emission is locked to aarch64-macos in M1.
+    // A `build`/`run` verb or `-o`/`--output` forces executable emission; otherwise a
+    // bare invocation builds by default unless an inspection `--emit` was requested.
+    const build_exe = !dump_dag and (verb_seen or out_path != null or !emit_explicit);
+    const run_after = command == .run;
+    if (build_exe and !isAarch64Macos(target)) {
         try argError(out, "code emission only supports aarch64-macos in M1");
         std.process.exit(1);
     }
@@ -177,9 +198,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(try emitDumpDag(gpa, out, target, paths.items, opt, jlimit));
     }
 
-    // `-o`: lower `main` and write a signed, runnable executable.
-    if (out_path) |path| {
-        std.process.exit(try emitExecutable(gpa, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats, query_stats, timings, jlimit));
+    // Build the executable: output → `-o`/`--output`, else the default build dir.
+    if (build_exe) {
+        std.process.exit(try emitExecutable(gpa, out, target, paths.items, out_path, run_after, mode, codegen_stats, opt, opt_stats, query_stats, timings, jlimit));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -227,6 +248,87 @@ fn isAarch64Macos(target: []const u8) bool {
 fn basename(path: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[i + 1 ..];
     return path;
+}
+
+/// Strip a trailing `.toy` source extension for the default output binary name.
+fn stemOf(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".toy")) return name[0 .. name.len - ".toy".len];
+    return name;
+}
+
+/// The default executable output when no `-o`/`--output` is given:
+/// `.toy/<stamp>/build/<entry-stem>`. Creates the build dir on demand; the path is
+/// written into `buf` (caller-owned, must outlive the write).
+fn defaultOutputPath(io: Io, buf: []u8, entry: []const u8) ![]const u8 {
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    var dir_buf: [Driver.cache_root.len + 1 + version.stamp_max + "/build".len]u8 = undefined;
+    const build_dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/build", .{ Driver.cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    try Io.Dir.cwd().createDirPath(io, build_dir);
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ build_dir, stemOf(basename(entry)) }) catch unreachable;
+}
+
+/// Print the always-on `built binary in <n> <unit>` line. Single integers for
+/// ns/ms/s; minutes carry a seconds remainder. Units: ns, ms, s, min.
+fn printBuildTime(out: *Io.Writer, ns: u64) !void {
+    if (ns < std.time.ns_per_ms) {
+        try out.print("built binary in {d} ns\n", .{ns});
+    } else if (ns < std.time.ns_per_s) {
+        try out.print("built binary in {d} ms\n", .{ns / std.time.ns_per_ms});
+    } else if (ns < std.time.ns_per_min) {
+        try out.print("built binary in {d} s\n", .{ns / std.time.ns_per_s});
+    } else {
+        try out.print("built binary in {d} min {d} s\n", .{ ns / std.time.ns_per_min, (ns % std.time.ns_per_min) / std.time.ns_per_s });
+    }
+}
+
+/// `run` subcommand tail: execute the freshly built binary, wait for it, report how it
+/// ended, and adopt its exit status. A clean exit returns the child's code; a signal
+/// returns 128+signo (the shell convention); anything else → 1.
+fn runBinary(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8) !u8 {
+    // Spawn by ABSOLUTE path: the codesigned binary must be exec'd by a real path, and a
+    // bare name without a `/` would be looked up on PATH rather than in the build dir.
+    const abs = Io.Dir.cwd().realPathFileAlloc(io, path, gpa) catch |e| {
+        try out.print("run: cannot locate {s}: {t}\n", .{ path, e });
+        try out.flush();
+        return 1;
+    };
+    defer gpa.free(abs);
+
+    var child = std.process.spawn(io, .{ .argv = &.{abs} }) catch |e| {
+        try out.print("run: failed to launch {s}: {t}\n", .{ basename(path), e });
+        try out.flush();
+        return 1;
+    };
+    const term = child.wait(io) catch |e| {
+        try out.print("run: error awaiting {s}: {t}\n", .{ basename(path), e });
+        try out.flush();
+        return 1;
+    };
+    const name = basename(path);
+    switch (term) {
+        .exited => |code| {
+            try out.print("{s} exited with code {d}\n", .{ name, code });
+            try out.flush();
+            return code;
+        },
+        .signal => |sig| {
+            const s: u32 = @intCast(@intFromEnum(sig));
+            try out.print("{s} killed by signal {d}\n", .{ name, s });
+            try out.flush();
+            return @intCast(128 + (s & 0x7f));
+        },
+        .stopped => |sig| {
+            const s: u32 = @intCast(@intFromEnum(sig));
+            try out.print("{s} stopped by signal {d}\n", .{ name, s });
+            try out.flush();
+            return 1;
+        },
+        .unknown => |st| {
+            try out.print("{s} terminated abnormally (status {d})\n", .{ name, st });
+            try out.flush();
+            return 1;
+        },
+    }
 }
 
 /// Monotonic nanoseconds from the `Io` clock (CLOCK_UPTIME_RAW on macOS). Zig 0.16
@@ -296,7 +398,8 @@ fn emitExecutable(
     out: *Io.Writer,
     target: []const u8,
     paths: []const []const u8,
-    out_path: []const u8,
+    out_path: ?[]const u8,
+    run_after: bool,
     mode: CodegenIr.Mode,
     codegen_stats: bool,
     opt: Opt.Config,
@@ -318,6 +421,14 @@ fn emitExecutable(
     var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
     defer tail_io.deinit();
     const io = tail_io.io();
+
+    // Total build wall-clock for the always-on "built binary in X" line (one clock read).
+    const build_start = nowNs(io);
+
+    // Resolve the output: `-o`/`--output` wins; otherwise default to
+    // `.toy/<stamp>/build/<entry-stem>` (the build dir is created on demand).
+    var out_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved_out = out_path orelse try defaultOutputPath(io, &out_buf, paths[0]);
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     var pack = toyc.Cache.Pack.init(gpa);
@@ -487,7 +598,7 @@ fn emitExecutable(
             const image = try Driver.buildImage(
                 io,
                 gpa,
-                basename(out_path),
+                basename(resolved_out),
                 lp.text,
                 lp.entry_off,
                 lp.cstrings,
@@ -496,8 +607,11 @@ fn emitExecutable(
             );
             defer gpa.free(image);
 
-            try writeExecutable(io, out_path, image);
+            try writeExecutable(io, resolved_out, image);
             ns_image = lapNs(io, timings, &last_ns);
+            const elapsed = nowNs(io) - build_start;
+            try printBuildTime(out, if (elapsed > 0) @intCast(elapsed) else 0);
+            try out.flush();
             if (timings) {
                 const sub: LowerSub = .{
                     .compute_ns = lower_probe.compute_ns.load(.monotonic),
@@ -507,6 +621,8 @@ fn emitExecutable(
                 };
                 try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image, sub);
             }
+            // `run`: execute the freshly built binary and adopt its exit status.
+            if (run_after) return runBinary(gpa, io, out, resolved_out);
             return 0;
         },
     }
@@ -852,11 +968,13 @@ fn argError(out: *Io.Writer, message: []const u8) !void {
 fn usage(out: *Io.Writer) !void {
     var stamp_buf: [version.stamp_max]u8 = undefined;
     try out.print(
-        \\toyc {s} — toy compiler (lexer + parser + name resolution + typecheck)
+        \\toy {s} — toy compiler (lexer + parser + name resolution + typecheck)
         \\
-        \\usage: toyc [options] <file...>
-        \\  --emit lex|parse|check|ir  how far to run the pipeline (default: parse)
-        \\  -o <path>         emit a signed, runnable executable (aarch64-macos only)
+        \\usage: toy [build|run] [options] <file...>
+        \\  build <file>      compile to a signed executable (the default action)
+        \\  run <file>        build, then execute the binary and report its exit status
+        \\  -o, --output <p>  output path for the built binary (default: .toy/<stamp>/build/<name>)
+        \\  --emit lex|parse|check|ir  inspect the pipeline instead of building (no binary)
         \\  -j <N>            build worker threads (N>=1; -j1 = serial; default cpu-based)
         \\  --dump            print the emit phase's artifact (tokens, or the AST)
         \\  --target <triple> compilation target (default: native)

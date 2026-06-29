@@ -33,7 +33,7 @@ directives live in the entry `main.toy`.
 
 ## Running
 
-`./examples/modules/check.sh` resolves `zig-out/bin/toyc` (building it if
+`./examples/modules/check.sh` resolves `zig-out/bin/toy` (building it if
 absent — never via `zig build test`), then for each `main.toy` compiles from its
 directory (so the import root is correct) and verifies the directives. Exit 0
 means the module corpus matches its annotations.

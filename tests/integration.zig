@@ -4,12 +4,12 @@
 //! `toy_compiler` module (src/root.zig's `pub const` exports), via
 //! `@import("toy_compiler")` — never `../` into src/ (a Zig module cannot import
 //! above its root source file). build.zig gives this artifact the compiler as a
-//! module dependency (`toyc-integration-test`), so these run in their OWN binary,
-//! separate from the inline unit tests in `toyc-test`. The idiomatic split: src/
+//! module dependency (`toy-integration-test`), so these run in their OWN binary,
+//! separate from the inline unit tests in `toy-test`. The idiomatic split: src/
 //! holds the library + its inline unit tests; tests/ holds integration tests that
 //! exercise the published surface.
 //!
-//! Run: `zig build test-bin` then `./zig-out/bin/toyc-integration-test`
+//! Run: `zig build test-bin` then `./zig-out/bin/toy-integration-test`
 //! (the `zig build test` runner hangs on the unit suite's subprocess-spawning
 //! tests — see build.zig — so run the installed binary directly).
 
