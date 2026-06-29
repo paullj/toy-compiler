@@ -403,12 +403,16 @@ fn emitExecutable(
     // partial/false-green result).
     var prior_loaded: ?Dag.Loaded = null;
     defer if (prior_loaded) |*pl| pl.deinit(gpa);
-    if (prog_key) |pk| {
+    // The prior DAG is CONSUMED only by computeReuse (mode .normal/.verify) and
+    // reportQueryStats (--query-stats). On a plain `--force` build it is pure waste,
+    // so skip even the (now in-memory) pack lookup + deserialize. The fresh DAG is
+    // still PERSISTED below for the next build — only the LOAD is gated.
+    if (mode == .normal or mode == .verify or query_stats) if (prog_key) |pk| {
         if (cache.getDag(gpa, io, pk) catch null) |blob| {
             defer gpa.free(blob);
             prior_loaded = Dag.deserialize(gpa, blob) catch null;
         }
-    }
+    };
     const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
 
     // `--timings` SUB-stage attribution of `lower`: a borrowed probe splits the
