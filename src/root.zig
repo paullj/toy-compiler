@@ -18,6 +18,7 @@ pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
 pub const TypecheckGraph = @import("types_graph.zig");
+pub const LayoutEngine = @import("layout/Engine.zig");
 pub const Aarch64 = @import("codegen/Aarch64.zig");
 pub const CodegenIr = @import("codegen/CodegenIr.zig");
 pub const Abi = @import("codegen/abi/Abi.zig");
@@ -49,6 +50,7 @@ test {
     _ = ResolveGraph;
     _ = Typecheck;
     _ = TypecheckGraph;
+    _ = LayoutEngine;
     _ = Aarch64;
     _ = CodegenIr;
     _ = Abi;

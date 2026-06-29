@@ -36,103 +36,27 @@ const Io = std.Io;
 
 const Typecheck = @This();
 
-/// The type kind. `invalid` is the poison/error type: it absorbs further errors
-/// so one mistake produces one diagnostic. `@"struct"` carries a `struct_id`
-/// indexing the per-program struct table.
-pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum" };
+/// The type algebra + layout engine (the `Type`/`Kind`/`Layout` value types and
+/// the struct/enum layout-cycle state machine) live in their own deep module. The
+/// checker drives it via `LayoutEngine.layoutStruct`/`layoutEnum` (id-ordered, from
+/// `run`/`runGraph`) and consumes the laid syms through the re-exported aliases.
+const LayoutEngine = @import("layout/Engine.zig");
 
-/// A type. A byte-foldable struct (not a tagged union) so it preserves `@memset`,
-/// `node_types` triviality, and a stable fingerprint basis. A `@"struct"` kind
-/// carries an index into the struct table; a `@"enum"` kind an index into the
-/// parallel enum table; all other kinds leave both `no_struct`.
-pub const Type = struct {
-    kind: Kind,
-    struct_id: u32 = no_struct,
-    enum_id: u32 = no_struct,
+// Re-export the algebra/layout value types so every downstream importer keeps
+// reading `Typecheck.Type`/`.Layout`/`.EnumLayout` etc. unchanged.
+pub const Kind = LayoutEngine.Kind;
+pub const Type = LayoutEngine.Type;
+pub const Layout = LayoutEngine.Layout;
+pub const VariantForm = LayoutEngine.VariantForm;
+pub const VariantLayout = LayoutEngine.VariantLayout;
+pub const EnumLayout = LayoutEngine.EnumLayout;
 
-    pub const no_struct: u32 = std.math.maxInt(u32);
-
-    pub const invalid: Type = .{ .kind = .invalid };
-    pub const unit: Type = .{ .kind = .unit };
-    pub const int: Type = .{ .kind = .int };
-    pub const @"bool": Type = .{ .kind = .bool };
-    pub const str: Type = .{ .kind = .str };
-    pub const never: Type = .{ .kind = .never };
-
-    pub fn structT(id: u32) Type {
-        return .{ .kind = .@"struct", .struct_id = id };
-    }
-
-    pub fn enumT(id: u32) Type {
-        return .{ .kind = .@"enum", .enum_id = id };
-    }
-
-    pub fn eql(a: Type, b: Type) bool {
-        return a.kind == b.kind and
-            (a.kind != .@"struct" or a.struct_id == b.struct_id) and
-            (a.kind != .@"enum" or a.enum_id == b.enum_id);
-    }
-
-    /// The one assignability relation: is a value of type `got` acceptable where a
-    /// `want` is expected? Mirrors `merge`'s discipline so the two stay siblings —
-    /// `invalid` is poison (either side absorbs, so a root error yields exactly one
-    /// diagnostic and never cascades), `never` is bottom (a value that never exists
-    /// fits any slot), and otherwise assignability is structural equality with NO
-    /// implicit coercion. Returning `true` for poison/`never` means a caller guards
-    /// `if (!assignable(want, got)) emit(...)` and stays silent on already-reported
-    /// or unreachable values — exactly the manual `kind != .invalid` guards it
-    /// replaces.
-    pub fn assignable(want: Type, got: Type) bool {
-        if (want.kind == .invalid or got.kind == .invalid) return true;
-        if (got.kind == .never) return true;
-        return eql(want, got);
-    }
-
-    pub fn isStruct(t: Type) bool {
-        return t.kind == .@"struct";
-    }
-
-    pub fn isEnum(t: Type) bool {
-        return t.kind == .@"enum";
-    }
-};
-
-/// A resolved struct layout: a self-contained, index-free-ish snapshot threaded
-/// into Codegen/Fingerprint. Field types still reference the struct table by id
-/// (for nested structs), but offsets/size/align are precomputed here. Owned.
-pub const Layout = struct {
-    name: []const u8,
-    field_names: [][]const u8,
-    field_types: []Type,
-    offsets: []u32,
-    size: u32,
-    @"align": u32,
-};
-
-/// A variant's form: a unit (no payload), a tuple (positional payload, no field
-/// names), or a struct (named payload fields).
-pub const VariantForm = enum(u8) { unit, tuple, @"struct" };
-
-/// A resolved enum layout: a value tagged union — an 8-byte tag at offset 0, then
-/// payload storage sized to the largest variant's payload at `payload_off`. Each
-/// variant carries its payload field types + payload-LOCAL offsets (relative to
-/// `payload_off`). Owned (parallel to `Layout`). Threaded read-only into Codegen.
-pub const VariantLayout = struct {
-    name: []const u8,
-    form: VariantForm,
-    field_names: [][]const u8,
-    field_types: []Type,
-    /// Payload-local offsets (add `payload_off` for the absolute byte offset).
-    offsets: []u32,
-};
-pub const EnumLayout = struct {
-    name: []const u8,
-    variants: []VariantLayout,
-    tag_size: u32,
-    payload_off: u32,
-    size: u32,
-    @"align": u32,
-};
+// Internal aliases for the checker's own scratch tables. These ARE the engine's
+// table types (the `Model` aliases them; `BodyChecker` reads `.state`/`.poisoned`/
+// `.field_*`/`.variants` through them at fingerprint + exhaustiveness time).
+const StructSym = LayoutEngine.StructSym;
+const VariantSym = LayoutEngine.VariantSym;
+const EnumSym = LayoutEngine.EnumSym;
 
 /// Source spelling of a type reference → `Type`. Anything else is unknown (a
 /// struct name, or an error). The unit type `()` is spelled with parens, not an
@@ -279,76 +203,6 @@ const FnSym = struct {
     /// switch the active tree/tokens/source to this module before checking.
     mod: u32 = 0,
 };
-
-/// A struct's resolved symbol: its decl node, name, and (after layout) per-field
-/// names/types/offsets plus aggregate size/align. `state` guards the layout
-/// recursion so a directly- or indirectly-recursive struct is caught once.
-const LayoutState = enum { unseen, laying, done };
-const StructSym = struct {
-    decl_node: Ast.Index,
-    name: []const u8,
-    field_names: [][]const u8 = &.{},
-    field_types: []Type = &.{},
-    offsets: []u32 = &.{},
-    size: u32 = 0,
-    @"align": u32 = 1,
-    state: LayoutState = .unseen,
-    poisoned: bool = false,
-    /// Owning module id (graph mode); 0 single-file. Layout switches to it.
-    mod: u32 = 0,
-    /// Whether the struct decl is `pub` (graph mode; pub-signature coherence).
-    pub_export: bool = false,
-};
-
-/// One variant in the scratch enum table (during layout). `field_names`/`name`
-/// are BORROWED source slices; `field_types`/`offsets` are owned arrays.
-const VariantSym = struct {
-    name: []const u8,
-    form: VariantForm,
-    field_names: [][]const u8 = &.{},
-    field_types: []Type = &.{},
-    offsets: []u32 = &.{},
-    payload_size: u32 = 0,
-    payload_align: u32 = 1,
-};
-
-/// An enum's resolved symbol. The tag is a fixed 8 bytes at offset 0; the payload
-/// is sized to the largest variant and laid at `payload_off`. `state` guards the
-/// layout recursion so a recursive enum is caught once.
-const EnumSym = struct {
-    decl_node: Ast.Index,
-    name: []const u8,
-    variants: []VariantSym = &.{},
-    tag_size: u32 = 8,
-    payload_off: u32 = 8,
-    size: u32 = 0,
-    @"align": u32 = 8,
-    state: LayoutState = .unseen,
-    poisoned: bool = false,
-    /// Owning module id (graph mode); 0 single-file. Layout switches to it.
-    mod: u32 = 0,
-    /// Whether the enum decl is `pub` (graph mode; pub-signature coherence).
-    pub_export: bool = false,
-};
-
-/// Natural size/align of a scalar/str type (struct sizes come from the table).
-fn scalarSize(kind: Kind) u32 {
-    return switch (kind) {
-        .int, .bool => 8,
-        .str => 16,
-        else => 0,
-    };
-}
-fn scalarAlign(kind: Kind) u32 {
-    return switch (kind) {
-        .int, .bool, .str => 8,
-        else => 1,
-    };
-}
-fn roundUp(n: u32, a: u32) u32 {
-    if (a == 0) return n;
-    return (n + a - 1) / a * a;
-}
 
 /// Per-construct context, pushed/popped as bodies are entered. A label-
 /// addressable stack: `kind` distinguishes a
@@ -2125,6 +1979,67 @@ fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.enum_map;
 }
 
+/// The layout engine's view of this checker: its tables + the per-module accessors
+/// the layout recursion needs, wired to the existing methods. The `emit*` thunks
+/// forward to `sink.emitFmt` with the SAME literal format strings the layout code
+/// used in-line, so the emitted diagnostics stay byte-identical.
+fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
+    const T = struct {
+        fn castGph(ctx: *anyopaque, mod: u32) u32 {
+            return gphSelect(@ptrCast(@alignCast(ctx)), mod);
+        }
+        fn castTree(ctx: *anyopaque) Ast.Tree {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            return tc.tree;
+        }
+        fn castTypeFromNode(ctx: *anyopaque, n: Ast.Index) Type {
+            return typeFromNode(@ptrCast(@alignCast(ctx)), n);
+        }
+        fn castNameText(ctx: *anyopaque, tok: u32) []const u8 {
+            return nameText(@ptrCast(@alignCast(ctx)), tok);
+        }
+        fn castByteOf(ctx: *anyopaque, tok: u32) u32 {
+            return byteOf(@ptrCast(@alignCast(ctx)), tok);
+        }
+        fn emitRecursive(ctx: *anyopaque, byte: u32, requester: []const u8) error{OutOfMemory}!void {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            try tc.sink.emitFmt(byte, "recursive type '{s}' has infinite size", .{requester});
+        }
+        fn emitEmptyStruct(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            try tc.sink.emitFmt(byte, "empty struct '{s}' is not allowed", .{name});
+        }
+        fn emitEmptyEnum(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            try tc.sink.emitFmt(byte, "empty enum '{s}' is not allowed", .{name});
+        }
+        fn emitUnitField(ctx: *anyopaque, byte: u32, field: []const u8) error{OutOfMemory}!void {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            try tc.sink.emitFmt(byte, "field '{s}' cannot have type ()", .{field});
+        }
+        fn emitUnitPayload(ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            try tc.sink.emitFmt(byte, "variant '{s}' payload cannot have type ()", .{variant});
+        }
+    };
+    return .{
+        .gpa = t.gpa,
+        .structs = &t.structs,
+        .enums = &t.enums,
+        .ctx = t,
+        .gphSelect = T.castGph,
+        .typeFromNode = T.castTypeFromNode,
+        .nameText = T.castNameText,
+        .byteOf = T.castByteOf,
+        .emitRecursive = T.emitRecursive,
+        .emitEmptyStruct = T.emitEmptyStruct,
+        .emitEmptyEnum = T.emitEmptyEnum,
+        .emitUnitField = T.emitUnitField,
+        .emitUnitPayload = T.emitUnitPayload,
+        .tree = T.castTree,
+    };
+}
+
 /// Typecheck a resolved tree. Caller owns the returned `Result`.
 pub fn check(
     gpa: std.mem.Allocator,
@@ -2426,10 +2341,10 @@ pub fn checkGraph(
     }
 
     // ---- snapshot: layouts + enum_layouts (program-wide) ----
-    const layouts = try snapshotLayouts(gpa, t.structs.items);
-    errdefer freeLayouts(gpa, layouts);
-    const enum_layouts = try snapshotEnumLayouts(gpa, t.enums.items);
-    errdefer freeEnumLayouts(gpa, enum_layouts);
+    const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
+    errdefer LayoutEngine.freeLayouts(gpa, layouts);
+    const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
+    errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
     // ---- snapshot: diagnostics (each already carries its owning module in
     // `scope`, sorted by runGraph). Hand the owned slices to the result. ----
@@ -2471,8 +2386,8 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // Phase 0b: lay out every struct then every enum (global id order). Each
     // layoutStruct/layoutEnum switches to its owning module; nested/qualified
     // referents recurse cross-module and restore the active module on return.
-    for (0..t.structs.items.len) |id| try t.layoutStruct(@intCast(id));
-    for (0..t.enums.items.len) |id| try t.layoutEnum(@intCast(id));
+    for (0..t.structs.items.len) |id| try LayoutEngine.layoutStruct(t.layoutEnv(), @intCast(id));
+    for (0..t.enums.items.len) |id| try LayoutEngine.layoutEnum(t.layoutEnv(), @intCast(id));
 
     // Phase A: decode every fn signature into the GLOBAL fn table, in the exact
     // order of `fns` (parallel to the resolver's global fn ids), so `.func` ids
@@ -2856,116 +2771,6 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
     }
 }
 
-// ---- shared snapshot helpers (used by check + checkGraph) ------------------
-
-fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]Layout {
-    const layouts = try gpa.alloc(Layout, structs.len);
-    var built: usize = 0;
-    errdefer {
-        freeLayouts(gpa, layouts[0..built]);
-        gpa.free(layouts);
-    }
-    for (structs, 0..) |s, i| {
-        const fnames = try gpa.alloc([]const u8, s.field_names.len);
-        var dn: usize = 0;
-        errdefer {
-            for (fnames[0..dn]) |x| gpa.free(x);
-            gpa.free(fnames);
-        }
-        for (s.field_names, 0..) |nm, j| {
-            fnames[j] = try gpa.dupe(u8, nm);
-            dn += 1;
-        }
-        layouts[i] = .{
-            .name = try gpa.dupe(u8, s.name),
-            .field_names = @ptrCast(fnames),
-            .field_types = try gpa.dupe(Type, s.field_types),
-            .offsets = try gpa.dupe(u32, s.offsets),
-            .size = s.size,
-            .@"align" = s.@"align",
-        };
-        built += 1;
-    }
-    return layouts;
-}
-
-fn freeLayouts(gpa: std.mem.Allocator, layouts: []const Layout) void {
-    for (layouts) |l| {
-        gpa.free(l.name);
-        for (l.field_names) |fn_| gpa.free(fn_);
-        gpa.free(l.field_names);
-        gpa.free(l.field_types);
-        gpa.free(l.offsets);
-    }
-    gpa.free(layouts);
-}
-
-fn snapshotEnumLayouts(gpa: std.mem.Allocator, enums: []const EnumSym) ![]EnumLayout {
-    const enum_layouts = try gpa.alloc(EnumLayout, enums.len);
-    var built: usize = 0;
-    errdefer {
-        freeEnumLayouts(gpa, enum_layouts[0..built]);
-        gpa.free(enum_layouts);
-    }
-    for (enums, 0..) |e, i| {
-        const variants = try gpa.alloc(VariantLayout, e.variants.len);
-        var vbuilt: usize = 0;
-        errdefer {
-            for (variants[0..vbuilt]) |v| {
-                for (v.field_names) |x| gpa.free(x);
-                gpa.free(v.field_names);
-                gpa.free(v.field_types);
-                gpa.free(v.offsets);
-            }
-            gpa.free(variants);
-        }
-        for (e.variants, 0..) |v, j| {
-            const fnames = try gpa.alloc([]const u8, v.field_names.len);
-            var dn: usize = 0;
-            errdefer {
-                for (fnames[0..dn]) |x| gpa.free(x);
-                gpa.free(fnames);
-            }
-            for (v.field_names, 0..) |nm, k| {
-                fnames[k] = try gpa.dupe(u8, nm);
-                dn += 1;
-            }
-            variants[j] = .{
-                .name = v.name,
-                .form = v.form,
-                .field_names = @ptrCast(fnames),
-                .field_types = try gpa.dupe(Type, v.field_types),
-                .offsets = try gpa.dupe(u32, v.offsets),
-            };
-            vbuilt += 1;
-        }
-        enum_layouts[i] = .{
-            .name = try gpa.dupe(u8, e.name),
-            .variants = variants,
-            .tag_size = e.tag_size,
-            .payload_off = e.payload_off,
-            .size = e.size,
-            .@"align" = e.@"align",
-        };
-        built += 1;
-    }
-    return enum_layouts;
-}
-
-fn freeEnumLayouts(gpa: std.mem.Allocator, enum_layouts: []const EnumLayout) void {
-    for (enum_layouts) |e| {
-        gpa.free(e.name);
-        for (e.variants) |v| {
-            for (v.field_names) |fn_| gpa.free(fn_);
-            gpa.free(v.field_names);
-            gpa.free(v.field_types);
-            gpa.free(v.offsets);
-        }
-        gpa.free(e.variants);
-    }
-    gpa.free(enum_layouts);
-}
-
 fn run(t: *Typecheck) !void {
     if (t.tree.nodes.len == 0) return;
     const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
@@ -2979,11 +2784,11 @@ fn run(t: *Typecheck) !void {
     // Pass A0b: lay out each struct (visiting-guard catches recursive cycles).
     // Runs AFTER enum registration so a struct field of an enum type resolves.
     for (0..t.structs.items.len) |id| {
-        try t.layoutStruct(@intCast(id));
+        try LayoutEngine.layoutStruct(t.layoutEnv(), @intCast(id));
     }
     // Pass A0d: lay out each enum (guard catches recursive cycles).
     for (0..t.enums.items.len) |id| {
-        try t.layoutEnum(@intCast(id));
+        try LayoutEngine.layoutEnum(t.layoutEnv(), @intCast(id));
     }
 
     // Pass A: decode every function signature (forward refs resolve fine since
@@ -3239,210 +3044,6 @@ fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
     return .invalid;
 }
 
-/// Lay out struct `id`: field offsets in declaration order with natural
-/// alignment, size = aligned total, align = max field align. A `laying` field
-/// of struct type means a cycle (direct or indirect) → infinite size, poisoned.
-fn layoutStruct(t: *Typecheck, id: u32) error{OutOfMemory}!void {
-    if (t.structs.items[id].state == .done) return;
-    t.structs.items[id].state = .laying;
-
-    // Graph mode: lay this struct out in ITS owning module's tree (a nested/qualified
-    // field type may have switched the active module). Restore on the way out.
-    const prev = t.gphSelect(t.structs.items[id].mod);
-    defer _ = t.gphSelect(prev);
-
-    const decl = t.tree.nodes[t.structs.items[id].decl_node];
-    const field_nodes = Ast.rangeSlice(t.tree, decl.lhs);
-    const n = field_nodes.len;
-
-    // An empty struct lays out to size 0 — a zero-size aggregate is an ABI/codegen
-    // hazard (no eightbytes, a degenerate sret). Reject it with a clean diagnostic.
-    var empty_poison = false;
-    if (n == 0) {
-        try t.sink.emitFmt(t.byteOf(decl.main_token), "empty struct '{s}' is not allowed", .{t.structs.items[id].name});
-        empty_poison = true;
-    }
-
-    const names = try t.gpa.alloc([]const u8, n);
-    errdefer t.gpa.free(names);
-    const types = try t.gpa.alloc(Type, n);
-    errdefer t.gpa.free(types);
-    const offsets = try t.gpa.alloc(u32, n);
-    errdefer t.gpa.free(offsets);
-
-    var running: u32 = 0;
-    var max_align: u32 = 1;
-    var poisoned = false;
-    for (field_nodes, 0..) |field_idx, i| {
-        const field = t.tree.nodes[field_idx];
-        names[i] = t.nameText(field.main_token);
-        const fty = t.typeFromNode(field.lhs);
-        types[i] = fty;
-        var fsize: u32 = 0;
-        var falign: u32 = 1;
-        if (fty.kind == .unit) {
-            try t.sink.emitFmt(t.byteOf(field.main_token), "field '{s}' cannot have type ()", .{names[i]});
-            poisoned = true;
-        } else if (fty.kind != .invalid) {
-            const sz = try t.layoutReferent(fty, t.byteOf(decl.main_token), t.structs.items[id].name, &poisoned);
-            fsize = sz.size;
-            falign = sz.@"align";
-        }
-        const off = roundUp(running, falign);
-        offsets[i] = off;
-        running = off + fsize;
-        if (falign > max_align) max_align = falign;
-    }
-
-    t.structs.items[id].field_names = names;
-    t.structs.items[id].field_types = types;
-    t.structs.items[id].offsets = offsets;
-    t.structs.items[id].@"align" = max_align;
-    t.structs.items[id].size = if (poisoned or empty_poison) 0 else roundUp(running, max_align);
-    t.structs.items[id].poisoned = poisoned or empty_poison;
-    t.structs.items[id].state = .done;
-}
-
-/// Size/align of a field/payload type, laying out a nested struct/enum on demand.
-/// A `laying` referent means a cycle (direct or indirect): set `*requester_poison`
-/// and emit a recursion diagnostic at `at` naming `requester`. A scalar/str uses
-/// the natural sizes; `invalid`/`unit` size to 0 (the caller diagnoses `unit`).
-fn layoutReferent(t: *Typecheck, ty: Type, at: u32, requester: []const u8, requester_poison: *bool) error{OutOfMemory}!struct { size: u32, @"align": u32 } {
-    switch (ty.kind) {
-        .@"struct" => {
-            if (t.structs.items[ty.struct_id].state == .laying) {
-                try t.sink.emitFmt(at, "recursive type '{s}' has infinite size", .{requester});
-                requester_poison.* = true;
-                return .{ .size = 0, .@"align" = 1 };
-            }
-            try t.layoutStruct(ty.struct_id);
-            return .{ .size = t.structs.items[ty.struct_id].size, .@"align" = t.structs.items[ty.struct_id].@"align" };
-        },
-        .@"enum" => {
-            if (t.enums.items[ty.enum_id].state == .laying) {
-                try t.sink.emitFmt(at, "recursive type '{s}' has infinite size", .{requester});
-                requester_poison.* = true;
-                return .{ .size = 0, .@"align" = 1 };
-            }
-            try t.layoutEnum(ty.enum_id);
-            return .{ .size = t.enums.items[ty.enum_id].size, .@"align" = t.enums.items[ty.enum_id].@"align" };
-        },
-        else => return .{ .size = scalarSize(ty.kind), .@"align" = scalarAlign(ty.kind) },
-    }
-}
-
-/// Lay out enum `id`: an 8-byte tag at offset 0, then payload storage sized to the
-/// largest variant's payload at `payload_off`. Each variant's payload fields get
-/// payload-LOCAL offsets. A `laying` referent (direct/indirect cycle) poisons it.
-fn layoutEnum(t: *Typecheck, id: u32) error{OutOfMemory}!void {
-    if (t.enums.items[id].state == .done) return;
-    t.enums.items[id].state = .laying;
-
-    // Graph mode: lay this enum out in ITS owning module's tree. Restore on exit.
-    const prev = t.gphSelect(t.enums.items[id].mod);
-    defer _ = t.gphSelect(prev);
-
-    const decl = t.tree.nodes[t.enums.items[id].decl_node];
-    const variant_nodes = Ast.rangeSlice(t.tree, decl.lhs);
-    const nv = variant_nodes.len;
-
-    var poisoned = false;
-    if (nv == 0) {
-        try t.sink.emitFmt(t.byteOf(decl.main_token), "empty enum '{s}' is not allowed", .{t.enums.items[id].name});
-        poisoned = true;
-    }
-
-    const variants = try t.gpa.alloc(VariantSym, nv);
-    errdefer t.gpa.free(variants);
-    var vbuilt: usize = 0;
-    errdefer for (variants[0..vbuilt]) |v| {
-        t.gpa.free(v.field_names);
-        t.gpa.free(v.field_types);
-        t.gpa.free(v.offsets);
-    };
-
-    var max_payload_size: u32 = 0;
-    var max_payload_align: u32 = 1;
-    for (variant_nodes, 0..) |vnode_idx, vi| {
-        const vnode = t.tree.nodes[vnode_idx];
-        const vname = t.nameText(vnode.main_token);
-        var form: VariantForm = .unit;
-        var payload_nodes: []const Ast.Index = &.{};
-        var is_struct_form = false;
-        switch (vnode.tag) {
-            .enum_variant_unit => {},
-            .enum_variant_tuple => {
-                form = .tuple;
-                payload_nodes = Ast.rangeSlice(t.tree, vnode.lhs);
-            },
-            .enum_variant_struct => {
-                form = .@"struct";
-                is_struct_form = true;
-                payload_nodes = Ast.rangeSlice(t.tree, vnode.lhs);
-            },
-            else => {},
-        }
-        const np = payload_nodes.len;
-        const fnames = try t.gpa.alloc([]const u8, if (is_struct_form) np else 0);
-        errdefer t.gpa.free(fnames);
-        const ftypes = try t.gpa.alloc(Type, np);
-        errdefer t.gpa.free(ftypes);
-        const foffs = try t.gpa.alloc(u32, np);
-        errdefer t.gpa.free(foffs);
-
-        var running: u32 = 0;
-        var palign: u32 = 1;
-        for (payload_nodes, 0..) |pnode_idx, pi| {
-            // A tuple payload node is a type-ref; a struct payload node is a `param`
-            // (name + type-ref in lhs).
-            const pty: Type = if (is_struct_form) blk: {
-                const pnode = t.tree.nodes[pnode_idx];
-                fnames[pi] = t.nameText(pnode.main_token);
-                break :blk t.typeFromNode(pnode.lhs);
-            } else t.typeFromNode(pnode_idx);
-            ftypes[pi] = pty;
-            var psize: u32 = 0;
-            var pa: u32 = 1;
-            if (pty.kind == .unit) {
-                try t.sink.emitFmt(t.byteOf(vnode.main_token), "variant '{s}' payload cannot have type ()", .{vname});
-                poisoned = true;
-            } else if (pty.kind != .invalid) {
-                const sz = try t.layoutReferent(pty, t.byteOf(decl.main_token), t.enums.items[id].name, &poisoned);
-                psize = sz.size;
-                pa = sz.@"align";
-            }
-            const off = roundUp(running, pa);
-            foffs[pi] = off;
-            running = off + psize;
-            if (pa > palign) palign = pa;
-        }
-        const payload_size = roundUp(running, palign);
-        variants[vi] = .{
-            .name = vname,
-            .form = form,
-            .field_names = fnames,
-            .field_types = ftypes,
-            .offsets = foffs,
-            .payload_size = payload_size,
-            .payload_align = palign,
-        };
-        vbuilt += 1;
-        if (payload_size > max_payload_size) max_payload_size = payload_size;
-        if (palign > max_payload_align) max_payload_align = palign;
-    }
-
-    const tag_size: u32 = 8;
-    const payload_off = roundUp(tag_size, max_payload_align);
-    const aln = @max(@as(u32, 8), max_payload_align);
-    t.enums.items[id].variants = variants;
-    t.enums.items[id].tag_size = tag_size;
-    t.enums.items[id].payload_off = payload_off;
-    t.enums.items[id].@"align" = aln;
-    t.enums.items[id].size = if (poisoned) 0 else roundUp(payload_off + max_payload_size, aln);
-    t.enums.items[id].poisoned = poisoned;
-    t.enums.items[id].state = .done;
-}
-
 /// Human-readable name of a type (a struct's declared name, else its kind tag).
 fn typeName(t: *const Typecheck, ty: Type) []const u8 {
     if (ty.kind == .@"struct" and ty.struct_id < t.structs.items.len)
@@ -3516,26 +3117,8 @@ fn checkDiagCount(source: []const u8) !usize {
     return c.result.diags.len;
 }
 
-test "assignable: structural equality with no coercion" {
-    try testing.expect(Type.assignable(Type.int, Type.int));
-    try testing.expect(Type.assignable(Type.structT(3), Type.structT(3)));
-    try testing.expect(!Type.assignable(Type.int, Type.bool));
-    try testing.expect(!Type.assignable(Type.structT(1), Type.structT(2)));
-    try testing.expect(!Type.assignable(Type.int, Type.str));
-}
-
-test "assignable: invalid is poison (either side absorbs)" {
-    try testing.expect(Type.assignable(Type.invalid, Type.int));
-    try testing.expect(Type.assignable(Type.int, Type.invalid));
-    try testing.expect(Type.assignable(Type.invalid, Type.invalid));
-}
-
-test "assignable: never is bottom (fits any want)" {
-    try testing.expect(Type.assignable(Type.int, Type.never));
-    try testing.expect(Type.assignable(Type.structT(0), Type.never));
-    // but `never` as a WANT is not satisfied by a real value
-    try testing.expect(!Type.assignable(Type.never, Type.int));
-}
+// The pure `Type` algebra (eql/assignable) is owned by — and unit-tested in —
+// `layout/Engine.zig` now; the tests below exercise the checker's USE of it.
 
 test "clean program typechecks with zero diagnostics" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
