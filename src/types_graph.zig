@@ -18,8 +18,10 @@
 //!
 //! This module owns the bridging tables (the per-module bare-name → global-id
 //! maps + import namespaces) the type checker borrows; the returned
-//! `types.GraphResult` is owned by the caller. The single-file `types.check` path
-//! is untouched (single-file corpus + check table modes still use it).
+//! `types.GraphResult` is owned by the caller. This is the ONE type checker: a
+//! lone source file is checked as the trivial one-module graph (`Graph.single` →
+//! `checkGraph`), its result projected into the single-source `types.Result`
+//! carrier (see `Driver.projectTypecheck`).
 
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
@@ -40,7 +42,9 @@ pub fn checkGraph(
     graph: *const Graph.Graph,
     res: *const ResolveGraph.GraphResult,
     dag: ?*Dag,
-    io: std.Io,
+    /// Pass-C worker pool, or `null` to force serial (see `Typecheck.checkGraph`).
+    /// The single-source path (per-file pipeline + inline test helpers) passes null.
+    io: ?std.Io,
 ) !GraphResult {
     const n = graph.modules.len;
 

@@ -1785,6 +1785,41 @@ fn decodeStringLiteral(b: *Builder, tok: u32) error{OutOfMemory}!?[]u8 {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const Graph = @import("driver/Graph.zig");
+const ResolveGraph = @import("resolve_graph.zig");
+const TypecheckGraph = @import("types_graph.zig");
+const Driver = @import("driver/Driver.zig");
+
+/// The single-source front-end result a lower test feeds into `Inputs`: a
+/// name-resolution `Result` + a typecheck `Result`. Built by resolving and
+/// type-checking the source as the trivial one-module graph (the ONE front-end)
+/// and projecting back, via the SAME `Driver.project*` adapters `Driver.pipeline`
+/// uses — so the test reads (`rr.resolutions`, `tc.node_types`/`.layouts`/
+/// `.enum_layouts`) are unchanged.
+const FrontEnd = struct {
+    resolve: Resolve.Result,
+    typecheck: Typecheck.Result,
+
+    fn deinit(self: *FrontEnd, gpa: std.mem.Allocator) void {
+        self.typecheck.deinit(gpa);
+        self.resolve.deinit(gpa);
+    }
+};
+
+/// Resolve + typecheck `src` (already lexed/parsed) as a one-module graph. The
+/// graph BORROWS `tokens`/`tree`/`src` (the caller keeps them alive past the
+/// returned `FrontEnd`), so it is torn down immediately; the projected `Result`s
+/// own their arrays. `io = null` => serial Pass-C (deterministic).
+fn frontEnd(gpa: std.mem.Allocator, tokens: []const Token, tree: Ast.Tree, src: []const u8) !FrontEnd {
+    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinitSingle(gpa);
+    var gr = try ResolveGraph.resolveGraph(gpa, &g);
+    errdefer gr.deinit(gpa);
+    var gtc = try TypecheckGraph.checkGraph(gpa, &g, &gr, null, null);
+    const tc = Driver.projectTypecheck(gpa, &gtc);
+    const rr = Driver.projectResolve(gpa, &gr);
+    return .{ .resolve = rr, .typecheck = tc };
+}
 
 /// Parse + resolve + typecheck `src`, lower the named fn, render it, and compare
 /// the rendered IR text to `want`. A focused integration harness for lower-core.
@@ -1802,10 +1837,10 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         gpa.free(tree.extra);
     }
 
-    var rr = try Resolve.resolve(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src);
-    defer rr.deinit(gpa);
-    var tc = try Typecheck.check(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src, rr.resolutions);
-    defer tc.deinit(gpa);
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
 
     const prog = tree.nodes[Ast.root(tree.nodes)];
     var fn_nodes: std.ArrayList(Ast.Index) = .empty;
@@ -1912,10 +1947,10 @@ test "lower-core: while loop with break/continue is well-formed" {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
     }
-    var rr = try Resolve.resolve(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src);
-    defer rr.deinit(gpa);
-    var tc = try Typecheck.check(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src, rr.resolutions);
-    defer tc.deinit(gpa);
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
 
     const prog = tree.nodes[Ast.root(tree.nodes)];
     var fn_decl: Ast.Index = Ast.none;
@@ -1955,10 +1990,10 @@ test "lower-core: out-of-range int literal yields a diagnostic" {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
     }
-    var rr = try Resolve.resolve(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src);
-    defer rr.deinit(gpa);
-    var tc = try Typecheck.check(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src, rr.resolutions);
-    defer tc.deinit(gpa);
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
     const prog = tree.nodes[Ast.root(tree.nodes)];
     var fn_decl: Ast.Index = Ast.none;
     for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
@@ -2022,10 +2057,10 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
     }
-    var rr = try Resolve.resolve(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src);
-    defer rr.deinit(gpa);
-    var tc = try Typecheck.check(gpa, .{ .nodes = tree.nodes, .extra = tree.extra }, tokens, src, rr.resolutions);
-    defer tc.deinit(gpa);
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
 
     const prog = tree.nodes[Ast.root(tree.nodes)];
     var fn_decl: Ast.Index = Ast.none;

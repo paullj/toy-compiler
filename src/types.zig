@@ -260,13 +260,15 @@ enum_map: std.StringHashMapUnmanaged(u32),
 /// node it flows into; consumed ONLY by an inferred `enum_init_*` (lhs == none).
 expected: ?Type = null,
 
-/// M14 graph context. `null` for the single-file `check` path (everything below
-/// is local). When set (the `types_graph` orchestrator drives one shared
-/// `Typecheck` across the whole module graph), the `structs`/`enums`/`fns`
-/// tables are PROGRAM-WIDE (global ids), and `struct_map`/`enum_map` hold the
-/// CURRENT module's bare-name → global-id bindings (swapped per module). The
-/// context resolves a qualified `mod.Type` / `mod.Enum` receiver to the owning
-/// module's tables. Pre-collect + layout happen once; only Pass B runs per fn.
+/// M14 graph context. Always set in practice: `checkGraph` is the ONE entry and
+/// it drives one shared `Typecheck` across the whole module graph (a lone source
+/// file is the trivial one-module graph). The `structs`/`enums`/`fns` tables are
+/// PROGRAM-WIDE (global ids), and `struct_map`/`enum_map` hold the CURRENT
+/// module's bare-name → global-id bindings (swapped per module). The context
+/// resolves a qualified `mod.Type` / `mod.Enum` receiver to the owning module's
+/// tables. Pre-collect + layout happen once; only Pass B runs per fn. (The `null`
+/// zero-value is the inert default; the shared helpers' `graph == null` arms are
+/// the dormant single-module-implicit fallback.)
 graph: ?*GraphCtx = null,
 
 /// The active module being type-checked / laid out (graph mode). Single-file
@@ -2040,197 +2042,6 @@ fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
     };
 }
 
-/// Typecheck a resolved tree. Caller owns the returned `Result`.
-pub fn check(
-    gpa: std.mem.Allocator,
-    tree: Ast.Tree,
-    tokens: []const Token,
-    source: []const u8,
-    resolutions: []const Resolution,
-) !Result {
-    const node_types = try gpa.alloc(Type, tree.nodes.len);
-    @memset(node_types, .invalid);
-
-    var t: Typecheck = .{
-        .gpa = gpa,
-        .tree = tree,
-        .tokens = tokens,
-        .source = source,
-        .resolutions = resolutions,
-        .node_types = node_types,
-        .sink = DiagnosticSink.init(gpa),
-        .fns = .empty,
-        .slot_types = .empty,
-        .cur_ret = .unit,
-        .loop_stack = .empty,
-        .structs = .empty,
-        .struct_map = .empty,
-        .enums = .empty,
-        .enum_map = .empty,
-    };
-    defer {
-        for (t.fns.items) |f| gpa.free(f.params);
-        t.fns.deinit(gpa);
-        t.slot_types.deinit(gpa);
-        t.loop_stack.deinit(gpa);
-        for (t.enums.items) |e| {
-            for (e.variants) |v| {
-                gpa.free(v.field_names);
-                gpa.free(v.field_types);
-                gpa.free(v.offsets);
-            }
-            gpa.free(e.variants);
-        }
-        t.enums.deinit(gpa);
-        t.enum_map.deinit(gpa);
-        for (t.structs.items) |s| {
-            // field_names entries are BORROWED source slices (from nameText); only
-            // the arrays are owned here. The Result snapshot dupes them separately.
-            gpa.free(s.field_names);
-            gpa.free(s.field_types);
-            gpa.free(s.offsets);
-        }
-        t.structs.deinit(gpa);
-        t.struct_map.deinit(gpa);
-    }
-    errdefer {
-        gpa.free(node_types);
-        t.sink.deinit();
-    }
-
-    try t.run();
-
-    // Snapshot every fn's signature for the codegen fingerprint. `t.fns` is
-    // freed by the `defer` above, so dupe each params slice into owned memory.
-    const sigs = try gpa.alloc(Sig, t.fns.items.len);
-    errdefer gpa.free(sigs);
-    var sigs_built: usize = 0;
-    errdefer for (sigs[0..sigs_built]) |s| gpa.free(@constCast(s.params));
-    for (t.fns.items, 0..) |f, i| {
-        // Identity (kind/name) so a caller's fingerprint folds the bound symbol,
-        // not just its sig: a bodyless entry is the synthetic `print` builtin; a
-        // bodied one is a user fn named by its decl token. The driver's walkCalls
-        // re-derives this from the resolved SymName table, but keeping the sig
-        // self-consistent here avoids a misleading half-filled struct.
-        const kind: symbols.SymKind = if (f.decl_node == Ast.none) .builtin else .user_fn;
-        const name = if (f.decl_node == Ast.none) "print" else t.nameText(t.tree.nodes[f.decl_node].main_token);
-        sigs[i] = .{ .kind = kind, .name = name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
-        sigs_built += 1;
-    }
-
-    // Snapshot the struct table into owned `Layout`s (the scratch `t.structs` is
-    // freed by the `defer` above). Incremental-free errdefer on partial failure.
-    const layouts = try gpa.alloc(Layout, t.structs.items.len);
-    errdefer gpa.free(layouts);
-    var layouts_built: usize = 0;
-    errdefer for (layouts[0..layouts_built]) |l| {
-        gpa.free(l.name);
-        for (l.field_names) |fn_| gpa.free(fn_);
-        gpa.free(l.field_names);
-        gpa.free(l.field_types);
-        gpa.free(l.offsets);
-    };
-    for (t.structs.items, 0..) |s, i| {
-        const fnames = try gpa.alloc([]const u8, s.field_names.len);
-        var dn: usize = 0;
-        errdefer {
-            for (fnames[0..dn]) |x| gpa.free(x);
-            gpa.free(fnames);
-        }
-        for (s.field_names, 0..) |nm, j| {
-            fnames[j] = try gpa.dupe(u8, nm);
-            dn += 1;
-        }
-        layouts[i] = .{
-            .name = try gpa.dupe(u8, s.name),
-            .field_names = @ptrCast(fnames),
-            .field_types = try gpa.dupe(Type, s.field_types),
-            .offsets = try gpa.dupe(u32, s.offsets),
-            .size = s.size,
-            .@"align" = s.@"align",
-        };
-        layouts_built += 1;
-    }
-    // If the enum snapshot below fails, the layouts slice (built above) must be
-    // deep-freed too — the per-element errdefer above only covers a partial
-    // layouts build, not a fully-built `layouts` array.
-    errdefer for (layouts) |l| {
-        gpa.free(l.name);
-        for (l.field_names) |fn_| gpa.free(fn_);
-        gpa.free(l.field_names);
-        gpa.free(l.field_types);
-        gpa.free(l.offsets);
-    };
-
-    // Snapshot the enum table into owned `EnumLayout`s (parallel to layouts).
-    const enum_layouts = try gpa.alloc(EnumLayout, t.enums.items.len);
-    errdefer gpa.free(enum_layouts);
-    var enums_built: usize = 0;
-    errdefer for (enum_layouts[0..enums_built]) |e| {
-        gpa.free(e.name);
-        for (e.variants) |v| {
-            for (v.field_names) |fn_| gpa.free(fn_);
-            gpa.free(v.field_names);
-            gpa.free(v.field_types);
-            gpa.free(v.offsets);
-        }
-        gpa.free(e.variants);
-    };
-    for (t.enums.items, 0..) |e, i| {
-        const variants = try gpa.alloc(VariantLayout, e.variants.len);
-        var vbuilt: usize = 0;
-        errdefer {
-            for (variants[0..vbuilt]) |v| {
-                for (v.field_names) |x| gpa.free(x);
-                gpa.free(v.field_names);
-                gpa.free(v.field_types);
-                gpa.free(v.offsets);
-            }
-            gpa.free(variants);
-        }
-        for (e.variants, 0..) |v, j| {
-            const fnames = try gpa.alloc([]const u8, v.field_names.len);
-            var dn: usize = 0;
-            errdefer {
-                for (fnames[0..dn]) |x| gpa.free(x);
-                gpa.free(fnames);
-            }
-            for (v.field_names, 0..) |nm, k| {
-                fnames[k] = try gpa.dupe(u8, nm);
-                dn += 1;
-            }
-            variants[j] = .{
-                .name = v.name,
-                .form = v.form,
-                .field_names = @ptrCast(fnames),
-                .field_types = try gpa.dupe(Type, v.field_types),
-                .offsets = try gpa.dupe(u32, v.offsets),
-            };
-            vbuilt += 1;
-        }
-        enum_layouts[i] = .{
-            .name = try gpa.dupe(u8, e.name),
-            .variants = variants,
-            .tag_size = e.tag_size,
-            .payload_off = e.payload_off,
-            .size = e.size,
-            .@"align" = e.@"align",
-        };
-        enums_built += 1;
-    }
-
-    t.sink.sort();
-    const owned = try t.sink.toOwned();
-    return Result{
-        .node_types = node_types,
-        .diags = owned.diags,
-        .owned_msgs = owned.owned,
-        .sigs = sigs,
-        .layouts = layouts,
-        .enum_layouts = enum_layouts,
-    };
-}
-
 /// Whole-graph typecheck (M14). Builds ONE program-wide layout table (global
 /// struct/enum ids assigned in module-id then decl order — same-named types in
 /// different modules are DISTINCT ids), resolves qualified `mod.Type` refs to the
@@ -2246,7 +2057,13 @@ pub fn checkGraph(
     fns: []const GraphFnInput,
     entry_mod: u32,
     dag: ?*Dag,
-    io: Io,
+    /// The worker pool the parallel Pass-C body checks fan out onto. `null` forces
+    /// SERIAL Pass-C — the single-source path passes null so the per-file pipeline's
+    /// own per-file fan-out is the only parallelism (no nested-pool oversubscription),
+    /// and a 1-fn graph would never spawn anyway. `-o`/`--emit ir`/`--dump-dag` pass
+    /// the real `io`. SERIAL and PARALLEL are byte-identical (the merge is fn-id
+    /// ordered + stable-sorted), so this is a perf lever only.
+    io: ?Io,
 ) !GraphResult {
     // Per-module node_types (parallel to each module's node array).
     const node_types = try gpa.alloc([]Type, mods.len);
@@ -2771,56 +2588,6 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
     }
 }
 
-fn run(t: *Typecheck) !void {
-    if (t.tree.nodes.len == 0) return;
-    const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
-    if (prog.tag != .program) return; // defensive
-
-    const decl_nodes = Ast.rangeSlice(t.tree, prog.lhs);
-
-    try t.registerStructs(decl_nodes, 0);
-    try t.registerEnums(decl_nodes, 0);
-
-    // Pass A0b: lay out each struct (visiting-guard catches recursive cycles).
-    // Runs AFTER enum registration so a struct field of an enum type resolves.
-    for (0..t.structs.items.len) |id| {
-        try LayoutEngine.layoutStruct(t.layoutEnv(), @intCast(id));
-    }
-    // Pass A0d: lay out each enum (guard catches recursive cycles).
-    for (0..t.enums.items.len) |id| {
-        try LayoutEngine.layoutEnum(t.layoutEnv(), @intCast(id));
-    }
-
-    // Pass A: decode every function signature (forward refs resolve fine since
-    // calls look the signature up by index, not by walk order). Indices here
-    // match `Resolve`'s `func` indices (both number fns in source order).
-    for (decl_nodes) |fn_idx| {
-        const decl = t.tree.nodes[fn_idx];
-        if (decl.tag != .fn_decl) continue;
-        try t.decodeFnSig(fn_idx, 0);
-    }
-
-    // Synthetic `print(str) -> ()` builtin. Appended AFTER the user-fn loop so
-    // its index == user_fn_count, matching Resolve's seeding order (which assigns
-    // print the same index). `decl_node = Ast.none` flags it as bodyless so
-    // checkFn skips it (Pass B). Codegen emits a hand-written body at this sym.
-    try t.appendPrint();
-
-    // Rule 7 (Pass A): the entry `main` may only return int or () — a frozen-sig
-    // read, emitted into the sorted diagnostic stream like any other type error.
-    try t.checkMainReturn(0);
-
-    // Pass B/C: freeze the Pass-A tables into a read-only Model, then check each
-    // function body against it via a per-fn BodyChecker (skip the synthetic,
-    // bodyless builtins). The loop index IS the global fn id (parallel to the
-    // resolver func ids), used for the `body(fid)` DAG node.
-    const model = t.buildModel();
-    for (t.fns.items, 0..) |f, i| {
-        if (f.decl_node == Ast.none) continue;
-        try t.checkBodySerial(&model, @intCast(i), f);
-    }
-}
-
 /// Register the struct decls among `decl_nodes` (of the currently-active tree).
 /// `mod` is the owning module id (0 single-file). Global ids are assigned in
 /// append order; per-module duplicate/shadow diagnostics mirror the single-file
@@ -3076,6 +2843,10 @@ fn byteOf(t: *const Typecheck, tok: u32) u32 {
 const testing = std.testing;
 const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
+const Graph = @import("driver/Graph.zig");
+const ResolveGraph = @import("resolve_graph.zig");
+const TypecheckGraph = @import("types_graph.zig");
+const Driver = @import("driver/Driver.zig");
 
 const Checked = struct {
     tokens: []Token,
@@ -3093,6 +2864,12 @@ const Checked = struct {
     }
 };
 
+/// Resolve + typecheck a source as the trivial one-module graph (the ONE
+/// front-end), then project the whole-graph results back into the single-source
+/// `Resolve.Result`/`Result` carriers — exactly as `Driver.pipeline` does, via the
+/// SAME `Driver.project*` adapters, so the `Checked` shape (and every test that
+/// reads it) is unchanged. `io = null` forces serial Pass-C (deterministic; a
+/// 1-fn graph never spawns anyway).
 fn checkSource(source: []const u8) !Checked {
     const gpa = testing.allocator;
     const tokens = try Lexer.tokenize(gpa, source);
@@ -3103,9 +2880,15 @@ fn checkSource(source: []const u8) !Checked {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
     }
-    var res = try Resolve.resolve(gpa, tree, tokens, source);
-    errdefer res.deinit(gpa);
-    const result = try check(gpa, tree, tokens, source, res.resolutions);
+
+    var g = try Graph.single(gpa, "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinitSingle(gpa);
+    var gr = try ResolveGraph.resolveGraph(gpa, &g);
+    errdefer gr.deinit(gpa);
+    // checkGraph reads `gr`; keep it live until both projections run.
+    var gtc = try TypecheckGraph.checkGraph(gpa, &g, &gr, null, null);
+    const result = Driver.projectTypecheck(gpa, &gtc);
+    const res = Driver.projectResolve(gpa, &gr);
     return .{ .tokens = tokens, .tree = tree, .resolve = res, .result = result, .source = source };
 }
 

@@ -199,19 +199,92 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     if (!emit.runsCheck()) return;
 
     // --- check: name resolution then typecheck (in-memory only; uncached). ---
+    // A lone source file is compiled as the trivial one-module graph: the graph
+    // front-end (`resolveGraph`/`checkGraph`) is the ONLY resolve/typecheck path.
+    // The graph results are projected back into the single-source `FileResult`
+    // carriers (one module → program-wide tables == local tables) so every reader
+    // (report/printFailure/dumpCheck/lowerProgram) is unchanged.
     result.checked = true;
-    const tree_view: Ast.Tree = .{ .nodes = result.nodes, .extra = result.extra, .pub_bits = result.pub_bits };
-    const res = try Resolve.resolve(gpa, tree_view, result.tokens, result.source);
-    result.resolve = res;
-    if (res.diags.len > 0) {
-        // A name error would poison every dependent type; don't typecheck.
+    var graph = try Graph.single(gpa, "main", result.path, result.source, result.tokens, result.nodes, result.extra, result.pub_bits);
+    defer graph.deinitSingle(gpa);
+
+    var gr = try ResolveGraph.resolveGraph(gpa, &graph);
+    // `gr` must stay LIVE until typecheck has read it (checkGraph borrows the
+    // resolutions/fns); project it into `result.resolve` only at the end. Free it
+    // on any error path before the projection takes ownership.
+    errdefer gr.deinit(gpa);
+
+    if (gr.diags.len > 0) {
+        // A name error would poison every dependent type; don't typecheck. Project
+        // the (diag-bearing) resolve result and stop.
+        result.resolve = projectResolve(gpa, &gr);
         result.err = error.ResolveError;
         return;
     }
 
-    const tc = try Typecheck.check(gpa, tree_view, result.tokens, result.source, res.resolutions);
-    result.typecheck = tc;
-    if (tc.diags.len > 0) result.err = error.TypeError;
+    // dag=null + io=null => serial Pass-C: the per-file `run` fan-out is the only
+    // active parallelism for `--emit check`, so there is no nested-pool blowup. A
+    // 1-fn graph never spawns regardless; serial == parallel byte-for-byte.
+    var gtc = try TypecheckGraph.checkGraph(gpa, &graph, &gr, null, null);
+    result.typecheck = projectTypecheck(gpa, &gtc); // consumes gtc
+    result.resolve = projectResolve(gpa, &gr); // consumes gr (read by checkGraph above)
+    if (result.typecheck.?.diags.len > 0) result.err = error.TypeError;
+}
+
+/// Project a graph-of-one resolve result into the single-source `Resolve.Result`
+/// carrier the `FileResult` holds. CONSUMES `gr`: the entry module's resolution
+/// array + diags + owned messages MOVE into the result; the spine arrays and the
+/// global fn table (which the single-source `Result` does not carry) are freed
+/// here. After this call `gr` is fully drained — the caller must NOT `deinit` it.
+///
+/// `Resolve.Result.deinit` (unchanged) then owns teardown of the moved slices.
+/// The diags carry `scope == 0` (entry module) rather than `NO_SCOPE`; harmless —
+/// every single-source reader (`printFailure`/`dumpCheck`) reads only
+/// `byte_offset`/`message` against the entry source, never `scope`.
+pub fn projectResolve(gpa: std.mem.Allocator, gr: *ResolveGraph.GraphResult) Resolve.Result {
+    std.debug.assert(gr.resolutions.len == 1);
+    const resolutions = gr.resolutions[0];
+    // Free the spine only (NOT resolutions[0], which moves into the Result), then
+    // the global fn table (names + array) the single-source Result has no field for.
+    // NOTE: a projected `Typecheck.Result.sigs[i].name` ALIASES `gr.fns[i].name`
+    // (checkGraph borrows the qualified name into the sig). Freeing the fn names
+    // here leaves those `sigs[].name` dangling — which is SAFE because the
+    // single-source codegen never reads them: the codegen fingerprint folds callee
+    // names from `frozen.names` (the bare `buildNames` table), `walkTouchedSig`
+    // reads only `sig.params`/`sig.ret`, and `Typecheck.Result.deinit` does not
+    // free `sigs[].name` (it treats them as borrowed). This matches the whole-graph
+    // path, where `sigs[].name` likewise borrows `res.fns[].name`.
+    gpa.free(gr.resolutions);
+    for (gr.fns) |f| gpa.free(@constCast(f.name));
+    gpa.free(gr.fns);
+    const out: Resolve.Result = .{
+        .resolutions = resolutions,
+        .diags = gr.diags,
+        .owned_msgs = gr.owned_msgs,
+    };
+    gr.* = undefined;
+    return out;
+}
+
+/// Project a graph-of-one typecheck result into the single-source `Typecheck.Result`
+/// carrier. CONSUMES `gtc`: the entry module's `node_types` + program-wide
+/// `sigs`/`layouts`/`enum_layouts` + diags + owned messages MOVE into the result;
+/// only the `node_types` spine is freed here. After this call `gtc` is drained —
+/// the caller must NOT `deinit` it. `Typecheck.Result.deinit` owns teardown.
+pub fn projectTypecheck(gpa: std.mem.Allocator, gtc: *Typecheck.GraphResult) Typecheck.Result {
+    std.debug.assert(gtc.node_types.len == 1);
+    const node_types = gtc.node_types[0];
+    gpa.free(gtc.node_types); // spine only; node_types[0] moves into the Result
+    const out: Typecheck.Result = .{
+        .node_types = node_types,
+        .diags = gtc.diags,
+        .owned_msgs = gtc.owned_msgs,
+        .sigs = gtc.sigs,
+        .layouts = gtc.layouts,
+        .enum_layouts = gtc.enum_layouts,
+    };
+    gtc.* = undefined;
+    return out;
 }
 
 // ---- code emission (the `-o` path) -----------------------------------------
@@ -451,77 +524,12 @@ pub fn lowerProgram(
     return relink(io, gpa, slots, names, main_sym, compiled, cached_n, opt_stats, ir_instrs);
 }
 
-/// What `renderProgramIr` produced: either the rendered IR text (caller frees)
+/// What `renderGraphIr` produced: either the rendered IR text (caller frees)
 /// or one `EmitError`.
 pub const IrResult = union(enum) {
     ok: []u8,
     err: EmitError,
 };
-
-/// `--emit ir`: run the `lower` stage (Ast→Ir) over every function and render
-/// the deterministic IR text. No cache, no codegen — a front-end dump. The file
-/// must already be `checked` with no front-end errors.
-/// Caller owns the returned text on success. `opt` runs the M13 opt stage on
-/// each function before rendering so `--emit ir` shows the OPTIMIZED IR (the
-/// manual IR-count metric surface).
-pub fn renderProgramIr(gpa: std.mem.Allocator, r: *const FileResult, opt: Opt.Config) !IrResult {
-    const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
-    const prog = r.nodes[Ast.root(r.nodes)];
-    std.debug.assert(prog.tag == .program);
-
-    var fn_nodes: std.ArrayList(Ast.Index) = .empty;
-    defer fn_nodes.deinit(gpa);
-    var entry_fn: ?u32 = null;
-    for (Ast.rangeSlice(tree, prog.lhs)) |fn_idx| {
-        const decl = r.nodes[fn_idx];
-        if (decl.tag != .fn_decl) continue;
-        if (entry_fn == null and std.mem.eql(u8, r.tokens[decl.main_token].text(r.source), "main")) {
-            entry_fn = @intCast(fn_nodes.items.len);
-        }
-        try fn_nodes.append(gpa, fn_idx);
-    }
-
-    const names = try buildNames(gpa, tree, r.tokens, r.source, fn_nodes.items);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-
-    const in = lower.Inputs{
-        .tree = tree,
-        .tokens = r.tokens,
-        .source = r.source,
-        .resolutions = r.resolve.?.resolutions,
-        .node_types = r.typecheck.?.node_types,
-        .layouts = r.typecheck.?.layouts,
-        .enum_layouts = r.typecheck.?.enum_layouts,
-        .names = names,
-    };
-
-    var aw: std.Io.Writer.Allocating = .init(gpa);
-    errdefer aw.deinit();
-
-    // Lowering diagnostics are collected but not surfaced through this textual
-    // dump path (its purpose is the deterministic IR golden surface); a later
-    // stage wires lower diagnostics into the driver's failure path.
-    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-
-    for (fn_nodes.items, 0..) |fn_decl, i| {
-        const is_entry = if (entry_fn) |e| e == i else false;
-        var fn_in = in;
-        fn_in.sig = if (i < r.typecheck.?.sigs.len) r.typecheck.?.sigs[i] else null;
-        var func = try lower.lowerFn(gpa, fn_in, fn_decl, names[i], is_entry, &diags);
-        defer func.deinit(gpa);
-        var opt_st: Opt.Stats = .{};
-        try Opt.run(gpa, &func, opt, &opt_st);
-        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
-        if (i + 1 != fn_nodes.items.len) try aw.writer.writeAll("\n");
-    }
-
-    var list = aw.toArrayList();
-    return .{ .ok = try list.toOwnedSlice(gpa) };
-}
 
 /// One per-function codegen job: fingerprint → cache hit (with optional VERIFY)
 /// or fresh lower → cache store. Writes only its own `slot` (no locks).

@@ -118,6 +118,17 @@ pub const Graph = struct {
         g.* = undefined;
     }
 
+    /// Tear down a graph built by `single`: free ONLY the one-element `modules`
+    /// spine. Every module field is BORROWED from the caller (see `single`), so
+    /// freeing them (as `deinit` does) would be a double-free. Use this — not
+    /// `deinit` — for a `single`-built graph.
+    pub fn deinitSingle(g: *Graph, gpa: std.mem.Allocator) void {
+        std.debug.assert(g.modules.len == 1);
+        std.debug.assert(g.err == null);
+        gpa.free(g.modules);
+        g.* = undefined;
+    }
+
     pub fn entry(g: *const Graph) *const Module {
         return &g.modules[g.entry_index];
     }
@@ -188,6 +199,61 @@ pub fn discoverDag(
     };
 
     return d.toGraph(root_id);
+}
+
+/// Build the trivial one-module graph from an ALREADY lexed+parsed single source.
+/// A lone source file is a module graph with exactly one module and no imports —
+/// the in-memory analogue of `discover` for the case where the front-end already
+/// ran lex/parse (the per-file pipeline + the inline test helpers). This is the
+/// ONE entry every single-source resolve/typecheck now flows through, so the graph
+/// path (`resolveGraph`/`checkGraph`) is the only front-end implementation.
+///
+/// `name` is the entry module's canonical name (the file stem, e.g. `main`), so
+/// the entry `main` stays bare and every other fn qualifies as `<name>.<fn>`; for
+/// the single-source id space `name` is otherwise inert. `file` is the on-disk
+/// path verbatim (or `""` for in-memory tests).
+///
+/// All slices are BORROWED, NOT owned: the caller (the per-file `FileResult`, or a
+/// test's parse arena) owns them and OUTLIVES every result derived from this graph.
+/// This is LOAD-BEARING for correctness, not just an optimization: the typecheck
+/// `EnumLayout` carries its variant `name`s as BORROWED slices into `module.source`
+/// (see `layout/Engine.zig`), so the projected `Typecheck.Result` aliases this
+/// graph's `source`. If `single` duped the source and the graph were freed before
+/// the result is consumed (e.g. `Driver.pipeline`'s `defer graph.deinit` vs the
+/// later `lowerProgram`), every variant name would dangle. Borrowing the caller's
+/// (longer-lived) source keeps those names valid. Tear down with `deinitSingle`,
+/// which frees ONLY the one-element `modules` spine and never the borrowed fields.
+///
+/// Deterministic by construction: one allocation, zero map iteration, zero sort,
+/// no I/O — byte-identical at `-j1` and `-jN` ([C11]). `entry_index = 0` and
+/// `imports = &.{}` are LOAD-BEARING: they pin the global id space to pure decl
+/// order and suppress every cross-module diagnostic (the import-walk loops in
+/// `resolveGraph`/`checkGraph` are no-ops on zero imports).
+pub fn single(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    file: []const u8,
+    source: []const u8,
+    tokens: []const Token,
+    nodes: []const Ast.Node,
+    extra: []const u32,
+    pub_bits: []const u32,
+) !Graph {
+    const modules = try gpa.alloc(Module, 1);
+    // `Module` holds mutable slices (the discovery path owns them); the graph path
+    // only ever READS them, so borrowing the caller's const inputs via @constCast is
+    // safe. `deinitSingle` frees none of these — only the `modules` spine.
+    modules[0] = .{
+        .path = name,
+        .file = file,
+        .source = @constCast(source),
+        .tokens = @constCast(tokens),
+        .nodes = @constCast(nodes),
+        .extra = @constCast(extra),
+        .pub_bits = pub_bits,
+        .imports = &.{},
+    };
+    return .{ .modules = modules, .entry_index = 0, .err = null };
 }
 
 // ---- discovery internals ----------------------------------------------------
@@ -797,6 +863,34 @@ test "discover: single entry with no imports" {
         }
     };
     try withFixture(".toyc-test-graph-solo", files, "solo.toy", Check.run);
+}
+
+test "single: trivial one-module graph from a parsed source" {
+    const gpa = testing.allocator;
+    const Lexer = @import("../lex.zig");
+    const Parser = @import("../parse.zig");
+    const src = "fn main() -> int { return 0 }\n";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    var diag: ?Parser.Diagnostic = null;
+    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+        if (tree.pub_bits.len != 0) gpa.free(@constCast(tree.pub_bits));
+    }
+
+    var g = try single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinitSingle(gpa);
+    try testing.expect(g.err == null);
+    try testing.expectEqual(@as(usize, 1), g.modules.len);
+    try testing.expectEqual(@as(u32, 0), g.entry_index);
+    try testing.expectEqual(@as(usize, 0), g.entry().imports.len);
+    try testing.expectEqualStrings("main", g.entry().path);
+    // The graph BORROWS the caller's slices (same backing memory), so the variant
+    // names a downstream EnumLayout aliases stay valid for the caller's lifetime.
+    try testing.expectEqual(src.ptr, g.entry().source.ptr);
+    try testing.expectEqual(tokens.ptr, g.entry().tokens.ptr);
 }
 
 test "resolveFile rejects path escapes" {
