@@ -47,6 +47,16 @@ pub fn openCache(io: Io, dir_buf: []u8) !Cache {
     return Cache.init(io, dir);
 }
 
+/// Like `openCache` but attaches a borrowed packed-object-store sidecar so `get`/`put`
+/// route through ONE pack file + an in-memory index (bulk read at start, bulk write at
+/// end) instead of one file per entry. The caller owns `pack` and must `load` it before
+/// the build and `flush` it after.
+pub fn openCachePack(io: Io, dir_buf: []u8, pack: *Cache.Pack) !Cache {
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    return Cache.initPack(io, dir, pack);
+}
+
 /// How far to run the pipeline. Distinct from `Cache.Phase`: `lex`/`parse` are
 /// cached on disk, but `check` (name resolution, and later typecheck) is an
 /// in-memory level only — it has no cache phase of its own yet.
@@ -675,6 +685,10 @@ const GraphFrozen = struct {
     /// recomputes verbatim; a non-null slice is only present on the dag-driven path.
     reuse: ?[]const Engine.Reuse = null,
 
+    /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
+    /// only when `--timings` is on. BORROWED; null on a plain build => zero overhead.
+    probe: ?*Engine.LowerProbe = null,
+
     /// Build the single-fn `Frozen` view a codegen job runs against: this fn's
     /// owning module's per-module arrays + the program-wide tables. `fn_nodes` is
     /// a one-element slice (this fn) so `entry_fn`/`names[idx]` index correctly.
@@ -718,6 +732,8 @@ pub fn lowerGraphProgram(
     opt: Opt.Config,
     dag: ?*Dag,
     prior: ?*const Dag.Loaded,
+    probe: ?*Engine.LowerProbe,
+    link_ns: ?*u64,
 ) !LowerProgramResult {
     const n_mods = graph.modules.len;
 
@@ -833,6 +849,7 @@ pub fn lowerGraphProgram(
         .opt = opt,
         .dag = dag,
         .reuse = reuse_decisions,
+        .probe = probe,
     };
 
     // --- parallel per-fn fan-out (one slot per lowerable fn) ---
@@ -897,7 +914,17 @@ pub fn lowerGraphProgram(
     defer gpa.free(lowered_names);
     for (lower_ids.items, 0..) |gid, i| lowered_names[i] = names[gid];
 
-    return relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
+    const link_t0: i128 = if (link_ns != null) nowNs(io) else 0;
+    const out = relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
+    if (link_ns) |lp| {
+        const dt = nowNs(io) - link_t0;
+        lp.* = if (dt > 0) @intCast(dt) else 0;
+    }
+    return out;
+}
+
+fn nowNs(io: Io) i128 {
+    return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }
 
 /// Compute the per-lowerable-fn red-green REUSE decision SINGLE-THREADED before the
@@ -1000,7 +1027,7 @@ fn graphFnJobInner(
     // callee identity + touched layouts ride in through the program-wide
     // `names`/`sigs`/`layouts` of this fn's `frozen` view, so the fingerprint folds
     // a qualified callee distinctly with NO engine change. tmp_tag = `lower_i`.
-    const engine = if (gf.dag) |dp| Engine.initDag(cache, mode, dp) else Engine.init(cache, mode);
+    const engine = Engine.initProbe(cache, mode, gf.dag, gf.probe);
     const reuse: ?Engine.Reuse = if (gf.reuse) |r| r[lower_i] else null;
     try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, gid, reuse, slot);
 }

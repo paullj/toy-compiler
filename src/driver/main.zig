@@ -25,6 +25,7 @@ const TypecheckGraph = toyc.TypecheckGraph;
 const CodegenIr = toyc.CodegenIr;
 const Opt = toyc.Opt;
 const Dag = toyc.QueryDag;
+const Engine = toyc.QueryEngine;
 const version = toyc.version;
 
 pub fn main(init: std.process.Init) !void {
@@ -246,7 +247,7 @@ fn lapNs(io: Io, timings: bool, last: *i128) u64 {
 /// Print the `--timings` per-stage breakdown (ms + % of the summed total). `total`
 /// is the sum of the shown stages, not wall-clock — best-effort I/O (DAG persist)
 /// and stats prints are deliberately excluded so each row is the stage's own cost.
-fn printTimings(out: *Io.Writer, discover: u64, resolve: u64, typecheck: u64, lower: u64, image: u64) !void {
+fn printTimings(out: *Io.Writer, discover: u64, resolve: u64, typecheck: u64, lower: u64, image: u64, sub: ?LowerSub) !void {
     const total = discover + resolve + typecheck + lower + image;
     const tot_f: f64 = @floatFromInt(if (total == 0) 1 else total);
     const row = struct {
@@ -255,16 +256,36 @@ fn printTimings(out: *Io.Writer, discover: u64, resolve: u64, typecheck: u64, lo
             const pct = @as(f64, @floatFromInt(ns)) * 100.0 / tf;
             try w.print("  {s:<11}{d:>9.3} ms  ({d:>4.1}%)\n", .{ name, ms, pct });
         }
+        // The lower SUB-stages are attributed as a fraction of `lower` itself (not of
+        // the whole build): they answer "where does lower's time go". At -jN the
+        // per-fn compute/get/put are summed across workers, so they can exceed the
+        // wall-clock `lower` — that ratio IS the parallel-overlap signal.
+        fn sub_p(w: *Io.Writer, name: []const u8, ns: u64, lower_ns: u64) !void {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const lf: f64 = @floatFromInt(if (lower_ns == 0) 1 else lower_ns);
+            const pct = @as(f64, @floatFromInt(ns)) * 100.0 / lf;
+            try w.print("    {s:<13}{d:>9.3} ms  ({d:>5.1}% of lower)\n", .{ name, ms, pct });
+        }
     };
     try out.print("timings:\n", .{});
     try row.p(out, "discover", discover, tot_f);
     try row.p(out, "resolve", resolve, tot_f);
     try row.p(out, "typecheck", typecheck, tot_f);
     try row.p(out, "lower", lower, tot_f);
+    if (sub) |s| {
+        try row.sub_p(out, "compute", s.compute_ns, lower);
+        try row.sub_p(out, "cache-get", s.get_ns, lower);
+        try row.sub_p(out, "cache-put", s.put_ns, lower);
+        try row.sub_p(out, "link-tail", s.link_ns, lower);
+    }
     try row.p(out, "image+sign", image, tot_f);
     try out.print("  {s:<11}{d:>9.3} ms\n", .{ "total", @as(f64, @floatFromInt(total)) / 1_000_000.0 });
     try out.flush();
 }
+
+/// The `--timings` sub-breakdown of `lower`: codegen compute (summed across workers),
+/// cache get/put I/O (summed across workers), and the serial relink/link tail.
+const LowerSub = struct { compute_ns: u64, get_ns: u64, put_ns: u64, link_ns: u64 };
 
 /// Run lex→parse→check→codegen→link→sign for a single input and write the signed
 /// executable to `out_path` (mode 0o755). Returns the process exit code: 0 on
@@ -298,7 +319,17 @@ fn emitExecutable(
     const io = tail_io.io();
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
+    var pack = toyc.Cache.Pack.init(gpa);
+    defer pack.deinit();
+    const cache = try Driver.openCachePack(io, &dir_buf, &pack);
+    // BULK-READ the packed object store ONCE: every subsequent `cache.get` (front-end
+    // lex/parse + the per-fn codegen fan-out) is then a memory lookup instead of a
+    // per-entry `readFileAlloc` syscall. A missing/torn pack stays cold (empty index).
+    pack.load(gpa, io, cache.dir);
+    // WRITE the merged pack ONCE at build end (deferred so it runs on every exit path,
+    // matching the per-file path's best-effort persistence regardless of late errors).
+    // This collapses the 6200×4 per-entry syscalls to ~4 (one create+writev+rename).
+    defer pack.flush(io, cache.dir);
 
     // Red-green incremental is the DEFAULT drive: a single per-build dependency `Dag`
     // lives on this frame and is threaded through discovery, typecheck, and the per-fn
@@ -380,7 +411,16 @@ fn emitExecutable(
     }
     const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag, prior_ptr);
+    // `--timings` SUB-stage attribution of `lower`: a borrowed probe splits the
+    // codegen fan-out into compute (lowerOne) vs cache get/put I/O, and `link_ns`
+    // captures the serial relink/link tail. Null when timings are off => zero clock
+    // reads in the hot per-fn path.
+    var lower_probe: Engine.LowerProbe = .{};
+    var link_ns: u64 = 0;
+    const probe_ptr: ?*Engine.LowerProbe = if (timings) &lower_probe else null;
+    const link_ns_ptr: ?*u64 = if (timings) &link_ns else null;
+
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag, prior_ptr, probe_ptr, link_ns_ptr);
     ns_lower = lapNs(io, timings, &last_ns); // codegen fan-out + the parallel link tail (+ prior-DAG load)
     switch (lowered) {
         .err => |e| {
@@ -451,7 +491,15 @@ fn emitExecutable(
 
             try writeExecutable(io, out_path, image);
             ns_image = lapNs(io, timings, &last_ns);
-            if (timings) try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image);
+            if (timings) {
+                const sub: LowerSub = .{
+                    .compute_ns = lower_probe.compute_ns.load(.monotonic),
+                    .get_ns = lower_probe.get_ns.load(.monotonic),
+                    .put_ns = lower_probe.put_ns.load(.monotonic),
+                    .link_ns = link_ns,
+                };
+                try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image, sub);
+            }
             return 0;
         },
     }
@@ -589,7 +637,7 @@ fn emitDumpDag(
     // --- whole-program codegen with the dag threaded into every per-fn job ---
     // `--dump-dag` is purely observational: pass `prior=null` so codegen never takes
     // the green reuse path (the dump shows the freshly-recorded structure).
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, .normal, opt, &dag, null);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, .normal, opt, &dag, null, null, null);
     switch (lowered) {
         .err => |e| {
             try printGraphEmitError(out, &graph, e);

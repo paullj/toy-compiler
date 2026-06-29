@@ -58,6 +58,40 @@ mode: Mode = .normal,
 /// zero behavior change — the byte-identity guarantee for this milestone.
 dag: ?*Dag = null,
 
+/// `--timings` sub-stage probe (see `LowerProbe`). BORROWED; null on a plain build
+/// so the codegen path reads no clock. Only the `lower` codegen query times against
+/// it — front-end queries (lex/parse) ignore it.
+probe: ?*LowerProbe = null,
+
+/// `--timings` sub-stage accumulator for the `lower` stage, split into the three
+/// costs the profiler attributes lower to: codegen COMPUTE (lowerOne = IR build +
+/// opt + machine lower), cache GET I/O (the read on a normal incremental build),
+/// and cache PUT I/O (the atomic-rename temp-file write). Atomic because the codegen
+/// fan-out runs the jobs in parallel; each job adds its own deltas. BORROWED (like
+/// `dag`): a single probe lives on the driver frame and a `*LowerProbe` is threaded
+/// into every job. `null` (the default) is zero-overhead — no clock is read.
+pub const LowerProbe = struct {
+    compute_ns: std.atomic.Value(u64) = .init(0),
+    get_ns: std.atomic.Value(u64) = .init(0),
+    put_ns: std.atomic.Value(u64) = .init(0),
+
+    fn add(field: *std.atomic.Value(u64), dt: u64) void {
+        _ = field.fetchAdd(dt, .monotonic);
+    }
+};
+
+fn nowNs(io: Io) i128 {
+    return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+/// Charge `dt = now - start` to `field`, but only when a probe is present. Reading
+/// the clock per get/put/compute is cheap relative to the syscalls they bracket, and
+/// it is only paid under `--timings` (probe != null), so a plain build is unaffected.
+fn lap(io: Io, field: *std.atomic.Value(u64), start: i128) void {
+    const dt = nowNs(io) - start;
+    if (dt > 0) LowerProbe.add(field, @intCast(dt));
+}
+
 pub fn init(cache: Cache, mode: Mode) Engine {
     return .{ .cache = cache, .mode = mode };
 }
@@ -67,6 +101,13 @@ pub fn init(cache: Cache, mode: Mode) Engine {
 /// behave unchanged; only the driver scope that owns the per-build `Dag` opts in.
 pub fn initDag(cache: Cache, mode: Mode, dag: *Dag) Engine {
     return .{ .cache = cache, .mode = mode, .dag = dag };
+}
+
+/// Like `initDag`/`init` but also threads a borrowed `--timings` sub-stage probe.
+/// `dag` may be null (the default `-o` build records no DAG only when red-green is
+/// off; today it is always on, so this just carries both borrowed sinks).
+pub fn initProbe(cache: Cache, mode: Mode, dag: ?*Dag, probe: ?*LowerProbe) Engine {
+    return .{ .cache = cache, .mode = mode, .dag = dag, .probe = probe };
 }
 
 /// Map a `Cache.Key` to its in-memory DAG `NodeKey`. lex/parse/codegen fold the
@@ -498,7 +539,10 @@ pub fn codegen(
     }
 
     if (mode != .force) {
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+        const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+        const got = cache.get(u8, gpa, io, key) catch null;
+        if (self.probe) |p| lap(io, &p.get_ns, get_t0);
+        if (got) |blob| {
             defer gpa.free(blob);
             if (Link.unpack(gpa, blob) catch null) |fc| {
                 slot.* = .{ .fc = fc, .cached = true };
@@ -508,11 +552,15 @@ pub fn codegen(
     }
 
     var opt_out: OptOut = .{};
+    const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
     var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
+    if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
     errdefer fc.deinit(gpa);
     if (Link.pack(gpa, fc) catch null) |b| {
         defer gpa.free(b);
+        const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
         cache.put(u8, io, key, tmp_tag, b) catch {};
+        if (self.probe) |p| lap(io, &p.put_ns, put_t0);
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
 }
@@ -562,7 +610,10 @@ fn greenReuse(
     slot: anytype,
 ) !bool {
     const key = Key.Key.fromFingerprint(.codegen, target, rd.stamp);
-    const blob = (self.cache.get(u8, gpa, io, key) catch null) orelse return false;
+    const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    const got = self.cache.get(u8, gpa, io, key) catch null;
+    if (self.probe) |p| lap(io, &p.get_ns, get_t0);
+    const blob = got orelse return false;
     defer gpa.free(blob);
     const fc = (Link.unpack(gpa, blob) catch null) orelse return false;
 

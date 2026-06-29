@@ -903,7 +903,7 @@ fn wireBuild(
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, prior);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, prior, null, null);
     switch (lowered) {
         .err => return error.TestUnexpectedResult,
         .ok => |*lp| {
@@ -1059,7 +1059,7 @@ fn gateBuild(
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, prior);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, prior, null, null);
     switch (lowered) {
         .err => return error.TestUnexpectedResult,
         .ok => |*lp| {
