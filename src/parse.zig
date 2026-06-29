@@ -608,6 +608,18 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
                 const init_expr = try p.parseExpr(0);
                 return p.addNode(.{ .tag = .var_decl, .main_token = name_tok, .lhs = init_expr, .rhs = Ast.none });
             },
+            // `x: T = e` — explicitly-typed local. The type ref lands in the
+            // otherwise-unused var_decl.rhs slot; the checker prefers it over
+            // inferring from the initializer (the resolver ignores rhs).
+            .colon => {
+                const name_tok = p.index;
+                p.advance(); // name
+                p.advance(); // :
+                const type_ref = try p.parseType();
+                try p.expect(.eq, "expected '=' after type in typed declaration");
+                const init_expr = try p.parseExpr(0);
+                return p.addNode(.{ .tag = .var_decl, .main_token = name_tok, .lhs = init_expr, .rhs = type_ref });
+            },
             .eq => {
                 const name_tok = p.index;
                 const target = try p.leaf(.identifier, name_tok); // advances past name

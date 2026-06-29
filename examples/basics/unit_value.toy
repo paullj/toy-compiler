@@ -1,0 +1,10 @@
+# Feature: `()` as a VALUE expression in a unit-returning function (rule 8).
+# expect: exit 0
+# `noop` is declared `-> ()` and explicitly returns the unit value `()`.
+fn noop() -> () {
+    return ()
+}
+fn main() -> int {
+    noop()
+    return 0
+}

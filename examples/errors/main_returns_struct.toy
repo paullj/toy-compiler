@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — main may only return int or () (rule 7).
+# expect: compile-error "main must return int or ()"
+# A struct return has no entry-point exit-code semantics.
+struct P { x: int }
+fn main() -> P {
+    return P { x: 1 }
+}

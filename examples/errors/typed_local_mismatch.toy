@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — a typed local's initializer must match its annotation (rule 4).
+# expect: compile-error "cannot bind bool to 'x' of type int"
+# `x` is annotated `int` but the initializer is a bool; no implicit coercion.
+fn main() -> int {
+    x: int = true
+    return x
+}

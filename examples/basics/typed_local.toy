@@ -1,0 +1,7 @@
+# Feature: `x: T = e` explicit typed local declaration (rule 4).
+# expect: exit 7
+# The annotation `int` is checked against the initializer and binds x : int.
+fn main() -> int {
+    x: int = 7
+    return x
+}

@@ -151,7 +151,7 @@ fn record(comptime dir_name: []const u8, files: []const FixtureFile, entry: []co
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     errdefer res.deinit(gpa);
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
     errdefer tc.deinit(gpa);
 
     return .{
@@ -899,7 +899,7 @@ fn wireBuild(
     defer res.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
@@ -1055,7 +1055,7 @@ fn gateBuild(
     defer res.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 

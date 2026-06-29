@@ -1,0 +1,11 @@
+# Feature: SHOULD FAIL — omitted `-> T` is sugar for `-> ()`, so a non-unit
+# return value must be annotated (rule 5).
+# expect: compile-error "return type int does not match declared unit"
+# `f` has no arrow, so its declared return is (); `return 5` is rejected.
+fn f() {
+    return 5
+}
+fn main() -> int {
+    f()
+    return 0
+}

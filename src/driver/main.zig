@@ -64,6 +64,9 @@ pub fn main(init: std.process.Init) !void {
     // `-o` build (the content cache, not the walk, drives correctness); the walk is
     // the live in-production proof of the early-cutoff architecture.
     var query_stats = false;
+    // Per-stage wall-clock profile (discover/resolve/typecheck/lower/image+sign).
+    // Run at `-j1` for a clean serial breakdown of where time is spent.
+    var timings = false;
     // M18: the `-j N` jobs knob. `null` => default (a cpu-based pool, i.e. the
     // std runtime's `.unlimited` concurrent_limit); `1` => `.limited(0)` (forces
     // every `fanOut` onto its inline serial fallback — the true serial baseline);
@@ -95,6 +98,8 @@ pub fn main(init: std.process.Init) !void {
             dump_dag = true;
         } else if (std.mem.eql(u8, arg, "--query-stats")) {
             query_stats = true;
+        } else if (std.mem.eql(u8, arg, "--timings")) {
+            timings = true;
         } else if (std.mem.startsWith(u8, arg, "--opt=")) {
             // Start from level-off, then turn ON each named pass.
             opt = .O0;
@@ -172,12 +177,12 @@ pub fn main(init: std.process.Init) !void {
 
     // `-o`: lower `main` and write a signed, runnable executable.
     if (out_path) |path| {
-        std.process.exit(try emitExecutable(gpa, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats, query_stats, jlimit));
+        std.process.exit(try emitExecutable(gpa, out, target, paths.items, path, mode, codegen_stats, opt, opt_stats, query_stats, timings, jlimit));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (emit == .ir) {
-        std.process.exit(try emitIr(gpa, io, out, target, paths.items, opt));
+        std.process.exit(try emitIr(gpa, out, target, paths.items, opt, jlimit));
     }
 
     const results = try Driver.run(gpa, io, emit, target, paths.items);
@@ -222,6 +227,45 @@ fn basename(path: []const u8) []const u8 {
     return path;
 }
 
+/// Monotonic nanoseconds from the `Io` clock (CLOCK_UPTIME_RAW on macOS). Zig 0.16
+/// has no `std.time.Timer`; timing is an `Io` capability.
+fn nowNs(io: Io) i128 {
+    return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+/// Delta since `last` (advancing it), in ns, for the `--timings` profile. Reports 0
+/// when timings are off, so a plain build never reads the clock.
+fn lapNs(io: Io, timings: bool, last: *i128) u64 {
+    if (!timings) return 0;
+    const n = nowNs(io);
+    const dt = n - last.*;
+    last.* = n;
+    return if (dt > 0) @intCast(dt) else 0;
+}
+
+/// Print the `--timings` per-stage breakdown (ms + % of the summed total). `total`
+/// is the sum of the shown stages, not wall-clock — best-effort I/O (DAG persist)
+/// and stats prints are deliberately excluded so each row is the stage's own cost.
+fn printTimings(out: *Io.Writer, discover: u64, resolve: u64, typecheck: u64, lower: u64, image: u64) !void {
+    const total = discover + resolve + typecheck + lower + image;
+    const tot_f: f64 = @floatFromInt(if (total == 0) 1 else total);
+    const row = struct {
+        fn p(w: *Io.Writer, name: []const u8, ns: u64, tf: f64) !void {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const pct = @as(f64, @floatFromInt(ns)) * 100.0 / tf;
+            try w.print("  {s:<11}{d:>9.3} ms  ({d:>4.1}%)\n", .{ name, ms, pct });
+        }
+    };
+    try out.print("timings:\n", .{});
+    try row.p(out, "discover", discover, tot_f);
+    try row.p(out, "resolve", resolve, tot_f);
+    try row.p(out, "typecheck", typecheck, tot_f);
+    try row.p(out, "lower", lower, tot_f);
+    try row.p(out, "image+sign", image, tot_f);
+    try out.print("  {s:<11}{d:>9.3} ms\n", .{ "total", @as(f64, @floatFromInt(total)) / 1_000_000.0 });
+    try out.flush();
+}
+
 /// Run lex→parse→check→codegen→link→sign for a single input and write the signed
 /// executable to `out_path` (mode 0o755). Returns the process exit code: 0 on
 /// success, 1 on any failure (front-end errors, no `main`, unsupported node).
@@ -236,6 +280,7 @@ fn emitExecutable(
     opt: Opt.Config,
     opt_stats: bool,
     query_stats: bool,
+    timings: bool,
     jlimit: Io.Limit,
 ) !u8 {
     // M14: `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
@@ -279,6 +324,18 @@ fn emitExecutable(
     defer if (entry_canon) |ec| gpa.free(ec);
     const prog_key: ?u64 = if (entry_canon) |ec| toyc.Cache.programKey(ec, target) else null;
 
+    // Per-stage wall-clock (only when `--timings`). The monotonic timer is lapped at
+    // each stage boundary; accumulators live at fn scope so the success path can print
+    // the breakdown. Front-end stages (discover/resolve/typecheck) are serial at any
+    // `-j`; only `lower` shrinks with more workers — so a `-j1 --timings` run is the
+    // clean "where does the time go" profile that scopes the parallelization work.
+    var last_ns: i128 = if (timings) nowNs(io) else 0;
+    var ns_discover: u64 = 0;
+    var ns_resolve: u64 = 0;
+    var ns_typecheck: u64 = 0;
+    var ns_lower: u64 = 0;
+    var ns_image: u64 = 0;
+
     // --- discover the module graph from the entry file ---
     var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], dag.?);
     defer graph.deinit(gpa);
@@ -287,6 +344,7 @@ fn emitExecutable(
         try out.flush();
         return 1;
     }
+    ns_discover = lapNs(io, timings, &last_ns);
 
     // --- whole-graph name resolution ---
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
@@ -296,15 +354,17 @@ fn emitExecutable(
         try out.flush();
         return 1;
     }
+    ns_resolve = lapNs(io, timings, &last_ns);
 
     // --- whole-graph typecheck ---
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, dag);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, dag, io);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
         for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
+    ns_typecheck = lapNs(io, timings, &last_ns);
 
     // Load the prior on-disk DAG BEFORE codegen so the red-green walk can DRIVE codegen
     // reuse (the verdict decides reuse, not post-hoc observation). A load/parse failure
@@ -321,6 +381,7 @@ fn emitExecutable(
     const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
 
     var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag, prior_ptr);
+    ns_lower = lapNs(io, timings, &last_ns); // codegen fan-out + the parallel link tail (+ prior-DAG load)
     switch (lowered) {
         .err => |e| {
             try printGraphEmitError(out, &graph, e);
@@ -373,6 +434,9 @@ fn emitExecutable(
                 try out.flush();
             }
 
+            // Reset the lap so the best-effort DAG persist + any stats prints above
+            // are not charged to the image+sign bucket.
+            _ = lapNs(io, timings, &last_ns);
             const image = try Driver.buildImage(
                 io,
                 gpa,
@@ -386,6 +450,8 @@ fn emitExecutable(
             defer gpa.free(image);
 
             try writeExecutable(io, out_path, image);
+            ns_image = lapNs(io, timings, &last_ns);
+            if (timings) try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image);
             return 0;
         },
     }
@@ -396,17 +462,25 @@ fn emitExecutable(
 /// print the deterministic IR text to stdout. Returns the process exit code.
 fn emitIr(
     gpa: std.mem.Allocator,
-    io: Io,
     out: *Io.Writer,
     target: []const u8,
     paths: []const []const u8,
     opt: Opt.Config,
+    jlimit: Io.Limit,
 ) !u8 {
     // M14: `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph.
     if (paths.len != 1) {
         try argError(out, "--emit ir takes exactly one input file (the entry module)");
         return 1;
     }
+
+    // S4: this path runs WITHOUT a dependency DAG (dag == null), so the whole-graph
+    // typecheck Pass-C fans out per-fn body checks across our own `-j`-sized pool.
+    // `.limited(0)` (-j1) drives every job onto its inline serial path — the
+    // byte-identity baseline against which -jN must produce IDENTICAL diagnostics.
+    var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
+    defer tail_io.deinit();
+    const io = tail_io.io();
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
@@ -427,7 +501,7 @@ fn emitIr(
         return 1;
     }
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null, io);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
         for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
@@ -504,7 +578,7 @@ fn emitDumpDag(
         return 1;
     }
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
         for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);

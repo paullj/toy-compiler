@@ -1,0 +1,23 @@
+# bench/medium — entry tying the geometry + math modules together.
+# A realistic mid-size multi-module program for the --timings profile.
+import geom/vec
+import geom/shape
+import util/mathx
+
+fn total() -> int {
+    a := vec.new(3, 4)
+    b := vec.new(1, 2)
+    c := vec.add(a, b)
+    d := vec.dot(c, a)
+    s1 := shape.area(shape.circle(5))
+    s2 := shape.area(shape.rect(6, 7))
+    box := shape.bbox(shape.circle(3))
+    p := mathx.powi(2, 6)
+    m := mathx.maxi(d, p)
+    return m + s1 + s2 + box.x + mathx.sumto(10) + mathx.fib(10)
+}
+
+fn main() -> int {
+    print("bench medium\n")
+    return total()
+}

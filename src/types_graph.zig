@@ -40,6 +40,7 @@ pub fn checkGraph(
     graph: *const Graph.Graph,
     res: *const ResolveGraph.GraphResult,
     dag: ?*Dag,
+    io: std.Io,
 ) !GraphResult {
     const n = graph.modules.len;
 
@@ -96,7 +97,7 @@ pub fn checkGraph(
         };
     }
 
-    return Typecheck.checkGraph(gpa, &ctx, mods, fns, dag);
+    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, dag, io);
 }
 
 /// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
@@ -196,7 +197,7 @@ fn withCheckedGraph(
     var r = try ResolveGraph.resolveGraph(gpa, &graph);
     defer r.deinit(gpa);
 
-    var tr = try checkGraph(gpa, &graph, &r, null);
+    var tr = try checkGraph(gpa, &graph, &r, null, io);
     defer tr.deinit(gpa);
 
     try check(&graph, &r, &tr);
@@ -483,4 +484,109 @@ test "single-module graph typechecks like the single-file checker" {
         }
     };
     try withCheckedGraph(".toyc-test-typ-solo", files, "solo.toy", Check.run);
+}
+
+/// S4 PARALLEL == SERIAL: discover+resolve ONCE, then type-check the SAME graph
+/// twice — under a `.limited(0)` (serial, the -j1 baseline) pool and under a
+/// multi-worker (`.limited(8)`, the -jN) pool — and assert the diagnostic stream is
+/// IDENTICAL: same count, same (module, byte_offset, message) at every index. A
+/// multi-fn, multi-module reject program with errors in source-disordered fns is the
+/// real test of the stable (module, byte_offset) merge sort vs thread-arrival order.
+fn diagsUnder(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *ResolveGraph.GraphResult,
+    limit: Io.Limit,
+) ![]GraphDiagnostic {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraph(gpa, graph, res, null, threaded.io());
+    defer tr.deinit(gpa);
+    const copy = try gpa.alloc(GraphDiagnostic, tr.diags.len);
+    for (tr.diags, 0..) |d, i| copy[i] = .{
+        .module = d.module,
+        .byte_offset = d.byte_offset,
+        .message = try gpa.dupe(u8, d.message),
+    };
+    return copy;
+}
+
+test "S4: parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-test-typ-s4det";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const files = &[_]FixtureFile{
+        // Several fns each carrying ONE error, in deliberately source-disordered
+        // positions so a thread-arrival ordering would scramble the stream.
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn a() -> int { return true }
+        \\fn b() -> int { return 1 + true }
+        \\fn c() -> int { return lib.f(true) }
+        \\fn d() -> int { x: bool = 3
+        \\ return 0 }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub fn f(x: int) -> int { return x }
+        \\pub fn g() -> bool { return 1 }
+        \\
+        },
+    };
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (files) |f| {
+        const full = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, f.path });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = f.source });
+    }
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir});
+    const cache = try Cache.init(io, cache_dir);
+
+    var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/main.toy", .{dir});
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path);
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r.diags.len);
+
+    const serial = try diagsUnder(gpa, &graph, &r, .limited(0));
+    defer {
+        for (serial) |d| gpa.free(@constCast(d.message));
+        gpa.free(serial);
+    }
+    const parallel = try diagsUnder(gpa, &graph, &r, .limited(8));
+    defer {
+        for (parallel) |d| gpa.free(@constCast(d.message));
+        gpa.free(parallel);
+    }
+
+    // The four body errors surface (g's `1`-to-bool is in an UNUSED lib fn but still
+    // checked): a/b/c/d in main + g in lib. Same count, same order, same bytes.
+    try testing.expect(serial.len >= 4);
+    try testing.expectEqual(serial.len, parallel.len);
+    for (serial, parallel) |s, p| {
+        try testing.expectEqual(s.module, p.module);
+        try testing.expectEqual(s.byte_offset, p.byte_offset);
+        try testing.expectEqualStrings(s.message, p.message);
+    }
+
+    // And the serial stream is itself (module, byte_offset)-monotone (the stable
+    // merge key) — the property the parallel path must reproduce.
+    for (serial[1..], serial[0 .. serial.len - 1]) |cur, prev| {
+        try testing.expect(prev.module < cur.module or
+            (prev.module == cur.module and prev.byte_offset <= cur.byte_offset));
+    }
 }

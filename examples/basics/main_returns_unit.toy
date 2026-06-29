@@ -1,0 +1,6 @@
+# Feature: main may return () explicitly, with `return ()` as a value (rule 7).
+# expect: exit 0
+# A unit-returning main leaves the process exit code at 0.
+fn main() -> () {
+    return ()
+}

@@ -350,6 +350,18 @@ pub fn lowerProgram(
         } };
     }
 
+    // Rule 7: `main` may only yield `int` (the process exit code) or `()`. The
+    // type checker (`Typecheck.checkMainReturn`) is now the primary, sorted-
+    // diagnostic enforcement point; this codegen-entry guard is a defense-in-depth
+    // backstop for callers that reach `lowerProgram` without the typecheck-diag gate.
+    const main_ret = r.typecheck.?.sigs[main_sym].ret;
+    if (main_ret.kind != .int and main_ret.kind != .unit) {
+        return .{ .err = .{
+            .message = "main must return int or ()",
+            .byte_offset = r.tokens[main_decl.main_token].start,
+        } };
+    }
+
     // Build the index→SymName table once (user fns by spelling, print at the end).
     const names = try buildNames(gpa, tree, r.tokens, r.source, fn_nodes.items);
     defer {
@@ -769,6 +781,17 @@ pub fn lowerGraphProgram(
         const main_proto = Ast.protoAt(em.tree(), main_decl.lhs);
         if (main_proto.params.len > 0) return .{ .err = .{
             .message = "parameters on main unsupported in M1 codegen",
+            .byte_offset = em.tokens[main_decl.main_token].start,
+            .module = graph.entry_index,
+        } };
+
+        // Rule 7: `main` may only yield `int` (the process exit code) or `()`
+        // (nothing) — any other return type has no entry-point semantics. Enforced
+        // primarily in the type checker (`Typecheck.checkMainReturn`, sorted into the
+        // type-diagnostic stream); this is the codegen-entry backstop.
+        const main_ret = tc.sigs[eid].ret;
+        if (main_ret.kind != .int and main_ret.kind != .unit) return .{ .err = .{
+            .message = "main must return int or ()",
             .byte_offset = em.tokens[main_decl.main_token].start,
             .module = graph.entry_index,
         } };

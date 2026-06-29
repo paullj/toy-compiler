@@ -31,6 +31,8 @@ const Resolution = @import("symbols/Resolution.zig").Resolution;
 const Sig = @import("symbols/Sig.zig").Sig;
 const symbols = @import("symbols/Sym.zig");
 const Dag = @import("query/Dag.zig");
+const Engine = @import("query/Engine.zig");
+const Io = std.Io;
 
 const Typecheck = @This();
 
@@ -69,6 +71,21 @@ pub const Type = struct {
         return a.kind == b.kind and
             (a.kind != .@"struct" or a.struct_id == b.struct_id) and
             (a.kind != .@"enum" or a.enum_id == b.enum_id);
+    }
+
+    /// The one assignability relation: is a value of type `got` acceptable where a
+    /// `want` is expected? Mirrors `merge`'s discipline so the two stay siblings —
+    /// `invalid` is poison (either side absorbs, so a root error yields exactly one
+    /// diagnostic and never cascades), `never` is bottom (a value that never exists
+    /// fits any slot), and otherwise assignability is structural equality with NO
+    /// implicit coercion. Returning `true` for poison/`never` means a caller guards
+    /// `if (!assignable(want, got)) emit(...)` and stays silent on already-reported
+    /// or unreachable values — exactly the manual `kind != .invalid` guards it
+    /// replaces.
+    pub fn assignable(want: Type, got: Type) bool {
+        if (want.kind == .invalid or got.kind == .invalid) return true;
+        if (got.kind == .never) return true;
+        return eql(want, got);
     }
 
     pub fn isStruct(t: Type) bool {
@@ -428,6 +445,14 @@ dag: ?*Dag = null,
 /// IS `fns[i].name`). Null single-file (the decl-token name is used instead).
 gph_fn_names: ?[]const []const u8 = null,
 
+/// S4 — the runtime the parallel Pass-C body-check fan-out dispatches onto. Set
+/// in graph mode (carries the `-j N` worker cap from the driver's own pool); when
+/// `dag == null` Pass-C fans out per-fn body checks via `Engine.fanOut(io, ...)`.
+/// `.limited(0)` (`-j1`) drives every job onto the inline serial fallback — the
+/// byte-identity baseline. Incremental builds (`dag != null`) ignore it and stay
+/// serial so the red-green edge recording is unchanged.
+io: ?Io = null,
+
 /// The graph context the orchestrator hands the shared `Typecheck`. It owns the
 /// per-module bare-name maps + the import namespaces; `Typecheck` borrows it.
 pub const GraphCtx = struct {
@@ -458,6 +483,1628 @@ pub const GraphCtx = struct {
         return c.mods[mod].namespaces.get(recv_name);
     }
 };
+
+/// The immutable, whole-program model frozen after Pass A: the fn signature
+/// table + the laid-out struct/enum tables + their bare-name maps + the graph
+/// context. Pass C reads it READ-ONLY through every `BodyChecker`, so per-fn body
+/// checking can run against one shared frozen snapshot (the enabler for S4's
+/// parallel fan-out). The slices alias the still-live `Typecheck` ArrayLists,
+/// which are not mutated during Pass C. `graph`/`gph_fn_names` are borrowed.
+const Model = struct {
+    fns: []const FnSym,
+    structs: []const StructSym,
+    enums: []const EnumSym,
+    /// Single-file bare-name maps (graph mode reads the per-module maps in `graph`
+    /// via `graph_mod`; these stay the empty init maps then). Borrowed pointers.
+    struct_map: *const std.StringHashMapUnmanaged(u32),
+    enum_map: *const std.StringHashMapUnmanaged(u32),
+    graph: ?*GraphCtx,
+    gph_fn_names: ?[]const []const u8,
+};
+
+/// Per-function checking context over a FROZEN `*const Model`. Holds the per-fn
+/// scratch (slot_types/cur_ret/loop_stack/expected) and the cursor (tree/tokens/
+/// source/resolutions/node_types/graph_mod) — all set once at construction from
+/// the fn's owning module, never swapped (gphSelect's save/restore is gone on this
+/// path). Diagnostics go to LOCAL `diags`/`owned_msgs`/`diag_mods`; the Pass-C
+/// driver (`checkBodySerial` serial, `bodyJob` parallel) merges them into the
+/// shared result AFTER the body walk, so parallel Pass C never touches shared
+/// mutable diag state. `node_types` aliases the program-wide array but each
+/// BodyChecker writes ONLY its own fn's node span (disjoint by construction).
+const BodyChecker = struct {
+    model: *const Model,
+    gpa: std.mem.Allocator,
+
+    // Cursor — set at construction from the fn's owning module; never swapped.
+    tree: Ast.Tree,
+    tokens: []const Token,
+    source: []const u8,
+    resolutions: []const Resolution,
+    node_types: []Type,
+    graph_mod: u32,
+
+    // Per-fn scratch.
+    slot_types: std.ArrayList(Type) = .empty,
+    cur_ret: Type = .unit,
+    loop_stack: std.ArrayList(LoopCtx) = .empty,
+    expected: ?Type = null,
+
+    // Local diagnostics (merged into the shared result by the Pass-C driver).
+    diags: std.ArrayList(Diagnostic) = .empty,
+    owned_msgs: std.ArrayList([]u8) = .empty,
+    diag_mods: std.ArrayList(u32) = .empty,
+
+    dag: ?*Dag = null,
+    gph_fn_names: ?[]const []const u8 = null,
+
+    fn deinit(bc: *BodyChecker) void {
+        bc.slot_types.deinit(bc.gpa);
+        bc.loop_stack.deinit(bc.gpa);
+        bc.diags.deinit(bc.gpa);
+        bc.owned_msgs.deinit(bc.gpa);
+        bc.diag_mods.deinit(bc.gpa);
+    }
+
+    // ---- BodyChecker methods (the per-fn body-walk relations) --------------
+
+    /// Walk this fn's body: rebuild the slot table, record the M16 body/sig/layout
+    /// edges (no-op when dag == null), type the body block against the declared
+    /// return type, and enforce definite-return. The cursor + scratch live on `bc`;
+    /// the immutable fn/struct/enum tables are read through `bc.model`.
+    fn checkBody(bc: *BodyChecker, fid: u32, f: FnSym) !void {
+        var dag_prev: ?Dag.NodeKey = null;
+        var entered = false;
+        if (bc.dag) |d| {
+            const node: Dag.NodeKey = .{ .kind = .body, .id = fid };
+            const parent = Dag.Active.get();
+            dag_prev = Dag.Active.enter(node);
+            entered = true;
+            d.recordEdge(bc.gpa, parent, node, bc.bodyFp(fid, f));
+        }
+        defer if (entered) Dag.Active.leave(dag_prev);
+
+        const decl = bc.tree.nodes[f.decl_node];
+        const proto = Ast.protoAt(bc.tree, decl.lhs);
+
+        // Rebuild the per-function slot→type table. Parameters get slots 0..N first
+        // (the resolver declares them first), then `:=` locals as we encounter them.
+        bc.slot_types.clearRetainingCapacity();
+        for (f.params) |pty| try bc.slot_types.append(bc.gpa, pty);
+        bc.cur_ret = f.ret;
+
+        // body(fid)->signature(fid): the fn's own proto is a codegen dependency
+        // (see the unchanged firewall rationale). No-op when dag == null.
+        bc.recordSignature(fid);
+
+        // body(fid)->layout(param)/layout(ret) for the fn's own aggregate types: a
+        // layout-only edit leaves the sig fp stable, so the layout must be a direct
+        // body dep. Scalars no-op; whole block no-op when dag == null.
+        if (bc.dag != null) {
+            const body_node: Dag.NodeKey = .{ .kind = .body, .id = fid };
+            for (f.params) |pty| bc.recordLayoutOf(body_node, pty);
+            bc.recordLayoutOf(body_node, f.ret);
+        }
+
+        const want_value = (f.ret.kind != .unit and f.ret.kind != .invalid);
+        const body_ty = try bc.typeOfBlockExpected(decl.rhs, want_value, if (want_value) f.ret else null);
+
+        // A non-unit function must produce a value on every path: either all paths
+        // structurally return, OR the body's trailing expression has the declared
+        // type. `assignable` folds poison/never/eql exactly as before.
+        if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
+            try bc.emitFmt(bc.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
+        }
+        _ = proto;
+    }
+
+    fn blockReturns(bc: *const BodyChecker, block_idx: Ast.Index) bool {
+        const stmts = Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs);
+        if (stmts.len == 0) return false;
+        return bc.stmtReturns(stmts[stmts.len - 1]);
+    }
+
+    fn stmtReturns(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
+        const stmt = bc.tree.nodes[stmt_idx];
+        return switch (stmt.tag) {
+            .return_stmt => true,
+            // A statement-position block/if is parsed wrapped in an `expr_stmt`; unwrap
+            // it so a trailing diverging bare block (`{ return 5 }`) or parenthesized
+            // value-if satisfies definite-return and a divergent arm merges correctly.
+            .expr_stmt => bc.stmtReturns(stmt.lhs),
+            .block => bc.blockReturns(stmt_idx),
+            .if_stmt => blk: {
+                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
+                // An else-less `if` can be skipped, so it never guarantees a return.
+                if (h.else_node == Ast.none) break :blk false;
+                const then_ok = bc.blockReturns(h.then_block);
+                const else_ok = if (bc.tree.nodes[h.else_node].tag == .if_stmt)
+                    bc.stmtReturns(h.else_node)
+                else
+                    bc.blockReturns(h.else_node);
+                break :blk then_ok and else_ok;
+            },
+            // Conservative: a `while` may never execute, so it can't guarantee a
+            // return (`while true { return }` is rejected — acceptable for now).
+            .while_stmt => false,
+            // A `loop` diverges (returns/never-falls-through) iff it has NO `break`
+            // targeting it: the only ways out are `return` or an outer construct.
+            .loop_expr => bc.loopDiverges(stmt_idx),
+            // A labeled wrapper is transparent for definite-return: it returns iff its
+            // inner construct does (a labeled bare block via its trailing stmt).
+            .labeled => bc.stmtReturns(bc.tree.nodes[stmt_idx].lhs),
+            .for_stmt, .break_stmt, .continue_stmt => false,
+            else => false,
+        };
+    }
+
+    fn loopDiverges(bc: *const BodyChecker, loop_idx: Ast.Index) bool {
+        return !bc.blockHasBreak(bc.tree.nodes[loop_idx].lhs, loop_idx);
+    }
+
+    fn blockHasBreak(bc: *const BodyChecker, block_idx: Ast.Index, target: Ast.Index) bool {
+        for (Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs)) |s| {
+            if (bc.stmtHasBreak(s, target)) return true;
+        }
+        return false;
+    }
+
+    fn stmtHasBreak(bc: *const BodyChecker, stmt_idx: Ast.Index, target: Ast.Index) bool {
+        const stmt = bc.tree.nodes[stmt_idx];
+        return switch (stmt.tag) {
+            // A bare break (no label) binds to the innermost loop — counts only when
+            // `target` IS the innermost loop, i.e. the bare break is found before any
+            // nested loop swallows it (the nested-loop arms below stop the descent for
+            // bare breaks). A labeled break counts iff its resolved target matches.
+            .break_stmt => if (bc.resolutions[stmt_idx] == .label)
+                bc.resolutions[stmt_idx].label == target
+            else
+                true,
+            .expr_stmt => bc.stmtHasBreak(stmt.lhs, target),
+            .block => bc.blockHasBreak(stmt_idx, target),
+            // A labeled wrapper is transparent: descend its inner construct (a
+            // `break @target` may live inside a nested labeled loop).
+            .labeled => bc.stmtHasBreak(stmt.lhs, target),
+            .if_stmt => blk: {
+                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
+                if (bc.blockHasBreak(h.then_block, target)) break :blk true;
+                if (h.else_node == Ast.none) break :blk false;
+                break :blk if (bc.tree.nodes[h.else_node].tag == .if_stmt)
+                    bc.stmtHasBreak(h.else_node, target)
+                else
+                    bc.blockHasBreak(h.else_node, target);
+            },
+            // A nested loop/for/while swallows BARE breaks, but a `break @target`
+            // buried inside it still targets `target` — so descend its body and only
+            // count labeled breaks that name `target`.
+            .loop_expr => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
+            .while_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].rhs, target),
+            .for_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
+            else => false,
+        };
+    }
+
+    fn nestedHasLabeledBreak(bc: *const BodyChecker, block_idx: Ast.Index, target: Ast.Index) bool {
+        for (Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs)) |s| {
+            if (bc.stmtHasLabeledBreak(s, target)) return true;
+        }
+        return false;
+    }
+
+    fn stmtHasLabeledBreak(bc: *const BodyChecker, stmt_idx: Ast.Index, target: Ast.Index) bool {
+        const stmt = bc.tree.nodes[stmt_idx];
+        return switch (stmt.tag) {
+            .break_stmt => bc.resolutions[stmt_idx] == .label and bc.resolutions[stmt_idx].label == target,
+            .expr_stmt => bc.stmtHasLabeledBreak(stmt.lhs, target),
+            .block => bc.nestedHasLabeledBreak(stmt_idx, target),
+            .labeled => bc.stmtHasLabeledBreak(stmt.lhs, target),
+            .if_stmt => blk: {
+                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
+                if (bc.nestedHasLabeledBreak(h.then_block, target)) break :blk true;
+                if (h.else_node == Ast.none) break :blk false;
+                break :blk if (bc.tree.nodes[h.else_node].tag == .if_stmt)
+                    bc.stmtHasLabeledBreak(h.else_node, target)
+                else
+                    bc.nestedHasLabeledBreak(h.else_node, target);
+            },
+            .loop_expr => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
+            .while_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].rhs, target),
+            .for_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
+            else => false,
+        };
+    }
+
+    fn blockDiverges(bc: *const BodyChecker, block_idx: Ast.Index) bool {
+        const stmts = Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs);
+        if (stmts.len == 0) return false;
+        return bc.stmtDiverges(stmts[stmts.len - 1]);
+    }
+
+    fn stmtDiverges(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
+        const stmt = bc.tree.nodes[stmt_idx];
+        return switch (stmt.tag) {
+            .return_stmt, .break_stmt, .continue_stmt => true,
+            .expr_stmt => bc.stmtDiverges(stmt.lhs),
+            .block => bc.blockDiverges(stmt_idx),
+            .if_stmt => blk: {
+                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
+                if (h.else_node == Ast.none) break :blk false;
+                const then_ok = bc.blockDiverges(h.then_block);
+                const else_ok = if (bc.tree.nodes[h.else_node].tag == .if_stmt)
+                    bc.stmtDiverges(h.else_node)
+                else
+                    bc.blockDiverges(h.else_node);
+                break :blk then_ok and else_ok;
+            },
+            .while_stmt => false,
+            .loop_expr => bc.loopDiverges(stmt_idx),
+            .labeled => bc.labeledDiverges(stmt_idx),
+            .for_stmt => false,
+            // A `match` diverges iff it is exhaustive AND every arm body diverges.
+            .match_expr => bc.matchDiverges(stmt_idx),
+            else => false,
+        };
+    }
+
+    fn matchDiverges(bc: *const BodyChecker, node_idx: Ast.Index) bool {
+        const n = bc.tree.nodes[node_idx];
+        const st = bc.node_types[n.lhs];
+        // Conservative for int/bool scrutinees: `return false` (loses only a
+        // definite-return optimization, never miscompiles). Only enums get the
+        // variant-coverage analysis here.
+        if (!st.isEnum()) return false;
+        const arms = Ast.rangeSlice(bc.tree, n.rhs);
+        if (arms.len == 0) return false;
+        var has_wildcard = false;
+        const e = bc.model.enums[st.enum_id];
+        var seen = [_]bool{false} ** 64; // enum variant count is small
+        for (arms) |arm_idx| {
+            const arm = bc.tree.nodes[arm_idx];
+            const h = Ast.armHeaderAt(bc.tree, arm.rhs);
+            if (!bc.stmtDiverges(h.body)) return false;
+            if (h.guard != Ast.none) continue; // a guard can fail → no coverage
+            const pat = bc.tree.nodes[arm.lhs];
+            if (pat.tag == .pattern_wildcard) {
+                has_wildcard = true;
+            } else if (pat.tag == .pattern_variant) {
+                const vname = bc.nameText(pat.main_token);
+                for (e.variants, 0..) |v, i| {
+                    if (i < seen.len and std.mem.eql(u8, v.name, vname) and bc.variantPayloadIrrefutable(arm.lhs, v)) seen[i] = true;
+                }
+            }
+        }
+        if (has_wildcard) return true;
+        if (e.variants.len > seen.len) return false;
+        for (e.variants, 0..) |_, i| if (!seen[i]) return false;
+        return true;
+    }
+
+    fn labeledDiverges(bc: *const BodyChecker, idx: Ast.Index) bool {
+        const inner_idx = bc.tree.nodes[idx].lhs;
+        const inner = bc.tree.nodes[inner_idx];
+        return switch (inner.tag) {
+            .loop_expr => bc.loopDiverges(inner_idx),
+            .while_stmt, .for_stmt => false,
+            .block => bc.blockDiverges(inner_idx) and !bc.blockHasBreak(inner_idx, inner_idx),
+            else => false,
+        };
+    }
+
+    fn typeOfBlockExpected(bc: *BodyChecker, block_idx: Ast.Index, want_value: bool, exp: ?Type) error{OutOfMemory}!Type {
+        const save = bc.expected;
+        bc.expected = exp;
+        defer bc.expected = save;
+        return bc.checkBlock(block_idx, want_value);
+    }
+
+    fn checkBlock(bc: *BodyChecker, block_idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
+        const stmts = Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs);
+        if (stmts.len == 0) {
+            bc.node_types[block_idx] = .unit;
+            return .unit;
+        }
+        // The expected type (a one-shot for an inferred `.V`) applies ONLY to this
+        // block's trailing value expression, never the non-final statements. Capture
+        // it, clear it for the non-final walk, then restore for the trailing expr.
+        const block_expected = bc.expected;
+        bc.expected = null;
+        for (stmts[0 .. stmts.len - 1]) |s| try bc.checkStmt(s); // effect only
+        const last = stmts[stmts.len - 1];
+        const last_n = bc.tree.nodes[last];
+        var bt: Type = .unit;
+        if (last_n.tag == .expr_stmt) {
+            bt = try bc.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
+            bc.node_types[last] = bt; // the expr_stmt carries the value type
+        } else if (want_value and (last_n.tag == .if_stmt or last_n.tag == .block)) {
+            bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
+        } else {
+            try bc.checkStmt(last); // statement context (incl. trailing else-less if)
+        }
+        bc.node_types[block_idx] = bt;
+        return bt;
+    }
+
+    fn checkStmt(bc: *BodyChecker, stmt_idx: Ast.Index) error{OutOfMemory}!void {
+        const stmt = bc.tree.nodes[stmt_idx];
+        switch (stmt.tag) {
+            .var_decl => {
+                // `x: T = e` (rhs is the type ref) binds x:T and checks the
+                // initializer against it; `x := e` (rhs none) infers x from e.
+                const ty: Type = if (stmt.rhs != Ast.none) blk: {
+                    const declared = bc.typeFromNode(stmt.rhs);
+                    const got = try bc.typeOfExpected(stmt.lhs, declared);
+                    if (!Type.assignable(declared, got)) {
+                        try bc.emitFmt(bc.byteOf(stmt.main_token), "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
+                    }
+                    break :blk declared;
+                } else try bc.typeOf(stmt.lhs);
+                bc.node_types[stmt_idx] = ty;
+                // Record the new local's type at its slot. The resolver bound the
+                // var_decl node to a `.local` slot; append/extend slot_types to fit.
+                if (bc.resolutions[stmt_idx] == .local) {
+                    const slot = bc.resolutions[stmt_idx].local;
+                    try bc.setSlot(slot, ty);
+                }
+                if (ty.kind == .unit) {
+                    try bc.emitFmt(bc.byteOf(stmt.main_token), "cannot bind () to '{s}'", .{bc.nameText(stmt.main_token)});
+                }
+            },
+            .assign => {
+                const target = bc.tree.nodes[stmt.lhs];
+                // Compute the place type FIRST so it can flow into the rhs as the
+                // expected type (an inferred `.V` assigned to a known-typed place).
+                const lhs: Type = switch (target.tag) {
+                    .identifier => if (bc.resolutions[stmt.lhs] == .local)
+                        bc.slotType(bc.resolutions[stmt.lhs].local)
+                    else
+                        .invalid,
+                    .field_access => try bc.typeOf(stmt.lhs),
+                    else => .invalid,
+                };
+                bc.node_types[stmt.lhs] = lhs;
+                const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
+                if (!Type.assignable(lhs, rhs)) {
+                    try bc.emitFmt(bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
+                }
+            },
+            .return_stmt => {
+                const ty: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, if (bc.cur_ret.kind == .invalid) null else bc.cur_ret);
+                // Skip when either side is poison so an unknown return type (already
+                // reported) doesn't trigger a spurious second diagnostic here. A
+                // `never`-typed operand (e.g. `return x` where x binds a break-less
+                // loop) is also fine: control never actually reaches the return, so
+                // `never` unifies with any declared type — mirrors the trailing-expr
+                // body check above.
+                if (!Type.assignable(bc.cur_ret, ty)) {
+                    try bc.emitFmt(bc.byteOf(stmt.main_token), "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
+                }
+            },
+            .expr_stmt => _ = try bc.typeOf(stmt.lhs),
+            .block => _ = try bc.checkBlock(stmt_idx, false),
+            .if_stmt => {
+                const ct = try bc.typeOf(stmt.lhs);
+                if (ct.kind != .invalid and ct.kind != .bool)
+                    try bc.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "if condition must be bool");
+                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
+                _ = try bc.checkBlock(h.then_block, false);
+                if (h.else_node != Ast.none) {
+                    if (bc.tree.nodes[h.else_node].tag == .if_stmt)
+                        try bc.checkStmt(h.else_node)
+                    else
+                        _ = try bc.checkBlock(h.else_node, false);
+                }
+            },
+            .while_stmt => try bc.checkWhile(stmt_idx, null),
+            .for_stmt => try bc.checkFor(stmt_idx, null),
+            .labeled => _ = try bc.checkLabeled(stmt_idx, false),
+            .break_stmt => {
+                const ctx = bc.targetCtx(stmt_idx) orelse {
+                    // No matching context: a bare break with an empty stack ("outside a
+                    // loop"); a labeled break is reported by resolve as undefined.
+                    if (bc.resolutions[stmt_idx] != .label)
+                        try bc.emit(bc.byteOf(stmt.main_token), "break outside of a loop");
+                    if (stmt.lhs != Ast.none) _ = try bc.typeOf(stmt.lhs);
+                    return;
+                };
+                if (stmt.lhs == Ast.none) {
+                    ctx.saw_bare_break = true;
+                    if (ctx.is_value) ctx.join = try bc.merge(stmt.main_token, ctx.join, Type.unit);
+                } else {
+                    const vt = try bc.typeOf(stmt.lhs);
+                    if (!ctx.is_value) {
+                        if (vt.kind != .invalid and vt.kind != .unit)
+                            try bc.emit(bc.byteOf(stmt.main_token), "cannot break with a value out of a while/for loop");
+                    } else {
+                        ctx.saw_value_break = true;
+                        ctx.join = try bc.merge(stmt.main_token, ctx.join, vt);
+                    }
+                }
+            },
+            .continue_stmt => {
+                const ctx = bc.targetCtx(stmt_idx) orelse {
+                    if (bc.resolutions[stmt_idx] != .label)
+                        try bc.emit(bc.byteOf(stmt.main_token), "continue outside of a loop");
+                    return;
+                };
+                // `continue` is meaningful only on a loop; a labeled bare block is not.
+                if (ctx.kind == .labeled_block)
+                    try bc.emit(bc.byteOf(stmt.main_token), "cannot continue a labeled block (not a loop)");
+            },
+            else => _ = try bc.typeOf(stmt_idx),
+        }
+    }
+
+    fn targetCtx(bc: *BodyChecker, stmt_idx: Ast.Index) ?*LoopCtx {
+        const items = bc.loop_stack.items;
+        if (bc.resolutions[stmt_idx] == .label) {
+            const target = bc.resolutions[stmt_idx].label;
+            var i = items.len;
+            while (i > 0) {
+                i -= 1;
+                if (items[i].construct_node == target) return &items[i];
+            }
+            return null;
+        }
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            if (items[i].kind != .labeled_block) return &items[i];
+        }
+        return null;
+    }
+
+    fn checkWhile(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
+        const stmt = bc.tree.nodes[stmt_idx];
+        const ct = try bc.typeOf(stmt.lhs);
+        if (ct.kind != .invalid and ct.kind != .bool)
+            try bc.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "while condition must be bool");
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
+        _ = try bc.checkBlock(stmt.rhs, false);
+        _ = bc.loop_stack.pop();
+    }
+
+    fn checkFor(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
+        const stmt = bc.tree.nodes[stmt_idx];
+        const h = Ast.forHeaderAt(bc.tree, stmt.rhs);
+        const lo = try bc.typeOf(h.lo);
+        const hi = try bc.typeOf(h.hi);
+        if (lo.kind != .invalid and lo.kind != .int)
+            try bc.emit(bc.byteOf(bc.tree.nodes[h.lo].main_token), "for range bounds must be int");
+        if (hi.kind != .invalid and hi.kind != .int)
+            try bc.emit(bc.byteOf(bc.tree.nodes[h.hi].main_token), "for range bounds must be int");
+        if (bc.resolutions[stmt_idx] == .local) try bc.setSlot(bc.resolutions[stmt_idx].local, Type.int);
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
+        _ = try bc.checkBlock(stmt.lhs, false);
+        _ = bc.loop_stack.pop();
+    }
+
+    fn checkLabeled(bc: *BodyChecker, idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
+        const n = bc.tree.nodes[idx];
+        const label = bc.nameText(n.main_token);
+        const inner = bc.tree.nodes[n.lhs];
+        const ty: Type = switch (inner.tag) {
+            .block => try bc.typeOfLabeledBlock(n.lhs, label, want_value),
+            .loop_expr => try bc.typeOfLoop(n.lhs, inner, label),
+            .while_stmt => blk: {
+                try bc.checkWhile(n.lhs, label);
+                break :blk Type.unit;
+            },
+            .for_stmt => blk: {
+                try bc.checkFor(n.lhs, label);
+                break :blk Type.unit;
+            },
+            else => Type.invalid,
+        };
+        bc.node_types[idx] = ty;
+        return ty;
+    }
+
+    fn typeOfLabeledBlock(bc: *BodyChecker, block_idx: Ast.Index, label: []const u8, want_value: bool) error{OutOfMemory}!Type {
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .is_value = true, .join = .never, .saw_value_break = false, .saw_bare_break = false });
+        const fall = try bc.checkBlock(block_idx, want_value);
+        const ctx = bc.loop_stack.pop().?;
+        // The trailing-expr value is unreachable iff the block's last statement
+        // diverges; in that case the block's value comes entirely from its breaks.
+        const ft: Type = if (bc.blockDiverges(block_idx)) Type.never else fall;
+        return bc.merge(bc.tree.nodes[block_idx].main_token, ft, ctx.join);
+    }
+
+    fn typeOfExpected(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Type) error{OutOfMemory}!Type {
+        const save = bc.expected;
+        bc.expected = exp;
+        defer bc.expected = save;
+        return bc.typeOf(node_idx);
+    }
+
+    fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
+        if (node_idx == Ast.none) return .invalid;
+        const n = bc.tree.nodes[node_idx];
+        const ty: Type = switch (n.tag) {
+            .literal_number => Type.int,
+            .literal_bool => Type.@"bool",
+            .literal_string => Type.str,
+            .identifier => switch (bc.resolutions[node_idx]) {
+                .local => |slot| bc.slotType(slot),
+                .func => blk: {
+                    try bc.emitFmt(bc.byteOf(n.main_token), "function '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    break :blk Type.invalid;
+                },
+                .unresolved => blk: {
+                    // Resolve quietly skips a struct-named identifier (it expects this
+                    // to be a struct type-name in a position it doesn't bind, or a
+                    // positional `Point(...)` callee it diagnoses elsewhere). A BARE
+                    // struct name used as a value (`q := P`, `P.x`) reaches here with
+                    // no diagnostic — report it so it never escapes to codegen.
+                    if (bc.activeStructMap().get(bc.nameText(n.main_token)) != null)
+                        try bc.emitFmt(bc.byteOf(n.main_token), "type '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    break :blk Type.invalid;
+                },
+                .label => Type.invalid, // never on an identifier node (break/continue only)
+                .module => blk: {
+                    // A bare imported-namespace name used as a value (`x := mod`):
+                    // a module is not a value. (A `mod.member` access never reaches
+                    // here — the receiver is consumed by typeOfFieldAccess/Call.)
+                    try bc.emitFmt(bc.byteOf(n.main_token), "module '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    break :blk Type.invalid;
+                },
+            },
+            .unary => blk: {
+                const operand = try bc.typeOf(n.lhs);
+                if (operand.kind == .invalid) break :blk Type.invalid;
+                const op = bc.tokens[n.main_token].tag;
+                switch (op) {
+                    .minus => {
+                        if (operand.kind == .int) break :blk Type.int;
+                        try bc.emit(bc.byteOf(n.main_token), "operand of '-' must be int");
+                    },
+                    .bang => {
+                        if (operand.kind == .bool) break :blk Type.@"bool";
+                        try bc.emit(bc.byteOf(n.main_token), "operand of '!' must be bool");
+                    },
+                    else => {},
+                }
+                break :blk Type.invalid;
+            },
+            .binary => blk: {
+                const lt = try bc.typeOf(n.lhs);
+                const rt = try bc.typeOf(n.rhs);
+                if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid;
+                const op = bc.tokens[n.main_token].tag;
+                const op_text = bc.tokens[n.main_token].text(bc.source);
+                switch (op) {
+                    .plus, .minus, .star, .slash => {
+                        if (lt.kind == .int and rt.kind == .int) break :blk Type.int;
+                        try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                    },
+                    .lt, .lt_eq, .gt, .gt_eq => {
+                        if (lt.kind == .int and rt.kind == .int) break :blk Type.@"bool";
+                        try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                    },
+                    .eq_eq, .bang_eq => {
+                        if (Type.eql(lt, rt) and (lt.kind == .int or lt.kind == .bool)) break :blk Type.@"bool";
+                        if (Type.eql(lt, rt) and lt.kind == .str) {
+                            // Same type, but str comparison isn't supported — say so,
+                            // rather than the misleading "must have the same type".
+                            try bc.emitFmt(bc.byteOf(n.main_token), "'{s}' on str is unsupported", .{op_text});
+                        } else {
+                            try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                        }
+                    },
+                    .amp_amp, .pipe_pipe => {
+                        if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
+                        try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
+                    },
+                    else => {},
+                }
+                break :blk Type.invalid;
+            },
+            .call => try bc.typeOfCall(node_idx, n),
+            .struct_init => try bc.typeOfStructInit(node_idx, n),
+            .field_access => try bc.typeOfFieldAccess(node_idx, n),
+            .enum_init_unit, .enum_init_tuple, .enum_init_struct => try bc.typeOfEnumInit(node_idx, n),
+            .match_expr => return bc.typeOfMatch(node_idx, n), // sets node_types itself
+            .literal_unit => Type.unit,
+            .block => try bc.checkBlock(node_idx, true),
+            .if_stmt => try bc.typeOfIf(node_idx, n),
+            .loop_expr => return bc.typeOfLoop(node_idx, n, null), // sets node_types itself
+            .labeled => return bc.checkLabeled(node_idx, true), // sets node_types itself
+            else => Type.invalid,
+        };
+        bc.node_types[node_idx] = ty;
+        return ty;
+    }
+
+    fn typeOfStructInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        // A qualified struct-variant `N.V { ... }` would arrive as enum_init_struct
+        // (the parser upgrades a `field_access {`), not here — so struct_init's lhs is
+        // always a plain type-name identifier; no enum routing needed.
+        _ = node_idx;
+        const name = bc.nameText(bc.tree.nodes[n.lhs].main_token);
+        const id = bc.activeStructMap().get(name) orelse {
+            for (Ast.rangeSlice(bc.tree, n.rhs)) |fi| _ = try bc.typeOf(bc.tree.nodes[fi].lhs);
+            try bc.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "unknown struct type '{s}'", .{name});
+            return .invalid;
+        };
+        const sym = bc.model.structs[id];
+        bc.recordBodyLayout(Type.structT(id)); // body -> layout(struct): construction reads field offsets (M17)
+        const inits = Ast.rangeSlice(bc.tree, n.rhs);
+    
+        // Track which declared fields are supplied (for missing/duplicate checks).
+        var seen = try bc.gpa.alloc(bool, sym.field_names.len);
+        defer bc.gpa.free(seen);
+        @memset(seen, false);
+    
+        for (inits) |fi_idx| {
+            const fi = bc.tree.nodes[fi_idx];
+            const fname = bc.nameText(fi.main_token);
+            const vt = try bc.typeOf(fi.lhs);
+            // Find the declared field by name.
+            var found: ?usize = null;
+            for (sym.field_names, 0..) |dn, j| {
+                if (std.mem.eql(u8, dn, fname)) {
+                    found = j;
+                    break;
+                }
+            }
+            if (found) |j| {
+                if (seen[j]) {
+                    try bc.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, name });
+                }
+                seen[j] = true;
+                const fty = sym.field_types[j];
+                if (!Type.assignable(fty, vt)) {
+                    try bc.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
+                }
+            } else {
+                try bc.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, name });
+            }
+        }
+        for (sym.field_names, 0..) |dn, j| {
+            if (!seen[j]) try bc.emitFmt(bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, name });
+        }
+        return Type.structT(id);
+    }
+
+    fn qualifiedEnumId(bc: *BodyChecker, node_idx: Ast.Index) ?u32 {
+        const g = bc.model.graph orelse return null;
+        const n = bc.tree.nodes[node_idx];
+        if (n.tag != .field_access) return null;
+        const recv = bc.tree.nodes[n.lhs];
+        if (recv.tag != .identifier) return null;
+        if (bc.resolutions[n.lhs] != .module) return null;
+        const recv_name = bc.nameText(recv.main_token);
+        const target = g.namespaceOfIn(bc.graph_mod, recv_name) orelse return null;
+        const member = bc.nameText(n.main_token);
+        return g.mods[target].enum_ids.get(member);
+    }
+
+    fn typeOfFieldAccess(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
+        // identifier (resolved quietly to .unresolved). Treat it as construction.
+        const recv = bc.tree.nodes[n.lhs];
+        if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
+            return bc.typeOfEnumInitQualified(node_idx, .unit, n.lhs, n.main_token, Ast.none);
+        }
+        // A 3-level cross-module unit-variant `mod.Enum.Variant`: the receiver of THIS
+        // field_access is the inner `mod.Enum` field_access (graph mode). Resolve the
+        // inner to a global enum id and treat this node as a unit-variant construction.
+        if (bc.qualifiedEnumId(n.lhs)) |enum_id| {
+            const ty = try bc.checkVariant(enum_id, n.main_token, .unit, Ast.none);
+            bc.node_types[node_idx] = ty;
+            return ty;
+        }
+        const base = try bc.typeOf(n.lhs);
+        if (base.kind == .invalid) return .invalid;
+        if (!base.isStruct()) {
+            try bc.emitFmt(bc.byteOf(n.main_token), "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
+            return .invalid;
+        }
+        const sym = bc.model.structs[base.struct_id];
+        bc.recordBodyLayout(base); // body -> layout(struct): field access reads the field offset/type (M17)
+        const fname = bc.nameText(n.main_token);
+        for (sym.field_names, 0..) |dn, j| {
+            if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
+        }
+        try bc.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
+        return .invalid;
+    }
+
+    fn typeOfEnumInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        _ = node_idx;
+        const node_form: InitForm = switch (n.tag) {
+            .enum_init_unit => .unit,
+            .enum_init_tuple => .tuple,
+            .enum_init_struct => .@"struct",
+            else => unreachable,
+        };
+        const args: Ast.Index = if (n.tag == .enum_init_unit) Ast.none else n.rhs;
+        // Resolve the enum id: qualified (lhs is the type-name identifier) or inferred
+        // (the one-shot expected type must be an enum).
+        var enum_id: u32 = undefined;
+        if (n.lhs != Ast.none) {
+            const tname = bc.nameText(bc.tree.nodes[n.lhs].main_token);
+            enum_id = bc.activeEnumMap().get(tname) orelse {
+                try bc.typeArgsForEffect(node_form, args);
+                try bc.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "'{s}' is not an enum type", .{tname});
+                return .invalid;
+            };
+        } else {
+            const exp = bc.expected orelse {
+                try bc.typeArgsForEffect(node_form, args);
+                try bc.emitFmt(bc.byteOf(n.main_token), "cannot infer the enum type for '.{s}' here", .{bc.nameText(n.main_token)});
+                return .invalid;
+            };
+            if (!exp.isEnum()) {
+                try bc.typeArgsForEffect(node_form, args);
+                if (exp.kind != .invalid)
+                    try bc.emitFmt(bc.byteOf(n.main_token), "'.{s}' expects an enum type, but {s} was expected here", .{ bc.nameText(n.main_token), bc.typeName(exp) });
+                return .invalid;
+            }
+            enum_id = exp.enum_id;
+        }
+        return bc.checkVariant(enum_id, n.main_token, node_form, args);
+    }
+
+    fn typeOfEnumInitQualified(bc: *BodyChecker, node_idx: Ast.Index, node_form: InitForm, type_node: Ast.Index, vtok: u32, args: Ast.Index) error{OutOfMemory}!Type {
+        const tname = bc.nameText(bc.tree.nodes[type_node].main_token);
+        const enum_id = bc.activeEnumMap().get(tname) orelse return .invalid; // caller checked
+        const ty = try bc.checkVariant(enum_id, vtok, node_form, args);
+        bc.node_types[node_idx] = ty;
+        return ty;
+    }
+
+    fn typeArgsForEffect(bc: *BodyChecker, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!void {
+        if (args == Ast.none) return;
+        if (node_form == .@"struct") {
+            for (Ast.rangeSlice(bc.tree, args)) |fi| _ = try bc.typeOf(bc.tree.nodes[fi].lhs);
+        } else {
+            for (Ast.rangeSlice(bc.tree, args)) |a| _ = try bc.typeOf(a);
+        }
+    }
+
+    fn checkVariant(bc: *BodyChecker, enum_id: u32, vtok: u32, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!Type {
+        const e = bc.model.enums[enum_id];
+        bc.recordBodyLayout(Type.enumT(enum_id)); // body -> layout(enum): construction reads the tag/payload layout (M17)
+        const vname = bc.nameText(vtok);
+        var vi: ?usize = null;
+        for (e.variants, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, vname)) {
+                vi = i;
+                break;
+            }
+        }
+        const variant = if (vi) |i| e.variants[i] else {
+            try bc.typeArgsForEffect(node_form, args);
+            try bc.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            return .invalid;
+        };
+        const want_form: InitForm = switch (variant.form) {
+            .unit => .unit,
+            .tuple => .tuple,
+            .@"struct" => .@"struct",
+        };
+        if (node_form != want_form) {
+            try bc.typeArgsForEffect(node_form, args);
+            try bc.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
+            return Type.enumT(enum_id);
+        }
+        switch (variant.form) {
+            .unit => {},
+            .tuple => {
+                const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, args);
+                if (elems.len != variant.field_types.len) {
+                    for (elems) |a| _ = try bc.typeOf(a);
+                    try bc.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
+                    return Type.enumT(enum_id);
+                }
+                for (elems, variant.field_types) |a, fty| {
+                    const at = try bc.typeOfExpected(a, fty);
+                    if (!Type.assignable(fty, at))
+                        try bc.emitFmt(bc.byteOf(bc.tree.nodes[a].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
+                }
+            },
+            .@"struct" => {
+                const inits = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, args);
+                var seen = try bc.gpa.alloc(bool, variant.field_names.len);
+                defer bc.gpa.free(seen);
+                @memset(seen, false);
+                for (inits) |fi_idx| {
+                    const fi = bc.tree.nodes[fi_idx];
+                    const fname = bc.nameText(fi.main_token);
+                    var found: ?usize = null;
+                    for (variant.field_names, 0..) |dn, j| {
+                        if (std.mem.eql(u8, dn, fname)) {
+                            found = j;
+                            break;
+                        }
+                    }
+                    if (found) |j| {
+                        if (seen[j]) try bc.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                        seen[j] = true;
+                        const fty = variant.field_types[j];
+                        const vt = try bc.typeOfExpected(fi.lhs, fty);
+                        if (!Type.assignable(fty, vt))
+                            try bc.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
+                    } else {
+                        _ = try bc.typeOf(fi.lhs);
+                        try bc.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                    }
+                }
+                for (variant.field_names, 0..) |dn, j| {
+                    if (!seen[j]) try bc.emitFmt(bc.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
+                }
+            },
+        }
+        return Type.enumT(enum_id);
+    }
+
+    fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        const st = try bc.typeOf(n.lhs);
+        const arms = Ast.rangeSlice(bc.tree, n.rhs);
+        if (st.kind == .invalid) {
+            // Poison-absorb: still walk arms (bodies may have their own errors) but
+            // don't emit a scrutinee or exhaustiveness error.
+            for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, bc.tree.nodes[arm_idx].rhs).body);
+            bc.node_types[node_idx] = .invalid;
+            return .invalid;
+        }
+        if (st.kind != .@"enum" and st.kind != .int and st.kind != .bool) {
+            for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, bc.tree.nodes[arm_idx].rhs).body);
+            try bc.emitFmt(bc.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
+            bc.node_types[node_idx] = .invalid;
+            return .invalid;
+        }
+    
+        // body -> layout(enum): codegen reads the scrutinee's variant tags + payload
+        // offsets, a dependency of THIS body (M17). No-op for int/bool scrutinees.
+        bc.recordBodyLayout(st);
+    
+        var seen: []bool = &.{};
+        var bool_cov: BoolCov = .{};
+        var cov: Cov = switch (st.kind) {
+            .@"enum" => blk: {
+                seen = try bc.gpa.alloc(bool, bc.model.enums[st.enum_id].variants.len);
+                @memset(seen, false);
+                break :blk .{ .@"enum" = seen };
+            },
+            .bool => .{ .@"bool" = &bool_cov },
+            else => .int,
+        };
+        defer if (st.kind == .@"enum") bc.gpa.free(seen);
+    
+        var has_wildcard = false;
+        var result: Type = Type.never;
+        for (arms) |arm_idx| {
+            const arm = bc.tree.nodes[arm_idx];
+            const h = Ast.armHeaderAt(bc.tree, arm.rhs);
+            const guarded = h.guard != Ast.none;
+            try bc.checkPattern(arm.lhs, st, &cov, &has_wildcard, !guarded);
+            if (guarded) {
+                const gt = try bc.typeOf(h.guard);
+                if (gt.kind != .invalid and gt.kind != .bool)
+                    try bc.emitFmt(bc.byteOf(bc.tree.nodes[h.guard].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
+            }
+            const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
+            const body_ty: Type = if (bc.armDiverges(h.body)) Type.never else body_ty0;
+            result = try bc.merge(n.main_token, result, body_ty);
+        }
+        if (!has_wildcard) switch (cov) {
+            .@"enum" => |sv| {
+                const e = bc.model.enums[st.enum_id];
+                for (e.variants, 0..) |v, i| {
+                    if (!sv[i]) try bc.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing variant '{s}'", .{v.name});
+                }
+            },
+            .bool => |bcov| if (!(bcov.t and bcov.f))
+                try bc.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
+            .int => try bc.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
+        };
+        bc.node_types[node_idx] = result;
+        return result;
+    }
+
+    fn irrefutable(bc: *const BodyChecker, pat_idx: Ast.Index, ty: Type) bool {
+        if (ty.kind == .invalid) return true; // poison already reported; don't cascade a spurious miss
+        const pat = bc.tree.nodes[pat_idx];
+        return switch (pat.tag) {
+            .pattern_wildcard => true,
+            .pattern_binding => pat.rhs == Ast.none or bc.irrefutable(pat.rhs, ty),
+            .pattern_literal => false,
+            .pattern_variant => blk: {
+                // Total only when the enum has exactly ONE variant (the tag test cannot
+                // fail) AND that variant's payload is fully covered. Against a
+                // multi-variant enum a single `.V` is refutable.
+                if (ty.kind != .@"enum") break :blk false;
+                const e = bc.model.enums[ty.enum_id];
+                if (e.variants.len != 1) break :blk false;
+                break :blk bc.variantPayloadIrrefutable(pat_idx, e.variants[0]);
+            },
+            .pattern_or => bc.orCoversType(pat_idx, ty),
+            else => false,
+        };
+    }
+
+    fn variantPayloadIrrefutable(bc: *const BodyChecker, pat_idx: Ast.Index, variant: VariantSym) bool {
+        const pat = bc.tree.nodes[pat_idx];
+        const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, pat.rhs);
+        switch (variant.form) {
+            .unit => return binders.len == 0,
+            .tuple => {
+                if (binders.len != variant.field_types.len) return false;
+                for (binders, variant.field_types) |b, fty| if (!bc.irrefutable(b, fty)) return false;
+                return true;
+            },
+            .@"struct" => {
+                for (binders) |b_idx| {
+                    const b = bc.tree.nodes[b_idx];
+                    const src = if (b.lhs != Ast.none) bc.nameText(bc.tree.nodes[b.lhs].main_token) else bc.nameText(b.main_token);
+                    var fty: Type = .invalid;
+                    for (variant.field_names, 0..) |dn, j| if (std.mem.eql(u8, dn, src)) {
+                        fty = variant.field_types[j];
+                        break;
+                    };
+                    if (!bc.irrefutable(b_idx, fty)) return false;
+                }
+                return true;
+            },
+        }
+    }
+
+    fn orCoversType(bc: *const BodyChecker, or_idx: Ast.Index, ty: Type) bool {
+        const alts = Ast.rangeSlice(bc.tree, bc.tree.nodes[or_idx].lhs);
+        for (alts) |a| if (bc.irrefutable(a, ty)) return true;
+        if (ty.kind == .@"enum") {
+            const e = bc.model.enums[ty.enum_id];
+            var seen = [_]bool{false} ** 64;
+            if (e.variants.len > seen.len) return false;
+            for (alts) |a| {
+                const ap = bc.tree.nodes[a];
+                if (ap.tag != .pattern_variant) continue;
+                const vname = bc.nameText(ap.main_token);
+                for (e.variants, 0..) |v, i| {
+                    if (std.mem.eql(u8, v.name, vname) and bc.variantPayloadIrrefutable(a, v)) seen[i] = true;
+                }
+            }
+            for (e.variants, 0..) |_, i| if (!seen[i]) return false;
+            return true;
+        }
+        return false;
+    }
+
+    fn armDiverges(bc: *const BodyChecker, node_idx: Ast.Index) bool {
+        return bc.stmtDiverges(node_idx);
+    }
+
+    fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
+        const pat = bc.tree.nodes[pat_idx];
+        switch (pat.tag) {
+            .pattern_wildcard => if (count_cov) {
+                has_wildcard.* = true;
+            },
+            .pattern_binding => {
+                // Record the type this binding matched AGAINST on its own node. The
+                // binding's slot is SHARED across or-pattern alternatives (Resolve), so
+                // the slot type is overwritten and can't reveal a `.A(x) | .B(x)` type
+                // divergence; the per-node matched type can (read by `collectBindings`).
+                bc.node_types[pat_idx] = expected;
+                if (pat.rhs == Ast.none) {
+                    // Bind-whole: type by value; a top-level bare binding is irrefutable.
+                    if (bc.resolutions[pat_idx] == .local) try bc.setSlot(bc.resolutions[pat_idx].local, expected);
+                    if (count_cov) has_wildcard.* = true;
+                } else {
+                    try bc.checkPattern(pat.rhs, expected, cov, has_wildcard, count_cov);
+                }
+            },
+            .pattern_literal => {
+                const lt: Type = if (bc.tokens[pat.main_token].tag == .number) Type.int else Type.@"bool";
+                if (expected.kind != .invalid and !Type.eql(lt, expected))
+                    try bc.emitFmt(bc.byteOf(pat.main_token), "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
+                // A bool literal records its case toward coverage; int never covers.
+                if (count_cov) switch (cov.*) {
+                    .bool => |bcov| {
+                        if (lt.kind == .bool) {
+                            if (std.mem.eql(u8, bc.nameText(pat.main_token), "true")) bcov.t = true else bcov.f = true;
+                        }
+                    },
+                    else => {},
+                };
+            },
+            .pattern_or => {
+                for (Ast.rangeSlice(bc.tree, pat.lhs)) |a| try bc.checkPattern(a, expected, cov, has_wildcard, count_cov);
+                try bc.checkOrBindings(pat_idx);
+            },
+            .pattern_variant => try bc.checkVariantPattern(pat_idx, expected, cov, has_wildcard, count_cov),
+            else => {},
+        }
+    }
+
+    fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
+        const pat = bc.tree.nodes[pat_idx];
+        if (expected.kind != .@"enum") {
+            if (expected.kind != .invalid)
+                try bc.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
+            return;
+        }
+        const enum_id = expected.enum_id;
+        const e = bc.model.enums[enum_id];
+        bc.recordBodyLayout(expected); // body -> layout(enum): pattern reads variant tags/payloads, incl. NESTED enums (M17)
+        // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
+        if (pat.lhs != Ast.none) {
+            const tname = bc.nameText(bc.tree.nodes[pat.lhs].main_token);
+            if (bc.activeEnumMap().get(tname)) |qid| {
+                if (qid != enum_id)
+                    try bc.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+            } else {
+                try bc.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "'{s}' is not an enum type", .{tname});
+            }
+        }
+        const vname = bc.nameText(pat.main_token);
+        var vi: ?usize = null;
+        for (e.variants, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, vname)) {
+                vi = i;
+                break;
+            }
+        }
+        const variant = if (vi) |i| blk: {
+            // Cover variant i only when this arm counts AND variant i's payload is fully
+            // matched (`.V(_)`/`.V(x)` cover it; `.V(0)` or `.V(.W(x))` over a multi-variant
+            // inner enum do not — caught by the type-aware payload check).
+            if (count_cov and bc.variantPayloadIrrefutable(pat_idx, e.variants[i])) cov.@"enum"[i] = true;
+            break :blk e.variants[i];
+        } else {
+            try bc.emitFmt(bc.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            return;
+        };
+        const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, pat.rhs);
+        switch (variant.form) {
+            .unit => {
+                if (binders.len != 0)
+                    try bc.emitFmt(bc.byteOf(pat.main_token), "unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
+            },
+            .tuple => {
+                if (binders.len != variant.field_types.len) {
+                    try bc.emitFmt(bc.byteOf(pat.main_token), "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
+                    return;
+                }
+                for (binders, variant.field_types) |b_idx, fty| {
+                    try bc.checkPattern(b_idx, fty, cov, has_wildcard, false);
+                }
+            },
+            .@"struct" => {
+                for (binders) |b_idx| {
+                    const b = bc.tree.nodes[b_idx];
+                    // A struct binding's SOURCE field name is the rename source (lhs),
+                    // or the bound name itself when punning.
+                    const src_name = if (b.lhs != Ast.none) bc.nameText(bc.tree.nodes[b.lhs].main_token) else bc.nameText(b.main_token);
+                    var fty: Type = .invalid;
+                    var found = false;
+                    for (variant.field_names, 0..) |dn, j| {
+                        if (std.mem.eql(u8, dn, src_name)) {
+                            fty = variant.field_types[j];
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        try bc.emitFmt(bc.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
+                    }
+                    // The carrier IS a pattern_binding: if it has a sub-pattern, match
+                    // the field against it; else bind the whole field by value.
+                    try bc.checkPattern(b_idx, fty, cov, has_wildcard, false);
+                }
+            },
+        }
+    }
+
+    fn checkOrBindings(bc: *BodyChecker, or_idx: Ast.Index) error{OutOfMemory}!void {
+        const alts = Ast.rangeSlice(bc.tree, bc.tree.nodes[or_idx].lhs);
+        if (alts.len < 2) return;
+        var first_map: std.StringHashMapUnmanaged(Type) = .empty;
+        defer first_map.deinit(bc.gpa);
+        try bc.collectBindings(alts[0], &first_map);
+        var ok = true;
+        for (alts[1..]) |alt| {
+            var m: std.StringHashMapUnmanaged(Type) = .empty;
+            defer m.deinit(bc.gpa);
+            try bc.collectBindings(alt, &m);
+            if (m.count() != first_map.count()) {
+                ok = false;
+            } else {
+                var it = m.iterator();
+                while (it.next()) |entry| {
+                    const want = first_map.get(entry.key_ptr.*) orelse {
+                        ok = false;
+                        break;
+                    };
+                    if (!Type.eql(want, entry.value_ptr.*)) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!ok) break;
+        }
+        if (!ok)
+            try bc.emitFmt(bc.byteOf(bc.tree.nodes[or_idx].main_token), "or-pattern alternatives must bind the same names and types", .{});
+    }
+
+    fn collectBindings(bc: *BodyChecker, pat_idx: Ast.Index, out: *std.StringHashMapUnmanaged(Type)) error{OutOfMemory}!void {
+        const pat = bc.tree.nodes[pat_idx];
+        switch (pat.tag) {
+            .pattern_binding => {
+                const name = bc.nameText(pat.main_token);
+                // The PER-NODE matched type (set in checkPattern), NOT the shared slot
+                // type — so two alternatives binding the same name at different field
+                // types are seen as different and rejected.
+                const ty: Type = bc.node_types[pat_idx];
+                try out.put(bc.gpa, name, ty);
+                if (pat.rhs != Ast.none) try bc.collectBindings(pat.rhs, out);
+            },
+            .pattern_variant => if (pat.rhs != Ast.none)
+                for (Ast.rangeSlice(bc.tree, pat.rhs)) |c| try bc.collectBindings(c, out),
+            .pattern_or => for (Ast.rangeSlice(bc.tree, pat.lhs)) |a| try bc.collectBindings(a, out),
+            else => {},
+        }
+    }
+
+    fn typeOfIf(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        _ = node_idx;
+        const ct = try bc.typeOf(n.lhs);
+        if (ct.kind != .invalid and ct.kind != .bool)
+            try bc.emit(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "if condition must be bool");
+        const h = Ast.ifHeaderAt(bc.tree, n.rhs);
+        if (h.else_node == Ast.none) {
+            try bc.emit(bc.byteOf(n.main_token), "value-if requires else");
+            _ = try bc.checkBlock(h.then_block, false); // validate the arm anyway
+            return .invalid;
+        }
+        const then_ty0 = try bc.checkBlock(h.then_block, true);
+        const then_ty: Type = if (bc.blockDiverges(h.then_block)) Type.never else then_ty0;
+        var else_ty: Type = undefined;
+        if (bc.tree.nodes[h.else_node].tag == .if_stmt) {
+            const e0 = try bc.typeOfIf(h.else_node, bc.tree.nodes[h.else_node]); // else-if ladder
+            else_ty = if (bc.stmtDiverges(h.else_node)) Type.never else e0;
+        } else {
+            const e0 = try bc.checkBlock(h.else_node, true);
+            else_ty = if (bc.blockDiverges(h.else_node)) Type.never else e0;
+        }
+        return bc.merge(n.main_token, then_ty, else_ty);
+    }
+
+    fn typeOfLoop(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, label: ?[]const u8) error{OutOfMemory}!Type {
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .is_value = true, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
+        _ = try bc.checkBlock(n.lhs, false); // body in statement ctx; breaks fill join
+        const ctx = bc.loop_stack.pop().?;
+        const ty: Type = if (!ctx.saw_value_break and !ctx.saw_bare_break) Type.never else ctx.join;
+        bc.node_types[node_idx] = ty;
+        return ty;
+    }
+
+    fn merge(bc: *BodyChecker, at: u32, a: Type, b: Type) error{OutOfMemory}!Type {
+        if (a.kind == .invalid or b.kind == .invalid) return .invalid; // poison absorbs
+        if (a.kind == .never) return b; // covers never+never → never
+        if (b.kind == .never) return a;
+        if (Type.eql(a, b)) return a; // agreement → one phi type
+        try bc.emitFmt(bc.byteOf(at), "branches yield different types ({s} vs {s})", .{ bc.typeName(a), bc.typeName(b) });
+        return .invalid; // mismatch, no coercion
+    }
+
+    fn sigNodeName(bc: *const BodyChecker, fid: u32) []const u8 {
+        if (bc.gph_fn_names) |names| {
+            if (fid < names.len) return names[fid];
+            return "print";
+        }
+        const f = bc.model.fns[fid];
+        if (f.decl_node == Ast.none) return "print";
+        return bc.nameText(bc.tree.nodes[f.decl_node].main_token);
+    }
+
+    fn sigNodeId(bc: *const BodyChecker, fid: u32) u64 {
+        _ = bc;
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, fid, .little);
+        return std.hash.Wyhash.hash(0x53_47_4e_4d, &b); // "SGNM"
+    }
+
+    fn recordSignature(bc: *BodyChecker, fid: u32) void {
+        const d = bc.dag orelse return;
+        if (fid >= bc.model.fns.len) return;
+        const f = bc.model.fns[fid];
+        const sig: Sig = .{
+            .kind = if (f.decl_node == Ast.none) .builtin else .user_fn,
+            .name = bc.sigNodeName(fid),
+            .params = f.params,
+            .ret = f.ret,
+        };
+        const node: Dag.NodeKey = .{ .kind = .signature, .id = bc.sigNodeId(fid) };
+        d.recordEdge(bc.gpa, Dag.Active.get(), node, Dag.sigFingerprint(sig));
+        // The signature's aggregate param/return types are layout dependencies of the
+        // signature node (a layout edit to a named aggregate flows to its sig).
+        for (f.params) |p| bc.recordLayoutOf(node, p);
+        bc.recordLayoutOf(node, f.ret);
+    }
+
+    fn recordResolveName(bc: *BodyChecker, res: Resolution) void {
+        const d = bc.dag orelse return;
+        var h = std.hash.Wyhash.init(0x52_4e_4d_45); // "RNME"
+        const tag: u8 = @intFromEnum(std.meta.activeTag(res));
+        h.update(&[_]u8{tag});
+        const bound: u32 = switch (res) {
+            .local => |l| l,
+            .func => |fi| fi,
+            else => 0,
+        };
+        var ib: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ib, bound, .little);
+        h.update(&ib);
+        const fp = h.final();
+        // M16 AUDIT FIX: a module-LOCAL bound id (local/func index) is not unique across
+        // modules — two modules' `local#0` would collapse to one resolve_name node and
+        // serve a wrong-module resolution fp. Fold the current module id into the NODE id
+        // (mirroring recordTypeOf), so single-file mode (one module) is unchanged but
+        // cross-module nodes stay distinct. The fp keeps the resolution-shape content
+        // (no module fold) so an unrelated module renumbering does not spuriously flip it;
+        // distinctness comes from the id, soundness from the fp.
+        const node: Dag.NodeKey = .{ .kind = .resolve_name, .id = (@as(u64, bc.graph_mod) << 40) ^ fp };
+        d.recordEdge(bc.gpa, Dag.Active.get(), node, fp);
+    }
+
+    fn recordTypeOf(bc: *BodyChecker, node_idx: Ast.Index, ty: Type) void {
+        const d = bc.dag orelse return;
+        var h = std.hash.Wyhash.init(0x54_4f_46_5f); // "TOF_"
+        h.update(&[_]u8{@intFromEnum(ty.kind)});
+        var ib: [8]u8 = undefined;
+        std.mem.writeInt(u32, ib[0..4], ty.struct_id, .little);
+        std.mem.writeInt(u32, ib[4..8], ty.enum_id, .little);
+        h.update(&ib);
+        // node_idx is a MODULE-LOCAL Ast.Index; in graph mode two modules can share an
+        // index, collapsing distinct boundary types to one type_of node (last-writer-wins
+        // fp masks a real type change => M17 miscompile). Fold the current module id into
+        // the node id (mirroring how `body` uses the global fid), so single-file mode
+        // (one module) is unchanged but cross-module nodes stay distinct.
+        const node: Dag.NodeKey = .{ .kind = .type_of, .id = (@as(u64, bc.graph_mod) << 32) | node_idx };
+        d.recordEdge(bc.gpa, Dag.Active.get(), node, h.final());
+    }
+
+    fn recordLayoutOf(bc: *BodyChecker, parent: Dag.NodeKey, ty: Type) void {
+        const d = bc.dag orelse return;
+        switch (ty.kind) {
+            .@"struct" => {
+                const node: Dag.NodeKey = .{ .kind = .layout, .id = ty.struct_id };
+                d.recordEdge(bc.gpa, parent, node, bc.structLayoutFp(ty.struct_id));
+            },
+            .@"enum" => {
+                // struct ids and enum ids are SEPARATE 0-based sequences; without a kind
+                // tag struct(N) and enum(N) collapse to one layout#N node and recordEdge's
+                // unconditional fp upsert lets the last writer mask the other's layout edit
+                // (invisible change => M17 miscompile). Reserve the high bit for enums.
+                const node: Dag.NodeKey = .{ .kind = .layout, .id = @as(u64, ty.enum_id) | (@as(u64, 1) << 63) };
+                d.recordEdge(bc.gpa, parent, node, bc.enumLayoutFp(ty.enum_id));
+            },
+            else => {},
+        }
+    }
+
+    fn recordBodyLayout(bc: *BodyChecker, ty: Type) void {
+        if (bc.dag == null) return;
+        const parent = Dag.Active.get() orelse return;
+        bc.recordLayoutOf(parent, ty);
+    }
+
+    fn structLayoutFp(bc: *const BodyChecker, id: u32) u64 {
+        var h = std.hash.Wyhash.init(0x4c_41_59_53); // "LAYS"
+        bc.foldStructLayout(&h, id);
+        return h.final();
+    }
+
+    fn foldStructLayout(bc: *const BodyChecker, h: *std.hash.Wyhash, id: u32) void {
+        const s = bc.model.structs[id];
+        if (s.state != .done or s.poisoned) {
+            h.update("<rec>"); // sentinel: a recursive/poisoned referent (matches guard)
+            return;
+        }
+        h.update(s.name);
+        h.update(&[_]u8{0});
+        for (s.field_names, s.field_types, s.offsets) |fn_, fty, off| {
+            h.update(fn_);
+            h.update(&[_]u8{0});
+            h.update(&[_]u8{@intFromEnum(fty.kind)});
+            var ob: [4]u8 = undefined;
+            std.mem.writeInt(u32, &ob, off, .little);
+            h.update(&ob);
+            if (fty.kind == .@"struct") bc.foldStructLayout(h, fty.struct_id);
+        }
+        var sz: [8]u8 = undefined;
+        std.mem.writeInt(u32, sz[0..4], s.size, .little);
+        std.mem.writeInt(u32, sz[4..8], s.@"align", .little);
+        h.update(&sz);
+    }
+
+    fn enumLayoutFp(bc: *const BodyChecker, id: u32) u64 {
+        var h = std.hash.Wyhash.init(0x4c_41_59_45); // "LAYE"
+        bc.foldEnumLayout(&h, id);
+        return h.final();
+    }
+
+    fn foldEnumLayout(bc: *const BodyChecker, h: *std.hash.Wyhash, id: u32) void {
+        const e = bc.model.enums[id];
+        if (e.state != .done or e.poisoned) {
+            h.update("<rec>");
+            return;
+        }
+        h.update(e.name);
+        h.update(&[_]u8{0});
+        var hdr: [8]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], e.tag_size, .little);
+        std.mem.writeInt(u32, hdr[4..8], e.payload_off, .little);
+        h.update(&hdr);
+        for (e.variants) |v| {
+            h.update(v.name);
+            h.update(&[_]u8{0});
+            h.update(&[_]u8{@intFromEnum(v.form)});
+            if (v.form == .@"struct") {
+                for (v.field_names, v.field_types, v.offsets) |fn_, fty, off| {
+                    h.update(fn_);
+                    h.update(&[_]u8{0});
+                    h.update(&[_]u8{@intFromEnum(fty.kind)});
+                    var ob: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &ob, off, .little);
+                    h.update(&ob);
+                    if (fty.kind == .@"struct") bc.foldStructLayout(h, fty.struct_id);
+                    if (fty.kind == .@"enum") bc.foldEnumLayout(h, fty.enum_id);
+                }
+            } else {
+                for (v.field_types, v.offsets) |fty, off| {
+                    h.update(&[_]u8{@intFromEnum(fty.kind)});
+                    var ob: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &ob, off, .little);
+                    h.update(&ob);
+                    if (fty.kind == .@"struct") bc.foldStructLayout(h, fty.struct_id);
+                    if (fty.kind == .@"enum") bc.foldEnumLayout(h, fty.enum_id);
+                }
+            }
+        }
+        var sz: [8]u8 = undefined;
+        std.mem.writeInt(u32, sz[0..4], e.size, .little);
+        std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
+        h.update(&sz);
+    }
+
+    fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        // A qualified tuple-variant construction `N.V(args)` arrives as a `.call`
+        // whose callee is a `field_access` over an enum type-name identifier. Route
+        // it to the enum-init checker (treating `n` as a tuple construction).
+        const callee = bc.tree.nodes[n.lhs];
+        if (callee.tag == .field_access) {
+            const recv = bc.tree.nodes[callee.lhs];
+            if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
+                return bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
+            }
+            // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
+            // callee field_access's receiver is the inner `mod.Enum`.
+            if (bc.qualifiedEnumId(callee.lhs)) |enum_id| {
+                const ty = try bc.checkVariant(enum_id, callee.main_token, .tuple, n.rhs);
+                bc.node_types[node_idx] = ty;
+                return ty;
+            }
+        }
+        const callee_res = bc.resolutions[n.lhs];
+        // M16: a caller's body consumes the callee NAME resolution (cross-item read).
+        bc.recordResolveName(callee_res);
+        if (callee_res != .func) {
+            // Type the args anyway so their own errors surface, then poison.
+            for (Ast.rangeSlice(bc.tree, n.rhs)) |arg| _ = try bc.typeOf(arg);
+            if (callee_res == .local) {
+                try bc.emit(bc.byteOf(n.main_token), "called value is not a function");
+            } else if (bc.tree.nodes[n.lhs].tag == .identifier) {
+                // A struct-named callee `Point(1,2)` is positional construction, which
+                // we reject — point at named construction instead.
+                const cname = bc.nameText(bc.tree.nodes[n.lhs].main_token);
+                if (bc.activeStructMap().get(cname) != null)
+                    try bc.emitFmt(bc.byteOf(n.main_token), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
+            } else if (callee_res == .unresolved and bc.tree.nodes[n.lhs].tag == .field_access) {
+                // A qualified call `recv.member(...)` whose callee stayed `.unresolved`:
+                // resolve neither bound it to a fn nor reported it (e.g. `recv` is a
+                // top-level fn shadowing an import namespace, so the field-access value
+                // path is taken and left unresolved). Emit a clean diagnostic at the
+                // member token instead of silently poisoning — otherwise the call is
+                // dropped and `-o` later crashes in codegen with no user error.
+                const fa = bc.tree.nodes[n.lhs];
+                const member = bc.nameText(fa.main_token);
+                try bc.emitFmt(bc.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
+            }
+            // Any remaining `.unresolved` was already reported by resolve.
+            return .invalid;
+        }
+        // M16 FIREWALL: this caller's body reads the callee's SIGNATURE (params/ret),
+        // NEVER its body. Route the cross-item `bc.model.fns[callee]` read through the
+        // `signature(callee)` query so a body(caller)->signature(callee) edge is recorded
+        // (fp = sig-only fold). A body-only edit to the callee leaves this fp STABLE; a
+        // signature edit FLIPS it — the firewall, proven on a real program.
+        bc.recordSignature(callee_res.func);
+        const f = bc.model.fns[callee_res.func];
+        const args = Ast.rangeSlice(bc.tree, n.rhs);
+        if (args.len != f.params.len) {
+            for (args) |arg| _ = try bc.typeOf(arg);
+            try bc.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+            return f.ret;
+        }
+        for (args, f.params, 0..) |arg, pty, i| {
+            const at = try bc.typeOfExpected(arg, if (pty.kind == .invalid) null else pty);
+            // M16: the arg's inferred type is a cross-boundary `type_of` read.
+            bc.recordTypeOf(arg, at);
+            if (!Type.assignable(pty, at)) {
+                try bc.emitFmt(bc.byteOf(bc.tree.nodes[arg].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+            }
+        }
+        // M16: the call result type (the callee's return) is the boundary `type_of`.
+        bc.recordTypeOf(node_idx, f.ret);
+        return f.ret;
+    }
+
+    fn bodyFp(bc: *const BodyChecker, fid: u32, f: FnSym) u64 {
+        var h = std.hash.Wyhash.init(0x42_4f_44_59); // "BODY"
+        var ib: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ib, fid, .little);
+        h.update(&ib);
+        const decl = bc.tree.nodes[f.decl_node];
+        if (decl.rhs != Ast.none) {
+            const body = bc.tree.nodes[decl.rhs];
+            // Fold the whole decl span: from the fn decl's first token (the proto, which
+            // sits BEFORE the body `{`) through the matching `}` of the body block. Scan
+            // from the body's `{` (main_token) matching braces to find the close, then
+            // fold source[decl_start .. body_close]. Falls back to the brace span alone on
+            // a malformed token range.
+            const open = body.main_token;
+            if (open < bc.tokens.len and bc.tokens[open].tag == .l_brace) {
+                var depth: i32 = 0;
+                var ti: usize = open;
+                var close: usize = open;
+                while (ti < bc.tokens.len) : (ti += 1) {
+                    switch (bc.tokens[ti].tag) {
+                        .l_brace => depth += 1,
+                        .r_brace => {
+                            depth -= 1;
+                            if (depth == 0) {
+                                close = ti;
+                                break;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                const decl_start = bc.tokens[decl.main_token].start;
+                h.update(bc.source[decl_start..bc.tokens[close].end]);
+            }
+        }
+        return h.final();
+    }
+
+    fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {
+        if (ty.kind == .@"struct" and ty.struct_id < bc.model.structs.len)
+            return bc.model.structs[ty.struct_id].name;
+        if (ty.kind == .@"enum" and ty.enum_id < bc.model.enums.len)
+            return bc.model.enums[ty.enum_id].name;
+        return @tagName(ty.kind);
+    }
+
+    fn slotType(bc: *const BodyChecker, slot: u32) Type {
+        return if (slot < bc.slot_types.items.len) bc.slot_types.items[slot] else .invalid;
+    }
+
+    fn setSlot(bc: *BodyChecker, slot: u32, ty: Type) !void {
+        while (bc.slot_types.items.len <= slot) try bc.slot_types.append(bc.gpa, .invalid);
+        bc.slot_types.items[slot] = ty;
+    }
+
+    fn nameText(bc: *const BodyChecker, tok: u32) []const u8 {
+        return bc.tokens[tok].text(bc.source);
+    }
+
+    fn byteOf(bc: *const BodyChecker, tok: u32) u32 {
+        return bc.tokens[tok].start;
+    }
+
+    fn emit(bc: *BodyChecker, byte_offset: u32, message: []const u8) !void {
+        try bc.diags.append(bc.gpa, .{ .byte_offset = byte_offset, .message = message });
+        if (bc.model.graph != null) try bc.diag_mods.append(bc.gpa, bc.graph_mod);
+    }
+
+    fn emitFmt(bc: *BodyChecker, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
+        const msg = try std.fmt.allocPrint(bc.gpa, fmt, args);
+        try bc.owned_msgs.append(bc.gpa, msg);
+        try bc.diags.append(bc.gpa, .{ .byte_offset = byte_offset, .message = msg });
+        if (bc.model.graph != null) try bc.diag_mods.append(bc.gpa, bc.graph_mod);
+    }
+
+    fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {
+        if (type_node == Ast.none) return Type.unit;
+        const tn = bc.tree.nodes[type_node];
+        if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
+        // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
+        // receiver binds to a `.module`. Resolve it against the owning module's tables.
+        if (tn.tag == .field_access) return bc.typeFromQualified(type_node, tn);
+        const tok = tn.main_token;
+        const name = bc.nameText(tok);
+        if (type_names.get(name)) |b| return b;
+        if (bc.activeStructMap().get(name)) |id| return Type.structT(id);
+        if (bc.activeEnumMap().get(name)) |id| return Type.enumT(id);
+        bc.emitFmt(bc.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
+        return .invalid;
+    }
+
+    fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
+        _ = node_idx;
+        const g = bc.model.graph orelse {
+            bc.emitFmt(bc.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
+            return .invalid;
+        };
+        const recv = bc.tree.nodes[n.lhs];
+        if (recv.tag != .identifier) return .invalid;
+        const recv_name = bc.nameText(recv.main_token);
+        const target = g.namespaceOfIn(bc.graph_mod, recv_name) orelse {
+            bc.emitFmt(bc.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
+            return .invalid;
+        };
+        const member = bc.nameText(n.main_token);
+        if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
+        if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
+        bc.emitFmt(bc.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
+        return .invalid;
+    }
+
+    fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
+        if (bc.model.graph) |g| return &g.mods[bc.graph_mod].struct_ids;
+        return bc.model.struct_map;
+    }
+
+    fn activeEnumMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
+        if (bc.model.graph) |g| return &g.mods[bc.graph_mod].enum_ids;
+        return bc.model.enum_map;
+    }
+};
+
+/// Freeze the Pass-A tables into a read-only `Model`. The slices alias the live
+/// `Typecheck` ArrayLists; valid for as long as those are not mutated (Pass C).
+fn buildModel(t: *Typecheck) Model {
+    return .{
+        .fns = t.fns.items,
+        .structs = t.structs.items,
+        .enums = t.enums.items,
+        .struct_map = &t.struct_map,
+        .enum_map = &t.enum_map,
+        .graph = t.graph,
+        .gph_fn_names = t.gph_fn_names,
+    };
+}
+
+/// Construct a `BodyChecker` for fn `f`, wiring its cursor to the fn's owning
+/// module (single-file: the `Typecheck` cursor; graph: `graph.mods[f.mod]` + the
+/// module's node_types slice). The per-fn scratch starts empty.
+fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecker {
+    var bc: BodyChecker = .{
+        .model = model,
+        .gpa = t.gpa,
+        .tree = t.tree,
+        .tokens = t.tokens,
+        .source = t.source,
+        .resolutions = t.resolutions,
+        .node_types = t.node_types,
+        .graph_mod = 0,
+        .dag = t.dag,
+        .gph_fn_names = t.gph_fn_names,
+    };
+    if (t.graph) |g| {
+        const mc = &g.mods[f.mod];
+        bc.tree = mc.tree;
+        bc.tokens = mc.tokens;
+        bc.source = mc.source;
+        bc.resolutions = mc.resolutions;
+        bc.graph_mod = f.mod;
+        if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
+    }
+    return bc;
+}
 
 /// Switch the active tree/tokens/source/resolutions + bare-name maps to module
 /// `mod` (graph mode). Returns the previous active module so the caller can
@@ -697,7 +2344,9 @@ pub fn checkGraph(
     ctx: *GraphCtx,
     mods: []const GraphModuleInput,
     fns: []const GraphFnInput,
+    entry_mod: u32,
     dag: ?*Dag,
+    io: Io,
 ) !GraphResult {
     // Per-module node_types (parallel to each module's node array).
     const node_types = try gpa.alloc([]Type, mods.len);
@@ -733,6 +2382,7 @@ pub fn checkGraph(
         .enum_map = .empty,
         .graph = ctx,
         .dag = dag,
+        .io = io,
     };
     defer {
         for (t.fns.items) |f| gpa.free(f.params);
@@ -782,7 +2432,7 @@ pub fn checkGraph(
     for (fns, 0..) |gf, i| fn_names[i] = gf.name;
     t.gph_fn_names = fn_names;
 
-    try t.runGraph(mods, fns);
+    try t.runGraph(mods, fns, entry_mod);
 
     // ---- snapshot: sigs (qualified names from `fns`) ----
     const sigs = try gpa.alloc(Sig, t.fns.items.len);
@@ -830,7 +2480,7 @@ pub fn checkGraph(
 
 /// The graph driver: register all types globally, lay them out, decode all fn
 /// sigs, check pub-signature coherence, then check every fn body.
-fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnInput) !void {
+fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnInput, entry_mod: u32) !void {
     // Phase 0: register every module's struct + enum names into ONE global id
     // space, deterministically (module-id order, then decl order). Structs first
     // across ALL modules, then enums, so the id spaces are independent + stable.
@@ -873,13 +2523,347 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // param/return position is an error (an importer could not name that type).
     try t.checkPubSignatures(fns);
 
-    // Phase B: check each fn body in its owning module (skip bodyless `print`).
-    // The loop index IS the global fn id (parallel to the resolver func ids + the
-    // codegen `names`/`sigs`), threaded into `checkFn` for the `body(fid)` node.
-    for (t.fns.items, 0..) |f, i| {
-        if (f.decl_node == Ast.none) continue;
-        try t.checkFn(@intCast(i), f);
+    // Rule 7 (Pass A): the entry-module `main` may only return int or (). Emitted
+    // here into the shared diag stream; the final sortDiagsStable below orders it
+    // with every other diagnostic, so it is byte-identical at -j1 and -jN.
+    try t.checkMainReturn(entry_mod);
+
+    // Phase B/C: freeze the Pass-A tables into a read-only Model, then check each
+    // fn body against it via a per-fn BodyChecker (skip bodyless `print`). The
+    // loop index IS the global fn id (parallel to the resolver func ids + the
+    // codegen `names`/`sigs`), threaded in for the `body(fid)` node.
+    //
+    // Pass-A is now frozen: `model` aliases the (no-longer-mutated) tables, every
+    // f.ret is final (returnRule=unit-sugar => no fn's return depends on another
+    // fn's body), and each BodyChecker writes ONLY its own fn's node_types span +
+    // its own local diags. So the per-fn body checks are independent and order-free
+    // — the S4 fan-out unit. The merge (concat + stable sort) happens once, serial,
+    // after the join, so PARALLEL == SERIAL.
+    const model = t.buildModel();
+
+    // Incremental builds (dag != null) record red-green edges into the shared Dag
+    // during checkBody — NOT thread-safe — so they stay serial. The default
+    // whole-program / `--emit` path (dag == null) fans out.
+    if (t.dag != null or t.io == null) {
+        for (t.fns.items, 0..) |f, i| {
+            if (f.decl_node == Ast.none) continue;
+            try t.checkBodySerial(&model, @intCast(i), f);
+        }
+        // Sort the SAME way the parallel path does so graph diagnostics are
+        // byte-identical at -j1 (serial) and -jN. Fn-id-order appends are already
+        // (module, byte_offset)-monotone for nearly every program, but a stable
+        // sort makes the contract explicit + total (PARALLEL == SERIAL).
+        sortDiagsStable(t);
+        return;
     }
+
+    try t.runPassCParallel(&model);
+}
+
+/// Per-fn body-check result produced by one parallel Pass-C job. Owns the fn's
+/// local diagnostics until the serial merge concatenates them; `node_types` were
+/// written directly into the shared per-module arrays (disjoint span, no race).
+const BodyResult = struct {
+    diags: []Diagnostic = &.{},
+    owned_msgs: [][]u8 = &.{},
+    diag_mods: []u32 = &.{},
+    err: ?anyerror = null,
+};
+
+/// Fan out every fn's body check across the worker pool, then merge the per-fn
+/// results on this (main) thread: concatenate the local diag lists in fn-id order,
+/// then STABLE-sort by (module, byte_offset). Stability is load-bearing — ties keep
+/// fn-id (= source) emission order, reproducing the serial discovery order exactly,
+/// so the merged diagnostic stream is byte-identical at every `-j`.
+fn runPassCParallel(t: *Typecheck, model: *const Model) !void {
+    const gpa = t.gpa;
+    const n = t.fns.items.len;
+    const slots = try gpa.alloc(BodyResult, n);
+    defer gpa.free(slots);
+    for (slots) |*s| s.* = .{};
+
+    const Ctx = struct {
+        t: *const Typecheck,
+        model: *const Model,
+        slots: []BodyResult,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(bodyJob)) {
+            return .{ c.t, c.model, @as(u32, @intCast(i)), &c.slots[i] };
+        }
+    };
+    Engine.fanOut(t.io.?, n, bodyJob, Ctx{ .t = t, .model = model, .slots = slots });
+
+    // Bubble a body error + RESERVE merge capacity inside a scoped errdefer window.
+    // Both the error path and a failed reservation free EVERY slot's buffers exactly
+    // once (nothing has been merged yet). The errdefer is block-scoped, so it is
+    // disarmed on normal exit — it can NOT fire during the merge below, where slot
+    // buffers are freed as their ownership transfers (otherwise an OOM mid-merge plus
+    // this errdefer would double-free the already-merged slots' diags/messages).
+    {
+        errdefer for (slots) |s| {
+            gpa.free(s.diags);
+            for (s.owned_msgs) |m| gpa.free(m);
+            gpa.free(s.owned_msgs);
+            gpa.free(s.diag_mods);
+        };
+        for (slots) |s| if (s.err) |e| return e;
+
+        var n_diags: usize = 0;
+        var n_msgs: usize = 0;
+        var n_mods: usize = 0;
+        for (slots) |s| {
+            n_diags += s.diags.len;
+            n_msgs += s.owned_msgs.len;
+            n_mods += s.diag_mods.len;
+        }
+        try t.diags.ensureUnusedCapacity(gpa, n_diags);
+        try t.owned_msgs.ensureUnusedCapacity(gpa, n_msgs);
+        if (t.graph != null) try t.diag_mods.ensureUnusedCapacity(gpa, n_mods);
+    }
+
+    // Merge (infallible — capacity is reserved): append per-fn diags in fn-id order
+    // (the slot arrays' own backing is freed; the message bytes' ownership transfers
+    // to t.owned_msgs). No `try` here, so no double-free window.
+    for (slots) |s| {
+        t.diags.appendSliceAssumeCapacity(s.diags);
+        t.owned_msgs.appendSliceAssumeCapacity(s.owned_msgs);
+        if (t.graph != null) t.diag_mods.appendSliceAssumeCapacity(s.diag_mods);
+        gpa.free(s.diags);
+        gpa.free(s.owned_msgs);
+        gpa.free(s.diag_mods);
+    }
+
+    sortDiagsStable(t);
+}
+
+/// One parallel Pass-C unit: construct a BodyChecker for fn `fid` over the frozen
+/// `model`, walk its body, and move its local diagnostics into `out`. Writes only
+/// its own fn's node_types span + `out` — no shared mutable state — so jobs are
+/// race-free and order-free. `dag` is null on this path (the serial branch handles
+/// incremental), so checkBody records nothing.
+fn bodyJob(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
+    const f = model.fns[fid];
+    if (f.decl_node == Ast.none) return;
+    var bc = t.bodyCheckerFor(model, f);
+    defer bc.deinit();
+    bc.checkBody(fid, f) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.diags = bc.diags.toOwnedSlice(bc.gpa) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.owned_msgs = bc.owned_msgs.toOwnedSlice(bc.gpa) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.diag_mods = bc.diag_mods.toOwnedSlice(bc.gpa) catch |e| {
+        out.err = e;
+        return;
+    };
+}
+
+/// Stable-sort the merged diagnostics by (module, byte_offset). In graph mode the
+/// owning module rides in the parallel `diag_mods` array, so the two arrays are
+/// permuted together via a swap-aware STABLE index sort; single-file mode (no
+/// diag_mods) sorts on byte_offset alone. Stability is load-bearing — equal-key
+/// diagnostics keep their pre-sort (fn-id, then walk) order, which IS today's serial
+/// discovery order, so PARALLEL == SERIAL down to the byte. Diag counts are small
+/// (one per source error), so `insertionContext` (the std stable index sort) is the
+/// right tool over a permutation+apply dance.
+fn sortDiagsStable(t: *Typecheck) void {
+    if (t.graph != null) {
+        const SortCtx = struct {
+            diags: []Diagnostic,
+            mods: []u32,
+            pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+                if (c.mods[a] != c.mods[b]) return c.mods[a] < c.mods[b];
+                return c.diags[a].byte_offset < c.diags[b].byte_offset;
+            }
+            pub fn swap(c: @This(), a: usize, b: usize) void {
+                std.mem.swap(Diagnostic, &c.diags[a], &c.diags[b]);
+                std.mem.swap(u32, &c.mods[a], &c.mods[b]);
+            }
+        };
+        std.sort.insertionContext(0, t.diags.items.len, SortCtx{
+            .diags = t.diags.items,
+            .mods = t.diag_mods.items,
+        });
+    } else {
+        std.sort.block(Diagnostic, t.diags.items, {}, struct {
+            fn lessThan(_: void, a: Diagnostic, b: Diagnostic) bool {
+                return a.byte_offset < b.byte_offset;
+            }
+        }.lessThan);
+    }
+}
+
+// ---- Pass-A2 copies (checkPubSignatures records body->signature/layout
+
+// edges on the Typecheck cursor BEFORE the per-fn BodyCheckers exist; these
+
+// read the live t.structs/t.enums/t.fns ArrayLists, mirror the BodyChecker
+
+// versions byte-for-byte, and run only when dag != null). --------------
+
+/// Record `body(caller) -> signature(fid)` with the sig-only fingerprint. The
+/// CALLER's `body` node is the Active parent (entered in `checkFn`). The sig is
+/// rebuilt from the SAME `t.fns.items[fid]` table the whole-graph pass already
+/// filled (Pass A) — a pure read, no recompute. No-op when `dag == null`.
+fn recordSignature(t: *Typecheck, fid: u32) void {
+    const d = t.dag orelse return;
+    if (fid >= t.fns.items.len) return;
+    const f = t.fns.items[fid];
+    const sig: Sig = .{
+        .kind = if (f.decl_node == Ast.none) .builtin else .user_fn,
+        .name = t.sigNodeName(fid),
+        .params = f.params,
+        .ret = f.ret,
+    };
+    const node: Dag.NodeKey = .{ .kind = .signature, .id = t.sigNodeId(fid) };
+    d.recordEdge(t.gpa, Dag.Active.get(), node, Dag.sigFingerprint(sig));
+    // The signature's aggregate param/return types are layout dependencies of the
+    // signature node (a layout edit to a named aggregate flows to its sig).
+    for (f.params) |p| t.recordLayoutOf(node, p);
+    t.recordLayoutOf(node, f.ret);
+}
+
+/// The stable `signature(fn)` node id for global fn `fid`, folding the SAME name
+/// the codegen callee-sig fold uses (graph: the qualified `gph_fn_names[fid]`;
+/// single-file: the decl-token spelling, with the synthetic bodyless fn = "print").
+/// Must mirror `Engine.codegen`'s `Wyhash(0x53_47_4e_4d, csig.name)` so the typecheck
+/// body->signature edge and the codegen->signature edge share one node.
+fn sigNodeName(t: *const Typecheck, fid: u32) []const u8 {
+    if (t.gph_fn_names) |names| {
+        if (fid < names.len) return names[fid];
+        return "print";
+    }
+    const f = t.fns.items[fid];
+    if (f.decl_node == Ast.none) return "print";
+    return t.nameText(t.tree.nodes[f.decl_node].main_token);
+}
+
+/// The STABLE `signature(fid)` DAG node id. M16 AUDIT FIX: the historical id was
+/// `Wyhash(name)` — NOT module/target qualified, so two same-named pub fns in
+/// different modules (or a user fn named `print`) collapsed to ONE signature node
+/// and served a wrong sig fp. The content-fp in the codegen cache key MASKED this;
+/// with stable-id keying it is live. `fid` is the program-wide global fn id (the
+/// `res.fns`/`t.fns` index), globally unique across modules, exactly matching how
+/// `body(fid)` is keyed — so a caller's `body -> signature(callee_fid)` edge and the
+/// callee's own `signature(callee_fid)` node always agree, preserving the firewall.
+fn sigNodeId(t: *const Typecheck, fid: u32) u64 {
+    _ = t;
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, fid, .little);
+    return std.hash.Wyhash.hash(0x53_47_4e_4d, &b); // "SGNM"
+}
+
+/// Record `parent -> layout(type)` when `ty` names an aggregate (struct/enum). fp
+/// mirrors Walks.structLayoutBytes/enumLayoutBytes EXACTLY over the laid-out
+/// `t.structs`/`t.enums` snapshots, so the recorded layout fp flips iff the codegen
+/// layout bytes flip. No-op when `dag == null` or `ty` is a scalar.
+fn recordLayoutOf(t: *Typecheck, parent: Dag.NodeKey, ty: Type) void {
+    const d = t.dag orelse return;
+    switch (ty.kind) {
+        .@"struct" => {
+            const node: Dag.NodeKey = .{ .kind = .layout, .id = ty.struct_id };
+            d.recordEdge(t.gpa, parent, node, t.structLayoutFp(ty.struct_id));
+        },
+        .@"enum" => {
+            // struct ids and enum ids are SEPARATE 0-based sequences; without a kind
+            // tag struct(N) and enum(N) collapse to one layout#N node and recordEdge's
+            // unconditional fp upsert lets the last writer mask the other's layout edit
+            // (invisible change => M17 miscompile). Reserve the high bit for enums.
+            const node: Dag.NodeKey = .{ .kind = .layout, .id = @as(u64, ty.enum_id) | (@as(u64, 1) << 63) };
+            d.recordEdge(t.gpa, parent, node, t.enumLayoutFp(ty.enum_id));
+        },
+        else => {},
+    }
+}
+
+/// Fold struct `id`'s layout into a u64, mirroring `Walks.structLayoutBytes`
+/// byte-for-byte (name\0 + per-field name\0+kind+offset, recursing nested structs,
+/// + size + align). Folds ONLY a `.done` snapshot; a `.laying`/poisoned child emits
+/// a sentinel and does NOT recurse (the recursive-struct guard — KNOWN BUG a).
+fn structLayoutFp(t: *const Typecheck, id: u32) u64 {
+    var h = std.hash.Wyhash.init(0x4c_41_59_53); // "LAYS"
+    t.foldStructLayout(&h, id);
+    return h.final();
+}
+
+fn foldStructLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
+    const s = t.structs.items[id];
+    if (s.state != .done or s.poisoned) {
+        h.update("<rec>"); // sentinel: a recursive/poisoned referent (matches guard)
+        return;
+    }
+    h.update(s.name);
+    h.update(&[_]u8{0});
+    for (s.field_names, s.field_types, s.offsets) |fn_, fty, off| {
+        h.update(fn_);
+        h.update(&[_]u8{0});
+        h.update(&[_]u8{@intFromEnum(fty.kind)});
+        var ob: [4]u8 = undefined;
+        std.mem.writeInt(u32, &ob, off, .little);
+        h.update(&ob);
+        if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
+    }
+    var sz: [8]u8 = undefined;
+    std.mem.writeInt(u32, sz[0..4], s.size, .little);
+    std.mem.writeInt(u32, sz[4..8], s.@"align", .little);
+    h.update(&sz);
+}
+
+/// Fold enum `id`'s layout into a u64, mirroring `Walks.enumLayoutBytes`
+/// byte-for-byte. Reuses the `.done`/sentinel guard so a recursive enum never loops.
+fn enumLayoutFp(t: *const Typecheck, id: u32) u64 {
+    var h = std.hash.Wyhash.init(0x4c_41_59_45); // "LAYE"
+    t.foldEnumLayout(&h, id);
+    return h.final();
+}
+
+fn foldEnumLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
+    const e = t.enums.items[id];
+    if (e.state != .done or e.poisoned) {
+        h.update("<rec>");
+        return;
+    }
+    h.update(e.name);
+    h.update(&[_]u8{0});
+    var hdr: [8]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], e.tag_size, .little);
+    std.mem.writeInt(u32, hdr[4..8], e.payload_off, .little);
+    h.update(&hdr);
+    for (e.variants) |v| {
+        h.update(v.name);
+        h.update(&[_]u8{0});
+        h.update(&[_]u8{@intFromEnum(v.form)});
+        if (v.form == .@"struct") {
+            for (v.field_names, v.field_types, v.offsets) |fn_, fty, off| {
+                h.update(fn_);
+                h.update(&[_]u8{0});
+                h.update(&[_]u8{@intFromEnum(fty.kind)});
+                var ob: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ob, off, .little);
+                h.update(&ob);
+                if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
+                if (fty.kind == .@"enum") t.foldEnumLayout(h, fty.enum_id);
+            }
+        } else {
+            for (v.field_types, v.offsets) |fty, off| {
+                h.update(&[_]u8{@intFromEnum(fty.kind)});
+                var ob: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ob, off, .little);
+                h.update(&ob);
+                if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
+                if (fty.kind == .@"enum") t.foldEnumLayout(h, fty.enum_id);
+            }
+        }
+    }
+    var sz: [8]u8 = undefined;
+    std.mem.writeInt(u32, sz[0..4], e.size, .little);
+    std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
+    h.update(&sz);
 }
 
 /// A `pub` fn must not expose a non-`pub` type: if any param/return type resolves
@@ -950,6 +2934,33 @@ fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, ow
     };
     if (non_pub)
         try t.emitFmt(t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+}
+
+/// Rule 7: the entry `main` may only yield `int` (the process exit code) or `()`
+/// (nothing). Any other return type (bool/str/struct/enum) has no entry-point exit
+/// semantics and is rejected here, in the checker, so the diagnostic flows through
+/// the same (module, byte_offset)-sorted stream as every other type error (the
+/// driver `-o` guard is the codegen-time backstop, kept for defense in depth). A
+/// Pass-A check: it reads only the frozen fn signatures, so it never blocks the
+/// per-fn Pass-C parallelism. `entry_mod` is the entry module id (0 single-file);
+/// the entry is the FIRST fn named `main` in that module, mirroring the driver's
+/// own entry selection so the checker and codegen agree on which `main`.
+fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
+    for (t.fns.items) |f| {
+        if (f.decl_node == Ast.none or f.mod != entry_mod) continue;
+        const tree = if (t.graph) |g| g.mods[entry_mod].tree else t.tree;
+        const tokens = if (t.graph) |g| g.mods[entry_mod].tokens else t.tokens;
+        const source = if (t.graph) |g| g.mods[entry_mod].source else t.source;
+        const main_tok = tree.nodes[f.decl_node].main_token;
+        if (!std.mem.eql(u8, tokens[main_tok].text(source), "main")) continue;
+        if (f.ret.kind != .int and f.ret.kind != .unit and f.ret.kind != .invalid) {
+            // Select the entry module so byteOf/the graph diag_mods tag point into
+            // the right source (emit reads t.graph_mod for the module tag).
+            if (t.graph != null) _ = t.gphSelect(entry_mod);
+            try t.emit(tokens[main_tok].start, "main must return int or ()");
+        }
+        return; // only the first `main` is the entry
+    }
 }
 
 // ---- shared snapshot helpers (used by check + checkGraph) ------------------
@@ -1097,12 +3108,18 @@ fn run(t: *Typecheck) !void {
     // checkFn skips it (Pass B). Codegen emits a hand-written body at this sym.
     try t.appendPrint();
 
-    // Pass B: check each function body (skip the synthetic, bodyless builtins).
-    // The loop index IS the global fn id (parallel to the resolver func ids), used
-    // for the `body(fid)` DAG node.
+    // Rule 7 (Pass A): the entry `main` may only return int or () — a frozen-sig
+    // read, emitted into the sorted diagnostic stream like any other type error.
+    try t.checkMainReturn(0);
+
+    // Pass B/C: freeze the Pass-A tables into a read-only Model, then check each
+    // function body against it via a per-fn BodyChecker (skip the synthetic,
+    // bodyless builtins). The loop index IS the global fn id (parallel to the
+    // resolver func ids), used for the `body(fid)` DAG node.
+    const model = t.buildModel();
     for (t.fns.items, 0..) |f, i| {
         if (f.decl_node == Ast.none) continue;
-        try t.checkFn(@intCast(i), f);
+        try t.checkBodySerial(&model, @intCast(i), f);
     }
 }
 
@@ -1179,954 +3196,68 @@ fn appendPrint(t: *Typecheck) !void {
     try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .params = params, .ret = .unit });
 }
 
-fn checkFn(t: *Typecheck, fid: u32, f: FnSym) !void {
-    // Graph mode: check this fn body in its owning module's tree/resolutions.
-    const prev = t.gphSelect(f.mod);
-    defer _ = t.gphSelect(prev);
-
-    // M16: enter this fn's `body(fid)` node as the Active query parent for the
-    // duration of the body check, so every nested signature/type_of/layout/
-    // resolve_name read inside records `body(fid) -> callee`. The body fp is a
-    // body-content fold DISTINCT from the sig fold (so a body edit flips body fp
-    // but leaves the fn's signature fp STABLE — the firewall). No-op + zero
-    // overhead when `dag == null` (the verbatim default path).
-    var dag_prev: ?Dag.NodeKey = null;
-    var entered = false;
-    if (t.dag) |d| {
-        const node: Dag.NodeKey = .{ .kind = .body, .id = fid };
-        // Pass B runs each body at the top of the active stack: the parent is the
-        // saved-before value (null at Pass B top level), so `body(fid)` is a ROOT
-        // node here (its fp is recorded, no spurious self-edge).
-        const parent = Dag.Active.get();
-        dag_prev = Dag.Active.enter(node);
-        entered = true;
-        // Body content fp: a body-content fold DISTINCT from the sig fold; purely
-        // observational (the authoritative codegen fingerprint is the cache key).
-        d.recordEdge(t.gpa, parent, node, t.bodyFp(fid, f));
-    }
-    defer if (entered) Dag.Active.leave(dag_prev);
-
-    const decl = t.tree.nodes[f.decl_node];
-    const proto = Ast.protoAt(t.tree, decl.lhs);
-
-    // Rebuild the per-function slot→type table. Parameters get slots 0..N first
-    // (the resolver declares them first), then `:=` locals as we encounter them.
-    t.slot_types.clearRetainingCapacity();
-    for (f.params) |pty| try t.slot_types.append(t.gpa, pty);
-    t.cur_ret = f.ret;
-
-    // The fn's OWN signature (name + arity + EVERY param/return type, scalars
-    // included) is a real codegen dependency: the authoritative codegen fingerprint
-    // folds the emitted SymName + the full proto (Fingerprint.zig sig fold), and a
-    // proto-only edit (scalar param/ret type, arity, reorder, rename) — with the body
-    // brace span byte-identical — changes the emitted bytes (arg registers / frame /
-    // ABI / symbol). bodyFp deliberately excludes the proto (the firewall basis), so
-    // WITHOUT this edge body(fid) verifies green on a proto-only edit and greenReuse
-    // serves the stale blob = MISCOMPILE (no content-fp net on the green path). Record
-    // body(fid)->signature(fid) under the entered body Active node: sigFingerprint
-    // folds name+arity+all param/ret kinds+aggregate ids. A body-only edit leaves
-    // sigFingerprint stable, so the firewall holds. No-op when dag == null.
-    t.recordSignature(fid);
-
-    // ALSO record body(fid)->layout(param)/layout(ret) DIRECTLY for the fn's own
-    // aggregate param/return types. The signature edge above is NOT sufficient for an
-    // aggregate LAYOUT edit: a struct/enum field change leaves the sig FINGERPRINT
-    // stable (it folds the param/ret type IDENTITY, not the layout), so BACKDATING on
-    // signature(fid) reports it unchanged to body(fid) and a pass-through fn
-    // `fn id(p: P) -> P { return p }` (whose body never field-accesses P) verifies
-    // GREEN on an ABI-boundary layout edit = MISCOMPILE (no content-fp net on the green
-    // path). A direct body->layout edge makes the layout a first-class body dep the
-    // walk reddens. Scalars are a no-op in recordLayoutOf; no-op when dag == null.
-    if (t.dag != null) {
-        const body_node: Dag.NodeKey = .{ .kind = .body, .id = fid };
-        for (f.params) |pty| t.recordLayoutOf(body_node, pty);
-        t.recordLayoutOf(body_node, f.ret);
-    }
-
-    // A function body is a block; a non-unit fn wants its trailing expression to
-    // supply the value. A unit fn checks its body in statement context.
-    const want_value = (f.ret.kind != .unit and f.ret.kind != .invalid);
-    // The fn return type is the expected type for the body's trailing value
-    // expression (so a trailing inferred `.V` resolves to the return enum).
-    const body_ty = try t.typeOfBlockExpected(decl.rhs, want_value, if (want_value) f.ret else null);
-
-    // A non-unit function must produce a value on every path: either all paths
-    // structurally return, OR the body's trailing expression has the declared
-    // type (no explicit `return` needed). An else-less `if` or a `while`
-    // never guarantees a return, and a trailing non-expression item is unit.
-    if (want_value and !blockReturns(t, decl.rhs)) {
-        if (body_ty.kind == .invalid) {
-            // poison already reported elsewhere; no extra diagnostic
-        } else if (Type.eql(body_ty, f.ret) or body_ty.kind == .never) {
-            // trailing expression supplies the value — OK (or it is a `never`
-            // expression, e.g. a break-less `loop`, that can never fall through).
-        } else {
-            try t.emitFmt(t.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ t.nameText(decl.main_token), t.typeName(f.ret) });
-        }
-    }
-    _ = proto;
+/// Check one fn body against the FROZEN `model`. Constructs a per-fn
+/// `BodyChecker` (cursor wired to the fn's owning module, scratch fresh, diags
+/// local), runs the body walk through it, then MERGES the local diags back into
+/// the shared result in walk order. Serial Pass B calls this per fn in source
+/// order, so the merged diags reproduce today's discovery order byte-for-byte;
+/// this is also the unit of work a future parallel Pass C fans out (each worker
+/// owns its BodyChecker, touching only its own node_types span + local diags).
+/// Serial Pass-C unit (single-file `run`, the dag != null incremental path, and
+/// the io == null fallback). Identical body-walk to `bodyJob`; merges into the
+/// shared lists in fn-id order. The graph caller sorts after the loop.
+fn checkBodySerial(t: *Typecheck, model: *const Model, fid: u32, f: FnSym) !void {
+    var bc = t.bodyCheckerFor(model, f);
+    defer bc.deinit();
+    try bc.checkBody(fid, f);
+    try t.mergeBodyDiags(&bc);
 }
 
-/// The own-codegen fingerprint for `body(fid)`: it folds the fn's ENTIRE declaration
-/// source span — the proto (fn name + every param name/type + return type) AND the
-/// body block — so it flips on ANY edit that changes THIS fn's emitted bytes.
-///
-/// This is the validity oracle for the fn's OWN codegen reuse (Driver.computeReuse
-/// marks codegen green iff body(fid) verifies unchanged, with NO content-fp net on the
-/// green path). So it must be a SUPERSET of everything the authoritative codegen
-/// fingerprint folds about this fn's own decl (Fingerprint.zig fn_decl walk: fn name,
-/// each param name + type-ref text, return type-ref, body). It deliberately folds the
-/// proto TEXT (not just types) because the body binds params by NAME to slots, so a
-/// param REORDER or RENAME — which leaves the body brace span byte-identical yet
-/// changes the emitted slot/register assignment — MUST flip this fp. Folding only the
-/// brace span (the old behaviour) false-greened every proto-only edit = miscompile.
-///
-/// The caller firewall is UNAFFECTED: a caller depends on `signature(callee)` (the
-/// sig-only `Dag.sigFingerprint`, no body, no param names), never on body(callee). A
-/// callee body OR proto edit flips body(callee) (the callee recompiles) but leaves
-/// signature(callee) stable unless the callee's ABI shape changed — so a callee
-/// body-only edit still cuts off its callers.
-fn bodyFp(t: *const Typecheck, fid: u32, f: FnSym) u64 {
-    var h = std.hash.Wyhash.init(0x42_4f_44_59); // "BODY"
-    var ib: [4]u8 = undefined;
-    std.mem.writeInt(u32, &ib, fid, .little);
-    h.update(&ib);
-    const decl = t.tree.nodes[f.decl_node];
-    if (decl.rhs != Ast.none) {
-        const body = t.tree.nodes[decl.rhs];
-        // Fold the whole decl span: from the fn decl's first token (the proto, which
-        // sits BEFORE the body `{`) through the matching `}` of the body block. Scan
-        // from the body's `{` (main_token) matching braces to find the close, then
-        // fold source[decl_start .. body_close]. Falls back to the brace span alone on
-        // a malformed token range.
-        const open = body.main_token;
-        if (open < t.tokens.len and t.tokens[open].tag == .l_brace) {
-            var depth: i32 = 0;
-            var ti: usize = open;
-            var close: usize = open;
-            while (ti < t.tokens.len) : (ti += 1) {
-                switch (t.tokens[ti].tag) {
-                    .l_brace => depth += 1,
-                    .r_brace => {
-                        depth -= 1;
-                        if (depth == 0) {
-                            close = ti;
-                            break;
-                        }
-                    },
-                    else => {},
-                }
-            }
-            const decl_start = t.tokens[decl.main_token].start;
-            h.update(t.source[decl_start..t.tokens[close].end]);
-        }
-    }
-    return h.final();
+/// Append a finished BodyChecker's local diagnostics to the shared result. Serial
+/// per-fn-in-source-order calls preserve discovery order; node_types was written
+/// directly into the shared array (disjoint span). The owned message buffers
+/// transfer ownership to `t.owned_msgs` (freed once by the Result deinit).
+fn mergeBodyDiags(t: *Typecheck, bc: *BodyChecker) !void {
+    try t.diags.appendSlice(t.gpa, bc.diags.items);
+    try t.owned_msgs.appendSlice(t.gpa, bc.owned_msgs.items);
+    if (t.graph != null) try t.diag_mods.appendSlice(t.gpa, bc.diag_mods.items);
+    // The messages are now owned by t.owned_msgs; clear the local list WITHOUT
+    // freeing the buffers (ownership transferred) so bc.deinit frees only its
+    // (now-empty) backing arrays.
+    bc.owned_msgs.clearRetainingCapacity();
 }
 
-/// Structural definite-return: a block returns on every path iff its last
-/// statement does (earlier statements can't satisfy the requirement, since
-/// anything after a guaranteed return would be unreachable).
-fn blockReturns(t: *const Typecheck, block_idx: Ast.Index) bool {
-    const stmts = Ast.rangeSlice(t.tree, t.tree.nodes[block_idx].lhs);
-    if (stmts.len == 0) return false;
-    return stmtReturns(t, stmts[stmts.len - 1]);
-}
 
-/// Whether a single statement guarantees a return on every path through it.
-fn stmtReturns(t: *const Typecheck, stmt_idx: Ast.Index) bool {
-    const stmt = t.tree.nodes[stmt_idx];
-    return switch (stmt.tag) {
-        .return_stmt => true,
-        // A statement-position block/if is parsed wrapped in an `expr_stmt`; unwrap
-        // it so a trailing diverging bare block (`{ return 5 }`) or parenthesized
-        // value-if satisfies definite-return and a divergent arm merges correctly.
-        .expr_stmt => stmtReturns(t, stmt.lhs),
-        .block => blockReturns(t, stmt_idx),
-        .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(t.tree, stmt.rhs);
-            // An else-less `if` can be skipped, so it never guarantees a return.
-            if (h.else_node == Ast.none) break :blk false;
-            const then_ok = blockReturns(t, h.then_block);
-            const else_ok = if (t.tree.nodes[h.else_node].tag == .if_stmt)
-                stmtReturns(t, h.else_node)
-            else
-                blockReturns(t, h.else_node);
-            break :blk then_ok and else_ok;
-        },
-        // Conservative: a `while` may never execute, so it can't guarantee a
-        // return (`while true { return }` is rejected — acceptable for now).
-        .while_stmt => false,
-        // A `loop` diverges (returns/never-falls-through) iff it has NO `break`
-        // targeting it: the only ways out are `return` or an outer construct.
-        .loop_expr => loopDiverges(t, stmt_idx),
-        // A labeled wrapper is transparent for definite-return: it returns iff its
-        // inner construct does (a labeled bare block via its trailing stmt).
-        .labeled => stmtReturns(t, t.tree.nodes[stmt_idx].lhs),
-        .for_stmt, .break_stmt, .continue_stmt => false,
-        else => false,
-    };
-}
 
-/// A `loop` diverges (control never falls past it) iff no `break` targets it.
-/// `target` is the loop's own node — a break "targets THIS loop" iff it is a
-/// BARE break encountered at this loop's nesting level OR a labeled break whose
-/// resolved `.label` target == `target`. For the bare case the scan descends
-/// `if`/`block`/`expr_stmt` but NOT a nested loop (a bare break there binds to
-/// the inner loop); for the labeled case it MUST descend nested loops/labeled
-/// wrappers to find a `break @target` buried inside.
-fn loopDiverges(t: *const Typecheck, loop_idx: Ast.Index) bool {
-    return !blockHasBreak(t, t.tree.nodes[loop_idx].lhs, loop_idx);
-}
 
-fn blockHasBreak(t: *const Typecheck, block_idx: Ast.Index, target: Ast.Index) bool {
-    for (Ast.rangeSlice(t.tree, t.tree.nodes[block_idx].lhs)) |s| {
-        if (stmtHasBreak(t, s, target)) return true;
-    }
-    return false;
-}
 
-/// Whether `stmt` contains a `break` that targets the loop node `target`.
-fn stmtHasBreak(t: *const Typecheck, stmt_idx: Ast.Index, target: Ast.Index) bool {
-    const stmt = t.tree.nodes[stmt_idx];
-    return switch (stmt.tag) {
-        // A bare break (no label) binds to the innermost loop — counts only when
-        // `target` IS the innermost loop, i.e. the bare break is found before any
-        // nested loop swallows it (the nested-loop arms below stop the descent for
-        // bare breaks). A labeled break counts iff its resolved target matches.
-        .break_stmt => if (t.resolutions[stmt_idx] == .label)
-            t.resolutions[stmt_idx].label == target
-        else
-            true,
-        .expr_stmt => stmtHasBreak(t, stmt.lhs, target),
-        .block => blockHasBreak(t, stmt_idx, target),
-        // A labeled wrapper is transparent: descend its inner construct (a
-        // `break @target` may live inside a nested labeled loop).
-        .labeled => stmtHasBreak(t, stmt.lhs, target),
-        .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(t.tree, stmt.rhs);
-            if (blockHasBreak(t, h.then_block, target)) break :blk true;
-            if (h.else_node == Ast.none) break :blk false;
-            break :blk if (t.tree.nodes[h.else_node].tag == .if_stmt)
-                stmtHasBreak(t, h.else_node, target)
-            else
-                blockHasBreak(t, h.else_node, target);
-        },
-        // A nested loop/for/while swallows BARE breaks, but a `break @target`
-        // buried inside it still targets `target` — so descend its body and only
-        // count labeled breaks that name `target`.
-        .loop_expr => nestedHasLabeledBreak(t, t.tree.nodes[stmt_idx].lhs, target),
-        .while_stmt => nestedHasLabeledBreak(t, t.tree.nodes[stmt_idx].rhs, target),
-        .for_stmt => nestedHasLabeledBreak(t, t.tree.nodes[stmt_idx].lhs, target),
-        else => false,
-    };
-}
 
-/// Scan a nested loop's body for a labeled `break @target` (bare breaks here bind
-/// to the nested loop, so they do NOT count for `target`).
-fn nestedHasLabeledBreak(t: *const Typecheck, block_idx: Ast.Index, target: Ast.Index) bool {
-    for (Ast.rangeSlice(t.tree, t.tree.nodes[block_idx].lhs)) |s| {
-        if (stmtHasLabeledBreak(t, s, target)) return true;
-    }
-    return false;
-}
 
-fn stmtHasLabeledBreak(t: *const Typecheck, stmt_idx: Ast.Index, target: Ast.Index) bool {
-    const stmt = t.tree.nodes[stmt_idx];
-    return switch (stmt.tag) {
-        .break_stmt => t.resolutions[stmt_idx] == .label and t.resolutions[stmt_idx].label == target,
-        .expr_stmt => stmtHasLabeledBreak(t, stmt.lhs, target),
-        .block => nestedHasLabeledBreak(t, stmt_idx, target),
-        .labeled => stmtHasLabeledBreak(t, stmt.lhs, target),
-        .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(t.tree, stmt.rhs);
-            if (nestedHasLabeledBreak(t, h.then_block, target)) break :blk true;
-            if (h.else_node == Ast.none) break :blk false;
-            break :blk if (t.tree.nodes[h.else_node].tag == .if_stmt)
-                stmtHasLabeledBreak(t, h.else_node, target)
-            else
-                nestedHasLabeledBreak(t, h.else_node, target);
-        },
-        .loop_expr => nestedHasLabeledBreak(t, t.tree.nodes[stmt_idx].lhs, target),
-        .while_stmt => nestedHasLabeledBreak(t, t.tree.nodes[stmt_idx].rhs, target),
-        .for_stmt => nestedHasLabeledBreak(t, t.tree.nodes[stmt_idx].lhs, target),
-        else => false,
-    };
-}
 
-/// Does this block's final statement DIVERGE — i.e. control never falls past it,
-/// so when used as a value-merge arm the arm is `never`? Distinct from
-/// `blockReturns` ("guarantees a function return"): a `break`/`continue` diverts
-/// control out of the innermost loop (genuinely divergent for the merge) but does
-/// NOT guarantee a function return. The merge consumer needs divergence; the
-/// definite-return check needs return-guarantee. Do not conflate them.
-fn blockDiverges(t: *const Typecheck, block_idx: Ast.Index) bool {
-    const stmts = Ast.rangeSlice(t.tree, t.tree.nodes[block_idx].lhs);
-    if (stmts.len == 0) return false;
-    return stmtDiverges(t, stmts[stmts.len - 1]);
-}
 
-fn stmtDiverges(t: *const Typecheck, stmt_idx: Ast.Index) bool {
-    const stmt = t.tree.nodes[stmt_idx];
-    return switch (stmt.tag) {
-        .return_stmt, .break_stmt, .continue_stmt => true,
-        .expr_stmt => stmtDiverges(t, stmt.lhs),
-        .block => blockDiverges(t, stmt_idx),
-        .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(t.tree, stmt.rhs);
-            if (h.else_node == Ast.none) break :blk false;
-            const then_ok = blockDiverges(t, h.then_block);
-            const else_ok = if (t.tree.nodes[h.else_node].tag == .if_stmt)
-                stmtDiverges(t, h.else_node)
-            else
-                blockDiverges(t, h.else_node);
-            break :blk then_ok and else_ok;
-        },
-        .while_stmt => false,
-        .loop_expr => loopDiverges(t, stmt_idx),
-        .labeled => labeledDiverges(t, stmt_idx),
-        .for_stmt => false,
-        // A `match` diverges iff it is exhaustive AND every arm body diverges.
-        .match_expr => matchDiverges(t, stmt_idx),
-        else => false,
-    };
-}
 
-/// A `match` diverges (control never falls past it) iff it is exhaustive (every
-/// variant covered, or a `_` arm) AND every arm body diverges. Needed so a match
-/// as a fn's trailing expression satisfies definite-return.
-fn matchDiverges(t: *const Typecheck, node_idx: Ast.Index) bool {
-    const n = t.tree.nodes[node_idx];
-    const st = t.node_types[n.lhs];
-    // Conservative for int/bool scrutinees: `return false` (loses only a
-    // definite-return optimization, never miscompiles). Only enums get the
-    // variant-coverage analysis here.
-    if (!st.isEnum()) return false;
-    const arms = Ast.rangeSlice(t.tree, n.rhs);
-    if (arms.len == 0) return false;
-    var has_wildcard = false;
-    const e = t.enums.items[st.enum_id];
-    var seen = [_]bool{false} ** 64; // enum variant count is small
-    for (arms) |arm_idx| {
-        const arm = t.tree.nodes[arm_idx];
-        const h = Ast.armHeaderAt(t.tree, arm.rhs);
-        if (!stmtDiverges(t, h.body)) return false;
-        if (h.guard != Ast.none) continue; // a guard can fail → no coverage
-        const pat = t.tree.nodes[arm.lhs];
-        if (pat.tag == .pattern_wildcard) {
-            has_wildcard = true;
-        } else if (pat.tag == .pattern_variant) {
-            const vname = t.nameText(pat.main_token);
-            for (e.variants, 0..) |v, i| {
-                if (i < seen.len and std.mem.eql(u8, v.name, vname) and t.variantPayloadIrrefutable(arm.lhs, v)) seen[i] = true;
-            }
-        }
-    }
-    if (has_wildcard) return true;
-    if (e.variants.len > seen.len) return false;
-    for (e.variants, 0..) |_, i| if (!seen[i]) return false;
-    return true;
-}
 
-/// A `labeled` wrapper diverges (control never falls past it) when its inner
-/// construct does. For a labeled loop this is `loopDiverges` (break-less). For a
-/// labeled bare block it is: the block's trailing stmt diverges AND no `break`
-/// targets the block (a targeting break would exit normally, past the block).
-fn labeledDiverges(t: *const Typecheck, idx: Ast.Index) bool {
-    const inner_idx = t.tree.nodes[idx].lhs;
-    const inner = t.tree.nodes[inner_idx];
-    return switch (inner.tag) {
-        .loop_expr => loopDiverges(t, inner_idx),
-        .while_stmt, .for_stmt => false,
-        .block => blockDiverges(t, inner_idx) and !blockHasBreak(t, inner_idx, inner_idx),
-        else => false,
-    };
-}
 
-/// Type a block. Every non-final statement is checked for effect. The block's
-/// VALUE is the final item's type IFF that item is an expression carrier and a
-/// value is wanted; otherwise the block is `()`. When `!want_value`, a trailing
-/// if/block is checked in STATEMENT context (an else-less trailing `if` stays a
-/// `()` statement, never "value-if requires else"). Records the type on the node.
-/// `checkBlock` with a one-shot expected type for its trailing value expression.
-fn typeOfBlockExpected(t: *Typecheck, block_idx: Ast.Index, want_value: bool, exp: ?Type) error{OutOfMemory}!Type {
-    const save = t.expected;
-    t.expected = exp;
-    defer t.expected = save;
-    return t.checkBlock(block_idx, want_value);
-}
 
-fn checkBlock(t: *Typecheck, block_idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
-    const stmts = Ast.rangeSlice(t.tree, t.tree.nodes[block_idx].lhs);
-    if (stmts.len == 0) {
-        t.node_types[block_idx] = .unit;
-        return .unit;
-    }
-    // The expected type (a one-shot for an inferred `.V`) applies ONLY to this
-    // block's trailing value expression, never the non-final statements. Capture
-    // it, clear it for the non-final walk, then restore for the trailing expr.
-    const block_expected = t.expected;
-    t.expected = null;
-    for (stmts[0 .. stmts.len - 1]) |s| try t.checkStmt(s); // effect only
-    const last = stmts[stmts.len - 1];
-    const last_n = t.tree.nodes[last];
-    var bt: Type = .unit;
-    if (last_n.tag == .expr_stmt) {
-        bt = try t.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
-        t.node_types[last] = bt; // the expr_stmt carries the value type
-    } else if (want_value and (last_n.tag == .if_stmt or last_n.tag == .block)) {
-        bt = try t.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
-    } else {
-        try t.checkStmt(last); // statement context (incl. trailing else-less if)
-    }
-    t.node_types[block_idx] = bt;
-    return bt;
-}
 
-fn checkStmt(t: *Typecheck, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const stmt = t.tree.nodes[stmt_idx];
-    switch (stmt.tag) {
-        .var_decl => {
-            const ty = try t.typeOf(stmt.lhs);
-            t.node_types[stmt_idx] = ty;
-            // Record the new local's type at its slot. The resolver bound the
-            // var_decl node to a `.local` slot; append/extend slot_types to fit.
-            if (t.resolutions[stmt_idx] == .local) {
-                const slot = t.resolutions[stmt_idx].local;
-                try t.setSlot(slot, ty);
-            }
-            if (ty.kind == .unit) {
-                try t.emitFmt(t.byteOf(stmt.main_token), "cannot bind () to '{s}'", .{t.nameText(stmt.main_token)});
-            }
-        },
-        .assign => {
-            const target = t.tree.nodes[stmt.lhs];
-            // Compute the place type FIRST so it can flow into the rhs as the
-            // expected type (an inferred `.V` assigned to a known-typed place).
-            const lhs: Type = switch (target.tag) {
-                .identifier => if (t.resolutions[stmt.lhs] == .local)
-                    t.slotType(t.resolutions[stmt.lhs].local)
-                else
-                    .invalid,
-                .field_access => try t.typeOf(stmt.lhs),
-                else => .invalid,
-            };
-            t.node_types[stmt.lhs] = lhs;
-            const rhs = try t.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
-            if (lhs.kind != .invalid and rhs.kind != .invalid and !Type.eql(lhs, rhs)) {
-                try t.emitFmt(t.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ t.typeName(rhs), t.typeName(lhs) });
-            }
-        },
-        .return_stmt => {
-            const ty: Type = if (stmt.lhs == Ast.none) Type.unit else try t.typeOfExpected(stmt.lhs, if (t.cur_ret.kind == .invalid) null else t.cur_ret);
-            // Skip when either side is poison so an unknown return type (already
-            // reported) doesn't trigger a spurious second diagnostic here. A
-            // `never`-typed operand (e.g. `return x` where x binds a break-less
-            // loop) is also fine: control never actually reaches the return, so
-            // `never` unifies with any declared type — mirrors the trailing-expr
-            // body check above.
-            if (ty.kind != .invalid and ty.kind != .never and t.cur_ret.kind != .invalid and !Type.eql(ty, t.cur_ret)) {
-                try t.emitFmt(t.byteOf(stmt.main_token), "return type {s} does not match declared {s}", .{ t.typeName(ty), t.typeName(t.cur_ret) });
-            }
-        },
-        .expr_stmt => _ = try t.typeOf(stmt.lhs),
-        .block => _ = try t.checkBlock(stmt_idx, false),
-        .if_stmt => {
-            const ct = try t.typeOf(stmt.lhs);
-            if (ct.kind != .invalid and ct.kind != .bool)
-                try t.emit(t.byteOf(t.tree.nodes[stmt.lhs].main_token), "if condition must be bool");
-            const h = Ast.ifHeaderAt(t.tree, stmt.rhs);
-            _ = try t.checkBlock(h.then_block, false);
-            if (h.else_node != Ast.none) {
-                if (t.tree.nodes[h.else_node].tag == .if_stmt)
-                    try t.checkStmt(h.else_node)
-                else
-                    _ = try t.checkBlock(h.else_node, false);
-            }
-        },
-        .while_stmt => try t.checkWhile(stmt_idx, null),
-        .for_stmt => try t.checkFor(stmt_idx, null),
-        .labeled => _ = try t.checkLabeled(stmt_idx, false),
-        .break_stmt => {
-            const ctx = t.targetCtx(stmt_idx) orelse {
-                // No matching context: a bare break with an empty stack ("outside a
-                // loop"); a labeled break is reported by resolve as undefined.
-                if (t.resolutions[stmt_idx] != .label)
-                    try t.emit(t.byteOf(stmt.main_token), "break outside of a loop");
-                if (stmt.lhs != Ast.none) _ = try t.typeOf(stmt.lhs);
-                return;
-            };
-            if (stmt.lhs == Ast.none) {
-                ctx.saw_bare_break = true;
-                if (ctx.is_value) ctx.join = try t.merge(stmt.main_token, ctx.join, Type.unit);
-            } else {
-                const vt = try t.typeOf(stmt.lhs);
-                if (!ctx.is_value) {
-                    if (vt.kind != .invalid and vt.kind != .unit)
-                        try t.emit(t.byteOf(stmt.main_token), "cannot break with a value out of a while/for loop");
-                } else {
-                    ctx.saw_value_break = true;
-                    ctx.join = try t.merge(stmt.main_token, ctx.join, vt);
-                }
-            }
-        },
-        .continue_stmt => {
-            const ctx = t.targetCtx(stmt_idx) orelse {
-                if (t.resolutions[stmt_idx] != .label)
-                    try t.emit(t.byteOf(stmt.main_token), "continue outside of a loop");
-                return;
-            };
-            // `continue` is meaningful only on a loop; a labeled bare block is not.
-            if (ctx.kind == .labeled_block)
-                try t.emit(t.byteOf(stmt.main_token), "cannot continue a labeled block (not a loop)");
-        },
-        else => _ = try t.typeOf(stmt_idx),
-    }
-}
 
-/// Select the context a `break`/`continue` targets. A labeled break/continue
-/// (resolved to `.label`) scans the stack top-down for the matching construct
-/// node (the NAMED target, not the innermost). A bare break/continue scans
-/// top-down for the innermost LOOP (skipping labeled bare blocks).
-fn targetCtx(t: *Typecheck, stmt_idx: Ast.Index) ?*LoopCtx {
-    const items = t.loop_stack.items;
-    if (t.resolutions[stmt_idx] == .label) {
-        const target = t.resolutions[stmt_idx].label;
-        var i = items.len;
-        while (i > 0) {
-            i -= 1;
-            if (items[i].construct_node == target) return &items[i];
-        }
-        return null;
-    }
-    var i = items.len;
-    while (i > 0) {
-        i -= 1;
-        if (items[i].kind != .labeled_block) return &items[i];
-    }
-    return null;
-}
 
-/// Check a `while` statement; `label` is its label name (or null). A `()` loop.
-fn checkWhile(t: *Typecheck, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
-    const stmt = t.tree.nodes[stmt_idx];
-    const ct = try t.typeOf(stmt.lhs);
-    if (ct.kind != .invalid and ct.kind != .bool)
-        try t.emit(t.byteOf(t.tree.nodes[stmt.lhs].main_token), "while condition must be bool");
-    try t.loop_stack.append(t.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
-    _ = try t.checkBlock(stmt.rhs, false);
-    _ = t.loop_stack.pop();
-}
 
-/// Check a `for` statement; `label` is its label name (or null). A `()` loop.
-fn checkFor(t: *Typecheck, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
-    const stmt = t.tree.nodes[stmt_idx];
-    const h = Ast.forHeaderAt(t.tree, stmt.rhs);
-    const lo = try t.typeOf(h.lo);
-    const hi = try t.typeOf(h.hi);
-    if (lo.kind != .invalid and lo.kind != .int)
-        try t.emit(t.byteOf(t.tree.nodes[h.lo].main_token), "for range bounds must be int");
-    if (hi.kind != .invalid and hi.kind != .int)
-        try t.emit(t.byteOf(t.tree.nodes[h.hi].main_token), "for range bounds must be int");
-    if (t.resolutions[stmt_idx] == .local) try t.setSlot(t.resolutions[stmt_idx].local, Type.int);
-    try t.loop_stack.append(t.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
-    _ = try t.checkBlock(stmt.lhs, false);
-    _ = t.loop_stack.pop();
-}
 
-/// Check a `labeled` wrapper. The inner construct is typed through its label-
-/// aware variant; the wrapper's type is the inner's type (the loop value, `()`
-/// for while/for, or the labeled-block value). `want_value` flows to the block
-/// case so a statement-context labeled bare block stays `()`-discarded.
-fn checkLabeled(t: *Typecheck, idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
-    const n = t.tree.nodes[idx];
-    const label = t.nameText(n.main_token);
-    const inner = t.tree.nodes[n.lhs];
-    const ty: Type = switch (inner.tag) {
-        .block => try t.typeOfLabeledBlock(n.lhs, label, want_value),
-        .loop_expr => try t.typeOfLoop(n.lhs, inner, label),
-        .while_stmt => blk: {
-            try t.checkWhile(n.lhs, label);
-            break :blk Type.unit;
-        },
-        .for_stmt => blk: {
-            try t.checkFor(n.lhs, label);
-            break :blk Type.unit;
-        },
-        else => Type.invalid,
-    };
-    t.node_types[idx] = ty;
-    return ty;
-}
 
-/// Type a labeled BARE BLOCK used as a value: its value is the merge of its
-/// trailing-expression value and every `break @label <expr>` targeting it
-/// (`never` if it can only diverge). Lowers like a value-loop minus the back-edge.
-fn typeOfLabeledBlock(t: *Typecheck, block_idx: Ast.Index, label: []const u8, want_value: bool) error{OutOfMemory}!Type {
-    try t.loop_stack.append(t.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .is_value = true, .join = .never, .saw_value_break = false, .saw_bare_break = false });
-    const fall = try t.checkBlock(block_idx, want_value);
-    const ctx = t.loop_stack.pop().?;
-    // The trailing-expr value is unreachable iff the block's last statement
-    // diverges; in that case the block's value comes entirely from its breaks.
-    const ft: Type = if (blockDiverges(t, block_idx)) Type.never else fall;
-    return t.merge(t.tree.nodes[block_idx].main_token, ft, ctx.join);
-}
 
-/// Type a node with a one-shot expected type (a typed sink). Consumed only by an
-/// inferred `.V` construction; saved/restored so it never leaks past this node.
-fn typeOfExpected(t: *Typecheck, node_idx: Ast.Index, exp: ?Type) error{OutOfMemory}!Type {
-    const save = t.expected;
-    t.expected = exp;
-    defer t.expected = save;
-    return t.typeOf(node_idx);
-}
 
-/// Infer (and memoize) the type of an expression node.
-fn typeOf(t: *Typecheck, node_idx: Ast.Index) error{OutOfMemory}!Type {
-    if (node_idx == Ast.none) return .invalid;
-    const n = t.tree.nodes[node_idx];
-    const ty: Type = switch (n.tag) {
-        .literal_number => Type.int,
-        .literal_bool => Type.@"bool",
-        .literal_string => Type.str,
-        .identifier => switch (t.resolutions[node_idx]) {
-            .local => |slot| t.slotType(slot),
-            .func => blk: {
-                try t.emitFmt(t.byteOf(n.main_token), "function '{s}' is not a value", .{t.nameText(n.main_token)});
-                break :blk Type.invalid;
-            },
-            .unresolved => blk: {
-                // Resolve quietly skips a struct-named identifier (it expects this
-                // to be a struct type-name in a position it doesn't bind, or a
-                // positional `Point(...)` callee it diagnoses elsewhere). A BARE
-                // struct name used as a value (`q := P`, `P.x`) reaches here with
-                // no diagnostic — report it so it never escapes to codegen.
-                if (t.activeStructMap().get(t.nameText(n.main_token)) != null)
-                    try t.emitFmt(t.byteOf(n.main_token), "type '{s}' is not a value", .{t.nameText(n.main_token)});
-                break :blk Type.invalid;
-            },
-            .label => Type.invalid, // never on an identifier node (break/continue only)
-            .module => blk: {
-                // A bare imported-namespace name used as a value (`x := mod`):
-                // a module is not a value. (A `mod.member` access never reaches
-                // here — the receiver is consumed by typeOfFieldAccess/Call.)
-                try t.emitFmt(t.byteOf(n.main_token), "module '{s}' is not a value", .{t.nameText(n.main_token)});
-                break :blk Type.invalid;
-            },
-        },
-        .unary => blk: {
-            const operand = try t.typeOf(n.lhs);
-            if (operand.kind == .invalid) break :blk Type.invalid;
-            const op = t.tokens[n.main_token].tag;
-            switch (op) {
-                .minus => {
-                    if (operand.kind == .int) break :blk Type.int;
-                    try t.emit(t.byteOf(n.main_token), "operand of '-' must be int");
-                },
-                .bang => {
-                    if (operand.kind == .bool) break :blk Type.@"bool";
-                    try t.emit(t.byteOf(n.main_token), "operand of '!' must be bool");
-                },
-                else => {},
-            }
-            break :blk Type.invalid;
-        },
-        .binary => blk: {
-            const lt = try t.typeOf(n.lhs);
-            const rt = try t.typeOf(n.rhs);
-            if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid;
-            const op = t.tokens[n.main_token].tag;
-            const op_text = t.tokens[n.main_token].text(t.source);
-            switch (op) {
-                .plus, .minus, .star, .slash => {
-                    if (lt.kind == .int and rt.kind == .int) break :blk Type.int;
-                    try t.emitFmt(t.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
-                },
-                .lt, .lt_eq, .gt, .gt_eq => {
-                    if (lt.kind == .int and rt.kind == .int) break :blk Type.@"bool";
-                    try t.emitFmt(t.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
-                },
-                .eq_eq, .bang_eq => {
-                    if (Type.eql(lt, rt) and (lt.kind == .int or lt.kind == .bool)) break :blk Type.@"bool";
-                    if (Type.eql(lt, rt) and lt.kind == .str) {
-                        // Same type, but str comparison isn't supported — say so,
-                        // rather than the misleading "must have the same type".
-                        try t.emitFmt(t.byteOf(n.main_token), "'{s}' on str is unsupported", .{op_text});
-                    } else {
-                        try t.emitFmt(t.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                    }
-                },
-                .amp_amp, .pipe_pipe => {
-                    if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
-                    try t.emitFmt(t.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
-                },
-                else => {},
-            }
-            break :blk Type.invalid;
-        },
-        .call => try t.typeOfCall(node_idx, n),
-        .struct_init => try t.typeOfStructInit(node_idx, n),
-        .field_access => try t.typeOfFieldAccess(node_idx, n),
-        .enum_init_unit, .enum_init_tuple, .enum_init_struct => try t.typeOfEnumInit(node_idx, n),
-        .match_expr => return t.typeOfMatch(node_idx, n), // sets node_types itself
-        .literal_unit => Type.unit,
-        .block => try t.checkBlock(node_idx, true),
-        .if_stmt => try t.typeOfIf(node_idx, n),
-        .loop_expr => return t.typeOfLoop(node_idx, n, null), // sets node_types itself
-        .labeled => return t.checkLabeled(node_idx, true), // sets node_types itself
-        else => Type.invalid,
-    };
-    t.node_types[node_idx] = ty;
-    return ty;
-}
 
-/// Type a `Name { field: value, ... }` construction. The type name must be a
-/// known struct; every declared field must be supplied exactly once; each
-/// value's type must match the declared field type. Result is the struct type.
-fn typeOfStructInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    // A qualified struct-variant `N.V { ... }` would arrive as enum_init_struct
-    // (the parser upgrades a `field_access {`), not here — so struct_init's lhs is
-    // always a plain type-name identifier; no enum routing needed.
-    _ = node_idx;
-    const name = t.nameText(t.tree.nodes[n.lhs].main_token);
-    const id = t.activeStructMap().get(name) orelse {
-        for (Ast.rangeSlice(t.tree, n.rhs)) |fi| _ = try t.typeOf(t.tree.nodes[fi].lhs);
-        try t.emitFmt(t.byteOf(t.tree.nodes[n.lhs].main_token), "unknown struct type '{s}'", .{name});
-        return .invalid;
-    };
-    const sym = t.structs.items[id];
-    t.recordBodyLayout(Type.structT(id)); // body -> layout(struct): construction reads field offsets (M17)
-    const inits = Ast.rangeSlice(t.tree, n.rhs);
 
-    // Track which declared fields are supplied (for missing/duplicate checks).
-    var seen = try t.gpa.alloc(bool, sym.field_names.len);
-    defer t.gpa.free(seen);
-    @memset(seen, false);
 
-    for (inits) |fi_idx| {
-        const fi = t.tree.nodes[fi_idx];
-        const fname = t.nameText(fi.main_token);
-        const vt = try t.typeOf(fi.lhs);
-        // Find the declared field by name.
-        var found: ?usize = null;
-        for (sym.field_names, 0..) |dn, j| {
-            if (std.mem.eql(u8, dn, fname)) {
-                found = j;
-                break;
-            }
-        }
-        if (found) |j| {
-            if (seen[j]) {
-                try t.emitFmt(t.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, name });
-            }
-            seen[j] = true;
-            const fty = sym.field_types[j];
-            if (vt.kind != .invalid and fty.kind != .invalid and !Type.eql(vt, fty)) {
-                try t.emitFmt(t.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, t.typeName(fty), t.typeName(vt) });
-            }
-        } else {
-            try t.emitFmt(t.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, name });
-        }
-    }
-    for (sym.field_names, 0..) |dn, j| {
-        if (!seen[j]) try t.emitFmt(t.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, name });
-    }
-    return Type.structT(id);
-}
 
-/// In graph mode, resolve a `mod.Enum` node (an inner `field_access` whose
-/// receiver binds to a `.module`) to the owning module's GLOBAL enum id, or null
-/// if it is not a qualified cross-module enum reference.
-fn qualifiedEnumId(t: *Typecheck, node_idx: Ast.Index) ?u32 {
-    const g = t.graph orelse return null;
-    const n = t.tree.nodes[node_idx];
-    if (n.tag != .field_access) return null;
-    const recv = t.tree.nodes[n.lhs];
-    if (recv.tag != .identifier) return null;
-    if (t.resolutions[n.lhs] != .module) return null;
-    const recv_name = t.nameText(recv.main_token);
-    const target = g.namespaceOfIn(t.graph_mod, recv_name) orelse return null;
-    const member = t.nameText(n.main_token);
-    return g.mods[target].enum_ids.get(member);
-}
-
-/// Type a `recv.field` access. The receiver must be a struct; the field must
-/// exist. Yields the field type. Poison receivers stay silent (already reported).
-fn typeOfFieldAccess(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
-    // identifier (resolved quietly to .unresolved). Treat it as construction.
-    const recv = t.tree.nodes[n.lhs];
-    if (recv.tag == .identifier and t.activeEnumMap().get(t.nameText(recv.main_token)) != null) {
-        return t.typeOfEnumInitQualified(node_idx, .unit, n.lhs, n.main_token, Ast.none);
-    }
-    // A 3-level cross-module unit-variant `mod.Enum.Variant`: the receiver of THIS
-    // field_access is the inner `mod.Enum` field_access (graph mode). Resolve the
-    // inner to a global enum id and treat this node as a unit-variant construction.
-    if (t.qualifiedEnumId(n.lhs)) |enum_id| {
-        const ty = try t.checkVariant(enum_id, n.main_token, .unit, Ast.none);
-        t.node_types[node_idx] = ty;
-        return ty;
-    }
-    const base = try t.typeOf(n.lhs);
-    if (base.kind == .invalid) return .invalid;
-    if (!base.isStruct()) {
-        try t.emitFmt(t.byteOf(n.main_token), "cannot access field '{s}' of non-struct type {s}", .{ t.nameText(n.main_token), t.typeName(base) });
-        return .invalid;
-    }
-    const sym = t.structs.items[base.struct_id];
-    t.recordBodyLayout(base); // body -> layout(struct): field access reads the field offset/type (M17)
-    const fname = t.nameText(n.main_token);
-    for (sym.field_names, 0..) |dn, j| {
-        if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
-    }
-    try t.emitFmt(t.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
-    return .invalid;
-}
 
 /// The form a construction NODE supplies (independent of the declared variant).
 const InitForm = enum { unit, tuple, @"struct" };
 
-/// Type an inferred-or-qualified `enum_init_*` node. Resolves the enum id (from a
-/// qualified type-name lhs, else the expected type), the variant by name, checks
-/// the supplied payload against the variant's declared form/arity/types, and
-/// yields the enum type.
-fn typeOfEnumInit(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    _ = node_idx;
-    const node_form: InitForm = switch (n.tag) {
-        .enum_init_unit => .unit,
-        .enum_init_tuple => .tuple,
-        .enum_init_struct => .@"struct",
-        else => unreachable,
-    };
-    const args: Ast.Index = if (n.tag == .enum_init_unit) Ast.none else n.rhs;
-    // Resolve the enum id: qualified (lhs is the type-name identifier) or inferred
-    // (the one-shot expected type must be an enum).
-    var enum_id: u32 = undefined;
-    if (n.lhs != Ast.none) {
-        const tname = t.nameText(t.tree.nodes[n.lhs].main_token);
-        enum_id = t.activeEnumMap().get(tname) orelse {
-            try t.typeArgsForEffect(node_form, args);
-            try t.emitFmt(t.byteOf(t.tree.nodes[n.lhs].main_token), "'{s}' is not an enum type", .{tname});
-            return .invalid;
-        };
-    } else {
-        const exp = t.expected orelse {
-            try t.typeArgsForEffect(node_form, args);
-            try t.emitFmt(t.byteOf(n.main_token), "cannot infer the enum type for '.{s}' here", .{t.nameText(n.main_token)});
-            return .invalid;
-        };
-        if (!exp.isEnum()) {
-            try t.typeArgsForEffect(node_form, args);
-            if (exp.kind != .invalid)
-                try t.emitFmt(t.byteOf(n.main_token), "'.{s}' expects an enum type, but {s} was expected here", .{ t.nameText(n.main_token), t.typeName(exp) });
-            return .invalid;
-        }
-        enum_id = exp.enum_id;
-    }
-    return t.checkVariant(enum_id, n.main_token, node_form, args);
-}
 
-/// Type a QUALIFIED variant construction reinterpreted from `field_access`/`call`
-/// (`N.V`, `N.V(args)`). `type_node` is the enum type-name identifier; `vtok` the
-/// variant-name token; `args` the arg/field-init range (or `none` for unit).
-fn typeOfEnumInitQualified(t: *Typecheck, node_idx: Ast.Index, node_form: InitForm, type_node: Ast.Index, vtok: u32, args: Ast.Index) error{OutOfMemory}!Type {
-    const tname = t.nameText(t.tree.nodes[type_node].main_token);
-    const enum_id = t.activeEnumMap().get(tname) orelse return .invalid; // caller checked
-    const ty = try t.checkVariant(enum_id, vtok, node_form, args);
-    t.node_types[node_idx] = ty;
-    return ty;
-}
 
-/// Type a construction's payload args for effect only (so their own errors still
-/// surface) when the enum/variant could not be resolved.
-fn typeArgsForEffect(t: *Typecheck, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!void {
-    if (args == Ast.none) return;
-    if (node_form == .@"struct") {
-        for (Ast.rangeSlice(t.tree, args)) |fi| _ = try t.typeOf(t.tree.nodes[fi].lhs);
-    } else {
-        for (Ast.rangeSlice(t.tree, args)) |a| _ = try t.typeOf(a);
-    }
-}
 
-/// Check a variant construction against its declared variant: find the variant by
-/// name, check the node's form matches the variant's form, and check payload
-/// arity + per-element types (propagating the expected element type so a nested
-/// inferred `.V` in a payload resolves). Yields the enum type.
-fn checkVariant(t: *Typecheck, enum_id: u32, vtok: u32, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!Type {
-    const e = t.enums.items[enum_id];
-    t.recordBodyLayout(Type.enumT(enum_id)); // body -> layout(enum): construction reads the tag/payload layout (M17)
-    const vname = t.nameText(vtok);
-    var vi: ?usize = null;
-    for (e.variants, 0..) |v, i| {
-        if (std.mem.eql(u8, v.name, vname)) {
-            vi = i;
-            break;
-        }
-    }
-    const variant = if (vi) |i| e.variants[i] else {
-        try t.typeArgsForEffect(node_form, args);
-        try t.emitFmt(t.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
-        return .invalid;
-    };
-    const want_form: InitForm = switch (variant.form) {
-        .unit => .unit,
-        .tuple => .tuple,
-        .@"struct" => .@"struct",
-    };
-    if (node_form != want_form) {
-        try t.typeArgsForEffect(node_form, args);
-        try t.emitFmt(t.byteOf(vtok), "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
-        return Type.enumT(enum_id);
-    }
-    switch (variant.form) {
-        .unit => {},
-        .tuple => {
-            const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(t.tree, args);
-            if (elems.len != variant.field_types.len) {
-                for (elems) |a| _ = try t.typeOf(a);
-                try t.emitFmt(t.byteOf(vtok), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
-                return Type.enumT(enum_id);
-            }
-            for (elems, variant.field_types) |a, fty| {
-                const at = try t.typeOfExpected(a, fty);
-                if (at.kind != .invalid and fty.kind != .invalid and !Type.eql(at, fty))
-                    try t.emitFmt(t.byteOf(t.tree.nodes[a].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, t.typeName(fty), t.typeName(at) });
-            }
-        },
-        .@"struct" => {
-            const inits = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(t.tree, args);
-            var seen = try t.gpa.alloc(bool, variant.field_names.len);
-            defer t.gpa.free(seen);
-            @memset(seen, false);
-            for (inits) |fi_idx| {
-                const fi = t.tree.nodes[fi_idx];
-                const fname = t.nameText(fi.main_token);
-                var found: ?usize = null;
-                for (variant.field_names, 0..) |dn, j| {
-                    if (std.mem.eql(u8, dn, fname)) {
-                        found = j;
-                        break;
-                    }
-                }
-                if (found) |j| {
-                    if (seen[j]) try t.emitFmt(t.byteOf(fi.main_token), "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
-                    seen[j] = true;
-                    const fty = variant.field_types[j];
-                    const vt = try t.typeOfExpected(fi.lhs, fty);
-                    if (vt.kind != .invalid and fty.kind != .invalid and !Type.eql(vt, fty))
-                        try t.emitFmt(t.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, t.typeName(fty), t.typeName(vt) });
-                } else {
-                    _ = try t.typeOf(fi.lhs);
-                    try t.emitFmt(t.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
-                }
-            }
-            for (variant.field_names, 0..) |dn, j| {
-                if (!seen[j]) try t.emitFmt(t.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
-            }
-        },
-    }
-    return Type.enumT(enum_id);
-}
 
 /// Coverage state for a match, by scrutinee kind. Enum: a per-variant seen bitmap.
 /// Bool: which of true/false a literal arm has covered. Int: nothing (an infinite
@@ -2138,404 +3269,17 @@ const Cov = union(enum) {
 };
 const BoolCov = struct { t: bool = false, f: bool = false };
 
-/// Type a `match scrut { pat [if g] -> body, ... }` expression. The scrutinee may
-/// be an enum, int, or bool. Each arm's pattern is checked + binds its payload; an
-/// optional guard is typed as bool; all arm bodies merge to one type; the match
-/// must be exhaustive (enum: every variant or `_`; bool: true+false or `_`; int:
-/// `_` required). A guarded arm does NOT count toward coverage.
-fn typeOfMatch(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    const st = try t.typeOf(n.lhs);
-    const arms = Ast.rangeSlice(t.tree, n.rhs);
-    if (st.kind == .invalid) {
-        // Poison-absorb: still walk arms (bodies may have their own errors) but
-        // don't emit a scrutinee or exhaustiveness error.
-        for (arms) |arm_idx| _ = try t.typeOf(Ast.armHeaderAt(t.tree, t.tree.nodes[arm_idx].rhs).body);
-        t.node_types[node_idx] = .invalid;
-        return .invalid;
-    }
-    if (st.kind != .@"enum" and st.kind != .int and st.kind != .bool) {
-        for (arms) |arm_idx| _ = try t.typeOf(Ast.armHeaderAt(t.tree, t.tree.nodes[arm_idx].rhs).body);
-        try t.emitFmt(t.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{t.typeName(st)});
-        t.node_types[node_idx] = .invalid;
-        return .invalid;
-    }
 
-    // body -> layout(enum): codegen reads the scrutinee's variant tags + payload
-    // offsets, a dependency of THIS body (M17). No-op for int/bool scrutinees.
-    t.recordBodyLayout(st);
 
-    var seen: []bool = &.{};
-    var bool_cov: BoolCov = .{};
-    var cov: Cov = switch (st.kind) {
-        .@"enum" => blk: {
-            seen = try t.gpa.alloc(bool, t.enums.items[st.enum_id].variants.len);
-            @memset(seen, false);
-            break :blk .{ .@"enum" = seen };
-        },
-        .bool => .{ .@"bool" = &bool_cov },
-        else => .int,
-    };
-    defer if (st.kind == .@"enum") t.gpa.free(seen);
 
-    var has_wildcard = false;
-    var result: Type = Type.never;
-    for (arms) |arm_idx| {
-        const arm = t.tree.nodes[arm_idx];
-        const h = Ast.armHeaderAt(t.tree, arm.rhs);
-        const guarded = h.guard != Ast.none;
-        try t.checkPattern(arm.lhs, st, &cov, &has_wildcard, !guarded);
-        if (guarded) {
-            const gt = try t.typeOf(h.guard);
-            if (gt.kind != .invalid and gt.kind != .bool)
-                try t.emitFmt(t.byteOf(t.tree.nodes[h.guard].main_token), "match guard must be bool, got {s}", .{t.typeName(gt)});
-        }
-        const body_ty0 = try t.typeOfExpected(h.body, t.expected);
-        const body_ty: Type = if (t.armDiverges(h.body)) Type.never else body_ty0;
-        result = try t.merge(n.main_token, result, body_ty);
-    }
-    if (!has_wildcard) switch (cov) {
-        .@"enum" => |sv| {
-            const e = t.enums.items[st.enum_id];
-            for (e.variants, 0..) |v, i| {
-                if (!sv[i]) try t.emitFmt(t.byteOf(n.main_token), "non-exhaustive match: missing variant '{s}'", .{v.name});
-            }
-        },
-        .bool => |bc| if (!(bc.t and bc.f))
-            try t.emitFmt(t.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
-        .int => try t.emitFmt(t.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
-    };
-    t.node_types[node_idx] = result;
-    return result;
-}
 
-/// Whether `pat` matches EVERY value of type `ty` (covers the whole position): a
-/// wildcard, a bind-whole, a SINGLE-variant enum's variant whose payload is fully
-/// covered, or an or-pattern that jointly covers `ty`. A literal is refutable, and
-/// — crucially — a variant pattern is REFUTABLE against a MULTI-variant enum (`.V`
-/// does not match `.W`). Type-aware on purpose: a type-less version wrongly treats
-/// `.Out(.V(x))` as total and accepts a non-exhaustive match (runtime fall-through).
-fn irrefutable(t: *const Typecheck, pat_idx: Ast.Index, ty: Type) bool {
-    if (ty.kind == .invalid) return true; // poison already reported; don't cascade a spurious miss
-    const pat = t.tree.nodes[pat_idx];
-    return switch (pat.tag) {
-        .pattern_wildcard => true,
-        .pattern_binding => pat.rhs == Ast.none or t.irrefutable(pat.rhs, ty),
-        .pattern_literal => false,
-        .pattern_variant => blk: {
-            // Total only when the enum has exactly ONE variant (the tag test cannot
-            // fail) AND that variant's payload is fully covered. Against a
-            // multi-variant enum a single `.V` is refutable.
-            if (ty.kind != .@"enum") break :blk false;
-            const e = t.enums.items[ty.enum_id];
-            if (e.variants.len != 1) break :blk false;
-            break :blk t.variantPayloadIrrefutable(pat_idx, e.variants[0]);
-        },
-        .pattern_or => t.orCoversType(pat_idx, ty),
-        else => false,
-    };
-}
 
-/// Whether a variant pattern `.V(payload)`'s payload sub-patterns are each
-/// irrefutable against their field types — i.e. the arm fully handles variant V.
-/// `.V(_)` / `.V(x)` cover V; `.V(0)` and `.V(.W(x))` over a multi-variant inner
-/// enum do NOT. Omitted struct fields are implicitly wildcards (irrefutable).
-fn variantPayloadIrrefutable(t: *const Typecheck, pat_idx: Ast.Index, variant: VariantSym) bool {
-    const pat = t.tree.nodes[pat_idx];
-    const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(t.tree, pat.rhs);
-    switch (variant.form) {
-        .unit => return binders.len == 0,
-        .tuple => {
-            if (binders.len != variant.field_types.len) return false;
-            for (binders, variant.field_types) |b, fty| if (!t.irrefutable(b, fty)) return false;
-            return true;
-        },
-        .@"struct" => {
-            for (binders) |b_idx| {
-                const b = t.tree.nodes[b_idx];
-                const src = if (b.lhs != Ast.none) t.nameText(t.tree.nodes[b.lhs].main_token) else t.nameText(b.main_token);
-                var fty: Type = .invalid;
-                for (variant.field_names, 0..) |dn, j| if (std.mem.eql(u8, dn, src)) {
-                    fty = variant.field_types[j];
-                    break;
-                };
-                if (!t.irrefutable(b_idx, fty)) return false;
-            }
-            return true;
-        },
-    }
-}
 
-/// Whether an or-pattern jointly covers every value of `ty`: a single irrefutable
-/// alternative covers it, or (for an enum) the alternatives' covered variants union
-/// to all of them. Conservatively false otherwise — sound: under-claiming coverage
-/// only rejects a genuinely-exhaustive match, never accepts a non-exhaustive one.
-fn orCoversType(t: *const Typecheck, or_idx: Ast.Index, ty: Type) bool {
-    const alts = Ast.rangeSlice(t.tree, t.tree.nodes[or_idx].lhs);
-    for (alts) |a| if (t.irrefutable(a, ty)) return true;
-    if (ty.kind == .@"enum") {
-        const e = t.enums.items[ty.enum_id];
-        var seen = [_]bool{false} ** 64;
-        if (e.variants.len > seen.len) return false;
-        for (alts) |a| {
-            const ap = t.tree.nodes[a];
-            if (ap.tag != .pattern_variant) continue;
-            const vname = t.nameText(ap.main_token);
-            for (e.variants, 0..) |v, i| {
-                if (std.mem.eql(u8, v.name, vname) and t.variantPayloadIrrefutable(a, v)) seen[i] = true;
-            }
-        }
-        for (e.variants, 0..) |_, i| if (!seen[i]) return false;
-        return true;
-    }
-    return false;
-}
 
-/// Whether an arm body (an expression node) diverges (control never falls past
-/// it), so its value side is unreachable in the merge. A bare expr body never
-/// diverges by itself; a block/if/loop/match/return body might.
-fn armDiverges(t: *const Typecheck, node_idx: Ast.Index) bool {
-    return stmtDiverges(t, node_idx);
-}
 
-/// Check a match pattern against the `expected` scrutinee/field type. `count_cov`
-/// is true only at a top-level (non-nested) position of an UNGUARDED arm — then an
-/// irrefutable wildcard/bind sets `has_wildcard`, a bool literal records its case,
-/// and a fully-irrefutable variant marks `seen[variant]`. Nested positions pass
-/// `count_cov=false` (a nested literal must not claim coverage). Payload bindings
-/// are typed BY VALUE onto their `.local` slots (set by Resolve).
-fn checkPattern(t: *Typecheck, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
-    const pat = t.tree.nodes[pat_idx];
-    switch (pat.tag) {
-        .pattern_wildcard => if (count_cov) {
-            has_wildcard.* = true;
-        },
-        .pattern_binding => {
-            // Record the type this binding matched AGAINST on its own node. The
-            // binding's slot is SHARED across or-pattern alternatives (Resolve), so
-            // the slot type is overwritten and can't reveal a `.A(x) | .B(x)` type
-            // divergence; the per-node matched type can (read by `collectBindings`).
-            t.node_types[pat_idx] = expected;
-            if (pat.rhs == Ast.none) {
-                // Bind-whole: type by value; a top-level bare binding is irrefutable.
-                if (t.resolutions[pat_idx] == .local) try t.setSlot(t.resolutions[pat_idx].local, expected);
-                if (count_cov) has_wildcard.* = true;
-            } else {
-                try t.checkPattern(pat.rhs, expected, cov, has_wildcard, count_cov);
-            }
-        },
-        .pattern_literal => {
-            const lt: Type = if (t.tokens[pat.main_token].tag == .number) Type.int else Type.@"bool";
-            if (expected.kind != .invalid and !Type.eql(lt, expected))
-                try t.emitFmt(t.byteOf(pat.main_token), "literal pattern type {s} does not match scrutinee {s}", .{ t.typeName(lt), t.typeName(expected) });
-            // A bool literal records its case toward coverage; int never covers.
-            if (count_cov) switch (cov.*) {
-                .bool => |bc| {
-                    if (lt.kind == .bool) {
-                        if (std.mem.eql(u8, t.nameText(pat.main_token), "true")) bc.t = true else bc.f = true;
-                    }
-                },
-                else => {},
-            };
-        },
-        .pattern_or => {
-            for (Ast.rangeSlice(t.tree, pat.lhs)) |a| try t.checkPattern(a, expected, cov, has_wildcard, count_cov);
-            try t.checkOrBindings(pat_idx);
-        },
-        .pattern_variant => try t.checkVariantPattern(pat_idx, expected, cov, has_wildcard, count_cov),
-        else => {},
-    }
-}
 
-/// Check a `.V` / `N.V` variant pattern. Requires an enum scrutinee; marks the
-/// variant covered only when `count_cov` AND the whole pattern is irrefutable
-/// (so `.C(0)` does NOT cover `.C`). Recurses into payload sub-patterns with the
-/// field type and `count_cov=false`.
-fn checkVariantPattern(t: *Typecheck, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
-    const pat = t.tree.nodes[pat_idx];
-    if (expected.kind != .@"enum") {
-        if (expected.kind != .invalid)
-            try t.emitFmt(t.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{t.typeName(expected)});
-        return;
-    }
-    const enum_id = expected.enum_id;
-    const e = t.enums.items[enum_id];
-    t.recordBodyLayout(expected); // body -> layout(enum): pattern reads variant tags/payloads, incl. NESTED enums (M17)
-    // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
-    if (pat.lhs != Ast.none) {
-        const tname = t.nameText(t.tree.nodes[pat.lhs].main_token);
-        if (t.activeEnumMap().get(tname)) |qid| {
-            if (qid != enum_id)
-                try t.emitFmt(t.byteOf(t.tree.nodes[pat.lhs].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
-        } else {
-            try t.emitFmt(t.byteOf(t.tree.nodes[pat.lhs].main_token), "'{s}' is not an enum type", .{tname});
-        }
-    }
-    const vname = t.nameText(pat.main_token);
-    var vi: ?usize = null;
-    for (e.variants, 0..) |v, i| {
-        if (std.mem.eql(u8, v.name, vname)) {
-            vi = i;
-            break;
-        }
-    }
-    const variant = if (vi) |i| blk: {
-        // Cover variant i only when this arm counts AND variant i's payload is fully
-        // matched (`.V(_)`/`.V(x)` cover it; `.V(0)` or `.V(.W(x))` over a multi-variant
-        // inner enum do not — caught by the type-aware payload check).
-        if (count_cov and t.variantPayloadIrrefutable(pat_idx, e.variants[i])) cov.@"enum"[i] = true;
-        break :blk e.variants[i];
-    } else {
-        try t.emitFmt(t.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
-        return;
-    };
-    const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(t.tree, pat.rhs);
-    switch (variant.form) {
-        .unit => {
-            if (binders.len != 0)
-                try t.emitFmt(t.byteOf(pat.main_token), "unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
-        },
-        .tuple => {
-            if (binders.len != variant.field_types.len) {
-                try t.emitFmt(t.byteOf(pat.main_token), "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
-                return;
-            }
-            for (binders, variant.field_types) |b_idx, fty| {
-                try t.checkPattern(b_idx, fty, cov, has_wildcard, false);
-            }
-        },
-        .@"struct" => {
-            for (binders) |b_idx| {
-                const b = t.tree.nodes[b_idx];
-                // A struct binding's SOURCE field name is the rename source (lhs),
-                // or the bound name itself when punning.
-                const src_name = if (b.lhs != Ast.none) t.nameText(t.tree.nodes[b.lhs].main_token) else t.nameText(b.main_token);
-                var fty: Type = .invalid;
-                var found = false;
-                for (variant.field_names, 0..) |dn, j| {
-                    if (std.mem.eql(u8, dn, src_name)) {
-                        fty = variant.field_types[j];
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    try t.emitFmt(t.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
-                }
-                // The carrier IS a pattern_binding: if it has a sub-pattern, match
-                // the field against it; else bind the whole field by value.
-                try t.checkPattern(b_idx, fty, cov, has_wildcard, false);
-            }
-        },
-    }
-}
 
-/// Verify all alternatives of an or-pattern bind the SAME set of names with the
-/// SAME types. Collects each alt's `{name -> Type}` (from the binding nodes'
-/// resolved slot types) and compares against the first.
-fn checkOrBindings(t: *Typecheck, or_idx: Ast.Index) error{OutOfMemory}!void {
-    const alts = Ast.rangeSlice(t.tree, t.tree.nodes[or_idx].lhs);
-    if (alts.len < 2) return;
-    var first_map: std.StringHashMapUnmanaged(Type) = .empty;
-    defer first_map.deinit(t.gpa);
-    try t.collectBindings(alts[0], &first_map);
-    var ok = true;
-    for (alts[1..]) |alt| {
-        var m: std.StringHashMapUnmanaged(Type) = .empty;
-        defer m.deinit(t.gpa);
-        try t.collectBindings(alt, &m);
-        if (m.count() != first_map.count()) {
-            ok = false;
-        } else {
-            var it = m.iterator();
-            while (it.next()) |entry| {
-                const want = first_map.get(entry.key_ptr.*) orelse {
-                    ok = false;
-                    break;
-                };
-                if (!Type.eql(want, entry.value_ptr.*)) {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if (!ok) break;
-    }
-    if (!ok)
-        try t.emitFmt(t.byteOf(t.tree.nodes[or_idx].main_token), "or-pattern alternatives must bind the same names and types", .{});
-}
 
-/// Walk a pattern's binding leaves into `out` as `name -> slot type`.
-fn collectBindings(t: *Typecheck, pat_idx: Ast.Index, out: *std.StringHashMapUnmanaged(Type)) error{OutOfMemory}!void {
-    const pat = t.tree.nodes[pat_idx];
-    switch (pat.tag) {
-        .pattern_binding => {
-            const name = t.nameText(pat.main_token);
-            // The PER-NODE matched type (set in checkPattern), NOT the shared slot
-            // type — so two alternatives binding the same name at different field
-            // types are seen as different and rejected.
-            const ty: Type = t.node_types[pat_idx];
-            try out.put(t.gpa, name, ty);
-            if (pat.rhs != Ast.none) try t.collectBindings(pat.rhs, out);
-        },
-        .pattern_variant => if (pat.rhs != Ast.none)
-            for (Ast.rangeSlice(t.tree, pat.rhs)) |c| try t.collectBindings(c, out),
-        .pattern_or => for (Ast.rangeSlice(t.tree, pat.lhs)) |a| try t.collectBindings(a, out),
-        else => {},
-    }
-}
-
-/// Type an `if`/`else` used as a VALUE expression. Both arms must agree:
-/// the merge is the one phi/join. An else-less value-if is a type error
-/// ("value-if requires else"). A fully-diverging arm (returns on all paths) is
-/// compatible with the other arm's concrete type (its value side is unreachable).
-fn typeOfIf(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    _ = node_idx;
-    const ct = try t.typeOf(n.lhs);
-    if (ct.kind != .invalid and ct.kind != .bool)
-        try t.emit(t.byteOf(t.tree.nodes[n.lhs].main_token), "if condition must be bool");
-    const h = Ast.ifHeaderAt(t.tree, n.rhs);
-    if (h.else_node == Ast.none) {
-        try t.emit(t.byteOf(n.main_token), "value-if requires else");
-        _ = try t.checkBlock(h.then_block, false); // validate the arm anyway
-        return .invalid;
-    }
-    const then_ty0 = try t.checkBlock(h.then_block, true);
-    const then_ty: Type = if (blockDiverges(t, h.then_block)) Type.never else then_ty0;
-    var else_ty: Type = undefined;
-    if (t.tree.nodes[h.else_node].tag == .if_stmt) {
-        const e0 = try t.typeOfIf(h.else_node, t.tree.nodes[h.else_node]); // else-if ladder
-        else_ty = if (stmtDiverges(t, h.else_node)) Type.never else e0;
-    } else {
-        const e0 = try t.checkBlock(h.else_node, true);
-        else_ty = if (blockDiverges(t, h.else_node)) Type.never else e0;
-    }
-    return t.merge(n.main_token, then_ty, else_ty);
-}
-
-/// Type a `loop` used as a value expression. Its body is checked in statement
-/// context; each value-break fills the loop's `join`. A loop with NO break at
-/// all is `never` (it can only exit via `return` or an outer construct).
-fn typeOfLoop(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node, label: ?[]const u8) error{OutOfMemory}!Type {
-    try t.loop_stack.append(t.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .is_value = true, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
-    _ = try t.checkBlock(n.lhs, false); // body in statement ctx; breaks fill join
-    const ctx = t.loop_stack.pop().?;
-    const ty: Type = if (!ctx.saw_value_break and !ctx.saw_bare_break) Type.never else ctx.join;
-    t.node_types[node_idx] = ty;
-    return ty;
-}
-
-/// Merge two value types into a single join. `never` is the bottom type: it
-/// unifies with anything (a `never` expression never produces a value), so
-/// `never + T = T` and `never + never = never`. No implicit coercion otherwise:
-/// a mismatch is a type error.
-fn merge(t: *Typecheck, at: u32, a: Type, b: Type) error{OutOfMemory}!Type {
-    if (a.kind == .invalid or b.kind == .invalid) return .invalid; // poison absorbs
-    if (a.kind == .never) return b; // covers never+never → never
-    if (b.kind == .never) return a;
-    if (Type.eql(a, b)) return a; // agreement → one phi type
-    try t.emitFmt(t.byteOf(at), "branches yield different types ({s} vs {s})", .{ t.typeName(a), t.typeName(b) });
-    return .invalid; // mismatch, no coercion
-}
 
 // ===========================================================================
 // M16 — fine-grained typecheck QUERY PROJECTIONS (observational dependency DAG).
@@ -2571,297 +3315,15 @@ fn merge(t: *Typecheck, at: u32, a: Type, b: Type) error{OutOfMemory}!Type {
 // build path is verbatim/byte-identical and these edges exist ONLY under `--dump-dag`.
 // ===========================================================================
 
-/// The stable `signature(fn)` node id for global fn `fid`, folding the SAME name
-/// the codegen callee-sig fold uses (graph: the qualified `gph_fn_names[fid]`;
-/// single-file: the decl-token spelling, with the synthetic bodyless fn = "print").
-/// Must mirror `Engine.codegen`'s `Wyhash(0x53_47_4e_4d, csig.name)` so the typecheck
-/// body->signature edge and the codegen->signature edge share one node.
-fn sigNodeName(t: *const Typecheck, fid: u32) []const u8 {
-    if (t.gph_fn_names) |names| {
-        if (fid < names.len) return names[fid];
-        return "print";
-    }
-    const f = t.fns.items[fid];
-    if (f.decl_node == Ast.none) return "print";
-    return t.nameText(t.tree.nodes[f.decl_node].main_token);
-}
 
-/// The STABLE `signature(fid)` DAG node id. M16 AUDIT FIX: the historical id was
-/// `Wyhash(name)` — NOT module/target qualified, so two same-named pub fns in
-/// different modules (or a user fn named `print`) collapsed to ONE signature node
-/// and served a wrong sig fp. The content-fp in the codegen cache key MASKED this;
-/// with stable-id keying it is live. `fid` is the program-wide global fn id (the
-/// `res.fns`/`t.fns` index), globally unique across modules, exactly matching how
-/// `body(fid)` is keyed — so a caller's `body -> signature(callee_fid)` edge and the
-/// callee's own `signature(callee_fid)` node always agree, preserving the firewall.
-fn sigNodeId(t: *const Typecheck, fid: u32) u64 {
-    _ = t;
-    var b: [4]u8 = undefined;
-    std.mem.writeInt(u32, &b, fid, .little);
-    return std.hash.Wyhash.hash(0x53_47_4e_4d, &b); // "SGNM"
-}
 
-/// Record `body(caller) -> signature(fid)` with the sig-only fingerprint. The
-/// CALLER's `body` node is the Active parent (entered in `checkFn`). The sig is
-/// rebuilt from the SAME `t.fns.items[fid]` table the whole-graph pass already
-/// filled (Pass A) — a pure read, no recompute. No-op when `dag == null`.
-fn recordSignature(t: *Typecheck, fid: u32) void {
-    const d = t.dag orelse return;
-    if (fid >= t.fns.items.len) return;
-    const f = t.fns.items[fid];
-    const sig: Sig = .{
-        .kind = if (f.decl_node == Ast.none) .builtin else .user_fn,
-        .name = t.sigNodeName(fid),
-        .params = f.params,
-        .ret = f.ret,
-    };
-    const node: Dag.NodeKey = .{ .kind = .signature, .id = t.sigNodeId(fid) };
-    d.recordEdge(t.gpa, Dag.Active.get(), node, Dag.sigFingerprint(sig));
-    // The signature's aggregate param/return types are layout dependencies of the
-    // signature node (a layout edit to a named aggregate flows to its sig).
-    for (f.params) |p| t.recordLayoutOf(node, p);
-    t.recordLayoutOf(node, f.ret);
-}
 
-/// Record `body(caller) -> resolve_name(name)` for a consumed resolution. Coarse:
-/// one node per resolved symbol, deduped by `recordEdge`. fp folds the Resolution
-/// shape (kind tag + bound id). No-op when `dag == null`.
-fn recordResolveName(t: *Typecheck, res: Resolution) void {
-    const d = t.dag orelse return;
-    var h = std.hash.Wyhash.init(0x52_4e_4d_45); // "RNME"
-    const tag: u8 = @intFromEnum(std.meta.activeTag(res));
-    h.update(&[_]u8{tag});
-    const bound: u32 = switch (res) {
-        .local => |l| l,
-        .func => |fi| fi,
-        else => 0,
-    };
-    var ib: [4]u8 = undefined;
-    std.mem.writeInt(u32, &ib, bound, .little);
-    h.update(&ib);
-    const fp = h.final();
-    // M16 AUDIT FIX: a module-LOCAL bound id (local/func index) is not unique across
-    // modules — two modules' `local#0` would collapse to one resolve_name node and
-    // serve a wrong-module resolution fp. Fold the current module id into the NODE id
-    // (mirroring recordTypeOf), so single-file mode (one module) is unchanged but
-    // cross-module nodes stay distinct. The fp keeps the resolution-shape content
-    // (no module fold) so an unrelated module renumbering does not spuriously flip it;
-    // distinctness comes from the id, soundness from the fp.
-    const node: Dag.NodeKey = .{ .kind = .resolve_name, .id = (@as(u64, t.graph_mod) << 40) ^ fp };
-    d.recordEdge(t.gpa, Dag.Active.get(), node, fp);
-}
 
-/// Record `body(caller) -> type_of(node_idx)` for a typed def/expr at a cross-item
-/// boundary (the call result + each arg). Coarse — recorded ONLY at the call
-/// boundary, not per leaf. fp folds the Type. No-op when `dag == null`.
-fn recordTypeOf(t: *Typecheck, node_idx: Ast.Index, ty: Type) void {
-    const d = t.dag orelse return;
-    var h = std.hash.Wyhash.init(0x54_4f_46_5f); // "TOF_"
-    h.update(&[_]u8{@intFromEnum(ty.kind)});
-    var ib: [8]u8 = undefined;
-    std.mem.writeInt(u32, ib[0..4], ty.struct_id, .little);
-    std.mem.writeInt(u32, ib[4..8], ty.enum_id, .little);
-    h.update(&ib);
-    // node_idx is a MODULE-LOCAL Ast.Index; in graph mode two modules can share an
-    // index, collapsing distinct boundary types to one type_of node (last-writer-wins
-    // fp masks a real type change => M17 miscompile). Fold the current module id into
-    // the node id (mirroring how `body` uses the global fid), so single-file mode
-    // (one module) is unchanged but cross-module nodes stay distinct.
-    const node: Dag.NodeKey = .{ .kind = .type_of, .id = (@as(u64, t.graph_mod) << 32) | node_idx };
-    d.recordEdge(t.gpa, Dag.Active.get(), node, h.final());
-}
 
-/// Record `parent -> layout(type)` when `ty` names an aggregate (struct/enum). fp
-/// mirrors Walks.structLayoutBytes/enumLayoutBytes EXACTLY over the laid-out
-/// `t.structs`/`t.enums` snapshots, so the recorded layout fp flips iff the codegen
-/// layout bytes flip. No-op when `dag == null` or `ty` is a scalar.
-fn recordLayoutOf(t: *Typecheck, parent: Dag.NodeKey, ty: Type) void {
-    const d = t.dag orelse return;
-    switch (ty.kind) {
-        .@"struct" => {
-            const node: Dag.NodeKey = .{ .kind = .layout, .id = ty.struct_id };
-            d.recordEdge(t.gpa, parent, node, t.structLayoutFp(ty.struct_id));
-        },
-        .@"enum" => {
-            // struct ids and enum ids are SEPARATE 0-based sequences; without a kind
-            // tag struct(N) and enum(N) collapse to one layout#N node and recordEdge's
-            // unconditional fp upsert lets the last writer mask the other's layout edit
-            // (invisible change => M17 miscompile). Reserve the high bit for enums.
-            const node: Dag.NodeKey = .{ .kind = .layout, .id = @as(u64, ty.enum_id) | (@as(u64, 1) << 63) };
-            d.recordEdge(t.gpa, parent, node, t.enumLayoutFp(ty.enum_id));
-        },
-        else => {},
-    }
-}
 
-/// Record `body(current) -> layout(ty)` for an aggregate READ inside a function
-/// body (struct construct / field access, enum construct / match / variant
-/// pattern). The body is the Active node. Without this, a layout-only edit to an
-/// aggregate used ONLY in a body (not named in that body's signature) is invisible
-/// to the fine-grained DAG — a stale body/codegen result under M17 (the M16
-/// signature firewall covers signatures only). No-op when `dag == null` (verbatim).
-fn recordBodyLayout(t: *Typecheck, ty: Type) void {
-    if (t.dag == null) return;
-    const parent = Dag.Active.get() orelse return;
-    t.recordLayoutOf(parent, ty);
-}
 
-/// Fold struct `id`'s layout into a u64, mirroring `Walks.structLayoutBytes`
-/// byte-for-byte (name\0 + per-field name\0+kind+offset, recursing nested structs,
-/// + size + align). Folds ONLY a `.done` snapshot; a `.laying`/poisoned child emits
-/// a sentinel and does NOT recurse (the recursive-struct guard — KNOWN BUG a).
-fn structLayoutFp(t: *const Typecheck, id: u32) u64 {
-    var h = std.hash.Wyhash.init(0x4c_41_59_53); // "LAYS"
-    t.foldStructLayout(&h, id);
-    return h.final();
-}
-fn foldStructLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
-    const s = t.structs.items[id];
-    if (s.state != .done or s.poisoned) {
-        h.update("<rec>"); // sentinel: a recursive/poisoned referent (matches guard)
-        return;
-    }
-    h.update(s.name);
-    h.update(&[_]u8{0});
-    for (s.field_names, s.field_types, s.offsets) |fn_, fty, off| {
-        h.update(fn_);
-        h.update(&[_]u8{0});
-        h.update(&[_]u8{@intFromEnum(fty.kind)});
-        var ob: [4]u8 = undefined;
-        std.mem.writeInt(u32, &ob, off, .little);
-        h.update(&ob);
-        if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
-    }
-    var sz: [8]u8 = undefined;
-    std.mem.writeInt(u32, sz[0..4], s.size, .little);
-    std.mem.writeInt(u32, sz[4..8], s.@"align", .little);
-    h.update(&sz);
-}
 
-/// Fold enum `id`'s layout into a u64, mirroring `Walks.enumLayoutBytes`
-/// byte-for-byte. Reuses the `.done`/sentinel guard so a recursive enum never loops.
-fn enumLayoutFp(t: *const Typecheck, id: u32) u64 {
-    var h = std.hash.Wyhash.init(0x4c_41_59_45); // "LAYE"
-    t.foldEnumLayout(&h, id);
-    return h.final();
-}
-fn foldEnumLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
-    const e = t.enums.items[id];
-    if (e.state != .done or e.poisoned) {
-        h.update("<rec>");
-        return;
-    }
-    h.update(e.name);
-    h.update(&[_]u8{0});
-    var hdr: [8]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], e.tag_size, .little);
-    std.mem.writeInt(u32, hdr[4..8], e.payload_off, .little);
-    h.update(&hdr);
-    for (e.variants) |v| {
-        h.update(v.name);
-        h.update(&[_]u8{0});
-        h.update(&[_]u8{@intFromEnum(v.form)});
-        if (v.form == .@"struct") {
-            for (v.field_names, v.field_types, v.offsets) |fn_, fty, off| {
-                h.update(fn_);
-                h.update(&[_]u8{0});
-                h.update(&[_]u8{@intFromEnum(fty.kind)});
-                var ob: [4]u8 = undefined;
-                std.mem.writeInt(u32, &ob, off, .little);
-                h.update(&ob);
-                if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
-                if (fty.kind == .@"enum") t.foldEnumLayout(h, fty.enum_id);
-            }
-        } else {
-            for (v.field_types, v.offsets) |fty, off| {
-                h.update(&[_]u8{@intFromEnum(fty.kind)});
-                var ob: [4]u8 = undefined;
-                std.mem.writeInt(u32, &ob, off, .little);
-                h.update(&ob);
-                if (fty.kind == .@"struct") t.foldStructLayout(h, fty.struct_id);
-                if (fty.kind == .@"enum") t.foldEnumLayout(h, fty.enum_id);
-            }
-        }
-    }
-    var sz: [8]u8 = undefined;
-    std.mem.writeInt(u32, sz[0..4], e.size, .little);
-    std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
-    h.update(&sz);
-}
 
-fn typeOfCall(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    // A qualified tuple-variant construction `N.V(args)` arrives as a `.call`
-    // whose callee is a `field_access` over an enum type-name identifier. Route
-    // it to the enum-init checker (treating `n` as a tuple construction).
-    const callee = t.tree.nodes[n.lhs];
-    if (callee.tag == .field_access) {
-        const recv = t.tree.nodes[callee.lhs];
-        if (recv.tag == .identifier and t.activeEnumMap().get(t.nameText(recv.main_token)) != null) {
-            return t.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
-        }
-        // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
-        // callee field_access's receiver is the inner `mod.Enum`.
-        if (t.qualifiedEnumId(callee.lhs)) |enum_id| {
-            const ty = try t.checkVariant(enum_id, callee.main_token, .tuple, n.rhs);
-            t.node_types[node_idx] = ty;
-            return ty;
-        }
-    }
-    const callee_res = t.resolutions[n.lhs];
-    // M16: a caller's body consumes the callee NAME resolution (cross-item read).
-    t.recordResolveName(callee_res);
-    if (callee_res != .func) {
-        // Type the args anyway so their own errors surface, then poison.
-        for (Ast.rangeSlice(t.tree, n.rhs)) |arg| _ = try t.typeOf(arg);
-        if (callee_res == .local) {
-            try t.emit(t.byteOf(n.main_token), "called value is not a function");
-        } else if (t.tree.nodes[n.lhs].tag == .identifier) {
-            // A struct-named callee `Point(1,2)` is positional construction, which
-            // we reject — point at named construction instead.
-            const cname = t.nameText(t.tree.nodes[n.lhs].main_token);
-            if (t.activeStructMap().get(cname) != null)
-                try t.emitFmt(t.byteOf(n.main_token), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
-        } else if (callee_res == .unresolved and t.tree.nodes[n.lhs].tag == .field_access) {
-            // A qualified call `recv.member(...)` whose callee stayed `.unresolved`:
-            // resolve neither bound it to a fn nor reported it (e.g. `recv` is a
-            // top-level fn shadowing an import namespace, so the field-access value
-            // path is taken and left unresolved). Emit a clean diagnostic at the
-            // member token instead of silently poisoning — otherwise the call is
-            // dropped and `-o` later crashes in codegen with no user error.
-            const fa = t.tree.nodes[n.lhs];
-            const member = t.nameText(fa.main_token);
-            try t.emitFmt(t.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
-        }
-        // Any remaining `.unresolved` was already reported by resolve.
-        return .invalid;
-    }
-    // M16 FIREWALL: this caller's body reads the callee's SIGNATURE (params/ret),
-    // NEVER its body. Route the cross-item `t.fns.items[callee]` read through the
-    // `signature(callee)` query so a body(caller)->signature(callee) edge is recorded
-    // (fp = sig-only fold). A body-only edit to the callee leaves this fp STABLE; a
-    // signature edit FLIPS it — the firewall, proven on a real program.
-    t.recordSignature(callee_res.func);
-    const f = t.fns.items[callee_res.func];
-    const args = Ast.rangeSlice(t.tree, n.rhs);
-    if (args.len != f.params.len) {
-        for (args) |arg| _ = try t.typeOf(arg);
-        try t.emitFmt(t.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
-        return f.ret;
-    }
-    for (args, f.params, 0..) |arg, pty, i| {
-        const at = try t.typeOfExpected(arg, if (pty.kind == .invalid) null else pty);
-        // M16: the arg's inferred type is a cross-boundary `type_of` read.
-        t.recordTypeOf(arg, at);
-        // Skip when either side is poison (e.g. a parameter whose type failed to
-        // resolve) so we don't cascade a spurious "expected invalid" message.
-        if (at.kind != .invalid and pty.kind != .invalid and !Type.eql(at, pty)) {
-            try t.emitFmt(t.byteOf(t.tree.nodes[arg].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, t.typeName(pty), t.typeName(at) });
-        }
-    }
-    // M16: the call result type (the callee's return) is the boundary `type_of`.
-    t.recordTypeOf(node_idx, f.ret);
-    return f.ret;
-}
 
 /// Map a type-reference node (an `identifier`, a `literal_unit` for `()`, or in
 /// graph mode a qualified `mod.Type` `field_access`) to a `Type`.
@@ -3196,6 +3658,27 @@ fn checkDiagCount(source: []const u8) !usize {
     return c.result.diags.len;
 }
 
+test "assignable: structural equality with no coercion" {
+    try testing.expect(Type.assignable(Type.int, Type.int));
+    try testing.expect(Type.assignable(Type.structT(3), Type.structT(3)));
+    try testing.expect(!Type.assignable(Type.int, Type.bool));
+    try testing.expect(!Type.assignable(Type.structT(1), Type.structT(2)));
+    try testing.expect(!Type.assignable(Type.int, Type.str));
+}
+
+test "assignable: invalid is poison (either side absorbs)" {
+    try testing.expect(Type.assignable(Type.invalid, Type.int));
+    try testing.expect(Type.assignable(Type.int, Type.invalid));
+    try testing.expect(Type.assignable(Type.invalid, Type.invalid));
+}
+
+test "assignable: never is bottom (fits any want)" {
+    try testing.expect(Type.assignable(Type.int, Type.never));
+    try testing.expect(Type.assignable(Type.structT(0), Type.never));
+    // but `never` as a WANT is not satisfied by a real value
+    try testing.expect(!Type.assignable(Type.never, Type.int));
+}
+
 test "clean program typechecks with zero diagnostics" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn add(a: int, b: int) -> int { return a + b }
@@ -3249,6 +3732,81 @@ test "assignment type mismatch" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         "fn f() {\n x := 1\n x = true\n return\n}\n",
     ));
+}
+
+test "typed local x: T = e binds x to the annotation" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn f() {\n x: int = 1\n y := x + 2\n return\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .var_decl and n.rhs != Ast.none) try testing.expectEqual(Type.int, c.result.node_types[i]);
+    }
+}
+
+test "typed local rejects a mismatched initializer" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn f() {\n x: int = true\n return\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqualStrings("cannot bind bool to 'x' of type int", c.result.diags[0].message);
+}
+
+test "typed local with () annotation is still rejected (cannot bind ())" {
+    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+        "fn g() { return }\nfn f() {\n x: () = g()\n return\n}\n",
+    ));
+}
+
+test "rule 7: main returning int is accepted" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        "fn main() -> int {\n return 0\n}\n",
+    ));
+}
+
+test "rule 7: main returning () is accepted" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        "fn main() -> () {\n return ()\n}\n",
+    ));
+}
+
+test "rule 7: main with an omitted (unit-sugar) return is accepted" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        "fn main() {\n return\n}\n",
+    ));
+}
+
+test "rule 7: main returning bool is rejected" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn main() -> bool {\n return true\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqualStrings("main must return int or ()", c.result.diags[0].message);
+    // The diagnostic points at main's name token (col 4), not the return.
+    try testing.expectEqual(@as(u32, 3), c.result.diags[0].byte_offset);
+}
+
+test "rule 7: main returning a struct is rejected" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct P { x: int }\nfn main() -> P {\n return P { x: 1 }\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqualStrings("main must return int or ()", c.result.diags[0].message);
+}
+
+test "rule 7: a non-main fn may return any type" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        "fn flag() -> bool {\n return true\n}\nfn main() -> int {\n return 0\n}\n",
+    ));
+}
+
+test "typed local flows the annotation into an inferred enum literal" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        "enum E { A, B }\nfn f() {\n x: E = .A\n return\n}\n",
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
 test "arithmetic on bool is an error" {

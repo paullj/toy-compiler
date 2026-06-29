@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — main may only return int or () (rule 7).
+# expect: compile-error "main must return int or ()"
+# A bool return has no entry-point exit-code semantics.
+fn main() -> bool {
+    return true
+}
