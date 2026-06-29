@@ -381,7 +381,7 @@ fn emitExecutable(
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
     if (res.diags.len > 0) {
-        for (res.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        for (res.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
@@ -391,7 +391,7 @@ fn emitExecutable(
     var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, dag, io);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
-        for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        for (tc.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
@@ -548,7 +548,7 @@ fn emitIr(
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
     if (res.diags.len > 0) {
-        for (res.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        for (res.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
@@ -556,7 +556,7 @@ fn emitIr(
     var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null, io);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
-        for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        for (tc.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
@@ -625,7 +625,7 @@ fn emitDumpDag(
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
     if (res.diags.len > 0) {
-        for (res.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        for (res.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
@@ -633,7 +633,7 @@ fn emitDumpDag(
     var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
     defer tc.deinit(gpa);
     if (tc.diags.len > 0) {
-        for (tc.diags) |d| try printModuleDiag(out, &graph, d.module, d.byte_offset, d.message);
+        for (tc.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
         try out.flush();
         return 1;
     }
@@ -799,8 +799,10 @@ fn printGraphError(out: *Io.Writer, graph: *const Graph.Graph, e: Graph.Error) !
 }
 
 /// Render a cross-module resolve/typecheck diagnostic against its owning module.
-fn printModuleDiag(out: *Io.Writer, graph: *const Graph.Graph, module: u32, byte_offset: u32, message: []const u8) !void {
-    const m = &graph.modules[module];
+fn printModuleDiag(out: *Io.Writer, graph: *const Graph.Graph, scope: u32, byte_offset: u32, message: []const u8) !void {
+    // An untagged (single-file) diagnostic renders against the entry module; a
+    // graph diagnostic against its owning module.
+    const m = if (scope == toyc.DiagnosticSink.NO_SCOPE) graph.entry() else &graph.modules[scope];
     const loc = lineCol(m.source, byte_offset);
     try out.print("{s}:{d}:{d}: error: {s}\n", .{ m.path, loc.line, loc.col, message });
 }

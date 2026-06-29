@@ -37,6 +37,7 @@ const Token = @import("ast/Token.zig").Token;
 const Ast = @import("ast/Ast.zig");
 const Graph = @import("driver/Graph.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
+const DiagnosticSink = @import("diagnostics/Sink.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 
@@ -55,13 +56,6 @@ pub const GlobalFn = struct {
     is_pub: bool,
 };
 
-/// A resolution diagnostic that knows which module's source it points into.
-pub const ModuleDiagnostic = struct {
-    module: u32,
-    byte_offset: u32,
-    message: []const u8,
-};
-
 /// The whole-graph resolve output. Caller owns it; free with `deinit`.
 pub const GraphResult = struct {
     /// One `[]Resolution` per module, parallel to `Graph.modules` (indexed by
@@ -69,8 +63,8 @@ pub const GraphResult = struct {
     resolutions: [][]Resolution,
     /// The merged program-wide function table; `.func` resolutions index it.
     fns: []GlobalFn,
-    /// Diagnostics, each tagged with its owning module.
-    diags: []ModuleDiagnostic,
+    /// Diagnostics, each tagged with its owning module via `Diagnostic.scope`.
+    diags: []Diagnostic,
     owned_msgs: [][]u8,
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
@@ -127,8 +121,7 @@ const GraphResolve = struct {
     /// The growing global fn table.
     fns: std.ArrayList(GlobalFn),
 
-    diags: std.ArrayList(ModuleDiagnostic),
-    owned_msgs: std.ArrayList([]u8),
+    sink: DiagnosticSink,
 
     // --- current module / function lexical state (reset per fn) ---
     cur_mod: u32 = 0,
@@ -729,10 +722,11 @@ fn lookupName(g: *GraphResolve, name_tok: u32) Resolution {
     return .unresolved;
 }
 
+/// Stamp the owning module onto the diagnostic (this resolver emits with an
+/// explicit `mod` per call rather than a single per-walk scope) and record it.
 fn emit(g: *GraphResolve, mod: u32, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
-    const msg = try std.fmt.allocPrint(g.gpa, fmt, args);
-    try g.owned_msgs.append(g.gpa, msg);
-    try g.diags.append(g.gpa, .{ .module = mod, .byte_offset = byte_offset, .message = msg });
+    g.sink.setScope(mod);
+    try g.sink.emitFmt(byte_offset, fmt, args);
 }
 };
 
@@ -753,8 +747,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         .tables = tables,
         .resolutions = resolutions,
         .fns = .empty,
-        .diags = .empty,
-        .owned_msgs = .empty,
+        .sink = DiagnosticSink.init(gpa),
     };
     defer {
         for (tables) |*t| t.deinit(gpa);
@@ -769,9 +762,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         gpa.free(resolutions);
         for (g.fns.items) |f| gpa.free(@constCast(f.name));
         g.fns.deinit(gpa);
-        for (g.owned_msgs.items) |m| gpa.free(m);
-        g.owned_msgs.deinit(gpa);
-        g.diags.deinit(gpa);
+        g.sink.deinit();
     }
 
     // Allocate each module's resolution array (parallel to its node count).
@@ -785,11 +776,13 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
     try g.collectNamespaces();
     for (0..n) |i| try g.resolveModule(@intCast(i));
 
+    g.sink.sort();
+    const owned = try g.sink.toOwned();
     return GraphResult{
         .resolutions = resolutions,
         .fns = try g.fns.toOwnedSlice(gpa),
-        .diags = try g.diags.toOwnedSlice(gpa),
-        .owned_msgs = try g.owned_msgs.toOwnedSlice(gpa),
+        .diags = owned.diags,
+        .owned_msgs = owned.owned,
     };
 }
 
@@ -968,7 +961,7 @@ test "unknown cross-module member errors against the importer" {
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), r.diags.len);
-            try testing.expectEqual(modId(g, "main"), r.diags[0].module);
+            try testing.expectEqual(modId(g, "main"), r.diags[0].scope);
             try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "no member") != null);
         }
     };

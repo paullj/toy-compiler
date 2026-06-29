@@ -29,7 +29,7 @@ const Typecheck = @import("types.zig");
 const Dag = @import("query/Dag.zig");
 
 pub const GraphResult = Typecheck.GraphResult;
-pub const GraphDiagnostic = Typecheck.GraphDiagnostic;
+const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 /// Type-check the whole module `graph` against the resolver result `res`. Builds
 /// the program-wide layout tables, checks every module's fn bodies cross-module,
@@ -388,7 +388,7 @@ test "cross-module argument type mismatch is reported against the importer" {
         fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
             _ = r;
             try testing.expectEqual(@as(usize, 1), tr.diags.len);
-            try testing.expectEqual(modId(g, "main"), tr.diags[0].module);
+            try testing.expectEqual(modId(g, "main"), tr.diags[0].scope);
             try testing.expect(std.mem.indexOf(u8, tr.diags[0].message, "expected int") != null);
         }
     };
@@ -497,14 +497,14 @@ fn diagsUnder(
     graph: *const Graph.Graph,
     res: *ResolveGraph.GraphResult,
     limit: Io.Limit,
-) ![]GraphDiagnostic {
+) ![]Diagnostic {
     var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
     defer threaded.deinit();
     var tr = try checkGraph(gpa, graph, res, null, threaded.io());
     defer tr.deinit(gpa);
-    const copy = try gpa.alloc(GraphDiagnostic, tr.diags.len);
+    const copy = try gpa.alloc(Diagnostic, tr.diags.len);
     for (tr.diags, 0..) |d, i| copy[i] = .{
-        .module = d.module,
+        .scope = d.scope,
         .byte_offset = d.byte_offset,
         .message = try gpa.dupe(u8, d.message),
     };
@@ -578,15 +578,15 @@ test "S4: parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)"
     try testing.expect(serial.len >= 4);
     try testing.expectEqual(serial.len, parallel.len);
     for (serial, parallel) |s, p| {
-        try testing.expectEqual(s.module, p.module);
+        try testing.expectEqual(s.scope, p.scope);
         try testing.expectEqual(s.byte_offset, p.byte_offset);
         try testing.expectEqualStrings(s.message, p.message);
     }
 
-    // And the serial stream is itself (module, byte_offset)-monotone (the stable
+    // And the serial stream is itself (scope, byte_offset)-monotone (the stable
     // merge key) — the property the parallel path must reproduce.
     for (serial[1..], serial[0 .. serial.len - 1]) |cur, prev| {
-        try testing.expect(prev.module < cur.module or
-            (prev.module == cur.module and prev.byte_offset <= cur.byte_offset));
+        try testing.expect(prev.scope < cur.scope or
+            (prev.scope == cur.scope and prev.byte_offset <= cur.byte_offset));
     }
 }

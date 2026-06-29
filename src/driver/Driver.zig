@@ -645,7 +645,7 @@ fn buildNames(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, sou
 /// id space). `fn_decls`/`fn_modules` are parallel to the global fn id space (one
 /// entry per global fn; `print` excluded — only real fn bodies are lowered). A
 /// codegen job selects its fn's owning module to build a single-fn `Frozen` view,
-/// so `walkCalls`/`walkTouched`/`typeRefToType`/`fingerprint`/`lowerOne` run
+/// so `walkCalls`/`walkTouchedSig`/`typeRefToType`/`fingerprint`/`lowerOne` run
 /// UNCHANGED — the only difference from single-file is which module's tree/resolutions
 /// they read. [design 8/10]
 const GraphFrozen = struct {
@@ -1970,7 +1970,7 @@ test "M8 cache soundness: editing a labeled/break fn recompiles only it; verify 
     try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
 
     // Edit ONLY g's break value (7 -> 9). main is a cache hit; only g recompiles.
-    // The new label/break tags must be fingerprint-reachable AND walkTouched must
+    // The new label/break tags must be fingerprint-reachable AND walkTouchedSig must
     // descend the labeled wrapper, else g would be a STALE HIT (compiled==0).
     const v2 = "fn g() -> int {\n @L loop {\n break @L 9\n }\n}\nfn main() -> int {\n return g()\n}\n";
     var r2: FileResult = undefined;
@@ -2073,7 +2073,7 @@ test "M9 cache soundness: a struct touched ONLY via a param/return type folds it
 
     // Add a 3rd field (16B reg-pair -> 24B INDIRECT, an ABI-class change). `consume`
     // touches Box only via its param type, so its fingerprint MUST fold the layout
-    // (the param/ret-only fold in walkTouched). A stale hit here would bake in the
+    // (the param/ret-only fold in walkTouchedSig). A stale hit here would bake in the
     // wrong ABI. Both consume + main recompile.
     const v2 = "struct Box { a: int, b: int, c: int }\nfn consume(p: Box) -> int { return 7 }\nfn main() -> int {\n b := Box { a: 1, b: 2, c: 3 }\n return consume(b)\n}\n";
     var r2: FileResult = undefined;

@@ -146,6 +146,7 @@ const type_names = std.StaticStringMap(Type).initComptime(.{
 /// A reported problem. Same shape as `Parser`/`Resolve` diagnostics so the
 /// driver/CLI can render either uniformly (byte offset → line:col).
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
+const DiagnosticSink = @import("diagnostics/Sink.zig");
 
 /// The pass output. Owned by the caller; free with `deinit`.
 pub const Result = struct {
@@ -227,8 +228,8 @@ pub const GraphFnInput = struct {
 pub const GraphResult = struct {
     /// One `[]Type` per module (parallel to that module's node array).
     node_types: [][]Type,
-    /// Diagnostics tagged with their owning module id.
-    diags: []GraphDiagnostic,
+    /// Diagnostics tagged with their owning module id via `Diagnostic.scope`.
+    diags: []Diagnostic,
     owned_msgs: [][]u8,
     /// One Sig per GLOBAL fn id (parallel to the resolver's global fn table).
     sigs: []Sig,
@@ -266,13 +267,6 @@ pub const GraphResult = struct {
         gpa.free(self.enum_layouts);
         self.* = undefined;
     }
-};
-
-/// A typecheck diagnostic that knows which module's source it points into.
-pub const GraphDiagnostic = struct {
-    module: u32,
-    byte_offset: u32,
-    message: []const u8,
 };
 
 /// A top-level function's signature, decoded once up front so calls can be
@@ -381,12 +375,10 @@ source: []const u8,
 resolutions: []const Resolution,
 
 node_types: []Type,
-diags: std.ArrayList(Diagnostic),
-owned_msgs: std.ArrayList([]u8),
-/// Graph mode only: the owning module id for each entry in `diags` (parallel).
-/// Lets the orchestrator render each cross-module diagnostic against the right
-/// source. Empty in single-file mode.
-diag_mods: std.ArrayList(u32) = .empty,
+/// Owns the diagnostic list + message lifetimes. In graph mode the owning module
+/// rides in each `Diagnostic.scope` (stamped via `gphSelect` -> `sink.setScope`);
+/// single-file leaves every scope `NO_SCOPE`.
+sink: DiagnosticSink,
 /// Graph mode only: per-module node_types slices. `gphSelect` redirects the
 /// active `node_types` to the selected module's slice. Null single-file.
 gph_node_types: ?[][]Type = null,
@@ -506,9 +498,9 @@ const Model = struct {
 /// scratch (slot_types/cur_ret/loop_stack/expected) and the cursor (tree/tokens/
 /// source/resolutions/node_types/graph_mod) — all set once at construction from
 /// the fn's owning module, never swapped (gphSelect's save/restore is gone on this
-/// path). Diagnostics go to LOCAL `diags`/`owned_msgs`/`diag_mods`; the Pass-C
-/// driver (`checkBodySerial` serial, `bodyJob` parallel) merges them into the
-/// shared result AFTER the body walk, so parallel Pass C never touches shared
+/// path). Diagnostics go to a LOCAL `sink` (scoped to the fn's module); the Pass-C
+/// driver (`checkBodySerial` serial, `bodyJob` parallel) merges it into the
+/// shared sink AFTER the body walk, so parallel Pass C never touches shared
 /// mutable diag state. `node_types` aliases the program-wide array but each
 /// BodyChecker writes ONLY its own fn's node span (disjoint by construction).
 const BodyChecker = struct {
@@ -529,10 +521,10 @@ const BodyChecker = struct {
     loop_stack: std.ArrayList(LoopCtx) = .empty,
     expected: ?Type = null,
 
-    // Local diagnostics (merged into the shared result by the Pass-C driver).
-    diags: std.ArrayList(Diagnostic) = .empty,
-    owned_msgs: std.ArrayList([]u8) = .empty,
-    diag_mods: std.ArrayList(u32) = .empty,
+    // Local diagnostic sink (merged into the shared result by the Pass-C driver).
+    // Its scope is set once in `bodyCheckerFor` to the fn's owning module (graph)
+    // or left NO_SCOPE (single-file).
+    sink: DiagnosticSink,
 
     dag: ?*Dag = null,
     gph_fn_names: ?[]const []const u8 = null,
@@ -540,9 +532,7 @@ const BodyChecker = struct {
     fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
-        bc.diags.deinit(bc.gpa);
-        bc.owned_msgs.deinit(bc.gpa);
-        bc.diag_mods.deinit(bc.gpa);
+        bc.sink.deinit();
     }
 
     // ---- BodyChecker methods (the per-fn body-walk relations) --------------
@@ -592,7 +582,7 @@ const BodyChecker = struct {
         // structurally return, OR the body's trailing expression has the declared
         // type. `assignable` folds poison/never/eql exactly as before.
         if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
-            try bc.emitFmt(bc.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
+            try bc.sink.emitFmt(bc.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
         _ = proto;
     }
@@ -833,7 +823,7 @@ const BodyChecker = struct {
                     const declared = bc.typeFromNode(stmt.rhs);
                     const got = try bc.typeOfExpected(stmt.lhs, declared);
                     if (!Type.assignable(declared, got)) {
-                        try bc.emitFmt(bc.byteOf(stmt.main_token), "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
+                        try bc.sink.emitFmt(bc.byteOf(stmt.main_token), "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
                     }
                     break :blk declared;
                 } else try bc.typeOf(stmt.lhs);
@@ -845,7 +835,7 @@ const BodyChecker = struct {
                     try bc.setSlot(slot, ty);
                 }
                 if (ty.kind == .unit) {
-                    try bc.emitFmt(bc.byteOf(stmt.main_token), "cannot bind () to '{s}'", .{bc.nameText(stmt.main_token)});
+                    try bc.sink.emitFmt(bc.byteOf(stmt.main_token), "cannot bind () to '{s}'", .{bc.nameText(stmt.main_token)});
                 }
             },
             .assign => {
@@ -863,7 +853,7 @@ const BodyChecker = struct {
                 bc.node_types[stmt.lhs] = lhs;
                 const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
-                    try bc.emitFmt(bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
+                    try bc.sink.emitFmt(bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
                 }
             },
             .return_stmt => {
@@ -875,7 +865,7 @@ const BodyChecker = struct {
                 // `never` unifies with any declared type — mirrors the trailing-expr
                 // body check above.
                 if (!Type.assignable(bc.cur_ret, ty)) {
-                    try bc.emitFmt(bc.byteOf(stmt.main_token), "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
+                    try bc.sink.emitFmt(bc.byteOf(stmt.main_token), "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
                 }
             },
             .expr_stmt => _ = try bc.typeOf(stmt.lhs),
@@ -883,7 +873,7 @@ const BodyChecker = struct {
             .if_stmt => {
                 const ct = try bc.typeOf(stmt.lhs);
                 if (ct.kind != .invalid and ct.kind != .bool)
-                    try bc.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "if condition must be bool");
+                    try bc.sink.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "if condition must be bool");
                 const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
                 _ = try bc.checkBlock(h.then_block, false);
                 if (h.else_node != Ast.none) {
@@ -901,7 +891,7 @@ const BodyChecker = struct {
                     // No matching context: a bare break with an empty stack ("outside a
                     // loop"); a labeled break is reported by resolve as undefined.
                     if (bc.resolutions[stmt_idx] != .label)
-                        try bc.emit(bc.byteOf(stmt.main_token), "break outside of a loop");
+                        try bc.sink.emit(bc.byteOf(stmt.main_token), "break outside of a loop");
                     if (stmt.lhs != Ast.none) _ = try bc.typeOf(stmt.lhs);
                     return;
                 };
@@ -912,7 +902,7 @@ const BodyChecker = struct {
                     const vt = try bc.typeOf(stmt.lhs);
                     if (!ctx.is_value) {
                         if (vt.kind != .invalid and vt.kind != .unit)
-                            try bc.emit(bc.byteOf(stmt.main_token), "cannot break with a value out of a while/for loop");
+                            try bc.sink.emit(bc.byteOf(stmt.main_token), "cannot break with a value out of a while/for loop");
                     } else {
                         ctx.saw_value_break = true;
                         ctx.join = try bc.merge(stmt.main_token, ctx.join, vt);
@@ -922,12 +912,12 @@ const BodyChecker = struct {
             .continue_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
                     if (bc.resolutions[stmt_idx] != .label)
-                        try bc.emit(bc.byteOf(stmt.main_token), "continue outside of a loop");
+                        try bc.sink.emit(bc.byteOf(stmt.main_token), "continue outside of a loop");
                     return;
                 };
                 // `continue` is meaningful only on a loop; a labeled bare block is not.
                 if (ctx.kind == .labeled_block)
-                    try bc.emit(bc.byteOf(stmt.main_token), "cannot continue a labeled block (not a loop)");
+                    try bc.sink.emit(bc.byteOf(stmt.main_token), "cannot continue a labeled block (not a loop)");
             },
             else => _ = try bc.typeOf(stmt_idx),
         }
@@ -956,7 +946,7 @@ const BodyChecker = struct {
         const stmt = bc.tree.nodes[stmt_idx];
         const ct = try bc.typeOf(stmt.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "while condition must be bool");
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "while condition must be bool");
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.rhs, false);
         _ = bc.loop_stack.pop();
@@ -968,9 +958,9 @@ const BodyChecker = struct {
         const lo = try bc.typeOf(h.lo);
         const hi = try bc.typeOf(h.hi);
         if (lo.kind != .invalid and lo.kind != .int)
-            try bc.emit(bc.byteOf(bc.tree.nodes[h.lo].main_token), "for range bounds must be int");
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[h.lo].main_token), "for range bounds must be int");
         if (hi.kind != .invalid and hi.kind != .int)
-            try bc.emit(bc.byteOf(bc.tree.nodes[h.hi].main_token), "for range bounds must be int");
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[h.hi].main_token), "for range bounds must be int");
         if (bc.resolutions[stmt_idx] == .local) try bc.setSlot(bc.resolutions[stmt_idx].local, Type.int);
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.lhs, false);
@@ -1025,7 +1015,7 @@ const BodyChecker = struct {
             .identifier => switch (bc.resolutions[node_idx]) {
                 .local => |slot| bc.slotType(slot),
                 .func => blk: {
-                    try bc.emitFmt(bc.byteOf(n.main_token), "function '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "function '{s}' is not a value", .{bc.nameText(n.main_token)});
                     break :blk Type.invalid;
                 },
                 .unresolved => blk: {
@@ -1035,7 +1025,7 @@ const BodyChecker = struct {
                     // struct name used as a value (`q := P`, `P.x`) reaches here with
                     // no diagnostic — report it so it never escapes to codegen.
                     if (bc.activeStructMap().get(bc.nameText(n.main_token)) != null)
-                        try bc.emitFmt(bc.byteOf(n.main_token), "type '{s}' is not a value", .{bc.nameText(n.main_token)});
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "type '{s}' is not a value", .{bc.nameText(n.main_token)});
                     break :blk Type.invalid;
                 },
                 .label => Type.invalid, // never on an identifier node (break/continue only)
@@ -1043,7 +1033,7 @@ const BodyChecker = struct {
                     // A bare imported-namespace name used as a value (`x := mod`):
                     // a module is not a value. (A `mod.member` access never reaches
                     // here — the receiver is consumed by typeOfFieldAccess/Call.)
-                    try bc.emitFmt(bc.byteOf(n.main_token), "module '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "module '{s}' is not a value", .{bc.nameText(n.main_token)});
                     break :blk Type.invalid;
                 },
             },
@@ -1054,11 +1044,11 @@ const BodyChecker = struct {
                 switch (op) {
                     .minus => {
                         if (operand.kind == .int) break :blk Type.int;
-                        try bc.emit(bc.byteOf(n.main_token), "operand of '-' must be int");
+                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '-' must be int");
                     },
                     .bang => {
                         if (operand.kind == .bool) break :blk Type.@"bool";
-                        try bc.emit(bc.byteOf(n.main_token), "operand of '!' must be bool");
+                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '!' must be bool");
                     },
                     else => {},
                 }
@@ -1073,25 +1063,25 @@ const BodyChecker = struct {
                 switch (op) {
                     .plus, .minus, .star, .slash => {
                         if (lt.kind == .int and rt.kind == .int) break :blk Type.int;
-                        try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },
                     .lt, .lt_eq, .gt, .gt_eq => {
                         if (lt.kind == .int and rt.kind == .int) break :blk Type.@"bool";
-                        try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },
                     .eq_eq, .bang_eq => {
                         if (Type.eql(lt, rt) and (lt.kind == .int or lt.kind == .bool)) break :blk Type.@"bool";
                         if (Type.eql(lt, rt) and lt.kind == .str) {
                             // Same type, but str comparison isn't supported — say so,
                             // rather than the misleading "must have the same type".
-                            try bc.emitFmt(bc.byteOf(n.main_token), "'{s}' on str is unsupported", .{op_text});
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "'{s}' on str is unsupported", .{op_text});
                         } else {
-                            try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
                         }
                     },
                     .amp_amp, .pipe_pipe => {
                         if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
-                        try bc.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
                     },
                     else => {},
                 }
@@ -1121,7 +1111,7 @@ const BodyChecker = struct {
         const name = bc.nameText(bc.tree.nodes[n.lhs].main_token);
         const id = bc.activeStructMap().get(name) orelse {
             for (Ast.rangeSlice(bc.tree, n.rhs)) |fi| _ = try bc.typeOf(bc.tree.nodes[fi].lhs);
-            try bc.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "unknown struct type '{s}'", .{name});
+            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "unknown struct type '{s}'", .{name});
             return .invalid;
         };
         const sym = bc.model.structs[id];
@@ -1147,19 +1137,19 @@ const BodyChecker = struct {
             }
             if (found) |j| {
                 if (seen[j]) {
-                    try bc.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, name });
+                    try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, name });
                 }
                 seen[j] = true;
                 const fty = sym.field_types[j];
                 if (!Type.assignable(fty, vt)) {
-                    try bc.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
+                    try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                 }
             } else {
-                try bc.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, name });
+                try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, name });
             }
         }
         for (sym.field_names, 0..) |dn, j| {
-            if (!seen[j]) try bc.emitFmt(bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, name });
+            if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, name });
         }
         return Type.structT(id);
     }
@@ -1195,7 +1185,7 @@ const BodyChecker = struct {
         const base = try bc.typeOf(n.lhs);
         if (base.kind == .invalid) return .invalid;
         if (!base.isStruct()) {
-            try bc.emitFmt(bc.byteOf(n.main_token), "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
             return .invalid;
         }
         const sym = bc.model.structs[base.struct_id];
@@ -1204,7 +1194,7 @@ const BodyChecker = struct {
         for (sym.field_names, 0..) |dn, j| {
             if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
         }
-        try bc.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
+        try bc.sink.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
         return .invalid;
     }
 
@@ -1224,19 +1214,19 @@ const BodyChecker = struct {
             const tname = bc.nameText(bc.tree.nodes[n.lhs].main_token);
             enum_id = bc.activeEnumMap().get(tname) orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "'{s}' is not an enum type", .{tname});
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "'{s}' is not an enum type", .{tname});
                 return .invalid;
             };
         } else {
             const exp = bc.expected orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.emitFmt(bc.byteOf(n.main_token), "cannot infer the enum type for '.{s}' here", .{bc.nameText(n.main_token)});
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot infer the enum type for '.{s}' here", .{bc.nameText(n.main_token)});
                 return .invalid;
             };
             if (!exp.isEnum()) {
                 try bc.typeArgsForEffect(node_form, args);
                 if (exp.kind != .invalid)
-                    try bc.emitFmt(bc.byteOf(n.main_token), "'.{s}' expects an enum type, but {s} was expected here", .{ bc.nameText(n.main_token), bc.typeName(exp) });
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "'.{s}' expects an enum type, but {s} was expected here", .{ bc.nameText(n.main_token), bc.typeName(exp) });
                 return .invalid;
             }
             enum_id = exp.enum_id;
@@ -1274,7 +1264,7 @@ const BodyChecker = struct {
         }
         const variant = if (vi) |i| e.variants[i] else {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            try bc.sink.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
             return .invalid;
         };
         const want_form: InitForm = switch (variant.form) {
@@ -1284,7 +1274,7 @@ const BodyChecker = struct {
         };
         if (node_form != want_form) {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
+            try bc.sink.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
             return Type.enumT(enum_id);
         }
         switch (variant.form) {
@@ -1293,13 +1283,13 @@ const BodyChecker = struct {
                 const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, args);
                 if (elems.len != variant.field_types.len) {
                     for (elems) |a| _ = try bc.typeOf(a);
-                    try bc.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
+                    try bc.sink.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
                     return Type.enumT(enum_id);
                 }
                 for (elems, variant.field_types) |a, fty| {
                     const at = try bc.typeOfExpected(a, fty);
                     if (!Type.assignable(fty, at))
-                        try bc.emitFmt(bc.byteOf(bc.tree.nodes[a].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
+                        try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[a].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
                 }
             },
             .@"struct" => {
@@ -1318,19 +1308,19 @@ const BodyChecker = struct {
                         }
                     }
                     if (found) |j| {
-                        if (seen[j]) try bc.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                        if (seen[j]) try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                         seen[j] = true;
                         const fty = variant.field_types[j];
                         const vt = try bc.typeOfExpected(fi.lhs, fty);
                         if (!Type.assignable(fty, vt))
-                            try bc.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
+                            try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                     } else {
                         _ = try bc.typeOf(fi.lhs);
-                        try bc.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                        try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                     }
                 }
                 for (variant.field_names, 0..) |dn, j| {
-                    if (!seen[j]) try bc.emitFmt(bc.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
+                    if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
                 }
             },
         }
@@ -1349,7 +1339,7 @@ const BodyChecker = struct {
         }
         if (st.kind != .@"enum" and st.kind != .int and st.kind != .bool) {
             for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, bc.tree.nodes[arm_idx].rhs).body);
-            try bc.emitFmt(bc.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
             bc.node_types[node_idx] = .invalid;
             return .invalid;
         }
@@ -1381,7 +1371,7 @@ const BodyChecker = struct {
             if (guarded) {
                 const gt = try bc.typeOf(h.guard);
                 if (gt.kind != .invalid and gt.kind != .bool)
-                    try bc.emitFmt(bc.byteOf(bc.tree.nodes[h.guard].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[h.guard].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
             }
             const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
             const body_ty: Type = if (bc.armDiverges(h.body)) Type.never else body_ty0;
@@ -1391,12 +1381,12 @@ const BodyChecker = struct {
             .@"enum" => |sv| {
                 const e = bc.model.enums[st.enum_id];
                 for (e.variants, 0..) |v, i| {
-                    if (!sv[i]) try bc.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing variant '{s}'", .{v.name});
+                    if (!sv[i]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing variant '{s}'", .{v.name});
                 }
             },
             .bool => |bcov| if (!(bcov.t and bcov.f))
-                try bc.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
-            .int => try bc.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
+            .int => try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
         };
         bc.node_types[node_idx] = result;
         return result;
@@ -1497,7 +1487,7 @@ const BodyChecker = struct {
             .pattern_literal => {
                 const lt: Type = if (bc.tokens[pat.main_token].tag == .number) Type.int else Type.@"bool";
                 if (expected.kind != .invalid and !Type.eql(lt, expected))
-                    try bc.emitFmt(bc.byteOf(pat.main_token), "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
+                    try bc.sink.emitFmt(bc.byteOf(pat.main_token), "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
                 // A bool literal records its case toward coverage; int never covers.
                 if (count_cov) switch (cov.*) {
                     .bool => |bcov| {
@@ -1521,7 +1511,7 @@ const BodyChecker = struct {
         const pat = bc.tree.nodes[pat_idx];
         if (expected.kind != .@"enum") {
             if (expected.kind != .invalid)
-                try bc.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
+                try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
             return;
         }
         const enum_id = expected.enum_id;
@@ -1532,9 +1522,9 @@ const BodyChecker = struct {
             const tname = bc.nameText(bc.tree.nodes[pat.lhs].main_token);
             if (bc.activeEnumMap().get(tname)) |qid| {
                 if (qid != enum_id)
-                    try bc.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
             } else {
-                try bc.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "'{s}' is not an enum type", .{tname});
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "'{s}' is not an enum type", .{tname});
             }
         }
         const vname = bc.nameText(pat.main_token);
@@ -1552,18 +1542,18 @@ const BodyChecker = struct {
             if (count_cov and bc.variantPayloadIrrefutable(pat_idx, e.variants[i])) cov.@"enum"[i] = true;
             break :blk e.variants[i];
         } else {
-            try bc.emitFmt(bc.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            try bc.sink.emitFmt(bc.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
             return;
         };
         const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, pat.rhs);
         switch (variant.form) {
             .unit => {
                 if (binders.len != 0)
-                    try bc.emitFmt(bc.byteOf(pat.main_token), "unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
+                    try bc.sink.emitFmt(bc.byteOf(pat.main_token), "unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
             },
             .tuple => {
                 if (binders.len != variant.field_types.len) {
-                    try bc.emitFmt(bc.byteOf(pat.main_token), "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
+                    try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
                     return;
                 }
                 for (binders, variant.field_types) |b_idx, fty| {
@@ -1586,7 +1576,7 @@ const BodyChecker = struct {
                         }
                     }
                     if (!found) {
-                        try bc.emitFmt(bc.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
+                        try bc.sink.emitFmt(bc.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
                     }
                     // The carrier IS a pattern_binding: if it has a sub-pattern, match
                     // the field against it; else bind the whole field by value.
@@ -1625,7 +1615,7 @@ const BodyChecker = struct {
             if (!ok) break;
         }
         if (!ok)
-            try bc.emitFmt(bc.byteOf(bc.tree.nodes[or_idx].main_token), "or-pattern alternatives must bind the same names and types", .{});
+            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[or_idx].main_token), "or-pattern alternatives must bind the same names and types", .{});
     }
 
     fn collectBindings(bc: *BodyChecker, pat_idx: Ast.Index, out: *std.StringHashMapUnmanaged(Type)) error{OutOfMemory}!void {
@@ -1651,10 +1641,10 @@ const BodyChecker = struct {
         _ = node_idx;
         const ct = try bc.typeOf(n.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.emit(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "if condition must be bool");
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "if condition must be bool");
         const h = Ast.ifHeaderAt(bc.tree, n.rhs);
         if (h.else_node == Ast.none) {
-            try bc.emit(bc.byteOf(n.main_token), "value-if requires else");
+            try bc.sink.emit(bc.byteOf(n.main_token), "value-if requires else");
             _ = try bc.checkBlock(h.then_block, false); // validate the arm anyway
             return .invalid;
         }
@@ -1685,7 +1675,7 @@ const BodyChecker = struct {
         if (a.kind == .never) return b; // covers never+never → never
         if (b.kind == .never) return a;
         if (Type.eql(a, b)) return a; // agreement → one phi type
-        try bc.emitFmt(bc.byteOf(at), "branches yield different types ({s} vs {s})", .{ bc.typeName(a), bc.typeName(b) });
+        try bc.sink.emitFmt(bc.byteOf(at), "branches yield different types ({s} vs {s})", .{ bc.typeName(a), bc.typeName(b) });
         return .invalid; // mismatch, no coercion
     }
 
@@ -1895,13 +1885,13 @@ const BodyChecker = struct {
             // Type the args anyway so their own errors surface, then poison.
             for (Ast.rangeSlice(bc.tree, n.rhs)) |arg| _ = try bc.typeOf(arg);
             if (callee_res == .local) {
-                try bc.emit(bc.byteOf(n.main_token), "called value is not a function");
+                try bc.sink.emit(bc.byteOf(n.main_token), "called value is not a function");
             } else if (bc.tree.nodes[n.lhs].tag == .identifier) {
                 // A struct-named callee `Point(1,2)` is positional construction, which
                 // we reject — point at named construction instead.
                 const cname = bc.nameText(bc.tree.nodes[n.lhs].main_token);
                 if (bc.activeStructMap().get(cname) != null)
-                    try bc.emitFmt(bc.byteOf(n.main_token), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
             } else if (callee_res == .unresolved and bc.tree.nodes[n.lhs].tag == .field_access) {
                 // A qualified call `recv.member(...)` whose callee stayed `.unresolved`:
                 // resolve neither bound it to a fn nor reported it (e.g. `recv` is a
@@ -1911,7 +1901,7 @@ const BodyChecker = struct {
                 // dropped and `-o` later crashes in codegen with no user error.
                 const fa = bc.tree.nodes[n.lhs];
                 const member = bc.nameText(fa.main_token);
-                try bc.emitFmt(bc.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
+                try bc.sink.emitFmt(bc.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
             }
             // Any remaining `.unresolved` was already reported by resolve.
             return .invalid;
@@ -1926,7 +1916,7 @@ const BodyChecker = struct {
         const args = Ast.rangeSlice(bc.tree, n.rhs);
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
             return f.ret;
         }
         for (args, f.params, 0..) |arg, pty, i| {
@@ -1934,7 +1924,7 @@ const BodyChecker = struct {
             // M16: the arg's inferred type is a cross-boundary `type_of` read.
             bc.recordTypeOf(arg, at);
             if (!Type.assignable(pty, at)) {
-                try bc.emitFmt(bc.byteOf(bc.tree.nodes[arg].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[arg].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
             }
         }
         // M16: the call result type (the callee's return) is the boundary `type_of`.
@@ -2005,18 +1995,6 @@ const BodyChecker = struct {
         return bc.tokens[tok].start;
     }
 
-    fn emit(bc: *BodyChecker, byte_offset: u32, message: []const u8) !void {
-        try bc.diags.append(bc.gpa, .{ .byte_offset = byte_offset, .message = message });
-        if (bc.model.graph != null) try bc.diag_mods.append(bc.gpa, bc.graph_mod);
-    }
-
-    fn emitFmt(bc: *BodyChecker, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
-        const msg = try std.fmt.allocPrint(bc.gpa, fmt, args);
-        try bc.owned_msgs.append(bc.gpa, msg);
-        try bc.diags.append(bc.gpa, .{ .byte_offset = byte_offset, .message = msg });
-        if (bc.model.graph != null) try bc.diag_mods.append(bc.gpa, bc.graph_mod);
-    }
-
     fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {
         if (type_node == Ast.none) return Type.unit;
         const tn = bc.tree.nodes[type_node];
@@ -2029,27 +2007,27 @@ const BodyChecker = struct {
         if (type_names.get(name)) |b| return b;
         if (bc.activeStructMap().get(name)) |id| return Type.structT(id);
         if (bc.activeEnumMap().get(name)) |id| return Type.enumT(id);
-        bc.emitFmt(bc.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
+        bc.sink.emitFmt(bc.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
         return .invalid;
     }
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
         _ = node_idx;
         const g = bc.model.graph orelse {
-            bc.emitFmt(bc.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
+            bc.sink.emitFmt(bc.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
             return .invalid;
         };
         const recv = bc.tree.nodes[n.lhs];
         if (recv.tag != .identifier) return .invalid;
         const recv_name = bc.nameText(recv.main_token);
         const target = g.namespaceOfIn(bc.graph_mod, recv_name) orelse {
-            bc.emitFmt(bc.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
+            bc.sink.emitFmt(bc.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
             return .invalid;
         };
         const member = bc.nameText(n.main_token);
         if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
         if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-        bc.emitFmt(bc.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
+        bc.sink.emitFmt(bc.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
         return .invalid;
     }
 
@@ -2091,6 +2069,7 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
         .resolutions = t.resolutions,
         .node_types = t.node_types,
         .graph_mod = 0,
+        .sink = DiagnosticSink.init(t.gpa),
         .dag = t.dag,
         .gph_fn_names = t.gph_fn_names,
     };
@@ -2101,6 +2080,9 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
         bc.source = mc.source;
         bc.resolutions = mc.resolutions;
         bc.graph_mod = f.mod;
+        // Graph mode: every diagnostic this BodyChecker emits is tagged with the
+        // fn's owning module. Single-file leaves the sink NO_SCOPE.
+        bc.sink.setScope(f.mod);
         if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
     }
     return bc;
@@ -2117,6 +2099,10 @@ fn gphSelect(t: *Typecheck, mod: u32) u32 {
     t.tokens = mc.tokens;
     t.source = mc.source;
     t.resolutions = mc.resolutions;
+    // Graph mode only (we returned above when single-file): stamp every
+    // subsequent top-level emit with the active module. Single-file never reaches
+    // here, so its sink stays NO_SCOPE.
+    t.sink.setScope(mod);
     // The active bare-name maps are read via `activeStructMap`/`activeEnumMap`,
     // which dereference ctx.mods[graph_mod] directly (the maps live in the ctx, so
     // a `put` that grows is reflected — copying the map struct into `t` would
@@ -2157,8 +2143,7 @@ pub fn check(
         .source = source,
         .resolutions = resolutions,
         .node_types = node_types,
-        .diags = .empty,
-        .owned_msgs = .empty,
+        .sink = DiagnosticSink.init(gpa),
         .fns = .empty,
         .slot_types = .empty,
         .cur_ret = .unit,
@@ -2195,9 +2180,7 @@ pub fn check(
     }
     errdefer {
         gpa.free(node_types);
-        t.diags.deinit(gpa);
-        for (t.owned_msgs.items) |m| gpa.free(m);
-        t.owned_msgs.deinit(gpa);
+        t.sink.deinit();
     }
 
     try t.run();
@@ -2321,10 +2304,12 @@ pub fn check(
         enums_built += 1;
     }
 
+    t.sink.sort();
+    const owned = try t.sink.toOwned();
     return Result{
         .node_types = node_types,
-        .diags = try t.diags.toOwnedSlice(gpa),
-        .owned_msgs = try t.owned_msgs.toOwnedSlice(gpa),
+        .diags = owned.diags,
+        .owned_msgs = owned.owned,
         .sigs = sigs,
         .layouts = layouts,
         .enum_layouts = enum_layouts,
@@ -2370,8 +2355,7 @@ pub fn checkGraph(
         .source = if (mods.len != 0) mods[0].source else &.{},
         .resolutions = if (mods.len != 0) mods[0].resolutions else &.{},
         .node_types = if (mods.len != 0) node_types[0] else &.{},
-        .diags = .empty,
-        .owned_msgs = .empty,
+        .sink = DiagnosticSink.init(gpa),
         .fns = .empty,
         .slot_types = .empty,
         .cur_ret = .unit,
@@ -2410,13 +2394,8 @@ pub fn checkGraph(
             gpa.free(s.offsets);
         }
         t.structs.deinit(gpa);
-        t.diag_mods.deinit(gpa);
     }
-    errdefer {
-        t.diags.deinit(gpa);
-        for (t.owned_msgs.items) |m| gpa.free(m);
-        t.owned_msgs.deinit(gpa);
-    }
+    errdefer t.sink.deinit();
 
     // Point node_types at the active module's slice as we switch modules. The
     // Typecheck writes through t.node_types; redirect it in gphSelect-like fashion
@@ -2452,26 +2431,14 @@ pub fn checkGraph(
     const enum_layouts = try snapshotEnumLayouts(gpa, t.enums.items);
     errdefer freeEnumLayouts(gpa, enum_layouts);
 
-    // ---- snapshot: diagnostics tagged with their owning module ----
-    const diags = try gpa.alloc(GraphDiagnostic, t.diags.items.len);
-    errdefer gpa.free(diags);
-    for (t.diags.items, 0..) |d, i| {
-        diags[i] = .{
-            .module = if (i < t.diag_mods.items.len) t.diag_mods.items[i] else 0,
-            .byte_offset = d.byte_offset,
-            .message = d.message,
-        };
-    }
-    // Free the diags ArrayList backing buffer (messages are kept alive via
-    // owned_msgs, transferred to the result below). Reset to empty so the top
-    // errdefer's `t.diags.deinit` stays a safe no-op if a later step fails.
-    t.diags.deinit(gpa);
-    t.diags = .empty;
+    // ---- snapshot: diagnostics (each already carries its owning module in
+    // `scope`, sorted by runGraph). Hand the owned slices to the result. ----
+    const owned = try t.sink.toOwned();
 
     return GraphResult{
         .node_types = node_types,
-        .diags = diags,
-        .owned_msgs = try t.owned_msgs.toOwnedSlice(gpa),
+        .diags = owned.diags,
+        .owned_msgs = owned.owned,
         .sigs = sigs,
         .layouts = layouts,
         .enum_layouts = enum_layouts,
@@ -2524,8 +2491,8 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     try t.checkPubSignatures(fns);
 
     // Rule 7 (Pass A): the entry-module `main` may only return int or (). Emitted
-    // here into the shared diag stream; the final sortDiagsStable below orders it
-    // with every other diagnostic, so it is byte-identical at -j1 and -jN.
+    // here into the shared diag stream; the final sink.sort() below orders it with
+    // every other diagnostic, so it is byte-identical at -j1 and -jN.
     try t.checkMainReturn(entry_mod);
 
     // Phase B/C: freeze the Pass-A tables into a read-only Model, then check each
@@ -2551,36 +2518,37 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         }
         // Sort the SAME way the parallel path does so graph diagnostics are
         // byte-identical at -j1 (serial) and -jN. Fn-id-order appends are already
-        // (module, byte_offset)-monotone for nearly every program, but a stable
+        // (scope, byte_offset)-monotone for nearly every program, but the stable
         // sort makes the contract explicit + total (PARALLEL == SERIAL).
-        sortDiagsStable(t);
+        t.sink.sort();
         return;
     }
 
     try t.runPassCParallel(&model);
 }
 
-/// Per-fn body-check result produced by one parallel Pass-C job. Owns the fn's
-/// local diagnostics until the serial merge concatenates them; `node_types` were
-/// written directly into the shared per-module arrays (disjoint span, no race).
+/// Per-fn body-check result produced by one parallel Pass-C job. Each holds its
+/// own `DiagnosticSink` (already scoped to the fn's module) until the serial merge
+/// transfers it into the shared sink; `node_types` were written directly into the
+/// shared per-module arrays (disjoint span, no race).
 const BodyResult = struct {
-    diags: []Diagnostic = &.{},
-    owned_msgs: [][]u8 = &.{},
-    diag_mods: []u32 = &.{},
+    sink: DiagnosticSink,
     err: ?anyerror = null,
 };
 
 /// Fan out every fn's body check across the worker pool, then merge the per-fn
-/// results on this (main) thread: concatenate the local diag lists in fn-id order,
-/// then STABLE-sort by (module, byte_offset). Stability is load-bearing — ties keep
-/// fn-id (= source) emission order, reproducing the serial discovery order exactly,
-/// so the merged diagnostic stream is byte-identical at every `-j`.
+/// sinks on this (main) thread in fn-id order and STABLE-sort once. Stability is
+/// load-bearing — ties keep fn-id (= source) emission order, reproducing the serial
+/// discovery order exactly, so the merged stream is byte-identical at every `-j`.
 fn runPassCParallel(t: *Typecheck, model: *const Model) !void {
     const gpa = t.gpa;
     const n = t.fns.items.len;
     const slots = try gpa.alloc(BodyResult, n);
     defer gpa.free(slots);
-    for (slots) |*s| s.* = .{};
+    for (slots) |*s| s.* = .{ .sink = DiagnosticSink.init(gpa) };
+    // Free every slot's sink on any error path below (merge empties a slot's sink,
+    // so a deinit of an already-merged slot is a no-op — no double-free).
+    defer for (slots) |*s| s.sink.deinit();
 
     const Ctx = struct {
         t: *const Typecheck,
@@ -2592,53 +2560,20 @@ fn runPassCParallel(t: *Typecheck, model: *const Model) !void {
     };
     Engine.fanOut(t.io.?, n, bodyJob, Ctx{ .t = t, .model = model, .slots = slots });
 
-    // Bubble a body error + RESERVE merge capacity inside a scoped errdefer window.
-    // Both the error path and a failed reservation free EVERY slot's buffers exactly
-    // once (nothing has been merged yet). The errdefer is block-scoped, so it is
-    // disarmed on normal exit — it can NOT fire during the merge below, where slot
-    // buffers are freed as their ownership transfers (otherwise an OOM mid-merge plus
-    // this errdefer would double-free the already-merged slots' diags/messages).
-    {
-        errdefer for (slots) |s| {
-            gpa.free(s.diags);
-            for (s.owned_msgs) |m| gpa.free(m);
-            gpa.free(s.owned_msgs);
-            gpa.free(s.diag_mods);
-        };
-        for (slots) |s| if (s.err) |e| return e;
+    for (slots) |s| if (s.err) |e| return e;
 
-        var n_diags: usize = 0;
-        var n_msgs: usize = 0;
-        var n_mods: usize = 0;
-        for (slots) |s| {
-            n_diags += s.diags.len;
-            n_msgs += s.owned_msgs.len;
-            n_mods += s.diag_mods.len;
-        }
-        try t.diags.ensureUnusedCapacity(gpa, n_diags);
-        try t.owned_msgs.ensureUnusedCapacity(gpa, n_msgs);
-        if (t.graph != null) try t.diag_mods.ensureUnusedCapacity(gpa, n_mods);
-    }
-
-    // Merge (infallible — capacity is reserved): append per-fn diags in fn-id order
-    // (the slot arrays' own backing is freed; the message bytes' ownership transfers
-    // to t.owned_msgs). No `try` here, so no double-free window.
-    for (slots) |s| {
-        t.diags.appendSliceAssumeCapacity(s.diags);
-        t.owned_msgs.appendSliceAssumeCapacity(s.owned_msgs);
-        if (t.graph != null) t.diag_mods.appendSliceAssumeCapacity(s.diag_mods);
-        gpa.free(s.diags);
-        gpa.free(s.owned_msgs);
-        gpa.free(s.diag_mods);
-    }
-
-    sortDiagsStable(t);
+    // Merge per-fn sinks in fn-id order, then sort once. `merge` reserves capacity
+    // first (infallible appends) and empties each slot, so the trailing `defer`
+    // above never double-frees a transferred sink. An OOM in a reserve frees every
+    // slot exactly once via that defer.
+    for (slots) |*s| try t.sink.merge(&s.sink);
+    t.sink.sort();
 }
 
 /// One parallel Pass-C unit: construct a BodyChecker for fn `fid` over the frozen
-/// `model`, walk its body, and move its local diagnostics into `out`. Writes only
-/// its own fn's node_types span + `out` — no shared mutable state — so jobs are
-/// race-free and order-free. `dag` is null on this path (the serial branch handles
+/// `model`, walk its body, and move its local sink into `out`. Writes only its own
+/// fn's node_types span + `out` — no shared mutable state — so jobs are race-free
+/// and order-free. `dag` is null on this path (the serial branch handles
 /// incremental), so checkBody records nothing.
 fn bodyJob(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
     const f = model.fns[fid];
@@ -2649,53 +2584,11 @@ fn bodyJob(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult)
         out.err = e;
         return;
     };
-    out.diags = bc.diags.toOwnedSlice(bc.gpa) catch |e| {
-        out.err = e;
-        return;
-    };
-    out.owned_msgs = bc.owned_msgs.toOwnedSlice(bc.gpa) catch |e| {
-        out.err = e;
-        return;
-    };
-    out.diag_mods = bc.diag_mods.toOwnedSlice(bc.gpa) catch |e| {
-        out.err = e;
-        return;
-    };
-}
-
-/// Stable-sort the merged diagnostics by (module, byte_offset). In graph mode the
-/// owning module rides in the parallel `diag_mods` array, so the two arrays are
-/// permuted together via a swap-aware STABLE index sort; single-file mode (no
-/// diag_mods) sorts on byte_offset alone. Stability is load-bearing — equal-key
-/// diagnostics keep their pre-sort (fn-id, then walk) order, which IS today's serial
-/// discovery order, so PARALLEL == SERIAL down to the byte. Diag counts are small
-/// (one per source error), so `insertionContext` (the std stable index sort) is the
-/// right tool over a permutation+apply dance.
-fn sortDiagsStable(t: *Typecheck) void {
-    if (t.graph != null) {
-        const SortCtx = struct {
-            diags: []Diagnostic,
-            mods: []u32,
-            pub fn lessThan(c: @This(), a: usize, b: usize) bool {
-                if (c.mods[a] != c.mods[b]) return c.mods[a] < c.mods[b];
-                return c.diags[a].byte_offset < c.diags[b].byte_offset;
-            }
-            pub fn swap(c: @This(), a: usize, b: usize) void {
-                std.mem.swap(Diagnostic, &c.diags[a], &c.diags[b]);
-                std.mem.swap(u32, &c.mods[a], &c.mods[b]);
-            }
-        };
-        std.sort.insertionContext(0, t.diags.items.len, SortCtx{
-            .diags = t.diags.items,
-            .mods = t.diag_mods.items,
-        });
-    } else {
-        std.sort.block(Diagnostic, t.diags.items, {}, struct {
-            fn lessThan(_: void, a: Diagnostic, b: Diagnostic) bool {
-                return a.byte_offset < b.byte_offset;
-            }
-        }.lessThan);
-    }
+    // Transfer the finished sink into the slot; leave bc holding a fresh empty sink
+    // so the `defer bc.deinit()` frees nothing it no longer owns.
+    out.sink.deinit();
+    out.sink = bc.sink;
+    bc.sink = DiagnosticSink.init(bc.gpa);
 }
 
 // ---- Pass-A2 copies (checkPubSignatures records body->signature/layout
@@ -2759,7 +2652,7 @@ fn sigNodeId(t: *const Typecheck, fid: u32) u64 {
 }
 
 /// Record `parent -> layout(type)` when `ty` names an aggregate (struct/enum). fp
-/// mirrors Walks.structLayoutBytes/enumLayoutBytes EXACTLY over the laid-out
+/// mirrors AstWalk.structLayoutBytes/enumLayoutBytes EXACTLY over the laid-out
 /// `t.structs`/`t.enums` snapshots, so the recorded layout fp flips iff the codegen
 /// layout bytes flip. No-op when `dag == null` or `ty` is a scalar.
 fn recordLayoutOf(t: *Typecheck, parent: Dag.NodeKey, ty: Type) void {
@@ -2781,7 +2674,7 @@ fn recordLayoutOf(t: *Typecheck, parent: Dag.NodeKey, ty: Type) void {
     }
 }
 
-/// Fold struct `id`'s layout into a u64, mirroring `Walks.structLayoutBytes`
+/// Fold struct `id`'s layout into a u64, mirroring `AstWalk.structLayoutBytes`
 /// byte-for-byte (name\0 + per-field name\0+kind+offset, recursing nested structs,
 /// + size + align). Folds ONLY a `.done` snapshot; a `.laying`/poisoned child emits
 /// a sentinel and does NOT recurse (the recursive-struct guard — KNOWN BUG a).
@@ -2814,7 +2707,7 @@ fn foldStructLayout(t: *const Typecheck, h: *std.hash.Wyhash, id: u32) void {
     h.update(&sz);
 }
 
-/// Fold enum `id`'s layout into a u64, mirroring `Walks.enumLayoutBytes`
+/// Fold enum `id`'s layout into a u64, mirroring `AstWalk.enumLayoutBytes`
 /// byte-for-byte. Reuses the `.done`/sentinel guard so a recursive enum never loops.
 fn enumLayoutFp(t: *const Typecheck, id: u32) u64 {
     var h = std.hash.Wyhash.init(0x4c_41_59_45); // "LAYE"
@@ -2933,7 +2826,7 @@ fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, ow
         else => false,
     };
     if (non_pub)
-        try t.emitFmt(t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+        try t.sink.emitFmt(t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
 }
 
 /// Rule 7: the entry `main` may only yield `int` (the process exit code) or `()`
@@ -2954,10 +2847,10 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
         const main_tok = tree.nodes[f.decl_node].main_token;
         if (!std.mem.eql(u8, tokens[main_tok].text(source), "main")) continue;
         if (f.ret.kind != .int and f.ret.kind != .unit and f.ret.kind != .invalid) {
-            // Select the entry module so byteOf/the graph diag_mods tag point into
-            // the right source (emit reads t.graph_mod for the module tag).
+            // Select the entry module so the sink stamps this diagnostic with the
+            // entry module's scope (gphSelect -> sink.setScope).
             if (t.graph != null) _ = t.gphSelect(entry_mod);
-            try t.emit(tokens[main_tok].start, "main must return int or ()");
+            try t.sink.emit(tokens[main_tok].start, "main must return int or ()");
         }
         return; // only the first `main` is the entry
     }
@@ -3133,11 +3026,11 @@ fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void
         if (decl.tag != .struct_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
+            try t.sink.emitFmt(t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
+            try t.sink.emitFmt(t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
             continue;
         }
         const id: u32 = @intCast(t.structs.items.len);
@@ -3155,11 +3048,11 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
         if (decl.tag != .enum_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "enum '{s}' shadows a builtin type", .{name});
+            try t.sink.emitFmt(t.byteOf(decl.main_token), "enum '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null or t.activeEnumMap().get(name) != null) {
-            try t.emitFmt(t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
+            try t.sink.emitFmt(t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
             continue;
         }
         const id: u32 = @intCast(t.enums.items.len);
@@ -3180,7 +3073,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         const param = t.tree.nodes[param_idx];
         const pty = t.typeFromNode(param.lhs);
         if (pty.kind == .unit) {
-            try t.emitFmt(t.byteOf(param.main_token), "parameter '{s}' cannot have type ()", .{t.nameText(param.main_token)});
+            try t.sink.emitFmt(t.byteOf(param.main_token), "parameter '{s}' cannot have type ()", .{t.nameText(param.main_token)});
             params[i] = .invalid; // poison so call-arg checks don't cascade
         } else {
             params[i] = pty;
@@ -3197,38 +3090,17 @@ fn appendPrint(t: *Typecheck) !void {
 }
 
 /// Check one fn body against the FROZEN `model`. Constructs a per-fn
-/// `BodyChecker` (cursor wired to the fn's owning module, scratch fresh, diags
-/// local), runs the body walk through it, then MERGES the local diags back into
-/// the shared result in walk order. Serial Pass B calls this per fn in source
-/// order, so the merged diags reproduce today's discovery order byte-for-byte;
-/// this is also the unit of work a future parallel Pass C fans out (each worker
-/// owns its BodyChecker, touching only its own node_types span + local diags).
-/// Serial Pass-C unit (single-file `run`, the dag != null incremental path, and
-/// the io == null fallback). Identical body-walk to `bodyJob`; merges into the
-/// shared lists in fn-id order. The graph caller sorts after the loop.
+/// `BodyChecker` (cursor wired to the fn's owning module, scratch fresh, sink
+/// local + scoped), runs the body walk through it, then MERGES its sink into the
+/// shared sink in walk order. Serial Pass B/C calls this per fn in source order,
+/// so the merged diags reproduce today's discovery order byte-for-byte. Same
+/// body-walk as `bodyJob`; the graph caller sorts after the loop.
 fn checkBodySerial(t: *Typecheck, model: *const Model, fid: u32, f: FnSym) !void {
     var bc = t.bodyCheckerFor(model, f);
     defer bc.deinit();
     try bc.checkBody(fid, f);
-    try t.mergeBodyDiags(&bc);
+    try t.sink.merge(&bc.sink);
 }
-
-/// Append a finished BodyChecker's local diagnostics to the shared result. Serial
-/// per-fn-in-source-order calls preserve discovery order; node_types was written
-/// directly into the shared array (disjoint span). The owned message buffers
-/// transfer ownership to `t.owned_msgs` (freed once by the Result deinit).
-fn mergeBodyDiags(t: *Typecheck, bc: *BodyChecker) !void {
-    try t.diags.appendSlice(t.gpa, bc.diags.items);
-    try t.owned_msgs.appendSlice(t.gpa, bc.owned_msgs.items);
-    if (t.graph != null) try t.diag_mods.appendSlice(t.gpa, bc.diag_mods.items);
-    // The messages are now owned by t.owned_msgs; clear the local list WITHOUT
-    // freeing the buffers (ownership transferred) so bc.deinit frees only its
-    // (now-empty) backing arrays.
-    bc.owned_msgs.clearRetainingCapacity();
-}
-
-
-
 
 
 
@@ -3296,7 +3168,7 @@ const BoolCov = struct { t: bool = false, f: bool = false };
 //     node id matches codegen's `Wyhash("SGNM", name)` so a body(caller)->signature
 //     and a codegen(caller)->signature edge land on the SAME signature node.
 //   * type_of(def): coarse — recorded at the call boundary only; fp folds the Type.
-//   * layout(type): mirrors Walks.structLayoutBytes/enumLayoutBytes EXACTLY, reusing
+//   * layout(type): mirrors AstWalk.structLayoutBytes/enumLayoutBytes EXACTLY, reusing
 //     the .laying/.done guard so a recursive aggregate emits a sentinel, never loops.
 //   * resolve_name(name): coarse firewall; resolve is NOT engine-routed, so the edge
 //     is recorded directly from the typecheck read site. fp folds the Resolution.
@@ -3339,7 +3211,7 @@ fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
     if (type_names.get(name)) |b| return b;
     if (t.activeStructMap().get(name)) |id| return Type.structT(id);
     if (t.activeEnumMap().get(name)) |id| return Type.enumT(id);
-    t.emitFmt(t.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
+    t.sink.emitFmt(t.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
     return .invalid;
 }
 
@@ -3350,20 +3222,20 @@ fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
 fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
     _ = node_idx;
     const g = t.graph orelse {
-        t.emitFmt(t.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
+        t.sink.emitFmt(t.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
         return .invalid;
     };
     const recv = t.tree.nodes[n.lhs];
     if (recv.tag != .identifier) return .invalid;
     const recv_name = t.nameText(recv.main_token);
     const target = g.namespaceOfIn(t.graph_mod, recv_name) orelse {
-        t.emitFmt(t.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
+        t.sink.emitFmt(t.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
         return .invalid;
     };
     const member = t.nameText(n.main_token);
     if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
     if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-    t.emitFmt(t.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
+    t.sink.emitFmt(t.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
     return .invalid;
 }
 
@@ -3387,7 +3259,7 @@ fn layoutStruct(t: *Typecheck, id: u32) error{OutOfMemory}!void {
     // hazard (no eightbytes, a degenerate sret). Reject it with a clean diagnostic.
     var empty_poison = false;
     if (n == 0) {
-        try t.emitFmt(t.byteOf(decl.main_token), "empty struct '{s}' is not allowed", .{t.structs.items[id].name});
+        try t.sink.emitFmt(t.byteOf(decl.main_token), "empty struct '{s}' is not allowed", .{t.structs.items[id].name});
         empty_poison = true;
     }
 
@@ -3409,7 +3281,7 @@ fn layoutStruct(t: *Typecheck, id: u32) error{OutOfMemory}!void {
         var fsize: u32 = 0;
         var falign: u32 = 1;
         if (fty.kind == .unit) {
-            try t.emitFmt(t.byteOf(field.main_token), "field '{s}' cannot have type ()", .{names[i]});
+            try t.sink.emitFmt(t.byteOf(field.main_token), "field '{s}' cannot have type ()", .{names[i]});
             poisoned = true;
         } else if (fty.kind != .invalid) {
             const sz = try t.layoutReferent(fty, t.byteOf(decl.main_token), t.structs.items[id].name, &poisoned);
@@ -3439,7 +3311,7 @@ fn layoutReferent(t: *Typecheck, ty: Type, at: u32, requester: []const u8, reque
     switch (ty.kind) {
         .@"struct" => {
             if (t.structs.items[ty.struct_id].state == .laying) {
-                try t.emitFmt(at, "recursive type '{s}' has infinite size", .{requester});
+                try t.sink.emitFmt(at, "recursive type '{s}' has infinite size", .{requester});
                 requester_poison.* = true;
                 return .{ .size = 0, .@"align" = 1 };
             }
@@ -3448,7 +3320,7 @@ fn layoutReferent(t: *Typecheck, ty: Type, at: u32, requester: []const u8, reque
         },
         .@"enum" => {
             if (t.enums.items[ty.enum_id].state == .laying) {
-                try t.emitFmt(at, "recursive type '{s}' has infinite size", .{requester});
+                try t.sink.emitFmt(at, "recursive type '{s}' has infinite size", .{requester});
                 requester_poison.* = true;
                 return .{ .size = 0, .@"align" = 1 };
             }
@@ -3476,7 +3348,7 @@ fn layoutEnum(t: *Typecheck, id: u32) error{OutOfMemory}!void {
 
     var poisoned = false;
     if (nv == 0) {
-        try t.emitFmt(t.byteOf(decl.main_token), "empty enum '{s}' is not allowed", .{t.enums.items[id].name});
+        try t.sink.emitFmt(t.byteOf(decl.main_token), "empty enum '{s}' is not allowed", .{t.enums.items[id].name});
         poisoned = true;
     }
 
@@ -3532,7 +3404,7 @@ fn layoutEnum(t: *Typecheck, id: u32) error{OutOfMemory}!void {
             var psize: u32 = 0;
             var pa: u32 = 1;
             if (pty.kind == .unit) {
-                try t.emitFmt(t.byteOf(vnode.main_token), "variant '{s}' payload cannot have type ()", .{vname});
+                try t.sink.emitFmt(t.byteOf(vnode.main_token), "variant '{s}' payload cannot have type ()", .{vname});
                 poisoned = true;
             } else if (pty.kind != .invalid) {
                 const sz = try t.layoutReferent(pty, t.byteOf(decl.main_token), t.enums.items[id].name, &poisoned);
@@ -3598,20 +3470,6 @@ fn nameText(t: *const Typecheck, tok: u32) []const u8 {
 
 fn byteOf(t: *const Typecheck, tok: u32) u32 {
     return t.tokens[tok].start;
-}
-
-/// Record a static-literal diagnostic.
-fn emit(t: *Typecheck, byte_offset: u32, message: []const u8) !void {
-    try t.diags.append(t.gpa, .{ .byte_offset = byte_offset, .message = message });
-    if (t.graph != null) try t.diag_mods.append(t.gpa, t.graph_mod);
-}
-
-/// Format a data-bearing message, own the buffer, and record a diagnostic.
-fn emitFmt(t: *Typecheck, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
-    const msg = try std.fmt.allocPrint(t.gpa, fmt, args);
-    try t.owned_msgs.append(t.gpa, msg);
-    try t.diags.append(t.gpa, .{ .byte_offset = byte_offset, .message = msg });
-    if (t.graph != null) try t.diag_mods.append(t.gpa, t.graph_mod);
 }
 
 const testing = std.testing;

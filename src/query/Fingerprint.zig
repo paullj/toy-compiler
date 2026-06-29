@@ -13,21 +13,20 @@
 //! of M5: a callee BODY change must NOT recompile its callers (their fingerprint
 //! is unchanged), but a callee SIGNATURE change MUST (their fingerprint flips).
 //!
-//! Two correctness invariants the walk must never violate:
+//! The (a) body walk is defined ONCE in `AstWalk`; here `AstWalk.HashVisitor`
+//! folds its event stream. The walk's two correctness invariants (which this fold
+//! relies on) live with the walk:
 //!
-//!   * NO ABSOLUTE INDICES, NO SOURCE OFFSETS. The walk hashes node TAGS and leaf
-//!     token TEXT, never a node index, token index, or source byte offset. Those
-//!     all shift when an unrelated sibling function is edited; an unchanged fn
-//!     must keep an identical hash so it stays a cache hit. [C3]
-//!   * ORDER-SENSITIVE, NEVER XOR. Children are folded with a streaming Wyhash in
-//!     their exact wiring order, with arity/optionality sentinels. XOR (or +) is
-//!     commutative, so `a - b` and `b - a` — or swapped comparison operands —
-//!     would collide and miscompile. [C7]
+//!   * NO ABSOLUTE INDICES, NO SOURCE OFFSETS — node TAGS and leaf token TEXT
+//!     only, never an index/offset that shifts when a sibling is edited. [C3]
+//!   * ORDER-SENSITIVE, NEVER XOR — children fold in wiring order with arity
+//!     sentinels, so `a - b` and `b - a` cannot collide. [C7]
 
 const std = @import("std");
 const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
+const AstWalk = @import("AstWalk.zig");
 
 /// A callee's identity-and-signature, folded into a caller's fingerprint so a
 /// signature OR symbol-identity change (but not a body change) invalidates the
@@ -74,254 +73,36 @@ pub fn fingerprint(
     var h = std.hash.Wyhash.init(seed);
 
     // (a) structural body walk (tags + leaf text, order-sensitive, index-free).
-    walk(&h, tree, tokens, source, fn_decl);
+    // The walk order is defined ONCE in `AstWalk`; `HashVisitor` folds the same
+    // bytes this function folded when it owned the walk.
+    var hv = AstWalk.HashVisitor{ .h = &h };
+    // HashVisitor folds into the Wyhash (no allocation), so its error set is empty
+    // and this walk is infallible.
+    AstWalk.walk(.{ .tree = tree, .tokens = tokens, .source = source }, fn_decl, &hv) catch unreachable;
 
     // (b) callee identities + signatures, in walk order. The callee's resolved
     // SymName{kind,name} is folded BEFORE its sig: it is what the `.func` reloc
     // target carries, so a shadow/unshadow that changes the bound symbol (e.g.
     // builtin `print` vs a user `fn print` of the same sig) flips the caller's
     // hash even though the sig is identical. [Cx]
-    updateU32(&h, @intCast(callee_sigs.len));
+    AstWalk.updateU32(&h, @intCast(callee_sigs.len));
     for (callee_sigs) |s| {
         h.update(&[_]u8{@intFromEnum(s.kind)});
-        updateLeaf(&h, s.name);
-        updateU32(&h, @intCast(s.params.len));
+        AstWalk.updateLeaf(&h, s.name);
+        AstWalk.updateU32(&h, @intCast(s.params.len));
         for (s.params) |p| h.update(&[_]u8{@intFromEnum(p.kind)});
         h.update(&[_]u8{@intFromEnum(s.ret.kind)});
     }
 
     // (c) touched type layouts. A struct folds its full layout descriptor so an
     // edit to its fields (names/types/offsets/size) flips every using fn's hash.
-    updateU32(&h, @intCast(touched.len));
+    AstWalk.updateU32(&h, @intCast(touched.len));
     for (touched) |ty| {
         h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version });
-        if (ty.kind == .@"struct" or ty.kind == .@"enum") updateLeaf(&h, ty.layout);
+        if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
     }
 
     return h.final();
-}
-
-fn updateU32(h: *std.hash.Wyhash, v: u32) void {
-    var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &buf, v, .little);
-    h.update(&buf);
-}
-
-/// Length-prefixed leaf text, so `"ab"+"c"` cannot collide with `"a"+"bc"`.
-fn updateLeaf(h: *std.hash.Wyhash, text: []const u8) void {
-    updateU32(h, @intCast(text.len));
-    h.update(text);
-}
-
-/// Walk the subtree at `idx`, folding tag + leaf text + ordered children. Mirrors
-/// the `Ast` node wiring exactly (and the statement/expr sets the Codegen lowers).
-fn walk(h: *std.hash.Wyhash, tree: Ast.Tree, tokens: []const Token, source: []const u8, idx: Ast.Index) void {
-    if (idx == Ast.none) return;
-    const n = tree.nodes[idx];
-    h.update(&[_]u8{@intFromEnum(n.tag)});
-    const leaf = tokens[n.main_token].text(source);
-    switch (n.tag) {
-        // Leaf-bearing literals/identifiers: the spelling IS the content.
-        .literal_number, .literal_string, .literal_bool, .identifier => updateLeaf(h, leaf),
-
-        .unary => {
-            updateLeaf(h, leaf); // operator text
-            walk(h, tree, tokens, source, n.lhs);
-        },
-        .binary => {
-            updateLeaf(h, leaf); // operator text
-            walk(h, tree, tokens, source, n.lhs); // lhs THEN rhs: a-b ≠ b-a [C7]
-            walk(h, tree, tokens, source, n.rhs);
-        },
-        .call => {
-            // The callee leaf is folded by recursing the lhs identifier; the arity
-            // sentinel distinguishes f() from f(0). [C5]
-            walk(h, tree, tokens, source, n.lhs);
-            const args = Ast.rangeSlice(tree, n.rhs);
-            updateU32(h, @intCast(args.len));
-            for (args) |a| walk(h, tree, tokens, source, a);
-        },
-        .var_decl => {
-            updateLeaf(h, leaf); // bound name
-            walk(h, tree, tokens, source, n.lhs); // initializer
-        },
-        .assign => {
-            walk(h, tree, tokens, source, n.lhs); // target
-            walk(h, tree, tokens, source, n.rhs); // value
-        },
-        .return_stmt => {
-            h.update(&[_]u8{@intFromBool(n.lhs != Ast.none)}); // bare return ≠ return v
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs);
-        },
-        .expr_stmt => walk(h, tree, tokens, source, n.lhs),
-        .block => {
-            const stmts = Ast.rangeSlice(tree, n.lhs);
-            updateU32(h, @intCast(stmts.len));
-            for (stmts) |s| walk(h, tree, tokens, source, s);
-        },
-        .param => {
-            updateLeaf(h, leaf); // param name
-            walk(h, tree, tokens, source, n.lhs); // type-ref identifier
-        },
-        .fn_decl => {
-            updateLeaf(h, leaf); // fn name
-            const proto = Ast.protoAt(tree, n.lhs);
-            updateU32(h, @intCast(proto.params.len));
-            for (proto.params) |p| walk(h, tree, tokens, source, p);
-            h.update(&[_]u8{@intFromBool(proto.ret_type != Ast.none)});
-            if (proto.ret_type != Ast.none) walk(h, tree, tokens, source, proto.ret_type);
-            walk(h, tree, tokens, source, n.rhs); // body block
-        },
-        .while_stmt => {
-            walk(h, tree, tokens, source, n.lhs); // cond
-            walk(h, tree, tokens, source, n.rhs); // body
-        },
-        .if_stmt => {
-            walk(h, tree, tokens, source, n.lhs); // cond
-            const head = Ast.ifHeaderAt(tree, n.rhs);
-            walk(h, tree, tokens, source, head.then_block);
-            h.update(&[_]u8{@intFromBool(head.else_node != Ast.none)});
-            if (head.else_node != Ast.none) walk(h, tree, tokens, source, head.else_node);
-        },
-        // Never a fingerprint root / never reached inside a fn-body walk.
-        .program, .import_decl => {},
-        // Zero-sized leaf: the tag byte (folded before the switch) IS its content,
-        // so it is structurally distinct from any other node. Reached as a value
-        // literal and as a `()` type-ref (under param/fn_decl ret).
-        .literal_unit => {},
-        .loop_expr => walk(h, tree, tokens, source, n.lhs), // body
-        .for_stmt => {
-            updateLeaf(h, leaf); // loop-var name
-            const head = Ast.forHeaderAt(tree, n.rhs);
-            walk(h, tree, tokens, source, head.lo);
-            walk(h, tree, tokens, source, head.hi);
-            walk(h, tree, tokens, source, n.lhs); // body
-        },
-        .break_stmt => {
-            // The label target identity is load-bearing (it picks the join), so
-            // fold its TEXT (not a token index — index-free [C3]).
-            h.update(&[_]u8{@intFromBool(n.rhs != Ast.none)}); // bare ≠ @label
-            if (n.rhs != Ast.none) updateLeaf(h, tokens[n.rhs].text(source));
-            h.update(&[_]u8{@intFromBool(n.lhs != Ast.none)}); // bare break ≠ break v
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs);
-        },
-        .continue_stmt => {
-            h.update(&[_]u8{@intFromBool(n.rhs != Ast.none)}); // bare ≠ @label
-            if (n.rhs != Ast.none) updateLeaf(h, tokens[n.rhs].text(source));
-        },
-        // The label NAME at the def-site is folded so a break-target rename stays
-        // consistent with the wrapper; the inner construct is then walked.
-        .labeled => {
-            updateLeaf(h, leaf); // label name
-            walk(h, tree, tokens, source, n.lhs);
-        },
-        // Structs: the decl folds the type's SPELLING (name + fields); the
-        // resolved layout enters via the touched-types (c) component. A struct
-        // literal folds its type-name + each field-init; a field access folds the
-        // field-name + receiver. (Construction/access SPELLING is here; LAYOUT is (c).)
-        .struct_decl => {
-            updateLeaf(h, leaf); // struct name
-            const fields = Ast.rangeSlice(tree, n.lhs);
-            updateU32(h, @intCast(fields.len));
-            for (fields) |f| walk(h, tree, tokens, source, f);
-        },
-        .struct_init => {
-            walk(h, tree, tokens, source, n.lhs); // type-name identifier
-            const inits = Ast.rangeSlice(tree, n.rhs);
-            updateU32(h, @intCast(inits.len));
-            for (inits) |fi| walk(h, tree, tokens, source, fi);
-        },
-        .field_init => {
-            updateLeaf(h, leaf); // field name
-            walk(h, tree, tokens, source, n.lhs); // value
-        },
-        .field_access => {
-            updateLeaf(h, leaf); // field name
-            walk(h, tree, tokens, source, n.lhs); // receiver
-        },
-        // M10 enums: the decl folds the enum SPELLING (name + per-variant
-        // form/payload); the resolved LAYOUT enters via touched-types (c).
-        .enum_decl => {
-            updateLeaf(h, leaf); // enum name
-            const variants = Ast.rangeSlice(tree, n.lhs);
-            updateU32(h, @intCast(variants.len));
-            for (variants) |v| walk(h, tree, tokens, source, v);
-        },
-        .enum_variant_unit => updateLeaf(h, leaf), // variant name
-        .enum_variant_tuple => {
-            updateLeaf(h, leaf); // variant name
-            const types = Ast.rangeSlice(tree, n.lhs);
-            updateU32(h, @intCast(types.len));
-            for (types) |ty| walk(h, tree, tokens, source, ty);
-        },
-        .enum_variant_struct => {
-            updateLeaf(h, leaf); // variant name
-            const fields = Ast.rangeSlice(tree, n.lhs);
-            updateU32(h, @intCast(fields.len));
-            for (fields) |f| walk(h, tree, tokens, source, f);
-        },
-        // Variant construction: a sentinel distinguishes inferred `.V` from
-        // qualified `N.V` (load-bearing — they lower differently), then the
-        // variant name, then the payload args.
-        .enum_init_unit => {
-            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)}); // inferred vs qualified
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs); // type name
-            updateLeaf(h, leaf); // variant name
-        },
-        .enum_init_tuple => {
-            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)});
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs);
-            updateLeaf(h, leaf);
-            const args = Ast.rangeSlice(tree, n.rhs);
-            updateU32(h, @intCast(args.len));
-            for (args) |a| walk(h, tree, tokens, source, a);
-        },
-        .enum_init_struct => {
-            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)});
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs);
-            updateLeaf(h, leaf);
-            const inits = Ast.rangeSlice(tree, n.rhs);
-            updateU32(h, @intCast(inits.len));
-            for (inits) |fi| walk(h, tree, tokens, source, fi);
-        },
-        .match_expr => {
-            walk(h, tree, tokens, source, n.lhs); // scrutinee
-            const arms = Ast.rangeSlice(tree, n.rhs);
-            updateU32(h, @intCast(arms.len));
-            for (arms) |arm| walk(h, tree, tokens, source, arm);
-        },
-        .match_arm => {
-            walk(h, tree, tokens, source, n.lhs); // pattern
-            const ah = Ast.armHeaderAt(tree, n.rhs);
-            h.update(&[_]u8{@intFromBool(ah.guard != Ast.none)}); // guard sentinel
-            if (ah.guard != Ast.none) walk(h, tree, tokens, source, ah.guard);
-            walk(h, tree, tokens, source, ah.body); // body
-        },
-        .pattern_variant => {
-            h.update(&[_]u8{@intFromBool(n.lhs == Ast.none)}); // inferred vs qualified
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs); // type name
-            updateLeaf(h, leaf); // variant name
-            const binders = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(tree, n.rhs);
-            updateU32(h, @intCast(binders.len));
-            for (binders) |b| walk(h, tree, tokens, source, b);
-        },
-        .pattern_wildcard => {}, // the tag byte (folded above) IS its content
-        .pattern_binding => {
-            updateLeaf(h, leaf); // bound name
-            h.update(&[_]u8{@intFromBool(n.lhs != Ast.none)}); // rename vs pun
-            if (n.lhs != Ast.none) walk(h, tree, tokens, source, n.lhs); // source field
-            h.update(&[_]u8{@intFromBool(n.rhs != Ast.none)}); // has sub-pattern
-            if (n.rhs != Ast.none) walk(h, tree, tokens, source, n.rhs); // sub-pattern
-        },
-        // M11: literal value spelling IS its content; an or-pattern folds its
-        // arity then each alt in order (order-sensitive, not XOR).
-        .pattern_literal => updateLeaf(h, leaf),
-        .pattern_or => {
-            const alts = Ast.rangeSlice(tree, n.lhs);
-            updateU32(h, @intCast(alts.len));
-            for (alts) |a| walk(h, tree, tokens, source, a);
-        },
-    }
 }
 
 // Tests — the cheapest proofs of the miscompile-class ledger (C3, C5, C7).

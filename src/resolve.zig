@@ -34,6 +34,7 @@ pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 /// A reported problem. Same shape as `Parser.Diagnostic` so the driver/CLI can
 /// render either uniformly (byte offset → line:col).
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
+const DiagnosticSink = @import("diagnostics/Sink.zig");
 
 /// The pass output. Owned by the caller; free with `deinit`.
 pub const Result = struct {
@@ -89,8 +90,7 @@ tokens: []const Token,
 source: []const u8,
 
 resolutions: []Resolution,
-diags: std.ArrayList(Diagnostic),
-owned_msgs: std.ArrayList([]u8),
+sink: DiagnosticSink,
 
 /// Top-level function table + name → index map.
 fns: std.ArrayList(FnSym),
@@ -128,8 +128,7 @@ pub fn resolve(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, so
         .tokens = tokens,
         .source = source,
         .resolutions = resolutions,
-        .diags = .empty,
-        .owned_msgs = .empty,
+        .sink = DiagnosticSink.init(gpa),
         .fns = .empty,
         .fn_map = .empty,
         .struct_names = .empty,
@@ -152,17 +151,17 @@ pub fn resolve(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, so
     }
     errdefer {
         gpa.free(resolutions);
-        r.diags.deinit(gpa);
-        for (r.owned_msgs.items) |m| gpa.free(m);
-        r.owned_msgs.deinit(gpa);
+        r.sink.deinit();
     }
 
     try r.run();
 
+    r.sink.sort();
+    const owned = try r.sink.toOwned();
     return Result{
         .resolutions = resolutions,
-        .diags = try r.diags.toOwnedSlice(gpa),
-        .owned_msgs = try r.owned_msgs.toOwnedSlice(gpa),
+        .diags = owned.diags,
+        .owned_msgs = owned.owned,
     };
 }
 
@@ -190,7 +189,7 @@ fn run(r: *Resolve) !void {
         const name = r.nameText(decl.main_token);
         const gop = try r.fn_map.getOrPut(r.gpa, name);
         if (gop.found_existing) {
-            try r.emitFmt(r.tokens[decl.main_token].start, "duplicate function '{s}'", .{name});
+            try r.sink.emitFmt(r.tokens[decl.main_token].start, "duplicate function '{s}'", .{name});
             continue;
         }
         gop.value_ptr.* = @intCast(r.fns.items.len);
@@ -268,19 +267,19 @@ fn resolveStmt(r: *Resolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 const res = r.lookupName(target.main_token);
                 r.resolutions[stmt.lhs] = res;
                 switch (res) {
-                    .unresolved => try r.emitFmt(
+                    .unresolved => try r.sink.emitFmt(
                         r.tokens[target.main_token].start,
                         "assignment to undeclared name '{s}'",
                         .{r.nameText(target.main_token)},
                     ),
-                    .func => try r.emitFmt(
+                    .func => try r.sink.emitFmt(
                         r.tokens[target.main_token].start,
                         "cannot assign to function '{s}'",
                         .{r.nameText(target.main_token)},
                     ),
                     .local => {},
                     .label => {}, // unreachable on an assign target; defensive
-                    .module => try r.emitFmt(
+                    .module => try r.sink.emitFmt(
                         r.tokens[target.main_token].start,
                         "cannot assign to module '{s}'",
                         .{r.nameText(target.main_token)},
@@ -351,7 +350,7 @@ fn resolveExpr(r: *Resolve, node_idx: Ast.Index) error{OutOfMemory}!void {
                 // `Point(...)` callee that Typecheck diagnoses specifically).
                 if (r.struct_names.contains(r.nameText(n.main_token))) return;
                 if (r.enum_names.contains(r.nameText(n.main_token))) return;
-                try r.emitFmt(
+                try r.sink.emitFmt(
                     r.tokens[n.main_token].start,
                     "undeclared identifier '{s}'",
                     .{r.nameText(n.main_token)},
@@ -414,7 +413,7 @@ fn resolveLabeled(r: *Resolve, idx: Ast.Index) error{OutOfMemory}!void {
     // to the innermost same-named label and the body resolves.
     for (r.label_stack.items) |e| {
         if (std.mem.eql(u8, e.name, name)) {
-            try r.emitFmt(r.tokens[n.main_token].start, "duplicate label '{s}'", .{name});
+            try r.sink.emitFmt(r.tokens[n.main_token].start, "duplicate label '{s}'", .{name});
             break;
         }
     }
@@ -520,7 +519,7 @@ fn resolveLabelTarget(r: *Resolve, node_idx: Ast.Index, label_tok: u32, comptime
             return;
         }
     }
-    try r.emitFmt(r.tokens[label_tok].start, verb ++ " to undefined label '{s}'", .{name});
+    try r.sink.emitFmt(r.tokens[label_tok].start, verb ++ " to undefined label '{s}'", .{name});
 }
 
 // ---- scope / name helpers --------------------------------------------------
@@ -543,7 +542,7 @@ fn declare(r: *Resolve, name_tok: u32, comptime dup_fmt: []const u8) !?u32 {
     const scope = &r.scopes.items[r.scopes.items.len - 1];
     const gop = try scope.names.getOrPut(r.gpa, name);
     if (gop.found_existing) {
-        try r.emitFmt(r.tokens[name_tok].start, dup_fmt, .{name});
+        try r.sink.emitFmt(r.tokens[name_tok].start, dup_fmt, .{name});
         return null;
     }
     const slot = r.slot_next;
@@ -570,13 +569,6 @@ fn lookupName(r: *Resolve, name_tok: u32) Resolution {
 
 fn nameText(r: *const Resolve, tok: u32) []const u8 {
     return r.tokens[tok].text(r.source);
-}
-
-/// Format a name-bearing message, own the buffer, and record a diagnostic.
-fn emitFmt(r: *Resolve, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
-    const msg = try std.fmt.allocPrint(r.gpa, fmt, args);
-    try r.owned_msgs.append(r.gpa, msg);
-    try r.diags.append(r.gpa, .{ .byte_offset = byte_offset, .message = msg });
 }
 
 // ---- tests -----------------------------------------------------------------

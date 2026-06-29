@@ -35,6 +35,22 @@ fail_one() { echo "  FAIL: $1"; fail=$((fail + 1)); }
 
 while IFS= read -r src; do
   rel="${src#"$root"/}"
+
+  # Skip the IMPORT SUB-FILES of a multi-module program. A multi-module program is
+  # a directory whose entry is `main.toy` (the compiler discovers the rest of the
+  # graph from that one entry — see examples/modules/check.sh); its sibling/nested
+  # non-entry files have no `main` and use entry-relative imports, so compiling one
+  # standalone here spuriously fails. The entry `main.toy` itself still compiles
+  # and is kept (it adds real determinism coverage). A file is a sub-file iff some
+  # ancestor dir up to examples/ holds a `main.toy` and the file is not that entry.
+  if [ "$(basename "$src")" != "main.toy" ]; then
+    d="$(dirname "$src")"
+    while [ "$d" != "$root/examples" ] && [ "$d" != "$root" ] && [ "$d" != "/" ]; do
+      if [ -f "$d/main.toy" ]; then continue 2; fi
+      d="$(dirname "$d")"
+    done
+  fi
+
   directives="$(grep -E '^# expect:' "$src" | sed -E 's/^# expect:[[:space:]]*//')"
   want_cerr=0
   grep -qE '^compile-error' <<<"$directives" && want_cerr=1
@@ -80,10 +96,11 @@ while IFS= read -r src; do
   fi
 
   [ "$ok" -eq 1 ] && { echo "  ok: $rel (correct, deterministic)"; pass=$((pass + 1)); }
-# Skip examples/modules/ — those are MULTI-module programs (a directory whose entry
-# is main.toy, the rest reached via imports); they compile only through their entry,
-# so they have their own harness (examples/modules/check.sh). Compiling a module
-# sub-file standalone here would spuriously fail (no main / unresolved imports).
+# Skip examples/modules/ wholesale — those MULTI-module programs (a directory whose
+# entry is main.toy, the rest reached via imports) have their own harness
+# (examples/modules/check.sh). Multi-module programs OUTSIDE modules/ (e.g.
+# bench/medium) are handled per-file by the sub-file guard at the top of the loop:
+# their entry main.toy is compiled here, their import sub-files are skipped.
 done < <(find "$root/examples" -name '*.toy' -not -path '*/modules/*' | sort)
 
 echo "---"
