@@ -155,6 +155,24 @@ pub const Block = struct {
     params: []ValueId,
     instrs: []Instr,
     term: Terminator,
+
+    /// Free this block's nested owned slices (each `.call`'s args, then `instrs`,
+    /// `params`, and a `br`'s args) exactly once. The SINGLE definition of a
+    /// block's owned-slice set: `Function.deinit` and unreachable-block elim both
+    /// route through it so their free sets physically cannot diverge. Free order is
+    /// irrelevant (each slice is freed once); the set is what must match.
+    pub fn freeOwned(b: Block, gpa: std.mem.Allocator) void {
+        for (b.instrs) |ins| switch (ins.op) {
+            .call => |c| gpa.free(c.args),
+            else => {},
+        };
+        gpa.free(b.instrs);
+        gpa.free(b.params);
+        switch (b.term) {
+            .br => |br| gpa.free(br.args),
+            else => {},
+        }
+    }
 };
 
 /// A lowered function. All index spaces (slots/values/blocks) are dense and
@@ -177,20 +195,7 @@ pub const Function = struct {
     /// Free every owned slice. `name.name` is borrowed from the names table
     /// (owned by the caller), so it is NOT freed here.
     pub fn deinit(self: *Function, gpa: std.mem.Allocator) void {
-        for (self.blocks) |*b| {
-            gpa.free(b.params);
-            for (b.instrs) |*ins| {
-                switch (ins.op) {
-                    .call => |c| gpa.free(c.args),
-                    else => {},
-                }
-            }
-            gpa.free(b.instrs);
-            switch (b.term) {
-                .br => |br| gpa.free(br.args),
-                else => {},
-            }
-        }
+        for (self.blocks) |b| b.freeOwned(gpa);
         gpa.free(self.blocks);
         gpa.free(self.params);
         gpa.free(self.slots);

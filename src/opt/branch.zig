@@ -8,10 +8,9 @@
 //!
 //! PHASE 2 (unreachable-elim): whenever phase 1 changed a terminator, recompute
 //! reachability from `func.entry` (iterate-to-fixpoint over successors, ascending
-//! block id for determinism). Drop every block not reachable: free its nested
-//! owned slices in `deinit` order (each `.call`'s args; then `instrs`; then
-//! `params`; then `br.args`) EXACTLY once, then compact survivors with a single
-//! alloc-copy-free-old. Rewrite every surviving terminator's block refs and
+//! block id for determinism). Drop every block not reachable: free its owned
+//! slices through the shared `Ir.Block.freeOwned` (once), then compact survivors
+//! with a single alloc-copy-free-old. Rewrite every surviving terminator's block refs and
 //! `func.entry`/`func.exit` through an ascending-id block remap.
 //!
 //! INVARIANTS: only WHOLE unreachable blocks are dropped, so no live predecessor
@@ -148,19 +147,10 @@ fn elimUnreachable(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats
         }
     }
 
-    // Free each DROPPED block's nested owned slices, in deinit order.
-    for (func.blocks, 0..) |*b, i| {
+    // Free each DROPPED block's owned slices through the shared `freeOwned`.
+    for (func.blocks, 0..) |b, i| {
         if (reachable[i]) continue;
-        for (b.instrs) |*ins| switch (ins.op) {
-            .call => |c| gpa.free(c.args),
-            else => {},
-        };
-        gpa.free(b.instrs);
-        gpa.free(b.params);
-        switch (b.term) {
-            .br => |br| gpa.free(br.args),
-            else => {},
-        }
+        b.freeOwned(gpa);
     }
 
     // Compact survivors (single alloc-copy-free-old), in old-id order.
