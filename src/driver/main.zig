@@ -653,6 +653,27 @@ const Orchestrator = struct {
     /// tail) or render the IR text. The front-end stages are identical.
     pub const Tail = enum { lower, render_ir };
 
+    comptime {
+        // The hooks dispatch on `Stage` derived from the pipeline position
+        // (`@enumFromInt(stage_i)`); this pins each `Stage` to its `StageGraph.pipeline`
+        // entry, so a pipeline reorder/insert is a compile error here (a rename to fix),
+        // not a silent hook↔stage misdispatch.
+        const pipeline = toyc.StageGraph.pipeline;
+        const fields = @typeInfo(Stage).@"enum".fields;
+        if (pipeline.len != fields.len)
+            @compileError("Orchestrator.Stage count must match StageGraph.pipeline length");
+        for (fields) |f| {
+            const aligned = switch (@as(Stage, @enumFromInt(f.value))) {
+                .discover => pipeline[f.value].kind == .discover,
+                .resolve => pipeline[f.value].kind == .collect,
+                .typecheck => pipeline[f.value].kind == .global_tables,
+                .codegen => pipeline[f.value].kind == .codegen,
+            };
+            if (!aligned)
+                @compileError("Orchestrator stage '" ++ f.name ++ "' is not aligned with its StageGraph.pipeline entry");
+        }
+    }
+
     gpa: std.mem.Allocator,
     io: Io,
     cache: toyc.Cache,
@@ -717,33 +738,33 @@ const Orchestrator = struct {
     /// Stages 1/2 fill a caller-frame scratch list (the upstream result is ready) and
     /// return its slice; it outlives the `barrier` call that reads it.
     pub fn contributors(self: Orchestrator, comptime stage_i: usize) []const u64 {
-        switch (stage_i) {
-            0 => return self.entry_contributors,
-            1 => {
+        switch (@as(Stage, @enumFromInt(stage_i))) {
+            .discover => return self.entry_contributors,
+            .resolve => {
                 const list = self.collect_contribs;
                 list.clearRetainingCapacity();
                 for (self.graph.*.?.modules) |*m| list.append(self.gpa, Ast.contentFp(m.tree())) catch {};
                 return list.items;
             },
-            2 => {
+            .typecheck => {
                 const list = self.gt_contribs;
                 list.clearRetainingCapacity();
                 for (self.res.*.?.fns) |gf| list.append(self.gpa, fnResolveDigest(gf)) catch {};
                 return list.items;
             },
-            else => comptime unreachable,
+            .codegen => comptime unreachable,
         }
     }
 
-    pub fn barrierCompute(self: Orchestrator, comptime stage_i: usize) switch (stage_i) {
-        0 => DiscoverCompute,
-        1 => ResolveCompute,
-        2 => TypecheckCompute,
-        else => unreachable,
+    pub fn barrierCompute(self: Orchestrator, comptime stage_i: usize) switch (@as(Stage, @enumFromInt(stage_i))) {
+        .discover => DiscoverCompute,
+        .resolve => ResolveCompute,
+        .typecheck => TypecheckCompute,
+        .codegen => unreachable,
     } {
-        return switch (stage_i) {
-            0, 1, 2 => .{ .o = self },
-            else => comptime unreachable,
+        return switch (@as(Stage, @enumFromInt(stage_i))) {
+            .discover, .resolve, .typecheck => .{ .o = self },
+            .codegen => comptime unreachable,
         };
     }
 
@@ -751,11 +772,11 @@ const Orchestrator = struct {
     /// by `BarrierResult` is observability (recorded as the barrier node id); the join
     /// tables themselves live in the frame slots the compute wrote.
     pub fn recordBarrier(self: Orchestrator, comptime stage_i: usize, _: Engine.BarrierResult(void)) void {
-        switch (stage_i) {
-            0 => self.lap(self.ns_discover),
-            1 => self.lap(self.ns_resolve),
-            2 => self.lap(self.ns_typecheck),
-            else => comptime unreachable,
+        switch (@as(Stage, @enumFromInt(stage_i))) {
+            .discover => self.lap(self.ns_discover),
+            .resolve => self.lap(self.ns_resolve),
+            .typecheck => self.lap(self.ns_typecheck),
+            .codegen => comptime unreachable,
         }
     }
 
@@ -763,7 +784,7 @@ const Orchestrator = struct {
     /// `error.StageDiagnostics` (after recording which stage) if it produced
     /// diagnostics. The region owns its internal per-fn `Engine.fanOut` + relink join.
     pub fn region(self: Orchestrator, comptime stage_i: usize) !void {
-        comptime std.debug.assert(stage_i == 3);
+        comptime std.debug.assert(@as(Stage, @enumFromInt(stage_i)) == .codegen);
         switch (self.tail) {
             .lower => {
                 self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.probe, self.link_ns, self.ncpu);
