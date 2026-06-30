@@ -213,26 +213,31 @@ const Builder = struct {
     }
 };
 
+/// How a value-`break` to this context delivers its value — the two merge shapes
+/// are mutually exclusive, so a tagged union makes the illegal combinations
+/// unrepresentable (and `lowerBreak` switches it exhaustively).
+const Merge = union(enum) {
+    /// Non-value loop/block: a `break` carries no value.
+    none,
+    /// SCALAR/str value: a value-break's value rides POSITIONALLY as the join
+    /// block's br arg, so the join param id need not be stored here.
+    scalar,
+    /// AGGREGATE value: a value-break produces INTO `ptr` (of `ty`), then branches
+    /// argless to `break_bb` (the exit reads the destination, not a block-arg merge).
+    aggregate: struct { ptr: Ir.ValueId, ty: Typecheck.Type },
+};
+
 /// The lowering context for one enclosing loop / labeled bare block. `break`
-/// branches to `break_bb` (carrying a value when `is_value`); `continue` branches
+/// branches to `break_bb` (carrying a value per `merge`); `continue` branches
 /// to `continue_bb` (the loop header for while/loop; the inc block for `for`;
-/// `none_block` for a labeled bare block). `merge_param` is the destination
-/// block param a value-break stores into.
+/// `none_block` for a labeled bare block).
 const LoopCtx = struct {
     kind: enum { loop, while_for, labeled_block },
     label: ?[]const u8,
     construct_node: Ast.Index,
     break_bb: Ir.BlockId,
     continue_bb: Ir.BlockId,
-    is_value: bool,
-    /// For a SCALAR/str-by-param value merge: the join block param a value-break
-    /// stores into (carried as the br arg). `none_value` for a non-value or for an
-    /// AGGREGATE-by-slot merge (which uses `result_ptr` instead).
-    merge_param: Ir.ValueId,
-    /// For an AGGREGATE value merge: the destination ptr a value-break produces
-    /// into (then branches argless to `break_bb`). `none_value` otherwise.
-    result_ptr: Ir.ValueId = Ir.none_value,
-    result_ty: Typecheck.Type = .{ .kind = .invalid },
+    merge: Merge,
 };
 
 /// Lower one function declaration to an `Ir.Function`. Pure of `in` (frozen
@@ -1261,7 +1266,7 @@ fn lowerWhile(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     try genCond(b, stmt.lhs, body, done);
 
     b.switchTo(body);
-    try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = header, .is_value = false, .merge_param = Ir.none_value });
+    try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = header, .merge = .none });
     try lowerBlockStmts(b, stmt.rhs);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, header, .none); // back-edge
@@ -1298,7 +1303,7 @@ fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMem
     b.setTerm(.{ .cond_br = .{ .cond = cmp, .t = done, .f = body } });
 
     b.switchTo(body);
-    try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = inc, .is_value = false, .merge_param = Ir.none_value });
+    try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = inc, .merge = .none });
     try lowerBlockStmts(b, stmt.lhs);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, inc, .none);
@@ -1329,7 +1334,7 @@ fn lowerLoopValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type, label: ?
 
     try brTo(b, top, .none);
     b.switchTo(top);
-    try b.loops.append(b.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .break_bb = exit, .continue_bb = top, .is_value = is_value, .merge_param = merge });
+    try b.loops.append(b.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .break_bb = exit, .continue_bb = top, .merge = if (is_value) .scalar else .none });
     try lowerBlockStmts(b, n.lhs);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, top, .none); // back-edge
@@ -1384,7 +1389,7 @@ fn lowerLabeledBlock(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type, labe
     const is_value = ty.kind != .unit and ty.kind != .never;
     const merge: Ir.ValueId = if (is_value) try b.addParam(exit, ty) else Ir.none_value;
 
-    try b.loops.append(b.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .break_bb = exit, .continue_bb = Ir.none_block, .is_value = is_value, .merge_param = merge });
+    try b.loops.append(b.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .break_bb = exit, .continue_bb = Ir.none_block, .merge = if (is_value) .scalar else .none });
     const tv = try lowerBlockValue(b, block_idx, ty);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, exit, tv); // fall-through value
@@ -1449,7 +1454,7 @@ fn lowerLoopValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty:
 
     try brTo(b, top, .none);
     b.switchTo(top);
-    try b.loops.append(b.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .break_bb = exit, .continue_bb = top, .is_value = true, .merge_param = Ir.none_value, .result_ptr = dst_ptr, .result_ty = ty });
+    try b.loops.append(b.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .break_bb = exit, .continue_bb = top, .merge = .{ .aggregate = .{ .ptr = dst_ptr, .ty = ty } } });
     try lowerBlockStmts(b, n.lhs);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, top, .none); // back-edge
@@ -1470,7 +1475,7 @@ fn lowerLabeledValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, 
 
 fn lowerLabeledBlockInto(b: *Builder, block_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type, label: []const u8) error{OutOfMemory}!void {
     const exit = try b.addBlock();
-    try b.loops.append(b.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .break_bb = exit, .continue_bb = Ir.none_block, .is_value = true, .merge_param = Ir.none_value, .result_ptr = dst_ptr, .result_ty = ty });
+    try b.loops.append(b.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .break_bb = exit, .continue_bb = Ir.none_block, .merge = .{ .aggregate = .{ .ptr = dst_ptr, .ty = ty } } });
     try lowerBlockValueInto(b, block_idx, dst_ptr, ty);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, exit, .none);
@@ -1480,20 +1485,22 @@ fn lowerLabeledBlockInto(b: *Builder, block_idx: Ast.Index, dst_ptr: Ir.ValueId,
 fn lowerBreak(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
     const stmt = b.in.tree.nodes[stmt_idx];
     const ctx = targetLoop(b, stmt_idx);
-    if (stmt.lhs != Ast.none and ctx.is_value) {
-        if (ctx.result_ptr != Ir.none_value) {
-            // Aggregate value-break: produce the value INTO the destination ptr,
-            // then branch argless to the exit (which the producer already switched
-            // away from — the exit reads the destination, no block-arg merge).
-            try lowerExprInto(b, stmt.lhs, ctx.result_ptr, ctx.result_ty);
+    switch (ctx.merge) {
+        .aggregate => |agg| if (stmt.lhs != Ast.none) {
+            // Produce the value INTO the destination ptr, then branch argless to the
+            // exit (which the producer already switched away from — the exit reads
+            // the destination, no block-arg merge).
+            try lowerExprInto(b, stmt.lhs, agg.ptr, agg.ty);
             try brTo(b, ctx.break_bb, .none);
-        } else {
+        } else try brTo(b, ctx.break_bb, .none),
+        .scalar => if (stmt.lhs != Ast.none) {
             const v = try lowerExpr(b, stmt.lhs);
             try brTo(b, ctx.break_bb, v);
-        }
-    } else {
-        if (stmt.lhs != Ast.none) _ = try lowerExpr(b, stmt.lhs); // for effect, discard
-        try brTo(b, ctx.break_bb, .none);
+        } else try brTo(b, ctx.break_bb, .none),
+        .none => {
+            if (stmt.lhs != Ast.none) _ = try lowerExpr(b, stmt.lhs); // for effect, discard
+            try brTo(b, ctx.break_bb, .none);
+        },
     }
 }
 
