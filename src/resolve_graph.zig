@@ -42,6 +42,7 @@ const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
+const SymKind = @import("symbols/Sym.zig").SymKind;
 
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
@@ -51,9 +52,12 @@ pub const GlobalFn = struct {
     /// Owning module id (index into `Graph.modules`). For `print` this is the
     /// entry module (it has no real home; only the bare name matters).
     module: u32,
-    /// The `fn_decl` node in that module's tree, or `Ast.none` for the synthetic
-    /// bodyless `print`.
+    /// The `fn_decl` node in that module's tree (`Ast.none` for the bodyless
+    /// builtin `print`, identified by `kind` — never test `decl_node` for builtin-ness).
     decl_node: Ast.Index,
+    /// `.user_fn` for a real decl, `.builtin` for the synthetic `print`. The
+    /// single source of "is this a builtin", carried across the resolve→types boundary.
+    kind: SymKind,
     /// Whether the decl is `pub` (exported). `main`/`print` are not pub.
     is_pub: bool,
 };
@@ -199,6 +203,7 @@ fn collectGlobals(g: *GraphResolve) !void {
                         .name = qname,
                         .module = mod,
                         .decl_node = decl_idx,
+                        .kind = .user_fn,
                         .is_pub = is_pub,
                     });
                     if (is_pub) try g.tables[mod].pub_fns.put(g.gpa, name, id);
@@ -210,12 +215,13 @@ fn collectGlobals(g: *GraphResolve) !void {
 
     // Seed the shared synthetic `print` builtin once, at the end of the table.
     // Every module's bare `print` resolves to this id (global prelude). It is
-    // bodyless (`decl_node == Ast.none`) and not pub.
+    // bodyless and not pub; `kind = .builtin` is the homeless entry's marker.
     const print_id: u32 = @intCast(g.fns.items.len);
     try g.fns.append(g.gpa, .{
         .name = try g.gpa.dupe(u8, "print"),
         .module = entry,
         .decl_node = Ast.none,
+        .kind = .builtin,
         .is_pub = false,
     });
     // Register `print` into every module's local fn table UNLESS that module

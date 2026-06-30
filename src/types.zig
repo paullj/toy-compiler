@@ -152,10 +152,13 @@ pub const GraphModuleInput = struct {
 };
 
 /// A global function descriptor (parallel to the resolver's global fn table).
-/// `decl_node == Ast.none` is the synthetic bodyless `print`.
 pub const GraphFnInput = struct {
+    /// The fn's decl node (`Ast.none` for the bodyless builtin `print`; identify
+    /// builtin-ness by `kind`, never by this sentinel).
     decl_node: Ast.Index,
-    /// Owning module id; ignored when `decl_node == Ast.none`.
+    /// `.builtin` for the synthetic `print`, else `.user_fn` (from the resolver).
+    kind: symbols.SymKind,
+    /// Owning module id; meaningless for the homeless `print` builtin.
     module: u32,
     /// Whether this fn is `pub` (drives the pub-signature-coherence check).
     is_pub: bool,
@@ -216,7 +219,11 @@ pub const GraphResult = struct {
 /// A top-level function's signature, decoded once up front so calls can be
 /// checked against it (and forward references work).
 const FnSym = struct {
+    /// The fn's decl node (`Ast.none` for the bodyless builtin `print`; identify
+    /// builtin-ness by `kind`, never by this sentinel).
     decl_node: Ast.Index,
+    /// `.builtin` for the synthetic `print`, else `.user_fn`.
+    kind: symbols.SymKind,
     params: []Type,
     ret: Type,
     /// Owning module id (graph mode). 0 in single-file mode. The check loops
@@ -1855,9 +1862,8 @@ pub fn checkGraph(
     var sigs_built: usize = 0;
     errdefer for (sigs[0..sigs_built]) |s| gpa.free(@constCast(s.params));
     for (t.fns.items, 0..) |f, i| {
-        const kind: symbols.SymKind = if (f.decl_node == Ast.none) .builtin else .user_fn;
         const name = if (i < fns.len) fns[i].name else "print";
-        sigs[i] = .{ .kind = kind, .name = name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
+        sigs[i] = .{ .kind = f.kind, .name = name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
         sigs_built += 1;
     }
 
@@ -1914,7 +1920,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // order of `fns` (parallel to the resolver's global fn ids), so `.func` ids
     // index this table directly. The synthetic bodyless `print` is one of them.
     for (fns) |gf| {
-        if (gf.decl_node == Ast.none) {
+        if (gf.kind == .builtin) {
             try t.appendPrint();
         } else {
             _ = t.gphSelect(gf.module);
@@ -2007,7 +2013,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
 /// order-free (safe under `Engine.fanOut` and identical inline).
 fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
     const f = model.fns[fid];
-    if (f.decl_node == Ast.none) return;
+    if (f.kind == .builtin) return; // the bodyless `print` has no body to walk
     var bc = t.bodyCheckerFor(model, f);
     defer bc.deinit();
     bc.checkBody(fid, f) catch |e| {
@@ -2026,7 +2032,7 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
 /// name the type. Diagnose against the owning module + the offending type-ref.
 fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
     for (fns, 0..) |gf, i| {
-        if (gf.decl_node == Ast.none or !gf.is_pub) continue;
+        if (gf.kind == .builtin or !gf.is_pub) continue;
         _ = t.gphSelect(gf.module);
         const f = t.fns.items[i];
         const decl = t.tree.nodes[f.decl_node];
@@ -2090,7 +2096,7 @@ fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, ow
 /// own entry selection so the checker and codegen agree on which `main`.
 fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
     for (t.fns.items) |f| {
-        if (f.decl_node == Ast.none or f.mod != entry_mod) continue;
+        if (f.kind == .builtin or f.mod != entry_mod) continue;
         const tree = t.graph.mods[entry_mod].tree;
         const tokens = t.graph.mods[entry_mod].tokens;
         const source = t.graph.mods[entry_mod].source;
@@ -2170,13 +2176,13 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         }
     }
     const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .params = params, .ret = ret, .mod = mod });
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod });
 }
 
 /// Append the synthetic bodyless `print(str) -> ()` builtin to the fn table.
 fn appendPrint(t: *Typecheck) !void {
     const params = try t.gpa.dupe(Type, &.{.str});
-    try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .params = params, .ret = .unit });
+    try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .kind = .builtin, .params = params, .ret = .unit });
 }
 
 
