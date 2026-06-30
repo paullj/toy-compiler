@@ -15,8 +15,8 @@
 //!       the new op nor the displaced add/icmp/neg/bnot owns a nested slice, so
 //!       this is leak-free and allocation-free.
 //!   (b) BRANCH-FOLD replaces a `.cond_br` (argless, owns nothing) with
-//!       `.br{ dest, args = gpa.alloc(Operand, 0) }` — a REAL freeable 0-len heap
-//!       slice (NOT a static `&.{}`, which deinit would try to `gpa.free`).
+//!       `.br{ dest, args = &.{} }` — a static empty slice; deinit's `gpa.free`
+//!       no-ops on a 0-len slice (freeing a NON-empty static slice is the bug).
 //!   (c) UNREACHABLE-ELIM frees each DROPPED block's nested slices in deinit
 //!       order (each `.call`'s args; then instrs; then params; then `br.args`)
 //!       exactly once, then compacts survivors with one alloc-copy-free-old.
