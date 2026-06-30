@@ -15,7 +15,7 @@ const types = @import("../types.zig");
 /// (`{user_fn,"print"}` vs `{builtin,"print"}`). Folding only the sig would let
 /// a shadow-and-unshadow edit keep an identical fingerprint while the call binds
 /// to a different symbol — a stale-cache miscompile. So we fold the full
-/// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [Cx]
+/// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [C6]
 pub const Sig = struct {
     kind: Sym.SymKind,
     /// BORROWED from the resolve fns table (`GraphResult.fns[i].name`); its

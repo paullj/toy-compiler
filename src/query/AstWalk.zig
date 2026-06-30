@@ -385,7 +385,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
                     // what the .func reloc target carries) and `sigs` (params/ret).
                     // Fold the full identity so a builtin<->user_fn shadow switch flips
-                    // the caller's hash. [Cx]
+                    // the caller's hash. [C6]
                     if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
                         const sig = self.frozen.sigs[res.func];
                         const nm = self.frozen.names[res.func];

@@ -38,7 +38,7 @@ const AstWalk = @import("AstWalk.zig");
 /// (`{user_fn,"print"}` vs `{builtin,"print"}`). Folding only the sig would let
 /// a shadow-and-unshadow edit keep an identical fingerprint while the call binds
 /// to a different symbol — a stale-cache miscompile. So we fold the full
-/// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [Cx]
+/// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [C6]
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 
 /// A type this function touches, with an index-free layout descriptor. For
@@ -84,7 +84,7 @@ pub fn fingerprint(
     // SymName{kind,name} is folded BEFORE its sig: it is what the `.func` reloc
     // target carries, so a shadow/unshadow that changes the bound symbol (e.g.
     // builtin `print` vs a user `fn print` of the same sig) flips the caller's
-    // hash even though the sig is identical. [Cx]
+    // hash even though the sig is identical. [C6]
     AstWalk.updateU32(&h, @intCast(callee_sigs.len));
     for (callee_sigs) |s| {
         h.update(&[_]u8{@intFromEnum(s.kind)});
@@ -194,7 +194,7 @@ test "callee signature folds in: a sig change flips the caller's hash [C2]" {
     try testing.expect(ha != hb);
 }
 
-test "callee kind folds in: builtin vs user_fn of an identical sig flips the hash [Cx]" {
+test "callee kind folds in: builtin vs user_fn of an identical sig flips the hash [C6]" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn main() {\n print(\"hi\")\n return\n}\n");
     defer b.deinit(gpa);
