@@ -443,15 +443,9 @@ const Discoverer = struct {
     /// path also caches the SOURCE bytes (not just tokens/AST) precisely so the warm path can
     /// reconstitute a module without touching the disk.
     ///
-    /// SOUNDNESS — the (mtime, size, ctime) all-match is the UNCHANGED-PREDICATE (the central
-    /// risk: a wrong oracle = a silent MISCOMPILE). It rests on the BUILD CONTRACT: the source
-    /// tree is not mutated mid-build and a write updates mtime — the SAME assumption discover's
-    /// `realpath_cache` already relies on (see `Cache.Pack.ManifestEntry` for the full
-    /// rationale). ctime (the inode status-change time, read from the SAME stat) additionally
-    /// catches the same-size-mtime-restore window (`touch -r`/`cp -p`) at no extra I/O. Every
-    /// uncertain case FALLS BACK to the full read + lex + parse: no manifest entry, a failed
-    /// stat, a different size, a moved mtime, a moved ctime, or any of the three cache blobs
-    /// (source/lex/parse) missing. "When uncertain, READ."
+    /// SOUNDNESS — the (mtime, size, ctime) all-match unchanged-predicate (a wrong oracle =
+    /// a silent MISCOMPILE), the build-contract it rests on, the ctime window, and the
+    /// fall-back-when-uncertain rule all live at `Cache.Pack.ManifestEntry`. "When uncertain, READ."
     ///
     /// The serve changes ONLY how a file's source/tokens/AST are obtained — never WHICH
     /// files are discovered, in what order, or the import edges (those come from the AST,
@@ -469,8 +463,7 @@ const Discoverer = struct {
 
         // WARM SERVE (read + lex + parse skip): when the manifest's (mtime, size, ctime) all
         // match AND the file's cached source + tokens + AST are all present in the bulk-loaded
-        // pack, serve them straight from memory — no file read. This is the warm-discover
-        // fast path the whole manifest exists for.
+        // pack, serve them straight from memory — no file read.
         if (pre_stat) |st| {
             if (d.warmServe(id, st)) return;
         }
@@ -545,9 +538,7 @@ const Discoverer = struct {
 
     /// Try to serve module `id`'s SOURCE + tokens + AST from the bulk-loaded content
     /// cache WITHOUT reading the file. Returns true (slot filled) on a serve, false (the
-    /// caller falls through to the full read + lex + parse path) on ANY doubt. This is the
-    /// warm-discover fast path: a hit collapses the file's discovery to one stat + three
-    /// in-memory cache-gets (no open/read/close syscalls).
+    /// caller falls through to the full read + lex + parse path) on ANY doubt.
     ///
     /// The chain of guards, each falling back to false:
     ///   1. a manifest entry exists for this file's canonical path,
@@ -557,44 +548,26 @@ const Discoverer = struct {
     ///   5. the parse cache holds a blob for it that `Ast.unpack` validates.
     /// Only when all five hold do we adopt the cached {source, tokens, AST}.
     ///
-    /// SOUNDNESS — why the (mtime, size, ctime) all-match is the unchanged-predicate here
-    /// (the central risk: a wrong oracle = a silent MISCOMPILE). The match decides the file is
-    /// UNCHANGED and serves the bytes the last build recorded under `content_fp`. It rests
-    /// on the BUILD
-    /// CONTRACT: the source tree is not mutated mid-build, and a write updates the file's
-    /// mtime (POSIX writes do; editors/`cp`/compilers do). That is the SAME assumption
-    /// `realpath_cache` already relies on (see `discover`'s realpath memo) — we do not
-    /// take on a new, stronger assumption. ctime (the inode status-change time) rides the
-    /// SAME stat and closes the same-size-mtime-restore window for free. When ANYTHING is
-    /// uncertain — no manifest entry, the stat failed (`pre_stat == null`, handled by the
-    /// caller), a different size, a moved mtime, a moved ctime, or any of the three cache
-    /// blobs missing — we FALL BACK to the full read + lex + parse. "When uncertain, READ."
+    /// SOUNDNESS — why step 2 (the all-match) is the unchanged-predicate (a wrong oracle =
+    /// a silent MISCOMPILE), the build-contract it rests on, the ctime window, and the
+    /// fall-back-when-uncertain rule all live at `Cache.Pack.ManifestEntry`. The stat-failed
+    /// (`pre_stat == null`) case is handled by the CALLER (`load` only calls this inside
+    /// `if (pre_stat) |st|`), not here.
     ///
     /// The serve changes ONLY HOW a file's source/tokens/AST are obtained, never WHICH
     /// files are discovered or in what order: the served source is byte-identical to the
     /// bytes the priming build read (same content_fp), so its tokens (offsets into source)
     /// resolve identically, the cached AST yields the SAME import edges, and the DFS /
     /// global-id assignment are unchanged. Output is byte-identical ([C11]).
-    ///
-    /// Adding ctime closes the same-size-mtime-restore windows (`touch -r` / `cp -p` /
-    /// a coarse-granularity FS tick): each moves ctime, so they no longer serve stale. The
-    /// ONLY residual hole is a tool faking ALL of mtime + size + ctime + content at once —
-    /// not a shape a normal build produces. The alternative (re-read + rehash every file
-    /// every warm build) defeats the whole purpose of the manifest and is the bottleneck
-    /// this fixes.
     fn warmServe(d: *Discoverer, id: u32, st: Io.Dir.Stat) bool {
         const canon = d.slots.items[id].canon;
         const entry = d.cache.manifestGet(canon) orelse return false;
 
         // The unchanged-predicate: same size AND same mtime AND same ctime => the file is
-        // unchanged since the build that recorded this entry. Any mismatch falls back to a
-        // full re-read. ctime (the inode STATUS-CHANGE time) rides this SAME stat, so it
-        // catches the same-size-mtime-restore window (`touch -r`/`cp -p`, where the metadata
-        // write moves ctime even though mtime was pinned) at zero extra I/O — see
-        // `Cache.Pack.ManifestEntry`'s soundness contract.
-        const mtime: i64 = std.math.cast(i64, st.mtime.nanoseconds) orelse return false;
-        const ctime: i64 = std.math.cast(i64, st.ctime.nanoseconds) orelse return false;
-        if (mtime != entry.mtime or st.size != entry.size or ctime != entry.ctime) return false;
+        // unchanged since the build that recorded this entry; any mismatch (or an
+        // unrepresentable timestamp) falls back to a full re-read. The (ctime-window)
+        // soundness rationale lives at `Cache.Pack.ManifestEntry`.
+        if (!entry.matches(st)) return false;
 
         // OWNERSHIP: every cache-get is owned by a `defer free()` guarded by `served`,
         // which is set ONLY on the all-hit exit. A `return false` past any get frees what

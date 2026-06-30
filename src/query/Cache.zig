@@ -148,17 +148,33 @@ pub const Pack = struct {
     /// `(mtime, size)` alone could not: ANY metadata write moves ctime, so the out-of-band
     /// shapes that fake a matching mtime+size are caught by a moved ctime WITHOUT a read —
     /// ctime rides the SAME `stat` that already reads mtime+size, so the warm read-skip win
-    /// is unchanged. Two such shapes:
+    /// is unchanged. Three such shapes:
     ///   * `touch -r ref f` (and `cp -p`/`rsync --times` that copy mtime+size): the `touch`
     ///     itself is a metadata write that bumps `f`'s ctime, so ctime no longer matches;
     ///   * `cp -p src f` onto a fresh inode: a new inode carries a fresh ctime, so it can
-    ///     never match the recorded one.
+    ///     never match the recorded one;
+    ///   * a same-mtime edit on a coarse-granularity FS tick (the mtime resolution didn't
+    ///     advance): the write still moves ctime, so it is caught.
     /// The ONLY residual hole is a tool that fakes ALL of mtime + size + ctime + content in
     /// one go (e.g. restoring a verbatim inode image) — not a shape a normal build produces.
     /// Re-reading + rehashing every file every warm build (the only way to close even that)
     /// defeats the entire purpose of the manifest: the read IS the warm-discover bottleneck,
     /// since lex/parse are already cache hits.
-    pub const ManifestEntry = struct { mtime: i64, size: u64, ctime: i64, content_fp: u64 };
+    pub const ManifestEntry = struct {
+        mtime: i64,
+        size: u64,
+        ctime: i64,
+        content_fp: u64,
+
+        /// The unchanged-predicate as ONE call: true iff a fresh `stat` matches all three of
+        /// (mtime, size, ctime). An unrepresentable timestamp (a `std.math.cast` fail) returns
+        /// false so the caller falls back to a full read — never a trap or a coerced compare.
+        pub fn matches(entry: ManifestEntry, st: Io.Dir.Stat) bool {
+            const mtime = std.math.cast(i64, st.mtime.nanoseconds) orelse return false;
+            const ctime = std.math.cast(i64, st.ctime.nanoseconds) orelse return false;
+            return mtime == entry.mtime and st.size == entry.size and ctime == entry.ctime;
+        }
+    };
 
     gpa: std.mem.Allocator,
     /// Concatenated `[checksum][payload]` frames: prior entries carried forward by
