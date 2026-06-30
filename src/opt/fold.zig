@@ -99,8 +99,8 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                     stats.consts_folded += 1;
                     changed = true;
                 },
-                // smod is dead (never emitted); everything else (load/store/copy/
-                // call/slot_addr/field_addr/get_tag/cstr_ptr/unit) is not foldable.
+                // Everything else (load/store/copy/call/slot_addr/field_addr/
+                // get_tag/cstr_ptr/unit) is not foldable.
                 else => {},
             }
         }

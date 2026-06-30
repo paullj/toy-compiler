@@ -176,7 +176,7 @@ fn remapUses(func: *Ir.Function, remap: []const Ir.ValueId) void {
         for (b.instrs) |*ins| {
             switch (ins.op) {
                 .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
-                .add, .sub, .mul, .sdiv, .smod => |*bin| {
+                .add, .sub, .mul, .sdiv => |*bin| {
                     bin.lhs = mapUse(remap, bin.lhs);
                     bin.rhs = mapUse(remap, bin.rhs);
                 },

@@ -3,7 +3,7 @@
 //! These helpers MUST replicate what `CodegenIr.genArith` + `Aarch64` emit
 //! bit-for-bit, otherwise opt-on diverges from opt-off (the differential test
 //! is the backstop, but correctness lives here). Verified against
-//! CodegenIr.zig:362-429 + Aarch64.zig:
+//! `CodegenIr.genArith` + `Aarch64`:
 //!   add/sub/mul : 64-bit two's-complement WRAPPING (`+%`/`-%`/`*%`).
 //!   sdiv        : SIGNED. aarch64 hardware does NOT trap: /0 yields 0,
 //!                 INT_MIN / -1 yields INT_MIN. Zig `@divTrunc` TRAPS on both
@@ -11,7 +11,6 @@
 //!   neg         : `0 -% v` (so neg(INT_MIN) == INT_MIN, matching hardware).
 //!   bnot        : logical "== 0" on a BOOL (cmp #0 + cset eq), i.e. `!b`.
 //!   icmp        : SIGNED i64 comparison → bool.
-//! `smod` is DEAD (CodegenIr treats it as unreachable) — never folded here.
 
 const std = @import("std");
 const Ir = @import("../ir/Ir.zig");

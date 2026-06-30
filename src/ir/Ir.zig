@@ -100,9 +100,6 @@ pub const Op = union(enum) {
     sub: Bin,
     mul: Bin,
     sdiv: Bin,
-    /// Signed modulo. Kept per the LOCK #6 sketch but DEAD: the source has no `%`
-    /// operator, so lower never emits it and codegen treats it as `unreachable`.
-    smod: Bin,
 
     neg: ValueId,
     bnot: ValueId,
@@ -336,7 +333,6 @@ fn renderInstr(
         .sub => |b| try out.print("sub %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .mul => |b| try out.print("mul %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .sdiv => |b| try out.print("sdiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
-        .smod => |b| try out.print("smod %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .neg => |v| try out.print("neg %{d}\n", .{v}),
         .bnot => |v| try out.print("bnot %{d}\n", .{v}),
         .icmp => |c| try out.print("icmp {s} %{d}, %{d}\n", .{ condName(c.cc), c.lhs, c.rhs }),
