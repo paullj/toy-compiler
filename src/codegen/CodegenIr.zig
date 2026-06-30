@@ -452,7 +452,7 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     var arg_types: std.ArrayList(Type) = .empty;
     defer arg_types.deinit(g.gpa);
     try arg_types.ensureTotalCapacity(g.gpa, c.args.len);
-    for (c.args) |a| arg_types.appendAssumeCapacity(operandType(g, a));
+    for (c.args) |a| arg_types.appendAssumeCapacity(g.func.operandType(a));
     // Recover the RETURN type: an aggregate result lands in `ret_slot` (its type);
     // a scalar result is the call instr's own value type; a unit call has neither.
     const ret_ty: Type = if (c.ret_slot != Ir.none_slot)
@@ -695,14 +695,6 @@ fn emitEpilogue(g: *Gen) error{OutOfMemory}!void {
     }
     try g.emit(Aarch64.ldpFpLrPost);
     try g.emit(Aarch64.ret);
-}
-
-fn operandType(g: *const Gen, op: Ir.Operand) Type {
-    return switch (op) {
-        .value => |v| g.func.values[v].type,
-        .slot => |s| g.func.slots[s].type,
-        .none => Type.unit,
-    };
 }
 
 /// Register a decoded literal in the FnCode table (deduped, takes ownership).
