@@ -1,11 +1,11 @@
 //! The compilation-phase taxonomy — the SINGLE source of truth shared by the
 //! on-disk `Cache` (re-exported there as `Cache.Phase`) and the static
 //! `StageGraph`. The CACHEABLE subset (`Kind.cacheable()` below: lex/parse/
-//! codegen) names the on-disk cache entries; the rest are the fine-grained
+//! codegen/source) names the on-disk cache entries; the rest are the fine-grained
 //! typecheck phases and the scheduling BARRIER joins (`collect`/`global_tables`).
 //!
 //! EXPLICIT discriminants pin the CACHEABLE subset's bytes (lex=0, parse=1,
-//! codegen=3) so `Cache.Key.digest()` folds a stable byte per phase — folding a
+//! codegen=3, source=11) so `Cache.Key.digest()` folds a stable byte per phase — folding a
 //! different byte would cold-rebuild every codegen entry. The remaining kinds'
 //! bytes are kept distinct, but their values are not load-bearing.
 
@@ -39,9 +39,9 @@ pub const Kind = enum(u8) {
     /// The raw module SOURCE bytes, keyed by their own content fingerprint. Stored
     /// alongside lex/parse so the warm-discover fast path can serve a file's source +
     /// tokens + AST entirely from the bulk-loaded pack (no per-file read syscall) when
-    /// the manifest's (mtime, size) unchanged-predicate says the file is unchanged. New
-    /// byte (11): it never aliases the pinned codegen byte (3), so existing entries are
-    /// unaffected.
+    /// the manifest's (mtime, size) unchanged-predicate says the file is unchanged. Its
+    /// byte (11) is pinned alongside every other cacheable phase by the exhaustive
+    /// byte-pin test in `Cache.zig`.
     source = 11,
 
     /// Whether a node of this kind names an on-disk `Cache` entry (the CACHEABLE

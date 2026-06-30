@@ -680,12 +680,26 @@ const testing = std.testing;
 
 test "cacheable subset's enum bytes are PINNED (digest byte-identity across the enum collapse)" {
     // `digest()` folds `@intFromEnum(phase)`, so the on-disk entry name for every
-    // cacheable phase depends on these exact byte values. Aliasing `Cache.Phase` to
-    // `Phase.Kind` MUST NOT move them — a different byte is a silent cold rebuild of
-    // every entry. Pin them so a future reorder of the shared enum fails HERE.
-    try testing.expectEqual(@as(u8, 0), @intFromEnum(Phase.lex));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(Phase.parse));
-    try testing.expectEqual(@as(u8, 3), @intFromEnum(Phase.codegen));
+    // cacheable phase depends on these exact byte values. A different byte is a
+    // silent cold rebuild of every entry of that phase. Exhaustive (no else): every
+    // cacheable phase must pin its byte HERE, and any new kind must be classified,
+    // or this fails to compile.
+    inline for (@typeInfo(Phase).@"enum".fields) |f| {
+        const k: Phase = @enumFromInt(f.value);
+        const pinned: ?u8 = switch (k) {
+            .lex => 0,
+            .parse => 1,
+            .codegen => 3,
+            .source => 11,
+            .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables => null,
+        };
+        if (pinned) |want| {
+            try testing.expect(k.cacheable());
+            try testing.expectEqual(want, @intFromEnum(k));
+        } else {
+            try testing.expect(!k.cacheable());
+        }
+    }
 }
 
 test "cacheable/targetSensitive classify the unified enum's tiers" {
