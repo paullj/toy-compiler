@@ -8,15 +8,10 @@ const types = @import("../types.zig");
 /// A callee's identity-and-signature, folded into a caller's fingerprint so a
 /// signature OR symbol-identity change (but not a body change) invalidates the
 /// caller. [C1][C2]
-///
-/// The callee's resolved KIND (user_fn vs builtin vs import) is load-bearing,
-/// not just its sig: a user `fn print(s: str)` has the SAME sig {[str],void} as
-/// the builtin `print`, but lowers to a DIFFERENT `.func` reloc target
-/// (`{user_fn,"print"}` vs `{builtin,"print"}`). Folding only the sig would let
-/// a shadow-and-unshadow edit keep an identical fingerprint while the call binds
-/// to a different symbol — a stale-cache miscompile. So we fold the full
-/// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [C6]
 pub const Sig = struct {
+    /// Load-bearing, not just decorative: folded into the fingerprint alongside
+    /// the sig (see the `(b)` fold site in `query/Fingerprint.zig` for why a
+    /// shadow/unshadow of an identical sig must still flip the caller's hash). [C6]
     kind: Sym.SymKind,
     /// BORROWED from the resolve fns table (`GraphResult.fns[i].name`); its
     /// lifetime is tied to the sibling resolve result. NEVER freed through a Sig.
