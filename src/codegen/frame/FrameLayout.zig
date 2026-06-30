@@ -139,7 +139,7 @@ pub fn compute(
                         arg_types.clearRetainingCapacity();
                         try arg_types.ensureTotalCapacity(gpa, c.args.len);
                         for (c.args) |arg| {
-                            arg_types.appendAssumeCapacity(operandType(func, arg));
+                            arg_types.appendAssumeCapacity(func.operandType(arg));
                         }
                         // The callee's return type drives sret (x8), which does
                         // NOT consume NSAA — but planCall needs a ret type. Use
@@ -230,17 +230,6 @@ pub fn compute(
         .sret_save_off = sret_save_off,
         .slot_off = slot_off,
         .value_off = value_off,
-    };
-}
-
-/// The type carried by an operand: a `slot` operand's slot type, a `value`
-/// operand's value type, or `unit` for `none`. Used to recover arg types for
-/// the out_base call planning.
-fn operandType(func: *const Ir.Function, op: Ir.Operand) Type {
-    return switch (op) {
-        .value => |v| func.values[v].type,
-        .slot => |s| func.slots[s].type,
-        .none => Type.unit,
     };
 }
 

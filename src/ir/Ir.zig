@@ -199,6 +199,18 @@ pub const Function = struct {
         gpa.free(self.literals);
         self.* = undefined;
     }
+
+    /// The type an operand carries: a `value`'s value type, a `slot`'s slot type,
+    /// `unit` for `none`. The single source for recovering the call-arg types fed
+    /// to `Abi.planCall`; codegen and the frame pass MUST recover them identically
+    /// or an arg lands at the wrong offset (SIGBUS).
+    pub fn operandType(func: *const Function, op: Operand) Type {
+        return switch (op) {
+            .value => |v| func.values[v].type,
+            .slot => |s| func.slots[s].type,
+            .none => Type.unit,
+        };
+    }
 };
 
 /// Total straight-line instruction count across all blocks (terminators are
