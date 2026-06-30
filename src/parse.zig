@@ -985,17 +985,9 @@ fn leaf(p: *Parser, tag: Node.Tag, tok_index: u32) Error!Ast.Index {
 
 fn addNode(p: *Parser, node: Node) Error!Ast.Index {
     const idx: Ast.Index = @intCast(p.nodes.items.len);
-    // Rebuild from a zeroed value so the 3 padding bytes in the `extern struct`
-    // Node carry zeros, not stack garbage. The call sites build `node` with a
-    // struct literal, which leaves padding undefined; that garbage otherwise
-    // flows into the packed cache blob via `sliceAsBytes`, making the on-disk
-    // artifact differ run-to-run on a cold build.
-    var clean: Node = std.mem.zeroes(Node);
-    clean.tag = node.tag;
-    clean.main_token = node.main_token;
-    clean.lhs = node.lhs;
-    clean.rhs = node.rhs;
-    try p.nodes.append(p.gpa, clean);
+    // Zero the extern-struct padding before the node enters the cached blob
+    // (see `token.zeroPad`).
+    try p.nodes.append(p.gpa, token.zeroPad(Node, node));
     return idx;
 }
 
