@@ -87,56 +87,6 @@ pub const Tag = enum(u8) {
     kw_pub,
     /// `as` — renames an imported namespace (`import a/b as r`).
     kw_as,
-
-    pub fn lexeme(tag: Tag) ?[]const u8 {
-        return switch (tag) {
-            .kw_fn => "fn",
-            .kw_return => "return",
-            .kw_if => "if",
-            .kw_else => "else",
-            .kw_while => "while",
-            .kw_true => "true",
-            .kw_false => "false",
-            .kw_struct => "struct",
-            .kw_loop => "loop",
-            .kw_for => "for",
-            .kw_in => "in",
-            .kw_break => "break",
-            .kw_continue => "continue",
-            .kw_enum => "enum",
-            .kw_match => "match",
-            .kw_import => "import",
-            .kw_pub => "pub",
-            .kw_as => "as",
-            .plus => "+",
-            .minus => "-",
-            .star => "*",
-            .slash => "/",
-            .eq => "=",
-            .eq_eq => "==",
-            .bang => "!",
-            .bang_eq => "!=",
-            .lt => "<",
-            .lt_eq => "<=",
-            .gt => ">",
-            .gt_eq => ">=",
-            .amp_amp => "&&",
-            .pipe_pipe => "||",
-            .pipe => "|",
-            .l_paren => "(",
-            .r_paren => ")",
-            .l_brace => "{",
-            .r_brace => "}",
-            .comma => ",",
-            .colon => ":",
-            .colon_eq => ":=",
-            .dot => ".",
-            .arrow => "->",
-            .dotdot => "..",
-            .at => "@",
-            else => null,
-        };
-    }
 };
 
 /// Maps identifier text to its keyword tag, if any.
@@ -160,3 +110,18 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "pub", .kw_pub },
     .{ "as", .kw_as },
 });
+
+comptime {
+    // Every `kw_*` tag must appear in `keywords` exactly once, so a keyword cannot
+    // be added to `Tag` without registering its spelling here (nor be registered
+    // twice). The lexer's `keywords` lookup is then the sole keyword-spelling table.
+    for (@typeInfo(Tag).@"enum".fields) |f| {
+        if (!std.mem.startsWith(u8, f.name, "kw_")) continue;
+        const want: Tag = @enumFromInt(f.value);
+        var seen: usize = 0;
+        for (keywords.values()) |v| {
+            if (v == want) seen += 1;
+        }
+        if (seen != 1) @compileError("keyword tag '" ++ f.name ++ "' must be in `keywords` exactly once");
+    }
+}
