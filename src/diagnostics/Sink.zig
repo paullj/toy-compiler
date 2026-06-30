@@ -17,19 +17,12 @@
 
 const std = @import("std");
 
-/// The "untagged" scope: a single-file diagnostic carries no module id.
-pub const NO_SCOPE: u32 = std.math.maxInt(u32);
-
-/// The one diagnostic type shared by every stage. `byte_offset` points at the
-/// offending token; the driver/CLI renders byte_offset -> line:col uniformly.
-/// `scope` is the owning module id in graph mode, `NO_SCOPE` single-file. The
-/// default keeps every existing `.{ .byte_offset = x, .message = m }` literal
-/// compiling unchanged.
-pub const Diagnostic = struct {
-    byte_offset: u32,
-    message: []const u8,
-    scope: u32 = NO_SCOPE,
-};
+// The diagnostic datum + its `NO_SCOPE` sentinel are defined in `Diagnostic.zig`
+// (the type's home); re-exported so `Sink.Diagnostic`/`Sink.NO_SCOPE` and the
+// internal uses below keep working.
+const diag = @import("Diagnostic.zig");
+pub const NO_SCOPE = diag.NO_SCOPE;
+pub const Diagnostic = diag.Diagnostic;
 
 const DiagnosticSink = @This();
 
