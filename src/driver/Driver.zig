@@ -210,7 +210,7 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     // fn name) provably outlives the typecheck `sigs[].name` that borrow it.
     result.checked = true;
     var graph = try Graph.single(gpa, "main", result.path, result.source, result.tokens, result.nodes, result.extra, result.pub_bits);
-    defer graph.deinitSingle(gpa);
+    defer graph.deinit(gpa);
 
     var gr = try ResolveGraph.resolveGraph(gpa, &graph);
     // Move `gr` into the FileResult before any later fallible step so its teardown
@@ -814,7 +814,7 @@ fn lowerSingleFile(
     opt: Opt.Config,
 ) !LowerProgramResult {
     var graph = try Graph.single(gpa, "main", r.path, r.source, r.tokens, r.nodes, r.extra, r.pub_bits);
-    defer graph.deinitSingle(gpa);
+    defer graph.deinit(gpa);
     return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, 0);
 }
 

@@ -2292,7 +2292,7 @@ fn checkSource(source: []const u8) !Checked {
     }
 
     var g = try Graph.single(gpa, "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
-    defer g.deinitSingle(gpa);
+    defer g.deinit(gpa);
     var res = try ResolveGraph.resolveGraph(gpa, &g);
     errdefer res.deinit(gpa);
     const result = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);

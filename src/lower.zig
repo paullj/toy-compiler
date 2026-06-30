@@ -1812,7 +1812,7 @@ const FrontEnd = struct {
 /// arrays. `io = null` => serial Pass-C (deterministic).
 fn frontEnd(gpa: std.mem.Allocator, tokens: []const Token, tree: Ast.Tree, src: []const u8) !FrontEnd {
     var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
-    defer g.deinitSingle(gpa);
+    defer g.deinit(gpa);
     var res = try ResolveGraph.resolveGraph(gpa, &g);
     errdefer res.deinit(gpa);
     const tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
