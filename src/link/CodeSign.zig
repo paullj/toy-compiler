@@ -84,18 +84,14 @@ const BeWriter = struct {
 /// `image` already has the signature region reserved/zeroed by `MachO.assemble`,
 /// and `codeLimit == sig_file_off` so the hashed bytes are final before we touch
 /// the region. `text_size` is the `__text` section size (used for the
-/// exec-segment limit). The `gpa` parameter is unused — hashing streams directly
-/// over `image` — but is kept to match the planned signature.
+/// exec-segment limit). Hashing streams directly over `image`, so no allocator.
 pub fn sign(
     io: Io,
-    gpa: std.mem.Allocator,
     image: []u8,
     identifier: []const u8,
     sig_file_off: u32,
     text_size: u32,
 ) !void {
-    _ = gpa;
-
     const code_limit: u32 = sig_file_off;
     const ident_len: u32 = @intCast(identifier.len);
     const n_slots: u32 = nCodeSlots(code_limit);
@@ -238,7 +234,7 @@ test "sign writes a parseable SuperBlob + CodeDirectory" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    try sign(io, gpa, image, ident, sig_off, text_size);
+    try sign(io, image, ident, sig_off, text_size);
 
     const rd32 = struct {
         fn f(img: []const u8, off: usize) u32 {
@@ -323,13 +319,13 @@ test "sign: whole image byte-identical at -j1 vs -jN incl. partial final page" {
     {
         var t1 = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
         defer t1.deinit();
-        try sign(t1.io(), gpa, serial, ident, sig_off, text_size);
+        try sign(t1.io(), serial, ident, sig_off, text_size);
     }
     // -jN: a multi-worker pool that actually fans the page hashes out.
     {
         var tn = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
         defer tn.deinit();
-        try sign(tn.io(), gpa, parallel, ident, sig_off, text_size);
+        try sign(tn.io(), parallel, ident, sig_off, text_size);
     }
 
     // The WHOLE output (image + signature region, every digest incl. the partial
