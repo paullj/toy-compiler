@@ -3,9 +3,8 @@
 //! PHASE 1 (branch-fold): a `cond_br cond,t,f` whose `cond` is a constant bool
 //! (an SSA value defined by `bconst`) becomes an argless unconditional `br` to the
 //! taken target — `t` if true, `f` if false. `cond_br` is argless by design, so
-//! the replacement carries no merge args; we still allocate a REAL `gpa.alloc
-//! (Operand, 0)` for `br.args` (NOT a static `&.{}`) so `Function.deinit`'s
-//! `gpa.free(br.args)` is valid (Opt.zig memory strategy (b)).
+//! the replacement carries no merge args; `br.args` is a static empty slice
+//! (`Function.deinit`'s `gpa.free` no-ops on a 0-len slice — Opt.zig strategy (b)).
 //!
 //! PHASE 2 (unreachable-elim): whenever phase 1 changed a terminator, recompute
 //! reachability from `func.entry` (iterate-to-fixpoint over successors, ascending
@@ -54,10 +53,9 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
             .cond_br => |c| {
                 const taken_const = constBool(value_const, c.cond) orelse continue;
                 const taken: Ir.BlockId = if (taken_const) c.t else c.f;
-                // Replace argless cond_br with an argless br to the taken target.
-                // br.args MUST be a real heap 0-len slice (deinit frees it).
-                const args = try gpa.alloc(Ir.Operand, 0);
-                b.term = .{ .br = .{ .dest = taken, .args = args } };
+                // Replace argless cond_br with an argless br to the taken target;
+                // `br.args` is a static empty slice (deinit's free no-ops on len 0).
+                b.term = .{ .br = .{ .dest = taken, .args = &.{} } };
                 stats.branches_folded += 1;
                 folded_any = true;
             },
@@ -209,7 +207,7 @@ fn intVals(gpa: std.mem.Allocator, n: usize) ![]Ir.ValueDef {
     return v;
 }
 
-test "cond_br on bconst true -> br t with 0-len heap args" {
+test "cond_br on bconst true -> br t with empty args" {
     const gpa = testing.allocator;
     // b0: %0=bconst true; cond_br %0,b1,b2
     // b1: ret  ;  b2: ret  (both kept reachable only via the cond_br targets)
