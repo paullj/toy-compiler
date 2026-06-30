@@ -1,9 +1,10 @@
-//! Type checking over a parsed `Ast.Tree` plus its resolution array.
-//!
-//! This is the second semantic pass, run only after name resolution succeeded
-//! (a name error would otherwise poison every type that depends on it). It walks
-//! the program once, infers a `Type` for every expression node, and checks the
-//! statement-level rules:
+//! Type checking over the whole module graph (each module's `Ast.Tree` plus its
+//! resolution array), the semantic pass that runs after name resolution succeeded
+//! (a name error would otherwise poison every type that depends on it). It is
+//! query-fed and multi-phase: a global Pass-A builds the program-wide signature
+//! and struct/enum-layout tables (id-ordered for determinism), then a per-function
+//! Pass-C (`BodyChecker`, the bodies checked as independent parallel units) infers
+//! a `Type` for every expression node and enforces the statement-level rules:
 //!
 //!   * `name := expr`     — the local takes the initializer's type (() is an
 //!                          error: there is nothing to bind).
@@ -20,8 +21,7 @@
 //! Errors never cascade: the moment an operand is `invalid` (the poison type) the
 //! containing expression silently becomes `invalid` too, so each mistake yields
 //! exactly one diagnostic at its origin. Type references (`int`, `bool`) are
-//! `identifier` nodes whose text we map straight onto a `Type`. The result is
-//! in-memory only (not a cache phase yet).
+//! `identifier` nodes whose text we map straight onto a `Type`.
 
 const std = @import("std");
 const Token = @import("ast/Token.zig").Token;
@@ -38,7 +38,7 @@ const Typecheck = @This();
 /// The type algebra + layout engine (the `Type`/`Kind`/`Layout` value types and
 /// the struct/enum layout-cycle state machine) live in their own deep module. The
 /// checker drives it via `LayoutEngine.layoutStruct`/`layoutEnum` (id-ordered, from
-/// `run`/`runGraph`) and consumes the laid syms through the re-exported aliases.
+/// `checkGraph`/`runGraph`) and consumes the laid syms through the re-exported aliases.
 const LayoutEngine = @import("layout/Engine.zig");
 
 // Re-export the algebra/layout value types so every downstream importer keeps
@@ -95,7 +95,7 @@ pub const GraphFnInput = struct {
     name: []const u8,
 };
 
-/// The whole-graph typecheck output. Caller owns it; free with `deinitGraph`.
+/// The whole-graph typecheck output. Caller owns it; free with `GraphResult.deinit`.
 /// `node_types` is per-module; `layouts`/`enum_layouts`/`sigs` are PROGRAM-WIDE
 /// (global ids), exactly as the lowering stage's Frozen needs.
 pub const GraphResult = struct {
