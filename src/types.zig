@@ -207,10 +207,8 @@ enum_map: std.StringHashMapUnmanaged(u32),
 /// PROGRAM-WIDE (global ids), and `struct_map`/`enum_map` hold the CURRENT
 /// module's bare-name → global-id bindings (swapped per module). The context
 /// resolves a qualified `mod.Type` / `mod.Enum` receiver to the owning module's
-/// tables. Pre-collect + layout happen once; only Pass B runs per fn. (The `null`
-/// zero-value is the inert default; the shared helpers' `graph == null` arms are
-/// the dormant single-module-implicit fallback.)
-graph: ?*GraphCtx = null,
+/// tables. Pre-collect + layout happen once; only Pass B runs per fn.
+graph: *GraphCtx,
 
 /// The active module being type-checked / laid out (graph mode). Single-file
 /// leaves it 0. Used to pick the import-namespace table for qualified receivers.
@@ -285,7 +283,7 @@ const Model = struct {
     /// via `graph_mod`; these stay the empty init maps then). Borrowed pointers.
     struct_map: *const std.StringHashMapUnmanaged(u32),
     enum_map: *const std.StringHashMapUnmanaged(u32),
-    graph: ?*GraphCtx,
+    graph: *GraphCtx,
     gph_fn_names: ?[]const []const u8,
 };
 
@@ -924,7 +922,7 @@ const BodyChecker = struct {
     }
 
     fn qualifiedEnumId(bc: *BodyChecker, node_idx: Ast.Index) ?u32 {
-        const g = bc.model.graph orelse return null;
+        const g = bc.model.graph;
         const n = bc.tree.nodes[node_idx];
         if (n.tag != .field_access) return null;
         const recv = bc.tree.nodes[n.lhs];
@@ -1544,10 +1542,7 @@ const BodyChecker = struct {
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
         _ = node_idx;
-        const g = bc.model.graph orelse {
-            bc.sink.emitFmt(bc.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
-            return .invalid;
-        };
+        const g = bc.model.graph;
         const recv = bc.tree.nodes[n.lhs];
         if (recv.tag != .identifier) return .invalid;
         const recv_name = bc.nameText(recv.main_token);
@@ -1563,13 +1558,11 @@ const BodyChecker = struct {
     }
 
     fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
-        if (bc.model.graph) |g| return &g.mods[bc.graph_mod].struct_ids;
-        return bc.model.struct_map;
+        return &bc.model.graph.mods[bc.graph_mod].struct_ids;
     }
 
     fn activeEnumMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
-        if (bc.model.graph) |g| return &g.mods[bc.graph_mod].enum_ids;
-        return bc.model.enum_map;
+        return &bc.model.graph.mods[bc.graph_mod].enum_ids;
     }
 };
 
@@ -1588,8 +1581,8 @@ fn buildModel(t: *Typecheck) Model {
 }
 
 /// Construct a `BodyChecker` for fn `f`, wiring its cursor to the fn's owning
-/// module (single-file: the `Typecheck` cursor; graph: `graph.mods[f.mod]` + the
-/// module's node_types slice). The per-fn scratch starts empty.
+/// module (`graph.mods[f.mod]` + the module's node_types slice). The per-fn
+/// scratch starts empty.
 fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecker {
     var bc: BodyChecker = .{
         .model = model,
@@ -1603,35 +1596,30 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
         .sink = DiagnosticSink.init(t.gpa),
         .gph_fn_names = t.gph_fn_names,
     };
-    if (t.graph) |g| {
-        const mc = &g.mods[f.mod];
-        bc.tree = mc.tree;
-        bc.tokens = mc.tokens;
-        bc.source = mc.source;
-        bc.resolutions = mc.resolutions;
-        bc.graph_mod = f.mod;
-        // Graph mode: every diagnostic this BodyChecker emits is tagged with the
-        // fn's owning module. Single-file leaves the sink NO_SCOPE.
-        bc.sink.setScope(f.mod);
-        if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
-    }
+    const mc = &t.graph.mods[f.mod];
+    bc.tree = mc.tree;
+    bc.tokens = mc.tokens;
+    bc.source = mc.source;
+    bc.resolutions = mc.resolutions;
+    bc.graph_mod = f.mod;
+    // Every diagnostic this BodyChecker emits is tagged with the fn's owning module.
+    bc.sink.setScope(f.mod);
+    if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
     return bc;
 }
 
 /// Switch the active tree/tokens/source/resolutions + bare-name maps to module
-/// `mod` (graph mode). Returns the previous active module so the caller can
-/// restore it (layout recursion crosses module boundaries). No-op single-file.
+/// `mod`. Returns the previous active module so the caller can restore it (layout
+/// recursion crosses module boundaries).
 fn gphSelect(t: *Typecheck, mod: u32) u32 {
     const prev = t.graph_mod;
-    const g = t.graph orelse return prev;
+    const g = t.graph;
     const mc = &g.mods[mod];
     t.tree = mc.tree;
     t.tokens = mc.tokens;
     t.source = mc.source;
     t.resolutions = mc.resolutions;
-    // Graph mode only (we returned above when single-file): stamp every
-    // subsequent top-level emit with the active module. Single-file never reaches
-    // here, so its sink stays NO_SCOPE.
+    // Stamp every subsequent top-level emit with the active module.
     t.sink.setScope(mod);
     // The active bare-name maps are read via `activeStructMap`/`activeEnumMap`,
     // which dereference ctx.mods[graph_mod] directly (the maps live in the ctx, so
@@ -1642,17 +1630,14 @@ fn gphSelect(t: *Typecheck, mod: u32) u32 {
     return prev;
 }
 
-/// The active bare-name → global-struct-id map: the current module's table in
-/// graph mode, else the single-file `struct_map`.
+/// The active bare-name → global-struct-id map: the current module's table.
 fn activeStructMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
-    if (t.graph) |g| return &g.mods[t.graph_mod].struct_ids;
-    return &t.struct_map;
+    return &t.graph.mods[t.graph_mod].struct_ids;
 }
 
-/// The active bare-name → global-enum-id map (per active module in graph mode).
+/// The active bare-name → global-enum-id map: the current module's table.
 fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
-    if (t.graph) |g| return &g.mods[t.graph_mod].enum_ids;
-    return &t.enum_map;
+    return &t.graph.mods[t.graph_mod].enum_ids;
 }
 
 /// The layout engine's view of this checker: its tables + the per-module accessors
@@ -2036,7 +2021,6 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
 /// `owner_kind`/`owner_name` describe the exposing decl ("function" `lib.make`,
 /// "struct" `lib.Outer`, "enum" `lib.E`).
 fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, owner_name: []const u8) !void {
-    if (t.graph == null) return;
     const non_pub = switch (ty.kind) {
         .@"struct" => !t.structs.items[ty.struct_id].pub_export,
         .@"enum" => !t.enums.items[ty.enum_id].pub_export,
@@ -2058,15 +2042,15 @@ fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, ow
 fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
     for (t.fns.items) |f| {
         if (f.decl_node == Ast.none or f.mod != entry_mod) continue;
-        const tree = if (t.graph) |g| g.mods[entry_mod].tree else t.tree;
-        const tokens = if (t.graph) |g| g.mods[entry_mod].tokens else t.tokens;
-        const source = if (t.graph) |g| g.mods[entry_mod].source else t.source;
+        const tree = t.graph.mods[entry_mod].tree;
+        const tokens = t.graph.mods[entry_mod].tokens;
+        const source = t.graph.mods[entry_mod].source;
         const main_tok = tree.nodes[f.decl_node].main_token;
         if (!std.mem.eql(u8, tokens[main_tok].text(source), "main")) continue;
         if (f.ret.kind != .int and f.ret.kind != .unit and f.ret.kind != .invalid) {
             // Select the entry module so the sink stamps this diagnostic with the
             // entry module's scope (gphSelect -> sink.setScope).
-            if (t.graph != null) _ = t.gphSelect(entry_mod);
+            _ = t.gphSelect(entry_mod);
             try t.sink.emit(tokens[main_tok].start, "main must return int or ()");
         }
         return; // only the first `main` is the entry
@@ -2210,10 +2194,7 @@ fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
 /// `resolve_graph`, so a private type here is a defensive `invalid`.
 fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
     _ = node_idx;
-    const g = t.graph orelse {
-        t.sink.emitFmt(t.byteOf(n.main_token), "qualified type is not valid here", .{}) catch {};
-        return .invalid;
-    };
+    const g = t.graph;
     const recv = t.tree.nodes[n.lhs];
     if (recv.tag != .identifier) return .invalid;
     const recv_name = t.nameText(recv.main_token);
