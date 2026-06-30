@@ -742,7 +742,7 @@ fn coldFrontEndFps(comptime dir_name: []const u8, source: []const u8) !std.AutoH
     var dag: Dag = .init(gpa);
     defer dag.deinit(gpa);
 
-    var graph = try Graph.discoverDag(gpa, io, cache, "native", full, &dag);
+    var graph = try Graph.discoverDag(gpa, io, cache, "native", full, &dag, null);
     defer graph.deinit(gpa);
     try testing.expect(graph.err == null);
 
@@ -820,7 +820,7 @@ test "M17 PERSISTENCE: a build WRITES the DAG artifact; a fresh process LOADS it
         const cache = try Cache.init(io, cache_dir);
         var dag: Dag = .init(gpa);
         defer dag.deinit(gpa);
-        var graph = try Graph.discoverDag(gpa, io, cache, "native", entry, &dag);
+        var graph = try Graph.discoverDag(gpa, io, cache, "native", entry, &dag, null);
         defer graph.deinit(gpa);
         try testing.expect(graph.err == null);
 
@@ -846,7 +846,7 @@ test "M17 PERSISTENCE: a build WRITES the DAG artifact; a fresh process LOADS it
         // round-trips identically (the cold-stable-fp prerequisite, now persisted).
         var dag2: Dag = .init(gpa);
         defer dag2.deinit(gpa);
-        var graph2 = try Graph.discoverDag(gpa, io, cache, "native", entry, &dag2);
+        var graph2 = try Graph.discoverDag(gpa, io, cache, "native", entry, &dag2, null);
         defer graph2.deinit(gpa);
         try testing.expect(graph2.err == null);
 
@@ -890,7 +890,7 @@ fn wireBuild(
     var dag: Dag = .init(gpa);
     errdefer dag.deinit(gpa);
 
-    var graph = try Graph.discoverDag(gpa, io, cache, "aarch64-macos", entry, &dag);
+    var graph = try Graph.discoverDag(gpa, io, cache, "aarch64-macos", entry, &dag, null);
     defer graph.deinit(gpa);
     try testing.expect(graph.err == null);
 
@@ -1046,7 +1046,7 @@ fn gateBuild(
     var dag: Dag = .init(gpa);
     defer dag.deinit(gpa);
 
-    var graph = try Graph.discoverDag(gpa, io, cache, "aarch64-macos", entry, &dag);
+    var graph = try Graph.discoverDag(gpa, io, cache, "aarch64-macos", entry, &dag, null);
     defer graph.deinit(gpa);
     try testing.expect(graph.err == null);
 

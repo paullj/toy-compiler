@@ -354,11 +354,17 @@ fn lapNs(io: Io, timings: bool, last: *i128) u64 {
     return if (dt > 0) @intCast(dt) else 0;
 }
 
-/// Print the `--timings` per-stage breakdown (ms + % of the summed total). `total`
-/// is the sum of the shown stages, not wall-clock — best-effort I/O (DAG persist)
-/// and stats prints are deliberately excluded so each row is the stage's own cost.
-fn printTimings(out: *Io.Writer, discover: u64, resolve: u64, typecheck: u64, lower: u64, image: u64, sub: ?LowerSub) !void {
-    const total = discover + resolve + typecheck + lower + image;
+/// Print the `--timings` per-stage breakdown (ms + % of the wall-clock total). PERF P4:
+/// `total` is the BUILD WALL-CLOCK (`elapsed`), and the printed stage rows + the
+/// `other/overhead` reconciliation row SUM TO IT — there is no unattributed time left
+/// hiding. Each cache-backed stage (discover, lower) carries a compute / cache-get /
+/// cache-put sub-split (the discover split is file-read+lex+parse compute vs the
+/// lex/parse content cache; the lower split is codegen compute vs the codegen cache);
+/// the barrier-join stages (resolve, typecheck) have no cache so report compute only.
+/// `setup` is the pre-stage window (cache open + the one bulk `pack.load` + dag/realpath
+/// init); `other/overhead` = total - sum(setup..image) is the small residual the named
+/// rows don't cover (the stats/DAG-persist window + measurement slop).
+fn printTimings(out: *Io.Writer, total: u64, setup: u64, discover: u64, resolve: u64, typecheck: u64, lower: u64, post: u64, image: u64, disc_sub: ?StageSub, low_sub: ?LowerSub) !void {
     const tot_f: f64 = @floatFromInt(if (total == 0) 1 else total);
     const row = struct {
         fn p(w: *Io.Writer, name: []const u8, ns: u64, tf: f64) !void {
@@ -366,32 +372,51 @@ fn printTimings(out: *Io.Writer, discover: u64, resolve: u64, typecheck: u64, lo
             const pct = @as(f64, @floatFromInt(ns)) * 100.0 / tf;
             try w.print("  {s:<11}{d:>9.3} ms  ({d:>4.1}%)\n", .{ name, ms, pct });
         }
-        // The lower SUB-stages are attributed as a fraction of `lower` itself (not of
-        // the whole build): they answer "where does lower's time go". At -jN the
-        // per-fn compute/get/put are summed across workers, so they can exceed the
-        // wall-clock `lower` — that ratio IS the parallel-overlap signal.
-        fn sub_p(w: *Io.Writer, name: []const u8, ns: u64, lower_ns: u64) !void {
+        // A stage's SUB-rows are attributed as a fraction of the PARENT stage (not the
+        // whole build): they answer "where does this stage's time go". At -jN the
+        // per-unit compute/get/put are summed across workers, so they can exceed the
+        // wall-clock parent — that ratio IS the parallel-overlap signal.
+        fn sub_p(w: *Io.Writer, name: []const u8, ns: u64, parent_ns: u64, parent: []const u8) !void {
             const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const lf: f64 = @floatFromInt(if (lower_ns == 0) 1 else lower_ns);
-            const pct = @as(f64, @floatFromInt(ns)) * 100.0 / lf;
-            try w.print("    {s:<13}{d:>9.3} ms  ({d:>5.1}% of lower)\n", .{ name, ms, pct });
+            const pf: f64 = @floatFromInt(if (parent_ns == 0) 1 else parent_ns);
+            const pct = @as(f64, @floatFromInt(ns)) * 100.0 / pf;
+            try w.print("    {s:<13}{d:>9.3} ms  ({d:>5.1}% of {s})\n", .{ name, ms, pct, parent });
         }
     };
     try out.print("timings:\n", .{});
+    try row.p(out, "setup", setup, tot_f);
     try row.p(out, "discover", discover, tot_f);
+    if (disc_sub) |s| {
+        try row.sub_p(out, "compute", s.compute_ns, discover, "discover");
+        try row.sub_p(out, "cache-get", s.get_ns, discover, "discover");
+        try row.sub_p(out, "cache-put", s.put_ns, discover, "discover");
+    }
     try row.p(out, "resolve", resolve, tot_f);
     try row.p(out, "typecheck", typecheck, tot_f);
     try row.p(out, "lower", lower, tot_f);
-    if (sub) |s| {
-        try row.sub_p(out, "compute", s.compute_ns, lower);
-        try row.sub_p(out, "cache-get", s.get_ns, lower);
-        try row.sub_p(out, "cache-put", s.put_ns, lower);
-        try row.sub_p(out, "link-tail", s.link_ns, lower);
+    if (low_sub) |s| {
+        try row.sub_p(out, "compute", s.compute_ns, lower, "lower");
+        try row.sub_p(out, "cache-get", s.get_ns, lower, "lower");
+        try row.sub_p(out, "cache-put", s.put_ns, lower, "lower");
+        try row.sub_p(out, "link-tail", s.link_ns, lower, "lower");
     }
+    // The best-effort DAG persist + stats-print window (Debug records+persists a DAG
+    // here; a release build's null DAG skips it, so this is ~0 in production).
+    try row.p(out, "post", post, tot_f);
     try row.p(out, "image+sign", image, tot_f);
-    try out.print("  {s:<11}{d:>9.3} ms\n", .{ "total", @as(f64, @floatFromInt(total)) / 1_000_000.0 });
+    // RECONCILE TO TOTAL: everything the named rows didn't cover (measurement slop +
+    // the tiny tail after the image lap). Printed, never hidden — a saturating
+    // subtraction so clock jitter can't underflow it.
+    const named = setup +| discover +| resolve +| typecheck +| lower +| post +| image;
+    const other = total -| named;
+    try row.p(out, "other/ovh", other, tot_f);
+    try out.print("  {s:<11}{d:>9.3} ms  (wall-clock)\n", .{ "total", @as(f64, @floatFromInt(total)) / 1_000_000.0 });
     try out.flush();
 }
+
+/// A cache-backed stage's compute/get/put sub-split (the generic `StageProbe` snapshot).
+/// Used for `discover` (file-read+lex+parse compute vs the lex/parse content cache).
+const StageSub = struct { compute_ns: u64, get_ns: u64, put_ns: u64 };
 
 /// The `--timings` sub-breakdown of `lower`: codegen compute (summed across workers),
 /// cache get/put I/O (summed across workers), and the serial relink/link tail.
@@ -483,19 +508,39 @@ fn emitExecutable(
     // out with more workers — so a `-j1 --timings` run is the clean "where does the
     // time go" profile that scopes the parallelization work.
     var last_ns: i128 = if (timings) nowNs(io) else 0;
+    // PERF P4 reconcile-to-total: the SETUP window (build_start -> here) covers the
+    // output-dir create, cache open, the ONE bulk `pack.load`, dag init, and the entry
+    // realpath — all BEFORE the first stage lap, so previously it was unattributed
+    // "other". Lap it explicitly as its own row so the printed columns sum to the
+    // wall-clock total with only a small labeled residual.
+    const ns_setup: u64 = if (timings) blk: {
+        const dt = last_ns - build_start;
+        break :blk if (dt > 0) @intCast(dt) else 0;
+    } else 0;
     var ns_discover: u64 = 0;
     var ns_resolve: u64 = 0;
     var ns_typecheck: u64 = 0;
     var ns_lower: u64 = 0;
+    // The post-lower window: best-effort DAG load/persist + the `--codegen-stats`/
+    // `--query-stats`/`--opt-stats` prints. Previously DISCARDED (lap-reset) so it
+    // wouldn't pollute the image bucket, which left it as unattributed "other". PERF
+    // P4 captures it as its own labeled row so the residual stays small (it is the
+    // dominant non-stage cost on a Debug build, where the DAG is recorded + persisted;
+    // null-DAG release builds skip the persist, so it is ~0 there).
+    var ns_post: u64 = 0;
     var ns_image: u64 = 0;
 
-    // `--timings` SUB-stage attribution of `lower`: a borrowed probe splits the
-    // codegen fan-out into compute (lowerOne) vs cache get/put I/O, and `link_ns`
-    // captures the serial relink/link tail. Null when timings are off => zero clock
-    // reads in the hot per-fn path.
-    var lower_probe: Engine.LowerProbe = .{};
+    // `--timings` SUB-stage attribution of `lower` and `discover`: a borrowed probe per
+    // stage splits its cache-backed queries into compute (the miss path) vs cache
+    // get/put I/O. The lower probe splits the codegen fan-out (`lowerOne` vs cache I/O)
+    // and `link_ns` captures the serial relink/link tail; the discover probe splits the
+    // per-module file-read+lex+parse compute vs the lex/parse content-cache reads. Null
+    // when timings are off => zero clock reads in the hot paths.
+    var lower_probe: Engine.StageProbe = .{};
+    var discover_probe: Engine.StageProbe = .{};
     var link_ns: u64 = 0;
-    const probe_ptr: ?*Engine.LowerProbe = if (timings) &lower_probe else null;
+    const probe_ptr: ?*Engine.StageProbe = if (timings) &lower_probe else null;
+    const discover_probe_ptr: ?*Engine.StageProbe = if (timings) &discover_probe else null;
     const link_ns_ptr: ?*u64 = if (timings) &link_ns else null;
 
     // --- the WHOLE build is ONE StageGraph the interpreter drives ---
@@ -545,6 +590,7 @@ fn emitExecutable(
         .mode = mode,
         .opt = opt,
         .dag = dag,
+        .discover_probe = discover_probe_ptr,
         .probe = probe_ptr,
         .link_ns = link_ns_ptr,
         // `-j` chunk-count basis for the body-check + codegen fan-outs. `threads` is the
@@ -625,9 +671,10 @@ fn emitExecutable(
         try out.flush();
     }
 
-    // Reset the lap so the best-effort DAG persist + any stats prints above are not
-    // charged to the image+sign bucket.
-    _ = lapNs(io, timings, &last_ns);
+    // CAPTURE (not discard) the best-effort DAG persist + any stats-print window into
+    // its own `post` row, so it is attributed rather than leaking into image+sign or
+    // the residual. Laps the timer so image+sign measures only the image build below.
+    ns_post = lapNs(io, timings, &last_ns);
     const image = try Driver.buildImage(
         io,
         gpa,
@@ -646,13 +693,19 @@ fn emitExecutable(
     try printBuildTime(out, threads, if (elapsed > 0) @intCast(elapsed) else 0);
     try out.flush();
     if (timings) {
-        const sub: LowerSub = .{
+        const low_sub: LowerSub = .{
             .compute_ns = lower_probe.compute_ns.load(.monotonic),
             .get_ns = lower_probe.get_ns.load(.monotonic),
             .put_ns = lower_probe.put_ns.load(.monotonic),
             .link_ns = link_ns,
         };
-        try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image, sub);
+        const disc_sub: StageSub = .{
+            .compute_ns = discover_probe.compute_ns.load(.monotonic),
+            .get_ns = discover_probe.get_ns.load(.monotonic),
+            .put_ns = discover_probe.put_ns.load(.monotonic),
+        };
+        const total_wall: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
+        try printTimings(out, total_wall, ns_setup, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_post, ns_image, disc_sub, low_sub);
     }
     // `run`: execute the freshly built binary and adopt its exit status.
     if (run_after) return runBinary(gpa, io, out, resolved_out);
@@ -711,6 +764,10 @@ const Orchestrator = struct {
     mode: CodegenIr.Mode,
     opt: Opt.Config,
     dag: ?*Dag,
+    /// PERF P4: the discover stage's compute/cache probe (file-read+lex+parse compute
+    /// vs the lex/parse content cache). Distinct from `probe` (the lower stage's), so
+    /// the two stages' sub-splits never co-mingle. Null when not profiling.
+    discover_probe: ?*Engine.StageProbe,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
     /// The `-j` jobs knob (0 => host cpus): the chunk-count basis for the two hot
@@ -847,7 +904,7 @@ fn fnResolveDigest(gf: ResolveGraph.GlobalFn) u64 {
 const DiscoverCompute = struct {
     o: Orchestrator,
     pub fn run(c: DiscoverCompute) !void {
-        c.o.graph.* = try Graph.discoverDag(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, c.o.dag);
+        c.o.graph.* = try Graph.discoverDag(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, c.o.dag, c.o.discover_probe);
         if (c.o.graph.*.?.err != null) {
             c.o.failed_stage.* = .discover;
             return error.StageDiagnostics;
@@ -984,6 +1041,7 @@ fn emitIr(
         .mode = .normal,
         .opt = opt,
         .dag = null,
+        .discover_probe = null,
         .probe = null,
         .link_ns = null,
         // `-j` chunk basis from the pool limit: `.limited(N)`->N, `.unlimited`->host
@@ -1085,6 +1143,7 @@ fn emitDumpDag(
         .mode = .normal,
         .opt = opt,
         .dag = &dag,
+        .discover_probe = null,
         .probe = null,
         .link_ns = null,
         // `-j` chunk basis from the pool limit (see emitIr): keeps the dump byte-

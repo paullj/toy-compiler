@@ -146,7 +146,7 @@ pub fn discover(
     target: []const u8,
     entry_path: []const u8,
 ) !Graph {
-    return discoverDag(gpa, io, cache, target, entry_path, null);
+    return discoverDag(gpa, io, cache, target, entry_path, null, null);
 }
 
 /// Same as `discover`, but threads a borrowed `*Dag` so the lex/parse queries run
@@ -162,6 +162,10 @@ pub fn discoverDag(
     target: []const u8,
     entry_path: []const u8,
     dag: ?*Dag,
+    /// `--timings` probe for the discover stage's lex+parse queries (file-read+lex+parse
+    /// COMPUTE vs served from the lex/parse content cache). BORROWED; null on a plain
+    /// build => the front-end queries read no clock. PERF P4.
+    probe: ?*Engine.StageProbe,
 ) !Graph {
     var d: Discoverer = .{
         .gpa = gpa,
@@ -169,6 +173,7 @@ pub fn discoverDag(
         .cache = cache,
         .target = target,
         .dag = dag,
+        .probe = probe,
         .root = dirname(entry_path),
     };
     defer d.deinit();
@@ -307,6 +312,9 @@ const Discoverer = struct {
     target: []const u8,
     /// M16: per-build dependency sink (null on default builds; set by `--dump-dag`).
     dag: ?*Dag = null,
+    /// PERF P4: `--timings` probe for this stage's lex+parse queries (compute vs
+    /// cache). Null on a plain build => no clock reads.
+    probe: ?*Engine.StageProbe = null,
     /// The root directory (entry file's directory). Borrowed from `entry_path`.
     root: []const u8,
     /// Module slots, indexed by id, in interning order. Entry is id 0.
@@ -438,6 +446,10 @@ const Discoverer = struct {
     /// Read + lex + parse module `id` (cached). On a parse error, fail.
     fn load(d: *Discoverer, id: u32) DiscoverError!void {
         const file = d.slots.items[id].file;
+        // PERF P4: the file read is the always-paid, never-cached part of discover's
+        // "file-read+lex+parse" compute — charge it to the probe's COMPUTE bucket so a
+        // warm build (lex/parse served from cache) still shows the unavoidable I/O.
+        const read_t0: i128 = if (d.probe != null) Engine.StageProbe.now(d.io) else 0;
         const source = Io.Dir.cwd().readFileAlloc(d.io, file, d.gpa, .unlimited) catch {
             // The entry file failing to read is reported by the driver up front;
             // an imported file that the resolver thought existed but cannot be
@@ -448,12 +460,13 @@ const Discoverer = struct {
                 .module = if (id == 0) null else id,
             });
         };
+        if (d.probe) |p| p.lapCompute(d.io, read_t0);
 
         // Module discovery routes lex/parse through the same query engine as the
         // per-file pipeline, but with discovery's SWALLOW read policy (a failed
         // cache read is a plain miss, `tmp_tag` = module id). Front-end queries
         // ignore the engine's force/verify mode.
-        const engine = if (d.dag) |dp| Engine.initDag(d.cache, .normal, dp) else Engine.init(d.cache, .normal);
+        const engine = Engine.initProbe(d.cache, .normal, d.dag, d.probe);
 
         // --- lex (cached) ---
         const lexed = try engine.lex(d.gpa, d.io, d.target, source, id, true);

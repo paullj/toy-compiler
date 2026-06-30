@@ -104,6 +104,18 @@ hazard (chunk boundaries must not change merge order) — guarded by diff.sh + i
 
 ## P2 — Eliminate redundant `discover` syscalls (NOT parallelize — research overturned that)
 
+> **Status: SHIPPED (uncommitted on `main`, 2026-06-30).** `Graph.zig` only. Stage 1: deleted the
+> standalone `fileExists` open+close; `canonicalize` now returns `?[]u8` (null = missing), so each import
+> gets existence + physical-identity from ONE `realPathFileAlloc` instead of openFile/close THEN realpath.
+> Stage 2: added `realpath_cache` (memoize realpath by raw resolved path) so a file reached by N importers
+> realpaths once, not N×. (A fix round resolved a latent OOM double-free via dup-before-`put` ordering.)
+> **Independently verified — controlled best-of-5 before/after, same machine, back-to-back:** discover
+> **linear 17.2→9.9ms (1.73×)**, **fan-in (100 modules share one util) 29.4→13.7ms (2.14×)**.
+> Behaviour-identical: diff.sh [C11] 69/0, incremental 5/5, **missing-import diagnostics unchanged**
+> (modules/check.sh 10/0, same message + import-token offset), 465 unit + 42 integration; only `Graph.zig`
+> changed; no module-ordering/id change (no [C11] re-baseline). Stage 3 (warm manifest read-skip) NOT done
+> — optional future. (Single `profile.sh` runs are noisy ±2-3ms from machine load — see P4.)
+
 **Cluster:** `src/driver/Graph.zig` (`load` + `collectImports`: `fileExists`, `canonicalize`/`realPathFileAlloc`, `readFileAlloc`).
 
 > **RESEARCH OUTCOME (2026-06-30, read-only, INSTRUMENTED):** P2 began as "parallelize discover." A
@@ -181,8 +193,77 @@ no action.
 
 ---
 
+## P4 — `--timings` observability: per-stage compute/cache split + reconcile to total
+
+> **Status: SHIPPED (uncommitted on `main`, 2026-06-30).** `LowerProbe` generalized to a stage-agnostic
+> `Engine.StageProbe` (3 atomics; `LowerProbe` kept as an alias = no call-site churn), wired into the
+> shared query get/put path + a discover probe threaded through `Graph.discoverDag`/`load` (file-read+lex+
+> parse → compute, lex/parse cache → get). `printTimings` now uses build wall-clock as `total`, adds
+> `setup` (cache open + `pack.load` + dag/realpath init) and `post` (DAG-persist window) laps, and always
+> prints an explicit `other/ovh = total − Σ(named)` residual. **Independently verified:** top-level rows
+> SUM TO total (ReleaseFast force: setup+discover+resolve+typecheck+lower+post+image+sign+ovh = 50.944 vs
+> total 50.943 — `other/ovh 0.000`); `discover` shows compute/cache-get/cache-put. Observability-only:
+> diff.sh 69/0, incremental 5/5, 465 unit, 42 integration; probes are zero-cost when `--timings` off.
+> CAVEAT: sub-rows are per-worker times SUMMED across threads, so at `-jN` they can exceed their parent
+> wall-clock (a parallel-overlap signal, labeled "% of parent") — they are NOT part of the total
+> reconciliation (the total uses each stage's wall-clock). Lower-INTERNAL attribution (GraphFrozen +
+> per-fn Walks/fingerprint outside the codegen cache laps) is a deeper future split, out of P4's scope.
+>
+> **NEW finding (now visible because timings reconcile):** `setup` is a real cost — ~0.4ms cold but
+> **~8ms (25%) on a WARM build** (the `pack.load` first-FS-open + cache/dag init). That's the next warm
+> lever, previously hidden in the unattributed gap. Tracked under "Future candidates" below.
+
+**Cluster:** `src/driver/main.zig` (the `--timings` printer), `src/query/Engine.zig` (`LowerProbe` and the
+query get/put path), the `StageGraph` interpreter.
+
+### Why
+Two gaps undermine trust in every perf number this roadmap relies on:
+1. **No per-stage compute/cache split.** Only `lower` reports `compute` / `cache-get` / `cache-put` /
+   `link-tail` (via `Engine.LowerProbe`). The other stages — `discover` (lex+parse, which have an on-disk
+   content cache), `resolve`, `typecheck` (memo-tier in-build) — report a single wall-clock with no
+   visibility into whether time went to compute vs a cache hit/miss/write. You can't tell a slow stage
+   from a cold-cache stage.
+2. **Timings don't sum to total.** The per-stage lines + `image+sign` do NOT add up to the reported
+   `total` — there's unattributed time (GraphFrozen construction, the StageGraph interpreter + barrier
+   joins, allocator/setup/teardown, the `-jN` dispatch tail). The gap means the breakdown can mislead
+   (a real cost hides in "the gap").
+
+### Requirements
+- R1: Every stage reports a compute / cache-get / cache-put sub-breakdown where it has a cache tier
+  (generalize the `LowerProbe` pattern to a per-stage probe driven by the engine's get/put path, so any
+  query-backed stage gets it uniformly). Stages with no cache (e.g. the barrier joins) report compute only.
+- R2: The printed lines RECONCILE to total — either every contributor is a named line, or an explicit
+  `other/overhead` line carries `total − Σ(named)` so the columns always sum to `total` (and `--timings`
+  prints the residual rather than hiding it). The residual should be small and labeled, not a silent gap.
+- R3: Observability-only — NO behaviour/byte-identity change; the probes are behind `--timings` and add
+  ~zero cost when off (matches the existing `LowerProbe` discipline). Still run the gates after.
+- R4: Determinism of the NUMBERS is not required (wall-clock varies), but the STRUCTURE (which lines
+  exist, summing to total) must be stable.
+
+### Premises to re-check
+- After Item 7, timing is collected via the StageGraph interpreter + `Engine.LowerProbe`; confirm where
+  each stage's wall-clock is lapped and where get/put happen, so the per-stage probe hooks the right spots.
+- Confirm the current gap empirically first (sum the printed lines vs `total` on a real build) so the
+  `other/overhead` line is attributing a real residual, then drill into the largest contributor.
+
+### Success criteria
+- `--timings` shows compute/cache-get/cache-put per cache-backed stage, and the lines sum to `total`
+  (residual surfaced as a labeled line). Gates green (observability-only).
+
+### Risk / blast radius
+**Low.** Instrumentation behind `--timings`; no output/behaviour change. The value is trustworthy perf
+numbers for the rest of this roadmap. Do AFTER P2 lands (it touches `discover`, which this then instruments).
+
+---
+
 ## Future perf candidates (unscoped)
 
-- Warm discover re-lex/parse skip (folded into P2's research).
+- **P5 (new, surfaced by P4) — warm `setup` cost (~8ms / ~25% of a warm build):** the `pack.load`
+  first-FS-open + cache/dag init. Now visible because timings reconcile. Likely the top *warm* lever
+  (cold it's ~0.4ms). Investigate lazy/deferred pack load, mmap, or overlapping it with discover.
+- **Lower-internal attribution:** split `lower`'s wall-clock further (GraphFrozen build + per-fn
+  Walks/fingerprint/unpack outside the codegen cache laps) — a deeper `--timings` breakdown if wanted.
+- Warm discover re-lex/parse skip (folded into P2's research; partly Stage 3 there) — note P2 already cut
+  warm discover via the realpath cache; the remaining warm floor is `readFileAlloc` + `setup` (above).
 - `link-tail` / image+sign (currently small; revisit if it grows).
 - Allocator strategy for the per-unit job bodies (arena-per-range once P1 chunks dispatch).
