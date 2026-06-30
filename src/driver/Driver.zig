@@ -115,20 +115,6 @@ pub const FileResult = struct {
     /// (same lifetime — sibling fields, torn down together). Owned; freed in deinit.
     typecheck: ?Typecheck.GraphResult = null,
 
-    /// The entry module's node-parallel resolution array. A `FileResult` is a
-    /// graph-of-one, so module 0 IS the file (asserted, to trip loudly if a
-    /// multi-module result is ever stored here).
-    pub fn resolutions(r: *const FileResult) []const Resolve.Resolution {
-        std.debug.assert(r.resolve.?.resolutions.len == 1);
-        return r.resolve.?.resolutions[0];
-    }
-
-    /// The entry module's node-parallel inferred-type array (graph-of-one).
-    pub fn nodeTypes(r: *const FileResult) []const Typecheck.Type {
-        std.debug.assert(r.typecheck.?.node_types.len == 1);
-        return r.typecheck.?.node_types[0];
-    }
-
     pub fn deinit(r: *FileResult, gpa: std.mem.Allocator) void {
         gpa.free(r.source);
         gpa.free(r.tokens);
