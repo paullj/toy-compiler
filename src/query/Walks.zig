@@ -11,23 +11,16 @@
 //! walk to drift from the fingerprint fold. `frozen` is `anytype` so the
 //! single-file and graph callers can share it (both pass `*const Driver.Frozen`).
 //!
-//! M16 BACK-DOOR-READ AUDIT — codegen-level MIRROR sites (deferred to a later
-//! codegen-decompose stage; NOT a gap in the M16 typecheck DAG). The reads inside
-//! the visitors (`frozen.sigs`/`frozen.names` in `CallVisitor`; `frozen.layouts`/
-//! `frozen.enum_layouts` in `typeRefToType`/`structLayoutBytes`/`enumLayoutBytes`)
-//! are the CODEGEN-level mirrors of the typecheck firewall reads — they fold the
-//! SAME callee-signature and touched-type-layout dependencies the typecheck
-//! `body->signature`/`body->layout` edges already record, but at the codegen
-//! fingerprint level. The codegen node records a single `codegen(gid)->body(gid)`
-//! edge and reaches every signature/layout dependency transitively through the
-//! body subtree, so the plan's explicit `codegen(fn)->signature(callee)`/
-//! `codegen(fn)->layout(type)` edges are NOT separately recorded — the body subtree
-//! already carries them. These reads stay DIRECT here
-//! because the fingerprint these walks feed is itself the codegen node's fp;
-//! routing them through `signature(callee)`/`layout(type)` query calls is the
-//! deferred codegen-decompose work. They are SAFE to leave here: invalidation is
-//! still content-fingerprint, and the fingerprint folds these dependencies
-//! correctly today.
+//! The visitor reads (`frozen.sigs`/`frozen.names` in `CallVisitor`; `frozen.layouts`/
+//! `frozen.enum_layouts` in `typeRefToType`/`structLayoutBytes`/`enumLayoutBytes`) fold
+//! the SAME callee-signature and touched-type-layout dependencies the typecheck
+//! `body->signature`/`body->layout` edges record. The fingerprint these walks feed IS
+//! the codegen node's own fp, which records a single `codegen(gid)->body(gid)` edge and
+//! reaches every signature/layout dependency transitively through the body subtree — so
+//! the per-dependency `codegen(fn)->signature(callee)`/`codegen(fn)->layout(type)` edges
+//! are deliberately NOT recorded, not forgotten. The reads are SAFE to leave direct:
+//! invalidation is still content-fingerprint, and the fingerprint folds these
+//! dependencies correctly.
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
@@ -53,8 +46,8 @@ pub fn walkCalls(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, out: *
 /// `params`/`ret` carry the GLOBAL struct/enum ids the typechecker resolved —
 /// including a CROSS-MODULE qualified type-ref `b: rect.Rect` which a bare-name scan
 /// would otherwise mis-resolve to the FIRST same-named type in the program-wide
-/// layout table (the cross-module M9 / TOP-RISK-#1 hole). Folding the sig types
-/// makes a pub-type LAYOUT edit reach EXACTLY the importers that name it. [design 10]
+/// layout table (the cross-module hole). Folding the sig types
+/// makes a pub-type LAYOUT edit reach EXACTLY the importers that name it.
 pub fn walkTouchedSig(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, fn_sig: ?Fingerprint.Sig, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
     const Frozen = @TypeOf(frozen.*);
     var v = AstWalk.TouchedVisitor(Frozen){ .gpa = gpa, .frozen = frozen, .fn_sig = fn_sig, .out = out };

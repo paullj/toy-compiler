@@ -487,16 +487,10 @@ fn emitExecutable(
     const discover_probe_ptr: ?*Engine.StageProbe = if (timings) &discover_probe else null;
     const link_ns_ptr: ?*u64 = if (timings) &link_ns else null;
 
-    // --- the WHOLE build is ONE StageGraph the interpreter drives ---
-    // discover (DISCOVER barrier over the entry path) -> resolve -> typecheck ->
-    // codegen, each a node in `StageGraph.pipeline`. The interpreter owns the
-    // barrier/region cadence; the `Orchestrator` supplies each stage's compute and
-    // writes its result into a frame-local optional (torn down by the `defer`s here,
-    // in reverse order, regardless of how far the build got). A stage that produced
-    // diagnostics raises `error.StageDiagnostics` so the interpreter stops and we
-    // print that stage's diagnostics below — the ONLY per-stage logic lives in the
-    // Orchestrator's stage closures (no second hand-sequenced chain). Correctness +
-    // cutoff stay the content-fp cache; the StageGraph is scheduling + observability.
+    // The whole build is ONE `StageGraph.pipeline` the interpreter drives; the
+    // `Orchestrator` (below) supplies each stage's compute and writes its result into
+    // one of these frame-local optionals, torn down by the `defer`s regardless of how
+    // far the build got.
     var graph: ?Graph.Graph = null;
     defer if (graph) |*g| g.deinit(gpa);
     var res: ?ResolveGraph.GraphResult = null;
@@ -622,19 +616,10 @@ fn emitExecutable(
 /// The SINGLE stage adapter for `StageGraph.interpret`, shared by every
 /// program-producing build (`-o`, `--emit ir`). It supplies each stage's compute
 /// (discover / resolve / typecheck / codegen) and writes the result into a frame-local
-/// optional on the caller's stack. Indexed by the comptime stage position in
-/// `StageGraph.pipeline`:
-///   0 DISCOVER (BARRIER)       — fold the entry-path digest, build the module graph
-///   1 COLLECT (BARRIER)        — fold the module parse digests, build resolve tables
-///   2 GLOBAL_TABLES (BARRIER)  — fold the fn resolve digests, build layout/sig tables
-///                                then fan out the per-fn body checks (inside checkGraph)
-///   3 codegen (REGION)         — per-fn lower fan-out + relink, OR render IR text
-///
-/// The first three stages are fan-IN barriers: their `contributors(i)` hook folds a
-/// real, multi-element contributor multiset (the entry digest, then every module's
-/// parse digest, then every global fn's resolve digest) via `Engine.barrier`, so the
-/// order-independent set-fold is load-bearing on every build. A barrier's compute is
-/// the JOIN work that produces the tables the next stage demands.
+/// optional on the caller's stack, indexed by the comptime stage position in
+/// `StageGraph.pipeline` (which defines the cadence and what each barrier folds; the
+/// `comptime` block below pins this `Stage` enum to it). A barrier's compute is the JOIN
+/// work that produces the tables the next stage demands.
 ///
 /// The codegen stage's behavior is selected by `tail`: `.lower` (the `-o` path) runs
 /// `lowerGraphProgram` into `lowered`; `.render_ir` (`--emit ir`) runs `renderGraphIr`

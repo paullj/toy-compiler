@@ -134,28 +134,28 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         .literal_number, .literal_string, .literal_bool, .identifier => try emit(visitor, .{ .leaf = leaf }),
 
         .unary => {
-            try emit(visitor, .{ .leaf = leaf }); // operator text
+            try emit(visitor, .{ .leaf = leaf });
             try walkInner(src, n.lhs, collect, visitor);
         },
         .binary => {
-            try emit(visitor, .{ .leaf = leaf }); // operator text
+            try emit(visitor, .{ .leaf = leaf });
             try walkInner(src, n.lhs, collect, visitor); // lhs THEN rhs: a-b != b-a [C7]
             try walkInner(src, n.rhs, collect, visitor);
         },
         .call => {
-            try walkInner(src, n.lhs, collect, visitor); // callee subtree
+            try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .callee = .{ .idx = n.lhs } }); // record sig AFTER callee, BEFORE args
             const args = Ast.rangeSlice(tree, n.rhs);
             try emit(visitor, .{ .count = @intCast(args.len) }); // f() != f(0) [C5]
             for (args) |a| try walkInner(src, a, collect, visitor);
         },
         .var_decl => {
-            try emit(visitor, .{ .leaf = leaf }); // bound name
-            try walkInner(src, n.lhs, collect, visitor); // initializer
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.lhs, collect, visitor);
         },
         .assign => {
-            try walkInner(src, n.lhs, collect, visitor); // target
-            try walkInner(src, n.rhs, collect, visitor); // value
+            try walkInner(src, n.lhs, collect, visitor);
+            try walkInner(src, n.rhs, collect, visitor);
         },
         .return_stmt => {
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // bare return != return v
@@ -168,11 +168,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             for (stmts) |s| try walkInner(src, s, collect, visitor);
         },
         .param => {
-            try emit(visitor, .{ .leaf = leaf }); // param name
-            try walkInner(src, n.lhs, collect, visitor); // type-ref identifier
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.lhs, collect, visitor);
         },
         .fn_decl => {
-            try emit(visitor, .{ .leaf = leaf }); // fn name
+            try emit(visitor, .{ .leaf = leaf });
             const proto = Ast.protoAt(tree, n.lhs);
             try emit(visitor, .{ .count = @intCast(proto.params.len) });
             for (proto.params, 0..) |p, i| {
@@ -188,14 +188,14 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
                 try emit(visitor, .{ .type_ref = .{ .idx = proto.ret_type, .ordinal = 0, .is_ret = true } });
                 try walkInner(src, proto.ret_type, collect, visitor);
             }
-            try walkInner(src, n.rhs, collect, visitor); // body block
+            try walkInner(src, n.rhs, collect, visitor);
         },
         .while_stmt => {
-            try walkInner(src, n.lhs, collect, visitor); // cond
-            try walkInner(src, n.rhs, collect, visitor); // body
+            try walkInner(src, n.lhs, collect, visitor);
+            try walkInner(src, n.rhs, collect, visitor);
         },
         .if_stmt => {
-            try walkInner(src, n.lhs, collect, visitor); // cond
+            try walkInner(src, n.lhs, collect, visitor);
             const head = Ast.ifHeaderAt(tree, n.rhs);
             try walkInner(src, head.then_block, collect, visitor);
             try emit(visitor, .{ .flag = head.else_node != Ast.none });
@@ -206,13 +206,13 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // Zero-sized leaf: the tag byte IS its content. Reached as a value literal
         // and as a `()` type-ref (under param/fn_decl ret).
         .literal_unit => {},
-        .loop_expr => try walkInner(src, n.lhs, collect, visitor), // body
+        .loop_expr => try walkInner(src, n.lhs, collect, visitor),
         .for_stmt => {
-            try emit(visitor, .{ .leaf = leaf }); // loop-var name
+            try emit(visitor, .{ .leaf = leaf });
             const head = Ast.forHeaderAt(tree, n.rhs);
             try walkInner(src, head.lo, collect, visitor);
             try walkInner(src, head.hi, collect, visitor);
-            try walkInner(src, n.lhs, collect, visitor); // body
+            try walkInner(src, n.lhs, collect, visitor);
         },
         .break_stmt => {
             // The label target identity is load-bearing; fold its TEXT (not a
@@ -227,44 +227,44 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             if (n.rhs != Ast.none) try emit(visitor, .{ .raw_leaf = src.tokenText(n.rhs) });
         },
         .labeled => {
-            try emit(visitor, .{ .leaf = leaf }); // label name
+            try emit(visitor, .{ .leaf = leaf });
             try walkInner(src, n.lhs, collect, visitor);
         },
         .struct_decl => {
-            try emit(visitor, .{ .leaf = leaf }); // struct name
+            try emit(visitor, .{ .leaf = leaf });
             const fields = Ast.rangeSlice(tree, n.lhs);
             try emit(visitor, .{ .count = @intCast(fields.len) });
             for (fields) |f| try walkInner(src, f, collect, visitor);
         },
         .struct_init => {
-            try walkInner(src, n.lhs, collect, visitor); // type-name identifier
+            try walkInner(src, n.lhs, collect, visitor);
             const inits = Ast.rangeSlice(tree, n.rhs);
             try emit(visitor, .{ .count = @intCast(inits.len) });
             for (inits) |fi| try walkInner(src, fi, collect, visitor);
         },
         .field_init => {
-            try emit(visitor, .{ .leaf = leaf }); // field name
-            try walkInner(src, n.lhs, collect, visitor); // value
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.lhs, collect, visitor);
         },
         .field_access => {
-            try emit(visitor, .{ .leaf = leaf }); // field name
-            try walkInner(src, n.lhs, collect, visitor); // receiver
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.lhs, collect, visitor);
         },
         .enum_decl => {
-            try emit(visitor, .{ .leaf = leaf }); // enum name
+            try emit(visitor, .{ .leaf = leaf });
             const variants = Ast.rangeSlice(tree, n.lhs);
             try emit(visitor, .{ .count = @intCast(variants.len) });
             for (variants) |v| try walkInner(src, v, collect, visitor);
         },
-        .enum_variant_unit => try emit(visitor, .{ .leaf = leaf }), // variant name
+        .enum_variant_unit => try emit(visitor, .{ .leaf = leaf }),
         .enum_variant_tuple => {
-            try emit(visitor, .{ .leaf = leaf }); // variant name
+            try emit(visitor, .{ .leaf = leaf });
             const types = Ast.rangeSlice(tree, n.lhs);
             try emit(visitor, .{ .count = @intCast(types.len) });
             for (types) |ty| try walkInner(src, ty, collect, visitor);
         },
         .enum_variant_struct => {
-            try emit(visitor, .{ .leaf = leaf }); // variant name
+            try emit(visitor, .{ .leaf = leaf });
             const fields = Ast.rangeSlice(tree, n.lhs);
             try emit(visitor, .{ .count = @intCast(fields.len) });
             for (fields) |f| try walkInner(src, f, collect, visitor);
@@ -275,8 +275,8 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // `collect=false` to suppress its `.touch` while still folding its hash.
         .enum_init_unit => {
             try emit(visitor, .{ .flag = n.lhs == Ast.none }); // inferred vs qualified
-            if (n.lhs != Ast.none) try walkInner(src, n.lhs, false, visitor); // type name
-            try emit(visitor, .{ .leaf = leaf }); // variant name
+            if (n.lhs != Ast.none) try walkInner(src, n.lhs, false, visitor);
+            try emit(visitor, .{ .leaf = leaf });
         },
         .enum_init_tuple => {
             try emit(visitor, .{ .flag = n.lhs == Ast.none });
@@ -295,7 +295,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             for (inits) |fi| try walkInner(src, fi, collect, visitor);
         },
         .match_expr => {
-            try walkInner(src, n.lhs, collect, visitor); // scrutinee
+            try walkInner(src, n.lhs, collect, visitor);
             const arms = Ast.rangeSlice(tree, n.rhs);
             try emit(visitor, .{ .count = @intCast(arms.len) });
             for (arms) |arm| try walkInner(src, arm, collect, visitor);
@@ -304,27 +304,27 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             // The touched walk never descended the pattern (`n.lhs`); recurse it
             // with `collect=false` so its `.touch` is suppressed while the hash
             // still folds the pattern spelling.
-            try walkInner(src, n.lhs, false, visitor); // pattern
+            try walkInner(src, n.lhs, false, visitor);
             const ah = Ast.armHeaderAt(tree, n.rhs);
             try emit(visitor, .{ .flag = ah.guard != Ast.none }); // guard sentinel
             if (ah.guard != Ast.none) try walkInner(src, ah.guard, collect, visitor);
-            try walkInner(src, ah.body, collect, visitor); // body
+            try walkInner(src, ah.body, collect, visitor);
         },
         .pattern_variant => {
             try emit(visitor, .{ .flag = n.lhs == Ast.none }); // inferred vs qualified
-            if (n.lhs != Ast.none) try walkInner(src, n.lhs, collect, visitor); // type name
-            try emit(visitor, .{ .leaf = leaf }); // variant name
+            if (n.lhs != Ast.none) try walkInner(src, n.lhs, collect, visitor);
+            try emit(visitor, .{ .leaf = leaf });
             const binders = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(tree, n.rhs);
             try emit(visitor, .{ .count = @intCast(binders.len) });
             for (binders) |b| try walkInner(src, b, collect, visitor);
         },
         .pattern_wildcard => {}, // the tag byte IS its content
         .pattern_binding => {
-            try emit(visitor, .{ .leaf = leaf }); // bound name
+            try emit(visitor, .{ .leaf = leaf });
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // rename vs pun
-            if (n.lhs != Ast.none) try walkInner(src, n.lhs, collect, visitor); // source field
+            if (n.lhs != Ast.none) try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .flag = n.rhs != Ast.none }); // has sub-pattern
-            if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor); // sub-pattern
+            if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor);
         },
         .pattern_literal => try emit(visitor, .{ .leaf = leaf }),
         .pattern_or => {
