@@ -20,32 +20,21 @@
 
 const std = @import("std");
 const Io = std.Io;
+const Dag = @import("Dag.zig");
 
 const Cache = @This();
 
-/// Compilation phases that participate in the cache. Each is a distinct query.
-pub const Phase = enum(u8) {
-    lex,
-    parse,
-    /// Resolve + typecheck. A pipeline *level* only in M0 (run in-memory, not
-    /// stored), but ordered after `parse` so `@intFromEnum` gates the pipeline.
-    check,
-    /// Per-function lowering (M5+; M12 Ast→Ir→aarch64). Cached by a transitive
-    /// content fingerprint, not a source hash, and target-sensitive (the blob is
-    /// aarch64 machine code). The IR is built INSIDE this query and never cached
-    /// separately — the cache stays ONE-TIER ([C8]).
-    codegen,
-
-    /// Whether results for this phase depend on the compilation target. Target
-    /// is only folded into the cache key when true, so target-independent
-    /// phases (lex, parse, check) share a single entry across targets.
-    pub fn targetSensitive(phase: Phase) bool {
-        return switch (phase) {
-            .lex, .parse, .check => false,
-            .codegen => true, // aarch64 blobs must not alias across targets [C10]
-        };
-    }
-};
+/// Compilation phases that participate in the cache. The on-disk cache and the
+/// in-memory dependency graph share ONE node taxonomy (`Dag.Kind`): the phases the
+/// cache keys are exactly its CACHEABLE subset (`Dag.Kind.cacheable`: lex/parse/
+/// codegen). Re-exported under this name so the cache reads as "phases" while the
+/// graph reads as "kinds", with no second enum to keep in sync.
+///
+/// codegen (M5+; M12 Ast→Ir→aarch64) is cached by a transitive content fingerprint,
+/// not a source hash, and is target-sensitive (the blob is aarch64 machine code).
+/// The IR is built INSIDE that query and never cached separately — the cache stays
+/// ONE-TIER ([C8]).
+pub const Phase = Dag.Kind;
 
 /// Identifies a single cacheable unit of work.
 pub const Key = struct {
@@ -67,8 +56,12 @@ pub const Key = struct {
         return .{ .phase = phase, .target = target, .input = fp };
     }
 
-    /// Fold the key components into the on-disk entry name.
+    /// Fold the key components into the on-disk entry name. Only the CACHEABLE
+    /// subset of `Phase` may name an on-disk entry; an in-memory-only kind here is a
+    /// caller bug (the assert compiles out under ReleaseFast — it never folds, so
+    /// the digest bytes are unchanged).
     pub fn digest(k: Key) u64 {
+        std.debug.assert(k.phase.cacheable());
         var h = std.hash.Wyhash.init(0);
         h.update(&[_]u8{@intFromEnum(k.phase)});
         if (k.phase.targetSensitive()) h.update(k.target);
@@ -656,6 +649,31 @@ pub fn getDag(c: Cache, gpa: std.mem.Allocator, io: Io, program_key: u64) !?[]u8
 // digest logic in isolation.
 
 const testing = std.testing;
+
+test "cacheable subset's enum bytes are PINNED (digest byte-identity across the enum collapse)" {
+    // `digest()` folds `@intFromEnum(phase)`, so the on-disk entry name for every
+    // cacheable phase depends on these exact byte values. Unifying `Cache.Phase` with
+    // `Dag.Kind` MUST NOT move them — a different byte is a silent cold rebuild of
+    // every entry. Pin them so a future reorder of the unified enum fails HERE.
+    try testing.expectEqual(@as(u8, 0), @intFromEnum(Phase.lex));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(Phase.parse));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(Phase.codegen));
+}
+
+test "cacheable/targetSensitive classify the unified enum's tiers" {
+    // The cacheable subset names on-disk entries; the rest are in-memory-only.
+    try testing.expect(Phase.lex.cacheable());
+    try testing.expect(Phase.parse.cacheable());
+    try testing.expect(Phase.codegen.cacheable());
+    try testing.expect(!Phase.signature.cacheable());
+    try testing.expect(!Phase.body.cacheable());
+    try testing.expect(!Phase.layout.cacheable());
+    // Only codegen depends on the target ([C10]); the rest share one entry across
+    // targets (lex/parse) or never reach the on-disk key at all.
+    try testing.expect(Phase.codegen.targetSensitive());
+    try testing.expect(!Phase.lex.targetSensitive());
+    try testing.expect(!Phase.parse.targetSensitive());
+}
 
 test "same phase + content => same digest" {
     const a = Cache.Key.fromSource(.lex, "native", "fn main() {}");

@@ -150,9 +150,11 @@ pub fn discover(
 }
 
 /// Same as `discover`, but threads a borrowed `*Dag` so the lex/parse queries run
-/// during discovery record their nodes/edges into the per-build graph. The default
-/// `discover` passes `null` (verbatim fast path, byte-identical). Only `--dump-dag`
-/// opts in.
+/// during discovery record their nodes/edges into the per-build graph. The program
+/// build (the `Orchestrator`'s DISCOVER stage) threads a non-null dag whenever one
+/// exists — a Debug `-o` build, `--dump-dag`, or `--query-stats`; it is null in a
+/// release build (verbatim fast path, byte-identical). The `discover` wrapper passes
+/// `null` for the single-module / test callers that record no DAG.
 pub fn discoverDag(
     gpa: std.mem.Allocator,
     io: Io,
@@ -220,7 +222,7 @@ pub fn discoverDag(
 /// (see `layout/Engine.zig`), so the `Typecheck.GraphResult` aliases this graph's
 /// `source`. If `single` duped the source and the graph were freed before the
 /// result is consumed (e.g. `Driver.pipeline`'s `defer graph.deinit` vs the later
-/// `lowerProgram`), every variant name would dangle. Borrowing the caller's
+/// `lowerGraphProgram`), every variant name would dangle. Borrowing the caller's
 /// (longer-lived) source keeps those names valid. Tear down with `deinitSingle`,
 /// which frees ONLY the one-element `modules` spine and never the borrowed fields.
 ///

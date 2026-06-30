@@ -34,7 +34,7 @@ trap 'rm -rf "$work"' EXIT
 zig() { ( cd "$root" && mise exec -- zig "$@" ); }
 
 if [ ! -x "$toyc" ]; then
-  echo "building toyc (mise exec -- zig build)..."
+  echo "building toy (mise exec -- zig build)..."
   zig build || { echo "build failed"; exit 1; }
 fi
 [ -x "$toyc" ] || { echo "no toyc binary at $toyc"; exit 1; }
@@ -90,7 +90,10 @@ while IFS= read -r src; do
 
   if [ "$ok" -eq 1 ]; then echo "  ok: $rel (exit=$r0 O0==O1==#expect)"; corpus_pass=$((corpus_pass+1));
   else corpus_fail=$((corpus_fail+1)); fi
-done < <(find "$root/examples" -name '*.toy' | sort)
+# Exclude the multi-module dirs whose non-entry files have no standalone `# expect:`
+# (modules/ is its own harness; bench/medium is a multi-file perf program). The
+# single-file opt benches (bench/*.toy) stay — they ARE the differential corpus.
+done < <(find "$root/examples" \( -path "$root/examples/modules" -o -path "$root/examples/bench/medium" \) -prune -o -name '*.toy' -print | sort)
 echo "  corpus: $corpus_pass ok, $corpus_fail fail"
 
 # ---------------------------------------------------------------------------

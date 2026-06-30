@@ -594,3 +594,101 @@ test "S4: parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)"
             (prev.scope == cur.scope and prev.byte_offset <= cur.byte_offset));
     }
 }
+
+/// Type-check the SAME graph WITH a fresh `*Dag` under `limit`, and return the
+/// recorded DAG serialized to bytes (caller owns). The DAG is built fresh per call so
+/// two calls under different pool sizes record independently; `serialize` sorts at
+/// dump, so a byte-identical result across pool sizes proves the per-fn body recording
+/// is order-free (the 7b precondition for one unified per-unit region).
+fn dagBytesUnder(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *ResolveGraph.GraphResult,
+    limit: Io.Limit,
+) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var dag: Dag = .init(gpa);
+    defer dag.deinit(gpa);
+    var tr = try checkGraph(gpa, graph, res, &dag, threaded.io());
+    defer tr.deinit(gpa);
+    return dag.serialize(gpa);
+}
+
+test "Pass-C DAG recording is byte-identical at -j1 and -jN (thread-safe per-fn recording)" {
+    // The 7b.4 behaviour change: per-fn body checks now fan out EVEN WITH dag != null
+    // (recording is thread-safe). Run the SAME clean multi-module graph twice — serial
+    // (.limited(0)) and parallel (.limited(8)) — and assert (i) identical diagnostics
+    // AND (ii) byte-identical serialized DAG. recordEdge is commutative under its lock
+    // and serialize sorts at dump, so the recorded graph cannot depend on the schedule.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-typ-dagdet";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // A clean (no-error) multi-fn, multi-module program: every fn records a body
+    // subtree (body->signature/layout/type_of/resolve_name), and cross-module calls +
+    // a pub aggregate exercise the cross-module node-id folding under both schedules.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn a(x: int) -> int { return x + 1 }
+        \\fn b() -> int { return lib.f(2) }
+        \\fn c() -> int { return a(3) + b() }
+        \\fn main() -> int { return c() }
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub fn f(x: int) -> int { return x * 2 }
+        \\pub fn g(y: int) -> int { return f(y) + 1 }
+        \\
+        },
+    };
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (files) |f| {
+        const full = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, f.path });
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = f.source });
+    }
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache_dir = try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir});
+    const cache = try Cache.init(io, cache_dir);
+
+    var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/main.toy", .{dir});
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path);
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r.diags.len);
+
+    // (i) diagnostics identical (and empty for this clean program) across schedules.
+    const serial_diags = try diagsUnder(gpa, &graph, &r, .limited(0));
+    defer {
+        for (serial_diags) |d| gpa.free(@constCast(d.message));
+        gpa.free(serial_diags);
+    }
+    const parallel_diags = try diagsUnder(gpa, &graph, &r, .limited(8));
+    defer {
+        for (parallel_diags) |d| gpa.free(@constCast(d.message));
+        gpa.free(parallel_diags);
+    }
+    try testing.expectEqual(@as(usize, 0), serial_diags.len);
+    try testing.expectEqual(serial_diags.len, parallel_diags.len);
+
+    // (ii) the recorded DAG is byte-identical serial vs parallel.
+    const serial_dag = try dagBytesUnder(gpa, &graph, &r, .limited(0));
+    defer gpa.free(serial_dag);
+    const parallel_dag = try dagBytesUnder(gpa, &graph, &r, .limited(8));
+    defer gpa.free(parallel_dag);
+    try testing.expect(serial_dag.len > 0); // a non-trivial graph WAS recorded
+    try testing.expectEqualSlices(u8, serial_dag, parallel_dag);
+}

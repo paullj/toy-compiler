@@ -34,28 +34,74 @@ const std = @import("std");
 
 const Dag = @This();
 
-/// The KIND of a query node. `signature` and `body` are DISTINCT kinds for the
-/// same fn id: a caller depends on `signature(callee)`, NEVER on `body(callee)` —
-/// the firewall the spike proves. `lex`/`parse`/`codegen` align with the on-disk
-/// Cache identity (their id folds the Cache.Key digest); the fine-grained
-/// typecheck kinds (`signature`/`body`/`type_of`/`layout`/`resolve_name`) carry a
-/// deterministic global id and are memoized in-build (NOT a Cache phase).
+/// The KIND of a query node — the SINGLE source of truth shared by the on-disk
+/// `Cache` (re-exported there as `Cache.Phase`) and the in-memory dependency
+/// graph. The CACHEABLE subset (`cacheable()` below: lex/parse/codegen) names the
+/// on-disk entries; the rest are IN-MEMORY-ONLY fine-grained typecheck nodes and
+/// the two scheduling BARRIER joins (`collect`/`global_tables`).
+///
+/// `signature` and `body` are DISTINCT kinds for the same fn id: a caller depends
+/// on `signature(callee)`, NEVER on `body(callee)` — the firewall the spike proves.
+/// The cacheable kinds map to themselves 1:1 (no bridge switch): a query records
+/// its node directly off its kind.
+///
+/// `collect` and `global_tables` are the `Engine.barrier` fan-IN joins the
+/// `StageGraph` schedules: `collect`'s id is the order-independent fold of every
+/// module's parse digest (the global name-resolution tables built from them);
+/// `global_tables`'s id is the fold of every global fn's resolve digest (the
+/// program-wide layout/sig tables the per-fn body region depends on). They are
+/// OBSERVABILITY-only roots in the recorded DAG (never cacheable), so they have no
+/// 1:1 cache entry — only the fold value names them.
+///
+/// EXPLICIT discriminants pin the CACHEABLE subset's bytes (lex=0, parse=1,
+/// codegen=3) so `Cache.Key.digest()` is byte-identical to before this enum was
+/// unified — folding a different byte would cold-rebuild every codegen entry. The
+/// in-memory-only kinds' bytes are free to renumber (their only persisted use is
+/// the DAG blob, whose `format_version` gates a mismatch to a clean re-validation).
 pub const Kind = enum(u8) {
-    lex,
-    parse,
-    signature,
-    body,
-    type_of,
-    layout,
-    resolve_name,
-    codegen,
+    lex = 0,
+    parse = 1,
+    signature = 2,
+    /// KEEPS byte 3 (the old `Cache.Phase.codegen` value) — see the type doc.
+    codegen = 3,
+    body = 4,
+    type_of = 5,
+    layout = 6,
+    resolve_name = 7,
+    /// The DISCOVER barrier join (folds the entry-path digest -> the module graph).
+    discover = 8,
+    /// The resolve COLLECT barrier join (folds the per-module parse digests).
+    collect = 9,
+    /// The typecheck Pass-A GLOBAL_TABLES barrier join (folds the per-fn resolve
+    /// digests).
+    global_tables = 10,
+
+    /// Whether a node of this kind names an on-disk `Cache` entry (the CACHEABLE
+    /// subset) vs an in-memory-only dependency node. Exhaustive no-else: a new kind
+    /// FAILS TO COMPILE until it declares its tier here.
+    pub fn cacheable(kind: Kind) bool {
+        return switch (kind) {
+            .lex, .parse, .codegen => true,
+            .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables => false,
+        };
+    }
+
+    /// Whether results for this kind depend on the compilation target. Target is
+    /// folded into the on-disk cache key only when true, so target-independent
+    /// phases share one entry across targets. Exhaustive no-else: a new kind FAILS
+    /// TO COMPILE until it declares its target-sensitivity here.
+    pub fn targetSensitive(kind: Kind) bool {
+        return switch (kind) {
+            .codegen => true, // aarch64 blobs must not alias across targets [C10]
+            .lex, .parse, .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables => false,
+        };
+    }
 };
 
-/// An IN-MEMORY node key. NOT a `Cache.Phase` — adding Cache phases would change
-/// on-disk identity (cold-rebuild), which M16 avoids. `id` is the deterministic
-/// global id ([C11]) for the fine-grained typecheck kinds; for lex/parse/codegen
-/// it folds the existing `Cache.Key.digest()` so DAG nodes align with cache
-/// identity.
+/// An IN-MEMORY node key. `id` is the deterministic global id ([C11]) for the
+/// fine-grained typecheck kinds; for lex/parse it folds the `Cache.Key.digest()`
+/// so DAG nodes align with cache identity, and codegen folds a STABLE per-fn
+/// identity (`Key.codegenIdentity`) decoupled from the content fp.
 pub const NodeKey = struct {
     kind: Kind,
     id: u64,
@@ -214,10 +260,12 @@ pub fn dumpDeterministic(self: *Dag, gpa: std.mem.Allocator, writer: anytype) !v
 /// corruption FALLBACK; never a partial/false-green). The version MUST bump on
 /// ANY layout change to this format.
 const magic: u32 = 0x47_41_44_54; // "TDAG" little-endian
-// v2: dropped the never-recorded `Kind.resolve`, which renumbered the enum bytes;
-// a v1 blob's kind bytes would now mis-decode, so the version bump forces those to
-// deserialize to null (a clean full re-validation, never a misread node).
-const format_version: u32 = 2;
+// v3: the `Kind` enum was unified with `Cache.Phase` and its in-memory-only kinds
+// renumbered (codegen pinned to byte 3, body/type_of/layout/resolve_name shifted);
+// a v2 blob's kind bytes would now mis-decode, so the bump forces those to
+// deserialize to null (a clean full re-validation, never a misread node). v2 itself
+// had dropped the never-recorded `Kind.resolve` for the same reason.
+const format_version: u32 = 3;
 
 /// Header: magic, version, revision, node_count, edge_count. All u64-padded so
 /// the body alignment is trivially 8 and no struct padding is ever hashed/written

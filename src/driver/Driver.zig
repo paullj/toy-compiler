@@ -18,7 +18,6 @@ const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
 const Dag = @import("../query/Dag.zig");
-const Key = @import("../query/Key.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
 const Graph = @import("Graph.zig");
@@ -40,7 +39,7 @@ pub const cache_dir_buf_len = cache_root.len + 1 + version.stamp_max + "/cache".
 
 /// Open the per-compiler cache directory (`.toy/<stamp>/cache/`). `dir_buf` must
 /// outlive the returned `Cache` (it borrows the formatted path). Used by the CLI
-/// to share one cache across `Driver.run` (front-end) and `lowerProgram` (codegen).
+/// to share one cache across `Driver.run` (front-end) and `lowerGraphProgram` (codegen).
 pub fn openCache(io: Io, dir_buf: []u8) !Cache {
     var stamp_buf: [version.stamp_max]u8 = undefined;
     const dir = std.fmt.bufPrint(dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
@@ -311,7 +310,7 @@ pub const LinkedProgram = struct {
     }
 };
 
-/// What `lowerProgram` produced for a single, already type-checked file: either a
+/// What `lowerGraphProgram` produced for an already type-checked program: either a
 /// linked program (caller frees) or one `EmitError`.
 pub const LowerProgramResult = union(enum) {
     ok: LinkedProgram,
@@ -329,8 +328,9 @@ const FnSlot = struct {
     ir_instrs: usize = 0,
 };
 
-/// Frozen, read-only inputs shared by every codegen job (thread-safe: nothing
-/// here is mutated during the fan-out).
+/// The single-fn, read-only view one codegen job runs against (thread-safe: nothing
+/// here is mutated during the fan-out). Built per job by `GraphFrozen.frozenFor` from
+/// the job's owning-module per-module arrays plus the program-wide tables.
 const Frozen = struct {
     tree: Ast.Tree,
     tokens: []const Token,
@@ -340,152 +340,13 @@ const Frozen = struct {
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
+    /// A one-element slice naming this job's fn (`frozenFor` points it at a stack buf).
     fn_nodes: []const Ast.Index,
-    entry_fn: u32,
     sigs: []const Fingerprint.Sig,
     /// M13 opt level / pass selection. Mixed into the codegen cache key so
     /// toggling `-O` lands on a different entry, and threaded into `lowerOne`.
     opt: Opt.Config,
 };
-
-/// Lower EVERY function in the file (in parallel, memoized through the codegen
-/// cache), then run the serial relink tail: intern strings, lay the functions
-/// out in one `__text` blob with `main` as entry, and rebase cross-segment
-/// relocs. Locates the `fn_decl` named `main`. The file must already be `checked`
-/// with no front-end errors. Caller owns the returned `LinkedProgram` on success.
-pub fn lowerProgram(
-    gpa: std.mem.Allocator,
-    io: Io,
-    cache: Cache,
-    target: []const u8,
-    r: *const FileResult,
-    mode: CodegenIr.Mode,
-    opt: Opt.Config,
-) !LowerProgramResult {
-    const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
-    const prog = r.nodes[Ast.root(r.nodes)];
-    std.debug.assert(prog.tag == .program);
-
-    // Collect every function in source order; the index is the resolver/codegen
-    // symbol id. Find `main`'s position to use as the entry.
-    var fn_nodes: std.ArrayList(Ast.Index) = .empty;
-    defer fn_nodes.deinit(gpa);
-    var entry_fn: ?u32 = null;
-    for (Ast.rangeSlice(tree, prog.lhs)) |fn_idx| {
-        const decl = r.nodes[fn_idx];
-        if (decl.tag != .fn_decl) continue;
-        if (entry_fn == null and std.mem.eql(u8, r.tokens[decl.main_token].text(r.source), "main")) {
-            entry_fn = @intCast(fn_nodes.items.len);
-        }
-        try fn_nodes.append(gpa, fn_idx);
-    }
-
-    const main_sym = entry_fn orelse return .{ .err = .{
-        .message = "-o requires a function named 'main'",
-        .byte_offset = null,
-    } };
-
-    // Parameters on main are unsupported (Codegen also guards this, but the driver
-    // gives the cleaner up-front message at main's name token).
-    const main_decl = r.nodes[fn_nodes.items[main_sym]];
-    const main_proto = Ast.protoAt(tree, main_decl.lhs);
-    if (main_proto.params.len > 0) {
-        return .{ .err = .{
-            .message = "parameters on main unsupported in M1 codegen",
-            .byte_offset = r.tokens[main_decl.main_token].start,
-        } };
-    }
-
-    // Rule 7: `main` may only yield `int` (the process exit code) or `()`. The
-    // type checker (`Typecheck.checkMainReturn`) is now the primary, sorted-
-    // diagnostic enforcement point; this codegen-entry guard is a defense-in-depth
-    // backstop for callers that reach `lowerProgram` without the typecheck-diag gate.
-    const main_ret = r.typecheck.?.sigs[main_sym].ret;
-    if (main_ret.kind != .int and main_ret.kind != .unit) {
-        return .{ .err = .{
-            .message = "main must return int or ()",
-            .byte_offset = r.tokens[main_decl.main_token].start,
-        } };
-    }
-
-    // Build the index→SymName table once (user fns by spelling, print at the end).
-    const names = try buildNames(gpa, tree, r.tokens, r.source, fn_nodes.items);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-
-    const frozen = Frozen{
-        .tree = tree,
-        .tokens = r.tokens,
-        .source = r.source,
-        .resolutions = r.resolutions(),
-        .node_types = r.nodeTypes(),
-        .layouts = r.typecheck.?.layouts,
-        .enum_layouts = r.typecheck.?.enum_layouts,
-        .names = names,
-        .fn_nodes = fn_nodes.items,
-        .entry_fn = main_sym,
-        .sigs = r.typecheck.?.sigs,
-        .opt = opt,
-    };
-
-
-    // --- parallel per-fn fan-out ---
-    const slots = try gpa.alloc(FnSlot, fn_nodes.items.len);
-    defer gpa.free(slots);
-    for (slots) |*s| s.* = .{};
-
-    const Ctx = struct {
-        gpa: std.mem.Allocator,
-        io: Io,
-        cache: Cache,
-        target: []const u8,
-        mode: CodegenIr.Mode,
-        frozen: *const Frozen,
-        slots: []FnSlot,
-        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(fnJob)) {
-            return .{ c.gpa, c.io, c.cache, c.target, c.mode, c.frozen, i, &c.slots[i] };
-        }
-    };
-    Engine.fanOut(io, fn_nodes.items.len, fnJob, Ctx{
-        .gpa = gpa,
-        .io = io,
-        .cache = cache,
-        .target = target,
-        .mode = mode,
-        .frozen = &frozen,
-        .slots = slots,
-    });
-
-    // Collect: on any job error, free everything lowered so far and propagate.
-    var first_err: ?anyerror = null;
-    for (slots) |s| if (s.err) |e| {
-        if (first_err == null) first_err = e;
-    };
-    if (first_err) |e| {
-        for (slots) |*s| if (s.fc) |*fc| fc.deinit(gpa);
-        return e;
-    }
-
-    var compiled: usize = 0;
-    var cached_n: usize = 0;
-    var opt_stats: Opt.Stats = .{};
-    var ir_instrs: usize = 0;
-    for (slots) |s| {
-        if (s.cached) {
-            cached_n += 1;
-        } else {
-            compiled += 1;
-        }
-        // Cached fns leave opt_stats/ir_instrs at 0 (their opt ran on a prior
-        // build); --force re-lowers everything for honest --opt-stats numbers.
-        opt_stats.add(s.opt_stats);
-        ir_instrs += s.ir_instrs;
-    }
-
-    return relink(io, gpa, slots, names, main_sym, compiled, cached_n, opt_stats, ir_instrs);
-}
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
 /// or one `EmitError`.
@@ -493,43 +354,6 @@ pub const IrResult = union(enum) {
     ok: []u8,
     err: EmitError,
 };
-
-/// One per-function codegen job: fingerprint → cache hit (with optional VERIFY)
-/// or fresh lower → cache store. Writes only its own `slot` (no locks).
-fn fnJob(
-    gpa: std.mem.Allocator,
-    io: Io,
-    cache: Cache,
-    target: []const u8,
-    mode: CodegenIr.Mode,
-    frozen: *const Frozen,
-    idx: usize,
-    slot: *FnSlot,
-) void {
-    fnJobInner(gpa, io, cache, target, mode, frozen, idx, slot) catch |e| {
-        slot.err = e;
-    };
-}
-
-fn fnJobInner(
-    gpa: std.mem.Allocator,
-    io: Io,
-    cache: Cache,
-    target: []const u8,
-    mode: CodegenIr.Mode,
-    frozen: *const Frozen,
-    idx: usize,
-    slot: *FnSlot,
-) !void {
-    const fn_decl = frozen.fn_nodes[idx];
-    const sym = frozen.names[idx];
-    const is_entry = idx == frozen.entry_fn;
-    const my_sig: ?Fingerprint.Sig = if (idx < frozen.sigs.len) frozen.sigs[idx] else null;
-    const engine = Engine.init(cache, mode);
-    // Single-file: the fn index IS its global id; no red-green reuse oracle (the
-    // dag-driven path is graph-only), so `reuse = null` keeps this VERBATIM.
-    try engine.codegen(gpa, io, target, frozen, fn_decl, sym, is_entry, my_sig, idx, @intCast(idx), null, slot);
-}
 
 /// The SERIAL relink tail (every build, uncached): derive `uses_write`, append
 /// the print body, intern strings program-wide (deterministic: fn source order
@@ -590,24 +414,6 @@ fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []cons
     };
 }
 
-/// Build the index→SymName table: user fns named by their source spelling, plus
-/// the synthetic `print` builtin at user_fn_count. Caller owns the names.
-fn buildNames(gpa: std.mem.Allocator, tree: Ast.Tree, tokens: []const Token, source: []const u8, fn_nodes: []const Ast.Index) ![]Link.SymName {
-    const names = try gpa.alloc(Link.SymName, fn_nodes.len + 1);
-    var built: usize = 0;
-    errdefer {
-        for (names[0..built]) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-    for (fn_nodes, 0..) |fn_idx, i| {
-        const nm = tokens[tree.nodes[fn_idx].main_token].text(source);
-        names[i] = .{ .kind = .user_fn, .name = try gpa.dupe(u8, nm) };
-        built += 1;
-    }
-    names[fn_nodes.len] = .{ .kind = .builtin, .name = try gpa.dupe(u8, "print") };
-    return names;
-}
-
 // ---- M14 whole-graph code emission -----------------------------------------
 
 /// Frozen, read-only inputs shared by every codegen job in a WHOLE-GRAPH build.
@@ -649,20 +455,13 @@ const GraphFrozen = struct {
     /// `Engine.initDag` so `query()` records caller->callee codegen edges.
     dag: ?*Dag = null,
 
-    /// M16/M17: the per-lowerable-fn red-green REUSE decision, computed
-    /// single-threaded BEFORE the fan-out (the walk is not thread-safe) and indexed
-    /// by `lower_i`. Each worker just READS its slot — no shared mutation, so
-    /// determinism is preserved. `null` (the default) means no oracle => every fn
-    /// recomputes verbatim; a non-null slice is only present on the dag-driven path.
-    reuse: ?[]const Engine.Reuse = null,
-
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
     /// only when `--timings` is on. BORROWED; null on a plain build => zero overhead.
     probe: ?*Engine.LowerProbe = null,
 
     /// Build the single-fn `Frozen` view a codegen job runs against: this fn's
     /// owning module's per-module arrays + the program-wide tables. `fn_nodes` is
-    /// a one-element slice (this fn) so `entry_fn`/`names[idx]` index correctly.
+    /// a one-element slice naming this fn (the job reads `fn_nodes[0]`).
     fn frozenFor(gf: *const GraphFrozen, lower_i: usize, fn_node_buf: *[1]Ast.Index) Frozen {
         const mod = gf.fn_modules[lower_i];
         fn_node_buf[0] = gf.fn_decls[lower_i];
@@ -676,10 +475,6 @@ const GraphFrozen = struct {
             .enum_layouts = gf.enum_layouts,
             .names = gf.names,
             .fn_nodes = fn_node_buf[0..1],
-            // `entry_fn` is only read by the single-file `fnJobInner`; the graph
-            // job computes its own `is_entry` from the global fn id, so this view's
-            // value is inert. Set to the one slot so it can never alias another fn.
-            .entry_fn = 0,
             .sigs = gf.sigs,
             .opt = gf.opt,
         };
@@ -702,7 +497,6 @@ pub fn lowerGraphProgram(
     mode: CodegenIr.Mode,
     opt: Opt.Config,
     dag: ?*Dag,
-    prior: ?*const Dag.Loaded,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
 ) !LowerProgramResult {
@@ -784,28 +578,6 @@ pub fn lowerGraphProgram(
         } };
     }
 
-    // --- red-green REUSE pre-pass (single-threaded, BEFORE the fan-out) ---
-    // The walk is not thread-safe and must run on a fully-recorded fresh body
-    // subtree (resolve/typecheck ran before us and recorded body/signature/layout/
-    // type_of/resolve_name into `dag`). For each lowerable fn we drive the walk from
-    // its `body(gid)` node and mark its codegen GREEN iff body(gid) verifies
-    // unchanged (option b: a codegen node is a pure function of its body subtree, so
-    // body-green => codegen-green WITHOUT recomputing the codegen fingerprint — the
-    // perf win). The decision is materialized into a per-lower_i array each worker
-    // just reads. `null` when there is no dag or no prior snapshot => verbatim.
-    // Computed for `.verify` ONLY — to CROSS-CHECK each green verdict's stamp against a
-    // fresh recompute (the soundness audit). The `.normal` green fast-path was REMOVED:
-    // this pre-pass is SINGLE-THREADED and cost more than the parallel per-fn fingerprint
-    // it skipped (a fully-cached build ran ~2x slower than `--force`). `.normal` now always
-    // recomputes via the content-fp cache, which delivers the identical cutoff correctly.
-    // `--force` and release builds (`dag == null`) skip this entirely.
-    var reuse_decisions: ?[]Engine.Reuse = null;
-    defer if (reuse_decisions) |rds| gpa.free(rds);
-    if (mode == .verify) if (dag) |d| if (prior) |pr| {
-        const rds = try computeReuse(gpa, d, pr, target, opt, lower_ids.items, eid);
-        reuse_decisions = rds;
-    };
-
     const gf = GraphFrozen{
         .trees = trees,
         .tokens = toks,
@@ -822,7 +594,6 @@ pub fn lowerGraphProgram(
         .entry_id = eid,
         .opt = opt,
         .dag = dag,
-        .reuse = reuse_decisions,
         .probe = probe,
     };
 
@@ -901,64 +672,11 @@ fn nowNs(io: Io) i128 {
     return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
 }
 
-/// Compute the per-lowerable-fn red-green REUSE decision SINGLE-THREADED before the
-/// fan-out. Drives `Dag.RedGreen` over the fresh body subtree (already recorded by
-/// the resolve/typecheck passes) against the `prior` snapshot, then marks a fn's
-/// codegen GREEN iff:
-///   1. its `body(gid)` node verifies UNCHANGED in the walk (so the whole body
-///      subtree — signature/layout/type_of/resolve_name — is green; option b: a
-///      codegen node is a pure function of its body deps, so we never recompute the
-///      codegen fingerprint on the green path), AND
-///   2. the prior DAG carries a codegen node under THIS fn's stable identity (so we
-///      have its prior stamp = the content-fp cache key to reuse the cached blob).
-/// Any walk cycle / missing prior node falls back to RED (recompute) for that fn —
-/// never a false green. The returned array is parallel to `lower_ids` (indexed by
-/// lower_i). Caller owns + frees it.
-fn computeReuse(
-    gpa: std.mem.Allocator,
-    fresh: *Dag,
-    prior: *const Dag.Loaded,
-    target: []const u8,
-    opt: Opt.Config,
-    lower_ids: []const u32,
-    entry_id: u32,
-) ![]Engine.Reuse {
-    const rds = try gpa.alloc(Engine.Reuse, lower_ids.len);
-    errdefer gpa.free(rds);
-    for (rds) |*r| r.* = .{};
-
-    var rg = try Dag.RedGreen.init(gpa, prior, fresh);
-    defer rg.deinit();
-
-    // Drive the walk from each fn's body node. A cycle in the prior edges (should
-    // never happen — the firewall makes the body graph acyclic) means we cannot
-    // trust ANY verdict, so leave every decision RED (the safe full-rebuild fallback).
-    var body_roots: std.ArrayList(Dag.NodeKey) = .empty;
-    defer body_roots.deinit(gpa);
-    for (lower_ids) |gid| try body_roots.append(gpa, .{ .kind = .body, .id = gid });
-    rg.run(body_roots.items) catch return rds; // all-RED fallback on cycle
-
-    for (lower_ids, 0..) |gid, lower_i| {
-        const body_node: Dag.NodeKey = .{ .kind = .body, .id = gid };
-        const verdict = rg.verdictOf(body_node) catch continue; // RED on cycle
-        if (verdict != .green) continue;
-        // The prior codegen node's stamp = the content-fp cache key the green path
-        // reuses. Absent => we cannot reconstruct the cache key => recompute (RED).
-        // `is_entry` MUST match how Engine.codegen recorded the node (it folds the
-        // entry flag into the identity) so the lookup hits the right stamp.
-        const is_entry = gid == entry_id;
-        const stable_id = Key.codegenIdentity(target, opt, gid, is_entry);
-        const stamp = prior.nodeFp(.{ .kind = .codegen, .id = stable_id }) orelse continue;
-        rds[lower_i] = .{ .green = true, .stamp = stamp };
-    }
-    return rds;
-}
-
-/// One whole-graph per-fn codegen job: build the single-fn `Frozen` view for this
-/// fn's owning module, then run the SAME fingerprint→cache→lower path as the
-/// single-file `fnJob`. The cross-module callee identity + touched layouts ride
-/// in through the program-wide `names`/`sigs`/`layouts`, so the fingerprint folds
-/// a qualified callee's SymName+sig distinctly with NO engine change. [design 8/10]
+/// One per-fn codegen job: build the single-fn `Frozen` view for this fn's owning
+/// module, then run the fingerprint→cache→lower path via `Engine.codegen`. The
+/// cross-module callee identity + touched layouts ride in through the program-wide
+/// `names`/`sigs`/`layouts`, so the fingerprint folds a qualified callee's SymName+sig
+/// distinctly with NO engine change. [design 8/10]
 fn graphFnJob(
     gpa: std.mem.Allocator,
     io: Io,
@@ -997,13 +715,12 @@ fn graphFnJobInner(
     // layout edit at the importer (cross-module M9 / TOP-RISK-#1 hole). [design 10]
     const my_sig: ?Fingerprint.Sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
 
-    // SAME engine codegen query as the single-file `fnJobInner`: the cross-module
-    // callee identity + touched layouts ride in through the program-wide
-    // `names`/`sigs`/`layouts` of this fn's `frozen` view, so the fingerprint folds
-    // a qualified callee distinctly with NO engine change. tmp_tag = `lower_i`.
+    // The cross-module callee identity + touched layouts ride in through the
+    // program-wide `names`/`sigs`/`layouts` of this fn's `frozen` view, so the
+    // fingerprint folds a qualified callee distinctly with NO engine change.
+    // tmp_tag = `lower_i`.
     const engine = Engine.initProbe(cache, mode, gf.dag, gf.probe);
-    const reuse: ?Engine.Reuse = if (gf.reuse) |r| r[lower_i] else null;
-    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, gid, reuse, slot);
+    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, gid, slot);
 }
 
 /// Build the program-wide index→SymName table for a graph build: one entry per
@@ -1097,6 +814,27 @@ pub fn buildImage(
 // ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
+
+/// Test-only: lower an already-`.check`ed single-file `FileResult` through the SAME
+/// whole-graph codegen orchestration the production `-o` build drives. A lone file IS
+/// the trivial one-module graph, so we wrap it in `Graph.single` and feed its existing
+/// whole-graph `resolve`/`typecheck` results (graph-of-one == program-wide tables) to
+/// `lowerGraphProgram` — there is ONE codegen path, exercised here too. `io == null` to
+/// `lowerGraphProgram` would block on the pool; tests pass a real threaded `io`. Caller
+/// owns the result on `.ok`.
+fn lowerSingleFile(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    r: *const FileResult,
+    mode: CodegenIr.Mode,
+    opt: Opt.Config,
+) !LowerProgramResult {
+    var graph = try Graph.single(gpa, "main", r.path, r.source, r.tokens, r.nodes, r.extra, r.pub_bits);
+    defer graph.deinitSingle(gpa);
+    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, null);
+}
 
 test "cold then warm parse: 2nd run hits cache and renders identically" {
     const gpa = testing.allocator;
@@ -1209,7 +947,7 @@ test "emit=check on a bad program reports a resolve error" {
     try testing.expect(r.resolve.?.diags.len > 0);
 }
 
-test "lowerProgram reports missing main and lowers a simple main" {
+test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1234,7 +972,7 @@ test "lowerProgram reports missing main and lowers a simple main" {
         try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 0);
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
+        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         switch (lowered) {
             .err => |e| try testing.expect(e.byte_offset == null),
             .ok => |*lp| {
@@ -1254,7 +992,7 @@ test "lowerProgram reports missing main and lowers a simple main" {
         try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 1);
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
+        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         switch (lowered) {
             .err => return error.TestUnexpectedResult,
             .ok => |*lp| {
@@ -1611,7 +1349,7 @@ test "integration: emitted binary runs with the right exit code" {
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
 
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
+        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         const lp = switch (lowered) {
             .ok => |*ok| ok,
             .err => return error.TestUnexpectedResult,
@@ -1686,7 +1424,7 @@ test "integration: print writes the expected bytes to stdout" {
         defer r.deinit(gpa);
         try testing.expect(r.err == null);
 
-        var lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
+        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         const lp = switch (lowered) {
             .ok => |*ok| ok,
             .err => return error.TestUnexpectedResult,
@@ -1738,7 +1476,7 @@ fn checkAndLower(
     r_out.* = .{ .path = path };
     try pipeline(gpa, io, cache, .check, "aarch64-macos", r_out, 0);
     try testing.expect(r_out.err == null);
-    const lowered = try lowerProgram(gpa, io, cache, "aarch64-macos", r_out, mode, .O0);
+    const lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", r_out, mode, .O0);
     return switch (lowered) {
         .ok => |ok| ok,
         .err => error.TestUnexpectedResult,

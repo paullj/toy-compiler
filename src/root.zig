@@ -11,6 +11,7 @@ pub const Cache = @import("query/Cache.zig");
 pub const QueryEngine = @import("query/Engine.zig");
 pub const QueryKey = @import("query/Key.zig");
 pub const QueryDag = @import("query/Dag.zig");
+pub const StageGraph = @import("query/StageGraph.zig");
 pub const Driver = @import("driver/Driver.zig");
 pub const Graph = @import("driver/Graph.zig");
 pub const DiagnosticSink = @import("diagnostics/Sink.zig");
@@ -43,6 +44,7 @@ test {
     _ = QueryEngine;
     _ = QueryKey;
     _ = QueryDag;
+    _ = StageGraph;
     _ = Driver;
     _ = Graph;
     _ = DiagnosticSink;

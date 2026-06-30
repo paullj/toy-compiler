@@ -246,12 +246,15 @@ dag: ?*Dag = null,
 /// IS `fns[i].name`). Null single-file (the decl-token name is used instead).
 gph_fn_names: ?[]const []const u8 = null,
 
-/// S4 — the runtime the parallel Pass-C body-check fan-out dispatches onto. Set
-/// in graph mode (carries the `-j N` worker cap from the driver's own pool); when
-/// `dag == null` Pass-C fans out per-fn body checks via `Engine.fanOut(io, ...)`.
-/// `.limited(0)` (`-j1`) drives every job onto the inline serial fallback — the
-/// byte-identity baseline. Incremental builds (`dag != null`) ignore it and stay
-/// serial so the red-green edge recording is unchanged.
+/// S4 — the runtime the per-fn body region (Pass C) dispatches onto. Set in graph
+/// mode (carries the `-j N` worker cap from the driver's own pool). The body region
+/// fans out per-fn body checks via `Engine.fanOut(io, ...)` whenever a pool is present
+/// (`io != null`) — INDEPENDENT of whether a DAG is being recorded: per-fn recording
+/// is thread-safe (spinlock-guarded `recordEdge`, threadlocal `Dag.Active`), so a
+/// recorded DAG is byte-identical at any -j. `.limited(0)` (`-j1`) drives every unit
+/// onto the inline serial path — the byte-identity baseline. `io == null` (single-file
+/// internal callers + inline tests) is the only serial trigger; both dispatch modes
+/// feed the SAME slots + merge+sort, so the result is byte-identical regardless.
 io: ?Io = null,
 
 /// The graph context the orchestrator hands the shared `Typecheck`. It owns the
@@ -307,11 +310,11 @@ const Model = struct {
 /// scratch (slot_types/cur_ret/loop_stack/expected) and the cursor (tree/tokens/
 /// source/resolutions/node_types/graph_mod) — all set once at construction from
 /// the fn's owning module, never swapped (gphSelect's save/restore is gone on this
-/// path). Diagnostics go to a LOCAL `sink` (scoped to the fn's module); the Pass-C
-/// driver (`checkBodySerial` serial, `bodyJob` parallel) merges it into the
-/// shared sink AFTER the body walk, so parallel Pass C never touches shared
-/// mutable diag state. `node_types` aliases the program-wide array but each
-/// BodyChecker writes ONLY its own fn's node span (disjoint by construction).
+/// path). Diagnostics go to a LOCAL `sink` (scoped to the fn's module); the per-fn
+/// body region (`checkBodies`) merges it into the shared sink in fn-id order AFTER
+/// the body walk, so parallel Pass C never touches shared mutable diag state.
+/// `node_types` aliases the program-wide array but each BodyChecker writes ONLY its
+/// own fn's node span (disjoint by construction).
 const BodyChecker = struct {
     model: *const Model,
     gpa: std.mem.Allocator,
@@ -2192,40 +2195,33 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // — the S4 fan-out unit. The merge (concat + stable sort) happens once, serial,
     // after the join, so PARALLEL == SERIAL.
     const model = t.buildModel();
-
-    // Incremental builds (dag != null) record red-green edges into the shared Dag
-    // during checkBody — NOT thread-safe — so they stay serial. The default
-    // whole-program / `--emit` path (dag == null) fans out.
-    if (t.dag != null or t.io == null) {
-        for (t.fns.items, 0..) |f, i| {
-            if (f.decl_node == Ast.none) continue;
-            try t.checkBodySerial(&model, @intCast(i), f);
-        }
-        // Sort the SAME way the parallel path does so graph diagnostics are
-        // byte-identical at -j1 (serial) and -jN. Fn-id-order appends are already
-        // (scope, byte_offset)-monotone for nearly every program, but the stable
-        // sort makes the contract explicit + total (PARALLEL == SERIAL).
-        t.sink.sort();
-        return;
-    }
-
-    try t.runPassCParallel(&model);
+    try t.checkBodies(&model);
 }
 
-/// Per-fn body-check result produced by one parallel Pass-C job. Each holds its
-/// own `DiagnosticSink` (already scoped to the fn's module) until the serial merge
-/// transfers it into the shared sink; `node_types` were written directly into the
-/// shared per-module arrays (disjoint span, no race).
+/// Per-fn body-check result produced by one body-region job. Each holds its own
+/// `DiagnosticSink` (already scoped to the fn's module) until the merge transfers it
+/// into the shared sink; `node_types` were written directly into the shared
+/// per-module arrays (disjoint span, no race).
 const BodyResult = struct {
     sink: DiagnosticSink,
     err: ?anyerror = null,
 };
 
-/// Fan out every fn's body check across the worker pool, then merge the per-fn
-/// sinks on this (main) thread in fn-id order and STABLE-sort once. Stability is
-/// load-bearing — ties keep fn-id (= source) emission order, reproducing the serial
-/// discovery order exactly, so the merged stream is byte-identical at every `-j`.
-fn runPassCParallel(t: *Typecheck, model: *const Model) !void {
+/// THE per-fn body region (Pass C): run every fn's body check as an independent
+/// unit, then merge the per-fn sinks in fn-id order and STABLE-sort ONCE. This is
+/// the SINGLE body code path — there is no serial-vs-parallel fork. Dispatch is the
+/// only thing that varies: with a worker pool (`io != null`) the units fan out via
+/// `Engine.fanOut`; with no pool (`io == null`: single-file internal callers + inline
+/// tests) they run inline on this thread. Both feed the SAME slots and the SAME
+/// merge+sort, so the result is byte-identical regardless of dispatch.
+///
+/// DETERMINISM ([C11]): units are independent (each writes only its own fn's
+/// node_types span + its own local sink); the merge is fn-id ordered and the stable
+/// sort breaks (scope, byte_offset) ties by insertion order, reproducing source
+/// order exactly — so -j1 and -jN diagnostics are identical. DAG recording is
+/// thread-safe (spinlock-guarded `recordEdge`, threadlocal `Dag.Active`, each
+/// `body(fid)` a root), so the recorded DAG is byte-identical at any -j too.
+fn checkBodies(t: *Typecheck, model: *const Model) !void {
     const gpa = t.gpa;
     const n = t.fns.items.len;
     const slots = try gpa.alloc(BodyResult, n);
@@ -2235,15 +2231,19 @@ fn runPassCParallel(t: *Typecheck, model: *const Model) !void {
     // so a deinit of an already-merged slot is a no-op — no double-free).
     defer for (slots) |*s| s.sink.deinit();
 
-    const Ctx = struct {
-        t: *const Typecheck,
-        model: *const Model,
-        slots: []BodyResult,
-        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(bodyJob)) {
-            return .{ c.t, c.model, @as(u32, @intCast(i)), &c.slots[i] };
-        }
-    };
-    Engine.fanOut(t.io.?, n, bodyJob, Ctx{ .t = t, .model = model, .slots = slots });
+    if (t.io) |io| {
+        const Ctx = struct {
+            t: *const Typecheck,
+            model: *const Model,
+            slots: []BodyResult,
+            pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(bodyUnit)) {
+                return .{ c.t, c.model, @as(u32, @intCast(i)), &c.slots[i] };
+            }
+        };
+        Engine.fanOut(io, n, bodyUnit, Ctx{ .t = t, .model = model, .slots = slots });
+    } else {
+        for (slots, 0..) |*s, i| bodyUnit(t, model, @intCast(i), s);
+    }
 
     for (slots) |s| if (s.err) |e| return e;
 
@@ -2255,12 +2255,15 @@ fn runPassCParallel(t: *Typecheck, model: *const Model) !void {
     t.sink.sort();
 }
 
-/// One parallel Pass-C unit: construct a BodyChecker for fn `fid` over the frozen
+/// One body-region unit: construct a BodyChecker for fn `fid` over the frozen
 /// `model`, walk its body, and move its local sink into `out`. Writes only its own
-/// fn's node_types span + `out` — no shared mutable state — so jobs are race-free
-/// and order-free. `dag` is null on this path (the serial branch handles
-/// incremental), so checkBody records nothing.
-fn bodyJob(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
+/// fn's node_types span + `out` for shared MUTABLE state, so units are race-free and
+/// order-free (safe under `Engine.fanOut` and identical inline). The per-fn
+/// BodyChecker carries `t.dag` (via `bodyCheckerFor`): when a DAG is present each unit
+/// records its `body(fid)` subtree through the spinlock-guarded `recordEdge` with a
+/// threadlocal `Dag.Active`, so recording is thread-safe and the merged DAG is
+/// byte-identical at any -j.
+fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
     const f = model.fns[fid];
     if (f.decl_node == Ast.none) return;
     var bc = t.bodyCheckerFor(model, f);
@@ -2613,37 +2616,6 @@ fn appendPrint(t: *Typecheck) !void {
     const params = try t.gpa.dupe(Type, &.{.str});
     try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .params = params, .ret = .unit });
 }
-
-/// Check one fn body against the FROZEN `model`. Constructs a per-fn
-/// `BodyChecker` (cursor wired to the fn's owning module, scratch fresh, sink
-/// local + scoped), runs the body walk through it, then MERGES its sink into the
-/// shared sink in walk order. Serial Pass B/C calls this per fn in source order,
-/// so the merged diags reproduce today's discovery order byte-for-byte. Same
-/// body-walk as `bodyJob`; the graph caller sorts after the loop.
-fn checkBodySerial(t: *Typecheck, model: *const Model, fid: u32, f: FnSym) !void {
-    var bc = t.bodyCheckerFor(model, f);
-    defer bc.deinit();
-    try bc.checkBody(fid, f);
-    try t.sink.merge(&bc.sink);
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

@@ -25,7 +25,7 @@ set -u
 root="$(cd "$(dirname "$0")/.." && pwd)"
 toyc="$root/zig-out/bin/toy"
 
-echo "building toyc..."
+echo "building toy..."
 if command -v zig >/dev/null 2>&1; then zig="zig"
 elif command -v mise >/dev/null 2>&1; then zig="mise exec -- zig"
 else echo "build failed: no zig (and no mise to provide it)"; exit 1; fi
@@ -44,7 +44,7 @@ fail_one() { echo "  FAIL: $1"; fail=$((fail + 1)); }
 run_scenario() {
   local name="$1" base="$2" edited="$3" expect_cutoff="$4"
   local d="$work/$name"; mkdir -p "$d"; local src="$d/prog.toy"
-  ( cd "$d" && rm -rf .toy-cache )
+  ( cd "$d" && rm -rf .toy )
 
   printf '%s' "$base" > "$src"
   ( cd "$d" && "$toyc" -o base.bin --query-stats prog.toy >/dev/null 2>&1 ) \
@@ -140,7 +140,7 @@ fn main() -> int { return add(40, 2) }
 #    depends on the imported fn SIGNATURE, never its body, so the entry cuts off.
 run_cross_module() {
   local d="$work/cross"; mkdir -p "$d/lib"
-  ( cd "$d" && rm -rf .toy-cache )
+  ( cd "$d" && rm -rf .toy )
   cat > "$d/main.toy" <<'TOY'
 import lib/util
 fn main() -> int { return util.compute(40) }

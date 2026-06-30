@@ -9,7 +9,7 @@ toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-echo "building toyc..."
+echo "building toy..."
 ( cd "$root" && zig build ) || { echo "build failed"; exit 1; }
 
 pass=0; fail=0
@@ -47,9 +47,10 @@ while IFS= read -r src; do
   if [ -n "$exp_exit" ] && [ "$rc" -ne "$exp_exit" ]; then fail_one "$rel: exit $rc, want $exp_exit"; ok=0; fi
   if [ -n "$exp_stdout" ] && [ "$out" != "$exp_stdout" ]; then fail_one "$rel: stdout mismatch"; ok=0; fi
   [ "$ok" -eq 1 ] && { echo "  ok: $rel"; pass=$((pass + 1)); }
-# `modules/` holds multi-file programs whose non-entry files have no `main`;
-# they are driven by `examples/modules/check.sh`, not this single-file harness.
-done < <(find "$root/examples" -path "$root/examples/modules" -prune -o -name '*.toy' -print | sort)
+# `modules/` holds multi-file programs whose non-entry files have no `main` (driven
+# by `examples/modules/check.sh`); `bench/` is the perf/opt corpus (driven by
+# `examples/bench/opt-check.sh`). Neither belongs in this single-file expect harness.
+done < <(find "$root/examples" \( -path "$root/examples/modules" -o -path "$root/examples/bench" \) -prune -o -name '*.toy' -print | sort)
 
 echo "---"
 echo "$pass passed, $fail failed"

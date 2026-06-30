@@ -884,7 +884,6 @@ fn wireBuild(
     cache: Cache,
     entry: []const u8,
     source: []const u8,
-    prior: ?*const Dag.Loaded,
 ) !WireBuild {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry, .data = source });
 
@@ -903,7 +902,7 @@ fn wireBuild(
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, prior, null, null);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, null, null);
     switch (lowered) {
         .err => return error.TestUnexpectedResult,
         .ok => |*lp| {
@@ -958,7 +957,7 @@ test "M17 WIRE-AND-PROOF: a body edit through the real -o pipeline cuts off the 
     ;
 
     // --- build 1: cold, record + persist the DAG ---
-    var b0 = try wireBuild(gpa, io, cache, entry, base, null);
+    var b0 = try wireBuild(gpa, io, cache, entry, base);
     defer b0.deinit();
     try testing.expectEqual(@as(usize, 3), b0.compiled); // cold: all 3 fns lowered
     try testing.expectEqual(@as(usize, 0), b0.cached);
@@ -973,7 +972,7 @@ test "M17 WIRE-AND-PROOF: a body edit through the real -o pipeline cuts off the 
     var prior = (try Dag.deserialize(gpa, prior_blob)) orelse return error.ArtifactUnparseable;
     defer prior.deinit(gpa);
 
-    var b1 = try wireBuild(gpa, io, cache, entry, edited, null);
+    var b1 = try wireBuild(gpa, io, cache, entry, edited);
     defer b1.deinit();
     // THE BYTE-LEVEL CUTOFF: exactly ONE fn re-lowered (mul); add + main are cache
     // hits (their content fingerprints are unchanged — the firewall).
@@ -1011,17 +1010,18 @@ test "M17 WIRE-AND-PROOF: a body edit through the real -o pipeline cuts off the 
 }
 
 // ===========================================================================
-// M17 GREEN-GATE: the red-green walk DRIVES codegen reuse (not just observes it).
-// Each test edits a source, rebuilds with the prior DAG threaded in so the green
-// fast-path can fire, and asserts the emitted __text is BYTE-IDENTICAL to a cold
-// full rebuild of the same edited source. Byte-identity is the non-negotiable
-// correctness oracle: a false-green / stale-blob reuse would change a byte.
+// CONTENT-FP CUTOFF: the content-fp cache is the SOLE reuse driver. Each test edits
+// a source, rebuilds over a warm cache so unchanged fns are served from the cache,
+// and asserts the emitted __text is BYTE-IDENTICAL to a cold full rebuild of the
+// same edited source. Byte-identity is the non-negotiable correctness oracle: a
+// stale-blob reuse would change a byte. (The DAG records the same nodes for the
+// red-green REPORTER; it never gates these builds.)
 // ===========================================================================
 
 /// One full `-o`-shaped build returning the emitted __text (caller frees) + the
 /// codegen compiled/cached counters + the fresh serialized DAG blob (caller frees).
-/// `prior` (when non-null) is threaded into `lowerGraphProgram` so the green reuse
-/// fast-path can fire — modelling a second `--query-stats` invocation.
+/// Reuse is the content-fp cache (the sole driver); the DAG is recorded for
+/// observability and serialized so a caller can run the red-green REPORTER over it.
 const GateBuild = struct {
     text: []u8,
     dag_blob: []u8,
@@ -1040,7 +1040,6 @@ fn gateBuild(
     cache: Cache,
     entry: []const u8,
     files: []const FixtureFile,
-    prior: ?*const Dag.Loaded,
 ) !GateBuild {
     for (files) |f| try Io.Dir.cwd().writeFile(io, .{ .sub_path = f.path, .data = f.source });
 
@@ -1059,7 +1058,7 @@ fn gateBuild(
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, prior, null, null);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, null, null);
     switch (lowered) {
         .err => return error.TestUnexpectedResult,
         .ok => |*lp| {
@@ -1073,23 +1072,24 @@ fn gateBuild(
     }
 }
 
-/// Cold full rebuild of `files` under a FRESH cache (no prior, force mode) — the
-/// ground-truth __text every green-reuse build must match byte-for-byte. Uses a
+/// Cold full rebuild of `files` under a FRESH cache (no warm cache) — the
+/// ground-truth __text every incremental build must match byte-for-byte. Uses a
 /// distinct cache dir so no cached blob can leak in.
 fn coldText(gpa: std.mem.Allocator, io: Io, dir: []const u8, entry: []const u8, files: []const FixtureFile) ![]u8 {
     var cache_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cache_dir = try std.fmt.bufPrint(&cache_buf, "{s}/.cold-cache", .{dir});
     Io.Dir.cwd().deleteTree(io, cache_dir) catch {};
     const cache = try Cache.init(io, cache_dir);
-    var b = try gateBuild(gpa, io, cache, entry, files, null);
+    var b = try gateBuild(gpa, io, cache, entry, files);
     defer b.deinit();
     return gpa.dupe(u8, b.text);
 }
 
-/// Two-build driver: cold build of `base` (persist DAG), then an edited rebuild of
-/// `edited` with the prior DAG threaded in (green gate ON). Asserts the edited
-/// build's __text == a cold full rebuild of `edited`. Returns the green-gated
-/// build's (compiled, cached) so a caller can assert the cutoff shape.
+/// Two-build driver over ONE warm cache: cold build of `base`, then an edited
+/// rebuild of `edited` that reuses the unchanged fns from the content-fp cache.
+/// Asserts the edited build's __text == a cold full rebuild of `edited` (the
+/// byte-identity oracle for content-fp reuse). Returns the warm build's (compiled,
+/// cached) so a caller can assert the cutoff shape.
 const TwoBuild = struct { compiled: usize, cached: usize };
 
 fn twoBuild(
@@ -1104,15 +1104,12 @@ fn twoBuild(
     const cache_dir = try std.fmt.bufPrint(&cache_buf, "{s}/.cache", .{dir});
     const cache = try Cache.init(io, cache_dir);
 
-    // build 1: cold, persist its DAG blob.
-    var b0 = try gateBuild(gpa, io, cache, entry, base, null);
+    // build 1: cold, warms the content-fp cache.
+    var b0 = try gateBuild(gpa, io, cache, entry, base);
     defer b0.deinit();
 
-    var prior = (try Dag.deserialize(gpa, b0.dag_blob)) orelse return error.ArtifactUnparseable;
-    defer prior.deinit(gpa);
-
-    // build 2: edited source, prior DAG threaded => green reuse may fire.
-    var b1 = try gateBuild(gpa, io, cache, entry, edited, &prior);
+    // build 2: edited source over the warm cache => unchanged fns are content-fp hits.
+    var b1 = try gateBuild(gpa, io, cache, entry, edited);
     defer b1.deinit();
 
     // THE ORACLE: byte-identical to a cold full rebuild of the edited source.
@@ -1128,7 +1125,7 @@ fn gateDir(io: Io, name: []const u8) !void {
     try Io.Dir.cwd().createDirPath(io, name);
 }
 
-test "GREEN-GATE (a): a body-only edit reuses the caller (green) and stays byte-identical to a cold rebuild" {
+test "CONTENT-FP CUTOFF (a): a body-only edit reuses the caller from cache and stays byte-identical to a cold rebuild" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1154,14 +1151,14 @@ test "GREEN-GATE (a): a body-only edit reuses the caller (green) and stays byte-
     }};
 
     const r = try twoBuild(gpa, io, dir, entry, &base, &edited);
-    // The green gate fired: add + main are reused (cached), only the edited mul
-    // re-lowered. `cached` counts both content-cache hits AND green-path reuse; the
-    // byte-identity check inside twoBuild proves the reused bytes are correct.
+    // The content-fp cutoff fired: add + main are served from cache (their transitive
+    // fingerprints are unchanged), only the edited mul re-lowered. The byte-identity
+    // check inside twoBuild proves the cached bytes are correct.
     try testing.expectEqual(@as(usize, 1), r.compiled);
     try testing.expectEqual(@as(usize, 2), r.cached);
 }
 
-test "GREEN-GATE (b): a signature edit turns the caller RED but output is byte-identical to a cold rebuild" {
+test "CONTENT-FP CUTOFF (b): a signature edit turns the caller RED but output is byte-identical to a cold rebuild" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1177,9 +1174,9 @@ test "GREEN-GATE (b): a signature edit turns the caller RED but output is byte-i
         \\fn main() -> int { return id(7) }
         \\
     }};
-    // `id`'s SIGNATURE changes (a second param): the caller `main` MUST go RED (it
-    // folds the callee signature) and re-lower. Byte-identity vs cold proves the RED
-    // path is honest and the green gate did not falsely reuse a stale caller.
+    // `id`'s SIGNATURE changes (a second param): the caller `main`'s transitive
+    // fingerprint flips (it folds the callee signature) so it re-lowers. Byte-identity
+    // vs cold proves the content-fp cache did not falsely reuse a stale caller.
     const edited = [_]FixtureFile{.{ .path = entry, .source =
         \\fn id(a: int, b: int) -> int { return a + b }
         \\fn main() -> int { return id(7, 0) }
@@ -1189,7 +1186,7 @@ test "GREEN-GATE (b): a signature edit turns the caller RED but output is byte-i
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (c): an ABI layout edit to an aggregate used only in a callee body keeps the caller correct (closure guard)" {
+test "CONTENT-FP CUTOFF (c): an ABI layout edit to an aggregate used only in a callee body keeps the caller correct (closure guard)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1225,7 +1222,7 @@ test "GREEN-GATE (c): an ABI layout edit to an aggregate used only in a callee b
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (d): two same-named fns in different modules do not falsely reuse (sigNodeId collision fix)" {
+test "CONTENT-FP CUTOFF (d): two same-named fns in different modules do not falsely reuse (sigNodeId collision fix)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1239,9 +1236,9 @@ test "GREEN-GATE (d): two same-named fns in different modules do not falsely reu
     const apath = try std.fmt.bufPrint(&ab, "{s}/a.toy", .{dir});
 
     // BOTH modules define `helper`. With the old name-only signature id these two
-    // collided on one node; editing a.helper's BODY could falsely keep main GREEN.
-    // The fix keys signatures by global fn id, so the ids are distinct. We edit
-    // a.helper's body only; byte-identity vs cold proves no false reuse.
+    // collided on one DAG node (and the reporter could mis-attribute their fps). The
+    // fix keys signatures by global fn id, so the ids are distinct. We edit a.helper's
+    // body only; byte-identity vs cold proves the content-fp cache did not falsely reuse.
     const base = [_]FixtureFile{
         .{ .path = apath, .source =
         \\pub fn helper(x: int) -> int { return x + 1 }
@@ -1270,14 +1267,15 @@ test "GREEN-GATE (d): two same-named fns in different modules do not falsely reu
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (e): a fn's own PARAMETER REORDER (body brace identical) is not falsely reused" {
-    // The proto-only false-green class: `f`'s body brace span `{ return a + b }` is
-    // BYTE-IDENTICAL across the edit; only the proto order flips (a,b -> b,a). bodyFp
-    // folds only the brace span (excludes the proto), so WITHOUT the body->signature
-    // self-edge f would verify GREEN and greenReuse would serve the base blob (a->x0,
-    // b->x1) for a proto that now wants a->x1,b->x0 = miscompile. The body(f)->
-    // signature(f) edge (sigFingerprint folds param order) turns f RED. main also
-    // re-lowers (callee sig changed). Oracle: byte-identity vs cold rebuild.
+test "CONTENT-FP CUTOFF (e): a fn's own PARAMETER REORDER (body brace identical) is not falsely reused" {
+    // The proto-only stale-hit class: `f`'s body brace span `{ return a + b }` is
+    // BYTE-IDENTICAL across the edit; only the proto order flips (a,b -> b,a). The body
+    // hash folds only the brace span (excludes the proto), so if the codegen fingerprint
+    // did not also fold `f`'s OWN signature a content-fp cache HIT would serve the base
+    // blob (a->x0, b->x1) for a proto that now wants a->x1,b->x0 = miscompile. The
+    // fingerprint folds the proto (sigFingerprint folds param order), so `f`'s content
+    // fp flips and it re-lowers. main also re-lowers (callee sig changed). Oracle:
+    // byte-identity vs cold rebuild.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1302,12 +1300,12 @@ test "GREEN-GATE (e): a fn's own PARAMETER REORDER (body brace identical) is not
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (f): a fn's own ARITY change (body brace identical, params unused) is not falsely reused" {
-    // f's body `{ return 0 }` is byte-identical and references no param, so bodyFp +
-    // every body child is unchanged across the edit. Only the arity flips (1 -> 2
-    // params), which the authoritative codegen fp folds (an extra param slot). The
-    // body->signature self-edge (sigFingerprint folds params.len) turns f RED; without
-    // it greenReuse serves the 1-param base blob for a 2-param f = miscompile.
+test "CONTENT-FP CUTOFF (f): a fn's own ARITY change (body brace identical, params unused) is not falsely reused" {
+    // f's body `{ return 0 }` is byte-identical and references no param, so the body
+    // hash is unchanged across the edit. Only the arity flips (1 -> 2 params), which the
+    // authoritative codegen fp folds (sigFingerprint folds params.len) so f's content fp
+    // flips and it re-lowers; without that fold a content-fp cache HIT would serve the
+    // 1-param base blob for a 2-param f = miscompile.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1332,13 +1330,13 @@ test "GREEN-GATE (f): a fn's own ARITY change (body brace identical, params unus
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (g): a fn's own SCALAR param-type change (body brace identical) is not falsely reused" {
+test "CONTENT-FP CUTOFF (g): a fn's own SCALAR param-type change (body brace identical) is not falsely reused" {
     // f is UNCALLED (no caller to flip it). Its body `{ return 0 }` is byte-identical;
     // only the param type changes int -> str. scalarSize(str)=16 vs int=8, so the
-    // emitted prologue/frame differs (authoritative codegen fp flips). No layout edge
-    // exists (both scalar-class). The body->signature self-edge (sigFingerprint folds
-    // the param KIND) turns f RED; without it greenReuse serves the int-ABI blob = a
-    // wrong-ABI miscompile. Oracle: byte-identity vs cold rebuild.
+    // emitted prologue/frame differs. The codegen fp folds the param KIND
+    // (sigFingerprint), so f's content fp flips and it re-lowers; without that fold a
+    // content-fp cache HIT would serve the int-ABI blob = a wrong-ABI miscompile.
+    // Oracle: byte-identity vs cold rebuild.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1363,13 +1361,14 @@ test "GREEN-GATE (g): a fn's own SCALAR param-type change (body brace identical)
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (h): a fn RENAME at the same source position (body brace identical) is not falsely reused" {
+test "CONTENT-FP CUTOFF (h): a fn RENAME at the same source position (body brace identical) is not falsely reused" {
     // foo->baz keeps the same global fn id (same source slot) and the same body brace
-    // `{ return a }`, so bodyFp is stable. The codegen cache key folds the emitted
-    // SymName (symMix), and the body->signature self-edge (sigFingerprint folds the
-    // fn's own name) turns the renamed fn RED. Without it greenReuse would serve foo's
-    // old blob (FnCode.sym = "foo") for baz = wrong symbol / stale reloc. main also
-    // re-lowers (its call target name changed). Oracle: byte-identity vs cold rebuild.
+    // `{ return a }`, so the body hash is stable. The codegen cache key folds the
+    // emitted SymName (symMix) AND the fingerprint folds the fn's own name
+    // (sigFingerprint), so the renamed fn's content fp flips and it re-lowers. Without
+    // that a content-fp cache HIT would serve foo's old blob (FnCode.sym = "foo") for
+    // baz = wrong symbol / stale reloc. main also re-lowers (its call target name
+    // changed). Oracle: byte-identity vs cold rebuild.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1394,16 +1393,16 @@ test "GREEN-GATE (h): a fn RENAME at the same source position (body brace identi
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (i): a PASS-THROUGH aggregate param/return layout edit is not falsely reused" {
+test "CONTENT-FP CUTOFF (i): a PASS-THROUGH aggregate param/return layout edit is not falsely reused" {
     // The subtle one: `id` takes and returns P BY VALUE but its body never field-
-    // accesses P, so there is NO field-access body->layout edge. The proto TEXT
-    // `(p: P) -> P` is byte-identical across the edit (P's NAME is unchanged) so bodyFp
-    // does not flip, and sigFingerprint folds P's type IDENTITY (not its layout) so the
-    // body->signature self-edge is BACKDATED unchanged. Only the DIRECT body->layout(P)
-    // edge reddens id when P gains a field. Without it id verifies GREEN and greenReuse
-    // serves the 1-field-ABI blob for a 2-field P = ABI miscompile. Oracle: byte-identity
-    // vs cold rebuild. (Regression: a prior refactor dropped the direct edge, trusting
-    // the signature edge transitively — which backdating swallows for layout edits.)
+    // accesses P. The proto TEXT `(p: P) -> P` is byte-identical across the edit (P's
+    // NAME is unchanged) so the body hash does not flip. The codegen fingerprint MUST
+    // fold P's LAYOUT (its touched-type walk over the signature's aggregates), so when P
+    // gains a field id's content fp flips and it re-lowers. Without that fold a content-
+    // fp cache HIT would serve the 1-field-ABI blob for a 2-field P = ABI miscompile.
+    // Oracle: byte-identity vs cold rebuild. (Regression: a prior refactor dropped the
+    // touched-layout fold, trusting the type identity alone — which a name-stable layout
+    // edit slips past.)
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1436,14 +1435,15 @@ test "GREEN-GATE (i): a PASS-THROUGH aggregate param/return layout edit is not f
     _ = try twoBuild(gpa, io, dir, entry, &base, &edited);
 }
 
-test "GREEN-GATE (j): a PASS-THROUGH enum payload-layout edit is not falsely reused" {
+test "CONTENT-FP CUTOFF (j): a PASS-THROUGH enum payload-layout edit is not falsely reused" {
     // Same as (i) for the enum layout class (recordLayoutOf reserves the high id bit
     // for enums). The edit GROWS the R variant's payload (1 int -> 2 ints), which
     // enlarges E's by-value size = a real ABI change for the pass-through `route`
-    // (whose body never matches on E, so no match/field-access edge exists). A bare
-    // variant-COUNT bump within one tag size would NOT change `route`'s emitted bytes
-    // and so could not discriminate — the payload growth is what gives the gate teeth.
-    // Only the direct body->layout(E) edge carries it; without it route false-greens.
+    // (whose body never matches on E). A bare variant-COUNT bump within one tag size
+    // would NOT change `route`'s emitted bytes and so could not discriminate — the
+    // payload growth is what makes the test meaningful. The codegen fingerprint folds
+    // E's layout (the touched-type walk); without that fold a content-fp cache HIT
+    // would falsely reuse route's old blob = ABI miscompile.
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

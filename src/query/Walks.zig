@@ -18,14 +18,14 @@
 //! are the CODEGEN-level mirrors of the typecheck firewall reads — they fold the
 //! SAME callee-signature and touched-type-layout dependencies the typecheck
 //! `body->signature`/`body->layout` edges already record, but at the codegen
-//! fingerprint level. The codegen NodeKey is still COARSE this milestone
-//! (Engine.nodeKeyFor maps the single `check` Cache.Phase and codegen records its
-//! own already-computed fingerprint as the node fp), so the plan's
-//! `codegen(fn)->signature(callee)`/`codegen(fn)->layout(type)` edges are NOT yet
-//! recorded — only the typecheck-level edges are. These reads stay DIRECT here
+//! fingerprint level. The codegen node records a single `codegen(gid)->body(gid)`
+//! edge and reaches every signature/layout dependency transitively through the
+//! body subtree, so the plan's explicit `codegen(fn)->signature(callee)`/
+//! `codegen(fn)->layout(type)` edges are NOT separately recorded — the body subtree
+//! already carries them. These reads stay DIRECT here
 //! because the fingerprint these walks feed is itself the codegen node's fp;
 //! routing them through `signature(callee)`/`layout(type)` query calls is the
-//! deferred codegen-decompose work. They are SAFE to leave in M16: invalidation is
+//! deferred codegen-decompose work. They are SAFE to leave here: invalidation is
 //! still content-fingerprint, and the fingerprint folds these dependencies
 //! correctly today.
 

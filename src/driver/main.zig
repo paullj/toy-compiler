@@ -451,21 +451,21 @@ fn emitExecutable(
     // This collapses the 6200×4 per-entry syscalls to ~4 (one create+writev+rename).
     defer pack.flush(io, cache.dir);
 
-    // The per-build dependency `Dag` is a DEBUG-only diagnostic seam. The `.normal`
-    // green-reuse fast-path was removed: its red-green pre-pass walked the whole prior
-    // DAG SERIALLY, which cost more than the parallel per-fn fingerprint it let us skip
-    // (a fully-cached build ran ~2x SLOWER than `--force`). The content-addressed codegen
-    // cache already delivers the correct cutoff on its own, so `.normal`/`--force` no
-    // longer touch the DAG at all. It survives ONLY to feed `--verify`'s green-verdict
-    // audit and `--query-stats` — both dev-time tools — so a RELEASE build records, loads,
-    // and persists NO DAG: `null` threads through every `if (dag)` site as a verbatim
-    // no-op, keeping the production path lean.
+    // The per-build dependency `Dag` is SCHEDULING + OBSERVABILITY only — it never
+    // gates a build. The content-addressed codegen cache is the SOLE correctness +
+    // cutoff driver (a fn whose transitive fingerprint is unchanged is served from
+    // cache, never re-lowered), so `.normal`/`--force` do not consult the DAG at all.
+    // The recorded DAG survives ONLY to feed `--dump-dag`, the `--query-stats`
+    // red-green REPORTER, and the `--verify` soundness auditor — so a RELEASE build
+    // records, loads, and persists NO DAG: `null` threads through every `if (dag)`
+    // site as a verbatim no-op, keeping the production path lean.
     var dag_storage: Dag = .init(gpa);
     defer dag_storage.deinit(gpa);
     const dag: ?*Dag = if (builtin.mode == .Debug) &dag_storage else null;
 
     // The program key (entry canonical path + target) names this program's on-disk DAG
-    // artifact for BOTH the prior-DAG load (drive) and the post-build persist.
+    // artifact for the prior-DAG load (the --query-stats reporter) and the post-build
+    // persist. The DAG drives nothing — content-fp is the sole correctness/cutoff driver.
     const entry_canon: ?[]u8 = blk: {
         if (Io.Dir.cwd().realPathFileAlloc(io, paths[0], gpa) catch null) |rp| {
             defer gpa.free(rp);
@@ -478,64 +478,16 @@ fn emitExecutable(
 
     // Per-stage wall-clock (only when `--timings`). The monotonic timer is lapped at
     // each stage boundary; accumulators live at fn scope so the success path can print
-    // the breakdown. Front-end stages (discover/resolve/typecheck) are serial at any
-    // `-j`; only `lower` shrinks with more workers — so a `-j1 --timings` run is the
-    // clean "where does the time go" profile that scopes the parallelization work.
+    // the breakdown. The discover/resolve barrier joins + typecheck's Pass-A prologue
+    // are serial; the per-fn body checks (inside the typecheck stage) and `lower` fan
+    // out with more workers — so a `-j1 --timings` run is the clean "where does the
+    // time go" profile that scopes the parallelization work.
     var last_ns: i128 = if (timings) nowNs(io) else 0;
     var ns_discover: u64 = 0;
     var ns_resolve: u64 = 0;
     var ns_typecheck: u64 = 0;
     var ns_lower: u64 = 0;
     var ns_image: u64 = 0;
-
-    // --- discover the module graph from the entry file ---
-    var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], dag);
-    defer graph.deinit(gpa);
-    if (graph.err) |ge| {
-        try printGraphError(out, &graph, ge);
-        try out.flush();
-        return 1;
-    }
-    ns_discover = lapNs(io, timings, &last_ns);
-
-    // --- whole-graph name resolution ---
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-    if (res.diags.len > 0) {
-        for (res.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
-        try out.flush();
-        return 1;
-    }
-    ns_resolve = lapNs(io, timings, &last_ns);
-
-    // --- whole-graph typecheck ---
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, dag, io);
-    defer tc.deinit(gpa);
-    if (tc.diags.len > 0) {
-        for (tc.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
-        try out.flush();
-        return 1;
-    }
-    ns_typecheck = lapNs(io, timings, &last_ns);
-
-    // Load the prior on-disk DAG BEFORE codegen so the red-green walk can DRIVE codegen
-    // reuse (the verdict decides reuse, not post-hoc observation). A load/parse failure
-    // => `null` => full content-fp rebuild (the FALLBACK-SAFETY invariant — never a
-    // partial/false-green result).
-    var prior_loaded: ?Dag.Loaded = null;
-    defer if (prior_loaded) |*pl| pl.deinit(gpa);
-    // The prior DAG is CONSUMED only by computeReuse (the `.verify` green-verdict audit)
-    // and reportQueryStats (`--query-stats`); `.normal`/`--force` no longer reuse it. It
-    // is also DEBUG-only (`dag == null` in release), so skip even the (in-memory) pack
-    // lookup + deserialize unless a consumer actually needs it. The fresh DAG is still
-    // PERSISTED below (gated on `dag`) for the next build — only the LOAD is gated here.
-    if (dag != null and (mode == .verify or query_stats)) if (prog_key) |pk| {
-        if (cache.getDag(gpa, io, pk) catch null) |blob| {
-            defer gpa.free(blob);
-            prior_loaded = Dag.deserialize(gpa, blob) catch null;
-        }
-    };
-    const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
 
     // `--timings` SUB-stage attribution of `lower`: a borrowed probe splits the
     // codegen fan-out into compute (lowerOne) vs cache get/put I/O, and `link_ns`
@@ -546,99 +498,425 @@ fn emitExecutable(
     const probe_ptr: ?*Engine.LowerProbe = if (timings) &lower_probe else null;
     const link_ns_ptr: ?*u64 = if (timings) &link_ns else null;
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, mode, opt, dag, prior_ptr, probe_ptr, link_ns_ptr);
-    ns_lower = lapNs(io, timings, &last_ns); // codegen fan-out + the parallel link tail (+ prior-DAG load)
-    switch (lowered) {
-        .err => |e| {
-            try printGraphEmitError(out, &graph, e);
-            try out.flush();
-            return 1;
-        },
-        .ok => |*lp| {
-            defer lp.deinit(gpa);
-            if (lp.diags.len > 0) {
-                for (lp.diags) |d| try printGraphEmitError(out, &graph, .{ .message = d.message, .byte_offset = d.byte_offset });
-                try out.flush();
-                return 1;
-            }
+    // --- the WHOLE build is ONE StageGraph the interpreter drives ---
+    // discover (DISCOVER barrier over the entry path) -> resolve -> typecheck ->
+    // codegen, each a node in `StageGraph.pipeline`. The interpreter owns the
+    // barrier/region cadence; the `Orchestrator` supplies each stage's compute and
+    // writes its result into a frame-local optional (torn down by the `defer`s here,
+    // in reverse order, regardless of how far the build got). A stage that produced
+    // diagnostics raises `error.StageDiagnostics` so the interpreter stops and we
+    // print that stage's diagnostics below — the ONLY per-stage logic lives in the
+    // Orchestrator's stage closures (no second hand-sequenced chain). Correctness +
+    // cutoff stay the content-fp cache; the StageGraph is scheduling + observability.
+    var graph: ?Graph.Graph = null;
+    defer if (graph) |*g| g.deinit(gpa);
+    var res: ?ResolveGraph.GraphResult = null;
+    defer if (res) |*r| r.deinit(gpa);
+    var tc: ?TypecheckGraph.GraphResult = null;
+    defer if (tc) |*t| t.deinit(gpa);
+    var lowered: ?Driver.LowerProgramResult = null;
+    defer if (lowered) |*lw| switch (lw.*) {
+        .ok => |*lp| lp.deinit(gpa),
+        .err => {},
+    };
+    var ir_unused: ?Driver.IrResult = null; // the `.lower` tail never writes this
+    var failed_stage: ?Orchestrator.Stage = null;
 
-            // How many fns were freshly lowered vs. served from the codegen cache.
-            if (codegen_stats) {
-                try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
-                try out.flush();
-            }
+    // The DISCOVER barrier's single contributor: the entry path's digest (which
+    // program is being built). The COLLECT / GLOBAL_TABLES barriers fold a real
+    // multi-element multiset; their scratch lists live here so the `contributors` hook
+    // can fill + return a slice that outlives the `barrier` call.
+    const entry_contributors = [_]u64{std.hash.Wyhash.hash(0x44_53_43_56, paths[0])}; // "DSCV"
+    var collect_contribs: std.ArrayList(u64) = .empty;
+    defer collect_contribs.deinit(gpa);
+    var gt_contribs: std.ArrayList(u64) = .empty;
+    defer gt_contribs.deinit(gpa);
 
-            // Persist the fresh DAG for the next build's red-green drive. Best-effort:
-            // a serialize/write failure only costs the next build a full re-validation,
-            // never correctness. Done on EVERY successful build (this is what makes the
-            // NEXT build incremental), not just under `--query-stats`.
-            if (prog_key) |pk| if (dag) |d| {
-                if (d.serialize(gpa)) |blob| {
-                    defer gpa.free(blob);
-                    cache.putDag(io, pk, blob) catch {};
-                } else |_| {}
-            };
+    const orch = Orchestrator{
+        .gpa = gpa,
+        .io = io,
+        .cache = cache,
+        .target = target,
+        .entry = paths[0],
+        .tail = .lower,
+        .entry_contributors = &entry_contributors,
+        .collect_contribs = &collect_contribs,
+        .gt_contribs = &gt_contribs,
+        .mode = mode,
+        .opt = opt,
+        .dag = dag,
+        .probe = probe_ptr,
+        .link_ns = link_ns_ptr,
+        .timings = timings,
+        .last_ns = &last_ns,
+        .ns_discover = &ns_discover,
+        .ns_resolve = &ns_resolve,
+        .ns_typecheck = &ns_typecheck,
+        .ns_lower = &ns_lower,
+        .graph = &graph,
+        .res = &res,
+        .tc = &tc,
+        .lowered = &lowered,
+        .ir = &ir_unused,
+        .failed_stage = &failed_stage,
+    };
 
-            // `--query-stats`: print the red-green recompute set (the cutoff) over the
-            // just-recorded graph vs the prior snapshot. Purely diagnostic — the emitted
-            // bytes are identical with or without it.
-            if (query_stats) if (dag) |d| {
-                try reportQueryStats(out, gpa, prior_ptr, d, lp.codegen_compiled, lp.codegen_cached);
-                try out.flush();
-            };
+    const engine = Engine.initProbe(cache, mode, dag, probe_ptr);
+    if (!try runPipeline(out, gpa, engine, &orch)) return 1;
 
-            // M13 dual-metric counters, fixed field order, deterministic. Cached
-            // fns contribute 0 to the opt counters; use --force for honest numbers.
-            if (opt_stats) {
-                const s = lp.opt_stats;
-                try out.print("opt: rounds={d} ir_instrs={d}->{d} emitted_instrs={d}\n", .{
-                    s.rounds, s.ir_instrs_before, lp.ir_instrs, lp.emitted_instrs,
-                });
-                try out.print("  folded={d} branches={d} blocks={d} dced={d} forwarded={d} values_pruned={d}\n", .{
-                    s.consts_folded, s.branches_folded, s.blocks_removed, s.instrs_dced, s.loads_forwarded, s.values_pruned,
-                });
-                try out.flush();
-            }
+    // The interpreter ran every stage clean: `lowered` is `.ok` with no diagnostics.
+    const lp = &lowered.?.ok;
 
-            // Reset the lap so the best-effort DAG persist + any stats prints above
-            // are not charged to the image+sign bucket.
-            _ = lapNs(io, timings, &last_ns);
-            const image = try Driver.buildImage(
-                io,
-                gpa,
-                basename(resolved_out),
-                lp.text,
-                lp.entry_off,
-                lp.cstrings,
-                lp.data_relocs,
-                lp.uses_write,
-            );
-            defer gpa.free(image);
-
-            try writeExecutable(io, resolved_out, image);
-            ns_image = lapNs(io, timings, &last_ns);
-            const elapsed = nowNs(io) - build_start;
-            try printBuildTime(out, threads, if (elapsed > 0) @intCast(elapsed) else 0);
-            try out.flush();
-            if (timings) {
-                const sub: LowerSub = .{
-                    .compute_ns = lower_probe.compute_ns.load(.monotonic),
-                    .get_ns = lower_probe.get_ns.load(.monotonic),
-                    .put_ns = lower_probe.put_ns.load(.monotonic),
-                    .link_ns = link_ns,
-                };
-                try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image, sub);
-            }
-            // `run`: execute the freshly built binary and adopt its exit status.
-            if (run_after) return runBinary(gpa, io, out, resolved_out);
-            return 0;
-        },
+    // How many fns were freshly lowered vs. served from the codegen cache.
+    if (codegen_stats) {
+        try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
+        try out.flush();
     }
+
+    // `--query-stats`: LOAD the prior on-disk DAG snapshot NOW — BEFORE the fresh DAG is
+    // persisted below. With the pack, `putDag` stages the fresh blob and `getDag` is a
+    // last-writer-wins in-memory lookup, so loading AFTER the persist would compare the
+    // fresh DAG against ITSELF (recompute always 0). Capturing the prior here keeps the
+    // red-green REPORTER honest. Purely a post-hoc reporter — the content-fp cache
+    // delivered the actual cutoff; the DAG is the observability lens. Gated on `dag`
+    // (release builds record none) so a release build never touches it.
+    var prior_loaded: ?Dag.Loaded = null;
+    defer if (prior_loaded) |*pl| pl.deinit(gpa);
+    if (query_stats) if (dag != null) {
+        if (prog_key) |pk| if (cache.getDag(gpa, io, pk) catch null) |blob| {
+            defer gpa.free(blob);
+            prior_loaded = Dag.deserialize(gpa, blob) catch null;
+        };
+    };
+
+    // Persist the fresh DAG for the next build. Best-effort: a serialize/write failure
+    // only costs the next build a full re-validation, never correctness. Done on EVERY
+    // successful build (this is what primes `--query-stats`/`--verify` next time), gated
+    // on `dag` (release builds record none). Ordered AFTER the prior-DAG load above so
+    // the reporter compares the fresh graph against the genuine prior snapshot.
+    if (prog_key) |pk| if (dag) |d| {
+        if (d.serialize(gpa)) |blob| {
+            defer gpa.free(blob);
+            cache.putDag(io, pk, blob) catch {};
+        } else |_| {}
+    };
+
+    // Report the red-green recompute set (the cutoff) over the just-recorded graph vs
+    // the prior snapshot captured before the persist.
+    if (query_stats) if (dag) |d| {
+        const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
+        try reportQueryStats(out, gpa, prior_ptr, d, lp.codegen_compiled, lp.codegen_cached);
+        try out.flush();
+    };
+
+    // M13 dual-metric counters, fixed field order, deterministic. Cached fns
+    // contribute 0 to the opt counters; use --force for honest numbers.
+    if (opt_stats) {
+        const s = lp.opt_stats;
+        try out.print("opt: rounds={d} ir_instrs={d}->{d} emitted_instrs={d}\n", .{
+            s.rounds, s.ir_instrs_before, lp.ir_instrs, lp.emitted_instrs,
+        });
+        try out.print("  folded={d} branches={d} blocks={d} dced={d} forwarded={d} values_pruned={d}\n", .{
+            s.consts_folded, s.branches_folded, s.blocks_removed, s.instrs_dced, s.loads_forwarded, s.values_pruned,
+        });
+        try out.flush();
+    }
+
+    // Reset the lap so the best-effort DAG persist + any stats prints above are not
+    // charged to the image+sign bucket.
+    _ = lapNs(io, timings, &last_ns);
+    const image = try Driver.buildImage(
+        io,
+        gpa,
+        basename(resolved_out),
+        lp.text,
+        lp.entry_off,
+        lp.cstrings,
+        lp.data_relocs,
+        lp.uses_write,
+    );
+    defer gpa.free(image);
+
+    try writeExecutable(io, resolved_out, image);
+    ns_image = lapNs(io, timings, &last_ns);
+    const elapsed = nowNs(io) - build_start;
+    try printBuildTime(out, threads, if (elapsed > 0) @intCast(elapsed) else 0);
+    try out.flush();
+    if (timings) {
+        const sub: LowerSub = .{
+            .compute_ns = lower_probe.compute_ns.load(.monotonic),
+            .get_ns = lower_probe.get_ns.load(.monotonic),
+            .put_ns = lower_probe.put_ns.load(.monotonic),
+            .link_ns = link_ns,
+        };
+        try printTimings(out, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_image, sub);
+    }
+    // `run`: execute the freshly built binary and adopt its exit status.
+    if (run_after) return runBinary(gpa, io, out, resolved_out);
+    return 0;
 }
 
+/// The SINGLE stage adapter for `StageGraph.interpret`, shared by every
+/// program-producing build (`-o`, `--dump-dag`, `--emit ir`). It supplies each stage's
+/// compute (discover / resolve / typecheck / codegen) and writes the result into a
+/// frame-local optional on the caller's stack. Indexed by the comptime stage position
+/// in `StageGraph.pipeline`:
+///   0 DISCOVER (BARRIER)       — fold the entry-path digest, build the module graph
+///   1 COLLECT (BARRIER)        — fold the module parse digests, build resolve tables
+///   2 GLOBAL_TABLES (BARRIER)  — fold the fn resolve digests, build layout/sig tables
+///                                then fan out the per-fn body checks (inside checkGraph)
+///   3 codegen (REGION)         — per-fn lower fan-out + relink, OR render IR text
+///
+/// The first three stages are fan-IN barriers: their `contributors(i)` hook folds a
+/// real, multi-element contributor multiset (the entry digest, then every module's
+/// parse digest, then every global fn's resolve digest) via `Engine.barrier`, so the
+/// order-independent set-fold is load-bearing on every build. A barrier's compute is
+/// the JOIN work that produces the tables the next stage demands.
+///
+/// The codegen stage's behavior is selected by `tail`: `.lower` (the `-o`/`--dump-dag`
+/// paths) runs `lowerGraphProgram` into `lowered`; `.render_ir` (`--emit ir`) runs
+/// `renderGraphIr` into `ir`. The discover/resolve/typecheck stages are IDENTICAL
+/// across paths — there is ONE orchestration, not one per output kind.
+///
+/// A stage whose result carries diagnostics (or a structural discover error) raises
+/// `error.StageDiagnostics` after setting `failed_stage`, so the interpreter stops and
+/// `runPipeline` renders that stage's diagnostics. Hard errors (OOM/IO) propagate
+/// as-is. Every result slot is owned by the caller (torn down by its `defer`s), so a
+/// mid-pipeline failure never leaks. `--timings` laps (`ns_*`) are best-effort and may
+/// be null pointers on the inspection paths that don't profile.
+const Orchestrator = struct {
+    pub const Stage = enum { discover, resolve, typecheck, codegen };
+    /// What the codegen region (stage 3) does: lower to a `LinkedProgram` (image/sign
+    /// or dump-dag tail) or render the IR text. The front-end stages are identical.
+    pub const Tail = enum { lower, render_ir };
 
-/// `--emit ir`: run the front-end + the `lower` stage over every function and
-/// print the deterministic IR text to stdout. Returns the process exit code.
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: toyc.Cache,
+    target: []const u8,
+    entry: []const u8,
+    tail: Tail,
+    /// The single DISCOVER-barrier contributor (the entry-path digest), borrowed from
+    /// the caller's frame so the `contributors` hook can return a stable slice.
+    entry_contributors: []const u64,
+    /// Scratch lists (on the caller's frame) the `contributors` hook fills for the
+    /// COLLECT / GLOBAL_TABLES barriers: the per-module parse digests and the per-fn
+    /// resolve digests. Filled lazily when their barrier is reached (the upstream
+    /// stage's result is ready by then) and returned as a stable slice for the fold.
+    collect_contribs: *std.ArrayList(u64),
+    gt_contribs: *std.ArrayList(u64),
+    mode: CodegenIr.Mode,
+    opt: Opt.Config,
+    dag: ?*Dag,
+    probe: ?*Engine.LowerProbe,
+    link_ns: ?*u64,
+
+    // `--timings` per-stage laps (each stage closure charges its own bucket). Null
+    // pointers on paths that don't profile (`--dump-dag`/`--emit ir`) => no lap.
+    timings: bool,
+    last_ns: ?*i128,
+    ns_discover: ?*u64,
+    ns_resolve: ?*u64,
+    ns_typecheck: ?*u64,
+    ns_lower: ?*u64,
+
+    // Result slots on the caller's frame (it owns teardown). `lowered` is written by
+    // the `.lower` tail, `ir` by the `.render_ir` tail.
+    graph: *?Graph.Graph,
+    res: *?ResolveGraph.GraphResult,
+    tc: *?TypecheckGraph.GraphResult,
+    lowered: *?Driver.LowerProgramResult,
+    ir: *?Driver.IrResult,
+    failed_stage: *?Stage,
+
+    /// Lap a `--timings` bucket if both the accumulator and the running timer are
+    /// present; a no-op on the inspection paths (null pointers).
+    fn lap(self: Orchestrator, bucket: ?*u64) void {
+        if (bucket) |b| if (self.last_ns) |ln| {
+            b.* = lapNs(self.io, self.timings, ln);
+        };
+    }
+
+    /// The contributor multiset for barrier stage `i`, folded (order-independently) by
+    /// `Engine.barrier` into the join's id:
+    ///   0 DISCOVER      — the entry-path digest (borrowed, identifies the program);
+    ///   1 COLLECT       — every discovered module's parse digest (`Ast.contentFp`),
+    ///                     the inputs the global resolve tables are built from;
+    ///   2 GLOBAL_TABLES — every global fn's resolve digest (module+name+decl), the
+    ///                     inputs the program-wide layout/sig tables are built from.
+    /// Stages 1/2 fill a caller-frame scratch list (the upstream result is ready) and
+    /// return its slice; it outlives the `barrier` call that reads it.
+    pub fn contributors(self: Orchestrator, comptime stage_i: usize) []const u64 {
+        switch (stage_i) {
+            0 => return self.entry_contributors,
+            1 => {
+                const list = self.collect_contribs;
+                list.clearRetainingCapacity();
+                for (self.graph.*.?.modules) |*m| list.append(self.gpa, Ast.contentFp(m.tree())) catch {};
+                return list.items;
+            },
+            2 => {
+                const list = self.gt_contribs;
+                list.clearRetainingCapacity();
+                for (self.res.*.?.fns) |gf| list.append(self.gpa, fnResolveDigest(gf)) catch {};
+                return list.items;
+            },
+            else => comptime unreachable,
+        }
+    }
+
+    pub fn barrierCompute(self: Orchestrator, comptime stage_i: usize) switch (stage_i) {
+        0 => DiscoverCompute,
+        1 => ResolveCompute,
+        2 => TypecheckCompute,
+        else => unreachable,
+    } {
+        return switch (stage_i) {
+            0, 1, 2 => .{ .o = self },
+            else => comptime unreachable,
+        };
+    }
+
+    /// A barrier produced its join: lap the stage's timing bucket. The `fold` carried
+    /// by `BarrierResult` is observability (recorded as the barrier node id); the join
+    /// tables themselves live in the frame slots the compute wrote.
+    pub fn recordBarrier(self: Orchestrator, comptime stage_i: usize, _: Engine.BarrierResult(void)) void {
+        switch (stage_i) {
+            0 => self.lap(self.ns_discover),
+            1 => self.lap(self.ns_resolve),
+            2 => self.lap(self.ns_typecheck),
+            else => comptime unreachable,
+        }
+    }
+
+    /// The codegen REGION (stage 3): run the stage, lap its timing bucket, and raise
+    /// `error.StageDiagnostics` (after recording which stage) if it produced
+    /// diagnostics. The region owns its internal per-fn `Engine.fanOut` + relink join.
+    pub fn region(self: Orchestrator, comptime stage_i: usize) !void {
+        comptime std.debug.assert(stage_i == 3);
+        switch (self.tail) {
+            .lower => {
+                self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.dag, self.probe, self.link_ns);
+                self.lap(self.ns_lower);
+                const bad = switch (self.lowered.*.?) {
+                    .err => true,
+                    .ok => |lp| lp.diags.len > 0,
+                };
+                if (bad) {
+                    self.failed_stage.* = .codegen;
+                    return error.StageDiagnostics;
+                }
+            },
+            .render_ir => {
+                self.ir.* = try Driver.renderGraphIr(self.gpa, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.opt);
+                self.lap(self.ns_lower);
+                if (self.ir.*.? == .err) {
+                    self.failed_stage.* = .codegen;
+                    return error.StageDiagnostics;
+                }
+            },
+        }
+    }
+};
+
+/// The per-fn GLOBAL_TABLES contributor: fold one global fn's resolve identity
+/// (owning module + qualified name + decl node) into a u64. This is what the resolve
+/// stage settled for the fn; the typecheck Pass-A tables are built from the whole set,
+/// so folding all of them is the genuine fan-in the GLOBAL_TABLES barrier joins.
+fn fnResolveDigest(gf: ResolveGraph.GlobalFn) u64 {
+    var h = std.hash.Wyhash.init(0x52_53_4c_56); // "RSLV"
+    var b: [8]u8 = undefined;
+    std.mem.writeInt(u32, b[0..4], gf.module, .little);
+    std.mem.writeInt(u32, b[4..8], gf.decl_node, .little);
+    h.update(&b);
+    h.update(gf.name);
+    return h.final();
+}
+
+/// The DISCOVER barrier's compute: build the module graph from the entry path. A
+/// structural discover error lands in `graph.err`; signal it as a stage failure so
+/// the interpreter stops and `runPipeline` renders it. Returns `void` — the graph is
+/// written into the frame slot as a side effect (uniform with the other barriers).
+const DiscoverCompute = struct {
+    o: Orchestrator,
+    pub fn run(c: DiscoverCompute) !void {
+        c.o.graph.* = try Graph.discoverDag(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, c.o.dag);
+        if (c.o.graph.*.?.err != null) {
+            c.o.failed_stage.* = .discover;
+            return error.StageDiagnostics;
+        }
+    }
+};
+
+/// The COLLECT barrier's compute: build the whole-graph name-resolution tables
+/// (`resolveGraph` — global fn/type tables + per-fn binding). The join over the module
+/// parse digests; its result is written into the `res` frame slot. Resolve diagnostics
+/// raise `error.StageDiagnostics`.
+const ResolveCompute = struct {
+    o: Orchestrator,
+    pub fn run(c: ResolveCompute) !void {
+        c.o.res.* = try ResolveGraph.resolveGraph(c.o.gpa, &c.o.graph.*.?);
+        if (c.o.res.*.?.diags.len > 0) {
+            c.o.failed_stage.* = .resolve;
+            return error.StageDiagnostics;
+        }
+    }
+};
+
+/// The GLOBAL_TABLES barrier's compute: build the program-wide layout/sig tables
+/// (typecheck Pass-A) and check every fn body — the per-fn body checks fan out INSIDE
+/// `checkGraph` (via `Engine.fanOut` over the worker pool) as the PER_UNIT region past
+/// this barrier. The join over the per-fn resolve digests; result -> the `tc` frame
+/// slot. Type diagnostics raise `error.StageDiagnostics`.
+const TypecheckCompute = struct {
+    o: Orchestrator,
+    pub fn run(c: TypecheckCompute) !void {
+        c.o.tc.* = try TypecheckGraph.checkGraph(c.o.gpa, &c.o.graph.*.?, &c.o.res.*.?, c.o.dag, c.o.io);
+        if (c.o.tc.*.?.diags.len > 0) {
+            c.o.failed_stage.* = .typecheck;
+            return error.StageDiagnostics;
+        }
+    }
+};
+
+/// Drive the shared front-end (discover -> resolve -> typecheck -> codegen) through
+/// `StageGraph.interpret` and render any stage's diagnostics. This is the ONE
+/// sequencer every program-producing build runs — `-o`, `--dump-dag`, and `--emit ir`
+/// all call it, differing only in the codegen `tail` and the post-pipeline output.
+/// Returns `true` on clean completion (the caller reads the result slots), `false`
+/// when a stage produced diagnostics (already printed; the caller returns exit 1).
+fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, engine: Engine, orch: *const Orchestrator) !bool {
+    toyc.StageGraph.interpret(&toyc.StageGraph.pipeline, engine, gpa, orch.*) catch |e| switch (e) {
+        // A stage produced diagnostics: print them against the owning module and tell
+        // the caller to exit non-zero. `failed_stage` says which stage's diagnostics.
+        error.StageDiagnostics => {
+            const g = &orch.graph.*.?;
+            switch (orch.failed_stage.*.?) {
+                .discover => try printGraphError(out, g, g.err.?),
+                .resolve => for (orch.res.*.?.diags) |d| try printModuleDiag(out, g, d.scope, d.byte_offset, d.message),
+                .typecheck => for (orch.tc.*.?.diags) |d| try printModuleDiag(out, g, d.scope, d.byte_offset, d.message),
+                .codegen => switch (orch.tail) {
+                    .lower => switch (orch.lowered.*.?) {
+                        .err => |ee| try printGraphEmitError(out, g, ee),
+                        .ok => |lp| for (lp.diags) |d| try printGraphEmitError(out, g, .{ .message = d.message, .byte_offset = d.byte_offset }),
+                    },
+                    .render_ir => switch (orch.ir.*.?) {
+                        .err => |ee| try printGraphEmitError(out, g, ee),
+                        .ok => {}, // an .ok IR result never raises StageDiagnostics
+                    },
+                },
+            }
+            try out.flush();
+            return false;
+        },
+        else => return e,
+    };
+    return true;
+}
+
+/// `--emit ir`: run the SAME front-end StageGraph the `-o` build drives, with the
+/// codegen `tail` set to `.render_ir` so the final stage renders the deterministic IR
+/// text instead of lowering. Prints the IR to stdout. Returns the process exit code.
 fn emitIr(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
@@ -664,56 +942,77 @@ fn emitIr(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var graph = try Graph.discover(gpa, io, cache, target, paths[0]);
-    defer graph.deinit(gpa);
-    if (graph.err) |ge| {
-        try printGraphError(out, &graph, ge);
-        try out.flush();
-        return 1;
-    }
+    // ONE orchestration: the SAME discover->resolve->typecheck->codegen StageGraph the
+    // `-o` build drives, with the codegen `tail` set to `.render_ir` so stage 3 renders
+    // the IR text instead of lowering. No second hand-sequenced chain.
+    var graph: ?Graph.Graph = null;
+    defer if (graph) |*g| g.deinit(gpa);
+    var res: ?ResolveGraph.GraphResult = null;
+    defer if (res) |*r| r.deinit(gpa);
+    var tc: ?TypecheckGraph.GraphResult = null;
+    defer if (tc) |*t| t.deinit(gpa);
+    var lowered_unused: ?Driver.LowerProgramResult = null; // the `.render_ir` tail never writes this
+    var ir: ?Driver.IrResult = null;
+    defer if (ir) |*r| switch (r.*) {
+        .ok => |text| gpa.free(text),
+        .err => {},
+    };
+    var failed_stage: ?Orchestrator.Stage = null;
 
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-    if (res.diags.len > 0) {
-        for (res.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
-        try out.flush();
-        return 1;
-    }
+    const entry_contributors = [_]u64{std.hash.Wyhash.hash(0x44_53_43_56, paths[0])}; // "DSCV"
+    var collect_contribs: std.ArrayList(u64) = .empty;
+    defer collect_contribs.deinit(gpa);
+    var gt_contribs: std.ArrayList(u64) = .empty;
+    defer gt_contribs.deinit(gpa);
+    const orch = Orchestrator{
+        .gpa = gpa,
+        .io = io,
+        .cache = cache,
+        .target = target,
+        .entry = paths[0],
+        .tail = .render_ir,
+        .entry_contributors = &entry_contributors,
+        .collect_contribs = &collect_contribs,
+        .gt_contribs = &gt_contribs,
+        .mode = .normal,
+        .opt = opt,
+        .dag = null,
+        .probe = null,
+        .link_ns = null,
+        .timings = false,
+        .last_ns = null,
+        .ns_discover = null,
+        .ns_resolve = null,
+        .ns_typecheck = null,
+        .ns_lower = null,
+        .graph = &graph,
+        .res = &res,
+        .tc = &tc,
+        .lowered = &lowered_unused,
+        .ir = &ir,
+        .failed_stage = &failed_stage,
+    };
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, null, io);
-    defer tc.deinit(gpa);
-    if (tc.diags.len > 0) {
-        for (tc.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
-        try out.flush();
-        return 1;
-    }
+    const engine = Engine.init(cache, .normal);
+    if (!try runPipeline(out, gpa, engine, &orch)) return 1;
 
-    switch (try Driver.renderGraphIr(gpa, &graph, &res, &tc, opt)) {
-        .err => |e| {
-            try printGraphEmitError(out, &graph, e);
-            try out.flush();
-            return 1;
-        },
-        .ok => |text| {
-            defer gpa.free(text);
-            try out.writeAll(text);
-            try out.flush();
-            return 0;
-        },
-    }
+    try out.writeAll(ir.?.ok);
+    try out.flush();
+    return 0;
 }
 
-/// `--dump-dag`: compile the whole program with a per-build dependency `Dag`
-/// threaded through EVERY query (discovery lex/parse + per-fn codegen), then print
-/// the deterministic dump to stdout. This is the LIVE anti-dead-code proof: the
-/// recording infra runs in production, not just in unit tests.
+/// `--dump-dag`: compile the whole program through the SAME `StageGraph` the `-o`
+/// build drives, with a per-build dependency `Dag` threaded through EVERY stage
+/// (discovery lex/parse + typecheck + per-fn codegen), then print the deterministic
+/// dump to stdout. This is the LIVE anti-dead-code proof: the recording infra runs in
+/// production, not just in unit tests. It uses ONE orchestration (the interpreter),
+/// not a hand-sequenced chain — only its tail (dump + persist) differs from `-o`.
 ///
-/// OWNERSHIP: ONE `Dag` value lives on this stack frame and a `*Dag` is threaded
-/// down through `discoverDag` and `lowerGraphProgram`'s graph fan-out. A `*Dag`
-/// (never a value) is what reaches each per-fn job, so every worker's recorded
-/// edges land in the single shared graph (a value field would vanish per-job).
-/// The DAG is purely OBSERVATIONAL — emitted bytes are byte-identical to a normal
-/// build (default builds keep dag=null; only this path opts in).
+/// OWNERSHIP: ONE `Dag` value lives on this stack frame and a `*Dag` rides in the
+/// `Orchestrator` (and the codegen `engine`) so it reaches every per-fn job; every
+/// worker's recorded edges land in the single shared graph (a value field would vanish
+/// per-job). The DAG is purely OBSERVATIONAL — emitted bytes are byte-identical to a
+/// normal build (default builds keep dag=null; only this path opts in).
 fn emitDumpDag(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
@@ -740,50 +1039,60 @@ fn emitDumpDag(
     var dag: Dag = .init(gpa);
     defer dag.deinit(gpa);
 
-    // --- discover (lex/parse routed through the dag-threaded engine) ---
-    var graph = try Graph.discoverDag(gpa, io, cache, target, paths[0], &dag);
-    defer graph.deinit(gpa);
-    if (graph.err) |ge| {
-        try printGraphError(out, &graph, ge);
-        try out.flush();
-        return 1;
-    }
+    // ONE orchestration: the SAME discover->resolve->typecheck->codegen StageGraph the
+    // `-o` build drives, with the `dag` threaded into every stage so the dump shows the
+    // freshly-recorded structure. `--dump-dag` is purely observational (codegen reuse is
+    // the content-fp cache, recorded for observability). No second hand-sequenced chain.
+    var graph: ?Graph.Graph = null;
+    defer if (graph) |*g| g.deinit(gpa);
+    var res: ?ResolveGraph.GraphResult = null;
+    defer if (res) |*r| r.deinit(gpa);
+    var tc: ?TypecheckGraph.GraphResult = null;
+    defer if (tc) |*t| t.deinit(gpa);
+    var lowered: ?Driver.LowerProgramResult = null;
+    defer if (lowered) |*lw| switch (lw.*) {
+        .ok => |*lp| lp.deinit(gpa),
+        .err => {},
+    };
+    var ir_unused: ?Driver.IrResult = null; // the `.lower` tail never writes this
+    var failed_stage: ?Orchestrator.Stage = null;
 
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-    if (res.diags.len > 0) {
-        for (res.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
-        try out.flush();
-        return 1;
-    }
+    const entry_contributors = [_]u64{std.hash.Wyhash.hash(0x44_53_43_56, paths[0])}; // "DSCV"
+    var collect_contribs: std.ArrayList(u64) = .empty;
+    defer collect_contribs.deinit(gpa);
+    var gt_contribs: std.ArrayList(u64) = .empty;
+    defer gt_contribs.deinit(gpa);
+    const orch = Orchestrator{
+        .gpa = gpa,
+        .io = io,
+        .cache = cache,
+        .target = target,
+        .entry = paths[0],
+        .tail = .lower,
+        .entry_contributors = &entry_contributors,
+        .collect_contribs = &collect_contribs,
+        .gt_contribs = &gt_contribs,
+        .mode = .normal,
+        .opt = opt,
+        .dag = &dag,
+        .probe = null,
+        .link_ns = null,
+        .timings = false,
+        .last_ns = null,
+        .ns_discover = null,
+        .ns_resolve = null,
+        .ns_typecheck = null,
+        .ns_lower = null,
+        .graph = &graph,
+        .res = &res,
+        .tc = &tc,
+        .lowered = &lowered,
+        .ir = &ir_unused,
+        .failed_stage = &failed_stage,
+    };
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
-    defer tc.deinit(gpa);
-    if (tc.diags.len > 0) {
-        for (tc.diags) |d| try printModuleDiag(out, &graph, d.scope, d.byte_offset, d.message);
-        try out.flush();
-        return 1;
-    }
-
-    // --- whole-program codegen with the dag threaded into every per-fn job ---
-    // `--dump-dag` is purely observational: pass `prior=null` so codegen never takes
-    // the green reuse path (the dump shows the freshly-recorded structure).
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, target, &graph, &res, &tc, .normal, opt, &dag, null, null, null);
-    switch (lowered) {
-        .err => |e| {
-            try printGraphEmitError(out, &graph, e);
-            try out.flush();
-            return 1;
-        },
-        .ok => |*lp| {
-            defer lp.deinit(gpa);
-            if (lp.diags.len > 0) {
-                for (lp.diags) |d| try printGraphEmitError(out, &graph, .{ .message = d.message, .byte_offset = d.byte_offset });
-                try out.flush();
-                return 1;
-            }
-        },
-    }
+    const engine = Engine.initDag(cache, .normal, &dag);
+    if (!try runPipeline(out, gpa, engine, &orch)) return 1;
 
     // --- M17 persistence: LOAD the prior DAG (round-trip demo), then WRITE the
     // fresh one. Purely additive this stage: the artifact is recorded but does

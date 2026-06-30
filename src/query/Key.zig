@@ -1,5 +1,5 @@
 //! The uniform query key. A thin typed constructor over `Cache.Key` that
-//! discriminates every query shape (lex / parse / check / codegen, single-file
+//! discriminates every CACHEABLE query shape (lex / parse / codegen, single-file
 //! and graph) WITHOUT a new digest formula and WITHOUT cross-shape collision.
 //!
 //! Why no collision (and why we do NOT change `Cache.Key.digest()`):
@@ -51,25 +51,28 @@ pub fn optMix(cfg: Opt.Config) u64 {
 }
 
 /// The STABLE codegen DAG-node identity — distinct from `codegen(...).digest()`,
-/// which folds the transitive content fingerprint and so makes a node's identity
-/// its content hash (red-green then isomorphic to a cache hit). This id folds ONLY
-/// a phase tag + the target (target-sensitive) + the opt level + the program-wide
-/// global fn id (`gid`, the `res.fns` index) + whether the fn is the program ENTRY.
-/// `gid` is globally unique across modules (unlike the bare-name signature id), so
-/// this id is unique across (kind=codegen, module, target, opt, is_entry) — the
-/// precondition for keying codegen reuse off stable identity rather than the content fp.
+/// which folds the transitive content fingerprint and so makes a node's identity its
+/// content hash. This id folds ONLY a phase tag + the target (target-sensitive) + the
+/// opt level + the program-wide global fn id (`gid`, the `res.fns` index) + whether the
+/// fn is the program ENTRY. `gid` is globally unique across modules (unlike the
+/// bare-name signature id), so this id is unique across (kind=codegen, module, target,
+/// opt, is_entry) — a stable per-fn name independent of the content fp.
+///
+/// It names the in-memory DAG node recorded for OBSERVABILITY (consumed by the
+/// `--query-stats` red-green REPORTER, `--verify`'s auditor, and `--dump-dag`).
+/// Reuse/cutoff is NOT decided here — the content-fp cache (`Key.codegen`) is the sole
+/// driver; this id only makes the observed node STABLE across rebuilds so the reporter
+/// can track a fn's codegen node by identity.
 ///
 /// `is_entry` is folded because it is a codegen-root input NOT carried by the fn's
-/// body subtree (`body(gid)`): the entry fn gets a distinct prologue, but renaming a
-/// fn to/from `main` (the only way the entry assignment moves) is normally caught via
-/// the symbol/proto fold in `body(gid)`. Folding it here makes the reuse decision
-/// independent of that argument — an entry flip lands under a DIFFERENT stable id, so
-/// the prior stamp is simply absent and the fn recomputes (RED), never a stale-prologue
-/// false green. Costs nothing on the common path (is_entry is stable per fn).
+/// body subtree (`body(gid)`): the entry fn gets a distinct prologue. Folding it keeps
+/// the observed node honest — an entry flip lands under a DIFFERENT stable id rather
+/// than aliasing the prior (non-entry) node's fp. Costs nothing on the common path
+/// (is_entry is stable per fn).
 ///
 /// NOTE: this is NOT the on-disk cache key. `Key.codegen` (content-fp-derived) stays
-/// the cache-entry name so cold-cache bytes are byte-identical; this id only names
-/// the in-memory DAG node the red-green walk decides reuse for.
+/// the cache-entry name so cold-cache bytes are byte-identical; this id only names the
+/// in-memory DAG node the red-green reporter reads.
 pub fn codegenIdentity(target: []const u8, opt: Opt.Config, gid: u32, is_entry: bool) u64 {
     var h = std.hash.Wyhash.init(0x43_47_49_44); // "CGID"
     h.update(&[_]u8{@intFromEnum(Phase.codegen)});
@@ -112,21 +115,20 @@ test "codegenIdentity is unique per (gid, target, opt, is_entry) and ignores con
     const t_x = "x86_64-macos";
 
     // Distinct global fn ids => distinct stable node ids (the program-wide-unique
-    // precondition for keying codegen reuse off stable identity).
+    // precondition for naming each fn's observability node by stable identity).
     try testing.expect(codegenIdentity(t_arm, o0, 0, false) != codegenIdentity(t_arm, o0, 1, false));
     try testing.expect(codegenIdentity(t_arm, o0, 5, false) != codegenIdentity(t_arm, o0, 6, false));
 
-    // Same gid, different target => distinct (target-sensitive: a cross-target green
-    // must never reuse the wrong target's blob).
+    // Same gid, different target => distinct (target-sensitive: a cross-target node
+    // must not alias the wrong target's observed fp).
     try testing.expect(codegenIdentity(t_arm, o0, 3, false) != codegenIdentity(t_x, o0, 3, false));
 
     // Same gid+target, different opt level => distinct.
     const o1: Opt.Config = .{ .fold = true };
     try testing.expect(codegenIdentity(t_arm, o0, 3, false) != codegenIdentity(t_arm, o1, 3, false));
 
-    // Same gid+target+opt, different ENTRY flag => distinct (an entry flip must land
-    // under a different id so the prior stamp is absent and the fn recomputes RED,
-    // never reusing a blob with the wrong prologue).
+    // Same gid+target+opt, different ENTRY flag => distinct (an entry flip lands under
+    // a different id rather than aliasing the prior non-entry node's fp).
     try testing.expect(codegenIdentity(t_arm, o0, 3, false) != codegenIdentity(t_arm, o0, 3, true));
 
     // Stable for identical inputs (no content-fp dependence: identity is decoupled
