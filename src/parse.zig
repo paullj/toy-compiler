@@ -1253,7 +1253,39 @@ test "root is program and children precede parents" {
             },
             .field_init => try testing.expect(n.lhs < self),
             .field_access => try testing.expect(n.lhs < self),
-            else => {},
+            // Leaves: `main_token` only; no child node indices to order.
+            .literal_number, .literal_string, .literal_bool, .identifier => {},
+            .enum_decl => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            .enum_variant_unit => {},
+            .enum_variant_tuple, .enum_variant_struct => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            .enum_init_unit => if (n.lhs != Ast.none) try testing.expect(n.lhs < self),
+            .enum_init_tuple, .enum_init_struct => {
+                if (n.lhs != Ast.none) try testing.expect(n.lhs < self);
+                for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+            },
+            .match_expr => {
+                try testing.expect(n.lhs < self);
+                for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+            },
+            .match_arm => {
+                try testing.expect(n.lhs < self);
+                const h = Ast.armHeaderAt(tree, n.rhs);
+                if (h.guard != Ast.none) try testing.expect(h.guard < self);
+                try testing.expect(h.body < self);
+            },
+            .pattern_variant => {
+                if (n.lhs != Ast.none) try testing.expect(n.lhs < self);
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+            },
+            .pattern_wildcard, .pattern_literal => {},
+            .pattern_binding => {
+                if (n.lhs != Ast.none) try testing.expect(n.lhs < self);
+                if (n.rhs != Ast.none) try testing.expect(n.rhs < self);
+            },
+            .pattern_or => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            // `import_decl` overloads `lhs`/`rhs` as TOKEN indices (path segments,
+            // alias) like break/continue — no node children to order.
+            .import_decl => {},
         }
     }
 }
