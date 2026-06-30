@@ -245,7 +245,7 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     // dag=null + io=null => serial Pass-C: the per-file `run` fan-out is the only
     // active parallelism for `--emit check`, so there is no nested-pool blowup. A
     // 1-fn graph never spawns regardless; serial == parallel byte-for-byte.
-    result.typecheck = try TypecheckGraph.checkGraph(gpa, &graph, &result.resolve.?, null, null);
+    result.typecheck = try TypecheckGraph.checkGraph(gpa, &graph, &result.resolve.?, null, null, 0);
     if (result.typecheck.?.diags.len > 0) result.err = error.TypeError;
 }
 
@@ -499,6 +499,11 @@ pub fn lowerGraphProgram(
     dag: ?*Dag,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
+    /// The `-j` jobs knob: the chunk-count basis for the per-fn codegen fan-out (0 =>
+    /// host cpu count). PERF P1 — codegen dispatches ~`ncpu` chunks, not one task per
+    /// fn, so `-jN` scales. Determinism is unchanged (ranges are disjoint, slots read
+    /// back in index order), so this is a perf lever only.
+    ncpu: usize,
 ) !LowerProgramResult {
     const n_mods = graph.modules.len;
 
@@ -614,7 +619,7 @@ pub fn lowerGraphProgram(
             return .{ c.gpa, c.io, c.cache, c.target, c.mode, c.gf, i, &c.slots[i] };
         }
     };
-    Engine.fanOut(io, fn_decls.items.len, graphFnJob, Ctx{
+    Engine.chunkedFanOut(io, fn_decls.items.len, ncpu, Engine.Chunk.codegen.threshold, Engine.Chunk.codegen.chunks_per_cpu, graphFnJob, Ctx{
         .gpa = gpa,
         .io = io,
         .cache = cache,
@@ -833,7 +838,7 @@ fn lowerSingleFile(
 ) !LowerProgramResult {
     var graph = try Graph.single(gpa, "main", r.path, r.source, r.tokens, r.nodes, r.extra, r.pub_bits);
     defer graph.deinitSingle(gpa);
-    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, null);
+    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, null, 0);
 }
 
 test "cold then warm parse: 2nd run hits cache and renders identically" {

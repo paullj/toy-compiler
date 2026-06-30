@@ -371,7 +371,13 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
             return .{ c.gpa, c.fns, c.text, c.offsets, c.site_h, c.call_targets, c.call_base, i, &c.jobs[i] };
         }
     };
-    Engine.fanOut(io, fns.len, fnLinkJob, Ctx{
+    // PERF P1: one task per ~ncpu-sized contiguous fn RANGE (each looping its fns
+    // serially), not one task per fn — with 10K fns the per-task overhead otherwise
+    // swamps the µs of copy+patch work. ncpu=0 => host cpus (the link tail does not
+    // thread the `-j` knob; over-providing chunks is harmless). Determinism is
+    // unchanged: ranges own disjoint `text` regions + slots, relocs stable-concat in
+    // source order below.
+    Engine.chunkedFanOut(io, fns.len, 0, Engine.Chunk.fn_link.threshold, Engine.Chunk.fn_link.chunks_per_cpu, fnLinkJob, Ctx{
         .gpa = gpa,
         .fns = fns,
         .text = text,
@@ -499,7 +505,10 @@ pub fn applyDataRelocs(
             return .{ c.text, c.data_relocs[i], c.text_vmaddr, c.cstring_vmaddr, c.got_vmaddr, c.import_slots };
         }
     };
-    Engine.fanOut(io, data_relocs.len, dataRelocJob, Ctx{
+    // PERF P1: chunk the per-reloc patch into ~ncpu ranges. Reloc COUNT is usually
+    // small (not 10K), so the high threshold keeps it serial except on the largest
+    // images; each reloc still owns a unique disjoint 4-byte site, so chunked == serial.
+    Engine.chunkedFanOut(io, data_relocs.len, 0, Engine.Chunk.small_count.threshold, Engine.Chunk.small_count.chunks_per_cpu, dataRelocJob, Ctx{
         .text = text,
         .data_relocs = data_relocs,
         .text_vmaddr = text_vmaddr,

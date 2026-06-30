@@ -547,6 +547,9 @@ fn emitExecutable(
         .dag = dag,
         .probe = probe_ptr,
         .link_ns = link_ns_ptr,
+        // `-j` chunk-count basis for the body-check + codegen fan-outs. `threads` is the
+        // resolved jobs count (the `-j N` value, else the host cpu count).
+        .ncpu = threads,
         .timings = timings,
         .last_ns = &last_ns,
         .ns_discover = &ns_discover,
@@ -710,6 +713,10 @@ const Orchestrator = struct {
     dag: ?*Dag,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
+    /// The `-j` jobs knob (0 => host cpus): the chunk-count basis for the two hot
+    /// per-fn fan-outs the orchestrator drives — the GLOBAL_TABLES body checks
+    /// (`checkGraph`) and the codegen region (`lowerGraphProgram`). PERF P1.
+    ncpu: usize,
 
     // `--timings` per-stage laps (each stage closure charges its own bucket). Null
     // pointers on paths that don't profile (`--dump-dag`/`--emit ir`) => no lap.
@@ -796,7 +803,7 @@ const Orchestrator = struct {
         comptime std.debug.assert(stage_i == 3);
         switch (self.tail) {
             .lower => {
-                self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.dag, self.probe, self.link_ns);
+                self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.dag, self.probe, self.link_ns, self.ncpu);
                 self.lap(self.ns_lower);
                 const bad = switch (self.lowered.*.?) {
                     .err => true,
@@ -871,7 +878,7 @@ const ResolveCompute = struct {
 const TypecheckCompute = struct {
     o: Orchestrator,
     pub fn run(c: TypecheckCompute) !void {
-        c.o.tc.* = try TypecheckGraph.checkGraph(c.o.gpa, &c.o.graph.*.?, &c.o.res.*.?, c.o.dag, c.o.io);
+        c.o.tc.* = try TypecheckGraph.checkGraph(c.o.gpa, &c.o.graph.*.?, &c.o.res.*.?, c.o.dag, c.o.io, c.o.ncpu);
         if (c.o.tc.*.?.diags.len > 0) {
             c.o.failed_stage.* = .typecheck;
             return error.StageDiagnostics;
@@ -979,6 +986,9 @@ fn emitIr(
         .dag = null,
         .probe = null,
         .link_ns = null,
+        // `-j` chunk basis from the pool limit: `.limited(N)`->N, `.unlimited`->host
+        // cpus, `-j1` (`.limited(0)`)->1 (one chunk = the serial inline path).
+        .ncpu = @max(@as(usize, 1), jlimit.toInt() orelse Engine.hostCpus()),
         .timings = false,
         .last_ns = null,
         .ns_discover = null,
@@ -1077,6 +1087,9 @@ fn emitDumpDag(
         .dag = &dag,
         .probe = null,
         .link_ns = null,
+        // `-j` chunk basis from the pool limit (see emitIr): keeps the dump byte-
+        // identical at any -j (chunked recording is fn-id-ordered + spinlock-safe).
+        .ncpu = @max(@as(usize, 1), jlimit.toInt() orelse Engine.hostCpus()),
         .timings = false,
         .last_ns = null,
         .ns_discover = null,

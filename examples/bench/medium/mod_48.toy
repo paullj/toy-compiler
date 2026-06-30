@@ -1,0 +1,104 @@
+import mod_47
+struct S_48 { a: int, b: int }
+enum E_48 { Lo, Hi(int) }
+fn f_48_0(n: int) -> int {
+    acc := n + 0
+    for j in 0..4 {
+        acc = acc + j * 0
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + mod_47.entry(n)
+}
+fn f_48_1(n: int) -> int {
+    acc := n + 1
+    for j in 0..4 {
+        acc = acc + j * 1
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_0(n)
+}
+fn f_48_2(n: int) -> int {
+    acc := n + 2
+    for j in 0..4 {
+        acc = acc + j * 2
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_1(n)
+}
+fn f_48_3(n: int) -> int {
+    acc := n + 3
+    for j in 0..4 {
+        acc = acc + j * 3
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_2(n)
+}
+fn f_48_4(n: int) -> int {
+    acc := n + 4
+    for j in 0..4 {
+        acc = acc + j * 4
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_3(n)
+}
+fn f_48_5(n: int) -> int {
+    acc := n + 5
+    for j in 0..4 {
+        acc = acc + j * 5
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_4(n)
+}
+fn f_48_6(n: int) -> int {
+    acc := n + 6
+    for j in 0..4 {
+        acc = acc + j * 6
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_5(n)
+}
+fn f_48_7(n: int) -> int {
+    acc := n + 7
+    for j in 0..4 {
+        acc = acc + j * 7
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_6(n)
+}
+fn f_48_8(n: int) -> int {
+    acc := n + 8
+    for j in 0..4 {
+        acc = acc + j * 8
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_7(n)
+}
+fn f_48_9(n: int) -> int {
+    acc := n + 9
+    for j in 0..4 {
+        acc = acc + j * 9
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_8(n)
+}
+fn f_48_10(n: int) -> int {
+    acc := n + 10
+    for j in 0..4 {
+        acc = acc + j * 10
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_9(n)
+}
+fn f_48_11(n: int) -> int {
+    acc := n + 11
+    for j in 0..4 {
+        acc = acc + j * 11
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_48_10(n)
+}
+fn tag_48(e: E_48) -> int { match e { .Lo -> 0, .Hi(v) -> v } }
+pub fn entry(n: int) -> int {
+    s := S_48 { a: n, b: 48 }
+    return f_48_11(s.a) + tag_48(E_48.Hi(s.b))
+}

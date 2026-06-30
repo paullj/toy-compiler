@@ -151,7 +151,7 @@ fn record(comptime dir_name: []const u8, files: []const FixtureFile, entry: []co
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     errdefer res.deinit(gpa);
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io, 8);
     errdefer tc.deinit(gpa);
 
     return .{
@@ -898,11 +898,11 @@ fn wireBuild(
     defer res.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io, 8);
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, null, null);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, null, null, 8);
     switch (lowered) {
         .err => return error.TestUnexpectedResult,
         .ok => |*lp| {
@@ -1054,11 +1054,11 @@ fn gateBuild(
     defer res.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, &dag, io, 8);
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, null, null);
+    var lowered = try Driver.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, &dag, null, null, 8);
     switch (lowered) {
         .err => return error.TestUnexpectedResult,
         .ok => |*lp| {

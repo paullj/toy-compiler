@@ -45,6 +45,9 @@ pub fn checkGraph(
     /// Pass-C worker pool, or `null` to force serial (see `Typecheck.checkGraph`).
     /// The single-source path (per-file pipeline + inline test helpers) passes null.
     io: ?std.Io,
+    /// The `-j` jobs knob for the Pass-C body fan-out (0 => host cpus). Ignored when
+    /// `io == null`. See `Typecheck.ncpu`.
+    ncpu: usize,
 ) !GraphResult {
     const n = graph.modules.len;
 
@@ -101,7 +104,7 @@ pub fn checkGraph(
         };
     }
 
-    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, dag, io);
+    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, dag, io, ncpu);
 }
 
 /// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
@@ -201,7 +204,7 @@ fn withCheckedGraph(
     var r = try ResolveGraph.resolveGraph(gpa, &graph);
     defer r.deinit(gpa);
 
-    var tr = try checkGraph(gpa, &graph, &r, null, io);
+    var tr = try checkGraph(gpa, &graph, &r, null, io, 8);
     defer tr.deinit(gpa);
 
     try check(&graph, &r, &tr);
@@ -504,7 +507,7 @@ fn diagsUnder(
 ) ![]Diagnostic {
     var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
     defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, null, threaded.io());
+    var tr = try checkGraph(gpa, graph, res, null, threaded.io(), 8);
     defer tr.deinit(gpa);
     const copy = try gpa.alloc(Diagnostic, tr.diags.len);
     for (tr.diags, 0..) |d, i| copy[i] = .{
@@ -610,7 +613,7 @@ fn dagBytesUnder(
     defer threaded.deinit();
     var dag: Dag = .init(gpa);
     defer dag.deinit(gpa);
-    var tr = try checkGraph(gpa, graph, res, &dag, threaded.io());
+    var tr = try checkGraph(gpa, graph, res, &dag, threaded.io(), 8);
     defer tr.deinit(gpa);
     return dag.serialize(gpa);
 }

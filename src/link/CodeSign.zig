@@ -181,7 +181,10 @@ pub fn sign(
             return .{ c.image, @as(u32, @intCast(i)), c.hash_base, c.code_limit };
         }
     };
-    Engine.fanOut(io, n_slots, hashSlotJob, Ctx{
+    // PERF P1: chunk the per-page Merkle hash into ~ncpu ranges. Page COUNT is modest
+    // (one per 4KiB of code), so the high threshold leaves small images serial; each
+    // slot writes a unique disjoint digest by INDEX, so chunked == serial byte-for-byte.
+    Engine.chunkedFanOut(io, n_slots, 0, Engine.Chunk.small_count.threshold, Engine.Chunk.small_count.chunks_per_cpu, hashSlotJob, Ctx{
         .image = image,
         .hash_base = hash_base,
         .code_limit = code_limit,

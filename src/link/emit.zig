@@ -119,7 +119,10 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
                 return .{ c.fns[i], c.off_by_hash };
             }
         };
-        Engine.fanOut(io, all.items.len, rewriteCstrJob, Ctx{
+        // PERF P1: one task per ~ncpu fn RANGE, not per fn (10K fns × by-key map
+        // lookups). ncpu=0 => host cpus. `off_by_hash` is read-only by key (never
+        // iterated) and each fn owns its own relocs, so chunked == serial byte-for-byte.
+        Engine.chunkedFanOut(io, all.items.len, 0, Engine.Chunk.cstr.threshold, Engine.Chunk.cstr.chunks_per_cpu, rewriteCstrJob, Ctx{
             .fns = all.items,
             .off_by_hash = off_by_hash,
         });

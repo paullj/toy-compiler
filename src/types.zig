@@ -257,6 +257,14 @@ gph_fn_names: ?[]const []const u8 = null,
 /// feed the SAME slots + merge+sort, so the result is byte-identical regardless.
 io: ?Io = null,
 
+/// The `-j` jobs knob: the chunk-count basis for the per-fn Pass-C body fan-out
+/// (`checkBodies`), 0 => host cpu count. PERF P1 — body checks dispatch ~`ncpu`
+/// contiguous chunks (each looping its fns serially) instead of one task per fn, so
+/// `-jN` scales instead of drowning in per-task overhead. Only meaningful when
+/// `io != null` (the parallel dispatch path); determinism is unchanged (fn-id-ordered
+/// merge + one stable sort), so this is a perf lever only.
+ncpu: usize = 0,
+
 /// The graph context the orchestrator hands the shared `Typecheck`. It owns the
 /// per-module bare-name maps + the import namespaces; `Typecheck` borrows it.
 pub const GraphCtx = struct {
@@ -2020,6 +2028,9 @@ pub fn checkGraph(
     /// the real `io`. SERIAL and PARALLEL are byte-identical (the merge is fn-id
     /// ordered + stable-sorted), so this is a perf lever only.
     io: ?Io,
+    /// The `-j` jobs knob for the Pass-C body fan-out (0 => host cpus). Ignored when
+    /// `io == null` (serial). See `Typecheck.ncpu`.
+    ncpu: usize,
 ) !GraphResult {
     // Per-module node_types (parallel to each module's node array).
     const node_types = try gpa.alloc([]Type, mods.len);
@@ -2055,6 +2066,7 @@ pub fn checkGraph(
         .graph = ctx,
         .dag = dag,
         .io = io,
+        .ncpu = ncpu,
     };
     defer {
         for (t.fns.items) |f| gpa.free(f.params);
@@ -2240,7 +2252,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
                 return .{ c.t, c.model, @as(u32, @intCast(i)), &c.slots[i] };
             }
         };
-        Engine.fanOut(io, n, bodyUnit, Ctx{ .t = t, .model = model, .slots = slots });
+        Engine.chunkedFanOut(io, n, t.ncpu, Engine.Chunk.body.threshold, Engine.Chunk.body.chunks_per_cpu, bodyUnit, Ctx{ .t = t, .model = model, .slots = slots });
     } else {
         for (slots, 0..) |*s, i| bodyUnit(t, model, @intCast(i), s);
     }
@@ -2811,7 +2823,7 @@ fn checkSource(source: []const u8) !Checked {
     defer g.deinitSingle(gpa);
     var res = try ResolveGraph.resolveGraph(gpa, &g);
     errdefer res.deinit(gpa);
-    const result = try TypecheckGraph.checkGraph(gpa, &g, &res, null, null);
+    const result = try TypecheckGraph.checkGraph(gpa, &g, &res, null, null, 0);
     return .{ .tokens = tokens, .tree = tree, .resolve = res, .result = result, .source = source };
 }
 

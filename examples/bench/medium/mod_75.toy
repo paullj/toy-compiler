@@ -1,0 +1,104 @@
+import mod_74
+struct S_75 { a: int, b: int }
+enum E_75 { Lo, Hi(int) }
+fn f_75_0(n: int) -> int {
+    acc := n + 0
+    for j in 0..4 {
+        acc = acc + j * 0
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + mod_74.entry(n)
+}
+fn f_75_1(n: int) -> int {
+    acc := n + 1
+    for j in 0..4 {
+        acc = acc + j * 1
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_0(n)
+}
+fn f_75_2(n: int) -> int {
+    acc := n + 2
+    for j in 0..4 {
+        acc = acc + j * 2
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_1(n)
+}
+fn f_75_3(n: int) -> int {
+    acc := n + 3
+    for j in 0..4 {
+        acc = acc + j * 3
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_2(n)
+}
+fn f_75_4(n: int) -> int {
+    acc := n + 4
+    for j in 0..4 {
+        acc = acc + j * 4
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_3(n)
+}
+fn f_75_5(n: int) -> int {
+    acc := n + 5
+    for j in 0..4 {
+        acc = acc + j * 5
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_4(n)
+}
+fn f_75_6(n: int) -> int {
+    acc := n + 6
+    for j in 0..4 {
+        acc = acc + j * 6
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_5(n)
+}
+fn f_75_7(n: int) -> int {
+    acc := n + 7
+    for j in 0..4 {
+        acc = acc + j * 7
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_6(n)
+}
+fn f_75_8(n: int) -> int {
+    acc := n + 8
+    for j in 0..4 {
+        acc = acc + j * 8
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_7(n)
+}
+fn f_75_9(n: int) -> int {
+    acc := n + 9
+    for j in 0..4 {
+        acc = acc + j * 9
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_8(n)
+}
+fn f_75_10(n: int) -> int {
+    acc := n + 10
+    for j in 0..4 {
+        acc = acc + j * 10
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_9(n)
+}
+fn f_75_11(n: int) -> int {
+    acc := n + 11
+    for j in 0..4 {
+        acc = acc + j * 11
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_75_10(n)
+}
+fn tag_75(e: E_75) -> int { match e { .Lo -> 0, .Hi(v) -> v } }
+pub fn entry(n: int) -> int {
+    s := S_75 { a: n, b: 75 }
+    return f_75_11(s.a) + tag_75(E_75.Hi(s.b))
+}

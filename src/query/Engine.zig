@@ -305,6 +305,116 @@ pub fn fanOut(io: Io, n: usize, comptime jobFn: anytype, ctx: anytype) void {
     group.await(io) catch {};
 }
 
+/// PER-STAGE chunking heuristics for `chunkedFanOut`, tuned by the work-per-unit of
+/// each fan-out site (see PERF P1). `threshold` = stay serial at or below this unit
+/// count (chunking would cost more than it saves); `chunks_per_cpu` = how many ranges
+/// per cpu (more = finer ranges = better load-balance when unit cost varies, at a few
+/// more enqueues). The ratio "per-unit work vs per-task overhead" sets both: the
+/// tinier the unit, the LOWER the threshold has to be to ever activate on real
+/// programs, and a slightly higher chunk count keeps any one fat range from stalling.
+pub const Chunk = struct {
+    /// Per-fn body type-check (`types.checkBodies`): the TINIEST unit (~0.05-0.5ms, an
+    /// AST walk), so the worst overhead ratio — chunk aggressively. Low threshold so a
+    /// few-hundred-fn program already benefits; 8 ranges/cpu to even out fat bodies.
+    pub const body = .{ .threshold = 64, .chunks_per_cpu = 8 };
+    /// Per-fn codegen lower (`Driver.lowerGraphProgram`): more work/unit than body
+    /// (~1-5ms cold; a warm cache hit is ~0.02ms = back to tiny, so still chunk). 8
+    /// ranges/cpu because a warm/cold MIX makes per-unit cost highly uneven.
+    pub const codegen = .{ .threshold = 64, .chunks_per_cpu = 8 };
+    /// Per-fn link copy+call26 patch (`Link.link`): ~0.01-0.1ms/fn, one memcpy + a few
+    /// reloc patches. 4 ranges/cpu — units are uniform (no cache mix) so coarse is fine.
+    pub const fn_link = .{ .threshold = 128, .chunks_per_cpu = 4 };
+    /// Per-fn cstring-reloc rewrite (`emit.rewriteCstr`): ~0.001-0.01ms/fn, by-key map
+    /// lookups only. Tiny + uniform; chunk only on big programs, coarse ranges.
+    pub const cstr = .{ .threshold = 256, .chunks_per_cpu = 4 };
+    /// Per-reloc data-reloc patch (`Link.applyDataRelocs`) and per-page code-sign hash
+    /// (`CodeSign`): small unit COUNT (relocs/pages), not 10K, so contention is already
+    /// bounded. High threshold leaves them serial except on the largest images.
+    pub const small_count = .{ .threshold = 256, .chunks_per_cpu = 2 };
+};
+
+/// The host CPU count, the default chunk-count basis when a caller passes no `-j`
+/// hint (`ncpu_hint == 0`). It is the runtime knob — NOT a hardcoded constant — and
+/// over-providing chunks vs. the real pool size is harmless: surplus ranges queue on
+/// the pool and run as workers free up, and at `-j1` (`.limited(0)`) every range
+/// takes the inline serial path regardless of count, so byte-identity is unaffected.
+pub fn hostCpus() usize {
+    return std.Thread.getCpuCount() catch 1;
+}
+
+/// CHUNKED parallel fan-out: the PERF P1 primitive that makes `-jN` actually scale.
+///
+/// `Engine.fanOut` dispatches ONE task per unit; with 10K µs-scale units that is 10K
+/// `group.concurrent` enqueues on the main thread plus 10K completion atomics, and the
+/// per-task overhead (enqueue lock + worker dequeue + completion signal, all on shared
+/// cache lines) swamps the work — so `-jN` ends up SLOWER than `-j1`, worse with more
+/// cores. This splits `[0,n)` into ~`ncpu` CONTIGUOUS ranges and dispatches ONE task
+/// per range; each range loops its units SERIALLY. Dispatch count drops from `n` to
+/// ~`ncpu`, the shared-atomic traffic with it, so contention stops and it scales.
+///
+/// `threshold`: below it, run every unit inline on this thread (no dispatch) — the
+/// verbatim serial path for small programs where chunking would only add overhead.
+/// `chunks_per_cpu`: ranges = `min(n, ncpu * chunks_per_cpu)`; >1 gives the pool more,
+/// smaller ranges so an uneven unit-cost distribution still load-balances (static
+/// ranges, no work-stealing). `ncpu_hint`: the `-j` jobs knob; `0` => `hostCpus()`.
+///
+/// DETERMINISM ([C11]): ranges own DISJOINT unit spans (range r writes only units
+/// `start..end`); there is NO shared mutable state across ranges, and each range calls
+/// the SAME `jobFn(ctx.args(i))` the per-unit `fanOut` would, in ascending `i`. The
+/// caller still reads its slots back in unit-index order, so the merged result is
+/// byte-identical to `-j1` regardless of range count or thread-arrival order. The
+/// inline fallback (when `group.concurrent` can't provide concurrency, e.g. `-j1`'s
+/// `.limited(0)`) runs the ranges in order on this thread = a plain serial loop over
+/// all `n` units, the exact serial baseline.
+pub fn chunkedFanOut(
+    io: Io,
+    n: usize,
+    ncpu_hint: usize,
+    threshold: usize,
+    chunks_per_cpu: usize,
+    comptime jobFn: anytype,
+    ctx: anytype,
+) void {
+    if (n == 0) return;
+    // Small `n`: the serial path. Chunking here only pays dispatch overhead for work
+    // that is already a rounding error, and it keeps tiny programs byte-for-byte on
+    // the same code path `-j1` takes.
+    if (n <= threshold) {
+        var i: usize = 0;
+        while (i < n) : (i += 1) @call(.auto, jobFn, ctx.args(i));
+        return;
+    }
+
+    const ncpu = if (ncpu_hint != 0) ncpu_hint else hostCpus();
+    const target_chunks = @max(@as(usize, 1), ncpu * @max(@as(usize, 1), chunks_per_cpu));
+    const nchunks = @min(n, target_chunks);
+
+    // One task per CONTIGUOUS range; each runs its units serially. The range job
+    // closes over the user's `ctx`/`jobFn` and the `[start,end)` it owns. Args is a
+    // 3-tuple `{ctx, start, end}` — ONE enqueue per range, not per unit.
+    const RangeJob = struct {
+        fn run(c: @TypeOf(ctx), start: usize, end: usize) void {
+            var i = start;
+            while (i < end) : (i += 1) @call(.auto, jobFn, c.args(i));
+        }
+    };
+
+    var group: Io.Group = .init;
+    // Balanced split: the first `rem` ranges get one extra unit so every unit is
+    // covered with at most a 1-unit imbalance (no padding, no leftover tail).
+    const base = n / nchunks;
+    const rem = n % nchunks;
+    var start: usize = 0;
+    var c: usize = 0;
+    while (c < nchunks) : (c += 1) {
+        const len = base + @as(usize, if (c < rem) 1 else 0);
+        const end = start + len;
+        group.concurrent(io, RangeJob.run, .{ ctx, start, end }) catch RangeJob.run(ctx, start, end);
+        start = end;
+    }
+    group.await(io) catch {};
+}
+
 /// A DETERMINISTIC, ORDER-INDEPENDENT fold of a contributor multiset into one u64 —
 /// the aggregate identity of a fan-in BARRIER (e.g. "the global tables built from all
 /// module parse-result digests"). Each contributor is Wyhash'd, the per-element hashes
@@ -619,6 +729,91 @@ test "barrier folds contributors, runs compute once, and records a root node" {
     // A barrier is a ROOT: it records its own fp under {kind, fold} with no edge.
     try testing.expectEqual(@as(?u64, res.fold), dag.fingerprintOf(.{ .kind = .signature, .id = res.fold }));
     try testing.expectEqual(@as(usize, 0), dag.edges.count());
+}
+
+test "chunkedFanOut covers every unit exactly once, in disjoint ranges (any ncpu)" {
+    const gpa = testing.allocator;
+    // .limited(0) forces the inline path (every range runs on this thread): the
+    // serial baseline. A real pool is exercised by the integration/perf suite; here
+    // we assert the partition is total + disjoint regardless of the chunk count.
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Ctx = struct {
+        hits: []u32,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(job)) {
+            return .{ c.hits, i };
+        }
+        fn job(hits: []u32, i: usize) void {
+            hits[i] += 1;
+        }
+    };
+
+    // n=1000, threshold=10 so chunking activates; sweep ncpu incl. cases where n is
+    // NOT divisible by the chunk count (1000 % 7, % 13, % 64 != 0).
+    for ([_]usize{ 1, 2, 3, 4, 7, 8, 13, 64, 1000, 2000 }) |ncpu| {
+        const hits = try gpa.alloc(u32, 1000);
+        defer gpa.free(hits);
+        @memset(hits, 0);
+        chunkedFanOut(io, 1000, ncpu, 10, 4, Ctx.job, Ctx{ .hits = hits });
+        for (hits) |h| try testing.expectEqual(@as(u32, 1), h);
+    }
+}
+
+test "chunkedFanOut below threshold runs the serial inline path" {
+    const gpa = testing.allocator;
+    // .unlimited would still let a tiny n go inline, but pin .limited(0) so the test
+    // asserts the threshold branch (not pool behavior): n <= threshold => inline.
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var order: std.ArrayListUnmanaged(usize) = .empty;
+    defer order.deinit(gpa);
+    const Ctx = struct {
+        order: *std.ArrayListUnmanaged(usize),
+        gpa: std.mem.Allocator,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(job)) {
+            return .{ c.order, c.gpa, i };
+        }
+        fn job(o: *std.ArrayListUnmanaged(usize), g: std.mem.Allocator, i: usize) void {
+            o.append(g, i) catch {};
+        }
+    };
+    // n=5, threshold=100 => serial: the inline path visits units in ascending order.
+    chunkedFanOut(io, 5, 8, 100, 4, Ctx.job, Ctx{ .order = &order, .gpa = gpa });
+    try testing.expectEqual(@as(usize, 5), order.items.len);
+    for (order.items, 0..) |v, i| try testing.expectEqual(i, v);
+}
+
+test "chunkedFanOut result is identical to fanOut (per-unit slot writes)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const Ctx = struct {
+        out: []u64,
+        pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(job)) {
+            return .{ c.out, i };
+        }
+        fn job(out: []u64, i: usize) void {
+            // A deterministic per-unit value written to the unit's OWN slot.
+            out[i] = std.hash.Wyhash.hash(0xABCD, std.mem.asBytes(&i));
+        }
+    };
+
+    const a = try gpa.alloc(u64, 777);
+    defer gpa.free(a);
+    const b = try gpa.alloc(u64, 777);
+    defer gpa.free(b);
+    @memset(a, 0);
+    @memset(b, 0);
+
+    fanOut(io, 777, Ctx.job, Ctx{ .out = a });
+    chunkedFanOut(io, 777, 8, 16, 4, Ctx.job, Ctx{ .out = b });
+    try testing.expectEqualSlices(u64, a, b);
 }
 
 test "barrier with no DAG records nothing and still returns the fold" {

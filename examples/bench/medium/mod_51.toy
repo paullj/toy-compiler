@@ -1,0 +1,104 @@
+import mod_50
+struct S_51 { a: int, b: int }
+enum E_51 { Lo, Hi(int) }
+fn f_51_0(n: int) -> int {
+    acc := n + 0
+    for j in 0..4 {
+        acc = acc + j * 0
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + mod_50.entry(n)
+}
+fn f_51_1(n: int) -> int {
+    acc := n + 1
+    for j in 0..4 {
+        acc = acc + j * 1
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_0(n)
+}
+fn f_51_2(n: int) -> int {
+    acc := n + 2
+    for j in 0..4 {
+        acc = acc + j * 2
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_1(n)
+}
+fn f_51_3(n: int) -> int {
+    acc := n + 3
+    for j in 0..4 {
+        acc = acc + j * 3
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_2(n)
+}
+fn f_51_4(n: int) -> int {
+    acc := n + 4
+    for j in 0..4 {
+        acc = acc + j * 4
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_3(n)
+}
+fn f_51_5(n: int) -> int {
+    acc := n + 5
+    for j in 0..4 {
+        acc = acc + j * 5
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_4(n)
+}
+fn f_51_6(n: int) -> int {
+    acc := n + 6
+    for j in 0..4 {
+        acc = acc + j * 6
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_5(n)
+}
+fn f_51_7(n: int) -> int {
+    acc := n + 7
+    for j in 0..4 {
+        acc = acc + j * 7
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_6(n)
+}
+fn f_51_8(n: int) -> int {
+    acc := n + 8
+    for j in 0..4 {
+        acc = acc + j * 8
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_7(n)
+}
+fn f_51_9(n: int) -> int {
+    acc := n + 9
+    for j in 0..4 {
+        acc = acc + j * 9
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_8(n)
+}
+fn f_51_10(n: int) -> int {
+    acc := n + 10
+    for j in 0..4 {
+        acc = acc + j * 10
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_9(n)
+}
+fn f_51_11(n: int) -> int {
+    acc := n + 11
+    for j in 0..4 {
+        acc = acc + j * 11
+    }
+    if acc < 0 { acc = 0 - acc }
+    return acc + f_51_10(n)
+}
+fn tag_51(e: E_51) -> int { match e { .Lo -> 0, .Hi(v) -> v } }
+pub fn entry(n: int) -> int {
+    s := S_51 { a: n, b: 51 }
+    return f_51_11(s.a) + tag_51(E_51.Hi(s.b))
+}
