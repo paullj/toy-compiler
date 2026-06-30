@@ -66,6 +66,74 @@ const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "str", Type.str },
 });
 
+/// Shared type-reference resolution + token/diagnostic helpers, generic over the
+/// checker (`*Typecheck` for Pass-A or `*BodyChecker` for Pass-C). Both expose the
+/// same cursor (`tree`/`tokens`/`source`/`graph_mod`/`sink`) and table accessors
+/// (`graphCtx`/`structSyms`/`enumSyms`/`activeStructMap`/`activeEnumMap`), so this
+/// is the single home for the logic AND its diagnostic strings — the two passes
+/// can't drift (diagnostic-string drift is otherwise gated only by `check.sh`).
+const refs = struct {
+    const err_unknown_type = "unknown type '{s}'";
+    const err_unknown_module = "unknown module '{s}'";
+    const err_module_no_type = "module has no type '{s}'";
+
+    fn nameText(self: anytype, tok: u32) []const u8 {
+        return self.tokens[tok].text(self.source);
+    }
+
+    fn byteOf(self: anytype, tok: u32) u32 {
+        return self.tokens[tok].start;
+    }
+
+    /// Human-readable name of a type (a struct/enum's declared name, else its kind tag).
+    fn typeName(self: anytype, ty: Type) []const u8 {
+        if (ty.kind == .@"struct" and ty.struct_id < self.structSyms().len)
+            return self.structSyms()[ty.struct_id].name;
+        if (ty.kind == .@"enum" and ty.enum_id < self.enumSyms().len)
+            return self.enumSyms()[ty.enum_id].name;
+        return @tagName(ty.kind);
+    }
+
+    /// Map a type-reference node (an `identifier`, a `literal_unit` for `()`, or in
+    /// graph mode a qualified `mod.Type` `field_access`) to a `Type`.
+    fn typeFromNode(self: anytype, type_node: Ast.Index) Type {
+        if (type_node == Ast.none) return Type.unit;
+        const tn = self.tree.nodes[type_node];
+        if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
+        // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
+        // receiver binds to a `.module`. Resolve it against the owning module's tables.
+        if (tn.tag == .field_access) return refs.typeFromQualified(self, type_node, tn);
+        const tok = tn.main_token;
+        const name = refs.nameText(self, tok);
+        if (type_names.get(name)) |b| return b;
+        if (self.activeStructMap().get(name)) |id| return Type.structT(id);
+        if (self.activeEnumMap().get(name)) |id| return Type.enumT(id);
+        self.sink.emitFmt(refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
+        return .invalid;
+    }
+
+    /// Resolve a qualified `mod.Type` type-reference (a `field_access` in type
+    /// position; the receiver binds to a `.module`) to the owning module's GLOBAL
+    /// struct/enum id. Graph mode only. Visibility was already enforced by
+    /// `resolve_graph`, so a private type here is a defensive `invalid`.
+    fn typeFromQualified(self: anytype, node_idx: Ast.Index, n: Ast.Node) Type {
+        _ = node_idx;
+        const g = self.graphCtx();
+        const recv = self.tree.nodes[n.lhs];
+        if (recv.tag != .identifier) return .invalid;
+        const recv_name = refs.nameText(self, recv.main_token);
+        const target = g.namespaceOfIn(self.graph_mod, recv_name) orelse {
+            self.sink.emitFmt(refs.byteOf(self, recv.main_token), err_unknown_module, .{recv_name}) catch {};
+            return .invalid;
+        };
+        const member = refs.nameText(self, n.main_token);
+        if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
+        if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
+        self.sink.emitFmt(refs.byteOf(self, n.main_token), err_module_no_type, .{member}) catch {};
+        return .invalid;
+    }
+};
+
 /// A reported problem. Same shape as `Parser`/`Resolve` diagnostics so the
 /// driver/CLI can render either uniformly (byte offset → line:col).
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
@@ -1500,11 +1568,17 @@ const BodyChecker = struct {
     }
 
     fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {
-        if (ty.kind == .@"struct" and ty.struct_id < bc.model.structs.len)
-            return bc.model.structs[ty.struct_id].name;
-        if (ty.kind == .@"enum" and ty.enum_id < bc.model.enums.len)
-            return bc.model.enums[ty.enum_id].name;
-        return @tagName(ty.kind);
+        return refs.typeName(bc, ty);
+    }
+
+    fn graphCtx(bc: *const BodyChecker) *GraphCtx {
+        return bc.model.graph;
+    }
+    fn structSyms(bc: *const BodyChecker) []const StructSym {
+        return bc.model.structs;
+    }
+    fn enumSyms(bc: *const BodyChecker) []const EnumSym {
+        return bc.model.enums;
     }
 
     fn slotType(bc: *const BodyChecker, slot: u32) Type {
@@ -1517,44 +1591,19 @@ const BodyChecker = struct {
     }
 
     fn nameText(bc: *const BodyChecker, tok: u32) []const u8 {
-        return bc.tokens[tok].text(bc.source);
+        return refs.nameText(bc, tok);
     }
 
     fn byteOf(bc: *const BodyChecker, tok: u32) u32 {
-        return bc.tokens[tok].start;
+        return refs.byteOf(bc, tok);
     }
 
     fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {
-        if (type_node == Ast.none) return Type.unit;
-        const tn = bc.tree.nodes[type_node];
-        if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
-        // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
-        // receiver binds to a `.module`. Resolve it against the owning module's tables.
-        if (tn.tag == .field_access) return bc.typeFromQualified(type_node, tn);
-        const tok = tn.main_token;
-        const name = bc.nameText(tok);
-        if (type_names.get(name)) |b| return b;
-        if (bc.activeStructMap().get(name)) |id| return Type.structT(id);
-        if (bc.activeEnumMap().get(name)) |id| return Type.enumT(id);
-        bc.sink.emitFmt(bc.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
-        return .invalid;
+        return refs.typeFromNode(bc, type_node);
     }
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
-        _ = node_idx;
-        const g = bc.model.graph;
-        const recv = bc.tree.nodes[n.lhs];
-        if (recv.tag != .identifier) return .invalid;
-        const recv_name = bc.nameText(recv.main_token);
-        const target = g.namespaceOfIn(bc.graph_mod, recv_name) orelse {
-            bc.sink.emitFmt(bc.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
-            return .invalid;
-        };
-        const member = bc.nameText(n.main_token);
-        if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
-        if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-        bc.sink.emitFmt(bc.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
-        return .invalid;
+        return refs.typeFromQualified(bc, node_idx, n);
     }
 
     fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
@@ -2170,60 +2219,34 @@ const BoolCov = struct { t: bool = false, f: bool = false };
 
 
 
-/// Map a type-reference node (an `identifier`, a `literal_unit` for `()`, or in
-/// graph mode a qualified `mod.Type` `field_access`) to a `Type`.
 fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
-    if (type_node == Ast.none) return Type.unit;
-    const tn = t.tree.nodes[type_node];
-    if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
-    // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
-    // receiver binds to a `.module`. Resolve it against the owning module's tables.
-    if (tn.tag == .field_access) return t.typeFromQualified(type_node, tn);
-    const tok = tn.main_token;
-    const name = t.nameText(tok);
-    if (type_names.get(name)) |b| return b;
-    if (t.activeStructMap().get(name)) |id| return Type.structT(id);
-    if (t.activeEnumMap().get(name)) |id| return Type.enumT(id);
-    t.sink.emitFmt(t.byteOf(tok), "unknown type '{s}'", .{name}) catch {};
-    return .invalid;
+    return refs.typeFromNode(t, type_node);
 }
 
-/// Resolve a qualified `mod.Type` type-reference (a `field_access` in type
-/// position; the receiver binds to a `.module`) to the owning module's GLOBAL
-/// struct/enum id. Graph mode only. Visibility was already enforced by
-/// `resolve_graph`, so a private type here is a defensive `invalid`.
 fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
-    _ = node_idx;
-    const g = t.graph;
-    const recv = t.tree.nodes[n.lhs];
-    if (recv.tag != .identifier) return .invalid;
-    const recv_name = t.nameText(recv.main_token);
-    const target = g.namespaceOfIn(t.graph_mod, recv_name) orelse {
-        t.sink.emitFmt(t.byteOf(recv.main_token), "unknown module '{s}'", .{recv_name}) catch {};
-        return .invalid;
-    };
-    const member = t.nameText(n.main_token);
-    if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
-    if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-    t.sink.emitFmt(t.byteOf(n.main_token), "module has no type '{s}'", .{member}) catch {};
-    return .invalid;
+    return refs.typeFromQualified(t, node_idx, n);
 }
 
-/// Human-readable name of a type (a struct's declared name, else its kind tag).
 fn typeName(t: *const Typecheck, ty: Type) []const u8 {
-    if (ty.kind == .@"struct" and ty.struct_id < t.structs.items.len)
-        return t.structs.items[ty.struct_id].name;
-    if (ty.kind == .@"enum" and ty.enum_id < t.enums.items.len)
-        return t.enums.items[ty.enum_id].name;
-    return @tagName(ty.kind);
+    return refs.typeName(t, ty);
 }
 
 fn nameText(t: *const Typecheck, tok: u32) []const u8 {
-    return t.tokens[tok].text(t.source);
+    return refs.nameText(t, tok);
 }
 
 fn byteOf(t: *const Typecheck, tok: u32) u32 {
-    return t.tokens[tok].start;
+    return refs.byteOf(t, tok);
+}
+
+fn graphCtx(t: *const Typecheck) *GraphCtx {
+    return t.graph;
+}
+fn structSyms(t: *const Typecheck) []const StructSym {
+    return t.structs.items;
+}
+fn enumSyms(t: *const Typecheck) []const EnumSym {
+    return t.enums.items;
 }
 
 const testing = std.testing;
