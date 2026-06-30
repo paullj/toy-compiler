@@ -41,7 +41,7 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
     while (true) {
         // Recompute usage from the current instrs/terminators.
         @memset(used, false);
-        walk.forEachValueUse(func, used, markUsed);
+        walk.forEachValueUse(func, used, walk.markUsed);
 
         var round_changed = false;
         for (func.blocks) |*b| {
@@ -77,10 +77,6 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
     return any_instr_dropped or pruned;
 }
 
-fn markUsed(used: []bool, v: Ir.ValueId) void {
-    if (v < used.len) used[v] = true;
-}
-
 /// An instr survives iff it produces no value, OR its result is used, OR its op
 /// has a side effect (call/store/copy are never dropped).
 fn instrLive(ins: Ir.Instr, used: []const bool) bool {
@@ -106,7 +102,7 @@ fn pruneValues(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) er
     defer gpa.free(live);
     @memset(live, false);
     // Defs that survive: every surviving instr result + every block param.
-    walk.forEachValueDef(func, live, markUsed);
+    walk.forEachValueDef(func, live, walk.markUsed);
 
     var kept: usize = 0;
     for (live) |l| {

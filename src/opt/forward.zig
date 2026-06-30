@@ -45,6 +45,7 @@
 const std = @import("std");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("Opt.zig");
+const walk = @import("walk.zig");
 
 const AbstractAddr = union(enum) {
     /// Names slot S at byte offset `off`.
@@ -100,7 +101,7 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
     const used = try gpa.alloc(bool, func.values.len);
     defer gpa.free(used);
     @memset(used, false);
-    @import("walk.zig").forEachValueUse(func, used, markUsed);
+    walk.forEachValueUse(func, used, walk.markUsed);
 
     // Scratch avail list, reused per block (cleared at each boundary). Bounded by
     // the number of stores in the block; grown as needed.
@@ -162,67 +163,14 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
     // (instr.result, block params). Rewriting the forwarded load's own result would
     // duplicate a def; instead we leave it intact and now UNUSED, so DCE prunes the
     // load + its feeder slot_addr/field_addr next round (the real win). none_value
-    // is left untouched by remapUse.
-    remapUses(func, remap);
+    // is left untouched by mapUse.
+    walk.remapUses(func, remap, mapUse);
     return true;
-}
-
-/// Rewrite every value-USE in the function in place through `remap`. Mirrors
-/// `walk.forEachValueUse`'s site set exactly (operands that READ a value), but in a
-/// mutating form. DEFS (instr.result, block params) and slot/block ids are left
-/// untouched — forwarding only redirects readers, never redefines.
-fn remapUses(func: *Ir.Function, remap: []const Ir.ValueId) void {
-    for (func.blocks) |*b| {
-        for (b.instrs) |*ins| {
-            switch (ins.op) {
-                .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
-                .add, .sub, .mul, .sdiv => |*bin| {
-                    bin.lhs = mapUse(remap, bin.lhs);
-                    bin.rhs = mapUse(remap, bin.rhs);
-                },
-                .neg, .bnot, .get_tag => |*v| v.* = mapUse(remap, v.*),
-                .icmp => |*c| {
-                    c.lhs = mapUse(remap, c.lhs);
-                    c.rhs = mapUse(remap, c.rhs);
-                },
-                .field_addr => |*fa| fa.base = mapUse(remap, fa.base),
-                .load => |*l| l.addr = mapUse(remap, l.addr),
-                .store => |*s| {
-                    s.addr = mapUse(remap, s.addr);
-                    s.val = mapUse(remap, s.val);
-                },
-                .copy => |*c| {
-                    c.dst = mapUse(remap, c.dst);
-                    c.src = mapUse(remap, c.src);
-                },
-                .call => |*c| for (c.args) |*a| switch (a.*) {
-                    .value => |*v| v.* = mapUse(remap, v.*),
-                    .slot, .none => {},
-                },
-            }
-        }
-        switch (b.term) {
-            .br => |*br| for (br.args) |*a| switch (a.*) {
-                .value => |*v| v.* = mapUse(remap, v.*),
-                .slot, .none => {},
-            },
-            .cond_br => |*c| c.cond = mapUse(remap, c.cond),
-            .ret => |*o| switch (o.*) {
-                .value => |*v| v.* = mapUse(remap, v.*),
-                .slot, .none => {},
-            },
-            .@"unreachable" => {},
-        }
-    }
 }
 
 fn mapUse(remap: []const Ir.ValueId, v: Ir.ValueId) Ir.ValueId {
     if (v == Ir.none_value or v >= remap.len) return v;
     return remap[v];
-}
-
-fn markUsed(used: []bool, v: Ir.ValueId) void {
-    if (v < used.len) used[v] = true;
 }
 
 /// Follow a chain of prior forwards (the stored value may itself be a forwarded id).

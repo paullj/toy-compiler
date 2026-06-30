@@ -1,7 +1,8 @@
 //! Shared ValueId operand-walk — the SINGLE place that enumerates every site a
-//! `ValueId` can appear in a `Function`. Both DCE liveness-marking and value
-//! renumbering route through this so they can never drift (a missed site is a
-//! silent miscompile, caught only by the differential).
+//! `ValueId` can appear in a `Function`. DCE liveness-marking, value renumbering,
+//! and store→load forwarding's use-rewrite all route through this so they can
+//! never drift (a missed site is a silent miscompile, caught only by the
+//! differential).
 //!
 //! `forEachValueUse` visits every value USE (operands that read a value) and
 //! `forEachValueDef` visits every value DEF (the `Instr.result` + block params).
@@ -63,6 +64,12 @@ inline fn use(ctx: anytype, comptime f: fn (@TypeOf(ctx), Ir.ValueId) void, v: I
     if (v != Ir.none_value) f(ctx, v);
 }
 
+/// Set `flags[v]` for an in-bounds `v` — the shared visitor for marking a value
+/// used (with `forEachValueUse`) or defined (with `forEachValueDef`).
+pub fn markUsed(flags: []bool, v: Ir.ValueId) void {
+    if (v < flags.len) flags[v] = true;
+}
+
 /// Visit every value-DEF (each instr result + each block param), skipping
 /// `none_value` results, in block-id then instruction order.
 pub fn forEachValueDef(func: *const Ir.Function, ctx: anytype, comptime f: fn (@TypeOf(ctx), Ir.ValueId) void) void {
@@ -80,6 +87,57 @@ pub fn remapValues(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(c
         for (b.params) |*p| p.* = map(ctx, p.*);
         for (b.instrs) |*ins| {
             ins.result = map(ctx, ins.result);
+            switch (ins.op) {
+                .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
+                .add, .sub, .mul, .sdiv => |*bin| {
+                    bin.lhs = map(ctx, bin.lhs);
+                    bin.rhs = map(ctx, bin.rhs);
+                },
+                .neg, .bnot, .get_tag => |*v| v.* = map(ctx, v.*),
+                .icmp => |*c| {
+                    c.lhs = map(ctx, c.lhs);
+                    c.rhs = map(ctx, c.rhs);
+                },
+                .field_addr => |*fa| fa.base = map(ctx, fa.base),
+                .load => |*l| l.addr = map(ctx, l.addr),
+                .store => |*s| {
+                    s.addr = map(ctx, s.addr);
+                    s.val = map(ctx, s.val);
+                },
+                .copy => |*c| {
+                    c.dst = map(ctx, c.dst);
+                    c.src = map(ctx, c.src);
+                },
+                .call => |*c| for (c.args) |*a| switch (a.*) {
+                    .value => |*v| v.* = map(ctx, v.*),
+                    .slot, .none => {},
+                },
+            }
+        }
+        switch (b.term) {
+            .br => |*br| for (br.args) |*a| switch (a.*) {
+                .value => |*v| v.* = map(ctx, v.*),
+                .slot, .none => {},
+            },
+            .cond_br => |*c| c.cond = map(ctx, c.cond),
+            .ret => |*o| switch (o.*) {
+                .value => |*v| v.* = map(ctx, v.*),
+                .slot, .none => {},
+            },
+            .@"unreachable" => {},
+        }
+    }
+}
+
+/// Rewrite every value-USE site (operands that READ a value) in-place through
+/// `map`, leaving DEFS (instr results, block params) untouched — the mutating
+/// counterpart of `forEachValueUse`. `none_value` is passed through `map` too
+/// (callers' maps must preserve it). Used by store→load forwarding, which
+/// redirects readers of a forwarded load WITHOUT redefining anything (rewriting
+/// the forwarded load's own result would duplicate a def).
+pub fn remapUses(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(ctx), Ir.ValueId) Ir.ValueId) void {
+    for (func.blocks) |*b| {
+        for (b.instrs) |*ins| {
             switch (ins.op) {
                 .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
                 .add, .sub, .mul, .sdiv => |*bin| {
