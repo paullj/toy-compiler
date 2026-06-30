@@ -290,7 +290,7 @@ pub fn assembleAndSign(
     }
 
     // Sign last: the hash must cover the final, patched bytes.
-    try CodeSign.sign(io, gpa, layout.image, identifier, layout.sig_file_off, layout.text_size);
+    try CodeSign.sign(io, layout.image, identifier, layout.sig_file_off, layout.text_size);
 
     return layout.image;
 }
