@@ -79,6 +79,14 @@ pub const StageProbe = struct {
         lap(io, &self.compute_ns, start);
     }
 
+    /// Charge `now - start` to the cache-GET bucket from OUTSIDE the query path — for a
+    /// cached serve that doesn't go through `Engine.query`/`lex`/`parse` (the warm-discover
+    /// fast path's direct `cache.get`s of the source/lex/parse blobs). Mirrors `lapCompute`;
+    /// callers gate on the probe being present so a plain build reads no clock.
+    pub fn lapGet(self: *StageProbe, io: Io, start: i128) void {
+        lap(io, &self.get_ns, start);
+    }
+
     /// The monotonic clock the probe charges against (`Io.Clock`, since Zig 0.16 has no
     /// `std.time.Timer`). Exposed so an out-of-query caller can snapshot a start stamp.
     pub fn now(io: Io) i128 {

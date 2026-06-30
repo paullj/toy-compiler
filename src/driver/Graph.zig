@@ -422,12 +422,56 @@ const Discoverer = struct {
         d.slots.items[id].color = .black;
     }
 
-    /// Read + lex + parse module `id` (cached). On a parse error, fail.
+    /// Obtain module `id`'s source + tokens + AST, then fill its slot. On a parse error,
+    /// fail.
+    ///
+    /// WARM-DISCOVER FAST PATH (PERF): discover unconditionally read + lex + parsed every
+    /// module every build. On a warm rebuild lex/parse are content-cache HITS (memory
+    /// lookups, no compute), so the residual cost is the per-file READ syscalls — and that
+    /// is what dominated warm discover. The fix: a per-file MANIFEST (persisted alongside
+    /// the content cache) records each file's last-build `{mtime, size, ctime, content_fp}`.
+    /// When a `stat()` whose (mtime, size, ctime) all MATCH the entry says the file is
+    /// unchanged, we serve its source + tokens + AST straight from the bulk-loaded pack
+    /// (keyed by the recorded `content_fp`) and SKIP the read entirely — discover for that
+    /// file collapses to one stat + three in-memory cache-gets. The full read + lex + parse
+    /// path also caches the SOURCE bytes (not just tokens/AST) precisely so the warm path can
+    /// reconstitute a module without touching the disk.
+    ///
+    /// SOUNDNESS — the (mtime, size, ctime) all-match is the UNCHANGED-PREDICATE (the central
+    /// risk: a wrong oracle = a silent MISCOMPILE). It rests on the BUILD CONTRACT: the source
+    /// tree is not mutated mid-build and a write updates mtime — the SAME assumption discover's
+    /// `realpath_cache` already relies on (see `Cache.Pack.ManifestEntry` for the full
+    /// rationale). ctime (the inode status-change time, read from the SAME stat) additionally
+    /// catches the same-size-mtime-restore window (`touch -r`/`cp -p`) at no extra I/O. Every
+    /// uncertain case FALLS BACK to the full read + lex + parse: no manifest entry, a failed
+    /// stat, a different size, a moved mtime, a moved ctime, or any of the three cache blobs
+    /// (source/lex/parse) missing. "When uncertain, READ."
+    ///
+    /// The serve changes ONLY how a file's source/tokens/AST are obtained — never WHICH
+    /// files are discovered, in what order, or the import edges (those come from the AST,
+    /// which is byte-identical to a fresh parse because the served source is byte-identical
+    /// to the bytes the priming build read) — so the graph + emitted bytes are unchanged
+    /// ([C11]).
     fn load(d: *Discoverer, id: u32) DiscoverError!void {
         const file = d.slots.items[id].file;
-        // PERF P4: the file read is the always-paid, never-cached part of discover's
-        // "file-read+lex+parse" compute — charge it to the probe's COMPUTE bucket so a
-        // warm build (lex/parse served from cache) still shows the unavoidable I/O.
+        // Snapshot (mtime, size, ctime) FIRST — one cheap stat, BEFORE any read. This is the
+        // warm-discover unchanged-predicate (see `warmServe`): a match against the
+        // manifest collapses this file's discovery to stat + cache-gets, with NO read.
+        // `st` is optional: a stat failure just falls through to the full read path (and
+        // records no manifest entry, so next build re-reads too).
+        const pre_stat: ?Io.Dir.Stat = Io.Dir.cwd().statFile(d.io, file, .{}) catch null;
+
+        // WARM SERVE (read + lex + parse skip): when the manifest's (mtime, size, ctime) all
+        // match AND the file's cached source + tokens + AST are all present in the bulk-loaded
+        // pack, serve them straight from memory — no file read. This is the warm-discover
+        // fast path the whole manifest exists for.
+        if (pre_stat) |st| {
+            if (d.warmServe(id, st)) return;
+        }
+
+        // FULL PATH: the warm serve missed (new file / changed mtime or size / a cache
+        // blob absent), so READ the file and lex + parse it. Charge the read to the
+        // probe's COMPUTE bucket (it is the never-cached part of discover's work).
         const read_t0: i128 = if (d.probe != null) Engine.StageProbe.now(d.io) else 0;
         const source = Io.Dir.cwd().readFileAlloc(d.io, file, d.gpa, .unlimited) catch {
             // The entry file failing to read is reported by the driver up front;
@@ -439,12 +483,18 @@ const Discoverer = struct {
                 .module = if (id == 0) null else id,
             });
         };
+        // No `errdefer free(source)`: `source` is adopted into the slot on EVERY non-read
+        // exit below (parse error and success), and the slot/Module owns it thereafter
+        // (freed once by `deinit`/`toGraph`). An errdefer here would double-free it on the
+        // parse-error path (the slot already holds it when `fail` unwinds).
         if (d.probe) |p| p.lapCompute(d.io, read_t0);
 
-        // Module discovery routes lex/parse through the same query engine as the
-        // per-file pipeline, but with discovery's SWALLOW read policy (a failed
-        // cache read is a plain miss, `tmp_tag` = module id). Front-end queries
-        // ignore the engine's force/verify mode.
+        // The lex/parse/source cache key is `Wyhash(0, source)` of the bytes JUST read.
+        const content_fp = std.hash.Wyhash.hash(0, source);
+
+        // Routed through the same query engine as the per-file pipeline, but with
+        // discovery's SWALLOW read policy (a failed cache read is a plain miss, `tmp_tag`
+        // = module id). The lex/parse queries are themselves cache-first.
         const engine = Engine.initProbe(d.cache, .normal, d.probe);
 
         // --- lex (cached) ---
@@ -467,6 +517,11 @@ const Discoverer = struct {
         }
         const tree: ?Ast.Tree = parsed.tree;
 
+        // Cache the SOURCE bytes (keyed by content_fp) so next build's warm path can serve
+        // them from the pack without re-reading the file. Swallowed like every other
+        // discover put: a failed store just means next build re-reads this one file.
+        d.cache.put(u8, d.io, Cache.Key.fromSource(.source, d.target, source), id, source) catch {};
+
         const s = &d.slots.items[id];
         s.source = source;
         s.tokens = tokens;
@@ -474,6 +529,113 @@ const Discoverer = struct {
         s.extra = tree.?.extra;
         s.pub_bits = tree.?.pub_bits;
         s.loaded = true;
+
+        // Record this file's snapshot for next build's warm-discover unchanged-predicate.
+        // Only on a SUCCESSFUL parse + a successful pre-read stat: lex/parse/source all
+        // cached their blobs above on this path, so a recorded entry's content_fp points at
+        // a complete {source, tokens, AST} triple. Keyed by the canonical path (identity).
+        recordManifest(d, id, pre_stat, content_fp);
+    }
+
+    /// Try to serve module `id`'s SOURCE + tokens + AST from the bulk-loaded content
+    /// cache WITHOUT reading the file. Returns true (slot filled) on a serve, false (the
+    /// caller falls through to the full read + lex + parse path) on ANY doubt. This is the
+    /// warm-discover fast path: a hit collapses the file's discovery to one stat + three
+    /// in-memory cache-gets (no open/read/close syscalls).
+    ///
+    /// The chain of guards, each falling back to false:
+    ///   1. a manifest entry exists for this file's canonical path,
+    ///   2. the stat's (mtime, size, ctime) all MATCH the entry — the UNCHANGED-PREDICATE,
+    ///   3. the source cache holds the bytes for that content_fp,
+    ///   4. the lex cache holds tokens for it,
+    ///   5. the parse cache holds a blob for it that `Ast.unpack` validates.
+    /// Only when all five hold do we adopt the cached {source, tokens, AST}.
+    ///
+    /// SOUNDNESS — why the (mtime, size, ctime) all-match is the unchanged-predicate here
+    /// (the central risk: a wrong oracle = a silent MISCOMPILE). The match decides the file is
+    /// UNCHANGED and serves the bytes the last build recorded under `content_fp`. It rests
+    /// on the BUILD
+    /// CONTRACT: the source tree is not mutated mid-build, and a write updates the file's
+    /// mtime (POSIX writes do; editors/`cp`/compilers do). That is the SAME assumption
+    /// `realpath_cache` already relies on (see `discover`'s realpath memo) — we do not
+    /// take on a new, stronger assumption. ctime (the inode status-change time) rides the
+    /// SAME stat and closes the same-size-mtime-restore window for free. When ANYTHING is
+    /// uncertain — no manifest entry, the stat failed (`pre_stat == null`, handled by the
+    /// caller), a different size, a moved mtime, a moved ctime, or any of the three cache
+    /// blobs missing — we FALL BACK to the full read + lex + parse. "When uncertain, READ."
+    ///
+    /// The serve changes ONLY HOW a file's source/tokens/AST are obtained, never WHICH
+    /// files are discovered or in what order: the served source is byte-identical to the
+    /// bytes the priming build read (same content_fp), so its tokens (offsets into source)
+    /// resolve identically, the cached AST yields the SAME import edges, and the DFS /
+    /// global-id assignment are unchanged. Output is byte-identical ([C11]).
+    ///
+    /// Adding ctime closes the same-size-mtime-restore windows (`touch -r` / `cp -p` /
+    /// a coarse-granularity FS tick): each moves ctime, so they no longer serve stale. The
+    /// ONLY residual hole is a tool faking ALL of mtime + size + ctime + content at once —
+    /// not a shape a normal build produces. The alternative (re-read + rehash every file
+    /// every warm build) defeats the whole purpose of the manifest and is the bottleneck
+    /// this fixes.
+    fn warmServe(d: *Discoverer, id: u32, st: Io.Dir.Stat) bool {
+        const canon = d.slots.items[id].canon;
+        const entry = d.cache.manifestGet(canon) orelse return false;
+
+        // The unchanged-predicate: same size AND same mtime AND same ctime => the file is
+        // unchanged since the build that recorded this entry. Any mismatch falls back to a
+        // full re-read. ctime (the inode STATUS-CHANGE time) rides this SAME stat, so it
+        // catches the same-size-mtime-restore window (`touch -r`/`cp -p`, where the metadata
+        // write moves ctime even though mtime was pinned) at zero extra I/O — see
+        // `Cache.Pack.ManifestEntry`'s soundness contract.
+        const mtime: i64 = std.math.cast(i64, st.mtime.nanoseconds) orelse return false;
+        const ctime: i64 = std.math.cast(i64, st.ctime.nanoseconds) orelse return false;
+        if (mtime != entry.mtime or st.size != entry.size or ctime != entry.ctime) return false;
+
+        // OWNERSHIP: every cache-get is owned by a `defer free()` guarded by `served`,
+        // which is set ONLY on the all-hit exit. A `return false` past any get frees what
+        // it fetched and leaves the slot untouched (the caller then takes the full path).
+        // PERF P4: charge the warm serve's three cache-gets + unpack to the discover GET
+        // bucket so `--timings` attributes the warm path (it bypasses `Engine.query`).
+        const get_t0: i128 = if (d.probe != null) Engine.StageProbe.now(d.io) else 0;
+        var served = false;
+        const source = (d.cache.get(u8, d.gpa, d.io, Cache.Key.fromFingerprint(.source, d.target, entry.content_fp)) catch null) orelse return false;
+        defer if (!served) d.gpa.free(source);
+
+        const lex_key = Cache.Key.fromFingerprint(.lex, d.target, entry.content_fp);
+        const tokens = (d.cache.get(Token, d.gpa, d.io, lex_key) catch null) orelse return false;
+        defer if (!served) d.gpa.free(tokens);
+
+        const parse_key = Cache.Key.fromFingerprint(.parse, d.target, entry.content_fp);
+        const blob = (d.cache.get(u8, d.gpa, d.io, parse_key) catch null) orelse return false;
+        defer d.gpa.free(blob);
+        const tree = (Ast.unpack(d.gpa, blob) catch null) orelse return false;
+        if (d.probe) |p| p.lapGet(d.io, get_t0);
+        // The unpacked tree's arrays are caller-owned; the slot adopts them below. On a
+        // fallback past this point there is none (the next steps are infallible), so no
+        // tree-free guard is needed.
+
+        served = true;
+        const s = &d.slots.items[id];
+        s.source = source;
+        s.tokens = tokens;
+        s.nodes = tree.nodes;
+        s.extra = tree.extra;
+        s.pub_bits = tree.pub_bits;
+        s.loaded = true;
+
+        // Carry the (still-valid) entry forward into THIS build's manifest so it survives
+        // the flush (the manifest reflects the current graph, not a union).
+        d.cache.manifestPut(canon, entry);
+        return true;
+    }
+
+    /// Record module `id`'s `{mtime, size, ctime, content_fp}` snapshot for next build's
+    /// warm-discover unchanged-predicate, keyed by its canonical path. A no-op when the
+    /// stat failed (=> a safe full re-read next build) or either timestamp is unrepresentable.
+    fn recordManifest(d: *Discoverer, id: u32, pre_stat: ?Io.Dir.Stat, content_fp: u64) void {
+        const st = pre_stat orelse return;
+        const mtime = std.math.cast(i64, st.mtime.nanoseconds) orelse return;
+        const ctime = std.math.cast(i64, st.ctime.nanoseconds) orelse return;
+        d.cache.manifestPut(d.slots.items[id].canon, .{ .mtime = mtime, .size = st.size, .ctime = ctime, .content_fp = content_fp });
     }
 
     /// Extract this module's imports, resolve each to a slot id, and return them
@@ -873,6 +1035,26 @@ test "discover: self-import is a cycle" {
     try withFixture(".toy-test-graph-self", files, "main.toy", Check.run);
 }
 
+test "discover: a parse error is reported and owns its source (no leak/double-free)" {
+    // Exercises load()'s parse-error path, where the slot ADOPTS `source` before `fail`
+    // unwinds. The test allocator turns any double-free (the bug a stray errdefer on
+    // `source` would cause) or leak into a failure.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\fn main( -> int { return 0 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err != null);
+            try testing.expectEqual(Error.Kind.parse, g.err.?.kind);
+            try testing.expectEqual(@as(?u32, 0), g.err.?.module);
+        }
+    };
+    try withFixture(".toy-test-graph-parseerr", files, "main.toy", Check.run);
+}
+
 test "discover: single entry with no imports" {
     const files = &[_]FixtureFile{
         .{ .path = "solo.toy", .source =
@@ -917,6 +1099,382 @@ test "single: trivial one-module graph from a parsed source" {
     // names a downstream EnumLayout aliases stay valid for the caller's lifetime.
     try testing.expectEqual(src.ptr, g.entry().source.ptr);
     try testing.expectEqual(tokens.ptr, g.entry().tokens.ptr);
+}
+
+/// The text of the FIRST `literal_number` token in module `m`'s tree, read against the
+/// module's served source. Used by the warm-discover tests to assert which version of the
+/// program the served AST reflects (re-read vs cache-served).
+fn firstNumberLiteral(m: *const Module) ?[]const u8 {
+    for (m.nodes) |n| {
+        if (n.tag == .literal_number) return m.tokens[n.main_token].text(m.source);
+    }
+    return null;
+}
+
+test "discover: a same-size edit that MOVES the mtime is NOT served stale" {
+    // The central soundness guarantee under the build contract: a real write updates the
+    // file's mtime, so even a SIZE-PRESERVING edit (the size alone cannot tell v1 from v2)
+    // is caught by the moved mtime and re-read. The warm path serves the cache ONLY when
+    // (mtime, size) BOTH match the recorded entry; a moved mtime falls back to a full read.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-stale-serve";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const file = dir ++ "/prog.toy";
+    const cache_dir = dir ++ "/.cache";
+
+    // v1 and v2 are the SAME byte length, so the size cannot distinguish them — only the
+    // mtime can, which is exactly what the build contract guarantees a write moves.
+    const v1 = "fn main() -> int { return 1 }\n";
+    const v2 = "fn main() -> int { return 2 }\n";
+    try testing.expectEqual(v1.len, v2.len);
+
+    // Build 1 (cold): primes the source/lex/parse cache + the manifest for prog.toy.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = v1 });
+    const mtime_v1 = blk: {
+        const st = try Io.Dir.cwd().statFile(io, file, .{});
+        break :blk st.mtime;
+    };
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings("1", firstNumberLiteral(g.entry()).?);
+        pack.flush(io, cache_dir);
+    }
+
+    // EDIT to v2 (same size). A real write moves the mtime; bump it explicitly to a value
+    // strictly later than v1's so the test does not depend on the FS's mtime granularity
+    // (two writes in the same coarse tick is the documented out-of-contract case, not this).
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = v2 });
+    try Io.Dir.cwd().setTimestamps(io, file, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = mtime_v1.nanoseconds + 1_000_000_000 } } });
+    {
+        const st = try Io.Dir.cwd().statFile(io, file, .{});
+        try testing.expect(st.mtime.nanoseconds != mtime_v1.nanoseconds);
+    }
+
+    // Build 2 (warm): the mtime moved, so the unchanged-predicate misses and discover
+    // re-reads + re-parses, serving v2 (literal "2"), NOT the stale cached "1".
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings(v2, g.entry().source);
+        // The load-bearing assertion: the AST reflects v2 (literal "2"), NOT a stale "1".
+        try testing.expectEqualStrings("2", firstNumberLiteral(g.entry()).?);
+    }
+}
+
+test "discover: a touch -r style edit (mtime restored, ctime moved) is NOT served stale" {
+    // The HOLE ctime closes: a same-size edit that ALSO restores the prior mtime
+    // (`touch -r ref f`, `cp -p`, two edits in one coarse mtime tick) leaves (mtime, size)
+    // matching the recorded entry, so the OLD predicate served the cached v1 STALE. But ANY
+    // such metadata write moves ctime, so requiring ctime to match too catches it WITHOUT a
+    // read. We model that here by writing v2 (same size as v1), then forcing the file's
+    // (mtime, size) to equal the manifest's recorded values while the manifest's ctime is a
+    // sentinel that the file's REAL (moved) ctime can never equal — so warmServe rejects on
+    // the ctime field alone and re-reads, serving v2.
+    //
+    // The manifest ctime is forged (not produced by a real `touch -r`) on purpose: a real
+    // restore moves ctime to "now", which a coarse-granularity FS clock could round to the
+    // cold build's tick, making the test flaky. Pinning the recorded ctime to a value the
+    // current inode cannot hold tests the ctime guard deterministically. The end-to-end
+    // `touch -r` PROBE (the real binary) covers the genuine operation.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-stale-touchr";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const file = dir ++ "/prog.toy";
+    const cache_dir = dir ++ "/.cache";
+    // Same byte length, so only mtime/ctime (not size) can tell v1 from v2.
+    const v1 = "fn main() -> int { return 1 }\n";
+    const v2 = "fn main() -> int { return 2 }\n";
+    try testing.expectEqual(v1.len, v2.len);
+
+    // Cold build on v1: caches {source, tokens, AST} keyed by hash(v1). We do NOT keep its
+    // manifest entry — we forge our own below so the ctime mismatch is exact and stable.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = v1 });
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expectEqualStrings("1", firstNumberLiteral(g.entry()).?);
+        pack.flush(io, cache_dir);
+    }
+
+    // The touch -r outcome on disk: v2's bytes, but the prior mtime. (A real `touch -r`
+    // restores mtime; we restore it explicitly so the test does not depend on whether v2's
+    // own write happened to land in the same coarse mtime tick as v1's.)
+    const canon = try Io.Dir.cwd().realPathFileAlloc(io, file, gpa);
+    defer gpa.free(canon);
+    const v1_mtime = (try Io.Dir.cwd().statFile(io, file, .{})).mtime;
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = v2 });
+    try Io.Dir.cwd().setTimestamps(io, file, .{ .modify_timestamp = .{ .new = v1_mtime } });
+    const now = try Io.Dir.cwd().statFile(io, file, .{});
+    const now_ctime: i64 = @intCast(now.ctime.nanoseconds);
+
+    // Forge the manifest: (mtime, size) = the file's CURRENT values (so those two match), but
+    // ctime = a sentinel the live inode cannot hold (`now_ctime - 1`), and content_fp =
+    // hash(v1) (so a — wrongly — served entry would yield the STALE "1"). The only thing that
+    // stops the stale serve is the ctime guard.
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        cache.manifestPut(canon, .{
+            .mtime = @intCast(now.mtime.nanoseconds),
+            .size = now.size,
+            .ctime = now_ctime - 1, // the moved ctime can never match this
+            .content_fp = std.hash.Wyhash.hash(0, v1),
+        });
+        pack.flush(io, cache_dir);
+    }
+
+    // Warm build: (mtime, size) match the forged entry but ctime does not, so warmServe
+    // rejects and discover re-reads v2 ("2"), NOT the stale cached "1".
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings(v2, g.entry().source);
+        try testing.expectEqualStrings("2", firstNumberLiteral(g.entry()).?);
+    }
+}
+
+test "discover: a changed file whose mtime moves is re-read (size-changing edit)" {
+    // Belt-and-suspenders for the common edit shape: adding bytes changes BOTH size and
+    // mtime, so the warm-serve predicate misses on two independent fields and re-reads.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-stale-serve-grow";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const file = dir ++ "/prog.toy";
+    const cache_dir = dir ++ "/.cache";
+    const v1 = "fn main() -> int { return 1 }\n";
+    const v2 = "fn main() -> int { return 22 }\n"; // one byte longer
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = v1 });
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expectEqualStrings("1", firstNumberLiteral(g.entry()).?);
+        pack.flush(io, cache_dir);
+    }
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = v2 });
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expectEqualStrings(v2, g.entry().source);
+        try testing.expectEqualStrings("22", firstNumberLiteral(g.entry()).?);
+    }
+}
+
+test "discover: an unchanged file is served warm (literal preserved across a clean rebuild)" {
+    // The happy path the manifest exists for: same bytes + same (mtime, size) => the cached
+    // source + tokens + AST are served WITHOUT reading the file, and the result is identical.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-warm-serve";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const file = dir ++ "/prog.toy";
+    const cache_dir = dir ++ "/.cache";
+    const src = "fn main() -> int { return 7 }\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = src });
+
+    inline for (.{ "cold", "warm" }) |_| {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings("7", firstNumberLiteral(g.entry()).?);
+        pack.flush(io, cache_dir);
+    }
+}
+
+test "discover: the warm path serves from cache WITHOUT reading the file" {
+    // PROVES the read is actually skipped (the whole point of the manifest). A cold build on
+    // GOOD bytes caches {source, tokens, AST} keyed by content_fp = hash(good). We then put
+    // GARBAGE on disk and, in a priming build, OVERWRITE the manifest entry so its
+    // (mtime, size, ctime) equal the GARBAGE file's CURRENT stat but its content_fp still
+    // points at the GOOD blobs. The warm build's stat then MATCHES the manifest, so discover
+    // serves the cached GOOD tree off content_fp WITHOUT reading the garbage on disk — a
+    // clean "5" despite unparseable bytes is the direct read-skip assertion.
+    //
+    // Why not overwrite-then-restore (mtime, size)? With the ctime hardening that no longer
+    // serves stale: the overwrite + any `setTimestamps` BOTH move ctime, so the predicate
+    // would (correctly) miss and re-read. Forging the manifest to the garbage file's own
+    // current (mtime, size, ctime) is the only way to make all three match while the on-disk
+    // CONTENT differs — exactly the residual hole the contract documents, used here to prove
+    // the serve bypasses the disk read.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-read-skip";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const file = dir ++ "/prog.toy";
+    const cache_dir = dir ++ "/.cache";
+    const good = "fn main() -> int { return 5 }\n";
+    // Same byte length as `good` but pure garbage that would NOT parse — if discover read
+    // it, the build would fail (or serve "garbage"), so a clean "5" proves the read-skip.
+    const garbage = "@" ** (good.len - 1) ++ "\n";
+    comptime std.debug.assert(good.len == garbage.len);
+
+    // Cold build on GOOD bytes: primes the source/lex/parse blobs under hash(good).
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = good });
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings("5", firstNumberLiteral(g.entry()).?);
+        pack.flush(io, cache_dir);
+    }
+
+    // Put GARBAGE on disk, then snapshot ITS current (mtime, size, ctime).
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = garbage });
+    const canon = try Io.Dir.cwd().realPathFileAlloc(io, file, gpa);
+    defer gpa.free(canon);
+    const gst = try Io.Dir.cwd().statFile(io, file, .{});
+    const gmtime: i64 = @intCast(gst.mtime.nanoseconds);
+    const gctime: i64 = @intCast(gst.ctime.nanoseconds);
+
+    // Priming build: force the manifest entry to the GARBAGE file's stat (so the warm build's
+    // stat matches all three fields) but keep content_fp = hash(good) (so the serve resolves
+    // to the still-cached GOOD blobs). The GOOD blobs are carried forward by `load`.
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        cache.manifestPut(canon, .{ .mtime = gmtime, .size = gst.size, .ctime = gctime, .content_fp = std.hash.Wyhash.hash(0, good) });
+        pack.flush(io, cache_dir);
+    }
+
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        // Served from cache: no parse error despite the garbage on disk, and the GOOD tree.
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings(good, g.entry().source);
+        try testing.expectEqualStrings("5", firstNumberLiteral(g.entry()).?);
+    }
+}
+
+test "discover: warm path FALLS BACK to a read when the cache blobs are missing" {
+    // Soundness of the fallback chain: even when a manifest entry EXISTS and its
+    // (mtime, size, ctime) all match the file, a MISSING source/lex/parse blob (evicted/pruned
+    // cache) must NOT serve — warmServe's `cache.get -> null` guards fall back to a full read.
+    // We construct exactly this: persist a manifest entry keyed to the file's real
+    // (mtime, size, ctime) but NEVER put the blobs, then discover.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-warm-fallback";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const file = dir ++ "/prog.toy";
+    const cache_dir = dir ++ "/.cache";
+    const src = "fn main() -> int { return 9 }\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = src });
+
+    // The canonical path discover interns by (so the manifest key matches its lookup).
+    const canon = try Io.Dir.cwd().realPathFileAlloc(io, file, gpa);
+    defer gpa.free(canon);
+    const st = try Io.Dir.cwd().statFile(io, file, .{});
+    const mtime: i64 = @intCast(st.mtime.nanoseconds);
+    const ctime: i64 = @intCast(st.ctime.nanoseconds);
+
+    // Build 1: persist ONLY a manifest entry (matching mtime/size/ctime, with the true
+    // content_fp) — NO source/lex/parse blobs. This is the evicted-blob state.
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        cache.manifestPut(canon, .{ .mtime = mtime, .size = st.size, .ctime = ctime, .content_fp = std.hash.Wyhash.hash(0, src) });
+        pack.flush(io, cache_dir);
+    }
+
+    // Build 2: warmServe's manifestGet hits and (mtime, size, ctime) all match, but every
+    // blob get misses, so it falls back to a full read + parse — yielding the correct tree.
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, cache_dir);
+        const cache = try Cache.initPack(io, cache_dir, &pack);
+        var g = try discover(gpa, io, cache, "native", file, null);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings(src, g.entry().source);
+        try testing.expectEqualStrings("9", firstNumberLiteral(g.entry()).?);
+    }
 }
 
 test "resolveFile rejects path escapes" {

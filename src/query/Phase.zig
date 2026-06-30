@@ -36,13 +36,20 @@ pub const Kind = enum(u8) {
     /// The typecheck Pass-A GLOBAL_TABLES barrier join (folds the per-fn resolve
     /// digests).
     global_tables = 10,
+    /// The raw module SOURCE bytes, keyed by their own content fingerprint. Stored
+    /// alongside lex/parse so the warm-discover fast path can serve a file's source +
+    /// tokens + AST entirely from the bulk-loaded pack (no per-file read syscall) when
+    /// the manifest's (mtime, size) unchanged-predicate says the file is unchanged. New
+    /// byte (11): it never aliases the pinned codegen byte (3), so existing entries are
+    /// unaffected.
+    source = 11,
 
     /// Whether a node of this kind names an on-disk `Cache` entry (the CACHEABLE
     /// subset) vs an in-memory-only phase. Exhaustive no-else: a new kind FAILS TO
     /// COMPILE until it declares its tier here.
     pub fn cacheable(kind: Kind) bool {
         return switch (kind) {
-            .lex, .parse, .codegen => true,
+            .lex, .parse, .codegen, .source => true,
             .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables => false,
         };
     }
@@ -54,7 +61,7 @@ pub const Kind = enum(u8) {
     pub fn targetSensitive(kind: Kind) bool {
         return switch (kind) {
             .codegen => true, // aarch64 blobs must not alias across targets [C10]
-            .lex, .parse, .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables => false,
+            .lex, .parse, .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables, .source => false,
         };
     }
 };

@@ -80,23 +80,40 @@ pub const Key = struct {
 /// in-memory write buffer; `flush` writes the merged pack ONCE at build end.
 ///
 /// LAYOUT (all u64 little-endian):
-///   [magic][n_entries][index_checksum]
-///   index:  n_entries × [digest][offset][len]   (offsets into the blob region)
-///   blobs:  codegen [u64 checksum][payload] frames, concatenated (the SAME framing the
-///           per-file path used, so the per-entry checksum still turns a torn or foreign
-///           blob into a clean miss).
+///   [magic][n_entries][index_checksum][n_manifest][manifest_checksum]
+///   manifest: n_manifest × [path_len:u32][path bytes][mtime][size][ctime][content_fp]
+///             (the warm-discover unchanged-predicate; see `ManifestEntry`)
+///   index:    n_entries × [digest][offset][len]   (offsets into the blob region)
+///   blobs:    codegen [u64 checksum][payload] frames, concatenated (the SAME framing the
+///             per-file path used, so the per-entry checksum still turns a torn or foreign
+///             blob into a clean miss).
 /// The index is itself checksummed: a bad magic / bad index checksum / short file
 /// => the whole pack is treated as COLD (empty index, full rebuild), NEVER a false
-/// hit. Carrying-forward: `load` seeds the write buffer with EVERY prior entry, so
-/// `flush` rewrites a superset — entries from prior builds survive (the per-fn
-/// files were never deleted either; this matches that persistence).
+/// hit. The manifest carries its OWN checksum and sits BEFORE the codegen index (so the
+/// index offset is a fixed function of the manifest extent). Two corruption cases, both
+/// SOUND (degrade to a re-read/rebuild, never a false hit):
+///   * a manifest CONTENT/checksum corruption drops ONLY the manifest (every
+///     warm-discover lookup then misses and discover re-reads), codegen still loads;
+///   * a manifest FRAMING corruption (a bad n_manifest or path_len) shifts the computed
+///     idx_base, so the codegen index checksum then fails and the WHOLE pack goes cold
+///     (codegen dropped too) — still a clean rebuild, just a coarser degrade.
+/// Carrying-forward: `load`
+/// seeds the write buffer with EVERY prior entry, so `flush` rewrites a superset —
+/// entries from prior builds survive (the per-fn files were never deleted either; this
+/// matches that persistence). The manifest is rebuilt fresh each build from the files
+/// discover actually touched (it is NOT carried forward blindly): a file dropped from
+/// the graph drops out of the manifest, and a re-read file overwrites its entry.
 pub const Pack = struct {
-    // "TOYPACK3": bumped when the per-program DAG section was dropped from the pack.
-    // An older-magic file fails the magic check in `load` => treated as COLD (full
-    // rebuild), never a false hit — the same degrade-to-miss the checksums give.
-    const magic: u64 = 0x33_4b_43_41_50_59_4f_54;
-    // [magic][n_entries][index_checksum]
-    const hdr_len = 3 * @sizeOf(u64);
+    // "TOYPACK5": bumped when `ctime` was added to each manifest record (TOYPACK4 added
+    // the manifest section itself). An older-magic file fails the magic check in `load` =>
+    // treated as COLD (full rebuild), never a false hit — the same degrade-to-miss the
+    // checksums give. The bump is LOAD-BEARING for the ctime hardening: a TOYPACK4 manifest
+    // record has no ctime field, so reusing the magic would let `load` read an old record
+    // as if it carried a ctime (a framing mismatch) — the bump cold-misses it cleanly
+    // instead, so warm-serve never trusts a ctime-less entry.
+    const magic: u64 = 0x35_4b_43_41_50_59_4f_54;
+    // [magic][n_entries][index_checksum][n_manifest][manifest_checksum]
+    const hdr_len = 5 * @sizeOf(u64);
     const rec_len = 3 * @sizeOf(u64); // [digest][offset][len]
 
     /// A staged blob's location in `blobs`. Offsets are realloc-stable (unlike a
@@ -104,6 +121,44 @@ pub const Pack = struct {
     /// reconstructs the slice from `blobs.items[off..off+len]`. This sidesteps the
     /// dangling-slice hazard of caching slices into a growing buffer.
     const Rec = struct { digest: u64, off: usize, len: usize };
+
+    /// One warm-discover manifest record: the last build's snapshot of a module file.
+    /// `path` is the file's CANONICAL path (the same physical-identity key discover
+    /// interns by, so symlink/case duplicates collapse to one entry).
+    ///
+    /// SOUNDNESS CONTRACT — read carefully, a wrong oracle here is a silent MISCOMPILE.
+    /// `(mtime, size, ctime)` is the UNCHANGED-PREDICATE: when a fresh `stat` matches ALL
+    /// THREE, discover treats the file as unchanged since the build that recorded this entry
+    /// and serves the cached source + tokens + AST keyed by `content_fp` WITHOUT reading the
+    /// file. `content_fp` is the `Wyhash(0, source)` of the bytes that build read; it is
+    /// the CACHE KEY for the {source, lex, parse} blobs, not a re-checked authority (we do
+    /// not read the file, so there is nothing to rehash).
+    ///
+    /// This rests on the BUILD CONTRACT: the source tree is not mutated mid-build and a
+    /// write updates the file's mtime (POSIX writes do; so do editors, `cp`, and the
+    /// compilers/codegen tools that emit source). That is the SAME assumption discover's
+    /// `realpath_cache` already relies on — interning by physical identity assumes a path
+    /// resolves the same way for the whole build because the tree is immutable mid-build.
+    /// The manifest extends that one build-window further (across builds), keyed off mtime.
+    /// Every UNCERTAIN case falls back to a full read + lex + parse: no entry, a failed
+    /// stat, a different size, a moved mtime, a moved ctime, or any of the three cache blobs
+    /// missing.
+    ///
+    /// `ctime` (the inode STATUS-CHANGE time) closes the same-size-mtime-restore window that
+    /// `(mtime, size)` alone could not: ANY metadata write moves ctime, so the out-of-band
+    /// shapes that fake a matching mtime+size are caught by a moved ctime WITHOUT a read —
+    /// ctime rides the SAME `stat` that already reads mtime+size, so the warm read-skip win
+    /// is unchanged. Two such shapes:
+    ///   * `touch -r ref f` (and `cp -p`/`rsync --times` that copy mtime+size): the `touch`
+    ///     itself is a metadata write that bumps `f`'s ctime, so ctime no longer matches;
+    ///   * `cp -p src f` onto a fresh inode: a new inode carries a fresh ctime, so it can
+    ///     never match the recorded one.
+    /// The ONLY residual hole is a tool that fakes ALL of mtime + size + ctime + content in
+    /// one go (e.g. restoring a verbatim inode image) — not a shape a normal build produces.
+    /// Re-reading + rehashing every file every warm build (the only way to close even that)
+    /// defeats the entire purpose of the manifest: the read IS the warm-discover bottleneck,
+    /// since lex/parse are already cache hits.
+    pub const ManifestEntry = struct { mtime: i64, size: u64, ctime: i64, content_fp: u64 };
 
     gpa: std.mem.Allocator,
     /// Concatenated `[checksum][payload]` frames: prior entries carried forward by
@@ -115,6 +170,17 @@ pub const Pack = struct {
     /// digest -> index into `recs` (last writer wins on a duplicate digest, which is
     /// safe: same digest => same content => same bytes). Owned.
     index: std.AutoHashMapUnmanaged(u64, usize) = .{},
+    /// The PREVIOUS build's warm-discover manifest, keyed by canonical path: what
+    /// discover consults to decide if a file is unchanged (`manifestGet`). Seeded by
+    /// `load`; read-only thereafter. Owns its keys (the canonical path strings).
+    manifest_prev: std.StringHashMapUnmanaged(ManifestEntry) = .{},
+    /// THIS build's manifest, accumulated by discover as it touches each file
+    /// (`manifestPut`) — whether it served the file from cache (carries the prior
+    /// entry forward) or re-read it (records the fresh mtime/size/content_fp). This is
+    /// what `flush` serializes, so a file no longer in the graph drops out next build.
+    /// Owns its keys; guarded by `lock` (discover is serial today, but the lock keeps
+    /// it safe if a future change parallelizes load).
+    manifest_cur: std.StringHashMapUnmanaged(ManifestEntry) = .{},
     /// Guards `blobs`/`recs`/`index` against the codegen fan-out's concurrent `put`s.
     /// A lock-free atomic-bool spinlock: 0.16's `std.Io.Mutex` needs an `Io` to block,
     /// but the critical sections here are tiny (an appendSlice + a hashmap upsert), so a
@@ -139,7 +205,15 @@ pub const Pack = struct {
         self.blobs.deinit(self.gpa);
         self.recs.deinit(self.gpa);
         self.index.deinit(self.gpa);
+        freeManifest(self.gpa, &self.manifest_prev);
+        freeManifest(self.gpa, &self.manifest_cur);
         self.* = undefined;
+    }
+
+    fn freeManifest(gpa: std.mem.Allocator, m: *std.StringHashMapUnmanaged(ManifestEntry)) void {
+        var it = m.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        m.deinit(gpa);
     }
 
     fn packPath(buf: []u8, dir: []const u8) []const u8 {
@@ -161,13 +235,25 @@ pub const Pack = struct {
         if (std.mem.readInt(u64, bytes[0..8], .little) != magic) return;
         const n: u64 = std.mem.readInt(u64, bytes[8..16], .little);
         const want_idx_ck = std.mem.readInt(u64, bytes[16..24], .little);
+        const n_manifest: u64 = std.mem.readInt(u64, bytes[24..32], .little);
+        const want_manifest_ck = std.mem.readInt(u64, bytes[32..40], .little);
 
+        // The manifest records sit between the header and the codegen index. Parse
+        // their EXTENT first (so the codegen index offset is known) and validate the
+        // checksum; a bad manifest drops ONLY the manifest (cleared below) — the
+        // codegen index still loads, so warm-discover just misses and re-reads.
+        const manifest_bytes_len = manifestExtent(bytes[hdr_len..], n_manifest) catch return;
+        const manifest_bytes = bytes[hdr_len .. hdr_len + manifest_bytes_len];
+        const manifest_ok = std.hash.Wyhash.hash(checksum_seed, manifest_bytes) == want_manifest_ck;
+        if (manifest_ok) self.loadManifest(gpa, manifest_bytes, n_manifest) catch self.clearManifestPrev();
+
+        const idx_base = hdr_len + manifest_bytes_len;
         const idx_bytes_len = std.math.mul(usize, @intCast(n), rec_len) catch return;
-        if (bytes.len < hdr_len + idx_bytes_len) return;
-        const idx_bytes = bytes[hdr_len .. hdr_len + idx_bytes_len];
+        if (bytes.len < idx_base + idx_bytes_len) return;
+        const idx_bytes = bytes[idx_base .. idx_base + idx_bytes_len];
         if (std.hash.Wyhash.hash(checksum_seed, idx_bytes) != want_idx_ck) return;
 
-        const blob_region = bytes[hdr_len + idx_bytes_len ..];
+        const blob_region = bytes[idx_base + idx_bytes_len ..];
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -191,9 +277,93 @@ pub const Pack = struct {
     }
 
     fn reset(self: *Pack) void {
+        // The codegen tier only — `manifest_prev` is an INDEPENDENT section. A corrupt
+        // blob region wipes codegen entries; the manifest (already parsed + checksum-
+        // validated above) can stay, since every warm-serve still re-checks the
+        // lex/parse cache via `lookup` (which now misses) and falls back to a re-read.
         self.blobs.clearRetainingCapacity();
         self.recs.clearRetainingCapacity();
         self.index.clearRetainingCapacity();
+    }
+
+    // A manifest record's TRAILING fixed fields after `[path_len:u32][path]`:
+    // [mtime:u64][size:u64][ctime:u64][content_fp:u64].
+    const manifest_fixed = 4 * @sizeOf(u64);
+
+    fn clearManifestPrev(self: *Pack) void {
+        freeManifest(self.gpa, &self.manifest_prev);
+        self.manifest_prev = .{};
+    }
+
+    /// Walk `n_manifest` variable-length records from the start of `region` and return
+    /// their total byte length, bounds-checking every field. Errors (a truncated
+    /// record, a path_len that runs off the end) so `load` degrades to cold rather than
+    /// reading past the buffer. Does NOT validate content — just the framing extent.
+    fn manifestExtent(region: []const u8, n_manifest: u64) !usize {
+        var off: usize = 0;
+        var i: u64 = 0;
+        while (i < n_manifest) : (i += 1) {
+            if (off + @sizeOf(u32) > region.len) return error.Truncated;
+            const path_len = std.mem.readInt(u32, region[off..][0..4], .little);
+            const rec_len_total = std.math.add(usize, @sizeOf(u32) + manifest_fixed, path_len) catch return error.Truncated;
+            const next = std.math.add(usize, off, rec_len_total) catch return error.Truncated;
+            if (next > region.len) return error.Truncated;
+            off = next;
+        }
+        return off;
+    }
+
+    /// Parse the manifest records into `manifest_prev` (keyed by the OWNED canonical
+    /// path). `region` is exactly the bytes `manifestExtent` measured, so every field
+    /// is already in-bounds; this only decodes them. Last-writer-wins on a duplicate
+    /// path (flush emits each path once, so duplicates never occur in a sound pack).
+    fn loadManifest(self: *Pack, gpa: std.mem.Allocator, region: []const u8, n_manifest: u64) !void {
+        var off: usize = 0;
+        var i: u64 = 0;
+        while (i < n_manifest) : (i += 1) {
+            const path_len = std.mem.readInt(u32, region[off..][0..4], .little);
+            off += @sizeOf(u32);
+            const path = region[off .. off + path_len];
+            off += path_len;
+            const mtime = std.mem.readInt(i64, region[off..][0..8], .little);
+            const size = std.mem.readInt(u64, region[off + 8 ..][0..8], .little);
+            const ctime = std.mem.readInt(i64, region[off + 16 ..][0..8], .little);
+            const content_fp = std.mem.readInt(u64, region[off + 24 ..][0..8], .little);
+            off += manifest_fixed;
+
+            const key = try gpa.dupe(u8, path);
+            errdefer gpa.free(key);
+            const gop = try self.manifest_prev.getOrPut(gpa, key);
+            if (gop.found_existing) gpa.free(key); // duplicate path: keep the first key, overwrite value
+            gop.value_ptr.* = .{ .mtime = mtime, .size = size, .ctime = ctime, .content_fp = content_fp };
+        }
+    }
+
+    /// Warm-discover lookup: the PREVIOUS build's snapshot for `canon_path`, or null if
+    /// this file was not in the last build's manifest (=> a full read + lex + parse). A
+    /// `(mtime, size, ctime)` all-match against the returned entry is the UNCHANGED-PREDICATE
+    /// the caller serves the cached {source, tokens, AST} off of without reading the file (see
+    /// `ManifestEntry`'s soundness contract for why this is sound under the build contract).
+    pub fn manifestGet(self: *Pack, canon_path: []const u8) ?ManifestEntry {
+        return self.manifest_prev.get(canon_path);
+    }
+
+    /// Record THIS build's manifest entry for `canon_path` (copied). Called by discover
+    /// for every file it touches — both a warm serve (carries the prior entry forward)
+    /// and a re-read (the fresh mtime/size/content_fp). Last-writer-wins. Lock-guarded
+    /// so a future parallel discover is safe; today discover is serial. A failed put is
+    /// swallowed by the caller (worst case: next build re-reads that one file).
+    pub fn manifestPut(self: *Pack, canon_path: []const u8, e: ManifestEntry) !void {
+        self.lock();
+        defer self.unlock();
+        const gop = try self.manifest_cur.getOrPut(self.gpa, canon_path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, canon_path) catch |err| {
+                _ = self.manifest_cur.remove(canon_path);
+                return err;
+            };
+        }
+        gop.value_ptr.* = e;
     }
 
     /// Stage an already-framed `[checksum][payload]` slice. NOT thread-locked: `load`
@@ -289,6 +459,46 @@ pub const Pack = struct {
         return .{ .idx_bytes = idx_bytes, .idx_ck = std.hash.Wyhash.hash(checksum_seed, idx_bytes) };
     }
 
+    /// Serialize `manifest_cur` into a single byte buffer of variable-length records,
+    /// PATH-SORTED for byte-identical output run-to-run regardless of insertion order
+    /// (the same determinism the codegen index gets). Caller owns the returned bytes.
+    /// Record: `[path_len:u32][path][mtime:u64][size:u64][ctime:u64][content_fp:u64]`.
+    fn layoutManifest(self: *Pack) !struct { bytes: []u8, ck: u64 } {
+        const n: usize = self.manifest_cur.count();
+        const Pair = struct { path: []const u8, e: ManifestEntry };
+        const order = try self.gpa.alloc(Pair, n);
+        defer self.gpa.free(order);
+        {
+            var it = self.manifest_cur.iterator();
+            var i: usize = 0;
+            while (it.next()) |kv| : (i += 1) order[i] = .{ .path = kv.key_ptr.*, .e = kv.value_ptr.* };
+        }
+        std.sort.block(Pair, order, {}, struct {
+            fn lt(_: void, a: Pair, b: Pair) bool {
+                return std.mem.lessThan(u8, a.path, b.path);
+            }
+        }.lt);
+
+        var total: usize = 0;
+        for (order) |p| total += @sizeOf(u32) + p.path.len + manifest_fixed;
+        const bytes = try self.gpa.alloc(u8, total);
+        errdefer self.gpa.free(bytes);
+        var off: usize = 0;
+        for (order) |p| {
+            std.mem.writeInt(u32, bytes[off..][0..4], @intCast(p.path.len), .little);
+            off += @sizeOf(u32);
+            @memcpy(bytes[off .. off + p.path.len], p.path);
+            off += p.path.len;
+            std.mem.writeInt(i64, bytes[off..][0..8], p.e.mtime, .little);
+            std.mem.writeInt(u64, bytes[off + 8 ..][0..8], p.e.size, .little);
+            std.mem.writeInt(i64, bytes[off + 16 ..][0..8], p.e.ctime, .little);
+            std.mem.writeInt(u64, bytes[off + 24 ..][0..8], p.e.content_fp, .little);
+            off += manifest_fixed;
+        }
+        std.debug.assert(off == total);
+        return .{ .bytes = bytes, .ck = std.hash.Wyhash.hash(checksum_seed, bytes) };
+    }
+
     fn flushLocked(self: *Pack, io: Io, dir: []const u8) !void {
         var blob_out: std.ArrayList(u8) = try .initCapacity(self.gpa, self.blobs.items.len);
         defer blob_out.deinit(self.gpa);
@@ -296,12 +506,18 @@ pub const Pack = struct {
         const cg = try layoutSection(self.gpa, &self.index, self.recs.items, self.blobs.items, &blob_out);
         defer self.gpa.free(cg.idx_bytes);
 
+        const man = try self.layoutManifest();
+        defer self.gpa.free(man.bytes);
+
         const n: u64 = self.index.count();
+        const n_manifest: u64 = self.manifest_cur.count();
 
         var hdr: [hdr_len]u8 = undefined;
         std.mem.writeInt(u64, hdr[0..8], magic, .little);
         std.mem.writeInt(u64, hdr[8..16], n, .little);
         std.mem.writeInt(u64, hdr[16..24], cg.idx_ck, .little);
+        std.mem.writeInt(u64, hdr[24..32], n_manifest, .little);
+        std.mem.writeInt(u64, hdr[32..40], man.ck, .little);
 
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -311,6 +527,9 @@ pub const Pack = struct {
             var file = try Io.Dir.cwd().createFile(io, tmp, .{});
             defer file.close(io);
             try file.writeStreamingAll(io, &hdr);
+            // Manifest BEFORE the codegen index so the index offset is a fixed function
+            // of the manifest extent (load splits the two sections by that extent).
+            try file.writeStreamingAll(io, man.bytes);
             try file.writeStreamingAll(io, cg.idx_bytes);
             try file.writeStreamingAll(io, blob_out.items);
         }
@@ -435,6 +654,24 @@ fn entryPath(c: Cache, buf: []u8, key: Key) []const u8 {
     return std.fmt.bufPrint(buf, "{s}/{x:0>16}", .{ c.dir, key.digest() }) catch unreachable;
 }
 
+/// Warm-discover unchanged-predicate lookup (see `Pack.ManifestEntry`): the PREVIOUS
+/// build's snapshot for `canon_path`, or null when there is no pack sidecar (the per-file
+/// path never persists a manifest) or no prior entry. A null is always a SAFE miss — the
+/// caller re-reads + re-lexes + re-parses. A non-null entry whose `(mtime, size, ctime)` all
+/// match a fresh stat authorizes serving the cached {source, tokens, AST} without reading the file.
+pub fn manifestGet(c: Cache, canon_path: []const u8) ?Pack.ManifestEntry {
+    const p = c.pack orelse return null;
+    return p.manifestGet(canon_path);
+}
+
+/// Record THIS build's manifest entry for `canon_path`. A no-op without a pack
+/// sidecar. Non-fatal on OOM (the caller swallows it: worst case the file is re-read
+/// next build), mirroring `put`'s swallowed-write policy.
+pub fn manifestPut(c: Cache, canon_path: []const u8, e: Pack.ManifestEntry) void {
+    const p = c.pack orelse return;
+    p.manifestPut(canon_path, e) catch {};
+}
+
 // ---- tests: cache-key digest semantics ------------------------------------
 // The e2e cold/warm run exercises the on-disk round-trip; these pin down the
 // digest logic in isolation.
@@ -550,13 +787,13 @@ test "Pack: a corrupt pack file => cold (empty index), never a false hit" {
         pack.flush(io, dir);
     }
 
-    // Corrupt the index region (byte just past the header) so the index checksum fails.
+    // Corrupt the codegen index checksum in the header so the index validation fails.
     {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = std.fmt.bufPrint(&buf, "{s}/pack.bin", .{dir}) catch unreachable;
         const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
         defer gpa.free(bytes);
-        bytes[24] ^= 0xFF; // first index byte
+        bytes[16] ^= 0xFF; // codegen index checksum field ([magic][n][idx_ck]...)
         var file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
         defer file.close(io);
         try file.writeStreamingAll(io, bytes);
@@ -661,5 +898,223 @@ test "Pack: load carries prior entries forward across a flush" {
         const g2 = (try cache.get(u8, gpa, io, k2)).?;
         defer gpa.free(g2);
         try testing.expectEqualSlices(u8, &[_]u8{43}, g2);
+    }
+}
+
+// ---- tests: warm-discover manifest section --------------------------------
+
+test "Pack: manifest entries round-trip through flush then load (by canonical path)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-ut-manifest-rt";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const ea: Cache.Pack.ManifestEntry = .{ .mtime = 111, .size = 222, .ctime = 333, .content_fp = 0xABCDEF };
+    const eb: Cache.Pack.ManifestEntry = .{ .mtime = -5, .size = 0, .ctime = -7, .content_fp = 0 };
+
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir); // cold => empty manifest
+        const cache = try Cache.initPack(io, dir, &pack);
+        try testing.expect(cache.manifestGet("/a/main.toy") == null); // no prior build
+        cache.manifestPut("/a/main.toy", ea);
+        cache.manifestPut("/a/util.toy", eb);
+        pack.flush(io, dir);
+    }
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        const ga = cache.manifestGet("/a/main.toy").?;
+        try testing.expectEqual(ea, ga);
+        const gb = cache.manifestGet("/a/util.toy").?;
+        try testing.expectEqual(eb, gb);
+        try testing.expect(cache.manifestGet("/a/absent.toy") == null);
+    }
+}
+
+test "Pack: manifest flush is byte-identical regardless of insertion order" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_a = ".toyc-ut-manifest-det-a";
+    const dir_b = ".toyc-ut-manifest-det-b";
+    for ([_][]const u8{ dir_a, dir_b }) |d| Io.Dir.cwd().deleteTree(io, d) catch {};
+    defer for ([_][]const u8{ dir_a, dir_b }) |d| Io.Dir.cwd().deleteTree(io, d) catch {};
+
+    const e1: Cache.Pack.ManifestEntry = .{ .mtime = 1, .size = 2, .ctime = 3, .content_fp = 4 };
+    const e2: Cache.Pack.ManifestEntry = .{ .mtime = 5, .size = 6, .ctime = 7, .content_fp = 8 };
+
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir_a);
+        const cache = try Cache.initPack(io, dir_a, &pack);
+        cache.manifestPut("aaa.toy", e1);
+        cache.manifestPut("bbb.toy", e2);
+        pack.flush(io, dir_a);
+    }
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir_b);
+        const cache = try Cache.initPack(io, dir_b, &pack);
+        cache.manifestPut("bbb.toy", e2); // REVERSED insertion order
+        cache.manifestPut("aaa.toy", e1);
+        pack.flush(io, dir_b);
+    }
+
+    var buf_a: [std.fs.max_path_bytes]u8 = undefined;
+    var buf_b: [std.fs.max_path_bytes]u8 = undefined;
+    const pa = std.fmt.bufPrint(&buf_a, "{s}/pack.bin", .{dir_a}) catch unreachable;
+    const pb = std.fmt.bufPrint(&buf_b, "{s}/pack.bin", .{dir_b}) catch unreachable;
+    const ba = try Io.Dir.cwd().readFileAlloc(io, pa, gpa, .unlimited);
+    defer gpa.free(ba);
+    const bb = try Io.Dir.cwd().readFileAlloc(io, pb, gpa, .unlimited);
+    defer gpa.free(bb);
+    try testing.expectEqualSlices(u8, ba, bb);
+}
+
+test "Pack: manifest is rebuilt per build (a file not re-put drops out)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-ut-manifest-rebuild";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const e: Cache.Pack.ManifestEntry = .{ .mtime = 1, .size = 1, .ctime = 1, .content_fp = 1 };
+    // Build 1: two files in the graph.
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        cache.manifestPut("keep.toy", e);
+        cache.manifestPut("drop.toy", e);
+        pack.flush(io, dir);
+    }
+    // Build 2: only one file is still in the graph (only it is re-put). The dropped
+    // file must NOT carry forward (the manifest is the current graph, not a union).
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        try testing.expect(cache.manifestGet("keep.toy") != null); // last build saw it
+        try testing.expect(cache.manifestGet("drop.toy") != null); // last build saw it too
+        cache.manifestPut("keep.toy", e); // only keep is touched this build
+        pack.flush(io, dir);
+    }
+    // Build 3: `drop.toy` is gone from the persisted manifest.
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        try testing.expect(cache.manifestGet("keep.toy") != null);
+        try testing.expect(cache.manifestGet("drop.toy") == null);
+    }
+}
+
+test "Pack: codegen + manifest coexist; a corrupt manifest drops only the manifest" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-ut-manifest-coexist";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const k1 = Cache.Key.fromSource(.lex, "native", "fn a() {}");
+    const e: Cache.Pack.ManifestEntry = .{ .mtime = 9, .size = 9, .ctime = 9, .content_fp = 9 };
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        try cache.put(u8, io, k1, 0, &[_]u8{ 7, 7, 7 });
+        cache.manifestPut("m.toy", e);
+        pack.flush(io, dir);
+    }
+    // Corrupt the manifest checksum field (header bytes 32..40). The codegen index
+    // checksum is untouched, so codegen entries must STILL load while the manifest
+    // is dropped (every warm-serve then misses and discover re-reads — sound).
+    {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/pack.bin", .{dir}) catch unreachable;
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+        defer gpa.free(bytes);
+        bytes[32] ^= 0xFF; // manifest checksum field
+        var file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, bytes);
+    }
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        try testing.expect(cache.manifestGet("m.toy") == null); // manifest dropped
+        const g1 = (try cache.get(u8, gpa, io, k1)).?; // codegen survived
+        defer gpa.free(g1);
+        try testing.expectEqualSlices(u8, &[_]u8{ 7, 7, 7 }, g1);
+    }
+}
+
+test "Pack: a corrupt manifest FRAMING (bad n_manifest) degrades the whole pack to cold (still sound)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toyc-ut-manifest-framing";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const k1 = Cache.Key.fromSource(.lex, "native", "fn a() {}");
+    const e: Cache.Pack.ManifestEntry = .{ .mtime = 9, .size = 9, .ctime = 9, .content_fp = 9 };
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        try cache.put(u8, io, k1, 0, &[_]u8{ 7, 7, 7 });
+        cache.manifestPut("m.toy", e);
+        pack.flush(io, dir);
+    }
+    // Corrupt the n_manifest FRAMING count (header bytes 24..32), NOT the checksum.
+    // Unlike a checksum corruption, a wrong extent shifts idx_base, so the codegen index
+    // checksum then fails and the WHOLE pack goes cold — codegen is dropped too. This is
+    // still SOUND (a clean rebuild, never a false hit); it just pins that the codegen
+    // tier is NOT preserved under a framing (vs content) corruption.
+    {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, "{s}/pack.bin", .{dir}) catch unreachable;
+        const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+        defer gpa.free(bytes);
+        bytes[24] ^= 0x01; // n_manifest field: 1 -> 0, so the manifest record is read as codegen-index bytes
+        var file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writeStreamingAll(io, bytes);
+    }
+    {
+        var pack = Cache.Pack.init(gpa);
+        defer pack.deinit();
+        pack.load(gpa, io, dir);
+        const cache = try Cache.initPack(io, dir, &pack);
+        try testing.expect(cache.manifestGet("m.toy") == null); // manifest gone
+        try testing.expect((try cache.get(u8, gpa, io, k1)) == null); // codegen ALSO cold — never a false hit
     }
 }

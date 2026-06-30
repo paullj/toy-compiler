@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# M17 incremental (red-green early-cutoff) harness — the worthwhile proof.
+# Incremental (content-fingerprint early-cutoff) harness — the worthwhile proof.
 #
 # For each EDIT SCENARIO (body / signature / type-layout / comment-only /
 # cross-module) it:
-#   (1) cold-builds a base program with --query-stats (records the prior DAG),
-#   (2) applies the edit,
-#   (3) red-green INCREMENTAL rebuild with --query-stats (reads the prior DAG and
-#       reports the recompute set — the CUTOFF),
-#   (4) --force FULL rebuild of the SAME final source,
-#   (5) SOUNDNESS: cmp the __text of (3) vs (4) -> must be IDENTICAL. A divergence
+#   (1) cold-builds a base program (primes the content-fp cache),
+#   (2) records the FULL codegen count via `--codegen-stats --force`,
+#   (3) applies the edit,
+#   (4) INCREMENTAL rebuild with `--codegen-stats` (cache serves unchanged fns),
+#   (5) `--force` FULL rebuild of the SAME final source,
+#   (6) SOUNDNESS: cmp the __text of (4) vs (5) -> must be IDENTICAL. A divergence
 #       is a stale-cache miscompile (the critical anti-regression gate).
-#   (6) CUTOFF (localized edits): the codegen recompile set is a STRICT SUBSET of a
-#       full build (incremental compiled < full compiled). A red-green that
+#   (7) CUTOFF (localized edits): the incremental codegen count is a STRICT SUBSET
+#       of a full build (incremental compiled < full compiled). A cache that
 #       recomputes everything is "wired but inert".
 #
-# The byte-level cutoff is delivered by the content-fingerprint cache (a fn whose
-# transitive fingerprint is unchanged is served from cache, never re-lowered); the
-# red-green walk over the recorded DAG is the in-production proof of the
-# early-cutoff architecture and reports the fine-grained recompute set. The
-# wall-clock win is modest on this tiny single-page corpus — it is the
-# finer-incrementality FOUNDATION, not a headline speedup.
+# Cutoff is delivered by the content-fingerprint cache: a fn whose transitive
+# fingerprint is unchanged is served from cache, never re-lowered (`--codegen-stats`
+# reports `compiled=N cached=M`). The red-green DAG is gone — content-fp is the sole
+# correctness/cutoff driver, so `--codegen-stats` is the cutoff signal (was the
+# removed `--query-stats`). The wall-clock win is modest on this tiny corpus — it is
+# the finer-incrementality FOUNDATION, not a headline speedup.
 set -u
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,9 +33,7 @@ else echo "build failed: no zig (and no mise to provide it)"; exit 1; fi
 
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 texthash() { otool -s __TEXT __text "$1" 2>/dev/null | tail -n +2 | shasum | cut -d' ' -f1; }
-compiled_of() { sed -n 's/.*codegen compiled=\([0-9]*\).*/\1/p' <<<"$1"; }
-recompute_of() { sed -n 's/.*recompute=\([0-9]*\).*/\1/p' <<<"$1"; }
-total_of() { sed -n 's/.*of \([0-9]*\) nodes/\1/p' <<<"$1"; }
+compiled_of() { sed -n 's/.*compiled=\([0-9]*\).*/\1/p' <<<"$1"; }
 
 pass=0; fail=0
 fail_one() { echo "  FAIL: $1"; fail=$((fail + 1)); }
@@ -47,14 +45,14 @@ run_scenario() {
   ( cd "$d" && rm -rf .toy )
 
   printf '%s' "$base" > "$src"
-  ( cd "$d" && "$toyc" -o base.bin --query-stats prog.toy >/dev/null 2>&1 ) \
+  ( cd "$d" && "$toyc" -o base.bin prog.toy >/dev/null 2>&1 ) \
     || { fail_one "$name: cold build failed"; return; }
   local full_compiled
-  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force prog.toy 2>/dev/null | sed -n 's/.*compiled=\([0-9]*\).*/\1/p' )"
+  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force prog.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
 
   printf '%s' "$edited" > "$src"
   local inc_out
-  inc_out="$( cd "$d" && "$toyc" -o inc.bin --query-stats prog.toy 2>&1 )"
+  inc_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats prog.toy 2>&1 )"
   ( cd "$d" && "$toyc" -o force.bin --force prog.toy >/dev/null 2>&1 ) \
     || { fail_one "$name: force build failed"; return; }
 
@@ -65,23 +63,23 @@ run_scenario() {
     return
   fi
 
-  local rec tot comp
-  rec="$(recompute_of "$inc_out")"; tot="$(total_of "$inc_out")"; comp="$(compiled_of "$inc_out")"
+  local comp
+  comp="$(compiled_of "$inc_out")"
 
   if [ "$expect_cutoff" = "1" ]; then
     if [ -n "$comp" ] && [ -n "$full_compiled" ] && [ "$comp" -lt "$full_compiled" ]; then
-      echo "  OK   $name: SOUND; red-green recompute=$rec of $tot; CUTOFF codegen compiled=$comp < full=$full_compiled"
+      echo "  OK   $name: SOUND; CUTOFF codegen compiled=$comp < full=$full_compiled"
       pass=$((pass + 1))
     else
       fail_one "$name: CUTOFF — codegen compiled=$comp NOT < full=$full_compiled"
     fi
   else
-    echo "  OK   $name: SOUND; red-green recompute=$rec of $tot; codegen compiled=$comp full=$full_compiled (no-cutoff scenario)"
+    echo "  OK   $name: SOUND; codegen compiled=$comp full=$full_compiled (no-cutoff scenario)"
     pass=$((pass + 1))
   fi
 }
 
-echo "=== M17 edit battery (soundness + cutoff) ==="
+echo "=== edit battery (soundness + cutoff) ==="
 
 # 1) BODY — the headline: caller cuts off, only the edited fn re-lowers.
 run_scenario body \
@@ -149,17 +147,17 @@ TOY
 pub fn compute(n: int) -> int { return helper(n) + 2 }
 fn helper(n: int) -> int { return n }
 TOY
-  ( cd "$d" && "$toyc" -o base.bin --query-stats main.toy >/dev/null 2>&1 ) \
+  ( cd "$d" && "$toyc" -o base.bin main.toy >/dev/null 2>&1 ) \
     || { fail_one "cross-module: cold build failed"; return; }
   local full_compiled
-  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force main.toy 2>/dev/null | sed -n 's/.*compiled=\([0-9]*\).*/\1/p' )"
+  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force main.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
 
   cat > "$d/lib/util.toy" <<'TOY'
 pub fn compute(n: int) -> int { return helper(n) + 2 }
 fn helper(n: int) -> int { return n + 0 }
 TOY
   local inc_out
-  inc_out="$( cd "$d" && "$toyc" -o inc.bin --query-stats main.toy 2>&1 )"
+  inc_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats main.toy 2>&1 )"
   ( cd "$d" && "$toyc" -o force.bin --force main.toy >/dev/null 2>&1 ) \
     || { fail_one "cross-module: force build failed"; return; }
 
@@ -169,10 +167,10 @@ TOY
     fail_one "cross-module: SOUNDNESS — inc __text ($ih) != force __text ($fh) [STALE-CACHE MISCOMPILE]"
     return
   fi
-  local rec tot comp
-  rec="$(recompute_of "$inc_out")"; tot="$(total_of "$inc_out")"; comp="$(compiled_of "$inc_out")"
+  local comp
+  comp="$(compiled_of "$inc_out")"
   if [ -n "$comp" ] && [ -n "$full_compiled" ] && [ "$comp" -lt "$full_compiled" ]; then
-    echo "  OK   cross-module: SOUND; red-green recompute=$rec of $tot; CUTOFF codegen compiled=$comp < full=$full_compiled"
+    echo "  OK   cross-module: SOUND; CUTOFF codegen compiled=$comp < full=$full_compiled"
     pass=$((pass + 1))
   else
     fail_one "cross-module: CUTOFF — codegen compiled=$comp NOT < full=$full_compiled"
