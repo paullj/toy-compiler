@@ -277,7 +277,7 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
     for (g.func.blocks, 0..) |*blk, bid| {
         g.placeLabel(g.block_labels[bid]);
         for (blk.instrs) |ins| try genInstr(g, ins);
-        try genTerm(g, @intCast(bid), blk.term);
+        try genTerm(g, blk.term);
     }
 
     try g.resolveFixups();
@@ -572,7 +572,7 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     }
 }
 
-fn genTerm(g: *Gen, bid: Ir.BlockId, term: Ir.Terminator) error{OutOfMemory}!void {
+fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
     switch (term) {
         .br => |br| {
             try storeBeforeBr(g, br.dest, br.args);
@@ -596,7 +596,6 @@ fn genTerm(g: *Gen, bid: Ir.BlockId, term: Ir.Terminator) error{OutOfMemory}!voi
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
     }
-    _ = bid;
 }
 
 /// Store-before-br: write each edge arg into the destination block's param cell
