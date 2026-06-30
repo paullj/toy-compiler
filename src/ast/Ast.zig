@@ -148,8 +148,6 @@ pub const Node = extern struct {
         /// (reusing `.assign`).
         field_access,
 
-        // ---- M10: enums + match (appended last; ordinals frozen) -----------
-
         /// `enum N { ... }`. `main_token` is the enum name. `lhs` is the `extra`
         /// header of a `Range` over variant nodes (in declaration order).
         /// `rhs` is `none`.
@@ -203,8 +201,6 @@ pub const Node = extern struct {
         /// or a nested pattern), or `none` to bind the whole value (M10 leaf bind).
         pattern_binding,
 
-        // ---- M11: literal + or patterns (appended last; ordinals frozen) ----
-
         /// An int/bool literal pattern. `main_token` is the number/`true`/`false`
         /// token; matched against the scrutinee by equality. `lhs`/`rhs` are `none`.
         pattern_literal,
@@ -212,8 +208,6 @@ pub const Node = extern struct {
         /// `lhs` is the `extra` header of a `Range` over >=2 alternative pattern
         /// nodes; `rhs` is `none`. All alts must bind the same names/types.
         pattern_or,
-
-        // ---- M14: module imports (appended last; ordinals frozen) -----------
 
         /// `import a/b/c [as alias]`. `main_token` is the LAST path-segment
         /// identifier token (`c`) — the namespace this import binds by default.

@@ -77,9 +77,8 @@ pub const Tag = enum(u8) {
     /// `@` label sigil, prefixing a label name on a loop/while/for/block.
     at,
 
-    // ---- M14: module keywords (appended LAST; ordinals of all tags above are
-    // frozen because Tag is enum(u8) and `[]Token` is memcpy'd to/from the
-    // content cache — new variants must extend the end). -----------------------
+    // Module keywords. New `Tag` variants MUST extend the end: ordinals are frozen
+    // because `Tag` is `enum(u8)` and `[]Token` is memcpy'd to/from the content cache.
 
     /// `import` — begins a module import declaration.
     kw_import,
