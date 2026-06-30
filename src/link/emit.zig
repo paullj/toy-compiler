@@ -210,12 +210,12 @@ fn internCstrings(gpa: std.mem.Allocator, fns: []const Link.FnCode) !InternedCst
         for (fns) |f| {
             for (f.literals) |lit| {
                 if (seen.get(lit.hash)) |existing| {
-                    // Hash hit: confirm the bytes actually match before dedup'ing. A
-                    // 64-bit hash collision between two DISTINCT literals would
-                    // otherwise silently point the second's reloc at the first's
-                    // bytes (wrong-output miscompile); compare against the bytes of
-                    // the FIRST-occurrence literal already collected and fail loudly.
-                    std.debug.assert(std.mem.eql(u8, lit.bytes, uniques.items[existing].bytes));
+                    // Distinct literals sharing a 64-bit hash would otherwise point
+                    // the second's reloc at the first's bytes — a silent wrong-output
+                    // miscompile. Reject unconditionally (NOT a debug assert: this
+                    // guard must hold in the shipping ReleaseFast build too).
+                    if (!std.mem.eql(u8, lit.bytes, uniques.items[existing].bytes))
+                        return error.CstringHashCollision;
                     continue;
                 }
                 try seen.put(gpa, lit.hash, @intCast(uniques.items.len));
@@ -427,4 +427,16 @@ test "internCstrings: first-occurrence-in-fn-order wins regardless of which fn h
     }
     try testing.expectEqualSlices(u8, "only\x00", r.cstrings); // deduped to one copy
     try testing.expectEqual(@as(u32, 0), r.off_by_hash.get(7).?);
+}
+
+test "internCstrings: a hash collision between distinct literals fails loud" {
+    const gpa = testing.allocator;
+    // A real 64-bit collision is unconstructable, so inject one: two literals with
+    // an EQUAL hash but DIFFERENT bytes. Deduping the second onto the first would
+    // be a silent wrong-output miscompile; interning must refuse instead.
+    const P = Link.Literal{ .hash = 42, .bytes = @constCast("hello") };
+    const Q = Link.Literal{ .hash = 42, .bytes = @constCast("world") };
+    const lits = [_]Link.Literal{ P, Q };
+    const fns = [_]Link.FnCode{litFn(&lits)};
+    try testing.expectError(error.CstringHashCollision, internCstrings(gpa, &fns));
 }
