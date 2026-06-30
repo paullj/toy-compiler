@@ -55,6 +55,24 @@ pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 const Error = error{ OutOfMemory, ParseFailed };
 
+/// Scoped override of `p.no_block`: set it to `value`, restore the PRIOR value on
+/// `end()`. Every fresh-expression-context site sets it through this so set and
+/// restore are symmetric by construction — restoring the saved value (not a hard
+/// reset to false) is what keeps a nested site that was entered with `no_block`
+/// already set from silently changing parse classification.
+const NoBlockScope = struct {
+    p: *Parser,
+    saved: bool,
+    fn enter(p: *Parser, value: bool) NoBlockScope {
+        const s = NoBlockScope{ .p = p, .saved = p.no_block };
+        p.no_block = value;
+        return s;
+    }
+    fn end(s: NoBlockScope) void {
+        s.p.no_block = s.saved;
+    }
+};
+
 /// Parse a whole file into a `Tree`. On success returns the owned tree (root is
 /// the last node, a `.program`). On a parse error returns null and fills `diag`.
 pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
@@ -271,9 +289,8 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
                 variant = try p.addNode(.{ .tag = .enum_variant_tuple, .main_token = vname, .lhs = header, .rhs = Ast.none });
             },
             .l_brace => {
-                const saved_nb = p.no_block;
-                p.no_block = false;
-                defer p.no_block = saved_nb;
+                var nb = NoBlockScope.enter(p, false);
+                defer nb.end();
                 p.advance(); // {
                 var fields: std.ArrayList(Ast.Index) = .empty;
                 defer fields.deinit(p.gpa);
@@ -309,10 +326,14 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
 fn parseMatch(p: *Parser) Error!Ast.Index {
     const match_tok = p.index;
     p.advance(); // match
-    const saved_nb = p.no_block;
-    p.no_block = true;
+    // Scrutinee in `no_block` (a bare `match x { ... }` reads `x`, the `{` opening
+    // the arm list); then the arm list parses with blocks re-allowed, restoring the
+    // prior flag once the whole `match` is done.
+    var scrut_nb = NoBlockScope.enter(p, true);
     const scrut = try p.parseExpr(0);
-    p.no_block = false;
+    scrut_nb.end();
+    var arms_nb = NoBlockScope.enter(p, false);
+    defer arms_nb.end();
     try p.expect(.l_brace, "expected '{' to open a match");
 
     var arms: std.ArrayList(Ast.Index) = .empty;
@@ -324,10 +345,9 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
         var guard: Ast.Index = Ast.none;
         if (p.peek().tag == .kw_if) {
             p.advance();
-            const g_nb = p.no_block;
-            p.no_block = true; // stop the guard cond before `->`/`{`
+            var guard_nb = NoBlockScope.enter(p, true); // stop the guard cond before `->`/`{`
+            defer guard_nb.end();
             guard = try p.parseExpr(0);
-            p.no_block = g_nb;
         }
         const arrow = p.index;
         try p.expect(.arrow, "expected '->' after a match pattern");
@@ -338,7 +358,6 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
         if (p.peek().tag == .comma) p.advance();
     }
     try p.expect(.r_brace, "expected '}' to close match");
-    p.no_block = saved_nb;
 
     const header = try p.addRange(arms.items);
     return p.addNode(.{ .tag = .match_expr, .main_token = match_tok, .lhs = scrut, .rhs = header });
@@ -410,9 +429,8 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
             binders = try p.addRange(binds.items);
         },
         .l_brace => {
-            const saved_nb = p.no_block;
-            p.no_block = false;
-            defer p.no_block = saved_nb;
+            var nb = NoBlockScope.enter(p, false);
+            defer nb.end();
             p.advance(); // {
             var binds: std.ArrayList(Ast.Index) = .empty;
             defer binds.deinit(p.gpa);
@@ -460,9 +478,8 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
 fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
     const lbrace = p.index;
     p.advance(); // {
-    const saved_nb = p.no_block;
-    p.no_block = false;
-    defer p.no_block = saved_nb;
+    var nb = NoBlockScope.enter(p, false);
+    defer nb.end();
 
     var inits: std.ArrayList(Ast.Index) = .empty;
     defer inits.deinit(p.gpa);
@@ -528,9 +545,8 @@ fn parseType(p: *Parser) Error!Ast.Index {
 fn parseBlock(p: *Parser) Error!Ast.Index {
     // A block body is a fresh expression context: re-allow `{`/`if` expressions
     // inside it even when reached from an `if`/`while` condition.
-    const saved_nb = p.no_block;
-    p.no_block = false;
-    defer p.no_block = saved_nb;
+    var nb = NoBlockScope.enter(p, false);
+    defer nb.end();
     const lbrace = p.index;
     try p.expect(.l_brace, "expected '{' to open a block");
 
@@ -652,9 +668,9 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
 fn parseWhile(p: *Parser) Error!Ast.Index {
     const while_tok = p.index;
     p.advance(); // while
-    p.no_block = true;
+    var nb = NoBlockScope.enter(p, true);
     const cond = try p.parseExpr(0);
-    p.no_block = false;
+    nb.end();
     const body = try p.parseBlock();
     return p.addNode(.{ .tag = .while_stmt, .main_token = while_tok, .lhs = cond, .rhs = body });
 }
@@ -667,9 +683,9 @@ fn parseWhile(p: *Parser) Error!Ast.Index {
 fn parseIf(p: *Parser) Error!Ast.Index {
     const if_tok = p.index;
     p.advance(); // if
-    p.no_block = true;
+    var nb = NoBlockScope.enter(p, true);
     const cond = try p.parseExpr(0);
-    p.no_block = false;
+    nb.end();
     const then_block = try p.parseBlock();
     var else_node: Ast.Index = Ast.none;
     if (p.peek().tag == .kw_else) {
@@ -723,11 +739,11 @@ fn parseFor(p: *Parser) Error!Ast.Index {
     const ident_tok = p.index;
     try p.expect(.identifier, "expected a loop variable name");
     try p.expect(.kw_in, "expected 'in' after the loop variable");
-    p.no_block = true;
+    var nb = NoBlockScope.enter(p, true);
     const lo = try p.parseExpr(0); // halts at `..` (no infix bp)
     try p.expect(.dotdot, "expected '..' in the for range");
     const hi = try p.parseExpr(0);
-    p.no_block = false;
+    nb.end();
     const body = try p.parseBlock(); // re-arms no_block internally
     const header = try p.addExtra(&.{ lo, hi }); // children before parent
     return p.addNode(.{ .tag = .for_stmt, .main_token = ident_tok, .lhs = body, .rhs = header });
@@ -786,10 +802,9 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             }
             // A grouped sub-expression re-allows blocks (the escape hatch out of a
             // condition's `no_block`); restore the flag after.
-            const saved_nb = p.no_block;
-            p.no_block = false;
+            var nb = NoBlockScope.enter(p, false);
             const inner = try p.parseExpr(0);
-            p.no_block = saved_nb;
+            nb.end();
             try p.expect(.r_paren, "expected ')' to close group");
             return inner;
         },
@@ -877,9 +892,8 @@ fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast
     p.advance(); // (
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
-    const saved_nb = p.no_block;
-    p.no_block = false;
-    defer p.no_block = saved_nb;
+    var nb = NoBlockScope.enter(p, false);
+    defer nb.end();
     while (p.peek().tag != .r_paren) {
         try args.append(p.gpa, try p.parseExpr(0));
         if (p.peek().tag == .comma) p.advance() else break;
@@ -901,9 +915,8 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
     const vtok = p.nodes.items[node].main_token;
     const type_name: Ast.Index = if (qualified == Ast.none) Ast.none else p.nodes.items[node].lhs;
     p.advance(); // {
-    const saved_nb = p.no_block;
-    p.no_block = false;
-    defer p.no_block = saved_nb;
+    var nb = NoBlockScope.enter(p, false);
+    defer nb.end();
     var inits: std.ArrayList(Ast.Index) = .empty;
     defer inits.deinit(p.gpa);
     while (true) {
@@ -935,9 +948,8 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     defer args.deinit(p.gpa);
     // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
-    const saved_nb = p.no_block;
-    p.no_block = false;
-    defer p.no_block = saved_nb;
+    var nb = NoBlockScope.enter(p, false);
+    defer nb.end();
     while (p.peek().tag != .r_paren) {
         try args.append(p.gpa, try p.parseExpr(0));
         if (p.peek().tag == .comma) p.advance() else break;
