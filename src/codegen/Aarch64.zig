@@ -13,31 +13,9 @@
 //!
 //! Scope is the M1 subset only: movz/movk (+ an i64 materializer), reg/reg moves,
 //! add/sub (reg and imm12), mul, sdiv, neg, the frame stp/ldp pair, ldr/str
-//! unsigned-offset against sp, sp add/sub, bl, ret, and svc.
+//! unsigned-offset against sp, sp add/sub, bl, and ret.
 
 const std = @import("std");
-
-/// Register numbers. In most data-processing encodings 31 means the zero
-/// register (XZR); in load/store and add/sub-immediate the same field 31 means
-/// the stack pointer (SP). The two share an encoding slot — context decides.
-pub const Reg = enum(u5) {
-    x0 = 0,
-    x1 = 1,
-    x2 = 2,
-    x3 = 3,
-    x4 = 4,
-    x5 = 5,
-    x16 = 16,
-    fp = 29, // x29, frame pointer
-    lr = 30, // x30, link register
-    // 31 is SP or XZR depending on the instruction.
-    sp = 31,
-    _,
-
-    pub inline fn num(self: Reg) u32 {
-        return @intFromEnum(self);
-    }
-};
 
 pub const XZR: u32 = 31;
 pub const SP: u32 = 31;
@@ -129,14 +107,6 @@ pub fn ldrFp(rt: u32, byteOff: u32) u32 {
     return 0xF9400000 | (scaled << 10) | (FP << 5) | rt;
 }
 
-/// str rt, [x29, #byteOff] — symmetric 64-bit store against FP. str x9,[x29,#0]
-/// → 0xF90003A9. (Kept for symmetry; M3 only needs `ldrFp`.)
-pub fn strFp(rt: u32, byteOff: u32) u32 {
-    std.debug.assert(byteOff % 8 == 0);
-    const scaled: u32 = byteOff / 8;
-    return 0xF9000000 | (scaled << 10) | (FP << 5) | rt;
-}
-
 // --- Branch / system -------------------------------------------------------
 
 /// bl #(imm26 words) — branch-and-link, PC-relative by a signed *word* offset
@@ -146,11 +116,6 @@ pub fn strFp(rt: u32, byteOff: u32) u32 {
 pub fn bl(imm26: i26) u32 {
     const bits: u32 = @as(u26, @bitCast(imm26));
     return 0x94000000 | bits;
-}
-
-/// svc #imm16 — supervisor call (syscall trap). svc #0x80 → 0xD4001001.
-pub fn svc(imm16: u16) u32 {
-    return 0xD4000001 | (@as(u32, imm16) << 5);
 }
 
 // --- PC-relative data addressing + indirect call (M2) -----------------------
@@ -287,20 +252,6 @@ pub fn cset(rd: u32, c: Cond) u32 {
     return 0x9A9F07E0 | (@as(u32, @intFromEnum(invert(c))) << 12) | rd;
 }
 
-/// b.cond #(imm19 words) — conditional branch, PC-relative signed word offset in
-/// bits[23:5], cond in bits[3:0] (no inversion). Placeholder uses imm19 = 0.
-/// b.eq #0 → 0x54000000; b.eq #+2 → 0x54000040; b.lt #-2 → 0x54FFFFCB.
-pub fn bCond(c: Cond, imm19: i19) u32 {
-    return 0x54000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | @as(u32, @intFromEnum(c));
-}
-
-/// cbz rt, #(imm19 words) — branch if rt == 0; imm19 in bits[23:5], rt in
-/// bits[4:0]. cbz x0,#0 → 0xB4000000; cbz x0,#+2 → 0xB4000040; cbz x1,#-2 →
-/// 0xB4FFFFC1.
-pub fn cbz(rt: u32, imm19: i19) u32 {
-    return 0xB4000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | rt;
-}
-
 /// cbnz rt, #(imm19 words) — branch if rt != 0. cbnz x0,#0 → 0xB5000000;
 /// cbnz x0,#-4 → 0xB5FFFF80.
 pub fn cbnz(rt: u32, imm19: i19) u32 {
@@ -322,13 +273,13 @@ pub fn b(imm26: i26) u32 {
 // bits (cond ⊂ low4, or rt = low5) while clearing the imm19 field at bits[23:5].
 
 /// Rewrite a b.cond placeholder's imm19, keeping opcode + cond. Round-trips:
-/// patchBCond(bCond(.eq,0), 2) → 0x54000040.
+/// patchBCond(0x54000000, 2) → 0x54000040.
 pub fn patchBCond(word: u32, imm19: i19) u32 {
     return (word & 0xFF00001F) | (@as(u32, @as(u19, @bitCast(imm19))) << 5);
 }
 
 /// Rewrite a cbz/cbnz placeholder's imm19, keeping opcode + rt. Round-trips:
-/// patchCbz(cbz(0,0), -4) → 0xB4FFFF80.
+/// patchCbz(0xB4000000, -4) → 0xB4FFFF80.
 pub fn patchCbz(word: u32, imm19: i19) u32 {
     return (word & 0xFF00001F) | (@as(u32, @as(u19, @bitCast(imm19))) << 5);
 }
@@ -426,11 +377,9 @@ test "load/store sp-relative" {
 test "load/store fp-relative" {
     try testing.expectEqual(@as(u32, 0xF9400BA9), ldrFp(9, 16)); // ldr x9,[x29,#16]
     try testing.expectEqual(@as(u32, 0xF9400FA9), ldrFp(9, 24)); // ldr x9,[x29,#24]
-    try testing.expectEqual(@as(u32, 0xF90003A9), strFp(9, 0)); // str x9,[x29,#0] (objdump-verified)
 }
 
 test "branch/system and frame constants" {
-    try testing.expectEqual(@as(u32, 0xD4001001), svc(0x80)); // svc #0x80
     try testing.expectEqual(@as(u32, 0x94000000), bl(0)); // bl #0
     try testing.expectEqual(@as(u32, 0xA9BF7BFD), stpFpLrPre);
     try testing.expectEqual(@as(u32, 0x910003FD), movFpSp);
@@ -491,16 +440,6 @@ test "compare + condition codes" {
 }
 
 test "conditional + unconditional branches" {
-    try testing.expectEqual(@as(u32, 0x54000000), bCond(.eq, 0)); // b.eq .+0
-    try testing.expectEqual(@as(u32, 0x54000040), bCond(.eq, 2)); // b.eq .+8
-    try testing.expectEqual(@as(u32, 0x54FFFFCB), bCond(.lt, -2)); // b.lt .-8
-    try testing.expectEqual(@as(u32, 0x54FFFF8B), bCond(.lt, -4)); // b.lt .-16
-    try testing.expectEqual(@as(u32, 0x54FFFFC1), bCond(.ne, -2)); // b.ne .-8
-
-    try testing.expectEqual(@as(u32, 0xB4000000), cbz(0, 0)); // cbz x0,.+0
-    try testing.expectEqual(@as(u32, 0xB4000040), cbz(0, 2)); // cbz x0,.+8
-    try testing.expectEqual(@as(u32, 0xB4000080), cbz(0, 4)); // cbz x0,.+16
-    try testing.expectEqual(@as(u32, 0xB4FFFFC1), cbz(1, -2)); // cbz x1,.-8
     try testing.expectEqual(@as(u32, 0xB5000000), cbnz(0, 0)); // cbnz x0,.+0
     try testing.expectEqual(@as(u32, 0xB5FFFF80), cbnz(0, -4)); // cbnz x0,.-16
 
@@ -512,9 +451,9 @@ test "conditional + unconditional branches" {
 }
 
 test "branch patchers preserve opcode + identity" {
-    try testing.expectEqual(@as(u32, 0x54000040), patchBCond(bCond(.eq, 0), 2)); // keep .eq, set +2
-    try testing.expectEqual(@as(u32, 0x54FFFFCB), patchBCond(bCond(.lt, 0), -2)); // keep .lt, set -2
-    try testing.expectEqual(@as(u32, 0xB4FFFF80), patchCbz(cbz(0, 0), -4)); // keep cbz x0, set -4
+    try testing.expectEqual(@as(u32, 0x54000040), patchBCond(0x54000000, 2)); // keep .eq, set +2
+    try testing.expectEqual(@as(u32, 0x54FFFFCB), patchBCond(0x5400000B, -2)); // keep .lt, set -2
+    try testing.expectEqual(@as(u32, 0xB4FFFF80), patchCbz(0xB4000000, -4)); // keep cbz x0, set -4
     try testing.expectEqual(@as(u32, 0xB5FFFF80), patchCbz(cbnz(0, 0), -4)); // keep cbnz x0, set -4
     try testing.expectEqual(@as(u32, 0x17FFFFFE), patchB(b(0), -2)); // b -2
     try testing.expectEqual(@as(u32, 0x14000004), patchB(b(0), 4)); // b +4
