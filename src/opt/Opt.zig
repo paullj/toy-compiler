@@ -7,20 +7,20 @@
 //! manager's bounded fixpoint so fold→branch→forward→DCE cascade.
 //!
 //! === MEMORY STRATEGY (no arena; in-place mutate + mark-then-compact-once) ===
-//! `Ir.Function.deinit` frees, in order: each block's params; each `.call`
-//! instr's `args`; the block's `instrs`; the block's `br.args`; then `blocks`,
-//! `params`, `slots`, `values`, `literals.bytes`, `literals`. Every transform
-//! MUST preserve that invariant so deinit neither leaks nor double-frees:
+//! A block's owned slices are freed once by `Ir.Block.freeOwned` (the single
+//! definition of that set); `Ir.Function.deinit` frees every block through it,
+//! then `blocks`, `params`, `slots`, `values`, `literals.bytes`, `literals`.
+//! Every transform MUST preserve that invariant so deinit neither leaks nor
+//! double-frees:
 //!   (a) FOLD replaces an `Instr.op` with `.iconst`/`.bconst` IN PLACE. Neither
 //!       the new op nor the displaced add/icmp/neg/bnot owns a nested slice, so
 //!       this is leak-free and allocation-free.
 //!   (b) BRANCH-FOLD replaces a `.cond_br` (argless, owns nothing) with
 //!       `.br{ dest, args = &.{} }` — a static empty slice; deinit's `gpa.free`
 //!       no-ops on a 0-len slice (freeing a NON-empty static slice is the bug).
-//!   (c) UNREACHABLE-ELIM frees each DROPPED block's nested slices in deinit
-//!       order (each `.call`'s args; then instrs; then params; then `br.args`)
-//!       exactly once, then compacts survivors with one alloc-copy-free-old.
-//!       Per-block instr DCE compacts with one alloc-copy-free-old too.
+//!   (c) UNREACHABLE-ELIM frees each DROPPED block via `Block.freeOwned` (once),
+//!       then compacts survivors with one alloc-copy-free-old. Per-block instr
+//!       DCE compacts with one alloc-copy-free-old too.
 //!   (d) VALUE PRUNING rebuilds `func.values` (alloc-copy-free-old) and renumbers
 //!       EVERY ValueId site through the shared `walk.zig` helper (so liveness and
 //!       remap can't drift). `entry`/`exit` are BlockIds (remapped by the block
