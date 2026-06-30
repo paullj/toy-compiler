@@ -169,24 +169,6 @@ pub const Layout = struct {
     got_vmaddr: u64 = 0,
 };
 
-/// Build the fully signed, runnable image for a string-free program (no
-/// `__cstring`, no imports). Kept for the M1/M3 single-segment path and tests;
-/// the multi-segment (output) path runs through `link/emit.zig`'s
-/// `assembleAndSign`, which orchestrates assemble → applyDataRelocs → sign.
-/// `entry_text_off` is the entry
-/// function's byte offset within `code` (`main`'s resolved text offset); the
-/// LC_MAIN entryoff becomes `code_file_off + entry_text_off`. Caller owns the
-/// returned slice and should write it with mode 0o755.
-pub fn build(gpa: std.mem.Allocator, identifier: []const u8, code: []const u8, entry_text_off: u32) ![]u8 {
-    const layout = try assemble(gpa, identifier, code, entry_text_off, &.{}, &.{});
-    errdefer gpa.free(layout.image);
-
-    // Stage D fills the reserved region in place after hashing image[0..sig_off).
-    try CodeSign.sign(gpa, layout.image, identifier, layout.sig_file_off, layout.text_size);
-
-    return layout.image;
-}
-
 /// Assemble the image with the code-signature region reserved (and currently
 /// zeroed). The header / load commands / code are final; only the sig region is
 /// left for `CodeSign.sign` to fill. Caller owns `image`.
