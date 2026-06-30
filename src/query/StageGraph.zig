@@ -15,23 +15,13 @@
 //! barrier set-fold is order-free; a region's per-fn jobs are key-disjoint, read
 //! back in index order, and its diagnostics merge in fn-id order + one stable sort).
 //!
-//! A REGION stage is `driver.region(i)`: the driver runs the stage and owns its own
-//! internal scheduling. The codegen region FANS OUT per-fn internally (via
-//! `Engine.fanOut`, the one parallelism mechanism) and owns its post-region join (the
-//! relink tail). The interpreter owns only the cadence — it runs the stage, so the
-//! boundary BETWEEN a region and the next stage is a sequential join (the region fully
-//! completes before the next stage starts).
-//!
-//! A BARRIER stage is a fan-IN keyed by `Engine.barrier`'s order-independent set-fold
-//! over its `contributors`. There are THREE, and each folds a real, multi-element
-//! contributor multiset on every program build (so the set-fold is load-bearing, not a
-//! 1-element stub):
-//!   * DISCOVER folds the entry-path digest -> the discovered module graph;
-//!   * COLLECT folds every module's parse digest -> the global name-resolution tables
-//!     (resolve's whole-graph collect + per-fn bind is the join compute);
-//!   * GLOBAL_TABLES folds every global fn's resolve digest -> the program-wide
-//!     layout/sig tables (typecheck Pass-A is the join compute; the per-fn body checks
-//!     then fan out INSIDE that compute as the PER_UNIT region past the barrier).
+//! A REGION stage (`driver.region(i)`) owns its own internal scheduling (the codegen
+//! region fans out per-fn via `Engine.fanOut` and owns its relink join); the boundary
+//! between a region and the next stage is a sequential join — the region fully completes
+//! before the next stage starts. A BARRIER stage is a fan-IN keyed by `Engine.barrier`'s
+//! order-independent set-fold over its `contributors`; the three barriers each fold a
+//! real, multi-element contributor multiset on every program build (so the set-fold is
+//! load-bearing, not a 1-element stub) — see `pipeline` below for what each folds.
 //! Each fold is order-independent (sum-then-mix over the contributor digests), so the
 //! join id — and the recorded barrier node — is identical at -j1 and -jN. The body and
 //! codegen per-fn jobs are key-disjoint and read back in index order, diagnostics merge
@@ -70,9 +60,9 @@ pub const Stage = struct {
 /// boundary is the sequential one `interpret` imposes (the region completes before the
 /// build's tail runs).
 ///
-/// `kind` names each barrier's join phase (`Phase.Kind.discover`/`collect`/
-/// `global_tables`); for the codegen REGION it is the representative phase. The
-/// transitions are what `interpret` schedules on.
+/// `kind` names each barrier's join phase (documentary for the codegen REGION); the
+/// transitions are what `interpret` schedules on (see the `Stage` doc for how `kind`
+/// is consumed).
 pub const pipeline = [_]Stage{
     .{ .kind = .discover, .transition = .BARRIER }, // DISCOVER: entry path -> module graph
     .{ .kind = .collect, .transition = .BARRIER }, // COLLECT: module parse digests -> resolve tables
@@ -114,11 +104,9 @@ pub fn interpret(
     }
 }
 
-// ===========================================================================
 // Unit tests — a MOCK pipeline asserts the interpreter's cadence: a barrier runs
 // between two fan-out regions (never inside a job), and each region's jobs are
 // dispatched + read back in index order. No engine cache / real compute is touched.
-// ===========================================================================
 
 const testing = std.testing;
 
