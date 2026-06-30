@@ -746,8 +746,8 @@ fn operandPtr(b: *Builder, op: Ir.Operand) error{OutOfMemory}!Ir.ValueId {
     };
 }
 
-/// Store a str literal's (cstr_ptr, len) pair into the destination ptr (ptr@0,
-/// len@8). Mirrors `lowerStrLiteral` but writes a caller-supplied destination.
+/// Store a str literal's (cstr_ptr, len) pair into the destination ptr; the
+/// `ptr@0, len@8` field layout is pinned by the `lower-aggregates: str literal` test.
 fn storeStrLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[expr];
     const bytes = (try decodeStringLiteral(b, n.main_token)) orelse return;
@@ -2092,4 +2092,294 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         };
     }
     try testing.expect(saw_get_tag);
+}
+
+/// Parse + resolve + typecheck `src`, lower the named fn, and assert it produced at
+/// least one diagnostic (a `b.note`). The aggregate produce-into-slot family is the
+/// most miscompile-prone code here, so these pin the lowering-stage error paths that
+/// the whole-program byte-diff cannot reach (the source typechecks, then fails to
+/// lower).
+fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
+    const gpa = testing.allocator;
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    var diag: ?Parser.Diagnostic = null;
+    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
+    const prog = tree.nodes[Ast.root(tree.nodes)];
+    var fn_decl: Ast.Index = Ast.none;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
+        if (tree.nodes[idx].tag == .fn_decl and
+            std.mem.eql(u8, tokens[tree.nodes[idx].main_token].text(src), fn_name)) fn_decl = idx;
+    }
+    var names = [_]Link.SymName{.{ .kind = .user_fn, .name = try gpa.dupe(u8, fn_name) }};
+    defer gpa.free(names[0].name);
+    const in = Inputs{
+        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
+        .tokens = tokens,
+        .source = src,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = &names,
+    };
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var func = try lowerFn(gpa, in, fn_decl, names[0], false, &diags);
+    defer func.deinit(gpa);
+    try testing.expect(diags.items.len >= 1);
+}
+
+test "lower-aggregates: str literal produced into a var slot (ptr@0, len@8)" {
+    try expectLowered(
+        "fn f() {\n s := \"hi\"\n}\n",
+        "f",
+        "fn f() -> unit {\n" ++
+            "  slots: s0:str\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = cstr_ptr #c9c8bb6f84f1f9cf\n" ++
+            "  store %0, %1 : int\n" ++
+            "  %2 = field_addr %0, 8 : int\n" ++
+            "  %3 = iconst 2\n" ++
+            "  store %2, %3 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: nested struct init writes inner fields at nested offsets" {
+    try expectLowered(
+        "struct Inner { a: int, b: int }\nstruct Outer { p: Inner, q: int }\n" ++
+            "fn f() {\n o := Outer { p: Inner { a: 1, b: 2 }, q: 3 }\n}\n",
+        "f",
+        "fn f() -> unit {\n" ++
+            "  slots: s0:Outer\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = field_addr %0, 0 : Inner\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 1\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 2\n" ++
+            "  store %4, %5 : int\n" ++
+            "  %6 = field_addr %0, 16 : int\n" ++
+            "  %7 = iconst 3\n" ++
+            "  store %6, %7 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: tuple-variant enum init stores tag@0, payload@8" {
+    try expectLowered(
+        "enum E { C(int), N }\nfn f() {\n e := E.C(5)\n}\n",
+        "f",
+        "fn f() -> unit {\n" ++
+            "  slots: s0:E\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = iconst 0\n" ++
+            "  store %0, %1 : int\n" ++
+            "  %2 = field_addr %0, 8 : int\n" ++
+            "  %3 = iconst 5\n" ++
+            "  store %2, %3 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: struct-variant enum init stores tag@0, fields@8/16" {
+    try expectLowered(
+        "enum E { R { w: int, h: int }, N }\nfn f() {\n e := E.R { w: 3, h: 4 }\n}\n",
+        "f",
+        "fn f() -> unit {\n" ++
+            "  slots: s0:E\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = iconst 0\n" ++
+            "  store %0, %1 : int\n" ++
+            "  %2 = field_addr %0, 8 : int\n" ++
+            "  %3 = iconst 3\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %0, 16 : int\n" ++
+            "  %5 = iconst 4\n" ++
+            "  store %4, %5 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: value-if returning a struct produces into each arm slot" {
+    try expectLowered(
+        "struct V { a: int, b: int }\n" ++
+            "fn f(c: int) -> V {\n if c == 1 { V { a: 10, b: 20 } } else { V { a: 1, b: 1 } }\n}\n",
+        "f",
+        "fn f(s0) -> V {\n" ++
+            "  slots: s0:int s1:V s2:V\n" ++
+            "b0:\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  %3 = load %2 : int\n" ++
+            "  %4 = iconst 1\n" ++
+            "  %5 = icmp eq %3, %4\n" ++
+            "  cond_br %5, b2, b3\n" ++
+            "b1(%0:V):\n" ++
+            "  ret %0\n" ++
+            "b2:\n" ++
+            "  %6 = slot_addr s1\n" ++
+            "  %7 = field_addr %6, 0 : int\n" ++
+            "  %8 = iconst 10\n" ++
+            "  store %7, %8 : int\n" ++
+            "  %9 = field_addr %6, 8 : int\n" ++
+            "  %10 = iconst 20\n" ++
+            "  store %9, %10 : int\n" ++
+            "  br b4(s1)\n" ++
+            "b3:\n" ++
+            "  %11 = slot_addr s2\n" ++
+            "  %12 = field_addr %11, 0 : int\n" ++
+            "  %13 = iconst 1\n" ++
+            "  store %12, %13 : int\n" ++
+            "  %14 = field_addr %11, 8 : int\n" ++
+            "  %15 = iconst 1\n" ++
+            "  store %14, %15 : int\n" ++
+            "  br b4(s2)\n" ++
+            "b4(%1:V):\n" ++
+            "  br b1(%1)\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: value-loop break of a struct produces into the merge slot" {
+    try expectLowered(
+        "struct V { a: int, b: int }\nfn f() -> V {\n loop { break V { a: 1, b: 2 } }\n}\n",
+        "f",
+        "fn f() -> V {\n" ++
+            "  slots: s0:V\n" ++
+            "b0:\n" ++
+            "  br b2\n" ++
+            "b1(%0:V):\n" ++
+            "  ret %0\n" ++
+            "b2:\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  %3 = field_addr %2, 0 : int\n" ++
+            "  %4 = iconst 1\n" ++
+            "  store %3, %4 : int\n" ++
+            "  %5 = field_addr %2, 8 : int\n" ++
+            "  %6 = iconst 2\n" ++
+            "  store %5, %6 : int\n" ++
+            "  br b3(s0)\n" ++
+            "b3(%1:V):\n" ++
+            "  br b1(%1)\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: labeled-block break of a struct produces into the merge slot" {
+    try expectLowered(
+        "struct V { a: int, b: int }\nfn f() -> V {\n @blk { break @blk V { a: 1, b: 2 } }\n}\n",
+        "f",
+        "fn f() -> V {\n" ++
+            "  slots: s0:V\n" ++
+            "b0:\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  %3 = field_addr %2, 0 : int\n" ++
+            "  %4 = iconst 1\n" ++
+            "  store %3, %4 : int\n" ++
+            "  %5 = field_addr %2, 8 : int\n" ++
+            "  %6 = iconst 2\n" ++
+            "  store %5, %6 : int\n" ++
+            "  br b2(s0)\n" ++
+            "b1(%0:V):\n" ++
+            "  ret %0\n" ++
+            "b2(%1:V):\n" ++
+            "  br b1(%1)\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: match-into a struct per arm (get_tag dispatch)" {
+    try expectLowered(
+        "enum E { C(int), N }\nstruct V { a: int }\n" ++
+            "fn f(e: E) -> V {\n match e { .C(r) -> V { a: r }, .N -> V { a: 0 } }\n}\n",
+        "f",
+        "fn f(s0) -> V {\n" ++
+            "  slots: s0:E s1:V s2:int\n" ++
+            "b0:\n" ++
+            "  %1 = slot_addr s1\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  %3 = get_tag %2\n" ++
+            "  %4 = iconst 0\n" ++
+            "  %5 = icmp ne %3, %4\n" ++
+            "  cond_br %5, b3, b4\n" ++
+            "b1(%0:V):\n" ++
+            "  ret %0\n" ++
+            "b2:\n" ++
+            "  br b1(s1)\n" ++
+            "b3:\n" ++
+            "  %13 = slot_addr s0\n" ++
+            "  %14 = get_tag %13\n" ++
+            "  %15 = iconst 1\n" ++
+            "  %16 = icmp ne %14, %15\n" ++
+            "  cond_br %16, b5, b6\n" ++
+            "b4:\n" ++
+            "  %6 = slot_addr s0\n" ++
+            "  %7 = field_addr %6, 8 : int\n" ++
+            "  %8 = slot_addr s2\n" ++
+            "  %9 = load %7 : int\n" ++
+            "  store %8, %9 : int\n" ++
+            "  %10 = field_addr %1, 0 : int\n" ++
+            "  %11 = slot_addr s2\n" ++
+            "  %12 = load %11 : int\n" ++
+            "  store %10, %12 : int\n" ++
+            "  br b2\n" ++
+            "b5:\n" ++
+            "  br b2\n" ++
+            "b6:\n" ++
+            "  %17 = field_addr %1, 0 : int\n" ++
+            "  %18 = iconst 0\n" ++
+            "  store %17, %18 : int\n" ++
+            "  br b2\n" ++
+            "}\n",
+    );
+}
+
+test "lower-aggregates: aggregate identifier copy-into emits a copy" {
+    try expectLowered(
+        "struct V { a: int, b: int }\nfn f(p: V) {\n q := p\n}\n",
+        "f",
+        "fn f(s0) -> unit {\n" ++
+            "  slots: s0:V s1:V\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s1\n" ++
+            "  %1 = slot_addr s0\n" ++
+            "  copy %0 <- %1 : V\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "lower-diagnostics: an unknown string escape fails to lower" {
+    try expectLowerDiag("fn f() {\n s := \"\\q\"\n}\n", "f");
 }
