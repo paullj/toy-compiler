@@ -83,6 +83,7 @@ pub fn checkGraph(
     for (res.fns, 0..) |gf, i| {
         fns[i] = .{
             .decl_node = gf.decl_node,
+            .kind = gf.kind,
             .module = gf.module,
             .is_pub = gf.is_pub,
             .name = gf.name,
