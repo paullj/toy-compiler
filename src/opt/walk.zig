@@ -19,7 +19,7 @@ pub fn forEachValueUse(func: *const Ir.Function, ctx: anytype, comptime f: fn (@
         for (b.instrs) |ins| {
             switch (ins.op) {
                 .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
-                .add, .sub, .mul, .sdiv, .smod => |bin| {
+                .add, .sub, .mul, .sdiv => |bin| {
                     use(ctx, f, bin.lhs);
                     use(ctx, f, bin.rhs);
                 },
@@ -82,7 +82,7 @@ pub fn remapValues(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(c
             ins.result = map(ctx, ins.result);
             switch (ins.op) {
                 .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
-                .add, .sub, .mul, .sdiv, .smod => |*bin| {
+                .add, .sub, .mul, .sdiv => |*bin| {
                     bin.lhs = map(ctx, bin.lhs);
                     bin.rhs = map(ctx, bin.rhs);
                 },

@@ -359,7 +359,6 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         .sub => |b| try genArith(g, ins.result, b, .sub),
         .mul => |b| try genArith(g, ins.result, b, .mul),
         .sdiv => |b| try genArith(g, ins.result, b, .sdiv),
-        .smod => unreachable, // DEAD: the source has no `%`; lower never emits it.
         .neg => |v| {
             try g.loadValue(S0, v);
             try g.emit(Aarch64.neg(S0, S0));
