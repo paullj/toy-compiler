@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     var target: []const u8 = "native";
     var out_path: ?[]const u8 = null;
     var codegen_stats = false;
-    var mode: CodegenIr.Mode = .normal;
+    var mode: Engine.Mode = .normal;
     // M13 opt level / pass selection. Default -O0 (no opt). Last flag wins,
     // left-to-right; --opt= / --no-opt= toggle individual passes from current.
     var opt: Opt.Config = .O0;
@@ -404,7 +404,7 @@ fn emitExecutable(
     paths: []const []const u8,
     out_path: ?[]const u8,
     run_after: bool,
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     codegen_stats: bool,
     opt: Opt.Config,
     opt_stats: bool,
@@ -668,7 +668,7 @@ const Orchestrator = struct {
     /// stage's result is ready by then) and returned as a stable slice for the fold.
     collect_contribs: *std.ArrayList(u64),
     gt_contribs: *std.ArrayList(u64),
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     opt: Opt.Config,
     /// PERF P4: the discover stage's compute/cache probe (file-read+lex+parse compute
     /// vs the lex/parse content cache). Distinct from `probe` (the lower stage's), so

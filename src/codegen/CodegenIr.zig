@@ -34,14 +34,6 @@ const Typecheck = @import("../types.zig");
 
 pub const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
 
-/// Per-fn codegen cache policy (orthogonal to the now-single backend):
-///   normal — use a cached blob if present, else lower+cache.
-///   force  — ignore cache, always re-lower (cold build).
-///   verify — re-lower every fn TWICE and assert byte-identity ([C11]),
-///            independent of cache state. Implies force (the gate must hold on
-///            a cold build, not only on a primed cache hit).
-pub const Mode = enum { normal, force, verify };
-
 const Type = Typecheck.Type;
 const Layout = Typecheck.Layout;
 const EnumLayout = Typecheck.EnumLayout;

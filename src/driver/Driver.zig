@@ -473,7 +473,7 @@ pub fn lowerGraphProgram(
     graph: *const Graph.Graph,
     res: *const ResolveGraph.GraphResult,
     tc: *const Typecheck.GraphResult,
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     opt: Opt.Config,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
@@ -589,7 +589,7 @@ pub fn lowerGraphProgram(
         io: Io,
         cache: Cache,
         target: []const u8,
-        mode: CodegenIr.Mode,
+        mode: Engine.Mode,
         gf: *const GraphFrozen,
         slots: []FnSlot,
         pub fn args(c: @This(), i: usize) std.meta.ArgsTuple(@TypeOf(graphFnJob)) {
@@ -664,7 +664,7 @@ fn graphFnJob(
     io: Io,
     cache: Cache,
     target: []const u8,
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     gf: *const GraphFrozen,
     lower_i: usize,
     slot: *FnSlot,
@@ -679,7 +679,7 @@ fn graphFnJobInner(
     io: Io,
     cache: Cache,
     target: []const u8,
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     gf: *const GraphFrozen,
     lower_i: usize,
     slot: *FnSlot,
@@ -810,7 +810,7 @@ fn lowerSingleFile(
     cache: Cache,
     target: []const u8,
     r: *const FileResult,
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     opt: Opt.Config,
 ) !LowerProgramResult {
     var graph = try Graph.single(gpa, "main", r.path, r.source, r.tokens, r.nodes, r.extra, r.pub_bits);
@@ -1451,7 +1451,7 @@ fn checkAndLower(
     cache: Cache,
     path: []const u8,
     src: []const u8,
-    mode: CodegenIr.Mode,
+    mode: Engine.Mode,
     r_out: *FileResult,
 ) !LinkedProgram {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });

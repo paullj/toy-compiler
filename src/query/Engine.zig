@@ -33,9 +33,14 @@ const Phase = @import("Phase.zig");
 
 const Engine = @This();
 
-/// How force/verify behave for cached queries (threaded from `main.zig`). Aliased
-/// to the codegen mode so the driver and engine share one type.
-pub const Mode = CodegenIr.Mode;
+/// How force/verify behave for cached queries (threaded from `main.zig`), the
+/// cache/verify policy this engine owns and the verify gate enforces:
+///   normal — use a cached blob if present, else lower+cache.
+///   force  — ignore cache, always re-lower (cold build).
+///   verify — re-lower every fn TWICE and assert byte-identity ([C11]),
+///            independent of cache state. Implies force (the gate must hold on
+///            a cold build, not only on a primed cache hit).
+pub const Mode = enum { normal, force, verify };
 
 /// The on-disk content-addressed memo. Borrowed; must outlive the engine (the CLI
 /// keeps the cache + its dir buffer on its stack for the whole run).
