@@ -180,11 +180,18 @@ pub fn discoverDag(
     const entry_file = try gpa.dupe(u8, entry_path);
     errdefer gpa.free(entry_file);
 
-    const entry_canon = d.canonicalize(entry_file) catch |e| {
+    // A null canon means the entry file is unopenable; dupe the path verbatim as a
+    // best-effort key so interning still pins the entry to id 0 and `load`'s
+    // `readFileAlloc` surfaces the read failure (the driver reports a bad entry).
+    const entry_canon = (d.canonicalize(entry_file) catch |e| {
         gpa.free(entry_name);
         gpa.free(entry_file);
         return e;
-    };
+    }) orelse (gpa.dupe(u8, entry_file) catch |e| {
+        gpa.free(entry_name);
+        gpa.free(entry_file);
+        return e;
+    });
     const root_id = d.intern(entry_name, entry_file, entry_canon) catch |e| {
         gpa.free(entry_name);
         gpa.free(entry_file);
@@ -313,12 +320,29 @@ const Discoverer = struct {
     /// "one physical file = one set of type ids" invariants. The slot owns its
     /// canonical key; this map borrows it.
     by_canon: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Memoize `realpath` BY RAW RESOLVED PATH (`<root>/<path>.toy`). A module shared
+    /// by N importers is resolved to the same `file` string N times (once per edge,
+    /// BEFORE `intern` dedups by physical identity), so without this each shared file
+    /// pays N realpath(2) syscalls — the discover-time dominator on a graph with reuse.
+    /// Same input path → same realpath output on a stable FS (the build contract; the
+    /// tree is not mutated mid-build), so this is a pure memoization: it changes which
+    /// modules are discovered, their order, ids, and the case/symlink guardrails not at
+    /// all ([C11] byte-identical).
+    /// Owns one master copy of each key (raw path) and value (canon); callers get a
+    /// fresh dupe so the existing intern/free ownership is unchanged.
+    realpath_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
     err: ?Error = null,
 
     fn deinit(d: *Discoverer) void {
         for (d.slots.items) |*s| s.deinit(d.gpa);
         d.slots.deinit(d.gpa);
         d.by_canon.deinit(d.gpa);
+        var it = d.realpath_cache.iterator();
+        while (it.next()) |e| {
+            d.gpa.free(e.key_ptr.*);
+            d.gpa.free(e.value_ptr.*);
+        }
+        d.realpath_cache.deinit(d.gpa);
         // d.err is moved into the Graph by toGraph; if it stayed it's freed there.
     }
 
@@ -340,18 +364,32 @@ const Discoverer = struct {
     }
 
     /// Canonicalize a resolved file path to its physical identity: resolves symlinks
-    /// and (on a case-insensitive volume) returns the on-disk case-correct path. On
-    /// any failure (e.g. the file vanished between the existence check and here) the
-    /// import-text-relative path is duped verbatim as a best-effort key — discovery
-    /// will then surface the read failure as `missing` at load time.
-    fn canonicalize(d: *Discoverer, file: []const u8) ![]u8 {
-        if (Io.Dir.cwd().realPathFileAlloc(d.io, file, d.gpa) catch null) |rp| {
-            // `realPathFileAlloc` returns a sentinel `[:0]u8` (allocated len+1); to
-            // keep `canon` a plain `[]u8` that frees cleanly, copy and release it.
-            defer d.gpa.free(rp);
-            return d.gpa.dupe(u8, rp);
-        }
-        return d.gpa.dupe(u8, file);
+    /// and (on a case-insensitive volume) returns the on-disk case-correct path.
+    /// Returns `null` when the file does not exist (or is otherwise unopenable) —
+    /// `realPathFileAlloc` opens the file to read its real path, so a null here is
+    /// the same presence gate the now-removed separate open+close existence check
+    /// gave, folding two syscalls per import into one. A non-null result is a freshly OWNED canonical
+    /// key the caller takes (intern adopts it, or frees it on a physical-identity dedup).
+    /// Memoized by raw path (`realpath_cache`): a file reached by multiple importers
+    /// realpaths once; later hits return a dupe of the cached canon.
+    fn canonicalize(d: *Discoverer, file: []const u8) !?[]u8 {
+        if (d.realpath_cache.get(file)) |canon| return try d.gpa.dupe(u8, canon);
+        const rp = Io.Dir.cwd().realPathFileAlloc(d.io, file, d.gpa) catch return null;
+        // `realPathFileAlloc` returns a sentinel `[:0]u8` (allocated len+1); to keep
+        // `canon` a plain `[]u8` that frees cleanly, copy and release it.
+        defer d.gpa.free(rp);
+        const master = try d.gpa.dupe(u8, rp);
+        errdefer d.gpa.free(master);
+        const key = try d.gpa.dupe(u8, file);
+        errdefer d.gpa.free(key);
+        // Dupe the caller's copy BEFORE handing `key`/`master` to the cache: after a
+        // successful `put` the cache OWNS both, so no fallible op may follow that an
+        // errdefer would unwind into a free of cache-owned (and later deinit-freed)
+        // memory. `put` is therefore the last fallible step.
+        const ret = try d.gpa.dupe(u8, master);
+        errdefer d.gpa.free(ret);
+        try d.realpath_cache.put(d.gpa, key, master);
+        return ret;
     }
 
     /// Record a structural error (first one wins) and signal the DFS to unwind.
@@ -486,21 +524,22 @@ const Discoverer = struct {
             };
             errdefer d.gpa.free(file);
 
-            // Existence check before interning so a missing module is reported
-            // with the offending import's location.
-            if (!fileExists(d.io, file)) {
+            // Canonicalize to physical file identity (resolving symlinks/case) so two
+            // imports that open the SAME file (e.g. `util` and `Util` on a
+            // case-insensitive volume) intern to ONE module — one symbol set, one set
+            // of nominal type ids. `canonicalize` ALSO serves as the presence gate:
+            // `realPathFileAlloc` opens the file, so a null result means the import
+            // names a file that does not exist. Reporting the miss here (at the
+            // offending import's location) folds the old separate `openFile`+`close`
+            // existence check into this one realpath syscall.
+            const canon = (try d.canonicalize(file)) orelse {
                 return d.fail(.{
                     .kind = .missing,
                     .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (looked for '{s}')", .{ path, file }),
                     .module = id,
                     .byte_offset = import_off,
                 });
-            }
-
-            // Canonicalize to physical file identity so two imports that open the
-            // SAME file (e.g. `util` and `Util` on a case-insensitive volume)
-            // intern to ONE module — one symbol set, one set of nominal type ids.
-            const canon = try d.canonicalize(file);
+            };
 
             // Guardrail: on a normalizing FS, `import Util` against `util.toy`
             // silently opens the file but requests the wrong case. The canonical
@@ -667,13 +706,6 @@ fn resolveFile(gpa: std.mem.Allocator, root: []const u8, path: []const u8) PathE
         return std.fmt.allocPrint(gpa, "{s}{s}", .{ path, ext });
     }
     return std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ root, path, ext });
-}
-
-/// Whether `path` names an existing readable regular file.
-fn fileExists(io: Io, path: []const u8) bool {
-    var f = Io.Dir.cwd().openFile(io, path, .{}) catch return false;
-    f.close(io);
-    return true;
 }
 
 /// Directory portion of `path` (everything before the last `/`), or `""` when
