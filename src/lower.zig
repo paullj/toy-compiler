@@ -461,16 +461,7 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
         .unary => return try lowerUnary(b, node_idx, n),
         .binary => return try lowerBinary(b, node_idx, n),
         .call => {
-            // A qualified tuple-variant construction `N.V(args)` arrives as a
-            // `.call` whose CALLEE is a field_access over the enum type-name. A
-            // cross-module enum-RETURNING call `mod.fn(args)` has the SAME shape,
-            // so the two are distinguished by the callee's resolution: a real call
-            // binds its field_access callee to a `.func`; a variant constructor's
-            // receiver binds to a type and the callee stays unresolved. (Without
-            // this guard a `mod.fn(args)` returning an enum is mis-routed to
-            // variant construction → infinite recursion / wrong-layout inline.)
-            const callee_is_func = b.in.resolutions[n.lhs] == .func;
-            if (ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access and !callee_is_func) {
+            if (isQualifiedVariantCtorCall(b, n, ty)) {
                 return try aggregateValue(b, node_idx, ty);
             }
             return try lowerCall(b, node_idx, n);
@@ -669,6 +660,18 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
 /// value-if/block/loop/labeled/match, a copy of an identifier/field/call result —
 /// all write the destination, never value-then-copy at the top level. `dst_ptr` is
 /// a ptr VALUE (from slot_addr or field_addr).
+/// True when a `.call` node is a qualified tuple-variant CONSTRUCTION `N.V(args)`
+/// rather than a cross-module enum-RETURNING call `mod.fn(args)`. Both parse as a
+/// `.call` over a `field_access` callee and are told apart ONLY by the callee's
+/// resolution: a real call binds its field_access callee to a `.func`; a variant
+/// constructor's receiver binds to a type, so the callee stays unresolved.
+/// Misclassifying a call as construction inlines a wrong-layout variant and drops
+/// the call → silent miscompile / infinite recursion.
+fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool {
+    return ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access and
+        b.in.resolutions[n.lhs] != .func;
+}
+
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[expr];
     switch (ty.kind) {
@@ -704,16 +707,7 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
             }
         },
         .call => {
-            // A qualified `N.V(args)` enum CONSTRUCTION and a cross-module CALL
-            // returning an enum `mod.fn(args)` both parse as a `.call` over a
-            // `field_access` callee. They are distinguished by the callee's
-            // RESOLUTION: a real call's field_access binds to a `.func` (the
-            // resolver/typecheck resolved it to a fn id); a variant constructor's
-            // receiver binds to a type and the callee field_access stays unresolved.
-            // Misclassifying a cross-module enum-returning call as construction
-            // inlines a (wrong-layout) variant and drops the call → miscompile.
-            const callee_is_func = b.in.resolutions[n.lhs] == .func;
-            if (ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access and !callee_is_func) {
+            if (isQualifiedVariantCtorCall(b, n, ty)) {
                 try lowerEnumInitInto(b, expr, dst_ptr, ty);
             } else {
                 try copyAggInto(b, expr, dst_ptr, ty);
