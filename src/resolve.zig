@@ -1,11 +1,10 @@
-//! Name-resolution shared types (the `Resolution` value re-export + the
-//! `Diagnostic` shape).
+//! Name-resolution shared types (the `Resolution` value re-export).
 //!
 //! The resolution PASS itself lives in `resolve_graph.zig`: a lone source file is
 //! resolved as the trivial one-module graph (`Graph.single` → `resolveGraph`), so
 //! there is exactly ONE resolver, whose `ResolveGraph.GraphResult` is consumed
 //! whole everywhere (the driver `FileResult`, `lower`). This module just owns the
-//! peer types those readers spell as `Resolve.Resolution` / `Resolve.Diagnostic`.
+//! peer type those readers spell as `Resolve.Resolution`.
 //!
 //! Resolution is lexical and index-based: a result's `resolutions` is a
 //! `[]Resolution` parallel to the node array (only identifier-expression nodes
@@ -20,10 +19,6 @@ const Ast = @import("ast/Ast.zig");
 /// the `symbols/` peer data module; re-exported so `Resolve.Resolution` keeps
 /// working for downstream consumers.
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
-
-/// A reported problem. Same shape as `Parser.Diagnostic` so the driver/CLI can
-/// render either uniformly (byte offset → line:col).
-pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 // ---- tests -----------------------------------------------------------------
 
