@@ -28,17 +28,8 @@ const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const AstWalk = @import("AstWalk.zig");
 
-/// A callee's identity-and-signature, folded into a caller's fingerprint so a
-/// signature OR symbol-identity change (but not a body change) invalidates the
-/// caller. [C1][C2]
-///
-/// The callee's resolved KIND (user_fn vs builtin vs import) is load-bearing,
-/// not just its sig: a user `fn print(s: str)` has the SAME sig {[str],void} as
-/// the builtin `print`, but lowers to a DIFFERENT `.func` reloc target
-/// (`{user_fn,"print"}` vs `{builtin,"print"}`). Folding only the sig would let
-/// a shadow-and-unshadow edit keep an identical fingerprint while the call binds
-/// to a different symbol — a stale-cache miscompile. So we fold the full
-/// `SymName{kind,name}` (which IS what enters the lowered bytes) too. [C6]
+/// The callee identity-and-signature datum (`symbols/Sig.zig`); the `(b)` fold
+/// site in `fingerprint` below is the home for why its `kind` is load-bearing.
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 
 /// A type this function touches, with an index-free layout descriptor. For
