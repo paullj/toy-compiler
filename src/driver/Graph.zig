@@ -106,24 +106,30 @@ pub const Error = struct {
 /// `err` is set and `modules` holds whatever was discovered before the failure
 /// (still owned + freed by `deinit`).
 pub const Graph = struct {
+    /// Who owns the module FIELDS (source/tokens/nodes/extra/pub_bits): `discover`
+    /// allocates and OWNS them; `single` BORROWS the caller's const inputs via
+    /// `@constCast`. Non-defaulted so every constructor must state it and a partial
+    /// `Graph{}` fails to compile — an omission here would be a double-free or leak.
+    ownership: Ownership,
     modules: []Module = &.{},
     entry_index: u32 = 0,
     err: ?Error = null,
 
-    pub fn deinit(g: *Graph, gpa: std.mem.Allocator) void {
-        for (g.modules) |*m| m.deinit(gpa);
-        gpa.free(g.modules);
-        if (g.err) |*e| e.deinit(gpa);
-        g.* = undefined;
-    }
+    pub const Ownership = enum { owned, borrowed };
 
-    /// Tear down a graph built by `single`: free ONLY the one-element `modules`
-    /// spine. Every module field is BORROWED from the caller (see `single`), so
-    /// freeing them (as `deinit` does) would be a double-free. Use this — not
-    /// `deinit` — for a `single`-built graph.
-    pub fn deinitSingle(g: *Graph, gpa: std.mem.Allocator) void {
-        std.debug.assert(g.modules.len == 1);
-        std.debug.assert(g.err == null);
+    /// Tear down per `ownership`: the right teardown is impossible to pick wrong
+    /// because the value records who built it.
+    pub fn deinit(g: *Graph, gpa: std.mem.Allocator) void {
+        switch (g.ownership) {
+            // `discover` owns every module field (and any error message).
+            .owned => {
+                for (g.modules) |*m| m.deinit(gpa);
+                if (g.err) |*e| e.deinit(gpa);
+            },
+            // `single` borrows the caller's const inputs (see `single`), so freeing a
+            // module field would double-free — free ONLY the one-element spine below.
+            .borrowed => {},
+        }
         gpa.free(g.modules);
         g.* = undefined;
     }
@@ -216,8 +222,8 @@ pub fn discover(
 /// `source`. If `single` duped the source and the graph were freed before the
 /// result is consumed (e.g. `Driver.pipeline`'s `defer graph.deinit` vs the later
 /// `lowerGraphProgram`), every variant name would dangle. Borrowing the caller's
-/// (longer-lived) source keeps those names valid. Tear down with `deinitSingle`,
-/// which frees ONLY the one-element `modules` spine and never the borrowed fields.
+/// (longer-lived) source keeps those names valid. Built with `ownership = .borrowed`,
+/// so `deinit` frees ONLY the one-element `modules` spine, never the borrowed fields.
 ///
 /// Deterministic by construction: one allocation, zero map iteration, zero sort,
 /// no I/O — byte-identical at `-j1` and `-jN` ([C11]). `entry_index = 0` and
@@ -237,7 +243,7 @@ pub fn single(
     const modules = try gpa.alloc(Module, 1);
     // `Module` holds mutable slices (the discovery path owns them); the graph path
     // only ever READS them, so borrowing the caller's const inputs via @constCast is
-    // safe. `deinitSingle` frees none of these — only the `modules` spine.
+    // safe. The `.borrowed` ownership tag frees none of these — only the `modules` spine.
     modules[0] = .{
         .path = name,
         .file = file,
@@ -248,7 +254,7 @@ pub fn single(
         .pub_bits = pub_bits,
         .imports = &.{},
     };
-    return .{ .modules = modules, .entry_index = 0, .err = null };
+    return .{ .ownership = .borrowed, .modules = modules, .entry_index = 0, .err = null };
 }
 
 // ---- discovery internals ----------------------------------------------------
@@ -803,7 +809,7 @@ const Discoverer = struct {
         }
         const e = d.err;
         d.err = null; // ownership moves into the Graph
-        return .{ .modules = mods, .entry_index = root_id, .err = e };
+        return .{ .ownership = .owned, .modules = mods, .entry_index = root_id, .err = e };
     }
 };
 
@@ -1089,7 +1095,7 @@ test "single: trivial one-module graph from a parsed source" {
     }
 
     var g = try single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
-    defer g.deinitSingle(gpa);
+    defer g.deinit(gpa);
     try testing.expect(g.err == null);
     try testing.expectEqual(@as(usize, 1), g.modules.len);
     try testing.expectEqual(@as(u32, 0), g.entry_index);

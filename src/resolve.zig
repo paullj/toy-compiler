@@ -56,7 +56,7 @@ fn parseSource(gpa: std.mem.Allocator, source: []const u8) !Parsed {
 /// `res.deinit(gpa)` (GraphResult.deinit).
 fn resolveParsed(gpa: std.mem.Allocator, parsed: Parsed) !ResolveGraph.GraphResult {
     var g = try Graph.single(gpa, "main", "", parsed.source, parsed.tokens, parsed.tree.nodes, parsed.tree.extra, parsed.tree.pub_bits);
-    defer g.deinitSingle(gpa);
+    defer g.deinit(gpa);
     return ResolveGraph.resolveGraph(gpa, &g);
 }
 
