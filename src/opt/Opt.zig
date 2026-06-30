@@ -43,7 +43,9 @@ pub const Pass = enum(u3) { fold, branch, forward, dce };
 
 /// Which passes are enabled. A `packed struct` over a fixed `u8` so its `bits()`
 /// is a stable wire byte for the codegen fingerprint mix — toggling `-O` lands on
-/// a different cache key. Field order is locked (do not reorder).
+/// a different cache key. Field order is locked to the `Pass` enum order and the
+/// `comptime` block below fails the build on any divergence (a reorder would
+/// silently change `bits()`, hence cache keys).
 pub const Config = packed struct(u8) {
     fold: bool = false,
     branch: bool = false,
@@ -80,6 +82,20 @@ pub const Config = packed struct(u8) {
 
     pub fn any(self: Config) bool {
         return self.fold or self.branch or self.forward or self.dce;
+    }
+
+    comptime {
+        // Pin the wire-byte layout: pass `p` MUST occupy bit `@intFromEnum(p)` in
+        // `bits()`. Setting only `p` must light exactly that bit; a field-order slip
+        // (or a Pass/Config order divergence) fails the build instead of silently
+        // changing a codegen cache key.
+        for (@typeInfo(Pass).@"enum".fields) |f| {
+            const p: Pass = @enumFromInt(f.value);
+            var c: Config = .{};
+            c.set(p, true);
+            if (c.bits() != (@as(u8, 1) << @intFromEnum(p)))
+                @compileError("Opt.Config field order must match the Pass enum order");
+        }
     }
 };
 
