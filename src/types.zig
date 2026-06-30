@@ -193,12 +193,6 @@ gph_node_types: ?[][]Type = null,
 /// function indices in source order, and so do we (Pass A below).
 fns: std.ArrayList(FnSym),
 
-/// Per-function: a local's type indexed by its slot. Slots are function-wide and
-/// assigned densely from 0, so a flat array indexed by slot is exact.
-slot_types: std.ArrayList(Type),
-cur_ret: Type,
-loop_stack: std.ArrayList(LoopCtx),
-
 /// The struct table: one `StructSym` per struct id, plus a name→id map.
 structs: std.ArrayList(StructSym),
 struct_map: std.StringHashMapUnmanaged(u32),
@@ -206,11 +200,6 @@ struct_map: std.StringHashMapUnmanaged(u32),
 /// The enum table: one `EnumSym` per enum id, plus a name→id map.
 enums: std.ArrayList(EnumSym),
 enum_map: std.StringHashMapUnmanaged(u32),
-
-/// One-shot expected type for an inferred `.V` construction (a typed sink:
-/// fn arg/return, assign target, or match-arm body). Saved/restored around the
-/// node it flows into; consumed ONLY by an inferred `enum_init_*` (lhs == none).
-expected: ?Type = null,
 
 /// M14 graph context. Always set in practice: `checkGraph` is the ONE entry and
 /// it drives one shared `Typecheck` across the whole module graph (a lone source
@@ -1776,9 +1765,6 @@ pub fn checkGraph(
         .node_types = if (mods.len != 0) node_types[0] else &.{},
         .sink = DiagnosticSink.init(gpa),
         .fns = .empty,
-        .slot_types = .empty,
-        .cur_ret = .unit,
-        .loop_stack = .empty,
         .structs = .empty,
         .struct_map = .empty, // unused in graph mode (per-module maps live in ctx)
         .enums = .empty,
@@ -1790,8 +1776,6 @@ pub fn checkGraph(
     defer {
         for (t.fns.items) |f| gpa.free(f.params);
         t.fns.deinit(gpa);
-        t.slot_types.deinit(gpa);
-        t.loop_stack.deinit(gpa);
         for (t.enums.items) |e| {
             for (e.variants) |v| {
                 gpa.free(v.field_names);
@@ -2251,18 +2235,6 @@ fn typeName(t: *const Typecheck, ty: Type) []const u8 {
     if (ty.kind == .@"enum" and ty.enum_id < t.enums.items.len)
         return t.enums.items[ty.enum_id].name;
     return @tagName(ty.kind);
-}
-
-/// The type at a local slot, or `invalid` if out of range (shouldn't happen).
-fn slotType(t: *const Typecheck, slot: u32) Type {
-    return if (slot < t.slot_types.items.len) t.slot_types.items[slot] else .invalid;
-}
-
-/// Record the type of a local slot, growing the table to fit (slots are dense
-/// and monotonically increasing within a function).
-fn setSlot(t: *Typecheck, slot: u32, ty: Type) !void {
-    while (t.slot_types.items.len <= slot) try t.slot_types.append(t.gpa, .invalid);
-    t.slot_types.items[slot] = ty;
 }
 
 fn nameText(t: *const Typecheck, tok: u32) []const u8 {
