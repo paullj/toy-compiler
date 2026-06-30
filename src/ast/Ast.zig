@@ -40,6 +40,15 @@ pub const Node = extern struct {
     lhs: Index,
     rhs: Index,
 
+    comptime {
+        // Pinned wire layout: `[]Node` is reinterpreted as raw cache bytes, so a
+        // field change that shifts these offsets/size relocates padding and silently
+        // invalidates old blobs — make it a deliberate (build-breaking) decision.
+        if (@sizeOf(Node) != 16 or @offsetOf(Node, "main_token") != 4 or
+            @offsetOf(Node, "lhs") != 8 or @offsetOf(Node, "rhs") != 12)
+            @compileError("Node layout changed — bump the cache-blob format");
+    }
+
     pub const Tag = enum(u8) {
         /// Integer literal. `main_token` is the number.
         literal_number,

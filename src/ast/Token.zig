@@ -15,7 +15,27 @@ pub const Token = extern struct {
     pub fn text(tok: Token, source: []const u8) []const u8 {
         return source[tok.start..tok.end];
     }
+
+    comptime {
+        // Pinned wire layout: `[]Token` is reinterpreted as raw cache bytes, so a
+        // field change that shifts these offsets/size relocates padding and silently
+        // invalidates old blobs — make it a deliberate (build-breaking) decision.
+        if (@sizeOf(Token) != 12 or @offsetOf(Token, "start") != 4 or @offsetOf(Token, "end") != 8)
+            @compileError("Token layout changed — bump the cache-blob format");
+    }
 };
+
+/// Return `value` with its interior/trailing PADDING bytes zeroed. The cache-bound
+/// `extern struct`s (`Token`, `Ast.Node`) have a `[]T` reinterpreted as raw bytes for
+/// the content-addressed cache (and folded into the lex/parse fp); a field-wise struct
+/// literal leaves padding UNDEFINED, so the raw blob — and the recorded fp — would
+/// differ run-to-run on a cold build. Build every cached element through this so that
+/// byte/fp stays deterministic. See `Ast.contentFp`.
+pub fn zeroPad(comptime T: type, value: T) T {
+    var clean: T = std.mem.zeroes(T);
+    inline for (std.meta.fields(T)) |f| @field(clean, f.name) = @field(value, f.name);
+    return clean;
+}
 
 pub const Tag = enum(u8) {
     invalid,
