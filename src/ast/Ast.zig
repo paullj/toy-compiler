@@ -334,9 +334,9 @@ pub const ParseHeader = extern struct {
 /// A padding-free structural fingerprint of a parsed `Tree`. `Node` is an
 /// `extern struct` with 3 uninitialized padding bytes between `tag` and
 /// `main_token`; hashing the packed blob (or `sliceAsBytes(nodes)`) folds that
-/// garbage in, so the fp differs run-to-run on a COLD build. Persisted red-green
-/// compares result fps to decide green-vs-red, so a non-deterministic parse fp is
-/// either a permanent cache miss or a false-green miscompile. This folds ONLY the
+/// garbage in, so the fp differs run-to-run on a COLD build. The content-fp cache
+/// keys codegen entries off this fp, so a non-deterministic parse fp is a permanent
+/// cache miss (or, worse, a cross-build alias). This folds ONLY the
 /// semantically-meaningful fields (every field that round-trips through
 /// pack/unpack), keeping the canonical field list co-located with pack/unpack.
 pub fn contentFp(tree: Tree) u64 {
@@ -797,8 +797,8 @@ test "contentFp ignores Node padding (cold-build fp determinism foundation)" {
     // that struct literals leave undefined; on a cold build those carry stack
     // garbage, so hashing the raw bytes flips the fp run-to-run. `contentFp` folds
     // only the four semantic fields, so two trees with IDENTICAL fields but DISTINCT
-    // padding must produce the SAME fp — otherwise persisted red-green is inert
-    // (permanent miss) or unsound (false-green). Forge the padding via byte access.
+    // padding must produce the SAME fp — otherwise the content-fp cache is inert
+    // (permanent miss) or unsound (cross-build alias). Forge the padding via byte access.
     var a = [_]Node{
         .{ .tag = .binary, .main_token = 1, .lhs = 0, .rhs = 2 },
         .{ .tag = .program, .main_token = 0, .lhs = 0, .rhs = none },

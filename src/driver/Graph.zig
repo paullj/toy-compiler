@@ -22,7 +22,6 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
-const Dag = @import("../query/Dag.zig");
 
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
@@ -145,23 +144,6 @@ pub fn discover(
     cache: Cache,
     target: []const u8,
     entry_path: []const u8,
-) !Graph {
-    return discoverDag(gpa, io, cache, target, entry_path, null, null);
-}
-
-/// Same as `discover`, but threads a borrowed `*Dag` so the lex/parse queries run
-/// during discovery record their nodes/edges into the per-build graph. The program
-/// build (the `Orchestrator`'s DISCOVER stage) threads a non-null dag whenever one
-/// exists — a Debug `-o` build, `--dump-dag`, or `--query-stats`; it is null in a
-/// release build (verbatim fast path, byte-identical). The `discover` wrapper passes
-/// `null` for the single-module / test callers that record no DAG.
-pub fn discoverDag(
-    gpa: std.mem.Allocator,
-    io: Io,
-    cache: Cache,
-    target: []const u8,
-    entry_path: []const u8,
-    dag: ?*Dag,
     /// `--timings` probe for the discover stage's lex+parse queries (file-read+lex+parse
     /// COMPUTE vs served from the lex/parse content cache). BORROWED; null on a plain
     /// build => the front-end queries read no clock. PERF P4.
@@ -172,7 +154,6 @@ pub fn discoverDag(
         .io = io,
         .cache = cache,
         .target = target,
-        .dag = dag,
         .probe = probe,
         .root = dirname(entry_path),
     };
@@ -310,8 +291,6 @@ const Discoverer = struct {
     io: Io,
     cache: Cache,
     target: []const u8,
-    /// M16: per-build dependency sink (null on default builds; set by `--dump-dag`).
-    dag: ?*Dag = null,
     /// PERF P4: `--timings` probe for this stage's lex+parse queries (compute vs
     /// cache). Null on a plain build => no clock reads.
     probe: ?*Engine.StageProbe = null,
@@ -466,7 +445,7 @@ const Discoverer = struct {
         // per-file pipeline, but with discovery's SWALLOW read policy (a failed
         // cache read is a plain miss, `tmp_tag` = module id). Front-end queries
         // ignore the engine's force/verify mode.
-        const engine = Engine.initProbe(d.cache, .normal, d.dag, d.probe);
+        const engine = Engine.initProbe(d.cache, .normal, d.probe);
 
         // --- lex (cached) ---
         const lexed = try engine.lex(d.gpa, d.io, d.target, source, id, true);
@@ -780,7 +759,7 @@ fn withFixture(
     var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
 
-    var g = try discover(gpa, io, cache, "native", entry_path);
+    var g = try discover(gpa, io, cache, "native", entry_path, null);
     defer g.deinit(gpa);
     try check(gpa, &g);
 }

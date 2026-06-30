@@ -1814,7 +1814,7 @@ fn frontEnd(gpa: std.mem.Allocator, tokens: []const Token, tree: Ast.Tree, src: 
     defer g.deinitSingle(gpa);
     var res = try ResolveGraph.resolveGraph(gpa, &g);
     errdefer res.deinit(gpa);
-    const tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, null, 0);
+    const tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
     return .{ .resolve = res, .typecheck = tc };
 }
 

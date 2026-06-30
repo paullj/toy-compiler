@@ -843,8 +843,8 @@ test "engine: recursive enum is poisoned, and the fingerprint sentinel key fires
     try testing.expect(e.poisoned);
     try testing.expectEqual(@as(u32, 0), e.size);
     try testing.expectEqual(@as(usize, 1), countDiag(&h, "recursive type 'E' has infinite size"));
-    // The codegen fingerprint takes the `<rec>` sentinel path exactly when this key
-    // is true (foldEnumLayout in types.zig); guard that contract here directly.
+    // A poisoned-or-unfinished enum layout is the `<rec>` sentinel contract the
+    // content fingerprint relies on; guard that contract here directly.
     try testing.expect(e.state != .done or e.poisoned);
 }
 

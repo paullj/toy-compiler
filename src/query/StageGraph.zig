@@ -4,9 +4,9 @@
 //! primitives — `Engine.barrier` at a fan-IN join, a driver-supplied REGION
 //! otherwise — so the cadence lives in ONE declarative place. This is THE
 //! orchestration for every program-producing build: `main.zig`'s `interpretPipeline`
-//! drives `-o`, `--dump-dag`, and `--emit ir` through `interpret`, not a
-//! hand-sequenced chain. (`--emit lex|parse|check` is the per-file inspection
-//! report, a different shape, served by `Driver.run`.)
+//! drives `-o` and `--emit ir` through `interpret`, not a hand-sequenced chain.
+//! (`--emit lex|parse|check` is the per-file inspection report, a different shape,
+//! served by `Driver.run`.)
 //!
 //! The static graph is purely a SCHEDULING + OBSERVABILITY artifact: it says WHEN
 //! to barrier vs run a region, never WHAT the result is. Correctness/cutoff stays the
@@ -40,7 +40,7 @@
 
 const std = @import("std");
 const Engine = @import("Engine.zig");
-const Dag = @import("Dag.zig");
+const Phase = @import("Phase.zig");
 
 /// How a stage joins the schedule. A `BARRIER` is a fan-IN: `Engine.barrier` folds
 /// the stage's `contributors` into one aggregate id (recorded under `Stage.kind`) and
@@ -50,13 +50,12 @@ const Dag = @import("Dag.zig");
 /// completes before region i+1 starts) — the hard ordering the two-region design needs.
 pub const Transition = enum { BARRIER, REGION };
 
-/// One stage of the static pipeline. For a `BARRIER`, `kind` is the Dag.Kind of the
-/// recorded barrier node (load-bearing — `interpret` passes it to `Engine.barrier`).
-/// For a `REGION`, `kind` is the representative node kind (documentary: the region
-/// records its OWN fine-grained DAG nodes internally via its pass, e.g. typecheck's
-/// body/signature/layout nodes; `interpret` does not read `kind` for a REGION).
+/// One stage of the static pipeline. For a `BARRIER`, `kind` is the `Phase.Kind` of
+/// the join (load-bearing — `interpret` passes it to `Engine.barrier`). For a
+/// `REGION`, `kind` is the representative phase (documentary; `interpret` does not
+/// read `kind` for a REGION).
 pub const Stage = struct {
-    kind: Dag.Kind,
+    kind: Phase.Kind,
     transition: Transition,
 };
 
@@ -71,9 +70,8 @@ pub const Stage = struct {
 /// boundary is the sequential one `interpret` imposes (the region completes before the
 /// build's tail runs).
 ///
-/// `kind` names each barrier's recorded node (`Dag.Kind.discover`/`collect`/
-/// `global_tables`); for the codegen REGION it is the representative kind (the region
-/// records its own fine-grained codegen/body nodes internally for observability). The
+/// `kind` names each barrier's join phase (`Phase.Kind.discover`/`collect`/
+/// `global_tables`); for the codegen REGION it is the representative phase. The
 /// transitions are what `interpret` schedules on.
 pub const pipeline = [_]Stage{
     .{ .kind = .discover, .transition = .BARRIER }, // DISCOVER: entry path -> module graph
@@ -249,11 +247,11 @@ test "the static pipeline's shape matches the documented cadence" {
 
     // DISCOVER -> COLLECT -> GLOBAL_TABLES are barriers, in this order.
     try testing.expectEqual(Transition.BARRIER, pipeline[0].transition);
-    try testing.expectEqual(Dag.Kind.discover, pipeline[0].kind);
+    try testing.expectEqual(Phase.Kind.discover, pipeline[0].kind);
     try testing.expectEqual(Transition.BARRIER, pipeline[1].transition);
-    try testing.expectEqual(Dag.Kind.collect, pipeline[1].kind);
+    try testing.expectEqual(Phase.Kind.collect, pipeline[1].kind);
     try testing.expectEqual(Transition.BARRIER, pipeline[2].transition);
-    try testing.expectEqual(Dag.Kind.global_tables, pipeline[2].kind);
+    try testing.expectEqual(Phase.Kind.global_tables, pipeline[2].kind);
 
     var n_barriers: usize = 0;
     for (pipeline) |s| if (s.transition == .BARRIER) {
@@ -263,5 +261,5 @@ test "the static pipeline's shape matches the documented cadence" {
 
     // codegen is the sole REGION (its per-fn lower fan-out owns its relink join).
     try testing.expectEqual(Transition.REGION, pipeline[3].transition);
-    try testing.expectEqual(Dag.Kind.codegen, pipeline[3].kind);
+    try testing.expectEqual(Phase.Kind.codegen, pipeline[3].kind);
 }

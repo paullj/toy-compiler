@@ -17,7 +17,6 @@ const Parser = @import("../parse.zig");
 const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
-const Dag = @import("../query/Dag.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
 const Graph = @import("Graph.zig");
@@ -242,10 +241,10 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
         return;
     }
 
-    // dag=null + io=null => serial Pass-C: the per-file `run` fan-out is the only
-    // active parallelism for `--emit check`, so there is no nested-pool blowup. A
-    // 1-fn graph never spawns regardless; serial == parallel byte-for-byte.
-    result.typecheck = try TypecheckGraph.checkGraph(gpa, &graph, &result.resolve.?, null, null, 0);
+    // io=null => serial Pass-C: the per-file `run` fan-out is the only active
+    // parallelism for `--emit check`, so there is no nested-pool blowup. A 1-fn
+    // graph never spawns regardless; serial == parallel byte-for-byte.
+    result.typecheck = try TypecheckGraph.checkGraph(gpa, &graph, &result.resolve.?, null, 0);
     if (result.typecheck.?.diags.len > 0) result.err = error.TypeError;
 }
 
@@ -448,12 +447,6 @@ const GraphFrozen = struct {
     /// Global fn id of the entry `main` (indexes `names`).
     entry_id: u32,
     opt: Opt.Config,
-    /// M16: the per-build dependency-recording sink, threaded only by the
-    /// `--dump-dag` path. `null` on every default (`-o`/`run`/`--emit`) build so
-    /// each per-fn codegen job runs through `Engine.init` (dag=null) verbatim —
-    /// the byte-identity guarantee. When non-null each job runs through
-    /// `Engine.initDag` so `query()` records caller->callee codegen edges.
-    dag: ?*Dag = null,
 
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
     /// only when `--timings` is on. BORROWED; null on a plain build => zero overhead.
@@ -496,7 +489,6 @@ pub fn lowerGraphProgram(
     tc: *const Typecheck.GraphResult,
     mode: CodegenIr.Mode,
     opt: Opt.Config,
-    dag: ?*Dag,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
     /// The `-j` jobs knob: the chunk-count basis for the per-fn codegen fan-out (0 =>
@@ -598,7 +590,6 @@ pub fn lowerGraphProgram(
         .lower_ids = lower_ids.items,
         .entry_id = eid,
         .opt = opt,
-        .dag = dag,
         .probe = probe,
     };
 
@@ -724,8 +715,8 @@ fn graphFnJobInner(
     // program-wide `names`/`sigs`/`layouts` of this fn's `frozen` view, so the
     // fingerprint folds a qualified callee distinctly with NO engine change.
     // tmp_tag = `lower_i`.
-    const engine = Engine.initProbe(cache, mode, gf.dag, gf.probe);
-    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, gid, slot);
+    const engine = Engine.initProbe(cache, mode, gf.probe);
+    try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, slot);
 }
 
 /// Build the program-wide index→SymName table for a graph build: one entry per
@@ -838,7 +829,7 @@ fn lowerSingleFile(
 ) !LowerProgramResult {
     var graph = try Graph.single(gpa, "main", r.path, r.source, r.tokens, r.nodes, r.extra, r.pub_bits);
     defer graph.deinitSingle(gpa);
-    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, null, 0);
+    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, 0);
 }
 
 test "cold then warm parse: 2nd run hits cache and renders identically" {

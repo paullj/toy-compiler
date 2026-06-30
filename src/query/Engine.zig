@@ -29,7 +29,7 @@ const Link = @import("../link/Link.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
-const Dag = @import("Dag.zig");
+const Phase = @import("Phase.zig");
 
 const Engine = @This();
 
@@ -45,18 +45,6 @@ cache: Cache,
 /// ignore it — they are pure source-hash lookups with no re-lower gate.
 mode: Mode = .normal,
 
-/// M16 SPIKE — the OBSERVATIONAL dependency-recording sink. When non-null,
-/// `query()` records a caller->callee edge + the callee's result fingerprint into
-/// this shared `*Dag` (the active-query-stack supplies the caller). BORROWED, never
-/// a value field: the Engine is re-`init`'d per job from a copied cache+mode, so a
-/// value DAG would give each job a private empty graph and the edges would vanish —
-/// a single Dag lives in the driver scope and a `*Dag` is threaded into every job
-/// (mirrors how `Cache` is itself a borrowed dir handle).
-///
-/// When `null` (the default `init`), `query()` is VERBATIM-today: zero overhead,
-/// zero behavior change — the byte-identity guarantee for this milestone.
-dag: ?*Dag = null,
-
 /// `--timings` per-stage compute/cache probe (see `StageProbe`). BORROWED; null on a
 /// plain build so the query path reads no clock. EVERY cache-backed query — `lex` and
 /// `parse` (the `discover` stage) and `codegen` (the `lower` stage) — charges the
@@ -70,7 +58,7 @@ probe: ?*StageProbe = null,
 /// for lex, the AST build for parse), cache GET I/O (the hit-or-miss read), and cache
 /// PUT I/O (the atomic-rename temp-file write on a miss). Atomic because a stage's
 /// fan-out (codegen, and discovery's per-module queries) runs jobs in parallel and
-/// each adds its own deltas. BORROWED (like `dag`): one probe per stage lives on the
+/// each adds its own deltas. BORROWED: one probe per stage lives on the
 /// driver frame and a `*StageProbe` is threaded into every job. `null` (the default)
 /// is zero-overhead — no clock is read.
 pub const StageProbe = struct {
@@ -119,20 +107,9 @@ pub fn init(cache: Cache, mode: Mode) Engine {
     return .{ .cache = cache, .mode = mode };
 }
 
-/// Same as `init`, but threads a borrowed `*Dag` so `query()` records dependency
-/// edges. Existing call sites keep using `init` (dag = null) so they compile +
-/// behave unchanged; only the driver scope that owns the per-build `Dag` opts in.
-pub fn initDag(cache: Cache, mode: Mode, dag: *Dag) Engine {
-    return .{ .cache = cache, .mode = mode, .dag = dag };
-}
-
-/// Like `initDag`/`init` but also threads a borrowed `--timings` sub-stage probe.
-/// `dag` may be null: it is the OBSERVABILITY sink, present only on a Debug `-o`
-/// build (and on `--dump-dag`/`--query-stats`), and null in a release build — the
-/// content-fp cache is the sole correctness/cutoff driver, so a null dag changes no
-/// output bytes. This `init` just carries both borrowed sinks.
-pub fn initProbe(cache: Cache, mode: Mode, dag: ?*Dag, probe: ?*LowerProbe) Engine {
-    return .{ .cache = cache, .mode = mode, .dag = dag, .probe = probe };
+/// Like `init` but also threads a borrowed `--timings` sub-stage probe.
+pub fn initProbe(cache: Cache, mode: Mode, probe: ?*LowerProbe) Engine {
+    return .{ .cache = cache, .mode = mode, .probe = probe };
 }
 
 /// The result of a single query: the value plus whether it was served from the
@@ -162,49 +139,12 @@ pub fn query(
     comptime swallow_put: bool,
     compute: anytype,
 ) !Result(T) {
-    // FAST PATH: no DAG sink => VERBATIM-today (zero overhead, byte-identical) plus
-    // the `--timings` probe laps (gated on `self.probe != null`, so a plain build
-    // reads no clock — matching the codegen path's discipline).
-    if (self.dag == null) {
-        const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
-        const hit: ?[]T = if (swallow_get) (self.cache.get(T, gpa, io, key) catch null) else (try self.cache.get(T, gpa, io, key));
-        if (self.probe) |p| lap(io, &p.get_ns, get_t0);
-        if (hit) |h| {
-            return .{ .value = h, .cached = true };
-        }
-        const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
-        const fresh = try compute.run();
-        if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
-        const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
-        if (swallow_put) {
-            self.cache.put(T, io, key, tmp_tag, fresh) catch {};
-        } else {
-            try self.cache.put(T, io, key, tmp_tag, fresh);
-        }
-        if (self.probe) |p| lap(io, &p.put_ns, put_t0);
-        return .{ .value = fresh, .cached = false };
-    }
-
-    // OBSERVATIONAL PATH: same get->compute->put, but the active-query-stack
-    // records caller->this edge + this node's result fp. The C call stack IS the
-    // dependency stack: read the current active node as our PARENT, enter ourselves
-    // (so nested query() calls in `compute` see us as their parent), restore on
-    // exit. recordEdge runs UNCONDITIONALLY after the result is obtained — on a HIT
-    // and on a fresh compute alike — so the DAG is identical hit-vs-miss. [C11]
-    //
-    // The node's kind IS the key's cacheable phase 1:1 (Cache.Phase == Dag.Kind), so
-    // there is no phase->kind bridge: a cacheable kind names its DAG node directly.
-    const d = self.dag.?;
-    const node: Dag.NodeKey = .{ .kind = key.phase, .id = key.digest() };
-    const parent = Dag.Active.get();
-    const prev = Dag.Active.enter(node);
-    defer Dag.Active.leave(prev);
-
+    // get->compute->put, with the `--timings` probe laps gated on `self.probe != null`
+    // so a plain build reads no clock (matching the codegen path's discipline).
     const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
     const hit: ?[]T = if (swallow_get) (self.cache.get(T, gpa, io, key) catch null) else (try self.cache.get(T, gpa, io, key));
     if (self.probe) |p| lap(io, &p.get_ns, get_t0);
     if (hit) |h| {
-        d.recordEdge(gpa, parent, node, fpOfBytes(T, h));
         return .{ .value = h, .cached = true };
     }
     const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
@@ -217,17 +157,7 @@ pub fn query(
         try self.cache.put(T, io, key, tmp_tag, fresh);
     }
     if (self.probe) |p| lap(io, &p.put_ns, put_t0);
-    d.recordEdge(gpa, parent, node, fpOfBytes(T, fresh));
     return .{ .value = fresh, .cached = false };
-}
-
-/// A deterministic content fingerprint of a query RESULT slice for the recorded
-/// DAG. Observational only — it lets the dump show a stable per-node fp that flips
-/// iff the result bytes change. (The codegen path's authoritative content
-/// fingerprint is the `Fingerprint`-derived cache key; this engine-level fold is a
-/// uniform stand-in across result types `T` for the spike's edge recording.)
-fn fpOfBytes(comptime T: type, items: []const T) u64 {
-    return std.hash.Wyhash.hash(0x44_41_47_46, std.mem.sliceAsBytes(items)); // "DAGF"
 }
 
 /// lex query (the M15 proof seam): tokenize `source` for `target`, served from
@@ -286,17 +216,6 @@ pub fn parse(
     const cache = self.cache;
     const key = Key.parse(target, source);
 
-    // OBSERVATIONAL DAG: parse cannot use the generic `query()` (its unpack
-    // validation needs a custom hit path), so it records its node/edge directly.
-    // `enter` makes this parse the Active parent for any nested query in `compute`
-    // (lex during discovery runs separately, but this keeps the seam uniform); the
-    // edge + fp are recorded UNCONDITIONALLY after the result is obtained. No-op +
-    // zero-overhead when dag == null.
-    const node: Dag.NodeKey = .{ .kind = .parse, .id = key.digest() };
-    const dag_parent: ?Dag.NodeKey = if (self.dag != null) Dag.Active.get() else null;
-    const prev: ?Dag.NodeKey = if (self.dag != null) Dag.Active.enter(node) else null;
-    defer if (self.dag != null) Dag.Active.leave(prev);
-
     // --- cache read + validate (a corrupt blob is treated as a miss) ---
     // `--timings`: the read+unpack-validate is the GET cost; gated on `self.probe`
     // so a plain build reads no clock (the codegen-probe discipline).
@@ -307,7 +226,6 @@ pub fn parse(
         const unpacked: ?Ast.Tree = if (swallow_get) (Ast.unpack(gpa, bytes) catch null) else (try Ast.unpack(gpa, bytes));
         if (unpacked) |t| {
             if (self.probe) |p| lap(io, &p.get_ns, get_t0);
-            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, Ast.contentFp(t));
             return .{ .tree = t, .cached = true };
         }
     }
@@ -323,8 +241,7 @@ pub fn parse(
             const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
             cache.put(u8, io, key, tmp_tag, b) catch {};
             if (self.probe) |p| lap(io, &p.put_ns, put_t0);
-            if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, Ast.contentFp(t));
-        } else if (self.dag) |d| d.recordEdge(gpa, dag_parent, node, 0);
+        }
         return .{ .tree = t, .cached = false };
     }
     if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
@@ -494,32 +411,27 @@ fn ComputePayload(comptime Compute: type) type {
 }
 
 /// The fan-IN seam: a JOIN between two fan-out regions. Folds `contributors` (the
-/// upstream region's per-unit result digests) into one order-independent barrier id,
-/// runs `compute` ONCE to build the aggregate the downstream region depends on, and —
-/// when a DAG is present — records the barrier as a ROOT node (parent == null) so the
-/// observability dump shows the join. The aggregate is a build-local value, never an
-/// on-disk artifact (barriers are joins, not cacheable units), so nothing is cached.
+/// upstream region's per-unit result digests) into one order-independent barrier id
+/// and runs `compute` ONCE to build the aggregate the downstream region depends on.
+/// The aggregate is a build-local value, never an on-disk artifact (barriers are
+/// joins, not cacheable units), so nothing is cached.
 ///
-/// A barrier is ALWAYS a root: it runs BETWEEN regions, never inside a fan-out job, so
-/// `Dag.Active.get()` must be null at entry (asserted in safe builds — a barrier nested
-/// inside a job would mis-record its parent and break the two-region structure). This
-/// is the seam the StageGraph interpreter calls at each BARRIER transition. `compute`
-/// is `anytype` with a `pub fn run(self) !T` method (it crosses the module boundary
-/// into here, so `run` must be `pub` — unlike `query`'s same-file computes).
+/// This is the seam the StageGraph interpreter calls at each BARRIER transition;
+/// `kind` is the stage's `Phase.Kind` (carried for `--timings` attribution).
+/// `compute` is `anytype` with a `pub fn run(self) !T` method (it crosses the module
+/// boundary into here, so `run` must be `pub` — unlike `query`'s same-file computes).
 pub fn barrier(
     self: Engine,
     gpa: std.mem.Allocator,
-    kind: Dag.Kind,
+    kind: Phase.Kind,
     contributors: []const u64,
     compute: anytype,
 ) !BarrierResult(ComputePayload(@TypeOf(compute))) {
-    std.debug.assert(Dag.Active.get() == null); // a barrier is always a root, never in a job
+    _ = self;
+    _ = gpa;
+    _ = kind;
     const fold = aggKey(contributors);
     const value = try compute.run();
-    if (self.dag) |d| {
-        const node: Dag.NodeKey = .{ .kind = kind, .id = fold };
-        d.recordEdge(gpa, null, node, fold);
-    }
     return .{ .value = value, .fold = fold };
 }
 
@@ -583,10 +495,8 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
 ///
 /// REUSE = CONTENT-FP CACHE HIT, the SOLE driver. A `.normal` build serves the
 /// prior blob iff `cache.get(Key.codegen(...))` hits the fn's transitive content
-/// fingerprint; there is NO red-green verdict gate (the StageGraph schedules, the
-/// content cache decides). `.force` skips the cache; `.verify` re-lowers fresh and
-/// audits the bytes ([C11]). The DAG codegen node is still recorded for
-/// observability (`--dump-dag`/`--query-stats`) when `self.dag != null`.
+/// fingerprint; the StageGraph schedules, the content cache decides. `.force` skips
+/// the cache; `.verify` re-lowers fresh and audits the bytes ([C11]).
 ///
 /// The caller derives the per-fn view: `frozen` (a single-fn `Frozen` read-only
 /// view), the fn's emitted `sym`, `is_entry`, its typecheck `my_sig`, and a
@@ -605,18 +515,10 @@ pub fn codegen(
     is_entry: bool,
     my_sig: ?Fingerprint.Sig,
     tmp_tag: usize,
-    gid: u32,
     slot: anytype,
 ) !void {
     const cache = self.cache;
     const mode = self.mode;
-
-    // The STABLE codegen node identity (target+opt+global fn id), distinct from the
-    // content-fp-derived cache key below. This names the in-memory DAG node recorded
-    // for observability (consumed by `--dump-dag`/`--query-stats`/`--verify`), so a
-    // node's identity is decoupled from its content hash. Recorded under
-    // `Dag.Kind.codegen` directly (no phase->kind bridge).
-    const stable_id = Key.codegenIdentity(target, frozen.opt, gid, is_entry);
 
     // Gather this fn's callee sigs (in walk order) and touched types for the
     // fingerprint. The walk order is the body's call order; `walkCalls` mirrors
@@ -636,8 +538,6 @@ pub fn codegen(
     // and the fn's OWN emitted symbol, target-sensitive. `Key.codegen` is the ONE
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).
     const key = Key.codegen(target, fp, frozen.opt, sym);
-
-    if (self.dag) |d| recordCodegenNode(d, gpa, stable_id, gid, key.input);
 
     if (mode == .verify) {
         // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh and
@@ -702,30 +602,6 @@ pub fn codegen(
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
 }
 
-/// Record the codegen DAG node under a STABLE identity plus its complete dependency
-/// CLOSURE. The ONLY edge the codegen root records is `codegen(gid) -> body(gid)`:
-/// the body subtree the typecheck pass recorded (body -> signature(callee) / layout
-/// / type_of / resolve_name) carries every input that affects the emitted bytes, so
-/// the codegen root reaches all of them transitively through this one edge. The sig
-/// firewall is preserved — a caller's codegen reaches a callee's SIGNATURE (not its
-/// body) via codegen(caller) -> body(caller) -> signature(callee). WITHOUT this edge
-/// a body/layout edit recorded under body(gid) never reaches the codegen root and the
-/// node verifies green off its own stamp alone = MISCOMPILE.
-///
-/// `gid` is the SAME global fn id the typecheck pass keyed body(fid) under (checkFn
-/// enters `body` with .id = fid). `stamp` is the WIDENED node fp (fp ^ optMix ^
-/// symMix, target-sensitive via the key) so the observed fp flips iff the emitted
-/// bytes would change. Recording the SAME single edge on every path (fresh compute
-/// or cache hit) keeps the fresh DAG byte-identical regardless of how the fn was
-/// served (the HIT == MISS invariant the persisted snapshot relies on). [C11]
-fn recordCodegenNode(d: *Dag, gpa: std.mem.Allocator, stable_id: u64, gid: u32, stamp: u64) void {
-    const node: Dag.NodeKey = .{ .kind = .codegen, .id = stable_id };
-    const parent = Dag.Active.get();
-    d.recordEdge(gpa, parent, node, stamp);
-    const body_node: Dag.NodeKey = .{ .kind = .body, .id = gid };
-    d.recordEdge(gpa, node, body_node, d.fingerprintOf(body_node) orelse 0);
-}
-
 const testing = std.testing;
 
 test "aggKey is order-independent and does not cancel duplicates" {
@@ -749,13 +625,10 @@ test "aggKey is order-independent and does not cancel duplicates" {
     try testing.expect(aggKey(&dup) != aggKey(&.{}));
 }
 
-test "barrier folds contributors, runs compute once, and records a root node" {
+test "barrier folds contributors and runs compute exactly once" {
     const gpa = testing.allocator;
-    var dag: Dag = .init(gpa);
-    defer dag.deinit(gpa);
-
     const cache: Cache = .{ .dir = "unused-barrier-test" }; // barrier never touches it
-    const engine = Engine.initDag(cache, .normal, &dag);
+    const engine = Engine.init(cache, .normal);
 
     var runs: usize = 0;
     const Compute = struct {
@@ -774,9 +647,6 @@ test "barrier folds contributors, runs compute once, and records a root node" {
     try testing.expectEqual(@as(u32, 7), res.value);
     // The fold matches the standalone set-fold of the same contributors.
     try testing.expectEqual(aggKey(&contributors), res.fold);
-    // A barrier is a ROOT: it records its own fp under {kind, fold} with no edge.
-    try testing.expectEqual(@as(?u64, res.fold), dag.fingerprintOf(.{ .kind = .signature, .id = res.fold }));
-    try testing.expectEqual(@as(usize, 0), dag.edges.count());
 }
 
 test "chunkedFanOut covers every unit exactly once, in disjoint ranges (any ncpu)" {
@@ -864,10 +734,10 @@ test "chunkedFanOut result is identical to fanOut (per-unit slot writes)" {
     try testing.expectEqualSlices(u64, a, b);
 }
 
-test "barrier with no DAG records nothing and still returns the fold" {
+test "barrier returns the fold for any kind" {
     const gpa = testing.allocator;
     const cache: Cache = .{ .dir = "unused-barrier-test" };
-    const engine = Engine.init(cache, .normal); // dag == null
+    const engine = Engine.init(cache, .normal);
 
     const Compute = struct {
         pub fn run(_: @This()) !u32 {

@@ -11,7 +11,6 @@
 //! driver; `--emit ir` dumps the target-independent IR text.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Io = std.Io;
 // The CLI entry is the exe module's root; it lives in driver/ (the engine), but
 // because a Zig module cannot import files above its root source file, it reaches
@@ -25,7 +24,6 @@ const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const CodegenIr = toyc.CodegenIr;
 const Opt = toyc.Opt;
-const Dag = toyc.QueryDag;
 const Engine = toyc.QueryEngine;
 const version = toyc.version;
 
@@ -65,16 +63,6 @@ pub fn main(init: std.process.Init) !void {
     // left-to-right; --opt= / --no-opt= toggle individual passes from current.
     var opt: Opt.Config = .O0;
     var opt_stats = false;
-    // M16: `--dump-dag` compiles the whole program with the per-build dependency
-    // DAG threaded into every query, then prints the deterministic dump to stdout.
-    var dump_dag = false;
-    // M17: `--query-stats` (with `-o`) threads the dependency DAG through the real
-    // executable build, LOADS the prior on-disk DAG, runs the red-green
-    // re-validation walk, and reports the recompute set (the cutoff) to stderr,
-    // then persists the fresh DAG. The emitted bytes are byte-identical to a plain
-    // `-o` build (the content cache, not the walk, drives correctness); the walk is
-    // the live in-production proof of the early-cutoff architecture.
-    var query_stats = false;
     // Per-stage wall-clock profile (discover/resolve/typecheck/lower/image+sign).
     // Run at `-j1` for a clean serial breakdown of where time is spent.
     var timings = false;
@@ -82,8 +70,8 @@ pub fn main(init: std.process.Init) !void {
     // std runtime's `.unlimited` concurrent_limit); `1` => `.limited(0)` (forces
     // every `fanOut` onto its inline serial fallback — the true serial baseline);
     // `N>=2` => `.limited(N)` (cap the worker pool at N). The CLI's `init.io` is
-    // fixed at `.unlimited` and not reconfigurable, so the `-o`/`--dump-dag` paths
-    // build their OWN pool from this limit (see emitExecutable / emitDumpDag).
+    // fixed at `.unlimited` and not reconfigurable, so the `-o` path builds its OWN
+    // pool from this limit (see emitExecutable).
     var jlimit: Io.Limit = .unlimited;
     // Worker count for the "built with N threads" line: the `-j N` value, or the host
     // cpu count for the default (`.unlimited`) pool. 0 means "not set → use cpu count".
@@ -108,10 +96,6 @@ pub fn main(init: std.process.Init) !void {
             opt = .O1;
         } else if (std.mem.eql(u8, arg, "--opt-stats")) {
             opt_stats = true;
-        } else if (std.mem.eql(u8, arg, "--dump-dag")) {
-            dump_dag = true;
-        } else if (std.mem.eql(u8, arg, "--query-stats")) {
-            query_stats = true;
         } else if (std.mem.eql(u8, arg, "--timings")) {
             timings = true;
         } else if (std.mem.startsWith(u8, arg, "--opt=")) {
@@ -180,11 +164,11 @@ pub fn main(init: std.process.Init) !void {
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toyc <file>` (and any
     // `-o`/`--output`) compiles + links a binary, output defaulting to the build dir.
-    // `--emit lex|parse|check|ir` opts into an inspection mode (no binary); `--dump-dag`
-    // is its own path. Executable emission is locked to aarch64-macos in M1.
-    // A `build`/`run` verb or `-o`/`--output` forces executable emission; otherwise a
-    // bare invocation builds by default unless an inspection `--emit` was requested.
-    const build_exe = !dump_dag and (verb_seen or out_path != null or !emit_explicit);
+    // `--emit lex|parse|check|ir` opts into an inspection mode (no binary). Executable
+    // emission is locked to aarch64-macos in M1. A `build`/`run` verb or `-o`/`--output`
+    // forces executable emission; otherwise a bare invocation builds by default unless an
+    // inspection `--emit` was requested.
+    const build_exe = verb_seen or out_path != null or !emit_explicit;
     const run_after = command == .run;
     // Worker threads the build will use (for the "built with N threads" line).
     const threads: usize = if (job_count != 0) job_count else (std.Thread.getCpuCount() catch 1);
@@ -193,20 +177,9 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    // `--dump-dag`: compile the whole program with the per-build dependency DAG
-    // threaded through every query, then print the deterministic dump to stdout.
-    // This is the LIVE proof the recording infra runs in production (anti-dead-code).
-    if (dump_dag) {
-        if (!isAarch64Macos(target)) {
-            try argError(out, "--dump-dag only supports aarch64-macos (it runs codegen)");
-            std.process.exit(1);
-        }
-        std.process.exit(try emitDumpDag(gpa, out, target, paths.items, opt, jlimit));
-    }
-
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, target, paths.items, out_path, run_after, mode, codegen_stats, opt, opt_stats, query_stats, timings, jlimit, threads));
+        std.process.exit(try emitExecutable(gpa, out, target, paths.items, out_path, run_after, mode, codegen_stats, opt, opt_stats, timings, jlimit, threads));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -361,9 +334,9 @@ fn lapNs(io: Io, timings: bool, last: *i128) u64 {
 /// cache-put sub-split (the discover split is file-read+lex+parse compute vs the
 /// lex/parse content cache; the lower split is codegen compute vs the codegen cache);
 /// the barrier-join stages (resolve, typecheck) have no cache so report compute only.
-/// `setup` is the pre-stage window (cache open + the one bulk `pack.load` + dag/realpath
-/// init); `other/overhead` = total - sum(setup..image) is the small residual the named
-/// rows don't cover (the stats/DAG-persist window + measurement slop).
+/// `setup` is the pre-stage window (cache open + the one bulk `pack.load`);
+/// `other/overhead` = total - sum(setup..image) is the small residual the named rows
+/// don't cover (the stats-print window + measurement slop).
 fn printTimings(out: *Io.Writer, total: u64, setup: u64, discover: u64, resolve: u64, typecheck: u64, lower: u64, post: u64, image: u64, disc_sub: ?StageSub, low_sub: ?LowerSub) !void {
     const tot_f: f64 = @floatFromInt(if (total == 0) 1 else total);
     const row = struct {
@@ -400,8 +373,7 @@ fn printTimings(out: *Io.Writer, total: u64, setup: u64, discover: u64, resolve:
         try row.sub_p(out, "cache-put", s.put_ns, lower, "lower");
         try row.sub_p(out, "link-tail", s.link_ns, lower, "lower");
     }
-    // The best-effort DAG persist + stats-print window (Debug records+persists a DAG
-    // here; a release build's null DAG skips it, so this is ~0 in production).
+    // The stats-print window (reads ~0 unless `--codegen-stats`/`--opt-stats` print).
     try row.p(out, "post", post, tot_f);
     try row.p(out, "image+sign", image, tot_f);
     // RECONCILE TO TOTAL: everything the named rows didn't cover (measurement slop +
@@ -436,7 +408,6 @@ fn emitExecutable(
     codegen_stats: bool,
     opt: Opt.Config,
     opt_stats: bool,
-    query_stats: bool,
     timings: bool,
     jlimit: Io.Limit,
     threads: usize,
@@ -476,31 +447,6 @@ fn emitExecutable(
     // This collapses the 6200×4 per-entry syscalls to ~4 (one create+writev+rename).
     defer pack.flush(io, cache.dir);
 
-    // The per-build dependency `Dag` is SCHEDULING + OBSERVABILITY only — it never
-    // gates a build. The content-addressed codegen cache is the SOLE correctness +
-    // cutoff driver (a fn whose transitive fingerprint is unchanged is served from
-    // cache, never re-lowered), so `.normal`/`--force` do not consult the DAG at all.
-    // The recorded DAG survives ONLY to feed `--dump-dag`, the `--query-stats`
-    // red-green REPORTER, and the `--verify` soundness auditor — so a RELEASE build
-    // records, loads, and persists NO DAG: `null` threads through every `if (dag)`
-    // site as a verbatim no-op, keeping the production path lean.
-    var dag_storage: Dag = .init(gpa);
-    defer dag_storage.deinit(gpa);
-    const dag: ?*Dag = if (builtin.mode == .Debug) &dag_storage else null;
-
-    // The program key (entry canonical path + target) names this program's on-disk DAG
-    // artifact for the prior-DAG load (the --query-stats reporter) and the post-build
-    // persist. The DAG drives nothing — content-fp is the sole correctness/cutoff driver.
-    const entry_canon: ?[]u8 = blk: {
-        if (Io.Dir.cwd().realPathFileAlloc(io, paths[0], gpa) catch null) |rp| {
-            defer gpa.free(rp);
-            break :blk gpa.dupe(u8, rp) catch null;
-        }
-        break :blk gpa.dupe(u8, paths[0]) catch null;
-    };
-    defer if (entry_canon) |ec| gpa.free(ec);
-    const prog_key: ?u64 = if (entry_canon) |ec| toyc.Cache.programKey(ec, target) else null;
-
     // Per-stage wall-clock (only when `--timings`). The monotonic timer is lapped at
     // each stage boundary; accumulators live at fn scope so the success path can print
     // the breakdown. The discover/resolve barrier joins + typecheck's Pass-A prologue
@@ -509,10 +455,10 @@ fn emitExecutable(
     // time go" profile that scopes the parallelization work.
     var last_ns: i128 = if (timings) nowNs(io) else 0;
     // PERF P4 reconcile-to-total: the SETUP window (build_start -> here) covers the
-    // output-dir create, cache open, the ONE bulk `pack.load`, dag init, and the entry
-    // realpath — all BEFORE the first stage lap, so previously it was unattributed
-    // "other". Lap it explicitly as its own row so the printed columns sum to the
-    // wall-clock total with only a small labeled residual.
+    // output-dir create, cache open, and the ONE bulk `pack.load` — all BEFORE the first
+    // stage lap, so previously it was unattributed "other". Lap it explicitly as its own
+    // row so the printed columns sum to the wall-clock total with only a small labeled
+    // residual.
     const ns_setup: u64 = if (timings) blk: {
         const dt = last_ns - build_start;
         break :blk if (dt > 0) @intCast(dt) else 0;
@@ -521,12 +467,10 @@ fn emitExecutable(
     var ns_resolve: u64 = 0;
     var ns_typecheck: u64 = 0;
     var ns_lower: u64 = 0;
-    // The post-lower window: best-effort DAG load/persist + the `--codegen-stats`/
-    // `--query-stats`/`--opt-stats` prints. Previously DISCARDED (lap-reset) so it
-    // wouldn't pollute the image bucket, which left it as unattributed "other". PERF
-    // P4 captures it as its own labeled row so the residual stays small (it is the
-    // dominant non-stage cost on a Debug build, where the DAG is recorded + persisted;
-    // null-DAG release builds skip the persist, so it is ~0 there).
+    // The post-lower window: the `--codegen-stats`/`--opt-stats` prints. Previously
+    // DISCARDED (lap-reset) so it wouldn't pollute the image bucket, which left it as
+    // unattributed "other". PERF P4 captures it as its own labeled row so the residual
+    // stays small (it reads ~0 now that nothing heavy happens here).
     var ns_post: u64 = 0;
     var ns_image: u64 = 0;
 
@@ -589,7 +533,6 @@ fn emitExecutable(
         .gt_contribs = &gt_contribs,
         .mode = mode,
         .opt = opt,
-        .dag = dag,
         .discover_probe = discover_probe_ptr,
         .probe = probe_ptr,
         .link_ns = link_ns_ptr,
@@ -610,7 +553,7 @@ fn emitExecutable(
         .failed_stage = &failed_stage,
     };
 
-    const engine = Engine.initProbe(cache, mode, dag, probe_ptr);
+    const engine = Engine.initProbe(cache, mode, probe_ptr);
     if (!try runPipeline(out, gpa, engine, &orch)) return 1;
 
     // The interpreter ran every stage clean: `lowered` is `.ok` with no diagnostics.
@@ -621,42 +564,6 @@ fn emitExecutable(
         try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
         try out.flush();
     }
-
-    // `--query-stats`: LOAD the prior on-disk DAG snapshot NOW — BEFORE the fresh DAG is
-    // persisted below. With the pack, `putDag` stages the fresh blob and `getDag` is a
-    // last-writer-wins in-memory lookup, so loading AFTER the persist would compare the
-    // fresh DAG against ITSELF (recompute always 0). Capturing the prior here keeps the
-    // red-green REPORTER honest. Purely a post-hoc reporter — the content-fp cache
-    // delivered the actual cutoff; the DAG is the observability lens. Gated on `dag`
-    // (release builds record none) so a release build never touches it.
-    var prior_loaded: ?Dag.Loaded = null;
-    defer if (prior_loaded) |*pl| pl.deinit(gpa);
-    if (query_stats) if (dag != null) {
-        if (prog_key) |pk| if (cache.getDag(gpa, io, pk) catch null) |blob| {
-            defer gpa.free(blob);
-            prior_loaded = Dag.deserialize(gpa, blob) catch null;
-        };
-    };
-
-    // Persist the fresh DAG for the next build. Best-effort: a serialize/write failure
-    // only costs the next build a full re-validation, never correctness. Done on EVERY
-    // successful build (this is what primes `--query-stats`/`--verify` next time), gated
-    // on `dag` (release builds record none). Ordered AFTER the prior-DAG load above so
-    // the reporter compares the fresh graph against the genuine prior snapshot.
-    if (prog_key) |pk| if (dag) |d| {
-        if (d.serialize(gpa)) |blob| {
-            defer gpa.free(blob);
-            cache.putDag(io, pk, blob) catch {};
-        } else |_| {}
-    };
-
-    // Report the red-green recompute set (the cutoff) over the just-recorded graph vs
-    // the prior snapshot captured before the persist.
-    if (query_stats) if (dag) |d| {
-        const prior_ptr: ?*const Dag.Loaded = if (prior_loaded) |*pl| pl else null;
-        try reportQueryStats(out, gpa, prior_ptr, d, lp.codegen_compiled, lp.codegen_cached);
-        try out.flush();
-    };
 
     // M13 dual-metric counters, fixed field order, deterministic. Cached fns
     // contribute 0 to the opt counters; use --force for honest numbers.
@@ -671,9 +578,9 @@ fn emitExecutable(
         try out.flush();
     }
 
-    // CAPTURE (not discard) the best-effort DAG persist + any stats-print window into
-    // its own `post` row, so it is attributed rather than leaking into image+sign or
-    // the residual. Laps the timer so image+sign measures only the image build below.
+    // CAPTURE (not discard) the stats-print window into its own `post` row, so it is
+    // attributed rather than leaking into image+sign or the residual. Laps the timer so
+    // image+sign measures only the image build below.
     ns_post = lapNs(io, timings, &last_ns);
     const image = try Driver.buildImage(
         io,
@@ -713,10 +620,10 @@ fn emitExecutable(
 }
 
 /// The SINGLE stage adapter for `StageGraph.interpret`, shared by every
-/// program-producing build (`-o`, `--dump-dag`, `--emit ir`). It supplies each stage's
-/// compute (discover / resolve / typecheck / codegen) and writes the result into a
-/// frame-local optional on the caller's stack. Indexed by the comptime stage position
-/// in `StageGraph.pipeline`:
+/// program-producing build (`-o`, `--emit ir`). It supplies each stage's compute
+/// (discover / resolve / typecheck / codegen) and writes the result into a frame-local
+/// optional on the caller's stack. Indexed by the comptime stage position in
+/// `StageGraph.pipeline`:
 ///   0 DISCOVER (BARRIER)       — fold the entry-path digest, build the module graph
 ///   1 COLLECT (BARRIER)        — fold the module parse digests, build resolve tables
 ///   2 GLOBAL_TABLES (BARRIER)  — fold the fn resolve digests, build layout/sig tables
@@ -729,10 +636,10 @@ fn emitExecutable(
 /// order-independent set-fold is load-bearing on every build. A barrier's compute is
 /// the JOIN work that produces the tables the next stage demands.
 ///
-/// The codegen stage's behavior is selected by `tail`: `.lower` (the `-o`/`--dump-dag`
-/// paths) runs `lowerGraphProgram` into `lowered`; `.render_ir` (`--emit ir`) runs
-/// `renderGraphIr` into `ir`. The discover/resolve/typecheck stages are IDENTICAL
-/// across paths — there is ONE orchestration, not one per output kind.
+/// The codegen stage's behavior is selected by `tail`: `.lower` (the `-o` path) runs
+/// `lowerGraphProgram` into `lowered`; `.render_ir` (`--emit ir`) runs `renderGraphIr`
+/// into `ir`. The discover/resolve/typecheck stages are IDENTICAL across paths — there
+/// is ONE orchestration, not one per output kind.
 ///
 /// A stage whose result carries diagnostics (or a structural discover error) raises
 /// `error.StageDiagnostics` after setting `failed_stage`, so the interpreter stops and
@@ -743,7 +650,7 @@ fn emitExecutable(
 const Orchestrator = struct {
     pub const Stage = enum { discover, resolve, typecheck, codegen };
     /// What the codegen region (stage 3) does: lower to a `LinkedProgram` (image/sign
-    /// or dump-dag tail) or render the IR text. The front-end stages are identical.
+    /// tail) or render the IR text. The front-end stages are identical.
     pub const Tail = enum { lower, render_ir };
 
     gpa: std.mem.Allocator,
@@ -763,7 +670,6 @@ const Orchestrator = struct {
     gt_contribs: *std.ArrayList(u64),
     mode: CodegenIr.Mode,
     opt: Opt.Config,
-    dag: ?*Dag,
     /// PERF P4: the discover stage's compute/cache probe (file-read+lex+parse compute
     /// vs the lex/parse content cache). Distinct from `probe` (the lower stage's), so
     /// the two stages' sub-splits never co-mingle. Null when not profiling.
@@ -776,7 +682,7 @@ const Orchestrator = struct {
     ncpu: usize,
 
     // `--timings` per-stage laps (each stage closure charges its own bucket). Null
-    // pointers on paths that don't profile (`--dump-dag`/`--emit ir`) => no lap.
+    // pointers on paths that don't profile (`--emit ir`) => no lap.
     timings: bool,
     last_ns: ?*i128,
     ns_discover: ?*u64,
@@ -860,7 +766,7 @@ const Orchestrator = struct {
         comptime std.debug.assert(stage_i == 3);
         switch (self.tail) {
             .lower => {
-                self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.dag, self.probe, self.link_ns, self.ncpu);
+                self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.probe, self.link_ns, self.ncpu);
                 self.lap(self.ns_lower);
                 const bad = switch (self.lowered.*.?) {
                     .err => true,
@@ -904,7 +810,7 @@ fn fnResolveDigest(gf: ResolveGraph.GlobalFn) u64 {
 const DiscoverCompute = struct {
     o: Orchestrator,
     pub fn run(c: DiscoverCompute) !void {
-        c.o.graph.* = try Graph.discoverDag(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, c.o.dag, c.o.discover_probe);
+        c.o.graph.* = try Graph.discover(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, c.o.discover_probe);
         if (c.o.graph.*.?.err != null) {
             c.o.failed_stage.* = .discover;
             return error.StageDiagnostics;
@@ -935,7 +841,7 @@ const ResolveCompute = struct {
 const TypecheckCompute = struct {
     o: Orchestrator,
     pub fn run(c: TypecheckCompute) !void {
-        c.o.tc.* = try TypecheckGraph.checkGraph(c.o.gpa, &c.o.graph.*.?, &c.o.res.*.?, c.o.dag, c.o.io, c.o.ncpu);
+        c.o.tc.* = try TypecheckGraph.checkGraph(c.o.gpa, &c.o.graph.*.?, &c.o.res.*.?, c.o.io, c.o.ncpu);
         if (c.o.tc.*.?.diags.len > 0) {
             c.o.failed_stage.* = .typecheck;
             return error.StageDiagnostics;
@@ -945,8 +851,8 @@ const TypecheckCompute = struct {
 
 /// Drive the shared front-end (discover -> resolve -> typecheck -> codegen) through
 /// `StageGraph.interpret` and render any stage's diagnostics. This is the ONE
-/// sequencer every program-producing build runs — `-o`, `--dump-dag`, and `--emit ir`
-/// all call it, differing only in the codegen `tail` and the post-pipeline output.
+/// sequencer every program-producing build runs — `-o` and `--emit ir` both call it,
+/// differing only in the codegen `tail` and the post-pipeline output.
 /// Returns `true` on clean completion (the caller reads the result slots), `false`
 /// when a stage produced diagnostics (already printed; the caller returns exit 1).
 fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, engine: Engine, orch: *const Orchestrator) !bool {
@@ -995,10 +901,9 @@ fn emitIr(
         return 1;
     }
 
-    // S4: this path runs WITHOUT a dependency DAG (dag == null), so the whole-graph
-    // typecheck Pass-C fans out per-fn body checks across our own `-j`-sized pool.
-    // `.limited(0)` (-j1) drives every job onto its inline serial path — the
-    // byte-identity baseline against which -jN must produce IDENTICAL diagnostics.
+    // S4: the whole-graph typecheck Pass-C fans out per-fn body checks across our own
+    // `-j`-sized pool. `.limited(0)` (-j1) drives every job onto its inline serial path
+    // — the byte-identity baseline against which -jN must produce IDENTICAL diagnostics.
     var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
     defer tail_io.deinit();
     const io = tail_io.io();
@@ -1040,7 +945,6 @@ fn emitIr(
         .gt_contribs = &gt_contribs,
         .mode = .normal,
         .opt = opt,
-        .dag = null,
         .discover_probe = null,
         .probe = null,
         .link_ns = null,
@@ -1067,228 +971,6 @@ fn emitIr(
     try out.writeAll(ir.?.ok);
     try out.flush();
     return 0;
-}
-
-/// `--dump-dag`: compile the whole program through the SAME `StageGraph` the `-o`
-/// build drives, with a per-build dependency `Dag` threaded through EVERY stage
-/// (discovery lex/parse + typecheck + per-fn codegen), then print the deterministic
-/// dump to stdout. This is the LIVE anti-dead-code proof: the recording infra runs in
-/// production, not just in unit tests. It uses ONE orchestration (the interpreter),
-/// not a hand-sequenced chain — only its tail (dump + persist) differs from `-o`.
-///
-/// OWNERSHIP: ONE `Dag` value lives on this stack frame and a `*Dag` rides in the
-/// `Orchestrator` (and the codegen `engine`) so it reaches every per-fn job; every
-/// worker's recorded edges land in the single shared graph (a value field would vanish
-/// per-job). The DAG is purely OBSERVATIONAL — emitted bytes are byte-identical to a
-/// normal build (default builds keep dag=null; only this path opts in).
-fn emitDumpDag(
-    gpa: std.mem.Allocator,
-    out: *Io.Writer,
-    target: []const u8,
-    paths: []const []const u8,
-    opt: Opt.Config,
-    jlimit: Io.Limit,
-) !u8 {
-    if (paths.len != 1) {
-        try argError(out, "--dump-dag takes exactly one input file (the entry module)");
-        return 1;
-    }
-
-    // M18: same OWN-pool construction as emitExecutable so `-j` governs the
-    // dag-threaded codegen fan-out too (and the dump stays byte-identical at any -j).
-    var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
-    defer tail_io.deinit();
-    const io = tail_io.io();
-
-    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
-
-    // The single per-build dependency sink; outlives every fan-out await below.
-    var dag: Dag = .init(gpa);
-    defer dag.deinit(gpa);
-
-    // ONE orchestration: the SAME discover->resolve->typecheck->codegen StageGraph the
-    // `-o` build drives, with the `dag` threaded into every stage so the dump shows the
-    // freshly-recorded structure. `--dump-dag` is purely observational (codegen reuse is
-    // the content-fp cache, recorded for observability). No second hand-sequenced chain.
-    var graph: ?Graph.Graph = null;
-    defer if (graph) |*g| g.deinit(gpa);
-    var res: ?ResolveGraph.GraphResult = null;
-    defer if (res) |*r| r.deinit(gpa);
-    var tc: ?TypecheckGraph.GraphResult = null;
-    defer if (tc) |*t| t.deinit(gpa);
-    var lowered: ?Driver.LowerProgramResult = null;
-    defer if (lowered) |*lw| switch (lw.*) {
-        .ok => |*lp| lp.deinit(gpa),
-        .err => {},
-    };
-    var ir_unused: ?Driver.IrResult = null; // the `.lower` tail never writes this
-    var failed_stage: ?Orchestrator.Stage = null;
-
-    const entry_contributors = [_]u64{std.hash.Wyhash.hash(0x44_53_43_56, paths[0])}; // "DSCV"
-    var collect_contribs: std.ArrayList(u64) = .empty;
-    defer collect_contribs.deinit(gpa);
-    var gt_contribs: std.ArrayList(u64) = .empty;
-    defer gt_contribs.deinit(gpa);
-    const orch = Orchestrator{
-        .gpa = gpa,
-        .io = io,
-        .cache = cache,
-        .target = target,
-        .entry = paths[0],
-        .tail = .lower,
-        .entry_contributors = &entry_contributors,
-        .collect_contribs = &collect_contribs,
-        .gt_contribs = &gt_contribs,
-        .mode = .normal,
-        .opt = opt,
-        .dag = &dag,
-        .discover_probe = null,
-        .probe = null,
-        .link_ns = null,
-        // `-j` chunk basis from the pool limit (see emitIr): keeps the dump byte-
-        // identical at any -j (chunked recording is fn-id-ordered + spinlock-safe).
-        .ncpu = @max(@as(usize, 1), jlimit.toInt() orelse Engine.hostCpus()),
-        .timings = false,
-        .last_ns = null,
-        .ns_discover = null,
-        .ns_resolve = null,
-        .ns_typecheck = null,
-        .ns_lower = null,
-        .graph = &graph,
-        .res = &res,
-        .tc = &tc,
-        .lowered = &lowered,
-        .ir = &ir_unused,
-        .failed_stage = &failed_stage,
-    };
-
-    const engine = Engine.initDag(cache, .normal, &dag);
-    if (!try runPipeline(out, gpa, engine, &orch)) return 1;
-
-    // --- M17 persistence: LOAD the prior DAG (round-trip demo), then WRITE the
-    // fresh one. Purely additive this stage: the artifact is recorded but does
-    // NOT yet drive invalidation, so the dump on stdout is byte-identical to a
-    // build without persistence (the fp-determinism gate diffs stdout). The
-    // load/write status is logged to STDERR so it never perturbs stdout.
-    const entry_canon = blk: {
-        if (Io.Dir.cwd().realPathFileAlloc(io, paths[0], gpa) catch null) |rp| {
-            defer gpa.free(rp);
-            break :blk try gpa.dupe(u8, rp);
-        }
-        break :blk try gpa.dupe(u8, paths[0]);
-    };
-    defer gpa.free(entry_canon);
-    const prog_key = toyc.Cache.programKey(entry_canon, target);
-    persistDag(gpa, io, cache, prog_key, &dag) catch |e| {
-        // Persistence is best-effort scaffolding; a write/load failure must never
-        // fail the build (the fallback is always a full re-validation).
-        std.debug.print("--dump-dag: persistence skipped ({s})\n", .{@errorName(e)});
-    };
-
-    // --- emit the deterministic dump ---
-    try dag.dumpDeterministic(gpa, out);
-    try out.flush();
-    return 0;
-}
-
-/// M17 `--query-stats` (with `-o`): the production proof of the early-cutoff
-/// architecture. Load the prior on-disk DAG, run the red-green re-validation walk
-/// over the just-recorded fresh `dag`, report the recompute set (the CUTOFF) and
-/// the codegen cache outcome (the byte-level cutoff that actually drives
-/// correctness), then persist the fresh DAG for the next build. Output is to
-/// STDOUT (an explicit stats request, like `--codegen-stats`); the emitted
-/// executable is byte-identical to a build without this flag.
-///
-/// Two cutoff numbers are reported because they live at two granularities:
-///   * red-green over the recorded query DAG (fine-grained: per signature/body/
-///     type_of/layout/codegen node) — the architecture's recompute set;
-///   * codegen compiled/cached — the byte-level cutoff the content cache delivers
-///     (a fn whose transitive fingerprint is unchanged is served from cache, never
-///     re-lowered). These agree in spirit: a localized edit recompiles a strict
-///     subset, the rest cut off.
-fn reportQueryStats(
-    out: *Io.Writer,
-    gpa: std.mem.Allocator,
-    prior: ?*const Dag.Loaded,
-    dag: *Dag,
-    codegen_compiled: usize,
-    codegen_cached: usize,
-) !void {
-    const total_nodes = dag.result_fp.count();
-
-    if (prior) |loaded| {
-        const roots = try dag.nodeKeys(gpa);
-        defer gpa.free(roots);
-        var rg = try Dag.RedGreen.init(gpa, loaded, dag);
-        defer rg.deinit();
-        if (rg.run(roots)) |_| {
-            try out.print("query: red-green recompute={d} cutoff={d} of {d} nodes\n", .{ rg.red_count, rg.green_count, rg.red_count + rg.green_count });
-        } else |e| switch (e) {
-            // A cycle in the prior edges is reported, not fatal — the build already
-            // succeeded and this walk is purely the diagnostic stats reporter.
-            error.QueryCycle => try out.writeAll("query: red-green walk found a cycle in the prior DAG (skipped)\n"),
-            else => return e,
-        }
-    } else {
-        try out.print("query: no prior DAG (cold build) -> {d} nodes recorded\n", .{total_nodes});
-    }
-    try out.print("query: codegen compiled={d} cached={d}\n", .{ codegen_compiled, codegen_cached });
-}
-
-/// Round-trip the per-build DAG through the on-disk artifact: LOAD any prior blob,
-/// run the RED-GREEN re-validation walk against it (reporting the recompute set —
-/// the cutoff), then WRITE the fresh serialized DAG. Logs to stderr so stdout (the
-/// deterministic dump) stays byte-identical. Errors propagate to the best-effort
-/// caller.
-fn persistDag(gpa: std.mem.Allocator, io: Io, cache: toyc.Cache, prog_key: u64, dag: *Dag) !void {
-    const fresh = try dag.serialize(gpa);
-    defer gpa.free(fresh);
-
-    if (try cache.getDag(gpa, io, prog_key)) |blob| {
-        defer gpa.free(blob);
-        if (try Dag.deserialize(gpa, blob)) |loaded_const| {
-            var loaded = loaded_const;
-            defer loaded.deinit(gpa);
-            std.debug.print(
-                "--dump-dag: loaded prior DAG (rev={d}, {d} nodes, {d} edges); fresh build has {d} nodes\n",
-                .{ loaded.revision, loaded.nodes.len, loaded.edges.len, dag.result_fp.count() },
-            );
-            try reportRedGreen(gpa, &loaded, dag);
-        } else {
-            std.debug.print("--dump-dag: prior DAG present but unparseable -> full re-validation\n", .{});
-        }
-    } else {
-        std.debug.print("--dump-dag: no prior DAG (cold) -> full re-validation\n", .{});
-    }
-
-    try cache.putDag(io, prog_key, fresh);
-}
-
-/// Run the RED-GREEN re-validation walk (`Dag.RedGreen`) over the just-recorded
-/// fresh `dag` against the `prior` build snapshot, demanding every recorded node as
-/// a root so the whole graph is re-validated. Prints the recompute set — the CUTOFF
-/// metric — to stderr (so stdout's deterministic dump is untouched):
-///   `--dump-dag: red-green walk: N red (recompute), M green (cutoff) of T nodes`
-/// A cycle in the prior edges is reported, not fatal (the build already succeeded;
-/// the walk is observational this stage).
-fn reportRedGreen(gpa: std.mem.Allocator, prior: *const Dag.Loaded, dag: *Dag) !void {
-    const roots = try dag.nodeKeys(gpa);
-    defer gpa.free(roots);
-
-    var rg = try Dag.RedGreen.init(gpa, prior, dag);
-    defer rg.deinit();
-    rg.run(roots) catch |e| switch (e) {
-        error.QueryCycle => {
-            std.debug.print("--dump-dag: red-green walk: cycle detected in prior edges (skipped)\n", .{});
-            return;
-        },
-        else => return e,
-    };
-    std.debug.print(
-        "--dump-dag: red-green walk: {d} red (recompute), {d} green (cutoff) of {d} nodes\n",
-        .{ rg.red_count, rg.green_count, rg.red_count + rg.green_count },
-    );
 }
 
 /// Render a graph-discovery structural error against the owning module's source
@@ -1374,8 +1056,6 @@ fn usage(out: *Io.Writer) !void {
         \\  --opt=<list>      enable only these passes (fold,branch,dce,forward)
         \\  --no-opt=<pass>   disable one pass from the current level (e.g. -O1 --no-opt=forward)
         \\  --opt-stats       print per-pass opt counters + dual metric (with -o; use --force)
-        \\  --dump-dag        compile the program and print the per-build query DAG (aarch64-macos)
-        \\  --query-stats     with -o: red-green recompute set vs the prior build (the cutoff)
         \\
     , .{version.stamp(&stamp_buf)});
     try out.flush();
