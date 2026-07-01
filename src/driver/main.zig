@@ -59,14 +59,14 @@ pub fn main(init: std.process.Init) !void {
     var out_path: ?[]const u8 = null;
     var codegen_stats = false;
     var mode: Engine.Mode = .normal;
-    // M13 opt level / pass selection. Default -O0 (no opt). Last flag wins,
+    // opt level / pass selection. Default -O0 (no opt). Last flag wins,
     // left-to-right; --opt= / --no-opt= toggle individual passes from current.
     var opt: Opt.Config = .O0;
     var opt_stats = false;
     // Per-stage wall-clock profile (discover/resolve/typecheck/lower/image+sign).
     // Run at `-j1` for a clean serial breakdown of where time is spent.
     var timings = false;
-    // M18: the `-j N` jobs knob. `null` => default (a cpu-based pool, i.e. the
+    // the `-j N` jobs knob. `null` => default (a cpu-based pool, i.e. the
     // std runtime's `.unlimited` concurrent_limit); `1` => `.limited(0)` (forces
     // every `fanOut` onto its inline serial fallback — the true serial baseline);
     // `N>=2` => `.limited(N)` (cap the worker pool at N). The CLI's `init.io` is
@@ -165,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
     // The DEFAULT action is to BUILD a signed executable: a bare `toyc <file>` (and any
     // `-o`/`--output`) compiles + links a binary, output defaulting to the build dir.
     // `--emit lex|parse|check|ir` opts into an inspection mode (no binary). Executable
-    // emission is locked to aarch64-macos in M1. A `build`/`run` verb or `-o`/`--output`
+    // emission is locked to aarch64-macos. A `build`/`run` verb or `-o`/`--output`
     // forces executable emission; otherwise a bare invocation builds by default unless an
     // inspection `--emit` was requested.
     const build_exe = verb_seen or out_path != null or !emit_explicit;
@@ -327,7 +327,7 @@ fn lapNs(io: Io, timings: bool, last: *i128) u64 {
     return if (dt > 0) @intCast(dt) else 0;
 }
 
-/// Print the `--timings` per-stage breakdown (ms + % of the wall-clock total). PERF P4:
+/// Print the `--timings` per-stage breakdown (ms + % of the wall-clock total).
 /// `total` is the BUILD WALL-CLOCK (`elapsed`), and the printed stage rows + the
 /// `other/overhead` reconciliation row SUM TO IT — there is no unattributed time left
 /// hiding. Each cache-backed stage (discover, lower) carries a compute / cache-get /
@@ -412,14 +412,14 @@ fn emitExecutable(
     jlimit: Io.Limit,
     threads: usize,
 ) !u8 {
-    // M14: `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
+    // `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program.
     if (paths.len != 1) {
         try argError(out, "-o takes exactly one input file (the entry module)");
         return 1;
     }
 
-    // M18: the `-o` build runs on OUR OWN pool sized by `-j`, not the CLI's fixed
+    // the `-o` build runs on OUR OWN pool sized by `-j`, not the CLI's fixed
     // `.unlimited` io. `.limited(0)` (from `-j1`) drives every fanOut serial so the
     // single-thread build is the byte-identity baseline; `.limited(N)` caps workers.
     var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
@@ -454,7 +454,7 @@ fn emitExecutable(
     // out with more workers — so a `-j1 --timings` run is the clean "where does the
     // time go" profile that scopes the parallelization work.
     var last_ns: i128 = if (timings) nowNs(io) else 0;
-    // PERF P4 reconcile-to-total: the SETUP window (build_start -> here) covers the
+    // reconcile-to-total: the SETUP window (build_start -> here) covers the
     // output-dir create, cache open, and the ONE bulk `pack.load` — all BEFORE the first
     // stage lap, so previously it was unattributed "other". Lap it explicitly as its own
     // row so the printed columns sum to the wall-clock total with only a small labeled
@@ -469,7 +469,7 @@ fn emitExecutable(
     var ns_lower: u64 = 0;
     // The post-lower window: the `--codegen-stats`/`--opt-stats` prints. Previously
     // DISCARDED (lap-reset) so it wouldn't pollute the image bucket, which left it as
-    // unattributed "other". PERF P4 captures it as its own labeled row so the residual
+    // unattributed "other". Captured as its own labeled row so the residual
     // stays small (it reads ~0 now that nothing heavy happens here).
     var ns_post: u64 = 0;
     var ns_image: u64 = 0;
@@ -553,13 +553,12 @@ fn emitExecutable(
     // The interpreter ran every stage clean: `lowered` is `.ok` with no diagnostics.
     const lp = &lowered.?.ok;
 
-    // How many fns were freshly lowered vs. served from the codegen cache.
     if (codegen_stats) {
         try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
         try out.flush();
     }
 
-    // M13 dual-metric counters, fixed field order, deterministic. Cached fns
+    // dual-metric counters, fixed field order, deterministic. Cached fns
     // contribute 0 to the opt counters; use --force for honest numbers.
     if (opt_stats) {
         const s = lp.opt_stats;
@@ -676,7 +675,7 @@ const Orchestrator = struct {
     gt_contribs: *std.ArrayList(u64),
     mode: Engine.Mode,
     opt: Opt.Config,
-    /// PERF P4: the discover stage's compute/cache probe (file-read+lex+parse compute
+    /// the discover stage's compute/cache probe (file-read+lex+parse compute
     /// vs the lex/parse content cache). Distinct from `probe` (the lower stage's), so
     /// the two stages' sub-splits never co-mingle. Null when not profiling.
     discover_probe: ?*Engine.StageProbe,
@@ -684,7 +683,7 @@ const Orchestrator = struct {
     link_ns: ?*u64,
     /// The `-j` jobs knob (0 => host cpus): the chunk-count basis for the two hot
     /// per-fn fan-outs the orchestrator drives — the GLOBAL_TABLES body checks
-    /// (`checkGraph`) and the codegen region (`lowerGraphProgram`). PERF P1.
+    /// (`checkGraph`) and the codegen region (`lowerGraphProgram`).
     ncpu: usize,
 
     // `--timings` per-stage laps (each stage closure charges its own bucket). Null
@@ -901,13 +900,13 @@ fn emitIr(
     opt: Opt.Config,
     jlimit: Io.Limit,
 ) !u8 {
-    // M14: `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph.
+    // `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph.
     if (paths.len != 1) {
         try argError(out, "--emit ir takes exactly one input file (the entry module)");
         return 1;
     }
 
-    // S4: the whole-graph typecheck Pass-C fans out per-fn body checks across our own
+    // the whole-graph typecheck Pass-C fans out per-fn body checks across our own
     // `-j`-sized pool. `.limited(0)` (-j1) drives every job onto its inline serial path
     // — the byte-identity baseline against which -jN must produce IDENTICAL diagnostics.
     var tail_io: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = jlimit });
