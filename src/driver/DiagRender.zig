@@ -17,13 +17,13 @@ const term = toyc.term;
 const Style = term.Style;
 const Rr = term.render;
 
-// Status palette. Bright-ansi indices so `Color.downgrade` is the identity at ansi16/ansi256; every
+// Status palette. `err`/`faint` are sourced from `Theme` (the single source of the
+// diagnostic hues) so the status table and the pretty snippet can never drift; every
 // use goes through `Style.styled` (zero bytes at `.none`, so `.none` == plain).
-// `err` matches the Renderer's own header word hue (bright red 9, bold).
-pub const sty_err: Style.Style = .{ .fg = .{ .ansi = 9 }, .bold = true }; // Theme.plain.style(.err)
-pub const sty_ok: Style.Style = .{ .fg = .{ .ansi = 10 } }; // bright green
+pub const sty_err: Style.Style = Rr.Theme.plain.style(.err); // bright red 9, bold — the header word hue
+pub const sty_ok: Style.Style = .{ .fg = .{ .ansi = 10 } }; // bright green — success, not a severity (no Theme equivalent)
 pub const sty_head: Style.Style = .{ .bold = true };
-pub const sty_faint: Style.Style = .{ .dim = true };
+pub const sty_faint: Style.Style = Rr.Theme.plain.secondaryStyle(); // dim — matches secondary labels
 
 /// Renderer options for a colour level: ASCII carets (unicode off) keep output
 /// byte-stable and gate-safe.
