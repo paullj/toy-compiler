@@ -14,6 +14,7 @@ const EnumSym = LayoutEngine.EnumSym;
 // them here. The import is mutual (types.zig constructs a `BodyChecker` per fn), which
 // Zig resolves lazily — there is no by-value type cycle (`model` is a pointer).
 const Typecheck = @import("types.zig");
+const ControlFlow = @import("ControlFlow.zig");
 const Model = Typecheck.Model;
 const FnSym = Typecheck.FnSym;
 const LoopCtx = Typecheck.LoopCtx;
@@ -101,196 +102,34 @@ pub const BodyChecker = struct {
         _ = proto;
     }
 
+    // The control-flow / divergence / break family lives in `ControlFlow.zig` as
+    // pure functions over a small read-only `Ctx` (the tree + resolutions + enum
+    // table + tokens). These thin wrappers build a `Ctx` from `bc` and delegate,
+    // so the mutually-recursive AST walks (which drift when a new node is added)
+    // are defined and unit-tested in one place.
+
+    fn cflow(bc: *const BodyChecker) ControlFlow.Ctx {
+        return ControlFlow.Ctx.fromChecker(bc);
+    }
+
     fn blockReturns(bc: *const BodyChecker, block_idx: Ast.Index) bool {
-        const stmts = Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs);
-        if (stmts.len == 0) return false;
-        return bc.stmtReturns(stmts[stmts.len - 1]);
+        return ControlFlow.blockReturns(bc.cflow(), block_idx);
     }
 
     fn stmtReturns(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
-        const stmt = bc.tree.nodes[stmt_idx];
-        return switch (stmt.tag) {
-            .return_stmt => true,
-            // A statement-position block/if is parsed wrapped in an `expr_stmt`; unwrap
-            // it so a trailing diverging bare block (`{ return 5 }`) or parenthesized
-            // value-if satisfies definite-return and a divergent arm merges correctly.
-            .expr_stmt => bc.stmtReturns(stmt.lhs),
-            .block => bc.blockReturns(stmt_idx),
-            .if_stmt => blk: {
-                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
-                // An else-less `if` can be skipped, so it never guarantees a return.
-                if (h.else_node == Ast.none) break :blk false;
-                const then_ok = bc.blockReturns(h.then_block);
-                const else_ok = if (bc.tree.nodes[h.else_node].tag == .if_stmt)
-                    bc.stmtReturns(h.else_node)
-                else
-                    bc.blockReturns(h.else_node);
-                break :blk then_ok and else_ok;
-            },
-            // Conservative: a `while` may never execute, so it can't guarantee a
-            // return (`while true { return }` is rejected — acceptable for now).
-            .while_stmt => false,
-            // A `loop` diverges (returns/never-falls-through) iff it has NO `break`
-            // targeting it: the only ways out are `return` or an outer construct.
-            .loop_expr => bc.loopDiverges(stmt_idx),
-            // A labeled wrapper is transparent for definite-return: it returns iff its
-            // inner construct does (a labeled bare block via its trailing stmt).
-            .labeled => bc.stmtReturns(bc.tree.nodes[stmt_idx].lhs),
-            .for_stmt, .break_stmt, .continue_stmt => false,
-            else => false,
-        };
-    }
-
-    fn loopDiverges(bc: *const BodyChecker, loop_idx: Ast.Index) bool {
-        return !bc.blockHasBreak(bc.tree.nodes[loop_idx].lhs, loop_idx);
-    }
-
-    fn blockHasBreak(bc: *const BodyChecker, block_idx: Ast.Index, target: Ast.Index) bool {
-        for (Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs)) |s| {
-            if (bc.stmtHasBreak(s, target)) return true;
-        }
-        return false;
-    }
-
-    fn stmtHasBreak(bc: *const BodyChecker, stmt_idx: Ast.Index, target: Ast.Index) bool {
-        const stmt = bc.tree.nodes[stmt_idx];
-        return switch (stmt.tag) {
-            // A bare break (no label) binds to the innermost loop — counts only when
-            // `target` IS the innermost loop, i.e. the bare break is found before any
-            // nested loop swallows it (the nested-loop arms below stop the descent for
-            // bare breaks). A labeled break counts iff its resolved target matches.
-            .break_stmt => if (bc.resolutions[stmt_idx] == .label)
-                bc.resolutions[stmt_idx].label == target
-            else
-                true,
-            .expr_stmt => bc.stmtHasBreak(stmt.lhs, target),
-            .block => bc.blockHasBreak(stmt_idx, target),
-            // A labeled wrapper is transparent: descend its inner construct (a
-            // `break @target` may live inside a nested labeled loop).
-            .labeled => bc.stmtHasBreak(stmt.lhs, target),
-            .if_stmt => blk: {
-                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
-                if (bc.blockHasBreak(h.then_block, target)) break :blk true;
-                if (h.else_node == Ast.none) break :blk false;
-                break :blk if (bc.tree.nodes[h.else_node].tag == .if_stmt)
-                    bc.stmtHasBreak(h.else_node, target)
-                else
-                    bc.blockHasBreak(h.else_node, target);
-            },
-            // A nested loop/for/while swallows BARE breaks, but a `break @target`
-            // buried inside it still targets `target` — so descend its body and only
-            // count labeled breaks that name `target`.
-            .loop_expr => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
-            .while_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].rhs, target),
-            .for_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
-            else => false,
-        };
-    }
-
-    fn nestedHasLabeledBreak(bc: *const BodyChecker, block_idx: Ast.Index, target: Ast.Index) bool {
-        for (Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs)) |s| {
-            if (bc.stmtHasLabeledBreak(s, target)) return true;
-        }
-        return false;
-    }
-
-    fn stmtHasLabeledBreak(bc: *const BodyChecker, stmt_idx: Ast.Index, target: Ast.Index) bool {
-        const stmt = bc.tree.nodes[stmt_idx];
-        return switch (stmt.tag) {
-            .break_stmt => bc.resolutions[stmt_idx] == .label and bc.resolutions[stmt_idx].label == target,
-            .expr_stmt => bc.stmtHasLabeledBreak(stmt.lhs, target),
-            .block => bc.nestedHasLabeledBreak(stmt_idx, target),
-            .labeled => bc.stmtHasLabeledBreak(stmt.lhs, target),
-            .if_stmt => blk: {
-                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
-                if (bc.nestedHasLabeledBreak(h.then_block, target)) break :blk true;
-                if (h.else_node == Ast.none) break :blk false;
-                break :blk if (bc.tree.nodes[h.else_node].tag == .if_stmt)
-                    bc.stmtHasLabeledBreak(h.else_node, target)
-                else
-                    bc.nestedHasLabeledBreak(h.else_node, target);
-            },
-            .loop_expr => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
-            .while_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].rhs, target),
-            .for_stmt => bc.nestedHasLabeledBreak(bc.tree.nodes[stmt_idx].lhs, target),
-            else => false,
-        };
+        return ControlFlow.stmtReturns(bc.cflow(), stmt_idx);
     }
 
     fn blockDiverges(bc: *const BodyChecker, block_idx: Ast.Index) bool {
-        const stmts = Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs);
-        if (stmts.len == 0) return false;
-        return bc.stmtDiverges(stmts[stmts.len - 1]);
+        return ControlFlow.blockDiverges(bc.cflow(), block_idx);
     }
 
     fn stmtDiverges(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
-        const stmt = bc.tree.nodes[stmt_idx];
-        return switch (stmt.tag) {
-            .return_stmt, .break_stmt, .continue_stmt => true,
-            .expr_stmt => bc.stmtDiverges(stmt.lhs),
-            .block => bc.blockDiverges(stmt_idx),
-            .if_stmt => blk: {
-                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
-                if (h.else_node == Ast.none) break :blk false;
-                const then_ok = bc.blockDiverges(h.then_block);
-                const else_ok = if (bc.tree.nodes[h.else_node].tag == .if_stmt)
-                    bc.stmtDiverges(h.else_node)
-                else
-                    bc.blockDiverges(h.else_node);
-                break :blk then_ok and else_ok;
-            },
-            .while_stmt => false,
-            .loop_expr => bc.loopDiverges(stmt_idx),
-            .labeled => bc.labeledDiverges(stmt_idx),
-            .for_stmt => false,
-            // A `match` diverges iff it is exhaustive AND every arm body diverges.
-            .match_expr => bc.matchDiverges(stmt_idx),
-            else => false,
-        };
+        return ControlFlow.stmtDiverges(bc.cflow(), stmt_idx);
     }
 
-    fn matchDiverges(bc: *const BodyChecker, node_idx: Ast.Index) bool {
-        const n = bc.tree.nodes[node_idx];
-        const st = bc.node_types[n.lhs];
-        // Conservative for int/bool scrutinees: `return false` (loses only a
-        // definite-return optimization, never miscompiles). Only enums get the
-        // variant-coverage analysis here.
-        if (!st.isEnum()) return false;
-        const arms = Ast.rangeSlice(bc.tree, n.rhs);
-        if (arms.len == 0) return false;
-        var has_wildcard = false;
-        const e = bc.model.enums[st.enum_id];
-        var seen = [_]bool{false} ** 64; // enum variant count is small
-        for (arms) |arm_idx| {
-            const arm = bc.tree.nodes[arm_idx];
-            const h = Ast.armHeaderAt(bc.tree, arm.rhs);
-            if (!bc.stmtDiverges(h.body)) return false;
-            if (h.guard != Ast.none) continue; // a guard can fail → no coverage
-            const pat = bc.tree.nodes[arm.lhs];
-            if (pat.tag == .pattern_wildcard) {
-                has_wildcard = true;
-            } else if (pat.tag == .pattern_variant) {
-                const vname = bc.nameText(pat.main_token);
-                for (e.variants, 0..) |v, i| {
-                    if (i < seen.len and std.mem.eql(u8, v.name, vname) and bc.variantPayloadIrrefutable(arm.lhs, v)) seen[i] = true;
-                }
-            }
-        }
-        if (has_wildcard) return true;
-        if (e.variants.len > seen.len) return false;
-        for (e.variants, 0..) |_, i| if (!seen[i]) return false;
-        return true;
-    }
-
-    fn labeledDiverges(bc: *const BodyChecker, idx: Ast.Index) bool {
-        const inner_idx = bc.tree.nodes[idx].lhs;
-        const inner = bc.tree.nodes[inner_idx];
-        return switch (inner.tag) {
-            .loop_expr => bc.loopDiverges(inner_idx),
-            .while_stmt, .for_stmt => false,
-            .block => bc.blockDiverges(inner_idx) and !bc.blockHasBreak(inner_idx, inner_idx),
-            else => false,
-        };
+    fn blockHasBreak(bc: *const BodyChecker, block_idx: Ast.Index, target: Ast.Index) bool {
+        return ControlFlow.blockHasBreak(bc.cflow(), block_idx, target);
     }
 
     fn typeOfBlockExpected(bc: *BodyChecker, block_idx: Ast.Index, want_value: bool, exp: ?Type) error{OutOfMemory}!Type {
@@ -899,76 +738,21 @@ pub const BodyChecker = struct {
         return result;
     }
 
+    // Pattern irrefutability lives in `ControlFlow.zig` too (pure walks over the
+    // tree + enum table); the pattern checker below delegates through these thin
+    // wrappers. `variantPayloadIrrefutable` is the one that takes a resolved
+    // `VariantSym` directly (the caller already has it).
+
     fn irrefutable(bc: *const BodyChecker, pat_idx: Ast.Index, ty: Type) bool {
-        if (ty.kind == .invalid) return true; // poison already reported; don't cascade a spurious miss
-        const pat = bc.tree.nodes[pat_idx];
-        return switch (pat.tag) {
-            .pattern_wildcard => true,
-            .pattern_binding => pat.rhs == Ast.none or bc.irrefutable(pat.rhs, ty),
-            .pattern_literal => false,
-            .pattern_variant => blk: {
-                // Total only when the enum has exactly ONE variant (the tag test cannot
-                // fail) AND that variant's payload is fully covered. Against a
-                // multi-variant enum a single `.V` is refutable.
-                if (ty.kind != .@"enum") break :blk false;
-                const e = bc.model.enums[ty.enum_id];
-                if (e.variants.len != 1) break :blk false;
-                break :blk bc.variantPayloadIrrefutable(pat_idx, e.variants[0]);
-            },
-            .pattern_or => bc.orCoversType(pat_idx, ty),
-            else => false,
-        };
+        return ControlFlow.irrefutable(bc.cflow(), pat_idx, ty);
     }
 
     fn variantPayloadIrrefutable(bc: *const BodyChecker, pat_idx: Ast.Index, variant: VariantSym) bool {
-        const pat = bc.tree.nodes[pat_idx];
-        const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, pat.rhs);
-        switch (variant.form) {
-            .unit => return binders.len == 0,
-            .tuple => {
-                if (binders.len != variant.field_types.len) return false;
-                for (binders, variant.field_types) |b, fty| if (!bc.irrefutable(b, fty)) return false;
-                return true;
-            },
-            .@"struct" => {
-                for (binders) |b_idx| {
-                    const b = bc.tree.nodes[b_idx];
-                    const src = if (b.lhs != Ast.none) bc.nameText(bc.tree.nodes[b.lhs].main_token) else bc.nameText(b.main_token);
-                    var fty: Type = .invalid;
-                    for (variant.field_names, 0..) |dn, j| if (std.mem.eql(u8, dn, src)) {
-                        fty = variant.field_types[j];
-                        break;
-                    };
-                    if (!bc.irrefutable(b_idx, fty)) return false;
-                }
-                return true;
-            },
-        }
-    }
-
-    fn orCoversType(bc: *const BodyChecker, or_idx: Ast.Index, ty: Type) bool {
-        const alts = Ast.rangeSlice(bc.tree, bc.tree.nodes[or_idx].lhs);
-        for (alts) |a| if (bc.irrefutable(a, ty)) return true;
-        if (ty.kind == .@"enum") {
-            const e = bc.model.enums[ty.enum_id];
-            var seen = [_]bool{false} ** 64;
-            if (e.variants.len > seen.len) return false;
-            for (alts) |a| {
-                const ap = bc.tree.nodes[a];
-                if (ap.tag != .pattern_variant) continue;
-                const vname = bc.nameText(ap.main_token);
-                for (e.variants, 0..) |v, i| {
-                    if (std.mem.eql(u8, v.name, vname) and bc.variantPayloadIrrefutable(a, v)) seen[i] = true;
-                }
-            }
-            for (e.variants, 0..) |_, i| if (!seen[i]) return false;
-            return true;
-        }
-        return false;
+        return ControlFlow.variantPayloadIrrefutable(bc.cflow(), pat_idx, variant);
     }
 
     fn armDiverges(bc: *const BodyChecker, node_idx: Ast.Index) bool {
-        return bc.stmtDiverges(node_idx);
+        return ControlFlow.armDiverges(bc.cflow(), node_idx);
     }
 
     fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
