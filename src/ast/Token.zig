@@ -106,6 +106,17 @@ pub const Tag = enum(u8) {
     kw_pub,
     /// `as` — renames an imported namespace (`import a/b as r`).
     kw_as,
+
+    // Error tokens. Like all `Tag` variants these are append-only (frozen
+    // ordinals; `[]Token` is memcpy'd to/from the content cache). The lexer stays
+    // total — it never fails — and instead emits these so error runs are
+    // preserved as spans; the parser attaches diagnostics for them.
+
+    /// A string literal with no closing quote (ran into a newline or EOF). The
+    /// span starts at the opening quote and covers everything consumed, so a
+    /// caret can point at the quote. Distinct from `.invalid` so a partial string
+    /// is preserved as a string rather than an opaque byte run.
+    string_unterminated,
 };
 
 /// Maps identifier text to its keyword tag, if any.

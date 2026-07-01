@@ -14,9 +14,20 @@ index: u32,
 /// Tag of the last token returned, for newline terminator insertion. Starts as
 /// `.invalid` (which never ends a statement) so a leading newline inserts nothing.
 prev: Tag,
+/// Count of error tokens (`.invalid` / `.string_unterminated`) emitted so far.
+/// Once it reaches `max_error_tokens` the lexer stops trying to structure the
+/// rest of the file and swallows all remaining bytes into one trailing
+/// `.invalid`, so a pathological all-garbage file can't produce a token per byte.
+error_count: u32,
+
+/// Cap on structured error tokens before the lexer gives up and coalesces the
+/// whole tail into one `.invalid` (cf. Roslyn's `_badTokenCount`). Chosen so real
+/// files with a handful of typos are fully tokenized, while adversarial garbage is
+/// bounded to O(cap) tokens instead of O(bytes).
+pub const max_error_tokens: u32 = 100;
 
 pub fn init(source: []const u8) Lexer {
-    return .{ .source = source, .index = 0, .prev = .invalid };
+    return .{ .source = source, .index = 0, .prev = .invalid, .error_count = 0 };
 }
 
 /// Lex the whole source into a slice of tokens, terminated by a single `.eof`.
@@ -25,12 +36,28 @@ pub fn tokenize(gpa: std.mem.Allocator, source: []const u8) ![]Token {
     var lexer = Lexer.init(source);
     var tokens: std.ArrayList(Token) = .empty;
     errdefer tokens.deinit(gpa);
+    // Debug-only invariant: token spans tile `[0, source.len)` monotonically —
+    // each token's `start` is at or past the previous token's `end` (never
+    // backtracks or overlaps; the gaps are skipped trivia), each span is
+    // well-formed (`start <= end`), and the terminating `.eof` sits exactly at
+    // `source.len`. This is what makes error tokens safe to preserve as spans: no
+    // byte is double-counted and the cursor always makes forward progress, so a
+    // coalesced `.invalid` run can never desync the offsets a caret points at.
+    var prev_end: u32 = 0;
     while (true) {
         const tok = lexer.next();
+        if (std.debug.runtime_safety) {
+            std.debug.assert(tok.start >= prev_end); // monotonic, no overlap
+            std.debug.assert(tok.end >= tok.start); // well-formed span
+            prev_end = tok.end;
+        }
         // Zero the extern-struct padding before the token enters the cached blob
         // (see `token.zeroPad`).
         try tokens.append(gpa, token.zeroPad(Token, tok));
-        if (tok.tag == .eof) break;
+        if (tok.tag == .eof) {
+            if (std.debug.runtime_safety) std.debug.assert(tok.end == source.len);
+            break;
+        }
     }
     return tokens.toOwnedSlice(gpa);
 }
@@ -49,12 +76,30 @@ pub fn next(l: *Lexer) Token {
 
     const tok = l.lexToken();
     l.prev = tok.tag;
+    if (isError(tok.tag)) l.error_count += 1;
     return tok;
+}
+
+/// Whether a tag is one of the lexer's error tokens. Kept in one place so the
+/// spam-cap accounting and the parser's future diagnostic handling agree.
+fn isError(tag: Tag) bool {
+    return switch (tag) {
+        .invalid, .string_unterminated => true,
+        else => false,
+    };
 }
 
 fn lexToken(l: *Lexer) Token {
     const start = l.index;
     if (l.index >= l.source.len) return l.make(.eof, start);
+
+    // Spam cap: once a file has produced too many error tokens it is hopeless, so
+    // stop structuring it — swallow everything left into one trailing `.invalid`
+    // rather than emitting more per-construct error tokens (cf. `max_error_tokens`).
+    if (l.error_count >= max_error_tokens) {
+        l.index = @intCast(l.source.len);
+        return l.make(.invalid, start);
+    }
 
     const c = l.source[l.index];
     if (isIdentStart(c)) return l.lexIdentifier(start);
@@ -119,15 +164,29 @@ fn lexString(l: *Lexer, start: u32) Token {
                 l.index += 1; // closing quote
                 return l.make(.string, start);
             },
-            '\n' => return l.make(.invalid, start), // unterminated on this line
+            // Unterminated on this line: consume up to (not past) the newline so
+            // the span is total, and keep the start at the opening quote.
+            '\n' => return l.make(.string_unterminated, start),
             else => l.index += 1,
         }
     }
-    return l.make(.invalid, start); // unterminated at EOF
+    return l.make(.string_unterminated, start); // unterminated at EOF
 }
 
 fn lexSymbol(l: *Lexer, start: u32) Token {
     const c = l.source[l.index];
+
+    // An unrecognizable lead byte (one that begins no token) coalesces with the
+    // following unrecognizable bytes into ONE `.invalid`, so a garbage run is a
+    // single span instead of a token per byte. A recognized lead byte that merely
+    // fails to form an operator (e.g. a lone `&`) is NOT coalesced — it falls
+    // through to the switch below and stays a one-byte `.invalid`.
+    if (!beginsToken(c)) {
+        l.index += 1;
+        while (l.index < l.source.len and !beginsToken(l.source[l.index])) l.index += 1;
+        return l.make(.invalid, start);
+    }
+
     l.index += 1;
     const tag: Tag = switch (c) {
         '+' => .plus,
@@ -148,9 +207,24 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         ':' => if (l.eat('=')) .colon_eq else .colon,
         '.' => if (l.eat('.')) .dotdot else .dot,
         '@' => .at,
-        else => .invalid,
+        else => unreachable, // `beginsToken` already screened out non-lead bytes
     };
     return l.make(tag, start);
+}
+
+/// Whether byte `c` can begin a token or trivia — i.e. `next` would make progress
+/// on it rather than treat it as an unrecognizable byte. Used to bound a coalesced
+/// `.invalid` run: the run stops at the first byte that could start real input.
+/// The symbol set here must mirror the recognized lead bytes in `lexSymbol`'s
+/// switch and the trivia handled by `skipTrivia`.
+fn beginsToken(c: u8) bool {
+    if (isIdentStart(c) or isDigit(c)) return true;
+    return switch (c) {
+        '"' => true, // string
+        ' ', '\t', '\r', '\n', '#' => true, // trivia
+        '+', '-', '*', '/', '=', '!', '<', '>', '&', '|', '(', ')', '{', '}', ',', ':', '.', '@' => true,
+        else => false,
+    };
 }
 
 /// Consume the next byte if it equals `c`; report whether it did.
@@ -203,6 +277,103 @@ test "lone & is invalid; lone | is a pattern separator" {
     try expectTags("&", &.{ .invalid, .eof });
     try expectTags("|", &.{ .pipe, .eof });
     try expectTags("||", &.{ .pipe_pipe, .eof });
+}
+
+test "unterminated string at EOF is one string_unterminated token spanning to EOF" {
+    const src = "\"abc"; // no closing quote, runs to EOF
+    const tokens = try tokenize(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqual(Tag.string_unterminated, tokens[0].tag);
+    try testing.expectEqual(Tag.eof, tokens[1].tag);
+    // Span starts at the opening quote and covers the whole partial string, so a
+    // caret can point at the quote.
+    try testing.expectEqualStrings("\"abc", tokens[0].text(src));
+}
+
+test "unterminated string at newline stops before the newline" {
+    // The partial string ends at the newline (not consuming it); the newline then
+    // becomes its own trivia/terminator handling — here `prev` is an error tag so
+    // no terminator is inserted, and `x` follows on the next line.
+    const src = "\"abc\nx";
+    const tokens = try tokenize(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(Tag.string_unterminated, tokens[0].tag);
+    try testing.expectEqualStrings("\"abc", tokens[0].text(src));
+    try testing.expectEqual(Tag.identifier, tokens[1].tag);
+    try testing.expectEqualStrings("x", tokens[1].text(src));
+}
+
+test "a run of unknown bytes coalesces into one invalid token" {
+    // `$` `%` `^` begin no token and are not trivia, so a run of them is a single
+    // `.invalid` rather than one token per byte.
+    const src = "$$$";
+    const tokens = try tokenize(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len); // one .invalid + .eof
+    try testing.expectEqual(Tag.invalid, tokens[0].tag);
+    try testing.expectEqualStrings("$$$", tokens[0].text(src));
+    // A run bounded by real tokens on both sides is still one coalesced span.
+    try expectTags("a %^~ b", &.{ .identifier, .invalid, .identifier, .eof });
+}
+
+/// Assert the debug span-tiling invariant holds directly: spans are monotone with
+/// no overlap, cover to EOF, and (aside from skipped trivia) leave no byte behind.
+fn expectSpansTile(source: []const u8) !void {
+    const tokens = try tokenize(testing.allocator, source);
+    defer testing.allocator.free(tokens);
+    var prev_end: u32 = 0;
+    for (tokens) |tok| {
+        try testing.expect(tok.start >= prev_end);
+        try testing.expect(tok.end >= tok.start);
+        prev_end = tok.end;
+    }
+    try testing.expectEqual(@as(u32, @intCast(source.len)), tokens[tokens.len - 1].end);
+    try testing.expectEqual(Tag.eof, tokens[tokens.len - 1].tag);
+}
+
+test "span totality holds on mixed valid and invalid input" {
+    try expectSpansTile("fn f() { x := \"oops\n  y %% z + 1\n}\n");
+    try expectSpansTile("$$$");
+    try expectSpansTile("\"abc");
+    try expectSpansTile(""); // just .eof at [0,0)
+}
+
+test "a valid program tokenizes exactly as before" {
+    // Guards the invariant that valid programs are byte-identical after this change:
+    // no error tokens appear and the tag stream is unchanged.
+    try expectTags(
+        \\fn add(a: int, b: int) -> int {
+        \\    return a + b
+        \\}
+    , &.{
+        // `{` does not end a statement, so the newline after it inserts no
+        // terminator; the newline after `b` does.
+        .kw_fn,      .identifier, .l_paren, .identifier, .colon,     .identifier,
+        .comma,      .identifier, .colon,   .identifier, .r_paren,   .arrow,
+        .identifier, .l_brace,    .kw_return, .identifier, .plus,    .identifier,
+        .newline,    .r_brace,    .eof,
+    });
+}
+
+test "invalid error tokens are capped: garbage past the cap becomes one trailing invalid" {
+    // Build a source of `max_error_tokens + 50` isolated invalid bytes, each
+    // separated by a space so they would each be their own `.invalid` if uncapped.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    const n = max_error_tokens + 50;
+    var i: u32 = 0;
+    while (i < n) : (i += 1) try buf.appendSlice(testing.allocator, "$ ");
+    const tokens = try tokenize(testing.allocator, buf.items);
+    defer testing.allocator.free(tokens);
+    // Cap error tokens, then a single trailing `.invalid` swallowing the rest, then
+    // `.eof` — far fewer than `n` tokens.
+    try testing.expect(tokens.len < n);
+    try testing.expectEqual(Tag.eof, tokens[tokens.len - 1].tag);
+    // The token just before EOF is the trailing swallow and reaches EOF.
+    const last = tokens[tokens.len - 2];
+    try testing.expectEqual(Tag.invalid, last.tag);
+    try testing.expectEqual(@as(u32, @intCast(buf.items.len)), last.end);
 }
 
 test "short declaration with hash comment and string" {
