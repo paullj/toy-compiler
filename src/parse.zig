@@ -52,10 +52,155 @@ diags: std.ArrayList(Diagnostic),
 /// reads `c` as the condition and `{ ... }` as the body. Parens are the escape
 /// hatch. Reset (save/restore) inside `parseBlock` so a block body re-arms it.
 no_block: bool = false,
+/// Expression-recursion depth, bumped at the single `parseExpr` chokepoint and
+/// restored on every unwind (via `defer`). Past `MAX_EXPR_DEPTH` the parser emits
+/// one "nested too deeply" diagnostic and returns a bounded `error_node` instead
+/// of recursing further — the anti-crash backstop for the project's frame-sizing
+/// SIGBUS hazard on adversarially deep input.
+depth: u16 = 0,
 
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 const Error = error{ OutOfMemory, ParseError };
+
+/// Cap on `parseExpr` recursion depth. Conservative versus the frame-sizing
+/// SIGBUS hazard; no valid source nests expressions anywhere near this.
+const MAX_EXPR_DEPTH: u16 = 256;
+
+// ---- recovery policy (DATA) ------------------------------------------------
+//
+// Recovery lives as comptime `EnumSet(token.Tag)` FIRST sets and FOLLOW-union-
+// ancestor-anchor recovery sets, matklad-style, rather than scattered `!= .x`
+// conditionals. Every nested recovery set unions `decl_anchors` so a runaway
+// inner construct breaks all the way out at the next top-level decl keyword or
+// EOF, bounding cascade to the current declaration.
+
+const TagSet = std.EnumSet(token.Tag);
+
+fn setOf(comptime tags: []const token.Tag) TagSet {
+    var s = TagSet.initEmpty();
+    for (tags) |t| s.insert(t);
+    return s;
+}
+
+/// FIRST(top-level decl): the exact arms of `parseDecls`' dispatch.
+const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum });
+/// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
+const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
+/// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
+const expr_first = setOf(&.{ .identifier, .number, .string, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .at, .dot, .minus, .bang });
+/// FIRST(type): an identifier (dot-chained) or the unit type `()`.
+const type_first = setOf(&.{ .identifier, .l_paren });
+/// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
+const pattern_first = setOf(&.{ .identifier, .number, .kw_true, .kw_false, .dot });
+/// FIRST(stmt): `expr_first` ∪ the statement-keyword starters.
+const stmt_first = expr_first.unionWith(setOf(&.{ .kw_while, .kw_for, .kw_break, .kw_continue, .kw_return }));
+/// FOLLOW(param) ∪ decl_anchors: own closer `)`, `->` (ret), `{` (body start).
+const param_recovery = setOf(&.{ .r_paren, .arrow, .l_brace }).unionWith(decl_anchors);
+/// FOLLOW(elem) ∪ decl_anchors for `( ... )` comma lists. No newline: newlines
+/// are NOT skipped inside `( )` today — a newline there stays garbage (deleted).
+const tuple_recovery = setOf(&.{ .r_paren, .comma }).unionWith(decl_anchors);
+/// FOLLOW(field) ∪ decl_anchors for `{ ... }` item lists. Comma AND newline are
+/// both legal separators inside braces (loop-top `skipNewlines` handles newline).
+const field_recovery = setOf(&.{ .r_brace, .comma, .newline }).unionWith(decl_anchors);
+/// Same shape as field_recovery (enum body is brace-delimited, comma/newline sep).
+const variant_recovery = field_recovery;
+/// Same shape again (match body is brace-delimited, arms comma/newline sep).
+const arm_recovery = field_recovery;
+/// `findNextStmt`'s STOP set (at the block's brace-depth). Must contain `.newline`
+/// so a post-recovery `expectTerminator` does NOT spuriously cascade (resync lands
+/// on a newline that `skipNewlines` then swallows).
+const stmt_recovery = setOf(&.{ .newline, .r_brace, .eof }).unionWith(stmt_first).unionWith(decl_anchors);
+
+comptime {
+    // The headline audit: the 3-way list arms are unambiguous only if FIRST(expr)
+    // is disjoint from FIRST(decl) — otherwise a stray `fn` inside `f(` could be
+    // read as an argument instead of bailing to the decl loop.
+    if (expr_first.intersectWith(decl_first).count() != 0) @compileError("expr_first overlaps decl_first: 3-way arms ambiguous");
+    if (!tuple_recovery.contains(.r_paren) or !tuple_recovery.contains(.comma)) @compileError("tuple_recovery missing own closer/separator");
+    if (!field_recovery.contains(.r_brace) or !field_recovery.contains(.newline)) @compileError("field_recovery missing own closer/separator");
+    if (!stmt_recovery.contains(.newline)) @compileError("stmt_recovery must contain .newline (ASI anti-cascade)");
+    for ([_]TagSet{ param_recovery, tuple_recovery, field_recovery, stmt_recovery, decl_anchors }) |s| {
+        if (!s.contains(.eof)) @compileError("recovery set missing .eof anchor");
+    }
+}
+
+// ---- resync scanners -------------------------------------------------------
+//
+// Brace/paren-DEPTH-aware. Because blocks/if/match/struct-literals are
+// EXPRESSIONS, `r_brace` is structurally overloaded: a depth-naive scan would
+// resync to a nested block-expression's `}` instead of the enclosing block's.
+// Each scanner tracks depth and only STOPS at a target token when depth == 0.
+// Termination is trivial — every iteration calls `advance()` (clamped at eof) —
+// with a debug fuel guard as defense-in-depth against a depth-accounting bug.
+// The scanners emit NO diagnostics (the triggering diag already fired — this is
+// the no-cascade guarantee).
+
+/// Scan to the next top-level decl keyword (or eof). If the cursor already sits
+/// on a decl keyword (a decl that failed AT its own keyword), advance once first
+/// so we always make progress.
+///
+/// A decl keyword is an UNCONDITIONAL anchor here, ignoring brace depth: this
+/// grammar has no nested declarations, so `fn`/`struct`/`enum`/`import`/`pub`
+/// never legitimately appears inside a balanced brace/paren region. Depth-gating
+/// this stop (as the nested-block-aware `findNextStmt` must) would let an
+/// UNbalanced stray `{` — e.g. the trailing `{` of `fn f( ) ) ) {` — inflate the
+/// counter and swallow the next real `fn g`. Making decls a hard anchor keeps
+/// recovery landing on the next declaration regardless.
+fn findNextDecl(p: *Parser) void {
+    if (decl_first.contains(p.peek().tag)) p.advance();
+    var fuel: usize = p.tokens.len + 1;
+    while (!p.at(.eof)) {
+        std.debug.assert(fuel != 0);
+        fuel -= 1;
+        if (decl_first.contains(p.peek().tag)) return;
+        p.advance();
+    }
+}
+
+/// Scan to the next statement boundary at the block's brace-depth: a newline
+/// (`skipNewlines` swallows it — anti-cascade), `r_brace` (block loop breaks), a
+/// stmt-FIRST token (reparse the next statement), or a decl keyword (bail the
+/// wrecked block to the decl loop so it cannot eat the next fn).
+fn findNextStmt(p: *Parser) void {
+    var depth: i32 = 0;
+    var fuel: usize = p.tokens.len + 1;
+    while (!p.at(.eof)) {
+        std.debug.assert(fuel != 0);
+        fuel -= 1;
+        const t = p.peek().tag;
+        if (depth == 0 and (t == .r_brace or t == .newline or stmt_first.contains(t) or decl_first.contains(t))) return;
+        switch (t) {
+            .l_brace, .l_paren => depth += 1,
+            .r_brace, .r_paren => if (depth > 0) {
+                depth -= 1;
+            },
+            else => {},
+        }
+        p.advance();
+    }
+}
+
+/// Generic depth-aware scan stopping at `set` members at depth 0; backs the
+/// match-arm resync shim.
+fn resyncTo(p: *Parser, comptime set: TagSet) void {
+    var depth: i32 = 0;
+    var fuel: usize = p.tokens.len + 1;
+    while (!p.at(.eof)) {
+        std.debug.assert(fuel != 0);
+        fuel -= 1;
+        const t = p.peek().tag;
+        if (depth == 0 and set.contains(t)) return;
+        switch (t) {
+            .l_brace, .l_paren => depth += 1,
+            .r_brace, .r_paren => if (depth > 0) {
+                depth -= 1;
+            },
+            else => {},
+        }
+        p.advance();
+    }
+}
 
 /// What `parse()` returns: an always-present tree (on non-OOM runs) plus the
 /// accumulated diagnostics. A run with a non-empty `diags` is a TAINTED parse —
@@ -154,22 +299,16 @@ fn deinit(p: *Parser) void {
 
 // ---- program / declarations ------------------------------------------------
 
-/// Parse the whole program. On a `ParseError` from a top-level declaration this
-/// catches it and STOPS the decl loop, then finishes assembling the `.program`
-/// node over whatever decls were built so far — so `parse()` always yields a tree
-/// covering the parsed prefix. (Per-statement resync across independent errors is
-/// the NEXT milestone; here a single error yields ~one diagnostic and the partial
-/// tree.) Only `OutOfMemory` still propagates out.
+/// Parse the whole program. The decl loop is resilient: each broken top-level
+/// declaration records its diagnostics, resyncs to the next decl keyword, and the
+/// loop continues — so `parse()` yields a tree covering ALL parsed decls and
+/// reports many errors per file. `parseDecls` absorbs every `error.ParseError`
+/// per-decl, so nothing but `OutOfMemory` propagates here.
 fn parseProgram(p: *Parser) error{OutOfMemory}!Ast.Tree {
     var decls: std.ArrayList(Ast.Index) = .empty;
     defer decls.deinit(p.gpa);
 
-    p.parseDecls(&decls) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // A top-level parse error stops the decl loop; the partial tree is still
-        // assembled below and the diagnostic is already recorded in `p.diags`.
-        error.ParseError => {},
-    };
+    try p.parseDecls(&decls);
 
     const header = try p.addRange(decls.items);
     _ = try p.addNode(.{ .tag = .program, .main_token = 0, .lhs = header, .rhs = Ast.none });
@@ -186,33 +325,48 @@ fn parseProgram(p: *Parser) error{OutOfMemory}!Ast.Tree {
     return Ast.Tree{ .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
 }
 
-/// The top-level declaration loop, factored out so `parseProgram` can catch a
-/// `ParseError` from it and still assemble the partial `.program` node.
-fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void {
+/// The resilient top-level declaration loop (the Zig-std per-item resync model):
+/// parse one decl; on `error.ParseError` the diagnostic is already recorded, so
+/// resync to the next decl keyword and continue. Every following decl still
+/// parses, so N independent broken decls yield N (or more) diagnostics. The loop
+/// exits at eof (no trailing `expect(.eof)` — the `while` condition owns that).
+/// Narrowed to `error{OutOfMemory}`: the shim absorbs every `ParseError`.
+fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) error{OutOfMemory}!void {
     p.skipNewlines();
     while (!p.at(.eof)) {
-        // `import` decls have no `pub` modifier (imports are not re-exported).
-        if (p.at(.kw_import)) {
-            try decls.append(p.gpa, try p.parseImport());
-            p.skipNewlines();
-            continue;
-        }
-        // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
-        const is_pub = p.eat(.kw_pub);
-        const decl = switch (p.peek().tag) {
-            .kw_fn => try p.parseFnDecl(),
-            .kw_struct => try p.parseStructDecl(),
-            .kw_enum => try p.parseEnumDecl(),
-            else => return p.fail(p.peek(), if (is_pub)
-                "expected a function, struct, or enum declaration after 'pub'"
-            else
-                "expected a function, struct, enum, or import declaration"),
+        const entry = p.index;
+        p.parseDeclRecoverable(decls) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => p.findNextDecl(),
         };
-        if (is_pub) try p.pub_decls.append(p.gpa, decl);
-        try decls.append(p.gpa, decl);
         p.skipNewlines();
+        std.debug.assert(p.index > entry or p.at(.eof));
     }
-    try p.expect(.eof, "expected a declaration or end of input");
+}
+
+/// Parse ONE top-level declaration and append it (recording a `pub` export as a
+/// side effect). On any nested `ParseError` the diagnostic is already in
+/// `p.diags`; the error unwinds to the decl loop, which resyncs. This is the
+/// per-decl tolerance unit.
+fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void {
+    // `import` decls have no `pub` modifier (imports are not re-exported).
+    if (p.at(.kw_import)) {
+        try decls.append(p.gpa, try p.parseImport());
+        return;
+    }
+    // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
+    const is_pub = p.eat(.kw_pub);
+    const decl = switch (p.peek().tag) {
+        .kw_fn => try p.parseFnDecl(),
+        .kw_struct => try p.parseStructDecl(),
+        .kw_enum => try p.parseEnumDecl(),
+        else => return p.fail(p.peek(), if (is_pub)
+            "expected a function, struct, or enum declaration after 'pub'"
+        else
+            "expected a function, struct, enum, or import declaration"),
+    };
+    if (is_pub) try p.pub_decls.append(p.gpa, decl);
+    try decls.append(p.gpa, decl);
 }
 
 /// Materialize the `pub_bits` bitset from the collected `pub_decls` node indices.
@@ -272,14 +426,24 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
 
     var params: std.ArrayList(Ast.Index) = .empty;
     defer params.deinit(p.gpa);
-    while (!p.at(.r_paren)) {
-        const param_name = p.index;
-        try p.expect(.identifier, "expected a parameter name");
-        try p.expect(.colon, "expected ':' after parameter name");
-        const type_node = try p.parseType();
-        const param = try p.addNode(.{ .tag = .param, .main_token = param_name, .lhs = type_node, .rhs = Ast.none });
-        try params.append(p.gpa, param);
-        if (!p.eat(.comma)) break;
+    while (!p.at(.r_paren) and !p.at(.eof)) {
+        const entry = p.index;
+        if (p.at(.identifier)) {
+            const param_name = p.index;
+            p.bump(.identifier);
+            try p.expect(.colon, "expected ':' after parameter name");
+            const type_node = try p.parseType();
+            const param = try p.addNode(.{ .tag = .param, .main_token = param_name, .lhs = type_node, .rhs = Ast.none });
+            try params.append(p.gpa, param);
+            if (!p.eat(.comma)) {
+                if (p.at(.r_paren)) break;
+            }
+        } else if (param_recovery.contains(p.peek().tag)) {
+            break;
+        } else {
+            _ = try p.advanceWithError("expected a parameter name or ')'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
     }
     try p.expect(.r_paren, "expected ')' to close parameter list");
 
@@ -309,19 +473,26 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
 
     var fields: std.ArrayList(Ast.Index) = .empty;
     defer fields.deinit(p.gpa);
-    while (true) {
+    while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
-        const field_name = p.index;
-        try p.expect(.identifier, "expected a field name");
-        try p.expect(.colon, "expected ':' after field name");
-        const type_node = try p.parseType();
-        const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
-        try fields.append(p.gpa, field);
-        // A field is separated by a comma OR a newline (both insignificant inside
-        // `{}`); a `}` ends the list. An optional comma is consumed; the loop top
-        // skips newlines and checks for `}`.
-        _ = p.eat(.comma);
+        if (decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (p.at(.identifier)) {
+            const field_name = p.index;
+            p.bump(.identifier);
+            try p.expect(.colon, "expected ':' after field name");
+            const type_node = try p.parseType();
+            const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
+            try fields.append(p.gpa, field);
+            // A field is separated by a comma OR a newline (both insignificant
+            // inside `{}`); a `}` ends the list. The comma is optional; the loop
+            // top skips newlines and checks for `}`.
+            _ = p.eat(.comma);
+        } else {
+            _ = try p.advanceWithError("expected a field name or '}'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
     }
     try p.expect(.r_brace, "expected '}' to close struct body");
 
@@ -340,20 +511,37 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
 
     var variants: std.ArrayList(Ast.Index) = .empty;
     defer variants.deinit(p.gpa);
-    while (true) {
+    while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
+        if (decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (!p.at(.identifier)) {
+            _ = try p.advanceWithError("expected a variant name or '}'");
+            std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+            continue;
+        }
         const vname = p.index;
-        try p.expect(.identifier, "expected a variant name");
+        p.bump(.identifier);
         var variant: Ast.Index = undefined;
         switch (p.peek().tag) {
             .l_paren => {
                 p.bump(.l_paren);
                 var types: std.ArrayList(Ast.Index) = .empty;
                 defer types.deinit(p.gpa);
-                while (!p.at(.r_paren)) {
-                    try types.append(p.gpa, try p.parseType());
-                    if (!p.eat(.comma)) break;
+                while (!p.at(.r_paren) and !p.at(.eof)) {
+                    const t_entry = p.index;
+                    if (type_first.contains(p.peek().tag)) {
+                        try types.append(p.gpa, try p.parseType());
+                        if (!p.eat(.comma)) {
+                            if (p.at(.r_paren)) break;
+                        }
+                    } else if (tuple_recovery.contains(p.peek().tag)) {
+                        break;
+                    } else {
+                        _ = try p.advanceWithError("expected a type");
+                    }
+                    std.debug.assert(p.index > t_entry or p.at(.r_paren) or p.at(.eof));
                 }
                 try p.expect(.r_paren, "expected ')' to close a tuple variant");
                 const header = try p.addRange(types.items);
@@ -365,16 +553,23 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
                 p.bump(.l_brace);
                 var fields: std.ArrayList(Ast.Index) = .empty;
                 defer fields.deinit(p.gpa);
-                while (true) {
+                while (!p.at(.eof)) {
                     p.skipNewlines();
                     if (p.at(.r_brace)) break;
-                    const field_name = p.index;
-                    try p.expect(.identifier, "expected a field name");
-                    try p.expect(.colon, "expected ':' after field name");
-                    const type_node = try p.parseType();
-                    const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
-                    try fields.append(p.gpa, field);
-                    _ = p.eat(.comma);
+                    if (decl_anchors.contains(p.peek().tag)) break;
+                    const f_entry = p.index;
+                    if (p.at(.identifier)) {
+                        const field_name = p.index;
+                        p.bump(.identifier);
+                        try p.expect(.colon, "expected ':' after field name");
+                        const type_node = try p.parseType();
+                        const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
+                        try fields.append(p.gpa, field);
+                        _ = p.eat(.comma);
+                    } else {
+                        _ = try p.advanceWithError("expected a field name or '}'");
+                    }
+                    std.debug.assert(p.index > f_entry or p.at(.r_brace) or p.at(.eof));
                 }
                 try p.expect(.r_brace, "expected '}' to close a struct variant");
                 const header = try p.addRange(fields.items);
@@ -384,6 +579,7 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
         }
         try variants.append(p.gpa, variant);
         _ = p.eat(.comma);
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
     }
     try p.expect(.r_brace, "expected '}' to close enum body");
 
@@ -409,28 +605,52 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
 
     var arms: std.ArrayList(Ast.Index) = .empty;
     defer arms.deinit(p.gpa);
-    while (true) {
+    while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
-        const pat = try p.parsePattern();
-        var guard: Ast.Index = Ast.none;
-        if (p.eat(.kw_if)) {
-            var guard_nb = NoBlockScope.enter(p, true); // stop the guard cond before `->`/`{`
-            defer guard_nb.end();
-            guard = try p.parseExpr(0);
-        }
-        const arrow = p.index;
-        try p.expect(.arrow, "expected '->' after a match pattern");
-        const body = try p.parseExpr(0);
-        const arm_hdr = try p.addExtra(&.{ guard.int(), body.int() });
-        const arm = try p.addNode(.{ .tag = .match_arm, .main_token = arrow, .lhs = pat, .rhs = arm_hdr });
+        if (decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        // An arm is a compound (pattern/guard/arrow/body), so recover it by
+        // catch-and-resync rather than a bare-item 3-way arm.
+        const arm = p.parseMatchArm() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => {
+                p.resyncTo(arm_recovery);
+                // `resyncTo` STOPS on (without consuming) the first anchor at depth 0,
+                // so when the arm failed with the cursor already on a leading
+                // separator (`,`/newline) it returns having moved nothing. Consume one
+                // token in that case to guarantee forward progress (the loop-top
+                // `skipNewlines` and trailing `eat(.comma)` already treat separators as
+                // optional, so dropping one is safe). Never step past the arm-list end.
+                if (p.index == entry and !p.at(.eof) and !p.at(.r_brace) and !decl_anchors.contains(p.peek().tag)) p.advance();
+                std.debug.assert(p.index > entry or p.at(.r_brace) or decl_anchors.contains(p.peek().tag));
+                continue;
+            },
+        };
         try arms.append(p.gpa, arm);
         _ = p.eat(.comma);
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
     }
     try p.expect(.r_brace, "expected '}' to close match");
 
     const header = try p.addRange(arms.items);
     return p.addNode(.{ .tag = .match_expr, .main_token = match_tok, .lhs = scrut, .rhs = header });
+}
+
+/// One `pat [if guard] -> body` match arm.
+fn parseMatchArm(p: *Parser) Error!Ast.Index {
+    const pat = try p.parsePattern();
+    var guard: Ast.Index = Ast.none;
+    if (p.eat(.kw_if)) {
+        var guard_nb = NoBlockScope.enter(p, true); // stop the guard cond before `->`/`{`
+        defer guard_nb.end();
+        guard = try p.parseExpr(0);
+    }
+    const arrow = p.index;
+    try p.expect(.arrow, "expected '->' after a match pattern");
+    const body = try p.parseExpr(0);
+    const arm_hdr = try p.addExtra(&.{ guard.int(), body.int() });
+    return p.addNode(.{ .tag = .match_arm, .main_token = arrow, .lhs = pat, .rhs = arm_hdr });
 }
 
 /// A match pattern, with or-alternatives: `subpat ('|' subpat)*`. Emits a
@@ -443,7 +663,9 @@ fn parsePattern(p: *Parser) Error!Ast.Index {
     const first_tok = p.nodes.items[first.int()].main_token;
     try alts.append(p.gpa, first);
     while (p.eat(.pipe)) {
+        const entry = p.index;
         try alts.append(p.gpa, try p.parseSubPattern());
+        std.debug.assert(p.index > entry);
     }
     const hdr = try p.addRange(alts.items);
     return p.addNode(.{ .tag = .pattern_or, .main_token = first_tok, .lhs = hdr, .rhs = Ast.none });
@@ -488,11 +710,21 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
             p.bump(.l_paren);
             var binds: std.ArrayList(Ast.Index) = .empty;
             defer binds.deinit(p.gpa);
-            while (!p.at(.r_paren)) {
-                // Each tuple element is an arbitrary sub-pattern (literal, binding,
-                // wildcard, nested variant, or-pattern).
-                try binds.append(p.gpa, try p.parsePattern());
-                if (!p.eat(.comma)) break;
+            while (!p.at(.r_paren) and !p.at(.eof)) {
+                const entry = p.index;
+                if (pattern_first.contains(p.peek().tag)) {
+                    // Each tuple element is an arbitrary sub-pattern (literal,
+                    // binding, wildcard, nested variant, or-pattern).
+                    try binds.append(p.gpa, try p.parsePattern());
+                    if (!p.eat(.comma)) {
+                        if (p.at(.r_paren)) break;
+                    }
+                } else if (tuple_recovery.contains(p.peek().tag)) {
+                    break;
+                } else {
+                    _ = try p.advanceWithError("expected a pattern");
+                }
+                std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
             }
             try p.expect(.r_paren, "expected ')' to close a tuple pattern");
             binders = try p.addRange(binds.items);
@@ -503,11 +735,18 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
             p.bump(.l_brace);
             var binds: std.ArrayList(Ast.Index) = .empty;
             defer binds.deinit(p.gpa);
-            while (true) {
+            while (!p.at(.eof)) {
                 p.skipNewlines();
                 if (p.at(.r_brace)) break;
+                if (decl_anchors.contains(p.peek().tag)) break;
+                const entry = p.index;
+                if (!p.at(.identifier)) {
+                    _ = try p.advanceWithError("expected a field name in a struct pattern");
+                    std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+                    continue;
+                }
                 const field_tok = p.index;
-                try p.expect(.identifier, "expected a field name in a struct pattern");
+                p.bump(.identifier);
                 var bind: Ast.Index = undefined;
                 if (p.eat(.colon)) {
                     // `field: alias` (rename to a bare ident) vs `field: subpat`
@@ -531,6 +770,7 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
                 }
                 try binds.append(p.gpa, bind);
                 _ = p.eat(.comma);
+                std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
             }
             try p.expect(.r_brace, "expected '}' to close a struct pattern");
             binders = try p.addRange(binds.items);
@@ -551,11 +791,18 @@ fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
 
     var inits: std.ArrayList(Ast.Index) = .empty;
     defer inits.deinit(p.gpa);
-    while (true) {
+    while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
+        if (decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (!p.at(.identifier)) {
+            _ = try p.advanceWithError("expected a field name or '}'");
+            std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+            continue;
+        }
         const field_tok = p.index;
-        try p.expect(.identifier, "expected a field name");
+        p.bump(.identifier);
         var value: Ast.Index = undefined;
         if (p.eat(.colon)) {
             value = try p.parseExpr(0);
@@ -566,6 +813,7 @@ fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
         const fi = try p.addNode(.{ .tag = .field_init, .main_token = field_tok, .lhs = value, .rhs = Ast.none });
         try inits.append(p.gpa, fi);
         _ = p.eat(.comma);
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
     }
     try p.expect(.r_brace, "expected '}' to close struct literal");
 
@@ -609,6 +857,21 @@ fn parseType(p: *Parser) Error!Ast.Index {
 }
 
 fn parseBlock(p: *Parser) Error!Ast.Index {
+    // Nesting-depth guard on the block/statement recursion. Statement-keyword
+    // constructs (`if`/`while`/`for`/`loop`) recurse fn->parseBlock->parseStmt->fn
+    // WITHOUT funneling through parseExpr (their only parseExpr call is the
+    // condition, which unwinds `p.depth` back down before the body is parsed), so
+    // the parseExpr guard alone cannot see this recursion. Sharing `p.depth`/
+    // `MAX_EXPR_DEPTH` here caps total nesting: past the cap emit ONE diagnostic and
+    // return a bounded `error_node` (the caller's stmt/decl recovery loop resyncs
+    // depth-aware over the unparsed nested region) instead of overflowing the stack.
+    // Compiled in ALL modes — it defends a real SIGBUS.
+    p.depth += 1;
+    defer p.depth -= 1;
+    if (p.depth > MAX_EXPR_DEPTH) {
+        try p.warn(p.peek(), "block nested too deeply");
+        return p.addNode(.{ .tag = .error_node, .main_token = p.index, .lhs = Ast.none, .rhs = Ast.none });
+    }
     // A block body is a fresh expression context: re-allow `{`/`if` expressions
     // inside it even when reached from an `if`/`while` condition.
     var nb = NoBlockScope.enter(p, false);
@@ -618,13 +881,32 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
 
     var stmts: std.ArrayList(Ast.Index) = .empty;
     defer stmts.deinit(p.gpa);
-    while (true) {
+    // Resilient statement loop (Zig-std model): a broken statement resyncs to the
+    // next statement boundary rather than unwinding the whole block. The `while`
+    // exits at eof; the trailing `expect(.r_brace)` reports a missing `}` ONCE
+    // (no mid-loop unwind of the enclosing fn). A decl keyword at loop top bails
+    // the wrecked block to the decl loop so it cannot eat the next fn.
+    while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
-        if (p.at(.eof)) return p.fail(p.peek(), "expected '}' to close block");
-        const stmt = try p.parseStmt();
+        if (decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        const stmt = p.parseStmt() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => {
+                p.findNextStmt();
+                std.debug.assert(p.index > entry or p.at(.r_brace) or decl_anchors.contains(p.peek().tag));
+                continue;
+            },
+        };
         try stmts.append(p.gpa, stmt);
-        try p.expectTerminator();
+        // A missing terminator after a statement resyncs (the recovery set includes
+        // `.newline`, so `skipNewlines` at the next loop top swallows the landing
+        // token — no spurious ASI cascade).
+        p.expectTerminator() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => p.findNextStmt(),
+        };
     }
     try p.expect(.r_brace, "expected '}' to close block");
 
@@ -827,6 +1109,20 @@ fn parseExprStmt(p: *Parser) Error!Ast.Index {
 /// operators left-associative. The call postfix is applied to every operand
 /// before the infix loop, so it binds tighter than any infix operator.
 fn parseExpr(p: *Parser, min_bp: u8) Error!Ast.Index {
+    // Recursion-depth guard at the single mutual-recursion chokepoint (nested
+    // parens, unary chains, infix RHS via `continueInfix`, and call args all
+    // funnel through here). Past the cap, emit one diagnostic and return a bounded
+    // `error_node` (consuming to a boundary so the surrounding list/infix loop
+    // terminates via its anchor/eof guard) instead of overflowing the stack. This
+    // guard is compiled in ALL modes — it defends a real crash.
+    p.depth += 1;
+    defer p.depth -= 1;
+    if (p.depth > MAX_EXPR_DEPTH) {
+        try p.warn(p.peek(), "expression nested too deeply");
+        const et = p.index;
+        while (!p.at(.eof) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
+        return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
+    }
     const lhs = try p.parsePostfix(try p.parsePrefix());
     return p.continueInfix(lhs, min_bp);
 }
@@ -903,10 +1199,26 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             if (p.no_block) return p.fail(tok, "expected an expression");
             return p.parseMatch(); // a match as a value expression
         },
-        // No valid expression start (B2 single-token DELETION repair): report and
-        // fill the operand slot with an `error_node` over the offending token,
-        // consuming it so the enclosing parse makes progress instead of unwinding.
-        else => return p.advanceWithError("expected an expression"),
+        // No valid expression start. When the offending token is a structural
+        // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
+        // of a block/struct-literal), DELETING it (advanceWithError) would break
+        // that construct's closing `expect` and cascade — one missing operand
+        // (`g(1 + )`, or a trailing `:=`/`+` before `}`) would spray a diagnostic
+        // per unfinished ancestor. So report the missing expression and return an
+        // `error_node` WITHOUT consuming: the enclosing arg/group/block loop then
+        // sees its closer (its anchor branch breaks, its `expect` consumes it),
+        // collapsing the cascade to one diagnostic. Forward progress is still
+        // guaranteed — `continueInfix` already consumed the operator before
+        // recursing, and at statement start `findNextStmt` advances past a
+        // still-unconsumed closer. For any OTHER invalid start, keep the B2
+        // single-token DELETION repair (consume one token to make progress).
+        else => {
+            if (p.at(.r_paren) or p.at(.r_brace)) {
+                try p.warn(tok, "expected an expression");
+                return p.addNode(.{ .tag = .error_node, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
+            }
+            return p.advanceWithError("expected an expression");
+        },
     }
 }
 
@@ -962,9 +1274,19 @@ fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast
     defer args.deinit(p.gpa);
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
-    while (!p.at(.r_paren)) {
-        try args.append(p.gpa, try p.parseExpr(0));
-        if (!p.eat(.comma)) break;
+    while (!p.at(.r_paren) and !p.at(.eof)) {
+        const entry = p.index;
+        if (expr_first.contains(p.peek().tag)) {
+            try args.append(p.gpa, try p.parseExpr(0));
+            if (!p.eat(.comma)) {
+                if (p.at(.r_paren)) break;
+            }
+        } else if (tuple_recovery.contains(p.peek().tag)) {
+            break;
+        } else {
+            _ = try p.advanceWithError("expected an argument");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
     }
     try p.expect(.r_paren, "expected ')' to close a variant construction");
     const header = try p.addRange(args.items);
@@ -987,11 +1309,18 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
     defer nb.end();
     var inits: std.ArrayList(Ast.Index) = .empty;
     defer inits.deinit(p.gpa);
-    while (true) {
+    while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
+        if (decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (!p.at(.identifier)) {
+            _ = try p.advanceWithError("expected a field name or '}'");
+            std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+            continue;
+        }
         const field_tok = p.index;
-        try p.expect(.identifier, "expected a field name");
+        p.bump(.identifier);
         var value: Ast.Index = undefined;
         if (p.eat(.colon)) {
             value = try p.parseExpr(0);
@@ -1001,6 +1330,7 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
         const fi = try p.addNode(.{ .tag = .field_init, .main_token = field_tok, .lhs = value, .rhs = Ast.none });
         try inits.append(p.gpa, fi);
         _ = p.eat(.comma);
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
     }
     try p.expect(.r_brace, "expected '}' to close a variant construction");
     const header = try p.addRange(inits.items);
@@ -1017,9 +1347,19 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     // in arguments even inside an if/while condition (`no_block`); restore after.
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
-    while (!p.at(.r_paren)) {
-        try args.append(p.gpa, try p.parseExpr(0));
-        if (!p.eat(.comma)) break;
+    while (!p.at(.r_paren) and !p.at(.eof)) {
+        const entry = p.index;
+        if (expr_first.contains(p.peek().tag)) {
+            try args.append(p.gpa, try p.parseExpr(0));
+            if (!p.eat(.comma)) {
+                if (p.at(.r_paren)) break;
+            }
+        } else if (tuple_recovery.contains(p.peek().tag)) {
+            break;
+        } else {
+            _ = try p.advanceWithError("expected an argument");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
     }
     try p.expect(.r_paren, "expected ')' to close call");
     const header = try p.addRange(args.items);
@@ -1427,9 +1767,11 @@ test "B2: a syntax error is reported (>=1 diagnostic) and the parse is tainted" 
     try testing.expectEqual(@as(u32, @intCast(star_off)), res.diags[0].byte_offset);
 }
 
-test "B2: single-token INSERTION — a missing expected token reports but leaves a tree" {
-    // A missing `)` in the param list: `expect` REPORTS without consuming, so the
-    // parse unwinds to the top-level loop and still yields a (partial) tree.
+test "B2/B3: single-token INSERTION — a missing expected token reports and recovers" {
+    // A missing `)` in the param list: the 3-way param loop sees `->` (a
+    // param_recovery anchor) and breaks; the trailing `expect(.r_paren)` reports
+    // the missing `)` and unwinds the decl, which the resilient decl loop recovers
+    // from — so the parse still reaches EOF and yields a program tree.
     const gpa = testing.allocator;
     const source = "fn f( -> int { return 0 }\n";
     const res = try parseResult(gpa, source);
@@ -1437,6 +1779,7 @@ test "B2: single-token INSERTION — a missing expected token reports but leaves
     defer freeTree(gpa, res.tree);
 
     try testing.expect(res.tree.nodes.len > 0);
+    // Recovery reached EOF and closed the top-level node (a `.program` root).
     try testing.expectEqual(Node.Tag.program, res.tree.nodes[Ast.root(res.tree.nodes).int()].tag);
     try testing.expect(res.diags.len >= 1);
 }
@@ -2040,4 +2383,288 @@ test "program pack/unpack byte round-trip" {
 
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
     try testing.expectEqualSlices(u32, tree.extra, got.extra);
+}
+
+// ---- B3: resilient recovery (many errors/file, cross-construct resync) -------
+
+/// Render a (possibly tainted) parse result's tree into `buf`, returning the
+/// rendered slice — a test-only convenience for the recovery tests that inspect
+/// the shape of a recovered tree.
+fn renderResult(res: Result, source: []const u8, buf: []u8) ![]const u8 {
+    const gpa = testing.allocator;
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var w = std.Io.Writer.fixed(buf);
+    try Ast.render(&w, res.tree, tokens, source);
+    return w.buffered();
+}
+
+test "B3: two independent errors in one file both report and both decls survive" {
+    // `return )` in a, `return )` in b — two independent broken statements. Both
+    // fn decls must be present (a's error did not swallow b) and >=2 diagnostics.
+    const gpa = testing.allocator;
+    const source = "fn a() -> int {\n  return )\n}\nfn b() -> int {\n  return )\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.diags.len >= 2);
+    const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+    try testing.expectEqual(Node.Tag.program, prog.tag);
+    // BOTH fn decls present: the top-level decl loop recovered across the break.
+    try testing.expectEqual(@as(usize, 2), Ast.rangeSlice(res.tree, prog.lhs.int()).len);
+    // The two error offsets straddle b's declaration keyword (distinct sites).
+    const b_off: u32 = @intCast(std.mem.indexOf(u8, source, "fn b").?);
+    var before: usize = 0;
+    var after: usize = 0;
+    for (res.diags) |d| {
+        if (d.byte_offset < b_off) before += 1 else after += 1;
+    }
+    try testing.expect(before >= 1 and after >= 1);
+}
+
+test "B3: adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
+    // The anti-hang backstop: this must RETURN (a hanging test is the failure),
+    // yield a non-empty program tree, and report at least one diagnostic.
+    const gpa = testing.allocator;
+    const source = "fn f( ) ) ) {\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.tree.nodes.len > 0);
+    try testing.expectEqual(Node.Tag.program, res.tree.nodes[Ast.root(res.tree.nodes).int()].tag);
+    try testing.expect(res.diags.len >= 1);
+}
+
+test "B3: adversarial garbage recovers to a following well-formed decl" {
+    // After the adversarial decl the parser must resync to a real following decl.
+    const gpa = testing.allocator;
+    const source = "fn f( ) ) ) {\nfn g() -> int { 0 }\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    var buf: [512]u8 = undefined;
+    const rendered = try renderResult(res, source, &buf);
+    try testing.expect(std.mem.indexOf(u8, rendered, "(fn g") != null);
+    try testing.expect(res.diags.len >= 1);
+}
+
+test "B3: a broken statement recovers to the next statement" {
+    // `return )` is a broken statement (stray `)`); `y := 2` and the final
+    // `return` must still parse — a broken statement does not poison its siblings.
+    const gpa = testing.allocator;
+    const source = "fn f() {\n  return )\n  y := 2\n  return\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.diags.len >= 1);
+    var buf: [512]u8 = undefined;
+    const rendered = try renderResult(res, source, &buf);
+    // The later statements survived the broken one (resync landed on `y`).
+    try testing.expect(std.mem.indexOf(u8, rendered, "(:= y 2)") != null);
+    // The final bare `return` also parsed.
+    try testing.expect(std.mem.indexOf(u8, rendered, "(return))") != null);
+}
+
+test "B3: a broken decl recovers to the next decl" {
+    // `fn a( { }` is a malformed decl; `fn b` must still parse.
+    const gpa = testing.allocator;
+    const source = "fn a( { }\nfn b() -> int { 0 }\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.diags.len >= 1);
+    var buf: [512]u8 = undefined;
+    const rendered = try renderResult(res, source, &buf);
+    try testing.expect(std.mem.indexOf(u8, rendered, "(fn b") != null);
+}
+
+test "B3: one root error yields exactly one diagnostic (no cascade)" {
+    // A single bad operand (`*` after `return`) must produce exactly ONE
+    // diagnostic — the ASI/newline anti-cascade guards against duplicates.
+    const gpa = testing.allocator;
+    const source = "fn f() -> int {\n  return *\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("expected an expression", res.diags[0].message);
+    const star_off: u32 = @intCast(std.mem.indexOfScalar(u8, source, '*').?);
+    try testing.expectEqual(star_off, res.diags[0].byte_offset);
+}
+
+test "B3: a missing call operand before ')' yields exactly one diagnostic (no closer-delete cascade)" {
+    // `g(1 + )` — the RHS of `+` is missing and the next token is the call's own
+    // `)`. parsePrefix must NOT delete that `)` (doing so would break the call's
+    // closing `expect`, then the block's, spraying a diagnostic per open ancestor).
+    // It returns an error_node without consuming, so the arg loop sees `)`, breaks,
+    // and `expect(.r_paren)` consumes it — collapsing the whole cascade to ONE
+    // diagnostic (the missing expression).
+    const gpa = testing.allocator;
+    const source = "fn g(a: int) -> int { 0 }\nfn f() -> int {\n  g(1 + )\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("expected an expression", res.diags[0].message);
+}
+
+test "B3: a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete cascade)" {
+    // `x := \n}` — the trailing `:=` suppresses the newline, so the initializer's
+    // parsePrefix lands on the block's `}`. Deleting it would swallow the block
+    // closer and add a spurious "expected '}'"; instead the error_node is returned
+    // without consuming, `expectTerminator` accepts the implicit `}`, and the block
+    // loop closes normally — ONE diagnostic.
+    const gpa = testing.allocator;
+    const source = "fn a() -> int {\n  x := \n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("expected an expression", res.diags[0].message);
+}
+
+test "B3: a broken call argument list reports and resyncs without hanging" {
+    // `g(1, , 3)` — the doubled comma is a tuple_recovery anchor, so the arg loop
+    // breaks and the trailing `expect(.r_paren)` fails at the stray comma; the
+    // block-statement loop then resyncs to the next statement (`3`). The call is
+    // abandoned rather than repaired in place, but recovery is bounded: parsing
+    // reaches EOF, a diagnostic is reported, and there is no hang. (The design's
+    // recovery-set code — comma ∈ tuple_recovery → break — is authoritative over
+    // its own test-plan prose, which imagined the comma being eaten in place.)
+    const gpa = testing.allocator;
+    const source = "fn g(a: int, b: int, c: int) -> int { 0 }\nfn f() -> int { g(1, , 3) }\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.diags.len >= 1);
+    // Both fn decls survive: the error stayed inside f's body.
+    const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+    try testing.expectEqual(@as(usize, 2), Ast.rangeSlice(res.tree, prog.lhs.int()).len);
+    // Recovery resynced to the trailing `3` statement inside f's block.
+    var buf: [512]u8 = undefined;
+    const rendered = try renderResult(res, source, &buf);
+    try testing.expect(std.mem.indexOf(u8, rendered, "(fn f () int (block 3))") != null);
+}
+
+test "B3: deep expression nesting is capped instead of overflowing the stack" {
+    // ~300 nested parens (> MAX_EXPR_DEPTH). parse() must RETURN (no SIGBUS) with a
+    // "nested too deeply" diagnostic and a present tree.
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "fn f() -> int {\n  return ");
+    const n = 300;
+    try buf.appendNTimes(gpa, '(', n);
+    try buf.append(gpa, '1');
+    try buf.appendNTimes(gpa, ')', n);
+    try buf.appendSlice(gpa, "\n}\n");
+
+    const res = try parseResult(gpa, buf.items);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.tree.nodes.len > 0);
+    var found = false;
+    for (res.diags) |d| {
+        if (std.mem.eql(u8, d.message, "expression nested too deeply")) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "B3: deep statement nesting is capped instead of overflowing the stack" {
+    // Statement-keyword recursion (`while`/`if`) nests through parseBlock, NOT
+    // parseExpr, so the parseExpr guard cannot see it. ~2000 unclosed `while true{`
+    // is well above MAX_EXPR_DEPTH: parse() must RETURN (no SIGBUS) with a "nested
+    // too deeply" diagnostic and a present tree. Unclosed braces taint the parse,
+    // isolating the crash to the parser's recursion.
+    const gpa = testing.allocator;
+    inline for (.{ "while true{\n", "if a{\n" }) |nest| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "fn f() -> int {\n");
+        var i: usize = 0;
+        while (i < 2000) : (i += 1) try buf.appendSlice(gpa, nest);
+
+        const res = try parseResult(gpa, buf.items);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+
+        try testing.expect(res.tree.nodes.len > 0);
+        var found = false;
+        for (res.diags) |d| {
+            if (std.mem.eql(u8, d.message, "block nested too deeply")) found = true;
+        }
+        try testing.expect(found);
+    }
+}
+
+test "B3: match arm starting on a separator makes forward progress (no hang)" {
+    // A leading `,`/newline arm was the one recovery loop that could stall:
+    // resyncTo stops on the separator without consuming, so the loop must skip it.
+    // Each of these must RETURN with >=1 diagnostic and a present tree.
+    const gpa = testing.allocator;
+    inline for (.{
+        "fn f(s: S) -> int {\n match s {\n ,\n }\n}\n",
+        "fn f(s: S) -> int {\n match s { , , , }\n}\n",
+    }) |source| {
+        const res = try parseResult(gpa, source);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+
+        try testing.expect(res.tree.nodes.len > 0);
+        try testing.expect(res.diags.len >= 1);
+    }
+}
+
+test "B3: deep infix chain is bounded (RHS recursion depth)" {
+    // A long `1 + 1 + ... + 1` exercises infix-RHS recursion through parseExpr.
+    // Left-associative infix does not deepen parseExpr recursion, so a 200-term
+    // chain stays well under the cap and parses cleanly.
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "fn f() -> int {\n  return 1");
+    var i: usize = 0;
+    while (i < 200) : (i += 1) try buf.appendSlice(gpa, " + 1");
+    try buf.appendSlice(gpa, "\n}\n");
+
+    const res = try parseResult(gpa, buf.items);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+}
+
+test "B3: a recovered error_node-bearing tree round-trips byte-identically" {
+    // Cache soundness under recovery: an error_node's contentFp uses only
+    // tag+main_token+lhs+rhs, so a recovered tree packs/unpacks byte-identically.
+    const gpa = testing.allocator;
+    const source = "fn f() -> int {\n  return *\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    // Sanity: the tree actually carries an error_node.
+    var has_error = false;
+    for (res.tree.nodes) |nd| {
+        if (nd.tag == .error_node) has_error = true;
+    }
+    try testing.expect(has_error);
+
+    const blob = try Ast.pack(gpa, res.tree);
+    defer gpa.free(blob);
+    const got = (try Ast.unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer freeTree(gpa, got);
+
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(res.tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, res.tree.extra, got.extra);
 }
