@@ -55,7 +55,7 @@ pub fn parse(
     gpa: std.mem.Allocator,
     comptime cmd: Spec.Command,
     argv: []const []const u8,
-    sink: *Sink.Sink,
+    sink: *Sink,
 ) std.mem.Allocator.Error!Result(cmd) {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -171,7 +171,7 @@ fn handleLong(
     a: std.mem.Allocator,
     appends: *AppendLists(cmd),
     seen: []bool,
-    sink: *Sink.Sink,
+    sink: *Sink,
     argv: []const []const u8,
     i: *usize,
     lv: Long,
@@ -217,7 +217,7 @@ fn handleShortCluster(
     a: std.mem.Allocator,
     appends: *AppendLists(cmd),
     seen: []bool,
-    sink: *Sink.Sink,
+    sink: *Sink,
     argv: []const []const u8,
     i: *usize,
     bytes: []const u8,
@@ -284,7 +284,7 @@ fn applyValue(
     gpa: std.mem.Allocator,
     a: std.mem.Allocator,
     appends: *AppendLists(cmd),
-    sink: *Sink.Sink,
+    sink: *Sink,
     arg: []const u8,
     raw: []const u8,
 ) !void {
@@ -312,7 +312,7 @@ fn bindPositional(
     gpa: std.mem.Allocator,
     a: std.mem.Allocator,
     appends: *AppendLists(cmd),
-    sink: *Sink.Sink,
+    sink: *Sink,
     arg: []const u8,
     pos_filled: *usize,
 ) !void {
@@ -376,7 +376,7 @@ fn sweepRequiredAndRelations(
     gpa: std.mem.Allocator,
     seen: []const bool,
     pos_filled: usize,
-    sink: *Sink.Sink,
+    sink: *Sink,
 ) !void {
     inline for (cmd.options, 0..) |o, oi| {
         if (o.required and !seen[oi])
@@ -656,7 +656,7 @@ test "Parsed.fieldName derives --dry-run -> dry_run" {
 
 test "sem1: long value both --opt=val and --opt val" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r1 = try parse(testing.allocator, cmd, &.{ "--jobs=4", "in.zig" }, &sink);
@@ -670,7 +670,7 @@ test "sem1: long value both --opt=val and --opt val" {
 
 test "sem2: short bundling trailing flags + value-taking short (-j4, -I path, -j 4)" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     // -av bundles two flags, then -j4 consumes rest of a fresh cluster.
@@ -693,7 +693,7 @@ test "sem2: short bundling trailing flags + value-taking short (-j4, -I path, -j
 
 test "sem3: -- terminator sends the rest to positionals" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "in.zig", "--", "--all", "-j" }, &sink);
@@ -707,7 +707,7 @@ test "sem3: -- terminator sends the rest to positionals" {
 
 test "sem4: bare - is a positional, not a flag" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{"-"}, &sink);
@@ -724,7 +724,7 @@ test "sem5: negative-number value accepted when a value is expected" {
         },
         .positionals = &.{.{ .name = "input", .value = .string }},
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "--off", "-5", "--ratio=-1.5", "in" }, &sink);
@@ -735,7 +735,7 @@ test "sem5: negative-number value accepted when a value is expected" {
 
 test "sem6: unknown flag pushes error and continues" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "--nope", "in.zig" }, &sink);
@@ -754,7 +754,7 @@ test "sem7: subcommand dispatch returns index + rest; caller re-enters" {
             .{ .name = "build", .options = &.{.{ .long = "release", .short = 'r', .value = .boolean }}, .positionals = &.{.{ .name = "target" }} },
         },
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "-a", "build", "--release", "x" }, &sink);
@@ -777,7 +777,7 @@ test "sem7: subcommand dispatch returns index + rest; caller re-enters" {
 
 test "collect-all: two independent errors in one parse" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "--nope", "--jobs", "99", "in.zig" }, &sink);
@@ -790,7 +790,7 @@ test "collect-all: two independent errors in one parse" {
 
 test "coercion: int range, float range, enum one-of failures" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "--jobs", "0", "--emit", "wat", "in.zig" }, &sink);
@@ -804,7 +804,7 @@ test "coercion: int range, float range, enum one-of failures" {
 
 test "coercion: valid enum binds the exact reified tag" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "--emit", "asm", "in.zig" }, &sink);
@@ -814,7 +814,7 @@ test "coercion: valid enum binds the exact reified tag" {
 
 test "append accumulates into an owned slice; ownership freed by arena deinit" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "-D", "A=1", "--define", "B=2", "-DC=3", "in.zig" }, &sink);
@@ -827,7 +827,7 @@ test "append accumulates into an owned slice; ownership freed by arena deinit" {
 
 test "variadic positional collects the tail; count option repeats" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "-vv", "a.zig", "b.zig", "c.zig" }, &sink);
@@ -846,7 +846,7 @@ test "optional positional binds when present, stays null when absent" {
             .{ .name = "out", .value = .string, .arity = .optional },
         },
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r1 = try parse(testing.allocator, cmd, &.{ "a", "b" }, &sink);
@@ -866,7 +866,7 @@ test "missing-required option and positional both reported" {
         .options = &.{.{ .long = "out", .short = 'o', .value = .string, .required = true }},
         .positionals = &.{.{ .name = "input", .value = .string }},
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{}, &sink);
@@ -881,7 +881,7 @@ test "missing-required option and positional both reported" {
 
 test "missing_value when a value-taking option ends argv" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "in.zig", "--jobs" }, &sink);
@@ -895,7 +895,7 @@ test "help short-circuits: -h short, --help long, before required checks" {
         .name = "toy",
         .options = &.{.{ .long = "out", .value = .string, .required = true }},
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var rs = try parse(testing.allocator, cmd, &.{"-h"}, &sink);
@@ -917,7 +917,7 @@ test "version short-circuits: -V and --version, before required checks" {
         .name = "toy",
         .options = &.{.{ .long = "out", .value = .string, .required = true }},
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var rs = try parse(testing.allocator, cmd, &.{"-V"}, &sink);
@@ -940,7 +940,7 @@ test "conflict and unmet_requirement reported from the sweep" {
             .{ .long = "y", .value = .boolean },
         },
     };
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "--a", "--b", "--x" }, &sink);
@@ -958,7 +958,7 @@ test "conflict and unmet_requirement reported from the sweep" {
 
 test "ok path leaks nothing: deinit frees the arena under testing.allocator" {
     const cmd = comptime repCmd();
-    var sink: Sink.Sink = .{};
+    var sink: Sink = .{};
     defer sink.deinit(testing.allocator);
 
     var r = try parse(testing.allocator, cmd, &.{ "-D", "x", "a.zig", "b.zig" }, &sink);

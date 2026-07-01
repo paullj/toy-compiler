@@ -1,15 +1,16 @@
-//! Standalone CLI error accumulator: collects parse errors without printing or
-//! exiting (mirrors the diagnostics Sink discipline, but simpler). The parser
-//! feeds errors in as it walks argv; rendering and process exit happen elsewhere,
-//! so this leaf pulls in nothing but `std`.
-//!
-//! Every string field on `Error` is BORROWED — a slice into argv or a static
-//! literal the parser hands over. The Sink allocates NO strings, so there is
-//! nothing per-error to free and no owned-string bookkeeping. The lifetime
-//! contract is the caller's: argv and any static strings must outlive the Sink,
-//! because `items()` returns those same borrowed slices.
+//! Exit-free CLI error accumulator: the parser feeds parse errors in as it walks
+//! argv; rendering and process exit happen elsewhere, so this leaf pulls in only
+//! `std`. Every `Error` string is BORROWED (a slice into argv or a static
+//! literal), so the Sink allocates none and argv must outlive it.
 
 const std = @import("std");
+
+const Sink = @This();
+
+/// Unmanaged accumulator: the backing list starts `.empty` and every method that
+/// can allocate takes the gpa per call, so a caller can hold a Sink by value with
+/// no init step (`var s: Sink = .{};`).
+list: std.ArrayList(Error) = .empty,
 
 pub const Kind = enum {
     unknown_flag,
@@ -32,43 +33,36 @@ pub const Error = struct {
     where: []const u8 = "",
 };
 
-/// Unmanaged accumulator: the backing list starts `.empty` and every method that
-/// can allocate takes the gpa per call, so a caller can hold a Sink by value with
-/// no init step (`var s: Sink = .{};`).
-pub const Sink = struct {
-    list: std.ArrayList(Error) = .empty,
+/// Append preserving insertion order. Errors surface in the sequence the parser
+/// encountered them, which is the order the caller will render.
+pub fn add(self: *Sink, gpa: std.mem.Allocator, e: Error) !void {
+    try self.list.append(gpa, e);
+}
 
-    /// Append preserving insertion order. Errors surface in the sequence the
-    /// parser encountered them, which is the order the caller will render.
-    pub fn add(self: *Sink, gpa: std.mem.Allocator, e: Error) !void {
-        try self.list.append(gpa, e);
-    }
+/// Free the backing list exactly once. There are no owned strings to free —
+/// every `Error` field is borrowed.
+pub fn deinit(self: *Sink, gpa: std.mem.Allocator) void {
+    self.list.deinit(gpa);
+    self.* = undefined;
+}
 
-    /// Free the backing list exactly once. There are no owned strings to free —
-    /// every `Error` field is borrowed.
-    pub fn deinit(self: *Sink, gpa: std.mem.Allocator) void {
-        self.list.deinit(gpa);
-        self.* = undefined;
-    }
+/// Drop all accumulated errors while keeping the allocation, so a reused Sink
+/// avoids a re-grow. No free — nothing here owns heap beyond the list itself.
+pub fn reset(self: *Sink) void {
+    self.list.clearRetainingCapacity();
+}
 
-    /// Drop all accumulated errors while keeping the allocation, so a reused Sink
-    /// avoids a re-grow. No free — nothing here owns heap beyond the list itself.
-    pub fn reset(self: *Sink) void {
-        self.list.clearRetainingCapacity();
-    }
+pub fn count(self: Sink) usize {
+    return self.list.items.len;
+}
 
-    pub fn count(self: Sink) usize {
-        return self.list.items.len;
-    }
+pub fn items(self: Sink) []const Error {
+    return self.list.items;
+}
 
-    pub fn items(self: Sink) []const Error {
-        return self.list.items;
-    }
-
-    pub fn isEmpty(self: Sink) bool {
-        return self.list.items.len == 0;
-    }
-};
+pub fn isEmpty(self: Sink) bool {
+    return self.list.items.len == 0;
+}
 
 // ---- tests -----------------------------------------------------------------
 
