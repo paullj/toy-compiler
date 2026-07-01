@@ -117,13 +117,13 @@ fn bindNamespaces(
 ) !void {
     if (m.nodes.len == 0) return;
     const tree = m.tree();
-    const prog = m.nodes[Ast.root(m.nodes)];
+    const prog = m.nodes[Ast.root(m.nodes).int()];
     if (prog.tag != .program) return;
-    for (Ast.rangeSlice(tree, prog.lhs)) |decl_idx| {
-        const decl = m.nodes[decl_idx];
+    for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
+        const decl = m.nodes[decl_idx.int()];
         if (decl.tag != .import_decl) continue;
         const target = importTarget(graph, m, decl) orelse continue;
-        const ns_tok = if (decl.rhs != Ast.none) decl.rhs else decl.main_token;
+        const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |alias| alias.int() else decl.main_token;
         const ns_name = m.tokens[ns_tok].text(m.source);
         // First binding wins (resolve_graph already diagnosed collisions).
         const gop = try mc.namespaces.getOrPut(gpa, ns_name);
@@ -135,11 +135,11 @@ fn bindNamespaces(
 /// `/`-joined path, match a module's canonical name), or null if unresolved.
 fn importTarget(graph: *const Graph.Graph, m: *const Graph.Module, decl: Ast.Node) ?u32 {
     const tree = m.tree();
-    const segs = Ast.rangeSlice(tree, decl.lhs);
+    const segs = Ast.importPathToks(tree, decl);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var len: usize = 0;
     for (segs, 0..) |seg, i| {
-        const txt = m.tokens[seg].text(m.source);
+        const txt = m.tokens[seg.int()].text(m.source);
         if (i != 0) {
             if (len >= buf.len) return null;
             buf[len] = '/';
@@ -216,7 +216,7 @@ fn modId(g: *const Graph.Graph, path: []const u8) u32 {
 
 /// Find the (first) node of a tag in a module.
 fn nodeOfTag(g: *const Graph.Graph, mod: u32, tag: Ast.Node.Tag) Ast.Index {
-    for (g.modules[mod].nodes, 0..) |n, i| if (n.tag == tag) return @intCast(i);
+    for (g.modules[mod].nodes, 0..) |n, i| if (n.tag == tag) return Ast.Index.from(@intCast(i));
     unreachable;
 }
 
@@ -239,7 +239,7 @@ test "cross-module call typechecks clean and yields the callee return type" {
             const entry = modId(g, "main");
             // The call node's inferred type is int (helper's return).
             const call = nodeOfTag(g, entry, .call);
-            try testing.expectEqual(Typecheck.Kind.int, tr.node_types[entry][call].kind);
+            try testing.expectEqual(Typecheck.Kind.int, tr.node_types[entry][call.int()].kind);
         }
     };
     try withCheckedGraph(".toy-test-typ-xcall", files, "main.toy", Check.run);

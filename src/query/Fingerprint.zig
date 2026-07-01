@@ -115,8 +115,8 @@ const Built = struct {
 
     /// The fn_decl node index of the `idx`-th top-level function (source order).
     fn fnDecl(self: *const Built, idx: usize) Ast.Index {
-        const prog = self.tree.nodes[Ast.root(self.tree.nodes)];
-        return Ast.rangeSlice(self.tree, prog.lhs)[idx];
+        const prog = self.tree.nodes[Ast.root(self.tree.nodes).int()];
+        return Ast.rangeSlice(self.tree, prog.lhs.int())[idx];
     }
 };
 

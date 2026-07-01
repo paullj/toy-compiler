@@ -324,8 +324,8 @@ pub fn lowerGraphProgram(
     // Parameters on main are unsupported (codegen also guards; cleaner up front).
     {
         const em = &graph.modules[graph.entry_index];
-        const main_decl = em.nodes[res.fns[eid].decl_node];
-        const main_proto = Ast.protoAt(em.tree(), main_decl.lhs);
+        const main_decl = em.nodes[res.fns[eid].decl_node.int()];
+        const main_proto = Ast.protoAt(em.tree(), main_decl.lhs.int());
         if (main_proto.params.len > 0) return .{ .err = .{
             .message = "parameters on main unsupported in M1 codegen",
             .byte_offset = em.tokens[main_decl.main_token].start,

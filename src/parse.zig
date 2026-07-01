@@ -159,7 +159,8 @@ fn buildPubBits(p: *Parser, node_count: usize) Error![]u32 {
     const bits = try p.gpa.alloc(u32, words);
     @memset(bits, 0);
     for (p.pub_decls.items) |idx| {
-        bits[idx >> 5] |= @as(u32, 1) << @intCast(idx & 31);
+        const i = idx.int();
+        bits[i >> 5] |= @as(u32, 1) << @intCast(i & 31);
     }
     return bits;
 }
@@ -170,24 +171,32 @@ fn buildPubBits(p: *Parser, node_count: usize) Error![]u32 {
 /// `/` appears ONLY here; `.` only in access — so there is no parse ambiguity.
 fn parseImport(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_import, "expected 'import'");
-    var segs: std.ArrayList(u32) = .empty;
+    var segs: std.ArrayList(Ast.TokIndex) = .empty;
     defer segs.deinit(p.gpa);
     const first = p.index;
     try p.expect(.identifier, "expected a module path after 'import'");
-    try segs.append(p.gpa, first);
+    try segs.append(p.gpa, Ast.TokIndex.from(first));
     while (p.eat(.slash)) {
         const seg = p.index;
         try p.expect(.identifier, "expected a path segment after '/'");
-        try segs.append(p.gpa, seg);
+        try segs.append(p.gpa, Ast.TokIndex.from(seg));
     }
-    var alias: Ast.Index = Ast.none;
+    var alias: Ast.TokIndex = Ast.TokIndex.none;
     if (p.eat(.kw_as)) {
-        alias = p.index;
+        alias = Ast.TokIndex.from(p.index);
         try p.expect(.identifier, "expected an alias name after 'as'");
     }
     const last_seg = segs.items[segs.items.len - 1];
-    const header = try p.addRange(segs.items);
-    return p.addNode(.{ .tag = .import_decl, .main_token = last_seg, .lhs = header, .rhs = alias });
+    const header = try p.addTokRange(segs.items);
+    // The lhs holds a range header (a node-index slot by field type), and rhs
+    // holds the alias TOKEN index; both are stored in the `Index` fields but the
+    // decoders (`Ast.importPathToks`/`Ast.importAliasTok`) read them as tokens.
+    return p.addNode(.{
+        .tag = .import_decl,
+        .main_token = last_seg.int(),
+        .lhs = header,
+        .rhs = Ast.Index.from(alias.int()),
+    });
 }
 
 fn parseFnDecl(p: *Parser) Error!Ast.Index {
@@ -218,8 +227,9 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
 
     // Write the params run, then the fixed 3-cell FnProto immediately after.
     const params_start: u32 = @intCast(p.extra.items.len);
-    try p.extra.appendSlice(p.gpa, params.items);
-    const proto_header = try p.addExtra(&.{ ret_type, params_start, @intCast(params.items.len) });
+    const param_cells: []const u32 = @ptrCast(params.items);
+    try p.extra.appendSlice(p.gpa, param_cells);
+    const proto_header = try p.addExtra(&.{ ret_type.int(), params_start, @intCast(params.items.len) });
 
     return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
 }
@@ -347,7 +357,7 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
         const arrow = p.index;
         try p.expect(.arrow, "expected '->' after a match pattern");
         const body = try p.parseExpr(0);
-        const arm_hdr = try p.addExtra(&.{ guard, body });
+        const arm_hdr = try p.addExtra(&.{ guard.int(), body.int() });
         const arm = try p.addNode(.{ .tag = .match_arm, .main_token = arrow, .lhs = pat, .rhs = arm_hdr });
         try arms.append(p.gpa, arm);
         _ = p.eat(.comma);
@@ -365,7 +375,7 @@ fn parsePattern(p: *Parser) Error!Ast.Index {
     if (!p.at(.pipe)) return first;
     var alts: std.ArrayList(Ast.Index) = .empty;
     defer alts.deinit(p.gpa);
-    const first_tok = p.nodes.items[first].main_token;
+    const first_tok = p.nodes.items[first.int()].main_token;
     try alts.append(p.gpa, first);
     while (p.eat(.pipe)) {
         try alts.append(p.gpa, try p.parseSubPattern());
@@ -581,19 +591,20 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             const break_tok = p.index;
             p.bump(.kw_break);
             // A `@name` label may immediately follow `break`; parse it BEFORE the
-            // value-terminator decision (the documented ordering hazard).
+            // value-terminator decision (the documented ordering hazard). The label
+            // is a TOKEN index that overloads the (node-typed) `rhs` slot.
             const label_tok = try p.parseOptLabel();
             const expr: Ast.Index = switch (p.peek().tag) {
                 .newline, .r_brace, .eof => Ast.none,
                 else => try p.parseExpr(0),
             };
-            return p.addNode(.{ .tag = .break_stmt, .main_token = break_tok, .lhs = expr, .rhs = label_tok });
+            return p.addNode(.{ .tag = .break_stmt, .main_token = break_tok, .lhs = expr, .rhs = Ast.Index.from(label_tok.int()) });
         },
         .kw_continue => {
             const continue_tok = p.index;
             p.bump(.kw_continue);
             const label_tok = try p.parseOptLabel();
-            return p.addNode(.{ .tag = .continue_stmt, .main_token = continue_tok, .lhs = Ast.none, .rhs = label_tok });
+            return p.addNode(.{ .tag = .continue_stmt, .main_token = continue_tok, .lhs = Ast.none, .rhs = Ast.Index.from(label_tok.int()) });
         },
         // `@label <construct>` as a statement routes through parseExprStmt (like a
         // bare `loop`/`if`/block), so a trailing labeled loop/block is wrapped in an
@@ -681,19 +692,19 @@ fn parseIf(p: *Parser) Error!Ast.Index {
     if (p.eat(.kw_else)) {
         else_node = if (p.at(.kw_if)) try p.parseIf() else try p.parseBlock();
     }
-    const header = try p.addExtra(&.{ then_block, else_node });
+    const header = try p.addExtra(&.{ then_block.int(), else_node.int() });
     return p.addNode(.{ .tag = .if_stmt, .main_token = if_tok, .lhs = cond, .rhs = header });
 }
 
-/// If the cursor is at `@name`, consume both and return the identifier token
-/// index; otherwise consume nothing and return `Ast.none`. Used for the optional
-/// label on `break`/`continue`.
-fn parseOptLabel(p: *Parser) Error!Ast.Index {
-    if (!p.at(.at)) return Ast.none;
+/// If the cursor is at `@name`, consume both and return the identifier TOKEN
+/// index; otherwise consume nothing and return `TokIndex.none`. Used for the
+/// optional label on `break`/`continue` (a token-overloaded slot).
+fn parseOptLabel(p: *Parser) Error!Ast.TokIndex {
+    if (!p.at(.at)) return Ast.TokIndex.none;
     p.bump(.at);
     const name_tok = p.index;
     try p.expect(.identifier, "expected a label name after '@'");
-    return name_tok;
+    return Ast.TokIndex.from(name_tok);
 }
 
 /// `@name <loop|while|for|block>`: a label prefixed onto a block-like construct.
@@ -734,7 +745,7 @@ fn parseFor(p: *Parser) Error!Ast.Index {
     const hi = try p.parseExpr(0);
     nb.end();
     const body = try p.parseBlock(); // re-arms no_block internally
-    const header = try p.addExtra(&.{ lo, hi }); // children before parent
+    const header = try p.addExtra(&.{ lo.int(), hi.int() }); // children before parent
     return p.addNode(.{ .tag = .for_stmt, .main_token = ident_tok, .lhs = body, .rhs = header });
 }
 
@@ -840,7 +851,7 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             .l_paren => {
                 // An inferred `.V` followed by `(args)` is a tuple-variant
                 // construction; rebuild it in place (keep main_token / lhs=none).
-                if (p.nodes.items[lhs].tag == .enum_init_unit and p.nodes.items[lhs].lhs == Ast.none) {
+                if (p.nodes.items[lhs.int()].tag == .enum_init_unit and p.nodes.items[lhs.int()].lhs == Ast.none) {
                     const rebuilt = try p.upgradeTupleInit(lhs, Ast.none);
                     lhs = rebuilt;
                 } else {
@@ -855,10 +866,10 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             // group `( )` reset `no_block`, so `f(P{x:1})` works.
             .l_brace => {
                 if (p.no_block) break;
-                const ltag = p.nodes.items[lhs].tag;
+                const ltag = p.nodes.items[lhs.int()].tag;
                 switch (ltag) {
                     .identifier => lhs = try p.parseStructLiteral(lhs),
-                    .enum_init_unit => if (p.nodes.items[lhs].lhs == Ast.none) {
+                    .enum_init_unit => if (p.nodes.items[lhs.int()].lhs == Ast.none) {
                         lhs = try p.upgradeStructInit(lhs, Ast.none);
                     } else break,
                     // Qualified `N.V { ... }`: the type-name is the field_access's
@@ -889,8 +900,8 @@ fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast
     }
     try p.expect(.r_paren, "expected ')' to close a variant construction");
     const header = try p.addRange(args.items);
-    const vtok = p.nodes.items[node].main_token;
-    p.nodes.items[node] = .{ .tag = .enum_init_tuple, .main_token = vtok, .lhs = type_name, .rhs = header };
+    const vtok = p.nodes.items[node.int()].main_token;
+    p.nodes.items[node.int()] = .{ .tag = .enum_init_tuple, .main_token = vtok, .lhs = type_name, .rhs = header };
     return node;
 }
 
@@ -901,8 +912,8 @@ fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast
 fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!Ast.Index {
     // For a qualified `N.V`, the node is the field_access: variant = its field
     // token, type-name = its receiver.
-    const vtok = p.nodes.items[node].main_token;
-    const type_name: Ast.Index = if (qualified == Ast.none) Ast.none else p.nodes.items[node].lhs;
+    const vtok = p.nodes.items[node.int()].main_token;
+    const type_name: Ast.Index = if (qualified == Ast.none) Ast.none else p.nodes.items[node.int()].lhs;
     p.bump(.l_brace);
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
@@ -925,7 +936,7 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
     }
     try p.expect(.r_brace, "expected '}' to close a variant construction");
     const header = try p.addRange(inits.items);
-    p.nodes.items[node] = .{ .tag = .enum_init_struct, .main_token = vtok, .lhs = type_name, .rhs = header };
+    p.nodes.items[node.int()] = .{ .tag = .enum_init_struct, .main_token = vtok, .lhs = type_name, .rhs = header };
     return node;
 }
 
@@ -1021,7 +1032,7 @@ fn leaf(p: *Parser, tag: Node.Tag, tok_index: u32) Error!Ast.Index {
 }
 
 fn addNode(p: *Parser, node: Node) Error!Ast.Index {
-    const idx: Ast.Index = @intCast(p.nodes.items.len);
+    const idx = Ast.Index.from(@intCast(p.nodes.items.len));
     // Zero the extern-struct padding before the node enters the cached blob
     // (see `token.zeroPad`).
     try p.nodes.append(p.gpa, token.zeroPad(Node, node));
@@ -1029,21 +1040,41 @@ fn addNode(p: *Parser, node: Node) Error!Ast.Index {
 }
 
 /// Append a run of node indices then a two-cell `{start, len}` header; return
-/// the header cell index (what the parent `Node` stores).
-fn addRange(p: *Parser, items: []const Ast.Index) Error!u32 {
+/// the header cell as an `Ast.Index` (what the parent `Node` stores in an lhs/rhs
+/// slot). The `Index` run is written into the `[]u32` `extra` verbatim — `Index`
+/// is `enum(u32)`, so the bytes are identical.
+fn addRange(p: *Parser, items: []const Ast.Index) Error!Ast.Index {
     const start: u32 = @intCast(p.extra.items.len);
-    try p.extra.appendSlice(p.gpa, items);
+    const cells: []const u32 = @ptrCast(items);
+    try p.extra.appendSlice(p.gpa, cells);
     const header: u32 = @intCast(p.extra.items.len);
     try p.extra.append(p.gpa, start);
     try p.extra.append(p.gpa, @intCast(items.len));
-    return header;
+    return Ast.Index.from(header);
 }
 
-/// Append raw cells; return the index of the first.
-fn addExtra(p: *Parser, vals: []const u32) Error!u32 {
+/// Like `addRange` but for a run of TOKEN indices (an `import_decl`'s path
+/// segments, which name tokens rather than child nodes). The header cell still
+/// lands in an `Index`-typed slot, so it is returned as an `Ast.Index`.
+fn addTokRange(p: *Parser, items: []const Ast.TokIndex) Error!Ast.Index {
+    const start: u32 = @intCast(p.extra.items.len);
+    const cells: []const u32 = @ptrCast(items);
+    try p.extra.appendSlice(p.gpa, cells);
+    const header: u32 = @intCast(p.extra.items.len);
+    try p.extra.append(p.gpa, start);
+    try p.extra.append(p.gpa, @intCast(items.len));
+    return Ast.Index.from(header);
+}
+
+/// Append raw `u32` cells; return the index of the first as an `Ast.Index` (the
+/// header always lands in an lhs/rhs slot). Cells are raw because a `FnProto`
+/// header mixes a node index (`ret_type`) with `extra` offsets
+/// (`params_start`/`params_len`); node-index cells are converted with `.int()`
+/// at the call site.
+fn addExtra(p: *Parser, vals: []const u32) Error!Ast.Index {
     const start: u32 = @intCast(p.extra.items.len);
     try p.extra.appendSlice(p.gpa, vals);
-    return start;
+    return Ast.Index.from(start);
 }
 
 // ---- cursor ----------------------------------------------------------------
@@ -1262,91 +1293,91 @@ test "root is program and children precede parents" {
     const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
     defer freeTree(gpa, tree);
 
-    try testing.expectEqual(Node.Tag.program, tree.nodes[Ast.root(tree.nodes)].tag);
+    try testing.expectEqual(Node.Tag.program, tree.nodes[Ast.root(tree.nodes).int()].tag);
     // Topological: every child node index is strictly less than its parent's.
     for (tree.nodes, 0..) |n, i| {
         const self: u32 = @intCast(i);
         switch (n.tag) {
-            .unary => try testing.expect(n.lhs < self),
+            .unary => try testing.expect(n.lhs.int() < self),
             .binary, .assign => {
-                try testing.expect(n.lhs < self);
-                try testing.expect(n.rhs < self);
+                try testing.expect(n.lhs.int() < self);
+                try testing.expect(n.rhs.int() < self);
             },
-            .var_decl, .expr_stmt => try testing.expect(n.lhs < self),
-            .return_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs < self),
-            .param => try testing.expect(n.lhs < self),
+            .var_decl, .expr_stmt => try testing.expect(n.lhs.int() < self),
+            .return_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
+            .param => try testing.expect(n.lhs.int() < self),
             .call => {
-                try testing.expect(n.lhs < self);
-                for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+                try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
-            .block => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
-            .program => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            .block => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
+            .program => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             .fn_decl => {
-                const proto = Ast.protoAt(tree, n.lhs);
-                if (proto.ret_type != Ast.none) try testing.expect(proto.ret_type < self);
-                for (proto.params) |c| try testing.expect(c < self);
-                try testing.expect(n.rhs < self);
+                const proto = Ast.protoAt(tree, n.lhs.int());
+                if (proto.ret_type != Ast.none) try testing.expect(proto.ret_type.int() < self);
+                for (proto.params) |c| try testing.expect(c.int() < self);
+                try testing.expect(n.rhs.int() < self);
             },
             .while_stmt => {
-                try testing.expect(n.lhs < self);
-                try testing.expect(n.rhs < self);
+                try testing.expect(n.lhs.int() < self);
+                try testing.expect(n.rhs.int() < self);
             },
             .if_stmt => {
-                try testing.expect(n.lhs < self);
-                const h = Ast.ifHeaderAt(tree, n.rhs);
-                try testing.expect(h.then_block < self);
-                if (h.else_node != Ast.none) try testing.expect(h.else_node < self);
+                try testing.expect(n.lhs.int() < self);
+                const h = Ast.ifHeaderAt(tree, n.rhs.int());
+                try testing.expect(h.then_block.int() < self);
+                if (h.else_node != Ast.none) try testing.expect(h.else_node.int() < self);
             },
             .literal_unit => {},
-            .loop_expr => try testing.expect(n.lhs < self),
+            .loop_expr => try testing.expect(n.lhs.int() < self),
             .for_stmt => {
-                try testing.expect(n.lhs < self);
-                const h = Ast.forHeaderAt(tree, n.rhs);
-                try testing.expect(h.lo < self);
-                try testing.expect(h.hi < self);
+                try testing.expect(n.lhs.int() < self);
+                const h = Ast.forHeaderAt(tree, n.rhs.int());
+                try testing.expect(h.lo.int() < self);
+                try testing.expect(h.hi.int() < self);
             },
             // break/continue overload `rhs` as a *token* index (the label), so
             // only `lhs` (the value expr) is a child node to check.
-            .break_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs < self),
+            .break_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             .continue_stmt => {},
-            .labeled => try testing.expect(n.lhs < self),
-            .struct_decl => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            .labeled => try testing.expect(n.lhs.int() < self),
+            .struct_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             .struct_init => {
-                try testing.expect(n.lhs < self);
-                for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+                try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
-            .field_init => try testing.expect(n.lhs < self),
-            .field_access => try testing.expect(n.lhs < self),
+            .field_init => try testing.expect(n.lhs.int() < self),
+            .field_access => try testing.expect(n.lhs.int() < self),
             // Leaves: `main_token` only; no child node indices to order.
             .literal_number, .literal_string, .literal_bool, .identifier => {},
-            .enum_decl => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            .enum_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             .enum_variant_unit => {},
-            .enum_variant_tuple, .enum_variant_struct => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
-            .enum_init_unit => if (n.lhs != Ast.none) try testing.expect(n.lhs < self),
+            .enum_variant_tuple, .enum_variant_struct => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
+            .enum_init_unit => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             .enum_init_tuple, .enum_init_struct => {
-                if (n.lhs != Ast.none) try testing.expect(n.lhs < self);
-                for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+                if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
             .match_expr => {
-                try testing.expect(n.lhs < self);
-                for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+                try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
             .match_arm => {
-                try testing.expect(n.lhs < self);
-                const h = Ast.armHeaderAt(tree, n.rhs);
-                if (h.guard != Ast.none) try testing.expect(h.guard < self);
-                try testing.expect(h.body < self);
+                try testing.expect(n.lhs.int() < self);
+                const h = Ast.armHeaderAt(tree, n.rhs.int());
+                if (h.guard != Ast.none) try testing.expect(h.guard.int() < self);
+                try testing.expect(h.body.int() < self);
             },
             .pattern_variant => {
-                if (n.lhs != Ast.none) try testing.expect(n.lhs < self);
-                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs)) |c| try testing.expect(c < self);
+                if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self);
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
             .pattern_wildcard, .pattern_literal => {},
             .pattern_binding => {
-                if (n.lhs != Ast.none) try testing.expect(n.lhs < self);
-                if (n.rhs != Ast.none) try testing.expect(n.rhs < self);
+                if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self);
+                if (n.rhs != Ast.none) try testing.expect(n.rhs.int() < self);
             },
-            .pattern_or => for (Ast.rangeSlice(tree, n.lhs)) |c| try testing.expect(c < self),
+            .pattern_or => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             // `import_decl` overloads `lhs`/`rhs` as TOKEN indices (path segments,
             // alias) like break/continue — no node children to order.
             .import_decl => {},
@@ -1764,7 +1795,7 @@ test "import pack/unpack byte round-trip carries pub_bits" {
     // Exactly the `area` fn_decl node is pub; `helper` is not.
     var pub_count: usize = 0;
     for (tree.nodes, 0..) |node, i| {
-        if (node.tag == .fn_decl and tree.isPub(@intCast(i))) pub_count += 1;
+        if (node.tag == .fn_decl and tree.isPub(Ast.Index.from(@intCast(i)))) pub_count += 1;
     }
     try testing.expectEqual(@as(usize, 1), pub_count);
 

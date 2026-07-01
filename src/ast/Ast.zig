@@ -26,8 +26,47 @@ const Token = @import("Token.zig").Token;
 
 /// Index into the node array. `none` marks an absent child (e.g. a leaf's
 /// operands, or a bare `return`'s missing expression).
-pub const Index = u32;
-pub const none: Index = std.math.maxInt(Index);
+///
+/// A distinct `enum(u32)` newtype rather than a bare `u32`, so a slot that holds
+/// a NODE index cannot be silently confused with a slot that holds a TOKEN index
+/// (see `TokIndex`) or with the raw `u32` cells in the `extra` blob. The wire
+/// layout is unchanged: `enum(u32){none=maxInt,_}` is layout-compatible with the
+/// old `u32` (same size, same `none` sentinel bit-pattern), so cached blobs
+/// round-trip identically. Convert only at true boundaries — `.int()` to index
+/// the nodes array or write a cell, `Index.from()` to read one back.
+pub const Index = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+    pub fn from(i: u32) Index {
+        return @enumFromInt(i);
+    }
+    pub fn int(self: Index) u32 {
+        return @intFromEnum(self);
+    }
+    pub fn unwrap(self: Index) ?Index {
+        return if (self == .none) null else self;
+    }
+};
+pub const none: Index = Index.none;
+
+/// A TOKEN index stored in an lhs/rhs slot (as opposed to the usual NODE index).
+/// A handful of tags overload a slot to name a token rather than a child node:
+/// `break_stmt`/`continue_stmt`'s label, `import_decl`'s alias, and the segment
+/// cells of an `import_decl`'s path range. Giving those a distinct newtype makes
+/// a token-vs-node mixup a compile error. Same wire layout as `Index`/`u32`.
+pub const TokIndex = enum(u32) {
+    none = std.math.maxInt(u32),
+    _,
+    pub fn from(i: u32) TokIndex {
+        return @enumFromInt(i);
+    }
+    pub fn int(self: TokIndex) u32 {
+        return @intFromEnum(self);
+    }
+    pub fn unwrap(self: TokIndex) ?TokIndex {
+        return if (self == .none) null else self;
+    }
+};
 
 pub const Node = extern struct {
     tag: Tag,
@@ -256,9 +295,10 @@ pub const Tree = struct {
     /// Whether the decl node at `idx` carries `pub`. Out-of-range (or an empty
     /// bitset) reads as `false`.
     pub fn isPub(tree: Tree, idx: Index) bool {
-        const word = idx >> 5;
+        const i = idx.int();
+        const word = i >> 5;
         if (word >= tree.pub_bits.len) return false;
-        return (tree.pub_bits[word] >> @intCast(idx & 31)) & 1 != 0;
+        return (tree.pub_bits[word] >> @intCast(i & 31)) & 1 != 0;
     }
 };
 
@@ -287,36 +327,65 @@ pub fn rangeAt(tree: Tree, header: u32) Range {
 }
 
 /// The slice of child node indices described by the range header at `header`.
+/// The `extra` cells are raw `u32`s that ARE node indices, so reinterpret the run
+/// as `[]const Index` — layout-identical since `Index` is `enum(u32)`.
 pub fn rangeSlice(tree: Tree, header: u32) []const Index {
     const r = rangeAt(tree, header);
-    return tree.extra[r.start .. r.start + r.len]; // u32 == Index
+    return @ptrCast(tree.extra[r.start .. r.start + r.len]);
 }
 
 /// Decode the 2-cell `if_stmt` header at `header`: `{then_block, else_node}`.
 pub fn ifHeaderAt(tree: Tree, header: u32) struct { then_block: Index, else_node: Index } {
-    return .{ .then_block = tree.extra[header], .else_node = tree.extra[header + 1] };
+    return .{ .then_block = Index.from(tree.extra[header]), .else_node = Index.from(tree.extra[header + 1]) };
 }
 
 /// Decode the 2-cell `for_stmt` range header at `header`: `{lo, hi}`.
 pub fn forHeaderAt(tree: Tree, header: u32) struct { lo: Index, hi: Index } {
-    return .{ .lo = tree.extra[header], .hi = tree.extra[header + 1] };
+    return .{ .lo = Index.from(tree.extra[header]), .hi = Index.from(tree.extra[header + 1]) };
 }
 
 /// Decode the 2-cell `match_arm` header at `header`: `{guard, body}`.
 pub fn armHeaderAt(tree: Tree, header: u32) struct { guard: Index, body: Index } {
-    return .{ .guard = tree.extra[header], .body = tree.extra[header + 1] };
+    return .{ .guard = Index.from(tree.extra[header]), .body = Index.from(tree.extra[header + 1]) };
 }
 
 /// Decode the `FnProto` header at `header`.
 pub fn protoAt(tree: Tree, header: u32) FnProto {
     const ps = tree.extra[header + 1];
     const pl = tree.extra[header + 2];
-    return .{ .ret_type = tree.extra[header], .params = tree.extra[ps .. ps + pl] };
+    return .{ .ret_type = Index.from(tree.extra[header]), .params = @ptrCast(tree.extra[ps .. ps + pl]) };
 }
 
 /// The root (top-level) node of a non-empty tree — by construction the last.
 pub fn root(nodes: []const Node) Index {
-    return @intCast(nodes.len - 1);
+    return Index.from(@intCast(nodes.len - 1));
+}
+
+// ---- token-overloaded slot accessors ---------------------------------------
+//
+// A few tags store a TOKEN index in an lhs/rhs slot instead of a child node
+// index (see the `break_stmt`/`continue_stmt`/`import_decl` doc comments). The
+// slot's storage is still an `Index` field, but these accessors reinterpret it
+// as a `TokIndex` so downstream code that means "token" cannot accidentally feed
+// the value back into a node-index API (and vice versa).
+
+/// The `@label` token of a `break_stmt`/`continue_stmt` (in the `rhs` slot), or
+/// `TokIndex.none` when unlabeled.
+pub fn labelTok(node: Node) TokIndex {
+    return TokIndex.from(node.rhs.int());
+}
+
+/// The `as alias` token of an `import_decl` (in the `rhs` slot), or
+/// `TokIndex.none` when the import has no alias.
+pub fn importAliasTok(node: Node) TokIndex {
+    return TokIndex.from(node.rhs.int());
+}
+
+/// The `/`-separated path-segment TOKEN indices of an `import_decl`, decoded from
+/// the range header in its `lhs` slot. These are token indices, NOT node indices.
+pub fn importPathToks(tree: Tree, node: Node) []const TokIndex {
+    const r = rangeAt(tree, node.lhs.int());
+    return @ptrCast(tree.extra[r.start .. r.start + r.len]);
 }
 
 /// "TOYP" — a magic so a foreign/corrupt blob is treated as a cache miss.
@@ -418,7 +487,7 @@ pub fn render(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
 
 fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8, idx: Index) !void {
     const nodes = tree.nodes;
-    const n = nodes[idx];
+    const n = nodes[idx.int()];
     const tok_text = tokens[n.main_token].text(source);
     switch (n.tag) {
         .literal_number, .literal_string, .literal_bool, .identifier => try out.writeAll(tok_text),
@@ -438,7 +507,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .call => {
             try out.writeAll("(call ");
             try renderNode(out, tree, tokens, source, n.lhs);
-            for (rangeSlice(tree, n.rhs)) |arg| {
+            for (rangeSlice(tree, n.rhs.int())) |arg| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, arg);
             }
@@ -469,7 +538,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .expr_stmt => try renderNode(out, tree, tokens, source, n.lhs),
         .block => {
             try out.writeAll("(block");
-            for (rangeSlice(tree, n.lhs)) |stmt| {
+            for (rangeSlice(tree, n.lhs.int())) |stmt| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, stmt);
             }
@@ -481,7 +550,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeByte(')');
         },
         .fn_decl => {
-            const proto = protoAt(tree, n.lhs);
+            const proto = protoAt(tree, n.lhs.int());
             try out.print("(fn {s} (", .{tok_text});
             for (proto.params, 0..) |pidx, i| {
                 if (i != 0) try out.writeByte(' ');
@@ -499,7 +568,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .program => {
             try out.writeAll("(program");
-            for (rangeSlice(tree, n.lhs)) |decl_idx| {
+            for (rangeSlice(tree, n.lhs.int())) |decl_idx| {
                 try out.writeByte(' ');
                 // A `pub` decl renders as `(pub <decl>)` so the visibility surface
                 // is visible in the S-expression (and asserted by parse tests).
@@ -516,12 +585,12 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .import_decl => {
             try out.writeAll("(import");
             // Path segments are TOKEN indices in the range; render them `/`-joined.
-            for (rangeSlice(tree, n.lhs), 0..) |seg_tok, i| {
+            for (importPathToks(tree, n), 0..) |seg_tok, i| {
                 try out.writeByte(if (i == 0) ' ' else '/');
-                try out.writeAll(tokens[seg_tok].text(source));
+                try out.writeAll(tokens[seg_tok.int()].text(source));
             }
-            if (n.rhs != none) {
-                try out.print(" as {s}", .{tokens[n.rhs].text(source)});
+            if (importAliasTok(n).unwrap()) |alias| {
+                try out.print(" as {s}", .{tokens[alias.int()].text(source)});
             }
             try out.writeByte(')');
         },
@@ -533,7 +602,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeByte(')');
         },
         .if_stmt => {
-            const h = ifHeaderAt(tree, n.rhs);
+            const h = ifHeaderAt(tree, n.rhs.int());
             try out.writeAll("(if ");
             try renderNode(out, tree, tokens, source, n.lhs);
             try out.writeByte(' ');
@@ -550,7 +619,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeByte(')');
         },
         .for_stmt => {
-            const h = forHeaderAt(tree, n.rhs);
+            const h = forHeaderAt(tree, n.rhs.int());
             try out.print("(for {s} ", .{tok_text});
             try renderNode(out, tree, tokens, source, h.lo);
             try out.writeByte(' ');
@@ -561,8 +630,8 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .break_stmt => {
             try out.writeAll("(break");
-            if (n.rhs != none) {
-                try out.print(" @{s}", .{tokens[n.rhs].text(source)});
+            if (labelTok(n).unwrap()) |label| {
+                try out.print(" @{s}", .{tokens[label.int()].text(source)});
             }
             if (n.lhs != none) {
                 try out.writeByte(' ');
@@ -572,8 +641,8 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .continue_stmt => {
             try out.writeAll("(continue");
-            if (n.rhs != none) {
-                try out.print(" @{s}", .{tokens[n.rhs].text(source)});
+            if (labelTok(n).unwrap()) |label| {
+                try out.print(" @{s}", .{tokens[label.int()].text(source)});
             }
             try out.writeByte(')');
         },
@@ -584,7 +653,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .struct_decl => {
             try out.print("(struct {s}", .{tok_text});
-            for (rangeSlice(tree, n.lhs)) |field| {
+            for (rangeSlice(tree, n.lhs.int())) |field| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, field);
             }
@@ -593,7 +662,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .struct_init => {
             try out.writeAll("(new ");
             try renderNode(out, tree, tokens, source, n.lhs);
-            for (rangeSlice(tree, n.rhs)) |fi| {
+            for (rangeSlice(tree, n.rhs.int())) |fi| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, fi);
             }
@@ -611,7 +680,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .enum_decl => {
             try out.print("(enum {s}", .{tok_text});
-            for (rangeSlice(tree, n.lhs)) |v| {
+            for (rangeSlice(tree, n.lhs.int())) |v| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, v);
             }
@@ -620,7 +689,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .enum_variant_unit => try out.print("(variant.unit {s})", .{tok_text}),
         .enum_variant_tuple => {
             try out.print("(variant.tuple {s}", .{tok_text});
-            for (rangeSlice(tree, n.lhs)) |ty| {
+            for (rangeSlice(tree, n.lhs.int())) |ty| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, ty);
             }
@@ -628,7 +697,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .enum_variant_struct => {
             try out.print("(variant.struct {s}", .{tok_text});
-            for (rangeSlice(tree, n.lhs)) |f| {
+            for (rangeSlice(tree, n.lhs.int())) |f| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, f);
             }
@@ -649,7 +718,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
                 try renderNode(out, tree, tokens, source, n.lhs);
             }
             try out.print(" {s}", .{tok_text});
-            for (rangeSlice(tree, n.rhs)) |a| {
+            for (rangeSlice(tree, n.rhs.int())) |a| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, a);
             }
@@ -662,7 +731,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
                 try renderNode(out, tree, tokens, source, n.lhs);
             }
             try out.print(" {s}", .{tok_text});
-            for (rangeSlice(tree, n.rhs)) |fi| {
+            for (rangeSlice(tree, n.rhs.int())) |fi| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, fi);
             }
@@ -671,14 +740,14 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .match_expr => {
             try out.writeAll("(match ");
             try renderNode(out, tree, tokens, source, n.lhs);
-            for (rangeSlice(tree, n.rhs)) |arm| {
+            for (rangeSlice(tree, n.rhs.int())) |arm| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, arm);
             }
             try out.writeByte(')');
         },
         .match_arm => {
-            const h = armHeaderAt(tree, n.rhs);
+            const h = armHeaderAt(tree, n.rhs.int());
             try out.writeAll("(arm ");
             try renderNode(out, tree, tokens, source, n.lhs);
             if (h.guard != none) {
@@ -697,7 +766,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             }
             try out.print(" {s}", .{tok_text});
             if (n.rhs != none) {
-                for (rangeSlice(tree, n.rhs)) |b| {
+                for (rangeSlice(tree, n.rhs.int())) |b| {
                     try out.writeByte(' ');
                     try renderNode(out, tree, tokens, source, b);
                 }
@@ -720,7 +789,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .pattern_literal => try out.print("(lit {s})", .{tok_text}),
         .pattern_or => {
             try out.writeAll("(por");
-            for (rangeSlice(tree, n.lhs)) |a| {
+            for (rangeSlice(tree, n.lhs.int())) |a| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, a);
             }
@@ -743,26 +812,26 @@ test "rangeSlice and protoAt accessors round-trip on a hand-built tree" {
         .{ .tag = .param, .main_token = 0, .lhs = none, .rhs = none },
         .{ .tag = .identifier, .main_token = 0, .lhs = none, .rhs = none },
         .{ .tag = .block, .main_token = 0, .lhs = none, .rhs = none },
-        .{ .tag = .fn_decl, .main_token = 0, .lhs = 4, .rhs = 3 },
+        .{ .tag = .fn_decl, .main_token = 0, .lhs = Index.from(4), .rhs = Index.from(3) },
     };
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
 
     const params = rangeSlice(tree, 2);
     try testing.expectEqual(@as(usize, 2), params.len);
-    try testing.expectEqual(@as(Index, 0), params[0]);
-    try testing.expectEqual(@as(Index, 1), params[1]);
+    try testing.expectEqual(Index.from(0), params[0]);
+    try testing.expectEqual(Index.from(1), params[1]);
 
     const proto = protoAt(tree, 4);
-    try testing.expectEqual(@as(Index, 2), proto.ret_type);
+    try testing.expectEqual(Index.from(2), proto.ret_type);
     try testing.expectEqual(@as(usize, 2), proto.params.len);
-    try testing.expectEqual(@as(Index, 1), proto.params[1]);
+    try testing.expectEqual(Index.from(1), proto.params[1]);
 }
 
 test "pack/unpack byte round-trip" {
     const gpa = testing.allocator;
     var nodes = [_]Node{
         .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
-        .{ .tag = .program, .main_token = 0, .lhs = 0, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
     };
     var extra = [_]u32{ 0, 1, 0 };
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
@@ -785,7 +854,7 @@ test "renders the unit literal" {
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
     var buf: [16]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    try renderNode(&w, tree, &.{Token{ .tag = .l_paren, .start = 0, .end = 1 }}, "()", 0);
+    try renderNode(&w, tree, &.{Token{ .tag = .l_paren, .start = 0, .end = 1 }}, "()", Index.from(0));
     try testing.expectEqualStrings("()", w.buffered());
 }
 
@@ -803,8 +872,8 @@ test "contentFp ignores Node padding (cold-build fp determinism foundation)" {
     // padding must produce the SAME fp — otherwise the content-fp cache is inert
     // (permanent miss) or unsound (cross-build alias). Forge the padding via byte access.
     var a = [_]Node{
-        .{ .tag = .binary, .main_token = 1, .lhs = 0, .rhs = 2 },
-        .{ .tag = .program, .main_token = 0, .lhs = 0, .rhs = none },
+        .{ .tag = .binary, .main_token = 1, .lhs = Index.from(0), .rhs = Index.from(2) },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
     };
     var b = a;
     // Stamp differing garbage into the padding bytes (offsets 1..3 of each Node).

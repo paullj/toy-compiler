@@ -45,13 +45,13 @@ pub const Ctx = struct {
 // ---- Definite return -------------------------------------------------------
 
 pub fn blockReturns(ctx: Ctx, block_idx: Ast.Index) bool {
-    const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx].lhs);
+    const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int());
     if (stmts.len == 0) return false;
     return stmtReturns(ctx, stmts[stmts.len - 1]);
 }
 
 pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
-    const stmt = ctx.tree.nodes[stmt_idx];
+    const stmt = ctx.tree.nodes[stmt_idx.int()];
     return switch (stmt.tag) {
         .return_stmt => true,
         // A statement-position block/if is parsed wrapped in an `expr_stmt`; unwrap
@@ -60,11 +60,11 @@ pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
         .expr_stmt => stmtReturns(ctx, stmt.lhs),
         .block => blockReturns(ctx, stmt_idx),
         .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs);
+            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs.int());
             // An else-less `if` can be skipped, so it never guarantees a return.
             if (h.else_node == Ast.none) break :blk false;
             const then_ok = blockReturns(ctx, h.then_block);
-            const else_ok = if (ctx.tree.nodes[h.else_node].tag == .if_stmt)
+            const else_ok = if (ctx.tree.nodes[h.else_node.int()].tag == .if_stmt)
                 stmtReturns(ctx, h.else_node)
             else
                 blockReturns(ctx, h.else_node);
@@ -78,7 +78,7 @@ pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
         .loop_expr => loopDiverges(ctx, stmt_idx),
         // A labeled wrapper is transparent for definite-return: it returns iff its
         // inner construct does (a labeled bare block via its trailing stmt).
-        .labeled => stmtReturns(ctx, ctx.tree.nodes[stmt_idx].lhs),
+        .labeled => stmtReturns(ctx, ctx.tree.nodes[stmt_idx.int()].lhs),
         .for_stmt, .break_stmt, .continue_stmt => false,
         else => false,
     };
@@ -87,25 +87,25 @@ pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
 // ---- Break targeting -------------------------------------------------------
 
 pub fn loopDiverges(ctx: Ctx, loop_idx: Ast.Index) bool {
-    return !blockHasBreak(ctx, ctx.tree.nodes[loop_idx].lhs, loop_idx);
+    return !blockHasBreak(ctx, ctx.tree.nodes[loop_idx.int()].lhs, loop_idx);
 }
 
 pub fn blockHasBreak(ctx: Ctx, block_idx: Ast.Index, target: Ast.Index) bool {
-    for (Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx].lhs)) |s| {
+    for (Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int())) |s| {
         if (stmtHasBreak(ctx, s, target)) return true;
     }
     return false;
 }
 
 pub fn stmtHasBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
-    const stmt = ctx.tree.nodes[stmt_idx];
+    const stmt = ctx.tree.nodes[stmt_idx.int()];
     return switch (stmt.tag) {
         // A bare break (no label) binds to the innermost loop — counts only when
         // `target` IS the innermost loop, i.e. the bare break is found before any
         // nested loop swallows it (the nested-loop arms below stop the descent for
         // bare breaks). A labeled break counts iff its resolved target matches.
-        .break_stmt => if (ctx.resolutions[stmt_idx] == .label)
-            ctx.resolutions[stmt_idx].label == target
+        .break_stmt => if (ctx.resolutions[stmt_idx.int()] == .label)
+            ctx.resolutions[stmt_idx.int()].label == target
         else
             true,
         .expr_stmt => stmtHasBreak(ctx, stmt.lhs, target),
@@ -114,10 +114,10 @@ pub fn stmtHasBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
         // `break @target` may live inside a nested labeled loop).
         .labeled => stmtHasBreak(ctx, stmt.lhs, target),
         .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs);
+            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs.int());
             if (blockHasBreak(ctx, h.then_block, target)) break :blk true;
             if (h.else_node == Ast.none) break :blk false;
-            break :blk if (ctx.tree.nodes[h.else_node].tag == .if_stmt)
+            break :blk if (ctx.tree.nodes[h.else_node.int()].tag == .if_stmt)
                 stmtHasBreak(ctx, h.else_node, target)
             else
                 blockHasBreak(ctx, h.else_node, target);
@@ -125,39 +125,39 @@ pub fn stmtHasBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
         // A nested loop/for/while swallows BARE breaks, but a `break @target`
         // buried inside it still targets `target` — so descend its body and only
         // count labeled breaks that name `target`.
-        .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx].lhs, target),
-        .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx].rhs, target),
-        .for_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx].lhs, target),
+        .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
+        .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].rhs, target),
+        .for_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
         else => false,
     };
 }
 
 pub fn nestedHasLabeledBreak(ctx: Ctx, block_idx: Ast.Index, target: Ast.Index) bool {
-    for (Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx].lhs)) |s| {
+    for (Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int())) |s| {
         if (stmtHasLabeledBreak(ctx, s, target)) return true;
     }
     return false;
 }
 
 pub fn stmtHasLabeledBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
-    const stmt = ctx.tree.nodes[stmt_idx];
+    const stmt = ctx.tree.nodes[stmt_idx.int()];
     return switch (stmt.tag) {
-        .break_stmt => ctx.resolutions[stmt_idx] == .label and ctx.resolutions[stmt_idx].label == target,
+        .break_stmt => ctx.resolutions[stmt_idx.int()] == .label and ctx.resolutions[stmt_idx.int()].label == target,
         .expr_stmt => stmtHasLabeledBreak(ctx, stmt.lhs, target),
         .block => nestedHasLabeledBreak(ctx, stmt_idx, target),
         .labeled => stmtHasLabeledBreak(ctx, stmt.lhs, target),
         .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs);
+            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs.int());
             if (nestedHasLabeledBreak(ctx, h.then_block, target)) break :blk true;
             if (h.else_node == Ast.none) break :blk false;
-            break :blk if (ctx.tree.nodes[h.else_node].tag == .if_stmt)
+            break :blk if (ctx.tree.nodes[h.else_node.int()].tag == .if_stmt)
                 stmtHasLabeledBreak(ctx, h.else_node, target)
             else
                 nestedHasLabeledBreak(ctx, h.else_node, target);
         },
-        .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx].lhs, target),
-        .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx].rhs, target),
-        .for_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx].lhs, target),
+        .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
+        .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].rhs, target),
+        .for_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
         else => false,
     };
 }
@@ -165,22 +165,22 @@ pub fn stmtHasLabeledBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) boo
 // ---- Divergence ------------------------------------------------------------
 
 pub fn blockDiverges(ctx: Ctx, block_idx: Ast.Index) bool {
-    const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx].lhs);
+    const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int());
     if (stmts.len == 0) return false;
     return stmtDiverges(ctx, stmts[stmts.len - 1]);
 }
 
 pub fn stmtDiverges(ctx: Ctx, stmt_idx: Ast.Index) bool {
-    const stmt = ctx.tree.nodes[stmt_idx];
+    const stmt = ctx.tree.nodes[stmt_idx.int()];
     return switch (stmt.tag) {
         .return_stmt, .break_stmt, .continue_stmt => true,
         .expr_stmt => stmtDiverges(ctx, stmt.lhs),
         .block => blockDiverges(ctx, stmt_idx),
         .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs);
+            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs.int());
             if (h.else_node == Ast.none) break :blk false;
             const then_ok = blockDiverges(ctx, h.then_block);
-            const else_ok = if (ctx.tree.nodes[h.else_node].tag == .if_stmt)
+            const else_ok = if (ctx.tree.nodes[h.else_node.int()].tag == .if_stmt)
                 stmtDiverges(ctx, h.else_node)
             else
                 blockDiverges(ctx, h.else_node);
@@ -197,23 +197,23 @@ pub fn stmtDiverges(ctx: Ctx, stmt_idx: Ast.Index) bool {
 }
 
 pub fn matchDiverges(ctx: Ctx, node_idx: Ast.Index) bool {
-    const n = ctx.tree.nodes[node_idx];
-    const st = ctx.node_types[n.lhs];
+    const n = ctx.tree.nodes[node_idx.int()];
+    const st = ctx.node_types[n.lhs.int()];
     // Conservative for int/bool scrutinees: `return false` (loses only a
     // definite-return optimization, never miscompiles). Only enums get the
     // variant-coverage analysis here.
     if (!st.isEnum()) return false;
-    const arms = Ast.rangeSlice(ctx.tree, n.rhs);
+    const arms = Ast.rangeSlice(ctx.tree, n.rhs.int());
     if (arms.len == 0) return false;
     var has_wildcard = false;
     const e = ctx.enums[st.enum_id];
     var seen = [_]bool{false} ** 64; // enum variant count is small
     for (arms) |arm_idx| {
-        const arm = ctx.tree.nodes[arm_idx];
-        const h = Ast.armHeaderAt(ctx.tree, arm.rhs);
+        const arm = ctx.tree.nodes[arm_idx.int()];
+        const h = Ast.armHeaderAt(ctx.tree, arm.rhs.int());
         if (!stmtDiverges(ctx, h.body)) return false;
         if (h.guard != Ast.none) continue; // a guard can fail → no coverage
-        const pat = ctx.tree.nodes[arm.lhs];
+        const pat = ctx.tree.nodes[arm.lhs.int()];
         if (pat.tag == .pattern_wildcard) {
             has_wildcard = true;
         } else if (pat.tag == .pattern_variant) {
@@ -230,8 +230,8 @@ pub fn matchDiverges(ctx: Ctx, node_idx: Ast.Index) bool {
 }
 
 pub fn labeledDiverges(ctx: Ctx, idx: Ast.Index) bool {
-    const inner_idx = ctx.tree.nodes[idx].lhs;
-    const inner = ctx.tree.nodes[inner_idx];
+    const inner_idx = ctx.tree.nodes[idx.int()].lhs;
+    const inner = ctx.tree.nodes[inner_idx.int()];
     return switch (inner.tag) {
         .loop_expr => loopDiverges(ctx, inner_idx),
         .while_stmt, .for_stmt => false,
@@ -253,7 +253,7 @@ pub fn armDiverges(ctx: Ctx, node_idx: Ast.Index) bool {
 
 pub fn irrefutable(ctx: Ctx, pat_idx: Ast.Index, ty: Type) bool {
     if (ty.kind == .invalid) return true; // poison already reported; don't cascade a spurious miss
-    const pat = ctx.tree.nodes[pat_idx];
+    const pat = ctx.tree.nodes[pat_idx.int()];
     return switch (pat.tag) {
         .pattern_wildcard => true,
         .pattern_binding => pat.rhs == Ast.none or irrefutable(ctx, pat.rhs, ty),
@@ -273,8 +273,8 @@ pub fn irrefutable(ctx: Ctx, pat_idx: Ast.Index, ty: Type) bool {
 }
 
 pub fn variantPayloadIrrefutable(ctx: Ctx, pat_idx: Ast.Index, variant: VariantSym) bool {
-    const pat = ctx.tree.nodes[pat_idx];
-    const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(ctx.tree, pat.rhs);
+    const pat = ctx.tree.nodes[pat_idx.int()];
+    const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(ctx.tree, pat.rhs.int());
     switch (variant.form) {
         .unit => return binders.len == 0,
         .tuple => {
@@ -284,8 +284,8 @@ pub fn variantPayloadIrrefutable(ctx: Ctx, pat_idx: Ast.Index, variant: VariantS
         },
         .@"struct" => {
             for (binders) |b_idx| {
-                const b = ctx.tree.nodes[b_idx];
-                const src = if (b.lhs != Ast.none) ctx.nameText(ctx.tree.nodes[b.lhs].main_token) else ctx.nameText(b.main_token);
+                const b = ctx.tree.nodes[b_idx.int()];
+                const src = if (b.lhs != Ast.none) ctx.nameText(ctx.tree.nodes[b.lhs.int()].main_token) else ctx.nameText(b.main_token);
                 var fty: Type = .invalid;
                 for (variant.field_names, 0..) |dn, j| if (std.mem.eql(u8, dn, src)) {
                     fty = variant.field_types[j];
@@ -299,14 +299,14 @@ pub fn variantPayloadIrrefutable(ctx: Ctx, pat_idx: Ast.Index, variant: VariantS
 }
 
 pub fn orCoversType(ctx: Ctx, or_idx: Ast.Index, ty: Type) bool {
-    const alts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[or_idx].lhs);
+    const alts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[or_idx.int()].lhs.int());
     for (alts) |a| if (irrefutable(ctx, a, ty)) return true;
     if (ty.kind == .@"enum") {
         const e = ctx.enums[ty.enum_id];
         var seen = [_]bool{false} ** 64;
         if (e.variants.len > seen.len) return false;
         for (alts) |a| {
-            const ap = ctx.tree.nodes[a];
+            const ap = ctx.tree.nodes[a.int()];
             if (ap.tag != .pattern_variant) continue;
             const vname = ctx.nameText(ap.main_token);
             for (e.variants, 0..) |v, i| {
@@ -348,7 +348,7 @@ const Builder = struct {
     /// Append a node; also grow the parallel `resolutions`/`node_types` arrays so
     /// every node index is addressable. Returns the new node's index.
     fn add(b: *Builder, node: Ast.Node) !Ast.Index {
-        const idx: Ast.Index = @intCast(b.nodes.items.len);
+        const idx = Ast.Index.from(@intCast(b.nodes.items.len));
         try b.nodes.append(b.gpa, node);
         try b.resolutions.append(b.gpa, .unresolved);
         try b.node_types.append(b.gpa, .invalid);
@@ -356,22 +356,24 @@ const Builder = struct {
     }
 
     /// Append a `{start, len}` range header over `items`, returning the header
-    /// cell index (what a `Node`'s lhs/rhs stores).
-    fn range(b: *Builder, items: []const Ast.Index) !u32 {
+    /// cell as an `Ast.Index` (what a `Node`'s lhs/rhs stores). The `Index` run is
+    /// written into the `[]u32` `extra` verbatim (layout-identical).
+    fn range(b: *Builder, items: []const Ast.Index) !Ast.Index {
         const start: u32 = @intCast(b.extra.items.len);
-        try b.extra.appendSlice(b.gpa, items);
+        const cells: []const u32 = @ptrCast(items);
+        try b.extra.appendSlice(b.gpa, cells);
         const header: u32 = @intCast(b.extra.items.len);
         try b.extra.append(b.gpa, start);
         try b.extra.append(b.gpa, @intCast(items.len));
-        return header;
+        return Ast.Index.from(header);
     }
 
     /// Append a 2-cell header `{a, b}` (if/for/arm), returning its index.
-    fn pair(b: *Builder, a: u32, c: u32) !u32 {
+    fn pair(b: *Builder, a: Ast.Index, c: Ast.Index) !Ast.Index {
         const header: u32 = @intCast(b.extra.items.len);
-        try b.extra.append(b.gpa, a);
-        try b.extra.append(b.gpa, c);
-        return header;
+        try b.extra.append(b.gpa, a.int());
+        try b.extra.append(b.gpa, c.int());
+        return Ast.Index.from(header);
     }
 
     fn block(b: *Builder, stmts: []const Ast.Index) !Ast.Index {
@@ -391,7 +393,7 @@ const Builder = struct {
     /// A labeled `break @target`: resolves to `target`'s inner construct node.
     fn breakTo(b: *Builder, target: Ast.Index) !Ast.Index {
         const idx = try b.add(.{ .tag = .break_stmt, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
-        b.resolutions.items[idx] = .{ .label = target };
+        b.resolutions.items[idx.int()] = .{ .label = target };
         return idx;
     }
 
@@ -468,7 +470,7 @@ test "a labeled break escapes the outer loop it targets" {
     const outer_body = try b.block(&.{inner});
     const outer = try b.loopOf(outer_body);
     // Now retarget the break to `outer` (labeled break @outer).
-    b.resolutions.items[brk] = .{ .label = outer };
+    b.resolutions.items[brk.int()] = .{ .label = outer };
 
     const c = b.ctx();
     try testing.expect(loopDiverges(c, inner)); // bare-break gone; break is labeled to outer
@@ -541,7 +543,7 @@ test "match diverges iff exhaustive and every arm diverges" {
         .{ .name = "B", .form = .unit },
     };
     const enums = [_]EnumSym{
-        .{ .decl_node = 0, .name = "E", .variants = @constCast(&variants) },
+        .{ .decl_node = Ast.Index.from(0), .name = "E", .variants = @constCast(&variants) },
     };
     const scrut_ty = Type.enumT(0);
 
@@ -582,7 +584,7 @@ test "match diverges iff exhaustive and every arm diverges" {
     const match_fall = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms_fall });
 
     // Set the scrutinee's type in node_types.
-    b.node_types.items[scrut] = scrut_ty;
+    b.node_types.items[scrut.int()] =scrut_ty;
 
     const c: Ctx = .{
         .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },
@@ -610,7 +612,7 @@ test "guarded arm never contributes coverage" {
         .{ .name = "B", .form = .unit },
     };
     const enums = [_]EnumSym{
-        .{ .decl_node = 0, .name = "E", .variants = @constCast(&variants) },
+        .{ .decl_node = Ast.Index.from(0), .name = "E", .variants = @constCast(&variants) },
     };
     const source = "AB";
     const tokens = [_]Token{
@@ -631,7 +633,7 @@ test "guarded arm never contributes coverage" {
     const scrut = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     const arms = try b.range(&.{ armA, armB });
     const match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms });
-    b.node_types.items[scrut] = Type.enumT(0);
+    b.node_types.items[scrut.int()] =Type.enumT(0);
 
     const c: Ctx = .{
         .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },
@@ -654,7 +656,7 @@ test "wildcard arm makes a match exhaustive" {
         .{ .name = "B", .form = .unit },
     };
     const enums = [_]EnumSym{
-        .{ .decl_node = 0, .name = "E", .variants = @constCast(&variants) },
+        .{ .decl_node = Ast.Index.from(0), .name = "E", .variants = @constCast(&variants) },
     };
     const source = "A";
     const tokens = [_]Token{.{ .tag = .identifier, .start = 0, .end = 1 }};
@@ -668,7 +670,7 @@ test "wildcard arm makes a match exhaustive" {
     const scrut = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     const arms = try b.range(&.{ armA, armW });
     const match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms });
-    b.node_types.items[scrut] = Type.enumT(0);
+    b.node_types.items[scrut.int()] =Type.enumT(0);
 
     const c: Ctx = .{
         .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },

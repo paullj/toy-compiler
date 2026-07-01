@@ -625,18 +625,18 @@ const Discoverer = struct {
         if (s_nodes.len == 0) return d.gpa.alloc(u32, 0);
 
         const tree: Ast.Tree = .{ .nodes = s_nodes, .extra = s_extra };
-        const prog = s_nodes[Ast.root(s_nodes)];
+        const prog = s_nodes[Ast.root(s_nodes).int()];
         if (prog.tag != .program) return d.gpa.alloc(u32, 0);
 
         var edges: std.ArrayList(u32) = .empty;
         errdefer edges.deinit(d.gpa);
 
-        for (Ast.rangeSlice(tree, prog.lhs)) |decl_idx| {
-            const decl = s_nodes[decl_idx];
+        for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
+            const decl = s_nodes[decl_idx.int()];
             if (decl.tag != .import_decl) continue;
 
             // Rebuild the `/`-joined import path from the segment TOKEN indices.
-            const seg_tokens = Ast.rangeSlice(tree, decl.lhs);
+            const seg_tokens = Ast.importPathToks(tree, decl);
             const import_off = s_tokens[decl.main_token].start; // last-seg token, for diag
             const path = try joinPath(d.gpa, s_tokens, s_source, seg_tokens);
             defer d.gpa.free(path);
@@ -788,12 +788,12 @@ fn importTokenOffset(d: *Discoverer, from: u32, target: u32) ?u32 {
     const s = &d.slots.items[from];
     if (s.nodes.len == 0) return null;
     const tree: Ast.Tree = .{ .nodes = s.nodes, .extra = s.extra };
-    const prog = s.nodes[Ast.root(s.nodes)];
+    const prog = s.nodes[Ast.root(s.nodes).int()];
     if (prog.tag != .program) return null;
-    for (Ast.rangeSlice(tree, prog.lhs)) |decl_idx| {
-        const decl = s.nodes[decl_idx];
+    for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
+        const decl = s.nodes[decl_idx.int()];
         if (decl.tag != .import_decl) continue;
-        const seg_tokens = Ast.rangeSlice(tree, decl.lhs);
+        const seg_tokens = Ast.importPathToks(tree, decl);
         const path = joinPath(d.gpa, s.tokens, s.source, seg_tokens) catch return null;
         defer d.gpa.free(path);
         if (std.mem.eql(u8, path, d.slots.items[target].name)) return s.tokens[decl.main_token].start;
@@ -801,13 +801,13 @@ fn importTokenOffset(d: *Discoverer, from: u32, target: u32) ?u32 {
     return s.tokens[0].start;
 }
 
-/// Join the import path segments with `/`.
-fn joinPath(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, segs: []const u32) ![]u8 {
+/// Join the import path segments with `/`. Segments are TOKEN indices.
+fn joinPath(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, segs: []const Ast.TokIndex) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     for (segs, 0..) |seg, i| {
         if (i != 0) try buf.append(gpa, '/');
-        try buf.appendSlice(gpa, tokens[seg].text(source));
+        try buf.appendSlice(gpa, tokens[seg.int()].text(source));
     }
     return buf.toOwnedSlice(gpa);
 }

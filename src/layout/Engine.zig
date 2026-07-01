@@ -236,8 +236,8 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     defer _ = env.gphSelect(env.ctx, prev);
     const tree = env.tree(env.ctx);
 
-    const decl = tree.nodes[env.structs.items[id].decl_node];
-    const field_nodes = Ast.rangeSlice(tree, decl.lhs);
+    const decl = tree.nodes[env.structs.items[id].decl_node.int()];
+    const field_nodes = Ast.rangeSlice(tree, decl.lhs.int());
     const n = field_nodes.len;
 
     // An empty struct lays out to size 0 — a zero-size aggregate is an ABI/codegen
@@ -259,7 +259,7 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     var max_align: u32 = 1;
     var poisoned = false;
     for (field_nodes, 0..) |field_idx, i| {
-        const field = tree.nodes[field_idx];
+        const field = tree.nodes[field_idx.int()];
         names[i] = env.nameText(env.ctx, field.main_token);
         const fty = env.typeFromNode(env.ctx, field.lhs);
         types[i] = fty;
@@ -328,8 +328,8 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
     defer _ = env.gphSelect(env.ctx, prev);
     const tree = env.tree(env.ctx);
 
-    const decl = tree.nodes[env.enums.items[id].decl_node];
-    const variant_nodes = Ast.rangeSlice(tree, decl.lhs);
+    const decl = tree.nodes[env.enums.items[id].decl_node.int()];
+    const variant_nodes = Ast.rangeSlice(tree, decl.lhs.int());
     const nv = variant_nodes.len;
 
     var poisoned = false;
@@ -350,7 +350,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
     var max_payload_size: u32 = 0;
     var max_payload_align: u32 = 1;
     for (variant_nodes, 0..) |vnode_idx, vi| {
-        const vnode = tree.nodes[vnode_idx];
+        const vnode = tree.nodes[vnode_idx.int()];
         const vname = env.nameText(env.ctx, vnode.main_token);
         var form: VariantForm = .unit;
         var payload_nodes: []const Ast.Index = &.{};
@@ -359,12 +359,12 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             .enum_variant_unit => {},
             .enum_variant_tuple => {
                 form = .tuple;
-                payload_nodes = Ast.rangeSlice(tree, vnode.lhs);
+                payload_nodes = Ast.rangeSlice(tree, vnode.lhs.int());
             },
             .enum_variant_struct => {
                 form = .@"struct";
                 is_struct_form = true;
-                payload_nodes = Ast.rangeSlice(tree, vnode.lhs);
+                payload_nodes = Ast.rangeSlice(tree, vnode.lhs.int());
             },
             else => {},
         }
@@ -382,7 +382,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             // A tuple payload node is a type-ref; a struct payload node is a `param`
             // (name + type-ref in lhs).
             const pty: Type = if (is_struct_form) blk: {
-                const pnode = tree.nodes[pnode_idx];
+                const pnode = tree.nodes[pnode_idx.int()];
                 fnames[pi] = env.nameText(env.ctx, pnode.main_token);
                 break :blk env.typeFromNode(env.ctx, pnode.lhs);
             } else env.typeFromNode(env.ctx, pnode_idx);
@@ -618,20 +618,20 @@ const Harness = struct {
 
     /// Append a node and return its index.
     fn node(h: *Harness, n: Ast.Node) !Ast.Index {
-        const i: Ast.Index = @intCast(h.nodes.items.len);
+        const i = Ast.Index.from(@intCast(h.nodes.items.len));
         try h.nodes.append(h.gpa, n);
         return i;
     }
 
     /// Write a `{start, len}` range header over `items` into `extra`; return the
-    /// header cell index (what a Node's `lhs` stores).
-    fn range(h: *Harness, items: []const Ast.Index) !u32 {
+    /// header cell as an `Ast.Index` (what a Node's `lhs` stores).
+    fn range(h: *Harness, items: []const Ast.Index) !Ast.Index {
         const start: u32 = @intCast(h.extra.items.len + 2);
         const header: u32 = @intCast(h.extra.items.len);
         try h.extra.append(h.gpa, start);
         try h.extra.append(h.gpa, @intCast(items.len));
-        for (items) |it| try h.extra.append(h.gpa, it);
-        return header;
+        for (items) |it| try h.extra.append(h.gpa, it.int());
+        return Ast.Index.from(header);
     }
 
     /// A `param`-shaped field node `name: <typeref>` whose type-ref resolves to
