@@ -1,4 +1,4 @@
-//! Ir.Function → Link.FnCode codegen (M12, the IR path).
+//! Ir.Function → Link.FnCode codegen (the IR path).
 //!
 //! The dual-path peer to the legacy AST→FnCode `Codegen.lower`. This consumes a
 //! lowered `Ir.Function` (target-independent) and emits AArch64 bytes, deciding
@@ -43,8 +43,6 @@ const EnumLayout = Typecheck.EnumLayout;
 const S0: u32 = 9;
 const S1: u32 = 10;
 const S2: u32 = 11;
-
-// ---- intra-function labels & branch backpatch (same algorithm as Codegen) --
 
 const LabelId = u32;
 const UNPLACED: u32 = std.math.maxInt(u32);
@@ -127,8 +125,6 @@ const Gen = struct {
             std.mem.writeInt(u32, g.code.items[fx.site..][0..4], new, .little);
         }
     }
-
-    // ---- frame addressing -------------------------------------------------
 
     fn slotOff(g: *const Gen, sid: Ir.SlotId) u32 {
         return g.fl.slotAddr(sid);
@@ -250,7 +246,6 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
         try addLiteral(g, lit.hash, bytes);
     }
 
-    // PROLOGUE.
     try g.emit(Aarch64.stpFpLrPre); // stp x29,x30,[sp,#-16]!
     try g.emit(Aarch64.movFpSp); // mov x29, sp
     if (g.fl.frame > 0) {
@@ -264,8 +259,8 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
 
     try marshalParams(g);
 
-    // BODY: walk blocks in BlockId order. The exit block is emitted in sequence
-    // like any other (its terminator is `ret`, which owns the epilogue).
+    // Walk blocks in BlockId order. The exit block is emitted in sequence like
+    // any other (its terminator is `ret`, which owns the epilogue).
     for (g.func.blocks, 0..) |*blk, bid| {
         g.placeLabel(g.block_labels[bid]);
         for (blk.instrs) |ins| try genInstr(g, ins);
@@ -457,7 +452,6 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     var plan = try Abi.planCall(g.gpa, arg_types.items, ret_ty, g.layouts, g.enum_layouts);
     defer plan.deinit(g.gpa);
 
-    // 1) Marshal each argument into its ABI location.
     for (plan.locs, 0..) |loc, i| {
         const arg = c.args[i];
         switch (loc) {
@@ -523,14 +517,14 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
         }
     }
 
-    // 2) sret: point x8 at the result slot AFTER args (so an `add x8,sp` is not
-    //    disturbed by arg marshalling reading sp).
+    // sret: point x8 at the result slot AFTER args (so an `add x8,sp` is not
+    // disturbed by arg marshalling reading sp).
     if (plan.sret_in_x8) {
         std.debug.assert(c.ret_slot != Ir.none_slot);
         try g.emit(Aarch64.addImm(8, Aarch64.SP, @intCast(g.slotOff(c.ret_slot))));
     }
 
-    // 3) bl placeholder + `.call26` reloc.
+    // bl placeholder + `.call26` reloc.
     const name_copy = try g.gpa.dupe(u8, c.callee.name);
     errdefer g.gpa.free(name_copy);
     const site: u32 = @intCast(g.code.items.len);
@@ -542,9 +536,9 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     });
     try g.emit(Aarch64.bl(0));
 
-    // 4) Place the result. A scalar lands in x0 → store into its value cell. A
-    //    reg-pair aggregate result lands in x0[,x1] → store into ret_slot's words.
-    //    An sret result was already written through x8 by the callee. Unit: none.
+    // Place the result. A scalar lands in x0 → store into its value cell. A
+    // reg-pair aggregate result lands in x0[,x1] → store into ret_slot's words.
+    // An sret result was already written through x8 by the callee. Unit: none.
     switch (Abi.classifyRet(ret_ty, g.layouts, g.enum_layouts)) {
         .none => {},
         .reg => |r| {
@@ -575,8 +569,7 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
         },
         .cond_br => |c| {
             // ARGLESS by construction. Load the bool, cbnz true / fall to false,
-            // then unconditional b to false. (Mirrors genCondBareBool: cbnz to the
-            // true dest, then b to the false dest.)
+            // then unconditional b to false.
             try g.loadValue(S0, c.cond);
             try g.branchTo(Aarch64.cbnz(S0, 0), g.block_labels[c.t], .imm19);
             try g.branchTo(Aarch64.b(0), g.block_labels[c.f], .imm26);
@@ -703,11 +696,9 @@ fn addLiteral(g: *Gen, hash: u64, bytes: []u8) error{OutOfMemory}!void {
     };
 }
 
-// ===========================================================================
 // print(str) builtin body — hand-written, AST/IR-independent. Appended to the
 // program at link time (emit.zig) when any fn references `print`. Shuffles the
 // (ptr,len) str pair into write(fd=1, buf, len) and tail-calls libc `write`.
-// ===========================================================================
 
 /// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
 /// the result.
@@ -758,9 +749,7 @@ pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     };
 }
 
-// ===========================================================================
 // TESTS — hand-build a tiny Ir.Function and assert the emitted byte shape.
-// ===========================================================================
 
 const testing = std.testing;
 

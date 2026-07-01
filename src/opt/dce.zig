@@ -35,7 +35,6 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
     const used = try gpa.alloc(bool, func.values.len);
     defer gpa.free(used);
 
-    // --- Phase 1: dead-instr elim, local fixpoint -------------------------
     var any_instr_dropped = false;
     // Bounded by total instr count: each round drops ≥1 instr or stops.
     while (true) {
@@ -72,7 +71,6 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
         if (!round_changed) break;
     }
 
-    // --- Phase 2: dead-value pruning --------------------------------------
     const pruned = try pruneValues(gpa, func, stats);
     return any_instr_dropped or pruned;
 }
@@ -153,9 +151,7 @@ fn remapFn(remap: []const Ir.ValueId, v: Ir.ValueId) Ir.ValueId {
     return remap[v];
 }
 
-// ---------------------------------------------------------------------------
 // Tests — hand-built IR under std.testing.allocator (catches leak/double-free).
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 

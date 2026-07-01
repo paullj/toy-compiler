@@ -1,4 +1,4 @@
-//! IR optimization stage (M13): a small pass manager driving ir→ir transforms
+//! IR optimization stage: a small pass manager driving ir→ir transforms
 //! between `lower` and `codegen`. Peer to `lower`/`codegen`; reachable through
 //! the `toy_compiler` module (src/root.zig). The pipeline becomes
 //! lex→parse→resolve→types→lower→OPT→codegen→link.
@@ -6,7 +6,7 @@
 //! PASSES (each its own file): fold, branch, dce, forward. They run behind this
 //! manager's bounded fixpoint so fold→branch→forward→DCE cascade.
 //!
-//! === MEMORY STRATEGY (no arena; in-place mutate + mark-then-compact-once) ===
+//! MEMORY STRATEGY (no arena; in-place mutate + mark-then-compact-once)
 //! A block's owned slices are freed once by `Ir.Block.freeOwned` (the single
 //! definition of that set); `Ir.Function.deinit` frees every block through it,
 //! then `blocks`, `params`, `slots`, `values`, `literals.bytes`, `literals`.
@@ -166,10 +166,6 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, cfg: Config, stats: *Stat
     }
     stats.rounds = rounds;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test {
     _ = arith;

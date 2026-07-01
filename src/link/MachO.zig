@@ -44,7 +44,7 @@ const CodeSign = @import("CodeSign.zig");
 
 const Self = @This();
 
-// --- Mach-O constants (verified via `otool -hlv` on a cc-built reference) ----
+// Mach-O constants (verified via `otool -hlv` on a cc-built reference).
 
 const MH_MAGIC_64: u32 = 0xFEEDFACF;
 const CPU_TYPE_ARM64: u32 = 0x0100000C;
@@ -108,7 +108,6 @@ const CHAINED_FIXUPS_BLOB = [56]u8{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-// --- Computed cmdsizes ------------------------------------------------------
 // Each is built from real bytes below; these consts let layout be a single pass.
 
 const SEG_CMD_SIZE: u32 = 72; // sizeof(segment_command_64)
@@ -228,7 +227,7 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
     errdefer gpa.free(image);
     @memset(image, 0);
 
-    // --- Mach-O header (little-endian) --------------------------------------
+    // Mach-O header (little-endian).
     var w = Writer{ .buf = image, .pos = 0 };
     w.put32(MH_MAGIC_64);
     w.put32(CPU_TYPE_ARM64);
@@ -237,9 +236,9 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
     w.put32(NCMDS);
     w.put32(SIZEOFCMDS);
     w.put32(MH_FLAGS);
-    w.put32(0); // reserved
+    w.put32(0);
 
-    // --- LC_SEGMENT_64 __PAGEZERO ------------------------------------------
+    // LC_SEGMENT_64 __PAGEZERO.
     w.segment("__PAGEZERO", .{
         .vmaddr = 0,
         .vmsize = BASE,
@@ -250,33 +249,33 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
         .nsects = 0,
     });
 
-    // --- LC_SEGMENT_64 __TEXT (+ __text section) ---------------------------
+    // LC_SEGMENT_64 __TEXT (+ __text section).
     w.put32(LC_SEGMENT_64);
     w.put32(TEXT_SEG_CMD_SIZE);
     w.name16("__TEXT");
     w.put64(BASE);
     w.put64(text_seg_size); // vmsize: whole-page span
-    w.put64(0); // fileoff
+    w.put64(0);
     w.put64(text_seg_size); // filesize: whole-page span
-    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // maxprot r-x
-    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // initprot r-x
-    w.put32(1); // nsects
-    w.put32(0); // flags
+    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // r-x
+    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // r-x
+    w.put32(1);
+    w.put32(0);
     // section_64 __text
     w.name16("__text");
     w.name16("__TEXT");
-    w.put64(BASE + code_file_off); // addr
-    w.put64(text_size); // size
-    w.put32(code_file_off); // offset
+    w.put64(BASE + code_file_off);
+    w.put64(text_size);
+    w.put32(code_file_off);
     w.put32(2); // align 2^2 = 4
-    w.put32(0); // reloff
-    w.put32(0); // nreloc
+    w.put32(0);
+    w.put32(0);
     w.put32(TEXT_SECT_FLAGS);
-    w.put32(0); // reserved1
-    w.put32(0); // reserved2
-    w.put32(0); // reserved3
+    w.put32(0);
+    w.put32(0);
+    w.put32(0);
 
-    // --- LC_SEGMENT_64 __LINKEDIT ------------------------------------------
+    // LC_SEGMENT_64 __LINKEDIT.
     w.segment("__LINKEDIT", .{
         .vmaddr = BASE + linkedit_off,
         // vmsize must cover filesize; round up so it can never be smaller.
@@ -288,46 +287,45 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
         .nsects = 0,
     });
 
-    // --- LC_DYLD_CHAINED_FIXUPS --------------------------------------------
+    // LC_DYLD_CHAINED_FIXUPS.
     w.put32(LC_DYLD_CHAINED_FIXUPS);
     w.put32(FIXUPS_CMD_SIZE);
-    w.put32(fixups_off); // dataoff
-    w.put32(@intCast(CHAINED_FIXUPS_BLOB.len)); // datasize
+    w.put32(fixups_off);
+    w.put32(@intCast(CHAINED_FIXUPS_BLOB.len));
 
-    // --- LC_LOAD_DYLINKER /usr/lib/dyld ------------------------------------
+    // LC_LOAD_DYLINKER /usr/lib/dyld.
     w.put32(LC_LOAD_DYLINKER);
     w.put32(DYLINKER_CMD_SIZE);
-    w.put32(12); // name.offset
+    w.put32(12);
     w.path(DYLD_PATH, DYLINKER_CMD_SIZE, 12);
 
-    // --- LC_MAIN -----------------------------------------------------------
+    // LC_MAIN.
     w.put32(LC_MAIN);
     w.put32(MAIN_CMD_SIZE);
     w.put64(code_file_off + entry_text_off); // entryoff = file offset of `main`
-    w.put64(0); // stacksize
+    w.put64(0);
 
-    // --- LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib --------------------------
+    // LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib.
     w.put32(LC_LOAD_DYLIB);
     w.put32(DYLIB_CMD_SIZE);
-    w.put32(24); // dylib.name.offset
-    w.put32(2); // timestamp
+    w.put32(24);
+    w.put32(2);
     w.put32(0x051F1304); // current_version
     w.put32(0x00010000); // compatibility_version
     w.path(LIBSYSTEM_PATH, DYLIB_CMD_SIZE, 24);
 
-    // --- LC_CODE_SIGNATURE (LAST) ------------------------------------------
+    // LC_CODE_SIGNATURE (LAST).
     w.put32(LC_CODE_SIGNATURE);
     w.put32(SIG_CMD_SIZE);
-    w.put32(sig_file_off); // dataoff
-    w.put32(sig_len); // datasize
+    w.put32(sig_file_off);
+    w.put32(sig_len);
 
     // Sanity: we wrote exactly the header + all load commands.
     std.debug.assert(w.pos == HEADER_SIZE + SIZEOFCMDS);
 
-    // --- Code blob ----------------------------------------------------------
     @memcpy(image[code_file_off..][0..code.len], code);
 
-    // --- __LINKEDIT: chained-fixups blob (sig region stays zeroed) ----------
+    // __LINKEDIT: chained-fixups blob (sig region stays zeroed).
     @memcpy(image[fixups_off..][0..CHAINED_FIXUPS_BLOB.len], &CHAINED_FIXUPS_BLOB);
 
     return .{
@@ -339,7 +337,7 @@ fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u
     };
 }
 
-// --- Multi-segment (output) layout ------------------------------------------
+// Multi-segment (output) layout.
 //
 // Segment order is locked to match the chained-fixups `seg_info_offset` indices
 // (verified against the clang `write` reference):
@@ -422,7 +420,6 @@ fn assembleMulti(
 
     var w = Writer{ .buf = image, .pos = 0 };
 
-    // --- Mach-O header ------------------------------------------------------
     w.put32(MH_MAGIC_64);
     w.put32(CPU_TYPE_ARM64);
     w.put32(CPU_SUBTYPE_ARM64_ALL);
@@ -430,9 +427,9 @@ fn assembleMulti(
     w.put32(NCMDS_MULTI);
     w.put32(SIZEOFCMDS_MULTI);
     w.put32(MH_FLAGS);
-    w.put32(0); // reserved
+    w.put32(0);
 
-    // --- [0] __PAGEZERO -----------------------------------------------------
+    // [0] __PAGEZERO
     w.segment("__PAGEZERO", .{
         .vmaddr = 0,
         .vmsize = BASE,
@@ -443,72 +440,72 @@ fn assembleMulti(
         .nsects = 0,
     });
 
-    // --- [1] __TEXT (+ __text + __cstring) ----------------------------------
+    // [1] __TEXT (+ __text + __cstring)
     w.put32(LC_SEGMENT_64);
     w.put32(SEG_CMD_SIZE + 2 * SECT_SIZE);
     w.name16("__TEXT");
     w.put64(text_vmaddr);
     w.put64(text_seg_size); // vmsize: whole-page span
-    w.put64(0); // fileoff
+    w.put64(0);
     w.put64(text_seg_size); // filesize: whole-page span
-    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // maxprot r-x
-    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // initprot r-x
-    w.put32(2); // nsects: __text + __cstring
-    w.put32(0); // flags
+    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // r-x
+    w.put32(VM_PROT_READ | VM_PROT_EXECUTE); // r-x
+    w.put32(2); // __text + __cstring
+    w.put32(0);
     // section_64 __text
     w.name16("__text");
     w.name16("__TEXT");
-    w.put64(text_vmaddr + code_file_off); // addr
-    w.put64(text_size); // size
-    w.put32(code_file_off); // offset
+    w.put64(text_vmaddr + code_file_off);
+    w.put64(text_size);
+    w.put32(code_file_off);
     w.put32(2); // align 2^2 = 4
-    w.put32(0); // reloff
-    w.put32(0); // nreloc
+    w.put32(0);
+    w.put32(0);
     w.put32(TEXT_SECT_FLAGS);
-    w.put32(0); // reserved1
-    w.put32(0); // reserved2
-    w.put32(0); // reserved3
+    w.put32(0);
+    w.put32(0);
+    w.put32(0);
     // section_64 __cstring
     w.name16("__cstring");
     w.name16("__TEXT");
-    w.put64(cstring_vmaddr); // addr
-    w.put64(@intCast(cstrings.len)); // size
-    w.put32(cstring_file_off); // offset
+    w.put64(cstring_vmaddr);
+    w.put64(@intCast(cstrings.len));
+    w.put32(cstring_file_off);
     w.put32(0); // align 2^0 = 1
-    w.put32(0); // reloff
-    w.put32(0); // nreloc
+    w.put32(0);
+    w.put32(0);
     w.put32(S_CSTRING_LITERALS);
-    w.put32(0); // reserved1
-    w.put32(0); // reserved2
-    w.put32(0); // reserved3
+    w.put32(0);
+    w.put32(0);
+    w.put32(0);
 
-    // --- [2] __DATA_CONST (+ __got) -----------------------------------------
+    // [2] __DATA_CONST (+ __got)
     w.put32(LC_SEGMENT_64);
     w.put32(DATAC_SEG_CMD_SIZE);
     w.name16("__DATA_CONST");
     w.put64(datac_vmaddr);
     w.put64(PAGE); // vmsize: full page
-    w.put64(datac_file_off); // fileoff
+    w.put64(datac_file_off);
     w.put64(PAGE); // filesize: full page
-    w.put32(VM_PROT_READ | VM_PROT_WRITE); // maxprot rw-
-    w.put32(VM_PROT_READ | VM_PROT_WRITE); // initprot rw-
-    w.put32(1); // nsects: __got
-    w.put32(SG_READ_ONLY); // flags
+    w.put32(VM_PROT_READ | VM_PROT_WRITE); // rw-
+    w.put32(VM_PROT_READ | VM_PROT_WRITE); // rw-
+    w.put32(1); // __got
+    w.put32(SG_READ_ONLY);
     // section_64 __got
     w.name16("__got");
     w.name16("__DATA_CONST");
-    w.put64(got_vmaddr); // addr
-    w.put64(got_size); // size
-    w.put32(datac_file_off); // offset
+    w.put64(got_vmaddr);
+    w.put64(got_size);
+    w.put32(datac_file_off);
     w.put32(3); // align 2^3 = 8
-    w.put32(0); // reloff
-    w.put32(0); // nreloc
+    w.put32(0);
+    w.put32(0);
     w.put32(S_NON_LAZY_SYMBOL_POINTERS);
-    w.put32(0); // reserved1 (indirect-symtab index; unused, we use chained fixups)
-    w.put32(0); // reserved2
-    w.put32(0); // reserved3
+    w.put32(0); // indirect-symtab index; unused, we use chained fixups
+    w.put32(0);
+    w.put32(0);
 
-    // --- [3] __LINKEDIT -----------------------------------------------------
+    // [3] __LINKEDIT
     w.segment("__LINKEDIT", .{
         .vmaddr = linkedit_vmaddr,
         // vmsize must cover filesize; round up so it can never be smaller.
@@ -520,52 +517,51 @@ fn assembleMulti(
         .nsects = 0,
     });
 
-    // --- LC_DYLD_CHAINED_FIXUPS ---------------------------------------------
+    // LC_DYLD_CHAINED_FIXUPS.
     w.put32(LC_DYLD_CHAINED_FIXUPS);
     w.put32(FIXUPS_CMD_SIZE);
-    w.put32(fixups_off); // dataoff
-    w.put32(@intCast(fixups_blob.len)); // datasize
+    w.put32(fixups_off);
+    w.put32(@intCast(fixups_blob.len));
 
-    // --- LC_LOAD_DYLINKER /usr/lib/dyld -------------------------------------
+    // LC_LOAD_DYLINKER /usr/lib/dyld.
     w.put32(LC_LOAD_DYLINKER);
     w.put32(DYLINKER_CMD_SIZE);
-    w.put32(12); // name.offset
+    w.put32(12);
     w.path(DYLD_PATH, DYLINKER_CMD_SIZE, 12);
 
-    // --- LC_MAIN ------------------------------------------------------------
+    // LC_MAIN.
     w.put32(LC_MAIN);
     w.put32(MAIN_CMD_SIZE);
     w.put64(code_file_off + entry_text_off); // entryoff = file offset of `main`
-    w.put64(0); // stacksize
+    w.put64(0);
 
-    // --- LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib ---------------------------
+    // LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib.
     w.put32(LC_LOAD_DYLIB);
     w.put32(DYLIB_CMD_SIZE);
-    w.put32(24); // dylib.name.offset
-    w.put32(2); // timestamp
+    w.put32(24);
+    w.put32(2);
     w.put32(0x051F1304); // current_version
     w.put32(0x00010000); // compatibility_version
     w.path(LIBSYSTEM_PATH, DYLIB_CMD_SIZE, 24);
 
-    // --- LC_CODE_SIGNATURE (LAST) -------------------------------------------
+    // LC_CODE_SIGNATURE (LAST).
     w.put32(LC_CODE_SIGNATURE);
     w.put32(SIG_CMD_SIZE);
-    w.put32(sig_file_off); // dataoff
-    w.put32(sig_len); // datasize
+    w.put32(sig_file_off);
+    w.put32(sig_len);
 
     std.debug.assert(w.pos == HEADER_SIZE + SIZEOFCMDS_MULTI);
 
-    // --- Code blob + __cstring ----------------------------------------------
     @memcpy(image[code_file_off..][0..code.len], code);
     @memcpy(image[cstring_file_off..][0..cstrings.len], cstrings);
 
-    // --- __DATA_CONST: seed each __got slot with the bind sentinel ----------
+    // __DATA_CONST: seed each __got slot with the bind sentinel.
     var i: usize = 0;
     while (i < imports.len) : (i += 1) {
         std.mem.writeInt(u64, image[datac_file_off + i * 8 ..][0..8], GOT_BIND_SENTINEL, .little);
     }
 
-    // --- __LINKEDIT: the chained-fixups blob (sig region stays zeroed) ------
+    // __LINKEDIT: the chained-fixups blob (sig region stays zeroed).
     @memcpy(image[fixups_off..][0..fixups_blob.len], fixups_blob);
 
     return .{
@@ -585,7 +581,6 @@ fn assembleMulti(
 const NSEGS_MULTI: u32 = 4;
 const DATAC_SEG_INDEX: u32 = 2;
 
-// --- Chained-fixups blob builder --------------------------------------------
 //
 // Produces the LC_DYLD_CHAINED_FIXUPS payload, verified byte-for-byte against
 // the clang `write` reference (one libSystem import, one __got slot). Layout:
@@ -693,7 +688,7 @@ fn buildChainedFixups(
     return blob;
 }
 
-// --- Little-endian byte writer ----------------------------------------------
+// Little-endian byte writer.
 
 const Writer = struct {
     buf: []u8,
@@ -759,14 +754,12 @@ const Writer = struct {
         self.put32(a.maxprot);
         self.put32(a.initprot);
         self.put32(a.nsects);
-        self.put32(0); // flags
+        self.put32(0);
     }
 };
 
-// ---------------------------------------------------------------------------
 // Tests — parse our own header/load commands back and assert key fields against
 // the documented byte map / `otool -hlv` ground truth.
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -799,7 +792,7 @@ test "header fields" {
     try testing.expectEqual(NCMDS, rd32(img, 16));
     try testing.expectEqual(SIZEOFCMDS, rd32(img, 20));
     try testing.expectEqual(MH_FLAGS, rd32(img, 24));
-    try testing.expectEqual(@as(u32, 0), rd32(img, 28)); // reserved
+    try testing.expectEqual(@as(u32, 0), rd32(img, 28));
     // ground truth: sizeofcmds is 440 (0x1B8) for the 8-command layout.
     try testing.expectEqual(@as(u32, 0x1B8), SIZEOFCMDS);
     try testing.expectEqual(@as(u32, 8), NCMDS);
@@ -810,7 +803,6 @@ test "segments and load command order" {
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
-    // Walk the load commands in order, recording their cmd ids.
     var off: usize = HEADER_SIZE;
     var cmds: [NCMDS]u32 = undefined;
     var i: usize = 0;
@@ -867,7 +859,6 @@ test "chained fixups, LC_MAIN entryoff, and sig placement" {
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
-    // Locate LC_DYLD_CHAINED_FIXUPS, LC_MAIN, LC_CODE_SIGNATURE by walking.
     var off: usize = HEADER_SIZE;
     var fixups_datasize: ?u32 = null;
     var main_entryoff: ?u64 = null;
@@ -942,11 +933,9 @@ test "code spanning multiple pages grows __TEXT instead of being rejected" {
     try testing.expect(layout.sig_file_off >= text_seg_size);
 }
 
-// ---------------------------------------------------------------------------
 // Multi-segment (output) path — exercised by any program that calls `print`.
 // Ground truth is the clang `write` reference dumped on this host
 // (`otool -hlv`, `xxd`, `dyld_info -fixups`).
-// ---------------------------------------------------------------------------
 
 /// "hello world\n\0", the demo's interned __cstring blob.
 const demo_cstrings = "hello world\n\x00";

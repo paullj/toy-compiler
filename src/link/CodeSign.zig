@@ -28,7 +28,7 @@ const PAGE_SIZE: u32 = 4096; // code-hash page (NOT the 0x4000 segment page)
 const SUPERBLOB_HEADER: u32 = 12; // magic + length + count
 const BLOB_INDEX: u32 = 8; // type + offset
 
-// --- Signature magic / version / flag constants (verified vs. ground truth) --
+// Signature magic / version / flag constants (verified vs. ground truth).
 
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE0CC0;
 const CSMAGIC_CODEDIRECTORY: u32 = 0xFADE0C02;
@@ -108,7 +108,6 @@ pub fn sign(
 
     var w = BeWriter{ .buf = image[sig_file_off..][0..sig_len], .pos = 0 };
 
-    // --- SuperBlob (CSMAGIC_EMBEDDED_SIGNATURE) -----------------------------
     w.put32(CSMAGIC_EMBEDDED_SIGNATURE);
     w.put32(sig_len); // length (whole SuperBlob)
     w.put32(1); // count: a single sub-blob
@@ -118,7 +117,6 @@ pub fn sign(
 
     std.debug.assert(w.pos == cd_off);
 
-    // --- CodeDirectory (CSMAGIC_CODEDIRECTORY, v0x20400) --------------------
     w.put32(CSMAGIC_CODEDIRECTORY);
     w.put32(cd_len); // length
     w.put32(CS_SUPPORTSEXECSEG); // version 0x20400
@@ -147,13 +145,11 @@ pub fn sign(
     // The fixed header ends exactly at identOffset.
     std.debug.assert(w.pos == cd_off + CD_HEADER_SIZE);
 
-    // --- Identifier C-string (NUL-terminated) ------------------------------
     @memcpy(w.buf[w.pos..][0..ident_len], identifier);
     w.pos += ident_len;
     w.put8(0); // NUL
     std.debug.assert(w.pos == cd_off + hash_offset);
 
-    // --- Code-slot hashes: SHA-256 of each page up to codeLimit ------------
     // The final page may be partial — clamp the end to codeLimit. The hashed
     // bytes (`image[0..codeLimit)`) are final; only this region beyond is being
     // written, so the digests are stable.
@@ -162,7 +158,6 @@ pub fn sign(
     // `image[slot*PAGE..min(+PAGE, code_limit))` and writes its 32-byte digest to
     // the FIXED destination `hash_base + slot*32` chosen by slot INDEX, not the
     // serial cursor — so the output is byte-identical regardless of dispatch order.
-    // [M18 INDEX-DRIVEN, NOT CURSOR-DRIVEN, DESTINATIONS / SINGLE-WRITER DISJOINT]
     //
     // `hash_base` is derived independently of `w.pos`: it equals the writer cursor
     // at this point (`cd_off + hash_offset`) shifted into absolute image space, so
@@ -177,7 +172,7 @@ pub fn sign(
             return .{ c.image, @as(u32, @intCast(i)), c.hash_base, c.code_limit };
         }
     };
-    // PERF P1: chunk the per-page Merkle hash into ~ncpu ranges. Page COUNT is modest
+    // chunk the per-page Merkle hash into ~ncpu ranges. Page COUNT is modest
     // (one per 4KiB of code), so the high threshold leaves small images serial; each
     // slot writes a unique disjoint digest by INDEX, so chunked == serial byte-for-byte.
     Engine.chunkedFanOut(io, n_slots, 0, Engine.Chunk.small_count.threshold, Engine.Chunk.small_count.chunks_per_cpu, hashSlotJob, Ctx{

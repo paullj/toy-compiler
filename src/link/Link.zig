@@ -116,7 +116,7 @@ pub const FnCode = struct {
 /// u32 instead of a string-hash per call site. The composite `[kind byte][name]`
 /// key keeps `user_fn "f"` ≠ `import "f"`.
 ///
-/// HANDLES ARE A STABLE-SORT RANK, NOT ARRIVAL ORDER ([M18 DETERMINISM #1]):
+/// HANDLES ARE A STABLE-SORT RANK, NOT ARRIVAL ORDER:
 /// `internAll` assigns each fn's handle as its rank in a stable sort of the fn
 /// set by composite key, ties broken by original source index. This makes the
 /// handle (and therefore every offset/concat/patch keyed by it) a pure function
@@ -238,7 +238,7 @@ pub const LinkError = error{ CallTargetTooFar, UnresolvedSymbol, NoEntry } || st
 /// handle; returns the total text size. `offsets.len == fns.len` and `si` must
 /// already have interned `fns`.
 ///
-/// WHY a standalone scan ([M18 PREFIX-SUM == SERIAL RUNNING SUM]): this is the one
+/// WHY a standalone scan: this is the one
 /// true ordering barrier of the parallel tail (every fn's address depends on the
 /// sum of all earlier ones), so it is factored out as a pure left-to-right scan
 /// that the parallel tail can replace with a real parallel prefix-scan WITHOUT
@@ -276,7 +276,7 @@ fn prefixSumTextOffsets(
 /// and needs NO runtime relocation under PIE/ASLR.
 pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName) LinkError!Linked {
     // 1) LAYOUT: assign every fn a dense handle by STABLE SORT of the fn set
-    //    (rank, never arrival/source order — the M18 determinism invariant), then
+    //    (rank, never arrival/source order), then
     //    walk `fns` in SOURCE ORDER to give each its text offset. Layout STAYS
     //    source order (cursor walks `fns`), so __text bytes are byte-identical to
     //    the pre-M18 baseline; only the handle VALUES that key the offset map
@@ -287,8 +287,8 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     const offsets = try gpa.alloc(u32, fns.len);
     defer gpa.free(offsets);
 
-    // Text offsets by EXCLUSIVE PREFIX-SUM of code lengths in SOURCE ORDER
-    // ([M18 PREFIX-SUM == SERIAL RUNNING SUM]). `offsets[h]` is the sum of the
+    // Text offsets by EXCLUSIVE PREFIX-SUM of code lengths in SOURCE ORDER.
+    // `offsets[h]` is the sum of the
     // code lengths of every fn appearing before fn-h in source order — exactly the
     // value the old `offsets[h]=cursor; cursor+=len` running sum produced, so
     // __text stays byte-identical to the pre-M18 baseline. The scan is split into
@@ -350,7 +350,7 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     //      `call_targets`/`site_h` are read-only across workers (the only writes are
     //      to a job's own text region + its own slot). Determinism is by INDEX, not
     //      arrival: the data_relocs are stable-concatenated in source order below, so
-    //      the slice is byte-identical at any -j ([M18 NO MAP-ITERATION-ORDER]).
+    //      the slice is byte-identical at any -j.
     const jobs = try gpa.alloc(FnLinkSlot, fns.len);
     defer {
         for (jobs) |*j| j.relocs.deinit(gpa);
@@ -395,7 +395,7 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     // STABLE-CONCAT the per-fn data_reloc lists in SOURCE ORDER (the `jobs`/`fns`
     // index), reproducing the exact order the old single shared-append loop produced
     // — never thread-arrival order. The `.import` name-dup loop downstream observes
-    // this order, so it must be a pure function of the fn set. [M18 determinism]
+    // this order, so it must be a pure function of the fn set.
     var data_relocs: std.ArrayList(Reloc) = .empty;
     errdefer data_relocs.deinit(gpa);
     for (jobs) |j| try data_relocs.appendSlice(gpa, j.relocs.items);
@@ -493,7 +493,7 @@ pub fn applyDataRelocs(
     // (`text[rl.site..site+4]`), so the fan-out is a race-free disjoint-region map.
     // `import_slots`/`text_vmaddr`/etc. are read-only across workers; the output is
     // independent of dispatch order because each site is written by exactly one
-    // worker. [M18 SINGLE-WRITER DISJOINT REGIONS]
+    // worker.
     const Ctx = struct {
         text: []u8,
         data_relocs: []const Reloc,
@@ -505,7 +505,7 @@ pub fn applyDataRelocs(
             return .{ c.text, c.data_relocs[i], c.text_vmaddr, c.cstring_vmaddr, c.got_vmaddr, c.import_slots };
         }
     };
-    // PERF P1: chunk the per-reloc patch into ~ncpu ranges. Reloc COUNT is usually
+    // chunk the per-reloc patch into ~ncpu ranges. Reloc COUNT is usually
     // small (not 10K), so the high threshold keeps it serial except on the largest
     // images; each reloc still owns a unique disjoint 4-byte site, so chunked == serial.
     Engine.chunkedFanOut(io, data_relocs.len, 0, Engine.Chunk.small_count.threshold, Engine.Chunk.small_count.chunks_per_cpu, dataRelocJob, Ctx{
@@ -553,8 +553,6 @@ fn dataRelocJob(
     std.mem.writeInt(u32, text[rl.site..][0..4], patched, .little);
 }
 
-// ---- FnCode (de)serialization ----------------------------------------------
-//
 // A lowered `FnCode` is the M5 cache payload. `Reloc.target` is a tagged union
 // with an `i64` addend, so it is NOT raw-memcpy-able; serialize each region into
 // `extern` records inside the same `[u64 checksum][payload]` envelope `Cache`
@@ -799,12 +797,10 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Tests — bl ground truth was assembled on this host (`as -arch arm64` +
 // objdump): forward +8 → 0x94000002, backward −12 → 0x97fffffd, self (delta 0)
 // → 0x94000000. Each test decodes the patched imm26 back to confirm it points
 // at the callee.
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 

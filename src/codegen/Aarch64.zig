@@ -22,8 +22,6 @@ pub const SP: u32 = 31;
 pub const FP: u32 = 29;
 pub const LR: u32 = 30;
 
-// --- Move-wide immediates --------------------------------------------------
-
 /// movz rd, #imm16, lsl #(hw*16) — load a 16-bit immediate into a lane, zeroing
 /// the rest. `hw` selects the lane (0..3). movz x0,#40 → 0xD2800500.
 pub fn movz(rd: u32, imm16: u16, hw: u2) u32 {
@@ -36,8 +34,6 @@ pub fn movk(rd: u32, imm16: u16, hw: u2) u32 {
     return 0xF2800000 | (@as(u32, hw) << 21) | (@as(u32, imm16) << 5) | rd;
 }
 
-// --- Add / sub immediate (imm12, unshifted) --------------------------------
-
 /// add rd, rn, #imm12. With rd/rn = SP this is the sp adjust. add sp,sp,#16 →
 /// 0x910043FF.
 pub fn addImm(rd: u32, rn: u32, imm12: u12) u32 {
@@ -48,8 +44,6 @@ pub fn addImm(rd: u32, rn: u32, imm12: u12) u32 {
 pub fn subImm(rd: u32, rn: u32, imm12: u12) u32 {
     return 0xD1000000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
 }
-
-// --- Add / sub / mul / sdiv (register, shifted-register form, no shift) -----
 
 /// add rd, rn, rm. add x0,x0,x1 → 0x8B010000.
 pub fn addReg(rd: u32, rn: u32, rm: u32) u32 {
@@ -78,8 +72,6 @@ pub fn neg(rd: u32, rm: u32) u32 {
     return subReg(rd, XZR, rm);
 }
 
-// --- Load / store, unsigned-offset, base = SP ------------------------------
-
 /// str rt, [sp, #byteOff] — 64-bit store; byteOff must be a multiple of 8 (the
 /// encoded imm12 is the scaled word index). str x0,[sp,#8] → 0xF90007E0.
 pub fn strSp(rt: u32, byteOff: u32) u32 {
@@ -96,8 +88,6 @@ pub fn ldrSp(rt: u32, byteOff: u32) u32 {
     return 0xF9400000 | (scaled << 10) | (SP << 5) | rt;
 }
 
-// --- Load / store, unsigned-offset, base = FP (x29) ------------------------
-
 /// ldr rt, [x29, #byteOff] — 64-bit load; base is FP(29). byteOff multiple of 8.
 /// Used to read incoming stack arguments (the (8+k)th param at [x29,#16+k*8]).
 /// ldr x9,[x29,#16] → 0xF9400BA9.
@@ -106,8 +96,6 @@ pub fn ldrFp(rt: u32, byteOff: u32) u32 {
     const scaled: u32 = byteOff / 8;
     return 0xF9400000 | (scaled << 10) | (FP << 5) | rt;
 }
-
-// --- Branch / system -------------------------------------------------------
 
 /// bl #(imm26 words) — branch-and-link, PC-relative by a signed *word* offset
 /// (the raw imm26 field). The linker patches the placeholder `bl #0` with
@@ -118,8 +106,6 @@ pub fn bl(imm26: i26) u32 {
     return 0x94000000 | bits;
 }
 
-// --- PC-relative data addressing + indirect call (M2) -----------------------
-//
 // These four encoders are how M2 reaches data the linker only sizes at the very
 // end: a string in `__cstring` and the `_write` slot in `__got`. `adrp` forms a
 // 4 KiB-page-relative base, `addImm` adds the in-page byte offset (for a cstring
@@ -167,8 +153,6 @@ pub fn movReg(rd: u32, rm: u32) u32 {
     return 0xAA0003E0 | (rm << 16) | rd;
 }
 
-// --- In-place patchers for the post-vmaddr relocation pass ------------------
-//
 // The placeholder words carry the destination register(s) in their low fields;
 // these recover those and re-encode with the resolved page delta / offset, so
 // the patch needs no separate record of which register the emitter chose.
@@ -195,8 +179,6 @@ pub fn patchLdrUoff(word: u32, byteOff: u32) u32 {
     return ldrRegUoff(rt, rn, byteOff);
 }
 
-// --- Compare + condition codes + branches (M4 control flow) ----------------
-//
 // WHY: M4 needs to test values and jump. Comparisons set NZCV via SUBS-to-XZR
 // (`cmp`), a condition turns NZCV into 0/1 (`cset`) in VALUE context or steers a
 // `b.cond`/`cbz`/`cbnz` in CONTROL context, and `b` is the unconditional jump.
@@ -264,8 +246,6 @@ pub fn b(imm26: i26) u32 {
     return 0x14000000 | @as(u32, @as(u26, @bitCast(imm26)));
 }
 
-// --- In-place patchers for intra-function branch backpatch ------------------
-//
 // Emit a branch with a #0 placeholder, record its site + target label, then
 // rewrite only the imm field once the label's byte offset is known. The opcode
 // + identity (cond for b.cond, rt for cbz/cbnz) is preserved. For b.cond and
@@ -291,8 +271,6 @@ pub fn patchB(word: u32, imm26: i26) u32 {
     return b(imm26);
 }
 
-// --- Frame save/restore + ret (fixed words; FP/LR pair against SP) ----------
-
 /// stp x29, x30, [sp, #-16]! — pre-index store of the FP/LR pair; opens the
 /// frame in one instruction. → 0xA9BF7BFD.
 pub const stpFpLrPre: u32 = 0xA9BF7BFD;
@@ -306,8 +284,6 @@ pub const ldpFpLrPost: u32 = 0xA8C17BFD;
 
 /// ret (returns to x30). → 0xD65F03C0.
 pub const ret: u32 = 0xD65F03C0;
-
-// --- i64 materialization ----------------------------------------------------
 
 /// Materialize an arbitrary i64 `value` into register `rd` using the minimal
 /// movz + movk sequence, writing the words (little-endian) into `out` starting
@@ -334,10 +310,8 @@ inline fn writeWord(out: []u8, len: *usize, word: u32) void {
     len.* += 4;
 }
 
-// ---------------------------------------------------------------------------
 // Tests — each expected word is the objdump hex for the matching mnemonic,
 // assembled on this host with `as -arch arm64` (see the file doc comment).
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 

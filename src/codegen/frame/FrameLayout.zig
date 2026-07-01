@@ -1,4 +1,4 @@
-//! Spill-everything frame layout (M12, LOCK #4).
+//! Spill-everything frame layout (LOCK #4).
 //!
 //! Replaces the FOUR M11 frame-sizing walkers (countSlots*/collectSlots*,
 //! measureOutgoing*, measureDepth*/measureExpr, buildSlotTable temp logic) with
@@ -57,11 +57,11 @@ pub const EnumLayout = types.EnumLayout;
 const FrameLayout = @This();
 
 /// The widest scalable ldr/str immediate offset (imm12 * 8). Any sp/fp offset
-/// past this cannot be encoded. Mirrors M11 `Codegen.MAX_SCALED_OFFSET`.
+/// past this cannot be encoded.
 const MAX_SCALED_OFFSET: u32 = 4095 * 8;
 
 /// `sret_save_off == NO_SRET` means the function does not return a >16B
-/// aggregate (no x8 buffer to save). Mirrors M11 `Codegen.NO_SRET`.
+/// aggregate (no x8 buffer to save).
 pub const NO_SRET: u32 = std.math.maxInt(u32);
 
 pub const Error = error{ OutOfMemory, FrameTooLarge, ParamOffsetTooLarge };
@@ -106,7 +106,6 @@ fn roundUp16(n: u32) u32 {
 /// Per-slot frame size: a slot must hold the WHOLE value. str is 16 (ptr,len);
 /// struct/enum take their layout size rounded to 8 (so the next slot stays
 /// 8-aligned; struct align is <=8 today). Everything else is one 8-byte word.
-/// Mirrors M11 `buildSlotTable` (~2482).
 fn slotSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
         .str => 16,
@@ -161,7 +160,7 @@ pub fn compute(
     const out_base: u32 = roundUp16(max_nsaa);
 
     // (2) slot region: each Ir.Slot laid sequentially, 8-aligned, shifted by
-    // out_base. Prefix sum, exactly the M11 buildSlotTable arithmetic.
+    // out_base.
     const slot_off = try gpa.alloc(u32, func.slots.len);
     errdefer gpa.free(slot_off);
     var running: u32 = 0;
@@ -232,10 +231,6 @@ pub fn compute(
         .value_off = value_off,
     };
 }
-
-// ===========================================================================
-// TESTS
-// ===========================================================================
 
 const testing = std.testing;
 

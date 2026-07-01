@@ -110,7 +110,7 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     // 3) Rewrite every `.cstr` reloc target from content hash → global offset, in
     //    parallel over fns. Each fn owns its own `relocs` array (disjoint writes);
     //    `off_by_hash` is a read-only map looked up BY KEY (never iterated), so the
-    //    rewrite is order-free and byte-identical at any -j. [M18 NO MAP-ITERATION-ORDER]
+    //    rewrite is order-free and byte-identical at any -j.
     {
         const Ctx = struct {
             fns: []Link.FnCode,
@@ -119,7 +119,7 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
                 return .{ c.fns[i], c.off_by_hash };
             }
         };
-        // PERF P1: one task per ~ncpu fn RANGE, not per fn (10K fns × by-key map
+        // one task per ~ncpu fn RANGE, not per fn (10K fns × by-key map
         // lookups). ncpu=0 => host cpus. `off_by_hash` is read-only by key (never
         // iterated) and each fn owns its own relocs, so chunked == serial byte-for-byte.
         Engine.chunkedFanOut(io, all.items.len, 0, Engine.Chunk.cstr.threshold, Engine.Chunk.cstr.chunks_per_cpu, rewriteCstrJob, Ctx{
@@ -185,12 +185,11 @@ pub const InternedCstrings = struct {
 
 /// Intern the per-fn string literals of `fns` program-wide. Split into a STABLE
 /// COLLECT pass and a PREFIX-SUM offset/blob pass so the offset assignment is the
-/// same standalone, parallel-scan-ready barrier as the text layout
-/// ([M18 PREFIX-SUM == SERIAL RUNNING SUM]) — the math (a running byte cursor) is
-/// unchanged, only the executor is.
+/// same standalone, parallel-scan-ready barrier as the text layout — the math (a
+/// running byte cursor) is unchanged, only the executor is.
 ///
 /// Pass A (collect): walk fns in SOURCE ORDER, then in-fn literal order, keeping
-/// the FIRST occurrence of each hash ([M18 FIRST-OCCURRENCE-WINS]). This stable
+/// the FIRST occurrence of each hash. This stable
 /// (fn-source-index, in-fn-index) order is the ONLY thing that decides the blob
 /// layout — never hashmap iteration order — so the blob is byte-identical
 /// regardless of any future sharding of the collect.
