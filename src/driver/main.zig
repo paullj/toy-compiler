@@ -20,6 +20,7 @@ const toyc = @import("toy_compiler");
 const Driver = toyc.Driver;
 const Ast = toyc.Ast;
 const Graph = toyc.Graph;
+const Codegen = toyc.DriverCodegen;
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const CodegenIr = toyc.CodegenIr;
@@ -497,12 +498,12 @@ fn emitExecutable(
     defer if (res) |*r| r.deinit(gpa);
     var tc: ?TypecheckGraph.GraphResult = null;
     defer if (tc) |*t| t.deinit(gpa);
-    var lowered: ?Driver.LowerProgramResult = null;
+    var lowered: ?Codegen.LowerProgramResult = null;
     defer if (lowered) |*lw| switch (lw.*) {
         .ok => |*lp| lp.deinit(gpa),
         .err => {},
     };
-    var ir_unused: ?Driver.IrResult = null; // the `.lower` tail never writes this
+    var ir_unused: ?Codegen.IrResult = null; // the `.lower` tail never writes this
     var failed_stage: ?Orchestrator.Stage = null;
 
     // The DISCOVER barrier's single contributor: the entry path's digest (which
@@ -575,7 +576,7 @@ fn emitExecutable(
     // attributed rather than leaking into image+sign or the residual. Laps the timer so
     // image+sign measures only the image build below.
     ns_post = lapNs(io, timings, &last_ns);
-    const image = try Driver.buildImage(
+    const image = try Codegen.buildImage(
         io,
         gpa,
         basename(resolved_out),
@@ -700,8 +701,8 @@ const Orchestrator = struct {
     graph: *?Graph.Graph,
     res: *?ResolveGraph.GraphResult,
     tc: *?TypecheckGraph.GraphResult,
-    lowered: *?Driver.LowerProgramResult,
-    ir: *?Driver.IrResult,
+    lowered: *?Codegen.LowerProgramResult,
+    ir: *?Codegen.IrResult,
     failed_stage: *?Stage,
 
     /// Lap a `--timings` bucket if both the accumulator and the running timer are
@@ -771,7 +772,7 @@ const Orchestrator = struct {
         comptime std.debug.assert(@as(Stage, @enumFromInt(stage_i)) == .codegen);
         switch (self.tail) {
             .lower => {
-                self.lowered.* = try Driver.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.probe, self.link_ns, self.ncpu);
+                self.lowered.* = try Codegen.lowerGraphProgram(self.gpa, self.io, self.cache, self.target, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.mode, self.opt, self.probe, self.link_ns, self.ncpu);
                 self.lap(self.ns_lower);
                 const bad = switch (self.lowered.*.?) {
                     .err => true,
@@ -783,7 +784,7 @@ const Orchestrator = struct {
                 }
             },
             .render_ir => {
-                self.ir.* = try Driver.renderGraphIr(self.gpa, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.opt);
+                self.ir.* = try Codegen.renderGraphIr(self.gpa, &self.graph.*.?, &self.res.*.?, &self.tc.*.?, self.opt);
                 self.lap(self.ns_lower);
                 if (self.ir.*.? == .err) {
                     self.failed_stage.* = .codegen;
@@ -925,8 +926,8 @@ fn emitIr(
     defer if (res) |*r| r.deinit(gpa);
     var tc: ?TypecheckGraph.GraphResult = null;
     defer if (tc) |*t| t.deinit(gpa);
-    var lowered_unused: ?Driver.LowerProgramResult = null; // the `.render_ir` tail never writes this
-    var ir: ?Driver.IrResult = null;
+    var lowered_unused: ?Codegen.LowerProgramResult = null; // the `.render_ir` tail never writes this
+    var ir: ?Codegen.IrResult = null;
     defer if (ir) |*r| switch (r.*) {
         .ok => |text| gpa.free(text),
         .err => {},
@@ -1004,7 +1005,7 @@ fn printModuleDiag(out: *Io.Writer, graph: *const Graph.Graph, scope: u32, byte_
 
 /// Render a code-emission `EmitError` from a graph build against its owning module
 /// (or the entry module when `module` is null).
-fn printGraphEmitError(out: *Io.Writer, graph: *const Graph.Graph, e: Driver.EmitError) !void {
+fn printGraphEmitError(out: *Io.Writer, graph: *const Graph.Graph, e: Codegen.EmitError) !void {
     const m = if (e.module) |mi| &graph.modules[mi] else graph.entry();
     if (e.byte_offset) |off| {
         const loc = lineCol(m.source, off);
@@ -1027,7 +1028,7 @@ fn writeExecutable(io: Io, path: []const u8, image: []const u8) !void {
 
 /// Render a code-emission error as `file:line:col: message` (or `file: message`
 /// when there is no source location), matching the front-end diagnostic style.
-fn printEmitError(out: *Io.Writer, r: *const Driver.FileResult, e: Driver.EmitError) !void {
+fn printEmitError(out: *Io.Writer, r: *const Driver.FileResult, e: Codegen.EmitError) !void {
     if (e.byte_offset) |off| {
         const loc = lineCol(r.source, off);
         try out.print("{s}:{d}:{d}: error: {s}\n", .{ r.path, loc.line, loc.col, e.message });

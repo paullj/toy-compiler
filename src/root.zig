@@ -13,6 +13,7 @@ pub const QueryKey = @import("query/Key.zig");
 pub const StageGraph = @import("query/StageGraph.zig");
 pub const Driver = @import("driver/Driver.zig");
 pub const Graph = @import("driver/Graph.zig");
+pub const DriverCodegen = @import("driver/Codegen.zig");
 pub const DiagnosticSink = @import("diagnostics/Sink.zig");
 pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
