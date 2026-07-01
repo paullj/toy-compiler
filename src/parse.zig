@@ -111,17 +111,16 @@ fn parseProgram(p: *Parser) Error!Ast.Tree {
     var decls: std.ArrayList(Ast.Index) = .empty;
     defer decls.deinit(p.gpa);
 
-    while (p.peek().tag == .newline) p.advance();
-    while (p.peek().tag != .eof) {
+    p.skipNewlines();
+    while (!p.at(.eof)) {
         // `import` decls have no `pub` modifier (imports are not re-exported).
-        if (p.peek().tag == .kw_import) {
+        if (p.at(.kw_import)) {
             try decls.append(p.gpa, try p.parseImport());
-            while (p.peek().tag == .newline) p.advance();
+            p.skipNewlines();
             continue;
         }
         // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
-        const is_pub = p.peek().tag == .kw_pub;
-        if (is_pub) p.advance();
+        const is_pub = p.eat(.kw_pub);
         const decl = switch (p.peek().tag) {
             .kw_fn => try p.parseFnDecl(),
             .kw_struct => try p.parseStructDecl(),
@@ -133,7 +132,7 @@ fn parseProgram(p: *Parser) Error!Ast.Tree {
         };
         if (is_pub) try p.pub_decls.append(p.gpa, decl);
         try decls.append(p.gpa, decl);
-        while (p.peek().tag == .newline) p.advance();
+        p.skipNewlines();
     }
     try p.expect(.eof, "expected a declaration or end of input");
 
@@ -176,15 +175,13 @@ fn parseImport(p: *Parser) Error!Ast.Index {
     const first = p.index;
     try p.expect(.identifier, "expected a module path after 'import'");
     try segs.append(p.gpa, first);
-    while (p.peek().tag == .slash) {
-        p.advance(); // /
+    while (p.eat(.slash)) {
         const seg = p.index;
         try p.expect(.identifier, "expected a path segment after '/'");
         try segs.append(p.gpa, seg);
     }
     var alias: Ast.Index = Ast.none;
-    if (p.peek().tag == .kw_as) {
-        p.advance(); // as
+    if (p.eat(.kw_as)) {
         alias = p.index;
         try p.expect(.identifier, "expected an alias name after 'as'");
     }
@@ -201,20 +198,19 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
 
     var params: std.ArrayList(Ast.Index) = .empty;
     defer params.deinit(p.gpa);
-    while (p.peek().tag != .r_paren) {
+    while (!p.at(.r_paren)) {
         const param_name = p.index;
         try p.expect(.identifier, "expected a parameter name");
         try p.expect(.colon, "expected ':' after parameter name");
         const type_node = try p.parseType();
         const param = try p.addNode(.{ .tag = .param, .main_token = param_name, .lhs = type_node, .rhs = Ast.none });
         try params.append(p.gpa, param);
-        if (p.peek().tag == .comma) p.advance() else break;
+        if (!p.eat(.comma)) break;
     }
     try p.expect(.r_paren, "expected ')' to close parameter list");
 
     var ret_type: Ast.Index = Ast.none;
-    if (p.peek().tag == .arrow) {
-        p.advance();
+    if (p.eat(.arrow)) {
         ret_type = try p.parseType();
     }
 
@@ -239,8 +235,8 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     var fields: std.ArrayList(Ast.Index) = .empty;
     defer fields.deinit(p.gpa);
     while (true) {
-        while (p.peek().tag == .newline) p.advance();
-        if (p.peek().tag == .r_brace) break;
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
         const field_name = p.index;
         try p.expect(.identifier, "expected a field name");
         try p.expect(.colon, "expected ':' after field name");
@@ -250,7 +246,7 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
         // A field is separated by a comma OR a newline (both insignificant inside
         // `{}`); a `}` ends the list. An optional comma is consumed; the loop top
         // skips newlines and checks for `}`.
-        if (p.peek().tag == .comma) p.advance();
+        _ = p.eat(.comma);
     }
     try p.expect(.r_brace, "expected '}' to close struct body");
 
@@ -270,19 +266,19 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
     var variants: std.ArrayList(Ast.Index) = .empty;
     defer variants.deinit(p.gpa);
     while (true) {
-        while (p.peek().tag == .newline) p.advance();
-        if (p.peek().tag == .r_brace) break;
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
         const vname = p.index;
         try p.expect(.identifier, "expected a variant name");
         var variant: Ast.Index = undefined;
         switch (p.peek().tag) {
             .l_paren => {
-                p.advance(); // (
+                p.bump(.l_paren);
                 var types: std.ArrayList(Ast.Index) = .empty;
                 defer types.deinit(p.gpa);
-                while (p.peek().tag != .r_paren) {
+                while (!p.at(.r_paren)) {
                     try types.append(p.gpa, try p.parseType());
-                    if (p.peek().tag == .comma) p.advance() else break;
+                    if (!p.eat(.comma)) break;
                 }
                 try p.expect(.r_paren, "expected ')' to close a tuple variant");
                 const header = try p.addRange(types.items);
@@ -291,19 +287,19 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
             .l_brace => {
                 var nb = NoBlockScope.enter(p, false);
                 defer nb.end();
-                p.advance(); // {
+                p.bump(.l_brace);
                 var fields: std.ArrayList(Ast.Index) = .empty;
                 defer fields.deinit(p.gpa);
                 while (true) {
-                    while (p.peek().tag == .newline) p.advance();
-                    if (p.peek().tag == .r_brace) break;
+                    p.skipNewlines();
+                    if (p.at(.r_brace)) break;
                     const field_name = p.index;
                     try p.expect(.identifier, "expected a field name");
                     try p.expect(.colon, "expected ':' after field name");
                     const type_node = try p.parseType();
                     const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
                     try fields.append(p.gpa, field);
-                    if (p.peek().tag == .comma) p.advance();
+                    _ = p.eat(.comma);
                 }
                 try p.expect(.r_brace, "expected '}' to close a struct variant");
                 const header = try p.addRange(fields.items);
@@ -312,7 +308,7 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
             else => variant = try p.addNode(.{ .tag = .enum_variant_unit, .main_token = vname, .lhs = Ast.none, .rhs = Ast.none }),
         }
         try variants.append(p.gpa, variant);
-        if (p.peek().tag == .comma) p.advance();
+        _ = p.eat(.comma);
     }
     try p.expect(.r_brace, "expected '}' to close enum body");
 
@@ -325,7 +321,7 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
 /// separated, newlines insignificant inside `{}`.
 fn parseMatch(p: *Parser) Error!Ast.Index {
     const match_tok = p.index;
-    p.advance(); // match
+    p.bump(.kw_match);
     // Scrutinee in `no_block` (a bare `match x { ... }` reads `x`, the `{` opening
     // the arm list); then the arm list parses with blocks re-allowed, restoring the
     // prior flag once the whole `match` is done.
@@ -339,12 +335,11 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
     var arms: std.ArrayList(Ast.Index) = .empty;
     defer arms.deinit(p.gpa);
     while (true) {
-        while (p.peek().tag == .newline) p.advance();
-        if (p.peek().tag == .r_brace) break;
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
         const pat = try p.parsePattern();
         var guard: Ast.Index = Ast.none;
-        if (p.peek().tag == .kw_if) {
-            p.advance();
+        if (p.eat(.kw_if)) {
             var guard_nb = NoBlockScope.enter(p, true); // stop the guard cond before `->`/`{`
             defer guard_nb.end();
             guard = try p.parseExpr(0);
@@ -355,7 +350,7 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
         const arm_hdr = try p.addExtra(&.{ guard, body });
         const arm = try p.addNode(.{ .tag = .match_arm, .main_token = arrow, .lhs = pat, .rhs = arm_hdr });
         try arms.append(p.gpa, arm);
-        if (p.peek().tag == .comma) p.advance();
+        _ = p.eat(.comma);
     }
     try p.expect(.r_brace, "expected '}' to close match");
 
@@ -367,13 +362,12 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
 /// `pattern_or` only when there are >=2 alternatives; otherwise the bare subpat.
 fn parsePattern(p: *Parser) Error!Ast.Index {
     const first = try p.parseSubPattern();
-    if (p.peek().tag != .pipe) return first;
+    if (!p.at(.pipe)) return first;
     var alts: std.ArrayList(Ast.Index) = .empty;
     defer alts.deinit(p.gpa);
     const first_tok = p.nodes.items[first].main_token;
     try alts.append(p.gpa, first);
-    while (p.peek().tag == .pipe) {
-        p.advance(); // |
+    while (p.eat(.pipe)) {
         try alts.append(p.gpa, try p.parseSubPattern());
     }
     const hdr = try p.addRange(alts.items);
@@ -416,14 +410,14 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
     var binders: Ast.Index = Ast.none;
     switch (p.peek().tag) {
         .l_paren => {
-            p.advance(); // (
+            p.bump(.l_paren);
             var binds: std.ArrayList(Ast.Index) = .empty;
             defer binds.deinit(p.gpa);
-            while (p.peek().tag != .r_paren) {
+            while (!p.at(.r_paren)) {
                 // Each tuple element is an arbitrary sub-pattern (literal, binding,
                 // wildcard, nested variant, or-pattern).
                 try binds.append(p.gpa, try p.parsePattern());
-                if (p.peek().tag == .comma) p.advance() else break;
+                if (!p.eat(.comma)) break;
             }
             try p.expect(.r_paren, "expected ')' to close a tuple pattern");
             binders = try p.addRange(binds.items);
@@ -431,17 +425,16 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
         .l_brace => {
             var nb = NoBlockScope.enter(p, false);
             defer nb.end();
-            p.advance(); // {
+            p.bump(.l_brace);
             var binds: std.ArrayList(Ast.Index) = .empty;
             defer binds.deinit(p.gpa);
             while (true) {
-                while (p.peek().tag == .newline) p.advance();
-                if (p.peek().tag == .r_brace) break;
+                p.skipNewlines();
+                if (p.at(.r_brace)) break;
                 const field_tok = p.index;
                 try p.expect(.identifier, "expected a field name in a struct pattern");
                 var bind: Ast.Index = undefined;
-                if (p.peek().tag == .colon) {
-                    p.advance(); // :
+                if (p.eat(.colon)) {
                     // `field: alias` (rename to a bare ident) vs `field: subpat`
                     // (a literal/`.`/`_`/nested pattern matched against the field).
                     // A bare identifier NOT opening a payload is the M10 rename alias.
@@ -462,7 +455,7 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
                     bind = try p.addNode(.{ .tag = .pattern_binding, .main_token = field_tok, .lhs = Ast.none, .rhs = Ast.none });
                 }
                 try binds.append(p.gpa, bind);
-                if (p.peek().tag == .comma) p.advance();
+                _ = p.eat(.comma);
             }
             try p.expect(.r_brace, "expected '}' to close a struct pattern");
             binders = try p.addRange(binds.items);
@@ -477,20 +470,19 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
 /// context (reset `no_block`) so nested exprs and literals parse.
 fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
     const lbrace = p.index;
-    p.advance(); // {
+    p.bump(.l_brace);
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
 
     var inits: std.ArrayList(Ast.Index) = .empty;
     defer inits.deinit(p.gpa);
     while (true) {
-        while (p.peek().tag == .newline) p.advance();
-        if (p.peek().tag == .r_brace) break;
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
         const field_tok = p.index;
         try p.expect(.identifier, "expected a field name");
         var value: Ast.Index = undefined;
-        if (p.peek().tag == .colon) {
-            p.advance(); // :
+        if (p.eat(.colon)) {
             value = try p.parseExpr(0);
         } else {
             // Punning shorthand: synthesize an identifier leaf on the field token.
@@ -498,7 +490,7 @@ fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
         }
         const fi = try p.addNode(.{ .tag = .field_init, .main_token = field_tok, .lhs = value, .rhs = Ast.none });
         try inits.append(p.gpa, fi);
-        if (p.peek().tag == .comma) p.advance();
+        _ = p.eat(.comma);
     }
     try p.expect(.r_brace, "expected '}' to close struct literal");
 
@@ -508,7 +500,7 @@ fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
 
 /// `recv.field`. Consumes the `.` then the field-name identifier.
 fn parseFieldAccess(p: *Parser, recv: Ast.Index) Error!Ast.Index {
-    p.advance(); // .
+    p.bump(.dot);
     const field_tok = p.index;
     try p.expect(.identifier, "expected a field name after '.'");
     return p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = recv, .rhs = Ast.none });
@@ -521,20 +513,19 @@ fn parseFieldAccess(p: *Parser, recv: Ast.Index) Error!Ast.Index {
 /// from value field access by its type position. `/` never appears in a type —
 /// only `.` — so this stays unambiguous with the `import` path grammar.
 fn parseType(p: *Parser) Error!Ast.Index {
-    if (p.peek().tag == .l_paren and p.peek2().tag == .r_paren) {
-        const at = p.index;
-        p.advance(); // (
-        p.advance(); // )
-        return p.addNode(.{ .tag = .literal_unit, .main_token = at, .lhs = Ast.none, .rhs = Ast.none });
+    if (p.at(.l_paren) and p.peek2().tag == .r_paren) {
+        const at_tok = p.index;
+        p.bump(.l_paren);
+        p.bump(.r_paren);
+        return p.addNode(.{ .tag = .literal_unit, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
     }
-    const at = p.index;
+    const at_tok = p.index;
     try p.expect(.identifier, "expected a type name");
-    var ty = try p.addNode(.{ .tag = .identifier, .main_token = at, .lhs = Ast.none, .rhs = Ast.none });
+    var ty = try p.addNode(.{ .tag = .identifier, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
     // A `.ident` chain qualifies the type by its owning module (`mod.Type`). The
     // chain nests left like value field access, so a deeper `a.b.C` is supported
     // structurally (the resolver decides what is legal).
-    while (p.peek().tag == .dot) {
-        p.advance(); // .
+    while (p.eat(.dot)) {
         const field_tok = p.index;
         try p.expect(.identifier, "expected a type name after '.'");
         ty = try p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = ty, .rhs = Ast.none });
@@ -553,9 +544,9 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
     var stmts: std.ArrayList(Ast.Index) = .empty;
     defer stmts.deinit(p.gpa);
     while (true) {
-        while (p.peek().tag == .newline) p.advance();
-        if (p.peek().tag == .r_brace) break;
-        if (p.peek().tag == .eof) return p.fail(p.peek(), "expected '}' to close block");
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
+        if (p.at(.eof)) return p.fail(p.peek(), "expected '}' to close block");
         const stmt = try p.parseStmt();
         try stmts.append(p.gpa, stmt);
         try p.expectTerminator();
@@ -571,7 +562,7 @@ fn expectTerminator(p: *Parser) Error!void {
     switch (p.peek().tag) {
         .newline => {
             p.advance();
-            while (p.peek().tag == .newline) p.advance();
+            p.skipNewlines();
         },
         .r_brace, .eof => {},
         else => return p.fail(p.peek(), "expected a newline or '}' after statement"),
@@ -588,7 +579,7 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
         .kw_for => return p.parseFor(),
         .kw_break => {
             const break_tok = p.index;
-            p.advance();
+            p.bump(.kw_break);
             // A `@name` label may immediately follow `break`; parse it BEFORE the
             // value-terminator decision (the documented ordering hazard).
             const label_tok = try p.parseOptLabel();
@@ -600,7 +591,7 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
         },
         .kw_continue => {
             const continue_tok = p.index;
-            p.advance();
+            p.bump(.kw_continue);
             const label_tok = try p.parseOptLabel();
             return p.addNode(.{ .tag = .continue_stmt, .main_token = continue_tok, .lhs = Ast.none, .rhs = label_tok });
         },
@@ -609,7 +600,7 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
         // expr_stmt and its value can satisfy a non-unit fn's trailing-expr rule.
         .kw_return => {
             const ret_tok = p.index;
-            p.advance();
+            p.bump(.kw_return);
             const expr: Ast.Index = switch (p.peek().tag) {
                 .newline, .r_brace, .eof => Ast.none,
                 else => try p.parseExpr(0),
@@ -619,8 +610,8 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
         .identifier => switch (p.peek2().tag) {
             .colon_eq => {
                 const name_tok = p.index;
-                p.advance(); // name
-                p.advance(); // :=
+                p.bump(.identifier);
+                p.bump(.colon_eq);
                 const init_expr = try p.parseExpr(0);
                 return p.addNode(.{ .tag = .var_decl, .main_token = name_tok, .lhs = init_expr, .rhs = Ast.none });
             },
@@ -629,8 +620,8 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             // inferring from the initializer (the resolver ignores rhs).
             .colon => {
                 const name_tok = p.index;
-                p.advance(); // name
-                p.advance(); // :
+                p.bump(.identifier);
+                p.bump(.colon);
                 const type_ref = try p.parseType();
                 try p.expect(.eq, "expected '=' after type in typed declaration");
                 const init_expr = try p.parseExpr(0);
@@ -649,8 +640,7 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             .dot => {
                 const first = p.index;
                 const place = try p.parsePostfix(try p.parsePrefix());
-                if (p.peek().tag == .eq) {
-                    p.advance(); // =
+                if (p.eat(.eq)) {
                     const value = try p.parseExpr(0);
                     return p.addNode(.{ .tag = .assign, .main_token = first, .lhs = place, .rhs = value });
                 }
@@ -667,7 +657,7 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
 /// required, Go-style); the body is a brace block.
 fn parseWhile(p: *Parser) Error!Ast.Index {
     const while_tok = p.index;
-    p.advance(); // while
+    p.bump(.kw_while);
     var nb = NoBlockScope.enter(p, true);
     const cond = try p.parseExpr(0);
     nb.end();
@@ -682,15 +672,14 @@ fn parseWhile(p: *Parser) Error!Ast.Index {
 /// `.kw_else` as the immediate next token).
 fn parseIf(p: *Parser) Error!Ast.Index {
     const if_tok = p.index;
-    p.advance(); // if
+    p.bump(.kw_if);
     var nb = NoBlockScope.enter(p, true);
     const cond = try p.parseExpr(0);
     nb.end();
     const then_block = try p.parseBlock();
     var else_node: Ast.Index = Ast.none;
-    if (p.peek().tag == .kw_else) {
-        p.advance(); // else
-        else_node = if (p.peek().tag == .kw_if) try p.parseIf() else try p.parseBlock();
+    if (p.eat(.kw_else)) {
+        else_node = if (p.at(.kw_if)) try p.parseIf() else try p.parseBlock();
     }
     const header = try p.addExtra(&.{ then_block, else_node });
     return p.addNode(.{ .tag = .if_stmt, .main_token = if_tok, .lhs = cond, .rhs = header });
@@ -700,8 +689,8 @@ fn parseIf(p: *Parser) Error!Ast.Index {
 /// index; otherwise consume nothing and return `Ast.none`. Used for the optional
 /// label on `break`/`continue`.
 fn parseOptLabel(p: *Parser) Error!Ast.Index {
-    if (p.peek().tag != .at) return Ast.none;
-    p.advance(); // @
+    if (!p.at(.at)) return Ast.none;
+    p.bump(.at);
     const name_tok = p.index;
     try p.expect(.identifier, "expected a label name after '@'");
     return name_tok;
@@ -727,7 +716,7 @@ fn parseLabeled(p: *Parser) Error!Ast.Index {
 /// `loop { body }`. A value-yielding infinite loop expression.
 fn parseLoop(p: *Parser) Error!Ast.Index {
     const loop_tok = p.index;
-    p.advance(); // loop
+    p.bump(.kw_loop);
     const body = try p.parseBlock();
     return p.addNode(.{ .tag = .loop_expr, .main_token = loop_tok, .lhs = body, .rhs = Ast.none });
 }
@@ -735,7 +724,7 @@ fn parseLoop(p: *Parser) Error!Ast.Index {
 /// `for ident in lo..hi { body }`. Iterates the half-open integer range
 /// `[lo, hi)` with `ident: int` bound per-iteration. A `()` statement.
 fn parseFor(p: *Parser) Error!Ast.Index {
-    p.advance(); // for
+    p.bump(.kw_for);
     const ident_tok = p.index;
     try p.expect(.identifier, "expected a loop variable name");
     try p.expect(.kw_in, "expected 'in' after the loop variable");
@@ -783,22 +772,22 @@ fn continueInfix(p: *Parser, lhs0: Ast.Index, min_bp: u8) Error!Ast.Index {
 
 fn parsePrefix(p: *Parser) Error!Ast.Index {
     const tok = p.peek();
-    const at = p.index;
+    const at_tok = p.index;
     switch (tok.tag) {
         .minus, .bang => {
             p.advance();
             const operand = try p.parseExpr(prefix_bp);
-            return p.addNode(.{ .tag = .unary, .main_token = at, .lhs = operand, .rhs = Ast.none });
+            return p.addNode(.{ .tag = .unary, .main_token = at_tok, .lhs = operand, .rhs = Ast.none });
         },
-        .number => return p.leaf(.literal_number, at),
-        .string => return p.leaf(.literal_string, at),
-        .kw_true, .kw_false => return p.leaf(.literal_bool, at),
-        .identifier => return p.leaf(.identifier, at),
+        .number => return p.leaf(.literal_number, at_tok),
+        .string => return p.leaf(.literal_string, at_tok),
+        .kw_true, .kw_false => return p.leaf(.literal_bool, at_tok),
+        .identifier => return p.leaf(.identifier, at_tok),
         .l_paren => {
-            p.advance();
-            if (p.peek().tag == .r_paren) { // the unit literal `()`
-                p.advance(); // )
-                return p.addNode(.{ .tag = .literal_unit, .main_token = at, .lhs = Ast.none, .rhs = Ast.none });
+            p.bump(.l_paren);
+            if (p.at(.r_paren)) { // the unit literal `()`
+                p.bump(.r_paren);
+                return p.addNode(.{ .tag = .literal_unit, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
             }
             // A grouped sub-expression re-allows blocks (the escape hatch out of a
             // condition's `no_block`); restore the flag after.
@@ -829,7 +818,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
         // then upgrades it to a tuple/struct form if `(`/`{` follows. (A postfix
         // `.field` is handled in parsePostfix, after an operand.)
         .dot => {
-            p.advance(); // .
+            p.bump(.dot);
             const name = p.index;
             try p.expect(.identifier, "expected a variant name after '.'");
             return p.addNode(.{ .tag = .enum_init_unit, .main_token = name, .lhs = Ast.none, .rhs = Ast.none });
@@ -889,14 +878,14 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
 /// qualified `N.V(...)` — a `field_access` whose receiver is the type name and
 /// whose field token is the variant. `type_name` is `none` for inferred.
 fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast.Index {
-    p.advance(); // (
+    p.bump(.l_paren);
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
-    while (p.peek().tag != .r_paren) {
+    while (!p.at(.r_paren)) {
         try args.append(p.gpa, try p.parseExpr(0));
-        if (p.peek().tag == .comma) p.advance() else break;
+        if (!p.eat(.comma)) break;
     }
     try p.expect(.r_paren, "expected ')' to close a variant construction");
     const header = try p.addRange(args.items);
@@ -914,26 +903,25 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
     // token, type-name = its receiver.
     const vtok = p.nodes.items[node].main_token;
     const type_name: Ast.Index = if (qualified == Ast.none) Ast.none else p.nodes.items[node].lhs;
-    p.advance(); // {
+    p.bump(.l_brace);
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
     var inits: std.ArrayList(Ast.Index) = .empty;
     defer inits.deinit(p.gpa);
     while (true) {
-        while (p.peek().tag == .newline) p.advance();
-        if (p.peek().tag == .r_brace) break;
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
         const field_tok = p.index;
         try p.expect(.identifier, "expected a field name");
         var value: Ast.Index = undefined;
-        if (p.peek().tag == .colon) {
-            p.advance(); // :
+        if (p.eat(.colon)) {
             value = try p.parseExpr(0);
         } else {
             value = try p.addNode(.{ .tag = .identifier, .main_token = field_tok, .lhs = Ast.none, .rhs = Ast.none });
         }
         const fi = try p.addNode(.{ .tag = .field_init, .main_token = field_tok, .lhs = value, .rhs = Ast.none });
         try inits.append(p.gpa, fi);
-        if (p.peek().tag == .comma) p.advance();
+        _ = p.eat(.comma);
     }
     try p.expect(.r_brace, "expected '}' to close a variant construction");
     const header = try p.addRange(inits.items);
@@ -943,16 +931,16 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
 
 fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     const lparen = p.index;
-    p.advance(); // (
+    p.bump(.l_paren);
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
     // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
-    while (p.peek().tag != .r_paren) {
+    while (!p.at(.r_paren)) {
         try args.append(p.gpa, try p.parseExpr(0));
-        if (p.peek().tag == .comma) p.advance() else break;
+        if (!p.eat(.comma)) break;
     }
     try p.expect(.r_paren, "expected ')' to close call");
     const header = try p.addRange(args.items);
@@ -1004,9 +992,9 @@ fn addRange(p: *Parser, items: []const Ast.Index) Error!u32 {
 
 /// Append raw cells; return the index of the first.
 fn addExtra(p: *Parser, vals: []const u32) Error!u32 {
-    const at: u32 = @intCast(p.extra.items.len);
+    const start: u32 = @intCast(p.extra.items.len);
     try p.extra.appendSlice(p.gpa, vals);
-    return at;
+    return start;
 }
 
 // ---- cursor ----------------------------------------------------------------
@@ -1024,6 +1012,33 @@ fn peek2(p: *const Parser) Token {
 fn advance(p: *Parser) void {
     // The token stream always ends in `.eof`; never step past it.
     if (p.tokens[p.index].tag != .eof) p.index += 1;
+}
+
+/// Is the cursor on `tag`? A predicate that never consumes — the readable form
+/// of `p.peek().tag == tag`.
+fn at(p: *const Parser, tag: token.Tag) bool {
+    return p.peek().tag == tag;
+}
+
+/// Consume the current token iff it matches `tag`; return whether it did. For
+/// OPTIONAL tokens (a trailing comma, an `as` alias, a leading `pub`).
+fn eat(p: *Parser, tag: token.Tag) bool {
+    if (!p.at(tag)) return false;
+    p.advance();
+    return true;
+}
+
+/// Consume a token the caller has ALREADY proven present (encodes the old
+/// breadcrumb comment as an assert).
+fn bump(p: *Parser, comptime tag: token.Tag) void {
+    std.debug.assert(p.at(tag));
+    p.advance();
+}
+
+/// Skip a run of statement terminators (Go-style newlines that are insignificant
+/// inside `{}` / at the top level).
+fn skipNewlines(p: *Parser) void {
+    while (p.at(.newline)) p.advance();
 }
 
 fn expect(p: *Parser, tag: token.Tag, message: []const u8) Error!void {
@@ -1059,7 +1074,7 @@ fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const 
     const run = struct {
         fn go(pp: *Parser) Error!Ast.Tree {
             _ = try pp.parseExpr(0);
-            while (pp.peek().tag == .newline) pp.advance();
+            pp.skipNewlines();
             try pp.expect(.eof, "expected end of input");
             return Ast.Tree{
                 .nodes = try pp.nodes.toOwnedSlice(pp.gpa),
