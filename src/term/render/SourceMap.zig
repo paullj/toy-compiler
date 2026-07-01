@@ -217,8 +217,6 @@ fn castLen(len: usize) u32 {
     return @intCast(len);
 }
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 
 // The byte-counting reference: a verbatim copy of driver/main.zig:983 `lineCol`.

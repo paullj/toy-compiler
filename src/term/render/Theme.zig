@@ -132,8 +132,6 @@ pub fn underline(self: Theme, kind: Diagnostic.LabelKind) []const u8 {
     };
 }
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 
 test "severity styles are bold with the documented ansi hue" {

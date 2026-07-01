@@ -85,7 +85,7 @@ const MultiSpan = struct {
 pub fn render(d: Diagnostic.Diagnostic, sm: *const SourceMap, w: *std.Io.Writer, opts: RenderOpts) std.Io.Writer.Error!void {
     const theme = Theme.forUnicode(opts.unicode);
 
-    // ---- LAYOUT (pure; never reads opts.color) -----------------------------
+    // LAYOUT (pure; never reads opts.color).
 
     // Collect labels into a fixed-cap index array: primary first (order 0), then
     // each secondary. Deterministic truncation past MAX_LABELS keeps the primary.
@@ -166,7 +166,7 @@ pub fn render(d: Diagnostic.Diagnostic, sm: *const SourceMap, w: *std.Io.Writer,
         refs[j] = key;
     }
 
-    // ---- EMIT --------------------------------------------------------------
+    // EMIT.
     // 1. HEADER: styled severity word, then plain "[code]" (omitted when null),
     //    then plain ": message". Nothing between word and '['; nothing between
     //    ']' and ':'; exactly one space after ':'.
@@ -654,8 +654,6 @@ fn multiLabel(refs: []const LabelRef, ms: MultiSpan) Diagnostic.Label {
     }
     return .{ .kind = .primary, .span = .{ .start = 0, .end = 0 } };
 }
-
-// ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -1241,8 +1239,6 @@ test "fromSink round-trips: a zero-width sink diagnostic renders one caret" {
         renderInto(&buf, d, &sm, .{}),
     );
 }
-
-// ---- M13 multi-line rail goldens -------------------------------------------
 
 // The canonical multi-line block diagnostic. Source "fn f() {\n    a\n}\n":
 //   line_starts = [0, 9, 15, 17]; '{' at byte 7 (line 1, byteCol 8, displayCol 8);
