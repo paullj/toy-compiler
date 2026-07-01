@@ -1169,6 +1169,57 @@ test "one bad identifier yields exactly one typecheck diagnostic (poison)" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
+test "error_node types as invalid, emits no diagnostics, and renders (error)" {
+    // The fault-tolerant parser will (in a later stage) emit `error_node` at a parse
+    // error; here we forge one into an otherwise-clean tree to pin the downstream
+    // contract: it is an already-diagnosed poison leaf, so resolve + typecheck add
+    // ZERO diagnostics for it and it types as the poison `invalid` (no cascade).
+    const gpa = testing.allocator;
+    const source = "fn main() {\n 0\n return\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var diag: ?Parser.Diagnostic = null;
+    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    // Locate the sole `literal_number` node (the bare `0` expression statement) and
+    // OVERWRITE it in place with an `error_node` leaf, keeping its `main_token` so
+    // its byte offset stays valid. lhs/rhs become `none` (it is a leaf).
+    var err_idx: ?Ast.Index = null;
+    for (tree.nodes, 0..) |*n, i| {
+        if (n.tag == .literal_number) {
+            n.tag = .error_node;
+            n.lhs = Ast.none;
+            n.rhs = Ast.none;
+            err_idx = Ast.Index.from(@intCast(i));
+        }
+    }
+    const ei = err_idx orelse return error.NoLiteralToPoison;
+
+    // Render must print the `(error)` leaf where the literal used to be.
+    var rbuf: [128]u8 = undefined;
+    var rw = std.Io.Writer.fixed(&rbuf);
+    try Ast.render(&rw, tree, tokens, source);
+    try testing.expect(std.mem.indexOf(u8, rw.buffered(), "(error)") != null);
+
+    // Run the real resolve + typecheck over the mutated tree (the same wiring as
+    // `checkSource`, just with the injected node).
+    var g = try Graph.single(gpa, "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    defer res.deinit(gpa);
+    var result = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
+    defer result.deinit(gpa);
+
+    // (a) the error_node types as the poison `invalid`.
+    try testing.expect(Type.eql(Type.invalid, result.node_types[0][ei.int()]));
+    // (b) no-cascade / already-diagnosed: resolve + typecheck emit ZERO diagnostics.
+    try testing.expectEqual(@as(usize, 0), result.diags.len);
+}
+
 test "unknown type name in a parameter" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         "fn f(a: nope) {\n return\n}\n",

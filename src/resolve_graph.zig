@@ -453,6 +453,8 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "continue");
         },
         .labeled => try g.resolveLabeled(stmt_idx),
+        // A poison leaf as a statement: already-diagnosed, resolve nothing.
+        .error_node => {},
         else => try g.resolveExpr(stmt_idx),
     }
 }
@@ -471,6 +473,8 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
             }
         },
         .literal_number, .literal_string, .literal_bool => {},
+        // A poison leaf is already-diagnosed: no name lookup, no diagnostic.
+        .error_node => {},
         .unary => try g.resolveExpr(n.lhs),
         .binary => {
             try g.resolveExpr(n.lhs);

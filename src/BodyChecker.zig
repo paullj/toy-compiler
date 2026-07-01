@@ -272,6 +272,8 @@ pub const BodyChecker = struct {
                 if (ctx.kind == .labeled_block)
                     try bc.sink.emit(bc.byteOf(stmt.main_token), "cannot continue a labeled block (not a loop)");
             },
+            // A poison leaf as a statement: already-diagnosed, no further check.
+            .error_node => {},
             else => _ = try bc.typeOf(stmt_idx),
         }
     }
@@ -450,6 +452,9 @@ pub const BodyChecker = struct {
             .if_stmt => try bc.typeOfIf(node_idx, n),
             .loop_expr => return bc.typeOfLoop(node_idx, n, null), // sets node_types itself
             .labeled => return bc.checkLabeled(node_idx, true), // sets node_types itself
+            // A poison leaf types as the poison `invalid` — already-diagnosed, so
+            // no diagnostic here and no cascade (`assignable` absorbs `.invalid`).
+            .error_node => Type.invalid,
             else => Type.invalid,
         };
         bc.node_types[(node_idx).int()] = ty;
