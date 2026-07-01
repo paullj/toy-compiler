@@ -797,7 +797,14 @@ fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel,
                 .codegen => switch (orch.tail) {
                     .lower => switch (orch.lowered.*.?) {
                         .err => |ee| try DiagRender.renderGraphEmit(gpa, out, level, g, ee),
-                        .ok => |lp| for (lp.diags) |d| try DiagRender.renderGraphEmit(gpa, out, level, g, .{ .message = d.message, .byte_offset = d.byte_offset }),
+                        .ok => |lp| for (lp.diags) |d| try DiagRender.renderGraphEmit(gpa, out, level, g, .{
+                            .message = d.message,
+                            .byte_offset = d.byte_offset,
+                            // Carry the diagnostic's owning module so it renders against the
+                            // right source once multi-module lowering emits per-module diags;
+                            // NO_SCOPE (single-file) stays null -> entry module.
+                            .module = if (d.scope == toyc.DiagnosticSink.NO_SCOPE) null else d.scope,
+                        }),
                     },
                     .render_ir => switch (orch.ir.*.?) {
                         .err => |ee| try DiagRender.renderGraphEmit(gpa, out, level, g, ee),
