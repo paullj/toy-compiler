@@ -58,6 +58,19 @@ no_block: bool = false,
 /// of recursing further — the anti-crash backstop for the project's frame-sizing
 /// SIGBUS hazard on adversarially deep input.
 depth: u16 = 0,
+/// Cascade-suppression latch (matklad/ANTLR "in error recovery" flag). Set the
+/// moment a diagnostic is appended (`warn`, which `fail` funnels through); while
+/// set, `warn` still unwinds/repairs but does NOT append a FURTHER diagnostic, so
+/// a burst of derived errors over the same unresynced region collapses to the
+/// first, actionable one. CLEARED at a real resync boundary — a cleanly crossed
+/// statement terminator (`expectTerminator`'s success arms) or the start of a new
+/// top-level decl (`parseDecls` loop top) — which is what preserves genuinely
+/// INDEPENDENT errors: after recovery reaches the next statement/decl the latch
+/// clears, so the next independent error IS reported. It is deliberately NOT
+/// cleared by every `expect`/`eat`/`advance`, because a statement re-parse after
+/// `findNextStmt` lands on the TAIL of the same broken statement (e.g. the `x` in
+/// a broken `let x =`) matches real tokens without having crossed a boundary.
+in_error: bool = false,
 
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
@@ -169,7 +182,20 @@ fn findNextStmt(p: *Parser) void {
         std.debug.assert(fuel != 0);
         fuel -= 1;
         const t = p.peek().tag;
-        if (depth == 0 and (t == .r_brace or t == .newline or stmt_first.contains(t) or decl_first.contains(t))) return;
+        if (depth == 0 and (t == .r_brace or t == .newline or stmt_first.contains(t) or decl_first.contains(t))) {
+            // Landing on a `.newline`/`.r_brace` is a cleanly crossed statement
+            // boundary — the same resync signal `expectTerminator`'s success arms
+            // give — so clear the cascade latch: the NEXT statement's first error
+            // must report. (When `expectTerminator` itself fails on a still-
+            // unconsumed closer like `return )`, the block loop recovers via THIS
+            // scan instead of the terminator's clear arm, so the clear has to live
+            // here too or an independent error on the following line is swallowed.)
+            // A stmt-FIRST/decl stop is deliberately NOT a clear: it can be the tail
+            // of the same broken statement on the same physical line, still in the
+            // unresynced region.
+            if (t == .newline or t == .r_brace) p.in_error = false;
+            return;
+        }
         switch (t) {
             .l_brace, .l_paren => depth += 1,
             .r_brace, .r_paren => if (depth > 0) {
@@ -334,6 +360,9 @@ fn parseProgram(p: *Parser) error{OutOfMemory}!Ast.Tree {
 fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) error{OutOfMemory}!void {
     p.skipNewlines();
     while (!p.at(.eof)) {
+        // Each top-level decl is a fresh recovery unit: clear the cascade latch so
+        // an independent error in THIS decl reports even after a prior decl broke.
+        p.in_error = false;
         const entry = p.index;
         p.parseDeclRecoverable(decls) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -596,9 +625,11 @@ fn parseMatch(p: *Parser) Error!Ast.Index {
     // Scrutinee in `no_block` (a bare `match x { ... }` reads `x`, the `{` opening
     // the arm list); then the arm list parses with blocks re-allowed, restoring the
     // prior flag once the whole `match` is done.
-    var scrut_nb = NoBlockScope.enter(p, true);
-    const scrut = try p.parseExpr(0);
-    scrut_nb.end();
+    const scrut = scrut: {
+        var scrut_nb = NoBlockScope.enter(p, true);
+        defer scrut_nb.end();
+        break :scrut try p.parseExpr(0);
+    };
     var arms_nb = NoBlockScope.enter(p, false);
     defer arms_nb.end();
     try p.expect(.l_brace, "expected '{' to open a match");
@@ -869,7 +900,7 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
     p.depth += 1;
     defer p.depth -= 1;
     if (p.depth > MAX_EXPR_DEPTH) {
-        try p.warn(p.peek(), "block nested too deeply");
+        try p.backstop(p.peek(), "block nested too deeply");
         return p.addNode(.{ .tag = .error_node, .main_token = p.index, .lhs = Ast.none, .rhs = Ast.none });
     }
     // A block body is a fresh expression context: re-allow `{`/`if` expressions
@@ -918,10 +949,13 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
 fn expectTerminator(p: *Parser) Error!void {
     switch (p.peek().tag) {
         .newline => {
+            // A cleanly crossed statement boundary is a resync point: clear the
+            // cascade latch so the NEXT statement's first error reports.
+            p.in_error = false;
             p.advance();
             p.skipNewlines();
         },
-        .r_brace, .eof => {},
+        .r_brace, .eof => p.in_error = false,
         else => return p.fail(p.peek(), "expected a newline or '}' after statement"),
     }
 }
@@ -1016,9 +1050,13 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
 fn parseWhile(p: *Parser) Error!Ast.Index {
     const while_tok = p.index;
     p.bump(.kw_while);
-    var nb = NoBlockScope.enter(p, true);
-    const cond = try p.parseExpr(0);
-    nb.end();
+    // `defer`-pair the scope so an error unwind while parsing the condition still
+    // restores `no_block`; a nested scope ends it before the body is parsed.
+    const cond = cond: {
+        var nb = NoBlockScope.enter(p, true);
+        defer nb.end();
+        break :cond try p.parseExpr(0);
+    };
     const body = try p.parseBlock();
     return p.addNode(.{ .tag = .while_stmt, .main_token = while_tok, .lhs = cond, .rhs = body });
 }
@@ -1031,9 +1069,11 @@ fn parseWhile(p: *Parser) Error!Ast.Index {
 fn parseIf(p: *Parser) Error!Ast.Index {
     const if_tok = p.index;
     p.bump(.kw_if);
-    var nb = NoBlockScope.enter(p, true);
-    const cond = try p.parseExpr(0);
-    nb.end();
+    const cond = cond: {
+        var nb = NoBlockScope.enter(p, true);
+        defer nb.end();
+        break :cond try p.parseExpr(0);
+    };
     const then_block = try p.parseBlock();
     var else_node: Ast.Index = Ast.none;
     if (p.eat(.kw_else)) {
@@ -1086,11 +1126,16 @@ fn parseFor(p: *Parser) Error!Ast.Index {
     const ident_tok = p.index;
     try p.expect(.identifier, "expected a loop variable name");
     try p.expect(.kw_in, "expected 'in' after the loop variable");
-    var nb = NoBlockScope.enter(p, true);
-    const lo = try p.parseExpr(0); // halts at `..` (no infix bp)
-    try p.expect(.dotdot, "expected '..' in the for range");
-    const hi = try p.parseExpr(0);
-    nb.end();
+    const range = range: {
+        var nb = NoBlockScope.enter(p, true);
+        defer nb.end();
+        const lo = try p.parseExpr(0); // halts at `..` (no infix bp)
+        try p.expect(.dotdot, "expected '..' in the for range");
+        const hi = try p.parseExpr(0);
+        break :range .{ lo, hi };
+    };
+    const lo = range[0];
+    const hi = range[1];
     const body = try p.parseBlock(); // re-arms no_block internally
     const header = try p.addExtra(&.{ lo.int(), hi.int() }); // children before parent
     return p.addNode(.{ .tag = .for_stmt, .main_token = ident_tok, .lhs = body, .rhs = header });
@@ -1118,7 +1163,7 @@ fn parseExpr(p: *Parser, min_bp: u8) Error!Ast.Index {
     p.depth += 1;
     defer p.depth -= 1;
     if (p.depth > MAX_EXPR_DEPTH) {
-        try p.warn(p.peek(), "expression nested too deeply");
+        try p.backstop(p.peek(), "expression nested too deeply");
         const et = p.index;
         while (!p.at(.eof) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
         return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
@@ -1162,10 +1207,13 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
                 return p.addNode(.{ .tag = .literal_unit, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
             }
             // A grouped sub-expression re-allows blocks (the escape hatch out of a
-            // condition's `no_block`); restore the flag after.
-            var nb = NoBlockScope.enter(p, false);
-            const inner = try p.parseExpr(0);
-            nb.end();
+            // condition's `no_block`); `defer`-restore the flag so an error unwind
+            // while parsing the inner expr still restores the prior value.
+            const inner = inner: {
+                var nb = NoBlockScope.enter(p, false);
+                defer nb.end();
+                break :inner try p.parseExpr(0);
+            };
             try p.expect(.r_paren, "expected ')' to close group");
             return inner;
         },
@@ -1545,7 +1593,22 @@ fn expect(p: *Parser, tag: token.Tag, message: []const u8) Error!void {
 
 /// Append a diagnostic WITHOUT unwinding. Marks the parse as tainted. Used by the
 /// repair primitives that recover in place; `fail` is `warn` + unwind.
-fn warn(p: *Parser, tok: Token, message: []const u8) Error!void {
+fn warn(p: *Parser, tok: Token, message: []const u8) error{OutOfMemory}!void {
+    // Cascade suppression: once a diagnostic has fired for the current unresynced
+    // region, swallow the derived ones (arm the latch on the FIRST). The caller
+    // still gets its `error_node`/unwind — only the duplicate append is dropped.
+    if (p.in_error) return;
+    p.in_error = true;
+    try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message });
+}
+
+/// Emit a depth-limit BACKSTOP diagnostic. Unlike `warn` this bypasses the
+/// cascade latch — the recursion-depth caps are the anti-SIGBUS crash backstop,
+/// not a syntax cascade, so they must report even when a prior diagnostic (e.g. an
+/// over-deep condition's own cap) already armed suppression. It does NOT arm the
+/// latch either: the ordinary unwind noise (unclosed `}`) is still governed by the
+/// normal `warn` latch, so this collapses to one backstop message plus one closer.
+fn backstop(p: *Parser, tok: Token, message: []const u8) error{OutOfMemory}!void {
     try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message });
 }
 
@@ -1553,7 +1616,9 @@ fn warn(p: *Parser, tok: Token, message: []const u8) Error!void {
 /// The top-level loop catches this and finishes the partial tree. `warn` then
 /// unwind — kept as one call so every `return p.fail(...)` site stays terse.
 fn fail(p: *Parser, tok: Token, message: []const u8) Error {
-    p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message }) catch return error.OutOfMemory;
+    // Route through `warn` so the cascade latch governs the append (a suppressed
+    // append is still a `fail` — the producer unwinds either way).
+    p.warn(tok, message) catch return error.OutOfMemory;
     return error.ParseError;
 }
 
@@ -2400,15 +2465,21 @@ fn renderResult(res: Result, source: []const u8, buf: []u8) ![]const u8 {
 }
 
 test "B3: two independent errors in one file both report and both decls survive" {
-    // `return )` in a, `return )` in b — two independent broken statements. Both
-    // fn decls must be present (a's error did not swallow b) and >=2 diagnostics.
+    // `return )` in a, `return )` in b — two INDEPENDENT broken statements, one per
+    // decl. Each stray `)` in return-value position is the cascade signature (a
+    // structural closer in a statement value slot): before the cascade fix each site
+    // sprayed TWO diagnostics ("expected an expression" + "expected a newline or
+    // '}'"), so the file yielded FOUR. The latch must collapse each site to one AND
+    // clear at the decl boundary so the second site still reports — EXACTLY TWO
+    // total, not four (over-cascade) and not one (over-suppression).
     const gpa = testing.allocator;
     const source = "fn a() -> int {\n  return )\n}\nfn b() -> int {\n  return )\n}\n";
     const res = try parseResult(gpa, source);
     defer gpa.free(@constCast(res.diags));
     defer freeTree(gpa, res.tree);
 
-    try testing.expect(res.diags.len >= 2);
+    try testing.expectEqual(@as(usize, 2), res.diags.len);
+    for (res.diags) |d| try testing.expectEqualStrings("expected an expression", d.message);
     const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
     try testing.expectEqual(Node.Tag.program, prog.tag);
     // BOTH fn decls present: the top-level decl loop recovered across the break.
@@ -2420,7 +2491,82 @@ test "B3: two independent errors in one file both report and both decls survive"
     for (res.diags) |d| {
         if (d.byte_offset < b_off) before += 1 else after += 1;
     }
-    try testing.expect(before >= 1 and after >= 1);
+    try testing.expectEqual(@as(usize, 1), before);
+    try testing.expectEqual(@as(usize, 1), after);
+}
+
+test "B3: a stray ')' in return-value position yields exactly one diagnostic (no cascade)" {
+    // The confirmed cascade defect: `return )` — a structural closer where an
+    // expression is expected. parsePrefix reports "expected an expression" and
+    // returns an error_node WITHOUT consuming the `)`; before the cascade latch the
+    // unconsumed `)` then tripped expectTerminator into a SECOND spurious "expected a
+    // newline or '}'" at the same offset. The latch collapses this to ONE.
+    const gpa = testing.allocator;
+    const source = "fn a() -> int {\n  return )\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("expected an expression", res.diags[0].message);
+    // Point at the stray `)` in return-value position (the one after `return `),
+    // not the `()` in the fn signature.
+    const paren_off: u32 = @intCast(std.mem.indexOf(u8, source, "return )").? + "return ".len);
+    try testing.expectEqual(paren_off, res.diags[0].byte_offset);
+}
+
+test "B3: a stray ')' after '=' assignment value yields exactly one diagnostic (no cascade)" {
+    // The same cascade signature across a different statement form: `x = )`. Proves
+    // the fix is systematic (not special-cased to `return`), collapsing the
+    // parsePrefix + expectTerminator pair over the unconsumed `)` to ONE diagnostic.
+    const gpa = testing.allocator;
+    const source = "fn a() -> int {\n  x = )\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("expected an expression", res.diags[0].message);
+}
+
+test "B3: two adjacent broken statements (no good stmt between) each report — no over-suppression" {
+    // Over-suppression regression guard. `return )` on line 2 and `x = )` on line 3
+    // are two INDEPENDENT sites on distinct lines with NO valid statement between
+    // them. The first site's stray `)` is left unconsumed, so recovery goes through
+    // `findNextStmt` (not `expectTerminator`'s clean newline arm). If the cascade
+    // latch is not cleared when that scan crosses the line's newline boundary, the
+    // second site's "expected an expression" is silently swallowed and the file
+    // reports only ONE diagnostic. It must report EXACTLY TWO, one per site.
+    const gpa = testing.allocator;
+    const source = "fn a() -> int {\n  return )\n  x = )\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 2), res.diags.len);
+    for (res.diags) |d| try testing.expectEqualStrings("expected an expression", d.message);
+    // The two diagnostics sit at two distinct offsets (the two stray `)`s), proving
+    // they are two independent sites, not a duplicated single-site cascade.
+    try testing.expect(res.diags[0].byte_offset != res.diags[1].byte_offset);
+    const first_paren: u32 = @intCast(std.mem.indexOf(u8, source, "return )").? + "return ".len);
+    const second_paren: u32 = @intCast(std.mem.indexOf(u8, source, "x = )").? + "x = ".len);
+    try testing.expectEqual(first_paren, res.diags[0].byte_offset);
+    try testing.expectEqual(second_paren, res.diags[1].byte_offset);
+}
+
+test "B3: a valid statement between two broken sites still yields exactly two diagnostics" {
+    // The complementary guard: a well-formed statement (`y := 1`) between the two
+    // broken sites must NOT itself add a diagnostic, and both broken sites must
+    // still report — exactly two total. Proves the latch clears cleanly across a
+    // successful statement without either over-reporting or over-suppressing.
+    const gpa = testing.allocator;
+    const source = "fn a() -> int {\n  return )\n  y := 1\n  x = )\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 2), res.diags.len);
+    for (res.diags) |d| try testing.expectEqualStrings("expected an expression", d.message);
 }
 
 test "B3: adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
