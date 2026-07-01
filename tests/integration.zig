@@ -15,4 +15,5 @@
 
 test {
     _ = @import("query_engine.zig");
+    _ = @import("driver.zig");
 }
