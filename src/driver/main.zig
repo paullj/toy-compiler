@@ -31,7 +31,6 @@ const Io = std.Io;
 // src/root.zig) rather than via relative `../` paths.
 const toyc = @import("toy_compiler");
 const Driver = toyc.Driver;
-const Ast = toyc.Ast;
 const Graph = toyc.Graph;
 const Codegen = toyc.DriverCodegen;
 const Orchestrator = @import("Orchestrator.zig").Orchestrator;
@@ -47,25 +46,16 @@ const cli = toyc.cli;
 const term = toyc.term;
 const Style = term.Style;
 const Terminal = term.Terminal;
-const Rr = term.render;
 const AppCli = @import("Cli.zig");
-
-// ---- status palette --------------------------------------------------------
-// Colours from Theme's bright-ansi indices so `Color.downgrade` is the identity at
-// ansi16/ansi256; dim/bold are pure attributes. Every use goes through
-// `Style.styled`, which writes ZERO bytes at `.none` — so on a pipe/CI (`.none`)
-// the coloured path is byte-identical to plain. `err` matches the Renderer's own
-// header word hue (bright red 9, bold) instead of a hardcoded normal red.
-const sty_err: Style.Style = .{ .fg = .{ .ansi = 9 }, .bold = true }; // Theme.plain.style(.err)
-const sty_ok: Style.Style = .{ .fg = .{ .ansi = 10 } }; // bright green
-const sty_head: Style.Style = .{ .bold = true };
-const sty_faint: Style.Style = .{ .dim = true };
-
-/// The renderer options for a colour level: ASCII carets (unicode off) keep the
-/// diagnostic output byte-stable and gate-safe under any future golden.
-fn renderOpts(level: Style.ColorLevel) Rr.Renderer.RenderOpts {
-    return .{ .color = level, .unicode = false };
-}
+// The extracted status-table + diagnostics-rendering clusters (sibling files). The
+// shared status palette (`sty_*`) lives in DiagRender — the lower layer both this and
+// Report style with — so the dependency runs main -> Report -> DiagRender (no cycle).
+const Report = @import("Report.zig");
+const DiagRender = @import("DiagRender.zig");
+const sty_err = DiagRender.sty_err;
+const sty_ok = DiagRender.sty_ok;
+const sty_head = DiagRender.sty_head;
+const sty_faint = DiagRender.sty_faint;
 
 /// Resolve the colour level ONCE from an explicit `choice`, the tty-ness of STDOUT
 /// (diagnostics + status all go to `out` == stdout, so probing stdout is what makes
@@ -146,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
         .errors => {
-            try printCliErrors(out, err_level, sink.items());
+            try DiagRender.printCliErrors(out, err_level, sink.items());
             try out.flush();
             std.process.exit(1);
         },
@@ -189,7 +179,7 @@ pub fn main(init: std.process.Init) !void {
                             return;
                         },
                         .errors => {
-                            try printCliErrors(out, err_level, sink.items());
+                            try DiagRender.printCliErrors(out, err_level, sink.items());
                             try out.flush();
                             std.process.exit(1);
                         },
@@ -250,7 +240,7 @@ pub fn main(init: std.process.Init) !void {
         gpa.free(results);
     }
 
-    const failures = try report(out, gpa, level, results, st.emit, st.target, st.dump);
+    const failures = try Report.report(out, gpa, level, results, st.emit, st.target, st.dump);
     try out.flush();
     // Signal compilation failure to scripts/CI. (Flush first; exit skips defers.)
     if (failures > 0) std.process.exit(1);
@@ -814,16 +804,16 @@ fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel,
         error.StageDiagnostics => {
             const g = &orch.graph.*.?;
             switch (orch.failed_stage.*.?) {
-                .discover => try renderGraphError(gpa, out, level, g, g.err.?),
-                .resolve => try renderScopedDiags(gpa, out, level, g, orch.res.*.?.diags),
-                .typecheck => try renderScopedDiags(gpa, out, level, g, orch.tc.*.?.diags),
+                .discover => try DiagRender.renderGraphError(gpa, out, level, g, g.err.?),
+                .resolve => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.res.*.?.diags),
+                .typecheck => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.tc.*.?.diags),
                 .codegen => switch (orch.tail) {
                     .lower => switch (orch.lowered.*.?) {
-                        .err => |ee| try renderGraphEmit(gpa, out, level, g, ee),
-                        .ok => |lp| for (lp.diags) |d| try renderGraphEmit(gpa, out, level, g, .{ .message = d.message, .byte_offset = d.byte_offset }),
+                        .err => |ee| try DiagRender.renderGraphEmit(gpa, out, level, g, ee),
+                        .ok => |lp| for (lp.diags) |d| try DiagRender.renderGraphEmit(gpa, out, level, g, .{ .message = d.message, .byte_offset = d.byte_offset }),
                     },
                     .render_ir => switch (orch.ir.*.?) {
-                        .err => |ee| try renderGraphEmit(gpa, out, level, g, ee),
+                        .err => |ee| try DiagRender.renderGraphEmit(gpa, out, level, g, ee),
                         .ok => {}, // an .ok IR result never raises StageDiagnostics
                     },
                 },
@@ -929,103 +919,6 @@ fn emitIr(
     return 0;
 }
 
-// ---- diagnostics rendering (pretty snippets via the render Renderer) -------
-//
-// FRAMEWORK GAP (worked around here, not patched): the Renderer needs a Span into a
-// source to draw a snippet, so a Graph.Error / EmitError with `byte_offset == null`
-// (or a discover error with no module loaded, i.e. no source) cannot snippet. We
-// fall back to `renderPlainError` — `path: error: msg (detail)` — preserving the old
-// no-location shape exactly, minus escapes at `.none`.
-
-/// Render a resolve/type sink diagnostic against a prepared SourceMap: a zero-width
-/// primary `.err` at `d.byte_offset` (via `fromSink`), snippet + caret.
-fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, d: toyc.DiagnosticSink.Diagnostic) !void {
-    try Rr.Renderer.render(Rr.Diagnostic.fromSink(d), sm, out, renderOpts(level));
-}
-
-/// Render a LOCATED error: with an offset, build a one-off SourceMap over `name`/`src`
-/// and a primary label at `[off, off)` carrying `message`; a non-empty `detail`
-/// becomes a `= note:` footer. With no offset, fall back to `renderPlainError`
-/// (detail inline as `(detail)`), preserving the old no-location shape.
-fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, byte_offset: ?u32, message: []const u8, detail: []const u8) !void {
-    const off = byte_offset orelse return renderPlainError(out, level, name, message, detail);
-    var sm = try Rr.SourceMap.init(gpa, name, src);
-    defer sm.deinit(gpa);
-    var notes_buf: [1]Rr.Diagnostic.Note = undefined;
-    const notes: []const Rr.Diagnostic.Note = if (detail.len != 0) blk: {
-        notes_buf[0] = .{ .kind = .note, .message = detail };
-        break :blk notes_buf[0..1];
-    } else &.{};
-    const d = Rr.Diagnostic.Diagnostic{
-        .severity = .err,
-        .message = message,
-        .primary = .{ .kind = .primary, .span = .{ .start = off, .end = off }, .message = message },
-        .notes = notes,
-    };
-    try Rr.Renderer.render(d, &sm, out, renderOpts(level));
-}
-
-/// The LOCATION-LESS fallback (no offset, or the arg-error path). Emits the old
-/// `path: error: msg (detail)` shape with only the `error` word styled at `sty_err`
-/// (bright red 9 bold — matching the Renderer's own header word hue). Gate-safe: at
-/// `.none` `styled` writes only "error".
-fn renderPlainError(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, message: []const u8, detail: []const u8) !void {
-    try out.print("{s}: ", .{path});
-    try sty_err.styled(out, level, "error");
-    try out.print(": {s}", .{message});
-    if (detail.len != 0) try out.print(" ({s})", .{detail});
-    try out.writeByte('\n');
-}
-
-/// Render a batch of sink diagnostics (resolve/type) against their owning modules,
-/// REUSING one SourceMap per scope: the diagnostics are sorted by (scope, offset) so
-/// same-scope diagnostics are contiguous — we build a map per scope and keep it while
-/// the scope holds. Scope `NO_SCOPE` (single-file) picks the entry module.
-fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, diags: []const toyc.DiagnosticSink.Diagnostic) !void {
-    var cached_scope: ?u32 = null;
-    var sm: Rr.SourceMap = undefined;
-    defer if (cached_scope != null) sm.deinit(gpa);
-    for (diags) |d| {
-        if (cached_scope == null or cached_scope.? != d.scope) {
-            if (cached_scope != null) sm.deinit(gpa);
-            const m = if (d.scope == toyc.DiagnosticSink.NO_SCOPE) g.entry() else &g.modules[d.scope];
-            // Clear `cached_scope` BEFORE the `try init`: `sm` was just deinit'd (set to
-            // `undefined`) above, so if `SourceMap.init` hits OOM and propagates, the
-            // `defer if (cached_scope != null) sm.deinit(gpa)` must NOT fire on the freed/
-            // undefined `sm` (double-free of an undefined pointer). Reassign after init.
-            cached_scope = null;
-            sm = try Rr.SourceMap.init(gpa, m.path, m.source); // Module.source []u8 coerces to []const u8
-            cached_scope = d.scope;
-        }
-        try renderSinkDiag(out, level, &sm, d);
-    }
-}
-
-/// Render a graph-discovery structural error against the owning module's source (or
-/// the entry path when no module loaded). With a location, snippet + `= note: detail`;
-/// otherwise the plain `path: error: msg (detail)` fallback.
-fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Graph.Error) !void {
-    const name = if (e.module) |m| g.modules[m].path else if (g.modules.len > 0) g.entry().path else "<entry>";
-    const has_src = e.module != null or g.modules.len > 0;
-    if (e.byte_offset != null and has_src) {
-        const src: []const u8 = if (e.module) |m| g.modules[m].source else g.entry().source;
-        try renderLocated(gpa, out, level, name, src, e.byte_offset, e.message, e.detail);
-    } else {
-        try renderPlainError(out, level, name, e.message, e.detail);
-    }
-}
-
-/// Render a code-emission `EmitError` from a graph build against its owning module
-/// (or the entry module when `module` is null). EmitError carries no detail.
-fn renderGraphEmit(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Codegen.EmitError) !void {
-    const m = if (e.module) |mi| &g.modules[mi] else g.entry();
-    if (e.byte_offset) |off| {
-        try renderLocated(gpa, out, level, m.path, m.source, off, e.message, "");
-    } else {
-        try renderPlainError(out, level, m.path, e.message, "");
-    }
-}
-
 /// Write `image` to `path` as an executable (mode 0o755). `createFile`'s
 /// `permissions` is subject to the process umask, so we also `setPermissions`
 /// explicitly afterwards to guarantee the executable bits land.
@@ -1063,245 +956,4 @@ fn argErr(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) noretur
 fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8 {
     try argLine(out, level, message);
     return 1;
-}
-
-/// Format + print every accumulated `cli.Sink` error (the parser never prints —
-/// this REPLACES the old `argError` for grammar/parse failures). One styled
-/// `error: <detail>` line per error; a trailing `Try 'toy --help' ...` hint. Every
-/// string in a Sink.Error is BORROWED from argv, so this must run before argv frees.
-fn printCliErrors(out: *Io.Writer, level: Style.ColorLevel, errs: []const cli.Sink.Error) !void {
-    for (errs) |e| {
-        try sty_err.styled(out, level, "error");
-        try out.writeAll(": ");
-        switch (e.kind) {
-            .unknown_flag => try out.print("unknown flag: {s}", .{e.arg}),
-            .missing_value => try out.print("{s} requires a value ({s})", .{ e.arg, e.expected }),
-            .bad_value => try out.print("invalid value for {s}: '{s}' (expected {s})", .{ e.arg, e.got, e.expected }),
-            .missing_required => try out.print("missing required argument: {s}", .{e.arg}),
-            .unexpected_arg => try out.print("unexpected argument: {s}", .{e.arg}),
-            .conflict => try out.print("{s} conflicts with {s}", .{ e.arg, e.where }),
-            .unmet_requirement => try out.print("{s} requires {s}", .{ e.arg, e.where }),
-        }
-        try out.writeByte('\n');
-    }
-    try sty_faint.styled(out, level, "Try 'toy --help' for more information.");
-    try out.writeByte('\n');
-}
-
-/// Print the per-file summary; returns the number of files that failed (so the
-/// caller can set a non-zero exit status). The summary TABLE is kept (now styled);
-/// per-diagnostic detail lines route through the Renderer via `printFailure`.
-fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, results: []const Driver.FileResult, emit: Driver.Emit, target: []const u8, dump: bool) !usize {
-    var stamp_buf: [version.stamp_max]u8 = undefined;
-    // Header: the version stamp bold, labels plain.
-    try out.writeAll("compiler ");
-    try sty_head.styled(out, level, version.stamp(&stamp_buf));
-    try out.print("  target {s}  emit {t}\n", .{ target, emit });
-
-    var total_tokens: usize = 0;
-    var total_bytes: usize = 0;
-    var lex_hits: usize = 0;
-    var parse_hits: usize = 0;
-    var failures: usize = 0;
-
-    // Table header row: bold (the whole line is a header, no data cells to keep plain).
-    {
-        var hbuf: [80]u8 = undefined;
-        const hdr = std.fmt.bufPrint(&hbuf, "{s: <28} {s: >8} {s: >7} {s: >6}  {s}", .{ "file", "bytes", "tokens", "nodes", "status" }) catch unreachable;
-        try sty_head.styled(out, level, hdr);
-        try out.writeByte('\n');
-    }
-    // Separator: dim.
-    try sty_faint.styled(out, level, "-" ** 72);
-    try out.writeByte('\n');
-
-    for (results) |r| {
-        total_bytes += r.source.len;
-        if (r.tokens_cached) lex_hits += 1;
-        if (r.nodes_cached) parse_hits += 1;
-
-        if (r.err) |err| {
-            failures += 1;
-            try printFailure(out, gpa, level, r, err);
-            continue;
-        }
-
-        // Every token stream ends in a synthetic .eof we don't count as "real".
-        const real_tokens = r.tokens.len -| 1;
-        total_tokens += real_tokens;
-
-        // Data cells (file/bytes/tokens/nodes) stay PLAIN; only the STATUS cell is
-        // coloured. The status cell is LAST (no trailing padding), so styling its
-        // whole content is width-safe.
-        try out.print("{s: <28} {d: >8} {d: >7} ", .{ r.path, r.source.len, real_tokens });
-        if (r.parsed) try out.print("{d: >6}", .{r.nodes.len}) else try out.print("{s: >6}", .{"-"});
-        try out.writeAll("  ");
-        const note = cacheNote(r, emit);
-        // `cached` recedes (dim); a fresh phase reads green.
-        const nstyle: Style.Style = if (std.mem.eql(u8, note, "cached")) sty_faint else sty_ok;
-        try nstyle.styled(out, level, note);
-        try out.writeByte('\n');
-
-        if (dump) try dumpArtifact(out, r, emit);
-    }
-
-    try sty_faint.styled(out, level, "-" ** 72);
-    try out.writeByte('\n');
-    // Totals: the `F failure(s)` fragment err-red bold when failures>0, else the
-    // whole line dim. Pad-plain (the numbers) then style only the coloured fragment.
-    if (failures > 0) {
-        try out.print(
-            "{d} file(s): {d} bytes, {d} tokens, cache hits lex={d} parse={d}, ",
-            .{ results.len, total_bytes, total_tokens, lex_hits, parse_hits },
-        );
-        var fbuf: [32]u8 = undefined;
-        const frag = std.fmt.bufPrint(&fbuf, "{d} failure(s)", .{failures}) catch unreachable;
-        try sty_err.styled(out, level, frag);
-        try out.writeByte('\n');
-    } else {
-        var lbuf: [160]u8 = undefined;
-        const line = std.fmt.bufPrint(&lbuf, "{d} file(s): {d} bytes, {d} tokens, cache hits lex={d} parse={d}, {d} failure(s)", .{ results.len, total_bytes, total_tokens, lex_hits, parse_hits, failures }) catch unreachable;
-        try sty_faint.styled(out, level, line);
-        try out.writeByte('\n');
-    }
-    return failures;
-}
-
-/// Short per-file status: which phases were fresh vs. served from cache.
-fn cacheNote(r: Driver.FileResult, emit: Driver.Emit) []const u8 {
-    const lex = if (r.tokens_cached) "cached" else "lexed";
-    if (emit == .lex) return lex;
-    // Resolution runs in-memory (uncached); report it explicitly when reached.
-    if (emit == .check and r.checked) return "checked";
-    const parse = if (r.nodes_cached) "cached" else "parsed";
-    if (r.tokens_cached and r.nodes_cached) return "cached";
-    if (!r.tokens_cached and !r.nodes_cached) return "lexed+parsed";
-    // Mixed: name the phase that actually ran.
-    return if (r.tokens_cached) parse else lex;
-}
-
-/// Emit a failing file's summary ROW (kept, now styled — the `error: ...` cell
-/// err-red bold, the path plain), then route each per-file diagnostic through the
-/// Renderer over ONE SourceMap of the file (single-file => scope == NO_SCOPE).
-fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, r: Driver.FileResult, err: anyerror) !void {
-    if (r.diag) |d| {
-        // Parse error: a single diagnostic. The row's `error:` cell is styled; the
-        // pretty snippet follows via the Renderer.
-        try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, "-", "parse error", 0);
-        var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
-        defer sm.deinit(gpa);
-        try renderSinkDiag(out, level, &sm, d);
-    } else if (err == error.ResolveError) {
-        const n = if (r.resolve) |res| res.diags.len else 0;
-        var msgbuf: [48]u8 = undefined;
-        try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, "-", std.fmt.bufPrint(&msgbuf, "{d} resolve diagnostic(s)", .{n}) catch "resolve diagnostics", 0);
-        if (r.resolve) |res| {
-            var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
-            defer sm.deinit(gpa);
-            for (res.diags) |d| try renderSinkDiag(out, level, &sm, d);
-        }
-    } else if (err == error.TypeError) {
-        const n = if (r.typecheck) |tc| tc.diags.len else 0;
-        var msgbuf: [48]u8 = undefined;
-        try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, null, std.fmt.bufPrint(&msgbuf, "{d} type diagnostic(s)", .{n}) catch "type diagnostics", r.nodes.len);
-        if (r.typecheck) |tc| {
-            var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
-            defer sm.deinit(gpa);
-            for (tc.diags) |d| try renderSinkDiag(out, level, &sm, d);
-        }
-    } else {
-        var msgbuf: [48]u8 = undefined;
-        try rowDashThenErr(out, level, r.path, std.fmt.bufPrint(&msgbuf, "{t}", .{err}) catch "error");
-    }
-}
-
-/// A failing-file summary row `path bytes tokens nodes  error: <msg>` where the data
-/// cells (path/bytes/tokens/nodes) stay PLAIN and only the trailing `error: <msg>`
-/// is styled (err-red bold, last on the line so width-safe). `nodes` is either the
-/// literal "-" (pass `"-"` as `nodes_str`, `nodes_num` unused) or a count (pass
-/// `null` as `nodes_str` and the count as `nodes_num`).
-fn rowThenErr(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, bytes: usize, tokens: usize, nodes_str: ?[]const u8, msg: []const u8, nodes_num: usize) !void {
-    try out.print("{s: <28} {d: >8} {d: >7} ", .{ path, bytes, tokens });
-    if (nodes_str) |s| try out.print("{s: >6}", .{s}) else try out.print("{d: >6}", .{nodes_num});
-    try out.writeAll("  ");
-    try errWord(out, level, msg);
-}
-
-/// Variant of `rowThenErr` for the catch-all error row: every data cell is "-".
-fn rowDashThenErr(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, msg: []const u8) !void {
-    try out.print("{s: <28} {s: >8} {s: >7} {s: >6}  ", .{ path, "-", "-", "-" });
-    try errWord(out, level, msg);
-}
-
-/// Emit a styled `error: <msg>` fragment (the `error:` prefix + message together in
-/// err-red bold) ending the line. Gate-safe at `.none`.
-fn errWord(out: *Io.Writer, level: Style.ColorLevel, msg: []const u8) !void {
-    var buf: [80]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "error: {s}", .{msg}) catch "error";
-    try sty_err.styled(out, level, s);
-    try out.writeByte('\n');
-}
-
-fn dumpArtifact(out: *Io.Writer, r: Driver.FileResult, emit: Driver.Emit) !void {
-    switch (emit) {
-        .lex => for (r.tokens, 0..) |tok, i| {
-            try out.print("    [{d: >4}] {s: <12} {d: >5}..{d: <5} {s}\n", .{
-                i, @tagName(tok.tag), tok.start, tok.end,
-                if (tok.tag == .eof) "" else tok.text(r.source),
-            });
-        },
-        .parse => {
-            try out.writeAll("    ");
-            try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra, .pub_bits = r.pub_bits }, r.tokens, r.source);
-            try out.writeByte('\n');
-        },
-        // Check dump: the AST plus a per-function signature summary with the
-        // inferred return type, then a tally of diagnostics (0 when clean).
-        // `ir` shares the front-end with `check`; its artifact (the IR text) is
-        // printed by `emitIr`, not the table dumper.
-        .check, .ir => {
-            try out.writeAll("    ");
-            try Ast.render(out, .{ .nodes = r.nodes, .extra = r.extra, .pub_bits = r.pub_bits }, r.tokens, r.source);
-            try out.writeByte('\n');
-            try dumpCheck(out, r);
-        },
-    }
-}
-
-/// Per-function summary under `--emit check --dump`: each function's resolved
-/// signature with its inferred return type, then a diagnostic count.
-fn dumpCheck(out: *Io.Writer, r: Driver.FileResult) !void {
-    if (r.nodes.len == 0) return;
-    const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
-    const prog = r.nodes[Ast.root(r.nodes)];
-    if (prog.tag != .program) return;
-
-    const tc = r.typecheck;
-    for (Ast.rangeSlice(tree, prog.lhs)) |fn_idx| {
-        const decl = r.nodes[fn_idx];
-        if (decl.tag != .fn_decl) continue;
-        const name = r.tokens[decl.main_token].text(r.source);
-        const proto = Ast.protoAt(tree, decl.lhs);
-
-        try out.print("    fn {s}(", .{name});
-        for (proto.params, 0..) |p_idx, i| {
-            if (i != 0) try out.writeAll(", ");
-            const p = r.nodes[p_idx];
-            const p_name = r.tokens[p.main_token].text(r.source);
-            const p_type = r.tokens[r.nodes[p.lhs].main_token].text(r.source);
-            try out.print("{s}: {s}", .{ p_name, p_type });
-        }
-        const ret = if (proto.ret_type == Ast.none)
-            "()"
-        else if (r.nodes[proto.ret_type].tag == .literal_unit)
-            "()"
-        else
-            r.tokens[r.nodes[proto.ret_type].main_token].text(r.source);
-        // `rhs` is the body block; its inferred type isn't tracked, so report the
-        // declared return spelling — the typechecker has already verified it.
-        try out.print(") -> {s}\n", .{ret});
-    }
-
-    const n_diags = if (tc) |t| t.diags.len else 0;
-    try out.print("    checked: {d} diagnostic(s)\n", .{n_diags});
 }
