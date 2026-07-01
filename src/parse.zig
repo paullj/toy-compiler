@@ -43,8 +43,10 @@ pub_decls: std.ArrayList(Ast.Index),
 /// Variable-arity child runs and range/proto headers (the "extra_data" side
 /// array). See `Ast` for the encoding.
 extra: std.ArrayList(u32),
-/// Set when parsing fails; describes the first error.
-diag: ?Diagnostic,
+/// Accumulated parse diagnostics (B2). A parse that appends any diagnostic is a
+/// TAINTED parse: `parse()` still returns the (partial) tree, but the caller must
+/// not cache it, lower it, or codegen it. Unmanaged-style (`append(gpa, d)`).
+diags: std.ArrayList(Diagnostic),
 /// While true (only while parsing an `if`/`while` condition), a leading `{` or
 /// `if` in `parsePrefix` is NOT taken as a block/if expression, so `if c { ... }`
 /// reads `c` as the condition and `{ ... }` as the body. Parens are the escape
@@ -53,7 +55,16 @@ no_block: bool = false,
 
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
-const Error = error{ OutOfMemory, ParseFailed };
+const Error = error{ OutOfMemory, ParseError };
+
+/// What `parse()` returns: an always-present tree (on non-OOM runs) plus the
+/// accumulated diagnostics. A run with a non-empty `diags` is a TAINTED parse —
+/// the tree is partial/poisoned and must not be cached, lowered, or codegen'd.
+/// The `diags` slice is owned by the caller (freed via `gpa.free`).
+pub const Result = struct {
+    tree: Ast.Tree,
+    diags: []const Diagnostic,
+};
 
 /// Scoped override of `p.no_block`: set it to `value`, restore the PRIOR value on
 /// `end()`. Every fresh-expression-context site sets it through this so set and
@@ -73,9 +84,12 @@ const NoBlockScope = struct {
     }
 };
 
-/// Parse a whole file into a `Tree`. On success returns the owned tree (root is
-/// the last node, a `.program`). On a parse error returns null and fills `diag`.
-pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
+/// Parse a whole file into a `Tree`. ALWAYS returns a `Result` on a non-OOM run:
+/// the tree is the (possibly partial) program built so far, and `diags` holds
+/// every accumulated diagnostic. A non-empty `diags` means the parse is TAINTED —
+/// the tree is usable for reporting/downstream inspection but must not be cached,
+/// lowered, or codegen'd (see `Result`). Only `OutOfMemory` is a hard error.
+pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8) error{OutOfMemory}!Result {
     var p: Parser = .{
         .gpa = gpa,
         .tokens = tokens,
@@ -84,21 +98,54 @@ pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, 
         .nodes = .empty,
         .extra = .empty,
         .pub_decls = .empty,
-        .diag = null,
+        .diags = .empty,
     };
-    return p.parseProgram() catch |err| switch (err) {
+    const tree = p.parseProgram() catch |err| switch (err) {
         error.OutOfMemory => {
-            p.deinit();
+            p.deinitAll();
             return error.OutOfMemory;
         },
-        error.ParseFailed => {
-            diag.* = p.diag.?;
-            p.deinit();
-            return null;
+    };
+    // The diagnostics list is handed to the caller; everything else is either
+    // moved into `tree` or already released inside `parseProgram`.
+    const diags = p.diags.toOwnedSlice(p.gpa) catch |err| switch (err) {
+        error.OutOfMemory => {
+            freeTree(p.gpa, tree);
+            p.diags.deinit(p.gpa);
+            return error.OutOfMemory;
         },
     };
+    return .{ .tree = tree, .diags = diags };
 }
 
+/// Test/consumer helper: parse a program that is expected to be VALID, returning
+/// only the owned `Tree`. Frees the (empty, on a clean parse) diagnostics list and
+/// returns `error.UnexpectedParseFailure` if the parse was tainted — so the many
+/// call sites that only care about a valid-program tree stay one line and never
+/// leak the diags slice. On taint, frees the partial tree too.
+pub fn expectTree(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8) !Ast.Tree {
+    const res = try parse(gpa, tokens, source);
+    if (res.diags.len != 0) {
+        gpa.free(@constCast(res.diags));
+        freeTree(gpa, res.tree);
+        return error.UnexpectedParseFailure;
+    }
+    gpa.free(@constCast(res.diags));
+    return res.tree;
+}
+
+/// Release all working buffers, including the diagnostics list. Used only on the
+/// OOM path (the success path moves `nodes`/`extra` into the tree and hands
+/// `diags` to the caller).
+fn deinitAll(p: *Parser) void {
+    p.nodes.deinit(p.gpa);
+    p.extra.deinit(p.gpa);
+    p.pub_decls.deinit(p.gpa);
+    p.diags.deinit(p.gpa);
+}
+
+/// Release the working buffers EXCEPT the diagnostics list (the parseExprOnly
+/// test helper owns the diags separately).
 fn deinit(p: *Parser) void {
     p.nodes.deinit(p.gpa);
     p.extra.deinit(p.gpa);
@@ -107,10 +154,41 @@ fn deinit(p: *Parser) void {
 
 // ---- program / declarations ------------------------------------------------
 
-fn parseProgram(p: *Parser) Error!Ast.Tree {
+/// Parse the whole program. On a `ParseError` from a top-level declaration this
+/// catches it and STOPS the decl loop, then finishes assembling the `.program`
+/// node over whatever decls were built so far — so `parse()` always yields a tree
+/// covering the parsed prefix. (Per-statement resync across independent errors is
+/// the NEXT milestone; here a single error yields ~one diagnostic and the partial
+/// tree.) Only `OutOfMemory` still propagates out.
+fn parseProgram(p: *Parser) error{OutOfMemory}!Ast.Tree {
     var decls: std.ArrayList(Ast.Index) = .empty;
     defer decls.deinit(p.gpa);
 
+    p.parseDecls(&decls) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // A top-level parse error stops the decl loop; the partial tree is still
+        // assembled below and the diagnostic is already recorded in `p.diags`.
+        error.ParseError => {},
+    };
+
+    const header = try p.addRange(decls.items);
+    _ = try p.addNode(.{ .tag = .program, .main_token = 0, .lhs = header, .rhs = Ast.none });
+
+    const nodes = try p.nodes.toOwnedSlice(p.gpa);
+    errdefer p.gpa.free(nodes);
+    const extra = try p.extra.toOwnedSlice(p.gpa);
+    errdefer p.gpa.free(extra);
+    const pub_bits = try p.buildPubBits(nodes.len);
+    // The pub-decl scratch list is fully consumed into `pub_bits`; release it on
+    // the success path (an OOM in this tail goes through `parse`'s `deinitAll`,
+    // which re-`deinit`s the now-empty lists harmlessly).
+    p.pub_decls.deinit(p.gpa);
+    return Ast.Tree{ .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
+}
+
+/// The top-level declaration loop, factored out so `parseProgram` can catch a
+/// `ParseError` from it and still assemble the partial `.program` node.
+fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void {
     p.skipNewlines();
     while (!p.at(.eof)) {
         // `import` decls have no `pub` modifier (imports are not re-exported).
@@ -135,25 +213,12 @@ fn parseProgram(p: *Parser) Error!Ast.Tree {
         p.skipNewlines();
     }
     try p.expect(.eof, "expected a declaration or end of input");
-
-    const header = try p.addRange(decls.items);
-    _ = try p.addNode(.{ .tag = .program, .main_token = 0, .lhs = header, .rhs = Ast.none });
-
-    const nodes = try p.nodes.toOwnedSlice(p.gpa);
-    errdefer p.gpa.free(nodes);
-    const extra = try p.extra.toOwnedSlice(p.gpa);
-    errdefer p.gpa.free(extra);
-    const pub_bits = try p.buildPubBits(nodes.len);
-    // The pub-decl scratch list is fully consumed into `pub_bits`; release it on
-    // the success path (the error paths go through `p.deinit`).
-    p.pub_decls.deinit(p.gpa);
-    return Ast.Tree{ .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
 }
 
 /// Materialize the `pub_bits` bitset from the collected `pub_decls` node indices.
 /// Returns an empty slice when nothing is exported (the common single-file case),
 /// so non-module programs pay nothing.
-fn buildPubBits(p: *Parser, node_count: usize) Error![]u32 {
+fn buildPubBits(p: *Parser, node_count: usize) error{OutOfMemory}![]u32 {
     if (p.pub_decls.items.len == 0) return &.{};
     const words = Ast.pubBitsLen(node_count);
     const bits = try p.gpa.alloc(u32, words);
@@ -838,7 +903,10 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             if (p.no_block) return p.fail(tok, "expected an expression");
             return p.parseMatch(); // a match as a value expression
         },
-        else => return p.fail(tok, "expected an expression"),
+        // No valid expression start (B2 single-token DELETION repair): report and
+        // fill the operand slot with an `error_node` over the offending token,
+        // consuming it so the enclosing parse makes progress instead of unwinding.
+        else => return p.advanceWithError("expected an expression"),
     }
 }
 
@@ -1031,7 +1099,10 @@ fn leaf(p: *Parser, tag: Node.Tag, tok_index: u32) Error!Ast.Index {
     return p.addNode(.{ .tag = tag, .main_token = tok_index, .lhs = Ast.none, .rhs = Ast.none });
 }
 
-fn addNode(p: *Parser, node: Node) Error!Ast.Index {
+// The node/extra builders only ever fail with `OutOfMemory` (they never call
+// `fail`), so they narrow their error set — which lets `parseProgram`'s tail
+// (which runs AFTER the `ParseError`-catching decl loop) stay `error{OutOfMemory}`.
+fn addNode(p: *Parser, node: Node) error{OutOfMemory}!Ast.Index {
     const idx = Ast.Index.from(@intCast(p.nodes.items.len));
     // Zero the extern-struct padding before the node enters the cached blob
     // (see `token.zeroPad`).
@@ -1043,7 +1114,7 @@ fn addNode(p: *Parser, node: Node) Error!Ast.Index {
 /// the header cell as an `Ast.Index` (what the parent `Node` stores in an lhs/rhs
 /// slot). The `Index` run is written into the `[]u32` `extra` verbatim — `Index`
 /// is `enum(u32)`, so the bytes are identical.
-fn addRange(p: *Parser, items: []const Ast.Index) Error!Ast.Index {
+fn addRange(p: *Parser, items: []const Ast.Index) error{OutOfMemory}!Ast.Index {
     const start: u32 = @intCast(p.extra.items.len);
     const cells: []const u32 = @ptrCast(items);
     try p.extra.appendSlice(p.gpa, cells);
@@ -1056,7 +1127,7 @@ fn addRange(p: *Parser, items: []const Ast.Index) Error!Ast.Index {
 /// Like `addRange` but for a run of TOKEN indices (an `import_decl`'s path
 /// segments, which name tokens rather than child nodes). The header cell still
 /// lands in an `Index`-typed slot, so it is returned as an `Ast.Index`.
-fn addTokRange(p: *Parser, items: []const Ast.TokIndex) Error!Ast.Index {
+fn addTokRange(p: *Parser, items: []const Ast.TokIndex) error{OutOfMemory}!Ast.Index {
     const start: u32 = @intCast(p.extra.items.len);
     const cells: []const u32 = @ptrCast(items);
     try p.extra.appendSlice(p.gpa, cells);
@@ -1071,7 +1142,7 @@ fn addTokRange(p: *Parser, items: []const Ast.TokIndex) Error!Ast.Index {
 /// header mixes a node index (`ret_type`) with `extra` offsets
 /// (`params_start`/`params_len`); node-index cells are converted with `.int()`
 /// at the call site.
-fn addExtra(p: *Parser, vals: []const u32) Error!Ast.Index {
+fn addExtra(p: *Parser, vals: []const u32) error{OutOfMemory}!Ast.Index {
     const start: u32 = @intCast(p.extra.items.len);
     try p.extra.appendSlice(p.gpa, vals);
     return Ast.Index.from(start);
@@ -1121,15 +1192,41 @@ fn skipNewlines(p: *Parser) void {
     while (p.at(.newline)) p.advance();
 }
 
+/// Expect `tag`. On a match, consume it. On a MISMATCH (B2 single-token
+/// INSERTION repair): REPORT the diagnostic but do NOT consume — the caller
+/// substitutes `Ast.none` for the missing child and keeps going. The propagated
+/// `error.ParseError` unwinds the current producer to `parseProgram`, which
+/// assembles the partial tree.
 fn expect(p: *Parser, tag: token.Tag, message: []const u8) Error!void {
     const tok = p.peek();
     if (tok.tag != tag) return p.fail(tok, message);
     p.advance();
 }
 
-fn fail(p: *Parser, tok: Token, message: []const u8) error{ParseFailed} {
-    p.diag = .{ .byte_offset = tok.start, .message = message };
-    return error.ParseFailed;
+/// Append a diagnostic WITHOUT unwinding. Marks the parse as tainted. Used by the
+/// repair primitives that recover in place; `fail` is `warn` + unwind.
+fn warn(p: *Parser, tok: Token, message: []const u8) Error!void {
+    try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message });
+}
+
+/// Report a diagnostic and unwind the current producer via `error.ParseError`.
+/// The top-level loop catches this and finishes the partial tree. `warn` then
+/// unwind — kept as one call so every `return p.fail(...)` site stays terse.
+fn fail(p: *Parser, tok: Token, message: []const u8) Error {
+    p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message }) catch return error.OutOfMemory;
+    return error.ParseError;
+}
+
+/// Single-token DELETION repair (B2): report `message`, consume EXACTLY ONE token
+/// (guaranteed forward progress, clamped at `.eof`), and return an `error_node`
+/// leaf wrapping the offending token. Fills an operand/child slot in place so the
+/// producer can keep building instead of unwinding.
+fn advanceWithError(p: *Parser, message: []const u8) Error!Ast.Index {
+    const tok = p.peek();
+    try p.warn(tok, message);
+    const at_tok = p.index;
+    p.advance(); // guaranteed progress (clamped at eof by `advance`)
+    return p.addNode(.{ .tag = .error_node, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
 }
 
 // ---- tests -----------------------------------------------------------------
@@ -1139,7 +1236,9 @@ const Lexer = @import("lex.zig");
 
 /// Test-only: parse a single bare expression (the pre-M0 grammar) into a Tree,
 /// so the expression-core tests below keep asserting on raw expressions without
-/// the program/fn scaffolding.
+/// the program/fn scaffolding. Unlike `parse()`, this helper still returns `null`
+/// on a parse error (the expression-core tests want the terse "did it parse?"
+/// shape); the first diagnostic (if any) is copied out through `diag`.
 fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, diag: *?Diagnostic) error{OutOfMemory}!?Ast.Tree {
     var p: Parser = .{
         .gpa = gpa,
@@ -1149,8 +1248,9 @@ fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const 
         .nodes = .empty,
         .extra = .empty,
         .pub_decls = .empty,
-        .diag = null,
+        .diags = .empty,
     };
+    defer p.diags.deinit(p.gpa);
     const run = struct {
         fn go(pp: *Parser) Error!Ast.Tree {
             _ = try pp.parseExpr(0);
@@ -1162,17 +1262,21 @@ fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const 
             };
         }
     }.go;
-    return run(&p) catch |err| switch (err) {
+    const tree = run(&p) catch |err| switch (err) {
         error.OutOfMemory => {
             p.deinit();
             return error.OutOfMemory;
         },
-        error.ParseFailed => {
-            diag.* = p.diag.?;
+        error.ParseError => {
+            if (p.diags.items.len > 0) diag.* = p.diags.items[0];
             p.deinit();
             return null;
         },
     };
+    // A tainted expression parse (a repair primitive fired without unwinding, e.g.
+    // an `error_node` operand) still surfaces its first diagnostic.
+    if (p.diags.items.len > 0) diag.* = p.diags.items[0];
+    return tree;
 }
 
 fn freeTree(gpa: std.mem.Allocator, tree: Ast.Tree) void {
@@ -1196,14 +1300,14 @@ fn expectSexpr(source: []const u8, want: []const u8) !void {
     try testing.expectEqualStrings(want, w.buffered());
 }
 
-/// Parse a full program and assert its rendered S-expression.
+/// Parse a full program and assert its rendered S-expression. A valid program
+/// must parse cleanly (no diagnostics); `expectTree` asserts that.
 fn expectProgram(source: []const u8, want: []const u8) !void {
     const gpa = testing.allocator;
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
 
-    var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
     var buf: [1024]u8 = undefined;
@@ -1239,15 +1343,123 @@ test "trailing newline terminator is allowed" {
 }
 
 test "parse error reports an offset and leaves a diagnostic" {
+    // B2: the missing operand after `+` no longer bails — `parsePrefix`'s else-arm
+    // repairs it with a single-token DELETION (an `error_node` over the offending
+    // token, here EOF), so `parseExprOnly` returns a (tainted) tree and surfaces
+    // the diagnostic through `diag`.
     const gpa = testing.allocator;
     const source = "1 +";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     var diag: ?Diagnostic = null;
     const result = try parseExprOnly(gpa, tokens, source, &diag);
-    try testing.expect(result == null);
+    if (result) |t| freeTree(gpa, t);
+    try testing.expect(result != null);
     try testing.expect(diag != null);
     try testing.expectEqualStrings("expected an expression", diag.?.message);
+    // The diagnostic points at the offending token (the EOF after `1 +`).
+    try testing.expectEqual(tokens[tokens.len - 1].start, diag.?.byte_offset);
+}
+
+// ---- B2: fault-tolerant contract (always-a-tree + single-token repairs) -----
+
+/// Run the full `parse()` and return the `Result` (tree + owned diags). The caller
+/// frees both. A test-only convenience for the fault-tolerance tests.
+fn parseResult(gpa: std.mem.Allocator, source: []const u8) !Result {
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    return parse(gpa, tokens, source);
+}
+
+test "B2: a syntax error still returns a tree covering all tokens to EOF" {
+    // A bad expression start (`*` after `return`) triggers the single-token
+    // DELETION repair, but parsing continues to the end of the file: the program
+    // node still covers the whole fn, and the tree is non-empty + rooted at program.
+    const gpa = testing.allocator;
+    const source = "fn f() -> int {\n return *\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    // ALWAYS a tree: it is non-empty and its root is a `.program` node.
+    try testing.expect(res.tree.nodes.len > 0);
+    try testing.expectEqual(Node.Tag.program, res.tree.nodes[Ast.root(res.tree.nodes).int()].tag);
+    // The program's decl range covers the (single) fn decl — the parse reached EOF
+    // and closed the top-level node rather than truncating at the error.
+    const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+    try testing.expectEqual(@as(usize, 1), Ast.rangeSlice(res.tree, prog.lhs.int()).len);
+}
+
+test "B2: the offending region is an error_node" {
+    // The invalid `*` operand is repaired into an `error_node` leaf: the poison
+    // node exists in the tree and renders as `(error)`.
+    const gpa = testing.allocator;
+    const source = "fn f() -> int {\n return *\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    var found_error_node = false;
+    for (res.tree.nodes) |n| {
+        if (n.tag == .error_node) found_error_node = true;
+    }
+    try testing.expect(found_error_node);
+
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ast.render(&w, res.tree, tokens, source);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "(error)") != null);
+}
+
+test "B2: a syntax error is reported (>=1 diagnostic) and the parse is tainted" {
+    const gpa = testing.allocator;
+    const source = "fn f() -> int {\n return *\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.diags.len >= 1);
+    try testing.expectEqualStrings("expected an expression", res.diags[0].message);
+    // The diagnostic points at the offending `*` token.
+    const star_off = std.mem.indexOfScalar(u8, source, '*').?;
+    try testing.expectEqual(@as(u32, @intCast(star_off)), res.diags[0].byte_offset);
+}
+
+test "B2: single-token INSERTION — a missing expected token reports but leaves a tree" {
+    // A missing `)` in the param list: `expect` REPORTS without consuming, so the
+    // parse unwinds to the top-level loop and still yields a (partial) tree.
+    const gpa = testing.allocator;
+    const source = "fn f( -> int { return 0 }\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.tree.nodes.len > 0);
+    try testing.expectEqual(Node.Tag.program, res.tree.nodes[Ast.root(res.tree.nodes).int()].tag);
+    try testing.expect(res.diags.len >= 1);
+}
+
+test "B2: a clean program is untainted (no diagnostics, byte-identical tree)" {
+    // The always-a-tree change must not perturb a VALID parse: zero diagnostics and
+    // the same rendered tree as before B2.
+    const gpa = testing.allocator;
+    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ast.render(&w, res.tree, tokens, source);
+    try testing.expectEqualStrings(
+        "(program (fn add ((param a int) (param b int)) int (block (return (+ a b)))))",
+        w.buffered(),
+    );
 }
 
 // program grammar
@@ -1289,8 +1501,7 @@ test "root is program and children precede parents" {
     const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
     try testing.expectEqual(Node.Tag.program, tree.nodes[Ast.root(tree.nodes).int()].tag);
@@ -1518,14 +1729,16 @@ test "bare break and labeled break/continue render" {
 }
 
 test "label without a following construct is a parse error" {
+    // B2 contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
     const source = "fn f() {\n @x 1\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const result = try parse(gpa, tokens, source, &diag);
-    try testing.expect(result == null);
-    try testing.expect(diag != null);
+    const result = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(result.diags));
+    defer freeTree(gpa, result.tree);
+    try testing.expect(result.diags.len >= 1);
+    try testing.expectEqualStrings("a label must prefix a loop, while, for, or block", result.diags[0].message);
 }
 
 // structs
@@ -1644,8 +1857,7 @@ test "enum program pack/unpack byte round-trip" {
     const source = "enum Shape { Empty, Circle(int), Rect { w: int, h: int } }\nfn area(s: Shape) -> int { match s { .Circle(r) -> r, .Rect { w, h } -> w, .Empty -> 0 } }\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
     const blob = try Ast.pack(gpa, tree);
@@ -1662,8 +1874,7 @@ test "struct program pack/unpack byte round-trip" {
     const source = "struct Point { x: int, y: int }\nfn f() -> int { p := Point { x: 1, y: 2 }\n p.x }\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
     const blob = try Ast.pack(gpa, tree);
@@ -1764,25 +1975,29 @@ test "module-qualified variant construction parses (3-level field_access)" {
 }
 
 test "pub modifier requires a declaration" {
+    // B2 contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
     const source = "pub import a/b\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const result = try parse(gpa, tokens, source, &diag);
-    try testing.expect(result == null);
-    try testing.expect(diag != null);
+    const result = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(result.diags));
+    defer freeTree(gpa, result.tree);
+    try testing.expect(result.diags.len >= 1);
+    try testing.expectEqualStrings("expected a function, struct, or enum declaration after 'pub'", result.diags[0].message);
 }
 
 test "import path missing a segment after slash is an error" {
+    // B2 contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
     const source = "import a/\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const result = try parse(gpa, tokens, source, &diag);
-    try testing.expect(result == null);
-    try testing.expect(diag != null);
+    const result = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(result.diags));
+    defer freeTree(gpa, result.tree);
+    try testing.expect(result.diags.len >= 1);
+    try testing.expectEqualStrings("expected a path segment after '/'", result.diags[0].message);
 }
 
 test "import pack/unpack byte round-trip carries pub_bits" {
@@ -1790,8 +2005,7 @@ test "import pack/unpack byte round-trip carries pub_bits" {
     const source = "import geometry/rect as r\npub fn area() -> int { 0 }\nfn helper() -> int { 1 }\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
     // Exactly the `area` fn_decl node is pub; `helper` is not.
@@ -1816,8 +2030,7 @@ test "program pack/unpack byte round-trip" {
     const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Diagnostic = null;
-    const tree = (try parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
     const blob = try Ast.pack(gpa, tree);

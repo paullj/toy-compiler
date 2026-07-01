@@ -43,8 +43,7 @@ const Parsed = struct {
 fn parseSource(gpa: std.mem.Allocator, source: []const u8) !Parsed {
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try Parser.expectTree(gpa, tokens, source);
     return .{ .tokens = tokens, .tree = tree, .source = source };
 }
 

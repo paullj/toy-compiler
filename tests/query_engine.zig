@@ -206,8 +206,7 @@ fn freeTree(gpa: std.mem.Allocator, tree: Ast.Tree) void {
 fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try Parser.expectTree(gpa, tokens, source);
     return .{ .tokens = tokens, .tree = tree, .source = source };
 }
 
@@ -307,13 +306,16 @@ test "parse query: miss parses+stores; hit serves a validated cached tree" {
 
     const miss = try engine.parse(gpa, h.io, "native", src, tokens, 0, false);
     try testing.expect(!miss.cached);
-    try testing.expect(miss.tree != null);
-    freeTree(gpa, miss.tree.?);
+    // B2: the parser always returns a tree; a clean parse leaves `diags` empty.
+    try testing.expectEqual(@as(usize, 0), miss.diags.len);
+    gpa.free(@constCast(miss.diags));
+    freeTree(gpa, miss.tree);
 
     const hit = try engine.parse(gpa, h.io, "native", src, tokens, 0, false);
     try testing.expect(hit.cached);
-    try testing.expect(hit.tree != null);
-    freeTree(gpa, hit.tree.?);
+    try testing.expectEqual(@as(usize, 0), hit.diags.len);
+    gpa.free(@constCast(hit.diags));
+    freeTree(gpa, hit.tree);
 }
 
 // ---- uniform key discrimination (no cross-shape collision) ----

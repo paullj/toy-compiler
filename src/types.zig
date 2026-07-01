@@ -981,8 +981,7 @@ fn checkSource(source: []const u8) !Checked {
     const gpa = testing.allocator;
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try Parser.expectTree(gpa, tokens, source);
     errdefer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
@@ -1178,8 +1177,7 @@ test "error_node types as invalid, emits no diagnostics, and renders (error)" {
     const source = "fn main() {\n 0\n return\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, source, &diag)) orelse return error.UnexpectedParseFailure;
+    const tree = try Parser.expectTree(gpa, tokens, source);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
