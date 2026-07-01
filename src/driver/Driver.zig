@@ -91,11 +91,15 @@ pub const FileResult = struct {
     nodes_cached: bool = false,
     /// True once the parse phase ran (or hit cache) for this file.
     parsed: bool = false,
+    /// B2: a TAINTED parse produced at least one diagnostic. The (partial) tree is
+    /// still populated for reporting, but the file does NOT proceed to check/codegen.
+    tainted: bool = false,
     /// True once name resolution ran for this file (emit == .check).
     checked: bool = false,
     err: ?anyerror = null,
-    /// On a parse error, where and what.
-    diag: ?Parser.Diagnostic = null,
+    /// On a parse error, every accumulated parser diagnostic (B2). Owned; freed in
+    /// deinit. Empty on a clean parse.
+    diags: []const Parser.Diagnostic = &.{},
     /// Whole-graph name-resolution result (emit == .check). A lone file IS the
     /// trivial one-module graph, so the graph result is stored whole. SOLE owner of
     /// the fn-name strings (`fns[i].name`); the typecheck `sigs[i].name` borrow them,
@@ -112,6 +116,7 @@ pub const FileResult = struct {
         gpa.free(r.nodes);
         gpa.free(r.extra);
         if (r.pub_bits.len != 0) gpa.free(@constCast(r.pub_bits));
+        if (r.diags.len != 0) gpa.free(@constCast(r.diags));
         if (r.resolve) |*res| res.deinit(gpa);
         if (r.typecheck) |*tc| tc.deinit(gpa);
         r.* = undefined;
@@ -179,15 +184,22 @@ pub fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target
     // Ast.unpack validates a hit and treats a corrupt/foreign blob as a miss.
     result.parsed = true;
     const parsed = try engine.parse(gpa, io, target, result.source, result.tokens, index, false);
-    const tree = parsed.tree orelse {
-        result.diag = parsed.diag;
-        result.err = error.ParseError;
-        return;
-    };
+    const tree = parsed.tree;
     result.nodes_cached = parsed.cached;
     result.nodes = tree.nodes;
     result.extra = tree.extra;
     result.pub_bits = tree.pub_bits;
+
+    // B2: a TAINTED parse still yields a (partial) tree, but the file does NOT
+    // proceed to check/codegen — a poisoned tree would only cascade spurious
+    // resolve/type errors (and the `error_node` arms in lower/codegen assume a
+    // tainted tree is gated out here). Report the diagnostics and stop.
+    if (parsed.diags.len > 0) {
+        result.tainted = true;
+        result.diags = parsed.diags;
+        result.err = error.ParseError;
+        return;
+    }
 
     if (!emit.runsCheck()) return;
 

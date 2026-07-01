@@ -1783,8 +1783,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
 
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    const tree = try Parser.expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
@@ -1894,8 +1893,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         "  return s\n}\n";
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    const tree = try Parser.expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
@@ -1937,8 +1935,7 @@ test "lower-core: out-of-range int literal yields a diagnostic" {
     const src = "fn f() -> int { return 99999999999999999999 }\n";
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    const tree = try Parser.expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
@@ -2004,8 +2001,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         "fn f(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }\n";
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    const tree = try Parser.expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
@@ -2061,8 +2057,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
 
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    const tree = try Parser.expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);

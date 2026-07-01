@@ -207,12 +207,18 @@ pub fn lex(
 /// `swallow_get` selects the caller's read policy: the per-file pipeline propagates
 /// `get`/`unpack` errors (`false`), while module-graph discovery swallows them and
 /// treats a failed read as a plain miss (`true`). `put` is always swallowed (a
-/// failed store just means the next build re-parses). On a parse FAILURE the tree
-/// is `null` and `diag` holds the parser diagnostic — the caller owns reporting it.
+/// failed store just means the next build re-parses).
+///
+/// B2: the parser now ALWAYS produces a tree, so `tree` is non-optional. A TAINTED
+/// parse (any accumulated diagnostic) sets `diags` non-empty; the caller must not
+/// proceed to codegen and reports every diagnostic. The cache PUT is gated on
+/// `diags.len == 0`, so a poisoned partial tree never becomes a cached "good"
+/// parse. `diags` is owned by the caller (freed via `gpa.free`); a cache HIT (a
+/// clean parse, never tainted) yields an empty `diags`.
 pub const ParseResult = struct {
-    tree: ?Ast.Tree,
+    tree: Ast.Tree,
     cached: bool = false,
-    diag: ?@import("../parse.zig").Diagnostic = null,
+    diags: []const @import("../parse.zig").Diagnostic = &.{},
 };
 
 pub fn parse(
@@ -244,21 +250,22 @@ pub fn parse(
     }
     if (self.probe) |p| lap(io, &p.get_ns, get_t0);
 
-    // --- miss: parse fresh, store on success ---
-    var diag: ?Parser.Diagnostic = null;
+    // --- miss: parse fresh; store ONLY a clean (untainted) parse ---
     const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
-    if (try Parser.parse(gpa, tokens, source, &diag)) |t| {
-        if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
-        if (Ast.pack(gpa, t) catch null) |b| {
+    const res = try Parser.parse(gpa, tokens, source);
+    if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
+    // Gate the cache PUT on a clean parse: a tainted (diagnostic-bearing) partial
+    // tree must never become a cached "good" parse — the next build would serve it
+    // as a hit and skip the diagnostics. A clean parse caches as before.
+    if (res.diags.len == 0) {
+        if (Ast.pack(gpa, res.tree) catch null) |b| {
             defer gpa.free(b);
             const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
             cache.put(u8, io, key, tmp_tag, b) catch {};
             if (self.probe) |p| lap(io, &p.put_ns, put_t0);
         }
-        return .{ .tree = t, .cached = false };
     }
-    if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
-    return .{ .tree = null, .diag = diag };
+    return .{ .tree = res.tree, .cached = false, .diags = res.diags };
 }
 
 /// The parallel fan-out COORDINATOR: dispatch `n` jobs onto the `Io` runtime's

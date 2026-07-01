@@ -229,6 +229,47 @@ test "codegen reports missing main and lowers a simple main" {
     }
 }
 
+test "B2: a syntax-error file is tainted, reported, and never reaches check/codegen" {
+    // The parser now ALWAYS returns a (partial) tree, so the driver must gate
+    // check/codegen on `!tainted`: a diagnostic-bearing parse stops with a
+    // ParseError and never populates resolve/typecheck — which is what keeps a
+    // poisoned tree (with `error_node`s) out of lower/codegen.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-tainted";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    const src = "fn main() -> int {\n return *\n}\n";
+    const path = dir_name ++ "/bad.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+    var r: FileResult = .{ .path = path };
+    try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 0);
+    defer r.deinit(gpa);
+
+    // Reported as a parse error, tainted, with at least one diagnostic surfaced.
+    try testing.expectEqual(@as(?anyerror, error.ParseError), r.err);
+    try testing.expect(r.tainted);
+    try testing.expect(r.diags.len >= 1);
+    // A tree was still produced (parse() is always-a-tree)...
+    try testing.expect(r.parsed);
+    try testing.expect(r.nodes.len > 0);
+    // ...but the file NEVER reached check: no resolve/typecheck ran, so there is no
+    // path to codegen. (`checked` is only set once resolve begins.)
+    try testing.expect(!r.checked);
+    try testing.expect(r.resolve == null);
+    try testing.expect(r.typecheck == null);
+}
+
 // End-to-end on the real OS: compile a `main`, write a signed 0o755 executable,
 // run it, and assert the masked exit code. Gated to this host because only here
 // can we exec what we produced. Proves the whole back-end (Codegen + MachO +

@@ -127,13 +127,15 @@ fn cacheNote(r: Driver.FileResult, emit: Driver.Emit) []const u8 {
 /// err-red bold, the path plain), then route each per-file diagnostic through the
 /// Renderer over ONE SourceMap of the file (single-file => scope == NO_SCOPE).
 fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, r: Driver.FileResult, err: anyerror) !void {
-    if (r.diag) |d| {
-        // Parse error: a single diagnostic. The row's `error:` cell is styled; the
-        // pretty snippet follows via the Renderer.
-        try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, "-", "parse error", 0);
+    if (r.diags.len > 0) {
+        // Parse error (B2): one or more accumulated diagnostics. The row's `error:`
+        // cell is styled; each pretty snippet follows via the Renderer.
+        var msgbuf: [48]u8 = undefined;
+        const msg = if (r.diags.len == 1) "parse error" else (std.fmt.bufPrint(&msgbuf, "{d} parse error(s)", .{r.diags.len}) catch "parse errors");
+        try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, "-", msg, 0);
         var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
         defer sm.deinit(gpa);
-        try DiagRender.renderSinkDiag(out, level, &sm, d);
+        for (r.diags) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
     } else if (err == error.ResolveError) {
         const n = if (r.resolve) |res| res.diags.len else 0;
         var msgbuf: [48]u8 = undefined;

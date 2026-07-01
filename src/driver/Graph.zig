@@ -498,16 +498,29 @@ const Discoverer = struct {
         const tokens = lexed.value;
 
         const parsed = try engine.parse(d.gpa, d.io, d.target, source, tokens, id, true);
-        if (parsed.tree == null) {
+        // B2: the parser always returns a tree; a TAINTED parse (any diagnostic)
+        // means the module does not enter the graph. The partial tree's arrays are
+        // caller-owned — free them here (the slot only adopts `source`/`tokens`).
+        if (parsed.diags.len > 0) {
+            // The diagnostic `message` is a static string literal (not tree/diags
+            // memory), so free the partial tree + diags list first, then dupe it —
+            // no leak if the dupe OOMs. The slot only adopts `source`/`tokens`.
+            const first = parsed.diags[0];
+            const byte_offset = first.byte_offset;
+            const message_static = first.message;
+            d.gpa.free(@constCast(parsed.diags));
+            d.gpa.free(parsed.tree.nodes);
+            d.gpa.free(parsed.tree.extra);
+            if (parsed.tree.pub_bits.len != 0) d.gpa.free(@constCast(parsed.tree.pub_bits));
             const s = &d.slots.items[id];
             s.source = source;
             s.tokens = tokens;
             s.loaded = true;
             return d.fail(.{
                 .kind = .parse,
-                .message = if (parsed.diag) |dg| try d.gpa.dupe(u8, dg.message) else try d.gpa.dupe(u8, "parse error"),
+                .message = try d.gpa.dupe(u8, message_static),
                 .module = id,
-                .byte_offset = if (parsed.diag) |dg| dg.byte_offset else null,
+                .byte_offset = byte_offset,
             });
         }
         const tree: ?Ast.Tree = parsed.tree;
@@ -1051,8 +1064,7 @@ test "single: trivial one-module graph from a parsed source" {
     const src = "fn main() -> int { return 0 }\n";
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
-    var diag: ?Parser.Diagnostic = null;
-    const tree = (try Parser.parse(gpa, tokens, src, &diag)).?;
+    const tree = try Parser.expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
