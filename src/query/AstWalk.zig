@@ -39,7 +39,7 @@ pub const Source = struct {
     source: []const u8,
 
     pub fn leaf(self: Source, idx: Ast.Index) []const u8 {
-        const n = self.tree.nodes[idx];
+        const n = self.tree.nodes[idx.int()];
         return self.tokens[n.main_token].text(self.source);
     }
 
@@ -126,7 +126,7 @@ inline fn emit(visitor: anytype, ev: Event) !void {
 fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) VisitorError(@TypeOf(visitor))!void {
     if (idx == Ast.none) return;
     const tree = src.tree;
-    const n = tree.nodes[idx];
+    const n = tree.nodes[idx.int()];
     try emit(visitor, .{ .enter = .{ .idx = idx, .tag = n.tag } });
     if (collect) try emit(visitor, .{ .touch = .{ .idx = idx } });
     const leaf = src.leaf(idx);
@@ -145,7 +145,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         .call => {
             try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .callee = .{ .idx = n.lhs } }); // record sig AFTER callee, BEFORE args
-            const args = Ast.rangeSlice(tree, n.rhs);
+            const args = Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(args.len) }); // f() != f(0) [C5]
             for (args) |a| try walkInner(src, a, collect, visitor);
         },
@@ -163,7 +163,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .expr_stmt => try walkInner(src, n.lhs, collect, visitor),
         .block => {
-            const stmts = Ast.rangeSlice(tree, n.lhs);
+            const stmts = Ast.rangeSlice(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(stmts.len) });
             for (stmts) |s| try walkInner(src, s, collect, visitor);
         },
@@ -173,13 +173,13 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .fn_decl => {
             try emit(visitor, .{ .leaf = leaf });
-            const proto = Ast.protoAt(tree, n.lhs);
+            const proto = Ast.protoAt(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(proto.params.len) });
             for (proto.params, 0..) |p, i| {
                 // Fold the OWNING sig's param type (carries the right GLOBAL id,
                 // incl. a cross-module qualified `mod.Type`) at the type-ref
                 // position the old touched walk did, BEFORE recursing the param.
-                const pty_node = tree.nodes[p].lhs;
+                const pty_node = tree.nodes[p.int()].lhs;
                 if (pty_node != Ast.none) try emit(visitor, .{ .type_ref = .{ .idx = pty_node, .ordinal = @intCast(i), .is_ret = false } });
                 try walkInner(src, p, collect, visitor);
             }
@@ -196,7 +196,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .if_stmt => {
             try walkInner(src, n.lhs, collect, visitor);
-            const head = Ast.ifHeaderAt(tree, n.rhs);
+            const head = Ast.ifHeaderAt(tree, n.rhs.int());
             try walkInner(src, head.then_block, collect, visitor);
             try emit(visitor, .{ .flag = head.else_node != Ast.none });
             if (head.else_node != Ast.none) try walkInner(src, head.else_node, collect, visitor);
@@ -209,7 +209,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         .loop_expr => try walkInner(src, n.lhs, collect, visitor),
         .for_stmt => {
             try emit(visitor, .{ .leaf = leaf });
-            const head = Ast.forHeaderAt(tree, n.rhs);
+            const head = Ast.forHeaderAt(tree, n.rhs.int());
             try walkInner(src, head.lo, collect, visitor);
             try walkInner(src, head.hi, collect, visitor);
             try walkInner(src, n.lhs, collect, visitor);
@@ -217,14 +217,16 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         .break_stmt => {
             // The label target identity is load-bearing; fold its TEXT (not a
             // token index — index-free [C3]). `rhs` names a TOKEN, not a node.
-            try emit(visitor, .{ .flag = n.rhs != Ast.none }); // bare != @label
-            if (n.rhs != Ast.none) try emit(visitor, .{ .raw_leaf = src.tokenText(n.rhs) });
+            const label = Ast.labelTok(n);
+            try emit(visitor, .{ .flag = label != .none }); // bare != @label
+            if (label.unwrap()) |t| try emit(visitor, .{ .raw_leaf = src.tokenText(t.int()) });
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // bare break != break v
             if (n.lhs != Ast.none) try walkInner(src, n.lhs, collect, visitor);
         },
         .continue_stmt => {
-            try emit(visitor, .{ .flag = n.rhs != Ast.none }); // bare != @label
-            if (n.rhs != Ast.none) try emit(visitor, .{ .raw_leaf = src.tokenText(n.rhs) });
+            const label = Ast.labelTok(n);
+            try emit(visitor, .{ .flag = label != .none }); // bare != @label
+            if (label.unwrap()) |t| try emit(visitor, .{ .raw_leaf = src.tokenText(t.int()) });
         },
         .labeled => {
             try emit(visitor, .{ .leaf = leaf });
@@ -232,13 +234,13 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .struct_decl => {
             try emit(visitor, .{ .leaf = leaf });
-            const fields = Ast.rangeSlice(tree, n.lhs);
+            const fields = Ast.rangeSlice(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(fields.len) });
             for (fields) |f| try walkInner(src, f, collect, visitor);
         },
         .struct_init => {
             try walkInner(src, n.lhs, collect, visitor);
-            const inits = Ast.rangeSlice(tree, n.rhs);
+            const inits = Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(inits.len) });
             for (inits) |fi| try walkInner(src, fi, collect, visitor);
         },
@@ -252,20 +254,20 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .enum_decl => {
             try emit(visitor, .{ .leaf = leaf });
-            const variants = Ast.rangeSlice(tree, n.lhs);
+            const variants = Ast.rangeSlice(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(variants.len) });
             for (variants) |v| try walkInner(src, v, collect, visitor);
         },
         .enum_variant_unit => try emit(visitor, .{ .leaf = leaf }),
         .enum_variant_tuple => {
             try emit(visitor, .{ .leaf = leaf });
-            const types = Ast.rangeSlice(tree, n.lhs);
+            const types = Ast.rangeSlice(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(types.len) });
             for (types) |ty| try walkInner(src, ty, collect, visitor);
         },
         .enum_variant_struct => {
             try emit(visitor, .{ .leaf = leaf });
-            const fields = Ast.rangeSlice(tree, n.lhs);
+            const fields = Ast.rangeSlice(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(fields.len) });
             for (fields) |f| try walkInner(src, f, collect, visitor);
         },
@@ -282,7 +284,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = n.lhs == Ast.none });
             if (n.lhs != Ast.none) try walkInner(src, n.lhs, false, visitor);
             try emit(visitor, .{ .leaf = leaf });
-            const args = Ast.rangeSlice(tree, n.rhs);
+            const args = Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(args.len) });
             for (args) |a| try walkInner(src, a, collect, visitor);
         },
@@ -290,13 +292,13 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = n.lhs == Ast.none });
             if (n.lhs != Ast.none) try walkInner(src, n.lhs, false, visitor);
             try emit(visitor, .{ .leaf = leaf });
-            const inits = Ast.rangeSlice(tree, n.rhs);
+            const inits = Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(inits.len) });
             for (inits) |fi| try walkInner(src, fi, collect, visitor);
         },
         .match_expr => {
             try walkInner(src, n.lhs, collect, visitor);
-            const arms = Ast.rangeSlice(tree, n.rhs);
+            const arms = Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(arms.len) });
             for (arms) |arm| try walkInner(src, arm, collect, visitor);
         },
@@ -305,7 +307,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             // with `collect=false` so its `.touch` is suppressed while the hash
             // still folds the pattern spelling.
             try walkInner(src, n.lhs, false, visitor);
-            const ah = Ast.armHeaderAt(tree, n.rhs);
+            const ah = Ast.armHeaderAt(tree, n.rhs.int());
             try emit(visitor, .{ .flag = ah.guard != Ast.none }); // guard sentinel
             if (ah.guard != Ast.none) try walkInner(src, ah.guard, collect, visitor);
             try walkInner(src, ah.body, collect, visitor);
@@ -314,7 +316,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = n.lhs == Ast.none }); // inferred vs qualified
             if (n.lhs != Ast.none) try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .leaf = leaf });
-            const binders = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(tree, n.rhs);
+            const binders = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(binders.len) });
             for (binders) |b| try walkInner(src, b, collect, visitor);
         },
@@ -328,7 +330,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .pattern_literal => try emit(visitor, .{ .leaf = leaf }),
         .pattern_or => {
-            const alts = Ast.rangeSlice(tree, n.lhs);
+            const alts = Ast.rangeSlice(tree, n.lhs.int());
             try emit(visitor, .{ .count = @intCast(alts.len) });
             for (alts) |a| try walkInner(src, a, collect, visitor);
         },
@@ -381,7 +383,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
                 .callee => |c| {
-                    const res = self.frozen.resolutions[c.idx];
+                    const res = self.frozen.resolutions[c.idx.int()];
                     // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
                     // what the .func reloc target carries) and `sigs` (params/ret).
                     // Fold the full identity so a builtin<->user_fn shadow switch flips
@@ -414,7 +416,7 @@ pub fn TouchedVisitor(comptime Frozen: type) type {
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
                 .touch => |t| {
-                    if (t.idx < self.frozen.node_types.len) try appendTouched(self.gpa, self.frozen, self.frozen.node_types[t.idx], self.out);
+                    if (t.idx.int() < self.frozen.node_types.len) try appendTouched(self.gpa, self.frozen, self.frozen.node_types[t.idx.int()], self.out);
                 },
                 .type_ref => |r| {
                     // Prefer the typecheck-resolved sig type (carries the right
@@ -440,7 +442,7 @@ pub fn TouchedVisitor(comptime Frozen: type) type {
 /// Mirrors `lower`'s type-ref resolution so the fingerprint folds the SAME layout
 /// codegen will use, independent of node_types (which Typecheck never sets here).
 pub fn typeRefToType(frozen: anytype, type_node: Ast.Index) Typecheck.Type {
-    const n = frozen.tree.nodes[type_node];
+    const n = frozen.tree.nodes[type_node.int()];
     if (n.tag == .literal_unit) return Typecheck.Type.unit;
     const name = frozen.tokens[n.main_token].text(frozen.source);
     if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
@@ -557,8 +559,8 @@ const Built = struct {
     }
 
     fn fnDecl(self: *const Built, idx: usize) Ast.Index {
-        const prog = self.tree.nodes[Ast.root(self.tree.nodes)];
-        return Ast.rangeSlice(self.tree, prog.lhs)[idx];
+        const prog = self.tree.nodes[Ast.root(self.tree.nodes).int()];
+        return Ast.rangeSlice(self.tree, prog.lhs.int())[idx];
     }
 
     fn src(self: *const Built) Source {
@@ -745,7 +747,7 @@ test "[R3 DRIFT GUARD] all three consumers observe the SAME event stream + dispa
     var pattern_entered: u32 = 0;
     for (stream) |st| {
         if (st.kind != .enter) continue;
-        if (isPatternTag(b.tree.nodes[st.idx].tag)) {
+        if (isPatternTag(b.tree.nodes[st.idx.int()].tag)) {
             pattern_entered += 1;
             // This pattern node was entered; assert it is NOT in the touch set.
             for (stream) |t| {
@@ -763,7 +765,7 @@ test "[R3 DRIFT GUARD] all three consumers observe the SAME event stream + dispa
         if (st.kind != .callee) continue;
         var matched = false;
         for (stream) |e| {
-            if (e.kind == .enter and b.tree.nodes[e.idx].tag == .call and b.tree.nodes[e.idx].lhs == st.idx) {
+            if (e.kind == .enter and b.tree.nodes[e.idx.int()].tag == .call and b.tree.nodes[e.idx.int()].lhs == st.idx) {
                 matched = true;
                 break;
             }
@@ -773,12 +775,12 @@ test "[R3 DRIFT GUARD] all three consumers observe the SAME event stream + dispa
 
     // (4) `.type_ref` PLACEMENT: every `.type_ref` idx is a param/return type node
     // of the fn_decl's proto. A type_ref emitted at the wrong position fails here.
-    const proto = Ast.protoAt(b.tree, b.tree.nodes[decl].lhs);
+    const proto = Ast.protoAt(b.tree, b.tree.nodes[decl.int()].lhs.int());
     for (stream) |st| {
         if (st.kind != .type_ref) continue;
         var is_proto_type = st.idx == proto.ret_type;
         for (proto.params) |p| {
-            if (b.tree.nodes[p].lhs == st.idx) is_proto_type = true;
+            if (b.tree.nodes[p.int()].lhs == st.idx) is_proto_type = true;
         }
         try testing.expect(is_proto_type);
     }

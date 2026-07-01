@@ -253,8 +253,8 @@ pub fn lowerFn(
 ) error{OutOfMemory}!Ir.Function {
     _ = is_entry; // the is_entry unit-main x0=0 contract is a codegen concern.
 
-    const decl = in.tree.nodes[fn_decl];
-    const proto = Ast.protoAt(in.tree, decl.lhs);
+    const decl = in.tree.nodes[(fn_decl).int()];
+    const proto = Ast.protoAt(in.tree, (decl.lhs).int());
     const ret_type = returnType(in, proto);
 
     var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = ret_type, .diags = out_diags };
@@ -361,23 +361,23 @@ pub fn lowerFn(
 
 /// Lower a block's statements in order into the current block (no merge value).
 fn lowerBlockStmts(b: *Builder, block_idx: Ast.Index) error{OutOfMemory}!void {
-    const block = b.in.tree.nodes[block_idx];
-    for (Ast.rangeSlice(b.in.tree, block.lhs)) |stmt_idx| {
+    const block = b.in.tree.nodes[(block_idx).int()];
+    for (Ast.rangeSlice(b.in.tree, (block.lhs).int())) |stmt_idx| {
         if (b.termSet()) break; // unreachable tail (after a return/divergent stmt)
         try lowerStmt(b, stmt_idx);
     }
 }
 
 fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const stmt = b.in.tree.nodes[stmt_idx];
+    const stmt = b.in.tree.nodes[(stmt_idx).int()];
     switch (stmt.tag) {
         .var_decl => {
-            const slot = try localSlot(b, stmt_idx, b.in.node_types[stmt_idx]);
-            try storeInto(b, slot, stmt.lhs, b.in.node_types[stmt_idx]);
+            const slot = try localSlot(b, stmt_idx, b.in.node_types[(stmt_idx).int()]);
+            try storeInto(b, slot, stmt.lhs, b.in.node_types[(stmt_idx).int()]);
         },
         .assign => {
-            const target = b.in.tree.nodes[stmt.lhs];
-            const place_ty = b.in.node_types[stmt.lhs];
+            const target = b.in.tree.nodes[(stmt.lhs).int()];
+            const place_ty = b.in.node_types[(stmt.lhs).int()];
             if (target.tag == .field_access) {
                 try lowerFieldStore(b, stmt.lhs, stmt.rhs, place_ty);
                 return;
@@ -424,7 +424,7 @@ fn storeInto(b: *Builder, slot: Ir.SlotId, expr: Ast.Index, ty: Typecheck.Type) 
         .unit => {
             _ = try lowerExpr(b, expr); // for effect
         },
-        else => try b.note(b.in.tree.nodes[expr].main_token, "aggregate var/assign unsupported in lower"),
+        else => try b.note(b.in.tree.nodes[(expr).int()].main_token, "aggregate var/assign unsupported in lower"),
     }
 }
 
@@ -432,8 +432,8 @@ fn storeInto(b: *Builder, slot: Ir.SlotId, expr: Ast.Index, ty: Typecheck.Type) 
 /// (16-byte aggregate) yields `Operand.slot`; unit yields `.none`.
 fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
     if (node_idx == Ast.none) return .none;
-    const n = b.in.tree.nodes[node_idx];
-    const ty = b.in.node_types[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const ty = b.in.node_types[(node_idx).int()];
     switch (n.tag) {
         .literal_number => {
             const v = parseInt(b.in.tokens[n.main_token].text(b.in.source)) orelse {
@@ -479,7 +479,7 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
 }
 
 fn lowerStrLiteral(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     const bytes = (try decodeStringLiteral(b, n.main_token)) orelse return .none;
     // Content-hash the decoded bytes; `cstr_ptr` carries the hash and the bytes
     // are registered in the fn's literal table (codegen recovers them there and
@@ -509,7 +509,7 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
         .str, .@"struct", .@"enum" => return .{ .slot = slot }, // aggregate: pass by slot, no load
         .unit => return .none,
         else => {
-            try b.note(b.in.tree.nodes[node_idx].main_token, "identifier type unsupported in lower");
+            try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "identifier type unsupported in lower");
             return .none;
         },
     }
@@ -599,16 +599,16 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     // The callee identifier resolves to a `.func` index into `names` (this also
     // covers the `print` builtin, whose name index points at the synthetic entry).
-    const callee_res = b.in.resolutions[n.lhs];
+    const callee_res = b.in.resolutions[(n.lhs).int()];
     if (callee_res != .func) {
         try b.note(n.main_token, "call target unsupported in lower");
         return .none;
     }
     const callee = b.in.names[callee_res.func];
-    const result_ty = b.in.node_types[node_idx];
+    const result_ty = b.in.node_types[(node_idx).int()];
 
     // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot).
-    const arg_nodes = Ast.rangeSlice(b.in.tree, n.rhs);
+    const arg_nodes = Ast.rangeSlice(b.in.tree, (n.rhs).int());
     const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len);
     errdefer b.gpa.free(args);
     for (arg_nodes, 0..) |arg, i| {
@@ -656,12 +656,12 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
 /// Misclassifying a call as construction inlines a wrong-layout variant and drops
 /// the call → silent miscompile / infinite recursion.
 fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool {
-    return ty.kind == .@"enum" and b.in.tree.nodes[n.lhs].tag == .field_access and
-        b.in.resolutions[n.lhs] != .func;
+    return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
+        b.in.resolutions[(n.lhs).int()] != .func;
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[expr];
+    const n = b.in.tree.nodes[(expr).int()];
     switch (ty.kind) {
         .int, .bool => {
             const v = operandValue(try lowerExpr(b, expr));
@@ -732,7 +732,7 @@ fn operandPtr(b: *Builder, op: Ir.Operand) error{OutOfMemory}!Ir.ValueId {
 /// Store a str literal's (cstr_ptr, len) pair into the destination ptr; the
 /// `ptr@0, len@8` field layout is pinned by the `lower-aggregates: str literal` test.
 fn storeStrLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[expr];
+    const n = b.in.tree.nodes[(expr).int()];
     const bytes = (try decodeStringLiteral(b, n.main_token)) orelse return;
     const h = std.hash.Wyhash.hash(lit_seed, bytes);
     const len: i64 = @intCast(bytes.len);
@@ -782,7 +782,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
         },
         .unit => return .none,
         else => {
-            try b.note(b.in.tree.nodes[node_idx].main_token, "field access type unsupported in lower");
+            try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "field access type unsupported in lower");
             return .none;
         },
     }
@@ -794,7 +794,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
 fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
     const addr = try lowerPlaceAddr(b, place);
     if (addr == Ir.none_value) {
-        try b.note(b.in.tree.nodes[place].main_token, "field store target unsupported in lower");
+        try b.note(b.in.tree.nodes[(place).int()].main_token, "field store target unsupported in lower");
         return;
     }
     switch (ty.kind) {
@@ -803,7 +803,7 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = v, .ty = ty } }, null);
         },
         .str, .@"struct", .@"enum" => try lowerExprInto(b, value, addr, ty),
-        else => try b.note(b.in.tree.nodes[place].main_token, "field store type unsupported in lower"),
+        else => try b.note(b.in.tree.nodes[(place).int()].main_token, "field store type unsupported in lower"),
     }
 }
 
@@ -811,17 +811,17 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
 /// root + a field_addr per `.field` hop, resolving each field name → byte offset
 /// from the layout. Returns `none_value` for a non-local-rooted place.
 fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueId {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     switch (n.tag) {
         .identifier => {
-            if (b.in.resolutions[node_idx] != .local) return Ir.none_value;
-            const slot = try localSlot(b, node_idx, b.in.node_types[node_idx]);
+            if (b.in.resolutions[(node_idx).int()] != .local) return Ir.none_value;
+            const slot = try localSlot(b, node_idx, b.in.node_types[(node_idx).int()]);
             return try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
         },
         .field_access => {
             const base_addr = try lowerPlaceAddr(b, n.lhs);
             if (base_addr == Ir.none_value) return Ir.none_value;
-            const base_ty = b.in.node_types[n.lhs];
+            const base_ty = b.in.node_types[(n.lhs).int()];
             if (base_ty.kind != .@"struct") return Ir.none_value;
             const layout = b.in.layouts[base_ty.struct_id];
             const fname = b.in.tokens[n.main_token].text(b.in.source);
@@ -841,11 +841,11 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
 /// reordered initializer list is fine), scalars via store, aggregates recursing
 /// through `lowerExprInto` at a field_addr.
 fn lowerStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[node_idx];
-    const id = b.in.node_types[node_idx].struct_id;
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const id = b.in.node_types[(node_idx).int()].struct_id;
     const layout = b.in.layouts[id];
-    for (Ast.rangeSlice(b.in.tree, n.rhs)) |fi_idx| {
-        const fi = b.in.tree.nodes[fi_idx];
+    for (Ast.rangeSlice(b.in.tree, (n.rhs).int())) |fi_idx| {
+        const fi = b.in.tree.nodes[(fi_idx).int()];
         const fname = b.in.tokens[fi.main_token].text(b.in.source);
         var foff: u32 = 0;
         var fty = Typecheck.Type.int;
@@ -870,13 +870,13 @@ const VariantCtor = struct {
 };
 
 fn decodeVariantCtor(b: *Builder, node_idx: Ast.Index) VariantCtor {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     return switch (n.tag) {
         .enum_init_unit => .{ .vtok = n.main_token, .payload = Ast.none, .is_struct_form = false },
         .enum_init_tuple => .{ .vtok = n.main_token, .payload = n.rhs, .is_struct_form = false },
         .enum_init_struct => .{ .vtok = n.main_token, .payload = n.rhs, .is_struct_form = true },
         .field_access => .{ .vtok = n.main_token, .payload = Ast.none, .is_struct_form = false },
-        .call => .{ .vtok = b.in.tree.nodes[n.lhs].main_token, .payload = n.rhs, .is_struct_form = false },
+        .call => .{ .vtok = b.in.tree.nodes[(n.lhs).int()].main_token, .payload = n.rhs, .is_struct_form = false },
         else => unreachable,
     };
 }
@@ -901,13 +901,13 @@ fn lowerEnumInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: 
     _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = tagv, .ty = Typecheck.Type.int } }, null);
 
     if (ctor.payload == Ast.none) return;
-    const elems = Ast.rangeSlice(b.in.tree, ctor.payload);
+    const elems = Ast.rangeSlice(b.in.tree, (ctor.payload).int());
     for (elems, 0..) |elem_idx, i| {
-        const value: Ast.Index = if (ctor.is_struct_form) b.in.tree.nodes[elem_idx].lhs else elem_idx;
+        const value: Ast.Index = if (ctor.is_struct_form) b.in.tree.nodes[(elem_idx).int()].lhs else elem_idx;
         // Map a struct-form field-init by name (reorder-safe); positional otherwise.
         var fi_idx: usize = i;
         if (ctor.is_struct_form) {
-            const fname = b.in.tokens[b.in.tree.nodes[elem_idx].main_token].text(b.in.source);
+            const fname = b.in.tokens[b.in.tree.nodes[(elem_idx).int()].main_token].text(b.in.source);
             for (variant.field_names, 0..) |dn, j| {
                 if (std.mem.eql(u8, dn, fname)) {
                     fi_idx = j;
@@ -943,7 +943,7 @@ fn lowerMatchValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
             return .none;
         },
         else => {
-            try b.note(b.in.tree.nodes[node_idx].main_token, "match result type unsupported in lower");
+            try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "match result type unsupported in lower");
             return .none;
         },
     }
@@ -955,19 +955,19 @@ fn lowerMatchValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
 /// arm body, which produces into `dst_ptr` and branches to a shared `join`. NO
 /// switch terminator (preserves overlapping-pattern order).
 fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[node_idx];
-    const scrut_ty = b.in.node_types[n.lhs];
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const scrut_ty = b.in.node_types[(n.lhs).int()];
 
     // Spill the scrutinee into a slot (every match reads it by address).
     const scrut_op = try lowerExpr(b, n.lhs);
-    const scrut_slot = try spillScrutinee(b, scrut_op, scrut_ty, b.in.tree.nodes[n.lhs].main_token);
+    const scrut_slot = try spillScrutinee(b, scrut_op, scrut_ty, b.in.tree.nodes[(n.lhs).int()].main_token);
     if (scrut_slot == Ir.none_slot) return; // diagnostic already emitted
 
     const join = try b.addBlock();
-    const arms = Ast.rangeSlice(b.in.tree, n.rhs);
+    const arms = Ast.rangeSlice(b.in.tree, (n.rhs).int());
     for (arms) |arm_idx| {
-        const arm = b.in.tree.nodes[arm_idx];
-        const h = Ast.armHeaderAt(b.in.tree, arm.rhs);
+        const arm = b.in.tree.nodes[(arm_idx).int()];
+        const h = Ast.armHeaderAt(b.in.tree, (arm.rhs).int());
         const next = try b.addBlock();
         // Structural test: a mismatch branches to `next`. Bindings are stored as a
         // side effect of a successful (sub)match.
@@ -1012,7 +1012,7 @@ fn spillScrutinee(b: *Builder, op: Ir.Operand, ty: Typecheck.Type, tok: u32) err
 /// bound leaves into their slots. Addresses via
 /// field_addr + the enum tag via get_tag.
 fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_ty: Typecheck.Type, fail: Ir.BlockId) error{OutOfMemory}!void {
-    const pat = b.in.tree.nodes[pat_idx];
+    const pat = b.in.tree.nodes[(pat_idx).int()];
     switch (pat.tag) {
         .pattern_wildcard => {},
         .pattern_binding => {
@@ -1036,7 +1036,7 @@ fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_t
             b.switchTo(ok);
         },
         .pattern_or => {
-            const alts = Ast.rangeSlice(b.in.tree, pat.lhs);
+            const alts = Ast.rangeSlice(b.in.tree, (pat.lhs).int());
             const body = try b.addBlock();
             for (alts, 0..) |alt, i| {
                 if (i + 1 == alts.len) {
@@ -1074,12 +1074,12 @@ fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_t
             // Recurse into payload sub-patterns IN PLACE.
             if (pat.rhs != Ast.none) {
                 const variant = e.variants[vi];
-                const binders = Ast.rangeSlice(b.in.tree, pat.rhs);
+                const binders = Ast.rangeSlice(b.in.tree, (pat.rhs).int());
                 for (binders, 0..) |bnd_idx, i| {
-                    const bnd = b.in.tree.nodes[bnd_idx];
+                    const bnd = b.in.tree.nodes[(bnd_idx).int()];
                     var fi: usize = i;
                     if (variant.form == .@"struct") {
-                        const src_name = if (bnd.lhs != Ast.none) b.in.tokens[b.in.tree.nodes[bnd.lhs].main_token].text(b.in.source) else b.in.tokens[bnd.main_token].text(b.in.source);
+                        const src_name = if (bnd.lhs != Ast.none) b.in.tokens[b.in.tree.nodes[(bnd.lhs).int()].main_token].text(b.in.source) else b.in.tokens[bnd.main_token].text(b.in.source);
                         for (variant.field_names, 0..) |dn, j| {
                             if (std.mem.eql(u8, dn, src_name)) {
                                 fi = j;
@@ -1100,7 +1100,7 @@ fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_t
 /// binding's slot (scalar load/store, aggregate copy). A binding with no `.local`
 /// (e.g. an unused field) is a no-op.
 fn bindLeaf(b: *Builder, bind_idx: Ast.Index, base: Ir.SlotId, off: u32, ty: Typecheck.Type) error{OutOfMemory}!void {
-    if (b.in.resolutions[bind_idx] != .local) return;
+    if (b.in.resolutions[(bind_idx).int()] != .local) return;
     const dst_slot = try localSlot(b, bind_idx, ty);
     const src = try slotFieldAddr(b, base, off, ty);
     const dst = try b.emit(.{ .slot_addr = dst_slot }, Typecheck.Type.int);
@@ -1123,9 +1123,9 @@ fn slotFieldAddr(b: *Builder, base: Ir.SlotId, off: u32, ty: Typecheck.Type) err
 
 /// Whether a `field_access`/identifier place is rooted at a local.
 fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     return switch (n.tag) {
-        .identifier => b.in.resolutions[node_idx] == .local,
+        .identifier => b.in.resolutions[(node_idx).int()] == .local,
         .field_access => isLocalRootedPlace(b, n.lhs),
         else => false,
     };
@@ -1136,8 +1136,8 @@ fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
 /// fall-through. An else-less if jumps straight to join on false. A divergent arm
 /// (already terminated) does not branch to join.
 fn lowerIfStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const stmt = b.in.tree.nodes[stmt_idx];
-    const h = Ast.ifHeaderAt(b.in.tree, stmt.rhs);
+    const stmt = b.in.tree.nodes[(stmt_idx).int()];
+    const h = Ast.ifHeaderAt(b.in.tree, (stmt.rhs).int());
     const then_bb = try b.addBlock();
     const join = try b.addBlock();
     const else_bb = if (h.else_node == Ast.none) join else try b.addBlock();
@@ -1150,7 +1150,7 @@ fn lowerIfStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 
     if (h.else_node != Ast.none) {
         b.switchTo(else_bb);
-        if (b.in.tree.nodes[h.else_node].tag == .if_stmt) {
+        if (b.in.tree.nodes[(h.else_node).int()].tag == .if_stmt) {
             try lowerIfStmt(b, h.else_node); // else if
         } else {
             try lowerBlockStmts(b, h.else_node);
@@ -1164,8 +1164,8 @@ fn lowerIfStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 /// `if cond { then } else { else }` as a VALUE: both arms produce the merge value
 /// carried as a block param on `join`. Typecheck guarantees an else.
 fn lowerIfValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
-    const stmt = b.in.tree.nodes[node_idx];
-    const h = Ast.ifHeaderAt(b.in.tree, stmt.rhs);
+    const stmt = b.in.tree.nodes[(node_idx).int()];
+    const h = Ast.ifHeaderAt(b.in.tree, (stmt.rhs).int());
     std.debug.assert(h.else_node != Ast.none);
 
     const then_bb = try b.addBlock();
@@ -1180,7 +1180,7 @@ fn lowerIfValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutO
     if (!b.termSet()) try brTo(b, join, tv);
 
     b.switchTo(else_bb);
-    const ev = if (b.in.tree.nodes[h.else_node].tag == .if_stmt)
+    const ev = if (b.in.tree.nodes[(h.else_node).int()].tag == .if_stmt)
         try lowerIfValue(b, h.else_node, ty)
     else
         try lowerBlockValue(b, h.else_node, ty);
@@ -1200,16 +1200,16 @@ fn lowerIfValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutO
 /// wrapped in an `expr_stmt` by the parser when it appears trailing, but it
 /// still yields the block's value, so recognize it by tag and lower it directly.
 fn trailingValueExpr(b: *Builder, stmt_idx: Ast.Index) ?Ast.Index {
-    const tag = b.in.tree.nodes[stmt_idx].tag;
+    const tag = b.in.tree.nodes[(stmt_idx).int()].tag;
     return switch (tag) {
-        .expr_stmt => b.in.tree.nodes[stmt_idx].lhs,
+        .expr_stmt => b.in.tree.nodes[(stmt_idx).int()].lhs,
         .if_stmt, .match_expr, .loop_expr, .labeled, .block => stmt_idx,
         else => null,
     };
 }
 
 fn lowerBlockValue(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
-    const stmts = Ast.rangeSlice(b.in.tree, b.in.tree.nodes[block_idx].lhs);
+    const stmts = Ast.rangeSlice(b.in.tree, (b.in.tree.nodes[(block_idx).int()].lhs).int());
     if (stmts.len == 0) return .none;
     for (stmts[0 .. stmts.len - 1]) |s| {
         if (b.termSet()) return .none;
@@ -1228,7 +1228,7 @@ fn lowerBlockValue(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type) error{
 /// `while cond { body }`: header (cond_br to body|done); body; back-edge to
 /// header. break→done, continue→header. A `()` statement.
 fn lowerWhile(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
-    const stmt = b.in.tree.nodes[stmt_idx];
+    const stmt = b.in.tree.nodes[(stmt_idx).int()];
     const header = try b.addBlock();
     const body = try b.addBlock();
     const done = try b.addBlock();
@@ -1250,8 +1250,8 @@ fn lowerWhile(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
 /// int). init store lo; header: re-eval hi, load i, `i >= hi` cond_br done|body;
 /// body; inc: i = i+1, br header. continue→inc, break→done.
 fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
-    const stmt = b.in.tree.nodes[stmt_idx];
-    const h = Ast.forHeaderAt(b.in.tree, stmt.rhs);
+    const stmt = b.in.tree.nodes[(stmt_idx).int()];
+    const h = Ast.forHeaderAt(b.in.tree, (stmt.rhs).int());
     const islot = try localSlot(b, stmt_idx, Typecheck.Type.int);
 
     // i := lo
@@ -1298,7 +1298,7 @@ fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMem
 /// back-edge target; `exit` carries the merge param. A break-less (`never`) loop
 /// never reaches `exit` → its body just back-edges; the exit stays unreachable.
 fn lowerLoopValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type, label: ?[]const u8) error{OutOfMemory}!Ir.Operand {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     const top = try b.addBlock();
     const exit = try b.addBlock();
     const is_value = ty.kind != .unit and ty.kind != .never;
@@ -1318,23 +1318,23 @@ fn lowerLoopValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type, label: ?
 /// A `labeled` wrapper as a STATEMENT: dispatch to the inner construct, threading
 /// the label. loop/block are value-yielding but discarded here.
 fn lowerLabeledStmt(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     const label = b.in.tokens[n.main_token].text(b.in.source);
-    const inner = b.in.tree.nodes[n.lhs];
+    const inner = b.in.tree.nodes[(n.lhs).int()];
     switch (inner.tag) {
         .while_stmt => try lowerWhile(b, n.lhs, label),
         .for_stmt => try lowerFor(b, n.lhs, label),
-        .loop_expr => _ = try lowerLoopValue(b, n.lhs, b.in.node_types[n.lhs], label),
-        .block => _ = try lowerLabeledBlock(b, n.lhs, b.in.node_types[node_idx], label),
+        .loop_expr => _ = try lowerLoopValue(b, n.lhs, b.in.node_types[(n.lhs).int()], label),
+        .block => _ = try lowerLabeledBlock(b, n.lhs, b.in.node_types[(node_idx).int()], label),
         else => try b.note(n.main_token, "labeled construct unsupported in lower"),
     }
 }
 
 /// A `labeled` wrapper as a VALUE expression.
 fn lowerLabeledValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     const label = b.in.tokens[n.main_token].text(b.in.source);
-    const inner = b.in.tree.nodes[n.lhs];
+    const inner = b.in.tree.nodes[(n.lhs).int()];
     switch (inner.tag) {
         .loop_expr => return try lowerLoopValue(b, n.lhs, ty, label),
         .block => return try lowerLabeledBlock(b, n.lhs, ty, label),
@@ -1377,8 +1377,8 @@ fn lowerLabeledBlock(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type, labe
 // and does NOT branch to join.
 
 fn lowerIfValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const stmt = b.in.tree.nodes[node_idx];
-    const h = Ast.ifHeaderAt(b.in.tree, stmt.rhs);
+    const stmt = b.in.tree.nodes[(node_idx).int()];
+    const h = Ast.ifHeaderAt(b.in.tree, (stmt.rhs).int());
     std.debug.assert(h.else_node != Ast.none);
     const then_bb = try b.addBlock();
     const else_bb = try b.addBlock();
@@ -1391,7 +1391,7 @@ fn lowerIfValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: T
     if (!b.termSet()) try brTo(b, join, .none);
 
     b.switchTo(else_bb);
-    if (b.in.tree.nodes[h.else_node].tag == .if_stmt)
+    if (b.in.tree.nodes[(h.else_node).int()].tag == .if_stmt)
         try lowerIfValueInto(b, h.else_node, dst_ptr, ty)
     else
         try lowerBlockValueInto(b, h.else_node, dst_ptr, ty);
@@ -1401,7 +1401,7 @@ fn lowerIfValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: T
 }
 
 fn lowerBlockValueInto(b: *Builder, block_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const stmts = Ast.rangeSlice(b.in.tree, b.in.tree.nodes[block_idx].lhs);
+    const stmts = Ast.rangeSlice(b.in.tree, (b.in.tree.nodes[(block_idx).int()].lhs).int());
     if (stmts.len == 0) return;
     for (stmts[0 .. stmts.len - 1]) |s| {
         if (b.termSet()) return;
@@ -1417,7 +1417,7 @@ fn lowerBlockValueInto(b: *Builder, block_idx: Ast.Index, dst_ptr: Ir.ValueId, t
 }
 
 fn lowerLoopValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type, label: ?[]const u8) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     const top = try b.addBlock();
     const exit = try b.addBlock();
 
@@ -1432,9 +1432,9 @@ fn lowerLoopValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty:
 }
 
 fn lowerLabeledValueInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     const label = b.in.tokens[n.main_token].text(b.in.source);
-    const inner = b.in.tree.nodes[n.lhs];
+    const inner = b.in.tree.nodes[(n.lhs).int()];
     switch (inner.tag) {
         .loop_expr => try lowerLoopValueInto(b, n.lhs, dst_ptr, ty, label),
         .block => try lowerLabeledBlockInto(b, n.lhs, dst_ptr, ty, label),
@@ -1452,7 +1452,7 @@ fn lowerLabeledBlockInto(b: *Builder, block_idx: Ast.Index, dst_ptr: Ir.ValueId,
 }
 
 fn lowerBreak(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const stmt = b.in.tree.nodes[stmt_idx];
+    const stmt = b.in.tree.nodes[(stmt_idx).int()];
     const ctx = targetLoop(b, stmt_idx);
     switch (ctx.merge) {
         .aggregate => |agg| if (stmt.lhs != Ast.none) {
@@ -1483,8 +1483,8 @@ fn lowerContinue(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 /// (skipping labeled bare blocks). Typecheck guarantees a match exists.
 fn targetLoop(b: *Builder, stmt_idx: Ast.Index) LoopCtx {
     const items = b.loops.items;
-    if (b.in.resolutions[stmt_idx] == .label) {
-        const target = b.in.resolutions[stmt_idx].label;
+    if (b.in.resolutions[(stmt_idx).int()] == .label) {
+        const target = b.in.resolutions[(stmt_idx).int()].label;
         var i = items.len;
         while (i > 0) {
             i -= 1;
@@ -1507,7 +1507,7 @@ fn targetLoop(b: *Builder, stmt_idx: Ast.Index) LoopCtx {
 /// value. cond_br is argless by design (the value-merge edges are arranged by the
 /// if/loop value paths, which `brTo` with the merge operand).
 fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.BlockId) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[node_idx];
+    const n = b.in.tree.nodes[(node_idx).int()];
     switch (n.tag) {
         .binary => {
             const op = b.in.tokens[n.main_token].tag;
@@ -1590,7 +1590,7 @@ fn operandValue(op: Ir.Operand) Ir.ValueId {
 /// the first time it is touched. Allocating in touch order keeps slot ids
 /// deterministic for a given source.
 fn localSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
-    const res = b.in.resolutions[node_idx];
+    const res = b.in.resolutions[(node_idx).int()];
     std.debug.assert(res == .local);
     const li = res.local;
     if (b.local_slots.get(li)) |sid| return sid;
@@ -1603,7 +1603,7 @@ fn localSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMe
 /// named refs map to scalars or to a struct/enum layout by name.
 fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
     if (proto.ret_type == Ast.none) return Typecheck.Type.unit;
-    if (in.tree.nodes[proto.ret_type].tag == .literal_unit) return Typecheck.Type.unit;
+    if (in.tree.nodes[(proto.ret_type).int()].tag == .literal_unit) return Typecheck.Type.unit;
     // Prefer the typecheck-resolved sig for aggregates: it carries the GLOBAL
     // struct/enum id (incl. a cross-module qualified `mod.Type`), so the ABI
     // decision is taken on the correct layout. `typeFromRef`'s bare-name scan
@@ -1622,18 +1622,18 @@ fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
         const pt = s.params[slot];
         if (pt.kind == .@"struct" or pt.kind == .@"enum") return pt;
     };
-    if (param_node < in.node_types.len) {
-        const t = in.node_types[param_node];
+    if (param_node.int() < in.node_types.len) {
+        const t = in.node_types[(param_node).int()];
         if (t.kind != .invalid) return t;
     }
-    const pn = in.tree.nodes[param_node];
+    const pn = in.tree.nodes[(param_node).int()];
     if (pn.lhs != Ast.none) return typeFromRef(in, pn.lhs);
     return Typecheck.Type.int;
 }
 
 /// Map a type-ref node's token spelling to a `Type`.
 fn typeFromRef(in: Inputs, ref: Ast.Index) Typecheck.Type {
-    const name = in.tokens[in.tree.nodes[ref].main_token].text(in.source);
+    const name = in.tokens[in.tree.nodes[(ref).int()].main_token].text(in.source);
     if (std.mem.eql(u8, name, "str")) return Typecheck.Type.str;
     if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.@"bool";
     if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
@@ -1789,11 +1789,11 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
     const rr = fe.resolve;
     const tc = fe.typecheck;
 
-    const prog = tree.nodes[Ast.root(tree.nodes)];
+    const prog = tree.nodes[(Ast.root(tree.nodes)).int()];
     var fn_nodes: std.ArrayList(Ast.Index) = .empty;
     defer fn_nodes.deinit(gpa);
-    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
-        if (tree.nodes[idx].tag == .fn_decl) try fn_nodes.append(gpa, idx);
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, (prog.lhs).int())) |idx| {
+        if (tree.nodes[(idx).int()].tag == .fn_decl) try fn_nodes.append(gpa, idx);
     }
 
     const names = try gpa.alloc(Link.SymName, fn_nodes.items.len + 1);
@@ -1802,7 +1802,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         gpa.free(names);
     }
     for (fn_nodes.items, 0..) |idx, i| {
-        const nm = tokens[tree.nodes[idx].main_token].text(src);
+        const nm = tokens[tree.nodes[(idx).int()].main_token].text(src);
         names[i] = .{ .kind = .user_fn, .name = try gpa.dupe(u8, nm) };
     }
     names[fn_nodes.items.len] = .{ .kind = .builtin, .name = try gpa.dupe(u8, "print") };
@@ -1821,7 +1821,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
     var target: Ast.Index = Ast.none;
     var target_i: usize = 0;
     for (fn_nodes.items, 0..) |idx, i| {
-        if (std.mem.eql(u8, tokens[tree.nodes[idx].main_token].text(src), fn_name)) {
+        if (std.mem.eql(u8, tokens[tree.nodes[(idx).int()].main_token].text(src), fn_name)) {
             target = idx;
             target_i = i;
             break;
@@ -1899,10 +1899,10 @@ test "lower-core: while loop with break/continue is well-formed" {
     const rr = fe.resolve;
     const tc = fe.typecheck;
 
-    const prog = tree.nodes[Ast.root(tree.nodes)];
+    const prog = tree.nodes[(Ast.root(tree.nodes)).int()];
     var fn_decl: Ast.Index = Ast.none;
-    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
-        if (tree.nodes[idx].tag == .fn_decl) fn_decl = idx;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, (prog.lhs).int())) |idx| {
+        if (tree.nodes[(idx).int()].tag == .fn_decl) fn_decl = idx;
     }
     var names = [_]Link.SymName{.{ .kind = .user_fn, .name = try gpa.dupe(u8, "main") }};
     defer gpa.free(names[0].name);
@@ -1941,10 +1941,10 @@ test "lower-core: out-of-range int literal yields a diagnostic" {
     defer fe.deinit(gpa);
     const rr = fe.resolve;
     const tc = fe.typecheck;
-    const prog = tree.nodes[Ast.root(tree.nodes)];
+    const prog = tree.nodes[(Ast.root(tree.nodes)).int()];
     var fn_decl: Ast.Index = Ast.none;
-    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
-        if (tree.nodes[idx].tag == .fn_decl) fn_decl = idx;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, (prog.lhs).int())) |idx| {
+        if (tree.nodes[(idx).int()].tag == .fn_decl) fn_decl = idx;
     }
     var names = [_]Link.SymName{.{ .kind = .user_fn, .name = try gpa.dupe(u8, "f") }};
     defer gpa.free(names[0].name);
@@ -2009,10 +2009,10 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
     const rr = fe.resolve;
     const tc = fe.typecheck;
 
-    const prog = tree.nodes[Ast.root(tree.nodes)];
+    const prog = tree.nodes[(Ast.root(tree.nodes)).int()];
     var fn_decl: Ast.Index = Ast.none;
-    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
-        if (tree.nodes[idx].tag == .fn_decl) fn_decl = idx;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, (prog.lhs).int())) |idx| {
+        if (tree.nodes[(idx).int()].tag == .fn_decl) fn_decl = idx;
     }
     var names = [_]Link.SymName{.{ .kind = .user_fn, .name = try gpa.dupe(u8, "f") }};
     defer gpa.free(names[0].name);
@@ -2065,11 +2065,11 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
     defer fe.deinit(gpa);
     const rr = fe.resolve;
     const tc = fe.typecheck;
-    const prog = tree.nodes[Ast.root(tree.nodes)];
+    const prog = tree.nodes[(Ast.root(tree.nodes)).int()];
     var fn_decl: Ast.Index = Ast.none;
-    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs)) |idx| {
-        if (tree.nodes[idx].tag == .fn_decl and
-            std.mem.eql(u8, tokens[tree.nodes[idx].main_token].text(src), fn_name)) fn_decl = idx;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, (prog.lhs).int())) |idx| {
+        if (tree.nodes[(idx).int()].tag == .fn_decl and
+            std.mem.eql(u8, tokens[tree.nodes[(idx).int()].main_token].text(src), fn_name)) fn_decl = idx;
     }
     var names = [_]Link.SymName{.{ .kind = .user_fn, .name = try gpa.dupe(u8, fn_name) }};
     defer gpa.free(names[0].name);

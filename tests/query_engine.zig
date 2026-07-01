@@ -193,8 +193,8 @@ const Built = struct {
     }
 
     fn fnDecl(self: *const Built, idx: usize) Ast.Index {
-        const prog = self.tree.nodes[Ast.root(self.tree.nodes)];
-        return Ast.rangeSlice(self.tree, prog.lhs)[idx];
+        const prog = self.tree.nodes[Ast.root(self.tree.nodes).int()];
+        return Ast.rangeSlice(self.tree, prog.lhs.int())[idx];
     }
 };
 

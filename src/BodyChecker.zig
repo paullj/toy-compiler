@@ -81,8 +81,8 @@ pub const BodyChecker = struct {
     /// on `bc`; the immutable fn/struct/enum tables are read through `bc.model`.
     pub fn checkBody(bc: *BodyChecker, fid: u32, f: FnSym) !void {
         _ = fid;
-        const decl = bc.tree.nodes[f.decl_node];
-        const proto = Ast.protoAt(bc.tree, decl.lhs);
+        const decl = bc.tree.nodes[(f.decl_node).int()];
+        const proto = Ast.protoAt(bc.tree, (decl.lhs).int());
 
         // Rebuild the per-function slot→type table. Parameters get slots 0..N first
         // (the resolver declares them first), then `:=` locals as we encounter them.
@@ -140,9 +140,9 @@ pub const BodyChecker = struct {
     }
 
     fn checkBlock(bc: *BodyChecker, block_idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
-        const stmts = Ast.rangeSlice(bc.tree, bc.tree.nodes[block_idx].lhs);
+        const stmts = Ast.rangeSlice(bc.tree, (bc.tree.nodes[(block_idx).int()].lhs).int());
         if (stmts.len == 0) {
-            bc.node_types[block_idx] = .unit;
+            bc.node_types[(block_idx).int()] = .unit;
             return .unit;
         }
         // The expected type (a one-shot for an inferred `.V`) applies ONLY to this
@@ -152,22 +152,22 @@ pub const BodyChecker = struct {
         bc.expected = null;
         for (stmts[0 .. stmts.len - 1]) |s| try bc.checkStmt(s); // effect only
         const last = stmts[stmts.len - 1];
-        const last_n = bc.tree.nodes[last];
+        const last_n = bc.tree.nodes[(last).int()];
         var bt: Type = .unit;
         if (last_n.tag == .expr_stmt) {
             bt = try bc.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
-            bc.node_types[last] = bt; // the expr_stmt carries the value type
+            bc.node_types[(last).int()] = bt; // the expr_stmt carries the value type
         } else if (want_value and (last_n.tag == .if_stmt or last_n.tag == .block)) {
             bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
         } else {
             try bc.checkStmt(last); // statement context (incl. trailing else-less if)
         }
-        bc.node_types[block_idx] = bt;
+        bc.node_types[(block_idx).int()] = bt;
         return bt;
     }
 
     fn checkStmt(bc: *BodyChecker, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-        const stmt = bc.tree.nodes[stmt_idx];
+        const stmt = bc.tree.nodes[(stmt_idx).int()];
         switch (stmt.tag) {
             .var_decl => {
                 // `x: T = e` (rhs is the type ref) binds x:T and checks the
@@ -180,11 +180,11 @@ pub const BodyChecker = struct {
                     }
                     break :blk declared;
                 } else try bc.typeOf(stmt.lhs);
-                bc.node_types[stmt_idx] = ty;
+                bc.node_types[(stmt_idx).int()] = ty;
                 // Record the new local's type at its slot. The resolver bound the
                 // var_decl node to a `.local` slot; append/extend slot_types to fit.
-                if (bc.resolutions[stmt_idx] == .local) {
-                    const slot = bc.resolutions[stmt_idx].local;
+                if (bc.resolutions[(stmt_idx).int()] == .local) {
+                    const slot = bc.resolutions[(stmt_idx).int()].local;
                     try bc.setSlot(slot, ty);
                 }
                 if (ty.kind == .unit) {
@@ -192,18 +192,18 @@ pub const BodyChecker = struct {
                 }
             },
             .assign => {
-                const target = bc.tree.nodes[stmt.lhs];
+                const target = bc.tree.nodes[(stmt.lhs).int()];
                 // Compute the place type FIRST so it can flow into the rhs as the
                 // expected type (an inferred `.V` assigned to a known-typed place).
                 const lhs: Type = switch (target.tag) {
-                    .identifier => if (bc.resolutions[stmt.lhs] == .local)
-                        bc.slotType(bc.resolutions[stmt.lhs].local)
+                    .identifier => if (bc.resolutions[(stmt.lhs).int()] == .local)
+                        bc.slotType(bc.resolutions[(stmt.lhs).int()].local)
                     else
                         .invalid,
                     .field_access => try bc.typeOf(stmt.lhs),
                     else => .invalid,
                 };
-                bc.node_types[stmt.lhs] = lhs;
+                bc.node_types[(stmt.lhs).int()] = lhs;
                 const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
                     try bc.sink.emitFmt(bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
@@ -226,11 +226,11 @@ pub const BodyChecker = struct {
             .if_stmt => {
                 const ct = try bc.typeOf(stmt.lhs);
                 if (ct.kind != .invalid and ct.kind != .bool)
-                    try bc.sink.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "if condition must be bool");
-                const h = Ast.ifHeaderAt(bc.tree, stmt.rhs);
+                    try bc.sink.emit(bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "if condition must be bool");
+                const h = Ast.ifHeaderAt(bc.tree, (stmt.rhs).int());
                 _ = try bc.checkBlock(h.then_block, false);
                 if (h.else_node != Ast.none) {
-                    if (bc.tree.nodes[h.else_node].tag == .if_stmt)
+                    if (bc.tree.nodes[(h.else_node).int()].tag == .if_stmt)
                         try bc.checkStmt(h.else_node)
                     else
                         _ = try bc.checkBlock(h.else_node, false);
@@ -243,7 +243,7 @@ pub const BodyChecker = struct {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
                     // No matching context: a bare break with an empty stack ("outside a
                     // loop"); a labeled break is reported by resolve as undefined.
-                    if (bc.resolutions[stmt_idx] != .label)
+                    if (bc.resolutions[(stmt_idx).int()] != .label)
                         try bc.sink.emit(bc.byteOf(stmt.main_token), "break outside of a loop");
                     if (stmt.lhs != Ast.none) _ = try bc.typeOf(stmt.lhs);
                     return;
@@ -264,7 +264,7 @@ pub const BodyChecker = struct {
             },
             .continue_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
-                    if (bc.resolutions[stmt_idx] != .label)
+                    if (bc.resolutions[(stmt_idx).int()] != .label)
                         try bc.sink.emit(bc.byteOf(stmt.main_token), "continue outside of a loop");
                     return;
                 };
@@ -278,8 +278,8 @@ pub const BodyChecker = struct {
 
     fn targetCtx(bc: *BodyChecker, stmt_idx: Ast.Index) ?*LoopCtx {
         const items = bc.loop_stack.items;
-        if (bc.resolutions[stmt_idx] == .label) {
-            const target = bc.resolutions[stmt_idx].label;
+        if (bc.resolutions[(stmt_idx).int()] == .label) {
+            const target = bc.resolutions[(stmt_idx).int()].label;
             var i = items.len;
             while (i > 0) {
                 i -= 1;
@@ -296,34 +296,34 @@ pub const BodyChecker = struct {
     }
 
     fn checkWhile(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
-        const stmt = bc.tree.nodes[stmt_idx];
+        const stmt = bc.tree.nodes[(stmt_idx).int()];
         const ct = try bc.typeOf(stmt.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.sink.emit(bc.byteOf(bc.tree.nodes[stmt.lhs].main_token), "while condition must be bool");
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "while condition must be bool");
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.rhs, false);
         _ = bc.loop_stack.pop();
     }
 
     fn checkFor(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
-        const stmt = bc.tree.nodes[stmt_idx];
-        const h = Ast.forHeaderAt(bc.tree, stmt.rhs);
+        const stmt = bc.tree.nodes[(stmt_idx).int()];
+        const h = Ast.forHeaderAt(bc.tree, (stmt.rhs).int());
         const lo = try bc.typeOf(h.lo);
         const hi = try bc.typeOf(h.hi);
         if (lo.kind != .invalid and lo.kind != .int)
-            try bc.sink.emit(bc.byteOf(bc.tree.nodes[h.lo].main_token), "for range bounds must be int");
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[(h.lo).int()].main_token), "for range bounds must be int");
         if (hi.kind != .invalid and hi.kind != .int)
-            try bc.sink.emit(bc.byteOf(bc.tree.nodes[h.hi].main_token), "for range bounds must be int");
-        if (bc.resolutions[stmt_idx] == .local) try bc.setSlot(bc.resolutions[stmt_idx].local, Type.int);
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[(h.hi).int()].main_token), "for range bounds must be int");
+        if (bc.resolutions[(stmt_idx).int()] == .local) try bc.setSlot(bc.resolutions[(stmt_idx).int()].local, Type.int);
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.lhs, false);
         _ = bc.loop_stack.pop();
     }
 
     fn checkLabeled(bc: *BodyChecker, idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
-        const n = bc.tree.nodes[idx];
+        const n = bc.tree.nodes[(idx).int()];
         const label = bc.nameText(n.main_token);
-        const inner = bc.tree.nodes[n.lhs];
+        const inner = bc.tree.nodes[(n.lhs).int()];
         const ty: Type = switch (inner.tag) {
             .block => try bc.typeOfLabeledBlock(n.lhs, label, want_value),
             .loop_expr => try bc.typeOfLoop(n.lhs, inner, label),
@@ -337,7 +337,7 @@ pub const BodyChecker = struct {
             },
             else => Type.invalid,
         };
-        bc.node_types[idx] = ty;
+        bc.node_types[(idx).int()] = ty;
         return ty;
     }
 
@@ -348,7 +348,7 @@ pub const BodyChecker = struct {
         // The trailing-expr value is unreachable iff the block's last statement
         // diverges; in that case the block's value comes entirely from its breaks.
         const ft: Type = if (bc.blockDiverges(block_idx)) Type.never else fall;
-        return bc.merge(bc.tree.nodes[block_idx].main_token, ft, ctx.join);
+        return bc.merge(bc.tree.nodes[(block_idx).int()].main_token, ft, ctx.join);
     }
 
     fn typeOfExpected(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Type) error{OutOfMemory}!Type {
@@ -360,12 +360,12 @@ pub const BodyChecker = struct {
 
     fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
         if (node_idx == Ast.none) return .invalid;
-        const n = bc.tree.nodes[node_idx];
+        const n = bc.tree.nodes[(node_idx).int()];
         const ty: Type = switch (n.tag) {
             .literal_number => Type.int,
             .literal_bool => Type.@"bool",
             .literal_string => Type.str,
-            .identifier => switch (bc.resolutions[node_idx]) {
+            .identifier => switch (bc.resolutions[(node_idx).int()]) {
                 .local => |slot| bc.slotType(slot),
                 .func => blk: {
                     try bc.sink.emitFmt(bc.byteOf(n.main_token), "function '{s}' is not a value", .{bc.nameText(n.main_token)});
@@ -452,7 +452,7 @@ pub const BodyChecker = struct {
             .labeled => return bc.checkLabeled(node_idx, true), // sets node_types itself
             else => Type.invalid,
         };
-        bc.node_types[node_idx] = ty;
+        bc.node_types[(node_idx).int()] = ty;
         return ty;
     }
 
@@ -461,14 +461,14 @@ pub const BodyChecker = struct {
         // (the parser upgrades a `field_access {`), not here — so struct_init's lhs is
         // always a plain type-name identifier; no enum routing needed.
         _ = node_idx;
-        const name = bc.nameText(bc.tree.nodes[n.lhs].main_token);
+        const name = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
         const id = bc.activeStructMap().get(name) orelse {
-            for (Ast.rangeSlice(bc.tree, n.rhs)) |fi| _ = try bc.typeOf(bc.tree.nodes[fi].lhs);
-            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "unknown struct type '{s}'", .{name});
+            for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "unknown struct type '{s}'", .{name});
             return .invalid;
         };
         const sym = bc.model.structs[id];
-        const inits = Ast.rangeSlice(bc.tree, n.rhs);
+        const inits = Ast.rangeSlice(bc.tree, (n.rhs).int());
     
         // Track which declared fields are supplied (for missing/duplicate checks).
         var seen = try bc.gpa.alloc(bool, sym.field_names.len);
@@ -476,7 +476,7 @@ pub const BodyChecker = struct {
         @memset(seen, false);
     
         for (inits) |fi_idx| {
-            const fi = bc.tree.nodes[fi_idx];
+            const fi = bc.tree.nodes[(fi_idx).int()];
             const fname = bc.nameText(fi.main_token);
             const vt = try bc.typeOf(fi.lhs);
             // Find the declared field by name.
@@ -508,11 +508,11 @@ pub const BodyChecker = struct {
 
     fn qualifiedEnumId(bc: *BodyChecker, node_idx: Ast.Index) ?u32 {
         const g = bc.model.graph;
-        const n = bc.tree.nodes[node_idx];
+        const n = bc.tree.nodes[(node_idx).int()];
         if (n.tag != .field_access) return null;
-        const recv = bc.tree.nodes[n.lhs];
+        const recv = bc.tree.nodes[(n.lhs).int()];
         if (recv.tag != .identifier) return null;
-        if (bc.resolutions[n.lhs] != .module) return null;
+        if (bc.resolutions[(n.lhs).int()] != .module) return null;
         const recv_name = bc.nameText(recv.main_token);
         const target = g.namespaceOfIn(bc.graph_mod, recv_name) orelse return null;
         const member = bc.nameText(n.main_token);
@@ -522,7 +522,7 @@ pub const BodyChecker = struct {
     fn typeOfFieldAccess(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
         // identifier (resolved quietly to .unresolved). Treat it as construction.
-        const recv = bc.tree.nodes[n.lhs];
+        const recv = bc.tree.nodes[(n.lhs).int()];
         if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
             return bc.typeOfEnumInitQualified(node_idx, .unit, n.lhs, n.main_token, Ast.none);
         }
@@ -531,7 +531,7 @@ pub const BodyChecker = struct {
         // inner to a global enum id and treat this node as a unit-variant construction.
         if (bc.qualifiedEnumId(n.lhs)) |enum_id| {
             const ty = try bc.checkVariant(enum_id, n.main_token, .unit, Ast.none);
-            bc.node_types[node_idx] = ty;
+            bc.node_types[(node_idx).int()] = ty;
             return ty;
         }
         const base = try bc.typeOf(n.lhs);
@@ -562,10 +562,10 @@ pub const BodyChecker = struct {
         // (the one-shot expected type must be an enum).
         var enum_id: u32 = undefined;
         if (n.lhs != Ast.none) {
-            const tname = bc.nameText(bc.tree.nodes[n.lhs].main_token);
+            const tname = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
             enum_id = bc.activeEnumMap().get(tname) orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "'{s}' is not an enum type", .{tname});
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "'{s}' is not an enum type", .{tname});
                 return .invalid;
             };
         } else {
@@ -586,19 +586,19 @@ pub const BodyChecker = struct {
     }
 
     fn typeOfEnumInitQualified(bc: *BodyChecker, node_idx: Ast.Index, node_form: InitForm, type_node: Ast.Index, vtok: u32, args: Ast.Index) error{OutOfMemory}!Type {
-        const tname = bc.nameText(bc.tree.nodes[type_node].main_token);
+        const tname = bc.nameText(bc.tree.nodes[(type_node).int()].main_token);
         const enum_id = bc.activeEnumMap().get(tname) orelse return .invalid; // caller checked
         const ty = try bc.checkVariant(enum_id, vtok, node_form, args);
-        bc.node_types[node_idx] = ty;
+        bc.node_types[(node_idx).int()] = ty;
         return ty;
     }
 
     fn typeArgsForEffect(bc: *BodyChecker, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!void {
         if (args == Ast.none) return;
         if (node_form == .@"struct") {
-            for (Ast.rangeSlice(bc.tree, args)) |fi| _ = try bc.typeOf(bc.tree.nodes[fi].lhs);
+            for (Ast.rangeSlice(bc.tree, (args).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
         } else {
-            for (Ast.rangeSlice(bc.tree, args)) |a| _ = try bc.typeOf(a);
+            for (Ast.rangeSlice(bc.tree, (args).int())) |a| _ = try bc.typeOf(a);
         }
     }
 
@@ -630,7 +630,7 @@ pub const BodyChecker = struct {
         switch (variant.form) {
             .unit => {},
             .tuple => {
-                const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, args);
+                const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (args).int());
                 if (elems.len != variant.field_types.len) {
                     for (elems) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
@@ -639,16 +639,16 @@ pub const BodyChecker = struct {
                 for (elems, variant.field_types) |a, fty| {
                     const at = try bc.typeOfExpected(a, fty);
                     if (!Type.assignable(fty, at))
-                        try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[a].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
+                        try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
                 }
             },
             .@"struct" => {
-                const inits = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, args);
+                const inits = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (args).int());
                 var seen = try bc.gpa.alloc(bool, variant.field_names.len);
                 defer bc.gpa.free(seen);
                 @memset(seen, false);
                 for (inits) |fi_idx| {
-                    const fi = bc.tree.nodes[fi_idx];
+                    const fi = bc.tree.nodes[(fi_idx).int()];
                     const fname = bc.nameText(fi.main_token);
                     var found: ?usize = null;
                     for (variant.field_names, 0..) |dn, j| {
@@ -679,18 +679,18 @@ pub const BodyChecker = struct {
 
     fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         const st = try bc.typeOf(n.lhs);
-        const arms = Ast.rangeSlice(bc.tree, n.rhs);
+        const arms = Ast.rangeSlice(bc.tree, (n.rhs).int());
         if (st.kind == .invalid) {
             // Poison-absorb: still walk arms (bodies may have their own errors) but
             // don't emit a scrutinee or exhaustiveness error.
-            for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, bc.tree.nodes[arm_idx].rhs).body);
-            bc.node_types[node_idx] = .invalid;
+            for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
+            bc.node_types[(node_idx).int()] = .invalid;
             return .invalid;
         }
         if (st.kind != .@"enum" and st.kind != .int and st.kind != .bool) {
-            for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, bc.tree.nodes[arm_idx].rhs).body);
+            for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
-            bc.node_types[node_idx] = .invalid;
+            bc.node_types[(node_idx).int()] = .invalid;
             return .invalid;
         }
 
@@ -710,14 +710,14 @@ pub const BodyChecker = struct {
         var has_wildcard = false;
         var result: Type = Type.never;
         for (arms) |arm_idx| {
-            const arm = bc.tree.nodes[arm_idx];
-            const h = Ast.armHeaderAt(bc.tree, arm.rhs);
+            const arm = bc.tree.nodes[(arm_idx).int()];
+            const h = Ast.armHeaderAt(bc.tree, (arm.rhs).int());
             const guarded = h.guard != Ast.none;
             try bc.checkPattern(arm.lhs, st, &cov, &has_wildcard, !guarded);
             if (guarded) {
                 const gt = try bc.typeOf(h.guard);
                 if (gt.kind != .invalid and gt.kind != .bool)
-                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[h.guard].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(h.guard).int()].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
             }
             const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
             const body_ty: Type = if (bc.armDiverges(h.body)) Type.never else body_ty0;
@@ -734,7 +734,7 @@ pub const BodyChecker = struct {
                 try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
             .int => try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
         };
-        bc.node_types[node_idx] = result;
+        bc.node_types[(node_idx).int()] = result;
         return result;
     }
 
@@ -756,7 +756,7 @@ pub const BodyChecker = struct {
     }
 
     fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
-        const pat = bc.tree.nodes[pat_idx];
+        const pat = bc.tree.nodes[(pat_idx).int()];
         switch (pat.tag) {
             .pattern_wildcard => if (count_cov) {
                 has_wildcard.* = true;
@@ -766,10 +766,10 @@ pub const BodyChecker = struct {
                 // binding's slot is SHARED across or-pattern alternatives (Resolve), so
                 // the slot type is overwritten and can't reveal a `.A(x) | .B(x)` type
                 // divergence; the per-node matched type can (read by `collectBindings`).
-                bc.node_types[pat_idx] = expected;
+                bc.node_types[(pat_idx).int()] = expected;
                 if (pat.rhs == Ast.none) {
                     // Bind-whole: type by value; a top-level bare binding is irrefutable.
-                    if (bc.resolutions[pat_idx] == .local) try bc.setSlot(bc.resolutions[pat_idx].local, expected);
+                    if (bc.resolutions[(pat_idx).int()] == .local) try bc.setSlot(bc.resolutions[(pat_idx).int()].local, expected);
                     if (count_cov) has_wildcard.* = true;
                 } else {
                     try bc.checkPattern(pat.rhs, expected, cov, has_wildcard, count_cov);
@@ -790,7 +790,7 @@ pub const BodyChecker = struct {
                 };
             },
             .pattern_or => {
-                for (Ast.rangeSlice(bc.tree, pat.lhs)) |a| try bc.checkPattern(a, expected, cov, has_wildcard, count_cov);
+                for (Ast.rangeSlice(bc.tree, (pat.lhs).int())) |a| try bc.checkPattern(a, expected, cov, has_wildcard, count_cov);
                 try bc.checkOrBindings(pat_idx);
             },
             .pattern_variant => try bc.checkVariantPattern(pat_idx, expected, cov, has_wildcard, count_cov),
@@ -799,7 +799,7 @@ pub const BodyChecker = struct {
     }
 
     fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
-        const pat = bc.tree.nodes[pat_idx];
+        const pat = bc.tree.nodes[(pat_idx).int()];
         if (expected.kind != .@"enum") {
             if (expected.kind != .invalid)
                 try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
@@ -809,12 +809,12 @@ pub const BodyChecker = struct {
         const e = bc.model.enums[enum_id];
         // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
         if (pat.lhs != Ast.none) {
-            const tname = bc.nameText(bc.tree.nodes[pat.lhs].main_token);
+            const tname = bc.nameText(bc.tree.nodes[(pat.lhs).int()].main_token);
             if (bc.activeEnumMap().get(tname)) |qid| {
                 if (qid != enum_id)
-                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(pat.lhs).int()].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
             } else {
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[pat.lhs].main_token), "'{s}' is not an enum type", .{tname});
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(pat.lhs).int()].main_token), "'{s}' is not an enum type", .{tname});
             }
         }
         const vname = bc.nameText(pat.main_token);
@@ -835,7 +835,7 @@ pub const BodyChecker = struct {
             try bc.sink.emitFmt(bc.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
             return;
         };
-        const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, pat.rhs);
+        const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (pat.rhs).int());
         switch (variant.form) {
             .unit => {
                 if (binders.len != 0)
@@ -852,10 +852,10 @@ pub const BodyChecker = struct {
             },
             .@"struct" => {
                 for (binders) |b_idx| {
-                    const b = bc.tree.nodes[b_idx];
+                    const b = bc.tree.nodes[(b_idx).int()];
                     // A struct binding's SOURCE field name is the rename source (lhs),
                     // or the bound name itself when punning.
-                    const src_name = if (b.lhs != Ast.none) bc.nameText(bc.tree.nodes[b.lhs].main_token) else bc.nameText(b.main_token);
+                    const src_name = if (b.lhs != Ast.none) bc.nameText(bc.tree.nodes[(b.lhs).int()].main_token) else bc.nameText(b.main_token);
                     var fty: Type = .invalid;
                     var found = false;
                     for (variant.field_names, 0..) |dn, j| {
@@ -877,7 +877,7 @@ pub const BodyChecker = struct {
     }
 
     fn checkOrBindings(bc: *BodyChecker, or_idx: Ast.Index) error{OutOfMemory}!void {
-        const alts = Ast.rangeSlice(bc.tree, bc.tree.nodes[or_idx].lhs);
+        const alts = Ast.rangeSlice(bc.tree, (bc.tree.nodes[(or_idx).int()].lhs).int());
         if (alts.len < 2) return;
         var first_map: std.StringHashMapUnmanaged(Type) = .empty;
         defer first_map.deinit(bc.gpa);
@@ -905,24 +905,24 @@ pub const BodyChecker = struct {
             if (!ok) break;
         }
         if (!ok)
-            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[or_idx].main_token), "or-pattern alternatives must bind the same names and types", .{});
+            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(or_idx).int()].main_token), "or-pattern alternatives must bind the same names and types", .{});
     }
 
     fn collectBindings(bc: *BodyChecker, pat_idx: Ast.Index, out: *std.StringHashMapUnmanaged(Type)) error{OutOfMemory}!void {
-        const pat = bc.tree.nodes[pat_idx];
+        const pat = bc.tree.nodes[(pat_idx).int()];
         switch (pat.tag) {
             .pattern_binding => {
                 const name = bc.nameText(pat.main_token);
                 // The PER-NODE matched type (set in checkPattern), NOT the shared slot
                 // type — so two alternatives binding the same name at different field
                 // types are seen as different and rejected.
-                const ty: Type = bc.node_types[pat_idx];
+                const ty: Type = bc.node_types[(pat_idx).int()];
                 try out.put(bc.gpa, name, ty);
                 if (pat.rhs != Ast.none) try bc.collectBindings(pat.rhs, out);
             },
             .pattern_variant => if (pat.rhs != Ast.none)
-                for (Ast.rangeSlice(bc.tree, pat.rhs)) |c| try bc.collectBindings(c, out),
-            .pattern_or => for (Ast.rangeSlice(bc.tree, pat.lhs)) |a| try bc.collectBindings(a, out),
+                for (Ast.rangeSlice(bc.tree, (pat.rhs).int())) |c| try bc.collectBindings(c, out),
+            .pattern_or => for (Ast.rangeSlice(bc.tree, (pat.lhs).int())) |a| try bc.collectBindings(a, out),
             else => {},
         }
     }
@@ -931,8 +931,8 @@ pub const BodyChecker = struct {
         _ = node_idx;
         const ct = try bc.typeOf(n.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.sink.emit(bc.byteOf(bc.tree.nodes[n.lhs].main_token), "if condition must be bool");
-        const h = Ast.ifHeaderAt(bc.tree, n.rhs);
+            try bc.sink.emit(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "if condition must be bool");
+        const h = Ast.ifHeaderAt(bc.tree, (n.rhs).int());
         if (h.else_node == Ast.none) {
             try bc.sink.emit(bc.byteOf(n.main_token), "value-if requires else");
             _ = try bc.checkBlock(h.then_block, false); // validate the arm anyway
@@ -941,8 +941,8 @@ pub const BodyChecker = struct {
         const then_ty0 = try bc.checkBlock(h.then_block, true);
         const then_ty: Type = if (bc.blockDiverges(h.then_block)) Type.never else then_ty0;
         var else_ty: Type = undefined;
-        if (bc.tree.nodes[h.else_node].tag == .if_stmt) {
-            const e0 = try bc.typeOfIf(h.else_node, bc.tree.nodes[h.else_node]); // else-if ladder
+        if (bc.tree.nodes[(h.else_node).int()].tag == .if_stmt) {
+            const e0 = try bc.typeOfIf(h.else_node, bc.tree.nodes[(h.else_node).int()]); // else-if ladder
             else_ty = if (bc.stmtDiverges(h.else_node)) Type.never else e0;
         } else {
             const e0 = try bc.checkBlock(h.else_node, true);
@@ -956,7 +956,7 @@ pub const BodyChecker = struct {
         _ = try bc.checkBlock(n.lhs, false); // body in statement ctx; breaks fill join
         const ctx = bc.loop_stack.pop().?;
         const ty: Type = if (!ctx.saw_value_break and !ctx.saw_bare_break) Type.never else ctx.join;
-        bc.node_types[node_idx] = ty;
+        bc.node_types[(node_idx).int()] = ty;
         return ty;
     }
 
@@ -973,9 +973,9 @@ pub const BodyChecker = struct {
         // A qualified tuple-variant construction `N.V(args)` arrives as a `.call`
         // whose callee is a `field_access` over an enum type-name identifier. Route
         // it to the enum-init checker (treating `n` as a tuple construction).
-        const callee = bc.tree.nodes[n.lhs];
+        const callee = bc.tree.nodes[(n.lhs).int()];
         if (callee.tag == .field_access) {
-            const recv = bc.tree.nodes[callee.lhs];
+            const recv = bc.tree.nodes[(callee.lhs).int()];
             if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
                 return bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
             }
@@ -983,30 +983,30 @@ pub const BodyChecker = struct {
             // callee field_access's receiver is the inner `mod.Enum`.
             if (bc.qualifiedEnumId(callee.lhs)) |enum_id| {
                 const ty = try bc.checkVariant(enum_id, callee.main_token, .tuple, n.rhs);
-                bc.node_types[node_idx] = ty;
+                bc.node_types[(node_idx).int()] = ty;
                 return ty;
             }
         }
-        const callee_res = bc.resolutions[n.lhs];
+        const callee_res = bc.resolutions[(n.lhs).int()];
         if (callee_res != .func) {
             // Type the args anyway so their own errors surface, then poison.
-            for (Ast.rangeSlice(bc.tree, n.rhs)) |arg| _ = try bc.typeOf(arg);
+            for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
             if (callee_res == .local) {
                 try bc.sink.emit(bc.byteOf(n.main_token), "called value is not a function");
-            } else if (bc.tree.nodes[n.lhs].tag == .identifier) {
+            } else if (bc.tree.nodes[(n.lhs).int()].tag == .identifier) {
                 // A struct-named callee `Point(1,2)` is positional construction, which
                 // we reject — point at named construction instead.
-                const cname = bc.nameText(bc.tree.nodes[n.lhs].main_token);
+                const cname = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
                 if (bc.activeStructMap().get(cname) != null)
                     try bc.sink.emitFmt(bc.byteOf(n.main_token), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
-            } else if (callee_res == .unresolved and bc.tree.nodes[n.lhs].tag == .field_access) {
+            } else if (callee_res == .unresolved and bc.tree.nodes[(n.lhs).int()].tag == .field_access) {
                 // A qualified call `recv.member(...)` whose callee stayed `.unresolved`:
                 // resolve neither bound it to a fn nor reported it (e.g. `recv` is a
                 // top-level fn shadowing an import namespace, so the field-access value
                 // path is taken and left unresolved). Emit a clean diagnostic at the
                 // member token instead of silently poisoning — otherwise the call is
                 // dropped and `-o` later crashes in codegen with no user error.
-                const fa = bc.tree.nodes[n.lhs];
+                const fa = bc.tree.nodes[(n.lhs).int()];
                 const member = bc.nameText(fa.main_token);
                 try bc.sink.emitFmt(bc.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
             }
@@ -1014,7 +1014,7 @@ pub const BodyChecker = struct {
             return .invalid;
         }
         const f = bc.model.fns[callee_res.func];
-        const args = Ast.rangeSlice(bc.tree, n.rhs);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
@@ -1023,7 +1023,7 @@ pub const BodyChecker = struct {
         for (args, f.params, 0..) |arg, pty, i| {
             const at = try bc.typeOfExpected(arg, if (pty.kind == .invalid) null else pty);
             if (!Type.assignable(pty, at)) {
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[arg].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(arg).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
             }
         }
         return f.ret;

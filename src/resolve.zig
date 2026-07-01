@@ -132,7 +132,7 @@ test "x := x with an outer in scope resolves to the outer" {
     var found = false;
     for (parsed.tree.nodes, 0..) |n, i| {
         if (n.tag == .var_decl) {
-            const init_res = res.resolutions[0][n.lhs];
+            const init_res = res.resolutions[0][n.lhs.int()];
             try testing.expect(init_res == .local);
             try testing.expectEqual(@as(u32, 0), init_res.local);
             // The decl itself binds a fresh slot (1).
@@ -242,7 +242,7 @@ test "labeled loop and break @label resolve cleanly and target the named constru
     // the larger node index. The break must resolve to THAT node, not the inner.
     var outer_loop: Ast.Index = Ast.none;
     for (parsed.tree.nodes, 0..) |n, i| {
-        if (n.tag == .loop_expr) outer_loop = @intCast(i); // last wins → outermost
+        if (n.tag == .loop_expr) outer_loop = Ast.Index.from(@intCast(i)); // last wins → outermost
     }
     var found = false;
     for (parsed.tree.nodes, 0..) |n, i| {
@@ -372,7 +372,7 @@ test "forward call to a function resolves the callee" {
     var found = false;
     for (parsed.tree.nodes) |n| {
         if (n.tag == .call) {
-            const callee_res = res.resolutions[0][n.lhs];
+            const callee_res = res.resolutions[0][n.lhs.int()];
             try testing.expect(callee_res == .func);
             found = true;
         }

@@ -98,7 +98,7 @@ pub const refs = struct {
     /// graph mode a qualified `mod.Type` `field_access`) to a `Type`.
     pub fn typeFromNode(self: anytype, type_node: Ast.Index) Type {
         if (type_node == Ast.none) return Type.unit;
-        const tn = self.tree.nodes[type_node];
+        const tn = self.tree.nodes[type_node.int()];
         if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
         // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
         // receiver binds to a `.module`. Resolve it against the owning module's tables.
@@ -119,7 +119,7 @@ pub const refs = struct {
     pub fn typeFromQualified(self: anytype, node_idx: Ast.Index, n: Ast.Node) Type {
         _ = node_idx;
         const g = self.graphCtx();
-        const recv = self.tree.nodes[n.lhs];
+        const recv = self.tree.nodes[n.lhs.int()];
         if (recv.tag != .identifier) return .invalid;
         const recv_name = refs.nameText(self, recv.main_token);
         const target = g.namespaceOfIn(self.graph_mod, recv_name) orelse {
@@ -627,17 +627,17 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         const mod: u32 = @intCast(mi);
         _ = t.gphSelect(mod);
         if (t.tree.nodes.len == 0) continue;
-        const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
         if (prog.tag != .program) continue;
-        try t.registerStructs(Ast.rangeSlice(t.tree, prog.lhs), mod);
+        try t.registerStructs(Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
     for (mods, 0..) |_, mi| {
         const mod: u32 = @intCast(mi);
         _ = t.gphSelect(mod);
         if (t.tree.nodes.len == 0) continue;
-        const prog = t.tree.nodes[Ast.root(t.tree.nodes)];
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
         if (prog.tag != .program) continue;
-        try t.registerEnums(Ast.rangeSlice(t.tree, prog.lhs), mod);
+        try t.registerEnums(Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
 
     // Phase 0b: lay out every struct then every enum (global id order). Each
@@ -765,13 +765,13 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
         if (gf.kind == .builtin or !gf.is_pub) continue;
         _ = t.gphSelect(gf.module);
         const f = t.fns.items[i];
-        const decl = t.tree.nodes[f.decl_node];
-        const proto = Ast.protoAt(t.tree, decl.lhs);
+        const decl = t.tree.nodes[f.decl_node.int()];
+        const proto = Ast.protoAt(t.tree, decl.lhs.int());
         for (proto.params, f.params) |param_idx, pty| {
-            try t.checkPubType(pty, t.tree.nodes[param_idx].main_token, "function", gf.name);
+            try t.checkPubType(pty, t.tree.nodes[param_idx.int()].main_token, "function", gf.name);
         }
         if (proto.ret_type != Ast.none)
-            try t.checkPubType(f.ret, t.tree.nodes[proto.ret_type].main_token, "function", gf.name);
+            try t.checkPubType(f.ret, t.tree.nodes[proto.ret_type.int()].main_token, "function", gf.name);
     }
 
     // A `pub` struct FIELD or `pub` enum variant PAYLOAD that names a non-pub type
@@ -783,18 +783,18 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
     for (t.structs.items) |s| {
         if (s.decl_node == Ast.none or !s.pub_export or s.poisoned) continue;
         _ = t.gphSelect(s.mod);
-        const field_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[s.decl_node].lhs);
+        const field_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[s.decl_node.int()].lhs.int());
         for (s.field_types, 0..) |fty, fi| {
-            const at = if (fi < field_nodes.len) t.tree.nodes[field_nodes[fi]].main_token else t.tree.nodes[s.decl_node].main_token;
+            const at = if (fi < field_nodes.len) t.tree.nodes[field_nodes[fi].int()].main_token else t.tree.nodes[s.decl_node.int()].main_token;
             try t.checkPubType(fty, at, "struct", s.name);
         }
     }
     for (t.enums.items) |e| {
         if (e.decl_node == Ast.none or !e.pub_export or e.poisoned) continue;
         _ = t.gphSelect(e.mod);
-        const variant_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[e.decl_node].lhs);
+        const variant_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[e.decl_node.int()].lhs.int());
         for (e.variants, 0..) |v, vi| {
-            const at = if (vi < variant_nodes.len) t.tree.nodes[variant_nodes[vi]].main_token else t.tree.nodes[e.decl_node].main_token;
+            const at = if (vi < variant_nodes.len) t.tree.nodes[variant_nodes[vi].int()].main_token else t.tree.nodes[e.decl_node.int()].main_token;
             for (v.field_types) |fty| {
                 try t.checkPubType(fty, at, "enum", e.name);
             }
@@ -830,7 +830,7 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
         const tree = t.graph.mods[entry_mod].tree;
         const tokens = t.graph.mods[entry_mod].tokens;
         const source = t.graph.mods[entry_mod].source;
-        const main_tok = tree.nodes[f.decl_node].main_token;
+        const main_tok = tree.nodes[f.decl_node.int()].main_token;
         if (!std.mem.eql(u8, tokens[main_tok].text(source), "main")) continue;
         if (f.ret.kind != .int and f.ret.kind != .unit and f.ret.kind != .invalid) {
             // Select the entry module so the sink stamps this diagnostic with the
@@ -849,7 +849,7 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
 /// (`activeStructMap`, the current module's table in the ctx).
 fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
     for (decl_nodes) |decl_idx| {
-        const decl = t.tree.nodes[decl_idx];
+        const decl = t.tree.nodes[decl_idx.int()];
         if (decl.tag != .struct_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
@@ -871,7 +871,7 @@ fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void
 /// a struct, or another enum (in this module) is rejected.
 fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
     for (decl_nodes) |decl_idx| {
-        const decl = t.tree.nodes[decl_idx];
+        const decl = t.tree.nodes[decl_idx.int()];
         if (decl.tag != .enum_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
@@ -893,11 +893,11 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
 /// owning module id. Param/return type-refs resolve via the active maps (and, for
 /// a qualified `mod.Type`, via the graph context).
 fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
-    const decl = t.tree.nodes[fn_idx];
-    const proto = Ast.protoAt(t.tree, decl.lhs);
+    const decl = t.tree.nodes[fn_idx.int()];
+    const proto = Ast.protoAt(t.tree, decl.lhs.int());
     const params = try t.gpa.alloc(Type, proto.params.len);
     for (proto.params, 0..) |param_idx, i| {
-        const param = t.tree.nodes[param_idx];
+        const param = t.tree.nodes[param_idx.int()];
         const pty = t.typeFromNode(param.lhs);
         if (pty.kind == .unit) {
             try t.sink.emitFmt(t.byteOf(param.main_token), "parameter '{s}' cannot have type ()", .{t.nameText(param.main_token)});
@@ -1453,7 +1453,7 @@ test "print resolves and typechecks at index user_fn_count" {
     var found = false;
     for (c.tree.nodes) |n| {
         if (n.tag == .call) {
-            const callee_res = c.resolve.resolutions[0][n.lhs];
+            const callee_res = c.resolve.resolutions[0][n.lhs.int()];
             try testing.expect(callee_res == .func);
             try testing.expectEqual(@as(u32, 1), callee_res.func);
             found = true;

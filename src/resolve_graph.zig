@@ -162,11 +162,11 @@ fn collectGlobals(g: *GraphResolve) !void {
         const mod: u32 = @intCast(mi);
         if (m.nodes.len == 0) continue;
         const t = g.tree(mod);
-        const prog = m.nodes[Ast.root(m.nodes)];
+        const prog = m.nodes[Ast.root(m.nodes).int()];
         if (prog.tag != .program) continue;
 
-        for (Ast.rangeSlice(t, prog.lhs)) |decl_idx| {
-            const decl = m.nodes[decl_idx];
+        for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
+            const decl = m.nodes[decl_idx.int()];
             const is_pub = t.isPub(decl_idx);
             switch (decl.tag) {
                 .struct_decl => {
@@ -234,11 +234,11 @@ fn collectNamespaces(g: *GraphResolve) !void {
         const mod: u32 = @intCast(mi);
         if (m.nodes.len == 0) continue;
         const t = g.tree(mod);
-        const prog = m.nodes[Ast.root(m.nodes)];
+        const prog = m.nodes[Ast.root(m.nodes).int()];
         if (prog.tag != .program) continue;
 
-        for (Ast.rangeSlice(t, prog.lhs)) |decl_idx| {
-            const decl = m.nodes[decl_idx];
+        for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
+            const decl = m.nodes[decl_idx.int()];
             if (decl.tag != .import_decl) continue;
 
             // Resolve which graph module this import points at.
@@ -250,7 +250,7 @@ fn collectNamespaces(g: *GraphResolve) !void {
             };
 
             // Namespace name = alias token if present, else the last path segment.
-            const ns_tok = if (decl.rhs != Ast.none) decl.rhs else decl.main_token;
+            const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |alias| alias.int() else decl.main_token;
             const ns_name = g.nameOf(mod, ns_tok);
 
             // A namespace must not collide with a top-level declaration in the
@@ -283,11 +283,11 @@ fn collectNamespaces(g: *GraphResolve) !void {
 fn importTarget(g: *GraphResolve, mod: u32, decl: Ast.Node) ?u32 {
     const m = &g.graph.modules[mod];
     const t = g.tree(mod);
-    const segs = Ast.rangeSlice(t, decl.lhs);
+    const segs = Ast.importPathToks(t, decl);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var len: usize = 0;
     for (segs, 0..) |seg, i| {
-        const txt = m.tokens[seg].text(m.source);
+        const txt = m.tokens[seg.int()].text(m.source);
         if (i != 0) {
             if (len >= buf.len) return null;
             buf[len] = '/';
@@ -309,19 +309,19 @@ fn resolveModule(g: *GraphResolve, mod: u32) !void {
     const m = &g.graph.modules[mod];
     if (m.nodes.len == 0) return;
     const t = g.tree(mod);
-    const prog = m.nodes[Ast.root(m.nodes)];
+    const prog = m.nodes[Ast.root(m.nodes).int()];
     if (prog.tag != .program) return;
 
-    for (Ast.rangeSlice(t, prog.lhs)) |decl_idx| {
-        switch (m.nodes[decl_idx].tag) {
+    for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
+        switch (m.nodes[decl_idx.int()].tag) {
             .fn_decl => try g.resolveFn(decl_idx),
             // A struct's field type-refs may name a qualified cross-module type
             // (`box: rect.Rect`). Resolve those for namespace binding + pub-type
             // visibility (mirrors the param/return type-ref check below).
             .struct_decl => {
-                const decl = m.nodes[decl_idx];
-                for (Ast.rangeSlice(t, decl.lhs)) |field_idx| {
-                    const field = m.nodes[field_idx];
+                const decl = m.nodes[decl_idx.int()];
+                for (Ast.rangeSlice(t, decl.lhs.int())) |field_idx| {
+                    const field = m.nodes[field_idx.int()];
                     try g.resolveTypeRef(field.lhs);
                 }
             },
@@ -337,12 +337,12 @@ fn resolveFn(g: *GraphResolve, fn_idx: Ast.Index) error{OutOfMemory}!void {
     g.slot_next = 0;
     g.label_stack.clearRetainingCapacity();
 
-    const decl = g.nodes()[fn_idx];
-    const proto = Ast.protoAt(g.tree(g.cur_mod), decl.lhs);
+    const decl = g.nodes()[fn_idx.int()];
+    const proto = Ast.protoAt(g.tree(g.cur_mod), decl.lhs.int());
 
     try g.pushScope();
     for (proto.params) |param_idx| {
-        const param = g.nodes()[param_idx];
+        const param = g.nodes()[param_idx.int()];
         _ = try g.declare(param.main_token, "duplicate parameter '{s}'");
         // Resolve the param's type-ref for a qualified cross-module type.
         try g.resolveTypeRef(param.lhs);
@@ -360,9 +360,9 @@ fn resolveFn(g: *GraphResolve, fn_idx: Ast.Index) error{OutOfMemory}!void {
 /// module's actual layout id is bound later by Typecheck/`typeRefToType`.
 fn resolveTypeRef(g: *GraphResolve, type_idx: Ast.Index) error{OutOfMemory}!void {
     if (type_idx == Ast.none) return;
-    const n = g.nodes()[type_idx];
+    const n = g.nodes()[type_idx.int()];
     if (n.tag != .field_access) return; // bare name / unit: nothing to bind here
-    const recv = g.nodes()[n.lhs];
+    const recv = g.nodes()[n.lhs.int()];
     if (recv.tag != .identifier) return;
     const recv_name = g.nameText(recv.main_token);
     // A type-ref receiver is never a local (no value scope around a type), but a
@@ -385,16 +385,16 @@ fn resolveTypeRef(g: *GraphResolve, type_idx: Ast.Index) error{OutOfMemory}!void
 }
 
 fn resolveBlock(g: *GraphResolve, block_idx: Ast.Index) error{OutOfMemory}!void {
-    const block = g.nodes()[block_idx];
+    const block = g.nodes()[block_idx.int()];
     try g.pushScope();
-    for (Ast.rangeSlice(g.tree(g.cur_mod), block.lhs)) |stmt_idx| {
+    for (Ast.rangeSlice(g.tree(g.cur_mod), block.lhs.int())) |stmt_idx| {
         try g.resolveStmt(stmt_idx);
     }
     g.popScope();
 }
 
 fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const stmt = g.nodes()[stmt_idx];
+    const stmt = g.nodes()[stmt_idx.int()];
     switch (stmt.tag) {
         .var_decl => {
             try g.resolveExpr(stmt.lhs);
@@ -402,7 +402,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             if (slot) |s| g.res(stmt_idx, .{ .local = s });
         },
         .assign => {
-            const target = g.nodes()[stmt.lhs];
+            const target = g.nodes()[stmt.lhs.int()];
             if (target.tag == .field_access) {
                 try g.resolveExpr(stmt.lhs);
             } else {
@@ -422,10 +422,10 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .block => try g.resolveBlock(stmt_idx),
         .if_stmt => {
             try g.resolveExpr(stmt.lhs);
-            const h = Ast.ifHeaderAt(g.tree(g.cur_mod), stmt.rhs);
+            const h = Ast.ifHeaderAt(g.tree(g.cur_mod), stmt.rhs.int());
             try g.resolveBlock(h.then_block);
             if (h.else_node != Ast.none) {
-                if (g.nodes()[h.else_node].tag == .if_stmt)
+                if (g.nodes()[h.else_node.int()].tag == .if_stmt)
                     try g.resolveStmt(h.else_node)
                 else
                     try g.resolveBlock(h.else_node);
@@ -436,7 +436,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             try g.resolveBlock(stmt.rhs);
         },
         .for_stmt => {
-            const h = Ast.forHeaderAt(g.tree(g.cur_mod), stmt.rhs);
+            const h = Ast.forHeaderAt(g.tree(g.cur_mod), stmt.rhs.int());
             try g.resolveExpr(h.lo);
             try g.resolveExpr(h.hi);
             try g.pushScope();
@@ -446,11 +446,11 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             g.popScope();
         },
         .break_stmt => {
-            if (stmt.rhs != Ast.none) try g.resolveLabelTarget(stmt_idx, stmt.rhs, "break");
+            if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "break");
             if (stmt.lhs != Ast.none) try g.resolveExpr(stmt.lhs);
         },
         .continue_stmt => {
-            if (stmt.rhs != Ast.none) try g.resolveLabelTarget(stmt_idx, stmt.rhs, "continue");
+            if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "continue");
         },
         .labeled => try g.resolveLabeled(stmt_idx),
         else => try g.resolveExpr(stmt_idx),
@@ -459,7 +459,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 
 fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
     if (node_idx == Ast.none) return;
-    const n = g.nodes()[node_idx];
+    const n = g.nodes()[node_idx.int()];
     switch (n.tag) {
         .identifier => {
             const resn = g.lookupName(n.main_token);
@@ -478,15 +478,15 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         },
         .call => {
             try g.resolveExpr(n.lhs); // callee (may be a field_access mod.fn)
-            for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs)) |arg| try g.resolveExpr(arg);
+            for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |arg| try g.resolveExpr(arg);
         },
         .struct_init => {
-            for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs)) |fi| try g.resolveExpr(g.nodes()[fi].lhs);
+            for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs);
         },
         .field_access => try g.resolveFieldAccess(node_idx, n),
         .enum_init_unit => {},
-        .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs)) |a| try g.resolveExpr(a),
-        .enum_init_struct => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs)) |fi| try g.resolveExpr(g.nodes()[fi].lhs),
+        .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a),
+        .enum_init_struct => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs),
         .match_expr => try g.resolveMatch(node_idx),
         .literal_unit => {},
         .block => try g.resolveBlock(node_idx),
@@ -494,10 +494,10 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         .loop_expr => try g.resolveBlock(n.lhs),
         .if_stmt => {
             try g.resolveExpr(n.lhs);
-            const h = Ast.ifHeaderAt(g.tree(g.cur_mod), n.rhs);
+            const h = Ast.ifHeaderAt(g.tree(g.cur_mod), n.rhs.int());
             try g.resolveBlock(h.then_block);
             if (h.else_node != Ast.none) {
-                if (g.nodes()[h.else_node].tag == .if_stmt)
+                if (g.nodes()[h.else_node.int()].tag == .if_stmt)
                     try g.resolveExpr(h.else_node)
                 else
                     try g.resolveBlock(h.else_node);
@@ -515,7 +515,7 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
 /// ordinary value field access (or a same-module qualified enum `N.V`) and only
 /// the receiver chain is resolved, exactly as the single-file resolver does.
 fn resolveFieldAccess(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
-    const recv = g.nodes()[n.lhs];
+    const recv = g.nodes()[n.lhs.int()];
     if (recv.tag == .identifier) {
         // Innermost lexical binding shadows a namespace: only treat the receiver
         // as a module if the name is NOT a local/fn in scope and IS a namespace.
@@ -569,7 +569,7 @@ fn resolveModuleMember(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, targe
 }
 
 fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
-    const n = g.nodes()[idx];
+    const n = g.nodes()[idx.int()];
     const name = g.nameText(n.main_token);
     for (g.label_stack.items) |e| {
         if (std.mem.eql(u8, e.name, name)) {
@@ -578,7 +578,7 @@ fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
         }
     }
     try g.label_stack.append(g.gpa, .{ .name = name, .construct_node = n.lhs });
-    const inner = g.nodes()[n.lhs];
+    const inner = g.nodes()[n.lhs.int()];
     switch (inner.tag) {
         .block => try g.resolveBlock(n.lhs),
         .loop_expr, .while_stmt, .for_stmt => try g.resolveStmt(n.lhs),
@@ -588,13 +588,13 @@ fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
 }
 
 fn resolveMatch(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
-    const n = g.nodes()[node_idx];
+    const n = g.nodes()[node_idx.int()];
     try g.resolveExpr(n.lhs);
-    for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs)) |arm_idx| {
-        const arm = g.nodes()[arm_idx];
+    for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |arm_idx| {
+        const arm = g.nodes()[arm_idx.int()];
         try g.pushScope();
         try g.declarePattern(arm.lhs);
-        const h = Ast.armHeaderAt(g.tree(g.cur_mod), arm.rhs);
+        const h = Ast.armHeaderAt(g.tree(g.cur_mod), arm.rhs.int());
         if (h.guard != Ast.none) try g.resolveExpr(h.guard);
         try g.resolveExpr(h.body);
         g.popScope();
@@ -603,7 +603,7 @@ fn resolveMatch(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
 
 fn declarePattern(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!void {
     if (pat_idx == Ast.none) return;
-    const pat = g.nodes()[pat_idx];
+    const pat = g.nodes()[pat_idx.int()];
     switch (pat.tag) {
         .pattern_wildcard, .pattern_literal => {},
         .pattern_binding => {
@@ -613,10 +613,10 @@ fn declarePattern(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!void 
         },
         .pattern_variant => {
             if (pat.rhs != Ast.none)
-                for (Ast.rangeSlice(g.tree(g.cur_mod), pat.rhs)) |c| try g.declarePattern(c);
+                for (Ast.rangeSlice(g.tree(g.cur_mod), pat.rhs.int())) |c| try g.declarePattern(c);
         },
         .pattern_or => {
-            const alts = Ast.rangeSlice(g.tree(g.cur_mod), pat.lhs);
+            const alts = Ast.rangeSlice(g.tree(g.cur_mod), pat.lhs.int());
             if (alts.len == 0) return;
             try g.declarePattern(alts[0]);
             for (alts[1..]) |alt| try g.bindOrAltToFirst(alt);
@@ -627,7 +627,7 @@ fn declarePattern(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!void 
 
 fn bindOrAltToFirst(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!void {
     if (pat_idx == Ast.none) return;
-    const pat = g.nodes()[pat_idx];
+    const pat = g.nodes()[pat_idx.int()];
     switch (pat.tag) {
         .pattern_wildcard, .pattern_literal => {},
         .pattern_binding => {
@@ -642,10 +642,10 @@ fn bindOrAltToFirst(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!voi
         },
         .pattern_variant => {
             if (pat.rhs != Ast.none)
-                for (Ast.rangeSlice(g.tree(g.cur_mod), pat.rhs)) |c| try g.bindOrAltToFirst(c);
+                for (Ast.rangeSlice(g.tree(g.cur_mod), pat.rhs.int())) |c| try g.bindOrAltToFirst(c);
         },
         .pattern_or => {
-            for (Ast.rangeSlice(g.tree(g.cur_mod), pat.lhs)) |alt| try g.bindOrAltToFirst(alt);
+            for (Ast.rangeSlice(g.tree(g.cur_mod), pat.lhs.int())) |alt| try g.bindOrAltToFirst(alt);
         },
         else => {},
     }
@@ -665,7 +665,7 @@ fn resolveLabelTarget(g: *GraphResolve, node_idx: Ast.Index, label_tok: u32, com
 }
 
 fn res(g: *GraphResolve, node_idx: Ast.Index, r: Resolution) void {
-    g.resolutions[g.cur_mod][node_idx] = r;
+    g.resolutions[g.cur_mod][node_idx.int()] = r;
 }
 
 fn pushScope(g: *GraphResolve) !void {
@@ -838,7 +838,7 @@ fn modId(g: *const Graph.Graph, path: []const u8) u32 {
 
 /// Find the (first) node of a given tag in a module.
 fn nodeOfTag(g: *const Graph.Graph, mod: u32, tag: Ast.Node.Tag) Ast.Index {
-    for (g.modules[mod].nodes, 0..) |n, i| if (n.tag == tag) return @intCast(i);
+    for (g.modules[mod].nodes, 0..) |n, i| if (n.tag == tag) return Ast.Index.from(@intCast(i));
     unreachable;
 }
 
@@ -861,17 +861,17 @@ test "cross-module call resolves to a global fn with a qualified name" {
             // The call's callee is a field_access `util.helper`; resolve binds it
             // to a global .func, and its receiver `util` to a .module.
             const fa = nodeOfTag(g, entry, .field_access);
-            const fa_res = r.resolutions[entry][fa];
+            const fa_res = r.resolutions[entry][fa.int()];
             try testing.expect(fa_res == .func);
             const gf = r.fns[fa_res.func];
             try testing.expectEqualStrings("util.helper", gf.name);
             try testing.expect(gf.is_pub);
             // The receiver identifier resolves to the util module.
-            const recv = g.modules[entry].nodes[g.modules[entry].nodes[fa].lhs];
+            const recv = g.modules[entry].nodes[g.modules[entry].nodes[fa.int()].lhs.int()];
             _ = recv;
-            const recv_idx = g.modules[entry].nodes[fa].lhs;
-            try testing.expect(r.resolutions[entry][recv_idx] == .module);
-            try testing.expectEqual(modId(g, "util"), r.resolutions[entry][recv_idx].module);
+            const recv_idx = g.modules[entry].nodes[fa.int()].lhs;
+            try testing.expect(r.resolutions[entry][recv_idx.int()] == .module);
+            try testing.expectEqual(modId(g, "util"), r.resolutions[entry][recv_idx.int()].module);
             // Entry main stays a bare global fn.
             var saw_main = false;
             for (r.fns) |f| if (std.mem.eql(u8, f.name, "main")) {
@@ -1021,9 +1021,9 @@ test "a local shadows an import namespace (innermost binding wins)" {
             try testing.expectEqual(@as(usize, 0), r.diags.len);
             const entry = modId(g, "main");
             const fa = nodeOfTag(g, entry, .field_access);
-            const recv_idx = g.modules[entry].nodes[fa].lhs;
+            const recv_idx = g.modules[entry].nodes[fa.int()].lhs;
             // Receiver binds to the local Box, NOT the util module.
-            try testing.expect(r.resolutions[entry][recv_idx] == .local);
+            try testing.expect(r.resolutions[entry][recv_idx.int()] == .local);
         }
     };
     try withResolvedGraph(".toy-test-res-shadow", files, "main.toy", Check.run);
@@ -1100,9 +1100,9 @@ test "3-level cross-module mod.Enum.Variant binds the inner receiver to .module,
             var inner_recv_is_module = false;
             for (g.modules[entry].nodes, 0..) |n, i| {
                 if (n.tag == .field_access) {
-                    const recv = g.modules[entry].nodes[n.lhs];
+                    const recv = g.modules[entry].nodes[n.lhs.int()];
                     if (recv.tag == .identifier) {
-                        const cr = r.resolutions[entry][n.lhs];
+                        const cr = r.resolutions[entry][n.lhs.int()];
                         if (cr == .module) {
                             inner_recv_is_module = true;
                             try testing.expectEqual(modId(g, "palette"), cr.module);
@@ -1131,8 +1131,8 @@ test "single-module graph resolves bodies like the single-file resolver" {
             const entry = modId(g, "solo");
             // The bare call `add(...)` resolves to a global .func.
             const call = nodeOfTag(g, entry, .call);
-            const callee = g.modules[entry].nodes[call].lhs;
-            try testing.expect(r.resolutions[entry][callee] == .func);
+            const callee = g.modules[entry].nodes[call.int()].lhs;
+            try testing.expect(r.resolutions[entry][callee.int()] == .func);
         }
     };
     try withResolvedGraph(".toy-test-res-solo", files, "solo.toy", Check.run);
@@ -1158,11 +1158,11 @@ test "print is available unqualified in every module with one shared id" {
             for (g.modules, 0..) |m, mi| {
                 for (m.nodes) |n| {
                     if (n.tag == .call) {
-                        const callee = m.nodes[n.lhs];
+                        const callee = m.nodes[n.lhs.int()];
                         if (callee.tag == .identifier and
                             std.mem.eql(u8, m.tokens[callee.main_token].text(m.source), "print"))
                         {
-                            const cr = r.resolutions[mi][n.lhs];
+                            const cr = r.resolutions[mi][n.lhs.int()];
                             try testing.expect(cr == .func);
                             try testing.expectEqual(print_id.?, cr.func);
                         }
