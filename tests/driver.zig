@@ -14,6 +14,7 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 
 const Driver = toyc.Driver;
+const Codegen = toyc.DriverCodegen;
 const Ast = toyc.Ast;
 const Cache = toyc.Cache;
 const Engine = toyc.QueryEngine;
@@ -29,11 +30,11 @@ const cache_dir_buf_len = Driver.cache_dir_buf_len;
 const run = Driver.run;
 const pipeline = Driver.pipeline;
 const job = Driver.job;
-const lowerGraphProgram = Driver.lowerGraphProgram;
-const buildImage = Driver.buildImage;
+const lowerGraphProgram = Codegen.lowerGraphProgram;
+const buildImage = Codegen.buildImage;
 const FileResult = Driver.FileResult;
-const LinkedProgram = Driver.LinkedProgram;
-const LowerProgramResult = Driver.LowerProgramResult;
+const LinkedProgram = Codegen.LinkedProgram;
+const LowerProgramResult = Codegen.LowerProgramResult;
 
 const testing = std.testing;
 
