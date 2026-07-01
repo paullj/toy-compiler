@@ -220,6 +220,36 @@ fn nodeOfTag(g: *const Graph.Graph, mod: u32, tag: Ast.Node.Tag) Ast.Index {
     unreachable;
 }
 
+test "value-poison: a bare module name used as a value reports (poison() asserted)" {
+    // `util` is an import namespace misused as a value → "module ... is not a value".
+    // Routed through BodyChecker.poison(), whose assert (Debug/ReleaseSafe) proves the
+    // poison co-occurs with this fn's reported error; a silent poison would trip it.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\ x := util
+        \\ return x
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source = "pub fn helper() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            try testing.expect(tr.diags.len >= 1);
+            var saw = false;
+            for (tr.diags) |d| if (std.mem.indexOf(u8, d.message, "is not a value") != null) {
+                saw = true;
+            };
+            try testing.expect(saw);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-modval", files, "main.toy", Check.run);
+}
+
 test "cross-module call typechecks clean and yields the callee return type" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =

@@ -15,6 +15,7 @@ pub const Driver = @import("driver/Driver.zig");
 pub const Graph = @import("driver/Graph.zig");
 pub const DriverCodegen = @import("driver/Codegen.zig");
 pub const DiagnosticSink = @import("diagnostics/Sink.zig");
+pub const nearmiss = @import("diagnostics/nearmiss.zig");
 pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
@@ -69,6 +70,7 @@ test {
     _ = Driver;
     _ = Graph;
     _ = DiagnosticSink;
+    _ = nearmiss;
     _ = Resolve;
     _ = ResolveGraph;
     _ = Typecheck;

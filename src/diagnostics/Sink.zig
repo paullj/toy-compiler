@@ -10,10 +10,12 @@
 //! it in the struct makes the old "diags.len == diag_mods.len" length-sync
 //! hazard a type-level guarantee.
 //!
-//! Ordering is a single stable composite-key sort `(scope, byte_offset)` with
-//! ties broken by emission (insertion) order. The stable sort is load-bearing:
-//! the parallel Pass-C typecheck merges per-worker sinks in fn-id (slot) order
-//! and then sorts ONCE, so the merged stream is byte-identical at every `-j`.
+//! Ordering is a single stable composite-key sort `(scope, byte_offset, message)`.
+//! The message is the final tiebreak so exact-triple duplicates land ADJACENT for
+//! `dedupAdjacent` (even interleaved same-offset repeats). The sort key depends only
+//! on the diagnostic fields, so the merged stream is byte-identical at every `-j`:
+//! the parallel Pass-C typecheck merges per-worker sinks in fn-id (slot) order and
+//! then sorts ONCE.
 
 const std = @import("std");
 
@@ -93,19 +95,59 @@ pub fn merge(self: *DiagnosticSink, other: *DiagnosticSink) !void {
     other.owned.clearAndFree(other.gpa);
 }
 
-/// Deterministic stable total order: key `(scope, byte_offset)`, ties broken by
-/// pre-sort (insertion) index. ONE stable sort drives BOTH modes — single-file
-/// degenerates because every scope == NO_SCOPE. Idempotent; call once after all
-/// emits/merges.
+/// Deterministic stable total order: key `(scope, byte_offset, message)`, with any
+/// residual ties (fully identical triples) broken by pre-sort (insertion) index.
+/// ONE stable sort drives BOTH modes — single-file degenerates because every
+/// scope == NO_SCOPE. Idempotent; call once after all emits/merges.
 pub fn sort(self: *DiagnosticSink) void {
     std.sort.insertionContext(0, self.diags.items.len, SortCtx{ .diags = self.diags.items });
+    self.dedupAdjacent();
+}
+
+/// Collapse EXACT-duplicate diagnostics keyed on `(scope, byte_offset, message)`.
+/// PRECONDITION: called right after the stable sort, whose full key is
+/// `(scope, byte_offset, message)` — so every exact-triple repeat is contiguous,
+/// even interleaved same-offset duplicates like emission `A, B, A` (the message
+/// tiebreak pulls the two `A`s together). One linear compaction keeps the first of
+/// each adjacent run and drops later exact repeats. Idempotent (dedup of an
+/// already-deduped array is a no-op). COLLECTION stays complete: this is a post-sort
+/// view collapse of identical repeats, never distinct errors.
+///
+/// Frees NOTHING: a dropped duplicate's `emitFmt` buffer stays tracked in the
+/// parallel `owned` list and is freed exactly once on `deinit`/`Owned.deinit`. Only
+/// `diags` shrinks — freeing here would risk double-freeing (a surviving identical
+/// message may be a DIFFERENT `emitFmt` buffer).
+fn dedupAdjacent(self: *DiagnosticSink) void {
+    const d = self.diags.items;
+    if (d.len < 2) return;
+    var w: usize = 1;
+    for (d[1..]) |cur| {
+        const prev = d[w - 1];
+        const same = cur.scope == prev.scope and
+            cur.byte_offset == prev.byte_offset and
+            std.mem.eql(u8, cur.message, prev.message);
+        if (!same) {
+            d[w] = cur;
+            w += 1;
+        }
+    }
+    self.diags.shrinkRetainingCapacity(w);
 }
 
 const SortCtx = struct {
     diags: []Diagnostic,
     pub fn lessThan(c: SortCtx, a: usize, b: usize) bool {
         if (c.diags[a].scope != c.diags[b].scope) return c.diags[a].scope < c.diags[b].scope;
-        return c.diags[a].byte_offset < c.diags[b].byte_offset;
+        if (c.diags[a].byte_offset != c.diags[b].byte_offset) return c.diags[a].byte_offset < c.diags[b].byte_offset;
+        // Final tiebreak: message bytes. This groups exact-triple duplicates
+        // ADJACENTLY so `dedupAdjacent` catches interleaved same-offset repeats
+        // (emission order `A, B, A` would otherwise leave the two `A`s split by
+        // `B`). Depends only on message bytes, so it stays stable across `-j`
+        // modes. Distinct messages at one key now come out lexicographically
+        // (not emission order); that is fine — dedup only needs equal triples
+        // adjacent, and no test pins intra-offset emission order for DISTINCT
+        // messages under a shared key.
+        return std.mem.order(u8, c.diags[a].message, c.diags[b].message) == .lt;
     }
     pub fn swap(c: SortCtx, a: usize, b: usize) void {
         std.mem.swap(Diagnostic, &c.diags[a], &c.diags[b]);
@@ -148,26 +190,27 @@ pub fn toOwned(self: *DiagnosticSink) !Owned {
 
 const testing = std.testing;
 
-test "sort orders by (scope, byte_offset) and is stable for equal keys" {
+test "sort orders by (scope, byte_offset, message) deterministically for equal (scope, offset)" {
     var sink = DiagnosticSink.init(testing.allocator);
     defer sink.deinit();
 
-    // Emit OUT of (scope, byte_offset) order, including diagnostics that share a
-    // byte_offset across different scopes, AND a long run of equal-key (scope,
-    // byte_offset) diagnostics whose emission order must be preserved. The run is
-    // long + scrambled so ANY non-stable reordering scrambles at least one pair —
-    // this is what makes the test a real guard against reintroducing an unstable
-    // sort (verified: it FAILS under std.sort.pdq/block), not a happy-path check.
+    // Emit OUT of order, including diagnostics that share a byte_offset across
+    // different scopes, AND a long run of same-(scope, byte_offset) diagnostics with
+    // DISTINCT messages emitted in a scrambled order. The message is the final sort
+    // tiebreak, so that run must come out in LEXICOGRAPHIC message order regardless of
+    // emission order — the deterministic total order dedup relies on. The run is long
+    // + scrambled so any failure to apply the message tiebreak (e.g. an unstable sort
+    // that leaves same-(scope, offset) items in arrival order) mis-orders a pair.
     sink.setScope(1);
     try sink.emit(50, "s1@50");
     sink.setScope(0);
     try sink.emit(50, "s0@50"); // same byte_offset as s1@50, lower scope
-    // 32 equal-key diagnostics at (scope 0, byte_offset 10), carrying a bit-
-    // reversed payload as their distinguishing "emission tag". Stability means the
-    // run comes out in EMISSION order (tags in bit-reversed sequence, NOT
-    // ascending), which an unstable sort on 32 scrambled items will not reproduce.
+    // 32 same-key diagnostics at (scope 0, byte_offset 10). Their messages are
+    // zero-padded (`eq00`..`eq31`) so lexicographic order equals numeric index order;
+    // they are EMITTED in bit-reversed (scrambled) order, so recovering ascending
+    // order proves the message tiebreak drove the sort.
     const n_equal = 32;
-    var tags: [n_equal]u32 = undefined;
+    var emit_order: [n_equal]u32 = undefined;
     for (0..n_equal) |i| {
         var r: u32 = 0;
         var v: u32 = @intCast(i);
@@ -175,11 +218,11 @@ test "sort orders by (scope, byte_offset) and is stable for equal keys" {
             r = (r << 1) | (v & 1);
             v >>= 1;
         }
-        tags[i] = r;
+        emit_order[i] = r;
     }
     var payloads: [n_equal][16]u8 = undefined;
     for (0..n_equal) |i| {
-        const s = std.fmt.bufPrint(&payloads[i], "eq{d}", .{tags[i]}) catch unreachable;
+        const s = std.fmt.bufPrint(&payloads[i], "eq{d:0>2}", .{emit_order[i]}) catch unreachable;
         try sink.emit(10, s);
     }
     sink.setScope(1);
@@ -188,12 +231,13 @@ test "sort orders by (scope, byte_offset) and is stable for equal keys" {
     sink.sort();
     const got = sink.items();
     try testing.expectEqual(@as(usize, n_equal + 3), got.len);
-    // scope 0 group first: the equal-key run (byte_offset 10) in EMISSION order.
+    // scope 0 group first: the same-key run (byte_offset 10) in LEXICOGRAPHIC message
+    // order, i.e. eq00, eq01, ..., eq31 (ascending index), NOT emission order.
     for (0..n_equal) |i| {
         try testing.expectEqual(@as(u32, 0), got[i].scope);
         try testing.expectEqual(@as(u32, 10), got[i].byte_offset);
         var buf: [16]u8 = undefined;
-        const want = std.fmt.bufPrint(&buf, "eq{d}", .{tags[i]}) catch unreachable;
+        const want = std.fmt.bufPrint(&buf, "eq{d:0>2}", .{i}) catch unreachable;
         try testing.expectEqualStrings(want, got[i].message);
     }
     try testing.expectEqualStrings("s0@50", got[n_equal].message);
@@ -218,13 +262,13 @@ test "sort orders by (scope, byte_offset) — small smoke check" {
     const got = sink.items();
     try testing.expectEqual(@as(usize, 5), got.len);
     try testing.expectEqualStrings("s0@10-first", got[0].message);
-    try testing.expectEqualStrings("s0@10-second", got[1].message); // stability
+    try testing.expectEqualStrings("s0@10-second", got[1].message); // message tiebreak: "first" < "second"
     try testing.expectEqualStrings("s0@50", got[2].message);
     try testing.expectEqualStrings("s1@5", got[3].message);
     try testing.expectEqualStrings("s1@50", got[4].message);
 
-    // An unstable sort would be ALLOWED to swap the equal-key pair; assert it did
-    // not. This is the guard that pins the block->insertion (stable) change.
+    // The two same-(scope, byte_offset) diagnostics must come out message-ordered
+    // (deterministic), not in an arbitrary order an unstable sort could pick.
     try testing.expect(got[0].byte_offset == got[1].byte_offset);
     try testing.expect(got[0].scope == got[1].scope);
 }
@@ -320,6 +364,95 @@ test "emitFmt OOM after allocPrint leaks nothing and never double-frees" {
     try testing.expectError(error.OutOfMemory, sink.emitFmt(7, "msg {d}", .{1}));
     try testing.expectEqual(@as(usize, 0), sink.count());
     sink.deinit();
+}
+
+test "dedup collapses adjacent exact duplicates (keeps the first-emitted)" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    // Same (scope, byte_offset, message) triple emitted twice, plus a DISTINCT
+    // message at the same offset. After sort()+dedup the exact repeat collapses; the
+    // distinct one survives. The survivor of the collapsed pair is the first-emitted.
+    try sink.emit(10, "dup");
+    try sink.emit(10, "dup");
+    try sink.emit(10, "other");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    try testing.expectEqualStrings("dup", sink.items()[0].message);
+    try testing.expectEqualStrings("other", sink.items()[1].message);
+}
+
+test "dedup collapses INTERLEAVED same-offset duplicates (emission A,B,A)" {
+    // The two `A`s are emitted non-adjacently, split by `B`, all at one offset. The
+    // message sort tiebreak pulls the identical triples together so dedupAdjacent
+    // catches them: result is A, B (both survivors, no `A` repeat). This is the case
+    // a `(scope, byte_offset)`-only sort would miss (it would leave A, B, A).
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emit(10, "A");
+    try sink.emit(10, "B");
+    try sink.emit(10, "A");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    try testing.expectEqualStrings("A", sink.items()[0].message);
+    try testing.expectEqualStrings("B", sink.items()[1].message);
+}
+
+test "dedup keeps distinct messages at the same (scope, byte_offset)" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emit(10, "a");
+    try sink.emit(10, "b");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+}
+
+test "dedup keeps the same message at different byte_offsets" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emit(10, "same");
+    try sink.emit(20, "same");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+}
+
+test "dedup keeps the same (offset,message) under different scopes" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    sink.setScope(0);
+    try sink.emit(10, "x");
+    sink.setScope(1);
+    try sink.emit(10, "x");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+}
+
+test "dedup with emitFmt (heap) messages frees exactly once (no double-free)" {
+    // Under testing.allocator: a dropped duplicate's heap buffer must STILL be freed
+    // exactly once on deinit (it stays tracked in `owned`), proving dedup shrinks only
+    // `diags` and never touches `owned`.
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emitFmt(10, "val {d}", .{7});
+    try sink.emitFmt(10, "val {d}", .{7}); // identical text, DIFFERENT buffer
+    try sink.emitFmt(10, "val {d}", .{9});
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    try testing.expectEqualStrings("val 7", sink.items()[0].message);
+    try testing.expectEqualStrings("val 9", sink.items()[1].message);
+}
+
+test "dedup is idempotent (a second sort changes nothing)" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emit(10, "dup");
+    try sink.emit(10, "dup");
+    try sink.emit(5, "keep");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    try testing.expectEqualStrings("keep", sink.items()[0].message);
+    try testing.expectEqualStrings("dup", sink.items()[1].message);
 }
 
 test "sort is idempotent and count tracks items" {

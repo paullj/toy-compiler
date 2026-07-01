@@ -1021,6 +1021,48 @@ test "clean program typechecks with zero diagnostics" {
     ));
 }
 
+// ---- B4 report-once poison discipline -------------------------------------
+// Each value-poison site (function-as-value, bare-struct-as-value, module-as-value)
+// routes its `Type.invalid` through `BodyChecker.poison()`, which asserts (Debug/
+// ReleaseSafe) that this fn's sink already reported. Running these under `test-bin`
+// (Debug) therefore proves the poison co-occurs with a user error — a silent poison
+// would trip the assert. We ALSO check the identifier node itself types as `.invalid`
+// so the poison actually flows onto the node.
+
+/// The Type of the first identifier node whose text equals `name` in module 0.
+fn identTypeOf(c: *const Checked, name: []const u8) Type {
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .identifier and std.mem.eql(u8, c.tokens[n.main_token].text(c.source), name))
+            return c.result.node_types[0][i];
+    }
+    unreachable;
+}
+
+test "value-poison: a function used as a value reports and poisons the node" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn g() -> int { return 1 }\nfn f() -> int {\n return g\n}\n");
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len >= 1);
+    try testing.expectEqual(Kind.invalid, identTypeOf(&c, "g").kind);
+}
+
+test "value-poison: a bare struct name used as a value reports and poisons the node" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct P { x: int }\nfn f() -> int {\n q := P\n return q\n}\n");
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len >= 1);
+    // The bare `P` identifier (rhs of `q := P`) is the value-poison site.
+    try testing.expectEqual(Kind.invalid, identTypeOf(&c, "P").kind);
+}
+
+test "value-poison: a valid program mints no value-poison (poison() unreached)" {
+    // If poison() were reached with no reported error its assert would fire; a clean
+    // program simply never reaches it. Zero diagnostics confirms it.
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        "struct P { x: int }\nfn g() -> int { return 1 }\nfn main() -> int {\n p := P { x: g() }\n return p.x\n}\n",
+    ));
+}
+
 test "call argument count mismatch" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         "fn add(a: int, b: int) -> int { return a + b }\nfn f() {\n x := add(1)\n return\n}\n",

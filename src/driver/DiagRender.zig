@@ -30,6 +30,23 @@ fn renderOpts(level: Style.ColorLevel) Rr.Renderer.RenderOpts {
     return .{ .color = level, .unicode = false };
 }
 
+/// RENDER-TIME cap: at most this many diagnostics are drawn per batch; the rest
+/// collapse into one "... and N more" line. This is OUTPUT-ONLY — the collected /
+/// returned diagnostic set stays complete and uncapped, so incremental/cached
+/// fingerprints stay stable. A constant now; trivially a field/flag later.
+pub const DIAG_CAP: usize = 100;
+
+/// Emit the trailing "... and {total - shown} more" summary (dim) when a batch was
+/// capped. No-op when nothing was dropped. Borrows no diagnostic strings; the count
+/// is formatted into a stack buffer, so this never allocates.
+pub fn renderCapSummary(out: *Io.Writer, level: Style.ColorLevel, total: usize, shown: usize) !void {
+    if (total <= shown) return;
+    var buf: [48]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "... and {d} more", .{total - shown}) catch "... and more";
+    try sty_faint.styled(out, level, line);
+    try out.writeByte('\n');
+}
+
 /// Render a resolve/type sink diagnostic against a prepared SourceMap: a zero-width
 /// primary `.err` at `d.byte_offset` (via `fromSink`), snippet + caret.
 pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, d: toyc.DiagnosticSink.Diagnostic) !void {
@@ -86,7 +103,10 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
     var cached_scope: ?u32 = null;
     var sm: Rr.SourceMap = undefined;
     defer if (cached_scope != null) sm.deinit(gpa);
-    for (diags) |d| {
+    // Render-time cap: draw at most DIAG_CAP, then one "... and N more" line. The
+    // passed-in `diags` slice is NEVER truncated (render-only).
+    const shown = @min(diags.len, DIAG_CAP);
+    for (diags[0..shown]) |d| {
         if (cached_scope == null or cached_scope.? != d.scope) {
             if (cached_scope != null) sm.deinit(gpa);
             const m = moduleAt(g, d.scope); // NO_SCOPE / out-of-range -> entry
@@ -99,6 +119,7 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
         }
         try renderSinkDiag(out, level, &sm, d);
     }
+    try renderCapSummary(out, level, diags.len, shown);
 }
 
 /// Render a graph-discovery structural error against the owning module's source (or
