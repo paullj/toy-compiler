@@ -22,12 +22,11 @@
 //!   LC_MAIN, LC_LOAD_DYLIB libSystem, LC_CODE_SIGNATURE (LAST).
 //! The `__got` slot is seeded with the chained-fixups bind sentinel
 //! (0x8000000000000000), and `LC_DYLD_CHAINED_FIXUPS` names `_write` against
-//! libSystem so dyld binds the slot at load. The cross-segment adrp/add/ldr
-//! relocations are patched by `Link.applyDataRelocs` (in `link/emit.zig`'s
-//! `assembleAndSign`) once `assemble` has assigned every segment's vmaddr —
-//! which it reports in the extended `Layout`. `assemble` NO LONGER signs;
-//! `assembleAndSign` orchestrates assemble → applyDataRelocs → CodeSign.sign so
-//! the signature covers the final, patched bytes.
+//! libSystem so dyld binds the slot at load. `assemble` reports every segment's
+//! vmaddr in the extended `Layout` so the cross-segment adrp/add/ldr relocations
+//! can be patched afterward; it neither patches nor signs. The byte-load-bearing
+//! assemble → applyDataRelocs → sign-last order lives in its one home,
+//! `link/emit.zig`'s `assembleAndSign`.
 //!
 //! Everything is fixed-size, so layout is a single pass: place the header + load
 //! commands + code in __TEXT (one 0x4000 page), then __LINKEDIT carries the
@@ -176,8 +175,8 @@ pub const Layout = struct {
 /// `imports` the dyld symbols to bind. When BOTH are empty this is a pure M1/M3
 /// program and we take the unchanged single-__TEXT layout; otherwise the
 /// multi-segment path (__cstring section + __DATA_CONST/__got + a real
-/// chained-fixups blob). `assemble` does NOT sign — the caller patches
-/// cross-segment relocs first, then signs.
+/// chained-fixups blob). `assemble` neither patches cross-segment relocs nor
+/// signs; that sign-last order lives in `link/emit.zig`'s `assembleAndSign`.
 pub fn assemble(
     gpa: std.mem.Allocator,
     identifier: []const u8,
