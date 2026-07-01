@@ -71,6 +71,14 @@ pub fn renderPlainError(out: *Io.Writer, level: Style.ColorLevel, path: []const 
     try out.writeByte('\n');
 }
 
+/// The module a diagnostic's id points at. `NO_SCOPE` (single-file) and any
+/// out-of-range id fall back to the entry module, so a foreign or stale module id
+/// carried on a diagnostic can never index out of bounds once multi-module
+/// diagnostics land. Assumes `g.modules` is non-empty (every build has modules).
+fn moduleAt(g: *const Graph.Graph, id: u32) *const Graph.Module {
+    return if (id < g.modules.len) &g.modules[id] else g.entry();
+}
+
 /// Render a batch of sink diagnostics (resolve/type) against their owning modules,
 /// REUSING one SourceMap per scope: the diagnostics are sorted by (scope, offset) so
 /// same-scope diagnostics are contiguous — we build a map per scope and keep it while
@@ -82,7 +90,7 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
     for (diags) |d| {
         if (cached_scope == null or cached_scope.? != d.scope) {
             if (cached_scope != null) sm.deinit(gpa);
-            const m = if (d.scope == toyc.DiagnosticSink.NO_SCOPE) g.entry() else &g.modules[d.scope];
+            const m = moduleAt(g, d.scope); // NO_SCOPE / out-of-range -> entry
             // Clear `cached_scope` before the `try init`: `sm` was just deinit'd, so a
             // failing init must not let the `defer` fire on the freed `sm` (double-free).
             // Reassign after init.
@@ -98,10 +106,10 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
 /// the entry path when no module loaded). With a location, snippet + `= note: detail`;
 /// otherwise the plain `path: error: msg (detail)` fallback.
 pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Graph.Error) !void {
-    const name = if (e.module) |m| g.modules[m].path else if (g.modules.len > 0) g.entry().path else "<entry>";
+    const name = if (e.module) |m| moduleAt(g, m).path else if (g.modules.len > 0) g.entry().path else "<entry>";
     const has_src = e.module != null or g.modules.len > 0;
     if (e.byte_offset != null and has_src) {
-        const src: []const u8 = if (e.module) |m| g.modules[m].source else g.entry().source;
+        const src: []const u8 = if (e.module) |m| moduleAt(g, m).source else g.entry().source;
         try renderLocated(gpa, out, level, name, src, e.byte_offset, e.message, e.detail);
     } else {
         try renderPlainError(out, level, name, e.message, e.detail);
@@ -111,7 +119,7 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
 /// Render a code-emission `EmitError` from a graph build against its owning module
 /// (or the entry module when `module` is null). EmitError carries no detail.
 pub fn renderGraphEmit(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Codegen.EmitError) !void {
-    const m = if (e.module) |mi| &g.modules[mi] else g.entry();
+    const m = if (e.module) |mi| moduleAt(g, mi) else g.entry();
     if (e.byte_offset) |off| {
         try renderLocated(gpa, out, level, m.path, m.source, off, e.message, "");
     } else {
