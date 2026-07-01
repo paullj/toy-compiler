@@ -102,8 +102,9 @@ fn positionalField(comptime p: Spec.Positional) Field {
 /// Long name with '-' -> '_' (so --dry-run becomes dry_run); if there is no
 /// long, the single short byte is the field name. `Spec.checkCommand` already
 /// guarantees at least one of long/short and uniqueness, so no collision or
-/// empty-name handling is needed here.
-fn fieldName(comptime o: Spec.Option) [:0]const u8 {
+/// empty-name handling is needed here. Public so `Parser` reuses the exact same
+/// derivation instead of keeping a copy that could drift.
+pub fn fieldName(comptime o: Spec.Option) [:0]const u8 {
     if (o.long) |l| {
         var buf: [l.len:0]u8 = undefined;
         for (l, 0..) |c, i| buf[i] = if (c == '-') '_' else c;

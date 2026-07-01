@@ -269,7 +269,7 @@ fn isFlag(comptime o: Spec.Option) bool {
 }
 
 fn applyFlag(comptime cmd: Spec.Command, comptime o: Spec.Option, p: *Parsed.Parsed(cmd)) void {
-    const name = comptime fieldName(o);
+    const name = comptime Parsed.fieldName(o);
     switch (o.action) {
         .count => @field(p, name) +%= 1,
         else => @field(p, name) = true, // set_true or .set boolean
@@ -288,7 +288,7 @@ fn applyValue(
     arg: []const u8,
     raw: []const u8,
 ) !void {
-    const name = comptime fieldName(o);
+    const name = comptime Parsed.fieldName(o);
     if (comptime o.action == .append) {
         const Elem = ElemOf(cmd, name);
         const coerced = coerceInto(Elem, o.value, raw) orelse {
@@ -361,7 +361,7 @@ fn writeScalar(comptime cmd: Spec.Command, comptime name: [:0]const u8, comptime
 fn finishAppends(comptime cmd: Spec.Command, p: *Parsed.Parsed(cmd), a: std.mem.Allocator, appends: *AppendLists(cmd)) !void {
     inline for (cmd.options, 0..) |o, oi| {
         if (o.action == .append)
-            @field(p, fieldName(o)) = try appends.sliceOpt(oi, a);
+            @field(p, Parsed.fieldName(o)) = try appends.sliceOpt(oi, a);
     }
     inline for (cmd.positionals, 0..) |pp, pi| {
         if (pp.arity == .variadic)
@@ -432,7 +432,7 @@ fn optName(comptime o: Spec.Option) []const u8 {
 /// check that lands them in `.errors` when missing.
 fn initDefaults(comptime cmd: Spec.Command, p: *Parsed.Parsed(cmd)) void {
     inline for (cmd.options) |o| {
-        const name = comptime fieldName(o);
+        const name = comptime Parsed.fieldName(o);
         switch (o.action) {
             .set_true => @field(p, name) = false,
             .count => @field(p, name) = 0,
@@ -542,7 +542,7 @@ fn AppendLists(comptime cmd: Spec.Command) type {
         fn appendPos(self: *@This(), comptime pi: usize, a: std.mem.Allocator, v: anytype) !void {
             try @field(self.pos_lists, std.fmt.comptimePrint("p{d}", .{pi})).append(a, v);
         }
-        fn sliceOpt(self: *@This(), comptime oi: usize, a: std.mem.Allocator) ![]const ElemOf(cmd, fieldName(cmd.options[oi])) {
+        fn sliceOpt(self: *@This(), comptime oi: usize, a: std.mem.Allocator) ![]const ElemOf(cmd, Parsed.fieldName(cmd.options[oi])) {
             return @field(self.opt_lists, std.fmt.comptimePrint("o{d}", .{oi})).toOwnedSlice(a);
         }
         fn slicePos(self: *@This(), comptime pi: usize, a: std.mem.Allocator) ![]const ElemOf(cmd, cmd.positionals[pi].name) {
@@ -566,7 +566,7 @@ fn optListStruct(comptime cmd: Spec.Command) type {
         for (cmd.options, 0..) |o, oi| {
             if (o.action == .append) {
                 names[k] = std.fmt.comptimePrint("o{d}", .{oi});
-                const L = std.ArrayList(ElemOf(cmd, fieldName(o)));
+                const L = std.ArrayList(ElemOf(cmd, Parsed.fieldName(o)));
                 types[k] = L;
                 attrs[k] = defaultAttr(L, .empty);
                 k += 1;
@@ -609,21 +609,7 @@ fn Default(comptime T: type, comptime v: T) type {
     };
 }
 
-// ---- field name (mirrors Parsed's private derivation) ----------------------
-
-/// Long name with '-' -> '_'; else the single short byte. Duplicates Parsed's
-/// private `fieldName` — the two MUST stay byte-identical, guarded by the
-/// '--dry-run' @hasField test below.
-fn fieldName(comptime o: Spec.Option) [:0]const u8 {
-    if (o.long) |l| {
-        var buf: [l.len:0]u8 = undefined;
-        for (l, 0..) |c, i| buf[i] = if (c == '-') '_' else c;
-        buf[l.len] = 0;
-        const out = buf;
-        return &out;
-    }
-    return &[_:0]u8{o.short.?};
-}
+// Field-name derivation lives in Parsed.fieldName; Parser reuses it directly.
 
 // ============================================================================
 // Tests
@@ -661,9 +647,9 @@ test "classify: long, long=val, short cluster, dash positional, terminator" {
     try testing.expectEqualStrings("5", classify("-5").short_cluster);
 }
 
-test "fieldName mirrors Parsed: --dry-run -> dry_run" {
+test "Parsed.fieldName derives --dry-run -> dry_run" {
     const cmd = comptime Spec.Command{ .name = "c", .options = &.{.{ .long = "dry-run", .value = .boolean }} };
-    const derived = comptime fieldName(cmd.options[0]);
+    const derived = comptime Parsed.fieldName(cmd.options[0]);
     try testing.expect(@hasField(Parsed.Parsed(cmd), derived));
     try testing.expectEqualStrings("dry_run", derived);
 }
