@@ -48,6 +48,7 @@ pub const term = struct {
     pub const Style = @import("term/Style.zig");
     pub const Terminal = @import("term/Terminal.zig");
     pub const Progress = @import("term/Progress.zig");
+    pub const width = @import("term/width.zig");
     pub const render = struct {
         pub const SourceMap = @import("term/render/SourceMap.zig");
         pub const Diagnostic = @import("term/render/Diagnostic.zig");
@@ -96,6 +97,7 @@ test {
     _ = term.Style;
     _ = term.Terminal;
     _ = term.Progress;
+    _ = term.width;
     _ = term.render.SourceMap;
     _ = term.render.Diagnostic;
     _ = term.render.Theme;
