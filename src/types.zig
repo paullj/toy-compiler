@@ -108,7 +108,7 @@ pub const refs = struct {
         if (type_names.get(name)) |b| return b;
         if (self.activeStructMap().get(name)) |id| return Type.structT(id);
         if (self.activeEnumMap().get(name)) |id| return Type.enumT(id);
-        self.sink.emitFmt(refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
+        self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
         return .invalid;
     }
 
@@ -123,13 +123,13 @@ pub const refs = struct {
         if (recv.tag != .identifier) return .invalid;
         const recv_name = refs.nameText(self, recv.main_token);
         const target = g.namespaceOfIn(self.graph_mod, recv_name) orelse {
-            self.sink.emitFmt(refs.byteOf(self, recv.main_token), err_unknown_module, .{recv_name}) catch {};
+            self.sink.emitFmtCode(.T0002, refs.byteOf(self, recv.main_token), err_unknown_module, .{recv_name}) catch {};
             return .invalid;
         };
         const member = refs.nameText(self, n.main_token);
         if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
         if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-        self.sink.emitFmt(refs.byteOf(self, n.main_token), err_module_no_type, .{member}) catch {};
+        self.sink.emitFmtCode(.T0003, refs.byteOf(self, n.main_token), err_module_no_type, .{member}) catch {};
         return .invalid;
     }
 };
@@ -138,6 +138,7 @@ pub const refs = struct {
 /// driver/CLI can render either uniformly (byte offset → line:col).
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
+const codes = @import("diagnostics/codes.zig");
 
 // ---- M14 graph typecheck (program-wide layout + cross-module check) --------
 
@@ -456,23 +457,23 @@ fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
         }
         fn emitRecursive(ctx: *anyopaque, byte: u32, requester: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmt(byte, "recursive type '{s}' has infinite size", .{requester});
+            try tc.sink.emitFmtCode(.T0004, byte, "recursive type '{s}' has infinite size", .{requester});
         }
         fn emitEmptyStruct(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmt(byte, "empty struct '{s}' is not allowed", .{name});
+            try tc.sink.emitFmtCode(.T0005, byte, "empty struct '{s}' is not allowed", .{name});
         }
         fn emitEmptyEnum(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmt(byte, "empty enum '{s}' is not allowed", .{name});
+            try tc.sink.emitFmtCode(.T0006, byte, "empty enum '{s}' is not allowed", .{name});
         }
         fn emitUnitField(ctx: *anyopaque, byte: u32, field: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmt(byte, "field '{s}' cannot have type ()", .{field});
+            try tc.sink.emitFmtCode(.T0007, byte, "field '{s}' cannot have type ()", .{field});
         }
         fn emitUnitPayload(ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmt(byte, "variant '{s}' payload cannot have type ()", .{variant});
+            try tc.sink.emitFmtCode(.T0008, byte, "variant '{s}' payload cannot have type ()", .{variant});
         }
     };
     return .{
@@ -812,7 +813,7 @@ fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, ow
         else => false,
     };
     if (non_pub)
-        try t.sink.emitFmt(t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+        try t.sink.emitFmtCode(.T0009, t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
 }
 
 /// Rule 7: the entry `main` may only yield `int` (the process exit code) or `()`
@@ -836,7 +837,7 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
             // Select the entry module so the sink stamps this diagnostic with the
             // entry module's scope (gphSelect -> sink.setScope).
             _ = t.gphSelect(entry_mod);
-            try t.sink.emit(tokens[main_tok].start, "main must return int or ()");
+            try t.sink.emitCode(.T0010, tokens[main_tok].start, "main must return int or ()");
         }
         return; // only the first `main` is the entry
     }
@@ -853,11 +854,11 @@ fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void
         if (decl.tag != .struct_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.sink.emitFmt(t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
+            try t.sink.emitFmtCode(.T0011, t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null) {
-            try t.sink.emitFmt(t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
+            try t.sink.emitFmtCode(.T0012, t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
             continue;
         }
         const id: u32 = @intCast(t.structs.items.len);

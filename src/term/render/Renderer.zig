@@ -1223,10 +1223,16 @@ test "warning severity word is used in the header" {
     try testing.expect(std.mem.startsWith(u8, out, "warning: careful\n"));
 }
 
-test "fromSink round-trips: a zero-width sink diagnostic renders one caret" {
+test "a zero-width primary renders one caret (the sink-diagnostic render shape)" {
     var sm = mapOver("f.toy", "abcdef\n");
     defer sm.deinit(sm.gpa);
-    const d = Diagnostic.fromSink(.{ .byte_offset = 2, .message = "boom" });
+    // The shape `DiagRender.renderSinkDiag` builds inline from a POD: a zero-width
+    // primary at the byte offset, no code (=> no bracket), .err severity.
+    const d = Diagnostic.Diagnostic{
+        .severity = .err,
+        .message = "boom",
+        .primary = .{ .kind = .primary, .span = .{ .start = 2, .end = 2 }, .message = "boom" },
+    };
     var buf: [256]u8 = undefined;
     try testing.expectEqualStrings(
         \\error: boom

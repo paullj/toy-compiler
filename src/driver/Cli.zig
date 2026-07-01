@@ -37,6 +37,11 @@ const files_pos: []const Spec.Positional = &.{
     .{ .name = "file", .value = .string, .arity = .variadic, .help = "Input source file(s)" },
 };
 
+/// The single `<CODE>` positional for `toy explain` (e.g. `R0001`).
+const explain_pos: []const Spec.Positional = &.{
+    .{ .name = "code", .value = .string, .arity = .one, .help = "A diagnostic code, e.g. R0001" },
+};
+
 /// The whole `toy` CLI schema. `version` is the comptime `toyc.version.semver`
 /// (the runtime `version.stamp()` needs a buffer, so can't feed a comptime spec);
 /// `--version` therefore prints `toy <semver>` (see main.zig's deviation note).
@@ -53,6 +58,7 @@ pub const spec: Spec.Cli = .{
         .subcommands = &.{
             .{ .name = "build", .about = "Compile to a signed executable (the default action)", .options = shared_opts, .positionals = files_pos },
             .{ .name = "run", .about = "Build, then execute the binary and report its exit status", .options = shared_opts, .positionals = files_pos },
+            .{ .name = "explain", .about = "Print the documentation for a diagnostic code", .positionals = explain_pos },
         },
     },
 };

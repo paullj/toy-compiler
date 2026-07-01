@@ -41,6 +41,7 @@ const Graph = @import("driver/Graph.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const nearmiss = @import("diagnostics/nearmiss.zig");
+const codes = @import("diagnostics/codes.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const SymKind = @import("symbols/Sym.zig").SymKind;
@@ -182,7 +183,7 @@ fn collectGlobals(g: *GraphResolve) !void {
                     const name = g.nameOf(mod, decl.main_token);
                     const gop = try g.tables[mod].fns.getOrPut(g.gpa, name);
                     if (gop.found_existing) {
-                        try g.emit(mod, m.tokens[decl.main_token].start, "duplicate function '{s}'", .{name});
+                        try g.emit(.R0002, mod, m.tokens[decl.main_token].start, "duplicate function '{s}'", .{name});
                         continue;
                     }
                     const id: u32 = @intCast(g.fns.items.len);
@@ -246,7 +247,7 @@ fn collectNamespaces(g: *GraphResolve) !void {
             const target = g.importTarget(mod, decl) orelse {
                 // Discovery already proved every import resolves; a miss here is
                 // defensive (e.g. a stale graph). Report against this module.
-                try g.emit(mod, m.tokens[decl.main_token].start, "unknown imported module", .{});
+                try g.emit(.R0003, mod, m.tokens[decl.main_token].start, "unknown imported module", .{});
                 continue;
             };
 
@@ -265,13 +266,13 @@ fn collectNamespaces(g: *GraphResolve) !void {
                 g.tables[mod].structs.contains(ns_name) or
                 g.tables[mod].enums.contains(ns_name))
             {
-                try g.emit(mod, m.tokens[ns_tok].start, "import namespace '{s}' collides with a top-level declaration named '{s}' (use `as` to disambiguate)", .{ ns_name, ns_name });
+                try g.emit(.R0004, mod, m.tokens[ns_tok].start, "import namespace '{s}' collides with a top-level declaration named '{s}' (use `as` to disambiguate)", .{ ns_name, ns_name });
                 continue;
             }
 
             const gop = try g.tables[mod].namespaces.getOrPut(g.gpa, ns_name);
             if (gop.found_existing) {
-                try g.emit(mod, m.tokens[ns_tok].start, "import namespace '{s}' collides with an earlier import (use `as` to disambiguate)", .{ns_name});
+                try g.emit(.R0004, mod, m.tokens[ns_tok].start, "import namespace '{s}' collides with an earlier import (use `as` to disambiguate)", .{ns_name});
                 continue;
             }
             gop.value_ptr.* = target;
@@ -375,14 +376,14 @@ fn resolveTypeRef(g: *GraphResolve, type_idx: Ast.Index) error{OutOfMemory}!void
     const member = g.nameText(n.main_token);
     const tt = &g.tables[target_mod];
     if (tt.structs.get(member)) |is_pub| {
-        if (!is_pub) try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "struct '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target_mod].path });
+        if (!is_pub) try g.emit(.R0005, g.cur_mod, g.tokens()[n.main_token].start, "struct '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target_mod].path });
         return;
     }
     if (tt.enums.get(member)) |is_pub| {
-        if (!is_pub) try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "enum '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target_mod].path });
+        if (!is_pub) try g.emit(.R0005, g.cur_mod, g.tokens()[n.main_token].start, "enum '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target_mod].path });
         return;
     }
-    try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "module '{s}' has no type '{s}'", .{ g.graph.modules[target_mod].path, member });
+    try g.emit(.R0006, g.cur_mod, g.tokens()[n.main_token].start, "module '{s}' has no type '{s}'", .{ g.graph.modules[target_mod].path, member });
 }
 
 fn resolveBlock(g: *GraphResolve, block_idx: Ast.Index) error{OutOfMemory}!void {
@@ -410,9 +411,9 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 const resn = g.lookupName(target.main_token);
                 g.res(stmt.lhs, resn);
                 switch (resn) {
-                    .unresolved => try g.emit(g.cur_mod, g.tokens()[target.main_token].start, "assignment to undeclared name '{s}'", .{g.nameText(target.main_token)}),
-                    .func => try g.emit(g.cur_mod, g.tokens()[target.main_token].start, "cannot assign to function '{s}'", .{g.nameText(target.main_token)}),
-                    .module => try g.emit(g.cur_mod, g.tokens()[target.main_token].start, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
+                    .unresolved => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "assignment to undeclared name '{s}'", .{g.nameText(target.main_token)}),
+                    .func => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "cannot assign to function '{s}'", .{g.nameText(target.main_token)}),
+                    .module => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
                     .local, .label => {},
                 }
             }
@@ -477,9 +478,9 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
                 // suggester is conservative (short names / distant names / ties → no
                 // hint), so this stays byte-identical for the existing no-hint cases.
                 if (nearmiss.suggest(name, g.candidateIter())) |cand|
-                    try g.emit(g.cur_mod, off, "undeclared identifier '{s}'; did you mean '{s}'?", .{ name, cand })
+                    try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'; did you mean '{s}'?", .{ name, cand })
                 else
-                    try g.emit(g.cur_mod, off, "undeclared identifier '{s}'", .{name});
+                    try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'", .{name});
             }
         },
         .literal_number, .literal_string, .literal_bool => {},
@@ -565,20 +566,20 @@ fn resolveModuleMember(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, targe
     // its receiver chain resolved.
     if (tt.structs.get(member)) |is_pub| {
         if (is_pub) return;
-        try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "struct '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target].path });
+        try g.emit(.R0005, g.cur_mod, g.tokens()[n.main_token].start, "struct '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target].path });
         return;
     }
     if (tt.enums.get(member)) |is_pub| {
         if (is_pub) return;
-        try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "enum '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target].path });
+        try g.emit(.R0005, g.cur_mod, g.tokens()[n.main_token].start, "enum '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target].path });
         return;
     }
     // A private fn referenced cross-module: distinguish "exists but not pub" from
     // "no such member" for a clearer message.
     if (tt.fns.contains(member)) {
-        try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "function '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target].path });
+        try g.emit(.R0005, g.cur_mod, g.tokens()[n.main_token].start, "function '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target].path });
     } else {
-        try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "module '{s}' has no member '{s}'", .{ g.graph.modules[target].path, member });
+        try g.emit(.R0006, g.cur_mod, g.tokens()[n.main_token].start, "module '{s}' has no member '{s}'", .{ g.graph.modules[target].path, member });
     }
 }
 
@@ -587,7 +588,7 @@ fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
     const name = g.nameText(n.main_token);
     for (g.label_stack.items) |e| {
         if (std.mem.eql(u8, e.name, name)) {
-            try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "duplicate label '{s}'", .{name});
+            try g.emit(.R0008, g.cur_mod, g.tokens()[n.main_token].start, "duplicate label '{s}'", .{name});
             break;
         }
     }
@@ -675,7 +676,7 @@ fn resolveLabelTarget(g: *GraphResolve, node_idx: Ast.Index, label_tok: u32, com
             return;
         }
     }
-    try g.emit(g.cur_mod, g.tokens()[label_tok].start, verb ++ " to undefined label '{s}'", .{name});
+    try g.emit(.R0009, g.cur_mod, g.tokens()[label_tok].start, verb ++ " to undefined label '{s}'", .{name});
 }
 
 fn res(g: *GraphResolve, node_idx: Ast.Index, r: Resolution) void {
@@ -696,7 +697,7 @@ fn declare(g: *GraphResolve, name_tok: u32, comptime dup_fmt: []const u8) !?u32 
     const scope = &g.scopes.items[g.scopes.items.len - 1];
     const gop = try scope.names.getOrPut(g.gpa, name);
     if (gop.found_existing) {
-        try g.emit(g.cur_mod, g.tokens()[name_tok].start, dup_fmt, .{name});
+        try g.emit(.none, g.cur_mod, g.tokens()[name_tok].start, dup_fmt, .{name});
         return null;
     }
     const slot = g.slot_next;
@@ -774,10 +775,11 @@ fn lookupName(g: *GraphResolve, name_tok: u32) Resolution {
 }
 
 /// Stamp the owning module onto the diagnostic (this resolver emits with an
-/// explicit `mod` per call rather than a single per-walk scope) and record it.
-fn emit(g: *GraphResolve, mod: u32, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
+/// explicit `mod` per call rather than a single per-walk scope), attach the stable
+/// `code`, and record it. Message text is unchanged from the old `emitFmt`.
+fn emit(g: *GraphResolve, code: codes.Code, mod: u32, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
     g.sink.setScope(mod);
-    try g.sink.emitFmt(byte_offset, fmt, args);
+    try g.sink.emitFmtCode(code, byte_offset, fmt, args);
 }
 };
 

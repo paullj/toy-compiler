@@ -171,7 +171,14 @@ pub fn main(init: std.process.Init) !void {
                             std.process.exit(1);
                         },
                         .ok => |p| {
-                            if (try applyParsed(gpa, sub, p, out, err_level, &st)) |code| {
+                            // `explain` is a distinct action (print a code's docs, no
+                            // build); it has a `code` positional, not the shared option
+                            // set, so it bypasses `applyParsed` entirely.
+                            if (comptime std.mem.eql(u8, sub.name, "explain")) {
+                                try runExplain(out, err_level, p.code);
+                                try out.flush();
+                                return;
+                            } else if (try applyParsed(gpa, sub, p, out, err_level, &st)) |code| {
                                 try out.flush(); // exit skips defers; flush the styled arg-error line
                                 std.process.exit(code);
                             }
@@ -948,4 +955,20 @@ fn argErr(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) noretur
 fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8 {
     try argLine(out, level, message);
     return 1;
+}
+
+/// `toy explain <CODE>`: print the code's embedded documentation. A known code prints
+/// its doc and returns (caller flushes + exits 0); an unknown code prints a styled
+/// arg error and EXITS 2 (an argument error, distinct from a compile failure's 1).
+fn runExplain(out: *Io.Writer, level: Style.ColorLevel, code: []const u8) !void {
+    if (toyc.diagnostics.explain.docForStr(code)) |doc| {
+        try out.writeAll(doc);
+        if (doc.len == 0 or doc[doc.len - 1] != '\n') try out.writeByte('\n');
+        return;
+    }
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "unknown diagnostic code: {s}", .{code}) catch "unknown diagnostic code";
+    argLine(out, level, msg) catch {};
+    out.flush() catch {};
+    std.process.exit(2);
 }
