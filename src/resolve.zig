@@ -99,6 +99,87 @@ test "undeclared identifier yields exactly one diagnostic" {
     try testing.expectEqualStrings("undeclared identifier 'x'", res.diags[0].message);
 }
 
+test "a single root undeclared name yields exactly one diagnostic (report-once)" {
+    // Mirrors the B4 report-once smoke: one undeclared name → one diagnostic, no
+    // cascade through the `return` that consumes its poison.
+    const gpa = testing.allocator;
+    var parsed = try parseSource(gpa, "fn main() -> int {\n return nope\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expect(std.mem.startsWith(u8, res.diags[0].message, "undeclared identifier 'nope'"));
+}
+
+test "a close typo of an in-scope local yields a did-you-mean hint" {
+    const gpa = testing.allocator;
+    // `count` is bound; `cont` is undeclared and one deletion away → hint.
+    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n return cont\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'cont'; did you mean 'count'?", res.diags[0].message);
+}
+
+test "a close typo of a fn name yields a did-you-mean hint" {
+    const gpa = testing.allocator;
+    // `print` is always in the fn table; `prnt` is a transposition/deletion away.
+    var parsed = try parseSource(gpa, "fn f() {\n prnt(\"hi\")\n return\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'prnt'; did you mean 'print'?", res.diags[0].message);
+}
+
+test "a close typo of a SHADOWED local still yields a did-you-mean hint" {
+    const gpa = testing.allocator;
+    // `count` is declared in an outer scope and re-declared (shadowed) in an inner
+    // block, so candidateIter yields the string `count` twice. That duplicate must
+    // NOT be treated as an ambiguous tie — the hint must still fire.
+    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n {\n count := 2\n return cont\n }\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'cont'; did you mean 'count'?", res.diags[0].message);
+}
+
+test "a close typo of a fn name shadowed by a local still yields a hint" {
+    const gpa = testing.allocator;
+    // A local named `print` shadows the built-in fn `print`: the string `print` is
+    // yielded by both the local scope and the fn table. The duplicate must not
+    // suppress the hint for a typo of it.
+    var parsed = try parseSource(gpa, "fn f() -> int {\n print := 1\n return prin\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'prin'; did you mean 'print'?", res.diags[0].message);
+}
+
+test "a distant undeclared name yields NO hint" {
+    const gpa = testing.allocator;
+    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n return zzzzzz\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'zzzzzz'", res.diags[0].message);
+}
+
+test "an ambiguous near-miss (tie) yields NO hint" {
+    const gpa = testing.allocator;
+    // `cat` and `bar` are each distance 1 from `bat` → strict-unique-winner fails → no hint.
+    var parsed = try parseSource(gpa, "fn f() -> int {\n cat := 1\n bar := 2\n return bat\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'bat'", res.diags[0].message);
+}
+
 test "duplicate parameter is reported" {
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
         "fn f(a: int, a: int) {\n return\n}\n",

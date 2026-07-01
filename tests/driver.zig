@@ -170,6 +170,102 @@ test "emit=check on a bad program reports a resolve error" {
     try testing.expect(r.resolve.?.diags.len > 0);
 }
 
+test "B4: a many-error file collects the FULL uncapped diagnostic set (render cap is output-only)" {
+    // The render-time cap (DiagRender.DIAG_CAP = 100) never truncates the COLLECTED /
+    // returned diagnostics — the Sink/Result stays complete so incremental/cache
+    // fingerprints stay stable. Build a file with 120 distinct undeclared names and
+    // assert all 120 diagnostics are retained on the resolve result.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-cap";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // 120 statements each referencing a distinct undeclared name `uNNN`.
+    const n_errs = 120;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "fn f() {\n");
+    for (0..n_errs) |i| {
+        var line: [32]u8 = undefined;
+        try src.appendSlice(gpa, std.fmt.bufPrint(&line, " x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
+    }
+    try src.appendSlice(gpa, " return\n}\n");
+
+    const path = dir_name ++ "/many.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.items });
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    var r: FileResult = .{ .path = path };
+    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    defer r.deinit(gpa);
+
+    try testing.expectEqual(@as(?anyerror, error.ResolveError), r.err);
+    try testing.expect(r.resolve != null);
+    // The FULL set is collected — NOT capped to DIAG_CAP (100).
+    try testing.expectEqual(@as(usize, n_errs), r.resolve.?.diags.len);
+}
+
+test "B4: rendering a many-error file caps output at DIAG_CAP primaries + a summary line" {
+    // End-to-end render check via the built `toy` binary (the only path that exercises
+    // Report/DiagRender). Skips gracefully if the binary isn't present. DIAG_CAP = 100
+    // primary `-->` carets are drawn, then one `... and N more` line; the summary count
+    // is total - 100.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-driver-cap-render";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const n_errs = 120;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "fn f() {\n");
+    for (0..n_errs) |i| {
+        var line: [32]u8 = undefined;
+        try src.appendSlice(gpa, std.fmt.bufPrint(&line, " x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
+    }
+    try src.appendSlice(gpa, " return\n}\n");
+    const path = dir_name ++ "/many.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.items });
+
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--emit", "check", path }, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 20));
+    defer gpa.free(got);
+    _ = try child.wait(io);
+
+    // Count `-->` primaries: exactly DIAG_CAP (100) rendered.
+    var carets: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, got, i, "-->")) |at| {
+        carets += 1;
+        i = at + 3;
+    }
+    try testing.expectEqual(@as(usize, 100), carets);
+    // The trailing "... and 20 more" summary line is present.
+    try testing.expect(std.mem.indexOf(u8, got, "... and 20 more") != null);
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

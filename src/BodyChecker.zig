@@ -360,8 +360,22 @@ pub const BodyChecker = struct {
         return bc.typeOf(node_idx);
     }
 
+    /// Mint the poison type ONLY after THIS fn's local sink already reported a
+    /// diagnostic (the rustc `span_delayed_bug`/`ErrorGuaranteed` analog). `bc.sink`
+    /// is a PER-FN sink, so `count() > 0` proves the poison co-occurs with a
+    /// user-facing error emitted by this very fn — a silent poison (invalid minted
+    /// with no reported error) trips the assert in Debug/ReleaseSafe. It is a plain
+    /// `return Type.invalid` in ReleaseFast, so release bytes are unchanged. Only the
+    /// value-poison identifier sites (func/module/bare-struct-as-value) route through
+    /// here; structural poison (Ast.none, error_node, operand-invalid propagation) is
+    /// exempt because it carries no new error of its own.
+    fn poison(bc: *const BodyChecker) Type {
+        std.debug.assert(bc.sink.count() > 0);
+        return Type.invalid;
+    }
+
     fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
-        if (node_idx == Ast.none) return .invalid;
+        if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
         const ty: Type = switch (n.tag) {
             .literal_number => Type.int,
@@ -371,7 +385,7 @@ pub const BodyChecker = struct {
                 .local => |slot| bc.slotType(slot),
                 .func => blk: {
                     try bc.sink.emitFmt(bc.byteOf(n.main_token), "function '{s}' is not a value", .{bc.nameText(n.main_token)});
-                    break :blk Type.invalid;
+                    break :blk bc.poison();
                 },
                 .unresolved => blk: {
                     // Resolve quietly skips a struct-named identifier (it expects this
@@ -379,8 +393,12 @@ pub const BodyChecker = struct {
                     // positional `Point(...)` callee it diagnoses elsewhere). A BARE
                     // struct name used as a value (`q := P`, `P.x`) reaches here with
                     // no diagnostic — report it so it never escapes to codegen.
-                    if (bc.activeStructMap().get(bc.nameText(n.main_token)) != null)
+                    if (bc.activeStructMap().get(bc.nameText(n.main_token)) != null) {
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "type '{s}' is not a value", .{bc.nameText(n.main_token)});
+                        break :blk bc.poison();
+                    }
+                    // Else: an ordinary undeclared name already reported by resolve
+                    // (this branch emits nothing) — keep plain poison, no guard.
                     break :blk Type.invalid;
                 },
                 .label => Type.invalid, // never on an identifier node (break/continue only)
@@ -389,12 +407,12 @@ pub const BodyChecker = struct {
                     // a module is not a value. (A `mod.member` access never reaches
                     // here — the receiver is consumed by typeOfFieldAccess/Call.)
                     try bc.sink.emitFmt(bc.byteOf(n.main_token), "module '{s}' is not a value", .{bc.nameText(n.main_token)});
-                    break :blk Type.invalid;
+                    break :blk bc.poison();
                 },
             },
             .unary => blk: {
                 const operand = try bc.typeOf(n.lhs);
-                if (operand.kind == .invalid) break :blk Type.invalid;
+                if (operand.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
                 const op = bc.tokens[n.main_token].tag;
                 switch (op) {
                     .minus => {
@@ -412,7 +430,7 @@ pub const BodyChecker = struct {
             .binary => blk: {
                 const lt = try bc.typeOf(n.lhs);
                 const rt = try bc.typeOf(n.rhs);
-                if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid;
+                if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
                 const op = bc.tokens[n.main_token].tag;
                 const op_text = bc.tokens[n.main_token].text(bc.source);
                 switch (op) {
@@ -454,8 +472,8 @@ pub const BodyChecker = struct {
             .labeled => return bc.checkLabeled(node_idx, true), // sets node_types itself
             // A poison leaf types as the poison `invalid` — already-diagnosed, so
             // no diagnostic here and no cascade (`assignable` absorbs `.invalid`).
-            .error_node => Type.invalid,
-            else => Type.invalid,
+            .error_node => Type.invalid, // already diagnosed in the parser (exempt)
+            else => Type.invalid, // defensive unknown-kind fallthrough: no emit (exempt)
         };
         bc.node_types[(node_idx).int()] = ty;
         return ty;

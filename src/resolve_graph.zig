@@ -40,6 +40,7 @@ const Ast = @import("ast/Ast.zig");
 const Graph = @import("driver/Graph.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
+const nearmiss = @import("diagnostics/nearmiss.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const SymKind = @import("symbols/Sym.zig").SymKind;
@@ -469,7 +470,16 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
             if (resn == .unresolved) {
                 if (g.tables[g.cur_mod].structs.contains(g.nameText(n.main_token))) return;
                 if (g.tables[g.cur_mod].enums.contains(g.nameText(n.main_token))) return;
-                try g.emit(g.cur_mod, g.tokens()[n.main_token].start, "undeclared identifier '{s}'", .{g.nameText(n.main_token)});
+                const name = g.nameText(n.main_token);
+                const off = g.tokens()[n.main_token].start;
+                // If an in-scope name is a close typo of the undeclared one, append a
+                // "did you mean" hint (message-embedded — no note channel yet). The
+                // suggester is conservative (short names / distant names / ties → no
+                // hint), so this stays byte-identical for the existing no-hint cases.
+                if (nearmiss.suggest(name, g.candidateIter())) |cand|
+                    try g.emit(g.cur_mod, off, "undeclared identifier '{s}'; did you mean '{s}'?", .{ name, cand })
+                else
+                    try g.emit(g.cur_mod, off, "undeclared identifier '{s}'", .{name});
             }
         },
         .literal_number, .literal_string, .literal_bool => {},
@@ -710,6 +720,48 @@ fn lookupLocalOrFn(g: *GraphResolve, name_tok: u32) ?Resolution {
     }
     if (g.tables[g.cur_mod].fns.get(name)) |gid| return .{ .func = gid };
     return null;
+}
+
+/// An iterator over exactly the names `lookupName` searches, for near-miss
+/// suggestions: every lexical scope's local names (innermost scope first), then this
+/// module's fn names (incl. the shared `print`), then this module's import namespace
+/// names. Fixed traversal order; the suggester's strict-unique-winner rule makes the
+/// emitted string independent of the per-map hash iteration order.
+const CandidateIter = struct {
+    g: *GraphResolve,
+    /// Phase: 0 = scopes (walking from innermost outward), 1 = fns, 2 = namespaces.
+    phase: u8 = 0,
+    scope_i: usize, // index into g.scopes, walked downward from the end
+    map_it: ?std.StringHashMapUnmanaged(u32).KeyIterator = null,
+
+    pub fn next(self: *CandidateIter) ?[]const u8 {
+        while (true) {
+            if (self.map_it) |*it| {
+                if (it.next()) |k| return k.*;
+                self.map_it = null;
+            }
+            switch (self.phase) {
+                0 => {
+                    if (self.scope_i == 0) {
+                        self.phase = 1;
+                        self.map_it = self.g.tables[self.g.cur_mod].fns.keyIterator();
+                        continue;
+                    }
+                    self.scope_i -= 1;
+                    self.map_it = self.g.scopes.items[self.scope_i].names.keyIterator();
+                },
+                1 => {
+                    self.phase = 2;
+                    self.map_it = self.g.tables[self.g.cur_mod].namespaces.keyIterator();
+                },
+                else => return null,
+            }
+        }
+    }
+};
+
+fn candidateIter(g: *GraphResolve) CandidateIter {
+    return .{ .g = g, .scope_i = g.scopes.items.len };
 }
 
 /// Look a name up: locals (innermost first) → this module's fns (incl. the

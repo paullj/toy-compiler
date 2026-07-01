@@ -135,7 +135,9 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
         try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, "-", msg, 0);
         var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
         defer sm.deinit(gpa);
-        for (r.diags) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
+        const shown = @min(r.diags.len, DiagRender.DIAG_CAP);
+        for (r.diags[0..shown]) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
+        try DiagRender.renderCapSummary(out, level, r.diags.len, shown);
     } else if (err == error.ResolveError) {
         const n = if (r.resolve) |res| res.diags.len else 0;
         var msgbuf: [48]u8 = undefined;
@@ -143,7 +145,9 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
         if (r.resolve) |res| {
             var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
             defer sm.deinit(gpa);
-            for (res.diags) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
+            const shown = @min(res.diags.len, DiagRender.DIAG_CAP);
+            for (res.diags[0..shown]) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
+            try DiagRender.renderCapSummary(out, level, res.diags.len, shown);
         }
     } else if (err == error.TypeError) {
         const n = if (r.typecheck) |tc| tc.diags.len else 0;
@@ -152,7 +156,9 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
         if (r.typecheck) |tc| {
             var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
             defer sm.deinit(gpa);
-            for (tc.diags) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
+            const shown = @min(tc.diags.len, DiagRender.DIAG_CAP);
+            for (tc.diags[0..shown]) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
+            try DiagRender.renderCapSummary(out, level, tc.diags.len, shown);
         }
     } else {
         var msgbuf: [48]u8 = undefined;
