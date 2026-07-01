@@ -13,6 +13,7 @@ const term = toyc.term;
 const Style = term.Style;
 const Rr = term.render;
 const DiagRender = @import("DiagRender.zig");
+const SevCfg = toyc.diagnostics.severity_config;
 const sty_err = DiagRender.sty_err;
 const sty_ok = DiagRender.sty_ok;
 const sty_head = DiagRender.sty_head;
@@ -34,7 +35,7 @@ const fmt_row_dash = std.fmt.comptimePrint("{{s: <{d}}} {{s: >{d}}} {{s: >{d}}} 
 /// Print the per-file summary; returns the number of files that failed (for the
 /// caller's exit status). Per-diagnostic detail lines route through the Renderer
 /// via `printFailure`.
-pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, results: []const Driver.FileResult, emit: Driver.Emit, target: []const u8, dump: bool) !usize {
+pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, results: []const Driver.FileResult, emit: Driver.Emit, target: []const u8, dump: bool, cfg: SevCfg.SeverityConfig) !usize {
     var stamp_buf: [version.stamp_max]u8 = undefined;
     // Header: the version stamp bold, labels plain.
     try out.writeAll("compiler ");
@@ -65,7 +66,7 @@ pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, 
 
         if (r.err) |err| {
             failures += 1;
-            try printFailure(out, gpa, level, r, err);
+            try printFailure(out, gpa, level, r, err, cfg);
             continue;
         }
 
@@ -126,7 +127,7 @@ fn cacheNote(r: Driver.FileResult, emit: Driver.Emit) []const u8 {
 /// Emit a failing file's summary ROW (kept, now styled — the `error: ...` cell
 /// err-red bold, the path plain), then route each per-file diagnostic through the
 /// Renderer over ONE SourceMap of the file (single-file => scope == NO_SCOPE).
-fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, r: Driver.FileResult, err: anyerror) !void {
+fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, r: Driver.FileResult, err: anyerror, cfg: SevCfg.SeverityConfig) !void {
     if (r.diags.len > 0) {
         // Parse error (B2): one or more accumulated diagnostics. The row's `error:`
         // cell is styled; each pretty snippet follows via the Renderer.
@@ -135,9 +136,7 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
         try rowThenErr(out, level, r.path, r.source.len, r.tokens.len -| 1, "-", msg, 0);
         var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
         defer sm.deinit(gpa);
-        const shown = @min(r.diags.len, DiagRender.DIAG_CAP);
-        for (r.diags[0..shown]) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
-        try DiagRender.renderCapSummary(out, level, r.diags.len, shown);
+        try renderCapped(out, level, &sm, r.diags, cfg);
     } else if (err == error.ResolveError) {
         const n = if (r.resolve) |res| res.diags.len else 0;
         var msgbuf: [48]u8 = undefined;
@@ -145,9 +144,7 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
         if (r.resolve) |res| {
             var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
             defer sm.deinit(gpa);
-            const shown = @min(res.diags.len, DiagRender.DIAG_CAP);
-            for (res.diags[0..shown]) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
-            try DiagRender.renderCapSummary(out, level, res.diags.len, shown);
+            try renderCapped(out, level, &sm, res.diags, cfg);
         }
     } else if (err == error.TypeError) {
         const n = if (r.typecheck) |tc| tc.diags.len else 0;
@@ -156,14 +153,30 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
         if (r.typecheck) |tc| {
             var sm = try Rr.SourceMap.init(gpa, r.path, r.source);
             defer sm.deinit(gpa);
-            const shown = @min(tc.diags.len, DiagRender.DIAG_CAP);
-            for (tc.diags[0..shown]) |d| try DiagRender.renderSinkDiag(out, level, &sm, d);
-            try DiagRender.renderCapSummary(out, level, tc.diags.len, shown);
+            try renderCapped(out, level, &sm, tc.diags, cfg);
         }
     } else {
         var msgbuf: [48]u8 = undefined;
         try rowDashThenErr(out, level, r.path, std.fmt.bufPrint(&msgbuf, "{t}", .{err}) catch "error");
     }
+}
+
+/// Render a single-file diagnostic batch against one prepared `sm`, applying the C3
+/// severity config BEFORE the render cap: a first cheap pass counts VISIBLE (non-
+/// `--ignore`d) diagnostics so the "... and N more" summary excludes dropped ones,
+/// then draws up to `DIAG_CAP` visible ones. An empty `cfg` leaves every diagnostic
+/// visible, so the counts + bytes stay identical to the pre-C3 `@min`+loop shape.
+fn renderCapped(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, diags: []const toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) !void {
+    var visible: usize = 0;
+    for (diags) |d| {
+        if (SevCfg.resolve(d.code, d.severity, cfg) != null) visible += 1;
+    }
+    var drawn: usize = 0;
+    for (diags) |d| {
+        if (drawn == DiagRender.DIAG_CAP) break;
+        if (try DiagRender.renderSinkDiag(out, level, sm, d, cfg)) drawn += 1; // false == --ignore'd
+    }
+    try DiagRender.renderCapSummary(out, level, visible, drawn);
 }
 
 /// A failing-file summary row `path bytes tokens nodes  error: <msg>` where the data

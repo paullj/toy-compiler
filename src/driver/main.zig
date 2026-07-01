@@ -39,6 +39,8 @@ const AppCli = @import("Cli.zig");
 // Report style with — so the dependency runs main -> Report -> DiagRender (no cycle).
 const Report = @import("Report.zig");
 const DiagRender = @import("DiagRender.zig");
+const codes = toyc.diagnostics.codes;
+const SevCfg = toyc.diagnostics.severity_config;
 const sty_err = DiagRender.sty_err;
 const sty_ok = DiagRender.sty_ok;
 const sty_head = DiagRender.sty_head;
@@ -98,6 +100,12 @@ pub fn main(init: std.process.Init) !void {
     }
     const argv = argv_list.items;
 
+    // The C3 severity-override rule list. Fn-scope (like `st.paths`) so it outlives
+    // every render; `applyParsed` fills it in FIXED (error, warn, ignore) order from
+    // the repeatable flags, borrowing argv bytes, then points `st.sev` at its items.
+    var sev_rules: std.ArrayList(SevCfg.Rule) = .empty;
+    defer sev_rules.deinit(gpa);
+
     // The collect-all parse-error accumulator. The parser never prints/exits — it
     // fills this and the driver formats + prints the accumulated errors itself.
     var sink: cli.Sink = .{};
@@ -128,7 +136,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
         .ok => |p| {
-            if (try applyParsed(gpa, AppCli.spec.root, p, out, err_level, &st)) |code| {
+            if (try applyParsed(gpa, AppCli.spec.root, p, out, err_level, &st, &sev_rules)) |code| {
                 try out.flush(); // exit skips defers; flush the styled arg-error line
                 std.process.exit(code);
             }
@@ -178,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
                                 try runExplain(out, err_level, p.code);
                                 try out.flush();
                                 return;
-                            } else if (try applyParsed(gpa, sub, p, out, err_level, &st)) |code| {
+                            } else if (try applyParsed(gpa, sub, p, out, err_level, &st, &sev_rules)) |code| {
                                 try out.flush(); // exit skips defers; flush the styled arg-error line
                                 std.process.exit(code);
                             }
@@ -220,12 +228,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.opt_stats, st.timings, st.jlimit, threads));
+        std.process.exit(try emitExecutable(gpa, out, level, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.opt_stats, st.timings, st.jlimit, threads, st.sev));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (st.emit == .ir) {
-        std.process.exit(try emitIr(gpa, out, level, st.target, st.paths.items, st.opt, st.jlimit));
+        std.process.exit(try emitIr(gpa, out, level, st.target, st.paths.items, st.opt, st.jlimit, st.sev));
     }
 
     const results = try Driver.run(gpa, io, st.emit, st.target, st.paths.items);
@@ -234,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
         gpa.free(results);
     }
 
-    const failures = try Report.report(out, gpa, level, results, st.emit, st.target, st.dump);
+    const failures = try Report.report(out, gpa, level, results, st.emit, st.target, st.dump, st.sev);
     try out.flush();
     // Signal compilation failure to scripts/CI. (Flush first; exit skips defers.)
     if (failures > 0) std.process.exit(1);
@@ -270,6 +278,10 @@ const State = struct {
     job_count: usize = 0,
     // The resolved `--color` choice, fed once into `resolveLevel` after the parse.
     color_choice: Terminal.ColorChoice = .auto,
+    // C3 render-time severity overrides (--error/--warn/--ignore). Empty by default ==
+    // identity, so no-flag runs render byte-identical. `rules` BORROWS argv bytes via a
+    // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
+    sev: SevCfg.SeverityConfig = .{},
     paths: std.ArrayList([]const u8),
 };
 
@@ -278,7 +290,7 @@ const State = struct {
 /// reified types with the identical field set (the shared option/positional consts);
 /// fields are read by name. Returns a non-null `?u8` exit code when the driver
 /// detects a bad value the grammar can't express (an unknown/empty opt pass name).
-fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytype, out: *Io.Writer, level: Style.ColorLevel, st: *State) !?u8 {
+fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytype, out: *Io.Writer, level: Style.ColorLevel, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
     _ = cmd;
     st.dump = p.dump;
     st.codegen_stats = p.codegen_stats;
@@ -330,10 +342,37 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         const pass = passByName(name) orelse return argErrCode(out, level, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
         st.opt.set(pass, false);
     }
+    // C3 severity overrides. Build the borrowed rule slice in FIXED severity order:
+    // all --error, then all --warn, then all --ignore. With `resolve`'s last-match-wins
+    // this makes ignore dominate warn dominate error for a code named by multiple flags,
+    // deterministically and independent of cross-flag argv position (the flat model
+    // loses cross-flag order — the same documented deviation as --verify/--force). Each
+    // spec must be a known code (R0001) or a band letter (L/P/R/T); garbage arg-errors
+    // (exit 1), mirroring --opt validation. RENDER-ONLY: never flips the exit status.
+    // Field `error` is a Zig keyword => access it as `p.@"error"`.
+    for (p.@"error") |m| {
+        if (!validSpec(m)) return argErrCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
+        try sev_rules.append(gpa, .{ .match = m, .action = .err });
+    }
+    for (p.warn) |m| {
+        if (!validSpec(m)) return argErrCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
+        try sev_rules.append(gpa, .{ .match = m, .action = .warning });
+    }
+    for (p.ignore) |m| {
+        if (!validSpec(m)) return argErrCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
+        try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
+    }
+    st.sev = .{ .rules = sev_rules.items };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
+}
+
+/// True when `m` names a diagnostic override target: a known code string ("R0001")
+/// or a single band letter (L/P/R/T). Used to validate --error/--warn/--ignore specs.
+fn validSpec(m: []const u8) bool {
+    return codes.fromStr(m) != null or (m.len == 1 and (m[0] == 'L' or m[0] == 'P' or m[0] == 'R' or m[0] == 'T'));
 }
 
 /// Map a `--opt`/`--no-opt` pass name to its `Opt.Pass`, or null if unknown.
@@ -579,6 +618,7 @@ fn emitExecutable(
     timings: bool,
     jlimit: Io.Limit,
     threads: usize,
+    sev: SevCfg.SeverityConfig,
 ) !u8 {
     // `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program. This is an in-body check
@@ -719,7 +759,7 @@ fn emitExecutable(
     };
 
     const engine = Engine.initProbe(cache, mode, probe_ptr);
-    if (!try runPipeline(out, gpa, level, engine, &orch)) return 1;
+    if (!try runPipeline(out, gpa, level, engine, &orch, sev)) return 1;
 
     // The interpreter ran every stage clean: `lowered` is `.ok` with no diagnostics.
     const lp = &lowered.?.ok;
@@ -791,7 +831,7 @@ fn emitExecutable(
 /// when a stage produced diagnostics (already rendered; the caller returns exit 1).
 /// Each stage's diagnostics route through the pretty `Renderer` (snippet + caret)
 /// against the owning module's source, styled at `level` (gate-safe at `.none`).
-fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, engine: Engine, orch: *const Orchestrator) !bool {
+fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, engine: Engine, orch: *const Orchestrator, cfg: SevCfg.SeverityConfig) !bool {
     toyc.StageGraph.interpret(&toyc.StageGraph.pipeline, engine, gpa, orch.*) catch |e| switch (e) {
         // A stage produced diagnostics: render them against the owning module and tell
         // the caller to exit non-zero. `failed_stage` says which stage's diagnostics.
@@ -799,8 +839,8 @@ fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel,
             const g = &orch.graph.*.?;
             switch (orch.failed_stage.*.?) {
                 .discover => try DiagRender.renderGraphError(gpa, out, level, g, g.err.?),
-                .resolve => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.res.*.?.diags),
-                .typecheck => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.tc.*.?.diags),
+                .resolve => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.res.*.?.diags, cfg),
+                .typecheck => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.tc.*.?.diags, cfg),
                 .codegen => switch (orch.tail) {
                     .lower => switch (orch.lowered.*.?) {
                         .err => |ee| try DiagRender.renderGraphEmit(gpa, out, level, g, ee),
@@ -838,6 +878,7 @@ fn emitIr(
     paths: []const []const u8,
     opt: Opt.Config,
     jlimit: Io.Limit,
+    sev: SevCfg.SeverityConfig,
 ) !u8 {
     // `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph. In-body
     // check that RETURNS 1 (not exit); `argLine` prints the styled error line AND
@@ -913,7 +954,7 @@ fn emitIr(
     };
 
     const engine = Engine.init(cache, .normal);
-    if (!try runPipeline(out, gpa, level, engine, &orch)) return 1;
+    if (!try runPipeline(out, gpa, level, engine, &orch, sev)) return 1;
 
     try out.writeAll(ir.?.ok);
     try out.flush();

@@ -21,6 +21,7 @@ pub const diagnostics = struct {
     pub const model = @import("diagnostics/model.zig");
     pub const codes = @import("diagnostics/codes.zig");
     pub const explain = @import("diagnostics/explain.zig");
+    pub const severity_config = @import("diagnostics/severity_config.zig");
 };
 pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
@@ -81,6 +82,7 @@ test {
     _ = diagnostics.model;
     _ = diagnostics.codes;
     _ = diagnostics.explain;
+    _ = diagnostics.severity_config;
     _ = Resolve;
     _ = ResolveGraph;
     _ = Typecheck;

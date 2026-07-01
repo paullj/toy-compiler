@@ -30,6 +30,12 @@ const shared_opts: []const Spec.Option = &.{
     .{ .long = "opt-stats", .action = .set_true, .help = "Print per-pass opt counters + dual metric (with -o; use --force)" },
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
+    // Render-time severity overrides (C3). Repeatable; take a code (R0001) or a band
+    // letter (L/P/R/T). Fixed precedence ignore > warn > error; last match wins.
+    // Render-only: they NEVER change the exit status.
+    .{ .long = "error", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --error R0001 or --error T; render-only)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable; render-only)" },
+    .{ .long = "ignore", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable; render-only)" },
 };
 
 /// The variadic input-file positional, shared by root/build/run.
@@ -63,7 +69,11 @@ pub const spec: Spec.Cli = .{
     },
 };
 
-// A malformed spec is a build error: `Spec.validate` fires `@compileError`.
+// A malformed spec is a build error: `Spec.validate` fires `@compileError`. The
+// larger option set (the C3 --error/--warn/--ignore flags added here) pushes the
+// comptime cross-check over the default 1000-branch budget, so raise the quota at this
+// caller-side comptime site (not in the framework).
 comptime {
+    @setEvalBranchQuota(20_000);
     Spec.validate(spec.root);
 }
