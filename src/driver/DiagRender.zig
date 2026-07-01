@@ -27,7 +27,7 @@ pub const sty_faint: Style.Style = Rr.Theme.plain.secondaryStyle(); // dim — m
 
 /// Renderer options for a colour level: ASCII carets (unicode off) keep output
 /// byte-stable and gate-safe.
-pub fn renderOpts(level: Style.ColorLevel) Rr.Renderer.RenderOpts {
+fn renderOpts(level: Style.ColorLevel) Rr.Renderer.RenderOpts {
     return .{ .color = level, .unicode = false };
 }
 
@@ -41,7 +41,7 @@ pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.So
 /// and a primary label at `[off, off)` carrying `message`; a non-empty `detail`
 /// becomes a `= note:` footer. With no offset, fall back to `renderPlainError`
 /// (detail inline as `(detail)`), preserving the old no-location shape.
-pub fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, byte_offset: ?u32, message: []const u8, detail: []const u8) !void {
+fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, byte_offset: ?u32, message: []const u8, detail: []const u8) !void {
     const off = byte_offset orelse return renderPlainError(out, level, name, message, detail);
     var sm = try Rr.SourceMap.init(gpa, name, src);
     defer sm.deinit(gpa);
@@ -63,7 +63,7 @@ pub fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Color
 /// `path: error: msg (detail)` shape with only the `error` word styled at `sty_err`
 /// (bright red 9 bold — matching the Renderer's own header word hue). Gate-safe: at
 /// `.none` `styled` writes only "error".
-pub fn renderPlainError(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, message: []const u8, detail: []const u8) !void {
+fn renderPlainError(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, message: []const u8, detail: []const u8) !void {
     try out.print("{s}: ", .{path});
     try sty_err.styled(out, level, "error");
     try out.print(": {s}", .{message});
