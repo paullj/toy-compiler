@@ -3,8 +3,8 @@
 //! line/col/text out; no I/O, no writer. An eager `line_starts:[]u32` index built
 //! by one O(n) scan at init makes every query a `const` pure fn (O(log lines)).
 //! - Byte column vs display column are separate fns on purpose: `byteCol` counts
-//!   bytes since the last '\n' (byte-for-byte identical to the driver's `lineCol`
-//!   at main.zig:983, the offset a lexer/parser reports); `displayCol` counts
+//!   bytes since the last '\n' (the classic 1-based byte column a lexer/parser
+//!   reports, pinned by a reference byte-counter in the tests); `displayCol` counts
 //!   terminal cells (via `width` + tab expansion, the caret column). Mixing them
 //!   silently mis-aligns a caret, so they never share a name (parity test pins it).
 //! - Tab: elastic tab stops in the display path only (advances to the next
@@ -34,7 +34,7 @@ bytes: []const u8,
 line_starts: []u32,
 
 /// A resolved position. Both fields are 1-based. `col` is byte-based (bytes
-/// since the last '\n', +1) — superset-compatible with driver/main.zig:983.
+/// since the last '\n', +1) — the classic lexer/parser column convention.
 pub const LineCol = struct { line: usize, col: usize };
 
 /// A half-open byte range `[start, end)` into `bytes`. `start == end` is a legal
@@ -105,8 +105,8 @@ pub fn lineIndex(self: *const Source, offset: u32) usize {
     return lo - 1;
 }
 
-/// Resolve `offset` to a 1-based line + 1-based byte column. Byte-for-byte
-/// identical to driver/main.zig:983 `lineCol` for all input (both count bytes).
+/// Resolve `offset` to a 1-based line + 1-based byte column (bytes since the last
+/// '\n' + 1) — the classic lexer/parser column, pinned by the parity tests below.
 /// Out-of-range offsets clamp to `bytes.len`.
 pub fn lineCol(self: *const Source, offset: u32) LineCol {
     const off = @min(offset, castLen(self.bytes.len));
@@ -219,9 +219,9 @@ fn castLen(len: usize) u32 {
 
 const testing = std.testing;
 
-// The byte-counting reference: a verbatim copy of driver/main.zig:983 `lineCol`.
-// Parity tests assert `Source.lineCol` equals this at every offset, pinning the
-// superset-compatibility contract so a future refactor can't silently drift.
+// The byte-counting reference: the straightforward per-byte line/col counter the
+// lexer/parser convention implies. Parity tests assert `Source.lineCol` equals this
+// at every offset, pinning the byte-column contract so a future refactor can't drift.
 fn refLineCol(source: []const u8, offset: u32) LineCol {
     var line: usize = 1;
     var col: usize = 1;
@@ -289,7 +289,7 @@ test "EOF span clamps to last line; offset > len == offset == len" {
     try testing.expectEqual(src.lineCol(6), src.lineCol(1000));
 }
 
-test "byteCol parity with driver lineCol on ASCII, every offset" {
+test "byteCol parity with the byte-counting reference on ASCII, every offset" {
     const s = "let x = 1\nlet y = 2\n\nreturn x + y";
     var src = try Source.init(testing.allocator, "p.toy", s);
     defer src.deinit(src.gpa);
@@ -305,7 +305,7 @@ test "byteCol parity with driver lineCol on ASCII, every offset" {
     }
 }
 
-test "byteCol parity with driver lineCol on multi-byte UTF-8, every offset (GRAFT)" {
+test "byteCol parity with the byte-counting reference on multi-byte UTF-8, every offset (GRAFT)" {
     // Mix wide (世), emoji (🎉), and a combining acute so a codepoint-counting
     // impl would diverge — proving byteCol is BYTE-based, matching the driver.
     const s = "\u{4E16}a\n\u{1F389}\ne\u{0301}x";
