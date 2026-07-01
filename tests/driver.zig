@@ -338,6 +338,142 @@ test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-on
     try testing.expectEqual(@as(usize, 1), carets);
 }
 
+/// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
+/// capturing stdout+stderr merged and the exit code. Returns the captured bytes (the
+/// caller frees) and the term. Skips when the built binary is absent.
+fn runToyOnFixture(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, src: []const u8, args: []const []const u8) !struct { out: []u8, term: std.process.Child.Term } {
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    var path_buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/one.toy", .{dir_name});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, bin_abs);
+    for (args) |a| try argv.append(gpa, a);
+    try argv.append(gpa, path);
+
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    const term = try child.wait(io);
+    return .{ .out = got, .term = term };
+}
+
+const c3_fixture = "fn main() -> int {\n  return nope\n}\n";
+
+fn countCarets(got: []const u8) usize {
+    var carets: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, got, i, "-->")) |at| {
+        carets += 1;
+        i = at + 3;
+    }
+    return carets;
+}
+
+test "C3 --warn downgrades an error to a warning (render-only, one -->)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-warn";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--warn", "R0001" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[R0001]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") == null);
+    // report-once preserved: exactly one primary caret line.
+    try testing.expectEqual(@as(usize, 1), countCarets(res.out));
+}
+
+test "C3 --ignore suppresses a code entirely (zero diagnostic bytes, exit unchanged)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-ignore";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--ignore", "R0001" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    // The ignored diagnostic renders zero bytes: no code, no caret.
+    try testing.expect(std.mem.indexOf(u8, res.out, "R0001") == null);
+    try testing.expectEqual(@as(usize, 0), countCarets(res.out));
+    // Render-only: the file still FAILS (the summary table reports the failure), and
+    // the process still exits non-zero — --ignore never flips the exit status.
+    try testing.expect(std.mem.indexOf(u8, res.out, "failure(s)") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "C3 band flag affects the whole band (--warn R downgrades R0001)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-band";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--warn", "R" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[R0001]:") != null);
+}
+
+test "C3 an unknown --warn spec is an arg error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-bad";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--warn", "BOGUS" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    try testing.expect(std.mem.indexOf(u8, res.out, "unknown code or band") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "C3 no flags is byte-identical to the C2 coded baseline" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-baseline";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    // Empty config == identity: the coded error header, never a warning token.
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning") == null);
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
