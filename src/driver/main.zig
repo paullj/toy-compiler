@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
 
     // The collect-all parse-error accumulator. The parser never prints/exits — it
     // fills this and the driver formats + prints the accumulated errors itself.
-    var sink: cli.Sink.Sink = .{};
+    var sink: cli.Sink = .{};
     defer sink.deinit(gpa);
 
     // Resolve a PRE-PARSE colour level for the error path with `.auto` (env + tty
