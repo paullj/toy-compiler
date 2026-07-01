@@ -3,17 +3,50 @@
 //! `scope` carries the owning module id in graph mode (`NO_SCOPE` single-file).
 
 const std = @import("std");
+const codes = @import("codes.zig");
+const model = @import("model.zig");
 
 /// The "untagged" scope: a single-file diagnostic carries no module id.
 pub const NO_SCOPE: u32 = std.math.maxInt(u32);
 
 /// The one diagnostic type shared by every stage. `byte_offset` points at the
 /// offending token; the driver/CLI renders byte_offset -> line:col uniformly.
-/// `scope` is the owning module id in graph mode, `NO_SCOPE` single-file. The
-/// default keeps every existing `.{ .byte_offset = x, .message = m }` literal
-/// compiling unchanged.
+/// `scope` is the owning module id in graph mode, `NO_SCOPE` single-file.
+///
+/// `code`/`severity` are BOTH trivially-copyable enums, so this stays memcpy-trivial
+/// POD (the Engine caches `[]const Diagnostic` as a raw blob). `code` is the stable
+/// identity from `codes.zig`; `severity` is the registry DEFAULT (render-time config
+/// overrides it late, never rewriting the stored value, so the cached blob stays
+/// rule-set-independent). Every default keeps existing
+/// `.{ .byte_offset = x, .message = m }` literals compiling unchanged.
 pub const Diagnostic = struct {
     byte_offset: u32,
     message: []const u8,
     scope: u32 = NO_SCOPE,
+    /// Stable identity (enum ordinal, cache-safe). `.none` => no `[code]` bracket.
+    code: codes.Code = .none,
+    /// Registry default severity; overridden LATE at render, never here.
+    severity: model.Severity = .err,
 };
+
+const testing = std.testing;
+
+test "the sink POD stays memcpy-trivial: the two new fields are ENUMS (cache-stability gate)" {
+    // This is the load-bearing cache-stability gate: the Engine caches a
+    // `[]const Diagnostic` blob by memcpy, so no field may be a slice/pointer beyond
+    // the already-borrowed `message`. C1 grew the POD to FIVE fields; both new fields
+    // must be trivially-copyable enums (never a `?[]const u8` code pointer).
+    try testing.expectEqual(@as(usize, 5), @typeInfo(Diagnostic).@"struct".fields.len);
+    try testing.expect(@FieldType(Diagnostic, "byte_offset") == u32);
+    try testing.expect(@FieldType(Diagnostic, "message") == []const u8);
+    try testing.expect(@FieldType(Diagnostic, "scope") == u32);
+    try testing.expect(@FieldType(Diagnostic, "code") == codes.Code);
+    try testing.expect(@FieldType(Diagnostic, "severity") == model.Severity);
+    try testing.expect(@typeInfo(@FieldType(Diagnostic, "code")) == .@"enum");
+    try testing.expect(@typeInfo(@FieldType(Diagnostic, "severity")) == .@"enum");
+    // Defaults keep every existing `.{ .byte_offset = x, .message = m }` literal valid.
+    const d: Diagnostic = .{ .byte_offset = 1, .message = "m" };
+    try testing.expectEqual(codes.Code.none, d.code);
+    try testing.expectEqual(model.Severity.err, d.severity);
+    try testing.expectEqual(NO_SCOPE, d.scope);
+}

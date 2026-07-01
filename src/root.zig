@@ -16,6 +16,12 @@ pub const Graph = @import("driver/Graph.zig");
 pub const DriverCodegen = @import("driver/Codegen.zig");
 pub const DiagnosticSink = @import("diagnostics/Sink.zig");
 pub const nearmiss = @import("diagnostics/nearmiss.zig");
+pub const diagnostics = struct {
+    pub const Diagnostic = @import("diagnostics/Diagnostic.zig");
+    pub const model = @import("diagnostics/model.zig");
+    pub const codes = @import("diagnostics/codes.zig");
+    pub const explain = @import("diagnostics/explain.zig");
+};
 pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
@@ -71,6 +77,10 @@ test {
     _ = Graph;
     _ = DiagnosticSink;
     _ = nearmiss;
+    _ = diagnostics.Diagnostic;
+    _ = diagnostics.model;
+    _ = diagnostics.codes;
+    _ = diagnostics.explain;
     _ = Resolve;
     _ = ResolveGraph;
     _ = Typecheck;

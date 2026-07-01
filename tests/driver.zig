@@ -266,6 +266,78 @@ test "B4: rendering a many-error file caps output at DIAG_CAP primaries + a summ
     try testing.expect(std.mem.indexOf(u8, got, "... and 20 more") != null);
 }
 
+test "C2 explain: a known code prints its doc (exit 0); an unknown code arg-errors (exit 2)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    // Known code: prints the doc, exit 0.
+    {
+        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "R0001" }, .stdout = .pipe });
+        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+        defer gpa.free(got);
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+        try testing.expect(std.mem.indexOf(u8, got, "R0001") != null);
+        try testing.expect(std.mem.indexOf(u8, got, "undeclared identifier") != null);
+    }
+    // Unknown code: an argument error, exit 2.
+    {
+        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "BOGUS" }, .stdout = .pipe });
+        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+        defer gpa.free(got);
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, term);
+        try testing.expect(std.mem.indexOf(u8, got, "unknown diagnostic code") != null);
+    }
+}
+
+test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-once (one -->)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-driver-coded";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const path = dir_name ++ "/one.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n  return nope\n}\n" });
+
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--emit", "check", path }, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    _ = try child.wait(io);
+
+    // The authorized C2 output change: the coded header bracket.
+    try testing.expect(std.mem.indexOf(u8, got, "error[R0001]:") != null);
+    // report-once preserved: exactly one primary caret line.
+    var carets: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, got, i, "-->")) |at| {
+        carets += 1;
+        i = at + 3;
+    }
+    try testing.expectEqual(@as(usize, 1), carets);
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

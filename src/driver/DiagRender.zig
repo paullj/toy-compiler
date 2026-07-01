@@ -9,6 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
+const codes = toyc.diagnostics.codes;
 const Graph = toyc.Graph;
 const Codegen = toyc.DriverCodegen;
 const cli = toyc.cli;
@@ -47,10 +48,24 @@ pub fn renderCapSummary(out: *Io.Writer, level: Style.ColorLevel, total: usize, 
     try out.writeByte('\n');
 }
 
-/// Render a resolve/type sink diagnostic against a prepared SourceMap: a zero-width
-/// primary `.err` at `d.byte_offset` (via `fromSink`), snippet + caret.
+/// Render a resolve/type sink diagnostic against a prepared SourceMap: build the rich
+/// `Diagnostic` INLINE from the POD (a zero-width primary at `d.byte_offset`, severity
+/// from the POD, code string from the registry — null for `.none` => NO `[code]`
+/// bracket, so uncoded diagnostics render byte-identical to the old `fromSink` path).
 pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, d: toyc.DiagnosticSink.Diagnostic) !void {
-    try Rr.Renderer.render(Rr.Diagnostic.fromSink(d), sm, out, renderOpts(level));
+    const rich = Rr.Diagnostic.Diagnostic{
+        .severity = d.severity, // C1: POD default (.err); C3 would override late via config.
+        .message = d.message, // borrowed
+        .primary = .{
+            .kind = .primary,
+            .span = .{ .start = d.byte_offset, .end = d.byte_offset }, // zero-width point
+            .message = d.message, // borrowed, aliases d.message
+            .source = d.scope, // NO_SCOPE -> NO_SOURCE verbatim
+        },
+        .code = codes.str(d.code), // null when .none -> no bracket -> byte-identical
+        .scope = d.scope,
+    };
+    try Rr.Renderer.render(rich, sm, out, renderOpts(level));
 }
 
 /// Render a LOCATED error: with an offset, build a one-off SourceMap over `name`/`src`

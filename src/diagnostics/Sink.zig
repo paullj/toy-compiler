@@ -10,8 +10,9 @@
 //! it in the struct makes the old "diags.len == diag_mods.len" length-sync
 //! hazard a type-level guarantee.
 //!
-//! Ordering is a single stable composite-key sort `(scope, byte_offset, message)`.
-//! The message is the final tiebreak so exact-triple duplicates land ADJACENT for
+//! Ordering is a single stable composite-key sort `(scope, byte_offset, code, message)`.
+//! `code` is a stable enum ordinal (deterministic across `-j`); for uncoded (`.none`)
+//! diagnostics it is inert, so the message is the final tiebreak so duplicates land ADJACENT for
 //! `dedupAdjacent` (even interleaved same-offset repeats). The sort key depends only
 //! on the diagnostic fields, so the merged stream is byte-identical at every `-j`:
 //! the parallel Pass-C typecheck merges per-worker sinks in fn-id (slot) order and
@@ -25,6 +26,11 @@ const std = @import("std");
 const diag = @import("Diagnostic.zig");
 pub const NO_SCOPE = diag.NO_SCOPE;
 pub const Diagnostic = diag.Diagnostic;
+
+// The code registry + model types the coded builder threads into each diagnostic.
+const codes = @import("codes.zig");
+const model = @import("model.zig");
+pub const Code = codes.Code;
 
 const DiagnosticSink = @This();
 
@@ -81,6 +87,74 @@ pub fn emitFmt(self: *DiagnosticSink, byte_offset: u32, comptime fmt: []const u8
     });
 }
 
+/// Record a static (borrowed) coded message: like `emit`, but stamps the stable
+/// `code` and its registry default severity onto the diagnostic. Existing sites keep
+/// calling `emit` (code stays `.none`); coded sites call this or the builder.
+pub fn emitCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, message: []const u8) !void {
+    try self.diags.append(self.gpa, .{
+        .byte_offset = byte_offset,
+        .message = message,
+        .scope = self.cur_scope,
+        .code = code,
+        .severity = codes.defaultSeverity(code),
+    });
+}
+
+/// Format + own a coded message. Same load-bearing reserve->allocPrint->track OOM
+/// ordering as `emitFmt`; additionally stamps `code` + its default severity.
+pub fn emitFmtCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
+    try self.diags.ensureUnusedCapacity(self.gpa, 1);
+    const msg = try std.fmt.allocPrint(self.gpa, fmt, args);
+    errdefer self.gpa.free(msg);
+    try self.owned.append(self.gpa, msg);
+    self.diags.appendAssumeCapacity(.{
+        .byte_offset = byte_offset,
+        .message = msg,
+        .scope = self.cur_scope,
+        .code = code,
+        .severity = codes.defaultSeverity(code),
+    });
+}
+
+/// Start a fluent coded diagnostic: `sink.err(.R0001).span(a,b).emit()` or
+/// `.emitFmt(fmt, args)`. Severity is sourced from the registry default only — no
+/// builder method accepts a raw severity, so no rule-dependent state can leak into
+/// the cached POD. The builder is purely additive; `emit`/`emitFmt` are untouched.
+pub fn err(self: *DiagnosticSink, code: codes.Code) Builder {
+    return .{ .sink = self, .code = code, .severity = codes.defaultSeverity(code) };
+}
+
+/// Fluent builder for a coded diagnostic. `span` sets the primary byte offset (its
+/// `start`); `emit`/`emitFmt` terminate, reusing `emitCode`/`emitFmtCode`'s owning +
+/// OOM discipline. Value-typed (each setter returns a copy), so it never aliases.
+pub const Builder = struct {
+    sink: *DiagnosticSink,
+    code: codes.Code,
+    severity: model.Severity,
+    primary: ?model.Span = null,
+
+    /// Set the primary span; the emitted diagnostic's `byte_offset` is `s`.
+    pub fn span(b: Builder, s: u32, e: u32) Builder {
+        var n = b;
+        n.primary = .{ .start = s, .end = e };
+        return n;
+    }
+
+    fn offset(b: Builder) u32 {
+        return if (b.primary) |p| p.start else 0;
+    }
+
+    /// Terminate with a static (borrowed) message.
+    pub fn emit(b: Builder, message: []const u8) !void {
+        try b.sink.emitCode(b.code, b.offset(), message);
+    }
+
+    /// Terminate with an owned formatted message.
+    pub fn emitFmt(b: Builder, comptime fmt: []const u8, args: anytype) !void {
+        try b.sink.emitFmtCode(b.code, b.offset(), fmt, args);
+    }
+};
+
 /// Serial merge of a worker's sink into this one, transferring ownership of both
 /// its diags and its owned messages, then emptying it (so its `deinit` is a
 /// no-op and there is no double-free). Capacity is reserved FIRST so the appends
@@ -95,8 +169,8 @@ pub fn merge(self: *DiagnosticSink, other: *DiagnosticSink) !void {
     other.owned.clearAndFree(other.gpa);
 }
 
-/// Deterministic stable total order: key `(scope, byte_offset, message)`, with any
-/// residual ties (fully identical triples) broken by pre-sort (insertion) index.
+/// Deterministic stable total order: key `(scope, byte_offset, code, message)`, with any
+/// residual ties (fully identical tuples) broken by pre-sort (insertion) index.
 /// ONE stable sort drives BOTH modes — single-file degenerates because every
 /// scope == NO_SCOPE. Idempotent; call once after all emits/merges.
 pub fn sort(self: *DiagnosticSink) void {
@@ -104,9 +178,9 @@ pub fn sort(self: *DiagnosticSink) void {
     self.dedupAdjacent();
 }
 
-/// Collapse EXACT-duplicate diagnostics keyed on `(scope, byte_offset, message)`.
+/// Collapse EXACT-duplicate diagnostics keyed on `(scope, byte_offset, code, message)`.
 /// PRECONDITION: called right after the stable sort, whose full key is
-/// `(scope, byte_offset, message)` — so every exact-triple repeat is contiguous,
+/// `(scope, byte_offset, code, message)` — so every exact-tuple repeat is contiguous,
 /// even interleaved same-offset duplicates like emission `A, B, A` (the message
 /// tiebreak pulls the two `A`s together). One linear compaction keeps the first of
 /// each adjacent run and drops later exact repeats. Idempotent (dedup of an
@@ -125,6 +199,7 @@ fn dedupAdjacent(self: *DiagnosticSink) void {
         const prev = d[w - 1];
         const same = cur.scope == prev.scope and
             cur.byte_offset == prev.byte_offset and
+            cur.code == prev.code and
             std.mem.eql(u8, cur.message, prev.message);
         if (!same) {
             d[w] = cur;
@@ -139,6 +214,11 @@ const SortCtx = struct {
     pub fn lessThan(c: SortCtx, a: usize, b: usize) bool {
         if (c.diags[a].scope != c.diags[b].scope) return c.diags[a].scope < c.diags[b].scope;
         if (c.diags[a].byte_offset != c.diags[b].byte_offset) return c.diags[a].byte_offset < c.diags[b].byte_offset;
+        // Code before message: a stable enum ordinal (deterministic across `-j`,
+        // unlike a pointer). For all existing `.none` diagnostics this component is
+        // constant/inert, so the message tiebreak still drives ordering there.
+        if (c.diags[a].code != c.diags[b].code)
+            return @intFromEnum(c.diags[a].code) < @intFromEnum(c.diags[b].code);
         // Final tiebreak: message bytes. This groups exact-triple duplicates
         // ADJACENTLY so `dedupAdjacent` catches interleaved same-offset repeats
         // (emission order `A, B, A` would otherwise leave the two `A`s split by
@@ -453,6 +533,67 @@ test "dedup is idempotent (a second sort changes nothing)" {
     try testing.expectEqual(@as(usize, 2), sink.count());
     try testing.expectEqualStrings("keep", sink.items()[0].message);
     try testing.expectEqualStrings("dup", sink.items()[1].message);
+}
+
+test "sort orders by code BEFORE message at an equal (scope, byte_offset)" {
+    // Three diagnostics at one (scope, byte_offset), same message, DIFFERENT codes.
+    // The code component (an enum ordinal) sorts before message, so they come out
+    // none(0) < R0001 < R0002 regardless of emission order.
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emitCode(.R0002, 10, "x");
+    try sink.emit(10, "x"); // .none
+    try sink.emitCode(.R0001, 10, "x");
+    sink.sort();
+    const got = sink.items();
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expectEqual(codes.Code.none, got[0].code);
+    try testing.expectEqual(codes.Code.R0001, got[1].code);
+    try testing.expectEqual(codes.Code.R0002, got[2].code);
+}
+
+test "dedup respects code: identical (scope, offset, message) but different codes both survive" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.emitCode(.R0001, 10, "same");
+    try sink.emitCode(.R0002, 10, "same");
+    sink.sort();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    // And two truly-identical coded diagnostics DO collapse.
+    var s2 = DiagnosticSink.init(testing.allocator);
+    defer s2.deinit();
+    try s2.emitCode(.R0001, 10, "same");
+    try s2.emitCode(.R0001, 10, "same");
+    s2.sort();
+    try testing.expectEqual(@as(usize, 1), s2.count());
+}
+
+test "the coded builder stamps code + registry default severity" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.err(.R0001).span(7, 9).emitFmt("undeclared '{s}'", .{"x"});
+    try sink.err(.T0004).emit("recursive"); // no span => byte_offset 0
+    sink.sort();
+    const got = sink.items();
+    try testing.expectEqual(@as(usize, 2), got.len);
+    // T0004 sorts first (byte_offset 0 < 7).
+    try testing.expectEqual(@as(u32, 0), got[0].byte_offset);
+    try testing.expectEqual(codes.Code.T0004, got[0].code);
+    try testing.expectEqual(model.Severity.err, got[0].severity);
+    try testing.expectEqual(@as(u32, 7), got[1].byte_offset);
+    try testing.expectEqual(codes.Code.R0001, got[1].code);
+    try testing.expectEqualStrings("undeclared 'x'", got[1].message);
+}
+
+test "builder emitFmt OOM after allocPrint leaks nothing (mirrors the emitFmt OOM gate)" {
+    // The builder routes through `emitFmtCode`, which reuses the reserve->allocPrint->
+    // track ordering. Fail the `owned.append` after a successful `allocPrint`: the
+    // errdefer must free the message, so deinit sees no leak and no double-free.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    var sink = DiagnosticSink.init(failing.allocator());
+    try testing.expectError(error.OutOfMemory, sink.err(.R0001).span(1, 2).emitFmt("msg {d}", .{1}));
+    try testing.expectEqual(@as(usize, 0), sink.count());
+    sink.deinit();
 }
 
 test "sort is idempotent and count tracks items" {
