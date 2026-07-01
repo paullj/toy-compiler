@@ -218,30 +218,30 @@ fn dumpArtifact(out: *Io.Writer, r: Driver.FileResult, emit: Driver.Emit) !void 
 fn dumpCheck(out: *Io.Writer, r: Driver.FileResult) !void {
     if (r.nodes.len == 0) return;
     const tree: Ast.Tree = .{ .nodes = r.nodes, .extra = r.extra };
-    const prog = r.nodes[Ast.root(r.nodes)];
+    const prog = r.nodes[Ast.root(r.nodes).int()];
     if (prog.tag != .program) return;
 
     const tc = r.typecheck;
-    for (Ast.rangeSlice(tree, prog.lhs)) |fn_idx| {
-        const decl = r.nodes[fn_idx];
+    for (Ast.rangeSlice(tree, prog.lhs.int())) |fn_idx| {
+        const decl = r.nodes[fn_idx.int()];
         if (decl.tag != .fn_decl) continue;
         const name = r.tokens[decl.main_token].text(r.source);
-        const proto = Ast.protoAt(tree, decl.lhs);
+        const proto = Ast.protoAt(tree, decl.lhs.int());
 
         try out.print("    fn {s}(", .{name});
         for (proto.params, 0..) |p_idx, i| {
             if (i != 0) try out.writeAll(", ");
-            const p = r.nodes[p_idx];
+            const p = r.nodes[p_idx.int()];
             const p_name = r.tokens[p.main_token].text(r.source);
-            const p_type = r.tokens[r.nodes[p.lhs].main_token].text(r.source);
+            const p_type = r.tokens[r.nodes[p.lhs.int()].main_token].text(r.source);
             try out.print("{s}: {s}", .{ p_name, p_type });
         }
         const ret = if (proto.ret_type == Ast.none)
             "()"
-        else if (r.nodes[proto.ret_type].tag == .literal_unit)
+        else if (r.nodes[proto.ret_type.int()].tag == .literal_unit)
             "()"
         else
-            r.tokens[r.nodes[proto.ret_type].main_token].text(r.source);
+            r.tokens[r.nodes[proto.ret_type.int()].main_token].text(r.source);
         // `rhs` is the body block; its inferred type isn't tracked, so report the
         // declared return spelling — the typechecker has already verified it.
         try out.print(") -> {s}\n", .{ret});

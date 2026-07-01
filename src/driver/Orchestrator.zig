@@ -209,7 +209,7 @@ fn fnResolveDigest(gf: ResolveGraph.GlobalFn) u64 {
     var h = std.hash.Wyhash.init(0x52_53_4c_56); // "RSLV"
     var b: [8]u8 = undefined;
     std.mem.writeInt(u32, b[0..4], gf.module, .little);
-    std.mem.writeInt(u32, b[4..8], gf.decl_node, .little);
+    std.mem.writeInt(u32, b[4..8], gf.decl_node.int(), .little);
     h.update(&b);
     h.update(gf.name);
     return h.final();
