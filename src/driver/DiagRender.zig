@@ -2,10 +2,9 @@
 //! via SourceMap + render.Diagnostic + the pretty Renderer (snippet + caret). Owns
 //! the shared status palette (below) — the one hue set both this and Report use.
 //!
-//! Framework gap (worked around, not patched): the Renderer needs a Span to snippet,
-//! so a Graph.Error / EmitError with no `byte_offset` (or no loaded source) falls
-//! back to `renderPlainError` (`path: error: msg (detail)`), preserving the old
-//! no-location shape.
+//! Location fallback: the Renderer needs a Span to draw a snippet, so a Graph.Error
+//! or EmitError with no `byte_offset` (or no loaded source) renders through
+//! `renderPlainError` as the plain no-location `path: error: msg (detail)` shape.
 
 const std = @import("std");
 const Io = std.Io;
