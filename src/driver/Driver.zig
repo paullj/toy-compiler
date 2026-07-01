@@ -92,7 +92,7 @@ pub const FileResult = struct {
     nodes: []Ast.Node = &.{},
     /// Variable-arity child runs paired with `nodes` (see `Ast`). Owned.
     extra: []u32 = &.{},
-    /// `pub` export bitset paired with `nodes` (M14, see `Ast.Tree.pub_bits`).
+    /// `pub` export bitset paired with `nodes` (see `Ast.Tree.pub_bits`).
     /// Owned; empty for a program with no exports.
     pub_bits: []const u32 = &.{},
     /// Whether each phase's result was loaded from cache rather than recomputed.
@@ -175,7 +175,7 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     const cache_phase = emit.cachePhase();
     result.source = try Io.Dir.cwd().readFileAlloc(io, result.path, gpa, .unlimited);
 
-    // --- lex --- (routed through the query engine, the M15 seam)
+    // lex: routed through the query engine
     const engine = Engine.init(cache, .normal);
     const lexed = try engine.lex(gpa, io, target, result.source, index, false);
     result.tokens = lexed.value;
@@ -183,7 +183,6 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
 
     if (@intFromEnum(cache_phase) < @intFromEnum(Cache.Phase.parse)) return;
 
-    // --- parse ---
     // The parse output is a Tree (nodes + extra). We pack both into one flat
     // []u8 blob and store/load it through the existing generic byte cache;
     // Ast.unpack validates a hit and treats a corrupt/foreign blob as a miss.
@@ -201,7 +200,7 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
 
     if (!emit.runsCheck()) return;
 
-    // --- check: name resolution then typecheck (in-memory only; uncached). ---
+    // check: name resolution then typecheck, in-memory only; uncached.
     // A lone source file is compiled as the trivial one-module graph: the graph
     // front-end (`resolveGraph`/`checkGraph`) is the ONLY resolve/typecheck path,
     // and its whole-graph results (one module → program-wide tables == local
@@ -234,8 +233,6 @@ fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target: []
     if (result.typecheck.?.diags.len > 0) result.err = error.TypeError;
 }
 
-// ---- code emission (the `-o` path) -----------------------------------------
-
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
 /// returns these to `main`, which renders them and exits non-zero.
@@ -265,11 +262,11 @@ pub const LinkedProgram = struct {
     data_relocs: []Link.Reloc = &.{},
     /// Whether the program calls `print` (→ one `_write` import).
     uses_write: bool = false,
-    /// M5 incremental counters: how many functions were freshly lowered vs served
+    /// Incremental counters: how many functions were freshly lowered vs served
     /// from the codegen cache this build. Surfaced via `--codegen-stats`.
     codegen_compiled: usize = 0,
     codegen_cached: usize = 0,
-    /// M13 dual-metric: summed opt counters over freshly-lowered fns, the total
+    /// dual-metric: summed opt counters over freshly-lowered fns, the total
     /// IR instruction count after opt, and the emitted aarch64 instruction count
     /// (text.len/4). No owned slices → deinit unchanged. Cached fns contribute 0
     /// to opt_stats/ir_instrs (their opt ran on a prior build), so honest
@@ -307,7 +304,7 @@ const FnSlot = struct {
     fc: ?Link.FnCode = null,
     cached: bool = false,
     err: ?anyerror = null,
-    /// M13 dual-metric, set only when the fn is freshly lowered (cached fns
+    /// dual-metric, set only when the fn is freshly lowered (cached fns
     /// leave these at 0). Accumulated into the LinkedProgram in the collect loop.
     opt_stats: Opt.Stats = .{},
     ir_instrs: usize = 0,
@@ -328,7 +325,7 @@ const Frozen = struct {
     /// A one-element slice naming this job's fn (`frozenFor` points it at a stack buf).
     fn_nodes: []const Ast.Index,
     sigs: []const Fingerprint.Sig,
-    /// M13 opt level / pass selection. Mixed into the codegen cache key so
+    /// Opt level / pass selection. Mixed into the codegen cache key so
     /// toggling `-O` lands on a different entry, and threaded into `lowerOne`.
     opt: Opt.Config,
 };
@@ -399,8 +396,6 @@ fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []cons
     };
 }
 
-// ---- M14 whole-graph code emission -----------------------------------------
-
 /// Frozen, read-only inputs shared by every codegen job in a WHOLE-GRAPH build.
 /// Per-module arrays (trees/tokens/sources/resolutions/node_types) are indexed by
 /// module id; `layouts`/`enum_layouts`/`names`/`sigs` are PROGRAM-WIDE (one global
@@ -409,7 +404,7 @@ fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []cons
 /// codegen job selects its fn's owning module to build a single-fn `Frozen` view,
 /// so `walkCalls`/`walkTouchedSig`/`typeRefToType`/`fingerprint`/`lowerOne` run
 /// UNCHANGED — the only difference from single-file is which module's tree/resolutions
-/// they read. [design 8/10]
+/// they read.
 const GraphFrozen = struct {
     trees: []const Ast.Tree,
     tokens: []const []const Token,
@@ -464,7 +459,7 @@ const GraphFrozen = struct {
 /// through the codegen cache), then run the serial relink tail. The entry `main`
 /// MUST live in the entry module (error otherwise). `res`/`tc` are the whole-graph
 /// resolve/typecheck results (program-wide global ids). Caller owns the returned
-/// `LinkedProgram` on success. [design 5/8]
+/// `LinkedProgram` on success.
 pub fn lowerGraphProgram(
     gpa: std.mem.Allocator,
     io: Io,
@@ -478,14 +473,13 @@ pub fn lowerGraphProgram(
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
     /// The `-j` jobs knob: the chunk-count basis for the per-fn codegen fan-out (0 =>
-    /// host cpu count). PERF P1 — codegen dispatches ~`ncpu` chunks, not one task per
+    /// host cpu count). Codegen dispatches ~`ncpu` chunks, not one task per
     /// fn, so `-jN` scales. Determinism is unchanged (ranges are disjoint, slots read
     /// back in index order), so this is a perf lever only.
     ncpu: usize,
 ) !LowerProgramResult {
     const n_mods = graph.modules.len;
 
-    // --- per-module Frozen inputs (one Tree view + arrays per module) ---
     const trees = try gpa.alloc(Ast.Tree, n_mods);
     defer gpa.free(trees);
     const toks = try gpa.alloc([]const Token, n_mods);
@@ -504,18 +498,16 @@ pub fn lowerGraphProgram(
         ntypes[i] = tc.node_types[i];
     }
 
-    // --- program-wide SymName table (one per global fn id) ---
     // Mirrors the resolver's global fn order exactly: a user fn -> {user_fn, its
     // qualified/bare name from the typecheck sig}; the synthetic bodyless `print`
     // -> {builtin,"print"}. The qualified name MUST equal the typecheck sig name
-    // so the fingerprint callee fold lines up with the reloc target. [design 8]
+    // so the fingerprint callee fold lines up with the reloc target.
     const names = try buildGraphNames(gpa, res.fns, tc.sigs);
     defer {
         for (names) |nm| gpa.free(nm.name);
         gpa.free(names);
     }
 
-    // --- enumerate lowerable fns (skip the bodyless print) + find entry main ---
     var fn_decls: std.ArrayList(Ast.Index) = .empty;
     defer fn_decls.deinit(gpa);
     var fn_modules: std.ArrayList(u32) = .empty;
@@ -579,7 +571,6 @@ pub fn lowerGraphProgram(
         .probe = probe,
     };
 
-    // --- parallel per-fn fan-out (one slot per lowerable fn) ---
     const slots = try gpa.alloc(FnSlot, fn_decls.items.len);
     defer gpa.free(slots);
     for (slots) |*s| s.* = .{};
@@ -658,7 +649,7 @@ fn nowNs(io: Io) i128 {
 /// module, then run the fingerprint→cache→lower path via `Engine.codegen`. The
 /// cross-module callee identity + touched layouts ride in through the program-wide
 /// `names`/`sigs`/`layouts`, so the fingerprint folds a qualified callee's SymName+sig
-/// distinctly with NO engine change. [design 8/10]
+/// distinctly with NO engine change.
 fn graphFnJob(
     gpa: std.mem.Allocator,
     io: Io,
@@ -694,7 +685,7 @@ fn graphFnJobInner(
     // fn_decl param/return fold uses the ABI-correct GLOBAL type ids — including a
     // CROSS-MODULE qualified `b: rect.Rect`. A bare-name re-resolution would mis-pick
     // the first same-named type in the merged layout table, missing a pub-type
-    // layout edit at the importer (cross-module M9 / TOP-RISK-#1 hole). [design 10]
+    // layout edit at the importer (cross-module M9 / TOP-RISK-#1 hole).
     const my_sig: ?Fingerprint.Sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
 
     // The cross-module callee identity + touched layouts ride in through the
@@ -792,8 +783,6 @@ pub fn buildImage(
 ) ![]u8 {
     return link.assembleAndSign(io, gpa, identifier, code, entry_off, cstrings, data_relocs, uses_write);
 }
-
-// ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -1440,8 +1429,6 @@ test "integration: print writes the expected bytes to stdout" {
         try testing.expectEqualStrings(c.want, got);
     }
 }
-
-// ---- M5 incremental + parallel codegen tests -------------------------------
 
 /// Lower `src` (written to `path`) through the codegen cache in `cache`, then
 /// return the linked program. Caller owns the result (deinit) and `r` (deinit).

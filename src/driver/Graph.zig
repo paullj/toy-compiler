@@ -152,7 +152,7 @@ pub fn discover(
     entry_path: []const u8,
     /// `--timings` probe for the discover stage's lex+parse queries (file-read+lex+parse
     /// COMPUTE vs served from the lex/parse content cache). BORROWED; null on a plain
-    /// build => the front-end queries read no clock. PERF P4.
+    /// build => the front-end queries read no clock.
     probe: ?*Engine.StageProbe,
 ) !Graph {
     var d: Discoverer = .{
@@ -257,8 +257,6 @@ pub fn single(
     return .{ .ownership = .borrowed, .modules = modules, .entry_index = 0, .err = null };
 }
 
-// ---- discovery internals ----------------------------------------------------
-
 const DiscoverError = error{ Structural, OutOfMemory };
 
 /// Per-module discovery state during the DFS.
@@ -297,7 +295,7 @@ const Discoverer = struct {
     io: Io,
     cache: Cache,
     target: []const u8,
-    /// PERF P4: `--timings` probe for this stage's lex+parse queries (compute vs
+    /// `--timings` probe for this stage's lex+parse queries (compute vs
     /// cache). Null on a plain build => no clock reads.
     probe: ?*Engine.StageProbe = null,
     /// The root directory (entry file's directory). Borrowed from `entry_path`.
@@ -431,7 +429,7 @@ const Discoverer = struct {
     /// Obtain module `id`'s source + tokens + AST, then fill its slot. On a parse error,
     /// fail.
     ///
-    /// WARM-DISCOVER FAST PATH (PERF): discover unconditionally read + lex + parsed every
+    /// WARM-DISCOVER FAST PATH: discover unconditionally read + lex + parsed every
     /// module every build. On a warm rebuild lex/parse are content-cache HITS (memory
     /// lookups, no compute), so the residual cost is the per-file READ syscalls — and that
     /// is what dominated warm discover. The fix: a per-file MANIFEST (persisted alongside
@@ -496,11 +494,9 @@ const Discoverer = struct {
         // = module id). The lex/parse queries are themselves cache-first.
         const engine = Engine.initProbe(d.cache, .normal, d.probe);
 
-        // --- lex (cached) ---
         const lexed = try engine.lex(d.gpa, d.io, d.target, source, id, true);
         const tokens = lexed.value;
 
-        // --- parse (cached) ---
         const parsed = try engine.parse(d.gpa, d.io, d.target, source, tokens, id, true);
         if (parsed.tree == null) {
             const s = &d.slots.items[id];
@@ -572,7 +568,7 @@ const Discoverer = struct {
         // OWNERSHIP: every cache-get is owned by a `defer free()` guarded by `served`,
         // which is set ONLY on the all-hit exit. A `return false` past any get frees what
         // it fetched and leaves the slot untouched (the caller then takes the full path).
-        // PERF P4: charge the warm serve's three cache-gets + unpack to the discover GET
+        // charge the warm serve's three cache-gets + unpack to the discover GET
         // bucket so `--timings` attributes the warm path (it bypasses `Engine.query`).
         const get_t0: i128 = if (d.probe != null) Engine.StageProbe.now(d.io) else 0;
         var served = false;
@@ -805,8 +801,6 @@ fn importTokenOffset(d: *Discoverer, from: u32, target: u32) ?u32 {
     return s.tokens[0].start;
 }
 
-// ---- path helpers ------------------------------------------------------------
-
 /// Join the import path segments with `/`.
 fn joinPath(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, segs: []const u32) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -859,8 +853,6 @@ fn stem(name: []const u8) []const u8 {
     if (std.mem.endsWith(u8, name, ext)) return name[0 .. name.len - ext.len];
     return name;
 }
-
-// ---- tests -------------------------------------------------------------------
 
 const testing = std.testing;
 
