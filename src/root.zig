@@ -18,6 +18,7 @@ pub const DiagnosticSink = @import("diagnostics/Sink.zig");
 pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
+pub const ControlFlow = @import("ControlFlow.zig");
 pub const TypecheckGraph = @import("types_graph.zig");
 pub const LayoutEngine = @import("layout/Engine.zig");
 pub const Aarch64 = @import("codegen/Aarch64.zig");
@@ -71,6 +72,7 @@ test {
     _ = Resolve;
     _ = ResolveGraph;
     _ = Typecheck;
+    _ = ControlFlow;
     _ = TypecheckGraph;
     _ = LayoutEngine;
     _ = Aarch64;
