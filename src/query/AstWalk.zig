@@ -321,6 +321,9 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             for (binders) |b| try walkInner(src, b, collect, visitor);
         },
         .pattern_wildcard => {}, // the tag byte IS its content
+        // A poison leaf: inert, no children. The `.enter` tag byte (emitted above)
+        // is its whole contribution to the fingerprint, like `pattern_wildcard`.
+        .error_node => {},
         .pattern_binding => {
             try emit(visitor, .{ .leaf = leaf });
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // rename vs pun

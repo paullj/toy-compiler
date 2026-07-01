@@ -1350,6 +1350,8 @@ test "root is program and children precede parents" {
             .field_access => try testing.expect(n.lhs.int() < self),
             // Leaves: `main_token` only; no child node indices to order.
             .literal_number, .literal_string, .literal_bool, .identifier => {},
+            // A poison leaf holds only its offending token; no child nodes.
+            .error_node => {},
             .enum_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             .enum_variant_unit => {},
             .enum_variant_tuple, .enum_variant_struct => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),

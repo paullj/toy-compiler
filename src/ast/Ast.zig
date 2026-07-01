@@ -268,6 +268,16 @@ pub const Node = extern struct {
         /// has no node children and the children-before-parents invariant is
         /// vacuously satisfied.
         import_decl,
+
+        /// A poison/error leaf the fault-tolerant parser will emit at a parse
+        /// error to keep building a (partial) tree instead of bailing. A leaf:
+        /// `main_token` is the offending token; `lhs`/`rhs` are `Ast.none`. It is
+        /// already-diagnosed by construction, so downstream stages treat it as an
+        /// inert leaf that produces NO further diagnostics (no name lookup, no
+        /// type error — it types as the poison `Kind.invalid`) and never reaches
+        /// codegen (a later milestone gates a `tainted` tree out before lower).
+        /// NOTE: not produced anywhere yet, so behavior is unchanged for now.
+        error_node,
     };
 };
 
@@ -395,8 +405,10 @@ pub const parse_magic: u32 = 0x544f5950;
 pub const ParseHeader = extern struct {
     magic: u32,
     /// Bumped to 4 in M14 to add the trailing `pub_bits` section; older v3 blobs
-    /// (no `pub_bits`) miss cleanly via the version check in `unpack`.
-    version: u32 = 4,
+    /// (no `pub_bits`) miss cleanly via the version check in `unpack`. Bumped to 5
+    /// when the `error_node` Tag ordinal was appended, so a blob produced by an
+    /// older compiler is rejected rather than reused across the Tag change.
+    version: u32 = 5,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -457,7 +469,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 4) return null;
+    if (hdr.magic != parse_magic or hdr.version != 5) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -492,6 +504,9 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
     switch (n.tag) {
         .literal_number, .literal_string, .literal_bool, .identifier => try out.writeAll(tok_text),
         .literal_unit => try out.writeAll("()"),
+        // A poison leaf renders as a fixed `(error)` marker (its `main_token` is
+        // the offending token, but the marker deliberately elides its text).
+        .error_node => try out.writeAll("(error)"),
         .unary => {
             try out.print("({s} ", .{tok_text});
             try renderNode(out, tree, tokens, source, n.lhs);
