@@ -1,27 +1,14 @@
-//! `toyc` CLI entry point.
+//! `toyc` CLI entry point: `toy [build|run] [OPTIONS] <file...>`.
 //!
-//! Usage:
-//!   toy [build|run] [OPTIONS] <file...>
-//!
-//! With NO subcommand a bare `toy <file>` builds a signed executable (output → the
-//! default build dir); `--emit lex|parse|check|ir` opts into an INSPECTION mode
-//! instead (no binary). The `build`/`run` subcommands (and any `-o`/`--output`)
-//! force a build; `run` additionally execs the produced binary and reports its exit
-//! status. `--dump` prints the emit phase's artifact: tokens for `lex`, the AST
-//! S-expression for `parse`, and the AST plus a per-function signature summary for
-//! `check`; `--emit ir` prints the target-independent IR text. `-o` carries on
-//! through lower → codegen → link → sign.
-//!
-//! CLI + DIAGNOSTICS. Argument parsing is the typed `toyc.cli` framework: the app
-//! schema is `Cli.zig` (a sibling `@import`), parsed by `cli.Parser` with a
-//! collect-all `cli.Sink`; `-h`/`--help` and `-V`/`--version` route to
-//! `cli.Help`. Per-diagnostic lines render through the pretty
-//! `toyc.term.render.Renderer` (snippet + caret), and the STATUS output (the report
-//! table, --timings, the build-time line, the run-status line) is colourised via
-//! `toyc.term.Style`. Colour is resolved ONCE per phase from `--color` + a
-//! `detectTty(stdout)` probe + the environment (NO_COLOR / CLICOLOR / TERM), so a
-//! piped/redirected/CI run resolves to `.none` and emits ZERO escape bytes — the
-//! load-bearing gate that keeps diff.sh and any captured output byte-stable.
+//! A bare `toy <file>` builds a signed executable; `--emit lex|parse|check|ir`
+//! inspects the pipeline instead (no binary); `build`/`run` (and any `-o`) force a
+//! build, `run` also execs the binary. See `Cli.zig` for the schema.
+//! - Argument parsing is the typed `toyc.cli` framework (schema `Cli.zig`, parsed
+//!   by `cli.Parser` with a collect-all `cli.Sink`). Diagnostics render through
+//!   `toyc.term.render.Renderer`; status output colourises via `toyc.term.Style`.
+//! - Colour is resolved once per phase from `--color` + a `detectTty(stdout)` probe
+//!   + the environment, so a piped/redirected/CI run resolves to `.none` and emits
+//!   zero escape bytes — the gate that keeps diff.sh and captured output byte-stable.
 
 const std = @import("std");
 const Io = std.Io;

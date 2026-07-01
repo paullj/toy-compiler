@@ -1,20 +1,12 @@
-//! Terminal display width of Unicode text: how many terminal cells a codepoint
-//! or UTF-8 string occupies (0 for combining/zero-width/controls, 2 for
-//! East-Asian Wide + Fullwidth + emoji, else 1). A pure leaf — bytes/codepoint
-//! in, width out; no I/O, no allocation.
-//!
-//! LIMITS (documented on purpose, not bugs):
-//!   - The range tables are NOT the full Unicode Character Database. They cover
-//!     the common wide/combining blocks; a rare codepoint outside them defaults
-//!     to width 1.
-//!   - No grapheme / ZWJ segmentation. A ZWJ emoji sequence (e.g. a family
-//!     emoji built from several codepoints joined by U+200D) is measured
-//!     codepoint-by-codepoint, so it OVER-counts vs. what a modern terminal
-//!     renders. This is the conservative direction: we never under-reserve
-//!     space, so downstream caret/column alignment stays sound.
-//!   - Tab is NOT special-cased. A tab (U+0009) is a C0 control and reports 0
-//!     here; the CALLER is responsible for expanding tabs via its own
-//!     `tab_width` before measuring.
+//! Terminal display width of Unicode text: how many cells a codepoint or UTF-8
+//! string occupies (0 for combining/zero-width/controls, 2 for East-Asian Wide +
+//! Fullwidth + emoji, else 1). A pure leaf; no I/O, no allocation.
+//! - The range tables cover the common wide/combining blocks, not the full UCD; a
+//!   rare codepoint outside them defaults to width 1.
+//! - No grapheme/ZWJ segmentation: a ZWJ emoji sequence is measured per codepoint,
+//!   so it over-counts. Conservative direction — never under-reserve space.
+//! - Tab (U+0009) is a C0 control and reports 0; the caller expands tabs via its
+//!   own `tab_width` before measuring.
 
 const std = @import("std");
 const unicode = std.unicode;

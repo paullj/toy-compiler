@@ -1,33 +1,18 @@
-//! The `toy` compiler's CLI SCHEMA — a comptime `cli.Spec.Cli` the driver
-//! (`main.zig`) parses with `cli.Parser`. This is the APP spec (it lives in the
-//! driver, NOT in the `cli/*` framework); `main.zig` imports it as a sibling
-//! `@import("Cli.zig")`, distinct from the framework's `toyc.cli.Cli` facade.
+//! The `toy` compiler's CLI schema: a comptime `cli.Spec.Cli` the driver
+//! (`main.zig`) parses with `cli.Parser`. `build`/`run` are subcommands sharing
+//! the root's option set + variadic `<file>` positional; a bare `toy` builds/inspects.
 //!
-//! Shape (locked): `build` (compile to a signed executable; the default action)
-//! and `run` (build, then exec + report exit status) are real SUBCOMMANDS that
-//! share the root command's option set + variadic `<file>` positional. The root
-//! with no verb is the default build/inspect. The shared options + positional are
-//! defined once as comptime consts and referenced from root/build/run so all three
-//! carry the IDENTICAL surface.
-//!
-//! Every spelling + semantic here is chosen to match the pre-framework hand-rolled
-//! parser BYTE-FOR-BYTE (examples/ scripts + diff.sh depend on them):
-//!   - `-O` is SHORT-ONLY (int Range 0..1) so `-O0`/`-O1`/`-O 1` all parse and its
-//!     Parsed field is `O`; `-O2` is now rejected as a bad value (strictly safer).
-//!   - `--opt`/`--no-opt` carry pass-name LISTS the driver validates (the grammar
-//!     can't express pass-name validity), so they are plain strings here.
-//!   - `--color` is the new AUTO/NO_COLOR-aware colour knob (default auto).
-//! The reserved `-h`/`--help`/`-V`/`--version` flags are AUTO-INJECTED by the
-//! framework (`Spec.checkCommand` rejects them in the option list), so they are
-//! NOT listed here.
+//! Spellings match the old hand-rolled parser byte-for-byte (examples/ + diff.sh depend on them):
+//! - `-O` is short-only (Range 0..1) so `-O0`/`-O1`/`-O 1` parse (`-O2` rejected).
+//! - `--opt`/`--no-opt` are plain strings (the grammar can't validate pass names; the driver does).
+//! - `-h`/`--help`/`-V`/`--version` are auto-injected by the framework, so not listed here.
 
 const toyc = @import("toy_compiler");
 const Spec = toyc.cli.Spec;
 
-/// The option set shared verbatim by root, `build`, and `run` — defined once so
-/// all three carry the identical surface (a divergence would be a spelling drift).
-/// `--target` is deliberately NOT defaulted in-spec (the field stays `?[]const u8`);
-/// the driver applies "native" when it is null, matching the old behaviour.
+/// The option set shared verbatim by root, `build`, and `run` (defined once so
+/// they can't drift). `--target` is not defaulted in-spec (stays `?[]const u8`);
+/// the driver applies "native" when null, matching the old behaviour.
 const shared_opts: []const Spec.Option = &.{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
     .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
@@ -52,10 +37,9 @@ const files_pos: []const Spec.Positional = &.{
     .{ .name = "file", .value = .string, .arity = .variadic, .help = "Input source file(s)" },
 };
 
-/// The whole `toy` CLI schema. `version` is `toyc.version.semver`
-/// (`build_options.semver`, a comptime `[]const u8`) — the runtime `version.stamp()`
-/// needs a buffer and so cannot feed a comptime spec; `--version` therefore prints
-/// `toy <semver>` (see main.zig's deviation note).
+/// The whole `toy` CLI schema. `version` is the comptime `toyc.version.semver`
+/// (the runtime `version.stamp()` needs a buffer, so can't feed a comptime spec);
+/// `--version` therefore prints `toy <semver>` (see main.zig's deviation note).
 pub const spec: Spec.Cli = .{
     .name = "toy",
     .version = toyc.version.semver,
@@ -73,8 +57,7 @@ pub const spec: Spec.Cli = .{
     },
 };
 
-// A malformed spec is a BUILD error (not a test failure): `Spec.validate` fires
-// `@compileError` with the first problem at comptime.
+// A malformed spec is a build error: `Spec.validate` fires `@compileError`.
 comptime {
     Spec.validate(spec.root);
 }

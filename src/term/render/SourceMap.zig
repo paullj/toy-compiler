@@ -1,47 +1,19 @@
 //! Source registry: maps byte offsets to line/column and extracts source lines
-//! (tab-aware) for diagnostic snippets. This is the FIRST link of the
-//! diagnostics rendering chain — the typed data a pretty single-line renderer
-//! (M12) needs to point a caret under the exact terminal cell. It does the
-//! math; it never prints. A pure borrow-only leaf: bytes/offsets in,
-//! line/col/text out; no I/O, no writer.
-//!
-//! WHY an eager `line_starts:[]u32` index (not a per-query forward scan): a
-//! diagnostic BATCH resolves many offsets against ONE source. A forward scan
-//! re-walks from byte 0 for every offset (O(n) per query, O(n*d) per batch),
-//! whereas one O(n) scan at `init` plus O(log lines) binary search per query is
-//! strictly cheaper and — being immutable after init — makes every query a
-//! `const` pure fn with no lazy state and no races. It is also exactly the data
-//! structure M12 needs to slice a RANGE of lines (`lineStart(n)`) without
-//! re-deriving offsets. Memory is bounded at `#lines * 4` bytes.
-//!
-//! BYTE column vs DISPLAY column — kept as separately-named fns on purpose:
-//!   - `byteCol` counts BYTES since the last '\n' (1-based). It is byte-for-byte
-//!     identical to the driver's `lineCol` (src/driver/main.zig:983), which
-//!     iterates bytes and bumps `col` per byte — for ALL input, UTF-8 included,
-//!     not merely ASCII. This is the offset a lexer/parser reports.
-//!   - `displayCol` counts terminal CELLS since the last '\n' (1-based), via M9
-//!     `width.displayWidth` with tab expansion. This is the caret column M12
-//!     aligns under a glyph.
-//! Feeding a display column where a byte column is expected (or vice versa)
-//! silently mis-aligns a caret, so the two never share a name and a parity test
-//! pins `byteCol` to the driver convention on both ASCII and multi-byte sources.
-//!
-//! TAB model — elastic tab stops: a '\t' in the DISPLAY path advances the column
-//! to the next multiple of `tab_width` (the classic terminal behaviour), because
-//! `width.displayWidthCp` reports 0 for TAB (it is a C0 control), so expansion is
-//! genuinely this module's job. Expansion lives ONLY in the display path; the
-//! byte path treats a tab as the single byte it is.
-//!
-//! LIMITS (documented on purpose, not bugs):
-//!   - Lifetime: `name` and `bytes` are BORROWED. The caller owns them and they
-//!     MUST outlive the `Source`. `deinit` frees ONLY the owned `line_starts`.
-//!   - Only '\n' splits lines. A CRLF "\r\n" is handled (the trailing '\r' is
-//!     stripped from `lineText`), but a bare old-Mac '\r' is NOT a line break —
-//!     it stays inside the line's text. Matching width.zig, this is a stated
-//!     limit, not a silent misbehaviour.
-//!   - ZWJ over-count: display widths come from width.zig, which measures ZWJ
-//!     emoji sequences codepoint-by-codepoint and thus over-counts vs. a modern
-//!     terminal. Inherited here so caret columns never UNDER-shoot the glyph.
+//! (tab-aware) for diagnostic snippets. A pure borrow-only leaf: bytes/offsets in,
+//! line/col/text out; no I/O, no writer. An eager `line_starts:[]u32` index built
+//! by one O(n) scan at init makes every query a `const` pure fn (O(log lines)).
+//! - Byte column vs display column are separate fns on purpose: `byteCol` counts
+//!   bytes since the last '\n' (byte-for-byte identical to the driver's `lineCol`
+//!   at main.zig:983, the offset a lexer/parser reports); `displayCol` counts
+//!   terminal cells (via `width` + tab expansion, the caret column). Mixing them
+//!   silently mis-aligns a caret, so they never share a name (parity test pins it).
+//! - Tab: elastic tab stops in the display path only (advances to the next
+//!   `tab_width` multiple, since width.zig reports TAB as 0); the byte path treats
+//!   a tab as one byte.
+//! - Limits: `name`/`bytes` are borrowed and must outlive the `Source`; `deinit`
+//!   frees only `line_starts`. Only '\n' splits lines — CRLF "\r\n" is handled
+//!   (trailing '\r' stripped) but a bare '\r' is not a line break. ZWJ emoji
+//!   over-count (inherited from width.zig) so carets never under-shoot the glyph.
 
 const std = @import("std");
 const unicode = std.unicode;
@@ -52,44 +24,39 @@ const Source = @This();
 /// Stored so a caller can `src.deinit(src.gpa)` without re-threading the
 /// allocator; `deinit` still takes `gpa` explicitly per house style.
 gpa: std.mem.Allocator,
-/// BORROWED display name (e.g. "main.toy"). Never freed; must outlive `Source`.
+/// Borrowed display name (e.g. "main.toy"); must outlive `Source`.
 name: []const u8,
-/// BORROWED source bytes. Never freed; must outlive `Source`.
+/// Borrowed source bytes; must outlive `Source`.
 bytes: []const u8,
-/// OWNED. `line_starts[0] == 0` always; `line_starts[i]` is the byte offset of
-/// the first char of line `i+1`, i.e. one past the i-th '\n'. Its length is the
-/// line count == (number of '\n') + 1. Sorted ascending, so a binary search
-/// maps an offset to its line.
+/// Owned. `line_starts[0] == 0` always; `line_starts[i]` is the byte offset of
+/// the first char of line `i+1` (one past the i-th '\n'). Length == line count ==
+/// (number of '\n') + 1. Sorted ascending, so a binary search maps offset to line.
 line_starts: []u32,
 
-/// A resolved position. Both fields are 1-based. `col` is BYTE-based (bytes
+/// A resolved position. Both fields are 1-based. `col` is byte-based (bytes
 /// since the last '\n', +1) — superset-compatible with driver/main.zig:983.
 pub const LineCol = struct { line: usize, col: usize };
 
-/// A half-open byte range `[start, end)` into `bytes`. `start == end` is a
-/// legal ZERO-WIDTH point: a caret sitting between two chars, or at EOF.
+/// A half-open byte range `[start, end)` into `bytes`. `start == end` is a legal
+/// zero-width point: a caret between two chars, or at EOF.
 pub const Span = struct { start: u32, end: u32 };
 
-/// The tab stop used when a caller does not supply one. Four cells is a common
-/// editor default and keeps snippet carets aligned with typical source layout.
+/// The tab stop used when a caller does not supply one (a common editor default).
 pub const default_tab_width: usize = 4;
 
-/// Build the line index with a single O(n) scan over `bytes`. `name` and
-/// `bytes` are borrowed (see the module LIMITS) — this makes no copy of either.
-/// The only heap allocation is `line_starts`.
+/// Build the line index with a single O(n) scan over `bytes`. `name`/`bytes` are
+/// borrowed (no copy); the only heap allocation is `line_starts`.
 pub fn init(gpa: std.mem.Allocator, name: []const u8, bytes: []const u8) std.mem.Allocator.Error!Source {
-    // Offsets are u32 everywhere (Diagnostic.byte_offset), so a source larger
-    // than u32 can't be addressed. Catch it at the boundary rather than let an
-    // @intCast truncate silently below.
+    // Offsets are u32 everywhere (Diagnostic.byte_offset); catch an oversized
+    // source at the boundary rather than let an @intCast truncate silently.
     std.debug.assert(bytes.len <= std.math.maxInt(u32));
 
     var list: std.ArrayList(u32) = .empty;
-    // If any append or the final toOwnedSlice fails, free the partial list so
-    // init is leak-free on the error path (testing.allocator would catch a miss).
+    // Free the partial list if any append / toOwnedSlice fails (leak-free error path).
     errdefer list.deinit(gpa);
 
-    // Line 1 always starts at byte 0, even for an empty source (which is one
-    // empty line). Every '\n' opens the next line at the byte just past it.
+    // Line 1 always starts at byte 0 (an empty source is one empty line); every
+    // '\n' opens the next line at the byte just past it.
     try list.append(gpa, 0);
     for (bytes, 0..) |c, i| {
         if (c == '\n') try list.append(gpa, @intCast(i + 1)); // i < bytes.len <= maxInt(u32), so i+1 fits u32
@@ -103,9 +70,8 @@ pub fn init(gpa: std.mem.Allocator, name: []const u8, bytes: []const u8) std.mem
     };
 }
 
-/// Frees the owned `line_starts` (the only allocation). `name`/`bytes` are
-/// borrowed and left untouched. `gpa` is taken explicitly per house style and
-/// MUST be the same allocator passed to `init`.
+/// Frees the owned `line_starts` (the only allocation); `name`/`bytes` are
+/// borrowed and left untouched. `gpa` must be the same allocator passed to `init`.
 pub fn deinit(self: *Source, gpa: std.mem.Allocator) void {
     gpa.free(self.line_starts);
     self.* = undefined;
@@ -117,14 +83,11 @@ pub fn lineCount(self: *const Source) usize {
     return self.line_starts.len;
 }
 
-/// 0-based line index containing `offset` (clamped to `bytes.len` for EOF). This
-/// is the largest `i` with `line_starts[i] <= off`, i.e. `upperBound(off) - 1`.
-/// An offset landing EXACTLY on a line start (one past a '\n') maps to that NEW
-/// line — the classic off-by-one this fn is written to get right.
-///
-/// Hand-rolled binary search in the width.zig `inRanges` house style (keeps the
-/// leaf dependency-light — no std.sort import). Invariant: `line_starts[0] == 0`
-/// and it is sorted ascending, so a match always exists and `hi` never underflows.
+/// 0-based line index containing `offset` (clamped to `bytes.len` for EOF): the
+/// largest `i` with `line_starts[i] <= off` (`upperBound(off) - 1`). An offset
+/// landing exactly on a line start (one past a '\n') maps to that new line.
+/// Hand-rolled binary search (no std.sort import); `line_starts[0] == 0` sorted
+/// ascending, so a match always exists and `hi` never underflows.
 pub fn lineIndex(self: *const Source, offset: u32) usize {
     const off = @min(offset, castLen(self.bytes.len));
     var lo: usize = 0;
@@ -142,10 +105,9 @@ pub fn lineIndex(self: *const Source, offset: u32) usize {
     return lo - 1;
 }
 
-/// Resolve `offset` to a 1-based line + 1-based BYTE column. Byte-for-byte
-/// identical to driver/main.zig:983 `lineCol` for ALL input (ASCII and UTF-8),
-/// because that fn counts bytes and so does this one. Out-of-range offsets clamp
-/// to `bytes.len` exactly like the driver (`@min(offset, len)`).
+/// Resolve `offset` to a 1-based line + 1-based byte column. Byte-for-byte
+/// identical to driver/main.zig:983 `lineCol` for all input (both count bytes).
+/// Out-of-range offsets clamp to `bytes.len`.
 pub fn lineCol(self: *const Source, offset: u32) LineCol {
     const off = @min(offset, castLen(self.bytes.len));
     const i = self.lineIndex(off);
@@ -156,9 +118,9 @@ pub fn lineCol(self: *const Source, offset: u32) LineCol {
     return .{ .line = i + 1, .col = col };
 }
 
-/// Convenience alias for the BYTE column of `offset` (== `lineCol(offset).col`).
-/// Named distinctly from `displayCol` so a caller can never confuse a byte
-/// column (for arithmetic on offsets) with a display column (for caret layout).
+/// The byte column of `offset` (== `lineCol(offset).col`). Named distinctly from
+/// `displayCol` so a byte column (offset arithmetic) is never confused with a
+/// display column (caret layout).
 pub fn byteCol(self: *const Source, offset: u32) usize {
     return self.lineCol(offset).col;
 }
@@ -213,14 +175,10 @@ pub fn spanText(self: *const Source, span: Span) []const u8 {
     return self.bytes[start..end];
 }
 
-/// PRIVATE. 0-based DISPLAY width of `prefix`, expanding tabs to elastic stops.
-/// Walks by UTF-8 codepoint: a '\t' advances the running column to the next
-/// multiple of `tab_width`; anything else adds `width.displayWidthCp(cp)`.
-///
-/// Invalid bytes degrade EXACTLY as width.zig does — an invalid start byte or a
-/// truncated/ill-formed sequence counts as width 1 and advances one byte — so
-/// display columns and the widths width.zig reserves stay consistent, and the
-/// walk never stalls on corrupt input.
+/// 0-based display width of `prefix`, expanding tabs to elastic stops. Walks by
+/// UTF-8 codepoint: '\t' advances to the next `tab_width` multiple, else adds
+/// `width.displayWidthCp(cp)`. Invalid bytes degrade exactly as width.zig does
+/// (width 1, advance one byte), so widths stay consistent and the walk never stalls.
 fn displayWidthExpandingTabs(prefix: []const u8, tab_width: usize) usize {
     const tw = if (tab_width == 0) 1 else tab_width; // avoid divide-by-zero / stall
     var col: usize = 0;
@@ -254,9 +212,7 @@ fn displayWidthExpandingTabs(prefix: []const u8, tab_width: usize) usize {
     return col;
 }
 
-/// `bytes.len` as a u32. `init` asserts `bytes.len <= maxInt(u32)`, so this is
-/// lossless for any `Source` that was constructed successfully; centralised so
-/// the clamp sites read clearly.
+/// `bytes.len` as a u32 (lossless: `init` asserts `bytes.len <= maxInt(u32)`).
 fn castLen(len: usize) u32 {
     return @intCast(len);
 }

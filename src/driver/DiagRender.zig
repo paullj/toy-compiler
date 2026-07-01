@@ -1,12 +1,11 @@
 //! Diagnostics rendering: turn sink diagnostics / graph errors into terminal bytes
-//! via SourceMap + render.Diagnostic + the pretty Renderer (snippet + caret). Owns the
-//! shared status palette (see below) — the one hue set both this and Report style with.
+//! via SourceMap + render.Diagnostic + the pretty Renderer (snippet + caret). Owns
+//! the shared status palette (below) — the one hue set both this and Report use.
 //!
-//! FRAMEWORK GAP (worked around here, not patched): the Renderer needs a Span into a
-//! source to draw a snippet, so a Graph.Error / EmitError with `byte_offset == null`
-//! (or a discover error with no module loaded, i.e. no source) cannot snippet. We
-//! fall back to `renderPlainError` — `path: error: msg (detail)` — preserving the old
-//! no-location shape exactly, minus escapes at `.none`.
+//! Framework gap (worked around, not patched): the Renderer needs a Span to snippet,
+//! so a Graph.Error / EmitError with no `byte_offset` (or no loaded source) falls
+//! back to `renderPlainError` (`path: error: msg (detail)`), preserving the old
+//! no-location shape.
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,18 +18,16 @@ const Style = term.Style;
 const Rr = term.render;
 
 // ---- status palette --------------------------------------------------------
-// Colours from Theme's bright-ansi indices so `Color.downgrade` is the identity at
-// ansi16/ansi256; dim/bold are pure attributes. Every use goes through
-// `Style.styled`, which writes ZERO bytes at `.none` — so on a pipe/CI (`.none`)
-// the coloured path is byte-identical to plain. `err` matches the Renderer's own
-// header word hue (bright red 9, bold) instead of a hardcoded normal red.
+// Bright-ansi indices so `Color.downgrade` is the identity at ansi16/ansi256; every
+// use goes through `Style.styled` (zero bytes at `.none`, so `.none` == plain).
+// `err` matches the Renderer's own header word hue (bright red 9, bold).
 pub const sty_err: Style.Style = .{ .fg = .{ .ansi = 9 }, .bold = true }; // Theme.plain.style(.err)
 pub const sty_ok: Style.Style = .{ .fg = .{ .ansi = 10 } }; // bright green
 pub const sty_head: Style.Style = .{ .bold = true };
 pub const sty_faint: Style.Style = .{ .dim = true };
 
-/// The renderer options for a colour level: ASCII carets (unicode off) keep the
-/// diagnostic output byte-stable and gate-safe under any future golden.
+/// Renderer options for a colour level: ASCII carets (unicode off) keep output
+/// byte-stable and gate-safe.
 pub fn renderOpts(level: Style.ColorLevel) Rr.Renderer.RenderOpts {
     return .{ .color = level, .unicode = false };
 }
@@ -87,10 +84,9 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
         if (cached_scope == null or cached_scope.? != d.scope) {
             if (cached_scope != null) sm.deinit(gpa);
             const m = if (d.scope == toyc.DiagnosticSink.NO_SCOPE) g.entry() else &g.modules[d.scope];
-            // Clear `cached_scope` BEFORE the `try init`: `sm` was just deinit'd (set to
-            // `undefined`) above, so if `SourceMap.init` hits OOM and propagates, the
-            // `defer if (cached_scope != null) sm.deinit(gpa)` must NOT fire on the freed/
-            // undefined `sm` (double-free of an undefined pointer). Reassign after init.
+            // Clear `cached_scope` before the `try init`: `sm` was just deinit'd, so a
+            // failing init must not let the `defer` fire on the freed `sm` (double-free).
+            // Reassign after init.
             cached_scope = null;
             sm = try Rr.SourceMap.init(gpa, m.path, m.source); // Module.source []u8 coerces to []const u8
             cached_scope = d.scope;
