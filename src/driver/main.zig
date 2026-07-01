@@ -188,7 +188,7 @@ pub fn main(init: std.process.Init) !void {
     // status + diagnostics. Still probes stdout, so a piped run stays `.none`.
     const level = resolveLevel(init, io, st.color_choice);
 
-    // ---- POST-PARSE TAIL (reproduces the old lines 157-201 verbatim) -----------
+    // Post-parse tail (reproduces the old hand-rolled tail verbatim).
 
     if (st.paths.items.len == 0) {
         // Asking to emit (`-o`) with no input is an error, not usage.
@@ -916,8 +916,6 @@ fn writeExecutable(io: Io, path: []const u8, image: []const u8) !void {
     try file.writeStreamingAll(io, image);
     try file.setPermissions(io, exec_perms);
 }
-
-// ---- CLI / arg-error output ------------------------------------------------
 
 /// Emit one `error: <message>` line styled at `sty_err` (the `error` word coloured,
 /// gate-safe at `.none`), then FLUSH. The in-body file-count checks that RETURN (not

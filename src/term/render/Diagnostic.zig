@@ -103,8 +103,6 @@ pub fn fromSink(d: sink.Diagnostic) Diagnostic {
     };
 }
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 
 test "fromSink synthesizes a zero-width primary error" {

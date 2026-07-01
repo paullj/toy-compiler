@@ -17,8 +17,7 @@ const term = toyc.term;
 const Style = term.Style;
 const Rr = term.render;
 
-// ---- status palette --------------------------------------------------------
-// Bright-ansi indices so `Color.downgrade` is the identity at ansi16/ansi256; every
+// Status palette. Bright-ansi indices so `Color.downgrade` is the identity at ansi16/ansi256; every
 // use goes through `Style.styled` (zero bytes at `.none`, so `.none` == plain).
 // `err` matches the Renderer's own header word hue (bright red 9, bold).
 pub const sty_err: Style.Style = .{ .fg = .{ .ansi = 9 }, .bold = true }; // Theme.plain.style(.err)
