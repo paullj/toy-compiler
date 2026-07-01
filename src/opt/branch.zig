@@ -30,7 +30,6 @@ const Opt = @import("Opt.zig");
 pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{OutOfMemory}!bool {
     if (func.values.len == 0 and func.blocks.len == 0) return false;
 
-    // --- Phase 1: branch-fold ---------------------------------------------
     // Indexed const-bool table by ValueId (NOT a hash map). Only `bconst` defs
     // are recorded; everything else stays null. Re-derived each pass.
     const value_const = try gpa.alloc(?bool, func.values.len);
@@ -62,7 +61,6 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
         }
     }
 
-    // --- Phase 2: unreachable-block elimination ---------------------------
     // Run whenever phase 1 folded a branch (a fold can orphan blocks). Also safe
     // to skip entirely when nothing folded — no fold means no new unreachables
     // this pass (lower never emits unreachable blocks that fold didn't create…
@@ -185,9 +183,7 @@ fn elimUnreachable(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats
     return true;
 }
 
-// ---------------------------------------------------------------------------
 // Tests — hand-built IR under std.testing.allocator (catches leak/double-free).
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 

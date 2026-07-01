@@ -1,4 +1,4 @@
-//! `lower`: the Ast→Ir transformation stage (M12), a TOP-LEVEL pipeline peer to
+//! `lower`: the Ast→Ir transformation stage, a TOP-LEVEL pipeline peer to
 //! `parse` (Ast) and `types` (the resolved type side-tables). It is PURE of its
 //! frozen inputs — no globals, no map-iteration-order — so the IR is a
 //! deterministic function of (tree, tokens, source, resolutions, node_types,
@@ -145,8 +145,6 @@ const Builder = struct {
         };
     }
 
-    // ---- id minting ---------------------------------------------------------
-
     fn addSlot(b: *Builder, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
         const id: Ir.SlotId = @intCast(b.slots.items.len);
         try b.slots.append(b.gpa, .{ .type = ty });
@@ -274,8 +272,7 @@ pub fn lowerFn(
         // resolve assigns local slot indices in declaration order, params FIRST
         // (it declares each param but does not write `.local` onto the param node).
         // So a body identifier referencing param `i` resolves to `.local(i)`. Bind
-        // local index `i` → this param's IR slot. (Mirrors codegen's "param i
-        // occupies slot i" prologue contract.)
+        // local index `i` → this param's IR slot.
         try b.local_slots.put(gpa, @intCast(i), sid);
     }
 
@@ -362,10 +359,6 @@ pub fn lowerFn(
     };
 }
 
-// ---------------------------------------------------------------------------
-// Statements
-// ---------------------------------------------------------------------------
-
 /// Lower a block's statements in order into the current block (no merge value).
 fn lowerBlockStmts(b: *Builder, block_idx: Ast.Index) error{OutOfMemory}!void {
     const block = b.in.tree.nodes[block_idx];
@@ -435,10 +428,6 @@ fn storeInto(b: *Builder, slot: Ir.SlotId, expr: Ast.Index, ty: Typecheck.Type) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Expressions (value context)
-// ---------------------------------------------------------------------------
-
 /// Lower an expression in VALUE context: a scalar yields `Operand.value`; a str
 /// (16-byte aggregate) yields `Operand.slot`; unit yields `.none`.
 fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
@@ -501,10 +490,8 @@ fn lowerStrLiteral(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Opera
 
     const slot = try b.addSlot(Typecheck.Type.str);
     const base = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
-    // ptr half @0
     const p = try b.emit(.{ .cstr_ptr = h }, Typecheck.Type.int);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = p, .ty = Typecheck.Type.int } }, null);
-    // len half @8
     const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
     const lenv = try b.emit(.{ .iconst = len }, Typecheck.Type.int);
     _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = lenv, .ty = Typecheck.Type.int } }, null);
@@ -581,7 +568,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
 /// `a && b` / `a || b` as a VALUE: short-circuit via blocks. The merge is a bool
 /// block param on the join. For `&&`: a-false stores `false` and branches to join;
 /// a-true falls through to evaluate b, which branches to join with its own value.
-/// For `||`: a-true stores `true`; a-false evaluates b. Mirrors M11's value path.
+/// For `||`: a-true stores `true`; a-false evaluates b.
 fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir.Operand {
     const eval_b = try b.addBlock();
     const short = try b.addBlock(); // the short-circuit constant block
@@ -655,10 +642,6 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     }
 }
 
-// ---------------------------------------------------------------------------
-// Aggregates (struct / enum / str) + field access + match
-// ---------------------------------------------------------------------------
-
 /// PRODUCE-INTO-SLOT: lower the aggregate (or scalar/str) `expr` writing its value
 /// directly to the memory at the ptr value `dst_ptr` (of element type `ty`). This
 /// generalizes the codegen `genStructTo*` family: struct/enum construction, a
@@ -701,9 +684,9 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         .literal_string => try storeStrLiteralInto(b, expr, dst_ptr),
         .struct_init => try lowerStructInitInto(b, expr, dst_ptr),
         .enum_init_unit, .enum_init_tuple, .enum_init_struct => try lowerEnumInitInto(b, expr, dst_ptr, ty),
-        // M10 qualified `N.V` (field_access) / `N.V(args)` (call) that typecheck
+        // qualified `N.V` (field_access) / `N.V(args)` (call) that typecheck
         // classified as enum-valued are variant constructions, NOT field reads /
-        // real calls. Detect by enum type + shape (mirrors genStructToSp).
+        // real calls. Detect by enum type + shape.
         .field_access => {
             if (ty.kind == .@"enum" and !isLocalRootedPlace(b, expr)) {
                 try lowerEnumInitInto(b, expr, dst_ptr, ty);
@@ -879,8 +862,7 @@ fn lowerStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId) er
 }
 
 /// Decoded view of a variant-construction node, normalizing inferred enum_init_*
-/// and qualified `N.V`/`N.V(...)` (field_access/call) into one shape. Mirrors
-/// Codegen.decodeVariantCtor.
+/// and qualified `N.V`/`N.V(...)` (field_access/call) into one shape.
 const VariantCtor = struct {
     vtok: u32,
     payload: Ast.Index, // Range header over arg/field-init nodes, or none
@@ -901,7 +883,7 @@ fn decodeVariantCtor(b: *Builder, node_idx: Ast.Index) VariantCtor {
 
 /// Build a variant value into the destination ptr: tag (iconst variant index) at
 /// offset 0, then each payload element at `payload_off + variant.offsets[i]`
-/// (struct-form fields mapped by name, reorder-safe). Mirrors Codegen.genVariantInit.
+/// (struct-form fields mapped by name, reorder-safe).
 fn lowerEnumInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const e = b.in.enum_layouts[ty.enum_id];
     const ctor = decodeVariantCtor(b, node_idx);
@@ -915,11 +897,9 @@ fn lowerEnumInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: 
     }
     const variant = e.variants[vi];
 
-    // 1) TAG at offset 0.
     const tagv = try b.emit(.{ .iconst = @intCast(vi) }, Typecheck.Type.int);
     _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = tagv, .ty = Typecheck.Type.int } }, null);
 
-    // 2) PAYLOAD.
     if (ctor.payload == Ast.none) return;
     const elems = Ast.rangeSlice(b.in.tree, ctor.payload);
     for (elems, 0..) |elem_idx, i| {
@@ -941,8 +921,6 @@ fn lowerEnumInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: 
         try lowerExprInto(b, value, faddr, fty);
     }
 }
-
-// ---- match -----------------------------------------------------------------
 
 /// A `match` in VALUE context yielding a SCALAR (or str/struct/enum). Materialize
 /// the result via `lowerMatchInto` into a fresh slot, then yield: a scalar loads
@@ -975,7 +953,7 @@ fn lowerMatchValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
 /// scrutinee to a slot, then a linear FIRST-MATCH-WINS chain of structural tests
 /// (each arm has a `next` block for a mismatch / failed guard) dispatches to each
 /// arm body, which produces into `dst_ptr` and branches to a shared `join`. NO
-/// switch terminator (preserves M11 semantics + overlapping-pattern order).
+/// switch terminator (preserves overlapping-pattern order).
 fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[node_idx];
     const scrut_ty = b.in.node_types[n.lhs];
@@ -1000,7 +978,6 @@ fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typ
             try genCond(b, h.guard, body_bb, next);
             b.switchTo(body_bb);
         }
-        // Arm body → dst, then join.
         try lowerExprInto(b, h.body, dst_ptr, ty);
         if (!b.termSet()) try brTo(b, join, .none);
         b.switchTo(next);
@@ -1032,7 +1009,7 @@ fn spillScrutinee(b: *Builder, op: Ir.Operand, ty: Typecheck.Type, tok: u32) err
 
 /// Recursively test a pattern against the value at byte offset `off` within the
 /// slot `base` (type `val_ty`), branching to `fail` on a mismatch and storing
-/// bound leaves into their slots. Mirrors Codegen.testPattern but addresses via
+/// bound leaves into their slots. Addresses via
 /// field_addr + the enum tag via get_tag.
 fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_ty: Typecheck.Type, fail: Ir.BlockId) error{OutOfMemory}!void {
     const pat = b.in.tree.nodes[pat_idx];
@@ -1144,8 +1121,7 @@ fn slotFieldAddr(b: *Builder, base: Ir.SlotId, off: u32, ty: Typecheck.Type) err
     return try b.emit(.{ .field_addr = .{ .base = ptr, .off = off, .ty = ty } }, Typecheck.Type.int);
 }
 
-/// Whether a `field_access`/identifier place is rooted at a local. Mirrors
-/// Codegen.isLocalRootedPlace.
+/// Whether a `field_access`/identifier place is rooted at a local.
 fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
     const n = b.in.tree.nodes[node_idx];
     return switch (n.tag) {
@@ -1154,10 +1130,6 @@ fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
         else => false,
     };
 }
-
-// ---------------------------------------------------------------------------
-// Control flow
-// ---------------------------------------------------------------------------
 
 /// `if cond { then } [else ...]` as a STATEMENT (value discarded). cond lowers in
 /// CONTROL context to a cond_br; the arms run for effect; a `join` block collects
@@ -1398,9 +1370,6 @@ fn lowerLabeledBlock(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type, labe
     return paramOperand(ty, merge);
 }
 
-// ---------------------------------------------------------------------------
-// Value control flow, PRODUCE-INTO-SLOT (aggregate results)
-// ---------------------------------------------------------------------------
 // These mirror the value-yielding control-flow lowerings but write each arm's
 // trailing value into a caller-supplied destination ptr (an aggregate sink: a var
 // slot, a field_addr, or an outer join slot), so a struct/enum/str result works in
@@ -1509,10 +1478,9 @@ fn lowerContinue(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
     try brTo(b, ctx.continue_bb, .none); // continue carries no args
 }
 
-/// Select the loop/labeled context a break/continue targets, mirroring Codegen's
-/// `targetLoop`: a labeled one finds the NAMED context by construct node; a bare
-/// one finds the innermost LOOP (skipping labeled bare blocks). Typecheck
-/// guarantees a match exists.
+/// Select the loop/labeled context a break/continue targets: a labeled one finds
+/// the NAMED context by construct node; a bare one finds the innermost LOOP
+/// (skipping labeled bare blocks). Typecheck guarantees a match exists.
 fn targetLoop(b: *Builder, stmt_idx: Ast.Index) LoopCtx {
     const items = b.loops.items;
     if (b.in.resolutions[stmt_idx] == .label) {
@@ -1531,10 +1499,6 @@ fn targetLoop(b: *Builder, stmt_idx: Ast.Index) LoopCtx {
     }
     unreachable; // typecheck-guaranteed
 }
-
-// ---------------------------------------------------------------------------
-// CONTROL-context bool lowering (cond_br with split intermediate blocks)
-// ---------------------------------------------------------------------------
 
 /// Lower a bool expression in CONTROL context: emit a `cond_br` (or a chain) so
 /// control reaches `true_bb` when the expression is true and `false_bb` when
@@ -1588,10 +1552,6 @@ fn genCondBareBool(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_
     b.setTerm(.{ .cond_br = .{ .cond = v, .t = true_bb, .f = false_bb } });
 }
 
-// ---------------------------------------------------------------------------
-// Edge helpers
-// ---------------------------------------------------------------------------
-
 /// Branch the current block to `dest`, carrying `arg` as the single merge edge
 /// value (or no args for a `.none` arg). Sets the terminator (guarded).
 fn brTo(b: *Builder, dest: Ir.BlockId, arg: Ir.Operand) error{OutOfMemory}!void {
@@ -1638,10 +1598,6 @@ fn localSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMe
     try b.local_slots.put(b.gpa, li, sid);
     return sid;
 }
-
-// ---------------------------------------------------------------------------
-// Type resolution (mirrors Codegen.fnReturnType / paramType / typeFromRef)
-// ---------------------------------------------------------------------------
 
 /// Resolve a function's declared return type. No ret-type node (or `()`) is unit;
 /// named refs map to scalars or to a struct/enum layout by name.
@@ -1690,10 +1646,6 @@ fn typeFromRef(in: Inputs, ref: Ast.Index) Typecheck.Type {
     return Typecheck.Type.int;
 }
 
-// ---------------------------------------------------------------------------
-// Token/literal helpers (moved from Codegen per the plan: AST→IR owns decoding)
-// ---------------------------------------------------------------------------
-
 /// Map a comparison token to its signed IR condition.
 fn condFromToken(tag: TokenTag) Ir.Cond {
     return switch (tag) {
@@ -1707,12 +1659,13 @@ fn condFromToken(tag: TokenTag) Ir.Cond {
     };
 }
 
-/// Seed for the literal content hash. MUST match Codegen's `lit_seed` so the
-/// `.cstr` reloc target (the hash) lines up with the codegen-side literal table.
+/// Seed for the literal content hash. FROZEN: changing it re-hashes every literal,
+/// so the `.cstr` reloc targets (the hashes) in existing cached FnCode blobs would
+/// no longer line up with the literal table — cached blobs rot.
 const lit_seed: u64 = 0x10c5_7e87;
 
 /// Parse a number-literal token text into i64, stripping `_` separators. Returns
-/// null if it does not fit i64 (range-checked, mirroring Codegen.parseInt). The
+/// null if it does not fit i64 (range-checked). The
 /// asymmetry vs the NON-range-checked pattern-literal parse is preserved for a
 /// later match stage.
 fn parseInt(raw: []const u8) ?i64 {
@@ -1728,7 +1681,7 @@ fn parseInt(raw: []const u8) ?i64 {
 }
 
 /// Parse a (possibly `_`-separated) decimal int literal as written in source, for
-/// a PATTERN literal. NON-range-checked (mirrors Codegen.parseIntLit) — the
+/// a PATTERN literal. NON-range-checked — the
 /// asymmetry vs the range-checked `parseInt` for `literal_number` is intentional.
 fn parseIntLit(text: []const u8) i64 {
     var v: i64 = 0;
@@ -1780,10 +1733,6 @@ fn decodeStringLiteral(b: *Builder, tok: u32) error{OutOfMemory}!?[]u8 {
     }
     return try out.toOwnedSlice(b.gpa);
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 const Graph = @import("driver/Graph.zig");

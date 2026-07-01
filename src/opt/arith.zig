@@ -58,9 +58,7 @@ pub fn icmp(cc: Ir.Cond, l: i64, r: i64) bool {
     };
 }
 
-// ---------------------------------------------------------------------------
 // Tests — the fold-divergence edge cases (run under std.testing.allocator).
-// ---------------------------------------------------------------------------
 
 test "sdiv by zero is 0 (no trap)" {
     try std.testing.expectEqual(@as(i64, 0), sdiv(5, 0));

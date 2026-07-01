@@ -1,4 +1,4 @@
-//! M14 whole-graph name resolution ("query consumer #1").
+//! Whole-graph name resolution.
 //!
 //! Generalises the single-file `resolve.zig` across a discovered module `Graph`.
 //! Two phases, mirroring the per-file resolver but at graph scope:
@@ -85,8 +85,6 @@ pub const GraphResult = struct {
     }
 };
 
-// ---- per-module collected tables -------------------------------------------
-
 /// Symbol tables collected for one module during the global-collect phase.
 const ModuleTables = struct {
     /// This module's fns (pub + private), name → global fn id. Visible only
@@ -109,8 +107,6 @@ const ModuleTables = struct {
         self.namespaces.deinit(gpa);
     }
 };
-
-// ---- resolver --------------------------------------------------------------
 
 const Local = struct { name_tok: u32, slot: u32 };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
@@ -156,8 +152,6 @@ const GraphResolve = struct {
     fn nameText(g: *GraphResolve, tok: u32) []const u8 {
         return g.nameOf(g.cur_mod, tok);
     }
-
-// ---- phase 1a: global symbol collect ---------------------------------------
 
 /// Assign every user fn a global id + qualified name, and register each module's
 /// struct/enum type names. Deterministic: modules in id order, decls in source
@@ -231,8 +225,6 @@ fn collectGlobals(g: *GraphResolve) !void {
     }
 }
 
-// ---- phase 1b: import namespace binding ------------------------------------
-
 /// Bind each module's import namespaces (last path segment, or the `as` alias) to
 /// the imported module id. A same-name collision (two imports sharing a last
 /// segment, or an alias colliding with another namespace) is an error unless
@@ -249,8 +241,7 @@ fn collectNamespaces(g: *GraphResolve) !void {
             const decl = m.nodes[decl_idx];
             if (decl.tag != .import_decl) continue;
 
-            // Resolve which graph module this import points at: rebuild the
-            // `/`-joined path and match it against a module's canonical name.
+            // Resolve which graph module this import points at.
             const target = g.importTarget(mod, decl) orelse {
                 // Discovery already proved every import resolves; a miss here is
                 // defensive (e.g. a stale graph). Report against this module.
@@ -312,8 +303,6 @@ fn importTarget(g: *GraphResolve, mod: u32, decl: Ast.Node) ?u32 {
     }
     return null;
 }
-
-// ---- phase 2: per-module body resolution -----------------------------------
 
 fn resolveModule(g: *GraphResolve, mod: u32) !void {
     g.cur_mod = mod;
@@ -675,8 +664,6 @@ fn resolveLabelTarget(g: *GraphResolve, node_idx: Ast.Index, label_tok: u32, com
     try g.emit(g.cur_mod, g.tokens()[label_tok].start, verb ++ " to undefined label '{s}'", .{name});
 }
 
-// ---- scope / name helpers --------------------------------------------------
-
 fn res(g: *GraphResolve, node_idx: Ast.Index, r: Resolution) void {
     g.resolutions[g.cur_mod][node_idx] = r;
 }
@@ -773,7 +760,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         g.sink.deinit();
     }
 
-    // Allocate each module's resolution array (parallel to its node count).
+    // Each module's resolution array is parallel to its node count.
     for (graph.modules, 0..) |m, i| {
         const rr = try gpa.alloc(Resolution, m.nodes.len);
         @memset(rr, .unresolved);
@@ -793,8 +780,6 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         .owned_msgs = owned.owned,
     };
 }
-
-// ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 const Lexer = @import("lex.zig");

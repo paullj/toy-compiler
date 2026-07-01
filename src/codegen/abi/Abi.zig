@@ -50,10 +50,7 @@ pub const num_gpr_args: u32 = 8;
 ///   * `indirect`  — aggregate >16B: passed/returned via a pointer (+ x8 sret).
 pub const AbiClass = enum { scalar, reg_pair, indirect };
 
-// ---- pure type queries (single source of truth, shared with FrameLayout) ----
-
 /// Byte size of a type (int/bool 8, str 16, struct/enum → its layout size).
-/// Mirrors the M11 `Codegen.typeSize` exactly.
 pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
         .int, .bool => 8,
@@ -65,7 +62,7 @@ pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLay
 }
 
 /// Natural alignment of a type (8 for scalars/str; a struct/enum's layout
-/// alignment). Mirrors the M11 `Codegen.typeAlign` exactly.
+/// alignment).
 pub fn typeAlign(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
         .int, .bool, .str => 8,
@@ -76,8 +73,7 @@ pub fn typeAlign(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLa
 }
 
 /// Whether a type is a value AGGREGATE (str / struct / enum) — passed in a reg
-/// pair (<=16B) or indirect+x8 (>16B), copied by bytes. Mirrors M11
-/// `Codegen.isAggregate`.
+/// pair (<=16B) or indirect+x8 (>16B), copied by bytes.
 pub fn isAggregate(ty: Type) bool {
     return ty.kind == .str or ty.kind == .@"struct" or ty.kind == .@"enum";
 }
@@ -89,14 +85,11 @@ pub fn eightbytes(size: u32) u32 {
 
 /// AAPCS64 class for a type: a non-aggregate is `scalar`; an aggregate is
 /// `reg_pair` (<=16B) or `indirect` (>16B). Single source of truth for the
-/// reg-pair vs indirect split (was `Codegen.abiClass`, but lifted to take the
-/// full type so callers needn't pre-compute the size).
+/// reg-pair vs indirect split.
 pub fn classify(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) AbiClass {
     if (!isAggregate(ty)) return .scalar;
     return if (typeSize(ty, layouts, enum_layouts) <= 16) .reg_pair else .indirect;
 }
-
-// ---- one parameter / argument location -------------------------------------
 
 /// Where one parameter (or one outbound call argument) lives per AAPCS64. The
 /// same encoding serves both directions (incoming prologue + outgoing call); the
@@ -144,8 +137,6 @@ pub fn classifyRet(ty: Type, layouts: []const Layout, enum_layouts: []const Enum
         .indirect => return .sret,
     }
 }
-
-// ---- the ONE shared NGRN/NSAA walk -----------------------------------------
 
 /// The single source of truth for the AAPCS64 argument-placement walk. Both
 /// `planParams` and `planCall` route through here so the three M11 walks
@@ -203,8 +194,6 @@ fn walkAbi(
     return nsaa;
 }
 
-// ---- parameter plan (incoming, prologue) -----------------------------------
-
 /// The full incoming-parameter plan for a function: where each param arrives,
 /// plus whether the indirect-result pointer arrives in x8.
 pub const ParamPlan = struct {
@@ -223,8 +212,7 @@ pub const ParamPlan = struct {
 };
 
 /// Plan the incoming parameters of a function with signature `params -> ret`.
-/// The result `locs` slice is allocated with `gpa`. Reproduces the M11 prologue
-/// NGRN/NSAA walk (Codegen.lowerFn ~519) exactly.
+/// The result `locs` slice is allocated with `gpa`.
 pub fn planParams(
     gpa: std.mem.Allocator,
     params: []const Type,
@@ -240,8 +228,6 @@ pub fn planParams(
         .locs = locs,
     };
 }
-
-// ---- call plan (outgoing, call site) ---------------------------------------
 
 /// The full outbound-argument plan for one call site: where each argument goes,
 /// the total NSAA stack-arg bytes (drives the frame's `out_base`), and whether
@@ -264,9 +250,9 @@ pub const CallPlan = struct {
 };
 
 /// Plan the outbound arguments of a call to a callee with signature
-/// `args -> ret`. The result `locs` slice is allocated with `gpa`. Reproduces
-/// the M11 `genCallInner` NGRN/NSAA walk (~992) exactly, so `nsaa_bytes` equals
-/// the stack bytes the emission writes (matching what the frame reserves).
+/// `args -> ret`. The result `locs` slice is allocated with `gpa`, so
+/// `nsaa_bytes` equals the stack bytes the emission writes (matching what the
+/// frame reserves).
 pub fn planCall(
     gpa: std.mem.Allocator,
     args: []const Type,
@@ -283,10 +269,6 @@ pub fn planCall(
         .sret_in_x8 = classifyRet(ret, layouts, enum_layouts) == .sret,
     };
 }
-
-// ===========================================================================
-// TESTS
-// ===========================================================================
 
 const testing = std.testing;
 

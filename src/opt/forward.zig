@@ -65,7 +65,7 @@ const Avail = struct {
 pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{OutOfMemory}!bool {
     if (func.values.len == 0) return false;
 
-    // --- def table: ValueId -> its defining Op (for resolve()) ---------------
+    // def table: ValueId -> its defining Op (for resolve())
     // SSA: each value is defined once. We only need the op kind to trace ptrs, so
     // store an optional op per value id. Indexed (no hash map) -> deterministic.
     const def = try gpa.alloc(?Ir.Op, func.values.len);
@@ -77,13 +77,13 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
         }
     }
 
-    // --- escape pre-pass: any slot whose ADDRESS leaves our analysis -----------
+    // escape pre-pass: any slot whose ADDRESS leaves our analysis
     const escaped = try gpa.alloc(bool, func.slots.len);
     defer gpa.free(escaped);
     @memset(escaped, false);
     markEscapes(func, def, escaped);
 
-    // --- forward, block by block (intra-block only) ----------------------------
+    // forward, block by block (intra-block only)
     // `remap[v]` (default identity) rewrites every value use after we forward. We
     // forward inside the same block then apply remap to the WHOLE function (the
     // load's result can only be used at >= its id, and only after this block, but a
@@ -247,7 +247,7 @@ fn escapeOf(def: []const ?Ir.Op, escaped: []bool, v: Ir.ValueId) void {
     }
 }
 
-// --- avail bookkeeping (flat indexed list; deterministic, no hash-map iter) ----
+// avail bookkeeping (flat indexed list; deterministic, no hash-map iter)
 
 fn recordStore(gpa: std.mem.Allocator, avail: *std.ArrayListUnmanaged(Avail), s: Ir.SlotId, off: u32, val: Ir.ValueId) !void {
     // A later store to the same {S,off} supersedes the earlier one: overwrite.
@@ -277,9 +277,7 @@ fn clearSlot(avail: *std.ArrayListUnmanaged(Avail), s: Ir.SlotId) void {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tests — hand-built IR under std.testing.allocator (catches leak/double-free).
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 

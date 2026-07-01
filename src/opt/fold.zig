@@ -125,10 +125,7 @@ fn constBool(known: []const Known, v: Ir.ValueId) ?bool {
     };
 }
 
-// ---------------------------------------------------------------------------
-// Tests — hand-built IR, run under std.testing.allocator (catches leak/double
-// -free). Each builds a single-block function so def-before-use holds trivially.
-// ---------------------------------------------------------------------------
+// Tests — hand-built IR, run under std.testing.allocator (catches leak/double-free). Each builds a single-block function so def-before-use holds trivially.
 
 const testing = std.testing;
 
