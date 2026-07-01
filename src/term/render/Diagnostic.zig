@@ -1,77 +1,45 @@
-//! Pretty-diagnostic data model: `Severity`, `Span`, `Label`, `Note`, and the
-//! rich `Diagnostic`, plus a one-way read-only adapter (`fromSink`) from the
-//! compiler's existing single-point diagnostic.
-//!
-//! WHY a second, richer diagnostic type. The compiler's diagnostic
-//! (`../../diagnostics/Diagnostic.zig`) is a single point: `{ byte_offset,
-//! message, scope }` — no end offset, no severity, no secondary labels, no
-//! notes. That shape is exactly right for the emit side (every stage stamps one
-//! by value, the sink sorts them) and MUST NOT grow. This model is the RENDER
-//! side: it carries everything a rustc-style pretty printer needs (a primary
-//! span, receding secondary labels, footer notes, an `error[E0001]` code) so
-//! M12 (the single-line renderer) and M13 (multi-line rails) consume it with
-//! zero reshape.
-//!
-//! `fromSink` is the bridge. It reads a `sink.Diagnostic` BY VALUE (so it
-//! provably cannot mutate the sink) and returns a `Diagnostic` with no error
-//! union and no allocator — a compile-time proof that it is infallible and
-//! ALLOCATION-FREE. It synthesizes the one thing today's compiler always means:
-//! an `error` with a single ZERO-WIDTH primary label at `byte_offset`, the
-//! message BORROWED (not copied — same `.ptr`), and the `scope` forwarded
-//! verbatim as an opaque `source` id. There is no gpa, no `deinit`, and no leak
-//! test anywhere in this file because nothing here ever allocates: every field
-//! is either a borrowed slice, an empty comptime slice, or a scalar.
-//!
-//! LAYERING. Pure data + a pure by-value adapter. Imports ONLY `std` and the
-//! sink diagnostic type (the one sanctioned render->diagnostics cross-import,
-//! read-only, by value). It does NOT import `Style`, `Theme`, `SourceMap`,
-//! `Terminal`, or anything under `cli/*`; styling is `Theme`'s job and emission
-//! is M12's. `source`/`scope` are SourceMap-independent opaque ids: a driver
-//! maps `scope -> which SourceMap` and the renderer takes one map.
+//! Pretty-diagnostic data model (`Severity`, `Span`, `Label`, `Note`, `Diagnostic`)
+//! plus `fromSink`, a read-only by-value adapter from the compiler's single-point
+//! diagnostic. The render-side counterpart to the emit-side sink diagnostic.
+//! - All slice fields are borrowed for the sink's lifetime; nothing here allocates.
+//! - `fromSink` takes the sink diagnostic by value (can't mutate it) and returns
+//!   a plain `Diagnostic` (no error union / no allocator = infallible + alloc-free).
+//! - Pure data: imports only `std` and the sink type (the one sanctioned,
+//!   read-only render->diagnostics cross-import); no Style/Theme/SourceMap.
 
 const std = @import("std");
-// The sink diagnostic type, imported from its HOME file (not via `Sink.zig`, so
-// this data leaf never pulls in the sink's ArrayList machinery). Read-only, by
-// value — this is the one render->diagnostics cross-import the ROADMAP sanctions.
+// The sink diagnostic type, imported from its home file (not via `Sink.zig`) so
+// this leaf never pulls in the sink's ArrayList machinery. Read-only, by value.
 const sink = @import("../../diagnostics/Diagnostic.zig");
 
-/// Diagnostic severity, most-to-least severe. Order is stable and fixed
-/// (`err`=0, `warning`=1, `note`=2, `help`=3); new severities APPEND at the end
-/// so every exhaustive `switch` (e.g. `Theme.info`) breaks loudly when one is
-/// added. Spelled `err` — NOT the `error` keyword, NOT `@"error"`: the
-/// user-facing word "error" is produced only by `Theme.word(.err)`, so the tag
-/// never needs to literally be `error`, and `.err` reads cleanly in switch
-/// prongs and comparisons with no quoting.
+/// Diagnostic severity, most-to-least severe. Append new severities at the end so
+/// exhaustive switches break loudly. Spelled `err` (not the `error` keyword): the
+/// user-facing word "error" is produced only by `Theme.word(.err)`.
 pub const Severity = enum { err, warning, note, help };
 
-/// A half-open byte range `[start, end)` into a single source. Render owns this
-/// shape (it is intentionally identical to `SourceMap.Span`) so the data model
-/// stays decoupled from `SourceMap`; M12 converts trivially.
+/// A half-open byte range `[start, end)` into a single source. Intentionally
+/// identical in shape to `SourceMap.Span` so the data model stays decoupled from it.
 pub const Span = struct {
     start: u32,
     end: u32,
 
-    /// True when the span covers no bytes (`start == end`). M12 uses this to
-    /// choose a single caret (zero-width point) over an underline run; every
-    /// `fromSink` span is zero-width.
+    /// True when the span covers no bytes (`start == end`) — a single caret point
+    /// rather than an underline run. Every `fromSink` span is zero-width.
     pub fn isZeroWidth(self: Span) bool {
         return self.start == self.end;
     }
 };
 
 /// Whether a label is the diagnostic's focus (`primary`, drawn with the caret /
-/// primary underline) or supporting context (`secondary`, which recedes). The
-/// kind rides ON each label so M13's merged, line-sorted label iteration is
-/// uniform without re-synthesizing the kind during its merge.
+/// primary underline) or supporting context (`secondary`, which recedes).
 pub const LabelKind = enum { primary, secondary };
 
 /// A span with an optional message pointing into one source. `message` and the
-/// backing bytes are BORROWED — a label copies neither. An empty `message`
-/// means a bare underline (span highlighted, no text).
+/// backing bytes are borrowed. An empty `message` means a bare underline (no text).
 pub const Label = struct {
     kind: LabelKind,
     span: Span,
-    /// BORROWED; may be "" for a bare underline with no text.
+    /// May be "" for a bare underline with no text.
     message: []const u8 = "",
     /// Opaque source/scope id selecting which `SourceMap` the span indexes.
     /// `NO_SOURCE` == the single-source case (mirrors the sink's `NO_SCOPE`).
@@ -81,11 +49,9 @@ pub const Label = struct {
 /// A footer note kind: an informational `note` or an actionable `help`.
 pub const NoteKind = enum { note, help };
 
-/// A free-standing footer line (rustc's `= note:` / `= help:`). `message` is
-/// BORROWED. `kind` is mandatory — a note is always one or the other.
+/// A free-standing footer line (rustc's `= note:` / `= help:`). `message` borrowed.
 pub const Note = struct {
     kind: NoteKind,
-    /// BORROWED.
     message: []const u8,
 };
 
@@ -94,55 +60,43 @@ pub const Note = struct {
 /// single-file `NO_SCOPE` lands on `NO_SOURCE` with no translation and no branch.
 pub const NO_SOURCE: u32 = std.math.maxInt(u32);
 
-/// The rich render-side diagnostic. A `primary` label is MANDATORY (a
-/// diagnostic always has a focus, and requiring it lets `fromSink` build one
-/// with no allocation); `secondary` and `notes` default to empty borrowed
-/// slices so the single-point case allocates nothing. All slice fields are
-/// BORROWED for the sink's lifetime.
+/// The rich render-side diagnostic. `primary` is mandatory (always a focus, and
+/// requiring it lets `fromSink` build one with no allocation); `secondary`/`notes`
+/// default empty so the single-point case allocates nothing. Slice fields borrowed.
 pub const Diagnostic = struct {
     severity: Severity,
-    /// BORROWED header message (the top line beside the severity word).
+    /// Header message (the top line beside the severity word).
     message: []const u8,
-    /// MANDATORY focus label; `.kind == .primary` by construction.
+    /// Focus label; `.kind == .primary` by construction.
     primary: Label,
-    /// BORROWED supporting labels; default empty keeps `fromSink` alloc-free.
     secondary: []const Label = &.{},
-    /// BORROWED footer notes; default empty.
     notes: []const Note = &.{},
-    /// BORROWED short code driving an `error[E0001]:` header; `fromSink` -> null.
+    /// Short code driving an `error[E0001]:` header; `fromSink` -> null.
     code: ?[]const u8 = null,
     /// Opaque routing id carried from the sink; equals `primary.source`.
     scope: u32 = NO_SOURCE,
 };
 
-// Pin the two "untagged" sentinels together at compile time. `fromSink`
-// forwards `scope` VERBATIM into `source`/`scope`, so this equality is what lets
-// a single-file `NO_SCOPE` mean `NO_SOURCE` with no translation table. If either
-// sentinel ever drifts, this fails the build.
+// Pin the two "untagged" sentinels together. `fromSink` forwards `scope` verbatim
+// into `source`/`scope`, so this equality is what lets a single-file `NO_SCOPE`
+// mean `NO_SOURCE` with no translation table. Drift fails the build.
 comptime {
     std.debug.assert(NO_SOURCE == sink.NO_SCOPE);
 }
 
-/// Adapt the compiler's single-point diagnostic into the rich render model.
-///
-/// Takes `sink.Diagnostic` BY VALUE (proving it cannot mutate the sink) and
-/// returns a plain `Diagnostic` (no error union, no allocator param — infallible
-/// and allocation-free). Synthesizes what every compiler diagnostic means today:
-///   - `severity`  = `.err`   (the compiler has only errors so far)
-///   - `message`   = borrowed `d.message` (same slice, same `.ptr`, not copied)
-///   - `primary`   = a ZERO-WIDTH label `[byte_offset, byte_offset)` carrying the
-///                   borrowed message and forwarding `scope` as its `source`
-///   - `secondary`/`notes` empty, `code` null
-///   - `scope`     = `d.scope` verbatim (== `primary.source`)
+/// Adapt the compiler's single-point diagnostic into the rich render model:
+/// `.err` severity, borrowed message, a zero-width primary at `byte_offset`, and
+/// `scope` forwarded verbatim (`NO_SCOPE` -> `NO_SOURCE`). Empty secondary/notes,
+/// null code. By value + no allocator, so infallible and alloc-free.
 pub fn fromSink(d: sink.Diagnostic) Diagnostic {
     return .{
         .severity = .err,
-        .message = d.message, // BORROWED: same .ptr, not duped.
+        .message = d.message, // borrowed: same .ptr, not duped
         .primary = .{
             .kind = .primary,
             .span = .{ .start = d.byte_offset, .end = d.byte_offset }, // zero-width point
-            .message = d.message, // BORROWED: aliases d.message.
-            .source = d.scope, // forwarded verbatim (NO_SCOPE -> NO_SOURCE).
+            .message = d.message, // borrowed: aliases d.message
+            .source = d.scope, // forwarded verbatim (NO_SCOPE -> NO_SOURCE)
         },
         // .secondary, .notes, .code take their struct defaults (empty / null).
         .scope = d.scope,

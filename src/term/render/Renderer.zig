@@ -1,122 +1,29 @@
-//! M13 — the multi-line pretty-diagnostic renderer: the FINAL link of the
-//! diagnostics chain. It EXTENDS M12's single-line renderer so a diagnostic
-//! whose labels span or straddle MULTIPLE source lines renders with a left RAIL
-//! column joining a span's start line to its end line (rustc/ariadne style),
-//! shows every source line that carries a label (not just the primary's), and
-//! reserves the gutter width from the MAX line number across all rendered lines.
-//!
-//!     error: unterminated block
-//!      --> blk.toy:1:8
-//!       |
-//!     1 |  fn f() {
-//!       | /-------^
-//!     2 | |    a
-//!     3 | |}
-//!       | \-^ unterminated block
-//!
-//! (unicode set uses │ ╭ ╰ ─ for the rail; the gutter '|' stays ASCII.)
-//!
-//! WHY a pure LAYOUT->EMIT seam (unchanged from M12). The load-bearing invariant
-//! of this whole framework is ZERO-ESCAPE at `ColorLevel.none`: colour must
-//! change ONLY styling, NEVER layout, so the plain bytes equal the coloured bytes
-//! with every SGR run removed. We make that STRUCTURAL rather than test-only by
-//! splitting the code in two disjoint categories:
-//!   - LAYOUT (pure): `digits`, `startDisplayCol`, `runCellsClamped`, `lessLabel`,
-//!     `classifyMulti`, `assignRails`, the line-set predicates and all rail/
-//!     connector column math — helpers that NEVER take/read `opts.color`. They
-//!     decide spacing, glyph counts, and text identically at every colour level.
-//!   - EMIT (writer + colour): every plain layout byte (spaces, `|`, `-->`,
-//!     digits, `:`, source text, `=`, plain messages, rail-cell spaces, the
-//!     elision glyph) goes through raw `writeAll`/`writeByte`/`splatByteAll`/
-//!     `print`, which CANNOT emit 0x1b. The ONLY escape-producing calls are
-//!     `Style.styled` and `styledGlyphRun` (a `sgrInto` + loop + `closeInto`
-//!     wrapper); both write ZERO bytes at `.none`. The rail glyphs (│╭╰─ / |/\-)
-//!     and connector carets go through `styledGlyphRun` with the owning span's
-//!     style, so they colour like an M12 caret and are bare at `.none`. The
-//!     gutter (pipe/number/prefix) is INTENTIONALLY UNSTYLED — even in unicode
-//!     mode the gutter '|' is ASCII '|'; only the RAIL region uses │/╭/╰/─. That
-//!     gutter-ASCII / rail-themed split is why the rail is a DISTINCT column from
-//!     the gutter pipe.
-//! Therefore stripping every `\x1b[...m` run from a coloured render yields the
-//! `.none` render byte-for-byte, and line count / glyph runs are colour-invariant
-//! by construction.
-//!
-//! DETERMINISM. Two INDEPENDENT stable orders, kept separate:
-//!   1. Labels for the marker rows are ordered by (start display column asc,
-//!      primary-before-secondary, original index asc) via an in-place insertion
-//!      sort over `refs` (no allocation).
-//!   2. Multi-line spans are assigned rail COLUMNS by deterministic greedy
-//!      interval coloring over a SEPARATE index array (never permuting `refs`):
-//!      sort by (start_line asc, end_line desc, order asc), then give each span
-//!      the lowest column whose last-assigned span ends before this one starts.
-//! The rendered-line sequence walks `min_line..max_line` with a per-line scan, so
-//! the same `Diagnostic` renders byte-identical every run.
-//!
-//! THE RAIL (multi-line). When any multi-line span is present, a RAIL region of
-//! `R` cells sits between the gutter `|` (after M12's single post-prefix space)
-//! and the source text; `R` == the rail depth (number of overlapping rail
-//! columns needed). A single multi-line span => `R == 1`. CRITICAL geometry: a
-//! CONNECTOR row draws ALL `R` rail cells, exactly like a source row, so the
-//! content-area origin (the first cell after the rail) is at DISPLAY offset `R`
-//! on BOTH a source row and its connector rows. A source char at line-relative
-//! display col `dcol` therefore sits at offset `R + (dcol - 1)` on every row, and
-//! the connector's horizontal run + caret — which start at offset `R` — reach it
-//! with `K = dcol - 1` regardless of which column the span owns. Each multi-line
-//! span owns one column `c` (0 == outermost, higher == more nested):
-//!   - START line: source row (its own cell is a SPACE — the corner descends on
-//!     the connector row BELOW), then a START-CONNECTOR row whose R rail cells are
-//!     [cells < c: open-state; cell c: `rail_top`; cells > c: `rail_horizontal`
-//!     (the run crosses them)], then `rail_horizontal` runs `K = start_dcol - 1`
-//!     more cells, ending in a caret at the span's start display column. NO
-//!     message.
-//!   - INTERVENING lines: source rows whose cell `c` is `rail_vertical` (open).
-//!   - END line: source row (cell `c` == `rail_vertical`), then an END-CONNECTOR
-//!     row whose R rail cells are [cells < c: open-state; cell c: `rail_bottom`;
-//!     cells > c: `rail_horizontal`], then `rail_horizontal` runs `K' =
-//!     end_dcol - 1` more cells, ending in a caret at the EXCLUSIVE end display
-//!     column + the label MESSAGE (the message rides the END connector,
-//!     rustc/ariadne).
-//! Every horizontal distance is a DIFFERENCE OF DISPLAY COLUMNS (`displayCol`),
-//! never a byte count, so connectors align on tab/CJK/emoji lines; every rail
-//! glyph is exactly 1 display cell and `styledGlyphRun` repeats by COUNT, so `R`
-//! rail cells are exactly `R` cells in both glyph sets and the content-area
-//! origin never shifts between a source row and its connector rows.
-//!
-//! OVERLAP CROSSING (documented simplification). When an OUTER connector (column
-//! `c`) crosses a rail column `> c` that is still open on that row, the outer's
-//! `rail_horizontal` overwrites the inner span's `rail_vertical` at the crossing
-//! cell — with only 4 rail glyphs there is no crossing glyph (`┼`) to draw. This
-//! is aligned + readable (the locked "must not corrupt" bar), just visually a
-//! `─` where rustc would show `┼`. Fully-nested spans never trigger it on their
-//! own connector rows; only partial/staggered overlaps do.
-//!
-//! ELISION. Between two consecutive RENDERED lines whose numbers differ by >= 2,
-//! one elision row collapses the gap: `emptyPrefix + ' ' + ELISION_GLYPH`. A gap
-//! can only occur where NO rail is open (every line inside a span's
-//! [start_line, end_line] is rendered), so the elision row never carries a rail
-//! cell (asserted in debug). Glyphs are file-local consts (no reserved Theme
-//! glyph exists and Theme must not be edited): plain "...", unicode "⋮". They sit
-//! in the CONTENT area (after the gutter), so the '|' column stays straight.
-//!
-//! SCOPE / SIMPLIFICATIONS (locked):
-//!   - SINGLE SOURCE still: one `SourceMap` arg; `Label.source`/`Diagnostic.scope`
-//!     are IGNORED and every span indexes the one map. The ROADMAP phrase "max
-//!     line number across all touched sources" is interpreted as "across all
-//!     rendered lines of the one source". Multi-source rendering (a source
-//!     registry, routing labels by source id) is OUT OF SCOPE / future and would
-//!     need a `render()` signature change.
-//!   - Message wrapping is out of scope (messages are single-line, unbounded).
-//!   - RAIL DEPTH is bounded at `MAX_MULTILINE` overlapping rail columns; the
-//!     common single-span case (`R == 1`) renders perfectly, and up to
-//!     `MAX_MULTILINE` overlapping spans render faithfully via greedy coloring.
-//!     Any overflow past the cap is deterministically re-tagged single-line and
-//!     rendered as an M12-style start-line-clamped underline (documented
-//!     simplification; a debug assert flags it; output never corrupts).
-//!
-//! LAYERING. Imports ONLY `std` plus the four render leaves it composes. It does
-//! NOT import `Terminal` (colour arrives as a `ColorLevel` in `opts`, never by
-//! sniffing a tty), `Progress`, `ansi` directly (reached only transitively
-//! through `Style`), or anything under `cli/*`.
+//! Multi-line pretty-diagnostic renderer: draws the snippet, carets/underlines,
+//! footer notes, and a left rail joining a multi-line span's start line to its end
+//! line (rustc/ariadne style). Single source, allocation-free (stack-only).
+//! - Zero-escape at `ColorLevel.none`: colour changes styling only, never layout,
+//!   so stripping every SGR run from a coloured render yields the `.none` render
+//!   byte-for-byte. Structural, not test-only: LAYOUT helpers never read
+//!   `opts.color`; EMIT sends plain bytes through raw writes (can't emit 0x1b) and
+//!   escapes only via `Style.styled`/`styledGlyphRun` (zero bytes at `.none`). The
+//!   gutter '|' stays ASCII even in unicode mode; only the rail region uses │╭╰─,
+//!   which is why the rail is a distinct column from the gutter pipe.
+//! - Rail geometry: a connector row draws all `R` rail cells (like a source row),
+//!   so the content origin is at display offset `R` on every row; a source char at
+//!   display col `dcol` sits at offset `R + (dcol-1)`, and a connector's run+caret
+//!   reach it with `K = dcol-1` regardless of the span's rail column. All
+//!   horizontal distances are display-column differences (never byte counts), so
+//!   connectors align on tab/CJK/emoji lines.
+//! - Overlap crossing (simplification): with only 4 rail glyphs an outer connector
+//!   crossing a still-open inner rail overwrites it with `rail_horizontal` (no `┼`).
+//!   Aligned + readable, never corrupt; only staggered (non-nested) overlaps hit it.
+//! - Determinism: markers sort by (start display col, primary-first, order); rails
+//!   are greedy-colored over a separate index array (never permuting the marker
+//!   sort). Same diagnostic renders byte-identical every run.
+//! - Scope: single source (`Label.source`/`scope` ignored); no message wrapping;
+//!   rail depth capped at `MAX_MULTILINE` (overflow demotes to a clamped underline).
+//! - Imports only `std` + the four render leaves; colour arrives as a `ColorLevel`,
+//!   never by sniffing a tty.
 
 const std = @import("std");
 const SourceMap = @import("SourceMap.zig");
@@ -130,28 +37,19 @@ const width = @import("../width.zig");
 /// truncated (primary kept at index 0), which keeps byte-stability at the cap.
 const MAX_LABELS: usize = 32;
 
-/// Rail-column cap (overlap depth). A single multi-line span is depth 1 and
-/// renders perfectly; up to `MAX_MULTILINE` overlapping spans render faithfully
-/// via greedy interval coloring. Extra multi-line spans past the cap are
-/// deterministically re-tagged single-line and rendered as M12-style
-/// start-line-clamped underlines (a debug assert flags the overflow). Sized for
-/// the real-world case (rustc rarely nests more than 2), keeping stack frames
-/// tiny while never corrupting output.
+/// Rail-column cap (overlap depth). Up to `MAX_MULTILINE` overlapping spans render
+/// faithfully via greedy coloring; extra spans past the cap are re-tagged
+/// single-line and rendered as a clamped underline (a debug assert flags overflow).
 const MAX_MULTILINE: usize = 4;
 
-/// The elision-row glyph (no reserved Theme glyph exists and Hard Rule 2 forbids
-/// editing Theme, so these are file-local consts). Placed in the CONTENT area
-/// (after the gutter's ` |` + space), never in the gutter number field, so the
-/// '|' column stays straight regardless of glyph width or gutter width. Chosen by
-/// `opts.unicode` in emit — presentation only, gate-safe (both are plain bytes,
-/// no escape).
+/// The elision-row glyph (file-local: no reserved Theme glyph exists). Sits in the
+/// content area (after ` |` + space), so the '|' column stays straight. Both are
+/// plain bytes (gate-safe); chosen by `opts.unicode` in emit.
 const ELISION_PLAIN: []const u8 = "...";
-const ELISION_UNICODE: []const u8 = "\u{22EE}"; // ⋮ VERTICAL ELLIPSIS, 1 cell
+const ELISION_UNICODE: []const u8 = "\u{22EE}"; // ⋮ vertical ellipsis, 1 cell
 
-/// Plain, tty-independent knobs. `color` is threaded to every `Style.styled` /
-/// `styledGlyphRun` call (never sniffed); `unicode` picks the glyph set via
-/// `Theme.forUnicode`; `tab_width` feeds `SourceMap.displayCol` so tab-indented
-/// carets land under the right cell.
+/// Tty-independent knobs. `color` is threaded to every styled call (never sniffed);
+/// `unicode` picks the glyph set; `tab_width` feeds `SourceMap.displayCol`.
 pub const RenderOpts = struct {
     color: Style.ColorLevel = .none,
     unicode: bool = false,
@@ -159,11 +57,10 @@ pub const RenderOpts = struct {
 };
 
 /// A label plus its original position in the diagnostic (index 0 == primary,
-/// 1.. == secondary[i-1]). `order` is the third, always-distinct sort key that
-/// makes the total order stable. `multi` marks a genuinely multi-line span (set
-/// during layout) and `rail` is its assigned rail column when multi (else unused)
-/// — a single-line label, or a multi-line span past the `MAX_MULTILINE` cap
-/// (re-tagged `multi = false`), takes the M12 marker/clamp path.
+/// 1.. == secondary[i-1]). `order` is the distinct third sort key for stability.
+/// `multi` marks a multi-line span (set during layout); `rail` is its assigned
+/// column when multi. A single-line label (or a demoted-past-cap span) takes the
+/// marker/clamp path.
 const LabelRef = struct {
     lbl: Diagnostic.Label,
     order: u8,
@@ -171,10 +68,8 @@ const LabelRef = struct {
     rail: usize = 0,
 };
 
-/// A resolved multi-line span, built during layout (PURE). Carries the 1-based
-/// line and DISPLAY-column endpoints plus the sort `order` and the greedily
-/// assigned `rail` column. All fields are small scalars, so `[MAX_MULTILINE]`
-/// MultiSpan is a tiny fixed-cap stack array.
+/// A resolved multi-line span (built during layout): 1-based line + display-column
+/// endpoints, the sort `order`, and the greedily assigned `rail` column.
 const MultiSpan = struct {
     start_line: usize,
     end_line: usize,
@@ -185,9 +80,8 @@ const MultiSpan = struct {
 };
 
 /// Render `d` against the single `SourceMap` `sm`. Derives the theme from
-/// `opts.unicode` internally and threads `opts.color` to every styled span.
-/// Allocation-free: all working state is stack-only. See the module doc for the
-/// output shape, the LAYOUT/EMIT seam, the rail, and the single-source scope.
+/// `opts.unicode`, threads `opts.color` to every styled span. Allocation-free.
+/// See the module doc for the output shape, the layout/emit seam, and the rail.
 pub fn render(d: Diagnostic.Diagnostic, sm: *const SourceMap, w: *std.Io.Writer, opts: RenderOpts) std.Io.Writer.Error!void {
     const theme = Theme.forUnicode(opts.unicode);
 
@@ -344,8 +238,7 @@ pub fn render(d: Diagnostic.Diagnostic, sm: *const SourceMap, w: *std.Io.Writer,
     }
 }
 
-/// Decimal digit count of `n`, min 1 (line numbers are 1-based, so `n >= 1`).
-/// A manual loop, matching the house style of hand-rolled math in the leaves.
+/// Decimal digit count of `n`, min 1 (line numbers are 1-based).
 fn digits(n: usize) usize {
     var v = n;
     var d: usize = 1;
@@ -353,11 +246,10 @@ fn digits(n: usize) usize {
     return d;
 }
 
-/// Classify a label's span (PURE): returns a `MultiSpan` iff the span's start and
-/// end resolve to DIFFERENT source lines (a genuine multi-line span), else `null`
-/// (single-line — including every zero-width span, which cannot cross a line by
-/// construction). The display columns are captured here so the connector emit
-/// never re-derives them. `order` is left 0 (the caller stamps the ref's order).
+/// Classify a label's span: returns a `MultiSpan` iff start and end resolve to
+/// different source lines, else `null` (single-line, incl. every zero-width span).
+/// Captures the display columns so the connector emit never re-derives them;
+/// `order` left 0 (the caller stamps the ref's order).
 fn classifyMulti(sm: *const SourceMap, lbl: Diagnostic.Label, tab_width: usize) ?MultiSpan {
     const start_line = sm.lineCol(lbl.span.start).line;
     const end_line = sm.lineCol(lbl.span.end).line;
@@ -372,23 +264,12 @@ fn classifyMulti(sm: *const SourceMap, lbl: Diagnostic.Label, tab_width: usize) 
     };
 }
 
-/// Assign each multi-line span a rail COLUMN via deterministic greedy interval
-/// coloring (PURE); returns the rail depth `R` (== max column + 1, or 0 when
-/// empty). Sorts a COPY-index array by (start_line asc, end_line desc, order asc)
-/// — NEVER permuting the caller's slice order beyond the `.rail` write — then
-/// gives each span the lowest column `c` whose last-assigned span ended before
-/// this span starts. Because an earlier-starting / later-ending span takes a
-/// lower column, nested spans land on HIGHER columns (column 0 == outermost). An
-/// INNER (higher-column) connector's corner + run always sits to the RIGHT of any
-/// still-open outer `rail_vertical`, so it never clashes. An OUTER (lower-column)
-/// connector, conversely, must cross the columns to its right: on a fully-nested
-/// layout the inner span has already closed by the time the outer connector
-/// fires, so those cells are blank and the crossing is clean; only a partial
-/// (staggered) overlap leaves an inner rail open under an outer connector, where
-/// the outer run overwrites it with `rail_horizontal` (see the module doc's
-/// OVERLAP CROSSING note — aligned + readable, never corrupt).
-/// Ties (identical start/end) break by `order` (primary first), fully
-/// deterministic. Allocation-free (fixed-cap stack arrays).
+/// Assign each multi-line span a rail column via deterministic greedy interval
+/// coloring; returns the rail depth `R` (max column + 1, or 0 when empty). Sorts a
+/// copy-index array (never permuting the caller's order beyond the `.rail` write),
+/// then gives each span the lowest column whose last span ended before it starts.
+/// Earlier-start / later-end spans take lower columns, so nested spans land on
+/// higher columns (column 0 == outermost). Ties break by `order` (primary first).
 fn assignRails(multis: []MultiSpan) usize {
     const m = multis.len;
     if (m == 0) return 0;
@@ -423,18 +304,17 @@ fn assignRails(multis: []MultiSpan) usize {
     return depth;
 }
 
-/// The coloring order over multi-line spans (PURE): (start_line asc, end_line
-/// desc, order asc). Outer (earlier-start / later-end) spans sort first so they
-/// claim the lower columns; `order` breaks exact ties deterministically.
+/// The coloring order over multi-line spans: (start_line asc, end_line desc,
+/// order asc). Outer spans sort first so they claim lower columns; `order` breaks ties.
 fn lessMulti(a: MultiSpan, b: MultiSpan) bool {
     if (a.start_line != b.start_line) return a.start_line < b.start_line;
     if (a.end_line != b.end_line) return a.end_line > b.end_line;
     return a.order < b.order;
 }
 
-/// True iff any multi-line span is OPEN across `line` (start_line <= line <=
-/// end_line) — PURE. Used both to decide whether a line is rendered and, on a
-/// source row, whether a rail cell is `rail_vertical` vs a space.
+/// True iff any multi-line span is open across `line` (start_line <= line <=
+/// end_line). Decides both whether a line renders and whether a source-row rail
+/// cell is `rail_vertical` vs a space.
 fn anyRailOpen(multis: []const MultiSpan, line: usize) bool {
     for (multis) |ms| {
         if (ms.start_line <= line and line <= ms.end_line) return true;
@@ -442,10 +322,9 @@ fn anyRailOpen(multis: []const MultiSpan, line: usize) bool {
     return false;
 }
 
-/// True iff any SINGLE-line ref has its start line == `line` (PURE). A multi-line
-/// ref is excluded here — it is rendered by the rail-open predicate — so a line
-/// that carries only multi-line connectors still renders, and a single-line label
-/// forces its own line to render even with no rail open.
+/// True iff any single-line ref starts on `line` (multi-line refs excluded — they
+/// render via the rail-open predicate). Forces a single-line label's own line to
+/// render even with no rail open.
 fn anySingleOnLine(sm: *const SourceMap, refs: []const LabelRef, line: usize) bool {
     for (refs) |ref| {
         if (ref.multi) continue;
@@ -454,26 +333,23 @@ fn anySingleOnLine(sm: *const SourceMap, refs: []const LabelRef, line: usize) bo
     return false;
 }
 
-/// A numbered gutter prefix: right-align `line` in a `gw`-wide field, then
-/// `<line> |`. The prefix has NO trailing space — content rows prepend their own
-/// single space, which keeps goldens free of trailing-whitespace ambiguity.
+/// A numbered gutter prefix: `line` right-aligned in a `gw`-wide field, then
+/// `<line> |`. No trailing space — content rows prepend their own single space.
 fn numberedPrefix(w: *std.Io.Writer, gw: usize, line: usize) std.Io.Writer.Error!void {
     try w.splatByteAll(' ', gw - digits(line));
     try w.print("{d} |", .{line});
 }
 
 /// An empty gutter prefix (separator / marker / connector rows): `gw` spaces then
-/// ` |`. Like `numberedPrefix`, no trailing space.
+/// ` |`. No trailing space.
 fn emptyPrefix(w: *std.Io.Writer, gw: usize) std.Io.Writer.Error!void {
     try w.splatByteAll(' ', gw);
     try w.writeAll(" |");
 }
 
-/// Emit a styled run of `n` copies of `glyph`. THE single escape-emitting seam
-/// for glyph runs: one `sgrInto`, `n` raw `writeAll`s, one `closeInto`. At
-/// `.none` `sgrInto`/`closeInto` write zero bytes, so the run is the bare glyphs.
-/// The glyph is repeated by COUNT (not by byte length) so a multi-byte unicode
-/// glyph ('─' = 3 bytes / 1 cell) yields exactly `n` cells, not `3n`.
+/// Emit a styled run of `n` copies of `glyph` — the single escape-emitting seam
+/// for glyph runs (bare glyphs at `.none`). Repeats by count, not byte length, so
+/// a multi-byte glyph ('─' = 3 bytes / 1 cell) yields `n` cells, not `3n`.
 fn styledGlyphRun(s: Style.Style, w: *std.Io.Writer, level: Style.ColorLevel, glyph: []const u8, n: usize) std.Io.Writer.Error!void {
     try s.sgrInto(w, level);
     var i: usize = 0;
@@ -481,18 +357,16 @@ fn styledGlyphRun(s: Style.Style, w: *std.Io.Writer, level: Style.ColorLevel, gl
     try s.closeInto(w, level);
 }
 
-/// The style for a ref's rail cells / marker run: a PRIMARY label uses the
-/// diagnostic's `severity` hue (so its rail/caret matches the header word), a
-/// SECONDARY label the dim `secondaryStyle`. Centralised so the source-row rail,
-/// the connectors, and the markers all agree.
+/// The style for a ref's rail cells / marker run: primary uses the severity hue
+/// (matching the header word), secondary the dim `secondaryStyle`. Centralised so
+/// the source-row rail, connectors, and markers all agree.
 fn refStyle(theme: Theme, severity: Diagnostic.Severity, kind: Diagnostic.LabelKind) Style.Style {
     return if (kind == .primary) theme.style(severity) else theme.secondaryStyle();
 }
 
-/// The rail style for the multi-line span assigned to rail column `c` (PURE
-/// lookup, no colour): finds the owning span among `multis`, matches its `order`
-/// back to a ref to recover its kind, and returns that style. If no span owns `c`
-/// (a blank cell), the returned style is irrelevant (a space is emitted raw).
+/// The rail style for the multi-line span owning rail column `c`: matches the
+/// span's `order` back to a ref to recover its kind. If no span owns `c` (a blank
+/// cell), the returned style is irrelevant (a space is emitted raw).
 fn railStyleForColumn(theme: Theme, severity: Diagnostic.Severity, multis: []const MultiSpan, refs: []const LabelRef, c: usize) Style.Style {
     for (multis) |ms| {
         if (ms.rail != c) continue;
@@ -512,11 +386,8 @@ fn noteSeverity(k: Diagnostic.NoteKind) Diagnostic.Severity {
     };
 }
 
-/// The stable total order over labels for the marker rows (PURE — no colour):
-///   1. start DISPLAY column ascending (leftmost marker first);
-///   2. tie -> primary before secondary;
-///   3. tie -> original index ascending (`order`).
-/// Total + stable, so the same diagnostic renders byte-identical every run.
+/// The stable total order over labels for the marker rows: (start display col asc,
+/// primary before secondary, order asc). Total + stable => byte-identical every run.
 fn lessLabel(sm: *const SourceMap, tab_width: usize, a: LabelRef, b: LabelRef) bool {
     const ca = startDisplayCol(sm, a.lbl, tab_width);
     const cb = startDisplayCol(sm, b.lbl, tab_width);
@@ -527,25 +398,19 @@ fn lessLabel(sm: *const SourceMap, tab_width: usize, a: LabelRef, b: LabelRef) b
     return a.order < b.order;
 }
 
-/// 1-based DISPLAY column of a label's span start (PURE). The caret's leading
-/// padding is `this - 1`; using the DISPLAY column (not the byte column) is what
-/// lands the marker under the exact terminal cell on tab/CJK/emoji lines.
+/// 1-based display column of a label's span start (caret pad is `this - 1`). The
+/// display column, not the byte column, is what lands the marker under the exact
+/// terminal cell on tab/CJK/emoji lines.
 fn startDisplayCol(sm: *const SourceMap, lbl: Diagnostic.Label, tab_width: usize) usize {
     return sm.displayCol(lbl.span.start, tab_width);
 }
 
-/// Display-cell width of a single-line label's underline run, with the M12 CLAMP
-/// (PURE). A span crossing a '\n' (only reachable here when a multi-line span
-/// OVERFLOWED the rail cap and was demoted) is clamped to the end of its start
-/// line — no cross-line rails, no runaway. A zero-width span yields 1 (a single
-/// caret cell); otherwise the clamped span's DISPLAY width, floored at 1.
-///
-/// The width is a DIFFERENCE OF DISPLAY COLUMNS, `displayCol(eff_end) -
-/// displayCol(start)`, NOT `width.displayWidth(spanText)`. That distinction is
-/// load-bearing for a span containing an INTERIOR tab: width.zig reports TAB as
-/// 0 cells (it is a C0 control), so `displayWidth("a\tb")` = 2, under-running the
-/// on-screen 5 cells. displayCol walks the line prefix with elastic tab-stop
-/// expansion, so its difference is the true on-screen cell span.
+/// Display-cell width of a single-line label's underline run, clamped to the start
+/// line (a cross-line span, only reachable when demoted past the rail cap, doesn't
+/// run away). Zero-width -> 1; else the clamped span's display width, floored at 1.
+/// The width is a difference of display columns, NOT `width.displayWidth(spanText)`:
+/// for an interior tab, width.zig reports TAB as 0 cells so `displayWidth("a\tb")`
+/// = 2, under-running the on-screen 5; the displayCol difference is the true span.
 fn runCellsClamped(sm: *const SourceMap, lbl: Diagnostic.Label, line: usize, tab_width: usize) usize {
     if (lbl.span.isZeroWidth()) return 1;
     const line_start_off = sm.lineStart(line);
@@ -556,14 +421,10 @@ fn runCellsClamped(sm: *const SourceMap, lbl: Diagnostic.Label, line: usize, tab
     return @max(cells, 1);
 }
 
-/// Emit the top or footer SEPARATOR row. `emptyPrefix` then the rail region
-/// TRAILING-TRIMMED: only cells up to the last non-blank cell are drawn, and when
-/// ALL cells are blank NOTHING is emitted (the row ends at `|`, byte-identical to
-/// M12's "  |"). The `.top` separator sits above the first rendered line, where
-/// nothing is open, so it is always all-blank => M12-identical at any R. (The
-/// footer separator is emitted directly in `render` as the M12 "  |" — it never
-/// carries a rail region — so `emitSeparator` is used only for the top row today,
-/// but the trailing-trim logic keeps it correct if that ever changes.)
+/// Emit the top separator row: `emptyPrefix` then the rail region trailing-trimmed
+/// (cells up to the last open one; all-blank emits nothing, so the row ends at `|`).
+/// The top separator sits above the first rendered line where nothing is open, so
+/// it is always all-blank; the trim logic keeps it correct if that ever changes.
 fn emitSeparator(w: *std.Io.Writer, gw: usize, R: usize, multis: []const MultiSpan, line: usize, kind: enum { top }) std.Io.Writer.Error!void {
     _ = kind;
     try emptyPrefix(w, gw);
@@ -587,10 +448,9 @@ fn emitSeparator(w: *std.Io.Writer, gw: usize, R: usize, multis: []const MultiSp
     try w.writeByte('\n');
 }
 
-/// True iff rail column `c` is drawn (open) on a SOURCE row for `line`: some span
-/// owns column `c` AND is strictly PAST its start line but not past its end line
-/// (start_line < line <= end_line). On a span's START line the cell is a SPACE
-/// (the corner descends on the connector below), so it is NOT open here.
+/// True iff rail column `c` is drawn on a source row for `line`: a span owns `c`
+/// and start_line < line <= end_line. On a span's start line the cell is a space
+/// (the corner descends on the connector below), so it is not open here.
 fn railCellOpen(multis: []const MultiSpan, c: usize, line: usize) bool {
     for (multis) |ms| {
         if (ms.rail == c and ms.start_line < line and line <= ms.end_line) return true;
@@ -598,11 +458,8 @@ fn railCellOpen(multis: []const MultiSpan, c: usize, line: usize) bool {
     return false;
 }
 
-/// Emit the R-cell rail region for a SOURCE row at `line`: each cell `c` is
-/// `rail_vertical` (styled) when open (`railCellOpen`), else a raw space. Emits
-/// NOTHING when `R == 0` (never entered from a depth-0 render). Gate-safe: the
-/// vertical glyph goes through `styledGlyphRun` (bare at `.none`), the blank cell
-/// is a raw `writeByte(' ')`.
+/// Emit the R-cell rail region for a source row at `line`: each cell is
+/// `rail_vertical` (styled) when open, else a raw space. Nothing at `R == 0`.
 fn emitRailRegion(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, severity: Diagnostic.Severity, R: usize, multis: []const MultiSpan, refs: []const LabelRef, line: usize) std.Io.Writer.Error!void {
     if (R == 0) return;
     var c: usize = 0;
@@ -616,27 +473,13 @@ fn emitRailRegion(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, severity: D
     }
 }
 
-/// Emit the R-cell rail region for a CONNECTOR row of the span owning column
-/// `own`. This draws ALL `R` cells — exactly like `emitRailRegion` on a source
-/// row — so the content-area origin (offset `R`) is IDENTICAL between a source
-/// row and its connector rows; the horizontal run + caret that follow then
-/// measure from that same origin, which is why the caret lands under the source
-/// column at DISPLAY offset `R + (dcol - 1)` for EVERY column `own`, not just the
-/// innermost (`own == R-1`). The cells are:
-///   - `c < own`: open-state (`rail_vertical` if the span owning column `c` is
-///     open through this line, else a raw space) — a lower/outer span whose rail
-///     passes vertically through this connector row keeps its `|`.
-///   - `c == own`: `own_glyph` (the corner `rail_top`/`rail_bottom`), styled with
-///     the owning span's style.
-///   - `c > own`: `rail_horizontal`, styled with the owning span's style — the
-///     connector's horizontal run CROSSES every rail cell to its right on its way
-///     to the caret, so those cells are part of THIS connector, not the cell's own
-///     span. This is the documented overlap simplification: with only 4 rail
-///     glyphs (no crossing glyph) an OUTER connector crossing an inner span that
-///     is still open on this row overwrites the inner `rail_vertical` with `─`.
-///     Output stays aligned and readable (never corrupt); the crossing point just
-///     reads as a horizontal rather than a rustc-style `┼`.
-/// Emits nothing at `R == 0`.
+/// Emit the R-cell rail region for a connector row of the span owning column
+/// `own`. Draws all `R` cells (like a source row) so the content origin stays at
+/// offset `R`, which is why the caret lands at display offset `R + (dcol-1)` for
+/// every `own`. Cells: `c < own` open-state (`rail_vertical` or space); `c == own`
+/// the corner `own_glyph`; `c > own` `rail_horizontal` (the run crosses them —
+/// overwriting a still-open inner rail, the documented overlap simplification).
+/// Nothing at `R == 0`.
 fn emitConnectorRail(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, severity: Diagnostic.Severity, R: usize, multis: []const MultiSpan, refs: []const LabelRef, line: usize, own: usize, own_glyph: []const u8, own_style: Style.Style) std.Io.Writer.Error!void {
     if (R == 0) return;
     var c: usize = 0;
@@ -655,9 +498,8 @@ fn emitConnectorRail(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, severity
     }
 }
 
-/// Emit a SOURCE row for `line`: `numberedPrefix` + ' ' + rail region + the
-/// borrowed (CRLF-stripped) line text. The source text is NEVER styled. At
-/// `R == 0` the rail region is 0 cells, so this is M12's source row exactly.
+/// Emit a source row for `line`: `numberedPrefix` + ' ' + rail region + the
+/// borrowed (CRLF-stripped) line text. The source text is never styled.
 fn emitSourceLine(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize, R: usize, severity: Diagnostic.Severity, sm: *const SourceMap, line: usize, multis: []const MultiSpan, refs: []const LabelRef) std.Io.Writer.Error!void {
     try numberedPrefix(w, gw, line);
     try w.writeByte(' ');
@@ -666,22 +508,15 @@ fn emitSourceLine(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize, 
     try w.writeByte('\n');
 }
 
-/// Emit the START-CONNECTOR row for multi-line span `s` (emitted immediately
-/// after its start-line source row): `emptyPrefix` + ' ' + the R-cell connector
-/// rail (cells left of `s.rail` in open-state, cell `s.rail` = `rail_top`, cells
-/// right of `s.rail` = `rail_horizontal` as the run crosses them) + a further
-/// `rail_horizontal` run of `K = start_dcol - 1` cells + a caret at the start
-/// display column. Because the connector rail draws all R cells, the run starts
-/// at content offset R (identical to a source row), so `K = start_dcol - 1`
-/// lands the caret under the start column for EVERY rail depth. NO message (the
-/// message rides the END connector). The run + caret are styled with the span's
-/// style; K floors at 0 (a span starting at col 1 gives an immediate caret).
+/// Emit the start-connector row for multi-line span `s` (after its start-line
+/// source row): the R-cell connector rail (corner `rail_top` at `s.rail`) + a
+/// `rail_horizontal` run of `K = start_dcol - 1` + a caret at the start column. No
+/// message (it rides the end connector). K floors at 0.
 fn emitStartConnector(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize, R: usize, severity: Diagnostic.Severity, s: MultiSpan, multis: []const MultiSpan, refs: []const LabelRef, kind: Diagnostic.LabelKind) std.Io.Writer.Error!void {
     const style = refStyle(theme, severity, kind);
     try emptyPrefix(w, gw);
     try w.writeByte(' ');
-    // Rail region: open cells left of `s.rail`, then rail_top at `s.rail`. Use
-    // the span's OWN start line so lower cells reflect their open-state there.
+    // Use the span's own start line so lower cells reflect their open-state there.
     try emitConnectorRail(w, theme, opts, severity, R, multis, refs, s.start_line, s.rail, theme.glyphs.rail_top, style);
     // Horizontal run to the caret. K = start_dcol - 1 (>= 0).
     const K = if (s.start_dcol > 0) s.start_dcol - 1 else 0;
@@ -690,22 +525,14 @@ fn emitStartConnector(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usi
     try w.writeByte('\n');
 }
 
-/// Emit the END-CONNECTOR row for multi-line span `s` (emitted immediately after
-/// its end-line source row): `emptyPrefix` + ' ' + the R-cell connector rail
-/// (cells left of `s.rail` open-state, cell `s.rail` = `rail_bottom`, cells right
-/// of `s.rail` = `rail_horizontal` as the run crosses them) + a further
-/// `rail_horizontal` run of `K' = end_dcol - 1` cells + a caret at the EXCLUSIVE
-/// end display column + the label MESSAGE (styled). As with the start connector,
-/// the R-cell rail puts the run origin at content offset R, so `K' = end_dcol - 1`
-/// lands the caret at every rail depth. The exclusive end means the caret points
-/// one cell past the last highlighted char (symmetric with `runCellsClamped`'s
-/// displayCol difference). K' floors at 0.
+/// Emit the end-connector row for multi-line span `s` (after its end-line source
+/// row): the R-cell connector rail (corner `rail_bottom` at `s.rail`) + a
+/// `rail_horizontal` run of `K' = end_dcol - 1` + a caret at the exclusive end
+/// column (one cell past the last highlighted char) + the label message. K' floors at 0.
 fn emitEndConnector(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize, R: usize, severity: Diagnostic.Severity, s: MultiSpan, lbl: Diagnostic.Label, multis: []const MultiSpan, refs: []const LabelRef) std.Io.Writer.Error!void {
     const style = refStyle(theme, severity, lbl.kind);
     try emptyPrefix(w, gw);
     try w.writeByte(' ');
-    // Rail region: on the END line, cells left of `s.rail` reflect their open
-    // state; cell `s.rail` shows rail_bottom.
     try emitConnectorRail(w, theme, opts, severity, R, multis, refs, s.end_line, s.rail, theme.glyphs.rail_bottom, style);
     const K = if (s.end_dcol > 0) s.end_dcol - 1 else 0;
     try styledGlyphRun(style, w, opts.color, theme.glyphs.rail_horizontal, K);
@@ -717,12 +544,10 @@ fn emitEndConnector(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize
     try w.writeByte('\n');
 }
 
-/// Emit one SINGLE-LINE marker row for `lbl` on `line`: `emptyPrefix` + ' ' +
-/// rail region (open cells => rail_vertical, so the marker sits AFTER the rail) +
-/// pad-to-column + styled glyph run + (optional) styled message. A one-cell or
-/// zero-width span draws a single caret; a wider span an underline as wide as its
-/// display cells. At `R == 0` the rail region is 0-width, so this is M12's marker
-/// row exactly.
+/// Emit one single-line marker row for `lbl` on `line`: `emptyPrefix` + ' ' + rail
+/// region (so the marker sits after the rail) + pad-to-column + styled glyph run +
+/// optional message. A one-cell/zero-width span draws a caret; a wider span an
+/// underline as wide as its display cells.
 fn emitMarkerRow(
     w: *std.Io.Writer,
     theme: Theme,
@@ -764,11 +589,9 @@ fn emitMarkerRow(
     try w.writeByte('\n');
 }
 
-/// Emit an ELISION row: `emptyPrefix` + ' ' + the elision glyph (chosen by
-/// `opts.unicode`). The rail region is ALWAYS blank here — a gap between rendered
-/// lines can only fall where no rail is open (every interior line of a span is
-/// rendered), asserted by the caller — so the glyph sits directly after the
-/// post-prefix space and the '|' column stays straight.
+/// Emit an elision row: `emptyPrefix` + ' ' + the elision glyph. The rail region
+/// is always blank here (a gap only falls where no rail is open, asserted by the
+/// caller), so the glyph sits after the post-prefix space and '|' stays straight.
 fn emitElisionRow(w: *std.Io.Writer, opts: RenderOpts, gw: usize) std.Io.Writer.Error!void {
     try emptyPrefix(w, gw);
     try w.writeByte(' ');
@@ -776,17 +599,10 @@ fn emitElisionRow(w: *std.Io.Writer, opts: RenderOpts, gw: usize) std.Io.Writer.
     try w.writeByte('\n');
 }
 
-/// Emit the full block of rows for one rendered `line`, in a DETERMINISTIC order:
-///   1. the SOURCE row;
-///   2. START-CONNECTOR rows for every multi-line span STARTING on `line`, by
-///      rail column ascending;
-///   3. SINGLE-LINE marker rows for every single-line label on `line`, in
-///      `lessLabel` order (the refs are already globally sorted, so filtering by
-///      line preserves that order);
-///   4. END-CONNECTOR rows for every multi-line span ENDING on `line`, by rail
-///      column ascending.
-/// This ordering keeps a span's start caret above its open rail and its end
-/// caret + message below, matching ariadne/rustc.
+/// Emit the full block of rows for one rendered `line`, in a deterministic order:
+/// source row, then start connectors (rail column asc), then single-line marker
+/// rows (`lessLabel` order), then end connectors (rail column asc). This keeps a
+/// span's start caret above its open rail and its end caret + message below.
 fn emitLineBlock(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize, R: usize, severity: Diagnostic.Severity, sm: *const SourceMap, line: usize, multis: []const MultiSpan, refs: []const LabelRef) std.Io.Writer.Error!void {
     // 1. source row.
     try emitSourceLine(w, theme, opts, gw, R, severity, sm, line, multis, refs);
@@ -820,9 +636,8 @@ fn emitLineBlock(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize, R
     }
 }
 
-/// Recover the `LabelKind` of the ref owning multi-line span `ms` (matched by
-/// `order`). Defaults to `.primary` if not found (unreachable — every MultiSpan
-/// came from a ref).
+/// Recover the `LabelKind` of the ref owning span `ms` (matched by `order`).
+/// Defaults `.primary` if not found (unreachable — every MultiSpan came from a ref).
 fn multiKind(refs: []const LabelRef, ms: MultiSpan) Diagnostic.LabelKind {
     for (refs) |ref| {
         if (ref.multi and ref.order == ms.order) return ref.lbl.kind;
@@ -830,9 +645,9 @@ fn multiKind(refs: []const LabelRef, ms: MultiSpan) Diagnostic.LabelKind {
     return .primary;
 }
 
-/// Recover the full `Label` of the ref owning multi-line span `ms` (matched by
-/// `order`), so the END connector can print its message. Defaults to a bare
-/// primary label if not found (unreachable).
+/// Recover the full `Label` of the ref owning span `ms` (matched by `order`), so
+/// the end connector can print its message. Defaults to a bare primary label
+/// if not found (unreachable).
 fn multiLabel(refs: []const LabelRef, ms: MultiSpan) Diagnostic.Label {
     for (refs) |ref| {
         if (ref.multi and ref.order == ms.order) return ref.lbl;

@@ -1,7 +1,7 @@
 //! The inspection-mode status output: the per-file summary table + row/cell
 //! formatters, the `--dump` artifact printers, and the cache-note helper. Statuses
 //! colourise via DiagRender's shared palette; per-diagnostic detail routes through
-//! DiagRender's Renderer. Only the LAST cell on a row is ever styled (width-safe).
+//! its Renderer. Only the last cell on a row is ever styled (width-safe).
 
 const std = @import("std");
 const Io = std.Io;
@@ -18,9 +18,9 @@ const sty_ok = DiagRender.sty_ok;
 const sty_head = DiagRender.sty_head;
 const sty_faint = DiagRender.sty_faint;
 
-/// Print the per-file summary; returns the number of files that failed (so the
-/// caller can set a non-zero exit status). The summary TABLE is kept (now styled);
-/// per-diagnostic detail lines route through the Renderer via `printFailure`.
+/// Print the per-file summary; returns the number of files that failed (for the
+/// caller's exit status). Per-diagnostic detail lines route through the Renderer
+/// via `printFailure`.
 pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, results: []const Driver.FileResult, emit: Driver.Emit, target: []const u8, dump: bool) !usize {
     var stamp_buf: [version.stamp_max]u8 = undefined;
     // Header: the version stamp bold, labels plain.

@@ -1,71 +1,44 @@
-//! Severity-to-presentation mapping: for each `Severity`, the user-facing word
-//! and a `Style` (fg color + attributes), plus two glyph sets — pure 7-bit
-//! ASCII and box-drawing unicode — for carets, underlines, notes, and the M13
-//! rail. This is the presentation TABLE; it hands back VALUES only.
-//!
-//! WHY a data-only theme. `Theme` NEVER emits, NEVER holds a writer, and NEVER
-//! calls `Style.styled`/`sgrInto`/`closeInto`. It returns `Style.Style` values
-//! and glyph `[]const u8` slices; M12 does all emission, passing the terminal's
-//! `ColorLevel` to `Style.styled`, which writes ZERO bytes at `.none`. So
-//! gate-safety (no escape codes on a dumb terminal) is automatic and lives in
-//! `Style`, not here — the `.none` gate-safety test below documents that.
-//!
-//! PALETTE (documented on purpose). Severity colors are BARE `.ansi` indices,
-//! chosen so `Color.downgrade` is the identity at every `ColorLevel` (the
-//! codebase's downgrade leaves `.ansi` untouched for `.ansi16`/`.ansi256`); no
-//! rounding, and zero bytes at `.none`. `.rgb`/`.indexed` would round on
-//! downgrade and are deliberately avoided.
-//!   error   = bright red    (ansi 9),  bold
-//!   warning = bright yellow (ansi 11), bold
-//!   note    = bright cyan   (ansi 14), bold
-//!   help    = bright green  (ansi 10), bold
-//! Secondary labels use a severity-INDEPENDENT `{ .dim = true }` so they recede
-//! behind the primary regardless of the diagnostic's severity.
-//!
-//! GLYPH SPLIT. The caret and underline glyphs are shared across severities
-//! (only the COLOR varies by severity, via `style`); the severity distinction
-//! is carried entirely by `Style`, not by glyph shape. The caret stays `"^"` in
-//! BOTH sets — it is guaranteed a single display cell, so M12's caret-column
-//! math never desyncs; a fancy caret risks width-2 rendering. The M13 rail
-//! glyphs are reserved NOW so `Theme` never reshapes when multi-line lands.
-//!
-//! LAYERING. Imports ONLY `std`, `../Style.zig` (for `Style.Style`/`Style.Color`
-//! VALUES), and the sibling `Diagnostic.zig` (for `Severity`/`LabelKind` — a
-//! single source of truth, so the two files cannot drift). It does NOT import
-//! `SourceMap`, `ansi`, `Terminal`, `Progress`, `Renderer`, or anything under
-//! `cli/*`, and takes NO writer.
+//! Severity-to-presentation mapping: for each `Severity`, the user-facing word,
+//! a `Style` (fg + attributes), and two glyph sets (7-bit ASCII / box-drawing
+//! unicode) for carets, underlines, notes, and the rail. A data-only table:
+//! returns values only, never emits and holds no writer (all emission is the
+//! renderer's job, so `.none` gate-safety lives in `Style`, not here).
+//! - Severity colors are bare `.ansi` indices so `Color.downgrade` is the
+//!   identity at every level (no rounding); `.rgb`/`.indexed` would round.
+//! - Severity is carried by color, not glyph shape (caret/underline shapes are
+//!   shared across severities). The caret stays "^" in both sets — guaranteed 1
+//!   cell, so the caret-column math never desyncs.
+//! - Imports only `std`, `../Style.zig`, and the sibling `Diagnostic.zig` (single
+//!   source of truth for `Severity`/`LabelKind`); takes no writer.
 
 const std = @import("std");
-// Note: `Style` is the FILE namespace; the struct is `Style.Style`, the color is
-// `Style.Color`. Returns/literals here are `Style.Style{...}`, never bare `Style`.
+// `Style` is the file namespace; the struct is `Style.Style`, the color `Style.Color`.
 const Style = @import("../Style.zig");
-// Sibling render types — single source of truth for the enums, so Theme's
-// severity keys and this file's `Diagnostic.Severity` can never drift apart.
+// Sibling render types — single source of truth for the enums, so the two files
+// can't drift.
 const Diagnostic = @import("Diagnostic.zig");
 const Severity = Diagnostic.Severity;
 
 const Theme = @This();
 
-/// Whether this theme draws with unicode box-drawing glyphs (`true`) or pure
-/// ASCII (`false`). Selects which glyph set is active; `style`/`word` are
-/// glyph-set-independent. Spelled `is_unicode` (not `unicode`) so it does not
-/// collide with the `pub const unicode` preset in this same namespace.
+/// Whether this theme draws with unicode box-drawing glyphs or pure ASCII; selects
+/// the active glyph set (`style`/`word` are glyph-set-independent). Spelled
+/// `is_unicode` so it does not collide with the `pub const unicode` preset.
 is_unicode: bool,
-/// The active glyph set (carets, underlines, and the reserved M13 rail).
+/// The active glyph set (carets, underlines, and the rail).
 glyphs: Glyphs,
 
 /// One glyph set. Carets/underlines are shared across severities (color, not
-/// shape, encodes severity). The rail glyphs are reserved for M13's multi-line
-/// spans so this struct never reshapes later.
+/// shape, encodes severity).
 pub const Glyphs = struct {
     /// Primary point / zero-width caret. Always a single display cell.
     caret: []const u8,
     /// Underline run under a wider primary span.
     underline_primary: []const u8,
-    /// Underline run under a secondary span (shape may equal primary; the
-    /// receding effect comes from `secondaryStyle`, not the glyph).
+    /// Underline run under a secondary span (the receding effect comes from
+    /// `secondaryStyle`, not the glyph shape).
     underline_secondary: []const u8,
-    // --- M13 rail set (reserved now; unused by M12) ---
+    // --- rail set ---
     rail_vertical: []const u8,
     rail_top: []const u8,
     rail_bottom: []const u8,
@@ -85,9 +58,8 @@ pub const plain_glyphs = Glyphs{
     .note_bullet = "=",
 };
 
-/// Box-drawing unicode glyph set (written with `\u{...}` escapes so this source
-/// stays 7-bit ASCII and the byte content is unambiguous). The caret stays `"^"`
-/// to keep a guaranteed 1-cell width.
+/// Box-drawing unicode glyph set (written with `\u{...}` so this source stays
+/// 7-bit ASCII). The caret stays "^" to keep a guaranteed 1-cell width.
 pub const unicode_glyphs = Glyphs{
     .caret = "^",
     .underline_primary = "\u{2500}", // ─ box drawings light horizontal
@@ -110,9 +82,8 @@ pub fn forUnicode(want_unicode: bool) Theme {
     return if (want_unicode) unicode else plain;
 }
 
-/// The word + style for a severity, kept together so the exhaustive `switch`
-/// (not an array) is the single place that must handle a new `Severity` — adding
-/// one is a compile error here.
+/// The word + style for a severity, kept together so the exhaustive `switch` in
+/// `info` is the single place a new `Severity` must be handled (compile error otherwise).
 const SevInfo = struct {
     word: []const u8,
     style: Style.Style,

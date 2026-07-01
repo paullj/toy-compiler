@@ -1,12 +1,10 @@
-//! Caller-driven spinners and progress bars with a pure frame renderer. The
-//! clock lives at the edge: the caller reads `Io.Clock.Timestamp.now(io,.awake)
-//! .raw.nanoseconds` (i96) and passes it in widened to i128 — Progress holds no
-//! Io, so `renderFrame`/`throttle` are pure and testable over literal
-//! timestamps with a fixed-buffer writer, no fake clock. A `.none` color level
-//! makes every public method a zero-byte no-op so Progress (meant for stderr)
-//! is structurally incapable of perturbing stdout byte gates. Cursor-hide on
-//! start is paired with show via an errdefer on every draw and finish path, so
-//! no return or error ever leaves the cursor hidden.
+//! Caller-driven spinners and progress bars with a pure frame renderer.
+//! - The clock lives at the edge: the caller passes a nanosecond timestamp in, so
+//!   `renderFrame`/`throttle` are pure and testable over literal timestamps.
+//! - A `.none` color level makes every public method a zero-byte no-op (Progress
+//!   is meant for stderr and must never perturb stdout byte gates).
+//! - Cursor-hide on start is paired with show via an errdefer on every draw/finish
+//!   path, so no return or error ever leaves the cursor hidden.
 
 const std = @import("std");
 const Style = @import("Style.zig");
