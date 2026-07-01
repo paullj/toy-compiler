@@ -1,18 +1,14 @@
-//! Exit-free argument parser: matches short/long flags, coerces and validates values, dispatches subcommands, and collects errors into a Sink.
+//! Exit-free argument parser: matches flags, coerces/validates values, dispatches
+//! subcommands, and collects errors into a Sink. Never prints, never exits.
 //!
-//! The parser never prints and never exits. Every parse-semantic failure is
-//! pushed to the caller's Sink and the walk CONTINUES (collect-all), so one call
-//! surfaces every problem at once. Only OutOfMemory escapes as an error union;
-//! all other outcomes travel in the returned Result.
-//!
-//! Ownership: `.append`/`.variadic` fields are the only heap the parser produces.
-//! They live in a single `std.heap.ArenaAllocator` carried inside `Result`, so
-//! `result.deinit()` frees every such slice in one shot regardless of which
-//! variant was returned — deinit is uniform whether the arena is empty
-//! (help/version/subcommand) or holds slices (ok, or errors after a partial
-//! bind). The Sink's own list is grown with the caller's `gpa`
-//! and owned/freed by the caller; Sink error strings are BORROWED from argv, so
-//! the parser allocates none of them.
+//! Non-obvious:
+//! - Collect-all: parse-semantic failures push to the Sink and the walk continues,
+//!   so one call surfaces every problem; only OutOfMemory escapes as an error.
+//! - Ownership: the only heap the parser produces (`.append`/`.variadic` slices)
+//!   lives in one arena inside `Result`, freed uniformly by `result.deinit()`;
+//!   the Sink's list is the caller's, and Sink error strings are borrowed from argv.
+//! - The append accumulators are comptime-reified `@Struct`s of ArrayLists (see
+//!   `AppendLists`) — the `@Struct` trick is used here too, not only for `Parsed`.
 
 const std = @import("std");
 const Spec = @import("Spec.zig");
