@@ -122,6 +122,17 @@ pub fn checkCommand(comptime c: Command) ?[]const u8 {
         }
     }
     {
+        // A required positional after an optional/variadic one can never bind:
+        // the greedy left-to-right fill satisfies the optional first, so the
+        // required slot spuriously reports "missing" on inputs meant for it.
+        var seen_non_required = false;
+        for (c.positionals) |p| {
+            if (seen_non_required and p.arity == .one)
+                return "required positional after an optional or variadic one is not allowed (required positionals must come first)";
+            if (p.arity != .one) seen_non_required = true;
+        }
+    }
+    {
         var variadic_count: usize = 0;
         for (c.positionals) |p| {
             if (p.arity == .variadic) variadic_count += 1;
@@ -316,6 +327,31 @@ test "reject positional after variadic" {
     const msg = comptime checkCommand(c);
     try std.testing.expect(msg != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.?, "variadic must be last") != null);
+}
+
+test "reject required positional after an optional one" {
+    const c = Command{
+        .name = "c",
+        .positionals = &.{
+            .{ .name = "maybe", .arity = .optional },
+            .{ .name = "must", .arity = .one },
+        },
+    };
+    const msg = comptime checkCommand(c);
+    try std.testing.expect(msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.?, "required positionals must come first") != null);
+}
+
+test "accept required-then-optional-then-variadic order" {
+    const c = Command{
+        .name = "c",
+        .positionals = &.{
+            .{ .name = "req", .arity = .one },
+            .{ .name = "maybe", .arity = .optional },
+            .{ .name = "rest", .arity = .variadic },
+        },
+    };
+    try std.testing.expect(comptime checkCommand(c) == null);
 }
 
 test "reject two variadics" {
