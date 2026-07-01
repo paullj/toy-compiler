@@ -268,21 +268,21 @@ gph_node_types: ?[][]Type = null,
 /// function indices in source order, and so do we (Pass A below).
 fns: std.ArrayList(FnSym),
 
-/// The struct table: one `StructSym` per struct id, plus a name→id map.
+/// The struct table: one `StructSym` per struct id. The bare-name → global-id
+/// map lives per-module in the graph ctx (`activeStructMap`).
 structs: std.ArrayList(StructSym),
-struct_map: std.StringHashMapUnmanaged(u32),
 
-/// The enum table: one `EnumSym` per enum id, plus a name→id map.
+/// The enum table: one `EnumSym` per enum id. Bare-name → id lives per-module in
+/// the graph ctx (`activeEnumMap`).
 enums: std.ArrayList(EnumSym),
-enum_map: std.StringHashMapUnmanaged(u32),
 
 /// M14 graph context. Always set in practice: `checkGraph` is the ONE entry and
 /// it drives one shared `Typecheck` across the whole module graph (a lone source
 /// file is the trivial one-module graph). The `structs`/`enums`/`fns` tables are
-/// PROGRAM-WIDE (global ids), and `struct_map`/`enum_map` hold the CURRENT
-/// module's bare-name → global-id bindings (swapped per module). The context
-/// resolves a qualified `mod.Type` / `mod.Enum` receiver to the owning module's
-/// tables. Pre-collect + layout happen once; only Pass B runs per fn.
+/// PROGRAM-WIDE (global ids); each module's bare-name → global-id bindings live
+/// in the ctx (`activeStructMap`/`activeEnumMap`, keyed by `graph_mod`). The
+/// context resolves a qualified `mod.Type` / `mod.Enum` receiver to the owning
+/// module's tables. Pre-collect + layout happen once; only Pass B runs per fn.
 graph: *GraphCtx,
 
 /// The active module being type-checked / laid out (graph mode). Single-file
@@ -354,10 +354,6 @@ pub const Model = struct {
     fns: []const FnSym,
     structs: []const StructSym,
     enums: []const EnumSym,
-    /// Single-file bare-name maps (graph mode reads the per-module maps in `graph`
-    /// via `graph_mod`; these stay the empty init maps then). Borrowed pointers.
-    struct_map: *const std.StringHashMapUnmanaged(u32),
-    enum_map: *const std.StringHashMapUnmanaged(u32),
     graph: *GraphCtx,
     gph_fn_names: ?[]const []const u8,
 };
@@ -371,8 +367,6 @@ fn buildModel(t: *Typecheck) Model {
         .fns = t.fns.items,
         .structs = t.structs.items,
         .enums = t.enums.items,
-        .struct_map = &t.struct_map,
-        .enum_map = &t.enum_map,
         .graph = t.graph,
         .gph_fn_names = t.gph_fn_names,
     };
@@ -549,9 +543,7 @@ pub fn checkGraph(
         .sink = DiagnosticSink.init(gpa),
         .fns = .empty,
         .structs = .empty,
-        .struct_map = .empty, // unused in graph mode (per-module maps live in ctx)
         .enums = .empty,
-        .enum_map = .empty,
         .graph = ctx,
         .io = io,
         .ncpu = ncpu,
@@ -568,12 +560,8 @@ pub fn checkGraph(
             gpa.free(e.variants);
         }
         t.enums.deinit(gpa);
-        // In graph mode the bare-name maps live in the ctx (accessed via
-        // activeStructMap/activeEnumMap); `t.struct_map`/`t.enum_map` stay the
-        // empty init maps (own nothing) — deinit is a safe no-op. The CALLER owns
-        // and frees the ctx maps.
-        t.struct_map.deinit(gpa);
-        t.enum_map.deinit(gpa);
+        // The bare-name maps live in the ctx (accessed via activeStructMap/
+        // activeEnumMap); the CALLER owns and frees them.
         for (t.structs.items) |s| {
             gpa.free(s.field_names);
             gpa.free(s.field_types);
@@ -857,7 +845,8 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
 /// Register the struct decls among `decl_nodes` (of the currently-active tree).
 /// `mod` is the owning module id (0 single-file). Global ids are assigned in
 /// append order; per-module duplicate/shadow diagnostics mirror the single-file
-/// rules. The bare name → global id binding goes into the active `struct_map`.
+/// rules. The bare name → global id binding goes into the active struct map
+/// (`activeStructMap`, the current module's table in the ctx).
 fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
     for (decl_nodes) |decl_idx| {
         const decl = t.tree.nodes[decl_idx];
