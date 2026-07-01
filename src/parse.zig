@@ -947,18 +947,67 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     return p.addNode(.{ .tag = .call, .main_token = lparen, .lhs = callee, .rhs = header });
 }
 
+/// Infix binding power indexed by `token.Tag` ordinal; `-1` marks a non-infix
+/// tag. Precedence is data the compiler validates rather than a hand-written
+/// switch: `directEnumArrayDefault` with `max_unused_slots = 0` proves `Tag`
+/// stays densely numbered, and a mistyped tag field name is a `@compileError`.
+/// Higher binds tighter.
+const infix_bp_table = std.enums.directEnumArrayDefault(token.Tag, i16, -1, 0, .{
+    .pipe_pipe = 1,
+    .amp_amp = 2,
+    .eq_eq = 3,
+    .bang_eq = 3,
+    .lt = 4,
+    .lt_eq = 4,
+    .gt = 4,
+    .gt_eq = 4,
+    .plus = 5,
+    .minus = 5,
+    .star = 6,
+    .slash = 6,
+});
+
 /// Infix binding power, or null if the tag is not an infix operator. Higher
 /// binds tighter.
 fn infixBp(tag: token.Tag) ?u8 {
-    return switch (tag) {
-        .pipe_pipe => 1,
-        .amp_amp => 2,
-        .eq_eq, .bang_eq => 3,
-        .lt, .lt_eq, .gt, .gt_eq => 4,
-        .plus, .minus => 5,
-        .star, .slash => 6,
-        else => null,
+    const v = infix_bp_table[@intFromEnum(tag)];
+    return if (v < 0) null else @intCast(v);
+}
+
+/// Comptime guard: every table operator must have a positive binding power (so
+/// the `-1` sentinel unambiguously means "not infix"), and the operator set must
+/// match exactly the tags the precedence-climbing loop recognizes. Returns an
+/// error string on violation, else null.
+fn checkInfixTable() ?[]const u8 {
+    const infix_ops = [_]token.Tag{
+        .pipe_pipe, .amp_amp,
+        .eq_eq,     .bang_eq,
+        .lt,        .lt_eq,
+        .gt,        .gt_eq,
+        .plus,      .minus,
+        .star,      .slash,
     };
+    // Every listed operator has a positive bp.
+    for (infix_ops) |op| {
+        if (infix_bp_table[@intFromEnum(op)] <= 0) {
+            return "infix operator missing a positive binding power in infix_bp_table";
+        }
+    }
+    // No tag outside the list carries a non-sentinel bp (the two sets match).
+    for (@typeInfo(token.Tag).@"enum".fields) |f| {
+        const tag: token.Tag = @enumFromInt(f.value);
+        if (infix_bp_table[f.value] < 0) continue;
+        var listed = false;
+        for (infix_ops) |op| {
+            if (op == tag) listed = true;
+        }
+        if (!listed) return "infix_bp_table entry not recognized by the infix loop";
+    }
+    return null;
+}
+
+comptime {
+    if (checkInfixTable()) |m| @compileError(m);
 }
 
 /// Prefix operators bind tighter than any infix operator.
