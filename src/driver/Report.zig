@@ -18,6 +18,19 @@ const sty_ok = DiagRender.sty_ok;
 const sty_head = DiagRender.sty_head;
 const sty_faint = DiagRender.sty_faint;
 
+// Per-file summary table column widths — one definition so the header, data rows,
+// and the dash/error rows share one layout and can never drift. Zig bakes the width
+// into the comptime format string, so `comptimePrint` is the single source.
+const w_file = 28; // file path, left-aligned
+const w_bytes = 8; // byte count, right
+const w_tokens = 7; // token count, right
+const w_nodes = 6; // node count, right
+const fmt_row = std.fmt.comptimePrint("{{s: <{d}}} {{d: >{d}}} {{d: >{d}}} ", .{ w_file, w_bytes, w_tokens }); // path, bytes, tokens
+const fmt_nodes_num = std.fmt.comptimePrint("{{d: >{d}}}", .{w_nodes});
+const fmt_nodes_dash = std.fmt.comptimePrint("{{s: >{d}}}", .{w_nodes});
+const fmt_hdr = std.fmt.comptimePrint("{{s: <{d}}} {{s: >{d}}} {{s: >{d}}} {{s: >{d}}}  {{s}}", .{ w_file, w_bytes, w_tokens, w_nodes });
+const fmt_row_dash = std.fmt.comptimePrint("{{s: <{d}}} {{s: >{d}}} {{s: >{d}}} {{s: >{d}}}  ", .{ w_file, w_bytes, w_tokens, w_nodes });
+
 /// Print the per-file summary; returns the number of files that failed (for the
 /// caller's exit status). Per-diagnostic detail lines route through the Renderer
 /// via `printFailure`.
@@ -37,7 +50,7 @@ pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, 
     // Table header row: bold (the whole line is a header, no data cells to keep plain).
     {
         var hbuf: [80]u8 = undefined;
-        const hdr = std.fmt.bufPrint(&hbuf, "{s: <28} {s: >8} {s: >7} {s: >6}  {s}", .{ "file", "bytes", "tokens", "nodes", "status" }) catch unreachable;
+        const hdr = std.fmt.bufPrint(&hbuf, fmt_hdr, .{ "file", "bytes", "tokens", "nodes", "status" }) catch unreachable;
         try sty_head.styled(out, level, hdr);
         try out.writeByte('\n');
     }
@@ -63,8 +76,8 @@ pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, 
         // Data cells (file/bytes/tokens/nodes) stay PLAIN; only the STATUS cell is
         // coloured. The status cell is LAST (no trailing padding), so styling its
         // whole content is width-safe.
-        try out.print("{s: <28} {d: >8} {d: >7} ", .{ r.path, r.source.len, real_tokens });
-        if (r.parsed) try out.print("{d: >6}", .{r.nodes.len}) else try out.print("{s: >6}", .{"-"});
+        try out.print(fmt_row, .{ r.path, r.source.len, real_tokens });
+        if (r.parsed) try out.print(fmt_nodes_num, .{r.nodes.len}) else try out.print(fmt_nodes_dash, .{"-"});
         try out.writeAll("  ");
         const note = cacheNote(r, emit);
         // `cached` recedes (dim); a fresh phase reads green.
@@ -151,15 +164,15 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
 /// literal "-" (pass `"-"` as `nodes_str`, `nodes_num` unused) or a count (pass
 /// `null` as `nodes_str` and the count as `nodes_num`).
 fn rowThenErr(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, bytes: usize, tokens: usize, nodes_str: ?[]const u8, msg: []const u8, nodes_num: usize) !void {
-    try out.print("{s: <28} {d: >8} {d: >7} ", .{ path, bytes, tokens });
-    if (nodes_str) |s| try out.print("{s: >6}", .{s}) else try out.print("{d: >6}", .{nodes_num});
+    try out.print(fmt_row, .{ path, bytes, tokens });
+    if (nodes_str) |s| try out.print(fmt_nodes_dash, .{s}) else try out.print(fmt_nodes_num, .{nodes_num});
     try out.writeAll("  ");
     try errWord(out, level, msg);
 }
 
 /// Variant of `rowThenErr` for the catch-all error row: every data cell is "-".
 fn rowDashThenErr(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, msg: []const u8) !void {
-    try out.print("{s: <28} {s: >8} {s: >7} {s: >6}  ", .{ path, "-", "-", "-" });
+    try out.print(fmt_row_dash, .{ path, "-", "-", "-" });
     try errWord(out, level, msg);
 }
 
