@@ -6,18 +6,10 @@ zig = "latest"
 # input file (and any flags) after the task name, e.g. `mise run run:release main.toy`.
 # These build the compiler then invoke the binary DIRECTLY (not via `zig build run`),
 # so `run`'s exit-code passthrough surfaces cleanly instead of as a zig "build failed".
-[tasks."build:debug"]
-description = "Build the toy compiler (Debug) and `build` the given program"
-run = "zig build && ./zig-out/bin/toy build"
+[tasks."toy:debug"]
+description = "Run toy cli in debug"
+run = "zig build && ./zig-out/bin/toy"
 
-[tasks."build:release"]
-description = "Build the toy compiler (ReleaseFast) and `build` the given program"
-run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy build"
-
-[tasks."run:debug"]
-description = "Build the toy compiler (Debug) and `run` the given program"
-run = "zig build && ./zig-out/bin/toy run"
-
-[tasks."run:release"]
-description = "Build the toy compiler (ReleaseFast) and `run` the given program"
-run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy run"
+[tasks."toy:release"]
+description = "Run toy cli in release"
+run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy"
