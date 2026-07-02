@@ -103,6 +103,34 @@ pub fn build(b: *std.Build) void {
     // Same runner-hang workaround: install the integration binary so it runs directly
     // (`./zig-out/bin/toy-integration-test`) alongside toy-test under `test-bin`.
     test_bin_step.dependOn(&b.addInstallArtifact(integration_tests, .{}).step);
+
+    // `zig build fuzz`: an in-process front-end fuzzer (tests/fuzz.zig). It feeds
+    // mutated seed-corpus bytes + grammar-generated programs through lex → parse →
+    // (on a clean parse) resolve + typecheck, enforcing the D4a robustness contract
+    // (no panic / no hang / always a tree, and the parser invariants that fire under
+    // runtime_safety). It is FORCED to Debug regardless of `-Doptimize`: those
+    // invariant asserts only exist when `std.debug.runtime_safety` is on, so a
+    // ReleaseFast build would silently turn the whole run into a no-op. Seeded +
+    // bounded (FUZZ_SEED / FUZZ_ITERS envs), so it terminates fast and reproducibly.
+    const fuzz_exe = b.addExecutable(.{
+        .name = "toy-fuzz",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fuzz.zig"),
+            .target = target,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "toy_compiler", .module = mod },
+            },
+        }),
+    });
+    const run_fuzz = b.addRunArtifact(fuzz_exe);
+    // The fuzzer reads its seed corpus from tests/ui + examples relative to cwd, so
+    // it must run from the build root (the default cwd for `zig build` run steps).
+    if (b.args) |args| run_fuzz.addArgs(args);
+    const fuzz_step = b.step("fuzz", "Build + run the bounded, seeded front-end fuzzer (FUZZ_SEED / FUZZ_ITERS envs)");
+    fuzz_step.dependOn(&run_fuzz.step);
+    // Also install the fuzz binary so it can be run directly for long soak runs.
+    b.installArtifact(fuzz_exe);
 }
 
 /// Hash every `.zig` file under `src/` (by path + contents, sorted for
