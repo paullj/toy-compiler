@@ -39,6 +39,7 @@ const AppCli = @import("Cli.zig");
 // Report style with — so the dependency runs main -> Report -> DiagRender (no cycle).
 const Report = @import("Report.zig");
 const DiagRender = @import("DiagRender.zig");
+const Check = toyc.Check;
 const codes = toyc.diagnostics.codes;
 const SevCfg = toyc.diagnostics.severity_config;
 const sty_err = DiagRender.sty_err;
@@ -189,6 +190,14 @@ pub fn main(init: std.process.Init) !void {
                             } else if (try applyParsed(gpa, sub, p, out, err_level, &st, &sev_rules)) |code| {
                                 try out.flush(); // exit skips defers; flush the styled arg-error line
                                 std.process.exit(code);
+                            } else if (comptime std.mem.eql(u8, sub.name, "check")) {
+                                // `check` is its OWN action: run the front-end (never
+                                // codegen), report ALL diagnostics, and exit on the diag
+                                // gate. `applyParsed` (above) already filled `st` (paths,
+                                // target, sev rules); the check-only knobs live on `p`.
+                                st.check_seen = true;
+                                st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
+                                st.check_exit_zero = p.exit_zero;
                             }
                         },
                         // A subcommand has no sub-subcommands in this spec.
@@ -206,12 +215,26 @@ pub fn main(init: std.process.Init) !void {
     // Post-parse tail (reproduces the old hand-rolled tail verbatim).
 
     if (st.paths.items.len == 0) {
-        // Asking to emit (`-o`) with no input is an error, not usage.
+        // `check` with no input is an argument error (exit 2, like a CLI/IO failure —
+        // distinct from a compile failure's 1). Asking to emit (`-o`) with no input is
+        // likewise an error, not usage.
+        if (st.check_seen) {
+            try argLine(out, level, "check: no input file");
+            std.process.exit(2);
+        }
         if (st.out_path != null) argErr(out, level, "no input file"); // flushes + exit(1)
         // No input, no `-o`: print short help and exit 0 (replaces usage()).
         try cli.Help.renderHelp(comptime AppCli.spec.root, out, .short);
         try out.flush();
         return;
+    }
+
+    // `toy check`: the diagnostics-focused front-end. Runs lex->parse->resolve->typecheck
+    // over every input (NEVER codegen), reports ALL diagnostics (no early-bail), applies
+    // the C3 severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
+    // the config, 2 on a hard CLI/IO error. `--exit-zero` forces 0 regardless.
+    if (st.check_seen) {
+        std.process.exit(try runCheck(gpa, io, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.sev));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -262,6 +285,14 @@ const State = struct {
     emit_explicit: bool = false,
     command: Command = .build,
     verb_seen: bool = false,
+    // The `check` subcommand: run the front-end (lex->parse->resolve->typecheck, never
+    // codegen), report EVERY diagnostic, and exit on the diagnostic gate. Distinct from
+    // `--emit check` (the inspection TABLE), which stays for back-compat.
+    check_seen: bool = false,
+    // `check --format ndjson`: emit line-delimited JSON instead of pretty snippets.
+    check_ndjson: bool = false,
+    // `check --exit-zero`: always exit 0 even with errors (editor/LSP streaming).
+    check_exit_zero: bool = false,
     target: []const u8 = "native",
     out_path: ?[]const u8 = null,
     codegen_stats: bool = false,
@@ -996,6 +1027,83 @@ fn argErr(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) noretur
 fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8 {
     try argLine(out, level, message);
     return 1;
+}
+
+/// `toy check <file...>`: the diagnostics-focused front-end. Runs lex->parse->resolve->
+/// typecheck over every input (NEVER codegen), collects EVERY diagnostic across all
+/// three stages (no early-bail on a tainted parse — that's the `-o` build's behaviour,
+/// not check's), applies the C3 severity config, and emits either pretty human snippets
+/// (per file, reusing the shared Renderer) or a stable NDJSON stream. Returns the process
+/// exit code: 0 when nothing survives the config as an error, 1 when >=1 error remains,
+/// 2 on a hard front-end/IO failure. `exit_zero` forces 0. `ndjson` picks the wire form.
+fn runCheck(
+    gpa: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    level: Style.ColorLevel,
+    target: []const u8,
+    paths: []const []const u8,
+    ndjson: bool,
+    exit_zero: bool,
+    sev: SevCfg.SeverityConfig,
+) !u8 {
+    // Run the SAME front-end the `--emit check` inspection table drives, but present
+    // diagnostics only. A per-file hard error (missing file, unreadable) surfaces as
+    // `r.err` with NO diagnostics — that's a CLI/IO failure (exit 2), not a compile
+    // failure (exit 1).
+    const results = Driver.run(gpa, io, .check, target, paths) catch |e| {
+        try argLine(out, level, @errorName(e));
+        return 2;
+    };
+    defer {
+        for (results) |*r| r.deinit(gpa);
+        gpa.free(results);
+    }
+
+    if (ndjson) {
+        // Emit NDJSON for every file that produced diagnostics (a missing/unreadable file
+        // has none), then apply the SAME hard-error gate the human form does: a file whose
+        // `err` is set with zero diagnostics is an IO/structural failure (exit 2), NOT a
+        // clean check. Without this an LSP/editor reading the stream would treat a missing
+        // file as "checked clean". `Check.anyHardError` is shared with the human branch
+        // below so the two forms can never diverge.
+        const counts = try Check.emitNdjson(out, gpa, results, sev);
+        try out.flush();
+        if (Check.anyHardError(results)) return 2;
+        return checkExit(counts, exit_zero);
+    }
+
+    // Human form: render each file's diagnostics (parse -> resolve -> typecheck) against
+    // its own source, then a program-wide `N error(s), M warning(s)` summary. A file with
+    // a hard error but NO diagnostics (e.g. read failure) prints a plain error line and
+    // forces exit 2 (see `Check.anyHardError`).
+    for (results) |r| {
+        const parse_diags = r.diags;
+        const resolve_diags: []const toyc.DiagnosticSink.Diagnostic = if (r.resolve) |res| res.diags else &.{};
+        const type_diags: []const toyc.DiagnosticSink.Diagnostic = if (r.typecheck) |tc| tc.diags else &.{};
+        // A hard error with no diagnostics is an IO/structural failure, not a compile
+        // diagnostic: report it plainly (the exit-2 gate below fires via anyHardError).
+        if (r.err != null and parse_diags.len == 0 and resolve_diags.len == 0 and type_diags.len == 0) {
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{s}: {t}", .{ r.path, r.err.? }) catch r.path;
+            try argLine(out, level, msg);
+            continue;
+        }
+        try DiagRender.renderFileDiags(gpa, out, level, r.path, r.source, parse_diags, resolve_diags, type_diags, sev);
+    }
+    const counts = Check.tallyAll(results, sev);
+    try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
+    try out.flush();
+    if (Check.anyHardError(results)) return 2;
+    return checkExit(counts, exit_zero);
+}
+
+/// Map a `check` tally to the process exit code: 0 clean (or `--exit-zero`), 1 when at
+/// least one diagnostic resolved to an error. IO/CLI failures (exit 2) are handled by
+/// the caller before reaching here.
+fn checkExit(counts: Check.Counts, exit_zero: bool) u8 {
+    if (exit_zero) return 0;
+    return if (counts.hasErrors()) 1 else 0;
 }
 
 /// `toy explain <CODE>`: print the code's embedded documentation. A known code prints
