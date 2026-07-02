@@ -187,6 +187,50 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
     try renderCapSummary(out, level, visible, drawn); // cap counts VISIBLE, not raw
 }
 
+/// `toy check`: render EVERY diagnostic on a single file (parse + resolve + typecheck,
+/// in that stable stage order) against ONE SourceMap over the file, applying the C3
+/// severity config and the render cap. Unlike the inspection table's `printFailure`,
+/// this never prints a summary row — the `check` action reports diagnostics only, then a
+/// program-wide `N error(s), M warning(s)` summary. Returns nothing; the caller tallies
+/// the visible counts separately (via `Check.tallyAll`) for the exit gate + summary.
+pub fn renderFileDiags(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    level: Style.ColorLevel,
+    path: []const u8,
+    source: []const u8,
+    parse_diags: []const toyc.DiagnosticSink.Diagnostic,
+    resolve_diags: []const toyc.DiagnosticSink.Diagnostic,
+    type_diags: []const toyc.DiagnosticSink.Diagnostic,
+    cfg: SevCfg.SeverityConfig,
+) !void {
+    const total = parse_diags.len + resolve_diags.len + type_diags.len;
+    if (total == 0) return;
+    var sm = try Rr.SourceMap.init(gpa, path, source);
+    defer sm.deinit(gpa);
+    // VISIBLE (non-`--ignore`d) count across all three stages, so the "... and N more"
+    // summary excludes suppressed diagnostics (matches `renderScopedDiags`).
+    var visible: usize = 0;
+    for (parse_diags) |d| if (SevCfg.resolve(d.code, d.severity, cfg) != null) {
+        visible += 1;
+    };
+    for (resolve_diags) |d| if (SevCfg.resolve(d.code, d.severity, cfg) != null) {
+        visible += 1;
+    };
+    for (type_diags) |d| if (SevCfg.resolve(d.code, d.severity, cfg) != null) {
+        visible += 1;
+    };
+    var drawn: usize = 0;
+    const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
+    for (batches) |batch| {
+        for (batch) |d| {
+            if (drawn == DIAG_CAP) break;
+            if (try renderSinkDiag(out, level, &sm, d, cfg)) drawn += 1; // false == --ignore'd
+        }
+    }
+    try renderCapSummary(out, level, visible, drawn);
+}
+
 /// Render a graph-discovery structural error against the owning module's source (or
 /// the entry path when no module loaded). With a location, snippet + `= note: detail`;
 /// otherwise the plain `path: error: msg (detail)` fallback.

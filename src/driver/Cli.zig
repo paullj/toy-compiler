@@ -43,6 +43,17 @@ const files_pos: []const Spec.Positional = &.{
     .{ .name = "file", .value = .string, .arity = .variadic, .help = "Input source file(s)" },
 };
 
+/// `check`'s option set: the shared build/inspect options PLUS the check-only knobs.
+/// `--format` picks the diagnostic wire form (pretty snippets vs stable NDJSON);
+/// `--exit-zero` forces a 0 exit even with errors (for editors that read the stream,
+/// not the status); `--watch` is accepted as a forward-compatible no-op stub so the
+/// schema is stable when an incremental watch loop lands.
+const check_opts: []const Spec.Option = shared_opts ++ [_]Spec.Option{
+    .{ .long = "format", .value = .{ .@"enum" = &.{ "human", "ndjson" } }, .value_name = "FORM", .help = "Diagnostic output form (human snippets or line-delimited JSON; default human)" },
+    .{ .long = "exit-zero", .action = .set_true, .help = "Always exit 0, even when diagnostics contain errors" },
+    .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },
+};
+
 /// The single `<CODE>` positional for `toy explain` (e.g. `R0001`).
 const explain_pos: []const Spec.Positional = &.{
     .{ .name = "code", .value = .string, .arity = .one, .help = "A diagnostic code, e.g. R0001" },
@@ -64,6 +75,7 @@ pub const spec: Spec.Cli = .{
         .subcommands = &.{
             .{ .name = "build", .about = "Compile to a signed executable (the default action)", .options = shared_opts, .positionals = files_pos },
             .{ .name = "run", .about = "Build, then execute the binary and report its exit status", .options = shared_opts, .positionals = files_pos },
+            .{ .name = "check", .about = "Check syntax and types without building; report all diagnostics", .options = check_opts, .positionals = files_pos },
             .{ .name = "explain", .about = "Print the documentation for a diagnostic code", .positionals = explain_pos },
         },
     },
