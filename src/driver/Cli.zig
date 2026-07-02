@@ -89,9 +89,15 @@ const check_opts: []const Spec.Option = &.{
     .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
 };
 
-/// The single `<CODE>` positional for `toy explain` (e.g. `R0001`).
+/// The optional `<CODE>` positional for `toy explain` (e.g. `R0001`); omitted for
+/// `toy explain --list` (or the bare word `list`).
 const explain_pos: []const Spec.Positional = &.{
-    .{ .name = "code", .value = .string, .arity = .one, .help = "A diagnostic code, e.g. R0001" },
+    .{ .name = "code", .value = .string, .arity = .optional, .help = "A diagnostic code, e.g. R0001 (omit with --list)" },
+};
+
+/// `toy explain` options: `--list` enumerates every code with its severity + title.
+const explain_opts: []const Spec.Option = &.{
+    .{ .long = "list", .action = .set_true, .help = "List every diagnostic code with its severity and title" },
 };
 
 /// The whole `toy` CLI schema. `version` is the comptime `toyc.version.semver`
@@ -111,7 +117,7 @@ pub const spec: Spec.Cli = .{
             .{ .name = "build", .about = "Compile to a signed executable (the default action)", .options = shared_opts, .positionals = files_pos },
             .{ .name = "run", .about = "Build, then execute the binary and report its exit status", .options = shared_opts, .positionals = files_pos },
             .{ .name = "check", .about = "Check syntax and types without building; report all diagnostics", .options = check_opts, .positionals = files_pos },
-            .{ .name = "explain", .about = "Print the documentation for a diagnostic code", .positionals = explain_pos },
+            .{ .name = "explain", .about = "Print the documentation for a diagnostic code, or --list all codes", .options = explain_opts, .positionals = explain_pos },
         },
     },
 };
