@@ -15,6 +15,14 @@ const Doc = struct { code: codes.Code, text: []const u8 };
 /// `codes.table` by the comptime coverage assert below — adding a code without its
 /// `src/diagnostics/errors/<CODE>.md` fails the build (`@embedFile` can't find the file).
 pub const docs = [_]Doc{
+    .{ .code = .P0001, .text = @embedFile("errors/P0001.md") },
+    .{ .code = .P0002, .text = @embedFile("errors/P0002.md") },
+    .{ .code = .P0003, .text = @embedFile("errors/P0003.md") },
+    .{ .code = .P0004, .text = @embedFile("errors/P0004.md") },
+    .{ .code = .P0005, .text = @embedFile("errors/P0005.md") },
+    .{ .code = .P0006, .text = @embedFile("errors/P0006.md") },
+    .{ .code = .P0007, .text = @embedFile("errors/P0007.md") },
+    .{ .code = .P0008, .text = @embedFile("errors/P0008.md") },
     .{ .code = .R0001, .text = @embedFile("errors/R0001.md") },
     .{ .code = .R0002, .text = @embedFile("errors/R0002.md") },
     .{ .code = .R0003, .text = @embedFile("errors/R0003.md") },
@@ -77,4 +85,8 @@ test "docForStr resolves a known code and rejects garbage" {
     const r1 = docForStr("R0001") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, r1, "undeclared identifier") != null);
     try testing.expectEqual(@as(?[]const u8, null), docForStr("Z9999"));
+
+    const p1 = docForStr("P0001") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, p1, "P0001") != null);
+    try testing.expect(std.mem.indexOf(u8, p1, "expected") != null);
 }

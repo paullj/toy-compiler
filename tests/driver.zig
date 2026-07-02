@@ -338,6 +338,58 @@ test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-on
     try testing.expectEqual(@as(usize, 1), carets);
 }
 
+test "C explain: a parse code (P0001) prints its doc (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "P0001" }, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try testing.expect(std.mem.indexOf(u8, got, "P0001") != null);
+}
+
+test "C coded render: a parse error renders `error[P0002]:` and stays report-once (one -->)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-driver-parse-coded";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const path = dir_name ++ "/one.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn a() -> int {\n  return )\n}\n" });
+
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--emit", "check", path }, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    _ = try child.wait(io);
+
+    // The authorized C output change: coded parse-diagnostic header bracket.
+    try testing.expect(std.mem.indexOf(u8, got, "error[P0002]:") != null);
+    // report-once preserved: exactly one primary caret line.
+    try testing.expectEqual(@as(usize, 1), countCarets(got));
+}
+
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
 /// capturing stdout+stderr merged and the exit code. Returns the captured bytes (the
 /// caller frees) and the term. Skips when the built binary is absent.
