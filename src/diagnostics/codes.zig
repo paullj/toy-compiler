@@ -25,6 +25,16 @@ pub const Fixable = enum { no, safe, unsafe };
 pub const Code = enum(u16) {
     none = 0,
 
+    // Parse band (P####).
+    P0001, // expected-token       (missing punctuation/keyword: every expect() site)
+    P0002, // expected-expression  (expression/argument position empty)
+    P0003, // expected-declaration (top-level / after-`pub` decl dispatch)
+    P0004, // expected-terminator  ("expected a newline or '}' after statement")
+    P0005, // nesting-too-deep     (block/expression depth backstop — SIGBUS guard)
+    P0006, // expected-name        (identifier: field/param/type/variant/label/loop-var/alias/path-seg)
+    P0007, // invalid-label-target ("a label must prefix a loop, while, for, or block")
+    P0008, // expected-pattern     (match sub-pattern / variant pattern)
+
     // Resolve band (R####).
     R0001, // undeclared-identifier
     R0002, // duplicate-function
@@ -70,6 +80,14 @@ const Entry = struct {
 /// The append-only registry. Every non-`.none` `Code` MUST have exactly one row (the
 /// comptime block below enforces coverage, uniqueness, prefix, and contiguity).
 pub const table = [_]Entry{
+    .{ .code = .P0001, .str = "P0001", .slug = "expected-token" },
+    .{ .code = .P0002, .str = "P0002", .slug = "expected-expression" },
+    .{ .code = .P0003, .str = "P0003", .slug = "expected-declaration" },
+    .{ .code = .P0004, .str = "P0004", .slug = "expected-terminator" },
+    .{ .code = .P0005, .str = "P0005", .slug = "nesting-too-deep" },
+    .{ .code = .P0006, .str = "P0006", .slug = "expected-name" },
+    .{ .code = .P0007, .str = "P0007", .slug = "invalid-label-target" },
+    .{ .code = .P0008, .str = "P0008", .slug = "expected-pattern" },
     .{ .code = .R0001, .str = "R0001", .slug = "undeclared-identifier" },
     .{ .code = .R0002, .str = "R0002", .slug = "duplicate-function" },
     .{ .code = .R0003, .str = "R0003", .slug = "unknown-imported-module" },
@@ -186,6 +204,12 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("R0001", str(.R0001).?);
     try testing.expectEqualStrings("undeclared-identifier", slug(.R0001).?);
     try testing.expectEqual(Severity.err, defaultSeverity(.R0001));
+
+    // Parse band (P####).
+    try testing.expectEqualStrings("P0001", str(.P0001).?);
+    try testing.expectEqualStrings("expected-token", slug(.P0001).?);
+    try testing.expectEqual(Severity.err, defaultSeverity(.P0001));
+    try testing.expectEqual(Code.P0005, fromStr("P0005").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
