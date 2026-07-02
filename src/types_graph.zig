@@ -1,4 +1,4 @@
-//! M14 whole-graph typecheck ("query consumer #1", types layer).
+//! Whole-graph typecheck (types layer).
 //!
 //! Adapts the discovered module `Graph` + the whole-graph name-resolution result
 //! (`resolve_graph.GraphResult`) into the program-wide type checker
@@ -9,7 +9,7 @@
 //!     are DISTINCT ids (`Type.eql` compares ids → nominal distinctness for free);
 //!   * resolves a qualified `mod.Type` type-ref (a `field_access` in type
 //!     position whose receiver binds to a `.module`) to the OWNING module's global
-//!     layout id — the cross-module form of the M9 param/ret hole, so a pub-type
+//!     layout id — the cross-module form of the param/ret hole, so a pub-type
 //!     layout change reaches the importer's fingerprint (closed by feeding the
 //!     real global layout into `layouts`/`enum_layouts`);
 //!   * type-checks every fn body against the resolver's GLOBAL fn table (`.func`
@@ -49,7 +49,6 @@ pub fn checkGraph(
 ) !GraphResult {
     const n = graph.modules.len;
 
-    // --- per-module type context (tree views + bare-name maps + namespaces) ---
     var ctx: Typecheck.GraphCtx = .{ .mods = try gpa.alloc(Typecheck.GraphCtx.ModuleCtx, n) };
     defer {
         for (ctx.mods) |*mc| {
@@ -77,7 +76,6 @@ pub fn checkGraph(
         try bindNamespaces(gpa, graph, &ctx.mods[mi], m);
     }
 
-    // --- global fn descriptors (parallel to the resolver's global fn table) ---
     const fns = try gpa.alloc(Typecheck.GraphFnInput, res.fns.len);
     defer gpa.free(fns);
     for (res.fns, 0..) |gf, i| {
@@ -90,7 +88,6 @@ pub fn checkGraph(
         };
     }
 
-    // --- module inputs (the type checker reads trees/resolutions through ctx) ---
     const mods = try gpa.alloc(Typecheck.GraphModuleInput, n);
     defer gpa.free(mods);
     for (graph.modules, 0..) |*m, i| {
@@ -155,8 +152,6 @@ fn importTarget(graph: *const Graph.Graph, m: *const Graph.Module, decl: Ast.Nod
     }
     return null;
 }
-
-// ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 const Cache = @import("query/Cache.zig");
@@ -522,7 +517,7 @@ test "single-module graph typechecks like the single-file checker" {
     try withCheckedGraph(".toy-test-typ-solo", files, "solo.toy", Check.run);
 }
 
-/// S4 PARALLEL == SERIAL: discover+resolve ONCE, then type-check the SAME graph
+/// PARALLEL == SERIAL: discover+resolve ONCE, then type-check the SAME graph
 /// twice — under a `.limited(0)` (serial, the -j1 baseline) pool and under a
 /// multi-worker (`.limited(8)`, the -jN) pool — and assert the diagnostic stream is
 /// IDENTICAL: same count, same (module, byte_offset, message) at every index. A
@@ -547,7 +542,7 @@ fn diagsUnder(
     return copy;
 }
 
-test "S4: parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
+test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

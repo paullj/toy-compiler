@@ -131,7 +131,7 @@ pub const IrResult = union(enum) {
 /// The SERIAL relink tail (every build, uncached): derive `uses_write`, append
 /// the print body, intern strings program-wide (deterministic: fn source order
 /// then in-fn literal order), rewrite `.cstr` hashes to offsets, then link and
-/// rebase cross-segment relocs. `slots` is consumed (each FnCode freed). [C8]
+/// rebase cross-segment relocs. `slots` is consumed (each FnCode freed).
 fn relink(
     io: Io,
     gpa: std.mem.Allocator,
@@ -476,13 +476,12 @@ fn graphFnJobInner(
     // fn_decl param/return fold uses the ABI-correct GLOBAL type ids — including a
     // CROSS-MODULE qualified `b: rect.Rect`. A bare-name re-resolution would mis-pick
     // the first same-named type in the merged layout table, missing a pub-type
-    // layout edit at the importer (cross-module M9 / TOP-RISK-#1 hole).
+    // layout edit at the importer (cross-module hole).
     const my_sig: ?Fingerprint.Sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
 
     // The cross-module callee identity + touched layouts ride in through the
     // program-wide `names`/`sigs`/`layouts` of this fn's `frozen` view, so the
     // fingerprint folds a qualified callee distinctly with NO engine change.
-    // tmp_tag = `lower_i`.
     const engine = Engine.initProbe(cache, mode, gf.probe);
     try engine.codegen(gpa, io, target, &frozen, fn_decl, sym, is_entry, my_sig, lower_i, slot);
 }

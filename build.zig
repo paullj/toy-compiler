@@ -106,7 +106,7 @@ pub fn build(b: *std.Build) void {
 
     // `zig build fuzz`: an in-process front-end fuzzer (tests/fuzz.zig). It feeds
     // mutated seed-corpus bytes + grammar-generated programs through lex → parse →
-    // (on a clean parse) resolve + typecheck, enforcing the D4a robustness contract
+    // (on a clean parse) resolve + typecheck, enforcing the robustness contract
     // (no panic / no hang / always a tree, and the parser invariants that fire under
     // runtime_safety). It is FORCED to Debug regardless of `-Doptimize`: those
     // invariant asserts only exist when `std.debug.runtime_safety` is on, so a

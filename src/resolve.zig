@@ -20,8 +20,6 @@ const Ast = @import("ast/Ast.zig");
 /// working for downstream consumers.
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
@@ -100,7 +98,7 @@ test "undeclared identifier yields exactly one diagnostic" {
 }
 
 test "a single root undeclared name yields exactly one diagnostic (report-once)" {
-    // Mirrors the B4 report-once smoke: one undeclared name → one diagnostic, no
+    // Mirrors the report-once smoke: one undeclared name → one diagnostic, no
     // cascade through the `return` that consumes its poison.
     const gpa = testing.allocator;
     var parsed = try parseSource(gpa, "fn main() -> int {\n return nope\n}\n");
@@ -405,8 +403,6 @@ test "assignment to a function name is reported" {
         "fn g() { return }\nfn f() {\n g = 1\n return\n}\n",
     ));
 }
-
-// ---- structs ---------------------------------------------------------------
 
 test "struct construction resolves clean (type name is not flagged)" {
     try testing.expectEqual(@as(usize, 0), try resolveDiagCount(

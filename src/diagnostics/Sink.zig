@@ -277,8 +277,6 @@ pub fn toOwned(self: *DiagnosticSink) !Owned {
     return .{ .diags = diags, .owned = owned };
 }
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 
 test "sort orders by (scope, byte_offset, message) deterministically for equal (scope, offset)" {

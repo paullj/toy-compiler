@@ -67,42 +67,25 @@ pub fn renderDiagSummary(out: *Io.Writer, level: Style.ColorLevel, n_err: usize,
     try out.writeByte('\n');
 }
 
-/// Render a resolve/type sink diagnostic against a prepared SourceMap: build the rich
-/// `Diagnostic` INLINE from the POD (a zero-width primary at `d.byte_offset`, code
-/// string from the registry — null for `.none` => NO `[code]` bracket, so uncoded
-/// diagnostics render byte-identical to the old `fromSink` path). Severity is C3's
+/// Count VISIBLE (non-`--ignore`d) diagnostics under `cfg`, so the "... and N more" cap
+/// summary excludes suppressed ones. Empty `cfg` == identity (all visible).
+fn countVisible(diags: []const toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) usize {
+    var n: usize = 0;
+    for (diags) |d| {
+        if (SevCfg.resolve(d.code, d.severity, cfg) != null) n += 1;
+    }
+    return n;
+}
+
+/// Render a resolve/type sink diagnostic against a prepared SourceMap. Severity is the
 /// LATE override: `SevCfg.resolve` reads the POD default and applies `cfg` (empty ==
-/// identity, so no-flag runs stay byte-identical); a `null` result means the code was
-/// `--ignore`'d, so nothing is written and `false` is returned (for cap/summary
-/// accounting). The POD is never rewritten — the cached blob stays rule-independent.
+/// identity); a `null` result means the code was `--ignore`'d, so nothing is written and
+/// `false` is returned (for cap/summary accounting). The POD is never rewritten, so the
+/// cached blob stays rule-independent.
 pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, d: toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) !bool {
     const eff = SevCfg.resolve(d.code, d.severity, cfg) orelse return false; // .ignore -> zero bytes
-    // C3: a RELATED prior location (same scope) becomes a secondary "previously defined
-    // here" label. Zero-width point (only the offset is carried), like the primary. The
-    // stack buffer outlives the render call below. NO_RELATED => no secondary (empty).
     var sec_buf: [1]Rr.Diagnostic.Label = undefined;
-    const secondary: []const Rr.Diagnostic.Label = if (d.related != toyc.DiagnosticSink.NO_RELATED) blk: {
-        sec_buf[0] = .{
-            .kind = .secondary,
-            .span = .{ .start = d.related, .end = d.related },
-            .message = "previously defined here",
-            .source = d.scope,
-        };
-        break :blk sec_buf[0..1];
-    } else &.{};
-    const rich = Rr.Diagnostic.Diagnostic{
-        .severity = eff, // C3: effective severity, computed LATE from the POD default
-        .message = d.message, // borrowed
-        .primary = .{
-            .kind = .primary,
-            .span = .{ .start = d.byte_offset, .end = d.byte_offset }, // zero-width point
-            .message = d.message, // borrowed, aliases d.message
-            .source = d.scope, // NO_SCOPE -> NO_SOURCE verbatim
-        },
-        .secondary = secondary,
-        .code = codes.str(d.code), // null when .none -> no bracket -> byte-identical
-        .scope = d.scope,
-    };
+    const rich = Rr.Diagnostic.richFromPod(d, eff, codes.str(d.code), &sec_buf);
     try Rr.Renderer.render(rich, sm, out, renderOpts(level));
     return true;
 }
@@ -154,41 +137,25 @@ fn moduleAt(g: *const Graph.Graph, id: u32) *const Graph.Module {
 /// same-scope diagnostics are contiguous — we build a map per scope and keep it while
 /// the scope holds. Scope `NO_SCOPE` (single-file) picks the entry module.
 pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, diags: []const toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) !void {
-    // C3: apply the severity config BEFORE the cap. A first cheap pass counts VISIBLE
-    // (non-`--ignore`d) diagnostics so the "... and N more" summary excludes dropped
-    // ones. When `cfg` is empty every diagnostic is visible, so this is byte-identical
-    // to the pre-C3 count.
-    var visible: usize = 0;
-    for (diags) |d| {
-        if (SevCfg.resolve(d.code, d.severity, cfg) != null) visible += 1;
-    }
-    var cached_scope: ?u32 = null;
-    var sm: Rr.SourceMap = undefined;
-    defer if (cached_scope != null) sm.deinit(gpa);
-    // Render-time cap: draw at most DIAG_CAP VISIBLE diagnostics, then one "... and N
-    // more" line. The passed-in `diags` slice is NEVER truncated (render-only).
+    // Apply the severity config before the cap so "... and N more" excludes --ignore'd
+    // diagnostics; the passed-in `diags` slice is NEVER truncated (render-only).
+    const visible = countVisible(diags, cfg);
+    var cache: Rr.SourceMap.ScopeCache = .{};
+    defer cache.deinit(gpa);
     var drawn: usize = 0;
     for (diags) |d| {
         if (SevCfg.resolve(d.code, d.severity, cfg) == null) continue; // --ignore: skip
         if (drawn == DIAG_CAP) break;
-        if (cached_scope == null or cached_scope.? != d.scope) {
-            if (cached_scope != null) sm.deinit(gpa);
-            const m = moduleAt(g, d.scope); // NO_SCOPE / out-of-range -> entry
-            // Clear `cached_scope` before the `try init`: `sm` was just deinit'd, so a
-            // failing init must not let the `defer` fire on the freed `sm` (double-free).
-            // Reassign after init.
-            cached_scope = null;
-            sm = try Rr.SourceMap.init(gpa, m.path, m.source); // Module.source []u8 coerces to []const u8
-            cached_scope = d.scope;
-        }
-        _ = try renderSinkDiag(out, level, &sm, d, cfg);
+        const m = moduleAt(g, d.scope); // NO_SCOPE / out-of-range -> entry
+        const sm = try cache.get(gpa, d.scope, m.path, m.source);
+        _ = try renderSinkDiag(out, level, sm, d, cfg);
         drawn += 1;
     }
-    try renderCapSummary(out, level, visible, drawn); // cap counts VISIBLE, not raw
+    try renderCapSummary(out, level, visible, drawn);
 }
 
 /// `toy check`: render EVERY diagnostic on a single file (parse + resolve + typecheck,
-/// in that stable stage order) against ONE SourceMap over the file, applying the C3
+/// in that stable stage order) against ONE SourceMap over the file, applying the
 /// severity config and the render cap. Unlike the inspection table's `printFailure`,
 /// this never prints a summary row — the `check` action reports diagnostics only, then a
 /// program-wide `N error(s), M warning(s)` summary. Returns nothing; the caller tallies
@@ -204,24 +171,17 @@ pub fn renderFileDiags(
     type_diags: []const toyc.DiagnosticSink.Diagnostic,
     cfg: SevCfg.SeverityConfig,
 ) !void {
-    const total = parse_diags.len + resolve_diags.len + type_diags.len;
+    const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
+    var total: usize = 0;
+    var visible: usize = 0;
+    for (batches) |batch| {
+        total += batch.len;
+        visible += countVisible(batch, cfg);
+    }
     if (total == 0) return;
     var sm = try Rr.SourceMap.init(gpa, path, source);
     defer sm.deinit(gpa);
-    // VISIBLE (non-`--ignore`d) count across all three stages, so the "... and N more"
-    // summary excludes suppressed diagnostics (matches `renderScopedDiags`).
-    var visible: usize = 0;
-    for (parse_diags) |d| if (SevCfg.resolve(d.code, d.severity, cfg) != null) {
-        visible += 1;
-    };
-    for (resolve_diags) |d| if (SevCfg.resolve(d.code, d.severity, cfg) != null) {
-        visible += 1;
-    };
-    for (type_diags) |d| if (SevCfg.resolve(d.code, d.severity, cfg) != null) {
-        visible += 1;
-    };
     var drawn: usize = 0;
-    const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
     for (batches) |batch| {
         for (batch) |d| {
             if (drawn == DIAG_CAP) break;

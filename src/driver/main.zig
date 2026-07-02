@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const argv = argv_list.items;
 
-    // The C3 severity-override rule list. Fn-scope (like `st.paths`) so it outlives
+    // The severity-override rule list. Fn-scope (like `st.paths`) so it outlives
     // every render; `applyParsed` fills it in FIXED (error, warn, ignore) order from
     // the repeatable flags, borrowing argv bytes, then points `st.sev` at its items.
     var sev_rules: std.ArrayList(SevCfg.Rule) = .empty;
@@ -235,10 +235,10 @@ pub fn main(init: std.process.Init) !void {
 
     // `toy check`: the diagnostics-focused front-end. Runs lex->parse->resolve->typecheck
     // over every input (NEVER codegen), reports ALL diagnostics (no early-bail), applies
-    // the C3 severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
+    // the severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
     // the config, 2 on a hard CLI/IO error. `--exit-zero` forces 0 regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, io, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.check_error_on_warning, st.sev));
+        std.process.exit(try runCheck(gpa, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.check_error_on_warning, st.sev));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -315,7 +315,7 @@ const State = struct {
     job_count: usize = 0,
     // The resolved `--color` choice, fed once into `resolveLevel` after the parse.
     color_choice: Terminal.ColorChoice = .auto,
-    // C3 render-time severity overrides (--error/--warn/--ignore). Empty by default ==
+    // Render-time severity overrides (--error/--warn/--ignore). Empty by default ==
     // identity, so no-flag runs render byte-identical. `rules` BORROWS argv bytes via a
     // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
     sev: SevCfg.SeverityConfig = .{},
@@ -384,7 +384,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         const pass = passByName(name) orelse return argErrCode(out, level, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
         st.opt.set(pass, false);
     }
-    // C3 severity overrides. Build the borrowed rule slice in FIXED severity order:
+    // Severity overrides. Build the borrowed rule slice in FIXED severity order:
     // all --error, then all --warn, then all --ignore. With `resolve`'s last-match-wins
     // this makes ignore dominate warn dominate error for a code named by multiple flags,
     // deterministically and independent of cross-flag argv position (the flat model
@@ -414,7 +414,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
 /// Map the `check` subcommand's RESTRICTED `Parsed` onto the driver `State`. Distinct
 /// from `applyParsed` because `check_opts` (Cli.zig) carries no codegen/emit/opt flags,
 /// so `Parsed(check)` has no `emit`/`dump`/`O`/... fields to read — only the diagnostic-
-/// shaping + input knobs. Fills paths, target, color, the C3 severity rules, and the
+/// shaping + input knobs. Fills paths, target, color, the severity rules, and the
 /// check-only knobs. Returns a non-null `?u8` exit code on a bad severity spec: unlike
 /// the build path's arg-errors (exit 1), a check-path usage error exits 2 (consistent
 /// with `check`'s missing-input-file exit 2 — a bad `--warn BOGUS` is the same class).
@@ -428,7 +428,7 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: 
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
     st.check_error_on_warning = p.error_on_warning;
-    // C3 severity overrides, FIXED order (error, warn, ignore) so ignore>warn>error under
+    // Severity overrides, FIXED order (error, warn, ignore) so ignore>warn>error under
     // last-match-wins. An unknown code OR band letter is a USAGE error -> exit 2 (not the
     // build path's 1): `usageCode` prints the styled `error:` line and returns 2.
     for (p.@"error") |m| {
@@ -1090,7 +1090,7 @@ fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u
 /// -> `checkGraph` — then STOPS before codegen/lower/link. Reports EVERY diagnostic
 /// from the discovered graph (whole-graph resolve diagnostics; if resolve is clean,
 /// whole-graph typecheck diagnostics) against each diagnostic's OWN module source,
-/// applies the C3 severity config, and emits either pretty human snippets or a stable
+/// applies the severity config, and emits either pretty human snippets or a stable
 /// NDJSON stream. Returns the process exit code: 0 when nothing survives the config as
 /// an error, 1 when >=1 error remains (incl. a structural graph error like a real
 /// missing import — matching `build`), 2 on a hard CLI/IO failure (a missing/unreadable
@@ -1102,7 +1102,6 @@ fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u
 /// through the graph makes `check` agree with `build`.
 fn runCheck(
     gpa: std.mem.Allocator,
-    io: Io,
     out: *Io.Writer,
     level: Style.ColorLevel,
     target: []const u8,
@@ -1144,17 +1143,13 @@ fn runCheck(
     defer graph.deinit(gpa);
 
     if (graph.err) |ge| {
-        // A tainted parse in the ENTRY module is the ONE structural error whose CLI
-        // reporting must stay byte-identical to the pre-fix single-file path: the old
-        // `check` rendered the ENTRY's FULL, CODED parse-diagnostic list (`error[P0002]:`
-        // + a caret), whereas `discover` records only the FIRST parse diagnostic as an
-        // uncoded structural error. Discovery bails on the entry before following any
-        // import, so re-running the single-file front-end over the entry reproduces the
-        // exact old output (all coded parse diagnostics, same exit gate). A parse error in
-        // an IMPORTED module instead falls through to `renderGraphError` (matching `build`)
-        // — Driver.run would not even parse the import, so it can't report it.
+        // A tainted parse in the ENTRY renders the entry's FULL coded parse-diagnostic
+        // list (`error[P0002]:` + a caret) — `discover` retained it on `ge.parse_diags`,
+        // so `check` reports every diagnostic, matching `build`'s per-file output. A parse
+        // error in an IMPORTED module instead falls through to `renderGraphError` (matching
+        // `build` — discovery never enters an import past a broken one).
         const parse_in_entry = ge.kind == .parse and (ge.module == null or ge.module == graph.entry_index);
-        if (parse_in_entry) return runCheckSingleFile(gpa, io, out, level, target, paths, ndjson, exit_zero, error_on_warning, sev);
+        if (parse_in_entry) return reportEntryFile(gpa, out, level, &graph, ndjson, ge.parse_diags, &.{}, &.{}, sev, exit_zero, error_on_warning);
         // A missing/unreadable ENTRY file (kind=.missing, module=null) is a hard CLI/IO
         // failure -> exit 2, matching `check`'s single-file missing-input contract. Every
         // OTHER structural error (a real missing/mis-cased IMPORT, a path escape, an import
@@ -1195,6 +1190,17 @@ fn runCheck(
         break :blk tc.?.diags;
     };
 
+    // SINGLE-MODULE (no imports discovered): render against the entry's ON-DISK `file`,
+    // not its module `path` (a bare stem like `fix_bad` vs `/tmp/fix_bad.toy`), so the
+    // human `-->` header matches the per-file build output. All entry parse errors already
+    // routed above, so a single-module graph carries only resolve OR type diagnostics.
+    // Both wire forms share `reportEntryFile` with the tainted-entry path.
+    if (graph.modules.len == 1) {
+        const resolve_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) diags else &.{};
+        const type_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) &.{} else diags;
+        return reportEntryFile(gpa, out, level, &graph, ndjson, &.{}, resolve_batch, type_batch, sev, exit_zero, error_on_warning);
+    }
+
     if (ndjson) {
         // NDJSON over the graph's flat slice: each diagnostic's `file` is its OWNING
         // module path (not always the entry), so an imported module's error is attributed
@@ -1203,26 +1209,8 @@ fn runCheck(
         try out.flush();
         return checkExit(counts, exit_zero, error_on_warning);
     }
-
     // Human form: pretty per-module snippets (reusing the multi-module renderer, which
     // builds ONE SourceMap per scope) + a program-wide `N error(s), M warning(s)` summary.
-    // SINGLE-MODULE case (no imports discovered): render against the entry's ON-DISK
-    // `file` path, not its module `path` (a bare stem). This keeps the human `-->` header
-    // BYTE-IDENTICAL to the pre-fix single-file `check` (requirement #5, acceptance (d)):
-    // `renderScopedDiags` builds its SourceMap from `Module.path`, which for the entry is
-    // `stem(basename(entry))` (`fix_bad`, not `/tmp/fix_bad.toy`). All entry parse errors
-    // already route to `runCheckSingleFile`, so a single-module graph carries only resolve
-    // OR type diagnostics — pass `diags` as whichever stage produced them.
-    if (graph.modules.len == 1) {
-        const e = graph.entry();
-        const resolve_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) diags else &.{};
-        const type_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) &.{} else diags;
-        try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, &.{}, resolve_batch, type_batch, sev);
-        const counts = Check.tallyGraph(diags, sev);
-        try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
-        try out.flush();
-        return checkExit(counts, exit_zero, error_on_warning);
-    }
     try DiagRender.renderScopedDiags(gpa, out, level, &graph, diags, sev);
     const counts = Check.tallyGraph(diags, sev);
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
@@ -1230,68 +1218,58 @@ fn runCheck(
     return checkExit(counts, exit_zero, error_on_warning);
 }
 
+/// Report the diagnostics belonging to the ENTRY file — a tainted entry parse, or a
+/// single-module graph with no imports — against its on-disk `file`/`source`, then a
+/// program-wide summary and the mapped exit code. The two entry-only cases share this one
+/// render + summary + exit path so their output and exit gate cannot drift. The three
+/// batches are disjoint stages (at most one is non-empty here), rendered in stage order.
+fn reportEntryFile(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    level: Style.ColorLevel,
+    g: *const Graph.Graph,
+    ndjson: bool,
+    parse_diags: []const toyc.DiagnosticSink.Diagnostic,
+    resolve_diags: []const toyc.DiagnosticSink.Diagnostic,
+    type_diags: []const toyc.DiagnosticSink.Diagnostic,
+    sev: SevCfg.SeverityConfig,
+    exit_zero: bool,
+    error_on_warning: bool,
+) !u8 {
+    const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
+    var counts: Check.Counts = .{};
+    if (ndjson) {
+        // Each batch is pre-sorted and attributed to the entry (scope -> entry file); the
+        // schema matches the multi-module form (`emitNdjsonGraph` is shared).
+        for (batches) |batch| {
+            const c = try Check.emitNdjsonGraph(out, gpa, g, batch, sev);
+            counts.errors += c.errors;
+            counts.warnings += c.warnings;
+        }
+        try out.flush();
+        return checkExit(counts, exit_zero, error_on_warning);
+    }
+    const e = g.entry();
+    try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, parse_diags, resolve_diags, type_diags, sev);
+    for (batches) |batch| {
+        const c = Check.tallyGraph(batch, sev);
+        counts.errors += c.errors;
+        counts.warnings += c.warnings;
+    }
+    try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
+    try out.flush();
+    return checkExit(counts, exit_zero, error_on_warning);
+}
+
 /// True when any diagnostic in `diags` carries an error-severity REGISTRY DEFAULT — the
 /// gate that decides whether the graph is resolved enough to typecheck. Deliberately
-/// reads the POD default (NOT the render-time C3 config): the ability to typecheck
+/// reads the POD default (NOT the render-time config): the ability to typecheck
 /// depends on whether resolution actually succeeded, which `--warn`/`--ignore` (a
 /// presentation choice) must never change. So a `--ignore`d resolve error still blocks
 /// typecheck, exactly as it does in a `build`.
 fn resolveHasError(diags: []const toyc.DiagnosticSink.Diagnostic) bool {
     for (diags) |d| if (d.severity == .err) return true;
     return false;
-}
-
-/// The PRESERVED pre-fix single-file `check` path, run ONLY for a tainted-parse ENTRY
-/// (see `runCheck`): `Driver.run(.check)` over the entry collects its FULL parse-
-/// diagnostic list, which `DiagRender.renderFileDiags` renders coded (`error[Pxxxx]:` +
-/// caret) — byte-identical to what `check` produced before the graph fix. This path is
-/// import-blind by design; a parse-broken entry never reaches discovery's import walk, so
-/// there is nothing to follow. Same exit gate (0/1/2) + `--format`/`--exit-zero`/severity.
-fn runCheckSingleFile(
-    gpa: std.mem.Allocator,
-    io: Io,
-    out: *Io.Writer,
-    level: Style.ColorLevel,
-    target: []const u8,
-    paths: []const []const u8,
-    ndjson: bool,
-    exit_zero: bool,
-    error_on_warning: bool,
-    sev: SevCfg.SeverityConfig,
-) !u8 {
-    const results = Driver.run(gpa, io, .check, target, paths) catch |e| {
-        try argLine(out, level, @errorName(e));
-        return 2;
-    };
-    defer {
-        for (results) |*r| r.deinit(gpa);
-        gpa.free(results);
-    }
-
-    if (ndjson) {
-        const counts = try Check.emitNdjson(out, gpa, results, sev);
-        try out.flush();
-        if (Check.anyHardError(results)) return 2;
-        return checkExit(counts, exit_zero, error_on_warning);
-    }
-
-    for (results) |r| {
-        const parse_diags = r.diags;
-        const resolve_diags: []const toyc.DiagnosticSink.Diagnostic = if (r.resolve) |res| res.diags else &.{};
-        const type_diags: []const toyc.DiagnosticSink.Diagnostic = if (r.typecheck) |tc| tc.diags else &.{};
-        if (r.err != null and parse_diags.len == 0 and resolve_diags.len == 0 and type_diags.len == 0) {
-            var buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "{s}: {t}", .{ r.path, r.err.? }) catch r.path;
-            try argLine(out, level, msg);
-            continue;
-        }
-        try DiagRender.renderFileDiags(gpa, out, level, r.path, r.source, parse_diags, resolve_diags, type_diags, sev);
-    }
-    const counts = Check.tallyAll(results, sev);
-    try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
-    try out.flush();
-    if (Check.anyHardError(results)) return 2;
-    return checkExit(counts, exit_zero, error_on_warning);
 }
 
 /// Map a `check` tally to the process exit code: 0 clean (or `--exit-zero`), 1 when at

@@ -69,7 +69,7 @@ test "check: a resolve error is tallied as one error and emitted as NDJSON" {
             const line = out[0 .. out.len - 1];
             var parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
             defer parsed.deinit();
-            // D2 enrichment: every line carries `file`, `rendered`, and a `labels` array.
+            // Every line carries `file`, `rendered`, and a `labels` array.
             const obj = parsed.value.object;
             try testing.expect(obj.get("file") != null);
             try testing.expect(obj.get("file").?.string.len > 0);

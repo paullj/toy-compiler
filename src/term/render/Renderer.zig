@@ -105,7 +105,7 @@ pub fn render(d: Diagnostic.Diagnostic, sm: *const SourceMap, w: *std.Io.Writer,
     // Classify each ref as single- or multi-line, and gather the multi-line spans
     // into `multis` (capped at MAX_MULTILINE, in original order). A ref whose span
     // crosses a '\n' but overflows the cap is re-tagged single-line so it takes
-    // the M12 start-line-clamped path (documented simplification; asserted).
+    // the start-line-clamped path (documented simplification; asserted).
     var multis: [MAX_MULTILINE]MultiSpan = undefined;
     var m: usize = 0;
     for (refs[0..n]) |*ref| {
@@ -190,7 +190,7 @@ pub fn render(d: Diagnostic.Diagnostic, sm: *const SourceMap, w: *std.Io.Writer,
     try w.print(":{d}:{d}\n", .{ loc.line, loc.col });
 
     // 3. TOP SEPARATOR: the rail region is trailing-trimmed to blank (nothing is
-    //    open above the first rendered line), so at any R this is M12's "  |".
+    //    open above the first rendered line), so at any R this is "  |".
     try emitSeparator(w, gw, R, multis[0..m], min_line, .top);
 
     // 4. LINE LOOP: walk every source line in [min_line, max_line], rendering a
@@ -1056,7 +1056,7 @@ test "T13 byte-identical across runs: same diagnostic renders the same bytes" {
     try testing.expectEqualStrings(first, b);
 }
 
-test "T14 cross-line span renders as a rail (M13 replaces the M12 clamp)" {
+test "T14 cross-line span renders as a rail" {
     // "abc\ndef": primary span [0,7) starts on line 1, ends on line 2 (byte 7 is
     // the '\n' terminating line 2? no: bytes 0..3 'abc', 3 '\n', 4..7 'def', 7
     // '\n'. lineCol(7) -> line 2, col 4 (one past 'def'). So this is a genuine
@@ -1178,10 +1178,10 @@ test "T18 empty message = bare marker: row ends right after the glyph run" {
     );
 }
 
-test "M13: off-line single-line label renders on its own line (no rail)" {
+test "off-line single-line label renders on its own line (no rail)" {
     // Primary on line 1 (single-line), a secondary on line 2 (also single-line).
-    // Both start_line==end_line => R=0 => NO rail. M13 renders line 2 on its own
-    // (M12 dropped it). Lines 1,2 adjacent => no elision.
+    // Both start_line==end_line => R=0 => NO rail. Renders line 2 on its own
+    // (previously dropped). Lines 1,2 adjacent => no elision.
     var sm = mapOver("d.toy", "abc\ndef\n");
     defer sm.deinit(sm.gpa);
     const secondary = [_]Diagnostic.Label{
@@ -1253,7 +1253,7 @@ test "a zero-width primary renders one caret (the sink-diagnostic render shape)"
 //   start_dcol=8 (K=7), end_dcol=2 (K'=1), gw=digits(3)=1, location 1:8.
 const blk_src = "fn f() {\n    a\n}\n";
 
-test "M13-1 single multi-line span PLAIN: rail top/vertical/bottom, connectors + message" {
+test "single multi-line span PLAIN: rail top/vertical/bottom, connectors + message" {
     var sm = mapOver("blk.toy", blk_src);
     defer sm.deinit(sm.gpa);
     const d = Diagnostic.Diagnostic{
@@ -1278,7 +1278,7 @@ test "M13-1 single multi-line span PLAIN: rail top/vertical/bottom, connectors +
     );
 }
 
-test "M13-2 single multi-line span UNICODE: rail ╭ │ ╰ ─, gutter '|' stays ASCII" {
+test "single multi-line span UNICODE: rail ╭ │ ╰ ─, gutter '|' stays ASCII" {
     var sm = mapOver("blk.toy", blk_src);
     defer sm.deinit(sm.gpa);
     const d = Diagnostic.Diagnostic{
@@ -1300,7 +1300,7 @@ test "M13-2 single multi-line span UNICODE: rail ╭ │ ╰ ─, gutter '|' sta
     );
 }
 
-test "M13-3 span across 4 lines PLAIN: intervening rail_vertical rows, no connector" {
+test "span across 4 lines PLAIN: intervening rail_vertical rows, no connector" {
     // "a\nb\nc\nd\n": line_starts [0,2,4,6,8]. Primary {0,7}: start line 1 (col 1),
     // end byte 7 -> line 4 ('d' at 6, byte 7 is one past 'd' -> col 2). Lines 2,3
     // are intervening: source rows with '|' and NO connector row.
@@ -1327,7 +1327,7 @@ test "M13-3 span across 4 lines PLAIN: intervening rail_vertical rows, no connec
     );
 }
 
-test "M13-4 message rides the END connector, not the START" {
+test "message rides the END connector, not the START" {
     var sm = mapOver("blk.toy", blk_src);
     defer sm.deinit(sm.gpa);
     const d = Diagnostic.Diagnostic{
@@ -1346,7 +1346,7 @@ test "M13-4 message rides the END connector, not the START" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "MSG_HERE"));
 }
 
-test "M13-5 single-line secondary on an interior line sits AFTER the rail_vertical" {
+test "single-line secondary on an interior line sits AFTER the rail_vertical" {
     // Multi-line primary {0,7} over "a\nb\nc\nd\n" opens the rail on lines 1..4.
     // A single-line secondary on line 2 ('b', byte 2, span {2,3}) must render its
     // caret AFTER the open rail cell.
@@ -1380,7 +1380,7 @@ test "M13-5 single-line secondary on an interior line sits AFTER the rail_vertic
     );
 }
 
-test "M13-6 gutter width from a 2-digit max line: rail + '|' stay straight" {
+test "gutter width from a 2-digit max line: rail + '|' stay straight" {
     // Source with lines up to a 2-digit end line. 8 short lines, then a span from
     // line 8 to line 12. line_starts: lines 1..9 are "N\n" (2 bytes) for N=1..8 =>
     // wait, build explicitly. Use "l1\n"..."l12\n" style so we get to line 12.
@@ -1417,7 +1417,7 @@ test "M13-6 gutter width from a 2-digit max line: rail + '|' stay straight" {
     );
 }
 
-test "M13-7 elision PLAIN: two single-line labels far apart => one '...' row" {
+test "elision PLAIN: two single-line labels far apart => one '...' row" {
     // Two SINGLE-line labels on lines 1 and 5, no multi-line span => R=0, no rail.
     // Lines 2,3,4 are not labelled and no rail is open => elide with one "...".
     var sm = mapOver("el.toy", "one\ntwo\nthree\nfour\nfive\n");
@@ -1447,7 +1447,7 @@ test "M13-7 elision PLAIN: two single-line labels far apart => one '...' row" {
     );
 }
 
-test "M13-8 elision UNICODE: same shape with '⋮'" {
+test "elision UNICODE: same shape with '⋮'" {
     var sm = mapOver("el.toy", "one\ntwo\nthree\nfour\nfive\n");
     defer sm.deinit(sm.gpa);
     const secondary = [_]Diagnostic.Label{
@@ -1473,7 +1473,7 @@ test "M13-8 elision UNICODE: same shape with '⋮'" {
     );
 }
 
-test "M13-9 two overlapping multi-line spans PLAIN: R=2, nested columns, no corruption" {
+test "two overlapping multi-line spans PLAIN: R=2, nested columns, no corruption" {
     // Source of 6 lines. Outer primary span lines 1->5, inner secondary span
     // lines 2->4. Greedy coloring: outer (start 1) gets column 0, inner (start 2,
     // last_end col0 = 5 >= 2) gets column 1 => R=2. Outer=primary (severity),
@@ -1529,7 +1529,7 @@ test "M13-9 two overlapping multi-line spans PLAIN: R=2, nested columns, no corr
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
 }
 
-test "M13-9b staggered (non-nested) overlap: crossing stays aligned, not corrupt" {
+test "staggered (non-nested) overlap: crossing stays aligned, not corrupt" {
     // The case greedy interval coloring is specifically built for: two multi-line
     // spans that OVERLAP but do NOT nest (outer ends WHILE the inner is still
     // open). Outer primary lines 1->4 (col 0), spanB secondary lines 3->6 (col 1).
@@ -1579,7 +1579,7 @@ test "M13-9b staggered (non-nested) overlap: crossing stays aligned, not corrupt
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
 }
 
-test "M13-10 tab/CJK start line: connector K + caret land via displayCol" {
+test "tab/CJK start line: connector K + caret land via displayCol" {
     // Line 1 begins with a tab, then a multi-line span starts after it. The start
     // connector's horizontal run must use displayCol (tab expands to col 5), not
     // the byte offset. "\tXY\nZ\n": tab (col 1->stop 4), X at display col 5.
@@ -1607,7 +1607,7 @@ test "M13-10 tab/CJK start line: connector K + caret land via displayCol" {
     );
 }
 
-test "M13-11 PLAIN zero-escape at .none for a railed diagnostic (generalizes T11)" {
+test "PLAIN zero-escape at .none for a railed diagnostic (generalizes T11)" {
     var sm = mapOver("blk.toy", blk_src);
     defer sm.deinit(sm.gpa);
     const secondary = [_]Diagnostic.Label{
@@ -1628,7 +1628,7 @@ test "M13-11 PLAIN zero-escape at .none for a railed diagnostic (generalizes T11
     try testing.expect(std.mem.indexOfScalar(u8, out, 0x1b) == null);
 }
 
-test "M13-12 color strip-equality for a railed diagnostic (generalizes T12)" {
+test "color strip-equality for a railed diagnostic (generalizes T12)" {
     var sm = mapOver("blk.toy", blk_src);
     defer sm.deinit(sm.gpa);
     const d = Diagnostic.Diagnostic{
@@ -1649,7 +1649,7 @@ test "M13-12 color strip-equality for a railed diagnostic (generalizes T12)" {
     try testing.expectEqualStrings(plain, stripSgr(&strip_buf, colored));
 }
 
-test "M13-13 byte-identical across runs for a railed + overlapping diagnostic (generalizes T13)" {
+test "byte-identical across runs for a railed + overlapping diagnostic (generalizes T13)" {
     var sm = mapOver("ov.toy", "aa\nbb\ncc\ndd\nee\nff\n");
     defer sm.deinit(sm.gpa);
     const secondary = [_]Diagnostic.Label{

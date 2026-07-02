@@ -1,12 +1,12 @@
 //! The incremental query engine: one testable seam that owns the on-disk memo
-//! (`Cache`) and the uniform `query(key, compute) -> result` entry. M15 lifts the
+//! (`Cache`) and the uniform `query(key, compute) -> result` entry. Lifts the
 //! distributed query/cache/fingerprint/force-verify/parallel logic out of the
 //! driver and into this module; the driver becomes a thin orchestrator that
 //! sequences phases and demands each unit through here.
 //!
 //! This is a BEHAVIOR-PRESERVING refactor: each query is still pull-computed or
 //! served from the on-disk content-addressed cache exactly as before. The cache
-//! stays the SOLE memo (lock-free atomic-rename writers, [C11] determinism); no
+//! stays the SOLE memo (lock-free atomic-rename writers, determinism); no
 //! shared mutable in-memory map is introduced — each unit is computed once per
 //! build, so a map would only race for zero gain.
 //!
@@ -37,7 +37,7 @@ const Engine = @This();
 /// cache/verify policy this engine owns and the verify gate enforces:
 ///   normal — use a cached blob if present, else lower+cache.
 ///   force  — ignore cache, always re-lower (cold build).
-///   verify — re-lower every fn TWICE and assert byte-identity ([C11]),
+///   verify — re-lower every fn TWICE and assert byte-identity,
 ///            independent of cache state. Implies force (the gate must hold on
 ///            a cold build, not only on a primed cache hit).
 pub const Mode = enum { normal, force, verify };
@@ -173,7 +173,7 @@ pub fn query(
     return .{ .value = fresh, .cached = false };
 }
 
-/// lex query (the M15 proof seam): tokenize `source` for `target`, served from
+/// lex query: tokenize `source` for `target`, served from
 /// cache or freshly lexed. Preserves the pipeline's policy: `get` propagates,
 /// `put` is swallowed, `tmp_tag` is the caller's file index.
 pub fn lex(
@@ -209,7 +209,7 @@ pub fn lex(
 /// treats a failed read as a plain miss (`true`). `put` is always swallowed (a
 /// failed store just means the next build re-parses).
 ///
-/// B2: the parser now ALWAYS produces a tree, so `tree` is non-optional. A TAINTED
+/// The parser now ALWAYS produces a tree, so `tree` is non-optional. A TAINTED
 /// parse (any accumulated diagnostic) sets `diags` non-empty; the caller must not
 /// proceed to codegen and reports every diagnostic. The cache PUT is gated on
 /// `diags.len == 0`, so a poisoned partial tree never becomes a cached "good"
@@ -235,7 +235,6 @@ pub fn parse(
     const cache = self.cache;
     const key = Key.parse(target, source);
 
-    // --- cache read + validate (a corrupt blob is treated as a miss) ---
     // `--timings`: the read+unpack-validate is the GET cost; gated on `self.probe`
     // so a plain build reads no clock (the codegen-probe discipline).
     const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
@@ -250,7 +249,6 @@ pub fn parse(
     }
     if (self.probe) |p| lap(io, &p.get_ns, get_t0);
 
-    // --- miss: parse fresh; store ONLY a clean (untainted) parse ---
     const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
     const res = try Parser.parse(gpa, tokens, source);
     if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
@@ -278,7 +276,7 @@ pub fn parse(
 ///
 /// `jobFn` is the per-unit work function; `ctx.args(i)` returns the exact
 /// `ArgsTuple` for job `i` (including its slot pointer and its `tmp_tag` index).
-/// Determinism ([C11]) is unaffected: jobs are independent and order-free, and the
+/// Determinism is unaffected: jobs are independent and order-free, and the
 /// caller's collect loop reads slots in deterministic index order afterward.
 pub fn fanOut(io: Io, n: usize, comptime jobFn: anytype, ctx: anytype) void {
     var group: Io.Group = .init;
@@ -291,7 +289,7 @@ pub fn fanOut(io: Io, n: usize, comptime jobFn: anytype, ctx: anytype) void {
 }
 
 /// PER-STAGE chunking heuristics for `chunkedFanOut`, tuned by the work-per-unit of
-/// each fan-out site (see PERF P1). `threshold` = stay serial at or below this unit
+/// each fan-out site. `threshold` = stay serial at or below this unit
 /// count (chunking would cost more than it saves); `chunks_per_cpu` = how many ranges
 /// per cpu (more = finer ranges = better load-balance when unit cost varies, at a few
 /// more enqueues). The ratio "per-unit work vs per-task overhead" sets both: the
@@ -327,7 +325,7 @@ pub fn hostCpus() usize {
     return std.Thread.getCpuCount() catch 1;
 }
 
-/// CHUNKED parallel fan-out: the PERF P1 primitive that makes `-jN` actually scale.
+/// CHUNKED parallel fan-out: the primitive that makes `-jN` actually scale.
 ///
 /// `Engine.fanOut` dispatches ONE task per unit; with 10K µs-scale units that is 10K
 /// `group.concurrent` enqueues on the main thread plus 10K completion atomics, and the
@@ -343,7 +341,7 @@ pub fn hostCpus() usize {
 /// smaller ranges so an uneven unit-cost distribution still load-balances (static
 /// ranges, no work-stealing). `ncpu_hint`: the `-j` jobs knob; `0` => `hostCpus()`.
 ///
-/// DETERMINISM ([C11]): ranges own DISJOINT unit spans (range r writes only units
+/// DETERMINISM: ranges own DISJOINT unit spans (range r writes only units
 /// `start..end`); there is NO shared mutable state across ranges, and each range calls
 /// the SAME `jobFn(ctx.args(i))` the per-unit `fanOut` would, in ascending `i`. The
 /// caller still reads its slots back in unit-index order, so the merged result is
@@ -462,7 +460,7 @@ pub const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
 /// Lower one function (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a job-local
 /// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
 /// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
-/// is freed here, keeping the codegen cache ONE-TIER ([C8]). The M13 opt stage runs
+/// is freed here, keeping the codegen cache ONE-TIER. The opt stage runs
 /// in-place on `irf` between lower and codegen; `opt_out` (when non-null) receives
 /// the per-fn dual-metric numbers.
 ///
@@ -489,8 +487,8 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
     // before we emit a partial FnCode.
     if (diags.items.len > 0) return error.CodegenDiagnostic;
 
-    // M13: run the opt stage in-place on the IR between lower and codegen. Stays
-    // ONE-TIER ([C8]) — the IR never escapes this query. With no passes enabled
+    // run the opt stage in-place on the IR between lower and codegen. Stays
+    // ONE-TIER — the IR never escapes this query. With no passes enabled
     // this is a pure no-op (the scaffold O0==O1 gate).
     var opt_st: Opt.Stats = .{};
     try Opt.run(gpa, &irf, frozen.opt, &opt_st);
@@ -516,13 +514,13 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
 /// REUSE = CONTENT-FP CACHE HIT, the SOLE driver. A `.normal` build serves the
 /// prior blob iff `cache.get(Key.codegen(...))` hits the fn's transitive content
 /// fingerprint; the StageGraph schedules, the content cache decides. `.force` skips
-/// the cache; `.verify` re-lowers fresh and audits the bytes ([C11]).
+/// the cache; `.verify` re-lowers fresh and audits the bytes.
 ///
 /// The caller derives the per-fn view: `frozen` (a single-fn `Frozen` read-only
 /// view), the fn's emitted `sym`, `is_entry`, its typecheck `my_sig`, and a
 /// `tmp_tag` unique among concurrent writers (the fn index / lowerable-fn index).
 /// `slot` is a `*FnSlot`-shaped out pointer the engine fills (taken `anytype` so
-/// the `FnSlot`/`Frozen` types can stay in the driver this stage). [C8] one-tier:
+/// the `FnSlot`/`Frozen` types can stay in the driver this stage). One-tier:
 /// the IR is built+freed inside `lowerOne`; only the packed `FnCode` blob is cached.
 pub fn codegen(
     self: Engine,
@@ -560,7 +558,7 @@ pub fn codegen(
     const key = Key.codegen(target, fp, frozen.opt, sym);
 
     if (mode == .verify) {
-        // [C11] determinism + cache-soundness gate. ALWAYS re-lower the fn fresh and
+        // Determinism + cache-soundness gate. ALWAYS re-lower the fn fresh and
         // check its packed FnCode bytes against a reference:
         //   * cache HIT  -> compare against the stored blob (cache soundness).
         //   * cache MISS -> compare against a SECOND fresh lowering (determinism).

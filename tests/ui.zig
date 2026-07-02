@@ -272,8 +272,8 @@ test "ui harness: parseAnnotation accepts the exact marker and rejects near-miss
 }
 
 test "ui harness: the matcher REJECTS a wrong code, a wrong substring, and an unannotated error" {
-    // This proves the two-way match is genuinely exhaustive (the acceptance
-    // requirement): a deliberately mismatched annotation/diagnostic set must fail.
+    // This proves the two-way match is genuinely exhaustive: a deliberately
+    // mismatched annotation/diagnostic set must fail.
     const gpa = testing.allocator;
 
     // 1) Wrong code: annotation says T0004 but the error is R0001 -> forward-match

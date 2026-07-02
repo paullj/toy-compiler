@@ -18,9 +18,9 @@
 //! never violate are unchanged from when `Fingerprint` owned the walk:
 //!
 //!   * NO ABSOLUTE INDICES, NO SOURCE OFFSETS — the fold sees node TAGS and leaf
-//!     token TEXT, never an index/offset that shifts when a sibling is edited. [C3]
+//!     token TEXT, never an index/offset that shifts when a sibling is edited.
 //!   * ORDER-SENSITIVE, NEVER XOR — children fold in wiring order with arity
-//!     sentinels, so `a - b` and `b - a` cannot collide. [C7]
+//!     sentinels, so `a - b` and `b - a` cannot collide.
 
 const std = @import("std");
 const Token = @import("../ast/Token.zig").Token;
@@ -58,14 +58,14 @@ pub const Event = union(enum) {
     /// Entry of the node at `idx` (tag `tag`), emitted before any child. The tag
     /// byte the hash folds is the visitor's job (see `HashVisitor.on`).
     enter: struct { idx: Ast.Index, tag: Ast.Node.Tag },
-    /// Length-prefixed leaf text [C3].
+    /// Length-prefixed leaf text.
     leaf: []const u8,
     /// Token-text leaf folded WITHOUT recursing a node (a `break`/`continue`
     /// `@label` target, whose label names a token, not a child node).
     raw_leaf: []const u8,
-    /// Arity sentinel [C5].
+    /// Arity sentinel.
     count: u32,
-    /// Optionality/shape sentinel [C7].
+    /// Optionality/shape sentinel.
     flag: bool,
     /// A node whose `node_types[idx]` is a touched type. Emitted at every node the
     /// touched walk collects (i.e. NOT inside a pattern subtree or an enum-init
@@ -139,14 +139,14 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .binary => {
             try emit(visitor, .{ .leaf = leaf });
-            try walkInner(src, n.lhs, collect, visitor); // lhs THEN rhs: a-b != b-a [C7]
+            try walkInner(src, n.lhs, collect, visitor); // lhs THEN rhs: a-b != b-a
             try walkInner(src, n.rhs, collect, visitor);
         },
         .call => {
             try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .callee = .{ .idx = n.lhs } }); // record sig AFTER callee, BEFORE args
             const args = Ast.rangeSlice(tree, n.rhs.int());
-            try emit(visitor, .{ .count = @intCast(args.len) }); // f() != f(0) [C5]
+            try emit(visitor, .{ .count = @intCast(args.len) }); // f() != f(0)
             for (args) |a| try walkInner(src, a, collect, visitor);
         },
         .var_decl => {
@@ -216,7 +216,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .break_stmt => {
             // The label target identity is load-bearing; fold its TEXT (not a
-            // token index — index-free [C3]). `rhs` names a TOKEN, not a node.
+            // token index — index-free). `rhs` names a TOKEN, not a node.
             const label = Ast.labelTok(n);
             try emit(visitor, .{ .flag = label != .none }); // bare != @label
             if (label.unwrap()) |t| try emit(visitor, .{ .raw_leaf = src.tokenText(t.int()) });
@@ -390,7 +390,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
                     // what the .func reloc target carries) and `sigs` (params/ret).
                     // Fold the full identity so a builtin<->user_fn shadow switch flips
-                    // the caller's hash. [C6]
+                    // the caller's hash.
                     if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
                         const sig = self.frozen.sigs[res.func];
                         const nm = self.frozen.names[res.func];
@@ -503,7 +503,7 @@ pub fn structLayoutBytes(gpa: std.mem.Allocator, frozen: anytype, id: u32, buf: 
 /// Index-free enum layout descriptor: name + tag_size + payload_off + per-variant
 /// (name + form byte + per payload field (name + kind + payload-local offset,
 /// recursing nested struct/enum)) + size + align. Editing any variant/payload
-/// flips the bytes, recompiling every using fn (M10 cache soundness).
+/// flips the bytes, recompiling every using fn (cache soundness).
 pub fn enumLayoutBytes(gpa: std.mem.Allocator, frozen: anytype, id: u32, buf: *std.ArrayList(u8)) !void {
     const e = frozen.enum_layouts[id];
     try buf.appendSlice(gpa, e.name);
@@ -543,8 +543,6 @@ pub fn enumLayoutBytes(gpa: std.mem.Allocator, frozen: anytype, id: u32, buf: *s
     std.mem.writeInt(u32, sz[4..8], e.@"align", .little);
     try buf.appendSlice(gpa, &sz);
 }
-
-// ---- Tests ----------------------------------------------------------------
 
 const testing = std.testing;
 const Lexer = @import("../lex.zig");
@@ -622,7 +620,7 @@ const FakeFrozen = struct {
     sigs: []const Sig = &.{},
 };
 
-test "[R3 DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {
+test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {
     const gpa = testing.allocator;
     // One fn exercising every shape: nested calls, binary a-b, struct + enum init,
     // a match with guard + or-pattern + sub-pattern, a labeled loop with break @l,

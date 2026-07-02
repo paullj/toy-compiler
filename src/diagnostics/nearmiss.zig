@@ -88,8 +88,6 @@ fn osaDistance(a: []const u8, b: []const u8, max: usize) ?usize {
     return if (prev[b.len] <= max) prev[b.len] else null;
 }
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 
 /// A trivial iterator over a fixed candidate slice for the unit tests.

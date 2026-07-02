@@ -42,8 +42,6 @@ pub const Ctx = struct {
     }
 };
 
-// ---- Definite return -------------------------------------------------------
-
 pub fn blockReturns(ctx: Ctx, block_idx: Ast.Index) bool {
     const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int());
     if (stmts.len == 0) return false;
@@ -83,8 +81,6 @@ pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
         else => false,
     };
 }
-
-// ---- Break targeting -------------------------------------------------------
 
 pub fn loopDiverges(ctx: Ctx, loop_idx: Ast.Index) bool {
     return !blockHasBreak(ctx, ctx.tree.nodes[loop_idx.int()].lhs, loop_idx);
@@ -161,8 +157,6 @@ pub fn stmtHasLabeledBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) boo
         else => false,
     };
 }
-
-// ---- Divergence ------------------------------------------------------------
 
 pub fn blockDiverges(ctx: Ctx, block_idx: Ast.Index) bool {
     const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int());
@@ -244,8 +238,6 @@ pub fn armDiverges(ctx: Ctx, node_idx: Ast.Index) bool {
     return stmtDiverges(ctx, node_idx);
 }
 
-// ---- Pattern irrefutability (shared with pattern checking) -----------------
-//
 // These are pure walks over the AST + enum table too: they answer "does this
 // pattern always match?", which `matchDiverges` needs for variant coverage and
 // the pattern checker needs for exhaustiveness. Kept here so the coverage logic
@@ -319,8 +311,6 @@ pub fn orCoversType(ctx: Ctx, or_idx: Ast.Index, ty: Type) bool {
     return false;
 }
 
-// ---- Tests -----------------------------------------------------------------
-//
 // These build small ASTs by hand (the same node-array + extra idiom as Ast.zig's
 // own tests) rather than parsing, so each test pins the exact node graph a walk
 // sees. A tiny `Builder` appends nodes/extra and hands back indices.

@@ -74,8 +74,6 @@ pub const BodyChecker = struct {
         bc.sink.deinit();
     }
 
-    // ---- BodyChecker methods (the per-fn body-walk relations) --------------
-
     /// Walk this fn's body: rebuild the slot table, type the body block against the
     /// declared return type, and enforce definite-return. The cursor + scratch live
     /// on `bc`; the immutable fn/struct/enum tables are read through `bc.model`.

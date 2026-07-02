@@ -1,4 +1,4 @@
-//! M14 module-graph discovery.
+//! Module-graph discovery.
 //!
 //! Given an ENTRY file, discover the whole module graph by following `import`
 //! declarations transitively. A module IS a file, named by a `/`-path; an import
@@ -6,7 +6,7 @@
 //!
 //! Discovery is two-phase and SERIAL at the discover level (a stable, sorted DFS
 //! over each module's imports) so the parse fan-out is never re-entered on a
-//! cycle and the module ordering is deterministic ([C11]). Each file's
+//! cycle and the module ordering is deterministic. Each file's
 //! lex→parse runs through the existing on-disk content cache, so a warm rebuild
 //! pays nothing.
 //!
@@ -22,6 +22,7 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
+const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
 
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
@@ -94,10 +95,16 @@ pub const Error = struct {
     /// For `cycle`/`missing`/`escape`: a heap string (the cycle path or the
     /// resolved file path) the caller may want in the message. Owned when set.
     detail: []const u8 = &.{},
+    /// For `parse`: the module's FULL coded parse-diagnostic list (owned), so `check`
+    /// can render every diagnostic (with codes + carets) rather than just `message`.
+    /// The POD is memcpy-trivial and its `message`s are static, so this dupe borrows
+    /// nothing from the freed tree. Empty for the other kinds.
+    parse_diags: []const Diagnostic = &.{},
 
     fn deinit(e: *Error, gpa: std.mem.Allocator) void {
         gpa.free(e.message);
         if (e.detail.len != 0) gpa.free(e.detail);
+        if (e.parse_diags.len != 0) gpa.free(e.parse_diags);
     }
 };
 
@@ -226,7 +233,7 @@ pub fn discover(
 /// so `deinit` frees ONLY the one-element `modules` spine, never the borrowed fields.
 ///
 /// Deterministic by construction: one allocation, zero map iteration, zero sort,
-/// no I/O — byte-identical at `-j1` and `-jN` ([C11]). `entry_index = 0` and
+/// no I/O — byte-identical at `-j1` and `-jN`. `entry_index = 0` and
 /// `imports = &.{}` are LOAD-BEARING: they pin the global id space to pure decl
 /// order and suppress every cross-module diagnostic (the import-walk loops in
 /// `resolveGraph`/`checkGraph` are no-ops on zero imports).
@@ -307,7 +314,7 @@ const Discoverer = struct {
     /// (default macOS APFS / Windows) `import util` and `import Util` both open the
     /// SAME file `util.toy` but carry distinct import-text names. Interning by
     /// physical identity collapses them to one module — one set of symbols, one set
-    /// of nominal type ids — preserving the M14 "shared module interned ONCE" and
+    /// of nominal type ids — preserving the "shared module interned ONCE" and
     /// "one physical file = one set of type ids" invariants. The slot owns its
     /// canonical key; this map borrows it.
     by_canon: std.StringHashMapUnmanaged(u32) = .empty,
@@ -318,7 +325,7 @@ const Discoverer = struct {
     /// Same input path → same realpath output on a stable FS (the build contract; the
     /// tree is not mutated mid-build), so this is a pure memoization: it changes which
     /// modules are discovered, their order, ids, and the case/symlink guardrails not at
-    /// all ([C11] byte-identical).
+    /// all (byte-identical).
     /// Owns one master copy of each key (raw path) and value (canon); callers get a
     /// fresh dupe so the existing intern/free ownership is unchanged.
     realpath_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -448,8 +455,7 @@ const Discoverer = struct {
     /// The serve changes ONLY how a file's source/tokens/AST are obtained — never WHICH
     /// files are discovered, in what order, or the import edges (those come from the AST,
     /// which is byte-identical to a fresh parse because the served source is byte-identical
-    /// to the bytes the priming build read) — so the graph + emitted bytes are unchanged
-    /// ([C11]).
+    /// to the bytes the priming build read) — so the graph + emitted bytes are unchanged.
     fn load(d: *Discoverer, id: u32) DiscoverError!void {
         const file = d.slots.items[id].file;
         // Snapshot (mtime, size, ctime) FIRST — one cheap stat, BEFORE any read. This is the
@@ -498,16 +504,24 @@ const Discoverer = struct {
         const tokens = lexed.value;
 
         const parsed = try engine.parse(d.gpa, d.io, d.target, source, tokens, id, true);
-        // B2: the parser always returns a tree; a TAINTED parse (any diagnostic)
+        // The parser always returns a tree; a TAINTED parse (any diagnostic)
         // means the module does not enter the graph. The partial tree's arrays are
         // caller-owned — free them here (the slot only adopts `source`/`tokens`).
         if (parsed.diags.len > 0) {
-            // The diagnostic `message` is a static string literal (not tree/diags
-            // memory), so free the partial tree + diags list first, then dupe it —
-            // no leak if the dupe OOMs. The slot only adopts `source`/`tokens`.
+            // A tainted parse keeps the module OUT of the graph. Diagnostic `message`s are
+            // static literals (not tree/diags memory), so dupe the full coded list (for
+            // `check` to render every one) BEFORE freeing the tree — no leak if a dupe
+            // OOMs. The slot only adopts `source`/`tokens`.
             const first = parsed.diags[0];
             const byte_offset = first.byte_offset;
             const message_static = first.message;
+            // No errdefer: `fail` always returns `error.Structural`, which would fire an
+            // errdefer on ownership already moved into the Error. Clean up by hand instead.
+            const diags_owned = try d.gpa.dupe(Diagnostic, parsed.diags);
+            const message_owned = d.gpa.dupe(u8, message_static) catch |e| {
+                d.gpa.free(diags_owned);
+                return e;
+            };
             d.gpa.free(@constCast(parsed.diags));
             d.gpa.free(parsed.tree.nodes);
             d.gpa.free(parsed.tree.extra);
@@ -518,9 +532,10 @@ const Discoverer = struct {
             s.loaded = true;
             return d.fail(.{
                 .kind = .parse,
-                .message = try d.gpa.dupe(u8, message_static),
+                .message = message_owned,
                 .module = id,
                 .byte_offset = byte_offset,
+                .parse_diags = diags_owned,
             });
         }
         const tree: ?Ast.Tree = parsed.tree;
@@ -567,7 +582,7 @@ const Discoverer = struct {
     /// files are discovered or in what order: the served source is byte-identical to the
     /// bytes the priming build read (same content_fp), so its tokens (offsets into source)
     /// resolve identically, the cached AST yields the SAME import edges, and the DFS /
-    /// global-id assignment are unchanged. Output is byte-identical ([C11]).
+    /// global-id assignment are unchanged. Output is byte-identical.
     fn warmServe(d: *Discoverer, id: u32, st: Io.Dir.Stat) bool {
         const canon = d.slots.items[id].canon;
         const entry = d.cache.manifestGet(canon) orelse return false;
@@ -1034,6 +1049,10 @@ test "discover: a parse error is reported and owns its source (no leak/double-fr
             try testing.expect(g.err != null);
             try testing.expectEqual(Error.Kind.parse, g.err.?.kind);
             try testing.expectEqual(@as(?u32, 0), g.err.?.module);
+            // The FULL coded diagnostic list is retained (not just `message`) so `check`
+            // renders every one; the first matches the structural error's offset.
+            try testing.expect(g.err.?.parse_diags.len >= 1);
+            try testing.expectEqual(g.err.?.byte_offset, g.err.?.parse_diags[0].byte_offset);
         }
     };
     try withFixture(".toy-test-graph-parseerr", files, "main.toy", Check.run);

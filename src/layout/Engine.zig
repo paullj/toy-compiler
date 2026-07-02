@@ -537,8 +537,6 @@ pub fn freeEnumLayouts(gpa: std.mem.Allocator, enum_layouts: []const EnumLayout)
     gpa.free(enum_layouts);
 }
 
-// ---- boundary tests (R3) -------------------------------------------------
-//
 // These drive the GENUINE `layoutStruct`/`layoutEnum`/`layoutReferent` over a
 // hand-built minimal `Ast.Tree` + a stub `Env`, with NO `check()` pass. The tree
 // is real (the engine walks `decl.lhs` -> `rangeSlice` -> field/variant nodes and

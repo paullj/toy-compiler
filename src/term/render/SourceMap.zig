@@ -175,6 +175,31 @@ pub fn spanText(self: *const Source, span: Span) []const u8 {
     return self.bytes[start..end];
 }
 
+/// Holds ONE `Source` at a time, keyed by scope id, for callers iterating diagnostics
+/// pre-sorted by scope: a contiguous same-scope run reuses the map; a scope change
+/// rebuilds it. `get` frees the old map and clears the key BEFORE the fallible init, so
+/// `deinit` can never double-free after a failed rebuild.
+pub const ScopeCache = struct {
+    scope: ?u32 = null,
+    map: Source = undefined,
+
+    pub fn deinit(self: *ScopeCache, gpa: std.mem.Allocator) void {
+        if (self.scope != null) self.map.deinit(gpa);
+    }
+
+    /// The `Source` for `scope`, rebuilt from (`name`,`bytes`) only on a scope change.
+    /// The returned pointer is invalidated by the next `get` with a different scope.
+    pub fn get(self: *ScopeCache, gpa: std.mem.Allocator, scope: u32, name: []const u8, bytes: []const u8) !*const Source {
+        if (self.scope == null or self.scope.? != scope) {
+            if (self.scope != null) self.map.deinit(gpa);
+            self.scope = null;
+            self.map = try Source.init(gpa, name, bytes);
+            self.scope = scope;
+        }
+        return &self.map;
+    }
+};
+
 /// 0-based display width of `prefix`, expanding tabs to elastic stops. Walks by
 /// UTF-8 codepoint: '\t' advances to the next `tab_width` multiple, else adds
 /// `width.displayWidthCp(cp)`. Invalid bytes degrade exactly as width.zig does
