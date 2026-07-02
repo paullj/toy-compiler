@@ -183,7 +183,16 @@ fn collectGlobals(g: *GraphResolve) !void {
                     const name = g.nameOf(mod, decl.main_token);
                     const gop = try g.tables[mod].fns.getOrPut(g.gpa, name);
                     if (gop.found_existing) {
-                        try g.emit(.R0002, mod, m.tokens[decl.main_token].start, "duplicate function '{s}'", .{name});
+                        const dup_off = m.tokens[decl.main_token].start;
+                        // Point a secondary "previously defined here" at the first
+                        // definition: the stored map value is its global fn id, whose
+                        // decl node lives in THIS module (same scope).
+                        if (g.fns.items[gop.value_ptr.*].decl_node.unwrap()) |first_dn| {
+                            const first_off = m.tokens[m.nodes[first_dn.int()].main_token].start;
+                            try g.emitRelated(.R0002, mod, dup_off, first_off, "duplicate function '{s}'", .{name});
+                        } else {
+                            try g.emit(.R0002, mod, dup_off, "duplicate function '{s}'", .{name});
+                        }
                         continue;
                     }
                     const id: u32 = @intCast(g.fns.items.len);
@@ -780,6 +789,14 @@ fn lookupName(g: *GraphResolve, name_tok: u32) Resolution {
 fn emit(g: *GraphResolve, code: codes.Code, mod: u32, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
     g.sink.setScope(mod);
     try g.sink.emitFmtCode(code, byte_offset, fmt, args);
+}
+
+/// Like `emit`, but records a RELATED prior location: `related` is a byte offset in
+/// module `mod` (e.g. a duplicate's first definition), rendered as a secondary
+/// "previously defined here" label.
+fn emitRelated(g: *GraphResolve, code: codes.Code, mod: u32, byte_offset: u32, related: u32, comptime fmt: []const u8, args: anytype) !void {
+    g.sink.setScope(mod);
+    try g.sink.emitFmtCodeRelated(code, byte_offset, related, fmt, args);
 }
 };
 

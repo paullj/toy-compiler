@@ -49,6 +49,24 @@ pub fn renderCapSummary(out: *Io.Writer, level: Style.ColorLevel, total: usize, 
     try out.writeByte('\n');
 }
 
+/// Emit the diagnostic-count summary line "N error(s), M warning(s)" (skipping a zero
+/// component); no-op when both are zero. The counts are already severity-config-resolved
+/// by the caller (ignored diagnostics excluded). The `error(s)` count reads err-red when
+/// non-zero, else the whole line is dim. Never allocates.
+pub fn renderDiagSummary(out: *Io.Writer, level: Style.ColorLevel, n_err: usize, n_warn: usize) !void {
+    if (n_err == 0 and n_warn == 0) return;
+    var buf: [64]u8 = undefined;
+    const line = if (n_err != 0 and n_warn != 0)
+        std.fmt.bufPrint(&buf, "{d} error(s), {d} warning(s)", .{ n_err, n_warn }) catch "errors"
+    else if (n_err != 0)
+        std.fmt.bufPrint(&buf, "{d} error(s)", .{n_err}) catch "errors"
+    else
+        std.fmt.bufPrint(&buf, "{d} warning(s)", .{n_warn}) catch "warnings";
+    const style = if (n_err != 0) sty_err else sty_faint;
+    try style.styled(out, level, line);
+    try out.writeByte('\n');
+}
+
 /// Render a resolve/type sink diagnostic against a prepared SourceMap: build the rich
 /// `Diagnostic` INLINE from the POD (a zero-width primary at `d.byte_offset`, code
 /// string from the registry — null for `.none` => NO `[code]` bracket, so uncoded
@@ -59,6 +77,19 @@ pub fn renderCapSummary(out: *Io.Writer, level: Style.ColorLevel, total: usize, 
 /// accounting). The POD is never rewritten — the cached blob stays rule-independent.
 pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, d: toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) !bool {
     const eff = SevCfg.resolve(d.code, d.severity, cfg) orelse return false; // .ignore -> zero bytes
+    // C3: a RELATED prior location (same scope) becomes a secondary "previously defined
+    // here" label. Zero-width point (only the offset is carried), like the primary. The
+    // stack buffer outlives the render call below. NO_RELATED => no secondary (empty).
+    var sec_buf: [1]Rr.Diagnostic.Label = undefined;
+    const secondary: []const Rr.Diagnostic.Label = if (d.related != toyc.DiagnosticSink.NO_RELATED) blk: {
+        sec_buf[0] = .{
+            .kind = .secondary,
+            .span = .{ .start = d.related, .end = d.related },
+            .message = "previously defined here",
+            .source = d.scope,
+        };
+        break :blk sec_buf[0..1];
+    } else &.{};
     const rich = Rr.Diagnostic.Diagnostic{
         .severity = eff, // C3: effective severity, computed LATE from the POD default
         .message = d.message, // borrowed
@@ -68,6 +99,7 @@ pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.So
             .message = d.message, // borrowed, aliases d.message
             .source = d.scope, // NO_SCOPE -> NO_SOURCE verbatim
         },
+        .secondary = secondary,
         .code = codes.str(d.code), // null when .none -> no bracket -> byte-identical
         .scope = d.scope,
     };

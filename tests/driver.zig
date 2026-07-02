@@ -526,6 +526,89 @@ test "C3 no flags is byte-identical to the C2 coded baseline" {
     try testing.expect(std.mem.indexOf(u8, res.out, "warning") == null);
 }
 
+test "C3 duplicate function renders a 'previously defined here' secondary label + a summary" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-secondary";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const dup =
+        \\fn f() -> int {
+        \\  return 1
+        \\}
+        \\fn f() -> int {
+        \\  return 2
+        \\}
+        \\fn main() -> int {
+        \\  return f()
+        \\}
+    ;
+    const res = runToyOnFixture(gpa, io, dir_name, dup, &.{ "--emit", "check" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    // The R0002 primary at the duplicate AND a secondary label at the FIRST definition —
+    // both locations visible (the flagship enrichment).
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[R0002]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "duplicate function 'f'") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "previously defined here") != null);
+    // The diagnostic-count summary line (one root error, no cascade).
+    try testing.expect(std.mem.indexOf(u8, res.out, "1 error(s)") != null);
+}
+
+test "C3 the summary line counts respect severity config (--warn, --ignore)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-c3-summary";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // Three independent undeclared names => three R0001 diagnostics (nothing near, so no
+    // "did you mean" hints).
+    const multi =
+        \\fn main() -> int {
+        \\  aaa
+        \\  bbb
+        \\  ccc
+        \\  return 0
+        \\}
+    ;
+    // Default: three errors.
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "--emit", "check" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "3 error(s)") != null);
+    }
+    // --warn R0001: counted as warnings, not errors.
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "--emit", "check", "--warn", "R0001" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "3 warning(s)") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "error(s)") == null);
+    }
+    // --ignore R0001: excluded from the summary entirely (no diagnostic-count line).
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "--emit", "check", "--ignore", "R0001" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "error(s)") == null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "warning(s)") == null);
+    }
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

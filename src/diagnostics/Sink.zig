@@ -25,6 +25,7 @@ const std = @import("std");
 // internal uses below keep working.
 const diag = @import("Diagnostic.zig");
 pub const NO_SCOPE = diag.NO_SCOPE;
+pub const NO_RELATED = diag.NO_RELATED;
 pub const Diagnostic = diag.Diagnostic;
 
 // The code registry + model types the coded builder threads into each diagnostic.
@@ -103,6 +104,15 @@ pub fn emitCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, messa
 /// Format + own a coded message. Same load-bearing reserve->allocPrint->track OOM
 /// ordering as `emitFmt`; additionally stamps `code` + its default severity.
 pub fn emitFmtCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
+    return self.emitFmtCodeRelated(code, byte_offset, diag.NO_RELATED, fmt, args);
+}
+
+/// Like `emitFmtCode`, but also records a RELATED prior location: `related` is a byte
+/// offset in the SAME scope (e.g. a duplicate's first definition), rendered as a
+/// secondary "previously defined here" label. Same load-bearing reserve->allocPrint->
+/// track OOM ordering; `related` is a memcpy-trivial `u32` on the POD, not part of the
+/// sort/dedup key.
+pub fn emitFmtCodeRelated(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, related: u32, comptime fmt: []const u8, args: anytype) !void {
     try self.diags.ensureUnusedCapacity(self.gpa, 1);
     const msg = try std.fmt.allocPrint(self.gpa, fmt, args);
     errdefer self.gpa.free(msg);
@@ -113,6 +123,7 @@ pub fn emitFmtCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, co
         .scope = self.cur_scope,
         .code = code,
         .severity = codes.defaultSeverity(code),
+        .related = related,
     });
 }
 

@@ -9,6 +9,9 @@ const model = @import("model.zig");
 /// The "untagged" scope: a single-file diagnostic carries no module id.
 pub const NO_SCOPE: u32 = std.math.maxInt(u32);
 
+/// Sentinel for `Diagnostic.related`: the diagnostic has no related prior location.
+pub const NO_RELATED: u32 = std.math.maxInt(u32);
+
 /// The one diagnostic type shared by every stage. `byte_offset` points at the
 /// offending token; the driver/CLI renders byte_offset -> line:col uniformly.
 /// `scope` is the owning module id in graph mode, `NO_SCOPE` single-file.
@@ -27,21 +30,27 @@ pub const Diagnostic = struct {
     code: codes.Code = .none,
     /// Registry default severity; overridden LATE at render, never here.
     severity: model.Severity = .err,
+    /// Optional byte offset of a RELATED prior location in the SAME scope (e.g. the
+    /// first definition for a duplicate), rendered as a secondary "previously defined
+    /// here" label. `NO_RELATED` => none. A memcpy-trivial `u32`, so the POD stays
+    /// cache-safe; it is NOT part of the sort/dedup key.
+    related: u32 = NO_RELATED,
 };
 
 const testing = std.testing;
 
-test "the sink POD stays memcpy-trivial: the two new fields are ENUMS (cache-stability gate)" {
+test "the sink POD stays memcpy-trivial: no field beyond `message` is a slice/pointer (cache-stability gate)" {
     // This is the load-bearing cache-stability gate: the Engine caches a
     // `[]const Diagnostic` blob by memcpy, so no field may be a slice/pointer beyond
-    // the already-borrowed `message`. C1 grew the POD to FIVE fields; both new fields
-    // must be trivially-copyable enums (never a `?[]const u8` code pointer).
-    try testing.expectEqual(@as(usize, 5), @typeInfo(Diagnostic).@"struct".fields.len);
+    // the already-borrowed `message`. C1 grew the POD to FIVE fields (code+severity,
+    // both enums); C3 added a SIXTH, `related`, a plain `u32` — still trivially copyable.
+    try testing.expectEqual(@as(usize, 6), @typeInfo(Diagnostic).@"struct".fields.len);
     try testing.expect(@FieldType(Diagnostic, "byte_offset") == u32);
     try testing.expect(@FieldType(Diagnostic, "message") == []const u8);
     try testing.expect(@FieldType(Diagnostic, "scope") == u32);
     try testing.expect(@FieldType(Diagnostic, "code") == codes.Code);
     try testing.expect(@FieldType(Diagnostic, "severity") == model.Severity);
+    try testing.expect(@FieldType(Diagnostic, "related") == u32);
     try testing.expect(@typeInfo(@FieldType(Diagnostic, "code")) == .@"enum");
     try testing.expect(@typeInfo(@FieldType(Diagnostic, "severity")) == .@"enum");
     // Defaults keep every existing `.{ .byte_offset = x, .message = m }` literal valid.
@@ -49,4 +58,5 @@ test "the sink POD stays memcpy-trivial: the two new fields are ENUMS (cache-sta
     try testing.expectEqual(codes.Code.none, d.code);
     try testing.expectEqual(model.Severity.err, d.severity);
     try testing.expectEqual(NO_SCOPE, d.scope);
+    try testing.expectEqual(NO_RELATED, d.related);
 }

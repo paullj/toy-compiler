@@ -108,7 +108,33 @@ pub fn report(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, 
         try sty_faint.styled(out, level, line);
         try out.writeByte('\n');
     }
+
+    // Diagnostic-level summary "N error(s), M warning(s)" — severity-config aware
+    // (`--ignore`d excluded; a code demoted via `--warn` counts as a warning). Distinct
+    // from the file-level "F failure(s)" tally above; skipped on a clean run (0 + 0).
+    var n_err: usize = 0;
+    var n_warn: usize = 0;
+    for (results) |r| {
+        tallySeverities(r.diags, cfg, &n_err, &n_warn);
+        if (r.resolve) |res| tallySeverities(res.diags, cfg, &n_err, &n_warn);
+        if (r.typecheck) |tc| tallySeverities(tc.diags, cfg, &n_err, &n_warn);
+    }
+    try DiagRender.renderDiagSummary(out, level, n_err, n_warn);
+
     return failures;
+}
+
+/// Count `diags` into `n_err`/`n_warn` by EFFECTIVE severity (registry default overridden
+/// by `cfg`); `--ignore`d diagnostics (a null `resolve`) are excluded.
+fn tallySeverities(diags: []const toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig, n_err: *usize, n_warn: *usize) void {
+    for (diags) |d| {
+        const s = SevCfg.resolve(d.code, d.severity, cfg) orelse continue;
+        switch (s) {
+            .err => n_err.* += 1,
+            .warning => n_warn.* += 1,
+            else => {},
+        }
+    }
 }
 
 /// Short per-file status: which phases were fresh vs. served from cache.
