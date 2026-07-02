@@ -27,7 +27,9 @@
 const std = @import("std");
 const Io = std.Io;
 const Driver = @import("Driver.zig");
+const Graph = @import("Graph.zig");
 const Diagnostic = @import("../diagnostics/Sink.zig").Diagnostic;
+const NO_SCOPE = @import("../diagnostics/Sink.zig").NO_SCOPE;
 const codes = @import("../diagnostics/codes.zig");
 const model = @import("../diagnostics/model.zig");
 const SevCfg = @import("../diagnostics/severity_config.zig");
@@ -256,6 +258,70 @@ pub fn tallyAll(results: []const Driver.FileResult, cfg: SevCfg.SeverityConfig) 
         for (r.diags) |d| tally(d, cfg, &counts);
         if (r.resolve) |res| for (res.diags) |d| tally(d, cfg, &counts);
         if (r.typecheck) |tc| for (tc.diags) |d| tally(d, cfg, &counts);
+    }
+    return counts;
+}
+
+// --- graph (multi-module) forms -------------------------------------------
+//
+// The CLI `toy check` routes through the SAME graph front-end `build` uses
+// (`Graph.discover` -> `resolveGraph` -> `checkGraph`), so imports are followed
+// and a valid multi-module program reports ZERO diagnostics. The graph carries a
+// FLAT diagnostic slice (resolve + typecheck), each tagged with its owning module
+// via `Diagnostic.scope`; these helpers tally + serialize that slice, mapping each
+// diagnostic's `file` to its OWNING module's path (`graph.modules[scope].path`),
+// not always the entry. The NDJSON wire schema is byte-identical to the per-file
+// form (`writeNdjsonLine` is shared), so a single-module graph emits exactly what
+// the old single-file path did.
+
+/// The module a diagnostic's scope points at: the owning module's on-disk file path,
+/// so the NDJSON `file` field and the human render both attribute a diagnostic from
+/// an imported module to THAT module. `NO_SCOPE` (single-file) or an out-of-range id
+/// falls back to the entry module (matching `DiagRender.moduleAt`).
+fn moduleFileFor(g: *const Graph.Graph, scope: u32) []const u8 {
+    if (scope != NO_SCOPE and scope < g.modules.len) return g.modules[scope].file;
+    return g.entry().file;
+}
+
+/// The owning module's SOURCE for a diagnostic's scope (same fallback as `moduleFileFor`).
+fn moduleSrcFor(g: *const Graph.Graph, scope: u32) []const u8 {
+    if (scope != NO_SCOPE and scope < g.modules.len) return g.modules[scope].source;
+    return g.entry().source;
+}
+
+/// Count the visible error/warning tally across a graph's FLAT diagnostic slice under
+/// `cfg` (the multi-module analogue of `tallyAll`). `--ignore`d and note/help
+/// diagnostics count toward neither.
+pub fn tallyGraph(diags: []const Diagnostic, cfg: SevCfg.SeverityConfig) Counts {
+    var counts: Counts = .{};
+    for (diags) |d| tally(d, cfg, &counts);
+    return counts;
+}
+
+/// Emit every diagnostic in a graph's FLAT slice as NDJSON (one JSON object per line),
+/// applying `cfg` so `--ignore`d ones vanish. Each diagnostic renders against its
+/// OWNING module's SourceMap (built lazily, one per scope; the slice is pre-sorted by
+/// (scope, offset) so same-scope diagnostics are contiguous and the map is reused).
+/// The `file` field is the owning module's path. Returns the visible tally.
+pub fn emitNdjsonGraph(out: *Io.Writer, gpa: std.mem.Allocator, g: *const Graph.Graph, diags: []const Diagnostic, cfg: SevCfg.SeverityConfig) !Counts {
+    var counts: Counts = .{};
+    var cached_scope: ?u32 = null;
+    var sm: Rr.SourceMap = undefined;
+    defer if (cached_scope != null) sm.deinit(gpa);
+    for (diags) |d| {
+        const eff = SevCfg.resolve(d.code, d.severity, cfg) orelse continue; // --ignore
+        if (cached_scope == null or cached_scope.? != d.scope) {
+            if (cached_scope != null) sm.deinit(gpa);
+            cached_scope = null; // clear before init so a failing init can't double-free
+            sm = try Rr.SourceMap.init(gpa, moduleFileFor(g, d.scope), moduleSrcFor(g, d.scope));
+            cached_scope = d.scope;
+        }
+        try writeNdjsonLine(out, gpa, &sm, moduleFileFor(g, d.scope), d, eff);
+        switch (eff) {
+            .err => counts.errors += 1,
+            .warning => counts.warnings += 1,
+            else => {},
+        }
     }
     return counts;
 }

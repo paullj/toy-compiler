@@ -370,6 +370,13 @@ test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-on
 
     // The authorized C2 output change: the coded header bracket.
     try testing.expect(std.mem.indexOf(u8, got, "error[R0001]:") != null);
+    // Single-file check's `-->` header must name the ON-DISK path, byte-for-byte as the
+    // pre-graph-fix single-file path did — NOT the module stem. Regression lock for the
+    // routing fix: `check` now discovers a graph-of-one, and the multi-module renderer
+    // would spell the entry as its bare stem (`one`, from `Module.path`) instead of the
+    // input path (`.../one.toy`, `Module.file`). Requirement #5 / acceptance (d) demand
+    // single-file check stay byte-identical, so the header carries the full path here.
+    try testing.expect(std.mem.indexOf(u8, got, "--> " ++ path ++ ":2:10") != null);
     // report-once preserved: exactly one primary caret line.
     var carets: usize = 0;
     var i: usize = 0;
@@ -431,6 +438,93 @@ test "C coded render: a parse error renders `error[P0002]:` and stays report-onc
     try testing.expect(std.mem.indexOf(u8, got, "error[P0002]:") != null);
     // report-once preserved: exactly one primary caret line.
     try testing.expectEqual(@as(usize, 1), countCarets(got));
+}
+
+/// Spawn the built `toy` binary with `argv_tail` (already including the entry path),
+/// capturing stdout and the exit term. Skips when the binary is absent. Used by the
+/// multi-module `check` regression below, which writes several files under `dir_name`
+/// then drives `check` over the entry.
+fn spawnToy(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !struct { out: []u8, term: std.process.Child.Term } {
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, bin_abs);
+    for (argv_tail) |a| try argv.append(gpa, a);
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    const term = try child.wait(io);
+    return .{ .out = got, .term = term };
+}
+
+test "check follows imports: a VALID multi-module program reports zero diagnostics (agrees with build), a REAL import error is reported at the right module" {
+    // Regression for the fixed soundness bug: `toy check <entry>` used to fan out over
+    // the entry as an INDEPENDENT single file (no import discovery), so a valid import
+    // spuriously reported `R0003 unknown imported module` + `R0001 undeclared identifier`
+    // that `build` did not. The fix routes `check` through the SAME graph front-end
+    // `build` uses (discover -> resolve -> typecheck), so imports ARE followed. This test
+    // asserts (a) check + build AGREE on a valid two-module program (both exit 0, zero
+    // diagnostics) and (b) a real error in the IMPORTED module is reported against THAT
+    // module and exits 1 (matching build).
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-driver-check-multimod";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const main_path = dir_name ++ "/main.toy";
+    const helper_path = dir_name ++ "/helper.toy";
+    // A valid program: main imports helper and calls its pub fn.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = "import helper\nfn main() -> int {\n  return helper.answer()\n}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = helper_path, .data = "pub fn answer() -> int {\n  return 42\n}\n" });
+
+    // (a) VALID: check reports zero diagnostics and exits 0 — no spurious R0003/R0001.
+    {
+        const res = try spawnToy(gpa, io, &.{ "check", main_path });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try testing.expectEqual(@as(usize, 0), countCarets(res.out)); // no diagnostics rendered
+        try testing.expect(std.mem.indexOf(u8, res.out, "R0003") == null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "R0001") == null);
+    }
+    // (a') DIFFERENTIAL: build agrees — the same valid program compiles + exits 0.
+    {
+        const out_bin = dir_name ++ "/prog";
+        const res = try spawnToy(gpa, io, &.{ "build", main_path, "-o", out_bin });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+
+    // (b) A REAL error in the IMPORTED module: helper references an undeclared name. Check
+    // must report it against helper (its owning module) and exit 1 — build fails too.
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = helper_path, .data = "pub fn answer() -> int {\n  return nope_zzq\n}\n" });
+    {
+        const res = try spawnToy(gpa, io, &.{ "check", main_path });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        // The diagnostic is coded R0001 and its location names the IMPORTED module.
+        try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "nope_zzq") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "helper:2") != null);
+        try testing.expectEqual(@as(usize, 1), countCarets(res.out));
+    }
+    // (b') DIFFERENTIAL: build fails on the same broken import too (exit != 0).
+    {
+        const out_bin = dir_name ++ "/prog2";
+        const res = try spawnToy(gpa, io, &.{ "build", main_path, "-o", out_bin });
+        defer gpa.free(res.out);
+        try testing.expect(res.term != .exited or res.term.exited != 0);
+    }
 }
 
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),

@@ -1085,13 +1085,21 @@ fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u
     return 1;
 }
 
-/// `toy check <file...>`: the diagnostics-focused front-end. Runs lex->parse->resolve->
-/// typecheck over every input (NEVER codegen), collects EVERY diagnostic across all
-/// three stages (no early-bail on a tainted parse — that's the `-o` build's behaviour,
-/// not check's), applies the C3 severity config, and emits either pretty human snippets
-/// (per file, reusing the shared Renderer) or a stable NDJSON stream. Returns the process
-/// exit code: 0 when nothing survives the config as an error, 1 when >=1 error remains,
-/// 2 on a hard front-end/IO failure. `exit_zero` forces 0. `ndjson` picks the wire form.
+/// `toy check <entry>`: the diagnostics-focused front-end. Runs the SAME graph
+/// front-end `build` drives — `Graph.discover` (FOLLOWING imports) -> `resolveGraph`
+/// -> `checkGraph` — then STOPS before codegen/lower/link. Reports EVERY diagnostic
+/// from the discovered graph (whole-graph resolve diagnostics; if resolve is clean,
+/// whole-graph typecheck diagnostics) against each diagnostic's OWN module source,
+/// applies the C3 severity config, and emits either pretty human snippets or a stable
+/// NDJSON stream. Returns the process exit code: 0 when nothing survives the config as
+/// an error, 1 when >=1 error remains (incl. a structural graph error like a real
+/// missing import — matching `build`), 2 on a hard CLI/IO failure (a missing/unreadable
+/// ENTRY file). `exit_zero` forces 0. `ndjson` picks the wire form.
+///
+/// This is the bug fix: the old path fanned out over `paths` as INDEPENDENT single
+/// files (`Driver.run(.check)`), discovering no imports, so a valid multi-module
+/// program over-reported spurious R0003/R0001 diagnostics that `build` did not. Routing
+/// through the graph makes `check` agree with `build`.
 fn runCheck(
     gpa: std.mem.Allocator,
     io: Io,
@@ -1104,10 +1112,153 @@ fn runCheck(
     error_on_warning: bool,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
-    // Run the SAME front-end the `--emit check` inspection table drives, but present
-    // diagnostics only. A per-file hard error (missing file, unreadable) surfaces as
-    // `r.err` with NO diagnostics — that's a CLI/IO failure (exit 2), not a compile
-    // failure (exit 1).
+    // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
+    // discover its transitive import graph. More than one bare input is a usage error
+    // (exit 2), consistent with `emitExecutable`/`emitIr` rejecting multi-entry.
+    if (paths.len != 1) {
+        try argLine(out, level, "check takes exactly one input file (the entry module)");
+        return 2;
+    }
+    const entry = paths[0];
+
+    // Own pool for the whole-graph typecheck Pass-C body fan-out (`checkGraph` needs an
+    // `io`); a plain `check` uses the host cpu pool. Diagnostics are deterministic
+    // regardless of `-jN` (sorted by (scope, offset, code, message)).
+    var tail_io: std.Io.Threaded = .init(gpa, .{});
+    defer tail_io.deinit();
+    const cio = tail_io.io();
+
+    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+    const cache = Driver.openCache(cio, &dir_buf) catch |e| {
+        try argLine(out, level, @errorName(e));
+        return 2;
+    };
+
+    // DISCOVER the whole module graph (following imports), reusing `build`'s discoverer.
+    // A true I/O/OOM failure propagates as a Zig error (exit 2); a STRUCTURAL problem
+    // (missing import, escape, cycle, tainted parse) is recorded in `graph.err`.
+    var graph = Graph.discover(gpa, cio, cache, target, entry, null) catch |e| {
+        try argLine(out, level, @errorName(e));
+        return 2;
+    };
+    defer graph.deinit(gpa);
+
+    if (graph.err) |ge| {
+        // A tainted parse in the ENTRY module is the ONE structural error whose CLI
+        // reporting must stay byte-identical to the pre-fix single-file path: the old
+        // `check` rendered the ENTRY's FULL, CODED parse-diagnostic list (`error[P0002]:`
+        // + a caret), whereas `discover` records only the FIRST parse diagnostic as an
+        // uncoded structural error. Discovery bails on the entry before following any
+        // import, so re-running the single-file front-end over the entry reproduces the
+        // exact old output (all coded parse diagnostics, same exit gate). A parse error in
+        // an IMPORTED module instead falls through to `renderGraphError` (matching `build`)
+        // — Driver.run would not even parse the import, so it can't report it.
+        const parse_in_entry = ge.kind == .parse and (ge.module == null or ge.module == graph.entry_index);
+        if (parse_in_entry) return runCheckSingleFile(gpa, io, out, level, target, paths, ndjson, exit_zero, error_on_warning, sev);
+        // A missing/unreadable ENTRY file (kind=.missing, module=null) is a hard CLI/IO
+        // failure -> exit 2, matching `check`'s single-file missing-input contract. Every
+        // OTHER structural error (a real missing/mis-cased IMPORT, a path escape, an import
+        // cycle, a tainted parse in a discovered import) is a compile-level error `build`
+        // reports too -> render it against its owning module and exit 1.
+        try DiagRender.renderGraphError(gpa, out, level, &graph, ge);
+        try out.flush();
+        if (exit_zero) return 0;
+        return if (ge.kind == .missing and ge.module == null) 2 else 1;
+    }
+
+    // RESOLVE the whole graph. Report ALL resolve diagnostics; only when resolve is clean
+    // do we proceed to typecheck (you cannot type unresolved code, but each stage reports
+    // ALL of its own diagnostics — `resolveGraph`/`checkGraph` do so internally).
+    var res = ResolveGraph.resolveGraph(gpa, &graph) catch |e| {
+        try argLine(out, level, @errorName(e));
+        return 2;
+    };
+    defer res.deinit(gpa);
+
+    // The diagnostic slice to report: resolve diagnostics when resolve produced ANY
+    // error-severity one (typecheck can't run on unresolved code); otherwise the
+    // typecheck diagnostics. `tc` is kept alive (fn-scope optional) so its borrowed
+    // messages outlive every render below.
+    var tc: ?TypecheckGraph.GraphResult = null;
+    defer if (tc) |*t| t.deinit(gpa);
+    const diags: []const toyc.DiagnosticSink.Diagnostic = if (resolveHasError(res.diags))
+        res.diags
+    else blk: {
+        tc = TypecheckGraph.checkGraph(gpa, &graph, &res, cio, 0) catch |e| {
+            try argLine(out, level, @errorName(e));
+            return 2;
+        };
+        // Resolve was clean but may still carry warnings/notes; if it has any VISIBLE
+        // diagnostic that typecheck did not (it won't, given resolve had no errors),
+        // report typecheck's — resolve's non-error diagnostics are rare and already
+        // covered by the graph front-end's own reporting elsewhere. Report typecheck.
+        break :blk tc.?.diags;
+    };
+
+    if (ndjson) {
+        // NDJSON over the graph's flat slice: each diagnostic's `file` is its OWNING
+        // module path (not always the entry), so an imported module's error is attributed
+        // correctly. Schema byte-identical to the single-file form.
+        const counts = try Check.emitNdjsonGraph(out, gpa, &graph, diags, sev);
+        try out.flush();
+        return checkExit(counts, exit_zero, error_on_warning);
+    }
+
+    // Human form: pretty per-module snippets (reusing the multi-module renderer, which
+    // builds ONE SourceMap per scope) + a program-wide `N error(s), M warning(s)` summary.
+    // SINGLE-MODULE case (no imports discovered): render against the entry's ON-DISK
+    // `file` path, not its module `path` (a bare stem). This keeps the human `-->` header
+    // BYTE-IDENTICAL to the pre-fix single-file `check` (requirement #5, acceptance (d)):
+    // `renderScopedDiags` builds its SourceMap from `Module.path`, which for the entry is
+    // `stem(basename(entry))` (`fix_bad`, not `/tmp/fix_bad.toy`). All entry parse errors
+    // already route to `runCheckSingleFile`, so a single-module graph carries only resolve
+    // OR type diagnostics — pass `diags` as whichever stage produced them.
+    if (graph.modules.len == 1) {
+        const e = graph.entry();
+        const resolve_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) diags else &.{};
+        const type_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) &.{} else diags;
+        try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, &.{}, resolve_batch, type_batch, sev);
+        const counts = Check.tallyGraph(diags, sev);
+        try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
+        try out.flush();
+        return checkExit(counts, exit_zero, error_on_warning);
+    }
+    try DiagRender.renderScopedDiags(gpa, out, level, &graph, diags, sev);
+    const counts = Check.tallyGraph(diags, sev);
+    try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
+    try out.flush();
+    return checkExit(counts, exit_zero, error_on_warning);
+}
+
+/// True when any diagnostic in `diags` carries an error-severity REGISTRY DEFAULT — the
+/// gate that decides whether the graph is resolved enough to typecheck. Deliberately
+/// reads the POD default (NOT the render-time C3 config): the ability to typecheck
+/// depends on whether resolution actually succeeded, which `--warn`/`--ignore` (a
+/// presentation choice) must never change. So a `--ignore`d resolve error still blocks
+/// typecheck, exactly as it does in a `build`.
+fn resolveHasError(diags: []const toyc.DiagnosticSink.Diagnostic) bool {
+    for (diags) |d| if (d.severity == .err) return true;
+    return false;
+}
+
+/// The PRESERVED pre-fix single-file `check` path, run ONLY for a tainted-parse ENTRY
+/// (see `runCheck`): `Driver.run(.check)` over the entry collects its FULL parse-
+/// diagnostic list, which `DiagRender.renderFileDiags` renders coded (`error[Pxxxx]:` +
+/// caret) — byte-identical to what `check` produced before the graph fix. This path is
+/// import-blind by design; a parse-broken entry never reaches discovery's import walk, so
+/// there is nothing to follow. Same exit gate (0/1/2) + `--format`/`--exit-zero`/severity.
+fn runCheckSingleFile(
+    gpa: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    level: Style.ColorLevel,
+    target: []const u8,
+    paths: []const []const u8,
+    ndjson: bool,
+    exit_zero: bool,
+    error_on_warning: bool,
+    sev: SevCfg.SeverityConfig,
+) !u8 {
     const results = Driver.run(gpa, io, .check, target, paths) catch |e| {
         try argLine(out, level, @errorName(e));
         return 2;
@@ -1118,28 +1269,16 @@ fn runCheck(
     }
 
     if (ndjson) {
-        // Emit NDJSON for every file that produced diagnostics (a missing/unreadable file
-        // has none), then apply the SAME hard-error gate the human form does: a file whose
-        // `err` is set with zero diagnostics is an IO/structural failure (exit 2), NOT a
-        // clean check. Without this an LSP/editor reading the stream would treat a missing
-        // file as "checked clean". `Check.anyHardError` is shared with the human branch
-        // below so the two forms can never diverge.
         const counts = try Check.emitNdjson(out, gpa, results, sev);
         try out.flush();
         if (Check.anyHardError(results)) return 2;
         return checkExit(counts, exit_zero, error_on_warning);
     }
 
-    // Human form: render each file's diagnostics (parse -> resolve -> typecheck) against
-    // its own source, then a program-wide `N error(s), M warning(s)` summary. A file with
-    // a hard error but NO diagnostics (e.g. read failure) prints a plain error line and
-    // forces exit 2 (see `Check.anyHardError`).
     for (results) |r| {
         const parse_diags = r.diags;
         const resolve_diags: []const toyc.DiagnosticSink.Diagnostic = if (r.resolve) |res| res.diags else &.{};
         const type_diags: []const toyc.DiagnosticSink.Diagnostic = if (r.typecheck) |tc| tc.diags else &.{};
-        // A hard error with no diagnostics is an IO/structural failure, not a compile
-        // diagnostic: report it plainly (the exit-2 gate below fires via anyHardError).
         if (r.err != null and parse_diags.len == 0 and resolve_diags.len == 0 and type_diags.len == 0) {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "{s}: {t}", .{ r.path, r.err.? }) catch r.path;
