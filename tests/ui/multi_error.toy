@@ -1,0 +1,5 @@
+fn main() -> int {
+  aaa  #~ ERROR [R0001] undeclared identifier 'aaa'
+  bbb  #~ ERROR [R0001] undeclared identifier 'bbb'
+  return 0
+}

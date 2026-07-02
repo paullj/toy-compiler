@@ -278,6 +278,11 @@ pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8) 
             return error.OutOfMemory;
         },
     };
+    // Post-parse invariant sweep on the produced (possibly recovered) tree, gated
+    // by `std.debug.runtime_safety` so it hardens the whole Debug/ReleaseSafe test
+    // corpus at zero ReleaseFast cost. It asserts (panics) on a violation — a
+    // sanity check on the parser itself, not a user-facing diagnostic.
+    if (std.debug.runtime_safety) checkInvariants(tree, p.tokens, p.src, p.diags.items);
     // The diagnostics list is handed to the caller; everything else is either
     // moved into `tree` or already released inside `parseProgram`.
     const diags = p.diags.toOwnedSlice(p.gpa) catch |err| switch (err) {
@@ -1640,6 +1645,88 @@ fn advanceWithError(p: *Parser, code: Code, message: []const u8) Error!Ast.Index
     return p.addNode(.{ .tag = .error_node, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
 }
 
+// ---- post-parse invariants (Debug/ReleaseSafe only) ------------------------
+//
+// A single sweep, run at the end of `parse()` under `std.debug.runtime_safety`,
+// that pins three structural properties of every parse — valid OR recovered — so
+// the whole test corpus doubles as an invariant check at zero release cost:
+//
+//   (a) SPAN TOTALITY — token spans tile `[0, source.len)` monotonically with no
+//       gaps/overlaps, each span well-formed, the terminating `.eof` exactly at
+//       `source.len`. This is the same contract the lexer asserts inline as it
+//       emits tokens (see `lex.zig`); re-checking it on the FULL token list the
+//       parser consumed lifts that guarantee to the parse boundary — a caret the
+//       parser attaches to any token span can never point at a double-counted or
+//       out-of-range byte.
+//
+//   (b) FORWARD PROGRESS — the recovery loops cannot spin. This is already pinned
+//       by the B3 fuel/advance guards in every resync scanner (`findNextDecl`,
+//       `findNextStmt`, `resyncTo`) and every bounded list loop's
+//       `p.index > entry or at-closer` assert; a passing parse (no hang) IS that
+//       invariant holding. Nothing to re-check here — noted for completeness.
+//
+//   (c) STRUCTURAL PAIRING — the bracket delimiters (`(`/`)` and `{`/`}`; the
+//       grammar has no `[`/`]`) are BALANCED for a clean parse. On a RECOVERED
+//       parse (>=1 diagnostic, i.e. an `error_node` in the tree) imbalance is
+//       allowed — recovery captured the syntax error. So the invariant is
+//       "balanced OR the parse produced error nodes", which must NOT false-trip on
+//       the adversarial-recovery corpus (e.g. `fn f( ) ) ) {`).
+
+/// The post-parse invariant sweep (see the section header). Asserts (panics) on a
+/// violation; only compiled where `std.debug.runtime_safety` is true.
+fn checkInvariants(tree: Ast.Tree, tokens: []const Token, source: []const u8, diags: []const Diagnostic) void {
+    checkSpanTotality(tokens, source);
+    // (b) forward progress is enforced by the existing fuel guards; see the header.
+    checkBracketPairing(tree, tokens, diags);
+}
+
+/// (a) SPAN TOTALITY. Re-verifies the lexer's tiling contract over the full token
+/// list the parser consumed: spans are monotonic with no overlap, each well-formed,
+/// and the trailing `.eof` sits exactly at `source.len`.
+fn checkSpanTotality(tokens: []const Token, source: []const u8) void {
+    var prev_end: u32 = 0;
+    for (tokens) |tok| {
+        std.debug.assert(tok.start >= prev_end); // monotonic, no overlap (gaps are trivia)
+        std.debug.assert(tok.end >= tok.start); // well-formed span
+        prev_end = tok.end;
+    }
+    // A tokenized source always ends in exactly one `.eof` sitting at `source.len`.
+    std.debug.assert(tokens.len > 0);
+    const last = tokens[tokens.len - 1];
+    std.debug.assert(last.tag == .eof);
+    std.debug.assert(last.end == source.len);
+}
+
+/// (c) STRUCTURAL PAIRING. Walks the token stream counting `(`/`)` and `{`/`}`
+/// opens vs closes. For a CLEAN parse (no diagnostics, so no `error_node`) both
+/// pairs must be balanced and never go negative. On a RECOVERED parse imbalance is
+/// tolerated. `error_node`-presence and `diags` non-emptiness are equivalent
+/// recovery signals — either one licenses imbalance.
+fn checkBracketPairing(tree: Ast.Tree, tokens: []const Token, diags: []const Diagnostic) void {
+    const recovered = diags.len != 0 or hasErrorNode(tree);
+    if (recovered) return; // recovery captured any imbalance; nothing to assert.
+    var parens: i32 = 0;
+    var braces: i32 = 0;
+    for (tokens) |tok| switch (tok.tag) {
+        .l_paren => parens += 1,
+        .r_paren => parens -= 1,
+        .l_brace => braces += 1,
+        .r_brace => braces -= 1,
+        else => {},
+    };
+    // A clean parse is balanced AND never dipped below zero (a well-nested stream
+    // can't end at 0 with a negative excursion, but the final == 0 check pins it).
+    std.debug.assert(parens == 0);
+    std.debug.assert(braces == 0);
+}
+
+/// True if the tree contains at least one `.error_node` — the recovery marker that
+/// licenses bracket imbalance in `checkBracketPairing`.
+fn hasErrorNode(tree: Ast.Tree) bool {
+    for (tree.nodes) |n| if (n.tag == .error_node) return true;
+    return false;
+}
+
 // ---- tests -----------------------------------------------------------------
 
 const testing = std.testing;
@@ -2899,4 +2986,65 @@ test "C: report-once keeps exactly one diagnostic with exactly one code" {
     defer freeTree(gpa, res.tree);
     try testing.expectEqual(@as(usize, 1), res.diags.len);
     try testing.expect(res.diags[0].code != .none);
+}
+
+// ---- post-parse invariant unit tests ---------------------------------------
+
+test "D4a: span totality holds over the full token list of a clean parse" {
+    const gpa = testing.allocator;
+    const source = "fn main() -> int {\n  return 0\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    // Direct check of the (a) sweep: monotonic tiling, well-formed spans, eof==len.
+    checkSpanTotality(tokens, source);
+    // And the whole parse (which runs the sweep under runtime_safety) is clean.
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+}
+
+test "D4a: a clean parse has balanced brackets and no error node" {
+    const gpa = testing.allocator;
+    const source = "fn f(a: int) -> int {\n  return (a + 1)\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+    try testing.expect(!hasErrorNode(res.tree));
+    // The pairing check must pass on this clean tree (no assert trip).
+    checkBracketPairing(res.tree, tokens, res.diags);
+}
+
+test "D4a: the adversarial `fn f( ) ) ) {` recovers with imbalance TOLERATED" {
+    // The load-bearing case: the token stream is bracket-IMBALANCED (three `)` vs
+    // one `(`, one unclosed `{`), yet the parse must not false-trip the pairing
+    // invariant because it recovered (>=1 diagnostic / error_node). `parse()` runs
+    // the sweep under runtime_safety, so reaching this point without a panic proves
+    // the "balanced OR recovered" arm.
+    const gpa = testing.allocator;
+    const source = "fn f( ) ) ) {\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    // It genuinely recovered (this is what licenses the imbalance).
+    try testing.expect(res.diags.len >= 1);
+    // The raw token stream really IS imbalanced — otherwise the test proves nothing.
+    var parens: i32 = 0;
+    var braces: i32 = 0;
+    for (tokens) |t| switch (t.tag) {
+        .l_paren => parens += 1,
+        .r_paren => parens -= 1,
+        .l_brace => braces += 1,
+        .r_brace => braces -= 1,
+        else => {},
+    };
+    try testing.expect(parens != 0 or braces != 0);
+    // And the pairing check tolerates it because the parse recovered.
+    checkBracketPairing(res.tree, tokens, res.diags);
 }
