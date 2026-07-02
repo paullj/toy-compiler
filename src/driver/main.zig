@@ -187,17 +187,21 @@ pub fn main(init: std.process.Init) !void {
                                 try runExplain(out, err_level, p.code);
                                 try out.flush();
                                 return;
+                            } else if (comptime std.mem.eql(u8, sub.name, "check")) {
+                                // `check` is its OWN action with its OWN restricted option
+                                // set (no codegen/emit/opt flags), so it has a distinct
+                                // `applyCheckParsed` — `applyParsed` reads build fields
+                                // (`emit`,`dump`,`O`,...) that `Parsed(check)` no longer has.
+                                // It fills `st` (paths, target, color, sev rules) + the
+                                // check-only knobs, and exit-2's on a bad severity spec.
+                                if (try applyCheckParsed(gpa, p, out, err_level, &st, &sev_rules)) |code| {
+                                    try out.flush(); // exit skips defers; flush the styled arg-error line
+                                    std.process.exit(code);
+                                }
+                                st.check_seen = true;
                             } else if (try applyParsed(gpa, sub, p, out, err_level, &st, &sev_rules)) |code| {
                                 try out.flush(); // exit skips defers; flush the styled arg-error line
                                 std.process.exit(code);
-                            } else if (comptime std.mem.eql(u8, sub.name, "check")) {
-                                // `check` is its OWN action: run the front-end (never
-                                // codegen), report ALL diagnostics, and exit on the diag
-                                // gate. `applyParsed` (above) already filled `st` (paths,
-                                // target, sev rules); the check-only knobs live on `p`.
-                                st.check_seen = true;
-                                st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
-                                st.check_exit_zero = p.exit_zero;
                             }
                         },
                         // A subcommand has no sub-subcommands in this spec.
@@ -234,7 +238,7 @@ pub fn main(init: std.process.Init) !void {
     // the C3 severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
     // the config, 2 on a hard CLI/IO error. `--exit-zero` forces 0 regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, io, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.sev));
+        std.process.exit(try runCheck(gpa, io, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.check_error_on_warning, st.sev));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -293,6 +297,8 @@ const State = struct {
     check_ndjson: bool = false,
     // `check --exit-zero`: always exit 0 even with errors (editor/LSP streaming).
     check_exit_zero: bool = false,
+    // `check --error-on-warning`: any surviving warning forces a non-zero (error) exit.
+    check_error_on_warning: bool = false,
     target: []const u8 = "native",
     out_path: ?[]const u8 = null,
     codegen_stats: bool = false,
@@ -338,14 +344,19 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         .always => .always,
         .never => .never,
     };
-    if (p.emit) |e| {
-        st.emit_explicit = true;
-        st.emit = switch (e) {
-            .lex => .lex,
-            .parse => .parse,
-            .check => .check,
-            .ir => .ir,
-        };
+    // `--emit lex|parse|ir` is registered ONLY in a dev build (dev_inspect); in a release
+    // build the option — and thus the `Parsed` field — does not exist, so guard the read
+    // with `@hasField`. The CLI value list dropped `check` (it is its own subcommand now),
+    // so the mapping is lex/parse/ir only; the internal `Driver.Emit.check` is untouched.
+    if (@hasField(@TypeOf(p), "emit")) {
+        if (p.emit) |e| {
+            st.emit_explicit = true;
+            st.emit = switch (e) {
+                .lex => .lex,
+                .parse => .parse,
+                .ir => .ir,
+            };
+        }
     }
     if (p.j) |n| {
         // n >= 1 guaranteed by the Range. -j1 => .limited(0) (serial baseline);
@@ -398,6 +409,51 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
+}
+
+/// Map the `check` subcommand's RESTRICTED `Parsed` onto the driver `State`. Distinct
+/// from `applyParsed` because `check_opts` (Cli.zig) carries no codegen/emit/opt flags,
+/// so `Parsed(check)` has no `emit`/`dump`/`O`/... fields to read — only the diagnostic-
+/// shaping + input knobs. Fills paths, target, color, the C3 severity rules, and the
+/// check-only knobs. Returns a non-null `?u8` exit code on a bad severity spec: unlike
+/// the build path's arg-errors (exit 1), a check-path usage error exits 2 (consistent
+/// with `check`'s missing-input-file exit 2 — a bad `--warn BOGUS` is the same class).
+fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: Style.ColorLevel, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
+    st.target = p.target orelse "native";
+    st.color_choice = switch (p.color orelse .auto) {
+        .auto => .auto,
+        .always => .always,
+        .never => .never,
+    };
+    st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
+    st.check_exit_zero = p.exit_zero;
+    st.check_error_on_warning = p.error_on_warning;
+    // C3 severity overrides, FIXED order (error, warn, ignore) so ignore>warn>error under
+    // last-match-wins. An unknown code OR band letter is a USAGE error -> exit 2 (not the
+    // build path's 1): `usageCode` prints the styled `error:` line and returns 2.
+    for (p.@"error") |m| {
+        if (!validSpec(m)) return usageCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
+        try sev_rules.append(gpa, .{ .match = m, .action = .err });
+    }
+    for (p.warn) |m| {
+        if (!validSpec(m)) return usageCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
+        try sev_rules.append(gpa, .{ .match = m, .action = .warning });
+    }
+    for (p.ignore) |m| {
+        if (!validSpec(m)) return usageCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
+        try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
+    }
+    st.sev = .{ .rules = sev_rules.items };
+    for (p.file) |f| try st.paths.append(gpa, f);
+    return null;
+}
+
+/// Like `argErrCode` but returns `2` (a USAGE error, not a compile failure): the `check`
+/// path treats a bad severity-flag value as a usage error, consistent with a missing
+/// input file (exit 2). Prints the styled `error:` line and returns `2`.
+fn usageCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8 {
+    try argLine(out, level, message);
+    return 2;
 }
 
 /// True when `m` names a diagnostic override target: a known code string ("R0001")
@@ -1045,6 +1101,7 @@ fn runCheck(
     paths: []const []const u8,
     ndjson: bool,
     exit_zero: bool,
+    error_on_warning: bool,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
     // Run the SAME front-end the `--emit check` inspection table drives, but present
@@ -1070,7 +1127,7 @@ fn runCheck(
         const counts = try Check.emitNdjson(out, gpa, results, sev);
         try out.flush();
         if (Check.anyHardError(results)) return 2;
-        return checkExit(counts, exit_zero);
+        return checkExit(counts, exit_zero, error_on_warning);
     }
 
     // Human form: render each file's diagnostics (parse -> resolve -> typecheck) against
@@ -1095,15 +1152,18 @@ fn runCheck(
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
     if (Check.anyHardError(results)) return 2;
-    return checkExit(counts, exit_zero);
+    return checkExit(counts, exit_zero, error_on_warning);
 }
 
 /// Map a `check` tally to the process exit code: 0 clean (or `--exit-zero`), 1 when at
-/// least one diagnostic resolved to an error. IO/CLI failures (exit 2) are handled by
-/// the caller before reaching here.
-fn checkExit(counts: Check.Counts, exit_zero: bool) u8 {
+/// least one diagnostic resolved to an error — or, under `--error-on-warning`, when at
+/// least one warning survives. `--exit-zero` DOMINATES (editors that read the stream, not
+/// the status). IO/CLI failures (exit 2) are handled by the caller before reaching here.
+fn checkExit(counts: Check.Counts, exit_zero: bool, error_on_warning: bool) u8 {
     if (exit_zero) return 0;
-    return if (counts.hasErrors()) 1 else 0;
+    if (counts.hasErrors()) return 1;
+    if (error_on_warning and counts.warnings > 0) return 1;
+    return 0;
 }
 
 /// `toy explain <CODE>`: print the code's embedded documentation. A known code prints

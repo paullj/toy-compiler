@@ -10,8 +10,13 @@
 //!
 //! - The NDJSON line schema is fixed and stable (keys emitted in a constant order, no
 //!   trailing whitespace, RFC-8259 string escaping): `{"code","level","byte","line",
-//!   "col","message"}`. `code` is null for an uncoded diagnostic. `line`/`col` are
-//!   1-based, computed from the owning file's SourceMap.
+//!   "col","message","file","rendered","labels"}`. `code` is null for an uncoded
+//!   diagnostic. `line`/`col` are 1-based, computed from the owning file's SourceMap.
+//!   `file` is the diagnostic's source path (the module path in graph mode, else the
+//!   input file). `rendered` is the PLAIN (uncolored) pretty single-diagnostic render
+//!   string, JSON-escaped (embedded newlines become `\n`). `labels` is an array of
+//!   SECONDARY labels: a duplicate-definition carries its "previously defined here"
+//!   label as `{message,file,line,col,byte_start,byte_end,is_primary:false}`.
 //! - Both emitters gate on the SAME effective severity as the human renderer
 //!   (`SevCfg.resolve`), so `--ignore`d diagnostics vanish from both forms and the
 //!   error/warning counts match what the summary line prints.
@@ -28,7 +33,10 @@ const model = @import("../diagnostics/model.zig");
 const SevCfg = @import("../diagnostics/severity_config.zig");
 const Rr = struct {
     const SourceMap = @import("../term/render/SourceMap.zig");
+    const Diagnostic = @import("../term/render/Diagnostic.zig");
+    const Renderer = @import("../term/render/Renderer.zig");
 };
+const Style = @import("../term/Style.zig");
 
 /// The error/warning tally over the VISIBLE (non-`--ignore`d) diagnostics, by
 /// effective severity. `notes`/`help` never count toward either.
@@ -94,10 +102,44 @@ fn writeJsonStr(out: *Io.Writer, s: []const u8) !void {
     }
 }
 
+/// Build the rich render `Diagnostic` for `d` at effective severity `eff`, mirroring
+/// `DiagRender.renderSinkDiag`: a zero-width primary at `d.byte_offset`, the code string
+/// (null => no bracket), and — when `d.related` is set — a secondary "previously defined
+/// here" label at the related offset (same scope). `sec_buf` is a caller-owned 1-slot
+/// backing array the returned diagnostic's `secondary` slice borrows from.
+fn richDiag(d: Diagnostic, eff: model.Severity, sec_buf: *[1]Rr.Diagnostic.Label) Rr.Diagnostic.Diagnostic {
+    const secondary: []const Rr.Diagnostic.Label = if (d.related != @import("../diagnostics/Diagnostic.zig").NO_RELATED) blk: {
+        sec_buf[0] = .{
+            .kind = .secondary,
+            .span = .{ .start = d.related, .end = d.related },
+            .message = "previously defined here",
+            .source = d.scope,
+        };
+        break :blk sec_buf[0..1];
+    } else &.{};
+    return .{
+        .severity = eff,
+        .message = d.message,
+        .primary = .{
+            .kind = .primary,
+            .span = .{ .start = d.byte_offset, .end = d.byte_offset },
+            .message = d.message,
+            .source = d.scope,
+        },
+        .secondary = secondary,
+        .code = codes.str(d.code),
+        .scope = d.scope,
+    };
+}
+
 /// Serialize ONE diagnostic as a single NDJSON line (trailing '\n') against a prepared
-/// SourceMap for its owning file. `eff` is the already-resolved effective severity.
-/// Key order is FIXED: code, level, byte, line, col, message.
-fn writeNdjsonLine(out: *Io.Writer, sm: *const Rr.SourceMap, d: Diagnostic, eff: model.Severity) !void {
+/// SourceMap for its owning file `file`. `eff` is the already-resolved effective
+/// severity. Key order is FIXED: code, level, byte, line, col, message, file, rendered,
+/// labels. `rendered` is the PLAIN (uncolored, ascii-caret) pretty single-diagnostic
+/// render, JSON-escaped (embedded newlines/control bytes escaped). `labels` is the
+/// diagnostic's secondary labels (empty `[]` when none); a duplicate-definition's
+/// "previously defined here" label carries its own line/col/byte span, `is_primary:false`.
+fn writeNdjsonLine(out: *Io.Writer, gpa: std.mem.Allocator, sm: *const Rr.SourceMap, file: []const u8, d: Diagnostic, eff: model.Severity) !void {
     const lc = sm.lineCol(d.byte_offset);
     try out.writeAll("{\"code\":");
     if (codes.str(d.code)) |cs| {
@@ -111,7 +153,34 @@ fn writeNdjsonLine(out: *Io.Writer, sm: *const Rr.SourceMap, d: Diagnostic, eff:
     try writeJsonStr(out, levelWord(eff));
     try out.print("\",\"byte\":{d},\"line\":{d},\"col\":{d},\"message\":\"", .{ d.byte_offset, lc.line, lc.col });
     try writeJsonStr(out, d.message);
-    try out.writeAll("\"}\n");
+    try out.writeAll("\",\"file\":\"");
+    try writeJsonStr(out, file);
+
+    // `rendered`: the PLAIN pretty single-diagnostic render (color .none, ascii carets),
+    // captured into a temp buffer then JSON-escaped so embedded newlines/carets survive
+    // as a single valid JSON string.
+    var sec_buf: [1]Rr.Diagnostic.Label = undefined;
+    const rich = richDiag(d, eff, &sec_buf);
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try Rr.Renderer.render(rich, sm, &aw.writer, .{ .color = Style.ColorLevel.none, .unicode = false });
+    try out.writeAll("\",\"rendered\":\"");
+    try writeJsonStr(out, aw.writer.buffered());
+
+    // `labels`: the secondary labels (currently only the duplicate's "previously defined
+    // here"). Each carries its own line/col computed off the SAME file's SourceMap (the
+    // related offset is in the same scope) plus the byte span and `is_primary:false`.
+    try out.writeAll("\",\"labels\":[");
+    for (rich.secondary, 0..) |lbl, i| {
+        if (i != 0) try out.writeByte(',');
+        const llc = sm.lineCol(lbl.span.start);
+        try out.writeAll("{\"message\":\"");
+        try writeJsonStr(out, lbl.message);
+        try out.writeAll("\",\"file\":\"");
+        try writeJsonStr(out, file);
+        try out.print("\",\"line\":{d},\"col\":{d},\"byte_start\":{d},\"byte_end\":{d},\"is_primary\":false}}", .{ llc.line, llc.col, lbl.span.start, lbl.span.end });
+    }
+    try out.writeAll("]}\n");
 }
 
 /// The per-file diagnostic sets a `check` run reports, in stable stage order:
@@ -140,12 +209,14 @@ pub fn emitNdjson(out: *Io.Writer, gpa: std.mem.Allocator, results: []const Driv
         defer sm.deinit(gpa);
         const Ctx = struct {
             out: *Io.Writer,
+            gpa: std.mem.Allocator,
             sm: *const Rr.SourceMap,
+            file: []const u8,
             cfg: SevCfg.SeverityConfig,
             counts: *Counts,
             fn emit(c: @This(), d: Diagnostic) anyerror!void {
                 const eff = SevCfg.resolve(d.code, d.severity, c.cfg) orelse return;
-                try writeNdjsonLine(c.out, c.sm, d, eff);
+                try writeNdjsonLine(c.out, c.gpa, c.sm, c.file, d, eff);
                 switch (eff) {
                     .err => c.counts.errors += 1,
                     .warning => c.counts.warnings += 1,
@@ -153,7 +224,7 @@ pub fn emitNdjson(out: *Io.Writer, gpa: std.mem.Allocator, results: []const Driv
                 }
             }
         };
-        try forEachDiag(r, Ctx{ .out = out, .sm = &sm, .cfg = cfg, .counts = &counts }, Ctx.emit);
+        try forEachDiag(r, Ctx{ .out = out, .gpa = gpa, .sm = &sm, .file = r.path, .cfg = cfg, .counts = &counts }, Ctx.emit);
     }
     return counts;
 }
@@ -207,19 +278,40 @@ test "writeJsonStr uses \\u00XX for other control bytes" {
     try testing.expectEqualStrings("\\u0001", w.buffered());
 }
 
-test "writeNdjsonLine emits fixed key order with 1-based line/col and null code" {
+test "writeNdjsonLine emits fixed key order with 1-based line/col, null code, file, rendered, empty labels" {
     const src = "fn main() {\n  x\n}\n";
     var sm = try Rr.SourceMap.init(testing.allocator, "t.toy", src);
     defer sm.deinit(testing.allocator);
-    var buf: [256]u8 = undefined;
-    var w = Io.Writer.fixed(&buf);
+    var aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
     // offset of the 'x' on line 2: after "fn main() {\n  " == 14
     const off: u32 = 14;
-    try writeNdjsonLine(&w, &sm, .{ .byte_offset = off, .message = "boom", .code = .none, .severity = .err }, .err);
-    try testing.expectEqualStrings(
-        "{\"code\":null,\"level\":\"error\",\"byte\":14,\"line\":2,\"col\":3,\"message\":\"boom\"}\n",
-        w.buffered(),
-    );
+    try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "t.toy", .{ .byte_offset = off, .message = "boom", .code = .none, .severity = .err }, .err);
+    const got = aw.writer.buffered();
+    // Prefix through the shared fields is stable and byte-checkable.
+    try testing.expect(std.mem.startsWith(u8, got,
+        "{\"code\":null,\"level\":\"error\",\"byte\":14,\"line\":2,\"col\":3,\"message\":\"boom\",\"file\":\"t.toy\",\"rendered\":\""));
+    // No related location => empty labels array; the line ends with `,"labels":[]}\n`.
+    try testing.expect(std.mem.endsWith(u8, got, ",\"labels\":[]}\n"));
+    // Every embedded newline in the rendered snippet is escaped (no raw '\n' before the
+    // trailing terminator), so the whole record stays one NDJSON line.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
+}
+
+test "writeNdjsonLine emits a secondary label for a related location (duplicate-definition shape)" {
+    const src = "fn f() {}\nfn f() {}\n";
+    var sm = try Rr.SourceMap.init(testing.allocator, "dup.toy", src);
+    defer sm.deinit(testing.allocator);
+    var aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    // primary at the second `f` (offset 13), related at the first `f` (offset 3).
+    try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "dup.toy", .{ .byte_offset = 13, .message = "duplicate function 'f'", .code = .R0002, .severity = .err, .related = 3 }, .err);
+    const got = aw.writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, got, "\"labels\":[{\"message\":\"previously defined here\",\"file\":\"dup.toy\"") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"is_primary\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"byte_start\":3") != null);
+    // Still exactly one NDJSON line.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\n"));
 }
 
 test "levelWord matches severity spelling" {

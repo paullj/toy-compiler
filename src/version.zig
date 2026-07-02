@@ -22,6 +22,14 @@ pub const semver = build_options.semver;
 /// Content hash of the whole compiler. Changes whenever any `src/` file does.
 pub const source_digest: u64 = build_options.source_digest;
 
+/// DEV pipeline-inspection switch (see build.zig): true in a Debug build (and every
+/// test binary), false in a release build. The CLI schema (`Cli.zig`) reads it at
+/// comptime to gate the `--emit lex|parse|ir` flag's presence. Re-exported here so the
+/// single library-module `build_options` is the ONE owner of that generated file — the
+/// exe module reaches it via `toyc.version.dev_inspect` rather than importing
+/// `build_options` a second time (which Zig rejects: one file, one module).
+pub const dev_inspect: bool = build_options.dev_inspect;
+
 /// The cache stamp: identifies "this exact compiler build". Written into a
 /// buffer (no allocation). Used as the per-compiler cache subdirectory name.
 pub fn stamp(buf: []u8) []const u8 {

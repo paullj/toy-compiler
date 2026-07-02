@@ -10,6 +10,14 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "semver", "0.0.0");
     options.addOption(u64, "source_digest", sourceDigest(b));
+    // DEV-only pipeline inspection. When true, the CLI registers `--emit
+    // lex|parse|ir` (front-end dump modes). Defaults to on in Debug (so the default
+    // build + all test binaries expose `--emit`), off in a release build — a
+    // ReleaseFast `toy` ships no `--emit` flag at all. Overridable with
+    // `-Ddev-inspect=true/false`. Threaded through `build_options` exactly like
+    // `source_digest`, so `Cli.zig` reads it at comptime to gate the option's presence.
+    const dev_inspect = b.option(bool, "dev-inspect", "Register the --emit lex|parse|ir pipeline-inspection flag (default: on in Debug)") orelse (optimize == .Debug);
+    options.addOption(bool, "dev_inspect", dev_inspect);
 
     const mod = b.addModule("toy_compiler", .{
         .root_source_file = b.path("src/root.zig"),

@@ -214,9 +214,10 @@ test "B4: a many-error file collects the FULL uncapped diagnostic set (render ca
     try testing.expectEqual(@as(usize, n_errs), r.resolve.?.diags.len);
 }
 
-test "B4: rendering a many-error file caps output at DIAG_CAP primaries + a summary line" {
+test "B4: `toy check` on a many-error file caps output at DIAG_CAP primaries + a summary line" {
     // End-to-end render check via the built `toy` binary (the only path that exercises
-    // Report/DiagRender). Skips gracefully if the binary isn't present. DIAG_CAP = 100
+    // DiagRender). Migrated from the removed `--emit check` inspection table to the
+    // `toy check` subcommand. Skips gracefully if the binary isn't present. DIAG_CAP = 100
     // primary `-->` carets are drawn, then one `... and N more` line; the summary count
     // is total - 100.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -248,7 +249,7 @@ test "B4: rendering a many-error file caps output at DIAG_CAP primaries + a summ
     const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
     defer gpa.free(bin_abs);
 
-    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--emit", "check", path }, .stdout = .pipe });
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "check", path }, .stdout = .pipe });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 20));
     defer gpa.free(got);
@@ -320,7 +321,8 @@ test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-on
     const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
     defer gpa.free(bin_abs);
 
-    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--emit", "check", path }, .stdout = .pipe });
+    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "check", path }, .stdout = .pipe });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     defer gpa.free(got);
@@ -378,7 +380,8 @@ test "C coded render: a parse error renders `error[P0002]:` and stays report-onc
     const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
     defer gpa.free(bin_abs);
 
-    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--emit", "check", path }, .stdout = .pipe });
+    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "check", path }, .stdout = .pipe });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     defer gpa.free(got);
@@ -437,7 +440,8 @@ test "C3 --warn downgrades an error to a warning (render-only, one -->)" {
     const dir_name = ".toy-test-driver-c3-warn";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--warn", "R0001" }) catch |e| {
+    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
@@ -447,9 +451,13 @@ test "C3 --warn downgrades an error to a warning (render-only, one -->)" {
     try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") == null);
     // report-once preserved: exactly one primary caret line.
     try testing.expectEqual(@as(usize, 1), countCarets(res.out));
+    // `toy check`'s summary counts the downgraded diagnostic as a warning; no errors
+    // survive so the exit is 0 (the removed inspection table had no such gate).
+    try testing.expect(std.mem.indexOf(u8, res.out, "1 warning(s)") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
-test "C3 --ignore suppresses a code entirely (zero diagnostic bytes, exit unchanged)" {
+test "C3 `toy check` --ignore suppresses a code entirely (zero diagnostic bytes; no errors survive => exit 0)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -457,7 +465,8 @@ test "C3 --ignore suppresses a code entirely (zero diagnostic bytes, exit unchan
     const dir_name = ".toy-test-driver-c3-ignore";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--ignore", "R0001" }) catch |e| {
+    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--ignore", "R0001" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
@@ -466,10 +475,13 @@ test "C3 --ignore suppresses a code entirely (zero diagnostic bytes, exit unchan
     // The ignored diagnostic renders zero bytes: no code, no caret.
     try testing.expect(std.mem.indexOf(u8, res.out, "R0001") == null);
     try testing.expectEqual(@as(usize, 0), countCarets(res.out));
-    // Render-only: the file still FAILS (the summary table reports the failure), and
-    // the process still exits non-zero — --ignore never flips the exit status.
-    try testing.expect(std.mem.indexOf(u8, res.out, "failure(s)") != null);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    // `toy check` gates its exit on the effective severity: with the ONLY diagnostic
+    // ignored, zero errors survive, so there is NO error/warning summary line and the
+    // process exits 0. (The removed inspection table always exited 1 on a failed file;
+    // `check` is the new, faithful behaviour.)
+    try testing.expect(std.mem.indexOf(u8, res.out, "error(s)") == null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning(s)") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
 test "C3 band flag affects the whole band (--warn R downgrades R0001)" {
@@ -480,7 +492,8 @@ test "C3 band flag affects the whole band (--warn R downgrades R0001)" {
     const dir_name = ".toy-test-driver-c3-band";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--warn", "R" }) catch |e| {
+    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
@@ -489,7 +502,7 @@ test "C3 band flag affects the whole band (--warn R downgrades R0001)" {
     try testing.expect(std.mem.indexOf(u8, res.out, "warning[R0001]:") != null);
 }
 
-test "C3 an unknown --warn spec is an arg error (exit 1)" {
+test "C3 `toy check` unknown --warn spec is a USAGE error (exit 2)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -497,17 +510,20 @@ test "C3 an unknown --warn spec is an arg error (exit 1)" {
     const dir_name = ".toy-test-driver-c3-bad";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check", "--warn", "BOGUS" }) catch |e| {
+    // Migrated from `--emit check` to `toy check`. D2 fixes the exit code: a bad
+    // severity-flag value on the check path is a USAGE error (exit 2), consistent with
+    // `check`'s missing-input-file exit 2 — NOT the generic CLI-parse exit 1.
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "BOGUS" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
     defer gpa.free(res.out);
 
     try testing.expect(std.mem.indexOf(u8, res.out, "unknown code or band") != null);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
 }
 
-test "C3 no flags is byte-identical to the C2 coded baseline" {
+test "C3 `toy check` with no severity flags renders the coded error + a 1-error summary (exit 1)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -515,7 +531,8 @@ test "C3 no flags is byte-identical to the C2 coded baseline" {
     const dir_name = ".toy-test-driver-c3-baseline";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "--emit", "check" }) catch |e| {
+    // Migrated from `--emit check` to `toy check`.
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{"check"}) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
@@ -524,6 +541,9 @@ test "C3 no flags is byte-identical to the C2 coded baseline" {
     // Empty config == identity: the coded error header, never a warning token.
     try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") != null);
     try testing.expect(std.mem.indexOf(u8, res.out, "warning") == null);
+    // `toy check`'s program-wide summary (one error) + the compile-failure exit code.
+    try testing.expect(std.mem.indexOf(u8, res.out, "1 error(s)") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
 }
 
 test "C3 duplicate function renders a 'previously defined here' secondary label + a summary" {
@@ -545,7 +565,8 @@ test "C3 duplicate function renders a 'previously defined here' secondary label 
         \\  return f()
         \\}
     ;
-    const res = runToyOnFixture(gpa, io, dir_name, dup, &.{ "--emit", "check" }) catch |e| {
+    // Migrated from `--emit check` to `toy check`.
+    const res = runToyOnFixture(gpa, io, dir_name, dup, &.{"check"}) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
@@ -578,9 +599,10 @@ test "C3 the summary line counts respect severity config (--warn, --ignore)" {
         \\  return 0
         \\}
     ;
+    // Migrated from `--emit check` to `toy check` (all three invocations).
     // Default: three errors.
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "--emit", "check" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{"check"}) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
@@ -589,7 +611,7 @@ test "C3 the summary line counts respect severity config (--warn, --ignore)" {
     }
     // --warn R0001: counted as warnings, not errors.
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "--emit", "check", "--warn", "R0001" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--warn", "R0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
@@ -599,13 +621,120 @@ test "C3 the summary line counts respect severity config (--warn, --ignore)" {
     }
     // --ignore R0001: excluded from the summary entirely (no diagnostic-count line).
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "--emit", "check", "--ignore", "R0001" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--ignore", "R0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
         defer gpa.free(res.out);
         try testing.expect(std.mem.indexOf(u8, res.out, "error(s)") == null);
         try testing.expect(std.mem.indexOf(u8, res.out, "warning(s)") == null);
+    }
+}
+
+test "D2 `toy --emit check` is rejected as an invalid --emit value (nonzero exit)" {
+    // `--emit check` no longer exists: the CLI value list is {lex,parse,ir} in a dev
+    // build. `toy --emit check <file>` must fail as a bad value. `--emit parse` still
+    // works in the default Debug build (dev_inspect on).
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-d2-emitcheck";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const clean = "fn main() -> int {\n  return 0\n}\n";
+    // `--emit check`: rejected (nonzero).
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, clean, &.{ "--emit", "check" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(res.term != .exited or res.term.exited != 0);
+    }
+    // `--emit parse`: still valid in the Debug build (dev_inspect on) -> exit 0.
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, clean, &.{ "--emit", "parse" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+}
+
+test "D2 `toy check --format ndjson` enriches each line with file, rendered, labels (valid JSON)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-d2-ndjson";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // A duplicate-fn program: R0002 carries a `previously defined here` secondary label.
+    const dup =
+        \\fn f() -> int {
+        \\  return 1
+        \\}
+        \\fn f() -> int {
+        \\  return 2
+        \\}
+        \\fn main() -> int {
+        \\  return f()
+        \\}
+    ;
+    const res = runToyOnFixture(gpa, io, dir_name, dup, &.{ "check", "--format", "ndjson" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    // Find the R0002 line and assert the new fields are present on it.
+    var it = std.mem.tokenizeScalar(u8, res.out, '\n');
+    var saw_r0002 = false;
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"code\":\"R0002\"") == null) continue;
+        saw_r0002 = true;
+        // The enrichment fields.
+        try testing.expect(std.mem.indexOf(u8, line, "\"file\":\"") != null);
+        try testing.expect(std.mem.indexOf(u8, line, dir_name) != null); // file is the input path
+        try testing.expect(std.mem.indexOf(u8, line, "\"rendered\":\"") != null);
+        // The rendered snippet is JSON-escaped: embedded newlines are `\n`, not raw.
+        try testing.expect(std.mem.indexOf(u8, line, "error[R0002]") != null);
+        // The secondary label is present in the labels array with is_primary:false.
+        try testing.expect(std.mem.indexOf(u8, line, "\"labels\":[") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "previously defined here") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "\"is_primary\":false") != null);
+        // Every line stays one physical line (no raw newline inside the record).
+    }
+    try testing.expect(saw_r0002);
+}
+
+test "D2 `toy check --error-on-warning` promotes a surviving warning to a nonzero exit" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-d2-eow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // --warn R0001 downgrades the only error to a warning. Without --error-on-warning the
+    // exit is 0 (no errors survive); WITH it, the surviving warning forces exit 1.
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001", "--error-on-warning" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
     }
 }
 

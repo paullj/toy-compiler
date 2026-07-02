@@ -9,14 +9,33 @@
 
 const toyc = @import("toy_compiler");
 const Spec = toyc.cli.Spec;
+// Build-time DEV switch (see build.zig): gates the `--emit lex|parse|ir`
+// pipeline-inspection flag on/off. Read at comptime so a release binary (dev_inspect
+// false) never even registers `--emit`; the default Debug build (and every test
+// binary) has it on, so the existing `--emit lex|parse` dump tests keep working.
+// Reached through the library module's `version` (the single `build_options` owner) —
+// importing `build_options` here directly would put that generated file in two modules.
+pub const dev_inspect: bool = toyc.version.dev_inspect;
 
 /// The option set shared verbatim by root, `build`, and `run` (defined once so
 /// they can't drift). `--target` is not defaulted in-spec (stays `?[]const u8`);
 /// the driver applies "native" when null, matching the old behaviour.
-const shared_opts: []const Spec.Option = &.{
+// The DEV pipeline-inspection flag, registered on root/build/run ONLY when
+// `dev_inspect` is true (Debug builds + every test binary). The value list is
+// `{lex,parse,ir}` — NOT `check`: `toy check` is its own subcommand now, so
+// `toy --emit check` is rejected as an invalid value. A release build (dev_inspect
+// false) drops this entirely, so the binary exposes no `--emit` at all.
+const emit_opt: []const Spec.Option = if (dev_inspect) &.{
+    .{ .long = "emit", .value = .{ .@"enum" = &.{ "lex", "parse", "ir" } }, .value_name = "STAGE", .help = "Inspect the pipeline instead of building (no binary; dev builds only)" },
+} else &.{};
+
+// The build/inspect options MINUS `--emit` (spliced in via `emit_opt` so it can be
+// gated behind `dev_inspect`). `shared_opts` below is `pre_emit ++ emit_opt ++ post_emit`.
+const pre_emit: []const Spec.Option = &.{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
     .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
-    .{ .long = "emit", .value = .{ .@"enum" = &.{ "lex", "parse", "check", "ir" } }, .value_name = "STAGE", .help = "Inspect the pipeline instead of building (no binary)" },
+};
+const post_emit: []const Spec.Option = &.{
     // -j: N>=1; the parser rejects -j0/negatives as a bad value via the Range.
     .{ .short = 'j', .value = .{ .int = .{ .min = 1, .max = null } }, .value_name = "N", .help = "Build worker threads (N>=1; -j1 = serial; default cpu-based)" },
     // -O is short-only => Parsed field `O`; -O0 / -O1 / -O 1 all parse, -O2 rejected.
@@ -38,20 +57,36 @@ const shared_opts: []const Spec.Option = &.{
     .{ .long = "ignore", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable; render-only)" },
 };
 
+/// The option set shared verbatim by root, `build`, and `run` (defined once so
+/// they can't drift). `--emit` sits between `pre_emit` and `post_emit` and is present
+/// only when `dev_inspect` is true (Debug builds + test binaries); a release build
+/// drops it entirely. `--target` is not defaulted in-spec (stays `?[]const u8`); the
+/// driver applies "native" when null, matching the old behaviour.
+const shared_opts: []const Spec.Option = pre_emit ++ emit_opt ++ post_emit;
+
 /// The variadic input-file positional, shared by root/build/run.
 const files_pos: []const Spec.Positional = &.{
     .{ .name = "file", .value = .string, .arity = .variadic, .help = "Input source file(s)" },
 };
 
-/// `check`'s option set: the shared build/inspect options PLUS the check-only knobs.
-/// `--format` picks the diagnostic wire form (pretty snippets vs stable NDJSON);
-/// `--exit-zero` forces a 0 exit even with errors (for editors that read the stream,
-/// not the status); `--watch` is accepted as a forward-compatible no-op stub so the
-/// schema is stable when an incremental watch loop lands.
-const check_opts: []const Spec.Option = shared_opts ++ [_]Spec.Option{
+/// `check`'s OWN option set — deliberately NOT the shared build/inspect options. `check`
+/// reports diagnostics without building, so nothing codegen/emit/opt related belongs
+/// here: only the diagnostic-shaping + input knobs. `--format` picks the wire form
+/// (pretty snippets vs stable NDJSON); `--error/--warn/--ignore` are the repeatable C3
+/// severity overrides; `--error-on-warning` promotes any surviving warning to an error
+/// for the exit gate; `--exit-zero` forces a 0 exit even with errors (editors that read
+/// the stream, not the status); `--watch` is a forward-compatible no-op stub; `--color`
+/// and `--target` mirror the shared spellings.
+const check_opts: []const Spec.Option = &.{
     .{ .long = "format", .value = .{ .@"enum" = &.{ "human", "ndjson" } }, .value_name = "FORM", .help = "Diagnostic output form (human snippets or line-delimited JSON; default human)" },
+    .{ .long = "error", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --error R0001 or --error T; render-only)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable; render-only)" },
+    .{ .long = "ignore", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable; render-only)" },
+    .{ .long = "error-on-warning", .action = .set_true, .help = "Exit non-zero if any warning survives the severity config" },
     .{ .long = "exit-zero", .action = .set_true, .help = "Always exit 0, even when diagnostics contain errors" },
     .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },
+    .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
+    .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
 };
 
 /// The single `<CODE>` positional for `toy explain` (e.g. `R0001`).
@@ -69,7 +104,7 @@ pub const spec: Spec.Cli = .{
     .root = .{
         .name = "toy",
         .about = "Build, check, and run toy programs from source",
-        .long_about = "Compile toy programs. With no subcommand, a bare `toy <file>` builds a signed executable; --emit lex|parse|check|ir inspects the pipeline instead. build and run force a build.",
+        .long_about = "Compile toy programs. With no subcommand, a bare `toy <file>` builds a signed executable; in a dev build --emit lex|parse|ir inspects the pipeline instead. build and run force a build; check reports diagnostics without building.",
         .options = shared_opts,
         .positionals = files_pos,
         .subcommands = &.{
@@ -88,4 +123,32 @@ pub const spec: Spec.Cli = .{
 comptime {
     @setEvalBranchQuota(20_000);
     Spec.validate(spec.root);
+}
+
+/// True when `opts` registers a long flag named `long`. Comptime-usable so the
+/// invariant below is checked at build time.
+fn hasLong(comptime opts: []const Spec.Option, comptime long: []const u8) bool {
+    for (opts) |o| {
+        if (o.long) |l| if (std.mem.eql(u8, l, long)) return true;
+    }
+    return false;
+}
+
+const std = @import("std");
+
+// LOAD-BEARING INVARIANT: the presence of `--emit` on the build/inspect option set is
+// tied EXACTLY to `dev_inspect`. A Debug build (or any test binary) has it; a
+// ReleaseFast build must not. `check`'s own option set NEVER carries `--emit` in either
+// mode (it is a diagnostics-only subcommand). Fired at comptime so it holds for the main
+// exe AND every test binary, in every optimize mode.
+comptime {
+    if (hasLong(shared_opts, "emit") != dev_inspect)
+        @compileError("`--emit` presence on shared_opts must equal build_options.dev_inspect");
+    if (hasLong(check_opts, "emit"))
+        @compileError("`check` must never register `--emit`");
+    // check_opts must carry ONLY the restricted, non-codegen knobs.
+    for ([_][]const u8{ "output", "j", "O", "opt", "no-opt", "dump", "codegen-stats", "verify", "force", "opt-stats", "timings", "emit" }) |banned| {
+        if (hasLong(check_opts, banned))
+            @compileError("`check` option set must not contain build/codegen/opt flags");
+    }
 }

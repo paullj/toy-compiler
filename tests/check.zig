@@ -69,6 +69,62 @@ test "check: a resolve error is tallied as one error and emitted as NDJSON" {
             const line = out[0 .. out.len - 1];
             var parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
             defer parsed.deinit();
+            // D2 enrichment: every line carries `file`, `rendered`, and a `labels` array.
+            const obj = parsed.value.object;
+            try testing.expect(obj.get("file") != null);
+            try testing.expect(obj.get("file").?.string.len > 0);
+            const rendered = obj.get("rendered").?.string;
+            // `rendered` is the PLAIN single-diagnostic render: the coded header + a caret
+            // line, with the embedded newline preserved through the JSON round-trip.
+            try testing.expect(std.mem.indexOf(u8, rendered, "error[R0001]") != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "-->") != null);
+            try testing.expect(std.mem.indexOf(u8, rendered, "\n") != null);
+            // No secondary labels on a plain undeclared-identifier error.
+            try testing.expectEqual(@as(usize, 0), obj.get("labels").?.array.items.len);
+        }
+    }.body);
+}
+
+test "check: a duplicate-definition NDJSON line carries a `previously defined here` label" {
+    const src =
+        \\fn f() -> int {
+        \\  return 1
+        \\}
+        \\fn f() -> int {
+        \\  return 2
+        \\}
+        \\fn main() -> int {
+        \\  return f()
+        \\}
+    ;
+    try withCheck(".toy-test-check-dup-label", src, struct {
+        fn body(results: []Driver.FileResult) anyerror!void {
+            const gpa = testing.allocator;
+            var aw: std.Io.Writer.Allocating = .init(gpa);
+            defer aw.deinit();
+            _ = try Check.emitNdjson(&aw.writer, gpa, results, .{});
+            const out = aw.written();
+            // Find the R0002 line and parse it as strict JSON.
+            var it = std.mem.tokenizeScalar(u8, out, '\n');
+            var checked = false;
+            while (it.next()) |line| {
+                if (std.mem.indexOf(u8, line, "\"code\":\"R0002\"") == null) continue;
+                checked = true;
+                var parsed = try std.json.parseFromSlice(std.json.Value, gpa, line, .{});
+                defer parsed.deinit();
+                const labels = parsed.value.object.get("labels").?.array;
+                try testing.expectEqual(@as(usize, 1), labels.items.len);
+                const lbl = labels.items[0].object;
+                try testing.expectEqualStrings("previously defined here", lbl.get("message").?.string);
+                try testing.expectEqual(false, lbl.get("is_primary").?.bool);
+                // The label carries its own location + byte span (the first definition).
+                try testing.expect(lbl.get("line").?.integer >= 1);
+                try testing.expect(lbl.get("col").?.integer >= 1);
+                try testing.expect(lbl.get("byte_start") != null);
+                try testing.expect(lbl.get("byte_end") != null);
+                try testing.expect(lbl.get("file") != null);
+            }
+            try testing.expect(checked);
         }
     }.body);
 }
