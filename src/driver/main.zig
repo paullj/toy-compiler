@@ -184,7 +184,7 @@ pub fn main(init: std.process.Init) !void {
                             // build); it has a `code` positional, not the shared option
                             // set, so it bypasses `applyParsed` entirely.
                             if (comptime std.mem.eql(u8, sub.name, "explain")) {
-                                try runExplain(out, err_level, p.code);
+                                try runExplain(out, err_level, p.code, p.list);
                                 try out.flush();
                                 return;
                             } else if (comptime std.mem.eql(u8, sub.name, "check")) {
@@ -1169,15 +1169,63 @@ fn checkExit(counts: Check.Counts, exit_zero: bool, error_on_warning: bool) u8 {
 /// `toy explain <CODE>`: print the code's embedded documentation. A known code prints
 /// its doc and returns (caller flushes + exits 0); an unknown code prints a styled
 /// arg error and EXITS 2 (an argument error, distinct from a compile failure's 1).
-fn runExplain(out: *Io.Writer, level: Style.ColorLevel, code: []const u8) !void {
-    if (toyc.diagnostics.explain.docForStr(code)) |doc| {
+/// `--list` (or the bare word `list`) enumerates every code instead; a bare `explain`
+/// with neither a code nor `--list` is a usage error (exit 2).
+fn runExplain(out: *Io.Writer, level: Style.ColorLevel, code: ?[]const u8, list: bool) !void {
+    // `--list`, or `toy explain list`, prints the whole registry.
+    if (list or (code != null and std.mem.eql(u8, code.?, "list"))) {
+        try listCodes(out, level);
+        return;
+    }
+    const c = code orelse {
+        argLine(out, level, "specify a diagnostic code (e.g. R0001) or --list") catch {};
+        out.flush() catch {};
+        std.process.exit(2);
+    };
+    if (toyc.diagnostics.explain.docForStr(c)) |doc| {
         try out.writeAll(doc);
         if (doc.len == 0 or doc[doc.len - 1] != '\n') try out.writeByte('\n');
         return;
     }
     var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "unknown diagnostic code: {s}", .{code}) catch "unknown diagnostic code";
+    const msg = std.fmt.bufPrint(&buf, "unknown diagnostic code: {s}", .{c}) catch "unknown diagnostic code";
     argLine(out, level, msg) catch {};
     out.flush() catch {};
     std.process.exit(2);
+}
+
+/// The band a code prefix belongs to (for `explain --list` grouping headers).
+fn bandTitle(prefix: u8) []const u8 {
+    return switch (prefix) {
+        'L' => "Lexer (L)",
+        'P' => "Parser (P)",
+        'R' => "Name resolution (R)",
+        'T' => "Type checking (T)",
+        else => "Other",
+    };
+}
+
+/// `toy explain --list`: print every registered diagnostic code with its default
+/// severity and kebab title, grouped by band. Driven straight from `codes.table`, so it
+/// can never drift from the registry (a new code shows up here automatically). Sorted by
+/// the table's append order, which is band-grouped + numerically contiguous.
+fn listCodes(out: *Io.Writer, level: Style.ColorLevel) !void {
+    const reg = toyc.diagnostics.codes;
+    var cur_band: u8 = 0;
+    for (reg.table) |e| {
+        const prefix = e.str[0];
+        if (prefix != cur_band) {
+            cur_band = prefix;
+            if (e.code != reg.table[0].code) try out.writeByte('\n');
+            try DiagRender.sty_head.styled(out, level, bandTitle(prefix));
+            try out.writeByte('\n');
+        }
+        const sev = switch (e.default_severity) {
+            .err => "error",
+            .warning => "warning",
+            .note => "note",
+            .help => "help",
+        };
+        try out.print("  {s: <6} {s: <8} {s}\n", .{ e.str, sev, e.slug });
+    }
 }

@@ -301,6 +301,46 @@ test "C2 explain: a known code prints its doc (exit 0); an unknown code arg-erro
     }
 }
 
+test "C5 explain --list enumerates EVERY registered code (and `explain list` works too)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    // `--list`: exit 0; band headers; and — the drift guard — EVERY registry code +
+    // its kebab title appears, so a newly-added code shows up automatically.
+    {
+        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "--list" }, .stdout = .pipe });
+        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+        defer gpa.free(got);
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+        try testing.expect(std.mem.indexOf(u8, got, "Parser") != null);
+        try testing.expect(std.mem.indexOf(u8, got, "Name resolution") != null);
+        try testing.expect(std.mem.indexOf(u8, got, "Type checking") != null);
+        for (toyc.diagnostics.codes.table) |e| {
+            try testing.expect(std.mem.indexOf(u8, got, e.str) != null);
+            try testing.expect(std.mem.indexOf(u8, got, e.slug) != null);
+        }
+    }
+    // The bare word `list` is an alias for `--list`.
+    {
+        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "list" }, .stdout = .pipe });
+        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+        defer gpa.free(got);
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+        try testing.expect(std.mem.indexOf(u8, got, "R0002") != null);
+    }
+}
+
 test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-once (one -->)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
