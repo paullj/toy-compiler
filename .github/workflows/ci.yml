@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# The backend emits arm64 macOS Mach-O executables and ad-hoc code-signs them;
+# the run/emit tests SkipZigTest on anything but macos+aarch64. Every job therefore
+# runs on an Apple-Silicon macOS runner, or the whole backend would silently no-op.
+# Tools come from mise (pinned in mise.toml).
+jobs:
+  test:
+    name: Zig tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add ubuntu-latest and windows-latest once the backend targets Linux/Windows.
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-test-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
+          restore-keys: zig-cache-test-${{ runner.os }}-
+      # Unit, cli, lsp and integration suites; integration includes the tests/corpora
+      # harness and the tree-sitter grammar agreement test.
+      - name: Tests
+        run: zig build test --summary all
+
+  fuzz:
+    name: Bounded fuzz (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add ubuntu-latest and windows-latest once the backend targets Linux/Windows.
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-fuzz-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
+          restore-keys: zig-cache-fuzz-${{ runner.os }}-
+      # Seeded + bounded (FUZZ_SEED / FUZZ_ITERS), so the run terminates fast and
+      # reproducibly. Forced to Debug by build.zig so the parser invariants fire.
+      - name: Front-end fuzzer
+        run: zig build fuzz
+        env:
+          FUZZ_SEED: "1"
+          FUZZ_ITERS: "5000"
+
+  lint:
+    name: fmt + release build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add ubuntu-latest and windows-latest once the backend targets Linux/Windows.
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-lint-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
+          restore-keys: zig-cache-lint-${{ runner.os }}-
+      - name: Format check
+        run: zig fmt --check packages build.zig build.zig.zon
+      - name: Release build
+        run: zig build -Doptimize=ReleaseFast
+
+  site:
+    name: Docs site (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add ubuntu-latest and windows-latest once the backend targets Linux/Windows.
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: packages/site
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: .zig-cache
+          key: zig-cache-site-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
+          restore-keys: zig-cache-site-${{ runner.os }}-
+      # Run once here; the site:test / site:e2e tasks would each rebuild it.
+      - name: Build wasm language server
+        run: mise run site:wasm
+      - name: Type check
+        run: pnpm check
+      - name: Unit tests
+        run: pnpm test
+      - name: Install Chromium
+        run: pnpm exec playwright install chromium
+      - name: End-to-end tests
+        run: pnpm e2e
