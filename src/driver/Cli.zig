@@ -49,7 +49,7 @@ const post_emit: []const Spec.Option = &.{
     .{ .long = "opt-stats", .action = .set_true, .help = "Print per-pass opt counters + dual metric (with -o; use --force)" },
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
-    // Render-time severity overrides (C3). Repeatable; take a code (R0001) or a band
+    // Render-time severity overrides. Repeatable; take a code (R0001) or a band
     // letter (L/P/R/T). Fixed precedence ignore > warn > error; last match wins.
     // Render-only: they NEVER change the exit status.
     .{ .long = "error", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --error R0001 or --error T; render-only)" },
@@ -72,7 +72,7 @@ const files_pos: []const Spec.Positional = &.{
 /// `check`'s OWN option set — deliberately NOT the shared build/inspect options. `check`
 /// reports diagnostics without building, so nothing codegen/emit/opt related belongs
 /// here: only the diagnostic-shaping + input knobs. `--format` picks the wire form
-/// (pretty snippets vs stable NDJSON); `--error/--warn/--ignore` are the repeatable C3
+/// (pretty snippets vs stable NDJSON); `--error/--warn/--ignore` are the repeatable
 /// severity overrides; `--error-on-warning` promotes any surviving warning to an error
 /// for the exit gate; `--exit-zero` forces a 0 exit even with errors (editors that read
 /// the stream, not the status); `--watch` is a forward-compatible no-op stub; `--color`
@@ -123,7 +123,7 @@ pub const spec: Spec.Cli = .{
 };
 
 // A malformed spec is a build error: `Spec.validate` fires `@compileError`. The
-// larger option set (the C3 --error/--warn/--ignore flags added here) pushes the
+// larger option set (the --error/--warn/--ignore flags added here) pushes the
 // comptime cross-check over the default 1000-branch budget, so raise the quota at this
 // caller-side comptime site (not in the framework).
 comptime {

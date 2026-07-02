@@ -246,7 +246,7 @@ pub const Node = extern struct {
         /// struct rename `field: alias` (then `main_token` is the alias), or
         /// `none` for a tuple-positional / struct-pun binding. `rhs` is an
         /// optional sub-pattern matched against the field/element (`.Rect { w: 0 }`
-        /// or a nested pattern), or `none` to bind the whole value (M10 leaf bind).
+        /// or a nested pattern), or `none` to bind the whole value.
         pattern_binding,
 
         /// An int/bool literal pattern. `main_token` is the number/`true`/`false`
@@ -269,14 +269,13 @@ pub const Node = extern struct {
         /// vacuously satisfied.
         import_decl,
 
-        /// A poison/error leaf the fault-tolerant parser will emit at a parse
-        /// error to keep building a (partial) tree instead of bailing. A leaf:
+        /// A poison/error leaf the fault-tolerant parser emits at a parse error
+        /// to keep building a partial tree instead of bailing. A leaf:
         /// `main_token` is the offending token; `lhs`/`rhs` are `Ast.none`. It is
-        /// already-diagnosed by construction, so downstream stages treat it as an
-        /// inert leaf that produces NO further diagnostics (no name lookup, no
-        /// type error — it types as the poison `Kind.invalid`) and never reaches
-        /// codegen (a later milestone gates a `tainted` tree out before lower).
-        /// NOTE: not produced anywhere yet, so behavior is unchanged for now.
+        /// already-diagnosed by construction, so earlier stages treat it as an
+        /// inert leaf that produces NO further diagnostics (types as the poison
+        /// `Kind.invalid`); the tainted-tree gate keeps it out of lower, where
+        /// `.error_node` is `unreachable`.
         error_node,
     };
 };
@@ -292,7 +291,7 @@ comptime {
 /// together and (de)serialize together via `pack`/`unpack`.
 ///
 /// `pub_bits` is a packed bitset (one bit per node index) marking which decl
-/// nodes carry the `pub` modifier (M14 export visibility). It is memcpy-trivial
+/// nodes carry the `pub` modifier (export visibility). It is memcpy-trivial
 /// like `nodes`/`extra` and round-trips through `pack`/`unpack`. It defaults to
 /// the empty slice so the many partial `Tree` views built across the driver
 /// (`.{ .nodes = ..., .extra = ... }`) keep compiling; `isPub` treats an absent
@@ -371,8 +370,6 @@ pub fn root(nodes: []const Node) Index {
     return Index.from(@intCast(nodes.len - 1));
 }
 
-// ---- token-overloaded slot accessors ---------------------------------------
-//
 // A few tags store a TOKEN index in an lhs/rhs slot instead of a child node
 // index (see the `break_stmt`/`continue_stmt`/`import_decl` doc comments). The
 // slot's storage is still an `Index` field, but these accessors reinterpret it
@@ -404,7 +401,7 @@ pub const parse_magic: u32 = 0x544f5950;
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
     magic: u32,
-    /// Bumped to 4 in M14 to add the trailing `pub_bits` section; older v3 blobs
+    /// Bumped to 4 to add the trailing `pub_bits` section; older v3 blobs
     /// (no `pub_bits`) miss cleanly via the version check in `unpack`. Bumped to 5
     /// when the `error_node` Tag ordinal was appended, so a blob produced by an
     /// older compiler is rejected rather than reused across the Tag change.

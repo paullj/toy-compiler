@@ -2,9 +2,9 @@
 //!
 //! Relocated out of `driver/Driver.zig`: these tests drive the whole compilation
 //! pipeline (discover → resolve → typecheck → codegen → link), compile-and-RUN real
-//! Mach-O binaries, and pin cache soundness / byte-identity across rebuilds — the
-//! `[iii]`/`[iv]`/`[v]`/`[vi]` soundness family. They exercise the driver as a black
-//! box through the published `toy_compiler` surface, so they belong in tests/ (not
+//! Mach-O binaries, and pin cache soundness / byte-identity across rebuilds. They
+//! exercise the driver as a black box through the published `toy_compiler` surface,
+//! so they belong in tests/ (not
 //! inline in the library) and run in the `toy-integration-test` binary. The bare
 //! symbol names below alias the driver's published surface so the moved test bodies
 //! stay byte-verbatim.
@@ -170,7 +170,7 @@ test "emit=check on a bad program reports a resolve error" {
     try testing.expect(r.resolve.?.diags.len > 0);
 }
 
-test "B4: a many-error file collects the FULL uncapped diagnostic set (render cap is output-only)" {
+test "a many-error file collects the FULL uncapped diagnostic set (render cap is output-only)" {
     // The render-time cap (DiagRender.DIAG_CAP = 100) never truncates the COLLECTED /
     // returned diagnostics — the Sink/Result stays complete so incremental/cache
     // fingerprints stay stable. Build a file with 120 distinct undeclared names and
@@ -214,7 +214,7 @@ test "B4: a many-error file collects the FULL uncapped diagnostic set (render ca
     try testing.expectEqual(@as(usize, n_errs), r.resolve.?.diags.len);
 }
 
-test "B4: `toy check` on a many-error file caps output at DIAG_CAP primaries + a summary line" {
+test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a summary line" {
     // End-to-end render check via the built `toy` binary (the only path that exercises
     // DiagRender). Migrated from the removed `--emit check` inspection table to the
     // `toy check` subcommand. Skips gracefully if the binary isn't present. DIAG_CAP = 100
@@ -267,7 +267,7 @@ test "B4: `toy check` on a many-error file caps output at DIAG_CAP primaries + a
     try testing.expect(std.mem.indexOf(u8, got, "... and 20 more") != null);
 }
 
-test "C2 explain: a known code prints its doc (exit 0); an unknown code arg-errors (exit 2)" {
+test "explain: a known code prints its doc (exit 0); an unknown code arg-errors (exit 2)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -301,7 +301,7 @@ test "C2 explain: a known code prints its doc (exit 0); an unknown code arg-erro
     }
 }
 
-test "C5 explain --list enumerates EVERY registered code (and `explain list` works too)" {
+test "explain --list enumerates EVERY registered code (and `explain list` works too)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -341,7 +341,7 @@ test "C5 explain --list enumerates EVERY registered code (and `explain list` wor
     }
 }
 
-test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-once (one -->)" {
+test "coded render: `return nope` renders `error[R0001]:` and stays report-once (one -->)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -368,14 +368,14 @@ test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-on
     defer gpa.free(got);
     _ = try child.wait(io);
 
-    // The authorized C2 output change: the coded header bracket.
+    // The authorized output change: the coded header bracket.
     try testing.expect(std.mem.indexOf(u8, got, "error[R0001]:") != null);
     // Single-file check's `-->` header must name the ON-DISK path, byte-for-byte as the
     // pre-graph-fix single-file path did — NOT the module stem. Regression lock for the
     // routing fix: `check` now discovers a graph-of-one, and the multi-module renderer
     // would spell the entry as its bare stem (`one`, from `Module.path`) instead of the
-    // input path (`.../one.toy`, `Module.file`). Requirement #5 / acceptance (d) demand
-    // single-file check stay byte-identical, so the header carries the full path here.
+    // input path (`.../one.toy`, `Module.file`). Single-file check must stay
+    // byte-identical, so the header carries the full path here.
     try testing.expect(std.mem.indexOf(u8, got, "--> " ++ path ++ ":2:10") != null);
     // report-once preserved: exactly one primary caret line.
     var carets: usize = 0;
@@ -387,7 +387,7 @@ test "C2 coded render: `return nope` renders `error[R0001]:` and stays report-on
     try testing.expectEqual(@as(usize, 1), carets);
 }
 
-test "C explain: a parse code (P0001) prints its doc (exit 0)" {
+test "explain: a parse code (P0001) prints its doc (exit 0)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -407,7 +407,7 @@ test "C explain: a parse code (P0001) prints its doc (exit 0)" {
     try testing.expect(std.mem.indexOf(u8, got, "P0001") != null);
 }
 
-test "C coded render: a parse error renders `error[P0002]:` and stays report-once (one -->)" {
+test "coded render: a parse error renders `error[P0002]:` and stays report-once (one -->)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -566,7 +566,7 @@ fn countCarets(got: []const u8) usize {
     return carets;
 }
 
-test "C3 --warn downgrades an error to a warning (render-only, one -->)" {
+test "--warn downgrades an error to a warning (render-only, one -->)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -591,7 +591,7 @@ test "C3 --warn downgrades an error to a warning (render-only, one -->)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
-test "C3 `toy check` --ignore suppresses a code entirely (zero diagnostic bytes; no errors survive => exit 0)" {
+test "`toy check` --ignore suppresses a code entirely (zero diagnostic bytes; no errors survive => exit 0)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -618,7 +618,7 @@ test "C3 `toy check` --ignore suppresses a code entirely (zero diagnostic bytes;
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
-test "C3 band flag affects the whole band (--warn R downgrades R0001)" {
+test "band flag affects the whole band (--warn R downgrades R0001)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -636,7 +636,7 @@ test "C3 band flag affects the whole band (--warn R downgrades R0001)" {
     try testing.expect(std.mem.indexOf(u8, res.out, "warning[R0001]:") != null);
 }
 
-test "C3 `toy check` unknown --warn spec is a USAGE error (exit 2)" {
+test "`toy check` unknown --warn spec is a USAGE error (exit 2)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -644,7 +644,7 @@ test "C3 `toy check` unknown --warn spec is a USAGE error (exit 2)" {
     const dir_name = ".toy-test-driver-c3-bad";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // Migrated from `--emit check` to `toy check`. D2 fixes the exit code: a bad
+    // Migrated from `--emit check` to `toy check`, which fixes the exit code: a bad
     // severity-flag value on the check path is a USAGE error (exit 2), consistent with
     // `check`'s missing-input-file exit 2 — NOT the generic CLI-parse exit 1.
     const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "BOGUS" }) catch |e| {
@@ -657,7 +657,7 @@ test "C3 `toy check` unknown --warn spec is a USAGE error (exit 2)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
 }
 
-test "C3 `toy check` with no severity flags renders the coded error + a 1-error summary (exit 1)" {
+test "`toy check` with no severity flags renders the coded error + a 1-error summary (exit 1)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -680,7 +680,7 @@ test "C3 `toy check` with no severity flags renders the coded error + a 1-error 
     try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
 }
 
-test "C3 duplicate function renders a 'previously defined here' secondary label + a summary" {
+test "duplicate function renders a 'previously defined here' secondary label + a summary" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -715,7 +715,7 @@ test "C3 duplicate function renders a 'previously defined here' secondary label 
     try testing.expect(std.mem.indexOf(u8, res.out, "1 error(s)") != null);
 }
 
-test "C3 the summary line counts respect severity config (--warn, --ignore)" {
+test "the summary line counts respect severity config (--warn, --ignore)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -765,7 +765,7 @@ test "C3 the summary line counts respect severity config (--warn, --ignore)" {
     }
 }
 
-test "D2 `toy --emit check` is rejected as an invalid --emit value (nonzero exit)" {
+test "`toy --emit check` is rejected as an invalid --emit value (nonzero exit)" {
     // `--emit check` no longer exists: the CLI value list is {lex,parse,ir} in a dev
     // build. `toy --emit check <file>` must fail as a bad value. `--emit parse` still
     // works in the default Debug build (dev_inspect on).
@@ -797,7 +797,7 @@ test "D2 `toy --emit check` is rejected as an invalid --emit value (nonzero exit
     }
 }
 
-test "D2 `toy check --format ndjson` enriches each line with file, rendered, labels (valid JSON)" {
+test "`toy check --format ndjson` enriches each line with file, rendered, labels (valid JSON)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -844,7 +844,7 @@ test "D2 `toy check --format ndjson` enriches each line with file, rendered, lab
     try testing.expect(saw_r0002);
 }
 
-test "D2 `toy check --error-on-warning` promotes a surviving warning to a nonzero exit" {
+test "`toy check --error-on-warning` promotes a surviving warning to a nonzero exit" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -931,7 +931,7 @@ test "codegen reports missing main and lowers a simple main" {
     }
 }
 
-test "B2: a syntax-error file is tainted, reported, and never reaches check/codegen" {
+test "a syntax-error file is tainted, reported, and never reaches check/codegen" {
     // The parser now ALWAYS returns a (partial) tree, so the driver must gate
     // check/codegen on `!tainted`: a diagnostic-bearing parse stops with a
     // ParseError and never populates resolve/typecheck — which is what keeps a
@@ -1003,7 +1003,7 @@ test "integration: emitted binary runs with the right exit code" {
         .{ .src = "fn main() -> int {\n x := 40\n y := 2\n return x + y\n}\n", .name = "add", .expect = 42 },
         // 300 & 0xFF == 44: dyld's start glue masks main's return to a byte.
         .{ .src = "fn main() -> int {\n return 300\n}\n", .name = "big", .expect = 44 },
-        // M3 multi-function cases — each exercises a back-end capability that a
+        // Multi-function cases — each exercises a back-end capability that a
         // unit assert can't catch: a wrong ABI/alignment/reloc/entry-offset bug
         // still faults or returns the wrong code when actually executed.
         // A forward call into a helper.
@@ -1019,7 +1019,7 @@ test "integration: emitted binary runs with the right exit code" {
         .{ .src = "fn sum10(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int, j: int) -> int {\n return a + b + c + d + e + f + g + h + i + j\n}\nfn main() -> int {\n return sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)\n}\n", .name = "tenargs", .expect = 55 },
         // A void call as an expression statement: result discarded, then return 5.
         .{ .src = "fn noop() {\n return\n}\nfn main() -> int {\n noop()\n return 5\n}\n", .name = "voidcall", .expect = 5 },
-        // M4 control flow — each RUN proves a back-end capability a byte assert
+        // Control flow — each RUN proves a back-end capability a byte assert
         // can't: a wrong b.cond sense, a sign-flipped branch offset, an un-backpatched
         // placeholder, or a missing frame-walk arm only shows when actually executed.
         // if true-arm taken.
@@ -1052,7 +1052,7 @@ test "integration: emitted binary runs with the right exit code" {
         // fib(10) = 55: return-continues + intra-fn backpatch + recursive calls all
         // at once. 55 & 0xFF == 55.
         .{ .src = "fn fib(n: int) -> int {\n if n < 2 {\n return n\n }\n return fib(n - 1) + fib(n - 2)\n}\nfn main() -> int {\n return fib(10)\n}\n", .name = "fib", .expect = 55 },
-        // M6 expression orientation — each RUN proves the value-merge/trailing-expr
+        // Expression orientation — each RUN proves the value-merge/trailing-expr
         // lowering with an actual exit code.
         // value-if, then-arm taken.
         .{ .src = "fn main() -> int {\n c := 1\n x := if c > 0 { 7 } else { 9 }\n return x\n}\n", .name = "ifval_then", .expect = 7 },
@@ -1090,7 +1090,7 @@ test "integration: emitted binary runs with the right exit code" {
         // Trailing bare-block value as the non-unit main body → 15.
         .{ .src = "fn main() -> int {\n {\n a := 10\n a + 5\n }\n}\n", .name = "trailing_main_block", .expect = 15 },
 
-        // M7 loops — each RUN is a HANG-CANARY: a wrong/sign-flipped back-edge would
+        // Loops — each RUN is a HANG-CANARY: a wrong/sign-flipped back-edge would
         // hang or fault instead of returning, so a completed run with the right exit
         // code proves the loop terminated.
         // value-loop yielding via break-value: i goes 0..5, breaks 5*10 = 50.
@@ -1122,7 +1122,7 @@ test "integration: emitted binary runs with the right exit code" {
         // back-edge sign canary: a tight count to 42 then break 42.
         .{ .src = "fn main() -> int {\n i := 0\n v := loop {\n if i >= 42 { break i }\n i = i + 1\n }\n return v\n}\n", .name = "loop_canary", .expect = 42 },
 
-        // M8 labels & multi-level exits — each RUN is a HANG-CANARY (a wrong outer
+        // Labels & multi-level exits — each RUN is a HANG-CANARY (a wrong outer
         // back-edge/target would hang or fault). LABEL-RESOLUTION canaries too: a
         // break/continue hitting the WRONG (innermost vs named) context miscompiles
         // to a visibly wrong exit code.
@@ -1137,7 +1137,7 @@ test "integration: emitted binary runs with the right exit code" {
         // On j==3 continue @outer; each outer iter adds 3 (j=0,1,2) → 3 outers → 9.
         .{ .src = "fn main() -> int {\n s := 0\n @outer for i in 0..3 {\n for j in 0..10 {\n if j == 3 { continue @outer }\n s = s + 1\n }\n }\n s\n}\n", .name = "continue_outer", .expect = 9 },
         // (4) bare break/continue STILL hit the INNERMOST loop under a labeled outer
-        // (M7 unchanged): inner `for` adds 1 then bare-breaks at j==1 → 1 per outer,
+        // (unchanged): inner `for` adds 1 then bare-breaks at j==1 → 1 per outer,
         // 3 outers → 3 (the bare break must NOT escape to @outer).
         .{ .src = "fn main() -> int {\n s := 0\n @outer loop {\n for i in 0..3 {\n for j in 0..3 {\n if j == 1 { break }\n s = s + 1\n }\n }\n break @outer s\n }\n}\n", .name = "bare_inner_under_labeled", .expect = 3 },
         // (5) FRAME-SIZING / SIGBUS canary: a labeled bare block as a deep call arg
@@ -1152,7 +1152,7 @@ test "integration: emitted binary runs with the right exit code" {
         // store/load through the labeled-block result slot.
         .{ .src = "fn greet(s: str) -> str {\n s\n}\nfn main() -> int {\n print(@blk { break @blk greet(\"hi\") })\n return 0\n}\n", .name = "labeledblock_str", .expect = 0 },
 
-        // M9 structs — each RUN proves a back-end capability (layout/ABI/copy) that
+        // Structs — each RUN proves a back-end capability (layout/ABI/copy) that
         // a byte assert can't: a wrong field offset, ABI class, or missed copy
         // silently corrupts data or faults only when actually executed.
         // (1) construct + read two fields → 42.
@@ -1183,7 +1183,7 @@ test "integration: emitted binary runs with the right exit code" {
         .{ .src = "struct V3 { a: int, b: int, c: int }\nfn sum(x: int, v: V3) -> int { x + v.a + v.b + v.c }\nfn main() -> int {\n return sum(36, V3 { a: 1, b: 2, c: 3 })\n}\n", .name = "struct_big_deeparg", .expect = 42 },
         // (12) SIGBUS canary: nested field access (o.i.v) as a deep call arg → 42.
         .{ .src = "struct Inner { v: int }\nstruct Outer { i: Inner, w: int }\nfn id(a: int, b: int, c: int) -> int { a + b + c }\nfn main() -> int {\n o := Outer { i: Inner { v: 30 }, w: 2 }\n return id(o.i.v, o.w, 10)\n}\n", .name = "struct_fieldarg", .expect = 42 },
-        // M9 SIGBUS regression (frame undersizing): RETURN a SMALL struct whose
+        // SIGBUS regression (frame undersizing): RETURN a SMALL struct whose
         // source is a bare param identifier (`return p`) — genStructExprPair spills
         // a temp at cg.depth that measureExpr's .identifier arm must reserve, else
         // the return-copy store lands on saved x29/x30 → SIGBUS. id(P{40,2})=42.
@@ -1194,19 +1194,19 @@ test "integration: emitted binary runs with the right exit code" {
         // the local-rooted .field_access arm of measureExpr must reserve the
         // reg-pair temp when the field itself is a struct. geti(Outer).a+.b = 42.
         .{ .src = "struct Inner { a: int, b: int }\nstruct Outer { i: Inner, z: int }\nfn geti(o: Outer) -> Inner {\n return o.i\n}\nfn main() -> int {\n o := Outer { i: Inner { a: 40, b: 2 }, z: 99 }\n r := geti(o)\n return r.a + r.b\n}\n", .name = "struct_ret_subfield", .expect = 42 },
-        // M9 sret regression: a >16B struct returned via a VALUE-IF body (not an
+        // sret regression: a >16B struct returned via a VALUE-IF body (not an
         // expr_stmt) must be written through x8 — was lowered as a statement-if and
         // x8 left unwritten (garbage). make(1)={10,20,30}, sum = 60.
         .{ .src = "struct V3 { a: int, b: int, c: int }\nfn make(c: int) -> V3 {\n if c == 1 { V3 { a: 10, b: 20, c: 30 } } else { V3 { a: 1, b: 1, c: 1 } }\n}\nfn main() -> int {\n p := make(1)\n return p.a + p.b + p.c\n}\n", .name = "struct_sret_valueif", .expect = 60 },
-        // M9 miscompile regression: a struct literal as a call arg whose field init
+        // Miscompile regression: a struct literal as a call arg whose field init
         // is itself a CALL — the field value must spill PAST the struct's own temp
         // bytes (not onto x). area(Point{40, id(2)}) = 42.
         .{ .src = "struct Point { x: int, y: int }\nfn id(n: int) -> int { return n }\nfn area(p: Point) -> int { p.x + p.y }\nfn main() -> int {\n return area(Point { x: 40, y: id(2) })\n}\n", .name = "struct_arg_callinit", .expect = 42 },
-        // M9 SIGSEGV regression: a >16B struct returned, a field init calls a 9-arg
+        // SIGSEGV regression: a >16B struct returned, a field init calls a 9-arg
         // fn (whose arg marshal dirties x9) — the sret dest pointer must NOT be held
         // in caller-saved x9 across the bl. val(1..9)=45, mk()={45,1,1}, sum = 47.
         .{ .src = "struct V3 { a: int, b: int, c: int }\nfn val(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int {\n return a + b + c + d + e + f + g + h + i\n}\nfn mk() -> V3 {\n return V3 { a: val(1,2,3,4,5,6,7,8,9), b: 1, c: 1 }\n}\nfn main() -> int {\n q := mk()\n return q.a + q.b + q.c\n}\n", .name = "struct_sret_x9", .expect = 47 },
-        // M9 coverage regression: a SMALL struct produced by a value-if, BOUND to a
+        // Coverage regression: a SMALL struct produced by a value-if, BOUND to a
         // local (a non-return sink) — was hard-rejected "struct expression
         // unsupported in codegen". P{10,20} → 30.
         .{ .src = "struct P { x: int, y: int }\nfn main() -> int {\n c := 1\n p := if c == 1 { P { x: 10, y: 20 } } else { P { x: 1, y: 1 } }\n return p.x + p.y\n}\n", .name = "struct_valueif_bind", .expect = 30 },
@@ -1217,7 +1217,7 @@ test "integration: emitted binary runs with the right exit code" {
         // A LARGE struct from a loop break, bound to a local (struct break-value
         // must copy full bytes, not just x0/x1). break V3{40,1,1} → 42.
         .{ .src = "struct V3 { a: int, b: int, c: int }\nfn main() -> int {\n i := 0\n v := loop {\n i = i + 1\n if i == 3 { break V3 { a: 40, b: 1, c: 1 } }\n }\n return v.a + v.b + v.c\n}\n", .name = "struct_loop_break_big", .expect = 42 },
-        // M10 enums — each RUN proves an enum capability a byte assert can't.
+        // Enums — each RUN proves an enum capability a byte assert can't.
         // (e1) all three variant forms, qualified + inferred, match binding tuple +
         // struct payloads + unit + a value-bound match. Circle(5)=25, Rect{3,4}=12,
         // Empty=0 → 37.
@@ -1232,7 +1232,7 @@ test "integration: emitted binary runs with the right exit code" {
         .{ .src = "enum Big { A { p: int, q: int, r: int }, B(int) }\nfn echo(b: Big) -> Big { b }\nfn main() -> int {\n x := echo(Big.A { p: 10, q: 20, r: 30 })\n return match x { .A { p, q, r } -> p + q + r, .B(n) -> n }\n}\n", .name = "enum_byvalue_big", .expect = 60 },
         // (e5) COPY semantics: a callee binds (by value) its enum param's payload;
         // the caller's value is unchanged. callee reads C(5)→5, caller still C(5)→5,
-        // 5 + 5 = 10. (M10 enums have no field-store; the by-value bind is the copy.)
+        // 5 + 5 = 10. (enums have no field-store; the by-value bind is the copy.)
         .{ .src = "enum E { C(int) }\nfn peek(e: E) -> int { match e { .C(r) -> r } }\nfn main() -> int {\n e := E.C(5)\n a := peek(e)\n b := match e { .C(r) -> r }\n return a + b\n}\n", .name = "enum_copy", .expect = 10 },
         // (e6) match as a value bound to a LOCAL and as a fn's TRAILING expression.
         // f's body IS the match; x binds a match. C(20) → 20, then +22 = 42.
@@ -1264,11 +1264,11 @@ test "integration: emitted binary runs with the right exit code" {
         // (e13) same, <=16B enum, INFERRED .C(42): the inner CALL result is the agg
         // arg, so inferred-vs-qualified does not change framing. pick(id(.C(42)))=42.
         .{ .src = "enum E { C(int), N }\nfn id(e: E) -> E { e }\nfn pick(e: E) -> int { match e { .C(r) -> r, .N -> 0 } }\nfn main() -> int {\n return pick(id(.C(42)))\n}\n", .name = "enum_small_call_in_arg_inferred", .expect = 42 },
-        // (e14) PRE-EXISTING M9 STRUCT widening of the same defect: a >16B struct
+        // (e14) PRE-EXISTING STRUCT widening of the same defect: a >16B struct
         // returned by a call passed as the struct arg of another call. echo identity,
         // consume sums. consume(echo(Big{10,20,30,40})) = 100.
         .{ .src = "struct Big { p: int, q: int, r: int, s: int }\nfn echo(b: Big) -> Big { b }\nfn consume(b: Big) -> int { b.p + b.q + b.r + b.s }\nfn main() -> int {\n return consume(echo(Big { p: 10, q: 20, r: 30, s: 40 }))\n}\n", .name = "struct_big_call_in_arg", .expect = 100 },
-        // M11 match enrichment.
+        // Match enrichment.
         // (m1) int literal match + wildcard. f(1)=20.
         .{ .src = "fn f(n: int) -> int { match n { 0 -> 10, 1 -> 20, _ -> 99 } }\nfn main() -> int { return f(1) }\n", .name = "match_int", .expect = 20 },
         // (m1b) int literal match falls to wildcard. f(7)=99.
@@ -1447,7 +1447,7 @@ fn checkAndLower(
     };
 }
 
-test "M5 edit-one-fn: only the edited fn recompiles; callers unaffected by a body change [iii]" {
+test "edit-one-fn: only the edited fn recompiles; callers unaffected by a body change" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1480,7 +1480,7 @@ test "M5 edit-one-fn: only the edited fn recompiles; callers unaffected by a bod
     var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
     defer r2.deinit(gpa);
     defer lp2.deinit(gpa);
-    // Exactly one fn recompiles (add); main is a cache hit. [C1]
+    // Exactly one fn recompiles (add); main is a cache hit.
     try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled);
     try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
 
@@ -1497,7 +1497,7 @@ test "M5 edit-one-fn: only the edited fn recompiles; callers unaffected by a bod
     try testing.expectEqual(@as(usize, 0), lp3.codegen_cached);
 }
 
-test "M5 verify-mode: re-lowering every fn matches the cached blob [v]" {
+test "verify-mode: re-lowering every fn matches the cached blob" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1530,7 +1530,7 @@ test "M5 verify-mode: re-lowering every fn matches the cached blob [v]" {
     try testing.expectEqual(@as(usize, 2), lp2.codegen_cached);
 }
 
-test "M6 cache soundness: editing a value-if fn recompiles only it; verify passes [v]" {
+test "cache soundness: editing a value-if fn recompiles only it; verify passes" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1575,7 +1575,7 @@ test "M6 cache soundness: editing a value-if fn recompiles only it; verify passe
     try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
 }
 
-test "M7 cache soundness: editing a loop/for/break fn recompiles only it; verify passes [v]" {
+test "cache soundness: editing a loop/for/break fn recompiles only it; verify passes" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1619,7 +1619,7 @@ test "M7 cache soundness: editing a loop/for/break fn recompiles only it; verify
     try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
 }
 
-test "M8 cache soundness: editing a labeled/break fn recompiles only it; verify passes [v]" {
+test "cache soundness: editing a labeled/break fn recompiles only it; verify passes" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1675,7 +1675,7 @@ test "M8 cache soundness: editing a labeled/break fn recompiles only it; verify 
     try testing.expectEqual(@as(usize, 2), lp4.codegen_cached);
 }
 
-test "M9 cache soundness: editing a struct's fields recompiles every fn that touches it; verify passes [v]" {
+test "cache soundness: editing a struct's fields recompiles every fn that touches it; verify passes" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1704,7 +1704,7 @@ test "M9 cache soundness: editing a struct's fields recompiles every fn that tou
     // Add a field to Point (a LAYOUT change). The bodies of area/other/main are
     // byte-identical, but area+main TOUCH Point, so they MUST recompile (a stale
     // hit would miscompile against the old 8-byte layout). `other` stays cached.
-    // This is the M5 "touched type layouts" hook made REAL.
+    // This is the "touched type layouts" hook made REAL.
     const v2 = "struct Point { x: int, y: int }\nfn area(p: Point) -> int { p.x }\nfn other() -> int { 5 }\nfn main() -> int {\n p := Point { x: 42, y: 0 }\n return area(p) + other() - 5\n}\n";
     var r2: FileResult = undefined;
     var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
@@ -1721,7 +1721,7 @@ test "M9 cache soundness: editing a struct's fields recompiles every fn that tou
     try testing.expectEqual(@as(usize, 3), lp3.codegen_cached);
 }
 
-test "M9 cache soundness: a struct touched ONLY via a param/return type folds its layout (no stale hit across the ABI boundary) [v]" {
+test "cache soundness: a struct touched ONLY via a param/return type folds its layout (no stale hit across the ABI boundary)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1767,7 +1767,7 @@ test "M9 cache soundness: a struct touched ONLY via a param/return type folds it
     try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
 }
 
-test "M10 cache soundness: editing an enum's variants recompiles every fn that touches it; verify passes [v]" {
+test "cache soundness: editing an enum's variants recompiles every fn that touches it; verify passes" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1810,7 +1810,7 @@ test "M10 cache soundness: editing an enum's variants recompiles every fn that t
     try testing.expectEqual(@as(usize, 3), lp3.codegen_cached);
 }
 
-test "M10 cache soundness: an enum touched ONLY via a param type folds its layout across the 16B<->24B ABI boundary [v]" {
+test "cache soundness: an enum touched ONLY via a param type folds its layout across the 16B<->24B ABI boundary" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1853,7 +1853,7 @@ test "M10 cache soundness: an enum touched ONLY via a param type folds its layou
     try testing.expectEqual(@as(usize, 2), lp3.codegen_cached);
 }
 
-test "M10 errors: non-exhaustive/unknown variant/arity/type; recursive enum; uninferable .V" {
+test "errors: non-exhaustive/unknown variant/arity/type; recursive enum; uninferable .V" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1891,7 +1891,7 @@ test "M10 errors: non-exhaustive/unknown variant/arity/type; recursive enum; uni
     }
 }
 
-test "M11 errors: non-exhaustive int/bool; guarded-only/partial-nested variant; inconsistent or-bindings; non-bool guard [iv]" {
+test "errors: non-exhaustive int/bool; guarded-only/partial-nested variant; inconsistent or-bindings; non-bool guard" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1929,7 +1929,7 @@ test "M11 errors: non-exhaustive int/bool; guarded-only/partial-nested variant; 
     }
 }
 
-test "M11 cache soundness: editing a literal/guard recompiles only that fn; verify byte-identical [v]" {
+test "cache soundness: editing a literal/guard recompiles only that fn; verify byte-identical" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1981,7 +1981,7 @@ test "M11 cache soundness: editing a literal/guard recompiles only that fn; veri
     try testing.expectEqual(@as(usize, 3), lp4.codegen_cached);
 }
 
-test "M9 errors: missing/unknown/mismatched fields; positional construction; recursive struct" {
+test "errors: missing/unknown/mismatched fields; positional construction; recursive struct" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -2028,7 +2028,7 @@ test "M9 errors: missing/unknown/mismatched fields; positional construction; rec
     }
 }
 
-test "M8 errors: undefined/duplicate labels (Resolve); continue-block & value-break-while (Type); bad label prefix (Parse)" {
+test "errors: undefined/duplicate labels (Resolve); continue-block & value-break-while (Type); bad label prefix (Parse)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -2082,7 +2082,7 @@ test "M8 errors: undefined/duplicate labels (Resolve); continue-block & value-br
     }
 }
 
-test "M7 error: break/continue outside a loop and break-value in while/for are rejected" {
+test "error: break/continue outside a loop and break-value in while/for are rejected" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -2118,7 +2118,7 @@ test "M7 error: break/continue outside a loop and break-value in while/for are r
     }
 }
 
-test "M5 byte-identical: a warm build equals a from-scratch (.force) build [iv]" {
+test "byte-identical: a warm build equals a from-scratch (.force) build" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -2162,7 +2162,7 @@ test "M5 byte-identical: a warm build equals a from-scratch (.force) build [iv]"
     try testing.expectEqualSlices(u8, fresh_img, warm_img);
 }
 
-test "M5 reorder: swapping fn order is all cache hits and keeps correct linkage [vi]" {
+test "reorder: swapping fn order is all cache hits and keeps correct linkage" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

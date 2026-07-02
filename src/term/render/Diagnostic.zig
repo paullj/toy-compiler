@@ -16,6 +16,7 @@ pub const NoteKind = model.NoteKind;
 pub const Note = model.Note;
 pub const NO_SOURCE = model.NO_SOURCE;
 pub const Diagnostic = model.Diagnostic;
+pub const richFromPod = model.richFromPod;
 
 // The model's own unit tests (Span.isZeroWidth, rich literal, defaults, sentinel
 // pinning) live in `diagnostics/model.zig` and run there; nothing to re-test here.

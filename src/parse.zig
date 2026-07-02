@@ -38,13 +38,13 @@ src: []const u8,
 /// Cursor into `tokens`.
 index: u32,
 nodes: std.ArrayList(Node),
-/// Node indices of top-level decls that carried a `pub` modifier (M14). Packed
+/// Node indices of top-level decls that carried a `pub` modifier. Packed
 /// into the `Tree.pub_bits` bitset after the `.program` node is appended.
 pub_decls: std.ArrayList(Ast.Index),
 /// Variable-arity child runs and range/proto headers (the "extra_data" side
 /// array). See `Ast` for the encoding.
 extra: std.ArrayList(u32),
-/// Accumulated parse diagnostics (B2). A parse that appends any diagnostic is a
+/// Accumulated parse diagnostics. A parse that appends any diagnostic is a
 /// TAINTED parse: `parse()` still returns the (partial) tree, but the caller must
 /// not cache it, lower it, or codegen it. Unmanaged-style (`append(gpa, d)`).
 diags: std.ArrayList(Diagnostic),
@@ -81,8 +81,6 @@ const Error = error{ OutOfMemory, ParseError };
 /// SIGBUS hazard; no valid source nests expressions anywhere near this.
 const MAX_EXPR_DEPTH: u16 = 256;
 
-// ---- recovery policy (DATA) ------------------------------------------------
-//
 // Recovery lives as comptime `EnumSet(token.Tag)` FIRST sets and FOLLOW-union-
 // ancestor-anchor recovery sets, matklad-style, rather than scattered `!= .x`
 // conditionals. Every nested recovery set unions `decl_anchors` so a runaway
@@ -139,8 +137,6 @@ comptime {
     }
 }
 
-// ---- resync scanners -------------------------------------------------------
-//
 // Brace/paren-DEPTH-aware. Because blocks/if/match/struct-literals are
 // EXPRESSIONS, `r_brace` is structurally overloaded: a depth-naive scan would
 // resync to a nested block-expression's `}` instead of the enclosing block's.
@@ -328,8 +324,6 @@ fn deinit(p: *Parser) void {
     p.extra.deinit(p.gpa);
     p.pub_decls.deinit(p.gpa);
 }
-
-// ---- program / declarations ------------------------------------------------
 
 /// Parse the whole program. The decl loop is resilient: each broken top-level
 /// declaration records its diagnostics, resyncs to the next decl keyword, and the
@@ -788,7 +782,7 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
                 if (p.eat(.colon)) {
                     // `field: alias` (rename to a bare ident) vs `field: subpat`
                     // (a literal/`.`/`_`/nested pattern matched against the field).
-                    // A bare identifier NOT opening a payload is the M10 rename alias.
+                    // A bare identifier NOT opening a payload is the rename alias.
                     const after = p.peek();
                     const is_alias = after.tag == .identifier and
                         !std.mem.eql(u8, after.text(p.src), "_") and
@@ -867,7 +861,7 @@ fn parseFieldAccess(p: *Parser, recv: Ast.Index) Error!Ast.Index {
 }
 
 /// A type reference is written as an identifier (e.g. `int`, `bool`, `str`), the
-/// unit type `()`, or a module-qualified type `mod.Type` (M14). A qualified type
+/// unit type `()`, or a module-qualified type `mod.Type`. A qualified type
 /// reuses the `field_access` node: receiver = the module-name `identifier` leaf,
 /// `main_token` = the type-name ident after `.`. The resolver disambiguates this
 /// from value field access by its type position. `/` never appears in a type —
@@ -965,8 +959,6 @@ fn expectTerminator(p: *Parser) Error!void {
         else => return p.fail(p.peek(), .P0004, "expected a newline or '}' after statement"),
     }
 }
-
-// ---- statements ------------------------------------------------------------
 
 fn parseStmt(p: *Parser) Error!Ast.Index {
     const tok = p.peek();
@@ -1153,8 +1145,6 @@ fn parseExprStmt(p: *Parser) Error!Ast.Index {
     return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
 }
 
-// ---- expressions (Pratt) ---------------------------------------------------
-
 /// Precedence-climbing core. `min_bp` is the minimum binding power that an infix
 /// operator must exceed to bind here; recursing with the operator's own bp makes
 /// operators left-associative. The call postfix is applied to every operand
@@ -1264,7 +1254,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
         // collapsing the cascade to one diagnostic. Forward progress is still
         // guaranteed — `continueInfix` already consumed the operator before
         // recursing, and at statement start `findNextStmt` advances past a
-        // still-unconsumed closer. For any OTHER invalid start, keep the B2
+        // still-unconsumed closer. For any OTHER invalid start, keep the
         // single-token DELETION repair (consume one token to make progress).
         else => {
             if (p.at(.r_paren) or p.at(.r_brace)) {
@@ -1486,8 +1476,6 @@ comptime {
 /// Prefix operators bind tighter than any infix operator.
 const prefix_bp: u8 = 7;
 
-// ---- node / extra builders -------------------------------------------------
-
 fn leaf(p: *Parser, tag: Node.Tag, tok_index: u32) Error!Ast.Index {
     p.advance();
     return p.addNode(.{ .tag = tag, .main_token = tok_index, .lhs = Ast.none, .rhs = Ast.none });
@@ -1542,8 +1530,6 @@ fn addExtra(p: *Parser, vals: []const u32) error{OutOfMemory}!Ast.Index {
     return Ast.Index.from(start);
 }
 
-// ---- cursor ----------------------------------------------------------------
-
 fn peek(p: *const Parser) Token {
     return p.tokens[p.index];
 }
@@ -1586,7 +1572,7 @@ fn skipNewlines(p: *Parser) void {
     while (p.at(.newline)) p.advance();
 }
 
-/// Expect `tag`. On a match, consume it. On a MISMATCH (B2 single-token
+/// Expect `tag`. On a match, consume it. On a MISMATCH (single-token
 /// INSERTION repair): REPORT the diagnostic but do NOT consume — the caller
 /// substitutes `Ast.none` for the missing child and keeps going. The propagated
 /// `error.ParseError` unwinds the current producer to `parseProgram`, which
@@ -1633,7 +1619,7 @@ fn fail(p: *Parser, tok: Token, code: Code, message: []const u8) Error {
     return error.ParseError;
 }
 
-/// Single-token DELETION repair (B2): report `message`, consume EXACTLY ONE token
+/// Single-token DELETION repair: report `message`, consume EXACTLY ONE token
 /// (guaranteed forward progress, clamped at `.eof`), and return an `error_node`
 /// leaf wrapping the offending token. Fills an operand/child slot in place so the
 /// producer can keep building instead of unwinding.
@@ -1645,8 +1631,6 @@ fn advanceWithError(p: *Parser, code: Code, message: []const u8) Error!Ast.Index
     return p.addNode(.{ .tag = .error_node, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
 }
 
-// ---- post-parse invariants (Debug/ReleaseSafe only) ------------------------
-//
 // A single sweep, run at the end of `parse()` under `std.debug.runtime_safety`,
 // that pins three structural properties of every parse — valid OR recovered — so
 // the whole test corpus doubles as an invariant check at zero release cost:
@@ -1660,7 +1644,7 @@ fn advanceWithError(p: *Parser, code: Code, message: []const u8) Error!Ast.Index
 //       out-of-range byte.
 //
 //   (b) FORWARD PROGRESS — the recovery loops cannot spin. This is already pinned
-//       by the B3 fuel/advance guards in every resync scanner (`findNextDecl`,
+//       by the fuel/advance guards in every resync scanner (`findNextDecl`,
 //       `findNextStmt`, `resyncTo`) and every bounded list loop's
 //       `p.index > entry or at-closer` assert; a passing parse (no hang) IS that
 //       invariant holding. Nothing to re-check here — noted for completeness.
@@ -1727,12 +1711,10 @@ fn hasErrorNode(tree: Ast.Tree) bool {
     return false;
 }
 
-// ---- tests -----------------------------------------------------------------
-
 const testing = std.testing;
 const Lexer = @import("lex.zig");
 
-/// Test-only: parse a single bare expression (the pre-M0 grammar) into a Tree,
+/// Test-only: parse a single bare expression into a Tree,
 /// so the expression-core tests below keep asserting on raw expressions without
 /// the program/fn scaffolding. Unlike `parse()`, this helper still returns `null`
 /// on a parse error (the expression-core tests want the terse "did it parse?"
@@ -1814,8 +1796,6 @@ fn expectProgram(source: []const u8, want: []const u8) !void {
     try testing.expectEqualStrings(want, w.buffered());
 }
 
-// expression core (unchanged grammar, via parseExprOnly)
-
 test "precedence: * binds tighter than +" {
     try expectSexpr("1 + 2 * 3", "(+ 1 (* 2 3))");
 }
@@ -1841,7 +1821,7 @@ test "trailing newline terminator is allowed" {
 }
 
 test "parse error reports an offset and leaves a diagnostic" {
-    // B2: the missing operand after `+` no longer bails — `parsePrefix`'s else-arm
+    // The missing operand after `+` no longer bails — `parsePrefix`'s else-arm
     // repairs it with a single-token DELETION (an `error_node` over the offending
     // token, here EOF), so `parseExprOnly` returns a (tainted) tree and surfaces
     // the diagnostic through `diag`.
@@ -1859,8 +1839,6 @@ test "parse error reports an offset and leaves a diagnostic" {
     try testing.expectEqual(tokens[tokens.len - 1].start, diag.?.byte_offset);
 }
 
-// ---- B2: fault-tolerant contract (always-a-tree + single-token repairs) -----
-
 /// Run the full `parse()` and return the `Result` (tree + owned diags). The caller
 /// frees both. A test-only convenience for the fault-tolerance tests.
 fn parseResult(gpa: std.mem.Allocator, source: []const u8) !Result {
@@ -1869,7 +1847,7 @@ fn parseResult(gpa: std.mem.Allocator, source: []const u8) !Result {
     return parse(gpa, tokens, source);
 }
 
-test "B2: a syntax error still returns a tree covering all tokens to EOF" {
+test "a syntax error still returns a tree covering all tokens to EOF" {
     // A bad expression start (`*` after `return`) triggers the single-token
     // DELETION repair, but parsing continues to the end of the file: the program
     // node still covers the whole fn, and the tree is non-empty + rooted at program.
@@ -1888,7 +1866,7 @@ test "B2: a syntax error still returns a tree covering all tokens to EOF" {
     try testing.expectEqual(@as(usize, 1), Ast.rangeSlice(res.tree, prog.lhs.int()).len);
 }
 
-test "B2: the offending region is an error_node" {
+test "the offending region is an error_node" {
     // The invalid `*` operand is repaired into an `error_node` leaf: the poison
     // node exists in the tree and renders as `(error)`.
     const gpa = testing.allocator;
@@ -1911,7 +1889,7 @@ test "B2: the offending region is an error_node" {
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "(error)") != null);
 }
 
-test "B2: a syntax error is reported (>=1 diagnostic) and the parse is tainted" {
+test "a syntax error is reported (>=1 diagnostic) and the parse is tainted" {
     const gpa = testing.allocator;
     const source = "fn f() -> int {\n return *\n}\n";
     const res = try parseResult(gpa, source);
@@ -1925,7 +1903,7 @@ test "B2: a syntax error is reported (>=1 diagnostic) and the parse is tainted" 
     try testing.expectEqual(@as(u32, @intCast(star_off)), res.diags[0].byte_offset);
 }
 
-test "B2/B3: single-token INSERTION — a missing expected token reports and recovers" {
+test "single-token INSERTION — a missing expected token reports and recovers" {
     // A missing `)` in the param list: the 3-way param loop sees `->` (a
     // param_recovery anchor) and breaks; the trailing `expect(.r_paren)` reports
     // the missing `)` and unwinds the decl, which the resilient decl loop recovers
@@ -1942,9 +1920,9 @@ test "B2/B3: single-token INSERTION — a missing expected token reports and rec
     try testing.expect(res.diags.len >= 1);
 }
 
-test "B2: a clean program is untainted (no diagnostics, byte-identical tree)" {
+test "a clean program is untainted (no diagnostics, byte-identical tree)" {
     // The always-a-tree change must not perturb a VALID parse: zero diagnostics and
-    // the same rendered tree as before B2.
+    // the same rendered tree as before.
     const gpa = testing.allocator;
     const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
     const res = try parseResult(gpa, source);
@@ -1962,8 +1940,6 @@ test "B2: a clean program is untainted (no diagnostics, byte-identical tree)" {
         w.buffered(),
     );
 }
-
-// program grammar
 
 test "fn with params, return type, binary body" {
     try expectProgram(
@@ -2230,7 +2206,7 @@ test "bare break and labeled break/continue render" {
 }
 
 test "label without a following construct is a parse error" {
-    // B2 contract: parse ALWAYS returns a tree; the error travels in `diags`.
+    // Contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
     const source = "fn f() {\n @x 1\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2241,8 +2217,6 @@ test "label without a following construct is a parse error" {
     try testing.expect(result.diags.len >= 1);
     try testing.expectEqualStrings("a label must prefix a loop, while, for, or block", result.diags[0].message);
 }
-
-// structs
 
 test "struct declaration parses to a struct_decl" {
     try expectProgram(
@@ -2314,8 +2288,6 @@ test "struct literal as a call argument (call reopens block context)" {
     );
 }
 
-// enums + match (M10)
-
 test "enum declaration with all three variant forms parses" {
     try expectProgram(
         "enum Shape { Empty, Circle(int), Rect { w: int, h: int } }\n",
@@ -2386,8 +2358,6 @@ test "struct program pack/unpack byte round-trip" {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
     try testing.expectEqualSlices(u32, tree.extra, got.extra);
 }
-
-// M14: imports, pub, qualified access/types
 
 test "import binds the last path segment" {
     try expectProgram(
@@ -2476,7 +2446,7 @@ test "module-qualified variant construction parses (3-level field_access)" {
 }
 
 test "pub modifier requires a declaration" {
-    // B2 contract: parse ALWAYS returns a tree; the error travels in `diags`.
+    // Contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
     const source = "pub import a/b\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2489,7 +2459,7 @@ test "pub modifier requires a declaration" {
 }
 
 test "import path missing a segment after slash is an error" {
-    // B2 contract: parse ALWAYS returns a tree; the error travels in `diags`.
+    // Contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
     const source = "import a/\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2543,8 +2513,6 @@ test "program pack/unpack byte round-trip" {
     try testing.expectEqualSlices(u32, tree.extra, got.extra);
 }
 
-// ---- B3: resilient recovery (many errors/file, cross-construct resync) -------
-
 /// Render a (possibly tainted) parse result's tree into `buf`, returning the
 /// rendered slice — a test-only convenience for the recovery tests that inspect
 /// the shape of a recovered tree.
@@ -2557,7 +2525,7 @@ fn renderResult(res: Result, source: []const u8, buf: []u8) ![]const u8 {
     return w.buffered();
 }
 
-test "B3: two independent errors in one file both report and both decls survive" {
+test "two independent errors in one file both report and both decls survive" {
     // `return )` in a, `return )` in b — two INDEPENDENT broken statements, one per
     // decl. Each stray `)` in return-value position is the cascade signature (a
     // structural closer in a statement value slot): before the cascade fix each site
@@ -2588,7 +2556,7 @@ test "B3: two independent errors in one file both report and both decls survive"
     try testing.expectEqual(@as(usize, 1), after);
 }
 
-test "B3: a stray ')' in return-value position yields exactly one diagnostic (no cascade)" {
+test "a stray ')' in return-value position yields exactly one diagnostic (no cascade)" {
     // The confirmed cascade defect: `return )` — a structural closer where an
     // expression is expected. parsePrefix reports "expected an expression" and
     // returns an error_node WITHOUT consuming the `)`; before the cascade latch the
@@ -2608,7 +2576,7 @@ test "B3: a stray ')' in return-value position yields exactly one diagnostic (no
     try testing.expectEqual(paren_off, res.diags[0].byte_offset);
 }
 
-test "B3: a stray ')' after '=' assignment value yields exactly one diagnostic (no cascade)" {
+test "a stray ')' after '=' assignment value yields exactly one diagnostic (no cascade)" {
     // The same cascade signature across a different statement form: `x = )`. Proves
     // the fix is systematic (not special-cased to `return`), collapsing the
     // parsePrefix + expectTerminator pair over the unconsumed `)` to ONE diagnostic.
@@ -2622,7 +2590,7 @@ test "B3: a stray ')' after '=' assignment value yields exactly one diagnostic (
     try testing.expectEqualStrings("expected an expression", res.diags[0].message);
 }
 
-test "B3: two adjacent broken statements (no good stmt between) each report — no over-suppression" {
+test "two adjacent broken statements (no good stmt between) each report — no over-suppression" {
     // Over-suppression regression guard. `return )` on line 2 and `x = )` on line 3
     // are two INDEPENDENT sites on distinct lines with NO valid statement between
     // them. The first site's stray `)` is left unconsumed, so recovery goes through
@@ -2647,7 +2615,7 @@ test "B3: two adjacent broken statements (no good stmt between) each report — 
     try testing.expectEqual(second_paren, res.diags[1].byte_offset);
 }
 
-test "B3: a valid statement between two broken sites still yields exactly two diagnostics" {
+test "a valid statement between two broken sites still yields exactly two diagnostics" {
     // The complementary guard: a well-formed statement (`y := 1`) between the two
     // broken sites must NOT itself add a diagnostic, and both broken sites must
     // still report — exactly two total. Proves the latch clears cleanly across a
@@ -2662,7 +2630,7 @@ test "B3: a valid statement between two broken sites still yields exactly two di
     for (res.diags) |d| try testing.expectEqualStrings("expected an expression", d.message);
 }
 
-test "B3: adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
+test "adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
     // The anti-hang backstop: this must RETURN (a hanging test is the failure),
     // yield a non-empty program tree, and report at least one diagnostic.
     const gpa = testing.allocator;
@@ -2676,7 +2644,7 @@ test "B3: adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
     try testing.expect(res.diags.len >= 1);
 }
 
-test "B3: adversarial garbage recovers to a following well-formed decl" {
+test "adversarial garbage recovers to a following well-formed decl" {
     // After the adversarial decl the parser must resync to a real following decl.
     const gpa = testing.allocator;
     const source = "fn f( ) ) ) {\nfn g() -> int { 0 }\n";
@@ -2690,7 +2658,7 @@ test "B3: adversarial garbage recovers to a following well-formed decl" {
     try testing.expect(res.diags.len >= 1);
 }
 
-test "B3: a broken statement recovers to the next statement" {
+test "a broken statement recovers to the next statement" {
     // `return )` is a broken statement (stray `)`); `y := 2` and the final
     // `return` must still parse — a broken statement does not poison its siblings.
     const gpa = testing.allocator;
@@ -2708,7 +2676,7 @@ test "B3: a broken statement recovers to the next statement" {
     try testing.expect(std.mem.indexOf(u8, rendered, "(return))") != null);
 }
 
-test "B3: a broken decl recovers to the next decl" {
+test "a broken decl recovers to the next decl" {
     // `fn a( { }` is a malformed decl; `fn b` must still parse.
     const gpa = testing.allocator;
     const source = "fn a( { }\nfn b() -> int { 0 }\n";
@@ -2722,7 +2690,7 @@ test "B3: a broken decl recovers to the next decl" {
     try testing.expect(std.mem.indexOf(u8, rendered, "(fn b") != null);
 }
 
-test "B3: one root error yields exactly one diagnostic (no cascade)" {
+test "one root error yields exactly one diagnostic (no cascade)" {
     // A single bad operand (`*` after `return`) must produce exactly ONE
     // diagnostic — the ASI/newline anti-cascade guards against duplicates.
     const gpa = testing.allocator;
@@ -2737,7 +2705,7 @@ test "B3: one root error yields exactly one diagnostic (no cascade)" {
     try testing.expectEqual(star_off, res.diags[0].byte_offset);
 }
 
-test "B3: a missing call operand before ')' yields exactly one diagnostic (no closer-delete cascade)" {
+test "a missing call operand before ')' yields exactly one diagnostic (no closer-delete cascade)" {
     // `g(1 + )` — the RHS of `+` is missing and the next token is the call's own
     // `)`. parsePrefix must NOT delete that `)` (doing so would break the call's
     // closing `expect`, then the block's, spraying a diagnostic per open ancestor).
@@ -2754,7 +2722,7 @@ test "B3: a missing call operand before ')' yields exactly one diagnostic (no cl
     try testing.expectEqualStrings("expected an expression", res.diags[0].message);
 }
 
-test "B3: a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete cascade)" {
+test "a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete cascade)" {
     // `x := \n}` — the trailing `:=` suppresses the newline, so the initializer's
     // parsePrefix lands on the block's `}`. Deleting it would swallow the block
     // closer and add a spurious "expected '}'"; instead the error_node is returned
@@ -2770,7 +2738,7 @@ test "B3: a trailing ':=' before '}' yields exactly one diagnostic (no closer-de
     try testing.expectEqualStrings("expected an expression", res.diags[0].message);
 }
 
-test "B3: a broken call argument list reports and resyncs without hanging" {
+test "a broken call argument list reports and resyncs without hanging" {
     // `g(1, , 3)` — the doubled comma is a tuple_recovery anchor, so the arg loop
     // breaks and the trailing `expect(.r_paren)` fails at the stray comma; the
     // block-statement loop then resyncs to the next statement (`3`). The call is
@@ -2794,7 +2762,7 @@ test "B3: a broken call argument list reports and resyncs without hanging" {
     try testing.expect(std.mem.indexOf(u8, rendered, "(fn f () int (block 3))") != null);
 }
 
-test "B3: deep expression nesting is capped instead of overflowing the stack" {
+test "deep expression nesting is capped instead of overflowing the stack" {
     // ~300 nested parens (> MAX_EXPR_DEPTH). parse() must RETURN (no SIGBUS) with a
     // "nested too deeply" diagnostic and a present tree.
     const gpa = testing.allocator;
@@ -2819,7 +2787,7 @@ test "B3: deep expression nesting is capped instead of overflowing the stack" {
     try testing.expect(found);
 }
 
-test "B3: deep statement nesting is capped instead of overflowing the stack" {
+test "deep statement nesting is capped instead of overflowing the stack" {
     // Statement-keyword recursion (`while`/`if`) nests through parseBlock, NOT
     // parseExpr, so the parseExpr guard cannot see it. ~2000 unclosed `while true{`
     // is well above MAX_EXPR_DEPTH: parse() must RETURN (no SIGBUS) with a "nested
@@ -2846,7 +2814,7 @@ test "B3: deep statement nesting is capped instead of overflowing the stack" {
     }
 }
 
-test "B3: match arm starting on a separator makes forward progress (no hang)" {
+test "match arm starting on a separator makes forward progress (no hang)" {
     // A leading `,`/newline arm was the one recovery loop that could stall:
     // resyncTo stops on the separator without consuming, so the loop must skip it.
     // Each of these must RETURN with >=1 diagnostic and a present tree.
@@ -2864,7 +2832,7 @@ test "B3: match arm starting on a separator makes forward progress (no hang)" {
     }
 }
 
-test "B3: deep infix chain is bounded (RHS recursion depth)" {
+test "deep infix chain is bounded (RHS recursion depth)" {
     // A long `1 + 1 + ... + 1` exercises infix-RHS recursion through parseExpr.
     // Left-associative infix does not deepen parseExpr recursion, so a 200-term
     // chain stays well under the cap and parses cleanly.
@@ -2883,7 +2851,7 @@ test "B3: deep infix chain is bounded (RHS recursion depth)" {
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 }
 
-test "B3: a recovered error_node-bearing tree round-trips byte-identically" {
+test "a recovered error_node-bearing tree round-trips byte-identically" {
     // Cache soundness under recovery: an error_node's contentFp uses only
     // tag+main_token+lhs+rhs, so a recovered tree packs/unpacks byte-identically.
     const gpa = testing.allocator;
@@ -2910,7 +2878,7 @@ test "B3: a recovered error_node-bearing tree round-trips byte-identically" {
 
 const codes = @import("diagnostics/codes.zig");
 
-test "C: parse diagnostics carry P-codes by syntactic category" {
+test "parse diagnostics carry P-codes by syntactic category" {
     const gpa = testing.allocator;
 
     // Expression position: `return )` => expected-expression => P0002.
@@ -2948,9 +2916,9 @@ test "C: parse diagnostics carry P-codes by syntactic category" {
     }
 }
 
-test "C: a nesting-depth backstop carries the P0005 code" {
+test "a nesting-depth backstop carries the P0005 code" {
     const gpa = testing.allocator;
-    // Mirror the B3 block-depth fixture (~2000 unclosed `while true{`), which is
+    // Mirror the block-depth fixture (~2000 unclosed `while true{`), which is
     // known to terminate with a "block nested too deeply" backstop; assert the code.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
@@ -2969,7 +2937,7 @@ test "C: a nesting-depth backstop carries the P0005 code" {
     try testing.expect(saw_p0005);
 }
 
-test "C: a valid program stamps no code (byte-identical contract)" {
+test "a valid program stamps no code (byte-identical contract)" {
     const gpa = testing.allocator;
     const res = try parseResult(gpa, "fn main() -> int {\n  return 0\n}\n");
     defer gpa.free(@constCast(res.diags));
@@ -2978,7 +2946,7 @@ test "C: a valid program stamps no code (byte-identical contract)" {
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 }
 
-test "C: report-once keeps exactly one diagnostic with exactly one code" {
+test "report-once keeps exactly one diagnostic with exactly one code" {
     const gpa = testing.allocator;
     // A cascade fixture: one broken statement must collapse to a single coded diag.
     const res = try parseResult(gpa, "fn a() -> int {\n  return )\n}\n");
@@ -2988,9 +2956,7 @@ test "C: report-once keeps exactly one diagnostic with exactly one code" {
     try testing.expect(res.diags[0].code != .none);
 }
 
-// ---- post-parse invariant unit tests ---------------------------------------
-
-test "D4a: span totality holds over the full token list of a clean parse" {
+test "span totality holds over the full token list of a clean parse" {
     const gpa = testing.allocator;
     const source = "fn main() -> int {\n  return 0\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -3004,7 +2970,7 @@ test "D4a: span totality holds over the full token list of a clean parse" {
     try testing.expectEqual(@as(usize, 0), res.diags.len);
 }
 
-test "D4a: a clean parse has balanced brackets and no error node" {
+test "a clean parse has balanced brackets and no error node" {
     const gpa = testing.allocator;
     const source = "fn f(a: int) -> int {\n  return (a + 1)\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -3018,7 +2984,7 @@ test "D4a: a clean parse has balanced brackets and no error node" {
     checkBracketPairing(res.tree, tokens, res.diags);
 }
 
-test "D4a: the adversarial `fn f( ) ) ) {` recovers with imbalance TOLERATED" {
+test "the adversarial `fn f( ) ) ) {` recovers with imbalance TOLERATED" {
     // The load-bearing case: the token stream is bracket-IMBALANCED (three `)` vs
     // one `(`, one unclosed `{`), yet the parse must not false-trip the pairing
     // invariant because it recovered (>=1 diagnostic / error_node). `parse()` runs

@@ -1,6 +1,6 @@
 //! The `toy check` emitter: run the front-end (lex -> parse -> resolve -> typecheck,
 //! never codegen) over the input files, collect EVERY diagnostic (unlike a `-o` build,
-//! which early-bails on the first tainted stage), apply the late C3 severity config,
+//! which early-bails on the first tainted stage), apply the late severity config,
 //! and render either the human pretty form (reusing the shared Renderer) or a stable
 //! line-delimited NDJSON stream.
 //!
@@ -81,57 +81,11 @@ fn levelWord(s: model.Severity) []const u8 {
     };
 }
 
-/// Write `s` as a JSON string BODY (no surrounding quotes) with RFC-8259 escaping:
-/// `"` and `\` are backslash-escaped, control bytes below 0x20 use the short escapes
-/// where defined (`\n`,`\t`,`\r`,`\b`,`\f`) else `\u00XX`. Deterministic byte-for-byte
-/// so golden NDJSON diffs are stable.
+/// Write `s` as a JSON string BODY (no surrounding quotes), reusing std's escaper.
+/// Default options leave bytes >= 0x20 (incl. UTF-8) raw and escape `"`/`\`/control
+/// bytes deterministically, so golden NDJSON diffs stay byte-stable.
 fn writeJsonStr(out: *Io.Writer, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try out.writeAll("\\\""),
-            '\\' => try out.writeAll("\\\\"),
-            '\n' => try out.writeAll("\\n"),
-            '\t' => try out.writeAll("\\t"),
-            '\r' => try out.writeAll("\\r"),
-            0x08 => try out.writeAll("\\b"),
-            0x0c => try out.writeAll("\\f"),
-            else => if (c < 0x20) {
-                try out.print("\\u{x:0>4}", .{c});
-            } else {
-                try out.writeByte(c);
-            },
-        }
-    }
-}
-
-/// Build the rich render `Diagnostic` for `d` at effective severity `eff`, mirroring
-/// `DiagRender.renderSinkDiag`: a zero-width primary at `d.byte_offset`, the code string
-/// (null => no bracket), and — when `d.related` is set — a secondary "previously defined
-/// here" label at the related offset (same scope). `sec_buf` is a caller-owned 1-slot
-/// backing array the returned diagnostic's `secondary` slice borrows from.
-fn richDiag(d: Diagnostic, eff: model.Severity, sec_buf: *[1]Rr.Diagnostic.Label) Rr.Diagnostic.Diagnostic {
-    const secondary: []const Rr.Diagnostic.Label = if (d.related != @import("../diagnostics/Diagnostic.zig").NO_RELATED) blk: {
-        sec_buf[0] = .{
-            .kind = .secondary,
-            .span = .{ .start = d.related, .end = d.related },
-            .message = "previously defined here",
-            .source = d.scope,
-        };
-        break :blk sec_buf[0..1];
-    } else &.{};
-    return .{
-        .severity = eff,
-        .message = d.message,
-        .primary = .{
-            .kind = .primary,
-            .span = .{ .start = d.byte_offset, .end = d.byte_offset },
-            .message = d.message,
-            .source = d.scope,
-        },
-        .secondary = secondary,
-        .code = codes.str(d.code),
-        .scope = d.scope,
-    };
+    try std.json.Stringify.encodeJsonStringChars(s, .{}, out);
 }
 
 /// Serialize ONE diagnostic as a single NDJSON line (trailing '\n') against a prepared
@@ -162,7 +116,7 @@ fn writeNdjsonLine(out: *Io.Writer, gpa: std.mem.Allocator, sm: *const Rr.Source
     // captured into a temp buffer then JSON-escaped so embedded newlines/carets survive
     // as a single valid JSON string.
     var sec_buf: [1]Rr.Diagnostic.Label = undefined;
-    const rich = richDiag(d, eff, &sec_buf);
+    const rich = model.richFromPod(d, eff, codes.str(d.code), &sec_buf);
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try Rr.Renderer.render(rich, sm, &aw.writer, .{ .color = Style.ColorLevel.none, .unicode = false });
@@ -262,8 +216,6 @@ pub fn tallyAll(results: []const Driver.FileResult, cfg: SevCfg.SeverityConfig) 
     return counts;
 }
 
-// --- graph (multi-module) forms -------------------------------------------
-//
 // The CLI `toy check` routes through the SAME graph front-end `build` uses
 // (`Graph.discover` -> `resolveGraph` -> `checkGraph`), so imports are followed
 // and a valid multi-module program reports ZERO diagnostics. The graph carries a
@@ -305,18 +257,13 @@ pub fn tallyGraph(diags: []const Diagnostic, cfg: SevCfg.SeverityConfig) Counts 
 /// The `file` field is the owning module's path. Returns the visible tally.
 pub fn emitNdjsonGraph(out: *Io.Writer, gpa: std.mem.Allocator, g: *const Graph.Graph, diags: []const Diagnostic, cfg: SevCfg.SeverityConfig) !Counts {
     var counts: Counts = .{};
-    var cached_scope: ?u32 = null;
-    var sm: Rr.SourceMap = undefined;
-    defer if (cached_scope != null) sm.deinit(gpa);
+    var cache: Rr.SourceMap.ScopeCache = .{};
+    defer cache.deinit(gpa);
     for (diags) |d| {
         const eff = SevCfg.resolve(d.code, d.severity, cfg) orelse continue; // --ignore
-        if (cached_scope == null or cached_scope.? != d.scope) {
-            if (cached_scope != null) sm.deinit(gpa);
-            cached_scope = null; // clear before init so a failing init can't double-free
-            sm = try Rr.SourceMap.init(gpa, moduleFileFor(g, d.scope), moduleSrcFor(g, d.scope));
-            cached_scope = d.scope;
-        }
-        try writeNdjsonLine(out, gpa, &sm, moduleFileFor(g, d.scope), d, eff);
+        const file = moduleFileFor(g, d.scope);
+        const sm = try cache.get(gpa, d.scope, file, moduleSrcFor(g, d.scope));
+        try writeNdjsonLine(out, gpa, sm, file, d, eff);
         switch (eff) {
             .err => counts.errors += 1,
             .warning => counts.warnings += 1,
@@ -325,8 +272,6 @@ pub fn emitNdjsonGraph(out: *Io.Writer, gpa: std.mem.Allocator, g: *const Graph.
     }
     return counts;
 }
-
-// --- tests -----------------------------------------------------------------
 
 const testing = std.testing;
 

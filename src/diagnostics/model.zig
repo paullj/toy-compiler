@@ -79,6 +79,37 @@ pub const Diagnostic = struct {
     scope: u32 = NO_SOURCE,
 };
 
+/// Build the rich render `Diagnostic` for a sink POD `d` at already-resolved effective
+/// severity `eff` and resolved `code` string (null => no `[code]` bracket). The primary
+/// is a zero-width point at `d.byte_offset`; a set `d.related` becomes a secondary
+/// "previously defined here" label at the related offset in the same scope. `sec_buf`
+/// backs that borrowed label, so it must outlive the render. Takes `code` as a param
+/// rather than calling `codes.zig` to keep this leaf's one-way import order.
+pub fn richFromPod(d: sink.Diagnostic, eff: Severity, code: ?[]const u8, sec_buf: *[1]Label) Diagnostic {
+    const secondary: []const Label = if (d.related != sink.NO_RELATED) blk: {
+        sec_buf[0] = .{
+            .kind = .secondary,
+            .span = .{ .start = d.related, .end = d.related },
+            .message = "previously defined here",
+            .source = d.scope,
+        };
+        break :blk sec_buf[0..1];
+    } else &.{};
+    return .{
+        .severity = eff,
+        .message = d.message,
+        .primary = .{
+            .kind = .primary,
+            .span = .{ .start = d.byte_offset, .end = d.byte_offset },
+            .message = d.message,
+            .source = d.scope,
+        },
+        .secondary = secondary,
+        .code = code,
+        .scope = d.scope,
+    };
+}
+
 // Pin the two "untagged" sentinels together. A single-file `NO_SCOPE` means
 // `NO_SOURCE` with no translation table. Drift fails the build.
 comptime {

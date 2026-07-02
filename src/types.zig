@@ -140,8 +140,6 @@ pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const codes = @import("diagnostics/codes.zig");
 
-// ---- M14 graph typecheck (program-wide layout + cross-module check) --------
-
 /// One module's parsed + resolved inputs for the graph typecheck.
 pub const GraphModuleInput = struct {
     tree: Ast.Tree,
@@ -277,7 +275,7 @@ structs: std.ArrayList(StructSym),
 /// the graph ctx (`activeEnumMap`).
 enums: std.ArrayList(EnumSym),
 
-/// M14 graph context. Always set in practice: `checkGraph` is the ONE entry and
+/// Graph context. Always set in practice: `checkGraph` is the ONE entry and
 /// it drives one shared `Typecheck` across the whole module graph (a lone source
 /// file is the trivial one-module graph). The `structs`/`enums`/`fns` tables are
 /// PROGRAM-WIDE (global ids); each module's bare-name → global-id bindings live
@@ -297,7 +295,7 @@ graph_mod: u32 = 0,
 /// IS `fns[i].name`). Null single-file (the decl-token name is used instead).
 gph_fn_names: ?[]const []const u8 = null,
 
-/// S4 — the runtime the per-fn body region (Pass C) dispatches onto. Set in graph
+/// The runtime the per-fn body region (Pass C) dispatches onto. Set in graph
 /// mode (carries the `-j N` worker cap from the driver's own pool). The body region
 /// fans out per-fn body checks via `Engine.fanOut(io, ...)` whenever a pool is present
 /// (`io != null`). `.limited(0)` (`-j1`) drives every unit onto the inline serial path
@@ -307,7 +305,7 @@ gph_fn_names: ?[]const []const u8 = null,
 io: ?Io = null,
 
 /// The `-j` jobs knob: the chunk-count basis for the per-fn Pass-C body fan-out
-/// (`checkBodies`), 0 => host cpu count. PERF P1 — body checks dispatch ~`ncpu`
+/// (`checkBodies`), 0 => host cpu count. Body checks dispatch ~`ncpu`
 /// contiguous chunks (each looping its fns serially) instead of one task per fn, so
 /// `-jN` scales instead of drowning in per-task overhead. Only meaningful when
 /// `io != null` (the parallel dispatch path); determinism is unchanged (fn-id-ordered
@@ -348,7 +346,7 @@ pub const GraphCtx = struct {
 /// The immutable, whole-program model frozen after Pass A: the fn signature
 /// table + the laid-out struct/enum tables + their bare-name maps + the graph
 /// context. Pass C reads it READ-ONLY through every `BodyChecker`, so per-fn body
-/// checking can run against one shared frozen snapshot (the enabler for S4's
+/// checking can run against one shared frozen snapshot (the enabler for the
 /// parallel fan-out). The slices alias the still-live `Typecheck` ArrayLists,
 /// which are not mutated during Pass C. `graph`/`gph_fn_names` are borrowed.
 pub const Model = struct {
@@ -494,7 +492,7 @@ fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
     };
 }
 
-/// Whole-graph typecheck (M14). Builds ONE program-wide layout table (global
+/// Whole-graph typecheck. Builds ONE program-wide layout table (global
 /// struct/enum ids assigned in module-id then decl order — same-named types in
 /// different modules are DISTINCT ids), resolves qualified `mod.Type` refs to the
 /// owning module's id, checks every fn body cross-module against the resolver's
@@ -587,7 +585,6 @@ pub fn checkGraph(
 
     try t.runGraph(mods, fns, entry_mod);
 
-    // ---- snapshot: sigs (qualified names from `fns`) ----
     const sigs = try gpa.alloc(Sig, t.fns.items.len);
     errdefer gpa.free(sigs);
     var sigs_built: usize = 0;
@@ -598,14 +595,13 @@ pub fn checkGraph(
         sigs_built += 1;
     }
 
-    // ---- snapshot: layouts + enum_layouts (program-wide) ----
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
     errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
-    // ---- snapshot: diagnostics (each already carries its owning module in
-    // `scope`, sorted by runGraph). Hand the owned slices to the result. ----
+    // Diagnostics already carry their owning module in `scope`, sorted by
+    // runGraph. Hand the owned slices to the result.
     const owned = try t.sink.toOwned();
 
     return GraphResult{
@@ -677,7 +673,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // f.ret is final (returnRule=unit-sugar => no fn's return depends on another
     // fn's body), and each BodyChecker writes ONLY its own fn's node_types span +
     // its own local diags. So the per-fn body checks are independent and order-free
-    // — the S4 fan-out unit. The merge (concat + stable sort) happens once, serial,
+    // — the fan-out unit. The merge (concat + stable sort) happens once, serial,
     // after the join, so PARALLEL == SERIAL.
     const model = t.buildModel();
     try t.checkBodies(&model);
@@ -700,7 +696,7 @@ const BodyResult = struct {
 /// tests) they run inline on this thread. Both feed the SAME slots and the SAME
 /// merge+sort, so the result is byte-identical regardless of dispatch.
 ///
-/// DETERMINISM ([C11]): units are independent (each writes only its own fn's
+/// DETERMINISM: units are independent (each writes only its own fn's
 /// node_types span + its own local sink); the merge is fn-id ordered and the stable
 /// sort breaks (scope, byte_offset) ties by insertion order, reproducing source
 /// order exactly — so -j1 and -jN diagnostics are identical.
@@ -777,8 +773,8 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
 
     // A `pub` struct FIELD or `pub` enum variant PAYLOAD that names a non-pub type
     // leaks it across the boundary exactly as a fn param/return would (an importer
-    // can read the field / destructure the variant but cannot name the type) — locked
-    // design item #4: "a pub signature naming a type forces that type pub" applies to
+    // can read the field / destructure the variant but cannot name the type): the
+    // locked rule "a pub signature naming a type forces that type pub" applies to
     // FIELD types too. Per-type checking makes this transitive: a pub type embedded in
     // another pub type is itself checked.
     for (t.structs.items) |s| {
@@ -1022,7 +1018,6 @@ test "clean program typechecks with zero diagnostics" {
     ));
 }
 
-// ---- B4 report-once poison discipline -------------------------------------
 // Each value-poison site (function-as-value, bare-struct-as-value, module-as-value)
 // routes its `Type.invalid` through `BodyChecker.poison()`, which asserts (Debug/
 // ReleaseSafe) that this fn's sink already reported. Running these under `test-bin`
@@ -1769,8 +1764,6 @@ test "node_types carry the struct type with the right id, and a 3-int layout is 
     try testing.expectEqual(@as(u32, 8), l.@"align");
 }
 
-// enums + match (M10)
-
 test "clean enum: all three variant forms, qualified + inferred, exhaustive match" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\enum Shape { Empty, Circle(int), Rect { w: int, h: int } }
@@ -1882,13 +1875,13 @@ test "inferred .V with no expected type is rejected" {
     ));
 }
 
-test "M11 int match with a wildcard compiles" {
+test "int match with a wildcard compiles" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         "fn f(x: int) -> int { match x { 0 -> 1, _ -> 0 } }\nfn main() -> int { return f(1) }\n",
     ));
 }
 
-test "M11 int match without a wildcard is non-exhaustive" {
+test "int match without a wildcard is non-exhaustive" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         "fn f(x: int) -> int { match x { 0 -> 1, 1 -> 2 } }\nfn main() -> int { return f(1) }\n",
     ));

@@ -1,4 +1,4 @@
-//! R2 BOUNDARY TESTS for the incremental query engine seam (integration).
+//! Boundary tests for the incremental query engine seam (integration).
 //!
 //! These exercise the engine END-TO-END: each spins up a threaded `Io` runtime + a
 //! temp-dir `Cache` stand-in and drives real lex/parse + a real on-disk cache. They
@@ -6,22 +6,22 @@
 //! published surface), so they live in the repo-root tests/ — not inline in
 //! Engine.zig — and run in their own `toy-integration-test` binary.
 //!
-//! M15 lifted the distributed query/cache/fingerprint/force-verify/parallel logic
-//! into `Engine` + `Key` + `Cache` + `Fingerprint`. These pin the five boundary
+//! The distributed query/cache/fingerprint/force-verify/parallel logic lives in
+//! `Engine` + `Key` + `Cache` + `Fingerprint`. These pin the five boundary
 //! behaviours that seam must preserve:
 //!
 //!   * MISS  — a cold key computes and stores.
 //!   * HIT   — a primed key serves the cached value without recomputing.
 //!   * FORCE — `.force` mode skips the cache READ but still stores (re-lower).
-//!   * VERIFY— `.verify` re-derivation is byte-identical (the [C11] determinism
+//!   * VERIFY— `.verify` re-derivation is byte-identical (the determinism
 //!             basis the codegen verify gate asserts against the stored blob).
 //!   * INVALIDATION — the uniform `Key.codegen` digest flips for exactly the edits
 //!             that must recompile (struct field edit on a touching fn; a callee
 //!             SIGNATURE change on the caller) and is STABLE for a callee BODY-only
-//!             change on the caller — the [C1]/[C2]/[C3] (a)/(b) split.
+//!             change on the caller — the (a)/(b) split.
 //!
 //! The whole-program force/verify and module-granular invalidation paths are
-//! additionally covered end-to-end by the Driver `[v]`/`[iv]` soundness tests and
+//! additionally covered end-to-end by the Driver soundness tests and
 //! the three corpora; these pin the engine UNIT contract those build on.
 
 const std = @import("std");
@@ -145,7 +145,7 @@ test "FORCE: .force-equivalent re-derivation ignores the primed cache (re-lower,
     try testing.expectEqualSlices(u8, "V2", after);
 }
 
-test "VERIFY: re-deriving identical inputs is byte-identical (the [C11] determinism basis)" {
+test "VERIFY: re-deriving identical inputs is byte-identical (the determinism basis)" {
     // The codegen VERIFY gate re-lowers a fn and asserts its packed bytes equal the
     // cached blob (hit) or a 2nd fresh lowering (cold). That gate only holds because
     // the underlying derivation is deterministic: identical frozen inputs -> an
@@ -178,8 +178,6 @@ test "VERIFY: re-deriving identical inputs is byte-identical (the [C11] determin
     defer gpa.free(got);
     try testing.expectEqualSlices(u8, "AARCH64BYTES", got);
 }
-
-// ---- INVALIDATION: the uniform codegen key flips for exactly the recompiling edits ----
 
 const Built = struct {
     tokens: []Token,
@@ -221,7 +219,7 @@ fn cgKey(b: *const Built, fn_idx: usize, sym_name: []const u8, callees: []const 
 test "INVALIDATION: a struct field edit flips the codegen key of a fn that TOUCHES it" {
     // Editing a struct's layout must recompile every fn whose touched set folds that
     // struct's layout bytes — its codegen key digest changes, so the on-disk slot
-    // changes (a stale hit would miscompile against the old layout). [C3]/[C9]
+    // changes (a stale hit would miscompile against the old layout).
     const gpa = testing.allocator;
     var b = try build(gpa, "fn area(p: int) -> int {\n return p\n}\n");
     defer b.deinit(gpa);
@@ -235,8 +233,8 @@ test "INVALIDATION: a struct field edit flips the codegen key of a fn that TOUCH
 
 test "INVALIDATION: a callee SIGNATURE change flips the caller's codegen key; a callee BODY change does NOT" {
     // The (a)/(b) split: a fn folds its callees' SIGNATURES, never their bodies. So
-    // editing a callee's body leaves the caller's key STABLE (a cache hit, [C1]),
-    // but changing a callee's signature flips it (the caller must re-lower, [C2]).
+    // editing a callee's body leaves the caller's key STABLE (a cache hit),
+    // but changing a callee's signature flips it (the caller must re-lower).
     const gpa = testing.allocator;
     var b = try build(gpa, "fn main() -> int {\n return g(1)\n}\n");
     defer b.deinit(gpa);
@@ -251,11 +249,11 @@ test "INVALIDATION: a callee SIGNATURE change flips the caller's codegen key; a 
     const k_body = cgKey(&b, 0, "main", &sig_body_only, &.{});
     const k_sig = cgKey(&b, 0, "main", &sig_changed, &.{});
 
-    try testing.expectEqual(k_base.digest(), k_body.digest()); // body-only edit: cache HIT [C1]
-    try testing.expect(k_base.digest() != k_sig.digest()); // sig change: recompile [C2]
+    try testing.expectEqual(k_base.digest(), k_body.digest()); // body-only edit: cache HIT
+    try testing.expect(k_base.digest() != k_sig.digest()); // sig change: recompile
 }
 
-test "INVALIDATION: a fn's OWN body edit flips its key, but leaves an untouched sibling's key stable [C3]" {
+test "INVALIDATION: a fn's OWN body edit flips its key, but leaves an untouched sibling's key stable" {
     // Position independence: editing one fn's body changes only THAT fn's key. A
     // sibling whose source is unchanged keeps an identical fingerprint (no indices
     // / offsets folded), so its codegen key — and thus its cache slot — is stable.
@@ -270,8 +268,6 @@ test "INVALIDATION: a fn's OWN body edit flips its key, but leaves an untouched 
     // main (fn 1) was edited -> its key flips (recompile).
     try testing.expect(cgKey(&v1, 1, "main", &.{}, &.{}).digest() != cgKey(&v2, 1, "main", &.{}, &.{}).digest());
 }
-
-// ---- lex/parse front-end queries through the engine ----
 
 test "lex query: miss computes then hit serves from cache" {
     const gpa = testing.allocator;
@@ -306,7 +302,7 @@ test "parse query: miss parses+stores; hit serves a validated cached tree" {
 
     const miss = try engine.parse(gpa, h.io, "native", src, tokens, 0, false);
     try testing.expect(!miss.cached);
-    // B2: the parser always returns a tree; a clean parse leaves `diags` empty.
+    // The parser always returns a tree; a clean parse leaves `diags` empty.
     try testing.expectEqual(@as(usize, 0), miss.diags.len);
     gpa.free(@constCast(miss.diags));
     freeTree(gpa, miss.tree);
@@ -318,11 +314,9 @@ test "parse query: miss parses+stores; hit serves a validated cached tree" {
     freeTree(gpa, hit.tree);
 }
 
-// ---- uniform key discrimination (no cross-shape collision) ----
-
 test "codegen key discrimination: opt level / own-symbol / fingerprint each key distinctly" {
     // The uniform `Key.codegen` must not alias across O-level, emitted symbol, or
-    // fingerprint — the [C10]/[Cx] invariants the consolidated key preserves.
+    // fingerprint — the invariants the consolidated key preserves.
     const base = Key.codegen("native", 0x1111, .{}, .{ .kind = .user_fn, .name = "add" });
 
     const diff_fp = Key.codegen("native", 0x2222, .{}, .{ .kind = .user_fn, .name = "add" });
@@ -332,7 +326,7 @@ test "codegen key discrimination: opt level / own-symbol / fingerprint each key 
     try testing.expect(base.digest() != diff_sym.digest());
 
     // A lex key and a codegen key with the SAME u64 input cannot alias — the phase
-    // byte is folded first ([uniform-key] no cross-shape collision).
+    // byte is folded first (no cross-shape collision).
     const lex_key = Key.lex("native", "add");
     try testing.expect(lex_key.digest() != Key.codegen("native", lex_key.input, .{}, .{ .kind = .user_fn, .name = "add" }).digest());
 }
@@ -344,7 +338,7 @@ test "phase discrimination: lex and parse of the same source land in distinct sl
     try testing.expect(Key.lex("native", src).digest() != Key.parse("native", src).digest());
 }
 
-test "target sensitivity: codegen keys differ across targets; lex keys do NOT [C10]" {
+test "target sensitivity: codegen keys differ across targets; lex keys do NOT" {
     // codegen blobs are target-specific machine code and must not alias across
     // targets; lex/parse are target-independent and intentionally share a slot.
     const cg_a = Key.codegen("aarch64-macos", 0x99, .{}, .{ .kind = .user_fn, .name = "f" });

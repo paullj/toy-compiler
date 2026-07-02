@@ -42,8 +42,7 @@ const testing = std.testing;
 test "the sink POD stays memcpy-trivial: no field beyond `message` is a slice/pointer (cache-stability gate)" {
     // This is the load-bearing cache-stability gate: the Engine caches a
     // `[]const Diagnostic` blob by memcpy, so no field may be a slice/pointer beyond
-    // the already-borrowed `message`. C1 grew the POD to FIVE fields (code+severity,
-    // both enums); C3 added a SIXTH, `related`, a plain `u32` — still trivially copyable.
+    // the already-borrowed `message`.
     try testing.expectEqual(@as(usize, 6), @typeInfo(Diagnostic).@"struct".fields.len);
     try testing.expect(@FieldType(Diagnostic, "byte_offset") == u32);
     try testing.expect(@FieldType(Diagnostic, "message") == []const u8);

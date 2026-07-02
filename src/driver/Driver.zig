@@ -91,13 +91,13 @@ pub const FileResult = struct {
     nodes_cached: bool = false,
     /// True once the parse phase ran (or hit cache) for this file.
     parsed: bool = false,
-    /// B2: a TAINTED parse produced at least one diagnostic. The (partial) tree is
+    /// A TAINTED parse produced at least one diagnostic. The (partial) tree is
     /// still populated for reporting, but the file does NOT proceed to check/codegen.
     tainted: bool = false,
     /// True once name resolution ran for this file (emit == .check).
     checked: bool = false,
     err: ?anyerror = null,
-    /// On a parse error, every accumulated parser diagnostic (B2). Owned; freed in
+    /// On a parse error, every accumulated parser diagnostic. Owned; freed in
     /// deinit. Empty on a clean parse.
     diags: []const Parser.Diagnostic = &.{},
     /// Whole-graph name-resolution result (emit == .check). A lone file IS the
@@ -190,7 +190,7 @@ pub fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target
     result.extra = tree.extra;
     result.pub_bits = tree.pub_bits;
 
-    // B2: a TAINTED parse still yields a (partial) tree, but the file does NOT
+    // A TAINTED parse still yields a (partial) tree, but the file does NOT
     // proceed to check/codegen — a poisoned tree would only cascade spurious
     // resolve/type errors (and the `error_node` arms in lower/codegen assume a
     // tainted tree is gated out here). Report the diagnostics and stop.

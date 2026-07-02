@@ -45,7 +45,6 @@ pub const Tag = enum(u8) {
     number,
     string,
 
-    // keywords
     kw_fn,
     kw_return,
     kw_if,
@@ -62,7 +61,6 @@ pub const Tag = enum(u8) {
     kw_enum,
     kw_match,
 
-    // punctuation / operators
     plus,
     minus,
     star,

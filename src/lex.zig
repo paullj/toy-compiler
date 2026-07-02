@@ -159,7 +159,7 @@ fn lexString(l: *Lexer, start: u32) Token {
     l.index += 1; // opening quote
     while (l.index < l.source.len) {
         switch (l.source[l.index]) {
-            '\\' => l.index += 2, // skip escaped char
+            '\\' => l.index = @min(l.index + 2, @as(u32, @intCast(l.source.len))),
             '"' => {
                 l.index += 1; // closing quote
                 return l.make(.string, start);
@@ -289,6 +289,16 @@ test "unterminated string at EOF is one string_unterminated token spanning to EO
     // Span starts at the opening quote and covers the whole partial string, so a
     // caret can point at the quote.
     try testing.expectEqualStrings("\"abc", tokens[0].text(src));
+}
+
+test "unterminated string ending in a backslash keeps its span within source" {
+    const src = "\"ab\\"; // trailing backslash at EOF must not skip past the end
+    const tokens = try tokenize(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(Tag.string_unterminated, tokens[0].tag);
+    try testing.expectEqualStrings(src, tokens[0].text(src));
+    try testing.expectEqual(Tag.eof, tokens[tokens.len - 1].tag);
+    try testing.expectEqual(@as(u32, src.len), tokens[tokens.len - 1].end);
 }
 
 test "unterminated string at newline stops before the newline" {

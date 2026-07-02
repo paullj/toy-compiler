@@ -1,5 +1,5 @@
 //! Transitive content fingerprint of a function — the cache key + parallel unit
-//! for M5 incremental codegen.
+//! for incremental codegen.
 //!
 //! `fingerprint(fn)` is a PURE function of frozen inputs: it returns a u64 that
 //! is determined ENTIRELY by what the lowered code would depend on, and NOTHING
@@ -9,8 +9,8 @@
 //! The key is TRANSITIVE: it folds (a) a structural walk of the fn BODY, (b) the
 //! SIGNATURES (not bodies) of every function this one calls, (c) the layouts of
 //! every type it touches, and (d) the compiler+target stamp (supplied externally
-//! via the cache `Key`/dir, not mixed here). The (a)+(b) split is the whole point
-//! of M5: a callee BODY change must NOT recompile its callers (their fingerprint
+//! via the cache `Key`/dir, not mixed here). The (a)+(b) split is the whole point:
+//! a callee BODY change must NOT recompile its callers (their fingerprint
 //! is unchanged), but a callee SIGNATURE change MUST (their fingerprint flips).
 //!
 //! The (a) body walk is defined ONCE in `AstWalk`; here `AstWalk.HashVisitor`
@@ -18,9 +18,9 @@
 //! relies on) live with the walk:
 //!
 //!   * NO ABSOLUTE INDICES, NO SOURCE OFFSETS — node TAGS and leaf token TEXT
-//!     only, never an index/offset that shifts when a sibling is edited. [C3]
+//!     only, never an index/offset that shifts when a sibling is edited.
 //!   * ORDER-SENSITIVE, NEVER XOR — children fold in wiring order with arity
-//!     sentinels, so `a - b` and `b - a` cannot collide. [C7]
+//!     sentinels, so `a - b` and `b - a` cannot collide.
 
 const std = @import("std");
 const Token = @import("../ast/Token.zig").Token;
@@ -35,7 +35,7 @@ pub const Sig = @import("../symbols/Sig.zig").Sig;
 /// A type this function touches, with an index-free layout descriptor. For
 /// a struct, `layout` is the Driver-precomputed byte string (name + per-field
 /// name+kind+offset, recursing nested structs, + size + align). Editing a touched
-/// struct's fields changes `layout`, flipping every using fn's hash. [C3]
+/// struct's fields changes `layout`, flipping every using fn's hash.
 pub const TouchedType = struct {
     kind: Typecheck.Kind,
     layout: []const u8 = &.{},
@@ -75,7 +75,7 @@ pub fn fingerprint(
     // SymName{kind,name} is folded BEFORE its sig: it is what the `.func` reloc
     // target carries, so a shadow/unshadow that changes the bound symbol (e.g.
     // builtin `print` vs a user `fn print` of the same sig) flips the caller's
-    // hash even though the sig is identical. [C6]
+    // hash even though the sig is identical.
     AstWalk.updateU32(&h, @intCast(callee_sigs.len));
     for (callee_sigs) |s| {
         h.update(&[_]u8{@intFromEnum(s.kind)});
@@ -96,7 +96,7 @@ pub fn fingerprint(
     return h.final();
 }
 
-// Tests — the cheapest proofs of the miscompile-class ledger (C3, C5, C7).
+// Tests — the cheapest proofs of the miscompile-class ledger.
 
 const testing = std.testing;
 const Lexer = @import("../lex.zig");
@@ -131,7 +131,7 @@ fn fp(b: *const Built, fn_idx: usize) u64 {
     return fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), &.{}, &.{});
 }
 
-test "position-independent: a fn's hash is the same regardless of sibling order [C3]" {
+test "position-independent: a fn's hash is the same regardless of sibling order" {
     const gpa = testing.allocator;
     var a = try build(gpa, "fn helper() -> int {\n return 7\n}\nfn main() -> int {\n return 1\n}\n");
     defer a.deinit(gpa);
@@ -144,7 +144,7 @@ test "position-independent: a fn's hash is the same regardless of sibling order 
     try testing.expectEqual(fp(&a, 1), fp(&b, 0));
 }
 
-test "swapped operands hash differently: a-b ≠ b-a [C7]" {
+test "swapped operands hash differently: a-b ≠ b-a" {
     const gpa = testing.allocator;
     var a = try build(gpa, "fn f(a: int, b: int) -> int {\n return a - b\n}\n");
     defer a.deinit(gpa);
@@ -153,7 +153,7 @@ test "swapped operands hash differently: a-b ≠ b-a [C7]" {
     try testing.expect(fp(&a, 0) != fp(&b, 0));
 }
 
-test "arity sentinel: f() ≠ f(0) [C5]" {
+test "arity sentinel: f() ≠ f(0)" {
     const gpa = testing.allocator;
     var a = try build(gpa, "fn g() -> int {\n return 0\n}\nfn f() -> int {\n return g()\n}\n");
     defer a.deinit(gpa);
@@ -172,7 +172,7 @@ test "optionality sentinel: bare return ≠ return 0" {
     try testing.expect(fp(&a, 0) != fp(&b, 0));
 }
 
-test "callee signature folds in: a sig change flips the caller's hash [C2]" {
+test "callee signature folds in: a sig change flips the caller's hash" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn main() -> int {\n return 1\n}\n");
     defer b.deinit(gpa);
@@ -184,7 +184,7 @@ test "callee signature folds in: a sig change flips the caller's hash [C2]" {
     try testing.expect(ha != hb);
 }
 
-test "callee kind folds in: builtin vs user_fn of an identical sig flips the hash [C6]" {
+test "callee kind folds in: builtin vs user_fn of an identical sig flips the hash" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn main() {\n print(\"hi\")\n return\n}\n");
     defer b.deinit(gpa);
@@ -264,7 +264,7 @@ test "labeled-block value folds in" {
     try testing.expect(fp(&a, 0) != fp(&b, 0));
 }
 
-test "editing a sibling fn does not change a labeled fn's hash [C3]" {
+test "editing a sibling fn does not change a labeled fn's hash" {
     const gpa = testing.allocator;
     var a = try build(gpa, "fn g() -> int {\n @l loop { break @l 5 }\n}\nfn h() -> int {\n return 1\n}\n");
     defer a.deinit(gpa);
@@ -281,8 +281,6 @@ test "identical body + identical sigs hash identically (cache hit)" {
     defer b.deinit(gpa);
     try testing.expectEqual(fp(&a, 0), fp(&b, 0));
 }
-
-// ---- struct layout fold ----
 
 /// Two struct layouts whose declared fields differ must hash differently when
 /// folded as a touched type; an unchanged layout must hash identically (cache
@@ -343,8 +341,6 @@ test "a fn NOT touching a struct is unaffected by an unrelated touched-struct fo
     try testing.expect(with != without);
 }
 
-// ---- enum layout + variant/match spelling fold (M10) ----
-
 test "variant spelling in a fn body folds into the body walk" {
     const gpa = testing.allocator;
     var a = try build(gpa, "enum S { A, B }\nfn f() -> S { return S.A }\n");
@@ -397,7 +393,7 @@ test "touched enum layout: identical layout hashes identically (cache hit)" {
     try testing.expectEqual(h1, h2);
 }
 
-test "M11: a match literal-value edit flips the hash" {
+test "a match literal-value edit flips the hash" {
     const gpa = testing.allocator;
     var a = try build(gpa, "fn f(n: int) -> int {\n match n { 0 -> 1, _ -> 2 }\n}\n");
     defer a.deinit(gpa);
@@ -406,7 +402,7 @@ test "M11: a match literal-value edit flips the hash" {
     try testing.expect(fp(&a, 0) != fp(&b, 0));
 }
 
-test "M11: adding a guard flips the hash (guard sentinel)" {
+test "adding a guard flips the hash (guard sentinel)" {
     const gpa = testing.allocator;
     var a = try build(gpa, "fn f(n: int) -> int {\n match n { 0 -> 1, _ -> 2 }\n}\n");
     defer a.deinit(gpa);
@@ -415,7 +411,7 @@ test "M11: adding a guard flips the hash (guard sentinel)" {
     try testing.expect(fp(&a, 0) != fp(&b, 0));
 }
 
-test "M11: reordering or-pattern alternatives flips the hash (order-sensitive)" {
+test "reordering or-pattern alternatives flips the hash (order-sensitive)" {
     const gpa = testing.allocator;
     var a = try build(gpa, "enum E { A, B, C }\nfn f(e: E) -> int {\n match e { .A | .B -> 1, .C -> 2 }\n}\n");
     defer a.deinit(gpa);
@@ -424,7 +420,7 @@ test "M11: reordering or-pattern alternatives flips the hash (order-sensitive)" 
     try testing.expect(fp(&a, 1) != fp(&b, 1));
 }
 
-test "M11: adding a nested sub-pattern flips the hash" {
+test "adding a nested sub-pattern flips the hash" {
     const gpa = testing.allocator;
     var a = try build(gpa, "enum E { C(int), N }\nfn f(e: E) -> int {\n match e { .C(r) -> r, .N -> 0 }\n}\n");
     defer a.deinit(gpa);

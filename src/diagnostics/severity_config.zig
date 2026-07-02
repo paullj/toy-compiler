@@ -1,7 +1,7 @@
-//! Render-time severity OVERRIDE policy (Stage C3). Pure, zero-alloc, borrowed.
+//! Render-time severity OVERRIDE policy. Pure, zero-alloc, borrowed.
 //! Applied LATE at render (reads the POD default, never rewrites it), so the cached
 //! []Diagnostic blob stays rule-set-independent. Empty config == identity, so
-//! no-flag runs render byte-identical. NON-GOAL: exit codes (render-only; D owns that).
+//! no-flag runs render byte-identical. NON-GOAL: exit codes (render-only).
 //! One-way imports: codes + model.
 
 const std = @import("std");

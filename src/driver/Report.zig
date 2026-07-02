@@ -155,7 +155,7 @@ fn cacheNote(r: Driver.FileResult, emit: Driver.Emit) []const u8 {
 /// Renderer over ONE SourceMap of the file (single-file => scope == NO_SCOPE).
 fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, r: Driver.FileResult, err: anyerror, cfg: SevCfg.SeverityConfig) !void {
     if (r.diags.len > 0) {
-        // Parse error (B2): one or more accumulated diagnostics. The row's `error:`
+        // Parse error: one or more accumulated diagnostics. The row's `error:`
         // cell is styled; each pretty snippet follows via the Renderer.
         var msgbuf: [48]u8 = undefined;
         const msg = if (r.diags.len == 1) "parse error" else (std.fmt.bufPrint(&msgbuf, "{d} parse error(s)", .{r.diags.len}) catch "parse errors");
@@ -187,11 +187,11 @@ fn printFailure(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel
     }
 }
 
-/// Render a single-file diagnostic batch against one prepared `sm`, applying the C3
+/// Render a single-file diagnostic batch against one prepared `sm`, applying the
 /// severity config BEFORE the render cap: a first cheap pass counts VISIBLE (non-
 /// `--ignore`d) diagnostics so the "... and N more" summary excludes dropped ones,
 /// then draws up to `DIAG_CAP` visible ones. An empty `cfg` leaves every diagnostic
-/// visible, so the counts + bytes stay identical to the pre-C3 `@min`+loop shape.
+/// visible, so the counts + bytes stay identical to the `@min`+loop shape.
 fn renderCapped(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, diags: []const toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) !void {
     var visible: usize = 0;
     for (diags) |d| {

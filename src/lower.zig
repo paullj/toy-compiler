@@ -292,7 +292,7 @@ pub fn lowerFn(
         .{ .ret = .{ .value = b.ret_param } };
     b.blocks.items[exit].term_set = true;
 
-    // Lower the body. A non-unit fn's body is a VALUE block (M6 implicit return):
+    // Lower the body. A non-unit fn's body is a VALUE block (implicit return):
     // its trailing expression is the return value, branched to the exit. A unit fn
     // lowers for effect and falls through with no value. If the body diverges
     // (every path returns), the trailing fall-through edge is simply not emitted.

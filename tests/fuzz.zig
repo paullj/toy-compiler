@@ -2,8 +2,8 @@
 //!
 //! Drives many random inputs through the SAME front-end `build`/`check` run —
 //! lex → `Parser.parse`, and on a clean parse also resolve + typecheck the
-//! single-file way (`Graph.single`) — and enforces the D4a robustness contract:
-//! the front-end NEVER panics, NEVER hangs (the B3 fuel guards bound every
+//! single-file way (`Graph.single`) — and enforces the robustness contract:
+//! the front-end NEVER panics, NEVER hangs (the fuel guards bound every
 //! recovery loop), and ALWAYS returns a tree. The parser's own invariants (span
 //! totality, structural pairing, forward progress) fire automatically on every
 //! `Parser.parse` under `std.debug.runtime_safety` — this driver's job is only to
@@ -43,8 +43,6 @@ const default_seed: u64 = 0x0123_4567_89ab_cdef;
 /// a few seconds (CI-runnable), overridable via `FUZZ_ITERS` for long soak runs.
 const default_iters: usize = 5000;
 
-// --- reproducibility: dump the offending input + seed on any panic/assert -----
-//
 // A parser-invariant assert (or any other panic) aborts the process; before it
 // does, print the exact bytes + seed that were in flight so the failure
 // reproduces deterministically. The globals are set right before each front-end
@@ -185,8 +183,6 @@ fn drive(gpa: std.mem.Allocator, input: []const u8) !bool {
     return true;
 }
 
-// --- corpus loading ---------------------------------------------------------
-
 /// Walk `tests/ui` and `examples` for `*.toy` files, returning their contents.
 /// Each entry is owned (freed by the caller). Empty files are kept (a valid, if
 /// degenerate, seed). A missing directory is skipped silently.
@@ -210,8 +206,6 @@ fn loadCorpus(gpa: std.mem.Allocator, io: Io) !std.ArrayList([]const u8) {
     }
     return out;
 }
-
-// --- mutation ---------------------------------------------------------------
 
 /// The maximum size a mutated input may reach; keeps a pathological insert/splice
 /// chain from ballooning the working buffer (and legitimately OOMing the host).
@@ -287,8 +281,6 @@ fn randByte(rand: std.Random) u8 {
     if (rand.boolean()) return interesting[rand.uintLessThan(usize, interesting.len)];
     return rand.int(u8);
 }
-
-// --- grammar-aware generation -----------------------------------------------
 
 const max_gen_depth: usize = 4;
 const idents = [_][]const u8{ "a", "b", "c", "x", "y", "foo", "bar", "n", "acc" };
@@ -509,8 +501,6 @@ fn genAtom(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random) er
 fn pick(comptime set: anytype, rand: std.Random) []const u8 {
     return set[rand.uintLessThan(usize, set.len)];
 }
-
-// --- env helpers ------------------------------------------------------------
 
 fn envU64(env: *std.process.Environ.Map, name: []const u8) ?u64 {
     const v = env.get(name) orelse return null;

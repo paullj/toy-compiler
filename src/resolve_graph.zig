@@ -127,7 +127,6 @@ const GraphResolve = struct {
 
     sink: DiagnosticSink,
 
-    // --- current module / function lexical state (reset per fn) ---
     cur_mod: u32 = 0,
     scopes: std.ArrayList(Scope) = .empty,
     locals: std.ArrayList(Local) = .empty,
