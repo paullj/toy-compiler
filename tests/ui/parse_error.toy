@@ -1,0 +1,3 @@
+fn a() -> int {
+  return )  #~ ERROR [P0002] expected an expression
+}

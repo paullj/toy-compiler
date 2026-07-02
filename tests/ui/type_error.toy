@@ -1,0 +1,4 @@
+struct A { b: A }  #~ ERROR [T0004] recursive type 'A' has infinite size
+fn main() -> int {
+  return 0
+}

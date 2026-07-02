@@ -1,0 +1,9 @@
+fn f() -> int {
+  return 1
+}
+fn f() -> int {  #~ ERROR [R0002] duplicate function 'f'
+  return 2
+}
+fn main() -> int {
+  return f()
+}
