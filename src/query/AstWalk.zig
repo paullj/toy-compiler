@@ -27,6 +27,7 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const Mono = @import("../symbols/Mono.zig");
+const Infer = @import("../symbols/Infer.zig");
 
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 pub const TouchedType = @import("Fingerprint.zig").TouchedType;
@@ -75,8 +76,10 @@ pub const Event = union(enum) {
     /// A call site: `idx` is the callee identifier node (`call.lhs`), whose
     /// `resolutions[idx]` carries the bound symbol. Emitted AFTER the callee
     /// subtree and BEFORE the args, matching where the old callee walk recorded
-    /// the sig (so nested calls in the callee record first).
-    callee: struct { idx: Ast.Index },
+    /// the sig (so nested calls in the callee record first). `call` is the enclosing
+    /// `.call` node itself — the reader needs it to reach the value-arg nodes when a
+    /// bare inferred generic callee must fold its resolved INSTANCE sig (M3).
+    callee: struct { idx: Ast.Index, call: Ast.Index },
     /// A `fn_decl` param/return type-ref position. `ordinal` indexes the proto's
     /// params; `is_ret` picks the return. Emitted immediately before recursing the
     /// type-ref node, matching where the touched walk folds the OWNING sig's
@@ -145,7 +148,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .call => {
             try walkInner(src, n.lhs, collect, visitor);
-            try emit(visitor, .{ .callee = .{ .idx = n.lhs } }); // record sig AFTER callee, BEFORE args
+            try emit(visitor, .{ .callee = .{ .idx = n.lhs, .call = idx } }); // record sig AFTER callee, BEFORE args
             const args = Ast.rangeSlice(tree, n.rhs.int());
             try emit(visitor, .{ .count = @intCast(args.len) }); // f() != f(0)
             for (args) |a| try walkInner(src, a, collect, visitor);
@@ -424,6 +427,16 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // the caller's hash.
                     if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
                         const sig = self.frozen.sigs[res.func];
+                        // A bare inferred generic call `id(7)` (M3): a PLAIN-IDENTIFIER
+                        // callee resolving to a generic template (its sig params carry
+                        // type_vars). Fold the resolved INSTANCE sig — not the template —
+                        // so the caller folds the SAME identity the reloc targets (mirroring
+                        // the type_app path). The plain-identifier gate matches the other
+                        // three sites; a bare qualified generic call is rejected at Pass C.
+                        if (self.frozen.tree.nodes[c.idx.int()].tag == .identifier and sigHasTypeVar(sig)) {
+                            try self.foldInferredGenericCallee(c.call, res.func, sig);
+                            return;
+                        }
                         const nm = self.frozen.names[res.func];
                         try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
                     }
@@ -446,7 +459,45 @@ pub fn CallVisitor(comptime Frozen: type) type {
             const inst = self.frozen.instances[ii];
             try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
         }
+
+        /// Bare inferred generic callee (M3): infer the type-args from the enclosing
+        /// call's value-arg node_types (the SAME matcher Pass C / scanCalls ran), find
+        /// the reified instance, and fold its INSTANCE sig. A miss (pre-typecheck view,
+        /// arity/conflict/unbound, or an unminted instance) folds nothing — identical to
+        /// `foldGenericCallee`, so exactly one-or-zero Sig per call is preserved.
+        fn foldInferredGenericCallee(self: *Self, call_idx: Ast.Index, gid: u32, sig: Sig) error{OutOfMemory}!void {
+            const call_node = self.frozen.tree.nodes[call_idx.int()];
+            const value_args = Ast.rangeSlice(self.frozen.tree, call_node.rhs.int());
+            const arg_types = try self.gpa.alloc(Typecheck.Type, value_args.len);
+            defer self.gpa.free(arg_types);
+            for (value_args, 0..) |va, i| {
+                if (va.int() >= self.frozen.node_types.len) return; // pre-typecheck view
+                arg_types[i] = self.frozen.node_types[va.int()];
+            }
+            const targs = (try Infer.infer(self.gpa, genericParamCount(sig), sig.params, arg_types)) orelse return;
+            defer self.gpa.free(targs);
+            const ii = Mono.find(self.frozen.instances, gid, targs) orelse return;
+            const inst = self.frozen.instances[ii];
+            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+        }
     };
+}
+
+/// True when `sig` is a generic template (some param is a check-time `type_var`).
+fn sigHasTypeVar(sig: Sig) bool {
+    for (sig.params) |p| if (p.isTypeVar()) return true;
+    return false;
+}
+
+/// `1 + max type_var ordinal` over `sig.params` — the generic-param count `Infer.infer`
+/// needs. Equals `generic_params.len` for any bare call folded here (it survived Pass C,
+/// so every type-var was bound, hence appears in a value param).
+fn genericParamCount(sig: Sig) u32 {
+    var m: u32 = 0;
+    for (sig.params) |p| if (p.isTypeVar() and p.typeVarOrd() > m) {
+        m = p.typeVarOrd();
+    };
+    return m + 1;
 }
 
 /// Records each touched type's layout in body-walk order: at a `.touch` event the

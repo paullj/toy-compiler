@@ -35,6 +35,7 @@ const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 const Mono = @import("symbols/Mono.zig");
+const Infer = @import("symbols/Infer.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 /// The read-only front-end inputs a lowering needs. Mirrors the slice of
@@ -68,6 +69,13 @@ pub const Inputs = struct {
     /// only concrete `node_types` — no substitution map is threaded here (the mono
     /// tail already substituted every `type_var` away before `node_types` froze).
     instances: []const Mono.Instance = &.{},
+    /// Program-wide callee signatures by global fn id (M3). A bare inferred generic
+    /// call `id(7)` resolves its callee to a generic template's `.func`; that is
+    /// detectable because the template's `sigs[func].params` carry `type_var`s. When
+    /// so, `lowerCall` re-runs the shared `Infer` matcher over the value-arg
+    /// `node_types` to select the SAME `Mono.Instance` Pass C created, instead of
+    /// emitting the template symbol. Empty for a program with no generics.
+    sigs: []const Sig = &.{},
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -610,6 +618,25 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
     return .{ .value = merge };
 }
 
+/// True when `sig` is a generic template (some param is a check-time `type_var`).
+/// Bare inferred calls resolve to the template's `.func`; genericness is detected
+/// from the callee sig so `lowerCall` selects the reified instance, not the template.
+fn sigHasTypeVar(sig: Sig) bool {
+    for (sig.params) |p| if (p.isTypeVar()) return true;
+    return false;
+}
+
+/// `1 + max type_var ordinal` over `sig.params` — the generic-param count `Infer.infer`
+/// needs. Equals `generic_params.len` for any bare call that reached lower: such a call
+/// passed Pass C, so every type-var was bound, hence appears in a value param.
+fn genericParamCount(sig: Sig) u32 {
+    var m: u32 = 0;
+    for (sig.params) |p| if (p.isTypeVar() and p.typeVarOrd() > m) {
+        m = p.typeVarOrd();
+    };
+    return m + 1;
+}
+
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
@@ -641,7 +668,31 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             try b.note(n.main_token, "call target unsupported in lower");
             return .none;
         }
-        callee = b.in.names[callee_res.func];
+        if (callee_node.tag == .identifier and callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func])) {
+            // A bare inferred generic call `id(7)` (M3): the plain-identifier callee
+            // resolves to a generic template (its sig params carry `type_var`s). Re-run
+            // the SHARED matcher over the value-arg node_types to pick the SAME instance
+            // Pass C / scanCalls selected, then use its mangled name (mirroring the
+            // type_app branch). A miss (arity/conflict/unbound/unminted) is an internal
+            // invariant break — Pass C already gated it — so note-and-drop.
+            const sig = b.in.sigs[callee_res.func];
+            const value_args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const arg_types = try b.gpa.alloc(Typecheck.Type, value_args.len);
+            defer b.gpa.free(arg_types);
+            for (value_args, 0..) |va, i| arg_types[i] = b.in.node_types[(va).int()];
+            const targs = (try Infer.infer(b.gpa, genericParamCount(sig), sig.params, arg_types)) orelse {
+                try b.note(callee_node.main_token, "unresolved generic instance in lower");
+                return .none;
+            };
+            defer b.gpa.free(targs);
+            const ii = Mono.find(b.in.instances, callee_res.func, targs) orelse {
+                try b.note(callee_node.main_token, "unresolved generic instance in lower");
+                return .none;
+            };
+            callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+        } else {
+            callee = b.in.names[callee_res.func];
+        }
     }
     const result_ty = b.in.node_types[(node_idx).int()];
 

@@ -31,6 +31,7 @@ const Resolution = @import("symbols/Resolution.zig").Resolution;
 const Sig = @import("symbols/Sig.zig").Sig;
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
+const Infer = @import("symbols/Infer.zig");
 const Engine = @import("query/Engine.zig");
 const Io = std.Io;
 
@@ -763,10 +764,10 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
 /// OWNED for the duration of the fixpoint (freed with the worklist).
 const Pending = struct { gid: u32, args: []Type };
 
-/// A generous ceiling on the number of monomorphized instances. UNREACHABLE in M2
-/// (type-args must already be concrete — there is no `App`, so the instance set is
-/// a finite closure of the source's explicit call sites); it is the belt-and-
-/// suspenders backstop for the recursive-instantiation hazard M4 introduces.
+/// A generous ceiling on the number of monomorphized instances. UNREACHABLE through
+/// M3 (type-args must already be concrete — there is no `App`, so the instance set is
+/// a finite closure of the source's explicit AND bare-inferred call sites); it is the
+/// belt-and-suspenders backstop for the recursive-instantiation hazard M4 introduces.
 const mono_instance_cap: usize = 10_000;
 
 /// True when `ty` is a concrete value type usable as a monomorphization type-arg
@@ -867,41 +868,82 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     for (tree.nodes) |n| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
         const callee = tree.nodes[n.lhs.int()];
-        if (callee.tag != .type_app) continue;
-        const bres = resolutions[callee.lhs.int()];
-        if (bres != .func) continue;
-        const gid = bres.func;
-        const f = model.fns[gid];
-        if (!f.isGeneric()) continue;
-        const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
-        if (targ_nodes.len != f.generic_params.len) continue;
-        const args = try t.gpa.alloc(Type, targ_nodes.len);
-        errdefer t.gpa.free(args);
-        var ok = true;
-        for (targ_nodes, 0..) |tn, k| {
-            const ty = node_types[tn.int()];
-            if (!isConcreteValue(ty)) {
-                ok = false;
-                break;
+        if (callee.tag == .type_app) {
+            // Explicit-args `id[int](..)` (M2): the type-args are the type-app's
+            // arg nodes, read straight from node_types.
+            const bres = resolutions[callee.lhs.int()];
+            if (bres != .func) continue;
+            const gid = bres.func;
+            const f = model.fns[gid];
+            if (!f.isGeneric()) continue;
+            const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
+            if (targ_nodes.len != f.generic_params.len) continue;
+            const args = try t.gpa.alloc(Type, targ_nodes.len);
+            defer t.gpa.free(args);
+            var ok = true;
+            for (targ_nodes, 0..) |tn, k| {
+                const ty = node_types[tn.int()];
+                if (!isConcreteValue(ty)) {
+                    ok = false;
+                    break;
+                }
+                args[k] = ty;
             }
-            args[k] = ty;
+            if (!ok) continue;
+            try t.enqueueInstance(gid, args, worklist, seen);
+        } else if (callee.tag == .identifier) {
+            // Bare inferred `id(7)` (M3): re-run the SHARED matcher over the value-arg
+            // node_types so discovery selects the exact same instance Pass C created.
+            // The never/invalid skip + the `isConcreteValue` gate are identical to Pass
+            // C's, so the `(gid, args)` tuple — hence the `Mono.Instance` — agrees.
+            const bres = resolutions[n.lhs.int()];
+            if (bres != .func) continue;
+            const gid = bres.func;
+            const f = model.fns[gid];
+            if (!f.isGeneric()) continue;
+            const value_args = Ast.rangeSlice(tree, n.rhs.int());
+            if (value_args.len != f.params.len) continue; // Pass C already erred arity
+            const arg_types = try t.gpa.alloc(Type, value_args.len);
+            defer t.gpa.free(arg_types);
+            for (value_args, 0..) |va, k| arg_types[k] = node_types[va.int()];
+            const n_gp: u32 = @intCast(f.generic_params.len);
+            const out = try t.gpa.alloc(Type, n_gp);
+            defer t.gpa.free(out);
+            const bnd = try t.gpa.alloc(bool, n_gp);
+            defer t.gpa.free(bnd);
+            const fp = try t.gpa.alloc(usize, n_gp);
+            defer t.gpa.free(fp);
+            switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp)) {
+                .ok => {},
+                else => continue, // conflict/unbound: Pass C reported it; mint nothing
+            }
+            var conc = true;
+            for (out) |ta| {
+                if (!isConcreteValue(ta)) {
+                    conc = false;
+                    break;
+                }
+            }
+            if (!conc) continue;
+            try t.enqueueInstance(gid, out, worklist, seen);
         }
-        if (!ok) {
-            t.gpa.free(args);
-            continue;
-        }
-        // Dedup on the canonical key.
-        var keybuf: std.ArrayList(u8) = .empty;
-        defer keybuf.deinit(t.gpa);
-        try Mono.writeKey(t.gpa, &keybuf, gid, args);
-        const gop = try seen.getOrPut(t.gpa, keybuf.items);
-        if (gop.found_existing) {
-            t.gpa.free(args);
-            continue;
-        }
-        gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items); // own the stored key
-        try worklist.append(t.gpa, .{ .gid = gid, .args = args });
     }
+}
+
+/// Enqueue `(gid, args)` for instantiation, deduped on the canonical key. `args` is
+/// BORROWED (the caller keeps its scratch); a fresh owned copy is stored on the
+/// worklist. Shared by the explicit and inferred `scanCalls` branches so their dedup
+/// path is byte-identical.
+fn enqueueInstance(t: *Typecheck, gid: u32, args: []const Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
+    var keybuf: std.ArrayList(u8) = .empty;
+    defer keybuf.deinit(t.gpa);
+    try Mono.writeKey(t.gpa, &keybuf, gid, args);
+    const gop = try seen.getOrPut(t.gpa, keybuf.items);
+    if (gop.found_existing) return;
+    gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items); // own the stored key
+    const owned = try t.gpa.dupe(Type, args);
+    errdefer t.gpa.free(owned);
+    try worklist.append(t.gpa, .{ .gid = gid, .args = owned });
 }
 
 /// Re-check one generic instance: substitute the template's params/ret to concrete
@@ -1413,19 +1455,106 @@ test "M2 gate: a bare type_app in a field type fires; a non-generic program does
     try testing.expectEqual(@as(usize, 0), try checkDiagCount("fn main() -> int { return 0 }\n"));
 }
 
-test "M2 gate: a bare (no-explicit-args) generic call requires explicit type arguments" {
+test "M3: a bare (no-explicit-args) generic call infers its type-arg from the argument" {
     const gpa = testing.allocator;
     var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return id(7) }\n");
     defer c.deinit(gpa);
-    try testing.expect(c.result.diags.len > 0);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // `id(7)` infers T=int and monomorphizes to exactly one instance, same as id[int].
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
+    try testing.expect(!c.result.instances[0].ret.isTypeVar());
+}
+
+test "M3: nested bare inference (snd(true, id(42))) infers all type-args; args are concrete" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn snd[T,U](a: T, b: U) -> U { b }\nfn id[T](x: T) -> T { x }\nfn main() -> int { return snd(true, id(42)) }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Two instances: id$int (from the nested bare call) and snd$bool$int.
+    try testing.expectEqual(@as(usize, 2), c.result.instances.len);
+    for (c.result.instances) |inst| {
+        try testing.expect(!inst.ret.isTypeVar());
+        for (inst.params) |p| try testing.expect(!p.isTypeVar());
+    }
+    // The snd instance's substituted sig is (bool, int) -> int (no surviving type_var).
+    var saw_snd = false;
+    for (c.result.instances) |inst| {
+        if (std.mem.startsWith(u8, inst.name, "main.snd$")) {
+            saw_snd = true;
+            try testing.expectEqualStrings("main.snd$bool$int", inst.name);
+            try testing.expectEqual(@as(usize, 2), inst.params.len);
+            try testing.expectEqual(Kind.bool, inst.params[0].kind);
+            try testing.expectEqual(Kind.int, inst.params[1].kind);
+            try testing.expectEqual(Kind.int, inst.ret.kind);
+        }
+    }
+    try testing.expect(saw_snd);
+}
+
+test "M3: an inferred call and its explicit form DEDUP to ONE instance (byte-for-byte parity)" {
+    const gpa = testing.allocator;
+    // Both `snd(true, id(42))` (inferred bool,int) and `snd[bool,int](true, 42)`
+    // resolve to the SAME (gid, args) tuple, so they collapse to ONE `snd$bool$int`
+    // instance — the operational proof that inference selects the explicit instance.
+    var c = try checkSource("fn snd[T,U](a: T, b: U) -> U { b }\nfn id[T](x: T) -> T { x }\nfn main() -> int {\n x := snd(true, id(42))\n y := snd[bool,int](true, 42)\n return x + y\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // id$int + one shared snd$bool$int (NOT two).
+    try testing.expectEqual(@as(usize, 2), c.result.instances.len);
+    var snd_count: usize = 0;
+    for (c.result.instances) |inst| {
+        if (std.mem.startsWith(u8, inst.name, "main.snd$")) snd_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), snd_count);
+}
+
+test "M3: a diverging (never) argument still infers the var from another concrete arg" {
+    const gpa = testing.allocator;
+    // same[T](a:T,b:T): never at 0 binds nothing; int at 1 binds T=int. Check-only
+    // (a break-less loop cannot run to an exit code).
+    var c = try checkSource("fn same[T](a: T, b: T) -> T { b }\nfn main() -> int { return same(loop {}, 42) }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqualStrings("main.same$int", c.result.instances[0].name);
+}
+
+test "M3: a conflicting bare call reports T0015 naming BOTH argument spans; mints no instance" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn same[T](a: T, b: T) -> T { a }\nfn main() -> int { return same(1, true) }\n");
+    defer c.deinit(gpa);
+    var saw: ?DiagnosticSink.Diagnostic = null;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0015) saw = d;
+    }
+    try testing.expect(saw != null);
+    // Both spans named: the related (earlier) span is set (not the NO_RELATED sentinel).
+    try testing.expect(saw.?.related != DiagnosticSink.NO_RELATED);
+    // A conflicting call is rejected, so it mints no instance.
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "M3: a return-only generic call reports T0016 (explicit args required)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn ro[T]() -> T { loop {} }\nfn main() -> int {\n ro()\n return 0\n}\n");
+    defer c.deinit(gpa);
     var saw = false;
     for (c.result.diags) |d| {
-        try testing.expectEqual(codes.Code.T0013, d.code);
-        if (std.mem.indexOf(u8, d.message, "explicit type arguments") != null) saw = true;
+        if (d.code == codes.Code.T0016) saw = true;
     }
     try testing.expect(saw);
-    // A bare generic call is rejected, so it mints no instance.
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "M3: explicit type args still override inference and satisfy an otherwise-uninferable call" {
+    const gpa = testing.allocator;
+    // The return-only `ro[T]` is uninferable bare, but explicit `ro[int]()` compiles.
+    var c = try checkSource("fn ro[T]() -> T { loop {} }\nfn main() -> int { return ro[int]() }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqualStrings("main.ro$int", c.result.instances[0].name);
 }
 
 test "M2: an uncalled generic fn mints ZERO instances (free in the binary)" {

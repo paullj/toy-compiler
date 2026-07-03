@@ -14,6 +14,7 @@ const EnumSym = LayoutEngine.EnumSym;
 // them here. The import is mutual (types.zig constructs a `BodyChecker` per fn), which
 // Zig resolves lazily — there is no by-value type cycle (`model` is a pointer).
 const Typecheck = @import("types.zig");
+const Infer = @import("symbols/Infer.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const Model = Typecheck.Model;
 const FnSym = Typecheck.FnSym;
@@ -1073,14 +1074,65 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        // A bare (no-explicit-args) generic call `id(7)` cannot be checked without
-        // inference (M3): its params/ret are `type_var`s. Reject it now — returning
-        // `f.ret` here would leak a `type_var` into `node_types`. (Inference is the
-        // droppable layer; explicit `id[int](7)` is the M2 escape hatch.)
+        // A bare (no-explicit-args) generic call `id(7)` (M3): infer each type-arg by
+        // one-sided structural matching of the template's param patterns against the
+        // ground argument types, then reuse `applyGenericSig` to check args + type the
+        // node. The matcher runs and is discarded here — no `type_var` is ever stored.
+        // Explicit `id[int](7)` is handled above (typeOfGenericCall) and still overrides.
         if (f.isGeneric()) {
-            for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "generic call requires explicit type arguments, e.g. f[int](..)");
-            return .invalid;
+            // M3 infers type-args only for a PLAIN-IDENTIFIER callee `id(7)`. A bare
+            // qualified generic call `mod.id(7)` (field_access callee) is NOT inferred:
+            // the three post-typecheck consumers (scanCalls/lower/CallVisitor) key the
+            // bare path on a plain identifier too, so accepting it here would type the
+            // node concretely but mint NO instance (a `Mono.find` miss in lower). Require
+            // explicit type args instead — the same clean reject as pre-M3.
+            if (callee.tag != .identifier) {
+                for (args) |arg| _ = try bc.typeOf(arg);
+                try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "generic call requires explicit type arguments, e.g. f[int](..)");
+                return .invalid;
+            }
+            const arg_types = try bc.gpa.alloc(Type, args.len);
+            defer bc.gpa.free(arg_types);
+            for (args, 0..) |arg, i| arg_types[i] = try bc.typeOf(arg); // synth once (self-typing)
+            if (args.len != f.params.len) {
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+                return .invalid; // never leak f.ret (a type_var) on the error path
+            }
+            const n_gp: u32 = @intCast(f.generic_params.len);
+            const out = try bc.gpa.alloc(Type, n_gp);
+            defer bc.gpa.free(out);
+            const bnd = try bc.gpa.alloc(bool, n_gp);
+            defer bc.gpa.free(bnd);
+            const fp = try bc.gpa.alloc(usize, n_gp);
+            defer bc.gpa.free(fp);
+            switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp)) {
+                .conflict => |c| {
+                    // Primary = the LATER arg (source order), related = the earlier one:
+                    // a stable, order-independent (symmetric `Type.eql`) span pair that is
+                    // reproducible at `-jN`. Emitted before the poison return.
+                    const later = bc.tree.nodes[(args[c.second_pos]).int()].main_token;
+                    const earlier = bc.tree.nodes[(args[c.first_pos]).int()].main_token;
+                    try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(arg_types[c.first_pos]), bc.typeName(arg_types[c.second_pos]) });
+                    return .invalid;
+                },
+                .unbound => |u| {
+                    try bc.sink.emitFmtCode(.T0016, bc.byteOf(n.main_token), "cannot infer type parameter '{s}'; add explicit type arguments, e.g. f[int](..)", .{f.generic_params[u.ord]});
+                    return .invalid;
+                },
+                .ok => {
+                    // The inferred args must be monomorphizable value types — the SAME
+                    // gate `scanCalls` applies, so Pass C and discovery agree on which
+                    // bare calls become instances (a `unit`-inferred var, say, is rejected
+                    // here rather than silently dropped by discovery → lower miss).
+                    for (out) |ta| {
+                        if (!isConcreteValue(ta)) {
+                            try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "inferred type argument must be a concrete value type; add explicit type arguments");
+                            return .invalid;
+                        }
+                    }
+                    return bc.applyGenericSig(node_idx, n, f, out, arg_types);
+                },
+            }
         }
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
@@ -1155,14 +1207,30 @@ pub const BodyChecker = struct {
             bc.node_types[(node_idx).int()] = ret;
             return ret;
         }
+        if (!all_concrete) {
+            for (args) |arg| _ = try bc.typeOfExpected(arg, null);
+            return .invalid;
+        }
+        return bc.applyGenericSig(node_idx, n, f, targs, null);
+    }
+
+    /// The shared tail of both generic-call paths (explicit `id[int](7)` and inferred
+    /// `id(7)`): check each value arg against the SUBSTITUTED param, type the call node
+    /// as the substituted return, and return it. `targs` is the concrete type-arg tuple
+    /// (explicit args, or the M3-inferred args). `pretyped` is the inferred path's
+    /// already-synthesized arg types — passing them avoids re-walking the args (which
+    /// would double-emit inner-arg diagnostics, a diag-count nondeterminism); `null`
+    /// re-types each arg in check mode against its substituted param, byte-identical to
+    /// the M2 explicit loop.
+    fn applyGenericSig(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, f: FnSym, targs: []const Type, pretyped: ?[]const Type) error{OutOfMemory}!Type {
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         for (args, f.params, 0..) |arg, pty, i| {
-            const want = if (all_concrete) substTy(pty, targs) else Type.invalid;
-            const at = try bc.typeOfExpected(arg, if (want.kind == .invalid) null else want);
-            if (all_concrete and !Type.assignable(want, at)) {
+            const want = substTy(pty, targs);
+            const at = if (pretyped) |pt| pt[i] else try bc.typeOfExpected(arg, if (want.kind == .invalid) null else want);
+            if (!Type.assignable(want, at)) {
                 try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(arg).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want), bc.typeName(at) });
             }
         }
-        if (!all_concrete) return .invalid;
         const ret = substTy(f.ret, targs);
         bc.node_types[(node_idx).int()] = ret;
         return ret;

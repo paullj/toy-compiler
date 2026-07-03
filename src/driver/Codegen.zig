@@ -601,6 +601,7 @@ pub fn renderGraphIr(
             .names = names,
             .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
             .instances = tc.instances,
+            .sigs = tc.sigs,
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -627,6 +628,7 @@ pub fn renderGraphIr(
             .names = names,
             .sig = .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret },
             .instances = tc.instances,
+            .sigs = tc.sigs,
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
