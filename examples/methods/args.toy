@@ -1,0 +1,18 @@
+# Feature: methods with extra params, a struct-returning method, and `Self` as the
+# return type alias for the receiver. Exercises self-by-value + non-self args + a
+# method call chained on a method result.
+# expect: exit 46
+# a={2,3}; a.scaled(2)={4,6}; then {4,6}.dot({4,5}) = 4*4 + 6*5 = 16 + 30 = 46.
+struct Vec { x: int, y: int }
+
+impl Vec {
+    fn dot(self, o: Vec) -> int { self.x * o.x + self.y * o.y }
+    fn scaled(self, k: int) -> Self { Vec{ x: self.x * k, y: self.y * k } }
+}
+
+fn main() -> int {
+    a := Vec{ x: 2, y: 3 }
+    b := Vec{ x: 4, y: 5 }
+    s := a.scaled(2)
+    return s.dot(b)
+}

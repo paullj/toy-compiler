@@ -62,6 +62,10 @@ pub const GlobalFn = struct {
     kind: SymKind,
     /// Whether the decl is `pub` (exported). `main`/`print` are not pub.
     is_pub: bool,
+    /// For an inherent method (M8): the receiver type-ref node (an `identifier`) in
+    /// this module's tree — Typecheck resolves it to the receiver `Type` and keys the
+    /// program-wide method table off it. `Ast.none` for an ordinary fn / builtin.
+    recv_type: Ast.Index = Ast.none,
 };
 
 /// The whole-graph resolve output. Caller owns it; free with `deinit`.
@@ -159,6 +163,12 @@ const GraphResolve = struct {
 /// order. `print` is seeded last (one shared synthetic builtin).
 fn collectGlobals(g: *GraphResolve) !void {
     const entry = g.graph.entry_index;
+    // Scratch set of minted method symbol names, to reject a duplicate `(Receiver,
+    // method)` (two `impl P { fn m }`) — which would otherwise be a linker duplicate
+    // symbol. Keyed by the mangled qname (owned by `g.fns` once appended); the map's
+    // own storage is freed here, the borrowed keys are not.
+    var method_names: std.StringHashMapUnmanaged(void) = .empty;
+    defer method_names.deinit(g.gpa);
     for (g.graph.modules, 0..) |m, mi| {
         const mod: u32 = @intCast(mi);
         if (m.nodes.len == 0) continue;
@@ -211,6 +221,34 @@ fn collectGlobals(g: *GraphResolve) !void {
                         .is_pub = is_pub,
                     });
                     if (is_pub) try g.tables[mod].pub_fns.put(g.gpa, name, id);
+                },
+                .impl_decl => {
+                    // Each method is an ordinary global fn with a MANGLED name
+                    // `<module.path>.<Receiver>.<method>` (so it gets a global id +
+                    // codegen unit) but is NOT bare-callable (never inserted into
+                    // `tables[mod].fns`) — a method is reached only via `x.m(..)`
+                    // dispatch through the program-wide method table (built in Pass A).
+                    const recv_name = g.nameOf(mod, decl.main_token);
+                    for (Ast.rangeSlice(t, decl.rhs.int())) |method_idx| {
+                        const method = m.nodes[method_idx.int()];
+                        if (method.tag != .fn_decl) continue;
+                        const mname = g.nameOf(mod, method.main_token);
+                        const qname = try std.fmt.allocPrint(g.gpa, "{s}.{s}.{s}", .{ m.path, recv_name, mname });
+                        const gop = try method_names.getOrPut(g.gpa, qname);
+                        if (gop.found_existing) {
+                            try g.emit(.R0002, mod, m.tokens[method.main_token].start, "duplicate method '{s}.{s}'", .{ recv_name, mname });
+                            g.gpa.free(qname);
+                            continue;
+                        }
+                        try g.fns.append(g.gpa, .{
+                            .name = qname,
+                            .module = mod,
+                            .decl_node = method_idx,
+                            .kind = .user_fn,
+                            .is_pub = false,
+                            .recv_type = decl.lhs,
+                        });
+                    }
                 },
                 else => {},
             }
@@ -333,6 +371,14 @@ fn resolveModule(g: *GraphResolve, mod: u32) !void {
                 for (Ast.rangeSlice(t, decl.lhs.int())) |field_idx| {
                     const field = m.nodes[field_idx.int()];
                     try g.resolveTypeRef(field.lhs);
+                }
+            },
+            // Resolve each method body like any fn: its synthesized `self` param
+            // binds as a local (slot 0) via the ordinary param loop in `resolveFn`.
+            .impl_decl => {
+                const decl = m.nodes[decl_idx.int()];
+                for (Ast.rangeSlice(t, decl.rhs.int())) |method_idx| {
+                    if (m.nodes[method_idx.int()].tag == .fn_decl) try g.resolveFn(method_idx);
                 }
             },
             else => {},

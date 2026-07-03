@@ -292,6 +292,18 @@ pub const Node = extern struct {
         /// or a `field_access` dot-chain). `rhs` is the `extra` header of a `Range`
         /// over the type-argument nodes.
         type_app,
+
+        // Inherent methods (M8). Appended at the END (frozen ordinal; `[]Node` is
+        // memcpy'd to/from the content cache; `ParseHeader.version` bumped 6->7 on
+        // this change). An `impl` block desugars each method to an ordinary
+        // `fn_decl` with a synthesized `self: <Receiver>` first param, so lower /
+        // typecheck treat a method like any fn; only method-call DISPATCH is new.
+
+        /// `impl Type { fn m(self, ..) -> R { .. } }` — an inherent-method block.
+        /// `main_token` is the receiver type-name identifier token. `lhs` is the
+        /// receiver type-ref `identifier` node. `rhs` is the `extra` header of a
+        /// `Range` over the method `fn_decl` nodes (in declaration order).
+        impl_decl,
     };
 };
 
@@ -437,8 +449,10 @@ pub const ParseHeader = extern struct {
     /// to 6 for the M1 generics front-end: the `FnProto` header grew 3->5 cells and
     /// the `generic_param`/`type_app` Tag ordinals were appended, so a v5 3-cell
     /// proto read by the 5-cell `protoAt` would alias neighbouring `extra` bytes —
-    /// a v5 blob must miss cleanly.
-    version: u32 = 6,
+    /// a v5 blob must miss cleanly. Bumped to 7 for the M8 `impl_decl` Tag ordinal
+    /// appended at the end: a v6 blob predating that tag must miss cleanly rather
+    /// than misdecode a cell whose meaning the new tag changed.
+    version: u32 = 7,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -499,7 +513,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 6) return null;
+    if (hdr.magic != parse_magic or hdr.version != 7) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -545,6 +559,14 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             for (rangeSlice(tree, n.rhs.int())) |arg| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, arg);
+            }
+            try out.writeByte(')');
+        },
+        .impl_decl => {
+            try out.print("(impl {s}", .{tok_text});
+            for (rangeSlice(tree, n.rhs.int())) |method| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, method);
             }
             try out.writeByte(')');
         },
@@ -975,6 +997,44 @@ test "unpack rejects a foreign blob" {
     const gpa = testing.allocator;
     try testing.expect((try unpack(gpa, "not a tree")) == null);
     try testing.expect((try unpack(gpa, &.{})) == null);
+}
+
+test "pack/unpack round-trips a tree containing an impl_decl (v7)" {
+    const gpa = testing.allocator;
+    // pack/unpack is a pure byte round-trip (memcpy of the node/extra arrays), so
+    // the tree need not be well-formed — it only has to contain the new tag so the
+    // v7 blob exercises `impl_decl`'s ordinal.
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .impl_decl, .main_token = 0, .lhs = Index.from(0), .rhs = Index.from(1) },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(1), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 1 }; // an arbitrary Range header {start=0,len=1}
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, tree.extra, got.extra);
+}
+
+test "unpack rejects a v6 blob (pre-impl_decl)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    // Rewrite the header `version` field (the second u32) to 6: a blob from a
+    // compiler predating the M8 tag must miss cleanly, not misdecode.
+    std.mem.writeInt(u32, blob[4..8], 6, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
 }
 
 test "contentFp ignores Node padding (cold-build fp determinism foundation)" {

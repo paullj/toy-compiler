@@ -85,6 +85,7 @@ pub fn checkGraph(
             .module = gf.module,
             .is_pub = gf.is_pub,
             .name = gf.name,
+            .recv_type = gf.recv_type,
         };
     }
 

@@ -76,6 +76,16 @@ pub const Inputs = struct {
     /// `node_types` to select the SAME `Mono.Instance` Pass C created, instead of
     /// emitting the template symbol. Empty for a program with no generics.
     sigs: []const Sig = &.{},
+    /// The program-wide inherent-method table (M8). A call whose callee is a
+    /// `field_access` over a VALUE receiver dispatches through this: the receiver's
+    /// concrete type + the member name select the method's global fn id (the mangled
+    /// SymName in `names`), and the receiver is prepended as the `self` arg. Empty for
+    /// a program with no methods; content-keyed (`findMethod`), so `-jN` deterministic.
+    ///
+    /// NOTE: the `&.{}` default is a SILENT-MISS hazard — a build site that forgets to
+    /// thread this compiles as "no methods" (a method call then hits "call target
+    /// unsupported"), not a compile error. Every `lower.Inputs` build site MUST set it.
+    methods: []const Typecheck.Method = &.{},
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -644,6 +654,10 @@ fn genericParamCount(sig: Sig) u32 {
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
+    // A method call `recv.m(args)` (M8): dispatch to the method's mangled symbol and
+    // PREPEND the receiver as the `self` arg (arg 0). `self_recv` set ⟺ this is a
+    // method call; the receiver expr is lowered as arg 0 below.
+    var self_recv: Ast.Index = Ast.none;
     if (callee_node.tag == .type_app) {
         // A generic call `id[int](..)` (M2): the callee is a `type_app` whose base
         // identifier carries the template gid. Resolve to the reified instance's
@@ -664,6 +678,11 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             return .none;
         };
         callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+    } else if (methodGidOf(b, n)) |gid| {
+        // Method dispatch (M8): callee = the method's mangled global symbol; the
+        // receiver (`callee_node.lhs`) is prepended as `self` in the arg build below.
+        callee = b.in.names[gid];
+        self_recv = callee_node.lhs;
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -700,12 +719,16 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     }
     const result_ty = b.in.node_types[(node_idx).int()];
 
-    // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot).
+    // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot). For a
+    // method call the receiver is the FIRST arg (`self`, by value — reusing the M2
+    // struct-arg reg-pair/sret path), followed by the source args in order.
     const arg_nodes = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-    const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len);
+    const self_n: usize = if (self_recv != Ast.none) 1 else 0;
+    const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len + self_n);
     errdefer b.gpa.free(args);
+    if (self_recv != Ast.none) args[0] = try lowerExpr(b, self_recv);
     for (arg_nodes, 0..) |arg, i| {
-        args[i] = try lowerExpr(b, arg);
+        args[self_n + i] = try lowerExpr(b, arg);
     }
 
     // Result placement: scalar → an Instr.result value; aggregate → a fresh
@@ -749,8 +772,27 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
 /// Misclassifying a call as construction inlines a wrong-layout variant and drops
 /// the call → silent miscompile / infinite recursion.
 fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool {
+    // A method returning an enum ALSO parses as `.call` over an unresolved
+    // field_access callee, so it would otherwise be misrouted to variant
+    // construction. Distinguish by the receiver being a VALUE with a resolved method.
     return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
-        b.in.resolutions[(n.lhs).int()] != .func;
+        b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null;
+}
+
+/// The global fn id a method call `recv.m(args)` dispatches to, or null when `n` is
+/// not a method call. A method callee is a `field_access` NOT bound to a `.func`
+/// (that is a qualified module call) whose receiver types to a concrete struct/enum
+/// with a matching entry in the method table. A pure content-keyed lookup (no
+/// hashmap/thread order), so it is identical at any `-jN`.
+fn methodGidOf(b: *Builder, n: Ast.Node) ?u32 {
+    const cn = b.in.tree.nodes[(n.lhs).int()];
+    if (cn.tag != .field_access) return null;
+    if (b.in.resolutions[(n.lhs).int()] == .func) return null;
+    const recv = b.in.node_types[(cn.lhs).int()];
+    if (recv.kind != .@"struct" and recv.kind != .@"enum") return null;
+    const member = b.in.tokens[cn.main_token].text(b.in.source);
+    const m = Typecheck.findMethod(b.in.methods, recv, member) orelse return null;
+    return m.fn_id;
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {

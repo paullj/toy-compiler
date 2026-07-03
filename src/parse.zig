@@ -96,7 +96,7 @@ fn setOf(comptime tags: []const token.Tag) TagSet {
 }
 
 /// FIRST(top-level decl): the exact arms of `parseDecls`' dispatch.
-const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum });
+const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl });
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
@@ -387,10 +387,16 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
         try decls.append(p.gpa, try p.parseImport());
         return;
     }
+    // `impl` blocks have no `pub` modifier either: a method's export follows its
+    // receiver type, not an `impl`-level keyword (M8 keeps methods module-private).
+    if (p.at(.kw_impl)) {
+        try decls.append(p.gpa, try p.parseImplDecl());
+        return;
+    }
     // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
-        .kw_fn => try p.parseFnDecl(),
+        .kw_fn => try p.parseFnDecl(null),
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
         else => return p.fail(p.peek(), .P0003, if (is_pub)
@@ -451,7 +457,13 @@ fn parseImport(p: *Parser) Error!Ast.Index {
     });
 }
 
-fn parseFnDecl(p: *Parser) Error!Ast.Index {
+/// Parse a `fn` declaration. `self_recv_tok`, when set, is the impl block's
+/// receiver type-name token: this fn is a method, so a leading bare `self` (a plain
+/// identifier recognized by TEXT — the `_`-wildcard precedent) is consumed and
+/// synthesized into `params[0] = self: <Receiver>`, an `identifier` type-ref on the
+/// receiver token. A top-level `fn` passes `null` (no receiver) and rejects a `self`
+/// receiver implicitly (it would just parse as a param named `self`).
+fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
@@ -467,6 +479,24 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
 
     var params: std.ArrayList(Ast.Index) = .empty;
     defer params.deinit(p.gpa);
+    // A method's leading `self` receiver (M8): a bare `self` with no `:` annotation
+    // (peek2 != colon) is the by-value receiver — synthesize `params[0] = self:
+    // <Receiver>` (child nodes created before the fn_decl, so children precede
+    // parents). Its type-ref is a synthetic `identifier` on the impl's receiver
+    // token. A method with no leading `self` is a static/associated fn, which is out
+    // of scope (M8): report P0006 and keep parsing the rest for recovery.
+    if (self_recv_tok) |recv_tok| {
+        if (p.at(.identifier) and std.mem.eql(u8, p.peek().text(p.src), "self") and p.peek2().tag != .colon) {
+            const self_tok = p.index;
+            p.bump(.identifier);
+            const recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
+            const self_param = try p.addNode(.{ .tag = .param, .main_token = self_tok, .lhs = recv_ref, .rhs = Ast.none });
+            try params.append(p.gpa, self_param);
+            _ = p.eat(.comma); // separator before the next param, if any
+        } else {
+            try p.warn(p.peek(), .P0006, "a method must take 'self' as its first parameter");
+        }
+    }
     while (!p.at(.r_paren) and !p.at(.eof)) {
         const entry = p.index;
         if (p.at(.identifier)) {
@@ -515,6 +545,50 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
     });
 
     return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
+}
+
+/// `impl Type { fn m(self, ..) -> R { .. } }` — a keyword-led inherent-method block
+/// (M8). The receiver is a BARE type name only: a generic receiver `impl Box[T]`
+/// (M10) or a qualified `impl mod.T` (coherence) is out of scope and rejected here,
+/// so the receiver never carries type-args/a qualifier. The body reuses the struct-
+/// body brace member loop, but over `fn` methods (each parsed with the receiver so
+/// its leading `self` is synthesized). Newlines/commas separate methods.
+fn parseImplDecl(p: *Parser) Error!Ast.Index {
+    try p.expect(.kw_impl, "expected 'impl'");
+    const recv_tok = p.index;
+    try p.expect(.identifier, "expected a type name after 'impl'");
+    const recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
+    // Bare receiver only: `[` (generic) / `.` (qualified) are deferred milestones.
+    if (p.at(.l_bracket) or p.at(.dot)) {
+        return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare type name");
+    }
+    try p.expect(.l_brace, "expected '{' after the impl receiver type");
+
+    var methods: std.ArrayList(Ast.Index) = .empty;
+    defer methods.deinit(p.gpa);
+    while (!p.at(.eof)) {
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
+        // `kw_fn` is the one decl keyword that legitimately STARTS an impl member, so
+        // it is NOT a bail anchor here (unlike the struct-body loop); any OTHER decl
+        // keyword means the impl body is wrecked → bail to the decl loop.
+        if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (p.at(.kw_fn)) {
+            const method = try p.parseFnDecl(recv_tok);
+            try methods.append(p.gpa, method);
+            // A method is separated by a newline (loop-top `skipNewlines`) or an
+            // optional comma; a `}` ends the block.
+            _ = p.eat(.comma);
+        } else {
+            _ = try p.advanceWithError(.P0006, "expected a method 'fn' or '}'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+    }
+    try p.expect(.r_brace, "expected '}' to close the impl block");
+
+    const header = try p.addRange(methods.items);
+    return p.addNode(.{ .tag = .impl_decl, .main_token = recv_tok, .lhs = recv_ref, .rhs = header });
 }
 
 /// `struct Name { x: int, y: int }`. Fields are `name: Type`, comma-separated,
@@ -2211,6 +2285,12 @@ test "root is program and children precede parents" {
                 try testing.expect(n.lhs.int() < self);
                 for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
+            // `impl T { fn .. }`: the receiver type-ref is `lhs`, the methods are a
+            // Range of `fn_decl`s in `rhs` (all created before the impl node).
+            .impl_decl => {
+                try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
         }
     }
 }
@@ -2246,6 +2326,40 @@ test "explicit call type-args wrap the callee in a tyapp" {
 test "nested type application nests tyapp nodes" {
     // Empty arg list renders with no trailing args after the callee.
     try expectSexpr("f[Box[int]]()", "(call (tyapp f (tyapp Box int)))");
+}
+
+// --- M8 inherent methods: impl block parsing ---
+
+test "impl block parses a method with a synthesized self param" {
+    try expectProgram(
+        "struct P { x: int, y: int }\nimpl P { fn sum(self) -> int { self.x + self.y } }\n",
+        "(program (struct P (param x int) (param y int)) (impl P (fn sum ((param self P)) int (block (+ (. self x) (. self y))))))",
+    );
+}
+
+test "impl method with an extra param keeps self as params[0]" {
+    try expectProgram(
+        "struct P { x: int }\nimpl P { fn add(self, a: int) -> int { self.x + a } }\n",
+        "(program (struct P (param x int)) (impl P (fn add ((param self P) (param a int)) int (block (+ (. self x) a)))))",
+    );
+}
+
+test "impl block with multiple methods" {
+    try expectProgram(
+        "struct P { x: int }\nimpl P {\n fn get(self) -> int { self.x }\n fn zero(self) -> int { 0 }\n}\n",
+        "(program (struct P (param x int)) (impl P (fn get ((param self P)) int (block (. self x))) (fn zero ((param self P)) int (block 0))))",
+    );
+}
+
+test "a method missing self is a tainted parse (static fns out of scope)" {
+    const gpa = testing.allocator;
+    const source = "struct P { x: int }\nimpl P { fn make() -> int { 0 } }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expect(res.diags.len >= 1);
 }
 
 test "generic nodes precede their parents (children-before-parents on generics)" {

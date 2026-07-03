@@ -114,6 +114,11 @@ pub const BodyChecker = struct {
     /// byte-identical. Borrowed for the duration of one re-check.
     subst: ?Subst = null,
 
+    /// The receiver type when checking an inherent method's body (M8), set by
+    /// `bodyCheckerFor` from the method's `FnSym.self_type`; null for a non-method.
+    /// Consumed by the `Self` type-ref hook (`selfType`).
+    cur_self_type: ?Type = null,
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
@@ -1504,6 +1509,46 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = ty;
                 return ty;
             }
+            // A method call `recv.m(args)` on a VALUE receiver (M8). The enum-variant /
+            // qualified-call cases above fire only for an enum type-name / type_app /
+            // qualified-namespace receiver; a field_access callee whose receiver is a
+            // plain VALUE of a concrete struct/enum is method dispatch. A qualified fn
+            // `mod.f()` binds the field_access itself to `.func` (handled below), so
+            // guard on that; a namespace receiver is `.module` (also skipped).
+            const recv_is_func = bc.resolutions[(n.lhs).int()] == .func;
+            const recv_res = bc.resolutions[(callee.lhs).int()];
+            if (!recv_is_func and recv_res != .module) {
+                const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
+                if (recv_ty.kind == .invalid) return .invalid; // receiver already errored → no cascade
+                if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum") {
+                    const member = bc.nameText(callee.main_token);
+                    const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                    if (Typecheck.findMethod(bc.model.methods, recv_ty, member)) |m| {
+                        const mf = bc.model.fns[m.fn_id];
+                        // params[0] is the synthesized `self`; value args match params[1..].
+                        const self_off: usize = @min(mf.params.len, 1);
+                        const want = mf.params.len - self_off;
+                        if (args.len != want) {
+                            for (args) |a| _ = try bc.typeOf(a);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+                            bc.node_types[(node_idx).int()] = mf.ret;
+                            return mf.ret;
+                        }
+                        for (args, mf.params[self_off..], 0..) |a, pty, i| {
+                            const at = try bc.typeOfExpected(a, if (pty.kind == .invalid) null else pty);
+                            if (!Type.assignable(pty, at)) {
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                            }
+                        }
+                        bc.node_types[(node_idx).int()] = mf.ret;
+                        return mf.ret;
+                    }
+                    // A concrete struct/enum value with no such method (M8).
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+                    return .invalid;
+                }
+            }
         }
         // An explicit-args generic call `id[int](7)` (M2): the callee is a `type_app`
         // whose base identifier carries the template's `.func`. A pure per-call
@@ -1748,6 +1793,13 @@ pub const BodyChecker = struct {
             if (std.mem.eql(u8, gp, name)) return if (i < s.types.len) s.types[i] else Type.invalid;
         }
         return null;
+    }
+
+    /// The receiver type when checking an inherent method's body (M8), so a `Self`
+    /// type-ref in a body annotation resolves to it via `refs.typeFromNode`. Null
+    /// outside a method (byte-identical to pre-M8 non-method checking).
+    pub fn selfType(bc: *const BodyChecker) ?Type {
+        return bc.cur_self_type;
     }
 
     /// Intern a composite `App(ctor, args)` (M4). The shared `refs` type-application
