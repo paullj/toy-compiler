@@ -1,0 +1,35 @@
+# Feature: overlapping-mutation correctness for `mut self` (M9). Exercises all three
+# by-address patches — a field write through the pointer, a whole-`self` READ, and a
+# whole-`self` REASSIGN — plus the two aliasing cases the design must get right:
+#   - `p.set(p.x)`: the arg `p.x` is materialized to a value BEFORE the call, so the
+#     store through &self sees the old value (v = 10).
+#   - `x = x.foo()`: foo's aggregate result lands in a FRESH ret_slot, then is copied
+#     back to `x`, so the return slot never aliases the &self slot.
+# expect: exit 116
+# p.set(p.x): v = old p.x = 10 -> p.x = 10.
+# x = x.foo(): foo bumps x.x to 6 and returns {6,0}; assigned back -> x.x = 6.
+# q.reset(): whole-self store -> q.x = 100.
+# 10 + 6 + 100 = 116.
+struct P { x: int, y: int }
+
+impl P {
+    fn set(mut self, v: int) { self.x = v }
+    fn foo(mut self) -> P {
+        self.x = self.x + 1
+        return self
+    }
+    fn reset(mut self) { self = P{ x: 100, y: 0 } }
+}
+
+fn main() -> int {
+    p := P{ x: 10, y: 0 }
+    p.set(p.x)
+
+    x := P{ x: 5, y: 0 }
+    x = x.foo()
+
+    q := P{ x: 1, y: 0 }
+    q.reset()
+
+    return p.x + x.x + q.x
+}

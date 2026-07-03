@@ -1525,6 +1525,14 @@ pub const BodyChecker = struct {
                     const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
                     if (Typecheck.findMethod(bc.model.methods, recv_ty, member)) |m| {
                         const mf = bc.model.fns[m.fn_id];
+                        // A `mut self` method mutates the receiver in place, so it may only
+                        // be called on a mutable place (a local or a field of one). Report
+                        // but do NOT unwind — fall through to arg checks + `return mf.ret`
+                        // so nothing cascades (whole-`self` reassign is fine: `self` is a
+                        // `.local`).
+                        if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
+                            try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+                        }
                         // params[0] is the synthesized `self`; value args match params[1..].
                         const self_off: usize = @min(mf.params.len, 1);
                         const want = mf.params.len - self_off;
@@ -1776,6 +1784,19 @@ pub const BodyChecker = struct {
 
     fn byteOf(bc: *const BodyChecker, tok: u32) u32 {
         return refs.byteOf(bc, tok);
+    }
+
+    /// Whether `node_idx` names a mutable, addressable place: an identifier bound to
+    /// a `.local` (all locals — incl. the `self` receiver — are mutable), or a
+    /// `field_access` chain rooted at one. A temporary/rvalue (a construction, a call
+    /// result, a literal) is NOT a place. Gates a `mut self` method call (M9, T0019).
+    fn isMutablePlace(bc: *const BodyChecker, node_idx: Ast.Index) bool {
+        const n = bc.tree.nodes[(node_idx).int()];
+        return switch (n.tag) {
+            .identifier => bc.resolutions[(node_idx).int()] == .local,
+            .field_access => bc.isMutablePlace(n.lhs),
+            else => false,
+        };
     }
 
     fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {

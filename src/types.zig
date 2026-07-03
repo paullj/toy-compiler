@@ -344,6 +344,11 @@ pub const Method = struct {
     recv: Type,
     name: []const u8,
     fn_id: u32,
+    /// `mut self` (M9): the receiver is passed BY ADDRESS and mutated in place, so a
+    /// call dispatch must enforce the receiver is a mutable place and `lower` must
+    /// pass its address instead of a by-value copy. Type-checking is unaffected —
+    /// the receiver type in the `Sig` stays the struct/enum (by-value-logical).
+    mut_self: bool = false,
 };
 
 /// Look up an inherent method by receiver type + source name. A linear scan over
@@ -1936,7 +1941,12 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     // Register the method into the program-wide table (SERIAL, fn-id order). The name
     // is BORROWED from source (like `Sig.name`); the table is frozen before Pass C.
     if (recv_type != Ast.none) {
-        try t.methods.append(t.gpa, .{ .recv = self_ty, .name = t.nameText(decl.main_token), .fn_id = gid });
+        try t.methods.append(t.gpa, .{
+            .recv = self_ty,
+            .name = t.nameText(decl.main_token),
+            .fn_id = gid,
+            .mut_self = proto.params.len > 0 and Ast.isMutParam(t.tree, t.tokens, proto.params[0]),
+        });
     }
 }
 
@@ -2187,6 +2197,73 @@ test "M8: `Self` in a method signature resolves to the receiver type" {
     try testing.expectEqual(@as(usize, 1), c.result.methods.len);
     const gid = c.result.methods[0].fn_id;
     try testing.expectEqual(Kind.@"struct", c.result.sigs[gid].ret.kind);
+}
+
+test "M9: decodeFnSig sets Method.mut_self for `mut self` but not plain `self`; the Sig stays by-value" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\impl P {
+        \\ fn bump(mut self, d: int) { self.x = self.x + d }
+        \\ fn get(self) -> int { self.x }
+        \\}
+        \\fn main() -> int {
+        \\ p := P{ x: 40, y: 0 }
+        \\ p.bump(2)
+        \\ return p.get()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.methods.len);
+    for (c.result.methods) |m| {
+        if (std.mem.eql(u8, m.name, "bump")) {
+            try testing.expect(m.mut_self);
+            // ABI is a lowering concern: the Sig's params[0] stays the struct type.
+            try testing.expectEqual(Kind.@"struct", c.result.sigs[m.fn_id].params[0].kind);
+        } else if (std.mem.eql(u8, m.name, "get")) {
+            try testing.expect(!m.mut_self);
+            try testing.expectEqual(Kind.@"struct", c.result.sigs[m.fn_id].params[0].kind);
+        } else return error.TestUnexpectedResult;
+    }
+}
+
+test "M9: a mut-self method on a temporary emits T0019; on a local / a field of a local it does not" {
+    const gpa = testing.allocator;
+    // On a temporary (the fresh construction): rejected.
+    {
+        var c = try checkSource(
+            \\struct P { x: int, y: int }
+            \\impl P { fn bump(mut self, d: int) { self.x = self.x + d } }
+            \\fn main() -> int {
+            \\ P{ x: 40, y: 0 }.bump(2)
+            \\ return 0
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0019, c.result.diags[0].code);
+    }
+    // On a local, and on a field of a local: accepted (no T0019).
+    {
+        var c = try checkSource(
+            \\struct P { x: int, y: int }
+            \\struct Q { inner: P }
+            \\impl P { fn bump(mut self, d: int) { self.x = self.x + d } }
+            \\fn main() -> int {
+            \\ p := P{ x: 40, y: 0 }
+            \\ p.bump(1)
+            \\ q := Q{ inner: P{ x: 1, y: 0 } }
+            \\ q.inner.bump(1)
+            \\ return p.x + q.inner.x
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    }
 }
 
 test "M4: Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {

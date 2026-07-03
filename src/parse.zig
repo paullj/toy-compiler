@@ -486,6 +486,15 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
     // token. A method with no leading `self` is a static/associated fn, which is out
     // of scope (M8): report P0006 and keep parsing the rest for recovery.
     if (self_recv_tok) |recv_tok| {
+        // A `mut self` receiver (M9): consume the leading `mut` ONLY when it qualifies
+        // `self`, leaving `main_token` on the `self` token so `tokens[self_tok-1]` is
+        // `kw_mut` (how `Ast.isMutParam` later detects mut-ness — no node-shape change).
+        // A `mut` on a non-self first param is out of scope: report P0006 once and drop
+        // the `mut` so the ordinary param loop still parses the rest.
+        const has_mut = p.at(.kw_mut);
+        const mut_self = has_mut and p.peek2().tag == .identifier and std.mem.eql(u8, p.peek2().text(p.src), "self");
+        if (has_mut and !mut_self) try p.warn(p.peek(), .P0006, "'mut' may only qualify a 'self' receiver");
+        if (has_mut) p.bump(.kw_mut);
         if (p.at(.identifier) and std.mem.eql(u8, p.peek().text(p.src), "self") and p.peek2().tag != .colon) {
             const self_tok = p.index;
             p.bump(.identifier);
@@ -493,7 +502,7 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
             const self_param = try p.addNode(.{ .tag = .param, .main_token = self_tok, .lhs = recv_ref, .rhs = Ast.none });
             try params.append(p.gpa, self_param);
             _ = p.eat(.comma); // separator before the next param, if any
-        } else {
+        } else if (!has_mut) {
             try p.warn(p.peek(), .P0006, "a method must take 'self' as its first parameter");
         }
     }
@@ -2349,6 +2358,75 @@ test "impl block with multiple methods" {
         "struct P { x: int }\nimpl P {\n fn get(self) -> int { self.x }\n fn zero(self) -> int { 0 }\n}\n",
         "(program (struct P (param x int)) (impl P (fn get ((param self P)) int (block (. self x))) (fn zero ((param self P)) int (block 0))))",
     );
+}
+
+test "mut self parses to the same synthesized self-param shape (no node change)" {
+    // `mut self` carries no dedicated node/cell — it renders identically to plain
+    // `self`; the `mut` is detected later by token adjacency (`Ast.isMutParam`).
+    try expectProgram(
+        "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n",
+        "(program (struct P (param x int)) (impl P (fn bump ((param self P) (param d int)) _ (block (= (. self x) (+ (. self x) d))))))",
+    );
+}
+
+test "isMutParam is true for `mut self`, false for plain self / a non-self first param" {
+    const gpa = testing.allocator;
+    const source =
+        "struct P { x: int }\n" ++
+        "impl P {\n" ++
+        "  fn bump(mut self, d: int) { self.x = self.x + d }\n" ++
+        "  fn get(self) -> int { self.x }\n" ++
+        "}\n" ++
+        "fn free(a: int) -> int { a }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, source);
+    defer freeTree(gpa, tree);
+
+    // Collect the three fn_decls in source order: bump (mut self), get (self), free.
+    var fns: [3]Ast.Index = undefined;
+    var nfns: usize = 0;
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag == .fn_decl) {
+            fns[nfns] = Ast.Index.from(@intCast(i));
+            nfns += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), nfns);
+
+    const bump_proto = Ast.protoAt(tree, tree.nodes[fns[0].int()].lhs.int());
+    const get_proto = Ast.protoAt(tree, tree.nodes[fns[1].int()].lhs.int());
+    const free_proto = Ast.protoAt(tree, tree.nodes[fns[2].int()].lhs.int());
+
+    try testing.expect(Ast.isMutParam(tree, tokens, bump_proto.params[0])); // `mut self`
+    try testing.expect(!Ast.isMutParam(tree, tokens, bump_proto.params[1])); // `d: int`
+    try testing.expect(!Ast.isMutParam(tree, tokens, get_proto.params[0])); // plain `self`
+    try testing.expect(!Ast.isMutParam(tree, tokens, free_proto.params[0])); // `a: int`
+}
+
+test "a mut on a non-self first param is rejected (P0006), mut self is not" {
+    const gpa = testing.allocator;
+    // `mut x` on a top-level fn is out of scope (M9): the reserved `mut` keyword makes
+    // the param loop's identifier expectation fail → a diagnostic. A `mut self` method
+    // parses cleanly.
+    const bad = "fn f(mut x: int) -> int { x }\n";
+    {
+        const tokens = try Lexer.tokenize(gpa, bad);
+        defer gpa.free(tokens);
+        const res = try parse(gpa, tokens, bad);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expect(res.diags.len >= 1);
+    }
+    const good = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn main() -> int { 0 }\n";
+    {
+        const tokens = try Lexer.tokenize(gpa, good);
+        defer gpa.free(tokens);
+        const res = try parse(gpa, tokens, good);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 0), res.diags.len);
+    }
 }
 
 test "a method missing self is a tainted parse (static fns out of scope)" {

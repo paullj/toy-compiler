@@ -134,6 +134,15 @@ pub const Tag = enum(u8) {
 
     /// `impl` — opens an inherent-method block for a concrete type.
     kw_impl,
+
+    // Mutating receiver (M9). Appended at the END (frozen ordinal; `[]Token` is
+    // memcpy'd to/from the content cache). `mut` qualifies a method's `self`
+    // receiver (`fn m(mut self, ..)`) so the receiver is passed by address and
+    // mutated in place. It is a reserved keyword only in that position; the parser
+    // rejects it elsewhere.
+
+    /// `mut` — qualifies a `self` receiver as a by-address, in-place-mutating one.
+    kw_mut,
 };
 
 /// Maps identifier text to its keyword tag, if any.
@@ -157,6 +166,7 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "pub", .kw_pub },
     .{ "as", .kw_as },
     .{ "impl", .kw_impl },
+    .{ "mut", .kw_mut },
 });
 
 comptime {

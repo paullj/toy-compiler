@@ -1,0 +1,17 @@
+# Feature: a `mut self` method mutates the receiver in place (M9). The receiver is
+# passed BY ADDRESS (not the by-value copy a plain `self` gets), so `self.x = ...`
+# writes the caller's original `p`. P is 16B (a reg-pair value normally), proving
+# the by-address path bypasses the reg-pair value ABI.
+# expect: exit 42
+# p starts {40,0}; p.bump(2) sets p.x = 40 + 2 = 42; return p.x.
+struct P { x: int, y: int }
+
+impl P {
+    fn bump(mut self, d: int) { self.x = self.x + d }
+}
+
+fn main() -> int {
+    p := P{ x: 40, y: 0 }
+    p.bump(2)
+    return p.x
+}

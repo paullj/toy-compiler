@@ -1,0 +1,14 @@
+# Feature: SHOULD FAIL — a `mut self` method mutates in place, so it cannot be called
+# on a temporary (an rvalue with no addressable storage). M9 rejects it with T0019.
+# expect: compile-error "T0019"
+# `P{ x: 40, y: 0 }` is a temporary, not a mutable place, so `.bump(2)` is rejected.
+struct P { x: int, y: int }
+
+impl P {
+    fn bump(mut self, d: int) { self.x = self.x + d }
+}
+
+fn main() -> int {
+    P{ x: 40, y: 0 }.bump(2)
+    return 0
+}
