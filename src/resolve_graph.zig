@@ -246,6 +246,9 @@ fn collectGlobals(g: *GraphResolve) !void {
                             .decl_node = method_idx,
                             .kind = .user_fn,
                             .is_pub = false,
+                            // `decl.lhs` is the receiver type-ref: a bare `identifier`
+                            // (M8) or, for a generic `impl Box[T]` (M10), the receiver
+                            // `type_app` — `decodeFnSig` decodes either to the self type.
                             .recv_type = decl.lhs,
                         });
                     }

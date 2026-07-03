@@ -1555,6 +1555,67 @@ pub const BodyChecker = struct {
                     for (args) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
                     return .invalid;
+                } else if (recv_ty.kind == .app) {
+                    // A method call on a generic-type instance `b.get()` (M10): the
+                    // receiver is an `App` (`Box[int]`; reify runs later in the mono
+                    // tail). Its ctor selects the `impl Box[T]` method TEMPLATE and the
+                    // impl's type-params bind by matching the template's `Self`
+                    // pattern-args against the receiver App's concrete args — the SAME
+                    // `Infer.match` scanCalls/lower run. Only the impl's params bind; a
+                    // method's OWN `[U]` generics are NOT inferred (deferred).
+                    const member = bc.nameText(callee.main_token);
+                    const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                    const e = bc.composite.at(recv_ty.appIdx());
+                    if (Typecheck.findGenericMethod(bc.model.methods, e.ctor, e.ctor_is_enum, member)) |m| {
+                        const mf = bc.model.fns[m.fn_id];
+                        const n_gp: u32 = @intCast(mf.generic_params.len);
+                        const targs = try bc.gpa.alloc(Type, n_gp);
+                        defer bc.gpa.free(targs);
+                        const bnd = try bc.gpa.alloc(bool, n_gp);
+                        defer bc.gpa.free(bnd);
+                        const fp = try bc.gpa.alloc(usize, n_gp);
+                        defer bc.gpa.free(fp);
+                        const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
+                        var bound_ok = pat.len == e.args.len;
+                        if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
+                            .ok => {},
+                            else => bound_ok = false, // an unbound impl param: poison, no cascade
+                        };
+                        // A `mut self` method mutates the receiver in place, so it may
+                        // only be called on a mutable place (reuse the M9 gate + T0019).
+                        if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
+                            try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+                        }
+                        // params[0] is the synthesized `self`; value args match params[1..].
+                        const self_off: usize = @min(mf.params.len, 1);
+                        const want = mf.params.len - self_off;
+                        if (args.len != want) {
+                            for (args) |a| _ = try bc.typeOf(a);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+                            if (!bound_ok) return .invalid;
+                            const ret = substTy(bc, mf.ret, targs);
+                            bc.node_types[(node_idx).int()] = ret;
+                            return ret;
+                        }
+                        if (!bound_ok) {
+                            for (args) |a| _ = try bc.typeOfExpected(a, null);
+                            return .invalid;
+                        }
+                        for (args, mf.params[self_off..], 0..) |a, pty, i| {
+                            const want_ty = substTy(bc, pty, targs);
+                            const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
+                            if (!Type.assignable(want_ty, at)) {
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
+                            }
+                        }
+                        const ret = substTy(bc, mf.ret, targs);
+                        bc.node_types[(node_idx).int()] = ret;
+                        return ret;
+                    }
+                    // A generic-type value with no such method (M10).
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+                    return .invalid;
                 }
             }
         }

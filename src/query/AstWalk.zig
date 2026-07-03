@@ -453,7 +453,17 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         if (recv.kind == .@"struct" or recv.kind == .@"enum") {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
                             if (Typecheck.findMethod(self.frozen.methods, recv, member)) |m| {
-                                if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
+                                // A method on a GENERIC-type instance (M10): the reified
+                                // recv (`structT`/`enumT`) selects the appended entry that
+                                // carries the mono `instance` index. Fold the INSTANCE
+                                // identity (name+sig) — the real reloc target — not the
+                                // never-lowered template's names/sigs[fn_id].
+                                if (m.instance) |ii| {
+                                    if (ii < self.frozen.instances.len) {
+                                        const inst = self.frozen.instances[ii];
+                                        try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+                                    }
+                                } else if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
                                     const nm = self.frozen.names[m.fn_id];
                                     const sig = self.frozen.sigs[m.fn_id];
                                     try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });

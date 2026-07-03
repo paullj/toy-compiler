@@ -717,7 +717,14 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     } else if (methodGidOf(b, n)) |m| {
         // Method dispatch (M8): callee = the method's mangled global symbol; the
         // receiver (`callee_node.lhs`) is prepended as `self` in the arg build below.
-        callee = b.in.names[m.fn_id];
+        // A method on a GENERIC-type instance (M10): `findMethod` (via `methodGidOf`)
+        // returns the reified-dispatch entry, which carries the mono `instance` index —
+        // dispatch to THAT instance's mangled symbol (its own per-instance codegen
+        // unit), not the never-lowered template's `names[fn_id]`.
+        callee = if (m.instance) |ii|
+            .{ .kind = .user_fn, .name = b.in.instances[ii].name }
+        else
+            b.in.names[m.fn_id];
         self_recv = callee_node.lhs;
         self_mut = m.mut_self;
     } else {

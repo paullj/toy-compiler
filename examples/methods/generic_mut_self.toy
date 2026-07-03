@@ -1,0 +1,17 @@
+# Feature: a `mut self` method on a GENERIC-type instance keeps the M9 by-address
+# receiver path, threaded through the per-instance dispatch entry (M10).
+# expect: exit 42
+# `b: Box[int]` is a local (a mutable place); `b.set(42)` passes `b` by ADDRESS and
+# writes `self.v = 42` into the caller's storage, so `b.get()` then reads 42.
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn get(self) -> T { self.v }
+    fn set(mut self, x: T) { self.v = x }
+}
+
+fn main() -> int {
+    b := Box[int]{ v: 0 }
+    b.set(42)
+    return b.get()
+}

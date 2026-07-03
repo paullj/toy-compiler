@@ -396,7 +396,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
     // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
-        .kw_fn => try p.parseFnDecl(null),
+        .kw_fn => try p.parseFnDecl(null, Ast.none, &.{}),
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
         else => return p.fail(p.peek(), .P0003, if (is_pub)
@@ -460,10 +460,16 @@ fn parseImport(p: *Parser) Error!Ast.Index {
 /// Parse a `fn` declaration. `self_recv_tok`, when set, is the impl block's
 /// receiver type-name token: this fn is a method, so a leading bare `self` (a plain
 /// identifier recognized by TEXT — the `_`-wildcard precedent) is consumed and
-/// synthesized into `params[0] = self: <Receiver>`, an `identifier` type-ref on the
-/// receiver token. A top-level `fn` passes `null` (no receiver) and rejects a `self`
-/// receiver implicitly (it would just parse as a param named `self`).
-fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
+/// synthesized into `params[0] = self: <Receiver>`. The self param's type-ref is
+/// `self_type_ref` when the impl supplies one (a `type_app` `Box[T]` for a generic
+/// receiver, M10), else a fresh `identifier` on the receiver token (a bare M8 impl —
+/// kept byte-identical). `impl_gparams` are the impl's generic-param nodes (`[T]`),
+/// PREPENDED into this method's FnProto generic run so the method becomes a bona-fide
+/// generic template (its `protoAt().generic_params.len > 0`), monomorphized per
+/// (type-instance, method) exactly like a generic fn — empty for a bare impl / a
+/// top-level fn (byte-identical). A top-level `fn` passes `null`/`none`/`&.{}` and
+/// rejects a `self` receiver implicitly (it would just parse as a param named `self`).
+fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index) Error!Ast.Index {
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
@@ -498,7 +504,10 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
         if (p.at(.identifier) and std.mem.eql(u8, p.peek().text(p.src), "self") and p.peek2().tag != .colon) {
             const self_tok = p.index;
             p.bump(.identifier);
-            const recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
+            // A generic impl (M10) hands down its `type_app` receiver (`Box[T]`) so the
+            // self param decodes to an `App`; a bare M8 impl synthesizes a fresh
+            // `identifier` on the receiver token (byte-identical to the old shape).
+            const recv_ref = if (self_type_ref != Ast.none) self_type_ref else try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
             const self_param = try p.addNode(.{ .tag = .param, .main_token = self_tok, .lhs = recv_ref, .rhs = Ast.none });
             try params.append(p.gpa, self_param);
             _ = p.eat(.comma); // separator before the next param, if any
@@ -539,10 +548,17 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
     // 3-cell decode site reads byte-identically; cells 3-4 hold the generics run.
     // An empty generics run leaves `generic_start` at the current extra length and
     // `generic_len` 0, which `protoAt` decodes to an empty (safe) slice.
+    //
+    // A generic impl's params (`[T]`, M10) come FIRST in the run, then the method's
+    // own `[U]` (parsed above but NOT yet inference-bound — deferred; only the impl's
+    // params are matched at a call site). Both `impl_gparams` and `generics` are empty
+    // for a bare impl / a top-level fn, so the run stays byte-identical there.
     const params_start: u32 = @intCast(p.extra.items.len);
     const param_cells: []const u32 = @ptrCast(params.items);
     try p.extra.appendSlice(p.gpa, param_cells);
     const generic_start: u32 = @intCast(p.extra.items.len);
+    const impl_gp_cells: []const u32 = @ptrCast(impl_gparams);
+    try p.extra.appendSlice(p.gpa, impl_gp_cells);
     const generic_cells: []const u32 = @ptrCast(generics.items);
     try p.extra.appendSlice(p.gpa, generic_cells);
     const proto_header = try p.addExtra(&.{
@@ -550,26 +566,47 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32) Error!Ast.Index {
         params_start,
         @intCast(params.items.len),
         generic_start,
-        @intCast(generics.items.len),
+        @intCast(impl_gparams.len + generics.items.len),
     });
 
     return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
 }
 
 /// `impl Type { fn m(self, ..) -> R { .. } }` — a keyword-led inherent-method block
-/// (M8). The receiver is a BARE type name only: a generic receiver `impl Box[T]`
-/// (M10) or a qualified `impl mod.T` (coherence) is out of scope and rejected here,
-/// so the receiver never carries type-args/a qualifier. The body reuses the struct-
-/// body brace member loop, but over `fn` methods (each parsed with the receiver so
-/// its leading `self` is synthesized). Newlines/commas separate methods.
+/// (M8). The receiver is a bare type name (`impl P`, M8) or a GENERIC type application
+/// (`impl Box[T]`, M10): the `[T]` declares the impl's type-params and turns the
+/// receiver into a `type_app` `Box[T]`. A qualified `impl mod.T` receiver (coherence)
+/// is still out of scope (M11) and rejected here. The body reuses the struct-body
+/// brace member loop, but over `fn` methods (each parsed with the receiver so its
+/// leading `self` is synthesized). Newlines/commas separate methods.
+///
+/// NODE SHARING (deliberate, safe): for a generic impl the ONE `type_app` node is both
+/// `impl_decl.lhs` and every method's `self` type-ref, and its `generic_param` leaves
+/// are shared with each method's FnProto generic run. All leaves are created before
+/// every referencing parent (child<self still holds), the graph is a cycle-free DAG
+/// (fine for the content fp + pack/unpack, which memcpy the flat node/extra arrays),
+/// and the runtime invariant sweep only checks span totality + bracket pairing.
 fn parseImplDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_impl, "expected 'impl'");
     const recv_tok = p.index;
     try p.expect(.identifier, "expected a type name after 'impl'");
     const recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
-    // Bare receiver only: `[` (generic) / `.` (qualified) are deferred milestones.
-    if (p.at(.l_bracket) or p.at(.dot)) {
-        return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare type name");
+    // A qualified `impl mod.T` receiver (coherence, M11) is still deferred; `[` (a
+    // generic receiver) is now accepted below.
+    if (p.at(.dot)) {
+        return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare or generic type name");
+    }
+    // A generic receiver `impl Box[T]` (M10): `[T]` declares the impl's type-params
+    // (each a `generic_param` leaf) and the receiver becomes a `type_app`. The leaves
+    // are prepended into every method's generic run (see `parseFnDecl`).
+    var impl_gparams: std.ArrayList(Ast.Index) = .empty;
+    defer impl_gparams.deinit(p.gpa);
+    var recv_node: Ast.Index = recv_ref;
+    if (p.at(.l_bracket)) {
+        const lbracket = p.index;
+        try p.parseGenericParams(&impl_gparams);
+        const args_range = try p.addRange(impl_gparams.items);
+        recv_node = try p.addNode(.{ .tag = .type_app, .main_token = lbracket, .lhs = recv_ref, .rhs = args_range });
     }
     try p.expect(.l_brace, "expected '{' after the impl receiver type");
 
@@ -584,7 +621,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
         if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.kw_fn)) {
-            const method = try p.parseFnDecl(recv_tok);
+            const method = try p.parseFnDecl(recv_tok, recv_node, impl_gparams.items);
             try methods.append(p.gpa, method);
             // A method is separated by a newline (loop-top `skipNewlines`) or an
             // optional comma; a `}` ends the block.
@@ -597,7 +634,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.r_brace, "expected '}' to close the impl block");
 
     const header = try p.addRange(methods.items);
-    return p.addNode(.{ .tag = .impl_decl, .main_token = recv_tok, .lhs = recv_ref, .rhs = header });
+    return p.addNode(.{ .tag = .impl_decl, .main_token = recv_tok, .lhs = recv_node, .rhs = header });
 }
 
 /// `struct Name { x: int, y: int }`. Fields are `name: Type`, comma-separated,
@@ -2367,6 +2404,54 @@ test "mut self parses to the same synthesized self-param shape (no node change)"
         "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n",
         "(program (struct P (param x int)) (impl P (fn bump ((param self P) (param d int)) _ (block (= (. self x) (+ (. self x) d))))))",
     );
+}
+
+test "M10: a generic impl parses; the receiver is a type_app and the method's self type-ref is it" {
+    // The method carries the impl's `[T]` in its FnProto generic run and its `self`
+    // type-ref is the receiver `type_app` `Box[T]` (so it decodes to an App).
+    try expectProgram(
+        "struct Box[T] { v: T }\nimpl Box[T] { fn get(self) -> T { self.v } }\n",
+        "(program (struct Box [T] (param v T)) (impl Box (fn get [T] ((param self (tyapp Box T))) T (block (. self v)))))",
+    );
+}
+
+test "M10: the generic impl's receiver type_app is SHARED as impl.lhs and each method's self type-ref" {
+    const gpa = testing.allocator;
+    const source = "struct Box[T] { v: T }\nimpl Box[T] { fn get(self) -> T { self.v } }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, source);
+    defer freeTree(gpa, tree);
+
+    var impl_idx: ?Ast.Index = null;
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag == .impl_decl) impl_idx = Ast.Index.from(@intCast(i));
+    }
+    try testing.expect(impl_idx != null);
+    const impl = tree.nodes[impl_idx.?.int()];
+    // impl_decl.lhs is a `type_app` (the generic receiver), not a bare identifier.
+    try testing.expectEqual(Node.Tag.type_app, tree.nodes[impl.lhs.int()].tag);
+
+    const methods = Ast.rangeSlice(tree, impl.rhs.int());
+    try testing.expectEqual(@as(usize, 1), methods.len);
+    const proto = Ast.protoAt(tree, tree.nodes[methods[0].int()].lhs.int());
+    // The method has exactly one generic param, named "T" (the impl's).
+    try testing.expectEqual(@as(usize, 1), proto.generic_params.len);
+    try testing.expectEqualStrings("T", tokens[tree.nodes[proto.generic_params[0].int()].main_token].text(source));
+    // The self param's type-ref IS the shared receiver type_app node.
+    try testing.expectEqual(@as(usize, 1), proto.params.len);
+    try testing.expectEqual(impl.lhs, tree.nodes[proto.params[0].int()].lhs);
+}
+
+test "M10: a qualified `impl mod.T` receiver is still rejected (P0001)" {
+    const gpa = testing.allocator;
+    const source = "impl a.b { fn m(self) -> int { 0 } }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expect(res.diags.len >= 1);
 }
 
 test "isMutParam is true for `mut self`, false for plain self / a non-self first param" {

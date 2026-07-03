@@ -1,0 +1,15 @@
+# Feature: inherent methods on a GENERIC type via `impl Box[T] { fn .. }` (M10).
+# expect: exit 42
+# `impl Box[T]` puts `T` in scope for the method body; `b.get()` on `b: Box[int]`
+# binds T=int by matching the receiver `Box[int]` against the `Self` pattern `Box[T]`,
+# so `get` monomorphizes to one concrete unit returning `self.v` = 42.
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn get(self) -> T { self.v }
+}
+
+fn main() -> int {
+    b := Box[int]{ v: 42 }
+    return b.get()
+}
