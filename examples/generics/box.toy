@@ -1,0 +1,14 @@
+# Feature: monomorphized generic STRUCTS with explicit type args (M4 [SECONDARY SPIKE]).
+# `Box[T]` is a generic struct; `Box[int]` reifies to an ordinary concrete struct
+# (one int field, size 8) via the composite `App` type + the serial reification tail,
+# so codegen/fingerprint/cache see only a plain struct — no runtime dictionaries, no
+# `App` at lower. Two `Box[int]` constructions share the one reified layout; field
+# access `b.v` reads through the substituted field type. Uninstantiated `Box[T]` emits
+# zero codegen.
+# expect: exit 42
+struct Box[T] { v: T }
+fn main() -> int {
+  b := Box[int]{ v: 41 }
+  c := Box[int]{ v: 1 }
+  return b.v + c.v
+}

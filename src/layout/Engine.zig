@@ -25,7 +25,15 @@ const Ast = @import("../ast/Ast.zig");
 /// generic template's decoded signature. It is substituted away to a concrete kind
 /// during the serial monomorphization tail, BEFORE any `node_types` slot is frozen,
 /// so it never reaches lower/codegen/layout (Debug-asserted there).
-pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var };
+///
+/// `app` (M4, APPENDED — ordinals frozen) is a CHECK-TIME composite type
+/// `Ctor[args..]` (a generic-struct application like `Box[int]`): it reuses
+/// `struct_id` as an index into the interned composite table (`symbols/Composite.zig`).
+/// Every reachable ground `app` is REIFIED to a fresh ordinary `struct_id` (its
+/// `Layout` registered on the live tables) during the serial monomorphization tail,
+/// BEFORE the layout snapshot, so codegen/fingerprint/cache see only plain `structT`
+/// and an `app` never reaches lower/codegen (Debug-asserted there).
+pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app };
 
 /// A type. A byte-foldable struct (not a tagged union) so it preserves `@memset`,
 /// `node_types` triviality, and a stable fingerprint basis. A `@"struct"` kind
@@ -68,11 +76,29 @@ pub const Type = struct {
         return t.struct_id;
     }
 
+    /// A check-time composite `Ctor[args..]` type (M4). Reuses `struct_id` as the
+    /// interned composite-table index (`symbols/Composite.zig`) — NO widening.
+    pub fn app(idx: u32) Type {
+        return .{ .kind = .app, .struct_id = idx };
+    }
+
+    pub fn isApp(t: Type) bool {
+        return t.kind == .app;
+    }
+
+    /// The composite-table index of an `app` (read of the reused id field). Two
+    /// structurally-equal `app`s share an index within a run (content-addressed
+    /// interning), so `eql`-by-id is correct.
+    pub fn appIdx(t: Type) u32 {
+        return t.struct_id;
+    }
+
     pub fn eql(a: Type, b: Type) bool {
         return a.kind == b.kind and
             (a.kind != .@"struct" or a.struct_id == b.struct_id) and
             (a.kind != .@"enum" or a.enum_id == b.enum_id) and
-            (a.kind != .type_var or a.struct_id == b.struct_id);
+            (a.kind != .type_var or a.struct_id == b.struct_id) and
+            (a.kind != .app or a.struct_id == b.struct_id);
     }
 
     /// The one assignability relation: is a value of type `got` acceptable where a
@@ -163,6 +189,13 @@ pub const StructSym = struct {
     mod: u32 = 0,
     /// Whether the struct decl is `pub` (graph mode; pub-signature coherence).
     pub_export: bool = false,
+    /// A generic TEMPLATE `struct Box[T] { .. }` (M4): its `field_types` carry
+    /// `type_var`/`App` PATTERNS, never a value type, so Phase 0b must SKIP laying it
+    /// out (its type-var fields have no ABI). Only its reified concrete instances get
+    /// a layout. `generic_params` are the ordered param NAMES (borrowed source slices;
+    /// the outer array is owned by the checker's `structs` table).
+    is_generic: bool = false,
+    generic_params: []const []const u8 = &.{},
 };
 
 /// One variant in the scratch enum table (during layout). `field_names`/`name`
@@ -249,6 +282,12 @@ pub const Env = struct {
     /// The active tree (after `gphSelect`). Resolved lazily inside the engine so
     /// the read happens AFTER the active-module swap (mirroring the checker).
     tree: *const fn (ctx: *anyopaque) Ast.Tree,
+    /// Reify the interned composite `App` at `app_idx` to a fresh concrete `struct_id`
+    /// (registering its `Layout` on the live tables, memoized) and return it (M4). Used
+    /// by `layoutStruct` to turn a concrete generic-struct field type `b: Box[int]`
+    /// (which decodes to an `App`) into a plain `structT` BEFORE it is stored/laid out,
+    /// so no `App` ever lands in a laid struct's `field_types`.
+    reifyApp: *const fn (ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!u32,
 };
 
 /// Lay out struct `id`: field offsets in declaration order with natural
@@ -291,13 +330,19 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         names[i] = env.nameText(env.ctx, field.main_token);
         const fty = env.typeFromNode(env.ctx, field.lhs);
         types[i] = fty;
+        // A concrete generic-struct field `b: Box[int]` decodes to a composite `App`
+        // (M4). Reify it on-demand to get the size/align for offsets, but KEEP the
+        // `App` in `field_types` so Pass-C field/construction checks compare it against
+        // the (same-interned) `App` a value expression produces — the mono-tail rewrite
+        // turns both into the reified `structT` before the snapshot.
+        const size_ty: Type = if (fty.isApp()) Type.structT(try env.reifyApp(env.ctx, fty.appIdx())) else fty;
         var fsize: u32 = 0;
         var falign: u32 = 1;
-        if (fty.kind == .unit) {
+        if (size_ty.kind == .unit) {
             try env.emitUnitField(env.ctx, env.byteOf(env.ctx, field.main_token), names[i]);
             poisoned = true;
-        } else if (fty.kind != .invalid) {
-            const sz = try layoutReferent(env, fty, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name, &poisoned);
+        } else if (size_ty.kind != .invalid) {
+            const sz = try layoutReferent(env, size_ty, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name, &poisoned);
             fsize = sz.size;
             falign = sz.@"align";
         }
@@ -313,6 +358,53 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     env.structs.items[id].@"align" = max_align;
     env.structs.items[id].size = if (poisoned or empty_poison) 0 else roundUp(running, max_align);
     env.structs.items[id].poisoned = poisoned or empty_poison;
+    env.structs.items[id].state = .done;
+}
+
+/// Lay out a REIFIED generic-struct instance (M4) whose `field_names`/`field_types`
+/// are ALREADY populated (by the monomorphization tail's substitution) — there is no
+/// decl in the tree to read fields from. Computes offsets/size/align + poison over the
+/// stored `field_types` via `layoutReferent`, using the SAME per-field offset formula
+/// as `layoutStruct` (roundUp per field align; size = roundUp(total, max_align)), so
+/// the reg-pair↔indirect ABI boundary is byte-identical to a hand-written struct.
+/// The field types are concrete by construction (type-args are checked to be concrete
+/// value types; nested `App` fields were reified to `structT` by `substReify`), so the
+/// empty/unit/`App` diagnostic paths cannot fire here; any residual `unit`/`invalid`
+/// is sized to 0 defensively (offsets stay well-defined).
+pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
+    if (env.structs.items[id].state == .done) return;
+    env.structs.items[id].state = .laying;
+    const prev = env.gphSelect(env.ctx, env.structs.items[id].mod);
+    defer _ = env.gphSelect(env.ctx, prev);
+
+    const types = env.structs.items[id].field_types;
+    const at = env.byteOf(env.ctx, env.tree(env.ctx).nodes[env.structs.items[id].decl_node.int()].main_token);
+    const name = env.structs.items[id].name;
+
+    const offsets = try env.gpa.alloc(u32, types.len);
+    errdefer env.gpa.free(offsets);
+
+    var running: u32 = 0;
+    var max_align: u32 = 1;
+    var poisoned = false;
+    for (types, 0..) |fty, i| {
+        var fsize: u32 = 0;
+        var falign: u32 = 1;
+        if (fty.kind != .invalid and fty.kind != .unit) {
+            const sz = try layoutReferent(env, fty, at, name, &poisoned);
+            fsize = sz.size;
+            falign = sz.@"align";
+        }
+        const off = roundUp(running, falign);
+        offsets[i] = off;
+        running = off + fsize;
+        if (falign > max_align) max_align = falign;
+    }
+
+    env.structs.items[id].offsets = offsets;
+    env.structs.items[id].@"align" = max_align;
+    env.structs.items[id].size = if (poisoned) 0 else roundUp(running, max_align);
+    env.structs.items[id].poisoned = poisoned;
     env.structs.items[id].state = .done;
 }
 
@@ -415,13 +507,20 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
                 break :blk env.typeFromNode(env.ctx, pnode.lhs);
             } else env.typeFromNode(env.ctx, pnode_idx);
             ftypes[pi] = pty;
+            // A concrete generic-struct payload `v(Box[int])` decodes to a composite
+            // `App` (M4). Reify it on-demand for its size/align but KEEP the `App` in
+            // `field_types` (mirroring layoutStruct) so Pass-C construction checks
+            // compare it against the same-interned `App`; the mono-tail rewrite turns it
+            // into the reified `structT` before the snapshot, so no `App` survives into
+            // the enum layout/fingerprint.
+            const size_ty: Type = if (pty.isApp()) Type.structT(try env.reifyApp(env.ctx, pty.appIdx())) else pty;
             var psize: u32 = 0;
             var pa: u32 = 1;
-            if (pty.kind == .unit) {
+            if (size_ty.kind == .unit) {
                 try env.emitUnitPayload(env.ctx, env.byteOf(env.ctx, vnode.main_token), vname);
                 poisoned = true;
-            } else if (pty.kind != .invalid) {
-                const sz = try layoutReferent(env, pty, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name, &poisoned);
+            } else if (size_ty.kind != .invalid) {
+                const sz = try layoutReferent(env, size_ty, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name, &poisoned);
                 psize = sz.size;
                 pa = sz.@"align";
             }
@@ -734,6 +833,7 @@ const Harness = struct {
             .emitUnitField = stubEmitUnitField,
             .emitUnitPayload = stubEmitUnitPayload,
             .tree = stubTree,
+            .reifyApp = stubReifyApp,
         };
     }
 };
@@ -776,6 +876,11 @@ fn stubEmitUnitField(ctx: *anyopaque, byte: u32, fld: []const u8) error{OutOfMem
 }
 fn stubEmitUnitPayload(ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void {
     return pushDiag(ctx, byte, "variant '{s}' payload cannot have type ()", .{variant});
+}
+fn stubReifyApp(_: *anyopaque, _: u32) error{OutOfMemory}!u32 {
+    // The layout unit tests never build a struct with a concrete `App` field, so this
+    // is never invoked; the full reify path is covered end-to-end in types.zig.
+    unreachable;
 }
 
 /// Count captured diagnostics whose message equals `want`.
@@ -830,6 +935,69 @@ test "algebra: type_var round-trips its ordinal and eql is per-ordinal" {
     // A type_var is not a struct even though it reuses struct_id (kind discriminates).
     try testing.expect(!Type.eql(t0, Type.structT(0)));
     try testing.expect(!t0.isStruct());
+}
+
+test "algebra: app round-trips its composite index and eql is per-index (M4)" {
+    // The byte-foldable Type never widens: the composite index rides `struct_id`.
+    try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
+    const a0 = Type.app(0);
+    const a1 = Type.app(1);
+    try testing.expect(a0.isApp());
+    try testing.expectEqual(@as(u32, 0), a0.appIdx());
+    try testing.expectEqual(@as(u32, 1), a1.appIdx());
+    // Same interned index => eql (structurally-equal Apps share an index); distinct
+    // indices are distinct types.
+    try testing.expect(Type.eql(a0, Type.app(0)));
+    try testing.expect(!Type.eql(a0, a1));
+    // An app is neither a struct nor a type_var even though all three reuse struct_id
+    // (kind discriminates), so eql-by-id never confuses them.
+    try testing.expect(!Type.eql(a0, Type.structT(0)));
+    try testing.expect(!Type.eql(a0, Type.typeVar(0)));
+    try testing.expect(!a0.isStruct());
+    // assignable delegates to eql: same-index apps are assignable, distinct are not.
+    try testing.expect(Type.assignable(a0, Type.app(0)));
+    try testing.expect(!Type.assignable(a0, a1));
+}
+
+test "engine: layoutReified matches a hand-written struct's offsets/size/align (M4)" {
+    // A reified generic instance is laid out from pre-populated field_types (no decl
+    // fields in the tree); its ABI math must equal the tree-driven `layoutStruct`.
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    // A "template" decl node just to supply a decl_node/main_token for the byte offset;
+    // its tree fields are NOT read by layoutReified.
+    const tmpl = try h.struct_("Box", &.{try h.field("v", Type.int)});
+    _ = tmpl;
+    // Reified Box$int: one int field, populated directly.
+    const names = try h.gpa.alloc([]const u8, 1);
+    names[0] = "v";
+    const types = try h.gpa.alloc(Type, 1);
+    types[0] = Type.int;
+    const decl = h.structs.items[0].decl_node;
+    try h.structs.append(h.gpa, .{ .decl_node = decl, .name = "Box$int", .field_names = names, .field_types = types });
+    const rid: u32 = @intCast(h.structs.items.len - 1);
+    try layoutReified(h.env(), rid);
+    const s = h.structs.items[rid];
+    try testing.expect(!s.poisoned);
+    try testing.expectEqual(@as(usize, 1), s.offsets.len);
+    try testing.expectEqual(@as(u32, 0), s.offsets[0]);
+    try testing.expectEqual(@as(u32, 8), s.size);
+    try testing.expectEqual(@as(u32, 8), s.@"align");
+
+    // Two int fields => offsets 0/8, size 16, align 8 — the reg-pair ABI boundary.
+    const names2 = try h.gpa.alloc([]const u8, 2);
+    names2[0] = "a";
+    names2[1] = "b";
+    const types2 = try h.gpa.alloc(Type, 2);
+    types2[0] = Type.int;
+    types2[1] = Type.int;
+    try h.structs.append(h.gpa, .{ .decl_node = decl, .name = "Pair$int$int", .field_names = names2, .field_types = types2 });
+    const rid2: u32 = @intCast(h.structs.items.len - 1);
+    try layoutReified(h.env(), rid2);
+    const s2 = h.structs.items[rid2];
+    try testing.expectEqual(@as(u32, 0), s2.offsets[0]);
+    try testing.expectEqual(@as(u32, 8), s2.offsets[1]);
+    try testing.expectEqual(@as(u32, 16), s2.size);
 }
 
 test "engine: directly-recursive struct is poisoned with one diagnostic" {

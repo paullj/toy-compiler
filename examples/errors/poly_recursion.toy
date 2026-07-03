@@ -1,0 +1,9 @@
+# Feature: the M4 termination guard (T0017). `go[T]` transitively instantiates
+# `go[Box[T]]`, forming type-args of strictly-growing generic-nesting depth
+# (Box[int], Box[Box[int]], ...) — an unbounded instantiation. The serial mono
+# worklist rejects it deterministically once the depth cap is exceeded, so the
+# compiler terminates with a diagnostic instead of hanging/OOMing.
+# expect: compile-error "instantiation too deep"
+struct Box[T] { v: T }
+fn go[T](x: T) { go[Box[T]](Box[Box[T]]{ v: x }) }
+fn main() { go[int](0) }

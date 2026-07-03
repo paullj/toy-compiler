@@ -1408,6 +1408,12 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
                 const ltag = p.nodes.items[lhs.int()].tag;
                 switch (ltag) {
                     .identifier => lhs = try p.parseStructLiteral(lhs),
+                    // Generic-struct construction `Box[int] { ... }` (M4): the `[..]`
+                    // was already wrapped into a `type_app` by the `.l_bracket` arm, so
+                    // build a `struct_init` whose lhs is that `type_app` (no new
+                    // Node.Tag ⇒ ParseHeader.version unchanged). The `type_app` + its
+                    // args were created first, so children still precede the parent.
+                    .type_app => lhs = try p.parseStructLiteral(lhs),
                     .enum_init_unit => if (p.nodes.items[lhs.int()].lhs == Ast.none) {
                         lhs = try p.upgradeStructInit(lhs, Ast.none);
                     } else break,
@@ -2278,6 +2284,26 @@ test "generic nodes precede their parents (children-before-parents on generics)"
     }
     try testing.expect(saw_generic_param);
     try testing.expect(saw_type_app);
+}
+
+test "generic-struct construction Box[int]{ v: 1 } builds struct_init over a type_app (M4)" {
+    const gpa = testing.allocator;
+    const source = "fn main() -> int {\n b := Box[int]{ v: 1 }\n b.v\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, source);
+    defer freeTree(gpa, tree);
+
+    var saw = false;
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag != .struct_init) continue;
+        // The construction's lhs is the `type_app` (Box[int]), created before it, so
+        // children still precede the parent (the on-every-parse invariant sweep holds).
+        try testing.expect(tree.nodes[n.lhs.int()].tag == .type_app);
+        try testing.expect(n.lhs.int() < @as(u32, @intCast(i)));
+        saw = true;
+    }
+    try testing.expect(saw);
 }
 
 test "malformed generic list recovers without crashing (tainted parse)" {

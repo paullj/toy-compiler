@@ -1,7 +1,7 @@
-# Feature: generic DATA types still parse but are not yet supported (M2 gate).
-# M2 ships generic FUNCTIONS (see id_explicit.toy), but generic structs/enums —
-# and any type-application in TYPE position — remain gated with T0013 until M4/M6.
-# A generic struct decl builds a well-formed AST but type-checking rejects it.
+# Feature: generic ENUM types still parse but are not yet supported (M4 residual gate).
+# M4 ships generic STRUCTS (see box.toy) + generic FUNCTIONS (M2, see id_explicit.toy),
+# but a generic enum decl `enum Opt[T]` remains gated with T0013 until M6. The decl
+# builds a well-formed AST but type-checking rejects it.
 # expect: compile-error "generics not yet supported"
-struct Box[T] { v: T }
+enum Opt[T] { some(T), none }
 fn main() -> int { return 0 }
