@@ -34,6 +34,7 @@ const Typecheck = @import("types.zig");
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
+const Mono = @import("symbols/Mono.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 /// The read-only front-end inputs a lowering needs. Mirrors the slice of
@@ -60,6 +61,13 @@ pub const Inputs = struct {
     /// owning module's id, including a qualified cross-module `b: rect.Rect` resolved
     /// by `Typecheck.typeFromQualified`); `typeFromRef` is only the fallback.
     sig: ?Sig = null,
+    /// The monomorphization instance table (M2). A generic call `id[int](..)` in
+    /// this body resolves its callee to the reified instance's mangled SymName by
+    /// matching `(template gid + the concrete type-args read from node_types)`
+    /// against this table. Empty for a program with no generics. Resolution reads
+    /// only concrete `node_types` — no substitution map is threaded here (the mono
+    /// tail already substituted every `type_var` away before `node_types` froze).
+    instances: []const Mono.Instance = &.{},
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -603,14 +611,38 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 }
 
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
-    // The callee identifier resolves to a `.func` index into `names` (this also
-    // covers the `print` builtin, whose name index points at the synthetic entry).
-    const callee_res = b.in.resolutions[(n.lhs).int()];
-    if (callee_res != .func) {
-        try b.note(n.main_token, "call target unsupported in lower");
-        return .none;
+    const callee_node = b.in.tree.nodes[(n.lhs).int()];
+    var callee: Link.SymName = undefined;
+    if (callee_node.tag == .type_app) {
+        // A generic call `id[int](..)` (M2): the callee is a `type_app` whose base
+        // identifier carries the template gid. Resolve to the reified instance's
+        // mangled SymName by matching (gid + the concrete type-args the checker
+        // wrote into node_types) against the instance table — a pure read of
+        // concrete types, no substitution needed here.
+        const base_res = b.in.resolutions[(callee_node.lhs).int()];
+        if (base_res != .func) {
+            try b.note(n.main_token, "call target unsupported in lower");
+            return .none;
+        }
+        const targ_nodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+        const targs = try b.gpa.alloc(Typecheck.Type, targ_nodes.len);
+        defer b.gpa.free(targs);
+        for (targ_nodes, 0..) |tn, i| targs[i] = b.in.node_types[(tn).int()];
+        const ii = Mono.find(b.in.instances, base_res.func, targs) orelse {
+            try b.note(callee_node.main_token, "unresolved generic instance in lower");
+            return .none;
+        };
+        callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+    } else {
+        // The callee identifier resolves to a `.func` index into `names` (this also
+        // covers the `print` builtin, whose name index points at the synthetic entry).
+        const callee_res = b.in.resolutions[(n.lhs).int()];
+        if (callee_res != .func) {
+            try b.note(n.main_token, "call target unsupported in lower");
+            return .none;
+        }
+        callee = b.in.names[callee_res.func];
     }
-    const callee = b.in.names[callee_res.func];
     const result_ty = b.in.node_types[(node_idx).int()];
 
     // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot).
@@ -1610,11 +1642,17 @@ fn localSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMe
 fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
     if (proto.ret_type == Ast.none) return Typecheck.Type.unit;
     if (in.tree.nodes[(proto.ret_type).int()].tag == .literal_unit) return Typecheck.Type.unit;
-    // Prefer the typecheck-resolved sig for aggregates: it carries the GLOBAL
-    // struct/enum id (incl. a cross-module qualified `mod.Type`), so the ABI
-    // decision is taken on the correct layout. `typeFromRef`'s bare-name scan
-    // can alias two modules' same-named distinct types — never on the ABI path.
-    if (in.sig) |s| if (s.ret.kind == .@"struct" or s.ret.kind == .@"enum") return s.ret;
+    // Prefer the typecheck-resolved sig for EVERY kind: it carries the GLOBAL
+    // struct/enum id (incl. a cross-module qualified `mod.Type`) so the ABI decision
+    // is taken on the correct layout, AND — for a monomorphized instance (M2) — it
+    // is the SUBSTITUTED concrete type, so a ret spelled `T` (whose token would
+    // otherwise fall to `typeFromRef`'s `int` default, miscompiling `id[bool]`/
+    // `id[str]`) is resolved correctly. Byte-identical for a non-generic fn, whose
+    // `s.ret` equals what `typeFromRef` would compute for the concrete spelling.
+    if (in.sig) |s| {
+        std.debug.assert(!s.ret.isTypeVar()); // reified-away before lower (M2)
+        return s.ret;
+    }
     return typeFromRef(in, proto.ret_type);
 }
 
@@ -1622,11 +1660,12 @@ fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
 /// its type-ref token spelling.
 fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
     const param_node = proto.params[slot];
-    // Prefer the typecheck-resolved sig for aggregates (correct GLOBAL id, incl.
-    // cross-module qualified types) so the param ABI decision is ABI-correct.
+    // Prefer the typecheck-resolved sig for EVERY kind (see `returnType`): correct
+    // GLOBAL id for aggregates AND the SUBSTITUTED concrete type for an instance's
+    // `T`-spelled param, so `id[bool]`/`id[str]` are not lost to the `int` default.
     if (in.sig) |s| if (slot < s.params.len) {
-        const pt = s.params[slot];
-        if (pt.kind == .@"struct" or pt.kind == .@"enum") return pt;
+        std.debug.assert(!s.params[slot].isTypeVar()); // reified-away before lower (M2)
+        return s.params[slot];
     };
     if (param_node.int() < in.node_types.len) {
         const t = in.node_types[(param_node).int()];
@@ -1649,6 +1688,8 @@ fn typeFromRef(in: Inputs, ref: Ast.Index) Typecheck.Type {
     for (in.enum_layouts, 0..) |e, id| {
         if (std.mem.eql(u8, e.name, name)) return Typecheck.Type.enumT(@intCast(id));
     }
+    // A generic-param spelling `T` never reaches here on the lowered path: the
+    // instance's sig (preferred above) already carries the concrete substitution.
     return Typecheck.Type.int;
 }
 

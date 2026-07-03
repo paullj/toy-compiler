@@ -24,6 +24,27 @@ const refs = Typecheck.refs;
 /// The form a construction NODE supplies (independent of the declared variant).
 const InitForm = enum { unit, tuple, @"struct" };
 
+/// Substitute a template type through a concrete type-arg tuple (M2): a
+/// `type_var(ord)` becomes `targs[ord]`; any concrete type passes through. The
+/// sibling of `Typecheck.subst`; kept here so `typeOfGenericCall` grounds a
+/// generic call's params/ret at the call site.
+fn substTy(ty: Type, targs: []const Type) Type {
+    if (ty.isTypeVar()) {
+        const ord = ty.typeVarOrd();
+        return if (ord < targs.len) targs[ord] else Type.invalid;
+    }
+    return ty;
+}
+
+/// True when `ty` is a concrete value type usable as a monomorphization type-arg
+/// (no `App`, no `type_var`, no `unit`, no poison). Mirrors `Typecheck.isConcreteValue`.
+fn isConcreteValue(ty: Type) bool {
+    return switch (ty.kind) {
+        .int, .bool, .str, .@"struct", .@"enum" => true,
+        else => false,
+    };
+}
+
 /// Coverage state for a match, by scrutinee kind. Enum: a per-variant seen bitmap.
 /// Bool: which of true/false a literal arm has covered. Int: nothing (an infinite
 /// domain — exhaustiveness only via `_`).
@@ -67,6 +88,17 @@ pub const BodyChecker = struct {
     sink: DiagnosticSink,
 
     gph_fn_names: ?[]const []const u8 = null,
+
+    /// Per-instance substitution, set ONLY by the monomorphization tail's
+    /// per-instance re-check (`Typecheck.recheck`). When set, a generic-parameter
+    /// type-ref name inside the body resolves through it (via `genericParamType`) to
+    /// the concrete arg; null on every normal Pass-C body walk, which is therefore
+    /// byte-identical. Borrowed for the duration of one re-check.
+    subst: ?Subst = null,
+
+    /// The ordered generic-param names + the concrete args they bind to, in
+    /// generic-param order (`names[i]` binds `types[i]`).
+    pub const Subst = struct { names: []const []const u8, types: []const Type };
 
     pub fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
@@ -1008,6 +1040,11 @@ pub const BodyChecker = struct {
                 return ty;
             }
         }
+        // An explicit-args generic call `id[int](7)` (M2): the callee is a `type_app`
+        // whose base identifier carries the template's `.func`. A pure per-call
+        // operation (substitute the params/ret through the explicit args, check the
+        // value args) that writes only concrete types into `node_types`.
+        if (callee.tag == .type_app) return bc.typeOfGenericCall(node_idx, n, callee);
         const callee_res = bc.resolutions[(n.lhs).int()];
         if (callee_res != .func) {
             // Type the args anyway so their own errors surface, then poison.
@@ -1036,6 +1073,15 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        // A bare (no-explicit-args) generic call `id(7)` cannot be checked without
+        // inference (M3): its params/ret are `type_var`s. Reject it now — returning
+        // `f.ret` here would leak a `type_var` into `node_types`. (Inference is the
+        // droppable layer; explicit `id[int](7)` is the M2 escape hatch.)
+        if (f.isGeneric()) {
+            for (args) |arg| _ = try bc.typeOf(arg);
+            try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "generic call requires explicit type arguments, e.g. f[int](..)");
+            return .invalid;
+        }
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
@@ -1048,6 +1094,78 @@ pub const BodyChecker = struct {
             }
         }
         return f.ret;
+    }
+
+    /// Type an explicit-args generic call `id[A,B](..)`. The callee `type_app`'s base
+    /// identifier resolves to the generic template; the explicit type-args resolve to
+    /// concrete `Type`s (written into `node_types` so the mono tail can read them back
+    /// to discover the instance), the value args are checked against the SUBSTITUTED
+    /// param types, and the call node types as the substituted return. Every type this
+    /// writes is concrete: a `type_var` never escapes (the args are concrete value
+    /// types, and inside an instance re-check `bc.subst` grounds a generic-param
+    /// type-arg to concrete before it is stored).
+    fn typeOfGenericCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!Type {
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        const base_res = bc.resolutions[(callee.lhs).int()];
+        if (base_res != .func) {
+            for (args) |arg| _ = try bc.typeOf(arg);
+            // The base of a `[..]` callee that is not a fn: nothing else takes type
+            // args in M2 (no generic types in value position), so it is a plain
+            // not-a-function.
+            try bc.sink.emit(bc.byteOf(n.main_token), "called value is not a function");
+            return .invalid;
+        }
+        const f = bc.model.fns[base_res.func];
+        const targ_nodes = Ast.rangeSlice(bc.tree, (callee.rhs).int());
+        if (!f.isGeneric()) {
+            for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
+            for (args) |arg| _ = try bc.typeOf(arg);
+            try bc.sink.emitFmt(bc.byteOf(callee.main_token), "'{s}' is not generic; drop the type arguments", .{bc.nameText(bc.tree.nodes[(callee.lhs).int()].main_token)});
+            return f.ret;
+        }
+        if (targ_nodes.len != f.generic_params.len) {
+            for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
+            for (args) |arg| _ = try bc.typeOf(arg);
+            try bc.sink.emitFmt(bc.byteOf(callee.main_token), "expected {d} type argument(s), got {d}", .{ f.generic_params.len, targ_nodes.len });
+            return .invalid;
+        }
+        const targs = try bc.gpa.alloc(Type, targ_nodes.len);
+        defer bc.gpa.free(targs);
+        var all_concrete = true;
+        for (targ_nodes, 0..) |tn, i| {
+            const ty = bc.typeFromNode(tn); // subst-aware inside an instance re-check
+            bc.node_types[(tn).int()] = ty;
+            targs[i] = ty;
+            if (ty.kind == .invalid) {
+                all_concrete = false; // an unknown type already reported by typeFromNode
+            } else if (!isConcreteValue(ty)) {
+                // `App`/`type_var`/`unit` are not monomorphizable type-args in M2.
+                try bc.sink.emitCode(.T0013, bc.byteOf(bc.tree.nodes[(tn).int()].main_token), "type argument must be a concrete value type");
+                all_concrete = false;
+            }
+        }
+        // Check the value args against the substituted params regardless (surface arg
+        // errors), but only produce the concrete return type when every type-arg is
+        // sound — else poison so no `type_var`/half-substituted type is stored.
+        if (args.len != f.params.len) {
+            for (args) |arg| _ = try bc.typeOf(arg);
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+            if (!all_concrete) return .invalid;
+            const ret = substTy(f.ret, targs);
+            bc.node_types[(node_idx).int()] = ret;
+            return ret;
+        }
+        for (args, f.params, 0..) |arg, pty, i| {
+            const want = if (all_concrete) substTy(pty, targs) else Type.invalid;
+            const at = try bc.typeOfExpected(arg, if (want.kind == .invalid) null else want);
+            if (all_concrete and !Type.assignable(want, at)) {
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(arg).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want), bc.typeName(at) });
+            }
+        }
+        if (!all_concrete) return .invalid;
+        const ret = substTy(f.ret, targs);
+        bc.node_types[(node_idx).int()] = ret;
+        return ret;
     }
 
     fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {
@@ -1083,6 +1201,19 @@ pub const BodyChecker = struct {
 
     fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {
         return refs.typeFromNode(bc, type_node);
+    }
+
+    /// Map a type-ref NAME to its concrete substitution when re-checking a generic
+    /// instance (`subst` set by the mono tail), else null. The Pass-C sibling of
+    /// `Typecheck.genericParamType`; `refs.typeFromNode` calls whichever the active
+    /// checker exposes. No `subst` (every normal body walk) => null => the ordinary
+    /// unknown-type path, so non-generic checking is byte-identical.
+    pub fn genericParamType(bc: *const BodyChecker, name: []const u8) ?Type {
+        const s = bc.subst orelse return null;
+        for (s.names, 0..) |gp, i| {
+            if (std.mem.eql(u8, gp, name)) return if (i < s.types.len) s.types[i] else Type.invalid;
+        }
+        return null;
     }
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {

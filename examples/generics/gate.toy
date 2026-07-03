@@ -1,6 +1,7 @@
-# Feature: generics parse but are not yet supported (M1 gate).
-# The generic fn and the explicit type-args `id[int](7)` build a well-formed AST,
-# but type-checking rejects them with T0013 and emits no binary.
+# Feature: generic DATA types still parse but are not yet supported (M2 gate).
+# M2 ships generic FUNCTIONS (see id_explicit.toy), but generic structs/enums —
+# and any type-application in TYPE position — remain gated with T0013 until M4/M6.
+# A generic struct decl builds a well-formed AST but type-checking rejects it.
 # expect: compile-error "generics not yet supported"
-fn id[T](x: T) -> T { x }
-fn main() -> int { return id[int](7) }
+struct Box[T] { v: T }
+fn main() -> int { return 0 }

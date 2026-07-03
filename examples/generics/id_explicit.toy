@@ -1,0 +1,13 @@
+# Feature: monomorphized generic functions over value types (M2 [PRIMARY SPIKE]).
+# `id[T]` is instantiated at two concrete type-args: `int` and the struct `P`.
+# Each reachable instance reifies to an ordinary concrete per-fn codegen unit with
+# a distinct mangled symbol (id$int, id$s<N>); no runtime dictionaries, no sharing.
+# The struct-typed instance exercises the reg-pair/indirect struct ABI unchanged.
+# expect: exit 42
+fn id[T](x: T) -> T { x }
+struct P { x: int, y: int }
+fn main() -> int {
+  a := id[int](7)
+  p := id[P](P{ x: 20, y: 15 })
+  return a + p.x + p.y
+}

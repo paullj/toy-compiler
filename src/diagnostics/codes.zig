@@ -60,6 +60,7 @@ pub const Code = enum(u16) {
     T0011, // shadows-builtin
     T0012, // duplicate-struct
     T0013, // generics-unsupported
+    T0014, // mono-depth (monomorphization instance/depth limit — M2 belt-and-suspenders)
 
     _,
 };
@@ -111,6 +112,7 @@ pub const table = [_]Entry{
     .{ .code = .T0011, .str = "T0011", .slug = "shadows-builtin" },
     .{ .code = .T0012, .str = "T0012", .slug = "duplicate-struct" },
     .{ .code = .T0013, .str = "T0013", .slug = "generics-unsupported" },
+    .{ .code = .T0014, .str = "T0014", .slug = "mono-depth" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so

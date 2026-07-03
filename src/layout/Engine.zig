@@ -19,7 +19,13 @@ const Ast = @import("../ast/Ast.zig");
 /// The type kind. `invalid` is the poison/error type: it absorbs further errors
 /// so one mistake produces one diagnostic. `@"struct"` carries a `struct_id`
 /// indexing the per-program struct table.
-pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum" };
+///
+/// `type_var` (M2, APPENDED — ordinals are frozen) is a CHECK-TIME type variable:
+/// it reuses `struct_id` as the generic-parameter ordinal and exists only inside a
+/// generic template's decoded signature. It is substituted away to a concrete kind
+/// during the serial monomorphization tail, BEFORE any `node_types` slot is frozen,
+/// so it never reaches lower/codegen/layout (Debug-asserted there).
+pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var };
 
 /// A type. A byte-foldable struct (not a tagged union) so it preserves `@memset`,
 /// `node_types` triviality, and a stable fingerprint basis. A `@"struct"` kind
@@ -47,10 +53,26 @@ pub const Type = struct {
         return .{ .kind = .@"enum", .enum_id = id };
     }
 
+    /// A check-time type variable for generic-parameter `ordinal` (M2). Reuses
+    /// `struct_id` as the ordinal — NO widening, `@sizeOf(Type)` is unchanged.
+    pub fn typeVar(ordinal: u32) Type {
+        return .{ .kind = .type_var, .struct_id = ordinal };
+    }
+
+    pub fn isTypeVar(t: Type) bool {
+        return t.kind == .type_var;
+    }
+
+    /// The generic-parameter ordinal of a `type_var` (read of the reused id field).
+    pub fn typeVarOrd(t: Type) u32 {
+        return t.struct_id;
+    }
+
     pub fn eql(a: Type, b: Type) bool {
         return a.kind == b.kind and
             (a.kind != .@"struct" or a.struct_id == b.struct_id) and
-            (a.kind != .@"enum" or a.enum_id == b.enum_id);
+            (a.kind != .@"enum" or a.enum_id == b.enum_id) and
+            (a.kind != .type_var or a.struct_id == b.struct_id);
     }
 
     /// The one assignability relation: is a value of type `got` acceptable where a
@@ -74,6 +96,12 @@ pub const Type = struct {
 
     pub fn isEnum(t: Type) bool {
         return t.kind == .@"enum";
+    }
+
+    comptime {
+        // The byte-foldable `Type` never widens (locked decision): `type_var` reuses
+        // `struct_id` as the ordinal, so appending the kind does not grow the struct.
+        std.debug.assert(@sizeOf(Type) == 12);
     }
 };
 
@@ -786,6 +814,22 @@ test "algebra: eql discriminates struct/enum ids" {
     try testing.expect(!Type.eql(Type.enumT(1), Type.enumT(2)));
     // same id, different kind: not equal (a struct id is not an enum id).
     try testing.expect(!Type.eql(Type.structT(0), Type.enumT(0)));
+}
+
+test "algebra: type_var round-trips its ordinal and eql is per-ordinal" {
+    // The byte-foldable Type never widens: the ordinal rides `struct_id`.
+    try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
+    const t0 = Type.typeVar(0);
+    const t1 = Type.typeVar(1);
+    try testing.expect(t0.isTypeVar());
+    try testing.expectEqual(@as(u32, 0), t0.typeVarOrd());
+    try testing.expectEqual(@as(u32, 1), t1.typeVarOrd());
+    // Distinct ordinals are distinct types; same ordinal is equal.
+    try testing.expect(Type.eql(t0, Type.typeVar(0)));
+    try testing.expect(!Type.eql(t0, t1));
+    // A type_var is not a struct even though it reuses struct_id (kind discriminates).
+    try testing.expect(!Type.eql(t0, Type.structT(0)));
+    try testing.expect(!t0.isStruct());
 }
 
 test "engine: directly-recursive struct is poisoned with one diagnostic" {

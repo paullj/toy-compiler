@@ -480,6 +480,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .enum_layouts = frozen.enum_layouts,
         .names = frozen.names,
         .sig = sig,
+        .instances = frozen.instances,
     };
     var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
     defer irf.deinit(gpa);
@@ -551,7 +552,18 @@ pub fn codegen(
     }
     try Walks.walkTouchedSig(gpa, frozen, fn_decl, my_sig, &touched);
 
-    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items);
+    // (d) The concrete type-args of a monomorphized instance (empty for a
+    // non-generic fn, so the fold is skipped and its fp is byte-identical). Built
+    // with the SAME layout descriptor the touched fold uses, so a struct-layout edit
+    // to a type-arg invalidates exactly the dependent instance.
+    var type_args: std.ArrayList(Fingerprint.TouchedType) = .empty;
+    defer {
+        Walks.freeTouched(gpa, type_args.items);
+        type_args.deinit(gpa);
+    }
+    try Walks.walkTypeArgs(gpa, frozen, frozen.type_args, &type_args);
+
+    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items);
     // The uniform codegen key: the content fingerprint xor'd with the opt level
     // and the fn's OWN emitted symbol, target-sensitive. `Key.codegen` is the ONE
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).

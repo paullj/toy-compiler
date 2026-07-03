@@ -60,6 +60,13 @@ pub fn fingerprint(
     fn_decl: Ast.Index,
     callee_sigs: []const Sig,
     touched: []const TouchedType,
+    /// (d) The concrete type-args of a monomorphized instance (M2), in
+    /// generic-param order — each an index-free layout descriptor built by
+    /// `appendTouched`. Empty for every non-generic (non-instance) fn: the fold is
+    /// then SKIPPED ENTIRELY, so an existing fn's fingerprint is byte-identical and
+    /// the warm cache is preserved. Two instances of one template get distinct
+    /// fingerprints even when the template body/sig folds are identical.
+    type_args: []const TouchedType,
 ) u64 {
     var h = std.hash.Wyhash.init(seed);
 
@@ -91,6 +98,19 @@ pub fn fingerprint(
     for (touched) |ty| {
         h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version });
         if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
+    }
+
+    // (d) monomorphization type-args. Folded ONLY when present (an instance), so a
+    // non-generic fn's fold is byte-identical — the warm cache survives M2. Ordered
+    // (a `[T,U]` reorder flips it) with a full per-arg layout descriptor so `id[int]`
+    // and `id[Point]` diverge and a struct-layout edit to a type-arg invalidates
+    // exactly the dependent instance. Never XOR, never the interned index.
+    if (type_args.len > 0) {
+        AstWalk.updateU32(&h, @intCast(type_args.len));
+        for (type_args) |ty| {
+            h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version });
+            if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
+        }
     }
 
     return h.final();
@@ -128,7 +148,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 }
 
 fn fp(b: *const Built, fn_idx: usize) u64 {
-    return fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), &.{}, &.{});
+    return fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), &.{}, &.{}, &.{});
 }
 
 test "position-independent: a fn's hash is the same regardless of sibling order" {
@@ -179,8 +199,8 @@ test "callee signature folds in: a sig change flips the caller's hash" {
     const decl = b.fnDecl(0);
     const sig_a = [_]Sig{.{ .kind = .user_fn, .name = "g", .params = &.{.int}, .ret = .int }};
     const sig_b = [_]Sig{.{ .kind = .user_fn, .name = "g", .params = &.{ .int, .int }, .ret = .int }};
-    const ha = fingerprint(b.tree, b.tokens, b.source, decl, &sig_a, &.{});
-    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &sig_b, &.{});
+    const ha = fingerprint(b.tree, b.tokens, b.source, decl, &sig_a, &.{}, &.{});
+    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &sig_b, &.{}, &.{});
     try testing.expect(ha != hb);
 }
 
@@ -194,8 +214,8 @@ test "callee kind folds in: builtin vs user_fn of an identical sig flips the has
     // shadow/unshadow edit is a stale-cache miscompile.
     const builtin_callee = [_]Sig{.{ .kind = .builtin, .name = "print", .params = &.{.str}, .ret = .unit }};
     const user_callee = [_]Sig{.{ .kind = .user_fn, .name = "print", .params = &.{.str}, .ret = .unit }};
-    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &builtin_callee, &.{});
-    const hu = fingerprint(b.tree, b.tokens, b.source, decl, &user_callee, &.{});
+    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &builtin_callee, &.{}, &.{});
+    const hu = fingerprint(b.tree, b.tokens, b.source, decl, &user_callee, &.{}, &.{});
     try testing.expect(hb != hu);
 }
 
@@ -298,8 +318,8 @@ test "touched struct layout folds in: a field-layout edit flips the hash" {
     // Same struct name, different layout bytes (a field added) → different hash.
     const v1 = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
     const v2 = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00y\x00\x02\x08\x00\x00\x00\x10\x00\x00\x00\x08\x00\x00\x00");
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1);
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2);
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
     try testing.expect(h1 != h2);
 }
 
@@ -310,8 +330,8 @@ test "touched struct layout: identical layout hashes identically (cache hit)" {
     const decl = b.fnDecl(0);
     const v = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
     const v2 = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v);
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2);
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
     try testing.expectEqual(h1, h2);
 }
 
@@ -333,11 +353,11 @@ test "a fn NOT touching a struct is unaffected by an unrelated touched-struct fo
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
     const v = touchedStruct("Q", "Q\x00n\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
-    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v);
-    const without = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{});
+    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{});
+    const without = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
     // They legitimately differ (the touched set is part of the key); the point is
     // each is a pure function of its OWN inputs — recomputing `without` matches.
-    try testing.expectEqual(without, fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}));
+    try testing.expectEqual(without, fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}));
     try testing.expect(with != without);
 }
 
@@ -376,8 +396,8 @@ test "touched enum layout folds in: a variant-layout edit flips the hash" {
     const decl = b.fnDecl(0);
     const v1 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00tag" }};
     const v2 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00TAG-changed" }};
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1);
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2);
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
     try testing.expect(h1 != h2);
 }
 
@@ -388,8 +408,8 @@ test "touched enum layout: identical layout hashes identically (cache hit)" {
     const decl = b.fnDecl(0);
     const v = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00same" }};
     const v2 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00same" }};
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v);
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2);
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
     try testing.expectEqual(h1, h2);
 }
 
@@ -427,4 +447,69 @@ test "adding a nested sub-pattern flips the hash" {
     var b = try build(gpa, "enum E { C(int), N }\nfn f(e: E) -> int {\n match e { .C(0) -> 1, .C(r) -> r, .N -> 0 }\n}\n");
     defer b.deinit(gpa);
     try testing.expect(fp(&a, 1) != fp(&b, 1));
+}
+
+test "type-args fold: id[int] and id[Point] get distinct fingerprints (M2)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn id(x: int) -> int {\n return x\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    // Same body/callees/touched; the SOLE difference is the concrete type-arg — an
+    // int scalar vs a struct with a layout. The (d) fold must separate them.
+    const as_int = [1]TouchedType{.{ .kind = .int }};
+    const as_pt = [1]TouchedType{.{ .kind = .@"struct", .layout = "Point\x00x\x00\x02y" }};
+    const h_int = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &as_int);
+    const h_pt = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &as_pt);
+    try testing.expect(h_int != h_pt);
+}
+
+test "type-args fold: empty type_args is byte-identical to no fold (warm cache preserved)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    // The (d) fold is CONDITIONAL on a non-empty slice, so an empty type_args folds
+    // NOTHING and a non-generic fn's fingerprint is stable across calls — the warm
+    // cache survives M2. (A pre-M2 blob keyed on the same fp still hits.)
+    const a = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
+    const c = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
+    try testing.expectEqual(a, c);
+    // A non-empty type_args MUST diverge from the empty fold (proving the gate fires).
+    const v = [1]TouchedType{.{ .kind = .int }};
+    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v);
+    try testing.expect(with != a);
+}
+
+test "generic-param carryover: reorder/add [T,U] flips the fp; a non-generic fn is stable" {
+    const gpa = testing.allocator;
+    var a = try build(gpa, "fn f[T, U](x: T) -> T { x }\n");
+    defer a.deinit(gpa);
+    var b = try build(gpa, "fn f[U, T](x: T) -> T { x }\n");
+    defer b.deinit(gpa);
+    // Identical body + param/ret spelling; ONLY the generic-param ORDER differs, so
+    // the (ordered) carryover fold must separate them.
+    try testing.expect(fp(&a, 0) != fp(&b, 0));
+    // Removing a generic param also flips it.
+    var c = try build(gpa, "fn f[T](x: T) -> T { x }\n");
+    defer c.deinit(gpa);
+    try testing.expect(fp(&a, 0) != fp(&c, 0));
+    // A non-generic fn folds NOTHING new (the carryover is conditional on non-empty),
+    // so two identical non-generic fns are byte-identical — the warm cache survives.
+    var d = try build(gpa, "fn g(x: int) -> int { x }\n");
+    defer d.deinit(gpa);
+    var e = try build(gpa, "fn g(x: int) -> int { x }\n");
+    defer e.deinit(gpa);
+    try testing.expectEqual(fp(&d, 0), fp(&e, 0));
+}
+
+test "type-args fold: identical type-args hash identically (instance cache hit)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn id(x: int) -> int {\n return x\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const v1 = [1]TouchedType{.{ .kind = .@"struct", .layout = "P\x00same" }};
+    const v2 = [1]TouchedType{.{ .kind = .@"struct", .layout = "P\x00same" }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v1);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v2);
+    try testing.expectEqual(h1, h2);
 }
