@@ -153,11 +153,10 @@ These rules are unchanged by the formalization and remain authoritative:
 ## Generics syntax reservation (M1)
 
 The generics front-end (`fn f[T, U](..)`, `struct Box[T]`, `enum E[T]`, a type
-application `Box[int]`, explicit call type-args `f[int](..)`) **parses** into a
-well-formed AST, but has **no semantics yet**: type-checking rejects every generic
-declaration and every type-application with **T0013 "generics not yet supported"**
-before any lower/codegen. The syntax is landed append-only now so later milestones
-add meaning without churning the front-end.
+application `Box[int]`, explicit call type-args `f[int](..)`) landed append-only in
+M1. Generic **functions** (M2) and generic **structs** (M4) now have semantics (see
+below); only a generic **enum** decl still emits **T0013 "generics not yet
+supported"** (M6).
 
 The `[..]` bracket is disambiguated by **position**, and this rule is reserved so a
 future value-index never collides:
@@ -171,6 +170,48 @@ future value-index never collides:
 **Value indexing `v[i]` is deliberately NOT parsed** — it is reserved to a distinct
 future form so it can never collide with type-application. Only an `identifier` or a
 `field_access` base is wrapped; any other `[..]` is a syntax error today.
+
+A third `[..]` position lands in M4: **construction position** — a `[..]` on a name
+followed by `{ .. }` (`Box[int]{ v: 1 }`) builds a `struct_init` whose lhs is the
+`type_app` (no new `Node.Tag`, so `ParseHeader.version` is unchanged).
+
+## Generic structs + the composite `App` type (M4)
+
+Generic **functions** (M2) and generic **structs** (M4) are monomorphized to
+concrete value types — there are no runtime dictionaries, no code sharing, and the
+byte-foldable `Type` never widens. Only a generic **enum** decl remains gated with
+T0013 (M6).
+
+A generic-struct application `Box[int]` is a **check-time composite type**:
+`Kind.app` (appended, frozen ordinal) reusing `Type.struct_id` as an index into a
+content-addressed intern table (`symbols/Composite.zig`). Structurally-equal
+applications intern to the SAME index within a run, so `Type.eql` comparing two
+`.app`s by that index is exactly structural equality. `App`s are formed while
+checking (`refs.typeFromTypeApp`), used to type construction (`Box[int]{ .. }`) and
+field access (`b.v` reads the field pattern substituted through the args), and admit
+a **ground** `App` as a monomorphization type-arg.
+
+**Reification (the mono tail, serial):** every reachable ground `App` is minted a
+FRESH ordinary `struct_id` — its field patterns substituted through the concrete
+args (a nested `Box[T]` field reifies bottom-up first), its `Layout` registered on
+the live tables **before** the snapshot — and every `.app` in every `node_types` /
+instance sig / non-generic fn sig is rewritten to that `structT`. So lower / codegen
+/ fingerprint / cache see only plain concrete structs; an `App` (or a `type_var`)
+reaching `lower` trips a Debug assert. The reified `struct_id` is assigned in an
+index-INDEPENDENT structural-key order, so it — and any `s<id>` mangling downstream —
+is a pure function of source (`-j1` == `-jN`). The fingerprint folds the reified
+LAYOUT (name + fields + offsets), never the id, so which id an instance lands on is
+invisible to the cache.
+
+**Explicit type args only.** `Box[int]{ .. }` must name its args; construction-site
+inference (`Box{ v: 1 }`) is deferred to M5.
+
+**Termination guard (T0017).** Generic structs are the first construct that makes
+unbounded instantiation expressible: `fn go[T](x: T) { go[Box[T]](..) }` forms
+type-args of strictly-growing generic-nesting depth. The serial mono worklist caps
+that depth and rejects the program with **T0017 "instantiation too deep"** —
+deterministically at `-j1`/`-jN`, never hanging or running out of memory — while a
+legitimately deep-but-finite generic program still compiles.
 
 ## Two-phase checking (and parallelism)
 

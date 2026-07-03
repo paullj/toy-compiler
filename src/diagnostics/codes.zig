@@ -63,6 +63,7 @@ pub const Code = enum(u16) {
     T0014, // mono-depth (monomorphization instance/depth limit — M2 belt-and-suspenders)
     T0015, // type-arg-inference-conflict (a type-var bound to two different concrete types — M3)
     T0016, // type-args-not-inferable (a generic type-param left unbound after matching — M3)
+    T0017, // instantiation-too-deep (unbounded generic-data instantiation depth — M4)
 
     _,
 };
@@ -117,6 +118,7 @@ pub const table = [_]Entry{
     .{ .code = .T0014, .str = "T0014", .slug = "mono-depth" },
     .{ .code = .T0015, .str = "T0015", .slug = "type-arg-inference-conflict" },
     .{ .code = .T0016, .str = "T0016", .slug = "type-args-not-inferable" },
+    .{ .code = .T0017, .str = "T0017", .slug = "instantiation-too-deep" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so

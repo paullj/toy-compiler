@@ -14,6 +14,7 @@ const EnumSym = LayoutEngine.EnumSym;
 // them here. The import is mutual (types.zig constructs a `BodyChecker` per fn), which
 // Zig resolves lazily — there is no by-value type cycle (`model` is a pointer).
 const Typecheck = @import("types.zig");
+const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const Model = Typecheck.Model;
@@ -25,23 +26,34 @@ const refs = Typecheck.refs;
 /// The form a construction NODE supplies (independent of the declared variant).
 const InitForm = enum { unit, tuple, @"struct" };
 
-/// Substitute a template type through a concrete type-arg tuple (M2): a
-/// `type_var(ord)` becomes `targs[ord]`; any concrete type passes through. The
-/// sibling of `Typecheck.subst`; kept here so `typeOfGenericCall` grounds a
-/// generic call's params/ret at the call site.
-fn substTy(ty: Type, targs: []const Type) Type {
+/// Substitute a template type through a concrete type-arg tuple (M2/M4): a
+/// `type_var(ord)` becomes `targs[ord]`; an `App(ctor, [pat..])` recursively
+/// substitutes each arg and re-interns (so a template's field pattern `Box[T]`
+/// grounds to `Box[int]`); any concrete type passes through. Needs the intern table,
+/// hence the `bc` receiver. The sibling of `Typecheck.substType`.
+fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
     if (ty.isTypeVar()) {
         const ord = ty.typeVarOrd();
         return if (ord < targs.len) targs[ord] else Type.invalid;
     }
+    if (ty.isApp()) {
+        const e = bc.composite.at(ty.appIdx());
+        var buf: [8]Type = undefined;
+        const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (bc.gpa.alloc(Type, e.args.len) catch return Type.invalid);
+        defer if (e.args.len > buf.len) bc.gpa.free(sub);
+        for (e.args, 0..) |a, i| sub[i] = substTy(bc, a, targs);
+        const idx = bc.composite.intern(bc.gpa, e.ctor, sub) catch return Type.invalid;
+        return Type.app(idx);
+    }
     return ty;
 }
 
-/// True when `ty` is a concrete value type usable as a monomorphization type-arg
-/// (no `App`, no `type_var`, no `unit`, no poison). Mirrors `Typecheck.isConcreteValue`.
+/// True when `ty` is a concrete value type usable as a monomorphization type-arg. M4
+/// admits a ground `App` (a generic-struct instance used as a type-arg). Mirrors
+/// `Typecheck.isConcreteValue`.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .str, .@"struct", .@"enum" => true,
+        .int, .bool, .str, .@"struct", .@"enum", .app => true,
         else => false,
     };
 }
@@ -89,6 +101,11 @@ pub const BodyChecker = struct {
     sink: DiagnosticSink,
 
     gph_fn_names: ?[]const []const u8 = null,
+
+    /// The shared composite (`App`) intern table (M4), borrowed from the owning
+    /// `Typecheck` (stable heap address). Generic-struct construction/field-access
+    /// forms + reads back `App`s here; the mono tail reifies them away afterward.
+    composite: *Composite,
 
     /// Per-instance substitution, set ONLY by the monomorphization tail's
     /// per-instance re-check (`Typecheck.recheck`). When set, a generic-parameter
@@ -511,24 +528,55 @@ pub const BodyChecker = struct {
     }
 
     fn typeOfStructInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-        // A qualified struct-variant `N.V { ... }` would arrive as enum_init_struct
-        // (the parser upgrades a `field_access {`), not here — so struct_init's lhs is
-        // always a plain type-name identifier; no enum routing needed.
         _ = node_idx;
-        const name = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
-        const id = bc.activeStructMap().get(name) orelse {
-            for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
-            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "unknown struct type '{s}'", .{name});
-            return .invalid;
-        };
-        const sym = bc.model.structs[id];
+        const lhs = bc.tree.nodes[(n.lhs).int()];
+        // Resolve the constructed type: a plain identifier `P { .. }` names a
+        // non-generic struct; a `type_app` lhs `Box[int] { .. }` names a generic-struct
+        // INSTANCE (M4) — a composite `App`. `targs` are the concrete type-args the
+        // template's field PATTERNS are substituted through (empty for a plain struct).
+        var ctor_id: u32 = undefined;
+        var targs: []const Type = &.{};
+        var result: Type = undefined;
+        var disp_name: []const u8 = undefined;
+        if (lhs.tag == .type_app) {
+            const app_ty = bc.typeFromNode(n.lhs); // App or invalid (already diagnosed)
+            if (!app_ty.isApp()) {
+                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+                return .invalid;
+            }
+            const e = bc.composite.at(app_ty.appIdx());
+            ctor_id = e.ctor;
+            targs = e.args;
+            result = app_ty;
+            disp_name = bc.model.structs[ctor_id].name;
+        } else {
+            // A qualified struct-variant `N.V { ... }` arrives as enum_init_struct (the
+            // parser upgrades a `field_access {`), not here — so the non-type_app lhs is
+            // always a plain type-name identifier; no enum routing needed.
+            disp_name = bc.nameText(lhs.main_token);
+            const id = bc.activeStructMap().get(disp_name) orelse {
+                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+                try bc.sink.emitFmt(bc.byteOf(lhs.main_token), "unknown struct type '{s}'", .{disp_name});
+                return .invalid;
+            };
+            // A generic struct constructed WITHOUT type args (`Box { v: 1 }`) is M5
+            // (construction inference) — out of scope here; require explicit args.
+            if (id < bc.model.structs.len and bc.model.structs[id].is_generic) {
+                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+                try bc.sink.emitFmtCode(.T0013, bc.byteOf(lhs.main_token), "generic struct '{s}' requires explicit type arguments, e.g. {s}[int]{{ .. }}", .{ disp_name, disp_name });
+                return .invalid;
+            }
+            ctor_id = id;
+            result = Type.structT(id);
+        }
+        const sym = bc.model.structs[ctor_id];
         const inits = Ast.rangeSlice(bc.tree, (n.rhs).int());
-    
+
         // Track which declared fields are supplied (for missing/duplicate checks).
         var seen = try bc.gpa.alloc(bool, sym.field_names.len);
         defer bc.gpa.free(seen);
         @memset(seen, false);
-    
+
         for (inits) |fi_idx| {
             const fi = bc.tree.nodes[(fi_idx).int()];
             const fname = bc.nameText(fi.main_token);
@@ -543,21 +591,24 @@ pub const BodyChecker = struct {
             }
             if (found) |j| {
                 if (seen[j]) {
-                    try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, name });
+                    try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
                 }
                 seen[j] = true;
-                const fty = sym.field_types[j];
+                // Substitute the (possibly generic) declared field type through the
+                // instance's type-args; a non-generic struct has `targs.len == 0`, so
+                // `substTy` is the identity and this is byte-identical to pre-M4.
+                const fty = substTy(bc, sym.field_types[j], targs);
                 if (!Type.assignable(fty, vt)) {
                     try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                 }
             } else {
-                try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, name });
+                try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, disp_name });
             }
         }
         for (sym.field_names, 0..) |dn, j| {
-            if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, name });
+            if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, disp_name });
         }
-        return Type.structT(id);
+        return result;
     }
 
     fn qualifiedEnumId(bc: *BodyChecker, node_idx: Ast.Index) ?u32 {
@@ -590,6 +641,19 @@ pub const BodyChecker = struct {
         }
         const base = try bc.typeOf(n.lhs);
         if (base.kind == .invalid) return .invalid;
+        // A field access over a generic-struct INSTANCE `b.v` where `b: Box[int]` (M4):
+        // the base is a composite `App`; resolve the field's DECLARED (pattern) type
+        // through the App's type-args so `v` on `Box[int]` types as `int`.
+        if (base.isApp()) {
+            const e = bc.composite.at(base.appIdx());
+            const sym = bc.model.structs[e.ctor];
+            const fname = bc.nameText(n.main_token);
+            for (sym.field_names, 0..) |dn, j| {
+                if (std.mem.eql(u8, dn, fname)) return substTy(bc, sym.field_types[j], e.args);
+            }
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
+            return .invalid;
+        }
         if (!base.isStruct()) {
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
             return .invalid;
@@ -1191,7 +1255,9 @@ pub const BodyChecker = struct {
             if (ty.kind == .invalid) {
                 all_concrete = false; // an unknown type already reported by typeFromNode
             } else if (!isConcreteValue(ty)) {
-                // `App`/`type_var`/`unit` are not monomorphizable type-args in M2.
+                // `type_var`/`unit` are not monomorphizable type-args. A ground `App`
+                // (`Box[int]`) now IS (M4) — it reifies to a concrete struct in the mono
+                // tail — so `isConcreteValue` admits it and it is stored + reified later.
                 try bc.sink.emitCode(.T0013, bc.byteOf(bc.tree.nodes[(tn).int()].main_token), "type argument must be a concrete value type");
                 all_concrete = false;
             }
@@ -1203,7 +1269,7 @@ pub const BodyChecker = struct {
             for (args) |arg| _ = try bc.typeOf(arg);
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
             if (!all_concrete) return .invalid;
-            const ret = substTy(f.ret, targs);
+            const ret = substTy(bc, f.ret, targs);
             bc.node_types[(node_idx).int()] = ret;
             return ret;
         }
@@ -1225,13 +1291,13 @@ pub const BodyChecker = struct {
     fn applyGenericSig(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, f: FnSym, targs: []const Type, pretyped: ?[]const Type) error{OutOfMemory}!Type {
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         for (args, f.params, 0..) |arg, pty, i| {
-            const want = substTy(pty, targs);
+            const want = substTy(bc, pty, targs);
             const at = if (pretyped) |pt| pt[i] else try bc.typeOfExpected(arg, if (want.kind == .invalid) null else want);
             if (!Type.assignable(want, at)) {
                 try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(arg).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want), bc.typeName(at) });
             }
         }
-        const ret = substTy(f.ret, targs);
+        const ret = substTy(bc, f.ret, targs);
         bc.node_types[(node_idx).int()] = ret;
         return ret;
     }
@@ -1282,6 +1348,12 @@ pub const BodyChecker = struct {
             if (std.mem.eql(u8, gp, name)) return if (i < s.types.len) s.types[i] else Type.invalid;
         }
         return null;
+    }
+
+    /// Intern a composite `App(ctor, args)` (M4). The shared `refs` type-application
+    /// resolver calls this via the `anytype` cursor.
+    pub fn internApp(bc: *BodyChecker, ctor: u32, args: []const Type) !u32 {
+        return bc.composite.intern(bc.gpa, ctor, args);
     }
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {

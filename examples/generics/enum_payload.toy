@@ -1,0 +1,20 @@
+# Feature: a non-generic enum whose variant payload is a concrete generic-struct
+# instance `Box[int]` (M4). The payload `App` is reified to the ordinary `Box$int`
+# struct and rewritten away before the enum layout snapshot, so codegen sees a plain
+# tagged union — no `App` in the enum's variant field_types.
+# Regression guard (check-vs-build differential): before the reify+rewrite covered
+# enum variant payloads, `toy check` reported this CLEAN while `toy build` crashed in
+# codegen on the surviving `App` (and mis-sized the payload to 0). check and build
+# must AGREE.
+# expect: exit 42
+struct Box[T] { v: T }
+enum E { none, some(Box[int]) }
+fn get(e: E) -> int {
+  match e {
+    .some(b) -> b.v,
+    _ -> 0
+  }
+}
+fn main() -> int {
+  return get(E.some(Box[int]{ v: 42 }))
+}

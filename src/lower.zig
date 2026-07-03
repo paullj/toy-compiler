@@ -453,6 +453,10 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
     if (node_idx == Ast.none) return .none;
     const n = b.in.tree.nodes[(node_idx).int()];
     const ty = b.in.node_types[(node_idx).int()];
+    // A check-time `type_var` (M2) / composite `App` (M4) is substituted/reified to a
+    // concrete kind BEFORE lowering; if one reaches here, the mono tail missed a
+    // node_types slot — trip loudly in Debug/ReleaseSafe rather than miscompile.
+    std.debug.assert(ty.kind != .type_var and ty.kind != .app);
     switch (n.tag) {
         .literal_number => {
             const v = parseInt(b.in.tokens[n.main_token].text(b.in.source)) orelse {
@@ -1701,7 +1705,7 @@ fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
     // `id[str]`) is resolved correctly. Byte-identical for a non-generic fn, whose
     // `s.ret` equals what `typeFromRef` would compute for the concrete spelling.
     if (in.sig) |s| {
-        std.debug.assert(!s.ret.isTypeVar()); // reified-away before lower (M2)
+        std.debug.assert(!s.ret.isTypeVar() and !s.ret.isApp()); // reified-away before lower (M2/M4)
         return s.ret;
     }
     return typeFromRef(in, proto.ret_type);
@@ -1715,7 +1719,7 @@ fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
     // GLOBAL id for aggregates AND the SUBSTITUTED concrete type for an instance's
     // `T`-spelled param, so `id[bool]`/`id[str]` are not lost to the `int` default.
     if (in.sig) |s| if (slot < s.params.len) {
-        std.debug.assert(!s.params[slot].isTypeVar()); // reified-away before lower (M2)
+        std.debug.assert(!s.params[slot].isTypeVar() and !s.params[slot].isApp()); // reified-away before lower (M2/M4)
         return s.params[slot];
     };
     if (param_node.int() < in.node_types.len) {
