@@ -26,6 +26,7 @@ const std = @import("std");
 const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
+const Mono = @import("../symbols/Mono.zig");
 
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 pub const TouchedType = @import("Fingerprint.zig").TouchedType;
@@ -174,6 +175,14 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         .fn_decl => {
             try emit(visitor, .{ .leaf = leaf });
             const proto = Ast.protoAt(tree, n.lhs.int());
+            // M2 carryover: fold the ordered generic-param NAMES so editing a
+            // generic signature (add / remove / reorder `[T,U]`) flips the template
+            // fingerprint (and thus every instance built from it). Conditional on
+            // non-empty, so a non-generic fn folds NOTHING new and stays byte-identical.
+            if (proto.generic_params.len > 0) {
+                try emit(visitor, .{ .count = @intCast(proto.generic_params.len) });
+                for (proto.generic_params) |gp| try emit(visitor, .{ .leaf = src.leaf(gp) });
+            }
             try emit(visitor, .{ .count = @intCast(proto.params.len) });
             for (proto.params, 0..) |p, i| {
                 // Fold the OWNING sig's param type (carries the right GLOBAL id,
@@ -397,6 +406,17 @@ pub fn CallVisitor(comptime Frozen: type) type {
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
                 .callee => |c| {
+                    // A generic call `id[int](..)` (M2): the callee node is a
+                    // `type_app` whose base identifier carries the template's `.func`.
+                    // Resolve (template gid + the concrete type-args the checker wrote
+                    // into node_types) to the reified instance's mangled name +
+                    // substituted sig, so a caller folds the SAME instance identity the
+                    // reloc targets. `Mono.find` is a deterministic scan.
+                    const cn = self.frozen.tree.nodes[c.idx.int()];
+                    if (cn.tag == .type_app) {
+                        try self.foldGenericCallee(cn);
+                        return;
+                    }
                     const res = self.frozen.resolutions[c.idx.int()];
                     // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
                     // what the .func reloc target carries) and `sigs` (params/ret).
@@ -410,6 +430,21 @@ pub fn CallVisitor(comptime Frozen: type) type {
                 },
                 else => {},
             }
+        }
+
+        fn foldGenericCallee(self: *Self, cn: Ast.Node) error{OutOfMemory}!void {
+            const bres = self.frozen.resolutions[cn.lhs.int()];
+            if (bres != .func) return;
+            const targ_nodes = Ast.rangeSlice(self.frozen.tree, cn.rhs.int());
+            const args = try self.gpa.alloc(Typecheck.Type, targ_nodes.len);
+            defer self.gpa.free(args);
+            for (targ_nodes, 0..) |tn, i| {
+                if (tn.int() >= self.frozen.node_types.len) return; // pre-typecheck view
+                args[i] = self.frozen.node_types[tn.int()];
+            }
+            const ii = Mono.find(self.frozen.instances, bres.func, args) orelse return;
+            const inst = self.frozen.instances[ii];
+            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
         }
     };
 }
@@ -629,6 +664,7 @@ const FakeFrozen = struct {
     enum_layouts: []const Typecheck.EnumLayout = &.{},
     names: []const @import("../link/Link.zig").SymName = &.{},
     sigs: []const Sig = &.{},
+    instances: []const Mono.Instance = &.{},
 };
 
 test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {

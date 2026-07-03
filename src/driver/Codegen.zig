@@ -14,6 +14,7 @@ const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
 const Resolve = @import("../resolve.zig");
 const Typecheck = @import("../types.zig");
+const Mono = @import("../symbols/Mono.zig");
 const Graph = @import("Graph.zig");
 const ResolveGraph = @import("../resolve_graph.zig");
 const CodegenIr = @import("../codegen/CodegenIr.zig");
@@ -119,6 +120,14 @@ const Frozen = struct {
     /// Opt level / pass selection. Mixed into the codegen cache key so
     /// toggling `-O` lands on a different entry, and threaded into `lowerOne`.
     opt: Opt.Config,
+    /// The whole monomorphization instance table (M2), so `walkCalls`/`lowerCall`
+    /// resolve a generic call site to its reified instance. Empty for a program with
+    /// no generics; shared read-only across all jobs.
+    instances: []const Mono.Instance = &.{},
+    /// This unit's OWN concrete type-args when it is a monomorphized instance
+    /// (`&.{}` for a base fn) — folded into the (d) fingerprint component so two
+    /// instances of one template get distinct cache keys.
+    type_args: []const Typecheck.Type = &.{},
 };
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
@@ -213,9 +222,16 @@ const GraphFrozen = struct {
     fn_decls: []const Ast.Index,
     /// The owning module id for each lowerable fn (parallel to `fn_decls`).
     fn_modules: []const u32,
-    /// Global fn id of each lowerable fn (parallel to `fn_decls`); indexes
-    /// `names`/`sigs`. Excludes `print` (bodyless).
+    /// Global fn id of each lowerable BASE fn (parallel to the first `base_count`
+    /// entries of `fn_decls`/`fn_modules`); indexes `names`/`sigs`. Excludes `print`
+    /// (bodyless) and generic templates (lowered only as instances).
     lower_ids: []const u32,
+    /// Number of base fn units; `fn_decls`/`fn_modules` entries at `[base_count..]`
+    /// are monomorphized instances (parallel to `instances`).
+    base_count: usize,
+    /// The monomorphization instance table (M2), in canonical order. Appended after
+    /// the base fns as extra lowerable units.
+    instances: []const Mono.Instance,
     /// Global fn id of the entry `main` (indexes `names`).
     entry_id: u32,
     opt: Opt.Config,
@@ -230,18 +246,27 @@ const GraphFrozen = struct {
     fn frozenFor(gf: *const GraphFrozen, lower_i: usize, fn_node_buf: *[1]Ast.Index) Frozen {
         const mod = gf.fn_modules[lower_i];
         fn_node_buf[0] = gf.fn_decls[lower_i];
+        // An instance unit reads its OWN per-lower_i `node_types` slice (written by
+        // the mono tail's per-instance re-check), NOT the module's shared slots — so
+        // two instances of one template never alias each other's node types. A base
+        // fn reads its module's slice as before.
+        const is_inst = lower_i >= gf.base_count;
+        const nts: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].node_types else gf.node_types[mod];
+        const targs: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].args else &.{};
         return .{
             .tree = gf.trees[mod],
             .tokens = gf.tokens[mod],
             .source = gf.sources[mod],
             .resolutions = gf.resolutions[mod],
-            .node_types = gf.node_types[mod],
+            .node_types = nts,
             .layouts = gf.layouts,
             .enum_layouts = gf.enum_layouts,
             .names = gf.names,
             .fn_nodes = fn_node_buf[0..1],
             .sigs = gf.sigs,
             .opt = gf.opt,
+            .instances = gf.instances,
+            .type_args = targs,
         };
     }
 };
@@ -308,12 +333,26 @@ pub fn lowerGraphProgram(
     var entry_id: ?u32 = null;
     for (res.fns, 0..) |gf, gid| {
         if (gf.decl_node == Ast.none) continue; // synthetic print: no body to lower
+        // Skip generic TEMPLATES (M2): their params/ret are `type_var`s with no ABI,
+        // so they are never lowered directly — only their concrete instances are
+        // (appended below). An uncalled generic fn thus emits ZERO codegen units.
+        const gm = &graph.modules[gf.module];
+        const gdecl = gm.nodes[gf.decl_node.int()];
+        if (Ast.protoAt(gm.tree(), gdecl.lhs.int()).generic_params.len > 0) continue;
         // The entry `main` is the bare {user_fn,"main"} fn in the entry module.
         if (gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main"))
             entry_id = @intCast(gid);
         try fn_decls.append(gpa, gf.decl_node);
         try fn_modules.append(gpa, gf.module);
         try lower_ids.append(gpa, @intCast(gid));
+    }
+    // The instance units follow the base fns (canonical order = the mono tail's
+    // sort), each a fully-concrete per-fn codegen unit. Its `node_types`/`args`/sig
+    // ride the `instances` table (consumed by `frozenFor`/`graphFnJobInner`).
+    const base_count = fn_decls.items.len;
+    for (tc.instances) |inst| {
+        try fn_decls.append(gpa, inst.decl_node);
+        try fn_modules.append(gpa, inst.mod);
     }
 
     const eid = entry_id orelse return .{ .err = .{
@@ -357,6 +396,8 @@ pub fn lowerGraphProgram(
         .fn_decls = fn_decls.items,
         .fn_modules = fn_modules.items,
         .lower_ids = lower_ids.items,
+        .base_count = base_count,
+        .instances = tc.instances,
         .entry_id = eid,
         .opt = opt,
         .probe = probe,
@@ -422,6 +463,9 @@ pub fn lowerGraphProgram(
     const lowered_names = try gpa.alloc(Link.SymName, fn_decls.items.len);
     defer gpa.free(lowered_names);
     for (lower_ids.items, 0..) |gid, i| lowered_names[i] = names[gid];
+    // Instance units carry their mangled SymName (borrowed from the instance table,
+    // which outlives relink). Parallel to the appended instance codegen units.
+    for (tc.instances, 0..) |inst, k| lowered_names[base_count + k] = .{ .kind = .user_fn, .name = inst.name };
 
     const link_t0: i128 = if (link_ns != null) nowNs(io) else 0;
     const out = relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
@@ -469,15 +513,26 @@ fn graphFnJobInner(
     var fn_node_buf: [1]Ast.Index = undefined;
     const frozen = gf.frozenFor(lower_i, &fn_node_buf);
     const fn_decl = frozen.fn_nodes[0];
-    const gid = gf.lower_ids[lower_i];
-    const sym = gf.names[gid];
-    const is_entry = gid == gf.entry_id;
+    var sym: Link.SymName = undefined;
+    var is_entry = false;
     // Thread this fn's typecheck sig (program-wide, indexed by global id) so the
     // fn_decl param/return fold uses the ABI-correct GLOBAL type ids — including a
     // CROSS-MODULE qualified `b: rect.Rect`. A bare-name re-resolution would mis-pick
     // the first same-named type in the merged layout table, missing a pub-type
     // layout edit at the importer (cross-module hole).
-    const my_sig: ?Fingerprint.Sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
+    var my_sig: ?Fingerprint.Sig = null;
+    if (lower_i < gf.base_count) {
+        const gid = gf.lower_ids[lower_i];
+        sym = gf.names[gid];
+        is_entry = gid == gf.entry_id;
+        my_sig = if (gid < gf.sigs.len) gf.sigs[gid] else null;
+    } else {
+        // A monomorphized instance: its identity is the mangled SymName and its sig
+        // is the SUBSTITUTED (fully concrete) params/ret. Never the entry.
+        const inst = gf.instances[lower_i - gf.base_count];
+        sym = .{ .kind = .user_fn, .name = inst.name };
+        my_sig = .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret };
+    }
 
     // The cross-module callee identity + touched layouts ride in through the
     // program-wide `names`/`sigs`/`layouts` of this fn's `frozen` view, so the
@@ -531,6 +586,9 @@ pub fn renderGraphIr(
     for (res.fns, 0..) |gf, gid| {
         if (gf.decl_node == Ast.none) continue; // skip bodyless print
         const m = &graph.modules[gf.module];
+        // Skip generic templates (M2): rendered only as concrete instances below.
+        const gdecl = m.nodes[gf.decl_node.int()];
+        if (Ast.protoAt(m.tree(), gdecl.lhs.int()).generic_params.len > 0) continue;
         const is_entry = gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main");
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -542,8 +600,35 @@ pub fn renderGraphIr(
             .enum_layouts = tc.enum_layouts,
             .names = names,
             .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
+            .instances = tc.instances,
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
+        defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
+        if (!first) try aw.writer.writeAll("\n");
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        first = false;
+    }
+
+    // Render each monomorphized instance as a concrete unit (its own node_types +
+    // substituted sig), in canonical order — the same units codegen lowers.
+    for (tc.instances) |inst| {
+        const m = &graph.modules[inst.mod];
+        const sym = Link.SymName{ .kind = .user_fn, .name = inst.name };
+        const in = lower.Inputs{
+            .tree = m.tree(),
+            .tokens = m.tokens,
+            .source = m.source,
+            .resolutions = res.resolutions[inst.mod],
+            .node_types = inst.node_types,
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = names,
+            .sig = .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret },
+            .instances = tc.instances,
+        };
+        var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);

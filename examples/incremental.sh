@@ -123,6 +123,31 @@ fn main() -> int {
 }
 ' 1
 
+# 3b) GENERIC MONOMORPHIZATION (M2) — editing a struct used as a TYPE-ARG recompiles
+#     EXACTLY the dependent instance (id[P]) + its constructing caller (main). The
+#     other instance id[int] and the unrelated fn cut off. Adding a field to P also
+#     crosses the 16-byte reg-pair→sret ABI boundary, so the SOUNDNESS cmp is a real
+#     stale-cache miscompile gate (a cached reg-pair id[P] would exit wrong).
+run_scenario generic_typearg \
+'fn id[T](x: T) -> T { x }
+struct P { x: int, y: int }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    a := id[int](7)
+    p := id[P](P{ x: 20, y: 15 })
+    return a + p.x + p.y + unrelated(0)
+}
+' \
+'fn id[T](x: T) -> T { x }
+struct P { x: int, y: int, z: int }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    a := id[int](7)
+    p := id[P](P{ x: 20, y: 15, z: 0 })
+    return a + p.x + p.y + unrelated(0)
+}
+' 1
+
 # 4) COMMENT-ONLY — no semantic change; EVERYTHING cuts off (codegen compiled=0),
 #    the strongest cutoff (index-free codegen fingerprint).
 run_scenario comment \

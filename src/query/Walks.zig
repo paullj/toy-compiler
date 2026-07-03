@@ -58,3 +58,13 @@ pub fn walkTouchedSig(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, f
 pub fn freeTouched(gpa: std.mem.Allocator, items: []const Fingerprint.TouchedType) void {
     for (items) |t| if (t.layout.len > 0) gpa.free(t.layout);
 }
+
+/// Build the ordered `TouchedType` list for a monomorphized instance's concrete
+/// type-args (M2), each carrying its full index-free layout descriptor via the
+/// same `appendTouched` the (c) touched fold uses. Fed into `fingerprint`'s (d)
+/// component so `id[int]` and `id[Point]` diverge and a struct-layout edit to a
+/// type-arg invalidates exactly the dependent instance. Empty for a non-generic
+/// fn (no args). Caller frees each `layout` via `freeTouched`.
+pub fn walkTypeArgs(gpa: std.mem.Allocator, frozen: anytype, args: []const @import("../layout/Engine.zig").Type, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
+    for (args) |a| try AstWalk.appendTouched(gpa, frozen, a, out);
+}

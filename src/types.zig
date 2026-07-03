@@ -30,6 +30,7 @@ const Resolve = @import("resolve.zig");
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const Sig = @import("symbols/Sig.zig").Sig;
 const symbols = @import("symbols/Sym.zig");
+const Mono = @import("symbols/Mono.zig");
 const Engine = @import("query/Engine.zig");
 const Io = std.Io;
 
@@ -108,6 +109,10 @@ pub const refs = struct {
         if (type_names.get(name)) |b| return b;
         if (self.activeStructMap().get(name)) |id| return Type.structT(id);
         if (self.activeEnumMap().get(name)) |id| return Type.enumT(id);
+        // A generic-parameter name resolves to a `type_var` (template decode) or a
+        // concrete type (per-instance re-check via the checker's substitution). Empty
+        // context => null => the normal unknown-type path, byte-identical otherwise.
+        if (self.genericParamType(name)) |ty| return ty;
         self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
         return .invalid;
     }
@@ -183,6 +188,9 @@ pub const GraphResult = struct {
     layouts: []Layout,
     /// Program-wide enum table (one EnumLayout per global enum id).
     enum_layouts: []EnumLayout,
+    /// Monomorphized generic instances (M2), in canonical order. Empty for a
+    /// program with no reachable generic instances. Owned.
+    instances: []Mono.Instance = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -211,6 +219,13 @@ pub const GraphResult = struct {
             gpa.free(e.variants);
         }
         gpa.free(self.enum_layouts);
+        for (self.instances) |*inst| {
+            gpa.free(@constCast(inst.args));
+            gpa.free(inst.node_types);
+            gpa.free(@constCast(inst.params));
+            gpa.free(@constCast(inst.name));
+        }
+        gpa.free(self.instances);
         self.* = undefined;
     }
 };
@@ -228,6 +243,15 @@ pub const FnSym = struct {
     /// Owning module id (graph mode). 0 in single-file mode. The check loops
     /// switch the active tree/tokens/source to this module before checking.
     mod: u32 = 0,
+    /// Ordered generic-parameter NAMES for a generic template `fn f[T,U](..)`
+    /// (borrowed source slices; the outer array is owned by `t.fns`). Empty for a
+    /// non-generic fn. `params`/`ret` of a template carry `Type.typeVar(ord)` where
+    /// `ord` indexes this list; the mono tail substitutes them to concrete types.
+    generic_params: []const []const u8 = &.{},
+
+    pub fn isGeneric(f: FnSym) bool {
+        return f.generic_params.len > 0;
+    }
 };
 
 /// Per-construct context, pushed/popped as bodies are entered. A label-
@@ -274,6 +298,17 @@ structs: std.ArrayList(StructSym),
 /// The enum table: one `EnumSym` per enum id. Bare-name → id lives per-module in
 /// the graph ctx (`activeEnumMap`).
 enums: std.ArrayList(EnumSym),
+
+/// Transient: the generic-param names of the fn CURRENTLY being decoded in
+/// `decodeFnSig`, so `refs.typeFromNode` maps a matching type-ref name to a
+/// `Type.typeVar(ord)`. Set/cleared around each `decodeFnSig`; empty otherwise
+/// (so non-generic decoding is byte-identical).
+cur_generic_params: []const []const u8 = &.{},
+
+/// Monomorphization instances discovered by the serial mono tail (M2). Transferred
+/// whole into `GraphResult.instances` by `checkGraph`; the leftover (on an error
+/// path) is freed by `checkGraph`'s defer.
+mono: std.ArrayList(Mono.Instance) = .empty,
 
 /// Graph context. Always set in practice: `checkGraph` is the ONE entry and
 /// it drives one shared `Typecheck` across the whole module graph (a lone source
@@ -548,8 +583,19 @@ pub fn checkGraph(
         .ncpu = ncpu,
     };
     defer {
-        for (t.fns.items) |f| gpa.free(f.params);
+        for (t.fns.items) |f| {
+            gpa.free(f.params);
+            if (f.generic_params.len > 0) gpa.free(@constCast(f.generic_params));
+        }
         t.fns.deinit(gpa);
+        // Any instances not transferred into the result (an error path) are freed
+        // here; the success path empties `t.mono` via `toOwnedSlice` first.
+        for (t.mono.items) |*inst| {
+            gpa.free(@constCast(inst.args));
+            gpa.free(inst.node_types);
+            gpa.free(@constCast(inst.params));
+        }
+        t.mono.deinit(gpa);
         for (t.enums.items) |e| {
             for (e.variants) |v| {
                 gpa.free(v.field_names);
@@ -595,6 +641,21 @@ pub fn checkGraph(
         sigs_built += 1;
     }
 
+    // Transfer the monomorphization instances (M2) out of the live table into the
+    // result before the layout snapshot. `toOwnedSlice` empties `t.mono` so the
+    // teardown defer no longer sees them; an errdefer frees them (incl. their minted
+    // names) if a later snapshot fails.
+    const instances = try t.mono.toOwnedSlice(gpa);
+    errdefer {
+        for (instances) |*inst| {
+            gpa.free(@constCast(inst.args));
+            gpa.free(inst.node_types);
+            gpa.free(@constCast(inst.params));
+            gpa.free(@constCast(inst.name));
+        }
+        gpa.free(instances);
+    }
+
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
@@ -611,6 +672,7 @@ pub fn checkGraph(
         .sigs = sigs,
         .layouts = layouts,
         .enum_layouts = enum_layouts,
+        .instances = instances,
     };
 }
 
@@ -688,28 +750,249 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // after the join, so PARALLEL == SERIAL.
     const model = t.buildModel();
     try t.checkBodies(&model);
+
+    // Monomorphization tail (M2): a SERIAL pass on the LIVE tables, after the
+    // per-fn Pass-C fan-out has joined and BEFORE `checkGraph` snapshots/frees them.
+    // It discovers every reachable `(template, concrete-args)` instance to a
+    // fixpoint, re-checks each instance body into its own `node_types`, and mints a
+    // canonical mangled name — a pure function of source, so `-jN` stays identical.
+    try t.monomorphize(&model);
 }
 
-/// M1 generics gate. Scans every module's nodes in ascending index order and emits
-/// T0013 ("generics not yet supported", a borrowed literal) at each `type_app`
-/// (its `[`) and each `generic_param` (its name). Returns whether any fired. It is
-/// SERIAL and runs before any Pass-C fan-out; module-id order + ascending node
-/// index make the emit stream a pure function of source (no hashmap/thread order).
-/// The caller calls `sink.sort()` (node-index order != byte-offset order) and
-/// early-returns, so the sole other sort site (`checkBodies`) is skipped for a
-/// generic program.
+/// A worklist entry: a `(template gid, concrete args)` to instantiate. `args` is
+/// OWNED for the duration of the fixpoint (freed with the worklist).
+const Pending = struct { gid: u32, args: []Type };
+
+/// A generous ceiling on the number of monomorphized instances. UNREACHABLE in M2
+/// (type-args must already be concrete — there is no `App`, so the instance set is
+/// a finite closure of the source's explicit call sites); it is the belt-and-
+/// suspenders backstop for the recursive-instantiation hazard M4 introduces.
+const mono_instance_cap: usize = 10_000;
+
+/// True when `ty` is a concrete value type usable as a monomorphization type-arg
+/// (M2 restriction: no `App`, no `type_var`, no `unit`, no poison).
+fn isConcreteValue(ty: Type) bool {
+    return switch (ty.kind) {
+        .int, .bool, .str, .@"struct", .@"enum" => true,
+        else => false,
+    };
+}
+
+/// Substitute a template type through a concrete arg tuple: a `type_var(ord)`
+/// becomes `args[ord]`; anything else passes through unchanged.
+fn subst(ty: Type, args: []const Type) Type {
+    if (ty.isTypeVar()) {
+        const ord = ty.typeVarOrd();
+        return if (ord < args.len) args[ord] else Type.invalid;
+    }
+    return ty;
+}
+
+/// The serial monomorphization tail. Seeds a worklist from every generic call site
+/// in the non-generic fn bodies (fn-id order, ascending node order), processes to a
+/// fixpoint (each instance re-check may discover nested generic calls), then
+/// canonically sorts the instances and mints their mangled names.
+fn monomorphize(t: *Typecheck, model: *const Model) !void {
+    var worklist: std.ArrayList(Pending) = .empty;
+    defer {
+        for (worklist.items) |p| t.gpa.free(p.args);
+        worklist.deinit(t.gpa);
+    }
+    // Dedup on the canonical `(gid, arg-bytes)` key so a repeated call site is
+    // instantiated once. Keys are owned (freed at the end).
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| t.gpa.free(k.*);
+        seen.deinit(t.gpa);
+    }
+
+    // Seed: scan every non-generic user fn's body (in fn-id order) for call-position
+    // generic calls, reading the Pass-C-populated per-module node_types.
+    const nts = t.gph_node_types orelse return; // graph mode always sets it
+    for (model.fns) |f| {
+        if (f.kind == .builtin or f.isGeneric()) continue;
+        try t.scanCalls(model, f.mod, nts[f.mod], &worklist, &seen);
+    }
+
+    var capped = false;
+    var idx: usize = 0;
+    while (idx < worklist.items.len) : (idx += 1) {
+        if (t.mono.items.len >= mono_instance_cap) {
+            if (!capped) {
+                const f = model.fns[worklist.items[idx].gid];
+                _ = t.gphSelect(f.mod);
+                const decl = t.tree.nodes[f.decl_node.int()];
+                try t.sink.emitCode(.T0014, t.byteOf(decl.main_token), "monomorphization instance limit exceeded");
+                capped = true;
+            }
+            break;
+        }
+        const p = worklist.items[idx];
+        const inst = try t.recheck(model, p.gid, p.args);
+        try t.mono.append(t.gpa, inst);
+        // Discover nested generic calls in the instance body (its own node_types).
+        try t.scanCalls(model, inst.mod, inst.node_types, &worklist, &seen);
+    }
+
+    // Canonical order (template gid, then arg bytes) drives BOTH the mangled-name
+    // assignment and the downstream codegen enumeration — never discovery order.
+    std.mem.sort(Mono.Instance, t.mono.items, {}, Mono.lessThan);
+    for (t.mono.items) |*inst| {
+        const tname = if (t.gph_fn_names) |fns| fns[inst.template_gid] else t.nameText(t.tree.nodes[model.fns[inst.template_gid].decl_node.int()].main_token);
+        inst.name = try Mono.mangle(t.gpa, tname, inst.args);
+    }
+    // A mangled name is a pure function of (template name, arg tuple); two distinct
+    // instances therefore never collide (Debug/ReleaseSafe guard).
+    if (std.debug.runtime_safety) {
+        for (t.mono.items, 0..) |a, i| {
+            for (t.mono.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name, b.name));
+        }
+    }
+
+    // The mono tail may have emitted instance-body diagnostics (and T0014); re-sort
+    // the shared stream so the final (scope, byte_offset) order is deterministic.
+    t.sink.sort();
+}
+
+/// Scan module `mod`'s nodes for call-position generic calls, reading `node_types`
+/// for the concrete type-args, and enqueue each new `(gid, args)`. Uniform for the
+/// base seed (module node_types) and an instance re-check (the instance's own
+/// node_types — other fns' nodes stay `.invalid` there, so only THIS body's calls
+/// are seen).
+fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
+    const mc = &t.graph.mods[mod];
+    const tree = mc.tree;
+    const resolutions = mc.resolutions;
+    for (tree.nodes) |n| {
+        if (n.tag != .call or n.lhs == Ast.none) continue;
+        const callee = tree.nodes[n.lhs.int()];
+        if (callee.tag != .type_app) continue;
+        const bres = resolutions[callee.lhs.int()];
+        if (bres != .func) continue;
+        const gid = bres.func;
+        const f = model.fns[gid];
+        if (!f.isGeneric()) continue;
+        const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
+        if (targ_nodes.len != f.generic_params.len) continue;
+        const args = try t.gpa.alloc(Type, targ_nodes.len);
+        errdefer t.gpa.free(args);
+        var ok = true;
+        for (targ_nodes, 0..) |tn, k| {
+            const ty = node_types[tn.int()];
+            if (!isConcreteValue(ty)) {
+                ok = false;
+                break;
+            }
+            args[k] = ty;
+        }
+        if (!ok) {
+            t.gpa.free(args);
+            continue;
+        }
+        // Dedup on the canonical key.
+        var keybuf: std.ArrayList(u8) = .empty;
+        defer keybuf.deinit(t.gpa);
+        try Mono.writeKey(t.gpa, &keybuf, gid, args);
+        const gop = try seen.getOrPut(t.gpa, keybuf.items);
+        if (gop.found_existing) {
+            t.gpa.free(args);
+            continue;
+        }
+        gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items); // own the stored key
+        try worklist.append(t.gpa, .{ .gid = gid, .args = args });
+    }
+}
+
+/// Re-check one generic instance: substitute the template's params/ret to concrete
+/// types, allocate a FRESH per-instance `node_types`, and walk the template body
+/// with a substitution-seeded `BodyChecker` so every node types concretely. Returns
+/// an owning `Instance` (name filled after the canonical sort).
+fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mono.Instance {
+    const f = model.fns[gid];
+
+    const params = try t.gpa.alloc(Type, f.params.len);
+    errdefer t.gpa.free(params);
+    for (f.params, 0..) |p, i| params[i] = subst(p, args);
+    const ret = subst(f.ret, args);
+
+    const node_count = t.graph.mods[f.mod].tree.nodes.len;
+    const inst_nt = try t.gpa.alloc(Type, node_count);
+    errdefer t.gpa.free(inst_nt);
+    @memset(inst_nt, .invalid);
+
+    const args_owned = try t.gpa.dupe(Type, args);
+    errdefer t.gpa.free(args_owned);
+
+    // The BodyChecker seeds slot_types from `f.params` and `cur_ret` from `f.ret`;
+    // hand it the SUBSTITUTED sig so the body types against concrete param/ret. Its
+    // `subst` map resolves any generic-param type-ref inside the body to concrete,
+    // and `typeOfCall` writes concrete type-arg node_types for nested generic calls.
+    var fsub = f;
+    fsub.params = params;
+    fsub.ret = ret;
+
+    var bc = t.bodyCheckerFor(model, fsub);
+    defer bc.deinit();
+    bc.node_types = inst_nt;
+    bc.subst = .{ .names = f.generic_params, .types = args };
+    try bc.checkBody(gid, fsub);
+    // Merge the instance's diagnostics into the shared stream (sorted at the end).
+    try t.sink.merge(&bc.sink);
+
+    return .{
+        .template_gid = gid,
+        .args = args_owned,
+        .node_types = inst_nt,
+        .params = params,
+        .ret = ret,
+        .name = undefined, // minted in canonical order after the sort
+        .mod = f.mod,
+        .decl_node = f.decl_node,
+    };
+}
+
+/// The NARROWED generics gate (M2). M2 ships generic FUNCTIONS instantiated at
+/// explicit concrete type-args; the still-unsupported generic surface stays gated
+/// with T0013:
+///   * a `type_app` in TYPE position (a param/field/ret/variant type, and a
+///     type-arg that is itself a `type_app` = the composite `App` type — M4). A
+///     `type_app` in CALL position (the callee of a `.call`, e.g. `id[int](7)`) is
+///     ALLOWED through to monomorphization.
+///   * a generic STRUCT/ENUM decl (`struct Box[T]` / `enum Opt[T]`) — generic data
+///     is M4/M6. Detected at the decl (its generic run rides `decl.rhs`).
+/// A generic fn decl and its `generic_param` leaves are NO LONGER gated (fn
+/// generics are the M2 feature); a bare (no-explicit-args) generic CALL is caught
+/// later by `BodyChecker.typeOfCall` (it needs resolution, not a syntactic scan).
+///
+/// SERIAL, before any Pass-C fan-out; module-id order then ascending node index
+/// makes the emit stream a pure function of source. The caller `sink.sort()`s and
+/// early-returns, so `checkBodies`' sort is skipped for a gated program.
 fn gateGenerics(t: *Typecheck, mods: []const GraphModuleInput) !bool {
     var fired = false;
     for (mods, 0..) |_, mi| {
         const mod: u32 = @intCast(mi);
         _ = t.gphSelect(mod); // sets the active tree/tokens + the sink emit scope
-        for (t.tree.nodes) |n| {
-            switch (n.tag) {
-                .type_app, .generic_param => {
-                    try t.sink.emitCode(.T0013, t.byteOf(n.main_token), "generics not yet supported");
-                    fired = true;
-                },
-                else => {},
+        const nodes = t.tree.nodes;
+        // Mark every `type_app` that is the callee of a `.call` (call position);
+        // post-order means a call appears after its callee, so a forward scan can't
+        // classify in one pass — a marker array is the clean, deterministic way.
+        const call_pos = try t.gpa.alloc(bool, nodes.len);
+        defer t.gpa.free(call_pos);
+        @memset(call_pos, false);
+        for (nodes) |n| {
+            if (n.tag == .call and n.lhs != Ast.none and nodes[n.lhs.int()].tag == .type_app)
+                call_pos[n.lhs.int()] = true;
+        }
+        for (nodes, 0..) |n, i| {
+            const gate = switch (n.tag) {
+                .type_app => !call_pos[i], // type-position (incl. App type-arg) only
+                .struct_decl, .enum_decl => n.rhs != Ast.none, // generic data
+                else => false,
+            };
+            if (gate) {
+                try t.sink.emitCode(.T0013, t.byteOf(n.main_token), "generics not yet supported");
+                fired = true;
             }
         }
     }
@@ -778,6 +1061,11 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
 fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
     const f = model.fns[fid];
     if (f.kind == .builtin) return; // the bodyless `print` has no body to walk
+    // A generic TEMPLATE is checked only through its concrete instances (the mono
+    // tail re-checks each instance body with a substitution). Checking the template
+    // body directly would type its `type_var`-typed params/locals, which have no ABI
+    // — so its node_types stay `.invalid`, never lowered.
+    if (f.isGeneric()) return;
     var bc = t.bodyCheckerFor(model, f);
     defer bc.deinit();
     bc.checkBody(fid, f) catch |e| {
@@ -929,6 +1217,19 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
 fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
     const decl = t.tree.nodes[fn_idx.int()];
     const proto = Ast.protoAt(t.tree, decl.lhs.int());
+
+    // A generic template: collect its ordered param NAMES so a param/ret type-ref
+    // spelled as one decodes (via `genericParamType`) to a `Type.typeVar(ord)`. The
+    // outer array is owned by `t.fns`; the name slices are borrowed from source.
+    var gnames: [][]const u8 = &.{};
+    errdefer if (gnames.len > 0) t.gpa.free(gnames);
+    if (proto.generic_params.len > 0) {
+        gnames = try t.gpa.alloc([]const u8, proto.generic_params.len);
+        for (proto.generic_params, 0..) |gp, i| gnames[i] = t.nameText(t.tree.nodes[gp.int()].main_token);
+    }
+    t.cur_generic_params = gnames;
+    defer t.cur_generic_params = &.{};
+
     const params = try t.gpa.alloc(Type, proto.params.len);
     for (proto.params, 0..) |param_idx, i| {
         const param = t.tree.nodes[param_idx.int()];
@@ -941,7 +1242,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         }
     }
     const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod });
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames });
 }
 
 /// Append the synthetic bodyless `print(str) -> ()` builtin to the fn table.
@@ -952,6 +1253,17 @@ fn appendPrint(t: *Typecheck) !void {
 
 fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
     return refs.typeFromNode(t, type_node);
+}
+
+/// Map a type-ref NAME to a `type_var` when it is a generic parameter of the fn
+/// currently being decoded (`cur_generic_params`), else null. Read by
+/// `refs.typeFromNode` so a generic template's param/ret type-refs decode to
+/// ordinal-carrying type-vars. Empty context (any non-template decode) => null.
+pub fn genericParamType(t: *const Typecheck, name: []const u8) ?Type {
+    for (t.cur_generic_params, 0..) |gp, i| {
+        if (std.mem.eql(u8, gp, name)) return Type.typeVar(@intCast(i));
+    }
+    return null;
 }
 
 fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
@@ -1055,25 +1367,73 @@ test "clean program typechecks with zero diagnostics" {
     ));
 }
 
-test "M1 gate: the generics demo reports T0013 with no T0001/body cascade" {
+test "M2: the generic-fn demo typechecks clean and monomorphizes one instance per type-arg" {
     const gpa = testing.allocator;
-    var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return id[int](7) }\n");
+    // The M1 gate is NARROWED in M2: a generic FN + an explicit-args CALL now compile.
+    var c = try checkSource("fn id[T](x: T) -> T { x }\nstruct P { x: int, y: int }\nfn main() -> int {\n a := id[int](7)\n p := id[P](P{ x: 20, y: 15 })\n return a + p.x + p.y\n}\n");
     defer c.deinit(gpa);
-    try testing.expect(c.result.diags.len > 0);
-    // Every diagnostic is the gate — no T0001 "unknown type '['" cascade — and at
-    // least one carries the exact substring the examples/check.sh harness greps for.
-    var saw_phrase = false;
-    for (c.result.diags) |d| {
-        try testing.expectEqual(codes.Code.T0013, d.code);
-        if (std.mem.indexOf(u8, d.message, "generics not yet supported") != null) saw_phrase = true;
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Exactly two instances (id$int, id$P) in canonical order (scalar kind < struct
+    // kind), each with a distinct mangled name and a fully-concrete substituted sig.
+    try testing.expectEqual(@as(usize, 2), c.result.instances.len);
+    // The template name is module-qualified (`main.id`) for cross-module uniqueness.
+    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
+    try testing.expect(std.mem.startsWith(u8, c.result.instances[1].name, "main.id$s"));
+    try testing.expectEqual(Kind.int, c.result.instances[0].ret.kind);
+    try testing.expectEqual(Kind.@"struct", c.result.instances[1].ret.kind);
+    // The substituted params/ret are concrete — no `type_var` survives the mono tail.
+    for (c.result.instances) |inst| {
+        try testing.expect(!inst.ret.isTypeVar());
+        for (inst.params) |p| try testing.expect(!p.isTypeVar());
     }
-    try testing.expect(saw_phrase);
 }
 
-test "M1 gate: a bare type_app in a field type fires; a non-generic program does not" {
+test "M2: repeated call sites of one (template,args) monomorphize to ONE instance (dedup)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int {\n a := id[int](1)\n b := id[int](2)\n c := id[int](3)\n return a + b + c\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
+}
+
+test "M2 gate: a generic STRUCT decl still fires T0013 (generic data is M4/M6)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Box[T] { v: T }\nfn main() -> int { return 0 }\n");
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len > 0);
+    for (c.result.diags) |d| try testing.expectEqual(codes.Code.T0013, d.code);
+    // No instances are minted when the program is gated.
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "M2 gate: a bare type_app in a field type fires; a non-generic program does not" {
     try testing.expect(try checkDiagCount("struct S { v: Box[int] }\nfn main() -> int { return 0 }\n") > 0);
     // No false gate on a plain program (and no spurious T0013).
     try testing.expectEqual(@as(usize, 0), try checkDiagCount("fn main() -> int { return 0 }\n"));
+}
+
+test "M2 gate: a bare (no-explicit-args) generic call requires explicit type arguments" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return id(7) }\n");
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len > 0);
+    var saw = false;
+    for (c.result.diags) |d| {
+        try testing.expectEqual(codes.Code.T0013, d.code);
+        if (std.mem.indexOf(u8, d.message, "explicit type arguments") != null) saw = true;
+    }
+    try testing.expect(saw);
+    // A bare generic call is rejected, so it mints no instance.
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "M2: an uncalled generic fn mints ZERO instances (free in the binary)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return 0 }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
 }
 
 // Each value-poison site (function-as-value, bare-struct-as-value, module-as-value)
