@@ -1,0 +1,6 @@
+# Feature: generics parse but are not yet supported (M1 gate).
+# The generic fn and the explicit type-args `id[int](7)` build a well-formed AST,
+# but type-checking rejects them with T0013 and emits no binary.
+# expect: compile-error "generics not yet supported"
+fn id[T](x: T) -> T { x }
+fn main() -> int { return id[int](7) }

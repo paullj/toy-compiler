@@ -203,6 +203,8 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         ')' => .r_paren,
         '{' => .l_brace,
         '}' => .r_brace,
+        '[' => .l_bracket,
+        ']' => .r_bracket,
         ',' => .comma,
         ':' => if (l.eat('=')) .colon_eq else .colon,
         '.' => if (l.eat('.')) .dotdot else .dot,
@@ -222,7 +224,7 @@ fn beginsToken(c: u8) bool {
     return switch (c) {
         '"' => true, // string
         ' ', '\t', '\r', '\n', '#' => true, // trivia
-        '+', '-', '*', '/', '=', '!', '<', '>', '&', '|', '(', ')', '{', '}', ',', ':', '.', '@' => true,
+        '+', '-', '*', '/', '=', '!', '<', '>', '&', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@' => true,
         else => false,
     };
 }
@@ -405,6 +407,13 @@ test "newline inserts terminator only after statement-ending tokens" {
 
 test "blank lines and trailing newline collapse to one terminator" {
     try expectTags("a\n\n\nb\n", &.{ .identifier, .newline, .identifier, .newline, .eof });
+}
+
+test "brackets lex to l_bracket and r_bracket" {
+    try expectTags("[ ]", &.{ .l_bracket, .r_bracket, .eof });
+    // A generic-application stream tiles cleanly with the surrounding tokens.
+    try expectTags("f[T]", &.{ .identifier, .l_bracket, .identifier, .r_bracket, .eof });
+    try expectSpansTile("fn id[T](x: T) -> T { x }\n");
 }
 
 test "loop keywords and dotdot" {

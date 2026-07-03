@@ -507,6 +507,11 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
             for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs);
         },
         .field_access => try g.resolveFieldAccess(node_idx, n),
+        // A type-application callee `id[int](..)`: resolve ONLY the base callee
+        // (`n.lhs`). The type-arg Range is NOT descended — resolving a type name
+        // like `int` would fire R0001 and stop the pipeline at resolve, pre-empting
+        // the T0013 generics gate at typecheck. Forward-safety for M2.
+        .type_app => try g.resolveExpr(n.lhs),
         .enum_init_unit => {},
         .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a),
         .enum_init_struct => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs),

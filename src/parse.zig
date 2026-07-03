@@ -119,6 +119,10 @@ const field_recovery = setOf(&.{ .r_brace, .comma, .newline }).unionWith(decl_an
 const variant_recovery = field_recovery;
 /// Same shape again (match body is brace-delimited, arms comma/newline sep).
 const arm_recovery = field_recovery;
+/// FOLLOW(generic param/arg) ∪ decl_anchors for a `[ .. ]` generic list: own
+/// closer `]`, separator `,`. No newline (a `[ .. ]` list stays on one line, like
+/// the `( .. )` param list).
+const generic_recovery = setOf(&.{ .r_bracket, .comma }).unionWith(decl_anchors);
 /// `findNextStmt`'s STOP set (at the block's brace-depth). Must contain `.newline`
 /// so a post-recovery `expectTerminator` does NOT spuriously cascade (resync lands
 /// on a newline that `skipNewlines` then swallows).
@@ -194,8 +198,8 @@ fn findNextStmt(p: *Parser) void {
             return;
         }
         switch (t) {
-            .l_brace, .l_paren => depth += 1,
-            .r_brace, .r_paren => if (depth > 0) {
+            .l_brace, .l_paren, .l_bracket => depth += 1,
+            .r_brace, .r_paren, .r_bracket => if (depth > 0) {
                 depth -= 1;
             },
             else => {},
@@ -215,8 +219,8 @@ fn resyncTo(p: *Parser, comptime set: TagSet) void {
         const t = p.peek().tag;
         if (depth == 0 and set.contains(t)) return;
         switch (t) {
-            .l_brace, .l_paren => depth += 1,
-            .r_brace, .r_paren => if (depth > 0) {
+            .l_brace, .l_paren, .l_bracket => depth += 1,
+            .r_brace, .r_paren, .r_bracket => if (depth > 0) {
                 depth -= 1;
             },
             else => {},
@@ -451,6 +455,14 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
+
+    // Optional generic-param list `[T, U]` between the name and the `(`. Its
+    // `generic_param` nodes are created here (before the params/body), so they
+    // still precede the `fn_decl` node.
+    var generics: std.ArrayList(Ast.Index) = .empty;
+    defer generics.deinit(p.gpa);
+    if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
+
     try p.expect(.l_paren, "expected '(' after function name");
 
     var params: std.ArrayList(Ast.Index) = .empty;
@@ -483,11 +495,24 @@ fn parseFnDecl(p: *Parser) Error!Ast.Index {
 
     const body = try p.parseBlock();
 
-    // Write the params run, then the fixed 3-cell FnProto immediately after.
+    // Write the params run, then the generics run, then the fixed 5-cell FnProto.
+    // The layout is ADDITIVE: cells 0-2 (ret/params) are unchanged, so every
+    // 3-cell decode site reads byte-identically; cells 3-4 hold the generics run.
+    // An empty generics run leaves `generic_start` at the current extra length and
+    // `generic_len` 0, which `protoAt` decodes to an empty (safe) slice.
     const params_start: u32 = @intCast(p.extra.items.len);
     const param_cells: []const u32 = @ptrCast(params.items);
     try p.extra.appendSlice(p.gpa, param_cells);
-    const proto_header = try p.addExtra(&.{ ret_type.int(), params_start, @intCast(params.items.len) });
+    const generic_start: u32 = @intCast(p.extra.items.len);
+    const generic_cells: []const u32 = @ptrCast(generics.items);
+    try p.extra.appendSlice(p.gpa, generic_cells);
+    const proto_header = try p.addExtra(&.{
+        ret_type.int(),
+        params_start,
+        @intCast(params.items.len),
+        generic_start,
+        @intCast(generics.items.len),
+    });
 
     return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
 }
@@ -498,6 +523,12 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_struct, "expected 'struct'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a struct name");
+
+    // Optional generic-param list `[T]` between the name and the body `{`.
+    var generics: std.ArrayList(Ast.Index) = .empty;
+    defer generics.deinit(p.gpa);
+    if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
+
     try p.expect(.l_brace, "expected '{' after struct name");
 
     var fields: std.ArrayList(Ast.Index) = .empty;
@@ -526,7 +557,10 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.r_brace, "expected '}' to close struct body");
 
     const header = try p.addRange(fields.items);
-    return p.addNode(.{ .tag = .struct_decl, .main_token = name_tok, .lhs = header, .rhs = Ast.none });
+    // Generics ride the otherwise-unused `rhs` slot as a Range header (or `none`
+    // for a non-generic struct, keeping every existing struct byte-identical).
+    const generic_hdr = if (generics.items.len == 0) Ast.none else try p.addRange(generics.items);
+    return p.addNode(.{ .tag = .struct_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
 /// `enum N { Empty, Circle(int), Rect { w: int, h: int } }`. Variants are
@@ -536,6 +570,12 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_enum, "expected 'enum'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected an enum name");
+
+    // Optional generic-param list `[T]` between the name and the body `{`.
+    var generics: std.ArrayList(Ast.Index) = .empty;
+    defer generics.deinit(p.gpa);
+    if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
+
     try p.expect(.l_brace, "expected '{' after enum name");
 
     var variants: std.ArrayList(Ast.Index) = .empty;
@@ -613,7 +653,9 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.r_brace, "expected '}' to close enum body");
 
     const header = try p.addRange(variants.items);
-    return p.addNode(.{ .tag = .enum_decl, .main_token = name_tok, .lhs = header, .rhs = Ast.none });
+    // Generics ride the otherwise-unused `rhs` slot as a Range header (see struct).
+    const generic_hdr = if (generics.items.len == 0) Ast.none else try p.addRange(generics.items);
+    return p.addNode(.{ .tag = .enum_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
 /// `match scrut { pat -> body, ... }`. Scrutinee parsed in `no_block` (so a bare
@@ -860,6 +902,64 @@ fn parseFieldAccess(p: *Parser, recv: Ast.Index) Error!Ast.Index {
     return p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = recv, .rhs = Ast.none });
 }
 
+/// `[ ident (, ident)* ]` — a generic-parameter list following a decl name. Each
+/// param becomes a `generic_param` leaf node appended to `out` (in source order,
+/// created BEFORE the owning decl node so children still precede parents). Called
+/// only when the cursor is already on `[`. Bracket-aware recovery: a non-identifier
+/// is a P0006, resyncing to the list's own `]`/`,` (unioned with decl anchors so a
+/// runaway bails to the next decl). A missing `]` unwinds to the decl loop.
+fn parseGenericParams(p: *Parser, out: *std.ArrayList(Ast.Index)) Error!void {
+    p.bump(.l_bracket);
+    while (!p.at(.r_bracket) and !p.at(.eof)) {
+        const entry = p.index;
+        if (p.at(.identifier)) {
+            const name_tok = p.index;
+            p.bump(.identifier);
+            const gp = try p.addNode(.{ .tag = .generic_param, .main_token = name_tok, .lhs = Ast.none, .rhs = Ast.none });
+            try out.append(p.gpa, gp);
+            if (!p.eat(.comma)) {
+                if (p.at(.r_bracket)) break;
+            }
+        } else if (generic_recovery.contains(p.peek().tag)) {
+            break;
+        } else {
+            _ = try p.advanceWithError(.P0006, "expected a type parameter name or ']'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_bracket) or p.at(.eof));
+    }
+    try p.expect(.r_bracket, "expected ']' to close a generic parameter list");
+}
+
+/// `Base[Arg, ..]` — a type application. `base` is the already-parsed base/callee
+/// node (an `identifier` or a `field_access` dot-chain). Parses the bracketed
+/// type-argument list (recursive `parseType`, so `Box[Vec[int]]` nests) and wraps
+/// it in a `type_app` node (`main_token` = `[`, `lhs` = base, `rhs` = a `Range` of
+/// the type-arg nodes). Called only when the cursor is already on `[`. The base
+/// and every arg node are created before the `type_app`, so children precede it.
+fn parseTypeApp(p: *Parser, base: Ast.Index) Error!Ast.Index {
+    const lbracket = p.index;
+    p.bump(.l_bracket);
+    var args: std.ArrayList(Ast.Index) = .empty;
+    defer args.deinit(p.gpa);
+    while (!p.at(.r_bracket) and !p.at(.eof)) {
+        const entry = p.index;
+        if (type_first.contains(p.peek().tag)) {
+            try args.append(p.gpa, try p.parseType());
+            if (!p.eat(.comma)) {
+                if (p.at(.r_bracket)) break;
+            }
+        } else if (generic_recovery.contains(p.peek().tag)) {
+            break;
+        } else {
+            _ = try p.advanceWithError(.P0006, "expected a type");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_bracket) or p.at(.eof));
+    }
+    try p.expect(.r_bracket, "expected ']' to close a type application");
+    const header = try p.addRange(args.items);
+    return p.addNode(.{ .tag = .type_app, .main_token = lbracket, .lhs = base, .rhs = header });
+}
+
 /// A type reference is written as an identifier (e.g. `int`, `bool`, `str`), the
 /// unit type `()`, or a module-qualified type `mod.Type`. A qualified type
 /// reuses the `field_access` node: receiver = the module-name `identifier` leaf,
@@ -884,6 +984,9 @@ fn parseType(p: *Parser) Error!Ast.Index {
         try p.expect(.identifier, "expected a type name after '.'");
         ty = try p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = ty, .rhs = Ast.none });
     }
+    // A trailing `[..]` applies type arguments in TYPE position (`Box[int]`,
+    // `mod.Box[int]`). Parses to a `type_app`; Typecheck rejects it (T0013).
+    if (p.at(.l_bracket)) ty = try p.parseTypeApp(ty);
     return ty;
 }
 
@@ -1284,6 +1387,18 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             },
             // `.field` access. `..` is a separate token, so `0..5` is unaffected.
             .dot => lhs = try p.parseFieldAccess(lhs),
+            // Explicit call type-args `id[int](..)`: wrap ONLY a name / qualified
+            // `mod.fn` callee into a `type_app`; the loop then sees the following
+            // `(` and builds a normal `call` whose callee is the `type_app`. This
+            // is the RESERVED postfix-call position; any other `lhs` (e.g. a call
+            // result) breaks WITHOUT consuming `[`, keeping a future value-index
+            // `v[i]` free to adopt a distinct form.
+            .l_bracket => {
+                const ltag = p.nodes.items[lhs.int()].tag;
+                if (ltag == .identifier or ltag == .field_access) {
+                    lhs = try p.parseTypeApp(lhs);
+                } else break;
+            },
             // `Name { ... }` literal / variant construction — only when blocks are
             // allowed and `lhs` is a bare name (struct), an inferred `.V`
             // (struct-variant), or a `field_access` (qualified `N.V`). The call/
@@ -1649,8 +1764,8 @@ fn advanceWithError(p: *Parser, code: Code, message: []const u8) Error!Ast.Index
 //       `p.index > entry or at-closer` assert; a passing parse (no hang) IS that
 //       invariant holding. Nothing to re-check here — noted for completeness.
 //
-//   (c) STRUCTURAL PAIRING — the bracket delimiters (`(`/`)` and `{`/`}`; the
-//       grammar has no `[`/`]`) are BALANCED for a clean parse. On a RECOVERED
+//   (c) STRUCTURAL PAIRING — the bracket delimiters (`(`/`)`, `{`/`}`, and the
+//       generics `[`/`]`) are BALANCED for a clean parse. On a RECOVERED
 //       parse (>=1 diagnostic, i.e. an `error_node` in the tree) imbalance is
 //       allowed — recovery captured the syntax error. So the invariant is
 //       "balanced OR the parse produced error nodes", which must NOT false-trip on
@@ -1681,27 +1796,31 @@ fn checkSpanTotality(tokens: []const Token, source: []const u8) void {
     std.debug.assert(last.end == source.len);
 }
 
-/// (c) STRUCTURAL PAIRING. Walks the token stream counting `(`/`)` and `{`/`}`
-/// opens vs closes. For a CLEAN parse (no diagnostics, so no `error_node`) both
-/// pairs must be balanced and never go negative. On a RECOVERED parse imbalance is
-/// tolerated. `error_node`-presence and `diags` non-emptiness are equivalent
-/// recovery signals — either one licenses imbalance.
+/// (c) STRUCTURAL PAIRING. Walks the token stream counting `(`/`)`, `{`/`}`, and
+/// the generics `[`/`]` opens vs closes. For a CLEAN parse (no diagnostics, so no
+/// `error_node`) all three pairs must be balanced and never go negative. On a
+/// RECOVERED parse imbalance is tolerated. `error_node`-presence and `diags`
+/// non-emptiness are equivalent recovery signals — either one licenses imbalance.
 fn checkBracketPairing(tree: Ast.Tree, tokens: []const Token, diags: []const Diagnostic) void {
     const recovered = diags.len != 0 or hasErrorNode(tree);
     if (recovered) return; // recovery captured any imbalance; nothing to assert.
     var parens: i32 = 0;
     var braces: i32 = 0;
+    var brackets: i32 = 0;
     for (tokens) |tok| switch (tok.tag) {
         .l_paren => parens += 1,
         .r_paren => parens -= 1,
         .l_brace => braces += 1,
         .r_brace => braces -= 1,
+        .l_bracket => brackets += 1,
+        .r_bracket => brackets -= 1,
         else => {},
     };
     // A clean parse is balanced AND never dipped below zero (a well-nested stream
     // can't end at 0 with a negative excursion, but the final == 0 check pins it).
     std.debug.assert(parens == 0);
     std.debug.assert(braces == 0);
+    std.debug.assert(brackets == 0);
 }
 
 /// True if the tree contains at least one `.error_node` — the recovery marker that
@@ -2004,6 +2123,7 @@ test "root is program and children precede parents" {
                 const proto = Ast.protoAt(tree, n.lhs.int());
                 if (proto.ret_type != Ast.none) try testing.expect(proto.ret_type.int() < self);
                 for (proto.params) |c| try testing.expect(c.int() < self);
+                for (proto.generic_params) |c| try testing.expect(c.int() < self);
                 try testing.expect(n.rhs.int() < self);
             },
             .while_stmt => {
@@ -2029,7 +2149,11 @@ test "root is program and children precede parents" {
             .break_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             .continue_stmt => {},
             .labeled => try testing.expect(n.lhs.int() < self),
-            .struct_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
+            .struct_decl => {
+                for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
+                // Generics (when present) ride the `rhs` slot as a Range.
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
             .struct_init => {
                 try testing.expect(n.lhs.int() < self);
                 for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
@@ -2040,7 +2164,10 @@ test "root is program and children precede parents" {
             .literal_number, .literal_string, .literal_bool, .identifier => {},
             // A poison leaf holds only its offending token; no child nodes.
             .error_node => {},
-            .enum_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
+            .enum_decl => {
+                for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
             .enum_variant_unit => {},
             .enum_variant_tuple, .enum_variant_struct => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             .enum_init_unit => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
@@ -2071,8 +2198,99 @@ test "root is program and children precede parents" {
             // `import_decl` overloads `lhs`/`rhs` as TOKEN indices (path segments,
             // alias) like break/continue — no node children to order.
             .import_decl => {},
+            // A declared type parameter is a leaf: only its name token.
+            .generic_param => {},
+            // `Base[Arg, ..]`: the base is `lhs`, the type-args are a Range in `rhs`.
+            .type_app => {
+                try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
         }
     }
+}
+
+// --- M1 generics front-end: parse-only (no semantics; Typecheck rejects them) ---
+
+test "generic fn parses with a [T] segment" {
+    try expectProgram("fn id[T](x: T) -> T { x }\n", "(program (fn id [T] ((param x T)) T (block x)))");
+}
+
+test "generic fn with multiple type params" {
+    try expectProgram("fn f[T, U]() {}\n", "(program (fn f [T U] () _ (block)))");
+}
+
+test "generic struct stores its params in the rhs slot" {
+    try expectProgram("struct Box[T] { v: T }\n", "(program (struct Box [T] (param v T)))");
+}
+
+test "generic enum stores its params in the rhs slot" {
+    try expectProgram("enum E[T] { Some(T), None }\n", "(program (enum E [T] (variant.tuple Some T) (variant.unit None)))");
+}
+
+test "type application in type position parses to a tyapp" {
+    try expectProgram("fn f(x: Box[int]) {}\n", "(program (fn f ((param x (tyapp Box int))) _ (block)))");
+}
+
+test "explicit call type-args wrap the callee in a tyapp" {
+    try expectSexpr("id[int](7)", "(call (tyapp id int) 7)");
+    // A qualified callee `mod.f[int](..)` wraps the field_access base.
+    try expectSexpr("m.f[int](7)", "(call (tyapp (. m f) int) 7)");
+}
+
+test "nested type application nests tyapp nodes" {
+    // Empty arg list renders with no trailing args after the callee.
+    try expectSexpr("f[Box[int]]()", "(call (tyapp f (tyapp Box int)))");
+}
+
+test "generic nodes precede their parents (children-before-parents on generics)" {
+    const gpa = testing.allocator;
+    const source =
+        \\struct Box[T] { v: T }
+        \\enum E[U] { Some(U), None }
+        \\fn f[A, B](x: Box[int]) -> A { x }
+        \\
+    ;
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, source);
+    defer freeTree(gpa, tree);
+
+    var saw_generic_param = false;
+    var saw_type_app = false;
+    for (tree.nodes, 0..) |n, i| {
+        const self: u32 = @intCast(i);
+        switch (n.tag) {
+            .generic_param => saw_generic_param = true,
+            .type_app => {
+                saw_type_app = true;
+                try testing.expect(n.lhs.int() < self);
+                for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
+            .fn_decl => {
+                const proto = Ast.protoAt(tree, n.lhs.int());
+                for (proto.generic_params) |c| try testing.expect(c.int() < self);
+            },
+            .struct_decl, .enum_decl => {
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_generic_param);
+    try testing.expect(saw_type_app);
+}
+
+test "malformed generic list recovers without crashing (tainted parse)" {
+    const gpa = testing.allocator;
+    const source = "fn f[ , ]() {}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    // A garbage generic list is rejected at parse time; the parse is tainted but the
+    // on-every-parse invariant sweep (span totality + bracket pairing) still holds.
+    try testing.expect(res.diags.len > 0);
 }
 
 test "logical operator precedence: || is loosest, && next, then equality" {

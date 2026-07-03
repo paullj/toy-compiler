@@ -115,6 +115,17 @@ pub const Tag = enum(u8) {
     /// caret can point at the quote. Distinct from `.invalid` so a partial string
     /// is preserved as a string rather than an opaque byte run.
     string_unterminated,
+
+    // Generics brackets. Appended at the END (frozen ordinals; `[]Token` is
+    // memcpy'd to/from the content cache). `[` opens a generic-param list, a
+    // type-application `Base[Arg,..]`, or explicit call type-args `f[int](..)`;
+    // `]` closes it. Reserved for type position and postfix-call position only —
+    // a future value-index `v[i]` must adopt a distinct form (see docs/typesystem.md).
+
+    /// `[` — opens a generic-param list / type-application / call type-args.
+    l_bracket,
+    /// `]` — closes a generic-param list / type-application / call type-args.
+    r_bracket,
 };
 
 /// Maps identifier text to its keyword tag, if any.
