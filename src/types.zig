@@ -1986,6 +1986,93 @@ test "M4: a generic struct with a generic-struct field reifies correctly with th
     for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
 }
 
+test "M5: Box{v:1} infers Box[int] and dedups with explicit Box[int] to ONE reified struct" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Box[T] { v: T }\nfn main() -> int {\n b := Box[int]{ v: 41 }\n c := Box{ v: 1 }\n return b.v + c.v\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Box is a struct, not a fn — no generic-FN instances.
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+    // The inferred `Box{v:1}` and explicit `Box[int]{..}` share ONE reified layout.
+    var box_int_count: usize = 0;
+    var reified: ?Layout = null;
+    for (c.result.layouts) |l| {
+        if (std.mem.eql(u8, l.name, "Box$int")) {
+            box_int_count += 1;
+            reified = l;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), box_int_count);
+    try testing.expectEqual(@as(u32, 8), reified.?.size);
+    try testing.expectEqual(@as(usize, 1), reified.?.field_types.len);
+    try testing.expectEqual(Kind.int, reified.?.field_types[0].kind);
+    try testing.expectEqual(@as(u32, 0), reified.?.offsets[0]);
+    // No `.app`/`.type_var` survives any node_types slot (the M4 invariant).
+    for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
+}
+
+test "M5: an inferred Box{v:true} reifies a distinct Box$bool layout" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Box[T] { v: T }\nfn use(x: bool) -> int { return 0 }\nfn main() -> int {\n c := Box{ v: true }\n return use(c.v)\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var saw_bool = false;
+    for (c.result.layouts) |l| {
+        if (std.mem.eql(u8, l.name, "Box$bool")) saw_bool = true;
+    }
+    try testing.expect(saw_bool);
+}
+
+test "M5: conflicting inferred field types report exactly one T0015" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Pair[T] { a: T, b: T }\nfn main() -> int {\n p := Pair{ a: 1, b: true }\n return 0\n}\n");
+    defer c.deinit(gpa);
+    var n15: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0015) n15 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n15);
+}
+
+test "M5: a phantom (uninferable) struct type-param routes to T0016" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct P[T] { x: int }\nfn main() -> int {\n p := P{ x: 1 }\n return 0\n}\n");
+    defer c.deinit(gpa);
+    var saw16 = false;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0016) saw16 = true;
+    }
+    try testing.expect(saw16);
+}
+
+test "M5: missing-field-with-inference still infers T then reports the missing field" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Pair[T] { a: T, b: T }\nfn main() -> int {\n p := Pair{ a: 1 }\n return 0\n}\n");
+    defer c.deinit(gpa);
+    // Inference succeeds (T=int from `a`), so this is neither a conflict nor uninferable;
+    // the missing `b` is reported by the shared field-check tail.
+    for (c.result.diags) |d| {
+        try testing.expect(d.code != codes.Code.T0015);
+        try testing.expect(d.code != codes.Code.T0016);
+    }
+    var saw_missing = false;
+    for (c.result.diags) |d| {
+        if (std.mem.indexOf(u8, d.message, "missing field 'b'") != null) saw_missing = true;
+    }
+    try testing.expect(saw_missing);
+}
+
+test "M5: a unit-typed inferred field value is gated with T0013 before internApp" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Box[T] { v: T }\nfn nop() {}\nfn main() -> int {\n c := Box{ v: nop() }\n return 0\n}\n");
+    defer c.deinit(gpa);
+    var saw13 = false;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0013) saw13 = true;
+    }
+    try testing.expect(saw13);
+}
+
 test "M3: a bare (no-explicit-args) generic call infers its type-arg from the argument" {
     const gpa = testing.allocator;
     var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return id(7) }\n");

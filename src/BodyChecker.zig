@@ -559,17 +559,94 @@ pub const BodyChecker = struct {
                 try bc.sink.emitFmt(bc.byteOf(lhs.main_token), "unknown struct type '{s}'", .{disp_name});
                 return .invalid;
             };
-            // A generic struct constructed WITHOUT type args (`Box { v: 1 }`) is M5
-            // (construction inference) — out of scope here; require explicit args.
+            // A generic struct constructed WITHOUT type args (`Box{ v: 1 }`) infers its
+            // type-params (M5) by matching field VALUE types against the declared field
+            // PATTERNS (the M3 matcher over M4's `App`). The inferred `App` is
+            // content-addressed, so it selects the SAME reified struct as an explicit
+            // `Box[int]{..}` and dedups to one codegen unit.
             if (id < bc.model.structs.len and bc.model.structs[id].is_generic) {
-                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
-                try bc.sink.emitFmtCode(.T0013, bc.byteOf(lhs.main_token), "generic struct '{s}' requires explicit type arguments, e.g. {s}[int]{{ .. }}", .{ disp_name, disp_name });
-                return .invalid;
+                const gsym = bc.model.structs[id];
+                const inits = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                // Type each value ONCE (source order); the shared field-check tail reuses
+                // these via `pretyped`, so inner-value diagnostics aren't double-emitted.
+                const pre = try bc.gpa.alloc(Type, inits.len);
+                defer bc.gpa.free(pre);
+                for (inits, 0..) |fi_idx, ii| pre[ii] = try bc.typeOf(bc.tree.nodes[(fi_idx).int()].lhs);
+                // Align values to decl order + record each field's first supplier (for
+                // conflict spans). A missing field's slot stays `.invalid`/`Ast.none`: the
+                // matcher's never/invalid rule skips it and its span is never dereferenced.
+                const aligned = try bc.gpa.alloc(Type, gsym.field_names.len);
+                defer bc.gpa.free(aligned);
+                @memset(aligned, Type.invalid);
+                const supplier = try bc.gpa.alloc(Ast.Index, gsym.field_names.len);
+                defer bc.gpa.free(supplier);
+                @memset(supplier, Ast.none);
+                for (inits, 0..) |fi_idx, ii| {
+                    const fname = bc.nameText(bc.tree.nodes[(fi_idx).int()].main_token);
+                    for (gsym.field_names, 0..) |dn, j| {
+                        if (std.mem.eql(u8, dn, fname)) {
+                            if (supplier[j] == Ast.none) {
+                                supplier[j] = fi_idx;
+                                aligned[j] = pre[ii];
+                            }
+                            break;
+                        }
+                    }
+                }
+                const n_gp: u32 = @intCast(gsym.generic_params.len);
+                const out = try bc.gpa.alloc(Type, n_gp);
+                defer bc.gpa.free(out);
+                const bnd = try bc.gpa.alloc(bool, n_gp);
+                defer bc.gpa.free(bnd);
+                const fp = try bc.gpa.alloc(usize, n_gp);
+                defer bc.gpa.free(fp);
+                switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp)) {
+                    .conflict => |c| {
+                        const later = bc.tree.nodes[(supplier[c.second_pos]).int()].main_token;
+                        const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
+                        try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
+                        return .invalid;
+                    },
+                    .unbound => |u| {
+                        try bc.sink.emitFmtCode(.T0016, bc.byteOf(lhs.main_token), "cannot infer type parameter '{s}' for '{s}'; add explicit type arguments, e.g. {s}[int]{{ .. }}", .{ gsym.generic_params[u.ord], disp_name, disp_name });
+                        return .invalid;
+                    },
+                    .ok => {
+                        // Mirror the call-path gate (a `unit`/non-value inferred arg must
+                        // not reach `internApp` → reifyApps).
+                        for (out) |ta| {
+                            if (!isConcreteValue(ta)) {
+                                try bc.sink.emitCode(.T0013, bc.byteOf(lhs.main_token), "inferred type argument must be a concrete value type; add explicit type arguments");
+                                return .invalid;
+                            }
+                        }
+                        const app = Type.app(try bc.internApp(id, out));
+                        return bc.checkStructFieldInits(n, gsym, out, disp_name, app, pre);
+                    },
+                }
             }
             ctor_id = id;
             result = Type.structT(id);
         }
         const sym = bc.model.structs[ctor_id];
+        return bc.checkStructFieldInits(n, sym, targs, disp_name, result, null);
+    }
+
+    /// The field-init check shared by all three struct-construction paths (non-generic
+    /// plain, explicit `Box[int]{..}`, and the M5-inferred `Box{..}`). When `pretyped`
+    /// is non-null it supplies the already-computed value type per init (source order),
+    /// so the inferred path — which must type each value ONCE to run inference — does not
+    /// re-walk (and thus re-diagnose) the value expressions; `pretyped == null` types
+    /// each value here and is byte-identical to the pre-M5 tail.
+    fn checkStructFieldInits(
+        bc: *BodyChecker,
+        n: Ast.Node,
+        sym: StructSym,
+        targs: []const Type,
+        disp_name: []const u8,
+        result: Type,
+        pretyped: ?[]const Type,
+    ) error{OutOfMemory}!Type {
         const inits = Ast.rangeSlice(bc.tree, (n.rhs).int());
 
         // Track which declared fields are supplied (for missing/duplicate checks).
@@ -577,10 +654,10 @@ pub const BodyChecker = struct {
         defer bc.gpa.free(seen);
         @memset(seen, false);
 
-        for (inits) |fi_idx| {
+        for (inits, 0..) |fi_idx, ii| {
             const fi = bc.tree.nodes[(fi_idx).int()];
             const fname = bc.nameText(fi.main_token);
-            const vt = try bc.typeOf(fi.lhs);
+            const vt = if (pretyped) |pt| pt[ii] else try bc.typeOf(fi.lhs);
             // Find the declared field by name.
             var found: ?usize = null;
             for (sym.field_names, 0..) |dn, j| {
