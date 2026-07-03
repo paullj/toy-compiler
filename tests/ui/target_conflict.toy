@@ -1,0 +1,5 @@
+enum Opt[T] { some(T), none }
+fn main() -> int {
+  x: Opt[int] = Opt.some(true)  #~ ERROR [T0015] conflicting types for type parameter
+  return match x { .some(_) -> 1, .none -> 0 }
+}

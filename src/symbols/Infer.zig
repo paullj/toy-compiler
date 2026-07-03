@@ -68,6 +68,42 @@ pub fn match(
     return .ok;
 }
 
+pub const FillOutcome = union(enum) {
+    ok,
+    /// Type-var `ord` was arg-bound to `arg` but the expected type wants `expected`.
+    conflict: struct { ord: u32, arg: Type, expected: Type },
+    /// Type-var `ord` is still open after the target-fill (lowest such ordinal).
+    unbound: struct { ord: u32 },
+};
+
+/// M7 target-fill reconcile, applied AFTER `match` at a CONSTRUCTION check site ONLY
+/// (enum/struct). It is NOT one of the four call-discovery consumers of `match`:
+/// enum/struct instances are discovered from `node_types` by `reifyApps`, never
+/// re-inferred, so filling here cannot drift them — that is why this lives beside
+/// `match` yet needs no consumer edit and function-call inference stays untouched.
+///
+/// Precedence (locked): arg-derived bindings are authoritative. A bound var whose
+/// `exp_args` entry disagrees is a `.conflict` (arg wins, but the disagreement is a
+/// hard error); an open var with `exp_args` present is filled; `exp_args == null` (no
+/// usable target) or an arity mismatch leaves everything as-is. Two passes so the
+/// reported `.unbound` is the LOWEST still-open ordinal AFTER all fills, matching
+/// `match`'s contract. Allocation-free.
+pub fn fillExpected(out: []Type, bound: []bool, exp_args: ?[]const Type) FillOutcome {
+    if (exp_args) |ea| if (ea.len == out.len) {
+        for (0..out.len) |i| {
+            if (bound[i]) {
+                if (!Type.eql(out[i], ea[i]))
+                    return .{ .conflict = .{ .ord = @intCast(i), .arg = out[i], .expected = ea[i] } };
+            } else {
+                out[i] = ea[i];
+                bound[i] = true;
+            }
+        }
+    };
+    for (0..out.len) |i| if (!bound[i]) return .{ .unbound = .{ .ord = @intCast(i) } };
+    return .ok;
+}
+
 /// Convenience for the two Sig-only reconstruction sites (`lower`, `CallVisitor`),
 /// which have the template params but not its generic-param count. The caller passes
 /// the authoritative `generic_param_count` (`1 + max typeVarOrd` over the sig's params,
@@ -194,4 +230,78 @@ test "infer returns null on arity mismatch and on conflict" {
     const gpa = testing.allocator;
     try testing.expectEqual(@as(?[]Type, null), try infer(gpa, 1, &.{Type.typeVar(0)}, &.{ Type.int, Type.int }));
     try testing.expectEqual(@as(?[]Type, null), try infer(gpa, 1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.int, Type.@"bool" }));
+}
+
+/// Run `fillExpected` over stack scratch seeded from `out_init`/`bound_init`.
+fn runFill(out_init: []const Type, bound_init: []const bool, exp: ?[]const Type) struct { out: FillOutcome, args: [4]Type } {
+    var out_args: [4]Type = undefined;
+    var bnd: [4]bool = undefined;
+    for (out_init, 0..) |t, i| out_args[i] = t;
+    for (bound_init, 0..) |b, i| bnd[i] = b;
+    const n = out_init.len;
+    const o = fillExpected(out_args[0..n], bnd[0..n], exp);
+    return .{ .out = o, .args = out_args };
+}
+
+test "fillExpected fills a still-open var from the target" {
+    const r = runFill(&.{Type.invalid}, &.{false}, &.{Type.int});
+    try testing.expectEqual(FillOutcome.ok, r.out);
+    try testing.expect(Type.eql(r.args[0], Type.int));
+}
+
+test "fillExpected: an arg-bound var that AGREES with the target is no conflict" {
+    const r = runFill(&.{Type.int}, &.{true}, &.{Type.int});
+    try testing.expectEqual(FillOutcome.ok, r.out);
+}
+
+test "fillExpected: an arg-bound var that DISAGREES with the target is a conflict" {
+    const r = runFill(&.{Type.@"bool"}, &.{true}, &.{Type.int});
+    switch (r.out) {
+        .conflict => |c| {
+            try testing.expectEqual(@as(u32, 0), c.ord);
+            try testing.expect(Type.eql(c.arg, Type.@"bool"));
+            try testing.expect(Type.eql(c.expected, Type.int));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fillExpected: null target leaves an open var unbound" {
+    const r = runFill(&.{Type.invalid}, &.{false}, null);
+    switch (r.out) {
+        .unbound => |u| try testing.expectEqual(@as(u32, 0), u.ord),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fillExpected: null target with all vars already bound is ok" {
+    const r = runFill(&.{Type.int}, &.{true}, null);
+    try testing.expectEqual(FillOutcome.ok, r.out);
+}
+
+test "fillExpected: two arg-bound vars agreeing with the target is ok" {
+    const r = runFill(&.{ Type.int, Type.@"bool" }, &.{ true, true }, &.{ Type.int, Type.@"bool" });
+    try testing.expectEqual(FillOutcome.ok, r.out);
+}
+
+test "fillExpected: partial — one arg-bound, one filled from the target" {
+    const r = runFill(&.{ Type.int, Type.invalid }, &.{ true, false }, &.{ Type.int, Type.@"bool" });
+    try testing.expectEqual(FillOutcome.ok, r.out);
+    try testing.expect(Type.eql(r.args[1], Type.@"bool"));
+}
+
+test "fillExpected: an agreeing ord0 does not mask a conflicting ord1" {
+    const r = runFill(&.{ Type.@"bool", Type.@"bool" }, &.{ true, true }, &.{ Type.@"bool", Type.int });
+    switch (r.out) {
+        .conflict => |c| try testing.expectEqual(@as(u32, 1), c.ord),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fillExpected: an arity mismatch is treated as no target (no-op)" {
+    const r = runFill(&.{Type.invalid}, &.{false}, &.{ Type.int, Type.@"bool" });
+    switch (r.out) {
+        .unbound => |u| try testing.expectEqual(@as(u32, 0), u.ord),
+        else => return error.TestUnexpectedResult,
+    }
 }

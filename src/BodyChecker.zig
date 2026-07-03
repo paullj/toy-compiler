@@ -601,27 +601,27 @@ pub const BodyChecker = struct {
                 const fp = try bc.gpa.alloc(usize, n_gp);
                 defer bc.gpa.free(fp);
                 switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp)) {
+                    // A field-vs-field conflict is authoritative, reported at the two
+                    // supplier spans — M7's target type never overrides it.
                     .conflict => |c| {
                         const later = bc.tree.nodes[(supplier[c.second_pos]).int()].main_token;
                         const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
                         try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
                         return .invalid;
                     },
-                    .unbound => |u| {
-                        try bc.sink.emitFmtCode(.T0016, bc.byteOf(lhs.main_token), "cannot infer type parameter '{s}' for '{s}'; add explicit type arguments, e.g. {s}[int]{{ .. }}", .{ gsym.generic_params[u.ord], disp_name, disp_name });
-                        return .invalid;
-                    },
-                    .ok => {
-                        // Mirror the call-path gate (a `unit`/non-value inferred arg must
-                        // not reach `internApp` → reifyApps).
-                        for (out) |ta| {
-                            if (!isConcreteValue(ta)) {
-                                try bc.sink.emitCode(.T0013, bc.byteOf(lhs.main_token), "inferred type argument must be a concrete value type; add explicit type arguments");
-                                return .invalid;
-                            }
-                        }
-                        const app = Type.app(try bc.internApp(id, out, false));
-                        return bc.checkStructFieldInits(n, gsym, out, disp_name, app, pre);
+                    // Target-fill any still-open param from the expected type
+                    // (`p: Phantom[int] = Phantom{..}`); an arg-vs-expected disagreement
+                    // surfaces as T0015. Byte-identical to pre-M7 when no target exists.
+                    .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, bc.expectedAppArgs(id, false), gsym.generic_params, lhs.main_token)) {
+                        .ok => {
+                            const app = Type.app(try bc.internApp(id, out, false));
+                            return bc.checkStructFieldInits(n, gsym, out, disp_name, app, pre);
+                        },
+                        .err => return .invalid,
+                        .unbound => |ord| {
+                            try bc.sink.emitFmtCode(.T0016, bc.byteOf(lhs.main_token), "cannot infer type parameter '{s}' for '{s}'; add explicit type arguments, e.g. {s}[int]{{ .. }}", .{ gsym.generic_params[ord], disp_name, disp_name });
+                            return .invalid;
+                        },
                     },
                 }
             }
@@ -903,22 +903,22 @@ pub const BodyChecker = struct {
         const fp = try bc.gpa.alloc(usize, n_gp);
         defer bc.gpa.free(fp);
         switch (Infer.match(n_gp, variant.field_types, aligned, out, bnd, fp)) {
+            // An arg-vs-arg conflict (two payload values disagree) is authoritative and
+            // reported at the payload spans — M7's target type never overrides it.
             .conflict => |c| {
                 try bc.sink.emitFmtCode(.T0015, bc.byteOf(vtok), "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
                 return .invalid;
             },
-            .unbound => |u| {
-                try bc.sink.emitFmtCode(.T0016, bc.byteOf(vtok), "cannot infer type parameter '{s}' for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ e.generic_params[u.ord], e.name, vname, e.name, vname });
-                return .invalid;
-            },
-            .ok => {
-                for (out) |ta| {
-                    if (!isConcreteValue(ta)) {
-                        try bc.sink.emitCode(.T0013, bc.byteOf(vtok), "inferred type argument must be a concrete value type; add explicit type arguments");
-                        return .invalid;
-                    }
-                }
-                return bc.checkVariantPayloads(enum_id, vtok, node_form, args, out, pre);
+            // Both a full arg-bind (`.ok`) and a partial/nullary bind (`.unbound`) funnel
+            // through the target-fill: the expected type (`x: Opt[int] = Opt.none`) pins
+            // any still-open param, and an arg-vs-expected disagreement surfaces as T0015.
+            .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, bc.expectedAppArgs(enum_id, true), e.generic_params, vtok)) {
+                .ok => return bc.checkVariantPayloads(enum_id, vtok, node_form, args, out, pre),
+                .err => return .invalid,
+                .unbound => |ord| {
+                    try bc.sink.emitFmtCode(.T0016, bc.byteOf(vtok), "cannot infer type parameter '{s}' for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ e.generic_params[ord], e.name, vname, e.name, vname });
+                    return .invalid;
+                },
             },
         }
     }
@@ -1029,6 +1029,56 @@ pub const BodyChecker = struct {
             if (e.ctor_is_enum) return e.ctor;
         }
         return null;
+    }
+
+    /// The target type-args when `bc.expected` is an `App` of exactly THIS ctor with
+    /// matching enum/struct-ness (M7 target typing). Anything else — a scalar, the
+    /// wrong ctor, a plain `enumT`, or no expected type — yields null, so the
+    /// `fillExpected` reconcile is a no-op and behavior is byte-identical to pre-M7.
+    /// This ctor-gate is the sole guard against a stale/unrelated expected type wrongly
+    /// filling; a same-ctor `App` always has `args.len == generic_params.len`, so the
+    /// arity matches at the two construction sites.
+    fn expectedAppArgs(bc: *const BodyChecker, ctor_id: u32, want_enum: bool) ?[]const Type {
+        const exp = bc.expected orelse return null;
+        if (!exp.isApp()) return null;
+        const e = bc.composite.at(exp.appIdx());
+        if (e.ctor != ctor_id or e.ctor_is_enum != want_enum) return null;
+        return e.args;
+    }
+
+    const Reconciled = union(enum) { ok, err, unbound: u32 };
+
+    /// The shared post-`match` target-fill reconcile for BOTH construction sites
+    /// (enum via `checkVariant`, struct via `typeOfStructInit`). It emits the
+    /// identically-worded T0015 arg-vs-expected conflict and the identical T0013
+    /// concrete-value gate (both differ across the two sites only by `span_tok`).
+    /// It returns `.unbound` WITHOUT emitting, so each site keeps its own
+    /// byte-identical, site-specific T0016 message. On `.ok` the caller proceeds to
+    /// the construction tail (`checkVariantPayloads` / `internApp` + field checks).
+    fn reconcileTargetArgs(
+        bc: *BodyChecker,
+        out: []Type,
+        bound: []bool,
+        exp_args: ?[]const Type,
+        param_names: []const []const u8,
+        span_tok: u32,
+    ) error{OutOfMemory}!Reconciled {
+        switch (Infer.fillExpected(out, bound, exp_args)) {
+            .conflict => |c| {
+                try bc.sink.emitFmtCode(.T0015, bc.byteOf(span_tok), "conflicting types for type parameter '{s}': {s} inferred from the value, {s} from the expected type", .{ param_names[c.ord], bc.typeName(c.arg), bc.typeName(c.expected) });
+                return .err;
+            },
+            .unbound => |u| return .{ .unbound = u.ord },
+            .ok => {
+                for (out) |ta| {
+                    if (!isConcreteValue(ta)) {
+                        try bc.sink.emitCode(.T0013, bc.byteOf(span_tok), "inferred type argument must be a concrete value type; add explicit type arguments");
+                        return .err;
+                    }
+                }
+                return .ok;
+            },
+        }
     }
 
     fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
@@ -1238,23 +1288,89 @@ pub const BodyChecker = struct {
         }
     }
 
+    /// App-aware `irrefutable` (M7). A non-`App` type delegates verbatim to
+    /// `bc.irrefutable` (= `ControlFlow.irrefutable`), so every scalar / plain-`enumT` /
+    /// `structT` payload is byte-identical to pre-M7. For an `App` payload (a substituted
+    /// generic-enum/struct instance — the case `ControlFlow` cannot resolve because its
+    /// `Ctx` has no composite table) we handle the pattern here: a nested variant/or
+    /// pattern resolves the enum via `scrutEnumId` + the App's own type-args and recurses.
+    /// Terminates: it descends the FINITE sub-pattern tree, not the (possibly cyclic) type.
+    fn irrefutableTy(bc: *BodyChecker, pat_idx: Ast.Index, ty: Type) error{OutOfMemory}!bool {
+        if (!ty.isApp()) return bc.irrefutable(pat_idx, ty);
+        const pat = bc.tree.nodes[(pat_idx).int()];
+        return switch (pat.tag) {
+            .pattern_wildcard => true,
+            .pattern_binding => pat.rhs == Ast.none or try bc.irrefutableTy(pat.rhs, ty),
+            .pattern_literal => false,
+            .pattern_or => try bc.orCoversTyApp(pat_idx, ty),
+            .pattern_variant => blk: {
+                // A single-variant enum instance is the only variant pattern that can be
+                // total (the tag test cannot fail); its payload must then be irrefutable.
+                const eid = bc.scrutEnumId(ty) orelse break :blk false;
+                const e = bc.model.enums[eid];
+                if (e.variants.len != 1) break :blk false;
+                break :blk try bc.variantPayloadIrrefutableSubst(pat_idx, e.variants[0], bc.composite.at(ty.appIdx()).args);
+            },
+            else => false,
+        };
+    }
+
+    /// `ControlFlow.orCoversType` mirrored, App-aware (payloads substituted through the
+    /// instance's `targs` before the per-variant irrefutability check).
+    fn orCoversTyApp(bc: *BodyChecker, or_idx: Ast.Index, ty: Type) error{OutOfMemory}!bool {
+        const alts = Ast.rangeSlice(bc.tree, (bc.tree.nodes[(or_idx).int()].lhs).int());
+        for (alts) |a| if (try bc.irrefutableTy(a, ty)) return true;
+        const eid = bc.scrutEnumId(ty) orelse return false;
+        const e = bc.model.enums[eid];
+        const targs = bc.composite.at(ty.appIdx()).args;
+        var seen = [_]bool{false} ** 64; // matches ControlFlow's cap
+        if (e.variants.len > seen.len) return false;
+        for (alts) |a| {
+            const ap = bc.tree.nodes[(a).int()];
+            if (ap.tag != .pattern_variant) continue;
+            const vname = bc.nameText(ap.main_token);
+            for (e.variants, 0..) |v, i| {
+                if (std.mem.eql(u8, v.name, vname) and try bc.variantPayloadIrrefutableSubst(a, v, targs)) seen[i] = true;
+            }
+        }
+        for (e.variants, 0..) |_, i| if (!seen[i]) return false;
+        return true;
+    }
+
     /// `variantPayloadIrrefutable` over a variant whose payload types have been
     /// SUBSTITUTED through the enum instance's `targs` (M6). For `targs.len == 0` (a
-    /// non-generic / plain-`enumT` scrutinee) this is exactly the borrowed-variant call,
-    /// byte-identical to pre-M6. For a generic instance it builds a temporary VariantSym
-    /// with substituted `field_types` so the type-aware irrefutability check sees the
-    /// concrete payload. NOTE (deferred to M7): if a substituted payload is itself a
-    /// generic-enum instance (an `App`, not `enumT`), `ControlFlow.irrefutable` treats a
-    /// nested variant pattern over it as refutable — a possible OVER-report of
-    /// non-exhaustiveness, never a miscompile. The common bind/wildcard cases (all of
-    /// M6's e2e) are irrefutable regardless of the payload type.
+    /// non-generic / plain-`enumT` scrutinee) this delegates to the borrowed-variant
+    /// call, byte-identical to pre-M6. For a generic instance each binder is checked via
+    /// the App-aware `irrefutableTy` against its substituted field type (M7) — this is
+    /// what makes a nested variant/or pattern over a substituted generic-enum-instance
+    /// (`App`) payload compute correctly rather than always-refutable.
     fn variantPayloadIrrefutableSubst(bc: *BodyChecker, pat_idx: Ast.Index, variant: VariantSym, targs: []const Type) error{OutOfMemory}!bool {
         if (targs.len == 0) return bc.variantPayloadIrrefutable(pat_idx, variant);
-        const sub = try bc.gpa.alloc(Type, variant.field_types.len);
-        defer bc.gpa.free(sub);
-        for (variant.field_types, 0..) |ft, i| sub[i] = substTy(bc, ft, targs);
-        const subst_variant: VariantSym = .{ .name = variant.name, .form = variant.form, .field_names = variant.field_names, .field_types = sub };
-        return bc.variantPayloadIrrefutable(pat_idx, subst_variant);
+        const pat = bc.tree.nodes[(pat_idx).int()];
+        const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (pat.rhs).int());
+        switch (variant.form) {
+            .unit => return binders.len == 0,
+            .tuple => {
+                if (binders.len != variant.field_types.len) return false;
+                for (binders, variant.field_types) |b, fpat| {
+                    if (!try bc.irrefutableTy(b, substTy(bc, fpat, targs))) return false;
+                }
+                return true;
+            },
+            .@"struct" => {
+                for (binders) |b_idx| {
+                    const b = bc.tree.nodes[(b_idx).int()];
+                    const src = if (b.lhs != Ast.none) bc.nameText(bc.tree.nodes[(b.lhs).int()].main_token) else bc.nameText(b.main_token);
+                    var fty: Type = .invalid;
+                    for (variant.field_names, 0..) |dn, j| if (std.mem.eql(u8, dn, src)) {
+                        fty = substTy(bc, variant.field_types[j], targs);
+                        break;
+                    };
+                    if (!try bc.irrefutableTy(b_idx, fty)) return false;
+                }
+                return true;
+            },
+        }
     }
 
     fn checkOrBindings(bc: *BodyChecker, or_idx: Ast.Index) error{OutOfMemory}!void {

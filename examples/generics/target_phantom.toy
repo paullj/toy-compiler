@@ -1,0 +1,11 @@
+# Feature: a PHANTOM struct type-param is filled from the target type (M7). `Phantom[T]`
+# uses `T` in no field, so `Phantom{ x: 42 }` alone leaves `T` unbound (uninferable). The
+# annotation `p: Phantom[int] = Phantom{ .. }` supplies the target, so the still-open `T`
+# is pinned to `int` and the same `Phantom[int]` instance is constructed. Without a target
+# (`p := Phantom{ .. }`) it stays explicit-args-required (T0016).
+# expect: exit 42
+struct Phantom[T] { x: int }
+fn main() -> int {
+  p: Phantom[int] = Phantom{ x: 42 }
+  return p.x
+}

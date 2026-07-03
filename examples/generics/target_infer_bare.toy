@@ -1,0 +1,10 @@
+# Feature: target-type inference reaches the BARE-variant form too (M7). `x: Opt[int] =
+# .none` has no qualifying type-name on the constructor; the enum id is recovered from
+# the expected type (`scrutEnumId` over the `Opt[int]` App), then the same target-fill
+# pins `T = int` for the nullary `.none`. Same instance as `Opt.none` / `Opt[int].none`.
+# expect: exit 42
+enum Opt[T] { some(T), none }
+fn main() -> int {
+  x: Opt[int] = .none
+  return match x { .some(n) -> n, .none -> 42 }
+}
