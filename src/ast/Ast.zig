@@ -461,8 +461,12 @@ pub const ParseHeader = extern struct {
     /// proto read by the 5-cell `protoAt` would alias neighbouring `extra` bytes —
     /// a v5 blob must miss cleanly. Bumped to 7 for the M8 `impl_decl` Tag ordinal
     /// appended at the end: a v6 blob predating that tag must miss cleanly rather
-    /// than misdecode a cell whose meaning the new tag changed.
-    version: u32 = 7,
+    /// than misdecode a cell whose meaning the new tag changed. Bumped to 8 for the
+    /// M10 generic-impl parse change: an `impl_decl`'s `lhs` may now be a `type_app`
+    /// (`impl Box[T]`) and a method carries an impl-derived `generic_param` run in its
+    /// FnProto (cells 3-4), so a v7 blob — which never produced either shape — must
+    /// miss cleanly rather than feed a stale AST into the M10 method-monomorphizer.
+    version: u32 = 8,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -523,7 +527,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 7) return null;
+    if (hdr.magic != parse_magic or hdr.version != 8) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -1047,7 +1051,7 @@ test "pack/unpack round-trips a tree containing an impl_decl (v7)" {
     try testing.expectEqualSlices(u32, tree.extra, got.extra);
 }
 
-test "unpack rejects a v6 blob (pre-impl_decl)" {
+test "unpack rejects a v7 blob (pre-generic-impl)" {
     const gpa = testing.allocator;
     var nodes = [_]Node{
         .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
@@ -1057,9 +1061,10 @@ test "unpack rejects a v6 blob (pre-impl_decl)" {
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
     const blob = try pack(gpa, tree);
     defer gpa.free(blob);
-    // Rewrite the header `version` field (the second u32) to 6: a blob from a
-    // compiler predating the M8 tag must miss cleanly, not misdecode.
-    std.mem.writeInt(u32, blob[4..8], 6, @import("builtin").cpu.arch.endian());
+    // Rewrite the header `version` field (the second u32) to 7: a blob from a
+    // compiler predating the M10 generic-impl parse change must miss cleanly, not
+    // misdecode an `impl`'s receiver / a method's generic run.
+    std.mem.writeInt(u32, blob[4..8], 7, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
 }
 
