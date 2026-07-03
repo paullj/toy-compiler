@@ -406,6 +406,16 @@ pub fn protoAt(tree: Tree, header: u32) FnProto {
     };
 }
 
+/// True when the `param` node at `param_idx` is a `mut`-qualified receiver: the
+/// token immediately before its name is `kw_mut` (M9). Token-adjacency detection
+/// mirrors the by-text `self`/`_` recognition — no dedicated node/cell, so no
+/// `ParseHeader.version` bump. `tokens` is passed explicitly because a `Tree` holds
+/// only nodes/extra, never the token stream.
+pub fn isMutParam(tree: Tree, tokens: []const Token, param_idx: Index) bool {
+    const n = tree.nodes[param_idx.int()];
+    return n.tag == .param and n.main_token > 0 and tokens[n.main_token - 1].tag == .kw_mut;
+}
+
 /// The root (top-level) node of a non-empty tree — by construction the last.
 pub fn root(nodes: []const Node) Index {
     return Index.from(@intCast(nodes.len - 1));
@@ -937,6 +947,22 @@ test "rangeSlice and protoAt accessors round-trip on a hand-built tree" {
     try testing.expectEqual(Index.from(1), proto.params[1]);
     // The additive cells decode to an empty generic-param slice for a plain fn.
     try testing.expectEqual(@as(usize, 0), proto.generic_params.len);
+}
+
+test "isMutParam detects a kw_mut token immediately before the param name" {
+    // tokens: [0]=kw_mut [1]=identifier(self) [2]=identifier(other)
+    const toks = [_]Token{
+        .{ .tag = .kw_mut, .start = 0, .end = 3 },
+        .{ .tag = .identifier, .start = 4, .end = 8 },
+        .{ .tag = .identifier, .start = 9, .end = 14 },
+    };
+    var nodes = [_]Node{
+        .{ .tag = .param, .main_token = 1, .lhs = none, .rhs = none }, // `mut self`
+        .{ .tag = .param, .main_token = 2, .lhs = none, .rhs = none }, // plain param
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &.{} };
+    try testing.expect(isMutParam(tree, &toks, Index.from(0)));
+    try testing.expect(!isMutParam(tree, &toks, Index.from(1)));
 }
 
 test "protoAt decodes a non-empty generic-param run" {

@@ -82,10 +82,11 @@ pub const Inputs = struct {
     /// SymName in `names`), and the receiver is prepended as the `self` arg. Empty for
     /// a program with no methods; content-keyed (`findMethod`), so `-jN` deterministic.
     ///
-    /// NOTE: the `&.{}` default is a SILENT-MISS hazard — a build site that forgets to
-    /// thread this compiles as "no methods" (a method call then hits "call target
-    /// unsupported"), not a compile error. Every `lower.Inputs` build site MUST set it.
-    methods: []const Typecheck.Method = &.{},
+    /// NO default: a build site that forgets to thread this must be a COMPILE error,
+    /// not a silent "no methods" miss (a method call would then hit "call target
+    /// unsupported" / lose its mut-self ABI). Every `lower.Inputs` build site MUST set
+    /// it — pass `&.{}` only when the program provably has no methods.
+    methods: []const Typecheck.Method,
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -111,6 +112,13 @@ const Builder = struct {
     ret_type: Typecheck.Type = .{ .kind = .invalid },
     /// The exit block's param value (or `none_value` for a unit function).
     ret_param: Ir.ValueId = Ir.none_value,
+
+    /// The slot holding the `mut self` receiver's ADDRESS (M9), or `none_slot` for
+    /// any non-mut fn. A mut-self param slot is typed `int` (an 8B pointer) rather
+    /// than the struct, so its scalar/1-GPR ABI carries the caller's slot address;
+    /// `rootAddr` loads through it so `self`/`self.f` reach the caller's storage.
+    /// `none_slot` never equals a live slot id, so every non-mut fn is byte-identical.
+    mut_self_slot: Ir.SlotId = Ir.none_slot,
 
     /// resolutions[].local index → the IR slot bound to that local. Allocated
     /// lazily the first time a local is touched (so id order tracks source order).
@@ -290,10 +298,16 @@ pub fn lowerFn(
     // index to its slot so an identifier reading the param finds the same slot.
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
-    for (proto.params, 0..) |pnode, i| {
-        _ = pnode;
-        const pty = paramType(in, proto, @intCast(i));
+    for (proto.params, 0..) |_, i| {
+        // A `mut self` receiver (M9): type param-0's slot as `int` (an 8B pointer to
+        // the caller's live slot), NOT the struct. This bypasses `paramType` — which
+        // would return the struct type from the Sig — so the existing scalar-param ABI
+        // carries the address in one GPR, with no Abi/Codegen change. `rootAddr` then
+        // loads through this slot for every `self`/`self.field` use.
+        const is_mut_self = i == 0 and Ast.isMutParam(in.tree, in.tokens, proto.params[0]);
+        const pty = if (is_mut_self) Typecheck.Type.int else paramType(in, proto, @intCast(i));
         const sid = try b.addSlot(pty);
+        if (is_mut_self) b.mut_self_slot = sid;
         try params.append(gpa, sid);
         // resolve assigns local slot indices in declaration order, params FIRST
         // (it declares each param but does not write `.local` onto the param node).
@@ -409,6 +423,13 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 return;
             }
             const slot = try localSlot(b, stmt.lhs, place_ty);
+            // Whole-`self` reassignment inside a `mut self` method (`self = expr`): the
+            // slot holds a POINTER, so produce the RHS through it into the caller's
+            // storage rather than overwriting the local pointer (M9).
+            if (slot == b.mut_self_slot) {
+                try lowerExprInto(b, stmt.rhs, try rootAddr(b, slot), place_ty);
+                return;
+            }
             try storeInto(b, slot, stmt.rhs, place_ty);
         },
         .return_stmt => {
@@ -542,7 +563,19 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
             const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
             return .{ .value = v };
         },
-        .str, .@"struct", .@"enum" => return .{ .slot = slot }, // aggregate: pass by slot, no load
+        .str, .@"struct", .@"enum" => {
+            // Whole-`self` value read inside a `mut self` method (`return self`, or
+            // passing `self` by value): the slot holds a POINTER, not the struct, so
+            // copy the pointee into a fresh temp and yield that (M9). An ordinary
+            // aggregate local is passed by slot directly (no copy).
+            if (slot == b.mut_self_slot) {
+                const tmp = try b.addSlot(ty);
+                const dst = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
+                _ = try b.emit(.{ .copy = .{ .dst = dst, .src = try rootAddr(b, slot), .ty = ty } }, null);
+                return .{ .slot = tmp };
+            }
+            return .{ .slot = slot }; // aggregate: pass by slot, no load
+        },
         .unit => return .none,
         else => {
             try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "identifier type unsupported in lower");
@@ -658,6 +691,9 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     // PREPEND the receiver as the `self` arg (arg 0). `self_recv` set ⟺ this is a
     // method call; the receiver expr is lowered as arg 0 below.
     var self_recv: Ast.Index = Ast.none;
+    // A `mut self` method (M9): pass the receiver's ADDRESS (a place) as arg 0 instead
+    // of a by-value copy, so the callee mutates the caller's storage.
+    var self_mut = false;
     if (callee_node.tag == .type_app) {
         // A generic call `id[int](..)` (M2): the callee is a `type_app` whose base
         // identifier carries the template gid. Resolve to the reified instance's
@@ -678,11 +714,12 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             return .none;
         };
         callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
-    } else if (methodGidOf(b, n)) |gid| {
+    } else if (methodGidOf(b, n)) |m| {
         // Method dispatch (M8): callee = the method's mangled global symbol; the
         // receiver (`callee_node.lhs`) is prepended as `self` in the arg build below.
-        callee = b.in.names[gid];
+        callee = b.in.names[m.fn_id];
         self_recv = callee_node.lhs;
+        self_mut = m.mut_self;
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -726,7 +763,22 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     const self_n: usize = if (self_recv != Ast.none) 1 else 0;
     const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len + self_n);
     errdefer b.gpa.free(args);
-    if (self_recv != Ast.none) args[0] = try lowerExpr(b, self_recv);
+    if (self_recv != Ast.none) {
+        if (self_mut) {
+            // Pass the receiver's place ADDRESS (an int value) as `self`. The receiver
+            // was proven a mutable place by the body checker (T0019); a non-place here
+            // is an internal invariant break — note-and-drop rather than miscompile.
+            const addr = try lowerPlaceAddr(b, self_recv);
+            if (addr == Ir.none_value) {
+                try b.note(callee_node.main_token, "mut-self receiver is not a place in lower");
+                b.gpa.free(args);
+                return .none;
+            }
+            args[0] = .{ .value = addr };
+        } else {
+            args[0] = try lowerExpr(b, self_recv);
+        }
+    }
     for (arg_nodes, 0..) |arg, i| {
         args[self_n + i] = try lowerExpr(b, arg);
     }
@@ -779,20 +831,21 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
         b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null;
 }
 
-/// The global fn id a method call `recv.m(args)` dispatches to, or null when `n` is
+/// The `Method` a method call `recv.m(args)` dispatches to, or null when `n` is
 /// not a method call. A method callee is a `field_access` NOT bound to a `.func`
 /// (that is a qualified module call) whose receiver types to a concrete struct/enum
 /// with a matching entry in the method table. A pure content-keyed lookup (no
-/// hashmap/thread order), so it is identical at any `-jN`.
-fn methodGidOf(b: *Builder, n: Ast.Node) ?u32 {
+/// hashmap/thread order), so it is identical at any `-jN`. Returns the whole
+/// `Method` (not just `fn_id`) so the caller reads `mut_self` for the by-address
+/// receiver ABI (M9); `null`-semantics are unchanged for the ctor-call classifier.
+fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     const cn = b.in.tree.nodes[(n.lhs).int()];
     if (cn.tag != .field_access) return null;
     if (b.in.resolutions[(n.lhs).int()] == .func) return null;
     const recv = b.in.node_types[(cn.lhs).int()];
     if (recv.kind != .@"struct" and recv.kind != .@"enum") return null;
     const member = b.in.tokens[cn.main_token].text(b.in.source);
-    const m = Typecheck.findMethod(b.in.methods, recv, member) orelse return null;
-    return m.fn_id;
+    return Typecheck.findMethod(b.in.methods, recv, member);
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
@@ -942,6 +995,18 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
     }
 }
 
+/// The address of a slot's CONTENTS. For an ordinary slot that is `slot_addr(slot)`.
+/// For the `mut self` receiver slot (M9) the slot holds a POINTER to the caller's
+/// place, so the address of the receiver's storage is that pointer — a `load` of
+/// `slot_addr(slot)`. Every non-mut fn has `mut_self_slot == none_slot`, which no
+/// live slot equals, so this collapses to a bare `slot_addr` (byte-identical).
+fn rootAddr(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    const sa = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+    if (slot == b.mut_self_slot)
+        return try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+    return sa;
+}
+
 /// The ptr VALUE of a LOCAL-ROOTED place (`p`, `p.x`, `p.a.b`): a slot_addr at the
 /// root + a field_addr per `.field` hop, resolving each field name → byte offset
 /// from the layout. Returns `none_value` for a non-local-rooted place.
@@ -951,7 +1016,7 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
         .identifier => {
             if (b.in.resolutions[(node_idx).int()] != .local) return Ir.none_value;
             const slot = try localSlot(b, node_idx, b.in.node_types[(node_idx).int()]);
-            return try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            return try rootAddr(b, slot);
         },
         .field_access => {
             const base_addr = try lowerPlaceAddr(b, n.lhs);
@@ -1959,6 +2024,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
+        .methods = tc.methods,
     };
 
     var target: Ast.Index = Ast.none;
@@ -1979,6 +2045,82 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
     defer func.deinit(gpa);
 
     var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
+    try testing.expectEqualStrings(want, w.buffered());
+}
+
+/// Like `expectLowered`, but resolves fns through the GRAPH-GLOBAL fn table
+/// (`res.fns`) so a method (declared inside an `impl`, absent from the program's
+/// direct children) — and a fn that CALLS one — lower with `names`/`sig` indexed by
+/// global fn id. Mirrors `Codegen.renderGraphIr`'s single-module path. The M9
+/// mut-self lowering lives on the method path, which the top-level `expectLowered`
+/// cannot reach.
+fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void {
+    const gpa = testing.allocator;
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
+
+    // Build `names` in global fn-id order (the space method dispatch/`sig` use).
+    const names = try gpa.alloc(Link.SymName, rr.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (rr.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    // Match `fn_name` against the LAST dot-segment: a top-level fn is named bare
+    // (`main`), a method is mangled (`main.P.bump` → matched by `bump`).
+    var target_gid: ?usize = null;
+    for (rr.fns, 0..) |gf, i| {
+        if (gf.decl_node == Ast.none) continue;
+        const last = if (std.mem.lastIndexOfScalar(u8, gf.name, '.')) |dot| gf.name[dot + 1 ..] else gf.name;
+        if (std.mem.eql(u8, last, fn_name)) {
+            target_gid = i;
+            break;
+        }
+    }
+    const gid = target_gid orelse return error.TestUnexpectedResult;
+
+    const in = Inputs{
+        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
+        .tokens = tokens,
+        .source = src,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
+        .instances = tc.instances,
+        .sigs = tc.sigs,
+        .methods = tc.methods,
+    };
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const is_entry = std.mem.eql(u8, fn_name, "main");
+    var func = try lowerFn(gpa, in, rr.fns[gid].decl_node, names[gid], is_entry, &diags);
+    defer func.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    var buf: [8192]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try Ir.render(&w, &func, in.layouts, in.enum_layouts);
     try testing.expectEqualStrings(want, w.buffered());
@@ -2057,6 +2199,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
+        .methods = tc.methods,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -2098,6 +2241,7 @@ test "lower-core: out-of-range int literal yields a diagnostic" {
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
+        .methods = tc.methods,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -2165,6 +2309,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
+        .methods = tc.methods,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -2221,6 +2366,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
+        .methods = tc.methods,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -2470,4 +2616,85 @@ test "lower-aggregates: aggregate identifier copy-into emits a copy" {
 
 test "lower-diagnostics: an unknown string escape fails to lower" {
     try expectLowerDiag("fn f() {\n s := \"\\q\"\n}\n", "f");
+}
+
+test "M9: a mut-self method body loads self through the pointer slot (s0:int)" {
+    try expectLoweredG(
+        "struct P { x: int, y: int }\n" ++
+            "impl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n" ++
+            "fn main() -> int { p := P{ x: 40, y: 0 }\n p.bump(2)\n return p.x }\n",
+        "bump",
+        // s0 is the mut-self POINTER slot (int, not P). Every `self.x` read/write
+        // loads the pointer (`slot_addr s0; load`) then a `field_addr`, so the store
+        // lands in the caller's storage.
+        "fn main.P.bump(s0, s1) -> unit {\n" ++
+            "  slots: s0:int s1:int\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = load %0 : int\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = slot_addr s0\n" ++
+            "  %4 = load %3 : int\n" ++
+            "  %5 = field_addr %4, 0 : int\n" ++
+            "  %6 = load %5 : int\n" ++
+            "  %7 = slot_addr s1\n" ++
+            "  %8 = load %7 : int\n" ++
+            "  %9 = add %6, %8\n" ++
+            "  store %2, %9 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "M9: the caller passes the receiver place ADDRESS as arg 0 (a scalar value)" {
+    try expectLoweredG(
+        "struct P { x: int, y: int }\n" ++
+            "impl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n" ++
+            "fn main() -> int { p := P{ x: 40, y: 0 }\n p.bump(2)\n return p.x }\n",
+        "main",
+        "fn main() -> int {\n" ++
+            "  slots: s0:P\n" ++
+            "b0:\n" ++
+            "  %1 = slot_addr s0\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 40\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 0\n" ++
+            "  store %4, %5 : int\n" ++
+            "  %6 = slot_addr s0\n" ++
+            "  %7 = iconst 2\n" ++
+            "  call @main.P.bump(%6, %7)\n" ++
+            "  %8 = slot_addr s0\n" ++
+            "  %9 = field_addr %8, 0 : int\n" ++
+            "  %10 = load %9 : int\n" ++
+            "  br b1(%10)\n" ++
+            "b1(%0:int):\n" ++
+            "  ret %0\n" ++
+            "}\n",
+    );
+}
+
+test "M9: whole-self value read copies the pointee into a fresh temp" {
+    try expectLoweredG(
+        "struct P { x: int, y: int }\n" ++
+            "impl P { fn ident(mut self) -> P { return self } }\n" ++
+            "fn main() -> int { p := P{ x: 1, y: 2 }\n q := p.ident()\n return q.x }\n",
+        "ident",
+        // Whole-`self` read: the slot holds a pointer, so `self` is COPIED from the
+        // pointee (`slot_addr s0; load` → the pointer) into a fresh temp (s1).
+        "fn main.P.ident(s0) -> P {\n" ++
+            "  slots: s0:int s1:P\n" ++
+            "b0:\n" ++
+            "  %1 = slot_addr s1\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  %3 = load %2 : int\n" ++
+            "  copy %1 <- %3 : P\n" ++
+            "  br b1(s1)\n" ++
+            "b1(%0:P):\n" ++
+            "  ret %0\n" ++
+            "}\n",
+    );
 }
