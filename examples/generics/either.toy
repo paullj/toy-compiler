@@ -1,0 +1,13 @@
+# Feature: monomorphized generic ENUMS (M6). `Either[L,R]` is a generic enum; the
+# instance `Either[int,bool]` is reified to an ordinary concrete `enum_id` (an 8-byte
+# tag + a payload sized per instance) via the composite `App` type + the serial
+# reification tail — so lower/codegen/Abi see only a plain tagged union, no `App`.
+# Explicit construction `Either[int,bool].left(42)` picks the reified instance; the
+# match substitutes the payload pattern `L` -> `int`, so `.left(n)` binds `n: int`.
+# An uninstantiated generic enum emits zero reified enums / zero codegen.
+# expect: exit 42
+enum Either[L,R] { left(L), right(R) }
+fn main() -> int {
+  e := Either[int,bool].left(42)
+  return match e { .left(n) -> n, .right(_) -> 0 }
+}

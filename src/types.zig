@@ -94,12 +94,19 @@ pub const refs = struct {
             return self.structSyms()[ty.struct_id].name;
         if (ty.kind == .@"enum" and ty.enum_id < self.enumSyms().len)
             return self.enumSyms()[ty.enum_id].name;
-        // A composite `App` (`Box[int]`) renders as its generic ctor's name (`Box`) —
-        // its args are not spelled here (no alloc in this borrowing accessor), but that
-        // beats leaking the internal kind tag "app" into a user diagnostic.
+        // A composite `App` (`Box[int]` / `Either[int,bool]`) renders as its generic
+        // ctor's name (`Box` / `Either`) — its args are not spelled here (no alloc in
+        // this borrowing accessor), but that beats leaking the internal kind tag "app"
+        // into a user diagnostic. The ctor id space is struct-vs-enum disambiguated by
+        // `ctor_is_enum` (M6), so render an enum-App off `enumSyms`, a struct-App off
+        // `structSyms`.
         if (ty.kind == .app) {
             const e = self.composite.at(ty.appIdx());
-            if (e.ctor < self.structSyms().len) return self.structSyms()[e.ctor].name;
+            if (e.ctor_is_enum) {
+                if (e.ctor < self.enumSyms().len) return self.enumSyms()[e.ctor].name;
+            } else {
+                if (e.ctor < self.structSyms().len) return self.structSyms()[e.ctor].name;
+            }
         }
         return @tagName(ty.kind);
     }
@@ -129,7 +136,16 @@ pub const refs = struct {
             }
             return Type.structT(id);
         }
-        if (self.activeEnumMap().get(name)) |id| return Type.enumT(id);
+        if (self.activeEnumMap().get(name)) |id| {
+            // A generic enum named WITHOUT type args (`x: Either`) is not a value type —
+            // it needs its args (M6). Diagnose rather than mis-resolve it to `enumT`
+            // (mirror the generic-struct gate above).
+            if (id < self.enumSyms().len and self.enumSyms()[id].is_generic) {
+                self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
+                return .invalid;
+            }
+            return Type.enumT(id);
+        }
         // A generic-parameter name resolves to a `type_var` (template decode) or a
         // concrete type (per-instance re-check via the checker's substitution). Empty
         // context => null => the normal unknown-type path, byte-identical otherwise.
@@ -159,24 +175,24 @@ pub const refs = struct {
         return .invalid;
     }
 
-    /// Resolve a type application `Box[int]` (a `type_app` node) to a composite `App`
-    /// (M4). The base must resolve to a GENERIC STRUCT ctor; each arg is recursively
-    /// resolved via `typeFromNode` (so it grounds to a concrete type inside an instance
-    /// re-check / a non-generic body, and to a `type_var` while decoding a template's
-    /// field patterns), then the `(ctor, args)` tuple is interned to one composite
-    /// index. A generic-ENUM base stays gated (T0013, M6); a non-generic base or an
-    /// arity mismatch is a clean type error.
+    /// Resolve a type application `Box[int]` / `Either[int,bool]` (a `type_app` node) to
+    /// a composite `App` (M4/M6). The base must resolve to a GENERIC STRUCT or GENERIC
+    /// ENUM ctor; each arg is recursively resolved via `typeFromNode` (so it grounds to a
+    /// concrete type inside an instance re-check / a non-generic body, and to a
+    /// `type_var` while decoding a template's field/payload patterns), then the
+    /// `(ctor, is_enum, args)` tuple is interned to one composite index. A non-generic
+    /// base or an arity mismatch is a clean type error.
     pub fn typeFromTypeApp(self: anytype, tn: Ast.Node) Type {
         const base = self.tree.nodes[tn.lhs.int()];
         var ctor_id: u32 = undefined;
+        var is_enum = false;
         if (base.tag == .identifier) {
             const bname = refs.nameText(self, base.main_token);
             if (self.activeStructMap().get(bname)) |id| {
                 ctor_id = id;
-            } else if (self.activeEnumMap().get(bname) != null) {
-                // Generic enum application is M6 — residual gate.
-                self.sink.emitCode(.T0013, refs.byteOf(self, base.main_token), "generics not yet supported") catch {};
-                return .invalid;
+            } else if (self.activeEnumMap().get(bname)) |id| {
+                ctor_id = id;
+                is_enum = true;
             } else {
                 self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type, .{bname}) catch {};
                 return .invalid;
@@ -186,28 +202,30 @@ pub const refs = struct {
             switch (q.kind) {
                 .@"struct" => ctor_id = q.struct_id,
                 .@"enum" => {
-                    self.sink.emitCode(.T0013, refs.byteOf(self, base.main_token), "generics not yet supported") catch {};
-                    return .invalid;
+                    ctor_id = q.enum_id;
+                    is_enum = true;
                 },
                 else => return q, // invalid: typeFromQualified already emitted
             }
         } else return .invalid;
 
-        const sym = self.structSyms()[ctor_id];
-        if (!sym.is_generic) {
-            self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), "'{s}' is not generic; drop the type arguments", .{sym.name}) catch {};
+        const gen_name = if (is_enum) self.enumSyms()[ctor_id].name else self.structSyms()[ctor_id].name;
+        const gen_params = if (is_enum) self.enumSyms()[ctor_id].generic_params else self.structSyms()[ctor_id].generic_params;
+        const gen_is_generic = if (is_enum) self.enumSyms()[ctor_id].is_generic else self.structSyms()[ctor_id].is_generic;
+        if (!gen_is_generic) {
+            self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), "'{s}' is not generic; drop the type arguments", .{gen_name}) catch {};
             return .invalid;
         }
         const arg_nodes = Ast.rangeSlice(self.tree, tn.rhs.int());
-        if (arg_nodes.len != sym.generic_params.len) {
-            self.sink.emitFmtCode(.T0001, refs.byteOf(self, tn.main_token), "'{s}' expects {d} type argument(s), got {d}", .{ sym.name, sym.generic_params.len, arg_nodes.len }) catch {};
+        if (arg_nodes.len != gen_params.len) {
+            self.sink.emitFmtCode(.T0001, refs.byteOf(self, tn.main_token), "'{s}' expects {d} type argument(s), got {d}", .{ gen_name, gen_params.len, arg_nodes.len }) catch {};
             return .invalid;
         }
         var buf: [8]Type = undefined;
         const args: []Type = if (arg_nodes.len <= buf.len) buf[0..arg_nodes.len] else (self.gpa.alloc(Type, arg_nodes.len) catch return .invalid);
         defer if (arg_nodes.len > buf.len) self.gpa.free(args);
         for (arg_nodes, 0..) |an, i| args[i] = refs.typeFromNode(self, an);
-        const idx = self.internApp(ctor_id, args) catch return .invalid;
+        const idx = self.internApp(ctor_id, args, is_enum) catch return .invalid;
         return Type.app(idx);
     }
 };
@@ -389,10 +407,21 @@ mono: std.ArrayList(Mono.Instance) = .empty,
 /// snapshot, so nothing in `GraphResult` references it.
 composite: *Composite = undefined,
 
-/// Maps a composite (`App`) index -> the fresh reified `struct_id` minted for it in
-/// the monomorphization tail (M4). Memoizes `reifyAppToStruct` so each ground `App`
-/// reifies to exactly one concrete struct. Deinit'd at teardown.
-reify_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+/// Maps a composite (`App`) index -> the concrete `Type` it reified to in the
+/// monomorphization tail (M4/M6): a `structT(fresh_struct_id)` for a struct-App, an
+/// `enumT(fresh_enum_id)` for an enum-App. Memoizes the `reifyAppTo` dispatcher so each
+/// ground `App` reifies to exactly one concrete type, and so `rewriteApp` can restore
+/// the decided type without re-dispatching. Deinit'd at teardown.
+reify_map: std.AutoHashMapUnmanaged(u32, Type) = .empty,
+
+/// The current `reifyAppTo` recursion depth (M6 termination guard). An unbounded
+/// generic-enum whose variant payload re-applies itself with a strictly-growing arg
+/// (`enum L[T] { cons(T, L[Box[T]]) }`) recurses forever through
+/// `reifyAppToEnum -> substReify -> reifyAppTo`; each level is a fresh distinct enum id
+/// (args are grounded to `structT`, so `Composite.appDepth` stays 1 and CANNOT catch
+/// it). This true-nesting counter latches T0017 and bails past `max_instantiation_depth`
+/// — covering the same latent hazard for `reifyAppToStruct` for free.
+reify_depth: u32 = 0,
 
 /// OWNS the mangled names minted for reified generic-struct instances (M4). A reified
 /// `StructSym.name` is a view into one of these; `snapshotLayouts` dupes it, so these
@@ -604,9 +633,9 @@ fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
             try tc.sink.emitFmtCode(.T0008, byte, "variant '{s}' payload cannot have type ()", .{variant});
         }
-        fn reifyApp(ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!u32 {
+        fn reifyApp(ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            return tc.reifyAppToStruct(app_idx);
+            return tc.reifyAppTo(app_idx);
         }
     };
     return .{
@@ -715,6 +744,9 @@ pub fn checkGraph(
                 gpa.free(v.offsets);
             }
             gpa.free(e.variants);
+            // A generic enum template's `generic_params` array is owned (M6); a reified /
+            // non-generic enum's default `&.{}` frees to a no-op.
+            if (e.generic_params.len > 0) gpa.free(@constCast(e.generic_params));
         }
         t.enums.deinit(gpa);
         // The bare-name maps live in the ctx (accessed via activeStructMap/
@@ -832,9 +864,10 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // patterns per instance. Marked `.done` so nothing accidentally lays out a
     // template's type-var fields (Phase 0b skips it anyway).
     try t.decodeTemplateFields();
+    try t.decodeTemplateVariants();
 
     // Phase 0b: lay out every NON-generic struct then every enum (global id order).
-    // A generic template is skipped (its type-var fields have no ABI); only its
+    // A generic template is skipped (its type-var fields/payloads have no ABI); only its
     // reified concrete instances (minted in the mono tail) get a layout. Each
     // layoutStruct/layoutEnum switches to its owning module; nested/qualified
     // referents recurse cross-module and restore the active module on return.
@@ -842,7 +875,10 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         if (t.structs.items[id].is_generic) continue;
         try LayoutEngine.layoutStruct(t.layoutEnv(), @intCast(id));
     }
-    for (0..t.enums.items.len) |id| try LayoutEngine.layoutEnum(t.layoutEnv(), @intCast(id));
+    for (0..t.enums.items.len) |id| {
+        if (t.enums.items[id].is_generic) continue;
+        try LayoutEngine.layoutEnum(t.layoutEnv(), @intCast(id));
+    }
 
     // Phase A: decode every fn signature into the GLOBAL fn table, in the exact
     // order of `fns` (parallel to the resolver's global fn ids), so `.func` ids
@@ -932,7 +968,7 @@ fn substType(t: *Typecheck, ty: Type, args: []const Type) Type {
         const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (t.gpa.alloc(Type, e.args.len) catch return Type.invalid);
         defer if (e.args.len > buf.len) t.gpa.free(sub);
         for (e.args, 0..) |a, i| sub[i] = t.substType(a, args);
-        const idx = t.internApp(e.ctor, sub) catch return Type.invalid;
+        const idx = t.internApp(e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
         return Type.app(idx);
     }
     return ty;
@@ -1191,32 +1227,64 @@ fn collectApp(t: *Typecheck, ty: Type, set: *std.AutoArrayHashMapUnmanaged(u32, 
     for (e.args) |a| try t.collectApp(a, set);
 }
 
-/// If `ty` is an `App`, rewrite it in place to the concrete `structT` it reified to.
+/// If `ty` is an `App`, rewrite it in place to the concrete type it reified to
+/// (`structT` for a struct-App, `enumT` for an enum-App). The stored `Type` was decided
+/// once at reification, so this never has to re-dispatch on `ctor_is_enum`.
 fn rewriteApp(t: *Typecheck, ty: *Type) void {
     if (ty.isApp()) {
-        if (t.reify_map.get(ty.appIdx())) |sid| ty.* = Type.structT(sid);
+        if (t.reify_map.get(ty.appIdx())) |rt| ty.* = rt;
     }
 }
 
-/// Reify a composite `App` (`Box[int]`) to a fresh concrete `struct_id` (M4),
-/// memoized. Grounds the `App`'s own args (a nested `App` arg -> its reified
-/// `structT`, bottom-up), mints a fresh struct with the template's field names +
-/// the field patterns substituted through the grounded args (`substReify`), and lays
-/// it out via `layoutReified` on the live tables. The minted name (`Box$int`) is a
-/// pure function of the template name + the concrete args. Memoizing BEFORE layout is
-/// safe: the args are already grounded, so there is no `App` self-cycle here (a
-/// genuinely self-referential generic datum is caught by the `.laying` guard).
+/// Reify a composite `App` to the concrete `Type` it stands for (M4/M6) — the single
+/// dispatcher + memo + termination guard. Memoizes on the composite index so each
+/// ground `App` reifies to exactly one concrete type; dispatches to `reifyAppToStruct`
+/// (-> `structT`) or `reifyAppToEnum` (-> `enumT`) on the `ctor_is_enum` discriminator.
+/// The `reify_depth` counter latches T0017 past `max_instantiation_depth` — an unbounded
+/// generic-enum type-growth chain (`enum L[T] { cons(T, L[Box[T]]) }`) recurses through
+/// `reifyAppToEnum -> substReify -> reifyAppTo` with a strictly-growing arg, and each
+/// level is a fresh distinct id whose args are grounded (so `Composite.appDepth` stays
+/// 1 and cannot catch it). Bailing with `.invalid` (UNmemoized, so a re-entry re-bails)
+/// truncates the chain deterministically. The memo check runs BEFORE the depth
+/// increment, so already-reified inners cost nothing and only true nesting accumulates.
+fn reifyAppTo(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
+    if (t.reify_map.get(app_idx)) |rt| return rt;
+    t.reify_depth += 1;
+    defer t.reify_depth -= 1;
+    if (t.reify_depth > max_instantiation_depth) {
+        if (!t.mono_depth_capped) {
+            const e = t.composite.at(app_idx);
+            const mod = if (e.ctor_is_enum) t.enums.items[e.ctor].mod else t.structs.items[e.ctor].mod;
+            _ = t.gphSelect(mod);
+            const decl_node = if (e.ctor_is_enum) t.enums.items[e.ctor].decl_node else t.structs.items[e.ctor].decl_node;
+            try t.sink.emitCode(.T0017, t.byteOf(t.tree.nodes[decl_node.int()].main_token), "instantiation too deep: generic type nesting exceeds the depth limit");
+            t.mono_depth_capped = true;
+        }
+        return Type.invalid; // NOT memoized: a re-entry re-bails + re-latches (quietly)
+    }
+    const e = t.composite.at(app_idx);
+    if (e.ctor_is_enum) return t.reifyAppToEnum(app_idx);
+    return Type.structT(try t.reifyAppToStruct(app_idx));
+}
+
+/// Reify a struct-`App` (`Box[int]`) to a fresh concrete `struct_id` (M4), memoized by
+/// the `reifyAppTo` dispatcher (which owns the memo check + depth guard). Grounds the
+/// `App`'s own args (a nested `App` arg -> its reified concrete type via `reifyAppTo`,
+/// bottom-up, so a mixed nest `Box[Either[int,bool]]` grounds its enum arg to `enumT`),
+/// mints a fresh struct with the template's field names + the field patterns
+/// substituted through the grounded args (`substReify`), and lays it out via
+/// `layoutReified` on the live tables. The minted name (`Box$int`) is a pure function
+/// of the template name + the concrete args.
 fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
-    if (t.reify_map.get(app_idx)) |sid| return sid;
     const e = t.composite.at(app_idx);
     var abuf: [8]Type = undefined;
     const cargs: []Type = if (e.args.len <= abuf.len) abuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
     defer if (e.args.len > abuf.len) t.gpa.free(cargs);
-    for (e.args, 0..) |a, i| cargs[i] = if (a.isApp()) Type.structT(try t.reifyAppToStruct(a.appIdx())) else a;
+    for (e.args, 0..) |a, i| cargs[i] = if (a.isApp()) try t.reifyAppTo(a.appIdx()) else a;
 
     const tmpl = t.structs.items[e.ctor]; // value copy; its field slices are stable
     const sid: u32 = @intCast(t.structs.items.len);
-    try t.reify_map.put(t.gpa, app_idx, sid);
+    try t.reify_map.put(t.gpa, app_idx, Type.structT(sid));
 
     const name = try Mono.mangle(t.gpa, tmpl.name, cargs);
     try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
@@ -1243,6 +1311,59 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
     return sid;
 }
 
+/// Reify an enum-`App` (`Either[int,bool]`) to a fresh concrete `enum_id` (M6),
+/// memoized by the `reifyAppTo` dispatcher. Mirrors `reifyAppToStruct`: grounds the
+/// `App`'s own args (via `reifyAppTo`), copies the template EnumSym, claims a fresh
+/// `enum_id` via a placeholder append (so a nested reify lands past it), substitutes
+/// each variant's payload patterns through the grounded args (`substReify`), and lays
+/// out the concrete variants via `layoutReifiedEnum` on the live tables BEFORE the enum
+/// snapshot, so lower/codegen/Abi see only a plain tagged union. The minted name
+/// (`Either$int$bool`) is a pure function of the template name + the concrete args.
+fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
+    const e = t.composite.at(app_idx);
+    var abuf: [8]Type = undefined;
+    const cargs: []Type = if (e.args.len <= abuf.len) abuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
+    defer if (e.args.len > abuf.len) t.gpa.free(cargs);
+    for (e.args, 0..) |a, i| cargs[i] = if (a.isApp()) try t.reifyAppTo(a.appIdx()) else a;
+
+    const tmpl = t.enums.items[e.ctor]; // value copy; its variant slices are stable
+    const eid: u32 = @intCast(t.enums.items.len);
+    try t.reify_map.put(t.gpa, app_idx, Type.enumT(eid));
+
+    const name = try Mono.mangle(t.gpa, tmpl.name, cargs);
+    try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
+    // Claim `eid` with a placeholder BEFORE substituting variants: a variant payload
+    // that re-applies a generic (`w(Box[T])` / `cons(T, L[Box[T]])`) makes `substReify`
+    // recurse + append, which must land PAST `eid` rather than steal it (mirrors
+    // reifyAppToStruct's placeholder discipline).
+    try t.enums.append(t.gpa, .{
+        .decl_node = tmpl.decl_node,
+        .name = name,
+        .mod = tmpl.mod,
+        .is_generic = false,
+    });
+    const src_variants = tmpl.variants;
+    const variants = try t.gpa.alloc(VariantSym, src_variants.len);
+    errdefer t.gpa.free(variants);
+    var vbuilt: usize = 0;
+    errdefer for (variants[0..vbuilt]) |v| {
+        t.gpa.free(v.field_names);
+        t.gpa.free(v.field_types);
+    };
+    for (src_variants, 0..) |sv, vi| {
+        const fnames = try t.gpa.dupe([]const u8, sv.field_names);
+        errdefer t.gpa.free(fnames);
+        const ftypes = try t.gpa.alloc(Type, sv.field_types.len);
+        errdefer t.gpa.free(ftypes);
+        for (sv.field_types, 0..) |ft, k| ftypes[k] = try t.substReify(ft, cargs);
+        variants[vi] = .{ .name = sv.name, .form = sv.form, .field_names = fnames, .field_types = ftypes };
+        vbuilt += 1;
+    }
+    t.enums.items[eid].variants = variants;
+    try LayoutEngine.layoutReifiedEnum(t.layoutEnv(), eid);
+    return Type.enumT(eid);
+}
+
 /// Substitute a template field-type PATTERN through a reified instance's concrete args
 /// (M4), always yielding a CONCRETE type: a `type_var(ord)` becomes `cargs[ord]`; a
 /// nested `App(c, [pat..])` (a field like `b: Box[T]`) grounds its args, re-interns,
@@ -1259,15 +1380,18 @@ fn substReify(t: *Typecheck, ty: Type, cargs: []const Type) error{OutOfMemory}!T
         const sub: []Type = if (e.args.len <= sbuf.len) sbuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
         defer if (e.args.len > sbuf.len) t.gpa.free(sub);
         for (e.args, 0..) |a, i| sub[i] = try t.substReify(a, cargs);
-        const new_idx = try t.internApp(e.ctor, sub);
-        return Type.structT(try t.reifyAppToStruct(new_idx));
+        const new_idx = try t.internApp(e.ctor, sub, e.ctor_is_enum);
+        // Dispatch struct-vs-enum on the interned discriminator: a `Box[T]` field grounds
+        // to `structT`, an `Either[T,U]`/`L[Box[T]]` payload to `enumT` (M6). The
+        // `reifyAppTo` depth guard makes an unbounded enum type-growth chain terminate.
+        return t.reifyAppTo(new_idx);
     }
     return ty;
 }
 
-/// Reify every reachable ground `App` to a concrete `struct_id` and rewrite all `.app`
-/// occurrences to it (M4). See the call site in `monomorphize` for why this runs where
-/// it does. `nts` is the per-module node_types (`t.gph_node_types`).
+/// Reify every reachable ground `App` to a concrete `structT`/`enumT` and rewrite all
+/// `.app` occurrences to it (M4/M6). See the call site in `monomorphize` for why this
+/// runs where it does. `nts` is the per-module node_types (`t.gph_node_types`).
 fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // (1) Collect every reachable ground `App` index (+ nested) from the slot sets an
     // `App` can reach lower/codegen/the snapshot through: all module node_types, every
@@ -1289,12 +1413,15 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         if (s.is_generic) continue;
         for (s.field_types) |ft| try t.collectApp(ft, &to_reify);
     }
-    // A non-generic enum with a concrete generic-struct payload (`enum E {
-    // v(Box[int]) }`) carries a ground `App` in a variant's `field_types`; collect it
-    // so the same reify+rewrite erases it before the enum snapshot/fingerprint. Generic
-    // enums are gated (T0013) upstream, so every enum here is non-generic (its App
-    // payloads were reified on-demand during Phase 0b layout, hence already memoized).
+    // A non-generic enum with a concrete generic-aggregate payload (`enum E {
+    // v(Box[int]) }` / `enum E { v(Either[int,bool]) }`) carries a ground `App` in a
+    // variant's `field_types`; collect it so the same reify+rewrite erases it before the
+    // enum snapshot/fingerprint. A generic ENUM TEMPLATE (M6) carries `type_var`/
+    // App-over-type_var PATTERNS in its variant payloads (never ground, never lowered) —
+    // skip it, exactly as generic structs are skipped above; a reified enum's payloads
+    // are already concrete (grounded by `substReify`), so `collectApp` is a no-op there.
     for (t.enums.items) |en| {
+        if (en.is_generic) continue;
         for (en.variants) |v| for (v.field_types) |ft| try t.collectApp(ft, &to_reify);
     }
     for (t.mono.items) |inst| {
@@ -1305,8 +1432,8 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     }
 
     // (2) Reify in (depth, structural-key) order so ids are a pure function of source.
-    // Apps reified on-demand during Phase 0b (concrete generic-struct fields) are
-    // already memoized; reifyAppToStruct returns their existing ids here.
+    // Apps reified on-demand during Phase 0b (concrete generic-aggregate fields) are
+    // already memoized; the `reifyAppTo` dispatcher returns their existing ids here.
     if (to_reify.count() > 0) {
         const items = try t.gpa.alloc(ReifyItem, to_reify.count());
         defer {
@@ -1320,12 +1447,12 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
             items[i] = .{ .idx = ai, .depth = t.composite.appDepth(Type.app(ai)), .key = try kb.toOwnedSlice(t.gpa) };
         }
         std.mem.sort(ReifyItem, items, {}, reifyItemLess);
-        for (items) |it| _ = try t.reifyAppToStruct(it.idx);
+        for (items) |it| _ = try t.reifyAppTo(it.idx);
     }
 
-    // (3) Rewrite every `.app` -> `structT(reified)` across the SAME slot set, so no
-    // `App` survives into the snapshot / instance table / fn sigs. A field's reified
-    // `structT` has the same size as the `App` it laid out from, so offsets are stable.
+    // (3) Rewrite every `.app` -> its reified `structT`/`enumT` across the SAME slot set,
+    // so no `App` survives into the snapshot / instance table / fn sigs. A field's
+    // reified type has the same size as the `App` it laid out from, so offsets are stable.
     for (nts) |mnt| for (mnt) |*ty| t.rewriteApp(ty);
     for (t.fns.items) |*f| {
         if (f.isGeneric()) continue;
@@ -1337,6 +1464,7 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         for (s.field_types) |*ft| t.rewriteApp(ft);
     }
     for (t.enums.items) |en| {
+        if (en.is_generic) continue; // a template's payload patterns are never lowered
         for (en.variants) |v| for (v.field_types) |*ft| t.rewriteApp(ft);
     }
     for (t.mono.items) |*inst| {
@@ -1347,36 +1475,15 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     }
 }
 
-/// The NARROWED generics gate (M4). Generic FUNCTIONS (M2) and generic STRUCTS +
-/// `type_app` in BOTH type and call position (M4) are supported; the only
-/// still-unsupported generic surface gated with T0013 is a generic ENUM decl
-/// (`enum Opt[T]` — M6), detected at the decl (its generic run rides `decl.rhs`).
-/// Because a generic-enum decl short-circuits the WHOLE program here (returns before
-/// Phase 0), a generic-enum APPLICATION `Opt[int]` can never reach the un-gated App
-/// paths; a defensive residual T0013 in `refs.typeFromTypeApp` covers a stray
-/// enum-base type-app anyway. Generic struct decls + `type_app` are NO LONGER gated.
-///
-/// SERIAL, before any Pass-C fan-out; module-id order then ascending node index
-/// makes the emit stream a pure function of source. The caller `sink.sort()`s and
-/// early-returns, so `checkBodies`' sort is skipped for a gated program.
+/// The generics gate, now INERT (M6). Generic FUNCTIONS (M2), generic STRUCTS (M4),
+/// and generic ENUMS (M6) — plus `type_app` in both type and call position — are all
+/// supported and flow through the full pipeline; there is no longer any generic surface
+/// to short-circuit here. Kept as a no-op (rather than deleting the call site) for
+/// minimal churn and as the seam for any future pre-Phase-0 gate; always returns false.
 fn gateGenerics(t: *Typecheck, mods: []const GraphModuleInput) !bool {
-    var fired = false;
-    for (mods, 0..) |_, mi| {
-        const mod: u32 = @intCast(mi);
-        _ = t.gphSelect(mod); // sets the active tree/tokens + the sink emit scope
-        for (t.tree.nodes) |n| {
-            // Only generic ENUM decls stay gated (M6). Generic STRUCTS + `type_app` in
-            // BOTH type and call position are M4 features, no longer gated (a
-            // generic-enum APPLICATION `Opt[int]` is caught later in `typeFromTypeApp`,
-            // but a generic-enum DECL short-circuits the whole program here first, so
-            // such uses can never reach the un-gated App paths).
-            if (n.tag == .enum_decl and n.rhs != Ast.none) {
-                try t.sink.emitCode(.T0013, t.byteOf(n.main_token), "generics not yet supported");
-                fired = true;
-            }
-        }
-    }
-    return fired;
+    _ = t;
+    _ = mods;
+    return false;
 }
 
 /// Per-fn body-check result produced by one body-region job. Each holds its own
@@ -1612,6 +1719,74 @@ fn decodeTemplateFields(t: *Typecheck) !void {
     }
 }
 
+/// Phase 0a (M6): decode each generic ENUM TEMPLATE's variants into `VariantSym`s whose
+/// payload `field_types` are PATTERNS (`left(L)` -> `type_var(0)`; `w(Box[T])` ->
+/// `App(Box,[type_var 0])`), with the template's generic params in scope so an
+/// `L`-spelled ref decodes to `type_var(ord)`. These patterns are the input to
+/// `substReify`, which grounds them per reified instance in `reifyAppToEnum`. The
+/// template is never a value type, so it is marked `.done` (size 0) and Phase 0b skips
+/// laying it out. Mirrors `decodeTemplateFields` + the variant decode of `layoutEnum`.
+fn decodeTemplateVariants(t: *Typecheck) !void {
+    for (0..t.enums.items.len) |id| {
+        if (!t.enums.items[id].is_generic) continue;
+        _ = t.gphSelect(t.enums.items[id].mod);
+        t.cur_generic_params = t.enums.items[id].generic_params;
+        defer t.cur_generic_params = &.{};
+        const decl = t.tree.nodes[t.enums.items[id].decl_node.int()];
+        const variant_nodes = Ast.rangeSlice(t.tree, decl.lhs.int());
+        const variants = try t.gpa.alloc(VariantSym, variant_nodes.len);
+        errdefer t.gpa.free(variants);
+        var vbuilt: usize = 0;
+        errdefer for (variants[0..vbuilt]) |v| {
+            t.gpa.free(v.field_names);
+            t.gpa.free(v.field_types);
+        };
+        for (variant_nodes, 0..) |vnode_idx, vi| {
+            const vnode = t.tree.nodes[vnode_idx.int()];
+            const vname = t.nameText(vnode.main_token);
+            var form: VariantForm = .unit;
+            var payload_nodes: []const Ast.Index = &.{};
+            var is_struct_form = false;
+            switch (vnode.tag) {
+                .enum_variant_unit => {},
+                .enum_variant_tuple => {
+                    form = .tuple;
+                    payload_nodes = Ast.rangeSlice(t.tree, vnode.lhs.int());
+                },
+                .enum_variant_struct => {
+                    form = .@"struct";
+                    is_struct_form = true;
+                    payload_nodes = Ast.rangeSlice(t.tree, vnode.lhs.int());
+                },
+                else => {},
+            }
+            const np = payload_nodes.len;
+            const fnames = try t.gpa.alloc([]const u8, if (is_struct_form) np else 0);
+            errdefer t.gpa.free(fnames);
+            const ftypes = try t.gpa.alloc(Type, np);
+            errdefer t.gpa.free(ftypes);
+            for (payload_nodes, 0..) |pnode_idx, pi| {
+                // A tuple payload node is a type-ref; a struct payload node is a `param`
+                // (name + type-ref in lhs). `typeFromNode` is subst-aware: `L` ->
+                // type_var, `Box[T]` -> App-over-type_var.
+                if (is_struct_form) {
+                    const pnode = t.tree.nodes[pnode_idx.int()];
+                    fnames[pi] = t.nameText(pnode.main_token);
+                    ftypes[pi] = t.typeFromNode(pnode.lhs);
+                } else {
+                    ftypes[pi] = t.typeFromNode(pnode_idx);
+                }
+            }
+            variants[vi] = .{ .name = vname, .form = form, .field_names = fnames, .field_types = ftypes };
+            vbuilt += 1;
+        }
+        t.enums.items[id].variants = variants;
+        t.enums.items[id].size = 0;
+        t.enums.items[id].@"align" = 8;
+        t.enums.items[id].state = .done;
+    }
+}
+
 /// Register the enum decls among `decl_nodes` (of the currently-active tree).
 /// One shared type-name namespace per module: an enum colliding with a builtin,
 /// a struct, or another enum (in this module) is rejected.
@@ -1628,8 +1803,22 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
             try t.sink.emitFmt(t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
             continue;
         }
+        // A generic template `enum Either[L,R] { .. }` carries its generic-param run in
+        // `decl.rhs` (M6, mirror registerStructs). Collect the ordered param NAMES so
+        // variant-payload type-refs decode to `type_var`s (Phase 0a) and
+        // `typeFromTypeApp` can arity-check; mark it `is_generic` so Phase 0b SKIPS
+        // laying out its type-var payloads.
+        var is_generic = false;
+        var gparams: []const []const u8 = &.{};
+        if (decl.rhs != Ast.none) {
+            is_generic = true;
+            const gp_nodes = Ast.rangeSlice(t.tree, decl.rhs.int());
+            const names = try t.gpa.alloc([]const u8, gp_nodes.len);
+            for (gp_nodes, 0..) |gp, i| names[i] = t.nameText(t.tree.nodes[gp.int()].main_token);
+            gparams = names;
+        }
         const id: u32 = @intCast(t.enums.items.len);
-        try t.enums.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx) });
+        try t.enums.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx), .is_generic = is_generic, .generic_params = gparams });
         try t.activeEnumMap().put(t.gpa, name, id);
     }
 }
@@ -1693,8 +1882,8 @@ pub fn genericParamType(t: *const Typecheck, name: []const u8) ?Type {
 /// Intern a composite `App(ctor, args)` to its table index (M4). The `refs`
 /// type-application resolver calls this via the shared `anytype` cursor; `BodyChecker`
 /// exposes the sibling.
-pub fn internApp(t: *Typecheck, ctor: u32, args: []const Type) !u32 {
-    return t.composite.intern(t.gpa, ctor, args);
+pub fn internApp(t: *Typecheck, ctor: u32, args: []const Type, ctor_is_enum: bool) !u32 {
+    return t.composite.intern(t.gpa, ctor, args, ctor_is_enum);
 }
 
 fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
@@ -1828,15 +2017,21 @@ test "M2: repeated call sites of one (template,args) monomorphize to ONE instanc
     try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
 }
 
-test "M4 gate: a generic ENUM decl still fires T0013; a generic STRUCT decl is un-gated" {
+test "M6: an uninstantiated generic enum (and struct) is clean and reifies NOTHING" {
     const gpa = testing.allocator;
-    // Generic enums stay gated until M6.
+    // A generic enum decl is NO LONGER gated (M6 un-gates it); UNinstantiated it is
+    // clean and emits ZERO reified enums (never a value type). The template `Opt`
+    // occupies enum id 0 with `type_var` payload patterns, never laid out / lowered.
     var e = try checkSource("enum Opt[T] { some(T), none }\nfn main() -> int { return 0 }\n");
     defer e.deinit(gpa);
-    try testing.expect(e.result.diags.len > 0);
-    for (e.result.diags) |d| try testing.expectEqual(codes.Code.T0013, d.code);
-    // An UNinstantiated generic struct is now clean (M4) and emits ZERO instances +
-    // zero reified structs (it is never a value type).
+    try testing.expectEqual(@as(usize, 0), e.result.diags.len);
+    // Only the template `Opt` exists — no reified `Opt$..` enum was minted.
+    var reified: usize = 0;
+    for (e.result.enum_layouts) |el| {
+        if (std.mem.indexOfScalar(u8, el.name, '$') != null) reified += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), reified);
+    // The un-gated generic STRUCT case stays clean too (M4 regression).
     try testing.expectEqual(@as(usize, 0), try checkDiagCount("struct Box[T] { v: T }\nfn main() -> int { return 0 }\n"));
 }
 
@@ -2071,6 +2266,162 @@ test "M5: a unit-typed inferred field value is gated with T0013 before internApp
         if (d.code == codes.Code.T0013) saw13 = true;
     }
     try testing.expect(saw13);
+}
+
+test "M6: the Either e2e typechecks clean and reifies exactly one concrete enum" {
+    const gpa = testing.allocator;
+    var c = try checkSource("enum Either[L,R] { left(L), right(R) }\nfn main() -> int {\n e := Either[int,bool].left(42)\n return match e { .left(n) -> n, .right(_) -> 0 }\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Exactly one reified concrete enum `Either$int$bool`, with an 8-byte tag and the
+    // payload sized to the largest variant (int|bool => 8): total 16.
+    var reified: ?EnumLayout = null;
+    var reified_count: usize = 0;
+    for (c.result.enum_layouts) |el| {
+        if (std.mem.indexOfScalar(u8, el.name, '$') != null) {
+            reified_count += 1;
+            reified = el;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), reified_count);
+    try testing.expectEqualStrings("Either$int$bool", reified.?.name);
+    try testing.expectEqual(@as(u32, 8), reified.?.tag_size);
+    try testing.expectEqual(@as(u32, 8), reified.?.payload_off);
+    try testing.expectEqual(@as(u32, 16), reified.?.size);
+    // The reified variants carry CONCRETE payload types (L->int, R->bool) — no `.app`
+    // / `.type_var` survives into the enum-layout snapshot.
+    for (reified.?.variants) |v| {
+        for (v.field_types) |ft| try testing.expect(ft.kind != .app and ft.kind != .type_var);
+    }
+    var saw_left_int = false;
+    for (reified.?.variants) |v| {
+        if (std.mem.eql(u8, v.name, "left")) {
+            try testing.expectEqual(Kind.int, v.field_types[0].kind);
+            saw_left_int = true;
+        }
+    }
+    try testing.expect(saw_left_int);
+    // No `.app` / `.type_var` survives ANY node_types slot (the reify invariant that
+    // the lower assert at lower.zig:459 guards).
+    for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
+}
+
+test "M6: a reified enum's payload offsets/size match a hand-written non-generic twin" {
+    const gpa = testing.allocator;
+    // `Pair[int,int]` (reg-pair payload, size 16) vs `Wrap[str]` (str payload: a 16-byte
+    // aggregate => size 24, the indirect boundary). Compare each reified layout against a
+    // hand-written non-generic enum with the same variants.
+    var c = try checkSource(
+        \\enum Pair[A,B] { both(A, B), none }
+        \\enum W[T] { wrap(T), empty }
+        \\enum PairC { both(int, int), none }
+        \\enum WC { wrap(str), empty }
+        \\fn usePair(p: Pair[int,int]) -> int { return 0 }
+        \\fn useW(w: W[str]) -> int { return 0 }
+        \\fn usePairC(p: PairC) -> int { return 0 }
+        \\fn useWC(w: WC) -> int { return 0 }
+        \\fn main() -> int {
+        \\ a := usePair(Pair[int,int].both(1, 2))
+        \\ b := useW(W[str].wrap("hi"))
+        \\ c := usePairC(PairC.both(1, 2))
+        \\ d := useWC(WC.wrap("hi"))
+        \\ return a + b + c + d
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var pair_g: ?EnumLayout = null;
+    var pair_c: ?EnumLayout = null;
+    var w_g: ?EnumLayout = null;
+    var w_c: ?EnumLayout = null;
+    for (c.result.enum_layouts) |el| {
+        if (std.mem.eql(u8, el.name, "Pair$int$int")) pair_g = el;
+        if (std.mem.eql(u8, el.name, "PairC")) pair_c = el;
+        if (std.mem.eql(u8, el.name, "W$str")) w_g = el;
+        if (std.mem.eql(u8, el.name, "WC")) w_c = el;
+    }
+    try testing.expect(pair_g != null and pair_c != null and w_g != null and w_c != null);
+    // Reified `Pair$int$int` == hand-written `PairC` (reg-pair payload).
+    try testing.expectEqual(pair_c.?.size, pair_g.?.size);
+    try testing.expectEqual(pair_c.?.payload_off, pair_g.?.payload_off);
+    try testing.expectEqual(pair_c.?.@"align", pair_g.?.@"align");
+    // Reified `W$str` == hand-written `WC` (str aggregate payload, the indirect boundary).
+    try testing.expectEqual(w_c.?.size, w_g.?.size);
+    try testing.expectEqual(w_c.?.payload_off, w_g.?.payload_off);
+}
+
+test "M6: Opt.none with no target reports exactly one T0016 (deterministic)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("enum Opt[T] { some(T), none }\nfn main() -> int {\n x := Opt.none\n return 0\n}\n");
+    defer c.deinit(gpa);
+    var n16: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0016) n16 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n16);
+    // No reified enum was minted (construction failed before reification).
+    for (c.result.enum_layouts) |el| try testing.expect(std.mem.indexOfScalar(u8, el.name, '$') == null);
+}
+
+test "M6: a construction payload-type mismatch reports one clean error (proves L->int subst)" {
+    const gpa = testing.allocator;
+    // `Either[int,bool].left(true)`: `left`'s payload pattern `L` substitutes to `int`,
+    // so passing a `bool` is a mismatch — proving the substitution actually happened.
+    var c = try checkSource("enum Either[L,R] { left(L), right(R) }\nfn main() -> int {\n e := Either[int,bool].left(true)\n return match e { .left(n) -> n, .right(_) -> 0 }\n}\n");
+    defer c.deinit(gpa);
+    var saw = false;
+    for (c.result.diags) |d| {
+        if (std.mem.indexOf(u8, d.message, "expected int, got bool") != null) saw = true;
+    }
+    try testing.expect(saw);
+}
+
+test "M6: an M5-style inferred construction Wrap.w(5) dedups with explicit Wrap[int].w(5)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("enum Wrap[T] { w(T) }\nfn use(x: Wrap[int]) -> int { return 0 }\nfn main() -> int {\n a := use(Wrap[int].w(5))\n b := use(Wrap.w(6))\n return a + b\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The inferred `Wrap.w(6)` and explicit `Wrap[int].w(5)` are the SAME interned App,
+    // so they reify to ONE `Wrap$int` enum.
+    var count: usize = 0;
+    for (c.result.enum_layouts) |el| {
+        if (std.mem.eql(u8, el.name, "Wrap$int")) count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "M6: a non-generic struct field of a generic-enum instance reifies + rewrites away" {
+    const gpa = testing.allocator;
+    // `struct S { o: Opt[int] }` embeds a concrete generic-enum instance; the field `App`
+    // is reified to the concrete `Opt$int` enum and rewritten to a plain `enumT`.
+    var c = try checkSource("enum Opt[T] { some(T), none }\nstruct S { o: Opt[int] }\nfn main() -> int {\n s := S{ o: Opt[int].some(7) }\n return match s.o { .some(n) -> n, .none -> 0 }\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // S's `o` field is a plain concrete enum (the reified Opt$int) after rewrite — no App.
+    var s_layout: ?Layout = null;
+    for (c.result.layouts) |l| {
+        if (std.mem.eql(u8, l.name, "S")) s_layout = l;
+    }
+    try testing.expect(s_layout != null);
+    try testing.expectEqual(Kind.@"enum", s_layout.?.field_types[0].kind);
+    for (s_layout.?.field_types) |ft| try testing.expect(ft.kind != .app and ft.kind != .type_var);
+}
+
+test "M6: unbounded generic-enum type-growth is rejected with T0017 and TERMINATES" {
+    const gpa = testing.allocator;
+    // `enum L[T] { cons(T, L[Box[T]]), nil }` used as a ground type grows the payload
+    // App forever (L[int] -> L[Box[int]] -> L[Box[Box[int]]] -> ...). Each level is a
+    // fresh distinct enum id whose args are grounded (appDepth stays 1), so ONLY the
+    // reify-recursion-depth counter can catch it. This test COMPLETING is the no-hang
+    // proof; exactly one T0017 (the one-shot latch).
+    var c = try checkSource("struct Box[T] { v: T }\nenum L[T] { cons(T, L[Box[T]]), nil }\nfn f(x: L[int]) -> int { return 0 }\nfn main() -> int { return 0 }\n");
+    defer c.deinit(gpa);
+    var t0017: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0017) t0017 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), t0017);
 }
 
 test "M3: a bare (no-explicit-args) generic call infers its type-arg from the argument" {

@@ -31,10 +31,15 @@ const Type = @import("../layout/Engine.zig").Type;
 const Composite = @This();
 
 /// One interned composite. `args` is OWNED (freed at teardown); its elements are
-/// concrete/`type_var`/nested-`App` types in generic-param order.
+/// concrete/`type_var`/nested-`App` types in generic-param order. `ctor_is_enum`
+/// (M6) disambiguates the `ctor` id space: struct ids and enum ids are independent,
+/// so a struct-App `S[..]` and an enum-App `E[..]` with the SAME `ctor` number must
+/// never share a dedup/structural key (else one would reify as the other). It folds
+/// into both `writeFlatKey` (interning) and `writeStructuralKey` (reify order).
 pub const Entry = struct {
     ctor: u32,
     args: []const Type,
+    ctor_is_enum: bool = false,
 };
 
 entries: std.ArrayList(Entry) = .empty,
@@ -68,7 +73,8 @@ pub fn deinit(c: *Composite, gpa: std.mem.Allocator) void {
 /// `(kind, struct_id, enum_id)` at fixed width. A nested `.app` arg contributes its
 /// own interned index (via `struct_id`), and a `.type_var` arg its ordinal — so the
 /// key is injective within a run (inner `App`s interned first).
-fn writeFlatKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ctor: u32, args: []const Type) !void {
+fn writeFlatKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ctor: u32, args: []const Type, ctor_is_enum: bool) !void {
+    try buf.append(gpa, @intFromBool(ctor_is_enum)); // disambiguate the struct/enum ctor id space
     var w: [4]u8 = undefined;
     std.mem.writeInt(u32, &w, ctor, .little);
     try buf.appendSlice(gpa, &w);
@@ -83,19 +89,19 @@ fn writeFlatKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ctor: u32, args
 
 /// Intern `(ctor, args)` to a stable composite index; structurally-equal calls return
 /// the same index. Mutex-guarded (Apps form during parallel Pass C).
-pub fn intern(c: *Composite, gpa: std.mem.Allocator, ctor: u32, args: []const Type) !u32 {
+pub fn intern(c: *Composite, gpa: std.mem.Allocator, ctor: u32, args: []const Type, ctor_is_enum: bool) !u32 {
     c.lock();
     defer c.unlock();
     var keybuf: std.ArrayList(u8) = .empty;
     defer keybuf.deinit(gpa);
-    try writeFlatKey(gpa, &keybuf, ctor, args);
+    try writeFlatKey(gpa, &keybuf, ctor, args, ctor_is_enum);
     const gop = try c.dedup.getOrPut(gpa, keybuf.items);
     if (gop.found_existing) return gop.value_ptr.*;
     gop.key_ptr.* = try gpa.dupe(u8, keybuf.items); // own the stored key
     const idx: u32 = @intCast(c.entries.items.len);
     gop.value_ptr.* = idx;
     const owned = try gpa.dupe(Type, args);
-    try c.entries.append(gpa, .{ .ctor = ctor, .args = owned });
+    try c.entries.append(gpa, .{ .ctor = ctor, .args = owned, .ctor_is_enum = ctor_is_enum });
     return idx;
 }
 
@@ -116,6 +122,7 @@ pub fn writeStructuralKey(c: *Composite, gpa: std.mem.Allocator, ty: Type, buf: 
     if (ty.isApp()) {
         const e = c.at(ty.appIdx());
         try buf.append(gpa, 0xAA); // app-open marker
+        try buf.append(gpa, @intFromBool(e.ctor_is_enum)); // struct-App vs enum-App: distinct reify order
         var w: [4]u8 = undefined;
         std.mem.writeInt(u32, &w, e.ctor, .little);
         try buf.appendSlice(gpa, &w);
@@ -152,19 +159,42 @@ test "intern is content-addressed: structurally-equal Apps share an index" {
     const gpa = testing.allocator;
     var c: Composite = .{};
     defer c.deinit(gpa);
-    const a = try c.intern(gpa, 3, &.{Type.int});
-    const b = try c.intern(gpa, 3, &.{Type.int});
+    const a = try c.intern(gpa, 3, &.{Type.int}, false);
+    const b = try c.intern(gpa, 3, &.{Type.int}, false);
     try testing.expectEqual(a, b); // same (ctor, args) => same index
-    const d = try c.intern(gpa, 3, &.{Type.bool});
+    const d = try c.intern(gpa, 3, &.{Type.bool}, false);
     try testing.expect(a != d); // different arg => different index
-    const e = try c.intern(gpa, 4, &.{Type.int});
+    const e = try c.intern(gpa, 4, &.{Type.int}, false);
     try testing.expect(a != e); // different ctor => different index
     // Nested App: Box[Box[int]] vs a fresh Box[Box[int]] share an index (the inner
     // App interns to the same index first, so the outer flat key matches).
-    const inner = try c.intern(gpa, 3, &.{Type.int});
-    const outer1 = try c.intern(gpa, 3, &.{Type.app(inner)});
-    const outer2 = try c.intern(gpa, 3, &.{Type.app(try c.intern(gpa, 3, &.{Type.int}))});
+    const inner = try c.intern(gpa, 3, &.{Type.int}, false);
+    const outer1 = try c.intern(gpa, 3, &.{Type.app(inner)}, false);
+    const outer2 = try c.intern(gpa, 3, &.{Type.app(try c.intern(gpa, 3, &.{Type.int}, false))}, false);
     try testing.expectEqual(outer1, outer2);
+}
+
+test "M6: a struct-App and an enum-App with the SAME ctor intern to DIFFERENT indices" {
+    const gpa = testing.allocator;
+    var c: Composite = .{};
+    defer c.deinit(gpa);
+    // ctor id 3 as a STRUCT vs as an ENUM: the id spaces are independent, so these
+    // are distinct types and must not alias (the discriminator is in the flat key).
+    const s = try c.intern(gpa, 3, &.{Type.int}, false);
+    const e = try c.intern(gpa, 3, &.{Type.int}, true);
+    try testing.expect(s != e);
+    // ...and their INDEX-INDEPENDENT structural keys differ too (so struct-App vs
+    // enum-App get a stable, distinct place in the (depth, key) reify order).
+    var ks: std.ArrayList(u8) = .empty;
+    defer ks.deinit(gpa);
+    var ke: std.ArrayList(u8) = .empty;
+    defer ke.deinit(gpa);
+    try c.writeStructuralKey(gpa, Type.app(s), &ks);
+    try c.writeStructuralKey(gpa, Type.app(e), &ke);
+    try testing.expect(!std.mem.eql(u8, ks.items, ke.items));
+    // The bit round-trips on the entry.
+    try testing.expect(!c.at(s).ctor_is_enum);
+    try testing.expect(c.at(e).ctor_is_enum);
 }
 
 test "writeStructuralKey is index-independent (order-stable under -jN)" {
@@ -176,10 +206,10 @@ test "writeStructuralKey is index-independent (order-stable under -jN)" {
     var c2: Composite = .{};
     defer c2.deinit(gpa);
     // c1: intern an unrelated App first, so Box[int] lands at index 1.
-    _ = try c1.intern(gpa, 9, &.{Type.bool});
-    const idx1 = try c1.intern(gpa, 3, &.{Type.int});
+    _ = try c1.intern(gpa, 9, &.{Type.bool}, false);
+    const idx1 = try c1.intern(gpa, 3, &.{Type.int}, false);
     // c2: intern Box[int] first, at index 0.
-    const idx2 = try c2.intern(gpa, 3, &.{Type.int});
+    const idx2 = try c2.intern(gpa, 3, &.{Type.int}, false);
     try testing.expect(idx1 != idx2); // indices differ across tables
 
     var k1: std.ArrayList(u8) = .empty;
@@ -196,9 +226,9 @@ test "appDepth counts nesting" {
     var c: Composite = .{};
     defer c.deinit(gpa);
     try testing.expectEqual(@as(u32, 0), c.appDepth(Type.int));
-    const b1 = try c.intern(gpa, 3, &.{Type.int}); // Box[int]
+    const b1 = try c.intern(gpa, 3, &.{Type.int}, false); // Box[int]
     try testing.expectEqual(@as(u32, 1), c.appDepth(Type.app(b1)));
-    const b2 = try c.intern(gpa, 3, &.{Type.app(b1)}); // Box[Box[int]]
+    const b2 = try c.intern(gpa, 3, &.{Type.app(b1)}, false); // Box[Box[int]]
     try testing.expectEqual(@as(u32, 2), c.appDepth(Type.app(b2)));
 }
 
@@ -206,7 +236,7 @@ test "at returns the entry by value with a stable args slice" {
     const gpa = testing.allocator;
     var c: Composite = .{};
     defer c.deinit(gpa);
-    const idx = try c.intern(gpa, 7, &.{ Type.int, Type.bool });
+    const idx = try c.intern(gpa, 7, &.{ Type.int, Type.bool }, false);
     const e = c.at(idx);
     try testing.expectEqual(@as(u32, 7), e.ctor);
     try testing.expectEqual(@as(usize, 2), e.args.len);
