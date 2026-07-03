@@ -227,6 +227,14 @@ pub const EnumSym = struct {
     mod: u32 = 0,
     /// Whether the enum decl is `pub` (graph mode; pub-signature coherence).
     pub_export: bool = false,
+    /// A generic TEMPLATE `enum Either[L,R] { .. }` (M6): its variants' payload
+    /// `field_types` carry `type_var`/`App` PATTERNS, never a value type, so Phase 0b
+    /// must SKIP laying it out (its type-var payloads have no ABI). Only its reified
+    /// concrete instances get a layout. `generic_params` are the ordered param NAMES
+    /// (borrowed source slices; the outer array is owned by the checker's `enums` table).
+    /// Mirrors `StructSym.is_generic`/`generic_params`.
+    is_generic: bool = false,
+    generic_params: []const []const u8 = &.{},
 };
 
 /// Natural size/align of a scalar/str type (struct sizes come from the table).
@@ -282,12 +290,14 @@ pub const Env = struct {
     /// The active tree (after `gphSelect`). Resolved lazily inside the engine so
     /// the read happens AFTER the active-module swap (mirroring the checker).
     tree: *const fn (ctx: *anyopaque) Ast.Tree,
-    /// Reify the interned composite `App` at `app_idx` to a fresh concrete `struct_id`
-    /// (registering its `Layout` on the live tables, memoized) and return it (M4). Used
-    /// by `layoutStruct` to turn a concrete generic-struct field type `b: Box[int]`
-    /// (which decodes to an `App`) into a plain `structT` BEFORE it is stored/laid out,
-    /// so no `App` ever lands in a laid struct's `field_types`.
-    reifyApp: *const fn (ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!u32,
+    /// Reify the interned composite `App` at `app_idx` to a fresh concrete type
+    /// (registering its `Layout`/`EnumLayout` on the live tables, memoized) and return
+    /// it (M4/M6). Used by `layoutStruct`/`layoutEnum` to turn a concrete generic
+    /// field/payload type `b: Box[int]` / `e: Either[int,bool]` (which decodes to an
+    /// `App`) into a plain `structT`/`enumT` BEFORE it is stored/laid out, so no `App`
+    /// ever lands in a laid aggregate's `field_types`. Returns a `Type` (not a bare
+    /// `struct_id`) so a generic-ENUM field/payload reifies to an `enumT` (M6).
+    reifyApp: *const fn (ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type,
 };
 
 /// Lay out struct `id`: field offsets in declaration order with natural
@@ -330,12 +340,13 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         names[i] = env.nameText(env.ctx, field.main_token);
         const fty = env.typeFromNode(env.ctx, field.lhs);
         types[i] = fty;
-        // A concrete generic-struct field `b: Box[int]` decodes to a composite `App`
-        // (M4). Reify it on-demand to get the size/align for offsets, but KEEP the
-        // `App` in `field_types` so Pass-C field/construction checks compare it against
-        // the (same-interned) `App` a value expression produces — the mono-tail rewrite
-        // turns both into the reified `structT` before the snapshot.
-        const size_ty: Type = if (fty.isApp()) Type.structT(try env.reifyApp(env.ctx, fty.appIdx())) else fty;
+        // A concrete generic-aggregate field `b: Box[int]` / `e: Either[int,bool]`
+        // decodes to a composite `App` (M4/M6). Reify it on-demand to get the size/align
+        // for offsets, but KEEP the `App` in `field_types` so Pass-C field/construction
+        // checks compare it against the (same-interned) `App` a value expression produces
+        // — the mono-tail rewrite turns both into the reified `structT`/`enumT` before
+        // the snapshot. `reifyApp` returns the concrete type directly (M6).
+        const size_ty: Type = if (fty.isApp()) try env.reifyApp(env.ctx, fty.appIdx()) else fty;
         var fsize: u32 = 0;
         var falign: u32 = 1;
         if (size_ty.kind == .unit) {
@@ -406,6 +417,66 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
     env.structs.items[id].size = if (poisoned) 0 else roundUp(running, max_align);
     env.structs.items[id].poisoned = poisoned;
     env.structs.items[id].state = .done;
+}
+
+/// Lay out a REIFIED generic-enum instance (M6) whose `variants` (name/form/
+/// field_names/field_types) are ALREADY populated (by the monomorphization tail's
+/// substitution) — there is no decl in the tree to read variants from. Computes each
+/// variant's payload-local offsets + payload size/align via `layoutReferent`, then the
+/// aggregate tag/payload_off/size/align, using the SAME formula as `layoutEnum` (8-byte
+/// tag at 0; payload sized to the largest variant at `payload_off`), so the ABI is
+/// byte-identical to a hand-written enum. The payload field types are concrete by
+/// construction (nested `App`s were reified to `structT`/`enumT` by `substReify`), so
+/// the empty/unit/`App` diagnostic paths cannot fire here; any residual `unit`/`invalid`
+/// sizes to 0 defensively (offsets stay well-defined). Mirrors `layoutReified`.
+pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
+    if (env.enums.items[id].state == .done) return;
+    env.enums.items[id].state = .laying;
+    const prev = env.gphSelect(env.ctx, env.enums.items[id].mod);
+    defer _ = env.gphSelect(env.ctx, prev);
+
+    const at = env.byteOf(env.ctx, env.tree(env.ctx).nodes[env.enums.items[id].decl_node.int()].main_token);
+    const name = env.enums.items[id].name;
+    const variants = env.enums.items[id].variants;
+
+    var poisoned = false;
+    var max_payload_size: u32 = 0;
+    var max_payload_align: u32 = 1;
+    for (variants) |*v| {
+        const foffs = try env.gpa.alloc(u32, v.field_types.len);
+        errdefer env.gpa.free(foffs);
+        var running: u32 = 0;
+        var palign: u32 = 1;
+        for (v.field_types, 0..) |fty, pi| {
+            var psize: u32 = 0;
+            var pa: u32 = 1;
+            if (fty.kind != .invalid and fty.kind != .unit) {
+                const sz = try layoutReferent(env, fty, at, name, &poisoned);
+                psize = sz.size;
+                pa = sz.@"align";
+            }
+            const off = roundUp(running, pa);
+            foffs[pi] = off;
+            running = off + psize;
+            if (pa > palign) palign = pa;
+        }
+        const payload_size = roundUp(running, palign);
+        v.offsets = foffs;
+        v.payload_size = payload_size;
+        v.payload_align = palign;
+        if (payload_size > max_payload_size) max_payload_size = payload_size;
+        if (palign > max_payload_align) max_payload_align = palign;
+    }
+
+    const tag_size: u32 = 8;
+    const payload_off = roundUp(tag_size, max_payload_align);
+    const aln = @max(@as(u32, 8), max_payload_align);
+    env.enums.items[id].tag_size = tag_size;
+    env.enums.items[id].payload_off = payload_off;
+    env.enums.items[id].@"align" = aln;
+    env.enums.items[id].size = if (poisoned) 0 else roundUp(payload_off + max_payload_size, aln);
+    env.enums.items[id].poisoned = poisoned;
+    env.enums.items[id].state = .done;
 }
 
 /// Size/align of a field/payload type, laying out a nested struct/enum on demand.
@@ -507,13 +578,13 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
                 break :blk env.typeFromNode(env.ctx, pnode.lhs);
             } else env.typeFromNode(env.ctx, pnode_idx);
             ftypes[pi] = pty;
-            // A concrete generic-struct payload `v(Box[int])` decodes to a composite
-            // `App` (M4). Reify it on-demand for its size/align but KEEP the `App` in
-            // `field_types` (mirroring layoutStruct) so Pass-C construction checks
-            // compare it against the same-interned `App`; the mono-tail rewrite turns it
-            // into the reified `structT` before the snapshot, so no `App` survives into
-            // the enum layout/fingerprint.
-            const size_ty: Type = if (pty.isApp()) Type.structT(try env.reifyApp(env.ctx, pty.appIdx())) else pty;
+            // A concrete generic-aggregate payload `v(Box[int])` / `v(Either[int,bool])`
+            // decodes to a composite `App` (M4/M6). Reify it on-demand for its size/align
+            // but KEEP the `App` in `field_types` (mirroring layoutStruct) so Pass-C
+            // construction checks compare it against the same-interned `App`; the mono-tail
+            // rewrite turns it into the reified `structT`/`enumT` before the snapshot, so
+            // no `App` survives into the enum layout/fingerprint.
+            const size_ty: Type = if (pty.isApp()) try env.reifyApp(env.ctx, pty.appIdx()) else pty;
             var psize: u32 = 0;
             var pa: u32 = 1;
             if (size_ty.kind == .unit) {
@@ -877,7 +948,7 @@ fn stubEmitUnitField(ctx: *anyopaque, byte: u32, fld: []const u8) error{OutOfMem
 fn stubEmitUnitPayload(ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void {
     return pushDiag(ctx, byte, "variant '{s}' payload cannot have type ()", .{variant});
 }
-fn stubReifyApp(_: *anyopaque, _: u32) error{OutOfMemory}!u32 {
+fn stubReifyApp(_: *anyopaque, _: u32) error{OutOfMemory}!Type {
     // The layout unit tests never build a struct with a concrete `App` field, so this
     // is never invoked; the full reify path is covered end-to-end in types.zig.
     unreachable;
@@ -998,6 +1069,42 @@ test "engine: layoutReified matches a hand-written struct's offsets/size/align (
     try testing.expectEqual(@as(u32, 0), s2.offsets[0]);
     try testing.expectEqual(@as(u32, 8), s2.offsets[1]);
     try testing.expectEqual(@as(u32, 16), s2.size);
+}
+
+test "engine: layoutReifiedEnum matches a hand-written enum's tag/payload_off/size (M6)" {
+    // A reified generic-enum instance is laid out from PRE-POPULATED concrete variants
+    // (no decl variants in the tree); its ABI math must equal tree-driven `layoutEnum`.
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    // A decl node just to supply decl_node/main_token for the byte offset; its tree
+    // variants are NOT read by layoutReifiedEnum.
+    const tmpl = try h.enum_("L", &.{try h.vUnit("nil")});
+    const decl = h.enums.items[tmpl].decl_node;
+
+    // Reified `{ c(int), n }`: variant c is a tuple carrying one int; n is unit.
+    const variants = try h.gpa.alloc(VariantSym, 2);
+    const c_names = try h.gpa.alloc([]const u8, 0);
+    const c_types = try h.gpa.alloc(Type, 1);
+    c_types[0] = Type.int;
+    variants[0] = .{ .name = "c", .form = .tuple, .field_names = c_names, .field_types = c_types };
+    const n_names = try h.gpa.alloc([]const u8, 0);
+    const n_types = try h.gpa.alloc(Type, 0);
+    variants[1] = .{ .name = "n", .form = .unit, .field_names = n_names, .field_types = n_types };
+    try h.enums.append(h.gpa, .{ .decl_node = decl, .name = "L$int", .variants = variants });
+    const rid: u32 = @intCast(h.enums.items.len - 1);
+    try layoutReifiedEnum(h.env(), rid);
+
+    const e = h.enums.items[rid];
+    try testing.expect(!e.poisoned);
+    try testing.expectEqual(@as(u32, 8), e.tag_size);
+    try testing.expectEqual(@as(u32, 8), e.payload_off);
+    try testing.expectEqual(@as(u32, 16), e.size);
+    try testing.expectEqual(@as(u32, 8), e.@"align");
+    // c's single int payload lands at payload-local offset 0.
+    try testing.expectEqual(@as(usize, 1), e.variants[0].offsets.len);
+    try testing.expectEqual(@as(u32, 0), e.variants[0].offsets[0]);
+    // n (unit) has no payload offsets.
+    try testing.expectEqual(@as(usize, 0), e.variants[1].offsets.len);
 }
 
 test "engine: directly-recursive struct is poisoned with one diagnostic" {

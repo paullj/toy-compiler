@@ -42,7 +42,7 @@ fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
         const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (bc.gpa.alloc(Type, e.args.len) catch return Type.invalid);
         defer if (e.args.len > buf.len) bc.gpa.free(sub);
         for (e.args, 0..) |a, i| sub[i] = substTy(bc, a, targs);
-        const idx = bc.composite.intern(bc.gpa, e.ctor, sub) catch return Type.invalid;
+        const idx = bc.composite.intern(bc.gpa, e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
         return Type.app(idx);
     }
     return ty;
@@ -620,7 +620,7 @@ pub const BodyChecker = struct {
                                 return .invalid;
                             }
                         }
-                        const app = Type.app(try bc.internApp(id, out));
+                        const app = Type.app(try bc.internApp(id, out, false));
                         return bc.checkStructFieldInits(n, gsym, out, disp_name, app, pre);
                     },
                 }
@@ -716,6 +716,20 @@ pub const BodyChecker = struct {
             bc.node_types[(node_idx).int()] = ty;
             return ty;
         }
+        // An explicit generic-enum UNIT-variant `Opt[int].none` (M6): the receiver is a
+        // `type_app` resolving to an enum-`App`. Construct the unit variant through the
+        // App's args and type the node as the `App` (reified to `enumT` in the mono tail).
+        // Placed BEFORE the value `typeOf(n.lhs)` so a `type_app` receiver never mis-routes
+        // into the struct-field-access path.
+        if (recv.tag == .type_app) {
+            const app_ty = bc.typeFromNode(n.lhs);
+            if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
+                const e = bc.composite.at(app_ty.appIdx());
+                const ty = try bc.checkVariantPayloads(e.ctor, n.main_token, .unit, Ast.none, e.args, null);
+                bc.node_types[(node_idx).int()] = ty;
+                return ty;
+            }
+        }
         const base = try bc.typeOf(n.lhs);
         if (base.kind == .invalid) return .invalid;
         // A field access over a generic-struct INSTANCE `b.v` where `b: Box[int]` (M4):
@@ -753,14 +767,30 @@ pub const BodyChecker = struct {
             else => unreachable,
         };
         const args: Ast.Index = if (n.tag == .enum_init_unit) Ast.none else n.rhs;
-        // Resolve the enum id: qualified (lhs is the type-name identifier) or inferred
-        // (the one-shot expected type must be an enum).
+        // Resolve the enum id: qualified (lhs is the type-name identifier), an explicit
+        // generic-enum instance (lhs is a `type_app`, M6), or inferred (the one-shot
+        // expected type must be an enum).
         var enum_id: u32 = undefined;
         if (n.lhs != Ast.none) {
-            const tname = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
+            const lhs_node = bc.tree.nodes[(n.lhs).int()];
+            // An explicit generic-enum variant `Shape[int].seg{ .. }` / `Either[int,bool].left(..)`
+            // reaching here as enum_init_* (the parser upgraded a `type_app`-rooted
+            // `field_access`): resolve the App and route through the payload checker with
+            // the instance's type-args (which reifies to a concrete `enumT`).
+            if (lhs_node.tag == .type_app) {
+                const app_ty = bc.typeFromNode(n.lhs);
+                if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
+                    const e = bc.composite.at(app_ty.appIdx());
+                    return bc.checkVariantPayloads(e.ctor, n.main_token, node_form, args, e.args, null);
+                }
+                // invalid App (already diagnosed) or a struct-App: type args + poison.
+                try bc.typeArgsForEffect(node_form, args);
+                return .invalid;
+            }
+            const tname = bc.nameText(lhs_node.main_token);
             enum_id = bc.activeEnumMap().get(tname) orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "'{s}' is not an enum type", .{tname});
+                try bc.sink.emitFmt(bc.byteOf(lhs_node.main_token), "'{s}' is not an enum type", .{tname});
                 return .invalid;
             };
         } else {
@@ -769,13 +799,16 @@ pub const BodyChecker = struct {
                 try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot infer the enum type for '.{s}' here", .{bc.nameText(n.main_token)});
                 return .invalid;
             };
-            if (!exp.isEnum()) {
+            // The expected type may be a plain `enumT` or a generic-enum instance `App`
+            // (M6). `checkVariant` infers the enum's type-params from the payload for the
+            // generic case (a nullary `.none` under a generic expected is uninferable ->
+            // T0016; target-typing it is M7).
+            enum_id = bc.scrutEnumId(exp) orelse {
                 try bc.typeArgsForEffect(node_form, args);
                 if (exp.kind != .invalid)
                     try bc.sink.emitFmt(bc.byteOf(n.main_token), "'.{s}' expects an enum type, but {s} was expected here", .{ bc.nameText(n.main_token), bc.typeName(exp) });
                 return .invalid;
-            }
-            enum_id = exp.enum_id;
+            };
         }
         return bc.checkVariant(enum_id, n.main_token, node_form, args);
     }
@@ -797,8 +830,20 @@ pub const BodyChecker = struct {
         }
     }
 
+    /// The entry every enum-construction site funnels through. For a non-generic enum it
+    /// delegates straight to `checkVariantPayloads` with empty type-args (byte-identical
+    /// to the pre-M6 body). For a generic enum constructed WITHOUT explicit type args
+    /// (`Wrap.w(5)`, `Opt.none`), it infers the enum's type-params (M5-style) by matching
+    /// the payload VALUE types against the variant's declared payload PATTERNS, then
+    /// delegates with the inferred args. A payload that binds only SOME params
+    /// (`Either.left(x)`) or a nullary variant (`Opt.none`) is uninferable — routed to
+    /// T0016 (the M6/M7 boundary: target-type inference for those is M7). Explicit
+    /// `Either[int,bool].left(..)` never reaches here (it calls `checkVariantPayloads`
+    /// directly with the App's args).
     fn checkVariant(bc: *BodyChecker, enum_id: u32, vtok: u32, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!Type {
         const e = bc.model.enums[enum_id];
+        if (!e.is_generic) return bc.checkVariantPayloads(enum_id, vtok, node_form, args, &.{}, null);
+
         const vname = bc.nameText(vtok);
         var vi: ?usize = null;
         for (e.variants, 0..) |v, i| {
@@ -812,27 +857,126 @@ pub const BodyChecker = struct {
             try bc.sink.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
             return .invalid;
         };
-        const want_form: InitForm = switch (variant.form) {
-            .unit => .unit,
-            .tuple => .tuple,
-            .@"struct" => .@"struct",
+
+        // Type each payload value ONCE (source order) so inference sees the value types;
+        // pass them to `checkVariantPayloads` as `pretyped` so payload expressions are not
+        // re-walked (and inner diagnostics not double-emitted).
+        const arg_nodes: []const Ast.Index = if (args == Ast.none) &.{} else Ast.rangeSlice(bc.tree, (args).int());
+        const pre = try bc.gpa.alloc(Type, arg_nodes.len);
+        defer bc.gpa.free(pre);
+        for (arg_nodes, 0..) |a_idx, ii| {
+            pre[ii] = if (node_form == .@"struct") try bc.typeOf(bc.tree.nodes[(a_idx).int()].lhs) else try bc.typeOf(a_idx);
+        }
+
+        // Align payload value types to the variant's declared payload PATTERNS: positional
+        // for a tuple, by-name for a struct. A slot with no supplier stays `.invalid`
+        // (the matcher's never/invalid rule skips it). Only used when the payload form
+        // matches the variant form; a form mismatch falls through to
+        // `checkVariantPayloads` (which reports it) with empty inferred args.
+        const want_struct = variant.form == .@"struct";
+        const aligned = try bc.gpa.alloc(Type, variant.field_types.len);
+        defer bc.gpa.free(aligned);
+        @memset(aligned, Type.invalid);
+        if (formMatches(node_form, variant.form)) {
+            if (want_struct) {
+                for (arg_nodes, 0..) |fi_idx, ii| {
+                    const fname = bc.nameText(bc.tree.nodes[(fi_idx).int()].main_token);
+                    for (variant.field_names, 0..) |dn, j| {
+                        if (std.mem.eql(u8, dn, fname)) {
+                            if (aligned[j].kind == .invalid) aligned[j] = pre[ii];
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (arg_nodes, 0..) |_, ii| {
+                    if (ii < aligned.len) aligned[ii] = pre[ii];
+                }
+            }
+        }
+
+        const n_gp: u32 = @intCast(e.generic_params.len);
+        const out = try bc.gpa.alloc(Type, n_gp);
+        defer bc.gpa.free(out);
+        const bnd = try bc.gpa.alloc(bool, n_gp);
+        defer bc.gpa.free(bnd);
+        const fp = try bc.gpa.alloc(usize, n_gp);
+        defer bc.gpa.free(fp);
+        switch (Infer.match(n_gp, variant.field_types, aligned, out, bnd, fp)) {
+            .conflict => |c| {
+                try bc.sink.emitFmtCode(.T0015, bc.byteOf(vtok), "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
+                return .invalid;
+            },
+            .unbound => |u| {
+                try bc.sink.emitFmtCode(.T0016, bc.byteOf(vtok), "cannot infer type parameter '{s}' for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ e.generic_params[u.ord], e.name, vname, e.name, vname });
+                return .invalid;
+            },
+            .ok => {
+                for (out) |ta| {
+                    if (!isConcreteValue(ta)) {
+                        try bc.sink.emitCode(.T0013, bc.byteOf(vtok), "inferred type argument must be a concrete value type; add explicit type arguments");
+                        return .invalid;
+                    }
+                }
+                return bc.checkVariantPayloads(enum_id, vtok, node_form, args, out, pre);
+            },
+        }
+    }
+
+    /// Whether a construction node's form matches a variant's declared form.
+    fn formMatches(node_form: InitForm, vform: LayoutEngine.VariantForm) bool {
+        return switch (vform) {
+            .unit => node_form == .unit,
+            .tuple => node_form == .tuple,
+            .@"struct" => node_form == .@"struct",
         };
-        if (node_form != want_form) {
+    }
+
+    /// Check one variant construction's payload against the variant's declared payload
+    /// (M6-generalized). `targs` are the enum instance's concrete type-args — each
+    /// declared payload pattern is substituted through them via `substTy` before the
+    /// assignability check (empty for a non-generic enum ⇒ `substTy` is the identity ⇒
+    /// byte-identical to the pre-M6 body). Returns the enum-`App` for a generic enum (so
+    /// the node types as `App`, later reified to `enumT`) or `enumT(enum_id)` for a
+    /// non-generic one. `pretyped` (source order, aligned with the payload nodes) skips
+    /// re-walking payload values the inference path already typed.
+    fn checkVariantPayloads(bc: *BodyChecker, enum_id: u32, vtok: u32, node_form: InitForm, args: Ast.Index, targs: []const Type, pretyped: ?[]const Type) error{OutOfMemory}!Type {
+        const e = bc.model.enums[enum_id];
+        const vname = bc.nameText(vtok);
+        // The result type: the enum-App for a generic instance (reified to `enumT` in the
+        // mono tail), else the plain concrete enum.
+        const result: Type = if (e.is_generic) Type.app(try bc.internApp(enum_id, targs, true)) else Type.enumT(enum_id);
+        var vi: ?usize = null;
+        for (e.variants, 0..) |v, i| {
+            if (std.mem.eql(u8, v.name, vname)) {
+                vi = i;
+                break;
+            }
+        }
+        const variant = if (vi) |i| e.variants[i] else {
+            try bc.typeArgsForEffect(node_form, args);
+            try bc.sink.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            return .invalid;
+        };
+        if (!formMatches(node_form, variant.form)) {
             try bc.typeArgsForEffect(node_form, args);
             try bc.sink.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
-            return Type.enumT(enum_id);
+            return result;
         }
         switch (variant.form) {
             .unit => {},
             .tuple => {
                 const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (args).int());
                 if (elems.len != variant.field_types.len) {
-                    for (elems) |a| _ = try bc.typeOf(a);
+                    if (pretyped == null) {
+                        for (elems) |a| _ = try bc.typeOf(a);
+                    }
                     try bc.sink.emitFmt(bc.byteOf(vtok), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
-                    return Type.enumT(enum_id);
+                    return result;
                 }
-                for (elems, variant.field_types) |a, fty| {
-                    const at = try bc.typeOfExpected(a, fty);
+                for (elems, variant.field_types, 0..) |a, fty_pat, i| {
+                    const fty = substTy(bc, fty_pat, targs);
+                    const at = if (pretyped) |pt| pt[i] else try bc.typeOfExpected(a, fty);
                     if (!Type.assignable(fty, at))
                         try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
                 }
@@ -842,7 +986,7 @@ pub const BodyChecker = struct {
                 var seen = try bc.gpa.alloc(bool, variant.field_names.len);
                 defer bc.gpa.free(seen);
                 @memset(seen, false);
-                for (inits) |fi_idx| {
+                for (inits, 0..) |fi_idx, ii| {
                     const fi = bc.tree.nodes[(fi_idx).int()];
                     const fname = bc.nameText(fi.main_token);
                     var found: ?usize = null;
@@ -855,12 +999,12 @@ pub const BodyChecker = struct {
                     if (found) |j| {
                         if (seen[j]) try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                         seen[j] = true;
-                        const fty = variant.field_types[j];
-                        const vt = try bc.typeOfExpected(fi.lhs, fty);
+                        const fty = substTy(bc, variant.field_types[j], targs);
+                        const vt = if (pretyped) |pt| pt[ii] else try bc.typeOfExpected(fi.lhs, fty);
                         if (!Type.assignable(fty, vt))
                             try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                     } else {
-                        _ = try bc.typeOf(fi.lhs);
+                        if (pretyped == null) _ = try bc.typeOf(fi.lhs);
                         try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                     }
                 }
@@ -869,7 +1013,22 @@ pub const BodyChecker = struct {
                 }
             },
         }
-        return Type.enumT(enum_id);
+        return result;
+    }
+
+    /// The GLOBAL enum id a match scrutinee / variant-pattern expected type refers to:
+    /// a plain `enumT` yields its id directly; a generic-enum instance `App`
+    /// (`Either[int,bool]`, M6) yields its enum ctor id (coverage/exhaustiveness run over
+    /// the TEMPLATE's variants — same names/arity as the reified instance; payload types
+    /// are substituted through the App's args at bind sites). A struct-App or scalar is
+    /// not an enum here.
+    fn scrutEnumId(bc: *const BodyChecker, ty: Type) ?u32 {
+        if (ty.kind == .@"enum") return ty.enum_id;
+        if (ty.isApp()) {
+            const e = bc.composite.at(ty.appIdx());
+            if (e.ctor_is_enum) return e.ctor;
+        }
+        return null;
     }
 
     fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
@@ -882,7 +1041,10 @@ pub const BodyChecker = struct {
             bc.node_types[(node_idx).int()] = .invalid;
             return .invalid;
         }
-        if (st.kind != .@"enum" and st.kind != .int and st.kind != .bool) {
+        // A generic-enum instance scrutinee is an `App` (reified to `enumT` in the mono
+        // tail); its coverage runs over the template enum's variants (M6).
+        const enum_id = bc.scrutEnumId(st);
+        if (enum_id == null and st.kind != .int and st.kind != .bool) {
             for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
             bc.node_types[(node_idx).int()] = .invalid;
@@ -891,17 +1053,16 @@ pub const BodyChecker = struct {
 
         var seen: []bool = &.{};
         var bool_cov: BoolCov = .{};
-        var cov: Cov = switch (st.kind) {
-            .@"enum" => blk: {
-                seen = try bc.gpa.alloc(bool, bc.model.enums[st.enum_id].variants.len);
-                @memset(seen, false);
-                break :blk .{ .@"enum" = seen };
-            },
+        var cov: Cov = if (enum_id) |eid| blk: {
+            seen = try bc.gpa.alloc(bool, bc.model.enums[eid].variants.len);
+            @memset(seen, false);
+            break :blk .{ .@"enum" = seen };
+        } else switch (st.kind) {
             .bool => .{ .@"bool" = &bool_cov },
             else => .int,
         };
-        defer if (st.kind == .@"enum") bc.gpa.free(seen);
-    
+        defer if (enum_id != null) bc.gpa.free(seen);
+
         var has_wildcard = false;
         var result: Type = Type.never;
         for (arms) |arm_idx| {
@@ -920,7 +1081,7 @@ pub const BodyChecker = struct {
         }
         if (!has_wildcard) switch (cov) {
             .@"enum" => |sv| {
-                const e = bc.model.enums[st.enum_id];
+                const e = bc.model.enums[enum_id.?];
                 for (e.variants, 0..) |v, i| {
                     if (!sv[i]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing variant '{s}'", .{v.name});
                 }
@@ -995,12 +1156,15 @@ pub const BodyChecker = struct {
 
     fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
         const pat = bc.tree.nodes[(pat_idx).int()];
-        if (expected.kind != .@"enum") {
+        // A generic-enum instance scrutinee is an `App` (M6); its enum id + instance
+        // type-args come off the composite entry. A plain `enumT` has no type-args, so
+        // `substTy(..., &.{})` below is the identity — byte-identical to pre-M6.
+        const enum_id = bc.scrutEnumId(expected) orelse {
             if (expected.kind != .invalid)
                 try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
             return;
-        }
-        const enum_id = expected.enum_id;
+        };
+        const targs: []const Type = if (expected.isApp()) bc.composite.at(expected.appIdx()).args else &.{};
         const e = bc.model.enums[enum_id];
         // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
         if (pat.lhs != Ast.none) {
@@ -1023,8 +1187,11 @@ pub const BodyChecker = struct {
         const variant = if (vi) |i| blk: {
             // Cover variant i only when this arm counts AND variant i's payload is fully
             // matched (`.V(_)`/`.V(x)` cover it; `.V(0)` or `.V(.W(x))` over a multi-variant
-            // inner enum do not — caught by the type-aware payload check).
-            if (count_cov and bc.variantPayloadIrrefutable(pat_idx, e.variants[i])) cov.@"enum"[i] = true;
+            // inner enum do not — caught by the type-aware payload check). For a generic
+            // instance the payload types must be SUBSTITUTED through `targs` first so the
+            // irrefutability decision sees concrete types (a bind/wildcard is irrefutable
+            // regardless, so `Either[int,bool]`'s `.left(n)`/`.right(_)` cover correctly).
+            if (count_cov and try bc.variantPayloadIrrefutableSubst(pat_idx, e.variants[i], targs)) cov.@"enum"[i] = true;
             break :blk e.variants[i];
         } else {
             try bc.sink.emitFmt(bc.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
@@ -1041,8 +1208,8 @@ pub const BodyChecker = struct {
                     try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
                     return;
                 }
-                for (binders, variant.field_types) |b_idx, fty| {
-                    try bc.checkPattern(b_idx, fty, cov, has_wildcard, false);
+                for (binders, variant.field_types) |b_idx, fty_pat| {
+                    try bc.checkPattern(b_idx, substTy(bc, fty_pat, targs), cov, has_wildcard, false);
                 }
             },
             .@"struct" => {
@@ -1055,7 +1222,7 @@ pub const BodyChecker = struct {
                     var found = false;
                     for (variant.field_names, 0..) |dn, j| {
                         if (std.mem.eql(u8, dn, src_name)) {
-                            fty = variant.field_types[j];
+                            fty = substTy(bc, variant.field_types[j], targs);
                             found = true;
                             break;
                         }
@@ -1069,6 +1236,25 @@ pub const BodyChecker = struct {
                 }
             },
         }
+    }
+
+    /// `variantPayloadIrrefutable` over a variant whose payload types have been
+    /// SUBSTITUTED through the enum instance's `targs` (M6). For `targs.len == 0` (a
+    /// non-generic / plain-`enumT` scrutinee) this is exactly the borrowed-variant call,
+    /// byte-identical to pre-M6. For a generic instance it builds a temporary VariantSym
+    /// with substituted `field_types` so the type-aware irrefutability check sees the
+    /// concrete payload. NOTE (deferred to M7): if a substituted payload is itself a
+    /// generic-enum instance (an `App`, not `enumT`), `ControlFlow.irrefutable` treats a
+    /// nested variant pattern over it as refutable — a possible OVER-report of
+    /// non-exhaustiveness, never a miscompile. The common bind/wildcard cases (all of
+    /// M6's e2e) are irrefutable regardless of the payload type.
+    fn variantPayloadIrrefutableSubst(bc: *BodyChecker, pat_idx: Ast.Index, variant: VariantSym, targs: []const Type) error{OutOfMemory}!bool {
+        if (targs.len == 0) return bc.variantPayloadIrrefutable(pat_idx, variant);
+        const sub = try bc.gpa.alloc(Type, variant.field_types.len);
+        defer bc.gpa.free(sub);
+        for (variant.field_types, 0..) |ft, i| sub[i] = substTy(bc, ft, targs);
+        const subst_variant: VariantSym = .{ .name = variant.name, .form = variant.form, .field_names = variant.field_names, .field_types = sub };
+        return bc.variantPayloadIrrefutable(pat_idx, subst_variant);
     }
 
     fn checkOrBindings(bc: *BodyChecker, or_idx: Ast.Index) error{OutOfMemory}!void {
@@ -1173,6 +1359,27 @@ pub const BodyChecker = struct {
             const recv = bc.tree.nodes[(callee.lhs).int()];
             if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
                 return bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
+            }
+            // An explicit generic-enum tuple-variant construction `Either[int,bool].left(42)`
+            // (M6): the callee field_access's receiver is a `type_app` resolving to an
+            // enum-`App`. Substitute the variant payload patterns through the App's args
+            // and type the node as the `App` (reified to `enumT` in the mono tail).
+            if (recv.tag == .type_app) {
+                const app_ty = bc.typeFromNode(callee.lhs);
+                if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
+                    const e = bc.composite.at(app_ty.appIdx());
+                    const ty = try bc.checkVariantPayloads(e.ctor, callee.main_token, .tuple, n.rhs, e.args, null);
+                    bc.node_types[(node_idx).int()] = ty;
+                    return ty;
+                }
+                if (!app_ty.isApp()) {
+                    // typeFromNode already diagnosed (unknown/arity/not-generic); type the
+                    // args for effect + poison so nothing cascades.
+                    for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
+                    return .invalid;
+                }
+                // A struct-`App` receiver (`Box[int].m(..)`) is a method call — M8+; fall
+                // through to the not-a-function path below.
             }
             // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
             // callee field_access's receiver is the inner `mod.Enum`.
@@ -1429,8 +1636,8 @@ pub const BodyChecker = struct {
 
     /// Intern a composite `App(ctor, args)` (M4). The shared `refs` type-application
     /// resolver calls this via the `anytype` cursor.
-    pub fn internApp(bc: *BodyChecker, ctor: u32, args: []const Type) !u32 {
-        return bc.composite.intern(bc.gpa, ctor, args);
+    pub fn internApp(bc: *BodyChecker, ctor: u32, args: []const Type, ctor_is_enum: bool) !u32 {
+        return bc.composite.intern(bc.gpa, ctor, args, ctor_is_enum);
     }
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
