@@ -1,0 +1,10 @@
+# Feature: a return-only / uninferable type-arg is a hard error (M3, T0016).
+# `ro[T]() -> T` has T in the return but in NO value parameter, so a bare `ro()`
+# gives the matcher nothing to bind T from — it is left unbound and the call is
+# rejected with T0016. Explicit `ro[int]()` would pin T and compile.
+# expect: compile-error "T0016"
+fn ro[T]() -> T { loop {} }
+fn main() -> int {
+  ro()
+  return 0
+}

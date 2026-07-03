@@ -1,0 +1,11 @@
+# Feature: local type-arg inference from argument types (M3).
+# The bare calls `snd(true, id(42))` and `id(42)` carry NO explicit `[T]` — each
+# type-arg is inferred by one-sided structural matching of the template's param
+# patterns against the ground argument types (T<-bool, U<-int for snd; T<-int for
+# id). Inference selects the SAME monomorphized instances the explicit forms would
+# (snd$bool$int, id$int); the matcher runs at the call site and is discarded — no
+# type variable is ever stored in a Type/AST/IR node.
+# expect: exit 42
+fn snd[T, U](a: T, b: U) -> U { b }
+fn id[T](x: T) -> T { x }
+fn main() -> int { return snd(true, id(42)) }

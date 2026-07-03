@@ -481,6 +481,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .names = frozen.names,
         .sig = sig,
         .instances = frozen.instances,
+        .sigs = frozen.sigs,
     };
     var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
     defer irf.deinit(gpa);
