@@ -617,6 +617,17 @@ pub fn checkGraph(
 /// The graph driver: register all types globally, lay them out, decode all fn
 /// sigs, check pub-signature coherence, then check every fn body.
 fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnInput, entry_mod: u32) !void {
+    // M1 generics gate. Generic syntax PARSES but has no semantics yet, so a serial
+    // pre-scan emits T0013 for every generic declaration / type-application and
+    // RETURNS before Phase 0 — no Phase-A/body cascade (a `type_app` in type
+    // position would otherwise misfire as T0001 "unknown type '['"). The driver's
+    // `tc.diags.len > 0` gate then stops the pipeline before codegen. The scan and
+    // its `sink.sort()` are a pure function of source, so `-jN` stays byte-identical.
+    if (try t.gateGenerics(mods)) {
+        t.sink.sort();
+        return;
+    }
+
     // Phase 0: register every module's struct + enum names into ONE global id
     // space, deterministically (module-id order, then decl order). Structs first
     // across ALL modules, then enums, so the id spaces are independent + stable.
@@ -677,6 +688,32 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // after the join, so PARALLEL == SERIAL.
     const model = t.buildModel();
     try t.checkBodies(&model);
+}
+
+/// M1 generics gate. Scans every module's nodes in ascending index order and emits
+/// T0013 ("generics not yet supported", a borrowed literal) at each `type_app`
+/// (its `[`) and each `generic_param` (its name). Returns whether any fired. It is
+/// SERIAL and runs before any Pass-C fan-out; module-id order + ascending node
+/// index make the emit stream a pure function of source (no hashmap/thread order).
+/// The caller calls `sink.sort()` (node-index order != byte-offset order) and
+/// early-returns, so the sole other sort site (`checkBodies`) is skipped for a
+/// generic program.
+fn gateGenerics(t: *Typecheck, mods: []const GraphModuleInput) !bool {
+    var fired = false;
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod); // sets the active tree/tokens + the sink emit scope
+        for (t.tree.nodes) |n| {
+            switch (n.tag) {
+                .type_app, .generic_param => {
+                    try t.sink.emitCode(.T0013, t.byteOf(n.main_token), "generics not yet supported");
+                    fired = true;
+                },
+                else => {},
+            }
+        }
+    }
+    return fired;
 }
 
 /// Per-fn body-check result produced by one body-region job. Each holds its own
@@ -1016,6 +1053,27 @@ test "clean program typechecks with zero diagnostics" {
         \\}
         \\
     ));
+}
+
+test "M1 gate: the generics demo reports T0013 with no T0001/body cascade" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return id[int](7) }\n");
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len > 0);
+    // Every diagnostic is the gate — no T0001 "unknown type '['" cascade — and at
+    // least one carries the exact substring the examples/check.sh harness greps for.
+    var saw_phrase = false;
+    for (c.result.diags) |d| {
+        try testing.expectEqual(codes.Code.T0013, d.code);
+        if (std.mem.indexOf(u8, d.message, "generics not yet supported") != null) saw_phrase = true;
+    }
+    try testing.expect(saw_phrase);
+}
+
+test "M1 gate: a bare type_app in a field type fires; a non-generic program does not" {
+    try testing.expect(try checkDiagCount("struct S { v: Box[int] }\nfn main() -> int { return 0 }\n") > 0);
+    // No false gate on a plain program (and no spurious T0013).
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount("fn main() -> int { return 0 }\n"));
 }
 
 // Each value-poison site (function-as-value, bare-struct-as-value, module-as-value)

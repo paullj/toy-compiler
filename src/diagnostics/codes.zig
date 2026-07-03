@@ -59,6 +59,7 @@ pub const Code = enum(u16) {
     T0010, // main-return-type
     T0011, // shadows-builtin
     T0012, // duplicate-struct
+    T0013, // generics-unsupported
 
     _,
 };
@@ -109,6 +110,7 @@ pub const table = [_]Entry{
     .{ .code = .T0010, .str = "T0010", .slug = "main-return-type" },
     .{ .code = .T0011, .str = "T0011", .slug = "shadows-builtin" },
     .{ .code = .T0012, .str = "T0012", .slug = "duplicate-struct" },
+    .{ .code = .T0013, .str = "T0013", .slug = "generics-unsupported" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so

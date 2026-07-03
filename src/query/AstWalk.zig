@@ -324,6 +324,17 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // A poison leaf: inert, no children. The `.enter` tag byte (emitted above)
         // is its whole contribution to the fingerprint, like `pattern_wildcard`.
         .error_node => {},
+        // Generics (M1). Unreachable for non-generic source and gated before
+        // codegen for generic source (T0013), so these fold nothing load-bearing —
+        // but the walk must stay exhaustive and deterministic.
+        .generic_param => try emit(visitor, .{ .leaf = leaf }),
+        .type_app => {
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.lhs, collect, visitor);
+            const args = Ast.rangeSlice(tree, n.rhs.int());
+            try emit(visitor, .{ .count = @intCast(args.len) });
+            for (args) |a| try walkInner(src, a, collect, visitor);
+        },
         .pattern_binding => {
             try emit(visitor, .{ .leaf = leaf });
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // rename vs pun

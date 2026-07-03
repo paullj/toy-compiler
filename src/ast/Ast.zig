@@ -277,6 +277,21 @@ pub const Node = extern struct {
         /// `Kind.invalid`); the tainted-tree gate keeps it out of lower, where
         /// `.error_node` is `unreachable`.
         error_node,
+
+        // Generics front-end (M1). Appended at the END (frozen ordinals; `[]Node`
+        // is memcpy'd to/from the content cache; `ParseHeader.version` bumped on
+        // this change). Both PARSE into a well-formed tree but Typecheck rejects
+        // them wholesale with T0013 before any lower/codegen — no semantics attach.
+
+        /// A declared type parameter `T` in a `[T, U]` generic-param list.
+        /// `main_token` is the param name identifier. `lhs`/`rhs` are `none`.
+        generic_param,
+        /// A type application `Base[Arg, ..]` — in TYPE position (`Box[int]`) or
+        /// wrapping a callee in POSTFIX-CALL position (`id[int]` before `(..)`).
+        /// `main_token` is the `[`. `lhs` is the base/callee node (an `identifier`
+        /// or a `field_access` dot-chain). `rhs` is the `extra` header of a `Range`
+        /// over the type-argument nodes.
+        type_app,
     };
 };
 
@@ -321,13 +336,19 @@ pub fn pubBitsLen(node_count: usize) usize {
 /// stores; the run lives at `extra[start .. start + len]`.
 pub const Range = struct { start: u32, len: u32 };
 
-/// A function's signature, decoded from a fixed 3-cell `FnProto` header in
-/// `extra`: `{ret_type_node, params_start, params_len}`.
+/// A function's signature, decoded from a fixed 5-cell `FnProto` header in
+/// `extra`: `{ret_type_node, params_start, params_len, generic_start, generic_len}`.
+/// The layout is ADDITIVE: cells 0-2 are unchanged, so every existing decode site
+/// that reads `.ret_type`/`.params` is byte-identical; cells 3-4 carry the
+/// (usually empty) generic-param run appended in M1.
 pub const FnProto = struct {
     /// type-ref node naming the return type, or `none` for unit `()`.
     ret_type: Index,
     /// `param` node indices, in source order.
     params: []const Index,
+    /// `generic_param` node indices for `fn f[T, U](..)`, in source order; empty
+    /// for a non-generic fn.
+    generic_params: []const Index,
 };
 
 /// Decode the `{start, len}` range header at `header`.
@@ -358,11 +379,19 @@ pub fn armHeaderAt(tree: Tree, header: u32) struct { guard: Index, body: Index }
     return .{ .guard = Index.from(tree.extra[header]), .body = Index.from(tree.extra[header + 1]) };
 }
 
-/// Decode the `FnProto` header at `header`.
+/// Decode the 5-cell `FnProto` header at `header`. Cells 3-4 hold the generic-param
+/// run; `gl == 0` yields an empty slice (`gs` may equal `extra.len`, so `extra[gs..gs]`
+/// is a safe empty view).
 pub fn protoAt(tree: Tree, header: u32) FnProto {
     const ps = tree.extra[header + 1];
     const pl = tree.extra[header + 2];
-    return .{ .ret_type = Index.from(tree.extra[header]), .params = @ptrCast(tree.extra[ps .. ps + pl]) };
+    const gs = tree.extra[header + 3];
+    const gl = tree.extra[header + 4];
+    return .{
+        .ret_type = Index.from(tree.extra[header]),
+        .params = @ptrCast(tree.extra[ps .. ps + pl]),
+        .generic_params = @ptrCast(tree.extra[gs .. gs + gl]),
+    };
 }
 
 /// The root (top-level) node of a non-empty tree — by construction the last.
@@ -404,8 +433,12 @@ pub const ParseHeader = extern struct {
     /// Bumped to 4 to add the trailing `pub_bits` section; older v3 blobs
     /// (no `pub_bits`) miss cleanly via the version check in `unpack`. Bumped to 5
     /// when the `error_node` Tag ordinal was appended, so a blob produced by an
-    /// older compiler is rejected rather than reused across the Tag change.
-    version: u32 = 5,
+    /// older compiler is rejected rather than reused across the Tag change. Bumped
+    /// to 6 for the M1 generics front-end: the `FnProto` header grew 3->5 cells and
+    /// the `generic_param`/`type_app` Tag ordinals were appended, so a v5 3-cell
+    /// proto read by the 5-cell `protoAt` would alias neighbouring `extra` bytes —
+    /// a v5 blob must miss cleanly.
+    version: u32 = 6,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -466,7 +499,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 5) return null;
+    if (hdr.magic != parse_magic or hdr.version != 6) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -504,6 +537,17 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         // A poison leaf renders as a fixed `(error)` marker (its `main_token` is
         // the offending token, but the marker deliberately elides its text).
         .error_node => try out.writeAll("(error)"),
+        // A declared type parameter renders as its bare name (like an identifier).
+        .generic_param => try out.writeAll(tok_text),
+        .type_app => {
+            try out.writeAll("(tyapp ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            for (rangeSlice(tree, n.rhs.int())) |arg| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, arg);
+            }
+            try out.writeByte(')');
+        },
         .unary => {
             try out.print("({s} ", .{tok_text});
             try renderNode(out, tree, tokens, source, n.lhs);
@@ -563,7 +607,17 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .fn_decl => {
             const proto = protoAt(tree, n.lhs.int());
-            try out.print("(fn {s} (", .{tok_text});
+            try out.print("(fn {s}", .{tok_text});
+            // Generics render only when present, so existing goldens are unchanged.
+            if (proto.generic_params.len > 0) {
+                try out.writeAll(" [");
+                for (proto.generic_params, 0..) |gp, i| {
+                    if (i != 0) try out.writeByte(' ');
+                    try renderNode(out, tree, tokens, source, gp);
+                }
+                try out.writeByte(']');
+            }
+            try out.writeAll(" (");
             for (proto.params, 0..) |pidx, i| {
                 if (i != 0) try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, pidx);
@@ -665,6 +719,16 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .struct_decl => {
             try out.print("(struct {s}", .{tok_text});
+            // Generics live in the `rhs` slot as a Range header, rendered only when
+            // present (`rhs != none`) so existing non-generic goldens are unchanged.
+            if (n.rhs != none) {
+                try out.writeAll(" [");
+                for (rangeSlice(tree, n.rhs.int()), 0..) |gp, i| {
+                    if (i != 0) try out.writeByte(' ');
+                    try renderNode(out, tree, tokens, source, gp);
+                }
+                try out.writeByte(']');
+            }
             for (rangeSlice(tree, n.lhs.int())) |field| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, field);
@@ -692,6 +756,15 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .enum_decl => {
             try out.print("(enum {s}", .{tok_text});
+            // Generics live in the `rhs` slot as a Range header (see struct_decl).
+            if (n.rhs != none) {
+                try out.writeAll(" [");
+                for (rangeSlice(tree, n.rhs.int()), 0..) |gp, i| {
+                    if (i != 0) try out.writeByte(' ');
+                    try renderNode(out, tree, tokens, source, gp);
+                }
+                try out.writeByte(']');
+            }
             for (rangeSlice(tree, n.lhs.int())) |v| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, v);
@@ -813,12 +886,15 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
 const testing = std.testing;
 
 test "rangeSlice and protoAt accessors round-trip on a hand-built tree" {
-    // Build extra for: a fn with two params (param nodes 0,1), ret_type node 2.
+    // Build extra for: a NON-generic fn with two params (param nodes 0,1),
+    // ret_type node 2. The 5-cell FnProto's generic run is empty (glen=0), with
+    // gstart pointing at the current extra length (a safe empty view).
     // extra layout:
-    //   [0]=0,[1]=1            params run (param node indices 0,1)
-    //   [2]=0,[3]=2            Range header {start=0, len=2}
-    //   [4]=2,[5]=0,[6]=2      FnProto {ret_type=2, params_start=0, params_len=2}
-    var extra = [_]u32{ 0, 1, 0, 2, 2, 0, 2 };
+    //   [0]=0,[1]=1              params run (param node indices 0,1)
+    //   [2]=0,[3]=2              Range header {start=0, len=2}
+    //   [4]=2,[5]=0,[6]=2,       FnProto ret_type=2, params_start=0, params_len=2,
+    //   [7]=4,[8]=0                       generic_start=4 (empty), generic_len=0
+    var extra = [_]u32{ 0, 1, 0, 2, 2, 0, 2, 4, 0 };
     var nodes = [_]Node{
         .{ .tag = .param, .main_token = 0, .lhs = none, .rhs = none },
         .{ .tag = .param, .main_token = 0, .lhs = none, .rhs = none },
@@ -837,6 +913,31 @@ test "rangeSlice and protoAt accessors round-trip on a hand-built tree" {
     try testing.expectEqual(Index.from(2), proto.ret_type);
     try testing.expectEqual(@as(usize, 2), proto.params.len);
     try testing.expectEqual(Index.from(1), proto.params[1]);
+    // The additive cells decode to an empty generic-param slice for a plain fn.
+    try testing.expectEqual(@as(usize, 0), proto.generic_params.len);
+}
+
+test "protoAt decodes a non-empty generic-param run" {
+    // A generic fn `f[T]()`: one generic_param node (index 0), no params, no
+    // ret_type. The generic run lives at extra[0..1]; the 5-cell header follows.
+    // extra layout:
+    //   [0]=0                    generic run (generic_param node index 0)
+    //   [1]=maxInt(ret none),    FnProto ret_type=none, params_start=1, params_len=0,
+    //   [2]=1,[3]=0,                      generic_start=0, generic_len=1
+    //   [4]=0,[5]=1
+    var extra = [_]u32{ 0, std.math.maxInt(u32), 1, 0, 0, 1 };
+    var nodes = [_]Node{
+        .{ .tag = .generic_param, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .block, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .fn_decl, .main_token = 0, .lhs = Index.from(1), .rhs = Index.from(1) },
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+
+    const proto = protoAt(tree, 1);
+    try testing.expectEqual(none, proto.ret_type);
+    try testing.expectEqual(@as(usize, 0), proto.params.len);
+    try testing.expectEqual(@as(usize, 1), proto.generic_params.len);
+    try testing.expectEqual(Index.from(0), proto.generic_params[0]);
 }
 
 test "pack/unpack byte round-trip" {

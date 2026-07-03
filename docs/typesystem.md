@@ -150,6 +150,28 @@ These rules are unchanged by the formalization and remain authoritative:
 * **pub-signature coherence** — a `pub` symbol's signature is consistent across
   the program.
 
+## Generics syntax reservation (M1)
+
+The generics front-end (`fn f[T, U](..)`, `struct Box[T]`, `enum E[T]`, a type
+application `Box[int]`, explicit call type-args `f[int](..)`) **parses** into a
+well-formed AST, but has **no semantics yet**: type-checking rejects every generic
+declaration and every type-application with **T0013 "generics not yet supported"**
+before any lower/codegen. The syntax is landed append-only now so later milestones
+add meaning without churning the front-end.
+
+The `[..]` bracket is disambiguated by **position**, and this rule is reserved so a
+future value-index never collides:
+
+* **type position** — a trailing `[..]` on a type-ref is a **type application**
+  (`x: Box[int]`, `mod.Box[int]`);
+* **postfix-call position** — a `[..]` immediately after a name / qualified
+  `mod.fn` callee is **explicit type-arguments** (`id[int](7)`); it wraps only that
+  callee, and the following `(..)` forms the call.
+
+**Value indexing `v[i]` is deliberately NOT parsed** — it is reserved to a distinct
+future form so it can never collide with type-application. Only an `identifier` or a
+`field_access` base is wrapped; any other `[..]` is a syntax error today.
+
 ## Two-phase checking (and parallelism)
 
 Checking is two phases over one frozen program model:
