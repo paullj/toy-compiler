@@ -1,0 +1,12 @@
+# Feature: target-type (expected) inference for type args (M7). A NULLARY generic-enum
+# variant carries no payload to infer `T` from, so `Opt.none` alone is uninferable (M6
+# rejected it). But under an annotation `x: Opt[int] = Opt.none` the expected type pins
+# `T = int`: arg-derived bindings win, the expected type fills only still-open params.
+# The construction interns the SAME `Opt[int]` instance an explicit `Opt[int].none`
+# would, so the match substitutes `.some(n)` to `n: int`.
+# expect: exit 42
+enum Opt[T] { some(T), none }
+fn main() -> int {
+  x: Opt[int] = Opt.none
+  return match x { .some(n) -> n, .none -> 42 }
+}
