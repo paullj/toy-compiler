@@ -1,0 +1,14 @@
+# Feature: inherent methods via `impl Type { fn m(self, ..) -> R { .. } }` (M8).
+# expect: exit 42
+# `p.sum()` dispatches STATICALLY to the method desugared from the impl block; the
+# receiver `p` is passed by value as `self`, so `self.x + self.y` is 20 + 22 = 42.
+struct P { x: int, y: int }
+
+impl P {
+    fn sum(self) -> int { self.x + self.y }
+}
+
+fn main() -> int {
+    p := P{ x: 20, y: 22 }
+    return p.sum()
+}

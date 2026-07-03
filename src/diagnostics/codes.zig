@@ -64,6 +64,7 @@ pub const Code = enum(u16) {
     T0015, // type-arg-inference-conflict (a type-var bound to two different concrete types — M3)
     T0016, // type-args-not-inferable (a generic type-param left unbound after matching — M3)
     T0017, // instantiation-too-deep (unbounded generic-data instantiation depth — M4)
+    T0018, // no-such-method (a method call names a receiver type that has no such method — M8)
 
     _,
 };
@@ -119,6 +120,7 @@ pub const table = [_]Entry{
     .{ .code = .T0015, .str = "T0015", .slug = "type-arg-inference-conflict" },
     .{ .code = .T0016, .str = "T0016", .slug = "type-args-not-inferable" },
     .{ .code = .T0017, .str = "T0017", .slug = "instantiation-too-deep" },
+    .{ .code = .T0018, .str = "T0018", .slug = "no-such-method" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so

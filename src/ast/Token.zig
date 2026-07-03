@@ -126,6 +126,14 @@ pub const Tag = enum(u8) {
     l_bracket,
     /// `]` — closes a generic-param list / type-application / call type-args.
     r_bracket,
+
+    // Inherent methods (M8). Appended at the END (frozen ordinal; `[]Token` is
+    // memcpy'd to/from the content cache). `impl` opens a keyword-led inherent-
+    // method block `impl Type { fn .. }`. `self`/`Self` stay plain identifiers
+    // recognized contextually by text (the `_` wildcard precedent) — NOT keywords.
+
+    /// `impl` — opens an inherent-method block for a concrete type.
+    kw_impl,
 };
 
 /// Maps identifier text to its keyword tag, if any.
@@ -148,6 +156,7 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "import", .kw_import },
     .{ "pub", .kw_pub },
     .{ "as", .kw_as },
+    .{ "impl", .kw_impl },
 });
 
 comptime {

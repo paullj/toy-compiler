@@ -155,6 +155,20 @@ test "differential: check agrees with build in-process (single-file + multi-modu
         try testing.expect(outcome.first_error_scope != NO_SCOPE);
         try testing.expect(outcome.first_error_scope != 0);
     }
+
+    // (iv) M8 check-vs-build parity: a single-file program calling a MISSING method
+    // reports EXACTLY one error (T0018) on the shared `checkGraph` front-end — the
+    // same path `build` runs, so `check` and `build` agree it is broken.
+    {
+        const dir = ".toy-test-diff-nomethod";
+        try writeFixture(io, dir, &.{
+            .{ "main.toy", "struct P { x: int }\nfn main() -> int {\n  p := P{ x: 1 }\n  return p.nope()\n}\n" },
+        });
+        defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const outcome = try checkEntry(gpa, io, dir ++ "/main.toy");
+        try testing.expect(!outcome.structural);
+        try testing.expectEqual(@as(usize, 1), outcome.errors);
+    }
 }
 
 /// Spawn the built `toy` with `argv_tail`, returning the exit code (or an error).

@@ -213,8 +213,10 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = head.else_node != Ast.none });
             if (head.else_node != Ast.none) try walkInner(src, head.else_node, collect, visitor);
         },
-        // Never a fingerprint root / never reached inside a fn-body walk.
-        .program, .import_decl => {},
+        // Never a fingerprint root / never reached inside a fn-body walk. An
+        // `impl_decl` is a top-level decl (its methods are walked as ordinary
+        // `fn_decl` fingerprint roots), so it folds nothing here.
+        .program, .import_decl, .impl_decl => {},
         // Zero-sized leaf: the tag byte IS its content. Reached as a value literal
         // and as a `()` type-ref (under param/fn_decl ret).
         .literal_unit => {},
@@ -439,6 +441,25 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         }
                         const nm = self.frozen.names[res.func];
                         try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+                        return;
+                    }
+                    // A method call `recv.m(..)` on a VALUE receiver (M8): the callee is
+                    // a `field_access` NOT bound to a `.func`, and the receiver types to
+                    // a concrete struct/enum. Fold the resolved method's Sig so editing
+                    // the method's signature/return flips every caller's fingerprint
+                    // (stale-cache soundness — mirrors the plain-func fold above).
+                    if (cn.tag == .field_access and res != .func and cn.lhs.int() < self.frozen.node_types.len) {
+                        const recv = self.frozen.node_types[cn.lhs.int()];
+                        if (recv.kind == .@"struct" or recv.kind == .@"enum") {
+                            const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
+                            if (Typecheck.findMethod(self.frozen.methods, recv, member)) |m| {
+                                if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
+                                    const nm = self.frozen.names[m.fn_id];
+                                    const sig = self.frozen.sigs[m.fn_id];
+                                    try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+                                }
+                            }
+                        }
                     }
                 },
                 else => {},
@@ -716,6 +737,7 @@ const FakeFrozen = struct {
     names: []const @import("../link/Link.zig").SymName = &.{},
     sigs: []const Sig = &.{},
     instances: []const Mono.Instance = &.{},
+    methods: []const Typecheck.Method = &.{},
 };
 
 test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {

@@ -1,0 +1,9 @@
+# Feature: a call to a missing method is a clean T0018 compile-error (no crash, no
+# codegen), naming the receiver type and the method.
+# expect: compile-error "no method"
+struct P { x: int }
+
+fn main() -> int {
+    p := P{ x: 1 }
+    return p.nope()
+}

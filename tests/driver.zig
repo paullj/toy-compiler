@@ -1303,6 +1303,17 @@ test "integration: emitted binary runs with the right exit code" {
         // (m12) FRAME canary: f(g(...)) where the inner match returns a >16B enum
         // via sret with a guarded arm, the outer sums it. pick guarded by s→true.
         .{ .src = "enum Sel { C, D }\nenum Big { A { p: int, q: int, r: int }, B(int) }\nfn pick(s: Sel) -> Big { match s { .C if 3 > 1 -> Big.A { p: 10, q: 20, r: 12 }, _ -> Big.B(0) } }\nfn consume(b: Big) -> int { match b { .A { p, q, r } -> p + q + r, .B(v) -> v } }\nfn main() -> int {\n return consume(pick(Sel.C))\n}\n", .name = "match_guard_sret_arg", .expect = 42 },
+
+        // Methods (M8) — each RUN proves STATIC method dispatch + self-by-value: a
+        // wrong callee / a dropped or misplaced self arg would fault or mis-total.
+        // (me1) `p.sum()` dispatches to the impl method; self passed by value → 42.
+        .{ .src = "struct P { x: int, y: int }\nimpl P { fn sum(self) -> int { self.x + self.y } }\nfn main() -> int {\n p := P{ x: 20, y: 22 }\n return p.sum()\n}\n", .name = "method_sum", .expect = 42 },
+        // (me2) a method with an extra struct param + a `Self`-returning method,
+        // chained: a.scaled(2)={4,6}, then {4,6}.dot({4,5}) = 16+30 = 46.
+        .{ .src = "struct Vec { x: int, y: int }\nimpl Vec {\n fn dot(self, o: Vec) -> int { self.x * o.x + self.y * o.y }\n fn scaled(self, k: int) -> Self { Vec{ x: self.x * k, y: self.y * k } }\n}\nfn main() -> int {\n a := Vec{ x: 2, y: 3 }\n b := Vec{ x: 4, y: 5 }\n s := a.scaled(2)\n return s.dot(b)\n}\n", .name = "method_args", .expect = 46 },
+        // (me3) a >16B receiver (3 ints) passed by value as `self` via the indirect-arg
+        // (sret-class) path; the method sums its fields → 6.
+        .{ .src = "struct V3 { a: int, b: int, c: int }\nimpl V3 { fn total(self) -> int { self.a + self.b + self.c } }\nfn main() -> int {\n v := V3{ a: 1, b: 2, c: 3 }\n return v.total()\n}\n", .name = "method_bigself", .expect = 6 },
     };
 
     for (cases, 0..) |c, i| {
@@ -1622,6 +1633,57 @@ test "verify-mode: re-lowering every fn matches the cached blob" {
     defer r2.deinit(gpa);
     defer lp2.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), lp2.codegen_cached);
+}
+
+test "cache soundness (M8): a method body edit recompiles only the method; a method return-type edit recompiles its caller" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // `main` calls the method `m` for effect (result discarded), so a change to m's
+    // RETURN TYPE keeps main's source valid while altering what main must codegen —
+    // the stale-cache hazard the method-sig fold guards. Cold: 2 units (m + main).
+    const v1 = "struct P { x: int }\nimpl P { fn m(self) -> int { self.x } }\nfn main() -> int {\n p := P{ x: 41 }\n p.m()\n return 0\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp1.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp1.codegen_cached);
+
+    // Edit ONLY m's body (self.x -> self.x + 0). main's source, the call, and the
+    // call node's type (int) are unchanged, so main is a cache HIT; only m recompiles.
+    const v2 = "struct P { x: int }\nimpl P { fn m(self) -> int { self.x + 0 } }\nfn main() -> int {\n p := P{ x: 41 }\n p.m()\n return 0\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
+
+    // Change m's RETURN TYPE (int -> ()). main still compiles (the discarded call is
+    // valid either way), but its codegen depends on the callee's result ABI, so main
+    // MUST recompile. A missing method-sig/return fold would stale-hit main here
+    // (compiled==1) — a wrong-return miscompile. Both units recompile => compiled==2.
+    const v3 = "struct P { x: int }\nimpl P { fn m(self) -> () { } }\nfn main() -> int {\n p := P{ x: 41 }\n p.m()\n return 0\n}\n";
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v3, .normal, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), lp3.codegen_compiled);
+    try testing.expectEqual(@as(usize, 0), lp3.codegen_cached);
 }
 
 test "cache soundness: editing a value-if fn recompiles only it; verify passes" {

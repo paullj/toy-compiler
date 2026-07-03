@@ -128,6 +128,9 @@ const Frozen = struct {
     /// (`&.{}` for a base fn) — folded into the (d) fingerprint component so two
     /// instances of one template get distinct cache keys.
     type_args: []const Typecheck.Type = &.{},
+    /// The program-wide inherent-method table (M8), for method-call dispatch in
+    /// `lowerCall` and the method-sig fold in `CallVisitor`. Shared read-only.
+    methods: []const Typecheck.Method = &.{},
 };
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
@@ -234,6 +237,8 @@ const GraphFrozen = struct {
     instances: []const Mono.Instance,
     /// Global fn id of the entry `main` (indexes `names`).
     entry_id: u32,
+    /// The program-wide inherent-method table (M8), threaded into every job's `Frozen`.
+    methods: []const Typecheck.Method = &.{},
     opt: Opt.Config,
 
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
@@ -267,6 +272,7 @@ const GraphFrozen = struct {
             .opt = gf.opt,
             .instances = gf.instances,
             .type_args = targs,
+            .methods = gf.methods,
         };
     }
 };
@@ -399,6 +405,7 @@ pub fn lowerGraphProgram(
         .base_count = base_count,
         .instances = tc.instances,
         .entry_id = eid,
+        .methods = tc.methods,
         .opt = opt,
         .probe = probe,
     };
@@ -602,6 +609,7 @@ pub fn renderGraphIr(
             .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
             .instances = tc.instances,
             .sigs = tc.sigs,
+            .methods = tc.methods,
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -629,6 +637,7 @@ pub fn renderGraphIr(
             .sig = .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret },
             .instances = tc.instances,
             .sigs = tc.sigs,
+            .methods = tc.methods,
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);

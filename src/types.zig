@@ -146,6 +146,12 @@ pub const refs = struct {
             }
             return Type.enumT(id);
         }
+        // Inside an inherent method, `Self` names the receiver type (M8). Resolved via
+        // the checker's `selfType` hook (mirroring `genericParamType`); null outside a
+        // method => the normal unknown-type path, so non-method decoding is unchanged.
+        if (std.mem.eql(u8, name, "Self")) {
+            if (self.selfType()) |ty| return ty;
+        }
         // A generic-parameter name resolves to a `type_var` (template decode) or a
         // concrete type (per-instance re-check via the checker's substitution). Empty
         // context => null => the normal unknown-type path, byte-identical otherwise.
@@ -259,6 +265,10 @@ pub const GraphFnInput = struct {
     is_pub: bool,
     /// Module-qualified symbol name (used in the coherence diagnostic).
     name: []const u8,
+    /// For an inherent method (M8): the receiver type-ref node in the owning
+    /// module's tree, decoded by `decodeFnSig` to build the method table + resolve
+    /// `Self`. `Ast.none` for an ordinary fn / builtin.
+    recv_type: Ast.Index = Ast.none,
 };
 
 /// The whole-graph typecheck output. Caller owns it; free with `GraphResult.deinit`.
@@ -282,6 +292,9 @@ pub const GraphResult = struct {
     /// Monomorphized generic instances (M2), in canonical order. Empty for a
     /// program with no reachable generic instances. Owned.
     instances: []Mono.Instance = &.{},
+    /// The program-wide inherent-method table (M8). Each entry's `name` is BORROWED
+    /// from the sibling tree/source (never freed here); only the slice is owned.
+    methods: []Method = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -317,9 +330,31 @@ pub const GraphResult = struct {
             gpa.free(@constCast(inst.name));
         }
         gpa.free(self.instances);
+        // Method `name`s are borrowed from source (like `Sig.name`) — free only the slice.
+        gpa.free(self.methods);
         self.* = undefined;
     }
 };
+
+/// One program-wide inherent-method table entry (M8): the receiver `Type`, the
+/// SOURCE method name, and the global fn id the method desugared to. Built serially
+/// in Pass A (`decodeFnSig`), frozen onto the `Model` before the parallel body pass,
+/// and read read-only by `BodyChecker` dispatch, the fingerprint fold, and `lower`.
+pub const Method = struct {
+    recv: Type,
+    name: []const u8,
+    fn_id: u32,
+};
+
+/// Look up an inherent method by receiver type + source name. A linear scan over
+/// `Type.eql` (pure content comparison of kind+id) + name equality — no hashmap /
+/// thread order, so every consumer selects the SAME method at any `-jN`.
+pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method {
+    for (methods) |mth| {
+        if (Type.eql(mth.recv, recv) and std.mem.eql(u8, mth.name, name)) return mth;
+    }
+    return null;
+}
 
 /// A top-level function's signature, decoded once up front so calls can be
 /// checked against it (and forward references work).
@@ -339,6 +374,11 @@ pub const FnSym = struct {
     /// non-generic fn. `params`/`ret` of a template carry `Type.typeVar(ord)` where
     /// `ord` indexes this list; the mono tail substitutes them to concrete types.
     generic_params: []const []const u8 = &.{},
+    /// For an inherent method (M8): the RESOLVED receiver `Type` (params[0] is the
+    /// synthesized `self`). Cached here (a 12-byte POD) rather than re-resolved from
+    /// the decl, so the body checker can map `Self` without re-running `typeFromNode`
+    /// (which would double-emit). `.invalid` ⟺ this fn is not a method.
+    self_type: Type = .invalid,
 
     pub fn isGeneric(f: FnSym) bool {
         return f.generic_params.len > 0;
@@ -395,6 +435,17 @@ enums: std.ArrayList(EnumSym),
 /// `Type.typeVar(ord)`. Set/cleared around each `decodeFnSig`; empty otherwise
 /// (so non-generic decoding is byte-identical).
 cur_generic_params: []const []const u8 = &.{},
+
+/// The program-wide inherent-method table (M8), built SERIALLY in Phase A
+/// (`decodeFnSig`) in global fn-id order, frozen onto the `Model` before the
+/// parallel body pass. Transferred into `GraphResult.methods` by `checkGraph`.
+methods: std.ArrayList(Method) = .empty,
+
+/// The receiver `Type` of the method currently being decoded/checked, so a `Self`
+/// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
+/// each method's `decodeFnSig` (Pass A); null otherwise (non-method decoding is
+/// byte-identical). The body pass sets its own copy on the `BodyChecker`.
+cur_self_type: ?Type = null,
 
 /// Monomorphization instances discovered by the serial mono tail (M2). Transferred
 /// whole into `GraphResult.instances` by `checkGraph`; the leftover (on an error
@@ -514,6 +565,9 @@ pub const Model = struct {
     enums: []const EnumSym,
     graph: *GraphCtx,
     gph_fn_names: ?[]const []const u8,
+    /// The program-wide inherent-method table (M8), frozen from Pass A. Read-only
+    /// during the parallel body pass; drives `BodyChecker` method dispatch.
+    methods: []const Method,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -527,6 +581,7 @@ fn buildModel(t: *Typecheck) Model {
         .enums = t.enums.items,
         .graph = t.graph,
         .gph_fn_names = t.gph_fn_names,
+        .methods = t.methods.items,
     };
 }
 
@@ -556,6 +611,9 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
     // Every diagnostic this BodyChecker emits is tagged with the fn's owning module.
     bc.sink.setScope(f.mod);
     if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
+    // A method (M8): put its receiver type in scope so a `Self` type-ref in a body
+    // annotation resolves to it. `.invalid` ⟺ not a method (leave the hook null).
+    if (f.self_type.kind != .invalid) bc.cur_self_type = f.self_type;
     return bc;
 }
 
@@ -737,6 +795,9 @@ pub fn checkGraph(
             gpa.free(@constCast(inst.params));
         }
         t.mono.deinit(gpa);
+        // The method table's backing array (entries' names are borrowed source
+        // slices). On success `toOwnedSlice` empties it, so this is a no-op there.
+        t.methods.deinit(gpa);
         for (t.enums.items) |e| {
             for (e.variants) |v| {
                 gpa.free(v.field_names);
@@ -803,6 +864,11 @@ pub fn checkGraph(
         gpa.free(instances);
     }
 
+    // Transfer the method table (M8) out of the live list before the teardown defer
+    // sees it. `toOwnedSlice` empties `t.methods`; the entries' names stay borrowed.
+    const methods = try t.methods.toOwnedSlice(gpa);
+    errdefer gpa.free(methods);
+
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
@@ -820,6 +886,7 @@ pub fn checkGraph(
         .layouts = layouts,
         .enum_layouts = enum_layouts,
         .instances = instances,
+        .methods = methods,
     };
 }
 
@@ -888,7 +955,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
             try t.appendPrint();
         } else {
             _ = t.gphSelect(gf.module);
-            try t.decodeFnSig(gf.decl_node, gf.module);
+            try t.decodeFnSig(gf.decl_node, gf.module, gf.recv_type);
         }
     }
 
@@ -1827,7 +1894,8 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
 /// global fn table. `fn_idx` is a node in the currently-active tree; `mod` its
 /// owning module id. Param/return type-refs resolve via the active maps (and, for
 /// a qualified `mod.Type`, via the graph context).
-fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
+fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index) !void {
+    const gid: u32 = @intCast(t.fns.items.len);
     const decl = t.tree.nodes[fn_idx.int()];
     const proto = Ast.protoAt(t.tree, decl.lhs.int());
 
@@ -1843,6 +1911,15 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
     t.cur_generic_params = gnames;
     defer t.cur_generic_params = &.{};
 
+    // Inherent method (M8): resolve the receiver type and put it in scope so the
+    // synthesized `self` param and any `Self` type-ref in the signature decode to it.
+    var self_ty: Type = .invalid;
+    if (recv_type != Ast.none) {
+        self_ty = t.typeFromNode(recv_type);
+        t.cur_self_type = self_ty;
+    }
+    defer t.cur_self_type = null;
+
     const params = try t.gpa.alloc(Type, proto.params.len);
     for (proto.params, 0..) |param_idx, i| {
         const param = t.tree.nodes[param_idx.int()];
@@ -1855,7 +1932,12 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         }
     }
     const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames });
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .self_type = self_ty });
+    // Register the method into the program-wide table (SERIAL, fn-id order). The name
+    // is BORROWED from source (like `Sig.name`); the table is frozen before Pass C.
+    if (recv_type != Ast.none) {
+        try t.methods.append(t.gpa, .{ .recv = self_ty, .name = t.nameText(decl.main_token), .fn_id = gid });
+    }
 }
 
 /// Append the synthetic bodyless `print(str) -> ()` builtin to the fn table.
@@ -1877,6 +1959,12 @@ pub fn genericParamType(t: *const Typecheck, name: []const u8) ?Type {
         if (std.mem.eql(u8, gp, name)) return Type.typeVar(@intCast(i));
     }
     return null;
+}
+
+/// The receiver type when decoding a method signature (M8), so a `Self` type-ref
+/// resolves to it via `refs.typeFromNode`. Null outside a method (byte-identical).
+pub fn selfType(t: *const Typecheck) ?Type {
+    return t.cur_self_type;
 }
 
 /// Intern a composite `App(ctor, args)` to its table index (M4). The `refs`
@@ -2033,6 +2121,72 @@ test "M6: an uninstantiated generic enum (and struct) is clean and reifies NOTHI
     try testing.expectEqual(@as(usize, 0), reified);
     // The un-gated generic STRUCT case stays clean too (M4 regression).
     try testing.expectEqual(@as(usize, 0), try checkDiagCount("struct Box[T] { v: T }\nfn main() -> int { return 0 }\n"));
+}
+
+test "M8: an inherent method typechecks clean; the call types to the method return; one method-table entry" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\impl P { fn sum(self) -> int { self.x + self.y } }
+        \\fn main() -> int {
+        \\ p := P{ x: 20, y: 22 }
+        \\ return p.sum()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Exactly one method (P, "sum") in the program-wide table.
+    try testing.expectEqual(@as(usize, 1), c.result.methods.len);
+    try testing.expectEqualStrings("sum", c.result.methods[0].name);
+    try testing.expectEqual(Kind.@"struct", c.result.methods[0].recv.kind);
+    // The `p.sum()` call node types to the method's return (int).
+    const nts = c.result.node_types[0];
+    var found = false;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .call) {
+            try testing.expectEqual(Kind.int, nts[i].kind);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "M8: a call to a missing method emits exactly one T0018 naming the receiver + method" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ p := P{ x: 1 }
+        \\ return p.nope()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "nope") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "P") != null);
+}
+
+test "M8: `Self` in a method signature resolves to the receiver type" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P { fn me(self) -> Self { self } }
+        \\fn main() -> int {
+        \\ p := P{ x: 7 }
+        \\ q := p.me()
+        \\ return q.x
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The method's return Sig is the receiver struct type (Self resolved to P).
+    try testing.expectEqual(@as(usize, 1), c.result.methods.len);
+    const gid = c.result.methods[0].fn_id;
+    try testing.expectEqual(Kind.@"struct", c.result.sigs[gid].ret.kind);
 }
 
 test "M4: Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {
