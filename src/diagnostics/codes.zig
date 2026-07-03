@@ -66,6 +66,8 @@ pub const Code = enum(u16) {
     T0017, // instantiation-too-deep (unbounded generic-data instantiation depth — M4)
     T0018, // no-such-method (a method call names a receiver type that has no such method — M8)
     T0019, // mut-self-not-place (a `mut self` method called on a temporary/non-place receiver — M9)
+    T0020, // overlapping-impl (two impls of the same protocol for the same type-ctor — coherence, M11)
+    T0021, // no-conformance (an `impl .. has P` omits a required method, or `has` names an undeclared protocol — M11)
 
     _,
 };
@@ -123,6 +125,8 @@ pub const table = [_]Entry{
     .{ .code = .T0017, .str = "T0017", .slug = "instantiation-too-deep" },
     .{ .code = .T0018, .str = "T0018", .slug = "no-such-method" },
     .{ .code = .T0019, .str = "T0019", .slug = "mut-self-not-place" },
+    .{ .code = .T0020, .str = "T0020", .slug = "overlapping-impl" },
+    .{ .code = .T0021, .str = "T0021", .slug = "no-conformance" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so

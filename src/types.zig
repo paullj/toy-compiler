@@ -397,6 +397,33 @@ pub fn findGenericMethod(methods: []const Method, ctor: u32, is_enum: bool, name
     return null;
 }
 
+/// A declared protocol (M11): a signature-only bundle of method NAMES. Registered
+/// SERIALLY in Phase 0c (`registerProtocols`) in module-then-decl order (its global id
+/// is its index in `t.protocols`), then frozen onto the `Model`. Only method-NAME
+/// completeness is checked in M11 (signature compatibility is a later tier).
+pub const ProtocolSym = struct {
+    /// Protocol name (borrowed source slice).
+    name: []const u8,
+    /// Owning module id.
+    mod: u32,
+    /// Whether the `protocol` decl is `pub` (exported to importers).
+    pub_export: bool,
+    /// The `protocol_decl` node in its owning module's tree.
+    decl_node: Ast.Index,
+    /// The protocol's required method names, in declaration order (borrowed source
+    /// slices). The OUTER array is owned by `t.protocols` (freed at teardown).
+    methods: []const []const u8,
+};
+
+/// One recorded conformance (M11): `impl <recv> has <protocol>`. Frozen onto the
+/// `Model` (read-only; no M11 Pass-C consumer — it sets up M13's conformance query).
+/// `recv` is the byte-foldable receiver `Type` (a `structT`/`enumT`), stored verbatim
+/// so a future `Type.eql` conformance lookup is a one-liner.
+pub const Conformance = struct {
+    protocol: u32,
+    recv: Type,
+};
+
 /// A top-level function's signature, decoded once up front so calls can be
 /// checked against it (and forward references work).
 pub const FnSym = struct {
@@ -481,6 +508,16 @@ cur_generic_params: []const []const u8 = &.{},
 /// (`decodeFnSig`) in global fn-id order, frozen onto the `Model` before the
 /// parallel body pass. Transferred into `GraphResult.methods` by `checkGraph`.
 methods: std.ArrayList(Method) = .empty,
+
+/// The program-wide protocol table (M11), built SERIALLY in Phase 0c
+/// (`registerProtocols`) in module-then-decl order (a protocol's global id is its
+/// index here). Frozen onto the `Model`; freed at teardown (each entry's `methods`
+/// outer array is owned, its name slices borrowed).
+protocols: std.ArrayList(ProtocolSym) = .empty,
+
+/// The recorded conformances (M11), filled by the SERIAL `checkCoherence` phase in
+/// module-then-decl order. Frozen onto the `Model` (M13 consumer); freed at teardown.
+conformances: std.ArrayList(Conformance) = .empty,
 
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
@@ -583,6 +620,9 @@ pub const GraphCtx = struct {
         struct_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Bare enum name → GLOBAL enum id.
         enum_ids: std.StringHashMapUnmanaged(u32) = .empty,
+        /// Bare protocol name → GLOBAL protocol id (this module's own protocol decls,
+        /// M11). Populated in Phase 0c (`registerProtocols`).
+        protocol_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Import namespace name → imported module id (graph module id).
         namespaces: std.StringHashMapUnmanaged(u32) = .empty,
     };
@@ -609,6 +649,10 @@ pub const Model = struct {
     /// The program-wide inherent-method table (M8), frozen from Pass A. Read-only
     /// during the parallel body pass; drives `BodyChecker` method dispatch.
     methods: []const Method,
+    /// The program-wide protocol table + recorded conformances (M11), frozen before
+    /// the parallel body pass. Read-only; no M11 Pass-C consumer (sets up M13).
+    protocols: []const ProtocolSym,
+    conformances: []const Conformance,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -623,6 +667,8 @@ fn buildModel(t: *Typecheck) Model {
         .graph = t.graph,
         .gph_fn_names = t.gph_fn_names,
         .methods = t.methods.items,
+        .protocols = t.protocols.items,
+        .conformances = t.conformances.items,
     };
 }
 
@@ -688,6 +734,11 @@ fn activeStructMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
 /// The active bare-name → global-enum-id map: the current module's table.
 fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].enum_ids;
+}
+
+/// The active bare-name → global-protocol-id map: the current module's table (M11).
+fn activeProtocolMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
+    return &t.graph.mods[t.graph_mod].protocol_ids;
 }
 
 /// The layout engine's view of this checker: its tables + the per-module accessors
@@ -839,6 +890,11 @@ pub fn checkGraph(
         // The method table's backing array (entries' names are borrowed source
         // slices). On success `toOwnedSlice` empties it, so this is a no-op there.
         t.methods.deinit(gpa);
+        // The protocol table (M11): each entry owns its `methods` outer array (the
+        // name slices are borrowed source); the conformance list owns only its array.
+        for (t.protocols.items) |p| gpa.free(@constCast(p.methods));
+        t.protocols.deinit(gpa);
+        t.conformances.deinit(gpa);
         for (t.enums.items) |e| {
             for (e.variants) |v| {
                 gpa.free(v.field_names);
@@ -965,6 +1021,19 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         try t.registerEnums(Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
 
+    // Phase 0c (M11): register every module's `protocol` decls into ONE global id
+    // space (module-id order, then decl order — same determinism as structs/enums).
+    // Each module's `protocol_ids` (bare name -> global id) is filled so a bare or
+    // qualified protocol reference resolves later. Must run before `checkCoherence`.
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod);
+        if (t.tree.nodes.len == 0) continue;
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
+        if (prog.tag != .program) continue;
+        try t.registerProtocols(Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
+    }
+
     // Phase 0a (M4): decode each generic struct TEMPLATE's field types as PATTERNS
     // (`v: T` -> `type_var(0)`; `b: Box[T]` -> `App(Box, [type_var 0])`) into its
     // `field_names`/`field_types`, with the template's generic params in scope so a
@@ -1008,6 +1077,13 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // here into the shared diag stream; the final sink.sort() below orders it with
     // every other diagnostic, so it is byte-identical at -j1 and -jN.
     try t.checkMainReturn(entry_mod);
+
+    // WHOLE-PROGRAM COHERENCE (M11): walk every `impl .. has ..`, reject a duplicate
+    // (protocol, receiver-ctor) conformance (T0020) — including a retroactive one in a
+    // sibling module — and an incomplete/undeclared conformance (T0021). SERIAL, in
+    // module-then-decl order, BEFORE the parallel Pass-C fan-out — so the emit order is
+    // a pure function of source (byte-identical at any `-jN`).
+    try t.checkCoherence(mods);
 
     // Phase B/C: freeze the Pass-A tables into a read-only Model, then check each
     // fn body against it via a per-fn BodyChecker (skip bodyless `print`). The
@@ -1830,6 +1906,122 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
     }
 }
 
+/// Resolve a (bare or qualified) protocol-reference node to a GLOBAL protocol id, or
+/// null if it names no protocol (M11). NON-EMITTING: `checkCoherence` turns a null into
+/// a single T0021 at the reference site (Phase A never touches a protocol ref, so there
+/// is no prior emit to double). A bare `identifier` resolves against the active module's
+/// protocol map; a qualified `mod.P` `field_access` resolves the receiver namespace then
+/// the owning module's protocol table, gated on `pub_export`.
+fn protocolIdFromNode(t: *Typecheck, node_idx: Ast.Index) ?u32 {
+    if (node_idx == Ast.none) return null;
+    const n = t.tree.nodes[node_idx.int()];
+    if (n.tag == .identifier) return t.activeProtocolMap().get(t.nameText(n.main_token));
+    if (n.tag == .field_access) {
+        const recv = t.tree.nodes[n.lhs.int()];
+        if (recv.tag != .identifier) return null;
+        const target = t.graph.namespaceOfIn(t.graph_mod, t.nameText(recv.main_token)) orelse return null;
+        if (t.graph.mods[target].protocol_ids.get(t.nameText(n.main_token))) |id| {
+            if (t.protocols.items[id].pub_export) return id;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// Resolve an `impl ... has` receiver type-ref node to its `Type` (a `structT`/`enumT`)
+/// WITHOUT emitting (M11). Phase A `decodeFnSig` already resolved the same node (and
+/// emitted any T0001/T0002/T0003 for a bad receiver), so re-resolving here must stay
+/// silent to avoid a double-emit. A bare `identifier` resolves against the active
+/// struct/enum maps; a qualified `mod.T` `field_access` resolves the receiver namespace
+/// then the owning module's tables. Null on any miss (Phase A already reported it).
+fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
+    if (node_idx == Ast.none) return null;
+    const n = t.tree.nodes[node_idx.int()];
+    if (n.tag == .identifier) {
+        const name = t.nameText(n.main_token);
+        if (t.activeStructMap().get(name)) |id| return Type.structT(id);
+        if (t.activeEnumMap().get(name)) |id| return Type.enumT(id);
+        return null;
+    }
+    if (n.tag == .field_access) {
+        const recv = t.tree.nodes[n.lhs.int()];
+        if (recv.tag != .identifier) return null;
+        const target = t.graph.namespaceOfIn(t.graph_mod, t.nameText(recv.main_token)) orelse return null;
+        const member = t.nameText(n.main_token);
+        if (t.graph.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
+        if (t.graph.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
+        return null;
+    }
+    return null;
+}
+
+/// Whole-program conformance coherence (M11). Walks every `impl .. has ..` in
+/// module-then-decl order (SERIAL, before Pass C) and enforces:
+///   * exactly one impl per (protocol, receiver type-ctor) — a duplicate (INCLUDING a
+///     retroactive one in a SIBLING module: no orphan rule) is T0020 at the second impl;
+///   * `has P` names a declared protocol AND provides every method P requires — an
+///     undeclared protocol OR a missing method is T0021.
+/// Accepted conformances are recorded onto `t.conformances` (frozen for M13). The
+/// `seen` set is `getOrPut`-only (never iterated), so its hash/thread order cannot leak
+/// into the emit stream; emit order is module-id then source order → `-jN`-stable.
+fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
+    const Key = struct { protocol: u32, recv_kind: u8, recv_id: u32 };
+    var seen: std.AutoHashMapUnmanaged(Key, void) = .empty;
+    defer seen.deinit(t.gpa);
+
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod);
+        if (t.tree.nodes.len == 0) continue;
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
+        if (prog.tag != .program) continue;
+
+        for (Ast.rangeSlice(t.tree, prog.lhs.int())) |decl_idx| {
+            const decl = t.tree.nodes[decl_idx.int()];
+            if (decl.tag != .impl_has_decl) continue;
+
+            // Resolve the protocol. An undeclared protocol ref -> T0021 (no coherence
+            // key to form; nothing more to check for this impl).
+            const proto_ref = Ast.implProtocol(t.tree, decl).?;
+            const pid = t.protocolIdFromNode(proto_ref) orelse {
+                const ref_tok = t.tree.nodes[proto_ref.int()].main_token;
+                try t.sink.emitFmtCode(.T0021, t.byteOf(ref_tok), "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
+                continue;
+            };
+
+            // Completeness: every method the protocol requires must be provided.
+            const provided = Ast.implMethods(t.tree, decl);
+            for (t.protocols.items[pid].methods) |req| {
+                var found = false;
+                for (provided) |mnode| {
+                    if (std.mem.eql(u8, t.nameText(t.tree.nodes[mnode.int()].main_token), req)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                    try t.sink.emitFmtCode(.T0021, t.byteOf(decl.main_token), "impl of protocol '{s}' for '{s}' is missing method '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token), req });
+            }
+
+            // Coherence: reject a duplicate (protocol, receiver-ctor). The receiver was
+            // already resolved (and any error emitted) in Phase A, so re-resolve
+            // silently; an unresolved receiver simply forms no coherence key.
+            const recv = t.receiverTypeFromNode(decl.lhs) orelse continue;
+            const key: Key = switch (recv.kind) {
+                .@"struct" => .{ .protocol = pid, .recv_kind = 0, .recv_id = recv.struct_id },
+                .@"enum" => .{ .protocol = pid, .recv_kind = 1, .recv_id = recv.enum_id },
+                else => continue,
+            };
+            const gop = try seen.getOrPut(t.gpa, key);
+            if (gop.found_existing) {
+                try t.sink.emitFmtCode(.T0020, t.byteOf(decl.main_token), "overlapping impl of protocol '{s}' for type '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token) });
+            } else {
+                try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = recv });
+            }
+        }
+    }
+}
+
 /// Register the struct decls among `decl_nodes` (of the currently-active tree).
 /// `mod` is the owning module id (0 single-file). Global ids are assigned in
 /// append order; per-module duplicate/shadow diagnostics mirror the single-file
@@ -1999,6 +2191,38 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
         const id: u32 = @intCast(t.enums.items.len);
         try t.enums.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx), .is_generic = is_generic, .generic_params = gparams });
         try t.activeEnumMap().put(t.gpa, name, id);
+    }
+}
+
+/// Phase 0c (M11): register the `protocol` decls among `decl_nodes` (of the active
+/// tree) into ONE global id space. Global ids are assigned in append order
+/// (module-then-decl); the bare name → global id binding goes into the active protocol
+/// map (this module's table). Each protocol's required method NAMES are collected
+/// (declaration order) for the coherence completeness check. A same-module duplicate
+/// `protocol P` is first-wins (silent); cross-module same-named protocols get DISTINCT
+/// ids (nominal distinctness, like structs/enums).
+fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
+    for (decl_nodes) |decl_idx| {
+        const decl = t.tree.nodes[decl_idx.int()];
+        if (decl.tag != .protocol_decl) continue;
+        const name = t.nameText(decl.main_token);
+        if (t.activeProtocolMap().get(name) != null) continue; // first-wins duplicate
+        // Required method names (declaration order); the sigs live as a Range in `lhs`.
+        // Once appended, the `ProtocolSym` owns `names` (freed at teardown), so no
+        // `errdefer` here — mirroring `registerStructs`/`registerEnums` (an OOM on the
+        // append below aborts the compile anyway).
+        const sig_nodes = Ast.rangeSlice(t.tree, decl.lhs.int());
+        const names = try t.gpa.alloc([]const u8, sig_nodes.len);
+        for (sig_nodes, 0..) |snode, i| names[i] = t.nameText(t.tree.nodes[snode.int()].main_token);
+        const id: u32 = @intCast(t.protocols.items.len);
+        try t.protocols.append(t.gpa, .{
+            .name = name,
+            .mod = mod,
+            .pub_export = t.tree.isPub(decl_idx),
+            .decl_node = decl_idx,
+            .methods = names,
+        });
+        try t.activeProtocolMap().put(t.gpa, name, id);
     }
 }
 

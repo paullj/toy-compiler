@@ -214,9 +214,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             if (head.else_node != Ast.none) try walkInner(src, head.else_node, collect, visitor);
         },
         // Never a fingerprint root / never reached inside a fn-body walk. An
-        // `impl_decl` is a top-level decl (its methods are walked as ordinary
-        // `fn_decl` fingerprint roots), so it folds nothing here.
-        .program, .import_decl, .impl_decl => {},
+        // `impl_decl`/`impl_has_decl` is a top-level decl (its methods are walked as
+        // ordinary `fn_decl` fingerprint roots) and a `protocol_decl`'s bodyless sigs
+        // never enter the fn table, so all three fold nothing here. The
+        // protocol/conformance -> fingerprint dependence is deferred to M13.
+        .program, .import_decl, .impl_decl, .protocol_decl, .impl_has_decl => {},
         // Zero-sized leaf: the tag byte IS its content. Reached as a value literal
         // and as a `()` type-ref (under param/fn_decl ret).
         .literal_unit => {},

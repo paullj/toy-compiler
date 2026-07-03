@@ -1,0 +1,18 @@
+# Feature: declare a signature-only `protocol`, conform a concrete type to it via
+# `impl T has P { .. }`, and dispatch the protocol method on a value (M11). The call
+# `p.name()` resolves to the has-impl method exactly like an inherent method.
+# expect: exit 42
+protocol Named {
+    fn name(self) -> int
+}
+
+struct P { x: int }
+
+impl P has Named {
+    fn name(self) -> int { self.x }
+}
+
+fn main() -> int {
+    p := P{ x: 42 }
+    return p.name()
+}

@@ -54,6 +54,7 @@ pub fn checkGraph(
         for (ctx.mods) |*mc| {
             mc.struct_ids.deinit(gpa);
             mc.enum_ids.deinit(gpa);
+            mc.protocol_ids.deinit(gpa);
             mc.namespaces.deinit(gpa);
         }
         gpa.free(ctx.mods);

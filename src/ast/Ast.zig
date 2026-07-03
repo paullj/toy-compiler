@@ -304,6 +304,29 @@ pub const Node = extern struct {
         /// receiver type-ref `identifier` node. `rhs` is the `extra` header of a
         /// `Range` over the method `fn_decl` nodes (in declaration order).
         impl_decl,
+
+        // Protocols + conformance (M11). Appended at the END (frozen ordinals;
+        // `[]Node` is memcpy'd to/from the content cache; `ParseHeader.version`
+        // bumped 8->9 on this change). A protocol declares signature-only methods;
+        // an `impl T has P` block conforms a concrete type to a protocol. Each
+        // conformance method desugars to an ordinary `fn_decl` exactly like an
+        // inherent-method block, so lower/typecheck treat it like any method.
+
+        /// `protocol P { fn m(self, ..) -> R }` — signature-only method decls.
+        /// `main_token` is the protocol-name identifier token. `lhs` is the `extra`
+        /// header of a `Range` over the bodyless method-signature `fn_decl` nodes.
+        /// `rhs` is `none`. The method sigs never enter the fn table (collectGlobals
+        /// ignores `protocol_decl`), so their synthesized `self` type-ref is inert.
+        protocol_decl,
+
+        /// `impl T has P { fn m.. {} }` — a keyword-led conformance-impl block.
+        /// `main_token` is the receiver type-name token (the LAST segment for a
+        /// qualified `impl mod.T`). `lhs` is the receiver type-ref node (an
+        /// `identifier`, or a `field_access` chain for `impl mod.T`). `rhs` is the
+        /// `extra` index of a 3-cell header `{protocol_ref_node, methods_start,
+        /// methods_len}`: the protocol reference is an `identifier`/`field_access`
+        /// node, and the method `fn_decl`s live at `extra[start .. start + len]`.
+        impl_has_decl,
     };
 };
 
@@ -446,6 +469,40 @@ pub fn importPathToks(tree: Tree, node: Node) []const TokIndex {
     return @ptrCast(tree.extra[r.start .. r.start + r.len]);
 }
 
+/// Decode the 3-cell `impl_has_decl` header at `header` (its `rhs` slot):
+/// `{protocol_ref_node, methods_start, methods_len}`. `protocol` is the
+/// (bare or qualified) protocol-reference node; `methods` is the run of method
+/// `fn_decl` node indices at `extra[start .. start + len]`.
+pub fn implHasAt(tree: Tree, header: u32) struct { protocol: Index, methods: []const Index } {
+    const ms = tree.extra[header + 1];
+    const ml = tree.extra[header + 2];
+    return .{
+        .protocol = Index.from(tree.extra[header]),
+        .methods = @ptrCast(tree.extra[ms .. ms + ml]),
+    };
+}
+
+/// The method `fn_decl` node indices of an inherent (`impl_decl`) OR conformance
+/// (`impl_has_decl`) block — one accessor so callers don't branch on the two
+/// impl shapes (they store their method run differently: a plain `Range` in
+/// `impl_decl.rhs`, a 3-cell header in `impl_has_decl.rhs`). Empty for any other tag.
+pub fn implMethods(tree: Tree, node: Node) []const Index {
+    return switch (node.tag) {
+        .impl_decl => rangeSlice(tree, node.rhs.int()),
+        .impl_has_decl => implHasAt(tree, node.rhs.int()).methods,
+        else => &.{},
+    };
+}
+
+/// The protocol-reference node an `impl_has_decl` conforms to, or `null` for a
+/// non-conformance (`impl_decl`) or any other tag.
+pub fn implProtocol(tree: Tree, node: Node) ?Index {
+    return switch (node.tag) {
+        .impl_has_decl => implHasAt(tree, node.rhs.int()).protocol,
+        else => null,
+    };
+}
+
 /// "TOYP" — a magic so a foreign/corrupt blob is treated as a cache miss.
 pub const parse_magic: u32 = 0x544f5950;
 
@@ -466,7 +523,11 @@ pub const ParseHeader = extern struct {
     /// (`impl Box[T]`) and a method carries an impl-derived `generic_param` run in its
     /// FnProto (cells 3-4), so a v7 blob — which never produced either shape — must
     /// miss cleanly rather than feed a stale AST into the M10 method-monomorphizer.
-    version: u32 = 8,
+    /// Bumped to 9 for the M11 protocols front-end: the `protocol_decl` and
+    /// `impl_has_decl` Tag ordinals were appended, and `impl_has_decl` stores a new
+    /// 3-cell header in its `rhs`, so a v8 blob predating these tags must miss cleanly
+    /// rather than misdecode a node whose tag/cell meaning the new tags changed.
+    version: u32 = 9,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -527,7 +588,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 8) return null;
+    if (hdr.magic != parse_magic or hdr.version != 9) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -579,6 +640,26 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .impl_decl => {
             try out.print("(impl {s}", .{tok_text});
             for (rangeSlice(tree, n.rhs.int())) |method| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, method);
+            }
+            try out.writeByte(')');
+        },
+        .protocol_decl => {
+            try out.print("(protocol {s}", .{tok_text});
+            for (rangeSlice(tree, n.lhs.int())) |method| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, method);
+            }
+            try out.writeByte(')');
+        },
+        .impl_has_decl => {
+            const h = implHasAt(tree, n.rhs.int());
+            try out.writeAll("(impl-has ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, h.protocol);
+            for (h.methods) |method| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, method);
             }
@@ -1065,6 +1146,48 @@ test "unpack rejects a v7 blob (pre-generic-impl)" {
     // compiler predating the M10 generic-impl parse change must miss cleanly, not
     // misdecode an `impl`'s receiver / a method's generic run.
     std.mem.writeInt(u32, blob[4..8], 7, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "pack/unpack round-trips a tree containing an impl_has_decl (v9)" {
+    const gpa = testing.allocator;
+    // A pure byte round-trip (memcpy of the node/extra arrays), so the tree need not
+    // be well-formed — it only has to contain the new tag + its 3-cell header so the
+    // v9 blob exercises `impl_has_decl`'s ordinal.
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = none, .rhs = none }, // recv type-ref
+        .{ .tag = .identifier, .main_token = 1, .lhs = none, .rhs = none }, // protocol ref
+        .{ .tag = .impl_has_decl, .main_token = 0, .lhs = Index.from(0), .rhs = Index.from(2) },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(3), .rhs = none },
+    };
+    // extra: [0..1]=methods run (empty here, start=0,len=0 lands at header cell 2),
+    // header at cell 2 = {protocol_ref=1, methods_start=0, methods_len=0};
+    // program's Range header {start=5,len=1} over decl node 2.
+    var extra = [_]u32{ 0, 0, 1, 0, 0, 2, 1 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, tree.extra, got.extra);
+}
+
+test "unpack rejects a v8 blob (pre-protocols)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    // Rewrite `version` to 8: a blob from a compiler predating the M11 protocol tags
+    // must miss cleanly, not misdecode an `impl_has_decl`'s 3-cell header.
+    std.mem.writeInt(u32, blob[4..8], 8, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
 }
 

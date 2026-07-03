@@ -96,7 +96,7 @@ fn setOf(comptime tags: []const token.Tag) TagSet {
 }
 
 /// FIRST(top-level decl): the exact arms of `parseDecls`' dispatch.
-const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl });
+const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl, .kw_protocol });
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
@@ -396,9 +396,10 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
     // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
-        .kw_fn => try p.parseFnDecl(null, Ast.none, &.{}),
+        .kw_fn => try p.parseFnDecl(null, Ast.none, &.{}, false),
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
+        .kw_protocol => try p.parseProtocolDecl(),
         else => return p.fail(p.peek(), .P0003, if (is_pub)
             "expected a function, struct, or enum declaration after 'pub'"
         else
@@ -469,7 +470,13 @@ fn parseImport(p: *Parser) Error!Ast.Index {
 /// (type-instance, method) exactly like a generic fn — empty for a bare impl / a
 /// top-level fn (byte-identical). A top-level `fn` passes `null`/`none`/`&.{}` and
 /// rejects a `self` receiver implicitly (it would just parse as a param named `self`).
-fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index) Error!Ast.Index {
+///
+/// `bodyless` is true for a protocol method SIGNATURE (`fn m(self, ..) -> R` with no
+/// `{ .. }`): the body is a synthesized empty `block` node so downstream shape checks
+/// (and pack/unpack) stay uniform, and no `parseBlock` is attempted. Only
+/// `parseProtocolDecl` passes true; every other caller (top-level fn, impl method)
+/// passes false and parses a real block.
+fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index, bodyless: bool) Error!Ast.Index {
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
@@ -541,7 +548,13 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_g
         ret_type = try p.parseType();
     }
 
-    const body = try p.parseBlock();
+    // A protocol method signature has no body: synthesize an empty `block` (its
+    // `main_token` is the current token — a leaf with an empty statement Range) so
+    // the node shape matches an ordinary fn and pack/unpack stays uniform.
+    const body = if (bodyless)
+        try p.addNode(.{ .tag = .block, .main_token = p.index, .lhs = try p.addRange(&.{}), .rhs = Ast.none })
+    else
+        try p.parseBlock();
 
     // Write the params run, then the generics run, then the fixed 5-cell FnProto.
     // The layout is ADDITIVE: cells 0-2 (ret/params) are unchanged, so every
@@ -572,13 +585,15 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_g
     return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
 }
 
-/// `impl Type { fn m(self, ..) -> R { .. } }` — a keyword-led inherent-method block
-/// (M8). The receiver is a bare type name (`impl P`, M8) or a GENERIC type application
-/// (`impl Box[T]`, M10): the `[T]` declares the impl's type-params and turns the
-/// receiver into a `type_app` `Box[T]`. A qualified `impl mod.T` receiver (coherence)
-/// is still out of scope (M11) and rejected here. The body reuses the struct-body
-/// brace member loop, but over `fn` methods (each parsed with the receiver so its
-/// leading `self` is synthesized). Newlines/commas separate methods.
+/// `impl Type { fn m(self, ..) -> R { .. } }` — an inherent-method block (M8/M10) —
+/// OR `impl T has P { fn m.. {} }` — a protocol-conformance block (M11). The receiver
+/// is a bare type name (`impl P`, M8), a GENERIC type application (`impl Box[T]`, M10 —
+/// inherent only), or (conformance only) a QUALIFIED name (`impl mod.T has mod.P`).
+/// `has` selects the conformance form: the protocol reference is a bare/qualified name
+/// node, a generic (`type_app`) receiver is rejected (bounds are M13), and the block is
+/// an `impl_has_decl`. WITHOUT `has`, a qualified receiver is still rejected (inherent
+/// impls stay bare-or-generic, M8/M10). The member loop is shared (`parseImplBody`);
+/// each method is parsed with the receiver so its leading `self` is synthesized.
 ///
 /// NODE SHARING (deliberate, safe): for a generic impl the ONE `type_app` node is both
 /// `impl_decl.lhs` and every method's `self` type-ref, and its `generic_param` leaves
@@ -588,13 +603,20 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_g
 /// and the runtime invariant sweep only checks span totality + bracket pairing.
 fn parseImplDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_impl, "expected 'impl'");
-    const recv_tok = p.index;
+    var recv_tok = p.index;
     try p.expect(.identifier, "expected a type name after 'impl'");
-    const recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
-    // A qualified `impl mod.T` receiver (coherence, M11) is still deferred; `[` (a
-    // generic receiver) is now accepted below.
-    if (p.at(.dot)) {
-        return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare or generic type name");
+    var recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
+    // A qualified `impl mod.T` receiver (coherence, M11): build a left-nested
+    // `field_access` chain and move `recv_tok` to the LAST segment (the type name).
+    // Only a conformance impl (`has`) may be qualified; an inherent impl rejects it.
+    var qualified = false;
+    while (p.at(.dot)) {
+        qualified = true;
+        p.bump(.dot);
+        const seg_tok = p.index;
+        try p.expect(.identifier, "expected a type name after '.'");
+        recv_ref = try p.addNode(.{ .tag = .field_access, .main_token = seg_tok, .lhs = recv_ref, .rhs = Ast.none });
+        recv_tok = seg_tok;
     }
     // A generic receiver `impl Box[T]` (M10): `[T]` declares the impl's type-params
     // (each a `generic_param` leaf) and the receiver becomes a `type_app`. The leaves
@@ -602,16 +624,48 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
     var impl_gparams: std.ArrayList(Ast.Index) = .empty;
     defer impl_gparams.deinit(p.gpa);
     var recv_node: Ast.Index = recv_ref;
+    var is_generic = false;
     if (p.at(.l_bracket)) {
         const lbracket = p.index;
         try p.parseGenericParams(&impl_gparams);
         const args_range = try p.addRange(impl_gparams.items);
         recv_node = try p.addNode(.{ .tag = .type_app, .main_token = lbracket, .lhs = recv_ref, .rhs = args_range });
+        is_generic = true;
     }
-    try p.expect(.l_brace, "expected '{' after the impl receiver type");
 
     var methods: std.ArrayList(Ast.Index) = .empty;
     defer methods.deinit(p.gpa);
+
+    // A conformance impl `impl T has P { .. }` (M11).
+    if (p.eat(.kw_has)) {
+        // A generic (`Box[T]`) receiver is a BOUND (`impl Box[T] has P`), which is M13;
+        // reject it cleanly rather than mint an unsupported shape.
+        if (is_generic) return p.fail(p.peek(), .P0001, "a generic 'impl ... has' receiver is not yet supported");
+        const proto_ref = try p.parseProtocolRef();
+        try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods);
+        // Write the method run, then the fixed 3-cell header {protocol_ref, start, len}
+        // — decoded by `Ast.implHasAt`. The run precedes the header (start < header), so
+        // every method node is created before the `impl_has_decl` node references it.
+        const methods_start: u32 = @intCast(p.extra.items.len);
+        const method_cells: []const u32 = @ptrCast(methods.items);
+        try p.extra.appendSlice(p.gpa, method_cells);
+        const header = try p.addExtra(&.{ proto_ref.int(), methods_start, @intCast(methods.items.len) });
+        return p.addNode(.{ .tag = .impl_has_decl, .main_token = recv_tok, .lhs = recv_node, .rhs = header });
+    }
+
+    // Inherent impl (M8/M10): a qualified receiver is out of scope.
+    if (qualified) return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare or generic type name");
+    try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods);
+    const header = try p.addRange(methods.items);
+    return p.addNode(.{ .tag = .impl_decl, .main_token = recv_tok, .lhs = recv_node, .rhs = header });
+}
+
+/// The shared impl-member loop `{ fn m.. {}  fn n.. {} }`: parse each `fn` method with
+/// the receiver so its leading `self` is synthesized, appending into `methods`
+/// (newline/comma-separated). Used by both the inherent and conformance impl forms, so
+/// the two cannot drift on member grammar / recovery.
+fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: []const Ast.Index, methods: *std.ArrayList(Ast.Index)) Error!void {
+    try p.expect(.l_brace, "expected '{' after the impl receiver type");
     while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
@@ -621,7 +675,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
         if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.kw_fn)) {
-            const method = try p.parseFnDecl(recv_tok, recv_node, impl_gparams.items);
+            const method = try p.parseFnDecl(recv_tok, recv_node, impl_gparams, false);
             try methods.append(p.gpa, method);
             // A method is separated by a newline (loop-top `skipNewlines`) or an
             // optional comma; a `}` ends the block.
@@ -632,9 +686,58 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
         std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
     }
     try p.expect(.r_brace, "expected '}' to close the impl block");
+}
 
-    const header = try p.addRange(methods.items);
-    return p.addNode(.{ .tag = .impl_decl, .main_token = recv_tok, .lhs = recv_node, .rhs = header });
+/// Parse a bare or dot-qualified protocol reference (`P` / `mod.P` / `a.b.P`) into an
+/// `identifier` (bare) or a left-nested `field_access` chain (qualified) — the same
+/// shape a qualified type-name uses, so the checker resolves it via the module tables.
+/// NOT a full type: no `()` unit and no `[..]` type-application (generic protocols are
+/// M14). The built node lands in the `impl_has_decl`'s 3-cell header.
+fn parseProtocolRef(p: *Parser) Error!Ast.Index {
+    const first_tok = p.index;
+    try p.expect(.identifier, "expected a protocol name after 'has'");
+    var node = try p.addNode(.{ .tag = .identifier, .main_token = first_tok, .lhs = Ast.none, .rhs = Ast.none });
+    while (p.at(.dot)) {
+        p.bump(.dot);
+        const seg_tok = p.index;
+        try p.expect(.identifier, "expected a protocol name after '.'");
+        node = try p.addNode(.{ .tag = .field_access, .main_token = seg_tok, .lhs = node, .rhs = Ast.none });
+    }
+    return node;
+}
+
+/// `protocol P { fn m(self, ..) -> R }` — a signature-only protocol declaration (M11).
+/// Each member is a BODYLESS method signature parsed via `parseFnDecl(.., bodyless=true)`
+/// with the protocol name as the synthetic receiver token (so a leading `self` is
+/// consumed and its type-ref renders as the protocol name — inert, never decoded: a
+/// protocol's method sigs never enter the fn table). The member loop mirrors the
+/// impl-body loop (newline/comma-separated `fn`s).
+fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
+    try p.expect(.kw_protocol, "expected 'protocol'");
+    const name_tok = p.index;
+    try p.expect(.identifier, "expected a protocol name");
+    try p.expect(.l_brace, "expected '{' after the protocol name");
+
+    var sigs: std.ArrayList(Ast.Index) = .empty;
+    defer sigs.deinit(p.gpa);
+    while (!p.at(.eof)) {
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
+        if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (p.at(.kw_fn)) {
+            const sig = try p.parseFnDecl(name_tok, Ast.none, &.{}, true);
+            try sigs.append(p.gpa, sig);
+            _ = p.eat(.comma);
+        } else {
+            _ = try p.advanceWithError(.P0006, "expected a method 'fn' or '}'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+    }
+    try p.expect(.r_brace, "expected '}' to close the protocol block");
+
+    const header = try p.addRange(sigs.items);
+    return p.addNode(.{ .tag = .protocol_decl, .main_token = name_tok, .lhs = header, .rhs = Ast.none });
 }
 
 /// `struct Name { x: int, y: int }`. Fields are `name: Type`, comma-separated,
@@ -2337,6 +2440,16 @@ test "root is program and children precede parents" {
                 try testing.expect(n.lhs.int() < self);
                 for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
+            // `protocol P { fn .. }`: the method sigs are a Range in `lhs`.
+            .protocol_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
+            // `impl T has P { fn .. }`: receiver type-ref is `lhs`; the protocol ref +
+            // methods live in the 3-cell header decoded by `implHasAt`.
+            .impl_has_decl => {
+                try testing.expect(n.lhs.int() < self);
+                const h = Ast.implHasAt(tree, n.rhs.int());
+                try testing.expect(h.protocol.int() < self);
+                for (h.methods) |c| try testing.expect(c.int() < self);
+            },
         }
     }
 }
@@ -2452,6 +2565,56 @@ test "M10: a qualified `impl mod.T` receiver is still rejected (P0001)" {
     defer gpa.free(@constCast(res.diags));
     defer freeTree(gpa, res.tree);
     try testing.expect(res.diags.len >= 1);
+}
+
+test "M11: a protocol decl parses signature-only methods (empty body)" {
+    // The self param's type-ref renders as the protocol name (inert — never decoded),
+    // and the bodyless signature carries a synthesized empty `(block)`.
+    try expectProgram(
+        "protocol Named { fn name(self) -> int }\n",
+        "(program (protocol Named (fn name ((param self Named)) int (block))))",
+    );
+}
+
+test "M11: a protocol decl with multiple signatures" {
+    try expectProgram(
+        "protocol Shape {\n fn area(self) -> int\n fn sides(self) -> int\n}\n",
+        "(program (protocol Shape (fn area ((param self Shape)) int (block)) (fn sides ((param self Shape)) int (block))))",
+    );
+}
+
+test "M11: an impl-has decl parses (recv then protocol then methods)" {
+    try expectProgram(
+        "struct P { x: int }\nimpl P has Named { fn name(self) -> int { self.x } }\n",
+        "(program (struct P (param x int)) (impl-has P Named (fn name ((param self P)) int (block (. self x)))))",
+    );
+}
+
+test "M11: a qualified impl-has parses (qualified receiver AND protocol)" {
+    // Both the receiver `lib.W` and the protocol `lib.Show` render as field_access
+    // chains; the self param's type-ref is the shared qualified receiver node.
+    try expectProgram(
+        "impl lib.W has lib.Show { fn show(self) -> int { self.n } }\n",
+        "(program (impl-has (. lib W) (. lib Show) (fn show ((param self (. lib W))) int (block (. self n)))))",
+    );
+}
+
+test "M11: a generic `impl Box[T] has P` receiver is rejected (P0001)" {
+    const gpa = testing.allocator;
+    const source = "impl Box[T] has P { fn m(self) -> int { 0 } }\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expect(res.diags.len >= 1);
+}
+
+test "M11: `pub protocol` records the pub export" {
+    try expectProgram(
+        "pub protocol Named { fn name(self) -> int }\n",
+        "(program (pub (protocol Named (fn name ((param self Named)) int (block)))))",
+    );
 }
 
 test "isMutParam is true for `mut self`, false for plain self / a non-self first param" {
