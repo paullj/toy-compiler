@@ -143,6 +143,16 @@ pub const Tag = enum(u8) {
 
     /// `mut` — qualifies a `self` receiver as a by-address, in-place-mutating one.
     kw_mut,
+
+    // Protocols (M11). Appended at the END (frozen ordinals; `[]Token` is memcpy'd
+    // to/from the content cache). `protocol` opens a signature-only protocol decl;
+    // `has` leads a conformance impl `impl T has P { .. }`. Both are reserved
+    // keywords; the current corpus never uses either as an identifier.
+
+    /// `protocol` — opens a signature-only protocol declaration.
+    kw_protocol,
+    /// `has` — the single conformance relation, leading `impl T has P { .. }`.
+    kw_has,
 };
 
 /// Maps identifier text to its keyword tag, if any.
@@ -167,6 +177,8 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "as", .kw_as },
     .{ "impl", .kw_impl },
     .{ "mut", .kw_mut },
+    .{ "protocol", .kw_protocol },
+    .{ "has", .kw_has },
 });
 
 comptime {

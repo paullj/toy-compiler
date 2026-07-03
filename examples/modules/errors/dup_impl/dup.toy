@@ -1,0 +1,8 @@
+# A RETROACTIVE, duplicate conformance: this module imports lib and conforms lib.W to
+# lib.Show a SECOND time. Whole-program coherence rejects it (T0020) — even though the
+# receiver and protocol both live in a sibling module (no orphan rule, just uniqueness).
+import lib
+
+impl lib.W has lib.Show {
+    fn show(self) -> int { 0 }
+}

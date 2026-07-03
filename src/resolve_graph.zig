@@ -222,14 +222,17 @@ fn collectGlobals(g: *GraphResolve) !void {
                     });
                     if (is_pub) try g.tables[mod].pub_fns.put(g.gpa, name, id);
                 },
-                .impl_decl => {
+                .impl_decl, .impl_has_decl => {
                     // Each method is an ordinary global fn with a MANGLED name
                     // `<module.path>.<Receiver>.<method>` (so it gets a global id +
                     // codegen unit) but is NOT bare-callable (never inserted into
                     // `tables[mod].fns`) — a method is reached only via `x.m(..)`
                     // dispatch through the program-wide method table (built in Pass A).
+                    // A conformance method (`impl_has_decl`) registers IDENTICALLY: its
+                    // protocol-method dispatch is indistinguishable from an inherent one
+                    // (M11). `Ast.implMethods` yields the method run for either shape.
                     const recv_name = g.nameOf(mod, decl.main_token);
-                    for (Ast.rangeSlice(t, decl.rhs.int())) |method_idx| {
+                    for (Ast.implMethods(t, decl)) |method_idx| {
                         const method = m.nodes[method_idx.int()];
                         if (method.tag != .fn_decl) continue;
                         const mname = g.nameOf(mod, method.main_token);
@@ -247,12 +250,15 @@ fn collectGlobals(g: *GraphResolve) !void {
                             .kind = .user_fn,
                             .is_pub = false,
                             // `decl.lhs` is the receiver type-ref: a bare `identifier`
-                            // (M8) or, for a generic `impl Box[T]` (M10), the receiver
-                            // `type_app` — `decodeFnSig` decodes either to the self type.
+                            // (M8), a generic `impl Box[T]` (M10) `type_app`, or a
+                            // qualified `impl mod.T` (M11) `field_access` —
+                            // `decodeFnSig` decodes any of them to the self type.
                             .recv_type = decl.lhs,
                         });
                     }
                 },
+                // A `protocol_decl`'s bodyless method sigs must NEVER enter the fn table
+                // (no global id / codegen / bare-callability): the `else` ignores it.
                 else => {},
             }
         }
@@ -378,12 +384,15 @@ fn resolveModule(g: *GraphResolve, mod: u32) !void {
             },
             // Resolve each method body like any fn: its synthesized `self` param
             // binds as a local (slot 0) via the ordinary param loop in `resolveFn`.
-            .impl_decl => {
+            // A conformance impl (`impl_has_decl`) resolves identically; its qualified
+            // self-param type-ref binds the module namespace via `resolveTypeRef`.
+            .impl_decl, .impl_has_decl => {
                 const decl = m.nodes[decl_idx.int()];
-                for (Ast.rangeSlice(t, decl.rhs.int())) |method_idx| {
+                for (Ast.implMethods(t, decl)) |method_idx| {
                     if (m.nodes[method_idx.int()].tag == .fn_decl) try g.resolveFn(method_idx);
                 }
             },
+            // A `protocol_decl`'s bodyless sigs have no bodies to resolve.
             else => {},
         }
     }

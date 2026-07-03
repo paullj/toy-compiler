@@ -1,0 +1,13 @@
+protocol Named {
+    fn name(self) -> int
+}
+
+struct P { x: int }
+
+impl P has Named {  #~ ERROR [T0021] missing method 'name'
+    fn other(self) -> int { self.x }
+}
+
+fn main() -> int {
+    return 0
+}

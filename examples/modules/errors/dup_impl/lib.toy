@@ -1,0 +1,13 @@
+# A library that declares a pub protocol + pub struct and conforms the struct to the
+# protocol. An importer may USE this conformance, but must not declare its own.
+pub protocol Show {
+    fn show(self) -> int
+}
+
+pub struct W {
+    n: int
+}
+
+impl W has Show {
+    fn show(self) -> int { self.n }
+}
