@@ -1,0 +1,17 @@
+protocol Doubler {
+    fn dbl(self) -> int
+}
+
+struct P { x: int }
+
+impl P has Doubler {
+    fn dbl(self) -> int { self.x * 2 }
+}
+
+struct Q { x: int }
+
+fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+
+fn main() -> int {
+    return twice(Q{ x: 1 })  #~ ERROR [T0023] does not conform to protocol 'Doubler'
+}

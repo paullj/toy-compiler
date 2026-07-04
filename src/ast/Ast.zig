@@ -284,7 +284,9 @@ pub const Node = extern struct {
         // them wholesale with T0013 before any lower/codegen — no semantics attach.
 
         /// A declared type parameter `T` in a `[T, U]` generic-param list.
-        /// `main_token` is the param name identifier. `lhs`/`rhs` are `none`.
+        /// `main_token` is the param name identifier. `rhs` is `none`. `lhs` is
+        /// `none` for an unbounded param, or (M13) a bound protocol-reference node
+        /// (`identifier` / `field_access` dot-chain) for `[T has P]` / `[T has mod.P]`.
         generic_param,
         /// A type application `Base[Arg, ..]` — in TYPE position (`Box[int]`) or
         /// wrapping a callee in POSTFIX-CALL position (`id[int]` before `(..)`).
@@ -494,6 +496,15 @@ pub fn implMethods(tree: Tree, node: Node) []const Index {
     };
 }
 
+/// The bound protocol-reference node of a `generic_param` (`[T has P]`, M13), stored
+/// in its `lhs` slot — an `identifier` (bare `P`) or a `field_access` chain (`mod.P`).
+/// Null for an unbounded param (`lhs == none`) or a non-`generic_param` node.
+pub fn genericParamBound(tree: Tree, node: Index) ?Index {
+    const n = tree.nodes[node.int()];
+    if (n.tag != .generic_param) return null;
+    return n.lhs.unwrap();
+}
+
 /// The protocol-reference node an `impl_has_decl` conforms to, or `null` for a
 /// non-conformance (`impl_decl`) or any other tag.
 pub fn implProtocol(tree: Tree, node: Node) ?Index {
@@ -527,7 +538,11 @@ pub const ParseHeader = extern struct {
     /// `impl_has_decl` Tag ordinals were appended, and `impl_has_decl` stores a new
     /// 3-cell header in its `rhs`, so a v8 blob predating these tags must miss cleanly
     /// rather than misdecode a node whose tag/cell meaning the new tags changed.
-    version: u32 = 9,
+    /// Bumped to 10 for the M13 constrained-generics parse change: a `generic_param`'s
+    /// `lhs` may now carry a bound protocol-ref node (`[T has P]`), where a v9 blob
+    /// always left it `none` — a v9 blob must miss cleanly so a stale parse never feeds
+    /// an unbounded generic-param shape into the M13 bound-resolution machinery.
+    version: u32 = 10,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -588,7 +603,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 9) return null;
+    if (hdr.magic != parse_magic or hdr.version != 10) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -1188,6 +1203,43 @@ test "unpack rejects a v8 blob (pre-protocols)" {
     // Rewrite `version` to 8: a blob from a compiler predating the M11 protocol tags
     // must miss cleanly, not misdecode an `impl_has_decl`'s 3-cell header.
     std.mem.writeInt(u32, blob[4..8], 8, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "pack/unpack round-trips a tree with a bound generic_param (v10)" {
+    const gpa = testing.allocator;
+    // A pure byte round-trip — the tree only has to contain a `generic_param` whose
+    // `lhs` names a bound protocol-ref node so the v10 shape is exercised.
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 1, .lhs = none, .rhs = none }, // bound protocol ref `P`
+        .{ .tag = .generic_param, .main_token = 0, .lhs = Index.from(0), .rhs = none }, // `T has P`
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(2), .rhs = none },
+    };
+    var extra = [_]u32{ 1, 1 }; // program's Range header {start=... } — arbitrary
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqual(@as(?Index, Index.from(0)), genericParamBound(got, Index.from(1)));
+}
+
+test "unpack rejects a v9 blob (pre-generic-bounds)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    // Rewrite `version` to 9: a blob from a compiler predating the M13 generic-bound
+    // parse change never left a bound in `generic_param.lhs`, so it must miss cleanly.
+    std.mem.writeInt(u32, blob[4..8], 9, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
 }
 

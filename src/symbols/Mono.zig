@@ -17,6 +17,28 @@ const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Type = @import("../layout/Engine.zig").Type;
 
+/// One resolved bound `[T has P]` on a monomorphized instance (M13): the witnessing
+/// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
+/// is the structural datum folded (ordered, never XOR) into the instance's content
+/// fingerprint so toggling a sibling-module conformance invalidates EXACTLY the
+/// dependent monomorphizations. NOT the impl body-fp (that would over-invalidate) —
+/// only the protocol identity + the conforming type's layout + the witnessing method
+/// symbols in protocol-declared order.
+///
+/// LIFETIME (getting this wrong is a use-after-free in codegen):
+///   * `protocol_name` borrows the SOURCE-backed `ProtocolSym.name` (stable; the
+///     `t.protocols` array is freed at typecheck teardown but the name BYTES are
+///     source slices that outlive codegen).
+///   * `witness_syms` element slices borrow `gph_fn_names` (resolve-result-backed,
+///     outlives codegen); the OUTER `witness_syms` slice is OWNED by the Instance.
+///   * `conform_ty` is a 12-byte POD (the ground conforming `structT`/`enumT`/scalar).
+/// Only the outer `conformances` slice + each `witness_syms` outer slice are owned.
+pub const ResolvedConformance = struct {
+    protocol_name: []const u8,
+    conform_ty: Type,
+    witness_syms: []const []const u8,
+};
+
 /// One reified generic instance. All slices are OWNED (freed by the owning
 /// `GraphResult`).
 pub const Instance = struct {
@@ -37,6 +59,12 @@ pub const Instance = struct {
     /// Owning module id (the template's module) and the template's decl node.
     mod: u32,
     decl_node: Ast.Index,
+    /// The resolved bounds `[T has P]` witnessing conformances for this instance
+    /// (M13), one per bounded generic param, in generic-param order. Empty (`&.{}`)
+    /// for an unbounded template's instance so its fingerprint fold is byte-identical
+    /// (warm cache preserved). The OUTER slice + each entry's `witness_syms` outer
+    /// slice are OWNED by the owning `GraphResult`; see `ResolvedConformance`.
+    conformances: []const ResolvedConformance = &.{},
 };
 
 /// The index of the instance for `(gid, args)`, or null. A deterministic linear
@@ -139,6 +167,30 @@ test "find matches on gid + args by Type.eql" {
     try testing.expectEqual(@as(?usize, 1), find(&insts, 0, &.{Type.structT(0)}));
     try testing.expectEqual(@as(?usize, null), find(&insts, 0, &.{Type.bool}));
     try testing.expectEqual(@as(?usize, null), find(&insts, 1, &.{Type.int}));
+}
+
+test "an instance carries its resolved conformances (M13)" {
+    const witness = [_][]const u8{"lib.P.dbl"};
+    const confs = [_]ResolvedConformance{.{ .protocol_name = "Doubler", .conform_ty = Type.structT(3), .witness_syms = &witness }};
+    const inst = Instance{
+        .template_gid = 5,
+        .args = &.{Type.structT(3)},
+        .node_types = &.{},
+        .params = &.{Type.structT(3)},
+        .ret = Type.int,
+        .name = "twice$s3",
+        .mod = 0,
+        .decl_node = Ast.none,
+        .conformances = &confs,
+    };
+    try testing.expectEqual(@as(usize, 1), inst.conformances.len);
+    try testing.expectEqualStrings("Doubler", inst.conformances[0].protocol_name);
+    try testing.expect(Type.eql(Type.structT(3), inst.conformances[0].conform_ty));
+    try testing.expectEqualStrings("lib.P.dbl", inst.conformances[0].witness_syms[0]);
+    // An instance built WITHOUT conformances defaults to the empty slice (warm-cache
+    // byte-identity for unbounded templates).
+    const plain = Instance{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .params = &.{Type.int}, .ret = Type.int, .name = "id$int", .mod = 0, .decl_node = Ast.none };
+    try testing.expectEqual(@as(usize, 0), plain.conformances.len);
 }
 
 test "lessThan is a total canonical order (gid then arg triples)" {

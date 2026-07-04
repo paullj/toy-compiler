@@ -1,0 +1,19 @@
+# Feature: a constrained generic `fn twice[T has Doubler](v: T)` (M13). The bound
+# `[T has Doubler]` is checked ONCE against the protocol (bound-as-axiom): `v.dbl()`
+# resolves through `Doubler`'s signature, so the body compiles independent of any
+# instantiation. At the call `twice(P{..})` the bound resolves against `P`'s
+# `impl P has Doubler` conformance and monomorphizes; `21 * 2 * 2 / 2 == 42`.
+# expect: exit 42
+protocol Doubler {
+    fn dbl(self) -> int
+}
+
+struct P { x: int }
+
+impl P has Doubler {
+    fn dbl(self) -> int { self.x * 2 }
+}
+
+fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+
+fn main() -> int { return twice(P{ x: 21 }) / 2 }

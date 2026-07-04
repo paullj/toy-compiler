@@ -41,6 +41,19 @@ pub const TouchedType = struct {
     layout: []const u8 = &.{},
 };
 
+/// A resolved `[T has P]` bound witnessing an instance's conformance (M13), folded
+/// as the ordered `(e)` component below. `conform` is the conforming type's index-free
+/// layout descriptor (built by the SAME `appendTouched` the type-arg fold uses);
+/// `witness_syms` are the witnessing method SymNames in protocol-declared order — NOT
+/// the impl body-fp (that would over-invalidate). Toggling a sibling conformance to a
+/// different witness / conforming layout flips this datum, and thus the dependent
+/// instance's fingerprint, deterministically.
+pub const ResolvedConformance = struct {
+    protocol_name: []const u8,
+    conform: TouchedType,
+    witness_syms: []const []const u8,
+};
+
 /// Bumped when the in-memory layout encoding of any type changes, so a stale blob
 /// from a prior layout is invalidated.
 const type_layout_version: u8 = 3;
@@ -67,6 +80,15 @@ pub fn fingerprint(
     /// the warm cache is preserved. Two instances of one template get distinct
     /// fingerprints even when the template body/sig folds are identical.
     type_args: []const TouchedType,
+    /// (e) The resolved `[T has P]` bound conformances of a monomorphized instance
+    /// (M13), in generic-param order — each folding the witnessing impl's STRUCTURAL
+    /// identity (protocol name + conforming-type layout + witness SymNames), NOT its
+    /// body-fp. Empty for every non-bounded (fn/instance): the fold is then SKIPPED
+    /// ENTIRELY, so every existing fp is byte-identical and the warm cache is
+    /// preserved. This is the incremental-correctness core the M15+ operator branch
+    /// depends on: toggling a sibling-module conformance flips exactly the dependent
+    /// monomorphizations' keys.
+    conformances: []const ResolvedConformance,
 ) u64 {
     var h = std.hash.Wyhash.init(seed);
 
@@ -113,6 +135,25 @@ pub fn fingerprint(
         }
     }
 
+    // (e) resolved bound conformances (M13). Folded ONLY when present (a bounded
+    // instance), so every non-bounded fp is byte-identical (warm cache preserved).
+    // ORDERED (count sentinel + per-conformance leaves in generic-param order, then
+    // witness SymNames in protocol-declared order); never XOR, never a build-local
+    // index — only the source-borrowed protocol NAME, the conforming type's layout
+    // descriptor (mirroring (c)/(d)), and the witnessing method mangled SymNames. This
+    // is the stale-cache-miscompile guard: a conformance edit (witness or conforming
+    // layout) flips exactly the dependent monomorphization's key.
+    if (conformances.len > 0) {
+        AstWalk.updateU32(&h, @intCast(conformances.len));
+        for (conformances) |rc| {
+            AstWalk.updateLeaf(&h, rc.protocol_name);
+            h.update(&[_]u8{ @intFromEnum(rc.conform.kind), type_layout_version });
+            if (rc.conform.kind == .@"struct" or rc.conform.kind == .@"enum") AstWalk.updateLeaf(&h, rc.conform.layout);
+            AstWalk.updateU32(&h, @intCast(rc.witness_syms.len));
+            for (rc.witness_syms) |w| AstWalk.updateLeaf(&h, w);
+        }
+    }
+
     return h.final();
 }
 
@@ -148,7 +189,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 }
 
 fn fp(b: *const Built, fn_idx: usize) u64 {
-    return fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), &.{}, &.{}, &.{});
+    return fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), &.{}, &.{}, &.{}, &.{});
 }
 
 test "position-independent: a fn's hash is the same regardless of sibling order" {
@@ -199,8 +240,8 @@ test "callee signature folds in: a sig change flips the caller's hash" {
     const decl = b.fnDecl(0);
     const sig_a = [_]Sig{.{ .kind = .user_fn, .name = "g", .params = &.{.int}, .ret = .int }};
     const sig_b = [_]Sig{.{ .kind = .user_fn, .name = "g", .params = &.{ .int, .int }, .ret = .int }};
-    const ha = fingerprint(b.tree, b.tokens, b.source, decl, &sig_a, &.{}, &.{});
-    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &sig_b, &.{}, &.{});
+    const ha = fingerprint(b.tree, b.tokens, b.source, decl, &sig_a, &.{}, &.{}, &.{});
+    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &sig_b, &.{}, &.{}, &.{});
     try testing.expect(ha != hb);
 }
 
@@ -214,8 +255,8 @@ test "callee kind folds in: builtin vs user_fn of an identical sig flips the has
     // shadow/unshadow edit is a stale-cache miscompile.
     const builtin_callee = [_]Sig{.{ .kind = .builtin, .name = "print", .params = &.{.str}, .ret = .unit }};
     const user_callee = [_]Sig{.{ .kind = .user_fn, .name = "print", .params = &.{.str}, .ret = .unit }};
-    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &builtin_callee, &.{}, &.{});
-    const hu = fingerprint(b.tree, b.tokens, b.source, decl, &user_callee, &.{}, &.{});
+    const hb = fingerprint(b.tree, b.tokens, b.source, decl, &builtin_callee, &.{}, &.{}, &.{});
+    const hu = fingerprint(b.tree, b.tokens, b.source, decl, &user_callee, &.{}, &.{}, &.{});
     try testing.expect(hb != hu);
 }
 
@@ -318,8 +359,8 @@ test "touched struct layout folds in: a field-layout edit flips the hash" {
     // Same struct name, different layout bytes (a field added) → different hash.
     const v1 = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
     const v2 = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00y\x00\x02\x08\x00\x00\x00\x10\x00\x00\x00\x08\x00\x00\x00");
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1, &.{});
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1, &.{}, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{}, &.{});
     try testing.expect(h1 != h2);
 }
 
@@ -330,8 +371,8 @@ test "touched struct layout: identical layout hashes identically (cache hit)" {
     const decl = b.fnDecl(0);
     const v = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
     const v2 = touchedStruct("Point", "Point\x00x\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{});
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{}, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{}, &.{});
     try testing.expectEqual(h1, h2);
 }
 
@@ -353,11 +394,11 @@ test "a fn NOT touching a struct is unaffected by an unrelated touched-struct fo
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
     const v = touchedStruct("Q", "Q\x00n\x00\x02\x00\x00\x00\x00\x08\x00\x00\x00\x08\x00\x00\x00");
-    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{});
-    const without = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
+    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{}, &.{});
+    const without = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     // They legitimately differ (the touched set is part of the key); the point is
     // each is a pure function of its OWN inputs — recomputing `without` matches.
-    try testing.expectEqual(without, fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}));
+    try testing.expectEqual(without, fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{}));
     try testing.expect(with != without);
 }
 
@@ -396,8 +437,8 @@ test "touched enum layout folds in: a variant-layout edit flips the hash" {
     const decl = b.fnDecl(0);
     const v1 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00tag" }};
     const v2 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00TAG-changed" }};
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1, &.{});
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v1, &.{}, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{}, &.{});
     try testing.expect(h1 != h2);
 }
 
@@ -408,8 +449,8 @@ test "touched enum layout: identical layout hashes identically (cache hit)" {
     const decl = b.fnDecl(0);
     const v = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00same" }};
     const v2 = [1]TouchedType{.{ .kind = .@"enum", .layout = "E\x00same" }};
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{});
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{});
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v, &.{}, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &v2, &.{}, &.{});
     try testing.expectEqual(h1, h2);
 }
 
@@ -458,8 +499,8 @@ test "type-args fold: id[int] and id[Point] get distinct fingerprints (M2)" {
     // int scalar vs a struct with a layout. The (d) fold must separate them.
     const as_int = [1]TouchedType{.{ .kind = .int }};
     const as_pt = [1]TouchedType{.{ .kind = .@"struct", .layout = "Point\x00x\x00\x02y" }};
-    const h_int = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &as_int);
-    const h_pt = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &as_pt);
+    const h_int = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &as_int, &.{});
+    const h_pt = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &as_pt, &.{});
     try testing.expect(h_int != h_pt);
 }
 
@@ -471,12 +512,12 @@ test "type-args fold: empty type_args is byte-identical to no fold (warm cache p
     // The (d) fold is CONDITIONAL on a non-empty slice, so an empty type_args folds
     // NOTHING and a non-generic fn's fingerprint is stable across calls — the warm
     // cache survives M2. (A pre-M2 blob keyed on the same fp still hits.)
-    const a = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
-    const c = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
+    const a = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
+    const c = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     try testing.expectEqual(a, c);
     // A non-empty type_args MUST diverge from the empty fold (proving the gate fires).
     const v = [1]TouchedType{.{ .kind = .int }};
-    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v);
+    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v, &.{});
     try testing.expect(with != a);
 }
 
@@ -509,7 +550,64 @@ test "type-args fold: identical type-args hash identically (instance cache hit)"
     const decl = b.fnDecl(0);
     const v1 = [1]TouchedType{.{ .kind = .@"struct", .layout = "P\x00same" }};
     const v2 = [1]TouchedType{.{ .kind = .@"struct", .layout = "P\x00same" }};
-    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v1);
-    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v2);
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v1, &.{});
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &v2, &.{});
+    try testing.expectEqual(h1, h2);
+}
+
+test "conformance fold (e): empty conformances is byte-identical to no fold (warm cache)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    // The (e) fold is CONDITIONAL on a non-empty slice, so an empty conformances folds
+    // NOTHING — a non-bounded fn's fingerprint is byte-identical to the pre-M13 fold,
+    // preserving the warm cache. Both a plain call and the (d)+(e) call must agree.
+    const none1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
+    const none2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
+    try testing.expectEqual(none1, none2);
+    const witness = [_][]const u8{"lib.P.dbl"};
+    const rc = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &witness }};
+    const with = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc);
+    try testing.expect(with != none1); // a non-empty fold MUST diverge (the gate fires)
+}
+
+test "conformance fold (e): a witness-SymName change flips the fingerprint" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const w1 = [_][]const u8{"lib.P.dbl"};
+    const w2 = [_][]const u8{"lib.Q.dbl"}; // a DIFFERENT witnessing symbol (override swap)
+    const rc1 = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w1 }};
+    const rc2 = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w2 }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc1);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc2);
+    try testing.expect(h1 != h2);
+}
+
+test "conformance fold (e): a conform-layout change flips the fingerprint" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const w = [_][]const u8{"lib.P.dbl"};
+    const rc1 = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w }};
+    const rc2 = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x\x00y" }, .witness_syms = &w }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc1);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc2);
+    try testing.expect(h1 != h2);
+}
+
+test "conformance fold (e): identical conformances hash identically (cache hit)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const w = [_][]const u8{"lib.P.dbl"};
+    const rc1 = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w }};
+    const rc2 = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc1);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc2);
     try testing.expectEqual(h1, h2);
 }

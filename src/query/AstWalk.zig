@@ -193,7 +193,17 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             // non-empty, so a non-generic fn folds NOTHING new and stays byte-identical.
             if (proto.generic_params.len > 0) {
                 try emit(visitor, .{ .count = @intCast(proto.generic_params.len) });
-                for (proto.generic_params) |gp| try emit(visitor, .{ .leaf = src.leaf(gp) });
+                for (proto.generic_params) |gp| {
+                    try emit(visitor, .{ .leaf = src.leaf(gp) });
+                    // M13: fold a `[T has P]` bound protocol-ref so `[T]`->`[T has P]`
+                    // and a bound-name change flip the template body-fp (hence every
+                    // instance). Unbounded params (lhs == none) emit NOTHING new, so a
+                    // non-generic AND an existing unbounded-generic fp stay byte-identical
+                    // (warm cache preserved); the count sentinel above already prevents a
+                    // `[T has P]` (count 1) from aliasing a `[T,U]` (count 2).
+                    const bound = tree.nodes[gp.int()].lhs;
+                    if (bound != Ast.none) try walkInner(src, bound, collect, visitor);
+                }
             }
             try emit(visitor, .{ .count = @intCast(proto.params.len) });
             for (proto.params, 0..) |p, i| {

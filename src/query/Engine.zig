@@ -565,7 +565,19 @@ pub fn codegen(
     }
     try Walks.walkTypeArgs(gpa, frozen, frozen.type_args, &type_args);
 
-    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items);
+    // (e) The resolved bound conformances of a bounded monomorphized instance (M13),
+    // folded structurally so toggling a sibling-module conformance invalidates exactly
+    // the dependent monomorphizations. Empty for every non-bounded unit -> the fold is
+    // skipped and its fp is byte-identical (warm cache preserved). This is the SINGLE
+    // Engine.codegen threading point the M13 contract names.
+    var confs: std.ArrayList(Fingerprint.ResolvedConformance) = .empty;
+    defer {
+        Walks.freeConformances(gpa, confs.items);
+        confs.deinit(gpa);
+    }
+    try Walks.walkConformances(gpa, frozen, frozen.conformances, &confs);
+
+    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items, confs.items);
     // The uniform codegen key: the content fingerprint xor'd with the opt level
     // and the fn's OWN emitted symbol, target-sensitive. `Key.codegen` is the ONE
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).

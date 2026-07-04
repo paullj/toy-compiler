@@ -119,6 +119,14 @@ pub const BodyChecker = struct {
     /// Consumed by the `Self` type-ref hook (`selfType`).
     cur_self_type: ?Type = null,
 
+    /// The per-generic-param bound protocol ids (M13, `[T has P]`), indexed by type-var
+    /// ordinal — `bound_protocols[ord]` is the protocol bounding param `ord`, or null if
+    /// unbounded. Set by `bodyCheckerFor` from `FnSym.generic_bounds`; empty (inert) for
+    /// a non-generic/unbounded fn. Consumed ONLY by the bound-as-axiom `type_var`-receiver
+    /// method dispatch in `typeOfCall` (a bounded template's body check); in a per-instance
+    /// re-check the receiver is grounded, so that branch never fires.
+    bound_protocols: []const ?u32 = &.{},
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
@@ -1642,6 +1650,49 @@ pub const BodyChecker = struct {
                     // A generic-type value with no such method (M10).
                     for (args) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+                    return .invalid;
+                } else if (recv_ty.isTypeVar()) {
+                    // A method call `v.m(..)` on a `type_var` receiver (M13 bound-as-axiom):
+                    // this only happens while checking a BOUNDED generic template's body.
+                    // ONLY the methods of the param's declared bound `[T has P]` are
+                    // callable; resolve `m` against the bound protocol's decoded signature
+                    // (Self -> the bounded type_var). A non-protocol/unbounded method call
+                    // is T0018. (In a per-instance re-check the receiver is grounded, so
+                    // this branch never fires — the struct/scalar branch above does.)
+                    const member = bc.nameText(callee.main_token);
+                    const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                    const ord = recv_ty.typeVarOrd();
+                    const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
+                    if (pid_opt) |pid| {
+                        const p = bc.model.protocols[pid];
+                        var mi: ?usize = null;
+                        for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
+                            mi = k;
+                            break;
+                        };
+                        if (mi) |k| {
+                            const psig = p.method_params[k]; // [self, ...]
+                            const self_off: usize = @min(psig.len, 1);
+                            const want = psig.len - self_off;
+                            if (args.len != want) {
+                                for (args) |a| _ = try bc.typeOf(a);
+                                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+                            } else for (args, psig[self_off..], 0..) |a, pty, i| {
+                                const wt = if (pty.isTypeVar()) recv_ty else pty; // Self -> the bounded type_var
+                                const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
+                                if (!Type.assignable(wt, at))
+                                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
+                            }
+                            const ret = if (p.method_rets[k].isTypeVar()) recv_ty else p.method_rets[k];
+                            bc.node_types[(node_idx).int()] = ret;
+                            return ret;
+                        }
+                        for (args) |a| _ = try bc.typeOf(a);
+                        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
+                        return .invalid;
+                    }
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on unbounded type parameter", .{member});
                     return .invalid;
                 }
             }

@@ -26,6 +26,7 @@ const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Fingerprint = @import("Fingerprint.zig");
 const AstWalk = @import("AstWalk.zig");
+const Mono = @import("../symbols/Mono.zig");
 
 /// Collect the signatures of every function this fn calls, in body walk order
 /// (matching the fingerprint's walk) so the fingerprint's (b) component lines up.
@@ -67,4 +68,26 @@ pub fn freeTouched(gpa: std.mem.Allocator, items: []const Fingerprint.TouchedTyp
 /// fn (no args). Caller frees each `layout` via `freeTouched`.
 pub fn walkTypeArgs(gpa: std.mem.Allocator, frozen: anytype, args: []const @import("../layout/Engine.zig").Type, out: *std.ArrayList(Fingerprint.TouchedType)) error{OutOfMemory}!void {
     for (args) |a| try AstWalk.appendTouched(gpa, frozen, a, out);
+}
+
+/// Build the ordered `Fingerprint.ResolvedConformance` list for a monomorphized
+/// instance's resolved `[T has P]` bounds (M13), fed into `fingerprint`'s (e)
+/// component. Each entry's `conform` is the conforming type's index-free layout
+/// descriptor built by the SAME `appendTouched` the type-arg (d) fold uses (reading
+/// `frozen.layouts`, the codegen-time concrete reified layout); `protocol_name` and
+/// `witness_syms` are borrowed verbatim from the `Mono.ResolvedConformance` (both
+/// outlive codegen). Empty for a non-bounded instance. Caller frees via `freeConformances`.
+pub fn walkConformances(gpa: std.mem.Allocator, frozen: anytype, conformances: []const Mono.ResolvedConformance, out: *std.ArrayList(Fingerprint.ResolvedConformance)) error{OutOfMemory}!void {
+    for (conformances) |rc| {
+        var tmp: std.ArrayList(Fingerprint.TouchedType) = .empty;
+        defer tmp.deinit(gpa);
+        try AstWalk.appendTouched(gpa, frozen, rc.conform_ty, &tmp);
+        try out.append(gpa, .{ .protocol_name = rc.protocol_name, .conform = tmp.items[0], .witness_syms = rc.witness_syms });
+    }
+}
+
+/// Free the conform-layout slices owned by a `walkConformances` result (the outer
+/// list is caller-owned; `protocol_name`/`witness_syms` are borrowed, never freed here).
+pub fn freeConformances(gpa: std.mem.Allocator, items: []const Fingerprint.ResolvedConformance) void {
+    for (items) |c| if (c.conform.layout.len > 0) gpa.free(c.conform.layout);
 }
