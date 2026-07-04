@@ -1,0 +1,7 @@
+struct P { x: int }
+
+fn main() -> int {
+    p := P{ x: 1 }
+    q := P{ x: 2 }
+    return if p == q { 1 } else { 0 }  #~ ERROR [T0026] requires an 'Eq' impl
+}

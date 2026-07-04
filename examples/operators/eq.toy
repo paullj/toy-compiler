@@ -1,0 +1,15 @@
+# Feature: `==` / `!=` are operators-as-protocols (M15). They desugar to the prelude
+# protocol `Eq { fn eq(self, other: Self) -> bool }`; a user struct conforms via
+# `impl P has Eq`, so `p == q` dispatches to `P::eq` and runs e2e.
+# expect: exit 42
+struct P { x: int }
+
+impl P has Eq {
+    fn eq(self, o: P) -> bool { self.x == o.x }
+}
+
+fn main() -> int {
+    p := P{ x: 42 }
+    q := P{ x: 42 }
+    return if p == q { 42 } else { 0 }
+}

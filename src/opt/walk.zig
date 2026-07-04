@@ -24,7 +24,7 @@ pub fn forEachValueUse(func: *const Ir.Function, ctx: anytype, comptime f: fn (@
                     use(ctx, f, bin.lhs);
                     use(ctx, f, bin.rhs);
                 },
-                .neg, .bnot, .get_tag => |v| use(ctx, f, v),
+                .neg, .bnot, .get_tag, .load_byte => |v| use(ctx, f, v),
                 .icmp => |c| {
                     use(ctx, f, c.lhs);
                     use(ctx, f, c.rhs);
@@ -93,7 +93,7 @@ pub fn remapValues(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(c
                     bin.lhs = map(ctx, bin.lhs);
                     bin.rhs = map(ctx, bin.rhs);
                 },
-                .neg, .bnot, .get_tag => |*v| v.* = map(ctx, v.*),
+                .neg, .bnot, .get_tag, .load_byte => |*v| v.* = map(ctx, v.*),
                 .icmp => |*c| {
                     c.lhs = map(ctx, c.lhs);
                     c.rhs = map(ctx, c.rhs);
@@ -144,7 +144,7 @@ pub fn remapUses(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(ctx
                     bin.lhs = map(ctx, bin.lhs);
                     bin.rhs = map(ctx, bin.rhs);
                 },
-                .neg, .bnot, .get_tag => |*v| v.* = map(ctx, v.*),
+                .neg, .bnot, .get_tag, .load_byte => |*v| v.* = map(ctx, v.*),
                 .icmp => |*c| {
                     c.lhs = map(ctx, c.lhs);
                     c.rhs = map(ctx, c.rhs);

@@ -132,6 +132,14 @@ pub fn ldrRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
     return 0xF9400000 | (scaled << 10) | (rn << 5) | rt;
 }
 
+/// ldrb wt, [rn, #byteOff] — zero-extended single-byte load, unsigned offset (the
+/// imm12 is UNSCALED for a byte access, so `byteOff` is a raw byte displacement,
+/// unlike `ldrRegUoff`'s /8 scaling). ldrb w0,[x0] → 0x39400000; ldrb w0,[x0,#1] →
+/// 0x39400400. The M15 str byte-compare reads `ptr[i]` with this.
+pub fn ldrbRegUoff(rt: u32, rn: u32, byteOff: u12) u32 {
+    return 0x39400000 | (@as(u32, byteOff) << 10) | (rn << 5) | rt;
+}
+
 /// str rt, [rn, #byteOff] — 64-bit store, unsigned scaled offset, arbitrary base
 /// register `rn`. byteOff must be a multiple of 8. str x0,[x8] → 0xF9000100;
 /// str x1,[x8,#8] → 0xF9000501. Symmetric to `ldrRegUoff`; used for the
@@ -376,6 +384,13 @@ test "str via arbitrary base register (M9 indirect/x8 sret + struct copy)" {
     try testing.expectEqual(@as(u32, 0xF9000100), strRegUoff(0, 8, 0)); // str x0, [x8]
     try testing.expectEqual(@as(u32, 0xF9000501), strRegUoff(1, 8, 8)); // str x1, [x8, #8]
     try testing.expectEqual(@as(u32, 0xF9000909), strRegUoff(9, 8, 16)); // str x9, [x8, #16]
+}
+
+test "ldrb zero-extended byte load (M15 str byte-compare)" {
+    try testing.expectEqual(@as(u32, 0x39400000), ldrbRegUoff(0, 0, 0)); // ldrb w0,[x0]
+    try testing.expectEqual(@as(u32, 0x39400400), ldrbRegUoff(0, 0, 1)); // ldrb w0,[x0,#1]
+    try testing.expectEqual(@as(u32, 0x39401441), ldrbRegUoff(1, 2, 5)); // ldrb w1,[x2,#5]
+    try testing.expectEqual(@as(u32, 0x397FFC00), ldrbRegUoff(0, 0, 4095)); // ldrb w0,[x0,#4095]
 }
 
 test "in-place patchers preserve register fields and resolve immediates" {
