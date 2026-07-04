@@ -709,6 +709,18 @@ ord_protocol_id: ?u32 = null,
 /// universally nameable with no import. Null until `registerPrelude` runs.
 ordering_enum_id: ?u32 = null,
 
+/// The global protocol ids of the prelude arithmetic protocols `Add`/`Sub`/`Mul`/`Div`
+/// (M17), assigned in `registerPrelude` right after `Ord` in fixed append order (so
+/// Add=2, Sub=3, Mul=4, Div=5 — a pure function of source). Each maps one operator
+/// (`+`/`-`/`*`/`/`) to a homogeneous `fn m(self, other: Self) -> Self`. A bare
+/// `Add`/… reference that misses the active module map falls back to these ids in
+/// `protocolIdFromNode` (mirroring the `Eq`/`Ord` fallbacks). Null until `registerPrelude`
+/// runs; a null id denies conformance (-> T0028) rather than miscompiling.
+add_protocol_id: ?u32 = null,
+sub_protocol_id: ?u32 = null,
+mul_protocol_id: ?u32 = null,
+div_protocol_id: ?u32 = null,
+
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
 /// each method's `decodeFnSig` (Pass A); null otherwise (non-method decoding is
@@ -863,6 +875,13 @@ pub const Model = struct {
     /// The prelude `Ordering` enum's global id (M16), or null if `registerPrelude` never
     /// ran. Reserved for downstream consumers that need the discriminant enum type.
     ordering_enum_id: ?u32,
+    /// The prelude arithmetic protocol ids (M17): `Add`/`Sub`/`Mul`/`Div`, or null if
+    /// `registerPrelude` never ran. `conformsToArith` keys the `+`/`-`/`*`/`/` typing off
+    /// the matching one; a null id denies conformance (-> T0028) rather than miscompiling.
+    add_protocol_id: ?u32,
+    sub_protocol_id: ?u32,
+    mul_protocol_id: ?u32,
+    div_protocol_id: ?u32,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -882,6 +901,10 @@ fn buildModel(t: *Typecheck) Model {
         .eq_protocol_id = t.eq_protocol_id,
         .ord_protocol_id = t.ord_protocol_id,
         .ordering_enum_id = t.ordering_enum_id,
+        .add_protocol_id = t.add_protocol_id,
+        .sub_protocol_id = t.sub_protocol_id,
+        .mul_protocol_id = t.mul_protocol_id,
+        .div_protocol_id = t.div_protocol_id,
     };
 }
 
@@ -2330,6 +2353,18 @@ fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         if (t.ord_protocol_id) |oid| {
             if (std.mem.eql(u8, name, "Ord")) return oid;
         }
+        if (t.add_protocol_id) |aid| {
+            if (std.mem.eql(u8, name, "Add")) return aid;
+        }
+        if (t.sub_protocol_id) |sid| {
+            if (std.mem.eql(u8, name, "Sub")) return sid;
+        }
+        if (t.mul_protocol_id) |mid| {
+            if (std.mem.eql(u8, name, "Mul")) return mid;
+        }
+        if (t.div_protocol_id) |did| {
+            if (std.mem.eql(u8, name, "Div")) return did;
+        }
         return null;
     }
     if (n.tag == .field_access) {
@@ -2870,6 +2905,44 @@ fn registerPrelude(t: *Typecheck) !void {
     try t.conformances.append(t.gpa, .{ .protocol = ord_id, .recv = Type.int });
     try t.conformances.append(t.gpa, .{ .protocol = ord_id, .recv = Type.str });
     try t.conformances.append(t.gpa, .{ .protocol = ord_id, .recv = Type.bool });
+
+    // Arithmetic operators-as-protocols (M17): Add/Sub/Mul/Div, each homogeneous
+    // `fn <m>(self, other: Self) -> Self` (Self = type_var(0), so both `[self, Self]`
+    // params AND the return are type_var(0); a `-> Self` return grounds to `recv` in the
+    // T0024 coherence check, enforcing Out=Self for a user impl). ids by append order right
+    // after Ord => Add=2, Sub=3, Mul=4, Div=5, a pure function of source. Builtin conformance
+    // is `int` ONLY — str/bool get NO arithmetic (str concatenation allocates, deferred to the
+    // heap roadmap), so `str + str`/`bool + bool` fall to T0028 rather than a silent heap op.
+    // All slices gpa-allocated (never comptime literals) so teardown frees them uniformly.
+    const arith = [_]struct { proto: []const u8, method: []const u8, id: *?u32 }{
+        .{ .proto = "Add", .method = "add", .id = &t.add_protocol_id },
+        .{ .proto = "Sub", .method = "sub", .id = &t.sub_protocol_id },
+        .{ .proto = "Mul", .method = "mul", .id = &t.mul_protocol_id },
+        .{ .proto = "Div", .method = "div", .id = &t.div_protocol_id },
+    };
+    for (arith) |a| {
+        const methods = try t.gpa.alloc([]const u8, 1);
+        methods[0] = a.method;
+        const params = try t.gpa.alloc([]const Type, 1);
+        const p0 = try t.gpa.alloc(Type, 2);
+        p0[0] = Type.typeVar(0);
+        p0[1] = Type.typeVar(0);
+        params[0] = p0;
+        const rets = try t.gpa.alloc(Type, 1);
+        rets[0] = Type.typeVar(0);
+        const pid: u32 = @intCast(t.protocols.items.len);
+        a.id.* = pid;
+        try t.protocols.append(t.gpa, .{
+            .name = a.proto,
+            .mod = 0,
+            .pub_export = true,
+            .decl_node = Ast.none,
+            .methods = methods,
+            .method_params = params,
+            .method_rets = rets,
+        });
+        try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = Type.int });
+    }
 }
 
 /// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
@@ -4015,6 +4088,123 @@ test "M16: explicit `impl P has Eq` alongside `impl P has Ord` yields no T0020 (
     );
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M17: `+`/`-`/`*`/`/` on a struct with the matching impl type to the operand type, zero diags" {
+    const gpa = testing.allocator;
+    // 0 diags proves each `(Add/Sub/Mul/Div, V2)` conformance resolves (the operator would
+    // otherwise be T0028); every top-level arithmetic binary types to the operand struct
+    // type (Out=Self), so the value is usable as a V2.
+    var c = try checkSource(
+        \\struct V2 { x: int, y: int }
+        \\impl V2 has Add { fn add(self, o: V2) -> V2 { V2{ x: self.x + o.x, y: self.y + o.y } } }
+        \\impl V2 has Sub { fn sub(self, o: V2) -> V2 { V2{ x: self.x - o.x, y: self.y - o.y } } }
+        \\impl V2 has Mul { fn mul(self, o: V2) -> V2 { V2{ x: self.x * o.x, y: self.y * o.y } } }
+        \\impl V2 has Div { fn div(self, o: V2) -> V2 { V2{ x: self.x / o.x, y: self.y / o.y } } }
+        \\fn use_all(p: V2, q: V2) -> V2 { p + q - p * q / p }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const nts = c.result.node_types[0];
+    var n_arith: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .binary) continue;
+        const tag = c.tokens[n.main_token].tag;
+        if ((tag == .plus or tag == .minus or tag == .star or tag == .slash) and nts[i].kind == .@"struct") n_arith += 1;
+    }
+    try testing.expect(n_arith >= 4);
+}
+
+test "M17: int `+`/`-`/`*`/`/` type to int (builtin, inline), zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int { return 1 + 2 - 3 * 4 / 5 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M17: `+` on a struct with no `Add` impl is exactly one T0028 at the operator" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct V2 { x: int, y: int }
+        \\fn main() -> int {
+        \\ a := V2{ x: 1, y: 2 }
+        \\ b := V2{ x: 3, y: 4 }
+        \\ s := a + b
+        \\ return s.x
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0028, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Add' impl") != null);
+}
+
+test "M17: `str + str` is T0028 (no builtin Add for str — never a silent allocation)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int { s := "a" + "b"
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    var n28: usize = 0;
+    for (c.result.diags) |d| if (d.code == codes.Code.T0028) {
+        n28 += 1;
+        try testing.expect(std.mem.indexOf(u8, d.message, "requires an 'Add' impl for type 'str'") != null);
+    };
+    try testing.expectEqual(@as(usize, 1), n28);
+}
+
+test "M17: `bool + bool` is T0028 (no builtin Add for bool)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn f(a: bool, b: bool) -> bool { a + b }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    var n28: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0028) n28 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n28);
+}
+
+test "M17: a cross-type `+` (int + str) stays a homogeneity error, never T0028" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ x := 1 + "a"
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expect(c.result.diags[0].code != codes.Code.T0028);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "same type") != null);
+}
+
+test "M17: a user `impl P has Add` whose method returns non-Self is T0024 (Out=Self enforced)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Add { fn add(self, o: P) -> int { self.x + o.x } }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0024, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "add") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Add") != null);
 }
 
 test "M12: a user `impl int has (user protocol)` records a conformance and dispatches, no error" {
