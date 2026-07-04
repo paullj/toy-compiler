@@ -52,6 +52,12 @@ pub const ResolvedConformance = struct {
     protocol_name: []const u8,
     conform: TouchedType,
     witness_syms: []const []const u8,
+    /// The protocol type-args of this conformance (M14, `Into[int]` -> `[int]`), each an
+    /// index-free layout descriptor built by the SAME `appendTouched` the type-arg fold
+    /// uses. Folded ordered (never XOR) into the (e) component so an `Into[int]` ->
+    /// `Into[bool]` edit flips the dependent instance's fingerprint (stale-witness guard).
+    /// Empty for a non-generic protocol -> that conformance folds byte-identically to M13.
+    protocol_args: []const TouchedType = &.{},
 };
 
 /// Bumped when the in-memory layout encoding of any type changes, so a stale blob
@@ -151,6 +157,16 @@ pub fn fingerprint(
             if (rc.conform.kind == .@"struct" or rc.conform.kind == .@"enum") AstWalk.updateLeaf(&h, rc.conform.layout);
             AstWalk.updateU32(&h, @intCast(rc.witness_syms.len));
             for (rc.witness_syms) |w| AstWalk.updateLeaf(&h, w);
+            // (M14) The conformance's protocol type-args, ordered + structural (mirroring
+            // (d)); gated `len > 0` so a non-generic-protocol conformance folds
+            // byte-identically to M13 (warm cache preserved). NEVER XOR / interned index.
+            if (rc.protocol_args.len > 0) {
+                AstWalk.updateU32(&h, @intCast(rc.protocol_args.len));
+                for (rc.protocol_args) |pa| {
+                    h.update(&[_]u8{ @intFromEnum(pa.kind), type_layout_version });
+                    if (pa.kind == .@"struct" or pa.kind == .@"enum") AstWalk.updateLeaf(&h, pa.layout);
+                }
+            }
         }
     }
 
@@ -610,4 +626,52 @@ test "conformance fold (e): identical conformances hash identically (cache hit)"
     const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc1);
     const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc2);
     try testing.expectEqual(h1, h2);
+}
+
+test "conformance fold (e) M14: a protocol-args change (Into[int] -> Into[bool]) flips the fp" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const w = [_][]const u8{"lib.P.into$Into$int"};
+    // Same protocol, same conforming layout, same witness NAME — only the protocol
+    // type-args differ. This is the load-bearing stale-witness guard: an `Into[int]`
+    // instance must NOT serve a cached `Into[bool]` witness.
+    const int_arg = [_]TouchedType{.{ .kind = .int }};
+    const bool_arg = [_]TouchedType{.{ .kind = .bool }};
+    const rc_int = [1]ResolvedConformance{.{ .protocol_name = "Into", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w, .protocol_args = &int_arg }};
+    const rc_bool = [1]ResolvedConformance{.{ .protocol_name = "Into", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w, .protocol_args = &bool_arg }};
+    const h_int = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_int);
+    const h_bool = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_bool);
+    try testing.expect(h_int != h_bool);
+}
+
+test "conformance fold (e) M14: identical protocol-args hash identically" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const w = [_][]const u8{"lib.P.into$Into$int"};
+    const a1 = [_]TouchedType{.{ .kind = .int }};
+    const a2 = [_]TouchedType{.{ .kind = .int }};
+    const rc1 = [1]ResolvedConformance{.{ .protocol_name = "Into", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w, .protocol_args = &a1 }};
+    const rc2 = [1]ResolvedConformance{.{ .protocol_name = "Into", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w, .protocol_args = &a2 }};
+    const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc1);
+    const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc2);
+    try testing.expectEqual(h1, h2);
+}
+
+test "conformance fold (e) M14: empty protocol-args is byte-identical to a pre-M14 fold" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const w = [_][]const u8{"lib.P.dbl"};
+    // A non-generic-protocol conformance leaves `protocol_args` empty; the `len > 0` gate
+    // must make its (e) fold byte-identical to an M13 conformance that never had the field.
+    const rc_default = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w }};
+    const rc_empty = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w, .protocol_args = &.{} }};
+    const h_default = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_default);
+    const h_empty = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_empty);
+    try testing.expectEqual(h_default, h_empty);
 }

@@ -231,10 +231,10 @@ surface**. `registerPrelude` runs at the head of Phase 0c (serial), giving the `
 protocol global id 0; a bare `Eq` that names no module protocol falls back to that id
 in `protocolIdFromNode` (a user protocol of the same name shadows it via first-lookup).
 
-**Multi-space conformance key.** The coherence key is
-`(protocol, @intFromEnum(recv.kind), recv_id)`, so it spans builtin scalar Kinds
-(int/bool/str/unit — which carry no `struct_id`/`enum_id`) as well as struct/enum
-nominals (`recv_id` is 0 for scalars, which the kind byte already distinguishes).
+**Multi-space conformance key.** The coherence key spans `(protocol, recv.kind, recv_id)`
+— builtin scalar Kinds (int/bool/str/unit — which carry no `struct_id`/`enum_id`) as well
+as struct/enum nominals (`recv_id` is 0 for scalars, which the kind byte distinguishes).
+(M14 extends this key with the protocol type-args; see the generic-protocols section.)
 `registerPrelude` pre-seeds the builtin scalar conformances into the conformance table
 and `checkCoherence` seeds its `seen` set from them, so a user `impl int has Eq`
 collides with the builtin (T0020). A user impl **may** target a builtin scalar
@@ -248,6 +248,50 @@ fingerprint folds a fixed sentinel sig. `str` (needs a heap-free byte-compare �
 backend work) and `unit` (`()` is not a `type_names` scalar) are **deferred**; the key
 still spans all four Kinds, so a future user `impl str has Eq` keys correctly and no
 builtin blocks it.
+
+## Generic protocols + multi-conformance (M14)
+
+A protocol may carry **type parameters** — `protocol Into[U] { fn into(self) -> U }` —
+the associated-type replacement. A conformance names the args: `impl P has Into[int]`.
+Because the args are part of the conformance identity, **one type may conform to the
+same protocol multiple times** with different args:
+
+```
+impl P has Into[int]  { fn into(self) -> int  { self.x } }
+impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+```
+
+**Conformance key = `(protocol, type, protocol-args)`.** The coherence key is a
+serialized byte vector (variable arity forces bytes, over a `StringHashMap`) folding the
+protocol id, the receiver kind/id, and each arg's kind/id. So `Into[int]` and
+`Into[bool]` on one type do **not** collide, but two identical `Into[int]` still do
+(**T0020**). `findConformance` compares the same vector, and the resolved args fold
+**structurally** (ordered, never XOR) into the M13 `(e)` fingerprint component — so an
+`Into[int]` → `Into[bool]` edit flips exactly the dependent monomorphizations' keys
+(no stale-witness miscompile). M14 restricts protocol-args to already-concrete non-`App`
+value types (scalar/struct/enum); a composite `App` arg's check-time index is
+run-order-dependent, so it is rejected (would break key + fp determinism).
+
+**Ordinal scheme: `Self = type_var(0)`, protocol params = `type_var(1..)`.** When a
+protocol method sig is decoded, the synthetic `self` slot is forced to `type_var(0)` and
+the protocol's generic params occupy ordinals `1..` (a `""` placeholder reserves index 0
+for `Self`, since `""` never matches a source identifier). So `fn into(self) -> U`
+decodes to `[type_var(0)] -> type_var(1)`, and `U` never aliases the receiver.
+`groundProtoType(ty, recv, args)` grounds `tv(0)→recv` and `tv(k≥1)→args[k-1]` — used
+consistently in the protocol-sig decode, the T0024 coherence signature check, and the
+bound-as-axiom body dispatch.
+
+**Multi-conformance requires explicit args (T0025).** At a use site `p.into()` where the
+receiver conforms to one generic protocol **multiple times** and no protocol type-args
+disambiguate, the compiler does **not** pick arbitrarily — it is a use-site error
+**T0025** naming the conflicting conformances in source (fn-id) order (deterministic at
+any `-jN`). An explicit `p.into[int]()` (parsed as `call(type_app(field_access, [int]))`)
+selects the matching conformance. A type conforming **once** (a non-generic protocol OR a
+single generic conformance) resolves with **no** explicit args — byte-identical dispatch
+to M11/M13. The single disambiguator `resolveConformanceMethod` is shared by all three
+consumers (BodyChecker types, `lower` symbols, `AstWalk` fingerprint), so they always
+select the identical witness. A `[T has Convert[U]]` bound resolves at the mono worklist
+by substituting the bound's args through the instance type-args before `findConformance`.
 
 ## Two-phase checking (and parallelism)
 

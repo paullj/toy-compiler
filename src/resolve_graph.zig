@@ -232,11 +232,35 @@ fn collectGlobals(g: *GraphResolve) !void {
                     // protocol-method dispatch is indistinguishable from an inherent one
                     // (M11). `Ast.implMethods` yields the method run for either shape.
                     const recv_name = g.nameOf(mod, decl.main_token);
+                    // M14: a GENERIC-protocol conformance (`impl P has Into[int]`) mangles
+                    // the method symbol + duplicate-check key with the protocol identity +
+                    // its type-args, so `Into[int]` and `Into[bool]` don't collide on the
+                    // shared `P.into` symbol (a linker duplicate) nor trip a spurious R0002.
+                    // A non-generic-protocol conformance / inherent impl keeps the bare
+                    // `<recv>.<method>` name — byte-identical to M11/M13.
+                    var proto_suffix: []const u8 = "";
+                    defer if (proto_suffix.len > 0) g.gpa.free(proto_suffix);
+                    if (decl.tag == .impl_has_decl) {
+                        if (Ast.implProtocol(t, decl)) |proto_ref| {
+                            const pargs = Ast.protocolRefArgs(t, proto_ref);
+                            if (pargs.len > 0) {
+                                var sb: std.ArrayList(u8) = .empty;
+                                errdefer sb.deinit(g.gpa);
+                                try sb.append(g.gpa, '$');
+                                try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[Ast.protocolRefBase(t, proto_ref).int()].main_token));
+                                for (pargs) |an| {
+                                    try sb.append(g.gpa, '$');
+                                    try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[an.int()].main_token));
+                                }
+                                proto_suffix = try sb.toOwnedSlice(g.gpa);
+                            }
+                        }
+                    }
                     for (Ast.implMethods(t, decl)) |method_idx| {
                         const method = m.nodes[method_idx.int()];
                         if (method.tag != .fn_decl) continue;
                         const mname = g.nameOf(mod, method.main_token);
-                        const qname = try std.fmt.allocPrint(g.gpa, "{s}.{s}.{s}", .{ m.path, recv_name, mname });
+                        const qname = try std.fmt.allocPrint(g.gpa, "{s}.{s}.{s}{s}", .{ m.path, recv_name, mname, proto_suffix });
                         const gop = try method_names.getOrPut(g.gpa, qname);
                         if (gop.found_existing) {
                             try g.emit(.R0002, mod, m.tokens[method.main_token].start, "duplicate method '{s}.{s}'", .{ recv_name, mname });

@@ -314,11 +314,14 @@ pub const Node = extern struct {
         // conformance method desugars to an ordinary `fn_decl` exactly like an
         // inherent-method block, so lower/typecheck treat it like any method.
 
-        /// `protocol P { fn m(self, ..) -> R }` — signature-only method decls.
+        /// `protocol P[X,..] { fn m(self, ..) -> R }` — signature-only method decls.
         /// `main_token` is the protocol-name identifier token. `lhs` is the `extra`
         /// header of a `Range` over the bodyless method-signature `fn_decl` nodes.
-        /// `rhs` is `none`. The method sigs never enter the fn table (collectGlobals
-        /// ignores `protocol_decl`), so their synthesized `self` type-ref is inert.
+        /// `rhs` is the `extra` header of a `Range` over the protocol's generic-param
+        /// `generic_param` nodes (M14, mirroring struct/enum templates), or `none` for
+        /// a non-generic protocol (keeping every M11/M13 protocol byte-identical). The
+        /// method sigs never enter the fn table (collectGlobals ignores `protocol_decl`),
+        /// so their synthesized `self` type-ref is inert.
         protocol_decl,
 
         /// `impl T has P { fn m.. {} }` — a keyword-led conformance-impl block.
@@ -514,6 +517,35 @@ pub fn implProtocol(tree: Tree, node: Node) ?Index {
     };
 }
 
+/// The generic-parameter `generic_param` node indices of a `protocol_decl` (`protocol
+/// Into[U]`, M14), stored as a `Range` in its `rhs` slot — empty for a non-generic
+/// protocol (`rhs == none`) or a non-`protocol_decl` node. Mirrors the struct/enum
+/// template read (their generic params ride the `rhs` `Range` too).
+pub fn protocolGenericParams(tree: Tree, node: Index) []const Index {
+    const n = tree.nodes[node.int()];
+    if (n.tag != .protocol_decl or n.rhs == none) return &.{};
+    return rangeSlice(tree, n.rhs.int());
+}
+
+/// Unwrap a protocol-reference node (`P` / `mod.P` / `P[int]` / `mod.P[int]`, M14) to
+/// its BASE name node — the `identifier`/`field_access` a bare/qualified ref already
+/// is, or the `type_app`'s `lhs` for a generic protocol-ref. `protocolIdFromNode`
+/// resolves the base; `protocolRefArgs` reads the type-args. A bare ref is its own base.
+pub fn protocolRefBase(tree: Tree, node: Index) Index {
+    const n = tree.nodes[node.int()];
+    return if (n.tag == .type_app) n.lhs else node;
+}
+
+/// The type-argument node indices of a protocol-reference (`P[int]` -> `[int]`, M14),
+/// or empty for a bare/qualified ref (no `[..]`). The args are a `Range` in the
+/// `type_app`'s `rhs`; each element is an ordinary type-ref node resolved by
+/// `typeFromNode`.
+pub fn protocolRefArgs(tree: Tree, node: Index) []const Index {
+    const n = tree.nodes[node.int()];
+    if (n.tag != .type_app) return &.{};
+    return rangeSlice(tree, n.rhs.int());
+}
+
 /// "TOYP" — a magic so a foreign/corrupt blob is treated as a cache miss.
 pub const parse_magic: u32 = 0x544f5950;
 
@@ -542,7 +574,13 @@ pub const ParseHeader = extern struct {
     /// `lhs` may now carry a bound protocol-ref node (`[T has P]`), where a v9 blob
     /// always left it `none` — a v9 blob must miss cleanly so a stale parse never feeds
     /// an unbounded generic-param shape into the M13 bound-resolution machinery.
-    version: u32 = 10,
+    /// Bumped to 11 for the M14 generic-protocols parse change: `protocol_decl`'s `rhs`
+    /// may now carry a generic-param Range (`protocol Into[U]`), and a `type_app` may now
+    /// appear in an `impl .. has P[int]` protocol slot and a `[T has P[int]]` generic-param
+    /// bound — where a v10 blob always left `protocol_decl.rhs` `none` and never wrapped a
+    /// protocol-ref in a `type_app`. A v10 blob must miss cleanly so a stale parse never
+    /// feeds a bare protocol-ref shape into the M14 protocol-args machinery.
+    version: u32 = 11,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -603,7 +641,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 10) return null;
+    if (hdr.magic != parse_magic or hdr.version != 11) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -662,6 +700,16 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .protocol_decl => {
             try out.print("(protocol {s}", .{tok_text});
+            // Generic params (M14) ride the `rhs` Range, rendered only when present so
+            // non-generic protocol goldens stay byte-identical (mirrors `struct_decl`).
+            if (n.rhs != none) {
+                try out.writeAll(" [");
+                for (rangeSlice(tree, n.rhs.int()), 0..) |gp, i| {
+                    if (i != 0) try out.writeByte(' ');
+                    try renderNode(out, tree, tokens, source, gp);
+                }
+                try out.writeByte(']');
+            }
             for (rangeSlice(tree, n.lhs.int())) |method| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, method);
@@ -1241,6 +1289,44 @@ test "unpack rejects a v9 blob (pre-generic-bounds)" {
     // parse change never left a bound in `generic_param.lhs`, so it must miss cleanly.
     std.mem.writeInt(u32, blob[4..8], 9, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "unpack rejects a v10 blob (pre-generic-protocols)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    // Rewrite `version` to 10: a blob from a compiler predating the M14 generic-protocol
+    // parse change never carried a `protocol_decl.rhs` generic-param Range nor a
+    // `type_app` in a protocol-ref slot, so it must miss cleanly.
+    std.mem.writeInt(u32, blob[4..8], 10, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "pack/unpack round-trips a tree with a generic protocol_decl (v11)" {
+    const gpa = testing.allocator;
+    // A pure byte round-trip exercising the M14 `protocol_decl.rhs` generic-param Range.
+    var nodes = [_]Node{
+        .{ .tag = .generic_param, .main_token = 1, .lhs = none, .rhs = none }, // `U`
+        .{ .tag = .protocol_decl, .main_token = 0, .lhs = Index.from(3), .rhs = Index.from(5) },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(7), .rhs = none },
+    };
+    // extra: [0]=sigs Range start, [1]=len(0) at 3; generic Range {start=0,len=1} at 5;
+    // program Range {start=1,len=1} at 7. Only the round-trip bytes matter here.
+    var extra = [_]u32{ 0, 0, 0, 0, 0, 0, 1, 1, 1 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqual(@as(usize, 1), protocolGenericParams(got, Index.from(1)).len);
 }
 
 test "contentFp ignores Node padding (cold-build fp determinism foundation)" {

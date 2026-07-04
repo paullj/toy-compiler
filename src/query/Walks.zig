@@ -82,12 +82,27 @@ pub fn walkConformances(gpa: std.mem.Allocator, frozen: anytype, conformances: [
         var tmp: std.ArrayList(Fingerprint.TouchedType) = .empty;
         defer tmp.deinit(gpa);
         try AstWalk.appendTouched(gpa, frozen, rc.conform_ty, &tmp);
-        try out.append(gpa, .{ .protocol_name = rc.protocol_name, .conform = tmp.items[0], .witness_syms = rc.witness_syms });
+        // (M14) The conformance's protocol type-args, each as an index-free layout
+        // descriptor built by the SAME `appendTouched` -> the (e) fold distinguishes
+        // `Into[int]` from `Into[bool]`. OWNED (freed via `freeConformances`).
+        var pargs: std.ArrayList(Fingerprint.TouchedType) = .empty;
+        errdefer {
+            freeTouched(gpa, pargs.items);
+            pargs.deinit(gpa);
+        }
+        for (rc.protocol_args) |pa| try AstWalk.appendTouched(gpa, frozen, pa, &pargs);
+        const pargs_owned = try pargs.toOwnedSlice(gpa);
+        try out.append(gpa, .{ .protocol_name = rc.protocol_name, .conform = tmp.items[0], .witness_syms = rc.witness_syms, .protocol_args = pargs_owned });
     }
 }
 
-/// Free the conform-layout slices owned by a `walkConformances` result (the outer
-/// list is caller-owned; `protocol_name`/`witness_syms` are borrowed, never freed here).
+/// Free the conform-layout + protocol-arg-layout slices owned by a `walkConformances`
+/// result (the outer list is caller-owned; `protocol_name`/`witness_syms` are borrowed,
+/// never freed here).
 pub fn freeConformances(gpa: std.mem.Allocator, items: []const Fingerprint.ResolvedConformance) void {
-    for (items) |c| if (c.conform.layout.len > 0) gpa.free(c.conform.layout);
+    for (items) |c| {
+        if (c.conform.layout.len > 0) gpa.free(c.conform.layout);
+        freeTouched(gpa, c.protocol_args);
+        if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
+    }
 }

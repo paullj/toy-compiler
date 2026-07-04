@@ -691,8 +691,10 @@ fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: 
 /// Parse a bare or dot-qualified protocol reference (`P` / `mod.P` / `a.b.P`) into an
 /// `identifier` (bare) or a left-nested `field_access` chain (qualified) — the same
 /// shape a qualified type-name uses, so the checker resolves it via the module tables.
-/// NOT a full type: no `()` unit and no `[..]` type-application (generic protocols are
-/// M14). The built node lands in the `impl_has_decl`'s 3-cell header.
+/// A trailing `[..]` (generic protocol, M14) wraps the ref in a `type_app` (`P[int]` ->
+/// `type_app(P, [int])`), the SAME shape a generic type-application uses. NOT otherwise a
+/// full type: no `()` unit. The built node lands in the `impl_has_decl`'s 3-cell header
+/// or in a `generic_param`'s `lhs` bound slot (`[T has P[int]]`).
 fn parseProtocolRef(p: *Parser) Error!Ast.Index {
     const first_tok = p.index;
     try p.expect(.identifier, "expected a protocol name after 'has'");
@@ -703,6 +705,9 @@ fn parseProtocolRef(p: *Parser) Error!Ast.Index {
         try p.expect(.identifier, "expected a protocol name after '.'");
         node = try p.addNode(.{ .tag = .field_access, .main_token = seg_tok, .lhs = node, .rhs = Ast.none });
     }
+    // A generic protocol reference `P[int, ..]` (M14): reuse the same `type_app` shape a
+    // generic type-application uses (`parseTypeApp` wraps the base ref into a `type_app`).
+    if (p.at(.l_bracket)) node = try p.parseTypeApp(node);
     return node;
 }
 
@@ -716,6 +721,15 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_protocol, "expected 'protocol'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a protocol name");
+
+    // Optional generic-param list `[X, ..]` between the name and the body `{` (M14),
+    // parsed by the SAME `parseGenericParams` a generic struct/enum/fn uses. Rides the
+    // otherwise-`none` `rhs` slot as a Range header, keeping non-generic protocols
+    // byte-identical.
+    var generics: std.ArrayList(Ast.Index) = .empty;
+    defer generics.deinit(p.gpa);
+    if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
+
     try p.expect(.l_brace, "expected '{' after the protocol name");
 
     var sigs: std.ArrayList(Ast.Index) = .empty;
@@ -737,7 +751,8 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.r_brace, "expected '}' to close the protocol block");
 
     const header = try p.addRange(sigs.items);
-    return p.addNode(.{ .tag = .protocol_decl, .main_token = name_tok, .lhs = header, .rhs = Ast.none });
+    const generic_hdr = if (generics.items.len == 0) Ast.none else try p.addRange(generics.items);
+    return p.addNode(.{ .tag = .protocol_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
 /// `struct Name { x: int, y: int }`. Fields are `name: Type`, comma-separated,
@@ -1138,11 +1153,11 @@ fn parseGenericParams(p: *Parser, out: *std.ArrayList(Ast.Index)) Error!void {
         if (p.at(.identifier)) {
             const name_tok = p.index;
             p.bump(.identifier);
-            // A constrained param `T has P` (M13): the bound protocol-ref (created
-            // BEFORE the owning `generic_param` node, so children precede parents) is
-            // stored in `lhs`; an unbounded `T` leaves it `none`. Reuses the same
-            // `parseProtocolRef` an `impl .. has P` uses (bare or dot-qualified; no
-            // generic protocol args — M14).
+            // A constrained param `T has P` / `T has P[int]` (M13/M14): the bound
+            // protocol-ref (created BEFORE the owning `generic_param` node, so children
+            // precede parents) is stored in `lhs`; an unbounded `T` leaves it `none`.
+            // Reuses the same `parseProtocolRef` an `impl .. has P` uses (bare or
+            // dot-qualified, with an optional generic-protocol `[int, ..]` arg list).
             const bound: Ast.Index = if (p.eat(.kw_has)) try p.parseProtocolRef() else Ast.none;
             const gp = try p.addNode(.{ .tag = .generic_param, .main_token = name_tok, .lhs = bound, .rhs = Ast.none });
             try out.append(p.gpa, gp);
@@ -2447,8 +2462,12 @@ test "root is program and children precede parents" {
                 try testing.expect(n.lhs.int() < self);
                 for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
-            // `protocol P { fn .. }`: the method sigs are a Range in `lhs`.
-            .protocol_decl => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
+            // `protocol P[X] { fn .. }`: the method sigs are a Range in `lhs`; the
+            // optional generic-param Range (M14) rides `rhs` (or `none`).
+            .protocol_decl => {
+                for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
             // `impl T has P { fn .. }`: receiver type-ref is `lhs`; the protocol ref +
             // methods live in the 3-cell header decoded by `implHasAt`.
             .impl_has_decl => {
@@ -2524,6 +2543,66 @@ test "unbounded generic param leaves its lhs none (M13)" {
     const fn_decl_idx = Ast.rangeSlice(tree, prog.lhs.int())[0];
     const proto = Ast.protoAt(tree, tree.nodes[fn_decl_idx.int()].lhs.int());
     try testing.expectEqual(@as(?Ast.Index, null), Ast.genericParamBound(tree, proto.generic_params[0]));
+}
+
+test "M14: a generic protocol stores its type-params in the rhs slot" {
+    try expectProgram(
+        "protocol Into[U] {\n fn into(self) -> U\n }\n",
+        "(program (protocol Into [U] (fn into ((param self Into)) U (block))))",
+    );
+}
+
+test "M14: a non-generic protocol leaves its rhs none (byte-identical to M11)" {
+    try expectProgram(
+        "protocol Named {\n fn name(self) -> int\n }\n",
+        "(program (protocol Named (fn name ((param self Named)) int (block))))",
+    );
+    const gpa = testing.allocator;
+    const src = "protocol Named {\n fn name(self) -> int\n }\n";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, src);
+    defer freeTree(gpa, tree);
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    const decl = Ast.rangeSlice(tree, prog.lhs.int())[0];
+    try testing.expectEqual(Ast.none, tree.nodes[decl.int()].rhs);
+    try testing.expectEqual(@as(usize, 0), Ast.protocolGenericParams(tree, decl).len);
+}
+
+test "M14: impl P has Into[int] builds a type_app protocol-ref" {
+    const gpa = testing.allocator;
+    const src = "impl P has Into[int] {\n fn into(self) -> int { self.x }\n }\n";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, src);
+    defer freeTree(gpa, tree);
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    const decl = tree.nodes[Ast.rangeSlice(tree, prog.lhs.int())[0].int()];
+    const proto = Ast.implProtocol(tree, decl) orelse return error.MissingProtocol;
+    try testing.expectEqual(Node.Tag.type_app, tree.nodes[proto.int()].tag);
+    const base = Ast.protocolRefBase(tree, proto);
+    try testing.expectEqual(Node.Tag.identifier, tree.nodes[base.int()].tag);
+    try testing.expectEqualStrings("Into", tokens[tree.nodes[base.int()].main_token].text(src));
+    const args = Ast.protocolRefArgs(tree, proto);
+    try testing.expectEqual(@as(usize, 1), args.len);
+    try testing.expectEqualStrings("int", tokens[tree.nodes[args[0].int()].main_token].text(src));
+}
+
+test "M14: [T has Into[int]] bound builds a type_app protocol-ref" {
+    const gpa = testing.allocator;
+    const src = "fn use[T has Into[int]](v: T) -> int { 0 }\n";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, src);
+    defer freeTree(gpa, tree);
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    const fn_decl_idx = Ast.rangeSlice(tree, prog.lhs.int())[0];
+    const proto = Ast.protoAt(tree, tree.nodes[fn_decl_idx.int()].lhs.int());
+    const bound = Ast.genericParamBound(tree, proto.generic_params[0]) orelse return error.MissingBound;
+    try testing.expectEqual(Node.Tag.type_app, tree.nodes[bound.int()].tag);
+    const base = Ast.protocolRefBase(tree, bound);
+    try testing.expectEqualStrings("Into", tokens[tree.nodes[base.int()].main_token].text(src));
+    try testing.expectEqual(@as(usize, 1), Ast.protocolRefArgs(tree, bound).len);
 }
 
 // --- M8 inherent methods: impl block parsing ---

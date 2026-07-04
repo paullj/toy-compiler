@@ -694,7 +694,24 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     // A `mut self` method (M9): pass the receiver's ADDRESS (a place) as arg 0 instead
     // of a by-value copy, so the callee mutates the caller's storage.
     var self_mut = false;
-    if (callee_node.tag == .type_app) {
+    if (methodGidOf(b, n)) |m| {
+        // Method dispatch (M8/M14): callee = the method's mangled global symbol; the
+        // receiver is prepended as `self` in the arg build below. TRIED FIRST so an
+        // explicit-protocol-args method call `v.into[int]()` (a `type_app` over a
+        // `field_access`) is not misread as a generic FUNCTION call by the `type_app`
+        // branch below. The receiver is the field_access's lhs — reached through the
+        // `type_app` for the explicit-args shape, else the callee (field_access) directly.
+        // A method on a GENERIC-type instance (M10): the resolver returns the
+        // reified-dispatch entry carrying the mono `instance` index — dispatch to THAT
+        // instance's mangled symbol (its own per-instance codegen unit), not the
+        // never-lowered template's `names[fn_id]`.
+        callee = if (m.instance) |ii|
+            .{ .kind = .user_fn, .name = b.in.instances[ii].name }
+        else
+            b.in.names[m.fn_id];
+        self_recv = if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
+        self_mut = m.mut_self;
+    } else if (callee_node.tag == .type_app) {
         // A generic call `id[int](..)` (M2): the callee is a `type_app` whose base
         // identifier carries the template gid. Resolve to the reified instance's
         // mangled SymName by matching (gid + the concrete type-args the checker
@@ -714,19 +731,6 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             return .none;
         };
         callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
-    } else if (methodGidOf(b, n)) |m| {
-        // Method dispatch (M8): callee = the method's mangled global symbol; the
-        // receiver (`callee_node.lhs`) is prepended as `self` in the arg build below.
-        // A method on a GENERIC-type instance (M10): `findMethod` (via `methodGidOf`)
-        // returns the reified-dispatch entry, which carries the mono `instance` index —
-        // dispatch to THAT instance's mangled symbol (its own per-instance codegen
-        // unit), not the never-lowered template's `names[fn_id]`.
-        callee = if (m.instance) |ii|
-            .{ .kind = .user_fn, .name = b.in.instances[ii].name }
-        else
-            b.in.names[m.fn_id];
-        self_recv = callee_node.lhs;
-        self_mut = m.mut_self;
     } else if (builtinScalarEqCallee(b, n)) |ba| {
         // A builtin scalar `eq` (M12): lower the receiver + single arg and emit an inline
         // `icmp eq` (reusing the comparison-lowering machinery), typed bool. No `.call` is
@@ -853,13 +857,32 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
 /// `Method` (not just `fn_id`) so the caller reads `mut_self` for the by-address
 /// receiver ABI (M9); `null`-semantics are unchanged for the ctor-call classifier.
 fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access) return null;
-    if (b.in.resolutions[(n.lhs).int()] == .func) return null;
+    // Two callee shapes are method dispatch: a bare `field_access` `v.m` (explicit args
+    // null), and an explicit-protocol-args `type_app` over a `field_access` `v.m[int]`
+    // (M14). A qualified fn / qualified generic fn binds its field_access to `.func` and
+    // is NOT a method — exclude both shapes on that.
+    var cn = b.in.tree.nodes[(n.lhs).int()];
+    var fa_idx = n.lhs;
+    var explicit_args: ?[]const Typecheck.Type = null;
+    var explicit_buf: [8]Typecheck.Type = undefined;
+    if (cn.tag == .type_app) {
+        const inner_idx = cn.lhs;
+        if (b.in.tree.nodes[(inner_idx).int()].tag != .field_access) return null;
+        if (b.in.resolutions[(inner_idx).int()] == .func) return null; // qualified generic fn
+        const targ_nodes = Ast.rangeSlice(b.in.tree, (cn.rhs).int());
+        if (targ_nodes.len > explicit_buf.len) return null; // defensive; a well-typed call is small
+        for (targ_nodes, 0..) |tn, i| explicit_buf[i] = b.in.node_types[(tn).int()];
+        explicit_args = explicit_buf[0..targ_nodes.len];
+        fa_idx = inner_idx;
+        cn = b.in.tree.nodes[(inner_idx).int()];
+    } else {
+        if (cn.tag != .field_access) return null;
+        if (b.in.resolutions[(n.lhs).int()] == .func) return null;
+    }
     const recv = b.in.node_types[(cn.lhs).int()];
     // Dispatch through the real Method path for any nominal OR builtin scalar receiver
     // (M12): a user `impl int has P` registered a real `fn_id` on `recv = Type.int`, so
-    // `findMethod` selects it. A builtin scalar `eq` has NO method entry (the recognizer
+    // the resolver selects it. A builtin scalar `eq` has NO method entry (the recognizer
     // is pure) → this misses → `lowerCall`'s `builtinScalarEqCallee` branch fires. Reject
     // only the non-dispatchable kinds (invalid/never/type_var/app never reach lower).
     switch (recv.kind) {
@@ -867,7 +890,13 @@ fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
         else => return null,
     }
     const member = b.in.tokens[cn.main_token].text(b.in.source);
-    const m = Typecheck.findMethod(b.in.methods, recv, member) orelse return null;
+    // The SAME multi-conformance disambiguation the checker + fingerprint use, so all
+    // three select the identical witness (a divergence would be a miscompile or `-jN`
+    // break). `.ambiguous`/`.none` -> not dispatchable here (the checker already erred).
+    const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, recv, member, explicit_args)) {
+        .one => |mm| mm,
+        else => return null,
+    };
     // Defense in depth: a `mut self` method on a builtin scalar is rejected at check
     // time (T0022) because the by-address self ABI has no write-back path. Never
     // dispatch one here so a stray lower can't turn the receiver's slot address into

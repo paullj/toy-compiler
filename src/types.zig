@@ -328,13 +328,19 @@ pub const GraphResult = struct {
             gpa.free(inst.node_types);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name));
-            // M13: each conformance's `witness_syms` OUTER slice + the vector itself
-            // are owned (elements are borrowed source / `gph_fn_names`).
-            for (inst.conformances) |rc| gpa.free(@constCast(rc.witness_syms));
+            // M13/M14: each conformance's `witness_syms` + `protocol_args` OUTER slices +
+            // the vector itself are owned (elements are borrowed source / `gph_fn_names` /
+            // PODs).
+            for (inst.conformances) |rc| {
+                gpa.free(@constCast(rc.witness_syms));
+                if (rc.protocol_args.len > 0) gpa.free(@constCast(rc.protocol_args));
+            }
             gpa.free(@constCast(inst.conformances));
         }
         gpa.free(self.instances);
-        // Method `name`s are borrowed from source (like `Sig.name`) — free only the slice.
+        // Method `name`s are borrowed from source (like `Sig.name`); M14: each entry may
+        // own a `protocol_args` dupe (freed here), then the backing array.
+        freeMethodEntries(gpa, self.methods);
         gpa.free(self.methods);
         self.* = undefined;
     }
@@ -372,7 +378,103 @@ pub const Method = struct {
     recv_is_enum: bool = false,
     recv_generic: bool = false,
     instance: ?u32 = null,
+    /// Generic-protocol conformance stamp (M14): the protocol id this method witnesses
+    /// (`impl <recv> has P[args]`), or `null` for an inherent method / a reified generic
+    /// dispatch entry / a method not registered through `checkCoherence`. Set IN PLACE by
+    /// `checkCoherence` (before the Model snapshot), so a doubly-conforming `(recv, name)`
+    /// pair carries distinct `(protocol_id, protocol_args)` per conformance and the
+    /// multi-conformance resolver can disambiguate them.
+    protocol_id: ?u32 = null,
+    /// The protocol type-args of the conformance this method witnesses (M14), an OWNED
+    /// dupe (freed per-entry via `freeMethodEntries`). Empty for a non-generic protocol or
+    /// a non-conformance entry. Folded into the multi-conformance disambiguation key.
+    protocol_args: []const Type = &.{},
 };
+
+/// Structural equality of two `Type` vectors (M14): same length and pairwise `Type.eql`.
+/// Used to compare a conformance's protocol type-args against a use site's explicit args.
+pub fn eqlTypeVec(a: []const Type, b: []const Type) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!Type.eql(x, y)) return false;
+    return true;
+}
+
+/// The outcome of resolving a method call to a conformance witness (M14). `.one` is the
+/// selected `Method`; `.ambiguous` means the receiver conforms to one generic protocol
+/// MULTIPLE times and the use site must supply explicit type-args (T0025); `.none` means
+/// no method matched (the caller falls back to builtin-scalar / T0018).
+pub const MethodPick = union(enum) {
+    none,
+    one: Method,
+    ambiguous,
+};
+
+/// The ONE disambiguation the three method-dispatch consumers (BodyChecker types, lower
+/// symbols, AstWalk fingerprint) share, so all three select the IDENTICAL witness (a
+/// divergence would be a miscompile or a `-jN` determinism break). A linear scan over
+/// `Type.eql` + name (table = source fn-id order → deterministic):
+///   * with `explicit_args`: pick the conformance method whose `protocol_args` match
+///     (a generic protocol's conformances are coherence-deduped, so at most one matches);
+///   * without explicit args and `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to
+///     `findMethod` (the pre-M14 path — inherent, single conformance, prelude, generic
+///     instance) so no existing program's dispatch/fingerprint changes;
+///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`.
+/// An inherent method shadowing a single conformance (`<2` conformance matches) keeps the
+/// first, unchanged.
+pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, explicit_args: ?[]const Type) MethodPick {
+    if (explicit_args) |ea| {
+        for (methods) |m| {
+            if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name) and
+                m.protocol_id != null and eqlTypeVec(m.protocol_args, ea))
+                return .{ .one = m };
+        }
+        return .none;
+    }
+    var first: ?Method = null;
+    var total: usize = 0;
+    var conform_count: usize = 0;
+    for (methods) |m| {
+        if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name)) {
+            if (first == null) first = m;
+            total += 1;
+            if (m.protocol_id != null) conform_count += 1;
+        }
+    }
+    if (total == 0) return .none;
+    if (total == 1) return .{ .one = first.? };
+    if (conform_count >= 2) return .ambiguous;
+    return .{ .one = first.? };
+}
+
+/// The conformance methods matching `(recv, name)` in table (source fn-id) order — used
+/// ONLY to build the T0025 ambiguity message deterministically (protocol id + args per
+/// conflicting conformance). `out` is caller-owned; each entry borrows the `Method`.
+pub fn conformancesFor(methods: []const Method, recv: Type, name: []const u8, gpa: std.mem.Allocator, out: *std.ArrayList(Method)) !void {
+    for (methods) |m| {
+        if (m.protocol_id != null and Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name))
+            try out.append(gpa, m);
+    }
+}
+
+/// The witness `Method` for a SPECIFIC conformance `(recv, name, protocol_id, args)` —
+/// how `buildConformances` picks the right witness under multi-conformance (a bare
+/// `findMethod` would take the first `(recv, name)`, aliasing a sibling conformance).
+/// Null when no such conformance method exists (e.g. a builtin-scalar witness, which has
+/// no `Method` entry — the caller then falls back to the bare method name).
+pub fn findConformanceMethod(methods: []const Method, recv: Type, name: []const u8, pid: u32, args: []const Type) ?Method {
+    for (methods) |m| {
+        if (m.protocol_id == pid and Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name) and eqlTypeVec(m.protocol_args, args))
+            return m;
+    }
+    return null;
+}
+
+/// Free the per-entry owned `protocol_args` of a method table (M14). The `name` slices
+/// stay borrowed (source); only `protocol_args` is owned (a `checkCoherence` dupe). A
+/// reified generic-dispatch entry defaults to `&.{}`, so freeing it is a no-op.
+pub fn freeMethodEntries(gpa: std.mem.Allocator, methods: []const Method) void {
+    for (methods) |m| if (m.protocol_args.len > 0) gpa.free(@constCast(m.protocol_args));
+}
 
 /// Look up an inherent method by receiver type + source name. A linear scan over
 /// `Type.eql` (pure content comparison of kind+id) + name equality — no hashmap /
@@ -422,8 +524,10 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type } {
 /// type-arg necessarily misses (conformances only record concrete `structT`/`enumT`/
 /// scalar receivers — `impl Box[T] has P` is rejected at parse), which is the correct
 /// "not conforming" answer.
-pub fn findConformance(model: *const Model, pid: u32, recv: Type) bool {
-    for (model.conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv)) return true;
+pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args: []const Type) bool {
+    for (model.conformances) |c| {
+        if (c.protocol == pid and Type.eql(c.recv, recv) and eqlTypeVec(c.protocol_args, protocol_args)) return true;
+    }
     return false;
 }
 
@@ -440,6 +544,12 @@ pub const ProtocolSym = struct {
     pub_export: bool,
     /// The `protocol_decl` node in its owning module's tree.
     decl_node: Ast.Index,
+    /// The protocol's generic type-params, in declaration order (borrowed source
+    /// slices), the associated-type replacement (M14): `protocol Into[U]` -> `["U"]`.
+    /// Empty for a non-generic protocol. The OUTER array is owned by `t.protocols`. When
+    /// a method sig is decoded these live at type-var ordinals 1.. (ordinal 0 is `Self`),
+    /// so `-> U` decodes to `type_var(1)`; see `registerProtocols`.
+    generic_params: []const []const u8 = &.{},
     /// The protocol's required method names, in declaration order (borrowed source
     /// slices). The OUTER array is owned by `t.protocols` (freed at teardown).
     methods: []const []const u8,
@@ -462,6 +572,12 @@ pub const ProtocolSym = struct {
 pub const Conformance = struct {
     protocol: u32,
     recv: Type,
+    /// The protocol type-args this conformance is keyed on (M14): `impl P has Into[int]`
+    /// records `[int]`. Two conformances `Into[int]`/`Into[bool]` on ONE type differ ONLY
+    /// here — so the coherence key and `findConformance` fold this vector structurally (a
+    /// bare `(protocol, recv)` match would alias them). Restricted to concrete non-`App`
+    /// value types. Empty for a non-generic protocol. OWNED by `t.conformances`.
+    protocol_args: []const Type = &.{},
 };
 
 /// A top-level function's signature, decoded once up front so calls can be
@@ -487,6 +603,13 @@ pub const FnSym = struct {
     /// a non-generic fn. Populated in `decodeFnSig` via `protocolIdFromNode` (an
     /// undeclared bound protocol -> T0021). Owned by `t.fns` (freed at teardown).
     generic_bounds: []const ?u32 = &.{},
+    /// The bound's protocol type-args per generic param (M14, `[T has P[args]]`), parallel
+    /// to `generic_bounds`: `generic_bound_args[i]` is the decoded arg vector for param i's
+    /// bound (empty for an unbounded param or a non-generic protocol). An arg may be a
+    /// `type_var` referencing ANOTHER generic param (`[T has Convert[U]]`), substituted
+    /// through the instance args at the mono worklist. Both the inner vectors AND the outer
+    /// array are OWNED by `t.fns` (freed at teardown).
+    generic_bound_args: []const []const Type = &.{},
     /// For an inherent method (M8): the RESOLVED receiver `Type` (params[0] is the
     /// synthesized `self`). Cached here (a 12-byte POD) rather than re-resolved from
     /// the decl, so the body checker can map `Self` without re-running `typeFromNode`
@@ -768,6 +891,7 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
     // Empty for a non-generic/unbounded fn (inert); in the per-instance re-check the
     // receiver is grounded so the `type_var` dispatch branch never fires.
     bc.bound_protocols = f.generic_bounds;
+    bc.bound_protocol_args = f.generic_bound_args;
     return bc;
 }
 
@@ -946,6 +1070,9 @@ pub fn checkGraph(
             if (f.generic_params.len > 0) gpa.free(@constCast(f.generic_params));
             // M13: the per-param bound protocol-id array (owned; borrows nothing).
             if (f.generic_bounds.len > 0) gpa.free(@constCast(f.generic_bounds));
+            // M14: the per-param bound protocol-args (inner vectors + outer array owned).
+            for (f.generic_bound_args) |ba| if (ba.len > 0) gpa.free(@constCast(ba));
+            if (f.generic_bound_args.len > 0) gpa.free(@constCast(f.generic_bound_args));
         }
         t.fns.deinit(gpa);
         // Any instances not transferred into the result (an error path) are freed
@@ -960,19 +1087,25 @@ pub fn checkGraph(
         // M13: the per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
         // The method table's backing array (entries' names are borrowed source
-        // slices). On success `toOwnedSlice` empties it, so this is a no-op there.
+        // slices). M14: each entry may own a `protocol_args` dupe (freed here). On success
+        // `toOwnedSlice` empties it, so both are a no-op there (the result frees them).
+        freeMethodEntries(gpa, t.methods.items);
         t.methods.deinit(gpa);
         // The protocol table (M11): each entry owns its `methods` outer array (the
         // name slices are borrowed source); the conformance list owns only its array.
         // M13: each entry also owns its decoded `method_params` (inner + outer) +
-        // `method_rets` arrays (the element Types are PODs).
+        // `method_rets` arrays (the element Types are PODs). M14: the `generic_params`
+        // outer array (name slices borrowed).
         for (t.protocols.items) |p| {
             gpa.free(@constCast(p.methods));
+            if (p.generic_params.len > 0) gpa.free(@constCast(p.generic_params));
             for (p.method_params) |mp| gpa.free(@constCast(mp));
             if (p.method_params.len > 0) gpa.free(@constCast(p.method_params));
             if (p.method_rets.len > 0) gpa.free(@constCast(p.method_rets));
         }
         t.protocols.deinit(gpa);
+        // M14: each conformance may own a `protocol_args` dupe.
+        for (t.conformances.items) |c| if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
         t.conformances.deinit(gpa);
         for (t.enums.items) |e| {
             for (e.variants) |v| {
@@ -1043,8 +1176,13 @@ pub fn checkGraph(
 
     // Transfer the method table (M8) out of the live list before the teardown defer
     // sees it. `toOwnedSlice` empties `t.methods`; the entries' names stay borrowed.
+    // M14: each entry may own a `protocol_args` dupe, freed on the error path here (the
+    // window after transfer, before the result owns it) — else it would leak.
     const methods = try t.methods.toOwnedSlice(gpa);
-    errdefer gpa.free(methods);
+    errdefer {
+        freeMethodEntries(gpa, methods);
+        gpa.free(methods);
+    }
 
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
@@ -1508,7 +1646,17 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
     for (f.generic_bounds, 0..) |maybe_pid, ord| {
         const pid = maybe_pid orelse continue;
         if (ord >= args.len) continue;
-        if (!findConformance(model, pid, args[ord])) {
+        // M14: the bound's protocol type-args are substituted THROUGH the instance args
+        // (so `[T has Convert[U]]` grounds `U` to the concrete arg bound to `U`), then the
+        // conformance is looked up keyed on `(protocol, recv, protocol-args)`.
+        const bargs = if (ord < f.generic_bound_args.len) f.generic_bound_args[ord] else &.{};
+        var subst_buf: []Type = &.{};
+        defer if (subst_buf.len > 0) t.gpa.free(subst_buf);
+        if (bargs.len > 0) {
+            subst_buf = try t.gpa.alloc(Type, bargs.len);
+            for (bargs, 0..) |ba, k| subst_buf[k] = t.substType(ba, args);
+        }
+        if (!findConformance(model, pid, args[ord], subst_buf)) {
             _ = t.gphSelect(mod);
             try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'", .{ t.typeName(args[ord]), model.protocols[pid].name });
             return;
@@ -1576,14 +1724,18 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     };
 }
 
-/// Build a monomorphized instance's resolved `[T has P]` bound conformances (M13), one
-/// per bounded generic param in generic-param order. Each witness SymName is resolved
-/// in protocol-DECLARED order via `findMethod` on the ground conforming type: the
-/// mangled name from `gph_fn_names` when a real impl method exists, else the bare
-/// method name (a builtin-scalar witness — deterministic, forward-looking to M18).
-/// `protocol_name` borrows the source-backed `ProtocolSym.name`; `witness_syms` borrow
-/// `gph_fn_names` (both outlive codegen). Only the outer slice + each `witness_syms`
-/// outer slice are OWNED by the returned Instance. Empty for an unbounded template.
+/// Build a monomorphized instance's resolved `[T has P]` bound conformances (M13/M14),
+/// one per bounded generic param in generic-param order. Each witness SymName is resolved
+/// in protocol-DECLARED order via `findConformanceMethod` on the ground conforming type,
+/// keyed on the bound's `(protocol, protocol-args)` (substituted through the instance
+/// args) so multi-conformance picks the RIGHT witness (a bare `findMethod` would take the
+/// first `(recv, name)`, aliasing a sibling conformance): the mangled name from
+/// `gph_fn_names` when a real impl method exists, else the bare method name (a
+/// builtin-scalar witness — deterministic, forward-looking to M18). `protocol_name`
+/// borrows the source-backed `ProtocolSym.name`; `witness_syms` borrow `gph_fn_names`
+/// (both outlive codegen). `protocol_args` is an OWNED dupe (folded into the (e) fp). Only
+/// the outer slice + each `witness_syms`/`protocol_args` outer slice are OWNED. Empty for
+/// an unbounded template.
 fn buildConformances(t: *Typecheck, model: *const Model, f: FnSym, args: []const Type) ![]const Mono.ResolvedConformance {
     var count: usize = 0;
     for (f.generic_bounds) |b| {
@@ -1593,31 +1745,47 @@ fn buildConformances(t: *Typecheck, model: *const Model, f: FnSym, args: []const
     const list = try t.gpa.alloc(Mono.ResolvedConformance, count);
     var built: usize = 0;
     errdefer {
-        for (list[0..built]) |rc| t.gpa.free(@constCast(rc.witness_syms));
+        for (list[0..built]) |rc| {
+            t.gpa.free(@constCast(rc.witness_syms));
+            if (rc.protocol_args.len > 0) t.gpa.free(@constCast(rc.protocol_args));
+        }
         t.gpa.free(list);
     }
     for (f.generic_bounds, 0..) |maybe_pid, ord| {
         const pid = maybe_pid orelse continue;
         const recv = args[ord];
         const prot = model.protocols[pid];
+        // The bound's protocol type-args (M14), substituted through the instance args, so
+        // `[T has Convert[U]]` resolves against the concrete arg bound to `U`. OWNED (rides
+        // the ResolvedConformance into the (e) fp fold).
+        const bargs = if (ord < f.generic_bound_args.len) f.generic_bound_args[ord] else &.{};
+        var pargs: []Type = &.{};
+        errdefer if (pargs.len > 0) t.gpa.free(pargs);
+        if (bargs.len > 0) {
+            pargs = try t.gpa.alloc(Type, bargs.len);
+            for (bargs, 0..) |ba, k| pargs[k] = t.substType(ba, args);
+        }
         const witness = try t.gpa.alloc([]const u8, prot.methods.len);
         for (prot.methods, 0..) |mname, k| {
-            witness[k] = if (findMethod(model.methods, recv, mname)) |m|
+            witness[k] = if (findConformanceMethod(model.methods, recv, mname, pid, pargs)) |m|
                 (if (t.gph_fn_names) |fns| fns[m.fn_id] else mname)
             else
                 mname;
         }
-        list[built] = .{ .protocol_name = prot.name, .conform_ty = recv, .witness_syms = witness };
+        list[built] = .{ .protocol_name = prot.name, .conform_ty = recv, .witness_syms = witness, .protocol_args = pargs };
         built += 1;
     }
     return list;
 }
 
-/// Free an instance's owned conformance vector (M13): each entry's `witness_syms` OUTER
-/// slice + the vector itself. `protocol_name`/`witness_syms` ELEMENTS are borrowed
-/// (source / `gph_fn_names`) and never freed here.
+/// Free an instance's owned conformance vector (M13/M14): each entry's `witness_syms` +
+/// `protocol_args` OUTER slices + the vector itself. Element slices are borrowed (source /
+/// `gph_fn_names`) or PODs (Types) and never freed here.
 fn freeInstanceConformances(gpa: std.mem.Allocator, confs: []const Mono.ResolvedConformance) void {
-    for (confs) |rc| gpa.free(@constCast(rc.witness_syms));
+    for (confs) |rc| {
+        gpa.free(@constCast(rc.witness_syms));
+        if (rc.protocol_args.len > 0) gpa.free(@constCast(rc.protocol_args));
+    }
     gpa.free(@constCast(confs));
 }
 
@@ -2108,8 +2276,11 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
 /// is no prior emit to double). A bare `identifier` resolves against the active module's
 /// protocol map; a qualified `mod.P` `field_access` resolves the receiver namespace then
 /// the owning module's protocol table, gated on `pub_export`.
-fn protocolIdFromNode(t: *Typecheck, node_idx: Ast.Index) ?u32 {
-    if (node_idx == Ast.none) return null;
+fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
+    if (ref_idx == Ast.none) return null;
+    // A generic protocol reference `P[int]` / `mod.P[int]` (M14) parses to a `type_app`;
+    // resolve its BASE name node (the args are read separately by the caller).
+    const node_idx = Ast.protocolRefBase(t.tree, ref_idx);
     const n = t.tree.nodes[node_idx.int()];
     if (n.tag == .identifier) {
         const name = t.nameText(n.main_token);
@@ -2174,16 +2345,29 @@ fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
 /// `seen` set is `getOrPut`-only (never iterated), so its hash/thread order cannot leak
 /// into the emit stream; emit order is module-id then source order → `-jN`-stable.
 fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
-    const Key = @TypeOf(coherenceKey(0, Type.int));
-    var seen: std.AutoHashMapUnmanaged(Key, void) = .empty;
-    defer seen.deinit(t.gpa);
+    // The coherence key is a serialized byte vector `(protocol, recv, protocol-args)`
+    // (M14): variable arity forces bytes (a struct key can't hold the arg slice). The
+    // `seen` set owns its keys (dup'd on insert); freed on return. Never iterated → its
+    // hash/thread order can't leak into the emit stream.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| t.gpa.free(k.*);
+        seen.deinit(t.gpa);
+    }
+    var keybuf: std.ArrayList(u8) = .empty;
+    defer keybuf.deinit(t.gpa);
 
     // Seed `seen` from the builtin conformances already pre-registered by the prelude
     // (M12) BEFORE walking user impls, so a duplicate user `impl int has Eq` collides
     // (T0020). At this point `t.conformances` holds EXACTLY the prelude entries (the
     // only other appender is this fn's accept path below), so iterating its slice in
     // insertion order is a pure function of source — `-jN`-stable.
-    for (t.conformances.items) |c| _ = try seen.getOrPut(t.gpa, coherenceKey(c.protocol, c.recv));
+    for (t.conformances.items) |c| {
+        try writeCoherenceKey(t.gpa, &keybuf, c.protocol, c.recv, c.protocol_args);
+        const gop = try seen.getOrPut(t.gpa, keybuf.items);
+        if (!gop.found_existing) gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+    }
 
     for (mods, 0..) |_, mi| {
         const mod: u32 = @intCast(mi);
@@ -2224,14 +2408,45 @@ fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // silently; an unresolved receiver simply forms no coherence key.
             const recv = t.receiverTypeFromNode(decl.lhs) orelse continue;
 
-            // Signature compatibility (M13, T0024): a conforming impl method's signature
-            // must MATCH the protocol's declared signature (with `Self` grounded to the
-            // receiver) — the soundness prerequisite for bound-as-axiom checking (a bound
-            // body types `v.m()` against the protocol sig, so a mismatched impl would
-            // miscompile). Builtin-scalar conformances (`int`/`bool has Eq`) are
-            // pre-registered by the prelude, not `impl_has_decl` source decls, so this
-            // loop never visits them (no method node to check) — correct by construction.
             const prot = t.protocols.items[pid];
+
+            // M14: decode + validate this impl's protocol type-args `impl P has Into[int]`.
+            // Arity must match the protocol's generic-param count; each arg must be a
+            // concrete non-composite value type (a composite `App` arg is out of scope —
+            // its check-time index is run-order-dependent, which would break the coherence
+            // key + fp determinism). A bad-args impl forms no key + records no conformance
+            // (so a later valid sibling still registers cleanly).
+            const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
+            if (arg_nodes.len != prot.generic_params.len) {
+                try t.sink.emitFmt(t.byteOf(decl.main_token), "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
+                continue;
+            }
+            var pargs_buf: std.ArrayList(Type) = .empty;
+            defer pargs_buf.deinit(t.gpa);
+            var pargs_ok = true;
+            for (arg_nodes) |an| {
+                const aty = t.typeFromNode(an);
+                switch (aty.kind) {
+                    .int, .bool, .str, .unit, .@"struct", .@"enum" => {},
+                    .invalid => pargs_ok = false, // typeFromNode already emitted T0001
+                    else => {
+                        try t.sink.emit(t.byteOf(t.tree.nodes[an.int()].main_token), "a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)");
+                        pargs_ok = false;
+                    },
+                }
+                try pargs_buf.append(t.gpa, aty);
+            }
+            if (!pargs_ok) continue;
+            const pargs = pargs_buf.items;
+
+            // Signature compatibility (M13/M14, T0024): a conforming impl method's signature
+            // must MATCH the protocol's declared signature, with `Self` grounded to the
+            // receiver and each protocol type-param grounded to `pargs` — the soundness
+            // prerequisite for bound-as-axiom checking (a bound body types `v.m()` against
+            // the protocol sig, so a mismatched impl would miscompile). Builtin-scalar
+            // conformances (`int`/`bool has Eq`) are pre-registered by the prelude, not
+            // `impl_has_decl` source decls, so this loop never visits them (no method node
+            // to check) — correct by construction.
             for (prot.methods, 0..) |req, j| {
                 // Resolve the method THIS impl block provides for `req` — never
                 // `findMethod`'s whole-program first match: for a shared imported
@@ -2251,9 +2466,11 @@ fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                 }
                 if (method_node == Ast.none) continue; // missing method: already T0021 above
                 var maybe_fn: ?FnSym = null;
-                for (t.fns.items) |f| {
+                var impl_gid: u32 = 0;
+                for (t.fns.items, 0..) |f, fi| {
                     if (f.mod == mod and f.decl_node == method_node) {
                         maybe_fn = f;
+                        impl_gid = @intCast(fi);
                         break;
                     }
                 }
@@ -2263,25 +2480,38 @@ fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                 var mismatch = impl_fn.params.len != want_params.len;
                 if (!mismatch) {
                     for (want_params, impl_fn.params) |wp, ip| {
-                        if (!Type.eql(substSelf(wp, recv), ip)) {
+                        if (!Type.eql(groundProtoType(wp, recv, pargs), ip)) {
                             mismatch = true;
                             break;
                         }
                     }
-                    if (!mismatch and !Type.eql(substSelf(want_ret, recv), impl_fn.ret)) mismatch = true;
+                    if (!mismatch and !Type.eql(groundProtoType(want_ret, recv, pargs), impl_fn.ret)) mismatch = true;
                 }
                 if (mismatch) {
                     const at_tok = t.tree.nodes[method_node.int()].main_token;
                     try t.sink.emitFmtCode(.T0024, t.byteOf(at_tok), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
                 }
+                // M14: STAMP this witness `Method` entry with the conformance's
+                // `(protocol_id, protocol_args)` so the multi-conformance resolver can pick
+                // it by args. Runs BEFORE `buildModel` (the Model aliases `t.methods.items`
+                // AFTER this), and mutates in place (no realloc), so the stamp is
+                // snapshot-safe. Each entry gets its OWN owned dupe (freed per-entry).
+                for (t.methods.items) |*mth| {
+                    if (mth.fn_id == impl_gid) {
+                        mth.protocol_id = pid;
+                        mth.protocol_args = try t.gpa.dupe(Type, pargs);
+                        break;
+                    }
+                }
             }
 
-            const key = coherenceKey(pid, recv);
-            const gop = try seen.getOrPut(t.gpa, key);
+            try writeCoherenceKey(t.gpa, &keybuf, pid, recv, pargs);
+            const gop = try seen.getOrPut(t.gpa, keybuf.items);
             if (gop.found_existing) {
                 try t.sink.emitFmtCode(.T0020, t.byteOf(decl.main_token), "overlapping impl of protocol '{s}' for type '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token) });
             } else {
-                try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = recv });
+                gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+                try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = recv, .protocol_args = try t.gpa.dupe(Type, pargs) });
             }
         }
     }
@@ -2497,29 +2727,52 @@ fn registerPrelude(t: *Typecheck) !void {
     try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.bool });
 }
 
-/// The multi-space (M12) coherence key for a `(protocol, receiver-type)` conformance.
-/// `recv_kind` is `@intFromEnum(recv.kind)`, so the key spans builtin scalar Kinds
-/// (int/bool/str/unit — which carry no `struct_id`/`enum_id`) as well as struct/enum
-/// nominals; `recv_id` is the nominal id (0 for scalars, which the kind already
-/// distinguishes). Internal to `checkCoherence` only — never persisted / fingerprinted —
-/// so widening from the old `{struct=0,enum=1}` scheme is safe.
-/// Ground a protocol-signature `Self` (`type_var(0)`, M13) to the conforming receiver
-/// type. A protocol's decoded sig uses `type_var(0)` for both the `self` slot and any
-/// `Self`-typed param/return; a non-`Self` param is a concrete type and passes through.
-fn substSelf(ty: Type, recv: Type) Type {
-    return if (ty.isTypeVar()) recv else ty;
+/// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
+/// protocol's decoded sig uses `type_var(0)` for the `self` slot + any `Self`-typed
+/// param/return, and `type_var(k>=1)` for the protocol's generic params (`protocol
+/// Into[U]` -> `U == type_var(1)`, ordinal-offset so `Self` keeps 0). Ground `tv(0)` to
+/// `recv` and `tv(k>=1)` to `protocol_args[k-1]`; anything else (a concrete type) passes
+/// through. The `k-1 < len` guard is defensive against an arity-mismatched impl (already
+/// rejected before this is trusted for a witness).
+pub fn groundProtoType(ty: Type, recv: Type, protocol_args: []const Type) Type {
+    if (!ty.isTypeVar()) return ty;
+    const ord = ty.typeVarOrd();
+    if (ord == 0) return recv;
+    return if (ord - 1 < protocol_args.len) protocol_args[ord - 1] else ty;
 }
 
-fn coherenceKey(pid: u32, recv: Type) struct { protocol: u32, recv_kind: u8, recv_id: u32 } {
-    return .{
-        .protocol = pid,
-        .recv_kind = @intFromEnum(recv.kind),
-        .recv_id = switch (recv.kind) {
-            .@"struct" => recv.struct_id,
-            .@"enum" => recv.enum_id,
-            else => 0,
-        },
+/// Append a little-endian u32 to a byte buffer (coherence-key serialization helper).
+fn appendKeyU32(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !void {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(u32, &b, v, .little);
+    try buf.appendSlice(gpa, b[0..]);
+}
+
+/// Append one `Type`'s identity (kind byte + nominal/ordinal id) to a byte buffer.
+fn appendKeyType(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ty: Type) !void {
+    try buf.append(gpa, @intFromEnum(ty.kind));
+    const id: u32 = switch (ty.kind) {
+        .@"struct" => ty.struct_id,
+        .@"enum" => ty.enum_id,
+        .type_var, .app => ty.struct_id,
+        else => 0,
     };
+    try appendKeyU32(gpa, buf, id);
+}
+
+/// Serialize a `(protocol, receiver-type, protocol-args)` conformance key into `buf`
+/// (M14). Variable arity forces a byte key (an `AutoHashMap` struct can't hold a slice),
+/// so `checkCoherence`'s `seen` is a `StringHashMap` over these bytes — the SAME
+/// serialized-key discipline `Mono.writeKey` uses for instances. Folding the protocol
+/// args means `impl P has Into[int]` and `impl P has Into[bool]` DON'T collide (distinct
+/// bytes), but two identical `Into[int]` still do (T0020). Internal to `checkCoherence`
+/// (never persisted / fingerprinted), so the layout is free to change.
+fn writeCoherenceKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), pid: u32, recv: Type, protocol_args: []const Type) !void {
+    buf.clearRetainingCapacity();
+    try appendKeyU32(gpa, buf, pid);
+    try appendKeyType(gpa, buf, recv);
+    try appendKeyU32(gpa, buf, @intCast(protocol_args.len));
+    for (protocol_args) |a| try appendKeyType(gpa, buf, a);
 }
 
 /// Phase 0c (M11): register the `protocol` decls among `decl_nodes` (of the active
@@ -2542,17 +2795,31 @@ fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !vo
         const sig_nodes = Ast.rangeSlice(t.tree, decl.lhs.int());
         const names = try t.gpa.alloc([]const u8, sig_nodes.len);
         for (sig_nodes, 0..) |snode, i| names[i] = t.nameText(t.tree.nodes[snode.int()].main_token);
-        // Decode each method SIGNATURE (M13), Self-aware. Force the synthetic `self`
-        // slot to `Type.typeVar(0)` (decoding it would resolve the protocol-name
-        // type-ref and spuriously T0001); a `Self`-typed later param resolves to
-        // `type_var(0)` via the `cur_self_type` hook. Structs/enums are already
-        // registered (Phase 0), so a struct/enum param type resolves (no layout needed
-        // here). `cur_generic_params` stays empty (generic protocols are M14).
+        // Generic type-params (M14): `protocol Into[U]` -> `["U"]`. Stored un-offset on
+        // the `ProtocolSym` (for arity checks); the OUTER array is owned by `t.protocols`.
+        const gp_nodes = Ast.protocolGenericParams(t.tree, decl_idx);
+        const generic_params = try t.gpa.alloc([]const u8, gp_nodes.len);
+        for (gp_nodes, 0..) |gp, i| generic_params[i] = t.nameText(t.tree.nodes[gp.int()].main_token);
+        // Decode each method SIGNATURE (M13/M14), Self- and protocol-param-aware. Force
+        // the synthetic `self` slot to `Type.typeVar(0)` (decoding it would resolve the
+        // protocol-name type-ref and spuriously T0001); a `Self`-typed later param resolves
+        // to `type_var(0)` via the `cur_self_type` hook. A protocol generic param resolves
+        // to `type_var(1..)` via a Self-OFFSET `cur_generic_params` (index 0 is a `""`
+        // placeholder that never matches a source ident, reserving ordinal 0 for `Self`),
+        // so `-> U` decodes to `type_var(1)` and never aliases the receiver. Structs/enums
+        // are already registered (Phase 0), so a struct/enum param type resolves.
         const method_params = try t.gpa.alloc([]const Type, sig_nodes.len);
         const method_rets = try t.gpa.alloc(Type, sig_nodes.len);
         const prev_self = t.cur_self_type;
         t.cur_self_type = Type.typeVar(0);
         defer t.cur_self_type = prev_self;
+        const offset_params = try t.gpa.alloc([]const u8, generic_params.len + 1);
+        defer t.gpa.free(offset_params);
+        offset_params[0] = ""; // ordinal 0 = Self, never matched by a source identifier
+        for (generic_params, 0..) |gp, i| offset_params[i + 1] = gp;
+        const prev_gp = t.cur_generic_params;
+        t.cur_generic_params = offset_params;
+        defer t.cur_generic_params = prev_gp;
         for (sig_nodes, 0..) |snode, i| {
             const mp = Ast.protoAt(t.tree, t.tree.nodes[snode.int()].lhs.int());
             const pars = try t.gpa.alloc(Type, mp.params.len);
@@ -2572,6 +2839,7 @@ fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !vo
             .mod = mod,
             .pub_export = t.tree.isPub(decl_idx),
             .decl_node = decl_idx,
+            .generic_params = generic_params,
             .methods = names,
             .method_params = method_params,
             .method_rets = method_rets,
@@ -2600,21 +2868,54 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     // handles a bare `P` (active module map + `Eq` prelude fallback) and a qualified `mod.P`.
     var gbounds: []?u32 = &.{};
     errdefer if (gbounds.len > 0) t.gpa.free(gbounds);
+    // The bound's protocol type-args per param (M14, `[T has P[args]]`), parallel to
+    // `gbounds`; inner + outer OWNED by `t.fns`. Decoded WITH the fn's generic params in
+    // scope (below) so a bound arg spelled as another param (`[T has Convert[U]]`) becomes
+    // a `type_var` substituted at the mono worklist.
+    var gbound_args: [][]const Type = &.{};
+    errdefer if (gbound_args.len > 0) {
+        for (gbound_args) |ba| if (ba.len > 0) t.gpa.free(@constCast(ba));
+        t.gpa.free(gbound_args);
+    };
     if (proto.generic_params.len > 0) {
         gnames = try t.gpa.alloc([]const u8, proto.generic_params.len);
         for (proto.generic_params, 0..) |gp, i| gnames[i] = t.nameText(t.tree.nodes[gp.int()].main_token);
+    }
+    // Put the fn's generic params in scope BEFORE decoding the bound args, so a bound arg
+    // referencing another param resolves to a `type_var` rather than an unknown type.
+    t.cur_generic_params = gnames;
+    defer t.cur_generic_params = &.{};
+    if (proto.generic_params.len > 0) {
         gbounds = try t.gpa.alloc(?u32, proto.generic_params.len);
+        gbound_args = try t.gpa.alloc([]const Type, proto.generic_params.len);
+        for (gbound_args) |*ba| ba.* = &.{};
         for (proto.generic_params, 0..) |gp, i| {
             const bound = Ast.genericParamBound(t.tree, gp);
             gbounds[i] = if (bound) |bn| (t.protocolIdFromNode(bn) orelse blk: {
-                const ref_tok = t.tree.nodes[bn.int()].main_token;
+                const ref_tok = t.tree.nodes[Ast.protocolRefBase(t.tree, bn).int()].main_token;
                 try t.sink.emitFmtCode(.T0021, t.byteOf(ref_tok), "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
                 break :blk null;
             }) else null;
+            // Decode the bound's protocol type-args (M14). A composite `App` arg is out of
+            // scope (its check-time index is run-order-dependent — would break the coherence
+            // key + fp determinism); reject it and drop the arg. A `type_var` (another
+            // param) is fine — it grounds at the mono worklist.
+            if (bound) |bn| {
+                const arg_nodes = Ast.protocolRefArgs(t.tree, bn);
+                if (arg_nodes.len > 0) {
+                    const av = try t.gpa.alloc(Type, arg_nodes.len);
+                    for (arg_nodes, 0..) |an, k| {
+                        const aty = t.typeFromNode(an);
+                        if (aty.isApp()) {
+                            try t.sink.emit(t.byteOf(t.tree.nodes[an.int()].main_token), "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)");
+                            av[k] = .invalid;
+                        } else av[k] = aty;
+                    }
+                    gbound_args[i] = av;
+                }
+            }
         }
     }
-    t.cur_generic_params = gnames;
-    defer t.cur_generic_params = &.{};
 
     // Inherent method (M8): resolve the receiver type and put it in scope so the
     // synthesized `self` param and any `Self` type-ref in the signature decode to it.
@@ -2637,7 +2938,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         }
     }
     const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .generic_bounds = gbounds, .self_type = self_ty });
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .generic_bounds = gbounds, .generic_bound_args = gbound_args, .self_type = self_ty });
     // Register the method into the program-wide table (SERIAL, fn-id order). The name
     // is BORROWED from source (like `Sig.name`); the table is frozen before Pass C.
     if (recv_type != Ast.none) {
@@ -3399,6 +3700,150 @@ test "M13: an undeclared bound protocol on a generic param is T0021 at the bound
     defer c.deinit(gpa);
     try testing.expectEqual(codes.Code.T0021, c.result.diags[0].code);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Ghost") != null);
+}
+
+test "M14: a doubly-conforming generic protocol registers TWO methods with NO T0020" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Into[U] { fn into(self) -> U }
+        \\struct P { x: int }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    // Two conformances keyed on (protocol, P, [int]) vs (protocol, P, [bool]) — distinct
+    // keys, so NO coherence collision.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Both `into` methods register on P, stamped with distinct protocol_args.
+    var into_on_p: usize = 0;
+    var saw_int = false;
+    var saw_bool = false;
+    for (c.result.methods) |m| {
+        if (std.mem.eql(u8, m.name, "into") and m.recv.kind == .@"struct") {
+            into_on_p += 1;
+            try testing.expect(m.protocol_id != null);
+            try testing.expectEqual(@as(usize, 1), m.protocol_args.len);
+            if (m.protocol_args[0].kind == .int) saw_int = true;
+            if (m.protocol_args[0].kind == .bool) saw_bool = true;
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), into_on_p);
+    try testing.expect(saw_int and saw_bool);
+}
+
+test "M14: a concrete doubly-conforming use with no type-args emits exactly one T0025" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Into[U] { fn into(self) -> U }
+        \\struct P { x: int }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+        \\fn main() -> int {
+        \\ p := P{ x: 42 }
+        \\ return p.into()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    var n25: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0025) n25 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n25);
+    // Names the conflicting conformances deterministically, in source order.
+    var msg: []const u8 = "";
+    for (c.result.diags) |d| if (d.code == codes.Code.T0025) {
+        msg = d.message;
+    };
+    try testing.expect(std.mem.indexOf(u8, msg, "ambiguous conformance") != null);
+    const int_at = std.mem.indexOf(u8, msg, "Into[int]") orelse return error.TestUnexpectedResult;
+    const bool_at = std.mem.indexOf(u8, msg, "Into[bool]") orelse return error.TestUnexpectedResult;
+    try testing.expect(int_at < bool_at); // source order (Into[int] declared first)
+}
+
+test "M14: an explicit-args concrete use v.into[int]() selects the Into[int] witness, no error" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Into[U] { fn into(self) -> U }
+        \\struct P { x: int }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+        \\fn main() -> int {
+        \\ p := P{ x: 42 }
+        \\ return p.into[int]()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M14: the generic-protocol e2e monomorphizes one bounded instance carrying its protocol_args" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Into[U] { fn into(self) -> U }
+        \\struct P { x: int }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+        \\fn use[T has Into[int]](v: T) -> int { v.into[int]() }
+        \\fn main() -> int { return use(P{ x: 42 }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    const inst = c.result.instances[0];
+    try testing.expectEqual(@as(usize, 1), inst.conformances.len);
+    try testing.expectEqualStrings("Into", inst.conformances[0].protocol_name);
+    // The bound's protocol type-args ride the conformance (folded into the (e) fp).
+    try testing.expectEqual(@as(usize, 1), inst.conformances[0].protocol_args.len);
+    try testing.expectEqual(Kind.int, inst.conformances[0].protocol_args[0].kind);
+    // The witness is the Into[int] method (mangled with the protocol identity + args),
+    // NOT the Into[bool] sibling.
+    try testing.expect(std.mem.indexOf(u8, inst.conformances[0].witness_syms[0], "into") != null);
+    try testing.expect(std.mem.indexOf(u8, inst.conformances[0].witness_syms[0], "int") != null);
+}
+
+test "M14: a single generic conformance resolves with no explicit args (byte-identical dispatch)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Into[U] { fn into(self) -> U }
+        \\struct P { x: int }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\fn main() -> int {
+        \\ p := P{ x: 42 }
+        \\ return p.into()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // With ONE conformance the resolver's `matches <= 1` fast path fires — `p.into()`
+    // resolves with no args, no ambiguity.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M14: a [T has Convert[U]] bound resolves after substituting U at the mono worklist" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Convert[U] { fn conv(self) -> U }
+        \\struct P { x: int }
+        \\impl P has Convert[int] { fn conv(self) -> int { self.x } }
+        \\fn use[T has Convert[U], U](v: T) -> int { 0 }
+        \\fn main() -> int { return use[P, int](P{ x: 42 }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    // The bound arg `U` is a `type_var`; at the `use[P, int]` call it substitutes to `int`,
+    // so `findConformance(Convert, P, [int])` succeeds at the mono worklist — one instance,
+    // no diagnostics. (The bound is resolved at monomorphization; the body need not call
+    // `conv`, matching the contract's in-scope `[T has Convert[U]]` resolution.)
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances[0].protocol_args.len);
+    try testing.expectEqual(Kind.int, c.result.instances[0].conformances[0].protocol_args[0].kind);
 }
 
 test "M4: Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {
