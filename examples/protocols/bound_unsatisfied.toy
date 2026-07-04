@@ -1,0 +1,20 @@
+# Feature (negative): a constrained generic `twice[T has Doubler]` called on a type
+# that does NOT conform to `Doubler` (M13). The bound is enforced at the
+# monomorphization use site: `Q` has no `impl Q has Doubler`, so the instantiation is
+# a use-site error naming the type + the protocol (T0023), and is skipped (no cascade).
+# expect: compile-error "type 'Q' does not conform to protocol 'Doubler'"
+protocol Doubler {
+    fn dbl(self) -> int
+}
+
+struct P { x: int }
+
+impl P has Doubler {
+    fn dbl(self) -> int { self.x * 2 }
+}
+
+struct Q { x: int }
+
+fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+
+fn main() -> int { return twice(Q{ x: 1 }) }

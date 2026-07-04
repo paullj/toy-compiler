@@ -32,6 +32,7 @@ const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const Diagnostic = toyc.DiagnosticSink.Diagnostic;
 const NO_SCOPE = toyc.DiagnosticSink.NO_SCOPE;
+const codes = toyc.codes;
 const testing = std.testing;
 
 /// The outcome of the in-process front-end over one entry: whether discovery hit a
@@ -169,6 +170,70 @@ test "differential: check agrees with build in-process (single-file + multi-modu
         try testing.expect(!outcome.structural);
         try testing.expectEqual(@as(usize, 1), outcome.errors);
     }
+}
+
+// M13 regression: the T0024 coherence signature check must anchor its diagnostic in
+// the CURRENTLY-scanned module's tree, not at the `decl_node` of `findMethod`'s
+// whole-program first match. When the SAME (protocol, receiver) is impl'd in two
+// different modules for a shared imported type (an overlapping impl -> T0020),
+// `findMethod` returns the first-registered method, whose `decl_node` indexes a
+// DIFFERENT (here far larger) module's tree; dereferencing it against the active,
+// shorter tree used to panic with `index out of bounds`, crashing the compiler on
+// mere source input (breaking the report-all contract). Here module `a` is imported
+// first and padded so its node array dwarfs tiny module `b`'s, and `a`'s impl
+// signature is the mismatched one. The check must NOT crash and must attribute
+// EXACTLY one T0024 (to `a`'s genuinely-wrong impl) plus one T0020 (the overlap) —
+// never a spurious T0024 against `b`'s correct sibling impl.
+test "M13 coherence: overlapping cross-module impls with a mismatched sig report T0024+T0020 without crashing" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const a_src = comptime blk: {
+        var s: []const u8 = "import lib\n";
+        var i: usize = 0;
+        while (i < 30) : (i += 1) {
+            s = s ++ std.fmt.comptimePrint("fn pad_{d}(a: int) -> int {{ return a + {d} }}\n", .{ i, i });
+        }
+        s = s ++ "impl lib.P has lib.Doubler {\n    fn dbl(self) -> bool { self.x > 0 }\n}\n";
+        break :blk s;
+    };
+
+    const dir = ".toy-test-diff-coherence-xmod";
+    try writeFixture(io, dir, &.{
+        .{ "lib.toy", "pub protocol Doubler {\n    fn dbl(self) -> int\n}\npub struct P {\n    x: int\n}\n" },
+        .{ "a.toy", a_src },
+        .{ "b.toy", "import lib\nimpl lib.P has lib.Doubler {\n    fn dbl(self) -> int { self.x + self.x }\n}\n" },
+        .{ "main.toy", "import lib\nimport a\nimport b\nfn main() -> int {\n    return 0\n}\n" },
+    });
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+    const cache = try Driver.openCache(io, &dir_buf);
+    var graph = try Graph.discover(gpa, io, cache, "native", dir ++ "/main.toy", null);
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), countErrors(res.diags));
+
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
+    defer tc.deinit(gpa);
+
+    var n_t0024: usize = 0;
+    var n_t0020: usize = 0;
+    for (tc.diags) |d| {
+        if (d.severity != .err) continue;
+        switch (d.code) {
+            .T0024 => n_t0024 += 1,
+            .T0020 => n_t0020 += 1,
+            else => {},
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), n_t0024);
+    try testing.expectEqual(@as(usize, 1), n_t0020);
 }
 
 /// Spawn the built `toy` with `argv_tail`, returning the exit code (or an error).

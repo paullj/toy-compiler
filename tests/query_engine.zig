@@ -162,8 +162,8 @@ test "VERIFY: re-deriving identical inputs is byte-identical (the determinism ba
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
 
-    const fp1 = Fingerprint.fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
-    const fp2 = Fingerprint.fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{});
+    const fp1 = Fingerprint.fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
+    const fp2 = Fingerprint.fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     try testing.expectEqual(fp1, fp2); // deterministic fingerprint
 
     const sym: Link.SymName = .{ .kind = .user_fn, .name = "add" };
@@ -212,7 +212,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 /// callee sigs and touched types — the exact `fp ^ optMix ^ symMix` fold the engine
 /// folds at the codegen seam.
 fn cgKey(b: *const Built, fn_idx: usize, sym_name: []const u8, callees: []const Sig, touched: []const TouchedType) Key.Key {
-    const fp = Fingerprint.fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), callees, touched, &.{});
+    const fp = Fingerprint.fingerprint(b.tree, b.tokens, b.source, b.fnDecl(fn_idx), callees, touched, &.{}, &.{});
     return Key.codegen("aarch64-macos", fp, .{}, .{ .kind = .user_fn, .name = sym_name });
 }
 

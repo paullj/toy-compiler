@@ -1138,7 +1138,13 @@ fn parseGenericParams(p: *Parser, out: *std.ArrayList(Ast.Index)) Error!void {
         if (p.at(.identifier)) {
             const name_tok = p.index;
             p.bump(.identifier);
-            const gp = try p.addNode(.{ .tag = .generic_param, .main_token = name_tok, .lhs = Ast.none, .rhs = Ast.none });
+            // A constrained param `T has P` (M13): the bound protocol-ref (created
+            // BEFORE the owning `generic_param` node, so children precede parents) is
+            // stored in `lhs`; an unbounded `T` leaves it `none`. Reuses the same
+            // `parseProtocolRef` an `impl .. has P` uses (bare or dot-qualified; no
+            // generic protocol args — M14).
+            const bound: Ast.Index = if (p.eat(.kw_has)) try p.parseProtocolRef() else Ast.none;
+            const gp = try p.addNode(.{ .tag = .generic_param, .main_token = name_tok, .lhs = bound, .rhs = Ast.none });
             try out.append(p.gpa, gp);
             if (!p.eat(.comma)) {
                 if (p.at(.r_bracket)) break;
@@ -2427,8 +2433,9 @@ test "root is program and children precede parents" {
             // `import_decl` overloads `lhs`/`rhs` as TOKEN indices (path segments,
             // alias) like break/continue — no node children to order.
             .import_decl => {},
-            // A declared type parameter is a leaf: only its name token.
-            .generic_param => {},
+            // A declared type parameter: its name token, plus (M13) an optional bound
+            // protocol-ref in `lhs` (`[T has P]`), created before this node.
+            .generic_param => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             // `Base[Arg, ..]`: the base is `lhs`, the type-args are a Range in `rhs`.
             .type_app => {
                 try testing.expect(n.lhs.int() < self);
@@ -2485,6 +2492,38 @@ test "explicit call type-args wrap the callee in a tyapp" {
 test "nested type application nests tyapp nodes" {
     // Empty arg list renders with no trailing args after the callee.
     try expectSexpr("f[Box[int]]()", "(call (tyapp f (tyapp Box int)))");
+}
+
+test "constrained generic param stores the bound protocol-ref in its lhs (M13)" {
+    const gpa = testing.allocator;
+    const src = "fn twice[T has Doubler](v: T) -> int { 0 }\n";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, src);
+    defer freeTree(gpa, tree);
+
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    const fn_decl_idx = Ast.rangeSlice(tree, prog.lhs.int())[0];
+    const proto = Ast.protoAt(tree, tree.nodes[fn_decl_idx.int()].lhs.int());
+    try testing.expectEqual(@as(usize, 1), proto.generic_params.len);
+    const bound = Ast.genericParamBound(tree, proto.generic_params[0]) orelse return error.MissingBound;
+    const bn = tree.nodes[bound.int()];
+    try testing.expectEqual(Node.Tag.identifier, bn.tag);
+    try testing.expectEqualStrings("Doubler", tokens[bn.main_token].text(src));
+}
+
+test "unbounded generic param leaves its lhs none (M13)" {
+    const gpa = testing.allocator;
+    const src = "fn id[T](x: T) -> T { x }\n";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try expectTree(gpa, tokens, src);
+    defer freeTree(gpa, tree);
+
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    const fn_decl_idx = Ast.rangeSlice(tree, prog.lhs.int())[0];
+    const proto = Ast.protoAt(tree, tree.nodes[fn_decl_idx.int()].lhs.int());
+    try testing.expectEqual(@as(?Ast.Index, null), Ast.genericParamBound(tree, proto.generic_params[0]));
 }
 
 // --- M8 inherent methods: impl block parsing ---

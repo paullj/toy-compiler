@@ -128,6 +128,11 @@ const Frozen = struct {
     /// (`&.{}` for a base fn) — folded into the (d) fingerprint component so two
     /// instances of one template get distinct cache keys.
     type_args: []const Typecheck.Type = &.{},
+    /// This unit's OWN resolved `[T has P]` bound conformances when it is a bounded
+    /// monomorphized instance (`&.{}` for a base or unbounded-template instance) —
+    /// folded into the (e) fingerprint component so toggling a sibling conformance
+    /// invalidates exactly the dependent monomorphizations (M13).
+    conformances: []const Mono.ResolvedConformance = &.{},
     /// The program-wide inherent-method table (M8), for method-call dispatch in
     /// `lowerCall` and the method-sig fold in `CallVisitor`. Shared read-only.
     methods: []const Typecheck.Method = &.{},
@@ -258,6 +263,7 @@ const GraphFrozen = struct {
         const is_inst = lower_i >= gf.base_count;
         const nts: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].node_types else gf.node_types[mod];
         const targs: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].args else &.{};
+        const confs: []const Mono.ResolvedConformance = if (is_inst) gf.instances[lower_i - gf.base_count].conformances else &.{};
         return .{
             .tree = gf.trees[mod],
             .tokens = gf.tokens[mod],
@@ -272,6 +278,7 @@ const GraphFrozen = struct {
             .opt = gf.opt,
             .instances = gf.instances,
             .type_args = targs,
+            .conformances = confs,
             .methods = gf.methods,
         };
     }

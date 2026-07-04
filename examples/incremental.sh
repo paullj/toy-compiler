@@ -148,6 +148,41 @@ fn main() -> int {
 }
 ' 1
 
+# 3c) BOUNDED CONFORMANCE (M13) — a bounded generic `twice[T has Doubler]` instantiated
+#     at BOTH X and Y, each conforming via `impl .. has Doubler`. Editing the conforming
+#     type X (add a field) must recompile EXACTLY the dependent monomorphization
+#     (twice$X) + X.dbl + main; the other instance twice$Y, Y.dbl, and the unrelated fn
+#     cut off. The cutoff is carried jointly by the (d) type-arg-layout fold AND the (e)
+#     resolved-conformance fold; the SOUNDNESS cmp (inc __text == force __text) is the
+#     stale-cache-miscompile gate — a cached twice$X against X's old layout would exit wrong.
+run_scenario bounded_conformance \
+'protocol Doubler { fn dbl(self) -> int }
+struct X { x: int }
+struct Y { y: int }
+impl X has Doubler { fn dbl(self) -> int { self.x * 2 } }
+impl Y has Doubler { fn dbl(self) -> int { self.y * 2 } }
+fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    a := twice(X{ x: 3 })
+    b := twice(Y{ y: 4 })
+    return a + b + unrelated(0)
+}
+' \
+'protocol Doubler { fn dbl(self) -> int }
+struct X { x: int, w: int }
+struct Y { y: int }
+impl X has Doubler { fn dbl(self) -> int { self.x * 2 } }
+impl Y has Doubler { fn dbl(self) -> int { self.y * 2 } }
+fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    a := twice(X{ x: 3, w: 0 })
+    b := twice(Y{ y: 4 })
+    return a + b + unrelated(0)
+}
+' 1
+
 # 4) COMMENT-ONLY — no semantic change; EVERYTHING cuts off (codegen compiled=0),
 #    the strongest cutoff (index-free codegen fingerprint).
 run_scenario comment \

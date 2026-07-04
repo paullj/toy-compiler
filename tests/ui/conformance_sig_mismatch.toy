@@ -1,0 +1,13 @@
+protocol Doubler {
+    fn dbl(self) -> int
+}
+
+struct P { x: int }
+
+impl P has Doubler {
+    fn dbl(self) -> bool { self.x > 0 }  #~ ERROR [T0024] incompatible with protocol 'Doubler'
+}
+
+fn main() -> int {
+    return 0
+}
