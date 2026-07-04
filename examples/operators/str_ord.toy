@@ -1,0 +1,16 @@
+# Feature: builtin `Ord` for `str` (M16). `<` / `>` / `<=` / `>=` on strings lower to a
+# heap-free lexicographic 3-way `load_byte` loop (no witness call): the first differing
+# byte decides, a proper prefix is less than its extension, and equal strings compare
+# equal. Exercises differ-at-byte, both prefix directions, and the equal case.
+# expect: exit 42
+fn main() -> int {
+    r := 0
+    if "abc" < "abd" { r = r + 1 }   # differ at the last byte -> lt
+    if "ab" < "abc" { r = r + 2 }    # "ab" is a prefix of "abc" -> lt
+    if "abc" > "ab" { r = r + 4 }    # "ab" is a prefix of "abc" -> gt
+    if "b" > "a" { r = r + 8 }       # first byte decides -> gt
+    if "" < "z" { r = r + 16 }       # empty is less than any non-empty
+    if "abc" <= "abc" { r = r + 5 }  # equal -> <= holds
+    if "abc" >= "abc" { r = r + 6 }  # equal -> >= holds
+    return r
+}

@@ -304,6 +304,14 @@ fn collectGlobals(g: *GraphResolve) !void {
     for (g.tables) |*t| {
         if (!t.fns.contains("print")) try t.fns.put(g.gpa, "print", print_id);
     }
+    // The prelude `enum Ordering { lt, eq, gt }` (M16) is nameable in every module with no
+    // import (the `print` precedent). Register it into each module's enum table UNLESS the
+    // module declares its own `Ordering` (user-first-wins), so `Ordering.lt` construction and
+    // a match on it resolve quietly (left for Typecheck, which native-registers the enum). The
+    // typecheck-time `enum_ids` injection in `registerPrelude` mirrors this on its own tables.
+    for (g.tables) |*t| {
+        if (!t.enums.contains("Ordering")) try t.enums.put(g.gpa, "Ordering", true);
+    }
 }
 
 /// Bind each module's import namespaces (last path segment, or the `as` alias) to
