@@ -68,6 +68,7 @@ pub const Code = enum(u16) {
     T0019, // mut-self-not-place (a `mut self` method called on a temporary/non-place receiver — M9)
     T0020, // overlapping-impl (two impls of the same protocol for the same type-ctor — coherence, M11)
     T0021, // no-conformance (an `impl .. has P` omits a required method, or `has` names an undeclared protocol — M11)
+    T0022, // mut-self-on-scalar (a `mut self` method called on a builtin scalar receiver — the by-address self ABI has no place to write back — M12)
 
     _,
 };
@@ -127,6 +128,7 @@ pub const table = [_]Entry{
     .{ .code = .T0019, .str = "T0019", .slug = "mut-self-not-place" },
     .{ .code = .T0020, .str = "T0020", .slug = "overlapping-impl" },
     .{ .code = .T0021, .str = "T0021", .slug = "no-conformance" },
+    .{ .code = .T0022, .str = "T0022", .slug = "mut-self-on-scalar" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so

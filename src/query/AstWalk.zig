@@ -32,6 +32,15 @@ const Infer = @import("../symbols/Infer.zig");
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 pub const TouchedType = @import("Fingerprint.zig").TouchedType;
 
+/// Fixed sentinel params for the builtin scalar `eq` fold (M12). FILE-SCOPE (not a stack
+/// temporary) because `Fingerprint.fingerprint` reads each folded `Sig.params` AFTER the
+/// call walk returns — a `&.{recv,recv}` local would dangle. `eq` is homogeneous, so the
+/// params mirror the receiver Kind; choosing per-kind (int vs bool) is strictly more
+/// forward-stable than a single kind-agnostic array at zero cost, and — once chosen —
+/// must stay stable or warm caches invalidate.
+const eq_params_int = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int };
+const eq_params_bool = [_]Typecheck.Type{ Typecheck.Type.bool, Typecheck.Type.bool };
+
 /// The read-only inputs a walk needs to spell a leaf. `tree`/`tokens`/`source`
 /// are the same trio every consumer already threads; `leaf`/`tokenText` fold the
 /// inline `tokens[n.main_token].text(source)` idiom the old walks repeated.
@@ -452,7 +461,9 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // (stale-cache soundness — mirrors the plain-func fold above).
                     if (cn.tag == .field_access and res != .func and cn.lhs.int() < self.frozen.node_types.len) {
                         const recv = self.frozen.node_types[cn.lhs.int()];
-                        if (recv.kind == .@"struct" or recv.kind == .@"enum") {
+                        if (recv.kind == .@"struct" or recv.kind == .@"enum" or
+                            recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit)
+                        {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
                             if (Typecheck.findMethod(self.frozen.methods, recv, member)) |m| {
                                 // A method on a GENERIC-type instance (M10): the reified
@@ -470,6 +481,14 @@ pub fn CallVisitor(comptime Frozen: type) type {
                                     const sig = self.frozen.sigs[m.fn_id];
                                     try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
                                 }
+                            } else if (Typecheck.builtinScalarMethod(recv, member) != null) {
+                                // A builtin scalar `eq` (M12): it has NO real fn_id/instance
+                                // (the recognizer lowers to an inline machine op, no symbol),
+                                // so fold a FIXED sentinel Sig instead. Deterministic + stable
+                                // across builds, and distinct from any future builtin scalar
+                                // method by its `eq` name + homogeneous params.
+                                const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
+                                try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = Typecheck.Type.bool });
                             }
                         }
                     }

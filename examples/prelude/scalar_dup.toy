@@ -1,0 +1,12 @@
+# Feature: whole-program coherence spans builtin scalar Kinds (M12). The compiler
+# pre-registers the builtin `(Eq, int)` conformance, so a user `impl int has Eq`
+# overlaps it and is rejected — exactly as two user impls of the same `(protocol, type)`
+# collide (T0020).
+# expect: compile-error "overlapping impl"
+impl int has Eq {
+    fn eq(self, o: int) -> bool { true }
+}
+
+fn main() -> int {
+    return 0
+}

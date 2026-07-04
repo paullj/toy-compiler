@@ -1520,7 +1520,9 @@ pub const BodyChecker = struct {
             if (!recv_is_func and recv_res != .module) {
                 const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
                 if (recv_ty.kind == .invalid) return .invalid; // receiver already errored → no cascade
-                if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum") {
+                if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
+                    recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
+                {
                     const member = bc.nameText(callee.main_token);
                     const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
                     if (Typecheck.findMethod(bc.model.methods, recv_ty, member)) |m| {
@@ -1529,9 +1531,16 @@ pub const BodyChecker = struct {
                         // be called on a mutable place (a local or a field of one). Report
                         // but do NOT unwind — fall through to arg checks + `return mf.ret`
                         // so nothing cascades (whole-`self` reassign is fine: `self` is a
-                        // `.local`).
-                        if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
-                            try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+                        // `.local`). On a builtin scalar receiver the by-address self ABI
+                        // (lower passes the slot pointer) has no write-back path — the body
+                        // would read the pointer as the value — so reject it outright
+                        // (T0022) and skip the place check, which is moot for scalars.
+                        if (m.mut_self) {
+                            if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
+                                try bc.sink.emitFmtCode(.T0022, bc.byteOf(callee.main_token), "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
+                            } else if (!bc.isMutablePlace(callee.lhs)) {
+                                try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+                            }
                         }
                         // params[0] is the synthesized `self`; value args match params[1..].
                         const self_off: usize = @min(mf.params.len, 1);
@@ -1551,7 +1560,25 @@ pub const BodyChecker = struct {
                         bc.node_types[(node_idx).int()] = mf.ret;
                         return mf.ret;
                     }
-                    // A concrete struct/enum value with no such method (M8).
+                    // A builtin scalar protocol method (M12): `n.eq(m)` on int/bool. Not a
+                    // `t.methods` entry (the recognizer is pure), so `findMethod` misses;
+                    // recognize it here, check arity==1 + the arg is assignable to `Self`
+                    // (the homogeneous `Eq` receiver), and type the call to the method's
+                    // return. A user `impl int has P` was already handled above (its real
+                    // `fn_id` is in the method table), so this only fires for the builtins.
+                    if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
+                        if (args.len != 1) {
+                            for (args) |a| _ = try bc.typeOf(a);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                        } else {
+                            const at = try bc.typeOfExpected(args[0], recv_ty);
+                            if (!Type.assignable(recv_ty, at))
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
+                        }
+                        bc.node_types[(node_idx).int()] = bm.ret;
+                        return bm.ret;
+                    }
+                    // A concrete struct/enum/scalar value with no such method (M8/M12).
                     for (args) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
                     return .invalid;

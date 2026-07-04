@@ -1,0 +1,14 @@
+# Feature: a `mut self` method on a builtin scalar receiver is rejected (M12, T0022).
+# The by-address self ABI passes the receiver's slot pointer, which only works for
+# struct/enum bodies (they touch `self` via field access); a scalar `self` is used
+# directly as a value, so there is no write-back path. Rejected at check time rather
+# than silently miscompiling `pointer + 1`.
+# expect: compile-error "not supported on the builtin type"
+impl int {
+    fn bump(mut self) -> int { return self + 1 }
+}
+
+fn main() -> int {
+    x := 41
+    return x.bump()
+}
