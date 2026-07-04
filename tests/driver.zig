@@ -1460,6 +1460,95 @@ test "integration (M2): monomorphized generic instances get distinct symbols, ru
     }
 }
 
+test "integration (M18): a derived-Eq struct runs to exit 42, mints one source-less unit, and costs zero when uncalled" {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_name_buf: [64]u8 = undefined;
+    const dir_name = std.fmt.bufPrint(&dir_name_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    // Case A: an all-Eq-fields struct compared with `==` derives structurally (no impl)
+    // and runs to 42. main + one SOURCE-LESS derive unit = 2 codegen units.
+    {
+        const src =
+            "struct P { x: int, y: int }\n" ++
+            "fn main() -> int {\n a := P{ x: 1, y: 2 }\n b := P{ x: 1, y: 2 }\n return if a == b { 42 } else { 0 }\n}\n";
+        const src_path = std.fmt.allocPrint(gpa, "{s}/deq.toy", .{dir_name}) catch unreachable;
+        defer gpa.free(src_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = src });
+
+        var r: FileResult = .{ .path = src_path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 0);
+        defer r.deinit(gpa);
+        try testing.expect(r.err == null);
+
+        // Exactly one synthetic recipe (Eq for struct id 0), canonically named.
+        const derives = r.typecheck.?.derives;
+        try testing.expectEqual(@as(usize, 1), derives.len);
+        try testing.expectEqualStrings("Eq$eq$s0", derives[0].name);
+
+        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .force, .O0);
+        const lp = switch (lowered) {
+            .ok => |*ok| ok,
+            .err => return error.TestUnexpectedResult,
+        };
+        defer lp.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), lp.diags.len);
+        try testing.expectEqual(@as(usize, 2), lp.codegen_compiled); // main + Eq$eq$s0
+
+        const image = try buildImage(io, gpa, "deq", lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        defer gpa.free(image);
+        const out_path = std.fmt.allocPrint(gpa, "{s}/deq", .{dir_name}) catch unreachable;
+        defer gpa.free(out_path);
+        {
+            const perms: Io.File.Permissions = .fromMode(0o755);
+            var f = try Io.Dir.cwd().createFile(io, out_path, .{ .permissions = perms });
+            defer f.close(io);
+            try f.writeStreamingAll(io, image);
+            try f.setPermissions(io, perms);
+        }
+        const abs = try Io.Dir.cwd().realPathFileAlloc(io, out_path, gpa);
+        defer gpa.free(abs);
+        var child = try std.process.spawn(io, .{ .argv = &.{abs} });
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
+    }
+
+    // Case B: a derivable struct never compared with `==` mints ZERO derive units
+    // (lazy — free in the binary). Only `main` is lowered.
+    {
+        const src = "struct Q { v: int }\nfn main() -> int {\n q := Q{ v: 9 }\n return q.v\n}\n";
+        const src_path = std.fmt.allocPrint(gpa, "{s}/dunused.toy", .{dir_name}) catch unreachable;
+        defer gpa.free(src_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = src });
+
+        var r: FileResult = .{ .path = src_path };
+        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, 1);
+        defer r.deinit(gpa);
+        try testing.expect(r.err == null);
+        try testing.expectEqual(@as(usize, 0), r.typecheck.?.derives.len);
+
+        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .force, .O0);
+        const lp = switch (lowered) {
+            .ok => |*ok| ok,
+            .err => return error.TestUnexpectedResult,
+        };
+        defer lp.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), lp.codegen_compiled); // just `main`
+    }
+}
+
 test "integration: print writes the expected bytes to stdout" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 

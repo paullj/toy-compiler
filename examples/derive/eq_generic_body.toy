@@ -1,0 +1,17 @@
+# Feature: auto-derive fires when the ONLY `==` on a derivable struct is inside an
+# unbounded generic body (M18). Pass C skips unbounded templates, so the structural-Eq
+# request is first recorded during the mono-tail per-instance re-check; that re-check must
+# forward the request or `synthesizeDerives` mints no unit and the instance's `==` fails
+# to resolve at codegen.
+struct P { x: int }
+
+fn cmp2[T](a: P, b: P) -> bool {
+    return a == b
+}
+
+fn main() -> int {
+    p := P{ x: 1 }
+    q := P{ x: 1 }
+    return if cmp2[int](p, q) { 42 } else { 0 }
+}
+# expect: exit 42

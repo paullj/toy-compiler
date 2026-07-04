@@ -1,7 +1,7 @@
-struct P { x: int }
+enum E { A(int), B }
 
 fn main() -> int {
-    p := P{ x: 1 }
-    q := P{ x: 2 }
+    p := E.B
+    q := E.B
     return if p == q { 1 } else { 0 }  #~ ERROR [T0026] requires an 'Eq' impl
 }

@@ -25,6 +25,7 @@ const CodegenIr = @import("../codegen/CodegenIr.zig");
 const Ast = @import("../ast/Ast.zig");
 const Fingerprint = @import("Fingerprint.zig");
 const Walks = @import("Walks.zig");
+const AstWalk = @import("AstWalk.zig");
 const Link = @import("../link/Link.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
@@ -483,6 +484,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .instances = frozen.instances,
         .sigs = frozen.sigs,
         .methods = frozen.methods,
+        .derives = frozen.derives,
     };
     var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
     defer irf.deinit(gpa);
@@ -642,6 +644,122 @@ pub fn codegen(
         const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
         cache.put(u8, io, key, tmp_tag, b) catch {};
         if (self.probe) |p| lap(io, &p.put_ns, put_t0);
+    }
+    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+}
+
+/// Lower one SOURCE-LESS auto-derive unit (recipe→Ir→OPT→FnCode), M18. The IR is built
+/// from the recipe + layouts (no AST) and never escapes — one-tier, like `lowerOne`.
+fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link.SymName, opt_out: ?*OptOut) !Link.FnCode {
+    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    const in: lower.Inputs = .{
+        .tree = frozen.tree,
+        .tokens = frozen.tokens,
+        .source = frozen.source,
+        .resolutions = frozen.resolutions,
+        .node_types = frozen.node_types, // &.{} for a derive unit — the emitter reads none
+        .layouts = frozen.layouts,
+        .enum_layouts = frozen.enum_layouts,
+        .names = frozen.names,
+        .sig = null,
+        .instances = frozen.instances,
+        .sigs = frozen.sigs,
+        .methods = frozen.methods,
+        .derives = frozen.derives,
+    };
+    var irf = try lower.lowerDeriveEq(gpa, in, d, sym, &diags);
+    defer irf.deinit(gpa);
+    if (diags.items.len > 0) return error.CodegenDiagnostic;
+
+    var opt_st: Opt.Stats = .{};
+    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
+    if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
+
+    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);
+    if (diags.items.len > 0) {
+        var tmp = fc;
+        tmp.deinit(gpa);
+        return error.CodegenDiagnostic;
+    }
+    return fc;
+}
+
+/// The per-derive-unit codegen query (M18): a source-less sibling of `codegen`. Builds a
+/// NON-AST fingerprint from the recipe (`Fingerprint.deriveFingerprint` over the
+/// conforming type's layout + the resolved field witnesses), folds the SAME
+/// `Key.codegen(target, fp, opt, sym)` key (UNCHANGED — `symMix` separates it from real
+/// fns), and honors normal/force/verify exactly like `codegen`. The emitter is pure, so
+/// verify's double-lower is byte-identical. Fills the same `FnSlot` shape.
+pub fn codegenSynthetic(
+    self: Engine,
+    gpa: std.mem.Allocator,
+    io: Io,
+    target: []const u8,
+    frozen: anytype,
+    di: usize,
+    tmp_tag: usize,
+    slot: anytype,
+) !void {
+    const cache = self.cache;
+    const mode = self.mode;
+    const d = frozen.derives[di];
+    const sym = Link.SymName{ .kind = .user_fn, .name = d.name };
+
+    // The conforming type's index-free layout descriptor (mirrors the touched fold), so a
+    // field-layout edit flips the unit's key. Built by the SAME `appendTouched` path.
+    var conform_list: std.ArrayList(Fingerprint.TouchedType) = .empty;
+    defer {
+        Walks.freeTouched(gpa, conform_list.items);
+        conform_list.deinit(gpa);
+    }
+    try AstWalk.appendTouched(gpa, frozen, d.conform_ty, &conform_list);
+    const conform: Fingerprint.TouchedType = if (conform_list.items.len > 0) conform_list.items[0] else .{ .kind = d.conform_ty.kind };
+
+    const fp = Fingerprint.deriveFingerprint(d.protocol_name, d.kind, conform, d.field_witnesses);
+    const key = Key.codegen(target, fp, frozen.opt, sym);
+
+    if (mode == .verify) {
+        var opt_out: OptOut = .{};
+        var fresh = try lowerSynthetic(gpa, frozen, d, sym, &opt_out);
+        errdefer fresh.deinit(gpa);
+        const fb = try Link.pack(gpa, fresh);
+        defer gpa.free(fb);
+
+        var was_cached = false;
+        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+            defer gpa.free(blob);
+            if (!std.mem.eql(u8, fb, blob)) return error.VerifyCacheMismatch;
+            was_cached = true;
+        } else {
+            var fresh2 = try lowerSynthetic(gpa, frozen, d, sym, null);
+            defer fresh2.deinit(gpa);
+            const fb2 = try Link.pack(gpa, fresh2);
+            defer gpa.free(fb2);
+            if (!std.mem.eql(u8, fb, fb2)) return error.VerifyNondeterministic;
+            cache.put(u8, io, key, tmp_tag, fb) catch {};
+        }
+        slot.* = .{ .fc = fresh, .cached = was_cached, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+        return;
+    }
+
+    if (mode != .force) {
+        if (cache.get(u8, gpa, io, key) catch null) |blob| {
+            defer gpa.free(blob);
+            if (Link.unpack(gpa, blob) catch null) |fc| {
+                slot.* = .{ .fc = fc, .cached = true };
+                return;
+            }
+        }
+    }
+
+    var opt_out: OptOut = .{};
+    var fc = try lowerSynthetic(gpa, frozen, d, sym, &opt_out);
+    errdefer fc.deinit(gpa);
+    if (Link.pack(gpa, fc) catch null) |b| {
+        defer gpa.free(b);
+        cache.put(u8, io, key, tmp_tag, b) catch {};
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
 }

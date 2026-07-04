@@ -1,11 +1,14 @@
-# Feature (negative): `==`/`!=` desugar to `Eq::eq` (M15). A struct with NO `Eq` impl
-# used with `==` is a compile-error AT THE OPERATOR (T0026) — the fix is an
-# `impl P has Eq { fn eq(self, o: P) -> bool { .. } }` (an auto-derive lands in M18).
+# Feature (negative): `==`/`!=` desugar to `Eq::eq` (M15). A type with NO `Eq` impl that
+# ALSO cannot be structurally auto-derived (M18) is a compile-error at the operator
+# (T0026). A payload-carrying enum does NOT structurally conform to `Eq` in M18 (its Eq
+# derive is deferred to M19), so comparing one with no impl still needs an explicit
+# `impl E has Eq { fn eq(self, o: E) -> bool { .. } }`. (An all-Eq-fields STRUCT, by
+# contrast, now derives `Eq` for free — see examples/derive/eq.toy.)
 # expect: compile-error "T0026"
-struct P { x: int }
+enum E { A(int), B }
 
 fn main() -> int {
-    p := P{ x: 1 }
-    q := P{ x: 2 }
+    p := E.B
+    q := E.B
     return if p == q { 1 } else { 0 }
 }

@@ -27,6 +27,7 @@ pub const diagnostics = struct {
 pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
+pub const Derive = @import("symbols/Derive.zig");
 pub const ControlFlow = @import("ControlFlow.zig");
 pub const TypecheckGraph = @import("types_graph.zig");
 pub const LayoutEngine = @import("layout/Engine.zig");
@@ -88,6 +89,7 @@ test {
     _ = Resolve;
     _ = ResolveGraph;
     _ = Typecheck;
+    _ = Derive;
     _ = ControlFlow;
     _ = TypecheckGraph;
     _ = LayoutEngine;

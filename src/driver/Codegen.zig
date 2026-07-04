@@ -136,6 +136,10 @@ const Frozen = struct {
     /// The program-wide inherent-method table (M8), for method-call dispatch in
     /// `lowerCall` and the method-sig fold in `CallVisitor`. Shared read-only.
     methods: []const Typecheck.Method = &.{},
+    /// The authorized structural auto-derive recipes (M18): so `lowerStructEq`/`lowerDeriveEq`
+    /// resolve a derived witness to its synthetic unit, and `CallVisitor.foldWitness`
+    /// folds the derived-Eq witness identity. Shared read-only.
+    derives: []const Typecheck.DeriveRecipe = &.{},
 };
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
@@ -244,6 +248,14 @@ const GraphFrozen = struct {
     entry_id: u32,
     /// The program-wide inherent-method table (M8), threaded into every job's `Frozen`.
     methods: []const Typecheck.Method = &.{},
+    /// The authorized structural auto-derive recipes (M18), in canonical order. Appended
+    /// after the base fns + Mono instances as a THIRD class of lowerable units, and
+    /// threaded into every job's `Frozen` (a base fn's `==` on a derived type resolves the
+    /// synthetic witness through it too).
+    derives: []const Typecheck.DeriveRecipe = &.{},
+    /// The count of BASE fns + Mono instances; `fn_decls`/`fn_modules` entries at
+    /// `[derive_base..]` are the source-less derive units (parallel to `derives`).
+    derive_base: usize = 0,
     opt: Opt.Config,
 
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
@@ -256,12 +268,14 @@ const GraphFrozen = struct {
     fn frozenFor(gf: *const GraphFrozen, lower_i: usize, fn_node_buf: *[1]Ast.Index) Frozen {
         const mod = gf.fn_modules[lower_i];
         fn_node_buf[0] = gf.fn_decls[lower_i];
-        // An instance unit reads its OWN per-lower_i `node_types` slice (written by
-        // the mono tail's per-instance re-check), NOT the module's shared slots — so
-        // two instances of one template never alias each other's node types. A base
-        // fn reads its module's slice as before.
-        const is_inst = lower_i >= gf.base_count;
-        const nts: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].node_types else gf.node_types[mod];
+        // Three lowerable-unit classes: base fns `[0, base_count)`, Mono instances
+        // `[base_count, derive_base)`, source-less derive units `[derive_base, ..)`. An
+        // instance reads its OWN per-lower_i `node_types` (so two instances of one
+        // template never alias); a derive unit reads NO AST/node_types (the emitter is
+        // layout-driven), so leave them empty. A base fn reads its module's slice.
+        const is_inst = lower_i >= gf.base_count and lower_i < gf.derive_base;
+        const is_derive = lower_i >= gf.derive_base;
+        const nts: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].node_types else if (is_derive) &.{} else gf.node_types[mod];
         const targs: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].args else &.{};
         const confs: []const Mono.ResolvedConformance = if (is_inst) gf.instances[lower_i - gf.base_count].conformances else &.{};
         return .{
@@ -280,6 +294,7 @@ const GraphFrozen = struct {
             .type_args = targs,
             .conformances = confs,
             .methods = gf.methods,
+            .derives = gf.derives,
         };
     }
 };
@@ -367,6 +382,15 @@ pub fn lowerGraphProgram(
         try fn_decls.append(gpa, inst.decl_node);
         try fn_modules.append(gpa, inst.mod);
     }
+    // The SOURCE-LESS auto-derive units follow the instances (M18), in canonical order.
+    // Each has a sentinel `decl_node` (never read — the emitter is layout-driven) + the
+    // recipe's `mod` (a real module id for the per-module tree/tokens the job's `Frozen`
+    // carries but never walks). Routed to `Engine.codegenSynthetic` in `graphFnJobInner`.
+    const derive_base = fn_decls.items.len;
+    for (tc.derives) |d| {
+        try fn_decls.append(gpa, Ast.none);
+        try fn_modules.append(gpa, d.mod);
+    }
 
     const eid = entry_id orelse return .{ .err = .{
         .message = "-o requires a function named 'main' in the entry module",
@@ -413,6 +437,8 @@ pub fn lowerGraphProgram(
         .instances = tc.instances,
         .entry_id = eid,
         .methods = tc.methods,
+        .derives = tc.derives,
+        .derive_base = derive_base,
         .opt = opt,
         .probe = probe,
     };
@@ -480,6 +506,8 @@ pub fn lowerGraphProgram(
     // Instance units carry their mangled SymName (borrowed from the instance table,
     // which outlives relink). Parallel to the appended instance codegen units.
     for (tc.instances, 0..) |inst, k| lowered_names[base_count + k] = .{ .kind = .user_fn, .name = inst.name };
+    // Derive units carry their synthetic mangled SymName (borrowed from `tc.derives`).
+    for (tc.derives, 0..) |d, k| lowered_names[derive_base + k] = .{ .kind = .user_fn, .name = d.name };
 
     const link_t0: i128 = if (link_ns != null) nowNs(io) else 0;
     const out = relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
@@ -535,7 +563,15 @@ fn graphFnJobInner(
     // the first same-named type in the merged layout table, missing a pub-type
     // layout edit at the importer (cross-module hole).
     var my_sig: ?Fingerprint.Sig = null;
-    if (lower_i < gf.base_count) {
+    if (lower_i >= gf.derive_base) {
+        // A SOURCE-LESS auto-derive unit (M18): no fn_decl / no AST fingerprint. Its
+        // identity is the recipe's synthetic mangled name; route to the synthetic engine
+        // entry which builds a NON-AST fingerprint from the recipe.
+        const di = lower_i - gf.derive_base;
+        const engine = Engine.initProbe(cache, mode, gf.probe);
+        try engine.codegenSynthetic(gpa, io, target, &frozen, di, lower_i, slot);
+        return;
+    } else if (lower_i < gf.base_count) {
         const gid = gf.lower_ids[lower_i];
         sym = gf.names[gid];
         is_entry = gid == gf.entry_id;
@@ -617,6 +653,7 @@ pub fn renderGraphIr(
             .instances = tc.instances,
             .sigs = tc.sigs,
             .methods = tc.methods,
+            .derives = tc.derives,
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -645,8 +682,39 @@ pub fn renderGraphIr(
             .instances = tc.instances,
             .sigs = tc.sigs,
             .methods = tc.methods,
+            .derives = tc.derives,
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
+        defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
+        if (!first) try aw.writer.writeAll("\n");
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        first = false;
+    }
+
+    // Render each SOURCE-LESS auto-derive unit (M18) via the layout-walking emitter, in
+    // canonical order — the same units codegen lowers, so `--emit ir` shows exactly one
+    // `Eq$eq$…` unit per derived type (the zero-codegen / override proofs read this).
+    for (tc.derives) |d| {
+        const m = &graph.modules[d.mod];
+        const sym = Link.SymName{ .kind = .user_fn, .name = d.name };
+        const in = lower.Inputs{
+            .tree = m.tree(),
+            .tokens = m.tokens,
+            .source = m.source,
+            .resolutions = res.resolutions[d.mod],
+            .node_types = &.{},
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = names,
+            .sig = .{ .kind = .user_fn, .name = d.name, .params = d.params, .ret = Typecheck.Type.@"bool" },
+            .instances = tc.instances,
+            .sigs = tc.sigs,
+            .methods = tc.methods,
+            .derives = tc.derives,
+        };
+        var func = try lower.lowerDeriveEq(gpa, in, d, sym, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);
