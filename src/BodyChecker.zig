@@ -127,6 +127,13 @@ pub const BodyChecker = struct {
     /// re-check the receiver is grounded, so that branch never fires.
     bound_protocols: []const ?u32 = &.{},
 
+    /// The per-generic-param bound protocol type-args (M14, `[T has P[args]]`), parallel to
+    /// `bound_protocols`. `bound_protocol_args[ord]` grounds the bound protocol's own
+    /// type-params in the bound-as-axiom `type_var`-receiver dispatch (so `v.into[int]()`
+    /// on a bounded `T` types the protocol method with `U == int`). Empty (inert) for a
+    /// non-generic/unbounded fn. Set by `bodyCheckerFor` from `FnSym.generic_bound_args`.
+    bound_protocol_args: []const []const Type = &.{},
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
@@ -1479,6 +1486,134 @@ pub const BodyChecker = struct {
         return .invalid; // mismatch, no coercion
     }
 
+    /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
+    /// (M8+): the `mut self` place gate, arity, and per-arg assignability, typing the call
+    /// node as the method's return. `fa` is the `field_access` (`main_token` = member,
+    /// `lhs` = receiver). Shared by the bare-dispatch path and the explicit-protocol-args
+    /// (`v.m[int]()`) path so both type identically. `args` is `n`'s value-arg range.
+    fn dispatchMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, fa: Ast.Node, recv_ty: Type, member: []const u8, m: Typecheck.Method) error{OutOfMemory}!Type {
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        const mf = bc.model.fns[m.fn_id];
+        if (m.mut_self) {
+            if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
+                try bc.sink.emitFmtCode(.T0022, bc.byteOf(fa.main_token), "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
+            } else if (!bc.isMutablePlace(fa.lhs)) {
+                try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(fa.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+            }
+        }
+        // params[0] is the synthesized `self`; value args match params[1..].
+        const self_off: usize = @min(mf.params.len, 1);
+        const want = mf.params.len - self_off;
+        if (args.len != want) {
+            for (args) |a| _ = try bc.typeOf(a);
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+            bc.node_types[(node_idx).int()] = mf.ret;
+            return mf.ret;
+        }
+        for (args, mf.params[self_off..], 0..) |a, pty, i| {
+            const at = try bc.typeOfExpected(a, if (pty.kind == .invalid) null else pty);
+            if (!Type.assignable(pty, at)) {
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+            }
+        }
+        bc.node_types[(node_idx).int()] = mf.ret;
+        return mf.ret;
+    }
+
+    /// Emit the T0025 ambiguity diagnostic (M14): the receiver conforms to one generic
+    /// protocol MULTIPLE times and the use site gave no disambiguating type-args. Names the
+    /// conflicting conformances in table (source fn-id) order — deterministic at any `-jN`.
+    fn emitAmbiguousConformance(bc: *BodyChecker, at_tok: u32, recv: Type, member: []const u8) error{OutOfMemory}!void {
+        var list: std.ArrayList(Typecheck.Method) = .empty;
+        defer list.deinit(bc.gpa);
+        try Typecheck.conformancesFor(bc.model.methods, recv, member, bc.gpa, &list);
+        var names: std.ArrayList(u8) = .empty;
+        defer names.deinit(bc.gpa);
+        for (list.items, 0..) |m, i| {
+            if (i != 0) try names.appendSlice(bc.gpa, " and ");
+            try names.appendSlice(bc.gpa, bc.model.protocols[m.protocol_id.?].name);
+            if (m.protocol_args.len > 0) {
+                try names.append(bc.gpa, '[');
+                for (m.protocol_args, 0..) |pa, j| {
+                    if (j != 0) try names.appendSlice(bc.gpa, ", ");
+                    try names.appendSlice(bc.gpa, bc.typeName(pa));
+                }
+                try names.append(bc.gpa, ']');
+            }
+        }
+        try bc.sink.emitFmtCode(.T0025, bc.byteOf(at_tok), "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
+    }
+
+    /// Type an explicit-protocol-args method call `v.m[int](args)` (M14): the callee is a
+    /// `type_app` over a `field_access`. The type-arg node_types are written (so lower /
+    /// AstWalk read them back to select the SAME witness), then the receiver is dispatched:
+    /// a concrete struct/enum/scalar disambiguates the witness by the explicit args; a
+    /// `type_var` (bound-as-axiom, checking a bounded template) grounds the bound protocol's
+    /// params with the explicit args.
+    fn typeOfExplicitMethodCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!Type {
+        const fa = bc.tree.nodes[(callee.lhs).int()]; // the field_access `v.m`
+        const member = bc.nameText(fa.main_token);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        const targ_nodes = Ast.rangeSlice(bc.tree, (callee.rhs).int());
+        const explicit = try bc.gpa.alloc(Type, targ_nodes.len);
+        defer bc.gpa.free(explicit);
+        for (targ_nodes, 0..) |tn, i| {
+            const ty = bc.typeFromNode(tn); // subst-aware inside an instance re-check
+            bc.node_types[(tn).int()] = ty;
+            explicit[i] = ty;
+        }
+        const recv_ty = try bc.typeOf(fa.lhs); // also populates node_types[recv] for lower
+        if (recv_ty.kind == .invalid) return .invalid;
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
+            recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
+        {
+            switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, explicit)) {
+                .one => |m| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, m),
+                else => {
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on type '{s}' for the given protocol type arguments", .{ member, bc.typeName(recv_ty) });
+                    return .invalid;
+                },
+            }
+        }
+        if (recv_ty.isTypeVar()) {
+            // Bound-as-axiom with explicit protocol args (checking a bounded template): the
+            // only protocol callable on `T` is its declared bound; ground the resolved
+            // method with the explicit args (`Self` -> the `type_var` receiver).
+            const ord = recv_ty.typeVarOrd();
+            const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
+            if (pid_opt) |pid| {
+                const p = bc.model.protocols[pid];
+                for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
+                    const psig = p.method_params[k];
+                    const self_off: usize = @min(psig.len, 1);
+                    const want = psig.len - self_off;
+                    if (args.len != want) {
+                        for (args) |a| _ = try bc.typeOf(a);
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+                    } else for (args, psig[self_off..], 0..) |a, pty, i| {
+                        const wt = Typecheck.groundProtoType(pty, recv_ty, explicit);
+                        const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
+                        if (!Type.assignable(wt, at))
+                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
+                    }
+                    const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, explicit);
+                    bc.node_types[(node_idx).int()] = ret;
+                    return ret;
+                };
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
+                return .invalid;
+            }
+            for (args) |a| _ = try bc.typeOf(a);
+            try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on unbounded type parameter", .{member});
+            return .invalid;
+        }
+        for (args) |a| _ = try bc.typeOf(a);
+        try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+        return .invalid;
+    }
+
     fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         // A qualified tuple-variant construction `N.V(args)` arrives as a `.call`
         // whose callee is a `field_access` over an enum type-name identifier. Route
@@ -1533,40 +1668,19 @@ pub const BodyChecker = struct {
                 {
                     const member = bc.nameText(callee.main_token);
                     const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-                    if (Typecheck.findMethod(bc.model.methods, recv_ty, member)) |m| {
-                        const mf = bc.model.fns[m.fn_id];
-                        // A `mut self` method mutates the receiver in place, so it may only
-                        // be called on a mutable place (a local or a field of one). Report
-                        // but do NOT unwind — fall through to arg checks + `return mf.ret`
-                        // so nothing cascades (whole-`self` reassign is fine: `self` is a
-                        // `.local`). On a builtin scalar receiver the by-address self ABI
-                        // (lower passes the slot pointer) has no write-back path — the body
-                        // would read the pointer as the value — so reject it outright
-                        // (T0022) and skip the place check, which is moot for scalars.
-                        if (m.mut_self) {
-                            if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
-                                try bc.sink.emitFmtCode(.T0022, bc.byteOf(callee.main_token), "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
-                            } else if (!bc.isMutablePlace(callee.lhs)) {
-                                try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
-                            }
-                        }
-                        // params[0] is the synthesized `self`; value args match params[1..].
-                        const self_off: usize = @min(mf.params.len, 1);
-                        const want = mf.params.len - self_off;
-                        if (args.len != want) {
+                    // M14: resolve the witness via the shared multi-conformance resolver
+                    // (the SAME rule lower + AstWalk use). `.one` is byte-identical to the
+                    // pre-M14 `findMethod` for every existing program (inherent / single
+                    // conformance / prelude); `.ambiguous` (a doubly-conforming generic
+                    // protocol used with no type-args) is T0025 — never an arbitrary pick.
+                    switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null)) {
+                        .one => |m| return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m),
+                        .ambiguous => {
                             for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
-                            bc.node_types[(node_idx).int()] = mf.ret;
-                            return mf.ret;
-                        }
-                        for (args, mf.params[self_off..], 0..) |a, pty, i| {
-                            const at = try bc.typeOfExpected(a, if (pty.kind == .invalid) null else pty);
-                            if (!Type.assignable(pty, at)) {
-                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
-                            }
-                        }
-                        bc.node_types[(node_idx).int()] = mf.ret;
-                        return mf.ret;
+                            try bc.emitAmbiguousConformance(callee.main_token, recv_ty, member);
+                            return .invalid;
+                        },
+                        .none => {},
                     }
                     // A builtin scalar protocol method (M12): `n.eq(m)` on int/bool. Not a
                     // `t.methods` entry (the recognizer is pure), so `findMethod` misses;
@@ -1665,6 +1779,10 @@ pub const BodyChecker = struct {
                     const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
                     if (pid_opt) |pid| {
                         const p = bc.model.protocols[pid];
+                        // M14: the bound's protocol type-args (`[T has Into[int]]` -> `[int]`)
+                        // ground the protocol's OWN generic params (`tv(1..)`); `Self`
+                        // (`tv(0)`) grounds to the bounded `type_var` receiver itself.
+                        const pargs: []const Type = if (ord < bc.bound_protocol_args.len) bc.bound_protocol_args[ord] else &.{};
                         var mi: ?usize = null;
                         for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
                             mi = k;
@@ -1678,12 +1796,12 @@ pub const BodyChecker = struct {
                                 for (args) |a| _ = try bc.typeOf(a);
                                 try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
                             } else for (args, psig[self_off..], 0..) |a, pty, i| {
-                                const wt = if (pty.isTypeVar()) recv_ty else pty; // Self -> the bounded type_var
+                                const wt = Typecheck.groundProtoType(pty, recv_ty, pargs);
                                 const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
                                 if (!Type.assignable(wt, at))
                                     try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
                             }
-                            const ret = if (p.method_rets[k].isTypeVar()) recv_ty else p.method_rets[k];
+                            const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, pargs);
                             bc.node_types[(node_idx).int()] = ret;
                             return ret;
                         }
@@ -1697,6 +1815,13 @@ pub const BodyChecker = struct {
                 }
             }
         }
+        // An explicit-protocol-args method call `v.into[int](..)` (M14): the callee is a
+        // `type_app` OVER a `field_access` NOT bound to a `.func` (a qualified generic fn
+        // `mod.f[int]()` binds its field_access to `.func` and stays a generic FUNCTION
+        // call). Intercept BEFORE the generic-function `type_app` path.
+        if (callee.tag == .type_app and bc.tree.nodes[(callee.lhs).int()].tag == .field_access and
+            bc.resolutions[(callee.lhs).int()] != .func)
+            return bc.typeOfExplicitMethodCall(node_idx, n, callee);
         // An explicit-args generic call `id[int](7)` (M2): the callee is a `type_app`
         // whose base identifier carries the template's `.func`. A pure per-call
         // operation (substitute the params/ret through the explicit args, check the

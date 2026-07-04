@@ -440,7 +440,19 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // reloc targets. `Mono.find` is a deterministic scan.
                     const cn = self.frozen.tree.nodes[c.idx.int()];
                     if (cn.tag == .type_app) {
-                        try self.foldGenericCallee(cn);
+                        // An explicit-protocol-args method call `v.into[int]()` (M14): a
+                        // `type_app` over a `field_access` NOT bound to a `.func` (a
+                        // qualified generic fn binds its field_access to `.func`). Fold the
+                        // resolved witness (mirroring the bare method fold below), so the
+                        // fingerprint tracks the SAME witness lower emits. Anything else is a
+                        // generic FUNCTION call.
+                        if (self.frozen.tree.nodes[cn.lhs.int()].tag == .field_access and
+                            cn.lhs.int() < self.frozen.resolutions.len and self.frozen.resolutions[cn.lhs.int()] != .func)
+                        {
+                            try self.foldMethodCalleeExplicit(cn);
+                        } else {
+                            try self.foldGenericCallee(cn);
+                        }
                         return;
                     }
                     const res = self.frozen.resolutions[c.idx.int()];
@@ -475,35 +487,70 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit)
                         {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
-                            if (Typecheck.findMethod(self.frozen.methods, recv, member)) |m| {
-                                // A method on a GENERIC-type instance (M10): the reified
-                                // recv (`structT`/`enumT`) selects the appended entry that
-                                // carries the mono `instance` index. Fold the INSTANCE
-                                // identity (name+sig) — the real reloc target — not the
-                                // never-lowered template's names/sigs[fn_id].
-                                if (m.instance) |ii| {
-                                    if (ii < self.frozen.instances.len) {
-                                        const inst = self.frozen.instances[ii];
-                                        try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+                            // The SAME multi-conformance resolver the checker + lower use, so
+                            // the folded witness matches the reloc target. `.one` is
+                            // byte-identical to the pre-M14 `findMethod` for every error-free
+                            // program (an ambiguous bare call halts the compile before codegen,
+                            // so the fp is never taken); `.ambiguous`/`.none` fold nothing here.
+                            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null)) {
+                                .one => |m| try self.foldWitness(m),
+                                .none, .ambiguous => {
+                                    // A builtin scalar `eq` (M12): it has NO real fn_id/instance
+                                    // (the recognizer lowers to an inline machine op, no symbol),
+                                    // so fold a FIXED sentinel Sig instead. Deterministic + stable
+                                    // across builds, and distinct from any future builtin scalar
+                                    // method by its `eq` name + homogeneous params.
+                                    if (Typecheck.builtinScalarMethod(recv, member) != null) {
+                                        const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
+                                        try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = Typecheck.Type.bool });
                                     }
-                                } else if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
-                                    const nm = self.frozen.names[m.fn_id];
-                                    const sig = self.frozen.sigs[m.fn_id];
-                                    try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
-                                }
-                            } else if (Typecheck.builtinScalarMethod(recv, member) != null) {
-                                // A builtin scalar `eq` (M12): it has NO real fn_id/instance
-                                // (the recognizer lowers to an inline machine op, no symbol),
-                                // so fold a FIXED sentinel Sig instead. Deterministic + stable
-                                // across builds, and distinct from any future builtin scalar
-                                // method by its `eq` name + homogeneous params.
-                                const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
-                                try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = Typecheck.Type.bool });
+                                },
                             }
                         }
                     }
                 },
                 else => {},
+            }
+        }
+
+        /// Fold a resolved method witness's identity+sig (M8+). A GENERIC-type instance
+        /// method (M10) carries the mono `instance` index -> fold the INSTANCE identity
+        /// (the real reloc target), not the never-lowered template's `names/sigs[fn_id]`.
+        fn foldWitness(self: *Self, m: Typecheck.Method) error{OutOfMemory}!void {
+            if (m.instance) |ii| {
+                if (ii < self.frozen.instances.len) {
+                    const inst = self.frozen.instances[ii];
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+                }
+            } else if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
+                const nm = self.frozen.names[m.fn_id];
+                const sig = self.frozen.sigs[m.fn_id];
+                try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+            }
+        }
+
+        /// Fold an explicit-protocol-args method callee `v.into[int]()` (M14): resolve the
+        /// witness by the type-arg node_types (the SAME rule the checker + lower use), so
+        /// the fingerprint tracks the SAME witness the reloc targets.
+        fn foldMethodCalleeExplicit(self: *Self, cn: Ast.Node) error{OutOfMemory}!void {
+            const fa = self.frozen.tree.nodes[cn.lhs.int()];
+            if (fa.lhs.int() >= self.frozen.node_types.len) return;
+            const recv = self.frozen.node_types[fa.lhs.int()];
+            switch (recv.kind) {
+                .@"struct", .@"enum", .int, .bool, .str, .unit => {},
+                else => return,
+            }
+            const member = self.frozen.tokens[fa.main_token].text(self.frozen.source);
+            const targ_nodes = Ast.rangeSlice(self.frozen.tree, cn.rhs.int());
+            var buf: [8]Typecheck.Type = undefined;
+            if (targ_nodes.len > buf.len) return;
+            for (targ_nodes, 0..) |tn, i| {
+                if (tn.int() >= self.frozen.node_types.len) return; // pre-typecheck view
+                buf[i] = self.frozen.node_types[tn.int()];
+            }
+            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, buf[0..targ_nodes.len])) {
+                .one => |m| try self.foldWitness(m),
+                .none, .ambiguous => {},
             }
         }
 

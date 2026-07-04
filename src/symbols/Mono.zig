@@ -32,11 +32,18 @@ const Type = @import("../layout/Engine.zig").Type;
 ///   * `witness_syms` element slices borrow `gph_fn_names` (resolve-result-backed,
 ///     outlives codegen); the OUTER `witness_syms` slice is OWNED by the Instance.
 ///   * `conform_ty` is a 12-byte POD (the ground conforming `structT`/`enumT`/scalar).
-/// Only the outer `conformances` slice + each `witness_syms` outer slice are owned.
+///   * `protocol_args` (M14) are the bound's protocol type-args (`[T has Into[int]]` ->
+///     `[int]`), substituted through the instance args — 12-byte POD Types. Empty for a
+///     non-generic protocol. The OUTER slice is OWNED by the Instance. Folded structurally
+///     into the (e) fingerprint component so an `Into[int]` -> `Into[bool]` edit can't
+///     serve a stale cached witness.
+/// Only the outer `conformances` slice + each `witness_syms`/`protocol_args` outer slice
+/// are owned.
 pub const ResolvedConformance = struct {
     protocol_name: []const u8,
     conform_ty: Type,
     witness_syms: []const []const u8,
+    protocol_args: []const Type = &.{},
 };
 
 /// One reified generic instance. All slices are OWNED (freed by the owning
@@ -169,26 +176,30 @@ test "find matches on gid + args by Type.eql" {
     try testing.expectEqual(@as(?usize, null), find(&insts, 1, &.{Type.int}));
 }
 
-test "an instance carries its resolved conformances (M13)" {
-    const witness = [_][]const u8{"lib.P.dbl"};
-    const confs = [_]ResolvedConformance{.{ .protocol_name = "Doubler", .conform_ty = Type.structT(3), .witness_syms = &witness }};
+test "an instance carries its resolved conformances (M13/M14)" {
+    const witness = [_][]const u8{"lib.P.into$Into$int"};
+    const pargs = [_]Type{Type.int};
+    const confs = [_]ResolvedConformance{.{ .protocol_name = "Into", .conform_ty = Type.structT(3), .witness_syms = &witness, .protocol_args = &pargs }};
     const inst = Instance{
         .template_gid = 5,
         .args = &.{Type.structT(3)},
         .node_types = &.{},
         .params = &.{Type.structT(3)},
         .ret = Type.int,
-        .name = "twice$s3",
+        .name = "use$s3",
         .mod = 0,
         .decl_node = Ast.none,
         .conformances = &confs,
     };
     try testing.expectEqual(@as(usize, 1), inst.conformances.len);
-    try testing.expectEqualStrings("Doubler", inst.conformances[0].protocol_name);
+    try testing.expectEqualStrings("Into", inst.conformances[0].protocol_name);
     try testing.expect(Type.eql(Type.structT(3), inst.conformances[0].conform_ty));
-    try testing.expectEqualStrings("lib.P.dbl", inst.conformances[0].witness_syms[0]);
+    try testing.expectEqualStrings("lib.P.into$Into$int", inst.conformances[0].witness_syms[0]);
+    // M14: the bound's protocol type-args ride the conformance (folded into the (e) fp).
+    try testing.expectEqual(@as(usize, 1), inst.conformances[0].protocol_args.len);
+    try testing.expect(Type.eql(Type.int, inst.conformances[0].protocol_args[0]));
     // An instance built WITHOUT conformances defaults to the empty slice (warm-cache
-    // byte-identity for unbounded templates).
+    // byte-identity for unbounded templates); its conformance's protocol_args default too.
     const plain = Instance{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .params = &.{Type.int}, .ret = Type.int, .name = "id$int", .mod = 0, .decl_node = Ast.none };
     try testing.expectEqual(@as(usize, 0), plain.conformances.len);
 }

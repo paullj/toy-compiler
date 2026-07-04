@@ -1,0 +1,24 @@
+# Feature (negative): a type `P` conforming to one generic protocol `Into` TWICE
+# (`Into[int]` and `Into[bool]`). A concrete use `p.into()` with NO disambiguating
+# type-args is ambiguous — the compiler will not silently pick a witness — so it is a
+# use-site error (T0025) naming the conflicting conformances. Disambiguate with
+# `p.into[int]()`.
+# expect: compile-error "ambiguous conformance"
+protocol Into[U] {
+    fn into(self) -> U
+}
+
+struct P { x: int }
+
+impl P has Into[int] {
+    fn into(self) -> int { self.x }
+}
+
+impl P has Into[bool] {
+    fn into(self) -> bool { self.x > 0 }
+}
+
+fn main() -> int {
+    p := P{ x: 42 }
+    return p.into()
+}

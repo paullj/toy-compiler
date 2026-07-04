@@ -71,6 +71,7 @@ pub const Code = enum(u16) {
     T0022, // mut-self-on-scalar (a `mut self` method called on a builtin scalar receiver — the by-address self ABI has no place to write back — M12)
     T0023, // unsatisfied-bound (a monomorphization type-arg does not conform to its generic param's `[T has P]` bound — use-site, M13)
     T0024, // conformance-signature-mismatch (a conforming impl method's signature does not match the protocol's declared signature — coherence, M13)
+    T0025, // ambiguous-conformance (a use site of a type that conforms to one generic protocol multiple times omits the disambiguating type-args — M14)
 
     _,
 };
@@ -133,6 +134,7 @@ pub const table = [_]Entry{
     .{ .code = .T0022, .str = "T0022", .slug = "mut-self-on-scalar" },
     .{ .code = .T0023, .str = "T0023", .slug = "unsatisfied-bound" },
     .{ .code = .T0024, .str = "T0024", .slug = "conformance-signature-mismatch" },
+    .{ .code = .T0025, .str = "T0025", .slug = "ambiguous-conformance" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -242,6 +244,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("conformance-signature-mismatch", slug(.T0024).?);
     try testing.expectEqual(Code.T0023, fromStr("T0023").?);
     try testing.expectEqual(Code.T0024, fromStr("T0024").?);
+
+    // M14 generic-protocol ambiguity code.
+    try testing.expectEqualStrings("T0025", str(.T0025).?);
+    try testing.expectEqualStrings("ambiguous-conformance", slug(.T0025).?);
+    try testing.expectEqual(Code.T0025, fromStr("T0025").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
