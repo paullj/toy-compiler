@@ -397,6 +397,20 @@ pub fn findGenericMethod(methods: []const Method, ctor: u32, is_enum: bool, name
     return null;
 }
 
+/// A builtin scalar protocol-method recognizer (M12): the pure, table-free source of
+/// truth for the compiler-registered `Eq` conformance on builtin scalars. Returns the
+/// method's return `Type` for a recognized `(recv, name)`, else null. Shared by all
+/// three method-dispatch consumers — BodyChecker (types the call), lower (emits an
+/// inline machine op), and the fingerprint fold (a fixed sentinel sig) — so a builtin
+/// scalar method is NEVER a phantom `t.fns`/`t.methods` entry (that would desync the
+/// `names`/`sigs` parallel arrays and churn the method-count unit tests). Only `eq` on
+/// `int`/`bool` ships in M12; `str` (needs a heap-free byte-compare) and `unit` (`()` is
+/// not a `type_names` scalar) are deferred, so they recognize nothing here.
+pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type } {
+    if ((recv.kind == .int or recv.kind == .bool) and std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool };
+    return null;
+}
+
 /// A declared protocol (M11): a signature-only bundle of method NAMES. Registered
 /// SERIALLY in Phase 0c (`registerProtocols`) in module-then-decl order (its global id
 /// is its index in `t.protocols`), then frozen onto the `Model`. Only method-NAME
@@ -517,7 +531,16 @@ protocols: std.ArrayList(ProtocolSym) = .empty,
 
 /// The recorded conformances (M11), filled by the SERIAL `checkCoherence` phase in
 /// module-then-decl order. Frozen onto the `Model` (M13 consumer); freed at teardown.
+/// M12 pre-seeds the builtin scalar conformances (`(Eq,int)`/`(Eq,bool)`) here in
+/// `registerPrelude` BEFORE any user impl, so `checkCoherence` collides a duplicate.
 conformances: std.ArrayList(Conformance) = .empty,
+
+/// The global protocol id of the prelude `Eq` protocol (M12), assigned in
+/// `registerPrelude` (Phase 0c, before the per-module `registerProtocols` loop, so it
+/// is always id 0). A bare `Eq` reference that misses the active module map falls back
+/// to this id in `protocolIdFromNode` — the "universal, no import" prelude naming. Null
+/// until `registerPrelude` runs (single-file internal callers that skip it stay null).
+eq_protocol_id: ?u32 = null,
 
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
@@ -1020,6 +1043,11 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         if (prog.tag != .program) continue;
         try t.registerEnums(Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
+
+    // Prelude (M12): native-register `Eq` (+ its builtin scalar conformances) BEFORE the
+    // per-module protocol loop, so `Eq` is global id 0 and is bare-nameable everywhere
+    // with no import (the `print` precedent — no module-graph/fingerprint surface).
+    try t.registerPrelude();
 
     // Phase 0c (M11): register every module's `protocol` decls into ONE global id
     // space (module-id order, then decl order — same determinism as structs/enums).
@@ -1915,7 +1943,16 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
 fn protocolIdFromNode(t: *Typecheck, node_idx: Ast.Index) ?u32 {
     if (node_idx == Ast.none) return null;
     const n = t.tree.nodes[node_idx.int()];
-    if (n.tag == .identifier) return t.activeProtocolMap().get(t.nameText(n.main_token));
+    if (n.tag == .identifier) {
+        const name = t.nameText(n.main_token);
+        // A user protocol of the same name shadows the prelude (active map is consulted
+        // first); a bare `Eq` that names no module protocol falls back to the prelude id.
+        if (t.activeProtocolMap().get(name)) |id| return id;
+        if (t.eq_protocol_id) |eid| {
+            if (std.mem.eql(u8, name, "Eq")) return eid;
+        }
+        return null;
+    }
     if (n.tag == .field_access) {
         const recv = t.tree.nodes[n.lhs.int()];
         if (recv.tag != .identifier) return null;
@@ -1939,6 +1976,10 @@ fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
     const n = t.tree.nodes[node_idx.int()];
     if (n.tag == .identifier) {
         const name = t.nameText(n.main_token);
+        // A builtin scalar receiver (`impl int has P`) resolves via the same static map
+        // Phase A used (M12), so a user impl on int/bool/str keys into the multi-space
+        // coherence check. A struct/enum shadow is impossible (T0011 rejects shadowing).
+        if (type_names.get(name)) |ty| return ty;
         if (t.activeStructMap().get(name)) |id| return Type.structT(id);
         if (t.activeEnumMap().get(name)) |id| return Type.enumT(id);
         return null;
@@ -1965,9 +2006,16 @@ fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
 /// `seen` set is `getOrPut`-only (never iterated), so its hash/thread order cannot leak
 /// into the emit stream; emit order is module-id then source order → `-jN`-stable.
 fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
-    const Key = struct { protocol: u32, recv_kind: u8, recv_id: u32 };
+    const Key = @TypeOf(coherenceKey(0, Type.int));
     var seen: std.AutoHashMapUnmanaged(Key, void) = .empty;
     defer seen.deinit(t.gpa);
+
+    // Seed `seen` from the builtin conformances already pre-registered by the prelude
+    // (M12) BEFORE walking user impls, so a duplicate user `impl int has Eq` collides
+    // (T0020). At this point `t.conformances` holds EXACTLY the prelude entries (the
+    // only other appender is this fn's accept path below), so iterating its slice in
+    // insertion order is a pure function of source — `-jN`-stable.
+    for (t.conformances.items) |c| _ = try seen.getOrPut(t.gpa, coherenceKey(c.protocol, c.recv));
 
     for (mods, 0..) |_, mi| {
         const mod: u32 = @intCast(mi);
@@ -2007,11 +2055,7 @@ fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // already resolved (and any error emitted) in Phase A, so re-resolve
             // silently; an unresolved receiver simply forms no coherence key.
             const recv = t.receiverTypeFromNode(decl.lhs) orelse continue;
-            const key: Key = switch (recv.kind) {
-                .@"struct" => .{ .protocol = pid, .recv_kind = 0, .recv_id = recv.struct_id },
-                .@"enum" => .{ .protocol = pid, .recv_kind = 1, .recv_id = recv.enum_id },
-                else => continue,
-            };
+            const key = coherenceKey(pid, recv);
             const gop = try seen.getOrPut(t.gpa, key);
             if (gop.found_existing) {
                 try t.sink.emitFmtCode(.T0020, t.byteOf(decl.main_token), "overlapping impl of protocol '{s}' for type '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token) });
@@ -2192,6 +2236,49 @@ fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
         try t.enums.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx), .is_generic = is_generic, .generic_params = gparams });
         try t.activeEnumMap().put(t.gpa, name, id);
     }
+}
+
+/// Native-register the implicit PRELUDE (M12), mirroring how `print` is a synthesized
+/// compiler entity (no module-graph / content-fingerprint surface). Runs SERIALLY at
+/// the head of Phase 0c, before the per-module `registerProtocols` loop, so the prelude
+/// `Eq` protocol takes global id 0 (a pure function of source — no hashmap/thread
+/// input). Registers `Eq` (method `eq`) into the global protocol table and pre-seeds the
+/// builtin scalar conformances `(Eq,int)`/`(Eq,bool)` into `t.conformances` in a fixed
+/// literal order, so `checkCoherence` can seed its `seen` set from them and collide a
+/// duplicate user `impl int has Eq`. The `methods` slice is `gpa`-allocated (never a
+/// comptime literal) so the teardown free loop treats it uniformly with a user protocol.
+fn registerPrelude(t: *Typecheck) !void {
+    const eq_methods = try t.gpa.alloc([]const u8, 1);
+    eq_methods[0] = "eq";
+    const eq_id: u32 = @intCast(t.protocols.items.len);
+    t.eq_protocol_id = eq_id;
+    try t.protocols.append(t.gpa, .{
+        .name = "Eq",
+        .mod = 0,
+        .pub_export = true,
+        .decl_node = Ast.none,
+        .methods = eq_methods,
+    });
+    try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.int });
+    try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.bool });
+}
+
+/// The multi-space (M12) coherence key for a `(protocol, receiver-type)` conformance.
+/// `recv_kind` is `@intFromEnum(recv.kind)`, so the key spans builtin scalar Kinds
+/// (int/bool/str/unit — which carry no `struct_id`/`enum_id`) as well as struct/enum
+/// nominals; `recv_id` is the nominal id (0 for scalars, which the kind already
+/// distinguishes). Internal to `checkCoherence` only — never persisted / fingerprinted —
+/// so widening from the old `{struct=0,enum=1}` scheme is safe.
+fn coherenceKey(pid: u32, recv: Type) struct { protocol: u32, recv_kind: u8, recv_id: u32 } {
+    return .{
+        .protocol = pid,
+        .recv_kind = @intFromEnum(recv.kind),
+        .recv_id = switch (recv.kind) {
+            .@"struct" => recv.struct_id,
+            .@"enum" => recv.enum_id,
+            else => 0,
+        },
+    };
 }
 
 /// Phase 0c (M11): register the `protocol` decls among `decl_nodes` (of the active
@@ -2623,6 +2710,39 @@ test "M9: a mut-self method on a temporary emits T0019; on a local / a field of 
     }
 }
 
+test "M12: a mut-self method on a builtin scalar receiver is rejected (T0022), even on a mutable local" {
+    const gpa = testing.allocator;
+    // On a mutable local `int` place: the place check would pass, but the by-address
+    // self ABI has no write-back path for a scalar, so exactly one T0022 fires (not
+    // T0019) and the call still types (to `mf.ret`) so nothing cascades.
+    {
+        var c = try checkSource(
+            \\impl int { fn bump(mut self) -> int { return self + 1 } }
+            \\fn main() -> int {
+            \\ x := 41
+            \\ return x.bump()
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0022, c.result.diags[0].code);
+    }
+    // A by-value `self` method on the same scalar is fine (no by-address ABI).
+    {
+        var c = try checkSource(
+            \\impl int { fn inc(self) -> int { return self + 1 } }
+            \\fn main() -> int {
+            \\ x := 41
+            \\ return x.inc()
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    }
+}
+
 test "M10: a generic-type method typechecks clean; one template + one reified entry; call types to T" {
     const gpa = testing.allocator;
     var c = try checkSource(
@@ -2783,6 +2903,125 @@ test "M10: an inherent impl on a CONCRETE type instance (impl Box[int]) is rejec
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "concrete type instance") != null);
     // No generic-template method entry was registered for the rejected impl.
     for (c.result.methods) |m| try testing.expect(!m.recv_generic);
+}
+
+test "M12: builtinScalarMethod recognizes `eq` on int/bool only (pure, table-free)" {
+    try testing.expect(builtinScalarMethod(Type.int, "eq") != null);
+    try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.int, "eq").?.ret.kind);
+    try testing.expect(builtinScalarMethod(Type.bool, "eq") != null);
+    try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.bool, "eq").?.ret.kind);
+    // str/unit eq deferred; a non-`eq` name and a nominal receiver recognize nothing.
+    try testing.expect(builtinScalarMethod(Type.str, "eq") == null);
+    try testing.expect(builtinScalarMethod(Type.unit, "eq") == null);
+    try testing.expect(builtinScalarMethod(Type.int, "foo") == null);
+    try testing.expect(builtinScalarMethod(Type.structT(0), "eq") == null);
+}
+
+test "M12: a.eq(b) on int types the call to bool, zero diags, and pollutes no method entry" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ a := 41
+        \\ b := 41
+        \\ return if a.eq(b) { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The builtin recognizer must NOT add a phantom method (the method-count tests rely
+    // on this): a program with no user impl has an empty method table.
+    try testing.expectEqual(@as(usize, 0), c.result.methods.len);
+    // The `a.eq(b)` call node types to bool.
+    const nts = c.result.node_types[0];
+    var found = false;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .call) {
+            try testing.expectEqual(Kind.bool, nts[i].kind);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "M12: a duplicate user `impl int has Eq` overlaps the builtin conformance (one T0020)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\impl int has Eq { fn eq(self, o: int) -> bool { true } }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    var n20: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0020) n20 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n20);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "overlapping impl") != null);
+}
+
+test "M12: a user `impl int has (user protocol)` records a conformance and dispatches, no error" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Dbl { fn dbl(self) -> int }
+        \\impl int has Dbl { fn dbl(self) -> int { self } }
+        \\fn main() -> int {
+        \\ a := 21
+        \\ return a.dbl() + a.dbl()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // A user scalar impl registers a REAL method (recv = int) — the widened dispatch
+    // guard routes `a.dbl()` through the normal fn_id Method path (no recognizer).
+    try testing.expectEqual(@as(usize, 1), c.result.methods.len);
+    try testing.expectEqualStrings("dbl", c.result.methods[0].name);
+    try testing.expectEqual(Kind.int, c.result.methods[0].recv.kind);
+}
+
+test "M12: the prelude `Eq` is nameable by BARE name with no import (user struct conformance)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct S { x: int }
+        \\impl S has Eq { fn eq(self, o: S) -> bool { self.x == o.x } }
+        \\fn main() -> int {
+        \\ a := S{ x: 21 }
+        \\ b := S{ x: 21 }
+        \\ return if a.eq(b) { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // If the prelude fallback failed, bare `Eq` would be undeclared -> T0021; zero diags
+    // proves it resolves with no import.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.methods.len);
+}
+
+test "M12: builtin `eq` arity / arg-type mismatch and unknown scalar method errors" {
+    const gpa = testing.allocator;
+    {
+        // Arity: `a.eq()` wants exactly one argument.
+        var c = try checkSource("fn main() -> int {\n a := 1\n return if a.eq() { 1 } else { 0 }\n}\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "argument") != null);
+    }
+    {
+        // Arg-type: the homogeneous `eq` arg must be assignable to the receiver (int).
+        var c = try checkSource("struct S { x: int }\nfn main() -> int {\n a := 1\n s := S{ x: 0 }\n return if a.eq(s) { 1 } else { 0 }\n}\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "expected int") != null);
+    }
+    {
+        // Unknown method on a scalar is a clean T0018 (was a raw non-coded diagnostic pre-M12).
+        var c = try checkSource("fn main() -> int {\n a := 1\n return if a.foo() { 1 } else { 0 }\n}\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+    }
 }
 
 test "M4: Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {

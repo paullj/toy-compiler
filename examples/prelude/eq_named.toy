@@ -1,0 +1,15 @@
+# Feature: the prelude protocol `Eq` is nameable by BARE name with NO import (M12), so a
+# user value type may conform to it directly. `impl S has Eq` references `Eq` with no
+# import; the call dispatches to the user method and runs e2e.
+# expect: exit 42
+struct S { x: int }
+
+impl S has Eq {
+    fn eq(self, o: S) -> bool { self.x == o.x }
+}
+
+fn main() -> int {
+    a := S{ x: 21 }
+    b := S{ x: 21 }
+    return if a.eq(b) { 42 } else { 0 }
+}

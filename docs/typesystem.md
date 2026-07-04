@@ -213,6 +213,42 @@ that depth and rejects the program with **T0017 "instantiation too deep"** —
 deterministically at `-j1`/`-jN`, never hanging or running out of memory — while a
 legitimately deep-but-finite generic program still compiles.
 
+## Protocols, the prelude, and builtin-scalar conformance (M11/M12)
+
+`has` is the single conformance relation: `impl T has P { .. }` conforms `T` to a
+declared `protocol P`. Coherence is checked **whole-program, serially** (before the
+parallel body pass): exactly one impl per `(protocol, type)`, no orphan rules — a
+duplicate (even in a sibling module) is **T0020**, a missing method or undeclared
+protocol is **T0021**. A protocol stores its method NAMES only; the per-impl
+signature-compatibility check (params/return vs the protocol) is **deferred to M13**
+(the builtin `Eq` below is signature-correct by construction).
+
+**Prelude (M12).** Protocol/type names that must be universally in scope with no
+import (`Eq`, later `Ord`/`Option`/...) are delivered by **native compiler
+registration** — the same mechanism as the synthesized `print`, chosen over an
+embedded `.toy` module so there is **no new module-graph or content-fingerprint
+surface**. `registerPrelude` runs at the head of Phase 0c (serial), giving the `Eq`
+protocol global id 0; a bare `Eq` that names no module protocol falls back to that id
+in `protocolIdFromNode` (a user protocol of the same name shadows it via first-lookup).
+
+**Multi-space conformance key.** The coherence key is
+`(protocol, @intFromEnum(recv.kind), recv_id)`, so it spans builtin scalar Kinds
+(int/bool/str/unit — which carry no `struct_id`/`enum_id`) as well as struct/enum
+nominals (`recv_id` is 0 for scalars, which the kind byte already distinguishes).
+`registerPrelude` pre-seeds the builtin scalar conformances into the conformance table
+and `checkCoherence` seeds its `seen` set from them, so a user `impl int has Eq`
+collides with the builtin (T0020). A user impl **may** target a builtin scalar
+(`impl int has MyProtocol`), coherence-checked whole-program.
+
+**Builtin `Eq`.** Shipped for **int and bool** only. Dispatch runs through a pure
+recognizer `builtinScalarMethod(recv, name)` (not a phantom `t.fns`/`t.methods` entry,
+which would desync the `names`/`sigs` parallel arrays): the body checker types
+`a.eq(b)` to `bool`, `lower` emits an inline `icmp eq` (no call, no reloc), and the
+fingerprint folds a fixed sentinel sig. `str` (needs a heap-free byte-compare — real
+backend work) and `unit` (`()` is not a `type_names` scalar) are **deferred**; the key
+still spans all four Kinds, so a future user `impl str has Eq` keys correctly and no
+builtin blocks it.
+
 ## Two-phase checking (and parallelism)
 
 Checking is two phases over one frozen program model:

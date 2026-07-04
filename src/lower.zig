@@ -727,6 +727,13 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             b.in.names[m.fn_id];
         self_recv = callee_node.lhs;
         self_mut = m.mut_self;
+    } else if (builtinScalarEqCallee(b, n)) |ba| {
+        // A builtin scalar `eq` (M12): lower the receiver + single arg and emit an inline
+        // `icmp eq` (reusing the comparison-lowering machinery), typed bool. No `.call` is
+        // built — the recognizer is pure, so there is no symbol/reloc to fold.
+        const lhs = operandValue(try lowerExpr(b, ba.recv));
+        const rhs = operandValue(try lowerExpr(b, ba.arg));
+        return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -850,9 +857,39 @@ fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     if (cn.tag != .field_access) return null;
     if (b.in.resolutions[(n.lhs).int()] == .func) return null;
     const recv = b.in.node_types[(cn.lhs).int()];
-    if (recv.kind != .@"struct" and recv.kind != .@"enum") return null;
+    // Dispatch through the real Method path for any nominal OR builtin scalar receiver
+    // (M12): a user `impl int has P` registered a real `fn_id` on `recv = Type.int`, so
+    // `findMethod` selects it. A builtin scalar `eq` has NO method entry (the recognizer
+    // is pure) → this misses → `lowerCall`'s `builtinScalarEqCallee` branch fires. Reject
+    // only the non-dispatchable kinds (invalid/never/type_var/app never reach lower).
+    switch (recv.kind) {
+        .@"struct", .@"enum", .int, .bool, .str, .unit => {},
+        else => return null,
+    }
     const member = b.in.tokens[cn.main_token].text(b.in.source);
-    return Typecheck.findMethod(b.in.methods, recv, member);
+    const m = Typecheck.findMethod(b.in.methods, recv, member) orelse return null;
+    // Defense in depth: a `mut self` method on a builtin scalar is rejected at check
+    // time (T0022) because the by-address self ABI has no write-back path. Never
+    // dispatch one here so a stray lower can't turn the receiver's slot address into
+    // the callee's value slot; a well-typed program never reaches this.
+    if (m.mut_self and recv.kind != .@"struct" and recv.kind != .@"enum") return null;
+    return m;
+}
+
+/// A builtin scalar `eq` call `recv.eq(arg)` (M12): the callee is a `field_access` NOT
+/// bound to a `.func`, the receiver types to a scalar the recognizer accepts, and there
+/// is exactly one arg (the checker already gated arity). Returns the receiver + arg
+/// nodes so `lowerCall` can emit an inline `icmp eq` (no `.call`, no external symbol, so
+/// nothing folds into a reloc — pure a-function-of-source, `--verify`-stable). Null when
+/// `n` is not such a call (so `lowerCall` falls through to its normal resolution).
+fn builtinScalarEqCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index, arg: Ast.Index } {
+    const cn = b.in.tree.nodes[(n.lhs).int()];
+    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
+    const member = b.in.tokens[cn.main_token].text(b.in.source);
+    if (Typecheck.builtinScalarMethod(b.in.node_types[(cn.lhs).int()], member) == null) return null;
+    const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+    if (args.len != 1) return null;
+    return .{ .recv = cn.lhs, .arg = args[0] };
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
