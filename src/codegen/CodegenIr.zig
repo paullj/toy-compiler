@@ -378,6 +378,11 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
             try g.emit(Aarch64.ldrRegUoff(S0, S0, 0));
             try g.storeValue(S0, ins.result);
         },
+        .load_byte => |v| {
+            try g.loadValue(S0, v); // S0 = byte address
+            try g.emit(Aarch64.ldrbRegUoff(S0, S0, 0)); // zero-extended single byte
+            try g.storeValue(S0, ins.result);
+        },
         .store => |s| {
             try g.loadValue(S0, s.addr); // S0 = address
             try g.loadValue(S1, s.val); // S1 = value

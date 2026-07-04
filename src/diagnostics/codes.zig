@@ -72,6 +72,7 @@ pub const Code = enum(u16) {
     T0023, // unsatisfied-bound (a monomorphization type-arg does not conform to its generic param's `[T has P]` bound — use-site, M13)
     T0024, // conformance-signature-mismatch (a conforming impl method's signature does not match the protocol's declared signature — coherence, M13)
     T0025, // ambiguous-conformance (a use site of a type that conforms to one generic protocol multiple times omits the disambiguating type-args — M14)
+    T0026, // missing-eq-impl (`==`/`!=` used on a value type with no `Eq` conformance — operator desugar, M15)
 
     _,
 };
@@ -135,6 +136,7 @@ pub const table = [_]Entry{
     .{ .code = .T0023, .str = "T0023", .slug = "unsatisfied-bound" },
     .{ .code = .T0024, .str = "T0024", .slug = "conformance-signature-mismatch" },
     .{ .code = .T0025, .str = "T0025", .slug = "ambiguous-conformance" },
+    .{ .code = .T0026, .str = "T0026", .slug = "missing-eq-impl" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -249,6 +251,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0025", str(.T0025).?);
     try testing.expectEqualStrings("ambiguous-conformance", slug(.T0025).?);
     try testing.expectEqual(Code.T0025, fromStr("T0025").?);
+
+    // M15 operator `Eq` code.
+    try testing.expectEqualStrings("T0026", str(.T0026).?);
+    try testing.expectEqualStrings("missing-eq-impl", slug(.T0026).?);
+    try testing.expectEqual(Code.T0026, fromStr("T0026").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

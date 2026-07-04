@@ -503,17 +503,18 @@ pub fn findGenericMethod(methods: []const Method, ctor: u32, is_enum: bool, name
     return null;
 }
 
-/// A builtin scalar protocol-method recognizer (M12): the pure, table-free source of
-/// truth for the compiler-registered `Eq` conformance on builtin scalars. Returns the
+/// A builtin scalar protocol-method recognizer (M12/M15): the pure, table-free source
+/// of truth for the compiler-registered `Eq` conformance on builtin scalars. Returns the
 /// method's return `Type` for a recognized `(recv, name)`, else null. Shared by all
 /// three method-dispatch consumers — BodyChecker (types the call), lower (emits an
 /// inline machine op), and the fingerprint fold (a fixed sentinel sig) — so a builtin
 /// scalar method is NEVER a phantom `t.fns`/`t.methods` entry (that would desync the
-/// `names`/`sigs` parallel arrays and churn the method-count unit tests). Only `eq` on
-/// `int`/`bool` ships in M12; `str` (needs a heap-free byte-compare) and `unit` (`()` is
-/// not a `type_names` scalar) are deferred, so they recognize nothing here.
+/// `names`/`sigs` parallel arrays and churn the method-count unit tests). All four scalars
+/// ship `eq` -> bool: `int`/`bool` lower to an inline `icmp`; `str` to a heap-free
+/// byte-compare (M15's `load_byte` loop); `unit` to a trivially-true `bconst` (the two
+/// `()` values are always equal). None gets a `t.fns` entry — each lowers to a machine op.
 pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type } {
-    if ((recv.kind == .int or recv.kind == .bool) and std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool };
+    if ((recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit) and std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool };
     return null;
 }
 
@@ -838,6 +839,11 @@ pub const Model = struct {
     /// the parallel body pass. Read-only; no M11 Pass-C consumer (sets up M13).
     protocols: []const ProtocolSym,
     conformances: []const Conformance,
+    /// The prelude `Eq` protocol's global id (M15), or null if `registerPrelude` never
+    /// ran (a narrow internal caller). The BodyChecker's `==`/`!=` typing keys the
+    /// operand's Eq-conformance check off this; a null id denies conformance (-> T0026)
+    /// rather than miscompiling, so the operator path is safe on any prelude-less caller.
+    eq_protocol_id: ?u32,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -854,6 +860,7 @@ fn buildModel(t: *Typecheck) Model {
         .methods = t.methods.items,
         .protocols = t.protocols.items,
         .conformances = t.conformances.items,
+        .eq_protocol_id = t.eq_protocol_id,
     };
 }
 
@@ -2723,8 +2730,14 @@ fn registerPrelude(t: *Typecheck) !void {
         .method_params = eq_params,
         .method_rets = eq_rets,
     });
+    // All four builtin scalars conform to `Eq` (M15), in a fixed literal order so the
+    // conformance table is a pure function of source. `str`/`unit` join `int`/`bool`
+    // here so the operator's uniform `findConformance(Eq, ..)` check covers every scalar;
+    // each lowers to a machine op (byte-compare / bconst), never a witness fn call.
     try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.int });
     try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.bool });
+    try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.str });
+    try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.unit });
 }
 
 /// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
@@ -3488,14 +3501,17 @@ test "M10: an inherent impl on a CONCRETE type instance (impl Box[int]) is rejec
     for (c.result.methods) |m| try testing.expect(!m.recv_generic);
 }
 
-test "M12: builtinScalarMethod recognizes `eq` on int/bool only (pure, table-free)" {
+test "M15: builtinScalarMethod recognizes `eq` on all four scalars (pure, table-free)" {
     try testing.expect(builtinScalarMethod(Type.int, "eq") != null);
     try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.int, "eq").?.ret.kind);
     try testing.expect(builtinScalarMethod(Type.bool, "eq") != null);
     try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.bool, "eq").?.ret.kind);
-    // str/unit eq deferred; a non-`eq` name and a nominal receiver recognize nothing.
-    try testing.expect(builtinScalarMethod(Type.str, "eq") == null);
-    try testing.expect(builtinScalarMethod(Type.unit, "eq") == null);
+    // M15: str (heap-free byte-compare) and unit (trivially true) now recognize `eq` -> bool.
+    try testing.expect(builtinScalarMethod(Type.str, "eq") != null);
+    try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.str, "eq").?.ret.kind);
+    try testing.expect(builtinScalarMethod(Type.unit, "eq") != null);
+    try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.unit, "eq").?.ret.kind);
+    // A non-`eq` name and a nominal receiver still recognize nothing.
     try testing.expect(builtinScalarMethod(Type.int, "foo") == null);
     try testing.expect(builtinScalarMethod(Type.structT(0), "eq") == null);
 }
@@ -3525,6 +3541,120 @@ test "M12: a.eq(b) on int types the call to bool, zero diags, and pollutes no me
         }
     }
     try testing.expect(found);
+}
+
+test "M15: `==` on a struct with `impl P has Eq` types to bool, zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
+        \\fn main() -> int {
+        \\ p := P{ x: 1 }
+        \\ q := P{ x: 1 }
+        \\ return if p == q { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The `p == q` binary node types to bool. `main` is module 0's last fn; find the
+    // eq_eq binary and assert bool.
+    const nts = c.result.node_types[0];
+    var found = false;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .binary and c.tokens[n.main_token].tag == .eq_eq) {
+            try testing.expectEqual(Kind.bool, nts[i].kind);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "M15: `==` on a struct with no `Eq` impl is exactly one T0026 at the operator" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ p := P{ x: 1 }
+        \\ q := P{ x: 2 }
+        \\ return if p == q { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0026, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Eq' impl") != null);
+}
+
+test "M15: str `==` and unit `==` type to bool (builtin-scalar Eq), zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn nothing() { return }
+        \\fn main() -> int {
+        \\ s := if "a" == "a" { 1 } else { 0 }
+        \\ u := if nothing() == nothing() { 1 } else { 0 }
+        \\ return s + u
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M15: a bounded generic body `fn eq2[T has Eq](a: T, b: T) -> bool { a == b }` checks once" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn eq2[T has Eq](a: T, b: T) -> bool { a == b }
+        \\fn main() -> int {
+        \\ return if eq2[int](7, 7) { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M15: `==` in a body bounded by a NON-Eq protocol is T0026 (bound is not the Eq axiom)" {
+    const gpa = testing.allocator;
+    // A bounded template body IS checked (bound-as-axiom); an UNBOUNDED one is skipped
+    // (types.zig `unbounded template: skip as before`), so the type_var-conforms branch
+    // is only exercised on a bounded body. `T has Doubler` gives `T` a bound, but it is
+    // NOT `Eq`, so `a == b` cannot desugar and must be T0026.
+    var c = try checkSource(
+        \\protocol Doubler { fn dbl(self) -> int }
+        \\fn bad[T has Doubler](a: T, b: T) -> bool { a == b }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    var n26: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0026) n26 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n26);
+}
+
+test "M15: a cross-type `==` (both Eq) stays a homogeneity error, never T0026" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\struct Q { y: int }
+        \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
+        \\impl Q has Eq { fn eq(self, o: Q) -> bool { self.y == o.y } }
+        \\fn main() -> int {
+        \\ p := P{ x: 1 }
+        \\ q := Q{ y: 1 }
+        \\ return if p == q { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    // Homogeneity is enforced FIRST, so a cross-type compare is a "same type" error —
+    // NOT T0026 — even though P and Q each conform to Eq.
+    try testing.expect(c.result.diags[0].code != codes.Code.T0026);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "same type") != null);
 }
 
 test "M12: a duplicate user `impl int has Eq` overlaps the builtin conformance (one T0020)" {

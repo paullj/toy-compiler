@@ -94,6 +94,12 @@ pub const Event = union(enum) {
     /// type-ref node, matching where the touched walk folds the OWNING sig's
     /// param/return type (carrying the cross-module-correct global id).
     type_ref: struct { idx: Ast.Index, ordinal: u32, is_ret: bool },
+    /// An `==`/`!=` operator on a `.binary` node `idx` (M15). Emitted AFTER both operands,
+    /// like `.callee` fires after a call's callee subtree. The hash IGNORES it (the byte
+    /// stream is unchanged, so every existing fingerprint — incl. int `==` — is preserved
+    /// and warm caches never churn); only `CallVisitor` reacts, folding the `Eq` witness
+    /// for a struct/enum operand so `p == q` tracks the SAME witness identity as `p.eq(q)`.
+    eq_operator: struct { idx: Ast.Index },
 };
 
 /// The error set of `visitor.on`, or the empty set when the visitor has no `on`.
@@ -154,6 +160,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .leaf = leaf });
             try walkInner(src, n.lhs, collect, visitor); // lhs THEN rhs: a-b != b-a
             try walkInner(src, n.rhs, collect, visitor);
+            // M15: after the operands (mirroring `.callee`'s post-subtree placement),
+            // signal an `==`/`!=` so `CallVisitor` can fold the `Eq` witness. Gated on
+            // the operator token so a `-`/`<` binary emits nothing; the hash ignores it.
+            const btag = src.tokens[n.main_token].tag;
+            if (btag == .eq_eq or btag == .bang_eq) try emit(visitor, .{ .eq_operator = .{ .idx = idx } });
         },
         .call => {
             try walkInner(src, n.lhs, collect, visitor);
@@ -413,7 +424,7 @@ pub const HashVisitor = struct {
             .leaf, .raw_leaf => |t| updateLeaf(self.h, t),
             .count => |c| updateU32(self.h, c),
             .flag => |f| self.h.update(&[_]u8{@intFromBool(f)}),
-            .touch, .callee, .type_ref => {},
+            .touch, .callee, .type_ref, .eq_operator => {},
         }
     }
 };
@@ -507,6 +518,24 @@ pub fn CallVisitor(comptime Frozen: type) type {
                                 },
                             }
                         }
+                    }
+                },
+                .eq_operator => |e| {
+                    // An `==`/`!=` on a struct/enum operand (M15) desugars to that type's
+                    // `Eq::eq`; fold the witness so the caller tracks the SAME identity the
+                    // desugared call's reloc targets — mirroring the `p.eq(q)` method fold
+                    // above (SAME `.one` resolver -> SAME Sig). A scalar operand (int/bool/
+                    // str/unit) inlines to a machine op with NO symbol, so there is nothing
+                    // to fold; skipping it keeps every scalar-`==` fingerprint byte-identical
+                    // (warm cache preserved). A pre-typecheck view (idx/lhs out of range or
+                    // an invalid recv) folds nothing.
+                    const bn = self.frozen.tree.nodes[e.idx.int()];
+                    if (bn.lhs.int() >= self.frozen.node_types.len) return;
+                    const recv = self.frozen.node_types[bn.lhs.int()];
+                    if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "eq", null)) {
+                        .one => |m| try self.foldWitness(m),
+                        .none, .ambiguous => {},
                     }
                 },
                 else => {},
@@ -787,7 +816,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 /// makes the guard catch a mis-placed `.touch`/`.callee`/`.type_ref` dispatch —
 /// not only a forked traversal order.
 const StreamStep = struct {
-    kind: enum { enter, touch, callee, type_ref },
+    kind: enum { enter, touch, callee, type_ref, eq_operator },
     idx: Ast.Index,
 };
 
@@ -805,6 +834,7 @@ const StreamRecorder = struct {
             .touch => |t| try self.out.append(self.gpa, .{ .kind = .touch, .idx = t.idx }),
             .callee => |c| try self.out.append(self.gpa, .{ .kind = .callee, .idx = c.idx }),
             .type_ref => |r| try self.out.append(self.gpa, .{ .kind = .type_ref, .idx = r.idx }),
+            .eq_operator => |e| try self.out.append(self.gpa, .{ .kind = .eq_operator, .idx = e.idx }),
             .leaf, .raw_leaf, .count, .flag => {},
         }
     }
@@ -842,6 +872,7 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         \\  q := g(g(p))
         \\  d := q.x - p.x
         \\  s := P { x: d }
+        \\  eqp := q == s
         \\  m := match e { .A | .C(0) -> 1, .C(r) -> r }
         \\  @l loop { if m > 0 { break @l 1 } else { break @l 2 } }
         \\  return s
@@ -926,13 +957,15 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
     var saw_touch = false;
     var saw_callee = false;
     var saw_type_ref = false;
+    var saw_eq_operator = false;
     for (stream) |st| switch (st.kind) {
         .enter => saw_enter = true,
         .touch => saw_touch = true,
         .callee => saw_callee = true,
         .type_ref => saw_type_ref = true,
+        .eq_operator => saw_eq_operator = true,
     };
-    try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref);
+    try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref and saw_eq_operator);
 
     // (1) NO ORPHAN DISPATCH: every touch/callee/type_ref idx is a node that was
     // entered. A dispatch at a node outside the walked subtree would fail here.
@@ -991,6 +1024,17 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
             if (b.tree.nodes[p.int()].lhs == st.idx) is_proto_type = true;
         }
         try testing.expect(is_proto_type);
+    }
+
+    // (5) `.eq_operator` PLACEMENT (M15): every `.eq_operator` idx is an entered
+    // `.binary` node whose operator token is `==`/`!=`. A signal at the wrong node — or
+    // fired for a non-eq binary — fails here.
+    for (stream) |st| {
+        if (st.kind != .eq_operator) continue;
+        const bnode = b.tree.nodes[st.idx.int()];
+        try testing.expect(bnode.tag == .binary);
+        const btag = b.tokens[bnode.main_token].tag;
+        try testing.expect(btag == .eq_eq or btag == .bang_eq);
     }
 }
 
@@ -1108,4 +1152,122 @@ test "[CROSS-MODULE TYPE-REF] threaded fn_sig folds the sig's type, not a bare-n
     }
     try testing.expect(found != null);
     try testing.expectEqualSlices(u8, expect_buf.items, found.?);
+}
+
+test "M15: the .eq_operator event is IGNORED by the hash (int == fingerprint unchanged)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(a: int, b: int) -> bool { a == b }\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+
+    // Hash 1: the real walk, which emits `.eq_operator` after the operands.
+    var h1 = std.hash.Wyhash.init(0);
+    var hv = HashVisitor{ .h = &h1 };
+    try walk(b.src(), decl, &hv);
+
+    // Hash 2: the SAME walk fed to a visitor that DROPS `.eq_operator` before folding —
+    // i.e. the hash as if the M15 event had never been introduced. Byte-identity proves
+    // the operator event never enters the fingerprint byte-stream, so every existing
+    // int/bool/str/unit `==` fp is preserved and warm caches never churn.
+    var h2 = std.hash.Wyhash.init(0);
+    const Filter = struct {
+        h: HashVisitor,
+        pub fn on(self: *@This(), ev: Event) void {
+            switch (ev) {
+                .eq_operator => {},
+                else => self.h.on(ev),
+            }
+        }
+    };
+    var fv = Filter{ .h = .{ .h = &h2 } };
+    try walk(b.src(), decl, &fv);
+
+    try testing.expectEqual(h1.final(), h2.final());
+}
+
+test "M15: `p == q` folds the SAME Eq witness Sig as `p.eq(q)` (fingerprint agreement)" {
+    const gpa = testing.allocator;
+    const Graph = @import("../driver/Graph.zig");
+    const ResolveGraph = @import("../resolve_graph.zig");
+    const TypecheckGraph = @import("../types_graph.zig");
+    const Link = @import("../link/Link.zig");
+
+    const src =
+        \\struct P { x: int }
+        \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
+        \\fn use_op(p: P, q: P) -> bool { p == q }
+        \\fn use_method(p: P, q: P) -> bool { p.eq(q) }
+        \\
+    ;
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    defer res.deinit(gpa);
+    var tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
+    defer tc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), tc.diags.len);
+
+    const names = try gpa.alloc(Link.SymName, res.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (res.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    const frozen = FakeFrozen{
+        .tree = tree,
+        .tokens = tokens,
+        .source = src,
+        .resolutions = res.resolutions[0],
+        .node_types = tc.node_types[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sigs = tc.sigs,
+        .instances = tc.instances,
+        .methods = tc.methods,
+    };
+
+    // The only TOP-LEVEL fn_decls are use_op then use_method (the impl's `eq` is nested
+    // inside the impl_has_decl, not a program child), so they arrive in source order.
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    var op_decl: Ast.Index = Ast.none;
+    var meth_decl: Ast.Index = Ast.none;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs.int())) |idx| {
+        if (tree.nodes[idx.int()].tag != .fn_decl) continue;
+        if (op_decl == Ast.none) op_decl = idx else meth_decl = idx;
+    }
+    try testing.expect(op_decl != Ast.none and meth_decl != Ast.none);
+
+    var op_sigs: std.ArrayList(Sig) = .empty;
+    defer op_sigs.deinit(gpa);
+    var vop = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = &op_sigs };
+    try walk(.{ .tree = tree, .tokens = tokens, .source = src }, op_decl, &vop);
+
+    var meth_sigs: std.ArrayList(Sig) = .empty;
+    defer meth_sigs.deinit(gpa);
+    var vm = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = &meth_sigs };
+    try walk(.{ .tree = tree, .tokens = tokens, .source = src }, meth_decl, &vm);
+
+    // Both fold exactly one witness Sig, and it is the SAME one: `p == q` desugars to the
+    // same `Eq::eq` `p.eq(q)` dispatches to, so the fingerprints track one identity.
+    try testing.expectEqual(@as(usize, 1), op_sigs.items.len);
+    try testing.expectEqual(@as(usize, 1), meth_sigs.items.len);
+    const a = op_sigs.items[0];
+    const m = meth_sigs.items[0];
+    try testing.expectEqual(a.kind, m.kind);
+    try testing.expectEqualStrings(a.name, m.name);
+    try testing.expectEqual(a.ret.kind, m.ret.kind);
+    try testing.expectEqual(a.params.len, m.params.len);
 }

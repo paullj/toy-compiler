@@ -620,11 +620,23 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             };
             return .{ .value = try b.emit(ir_op, Typecheck.Type.int) };
         },
-        .lt, .lt_eq, .gt, .gt_eq, .eq_eq, .bang_eq => {
+        .lt, .lt_eq, .gt, .gt_eq => {
             const lhs = operandValue(try lowerExpr(b, n.lhs));
             const rhs = operandValue(try lowerExpr(b, n.rhs));
             const cc = condFromToken(op);
             return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+        },
+        .eq_eq, .bang_eq => {
+            // int/bool stay an inline `icmp` (bytes unchanged); str/unit/struct/enum
+            // desugar to `Eq::eq` via `lowerEqValue` (M15).
+            const lt = b.in.node_types[(n.lhs).int()];
+            if (isInlineEq(lt.kind)) {
+                const lhs = operandValue(try lowerExpr(b, n.lhs));
+                const rhs = operandValue(try lowerExpr(b, n.rhs));
+                const cc = condFromToken(op);
+                return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+            }
+            return try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq);
         },
         .amp_amp, .pipe_pipe => return try lowerAndOrValue(b, n, op),
         else => {
@@ -663,6 +675,166 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 
     b.switchTo(join);
     return .{ .value = merge };
+}
+
+/// True for the two `Eq` operand kinds that stay an inline `icmp` (int/bool). Every other
+/// kind (unit/str/struct/enum) routes to `lowerEqValue`, so the int/bool emitted bytes are
+/// unchanged BY CONSTRUCTION (the M15 "int/bool == unchanged" acceptance criterion).
+fn isInlineEq(k: Typecheck.Kind) bool {
+    return k == .int or k == .bool;
+}
+
+/// The slot an aggregate/str operand travels by (str/struct/enum always lower to `.slot`).
+fn operandSlot(op: Ir.Operand) Ir.SlotId {
+    return switch (op) {
+        .slot => |s| s,
+        else => Ir.none_slot,
+    };
+}
+
+/// Lower `lhs == rhs` (or `!=` when `negate`) for a NON-inline operand kind
+/// (unit/str/struct/enum), producing a bool value Operand (M15). int/bool are never routed
+/// here — they stay the inline `icmp` in `lowerBinary`/`genCond`, unchanged.
+///   * unit  -> lower both operands for effect, then `bconst true` (the two `()` values are
+///              always equal).
+///   * str   -> a heap-free len-compare then a per-byte `load_byte` loop (see `lowerStrEq`).
+///   * struct/enum -> resolve the `Eq` witness and emit `witness(self-by-value, rhs)` ->
+///              bool, byte-identical to the `p.eq(q)` method form (see `lowerStructEq`).
+/// `!=` wraps the resulting bool in a `bnot`.
+fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
+    const raw: Ir.ValueId = switch (operand_ty.kind) {
+        .unit => blk: {
+            _ = try lowerExpr(b, lhs_node);
+            _ = try lowerExpr(b, rhs_node);
+            break :blk try b.emit(.{ .bconst = true }, Typecheck.Type.@"bool");
+        },
+        .str => try lowerStrEq(b, lhs_node, rhs_node),
+        .@"struct", .@"enum" => try lowerStructEq(b, operand_ty, lhs_node, rhs_node),
+        else => blk: {
+            // Unreachable for a well-typed program (int/bool never routed here; any other
+            // kind is a type error caught before lower). Note-and-drop to stay well-formed.
+            try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "'==' operand type unsupported in lower");
+            break :blk try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+        },
+    };
+    if (negate) return .{ .value = try b.emit(.{ .bnot = raw }, Typecheck.Type.@"bool") };
+    return .{ .value = raw };
+}
+
+/// Emit the `Eq` witness call for a struct/enum operand (M15). Selects the SAME `.one`
+/// witness `methodGidOf` and the fingerprint fold select (via `resolveConformanceMethod`),
+/// so `p == q` emits IR byte-identical to `p.eq(q)`. Returns the bool result value.
+fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!Ir.ValueId {
+    const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "eq", null)) {
+        .one => |mm| mm,
+        else => {
+            // The checker proves exactly one `Eq` witness before lower; a miss here (an
+            // exotic inherent-`eq`-plus-`impl` collision -> `.ambiguous`, or `.none`) is an
+            // internal invariant break — note-and-drop rather than miscompile.
+            try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "no unique 'Eq' witness for '==' in lower");
+            return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+        },
+    };
+    const callee: Link.SymName = if (m.instance) |ii|
+        .{ .kind = .user_fn, .name = b.in.instances[ii].name }
+    else
+        b.in.names[m.fn_id];
+    const args = try b.gpa.alloc(Ir.Operand, 2);
+    errdefer b.gpa.free(args);
+    args[0] = try lowerExpr(b, lhs_node); // self, by value
+    args[1] = try lowerExpr(b, rhs_node);
+    return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
+}
+
+/// Heap-free str equality (M15): compare lengths, then bytes at `ptr + i` via `load_byte`
+/// in a slot-counter loop, merging the bool result through a join block param. Built with
+/// the exact `lowerFor` (slot counter) + `lowerAndOrValue` (br-arg block-param join) idioms
+/// so it is a pure function of source (deterministic, `--verify`-stable). Returns the bool
+/// result value (the join's merge param). An empty string compares equal to another empty
+/// string (equal lengths -> `hdr` sees `i >= 0` immediately -> `eq_blk`).
+fn lowerStrEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+
+    // Evaluate both str operands in the current block; each travels by slot.
+    const lhs_op = try lowerExpr(b, lhs_node);
+    const rhs_op = try lowerExpr(b, rhs_node);
+    const ls = operandSlot(lhs_op);
+    const rs = operandSlot(rhs_op);
+    if (ls == Ir.none_slot or rs == Ir.none_slot) {
+        try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "str '==' operand is not a slot in lower");
+        return try b.emit(.{ .bconst = false }, bool_ty);
+    }
+
+    // ptr@0 + len@8 of each {ptr,len} aggregate.
+    const lbase = try b.emit(.{ .slot_addr = ls }, int_ty);
+    const lp = try b.emit(.{ .load = .{ .addr = lbase, .ty = int_ty } }, int_ty);
+    const llen_addr = try b.emit(.{ .field_addr = .{ .base = lbase, .off = 8, .ty = int_ty } }, int_ty);
+    const ll = try b.emit(.{ .load = .{ .addr = llen_addr, .ty = int_ty } }, int_ty);
+    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
+    const rp = try b.emit(.{ .load = .{ .addr = rbase, .ty = int_ty } }, int_ty);
+    const rlen_addr = try b.emit(.{ .field_addr = .{ .base = rbase, .off = 8, .ty = int_ty } }, int_ty);
+    const rl = try b.emit(.{ .load = .{ .addr = rlen_addr, .ty = int_ty } }, int_ty);
+    const len_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = ll, .rhs = rl } }, bool_ty);
+
+    // i := 0 in a slot (the loop induction var, mirroring `lowerFor`).
+    const islot = try b.addSlot(int_ty);
+    {
+        const ia = try b.emit(.{ .slot_addr = islot }, int_ty);
+        const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+        _ = try b.emit(.{ .store = .{ .addr = ia, .val = zero, .ty = int_ty } }, null);
+    }
+
+    const hdr = try b.addBlock();
+    const body = try b.addBlock();
+    const inc = try b.addBlock();
+    const eq_blk = try b.addBlock();
+    const ne_blk = try b.addBlock();
+    const join = try b.addBlock();
+    const merge = try b.addParam(join, bool_ty);
+
+    // Unequal lengths short-circuit to false; equal lengths enter the byte loop.
+    b.setTerm(.{ .cond_br = .{ .cond = len_eq, .t = hdr, .f = ne_blk } });
+
+    // hdr: i >= len ? all bytes matched (eq_blk) : compare byte i (body).
+    b.switchTo(hdr);
+    const ia_h = try b.emit(.{ .slot_addr = islot }, int_ty);
+    const iv = try b.emit(.{ .load = .{ .addr = ia_h, .ty = int_ty } }, int_ty);
+    const done = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = iv, .rhs = ll } }, bool_ty);
+    b.setTerm(.{ .cond_br = .{ .cond = done, .t = eq_blk, .f = body } });
+
+    // body: load lp[i] and rp[i]; equal ? -> inc : ne_blk.
+    b.switchTo(body);
+    const lx = try b.emit(.{ .add = .{ .lhs = lp, .rhs = iv } }, int_ty);
+    const lbyte = try b.emit(.{ .load_byte = lx }, int_ty);
+    const rx = try b.emit(.{ .add = .{ .lhs = rp, .rhs = iv } }, int_ty);
+    const rbyte = try b.emit(.{ .load_byte = rx }, int_ty);
+    const byte_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lbyte, .rhs = rbyte } }, bool_ty);
+    b.setTerm(.{ .cond_br = .{ .cond = byte_eq, .t = inc, .f = ne_blk } });
+
+    // inc: i += 1; back-edge to hdr.
+    b.switchTo(inc);
+    {
+        const ia = try b.emit(.{ .slot_addr = islot }, int_ty);
+        const cur = try b.emit(.{ .load = .{ .addr = ia, .ty = int_ty } }, int_ty);
+        const one = try b.emit(.{ .iconst = 1 }, int_ty);
+        const next = try b.emit(.{ .add = .{ .lhs = cur, .rhs = one } }, int_ty);
+        const ia2 = try b.emit(.{ .slot_addr = islot }, int_ty);
+        _ = try b.emit(.{ .store = .{ .addr = ia2, .val = next, .ty = int_ty } }, null);
+    }
+    try brTo(b, hdr, .none);
+
+    // eq_blk / ne_blk: deliver the merge bool to the join.
+    b.switchTo(eq_blk);
+    const tv = try b.emit(.{ .bconst = true }, bool_ty);
+    try brTo(b, join, .{ .value = tv });
+
+    b.switchTo(ne_blk);
+    const fv = try b.emit(.{ .bconst = false }, bool_ty);
+    try brTo(b, join, .{ .value = fv });
+
+    b.switchTo(join);
+    return merge;
 }
 
 /// True when `sig` is a generic template (some param is a check-time `type_var`).
@@ -732,12 +904,17 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         };
         callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
     } else if (builtinScalarEqCallee(b, n)) |ba| {
-        // A builtin scalar `eq` (M12): lower the receiver + single arg and emit an inline
-        // `icmp eq` (reusing the comparison-lowering machinery), typed bool. No `.call` is
-        // built — the recognizer is pure, so there is no symbol/reloc to fold.
-        const lhs = operandValue(try lowerExpr(b, ba.recv));
-        const rhs = operandValue(try lowerExpr(b, ba.arg));
-        return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+        // A builtin scalar `.eq()` (M12/M15). int/bool lower to an inline `icmp eq` (no
+        // `.call`, no symbol/reloc — the recognizer is pure). str/unit route through the
+        // SAME `lowerEqValue` the `==` operator uses (heap-free byte-compare / trivially
+        // -true bconst), so `a.eq(b)` and `a == b` emit identical IR.
+        const recv_ty = b.in.node_types[(ba.recv).int()];
+        if (isInlineEq(recv_ty.kind)) {
+            const lhs = operandValue(try lowerExpr(b, ba.recv));
+            const rhs = operandValue(try lowerExpr(b, ba.arg));
+            return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+        }
+        return try lowerEqValue(b, recv_ty, ba.recv, ba.arg, false);
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -1785,12 +1962,28 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
         .binary => {
             const op = b.in.tokens[n.main_token].tag;
             switch (op) {
-                .lt, .lt_eq, .gt, .gt_eq, .eq_eq, .bang_eq => {
+                .lt, .lt_eq, .gt, .gt_eq => {
                     const lhs = operandValue(try lowerExpr(b, n.lhs));
                     const rhs = operandValue(try lowerExpr(b, n.rhs));
                     const cc = condFromToken(op);
                     const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool");
                     b.setTerm(.{ .cond_br = .{ .cond = c, .t = true_bb, .f = false_bb } });
+                },
+                .eq_eq, .bang_eq => {
+                    // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
+                    // str/unit/struct/enum desugar via `lowerEqValue`, then cond_br on
+                    // the produced bool (its current block is the eq computation's tail).
+                    const lt = b.in.node_types[(n.lhs).int()];
+                    if (isInlineEq(lt.kind)) {
+                        const lhs = operandValue(try lowerExpr(b, n.lhs));
+                        const rhs = operandValue(try lowerExpr(b, n.rhs));
+                        const cc = condFromToken(op);
+                        const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool");
+                        b.setTerm(.{ .cond_br = .{ .cond = c, .t = true_bb, .f = false_bb } });
+                    } else {
+                        const v = operandValue(try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq));
+                        b.setTerm(.{ .cond_br = .{ .cond = v, .t = true_bb, .f = false_bb } });
+                    }
                 },
                 .amp_amp => {
                     // a-true → eval b; a-false → false_bb.
@@ -2197,6 +2390,150 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
     var w = std.Io.Writer.fixed(&buf);
     try Ir.render(&w, &func, in.layouts, in.enum_layouts);
     try testing.expectEqualStrings(want, w.buffered());
+}
+
+/// Like `expectLoweredG`, but returns the rendered IR as a gpa-owned string so a test
+/// can assert on SUBSTRINGS (used for the M15 desugar shapes, where the exact id
+/// numbering is not the point). Caller frees the returned slice.
+fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) ![]u8 {
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
+
+    const names = try gpa.alloc(Link.SymName, rr.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (rr.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    var target_gid: ?usize = null;
+    for (rr.fns, 0..) |gf, i| {
+        if (gf.decl_node == Ast.none) continue;
+        const last = if (std.mem.lastIndexOfScalar(u8, gf.name, '.')) |dot| gf.name[dot + 1 ..] else gf.name;
+        if (std.mem.eql(u8, last, fn_name)) {
+            target_gid = i;
+            break;
+        }
+    }
+    const gid = target_gid orelse return error.TestUnexpectedResult;
+
+    const in = Inputs{
+        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
+        .tokens = tokens,
+        .source = src,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
+        .instances = tc.instances,
+        .sigs = tc.sigs,
+        .methods = tc.methods,
+    };
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const is_entry = std.mem.eql(u8, fn_name, "main");
+    var func = try lowerFn(gpa, in, rr.fns[gid].decl_node, names[gid], is_entry, &diags);
+    defer func.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
+    return gpa.dupe(u8, w.buffered());
+}
+
+test "M15: struct == lowers to a call to the Eq witness (no inline icmp)" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\struct P { x: int }
+        \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
+        \\fn cmp(p: P, q: P) -> bool { p == q }
+        \\
+    , "cmp");
+    defer gpa.free(ir);
+    // Dispatches to the witness call; the struct compare itself has no inline icmp.
+    try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "eq(") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp") == null);
+}
+
+test "M15: str == lowers to a heap-free len-compare + per-byte load_byte loop" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn cmp(a: str, b: str) -> bool { a == b }
+        \\
+    , "cmp");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "load_byte") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp ge") != null); // the i >= len loop guard
+    try testing.expect(std.mem.indexOf(u8, ir, "call") == null); // no witness fn, no heap
+}
+
+test "M15: unit == folds to bconst true" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn nothing() { return }
+        \\fn cmp() -> bool { nothing() == nothing() }
+        \\
+    , "cmp");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "bconst true") != null);
+}
+
+test "M15: != wraps the Eq result in bnot" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\struct P { x: int }
+        \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
+        \\fn cmp(p: P, q: P) -> bool { p != q }
+        \\
+    , "cmp");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "bnot") != null);
+}
+
+test "M15: int == stays a single inline icmp eq (regression pin: bytes unchanged)" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn cmp(a: int, b: int) -> bool { a == b }
+        \\
+    , "cmp");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
+    try testing.expect(std.mem.indexOf(u8, ir, "load_byte") == null);
+    try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
+}
+
+test "M15: int != stays a single inline icmp ne (regression pin: no bnot)" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn cmp(a: int, b: int) -> bool { a != b }
+        \\
+    , "cmp");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp ne") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
 }
 
 test "lower-core: arithmetic return" {

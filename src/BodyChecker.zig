@@ -511,13 +511,17 @@ pub const BodyChecker = struct {
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },
                     .eq_eq, .bang_eq => {
-                        if (Type.eql(lt, rt) and (lt.kind == .int or lt.kind == .bool)) break :blk Type.@"bool";
-                        if (Type.eql(lt, rt) and lt.kind == .str) {
-                            // Same type, but str comparison isn't supported — say so,
-                            // rather than the misleading "must have the same type".
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "'{s}' on str is unsupported", .{op_text});
-                        } else {
+                        // `==`/`!=` desugar to `Eq::eq` (M15). HOMOGENEOUS: require the same
+                        // type FIRST (so a cross-type compare stays "same type" even if both
+                        // sides individually conform), then type to bool iff the operand
+                        // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
+                        // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
+                        if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                        } else if (bc.conformsToEq(lt)) {
+                            break :blk Type.@"bool";
+                        } else {
+                            try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.typeName(lt) });
                         }
                     },
                     .amp_amp, .pipe_pipe => {
@@ -2017,6 +2021,24 @@ pub const BodyChecker = struct {
         const ret = substTy(bc, f.ret, targs);
         bc.node_types[(node_idx).int()] = ret;
         return ret;
+    }
+
+    /// Whether `t` conforms to the prelude `Eq` protocol (M15) — the predicate the
+    /// `==`/`!=` operator typing uses. A concrete type resolves via the frozen
+    /// conformance table (`findConformance` covers the int/bool/str/unit prelude
+    /// conformances AND every user `impl T has Eq`); a `type_var` in a bounded generic
+    /// body conforms as-axiom when its declared bound IS `Eq`. A prelude-less caller
+    /// (`eq_protocol_id == null`) denies conformance, so the operator emits T0026 rather
+    /// than miscompiling.
+    fn conformsToEq(bc: *const BodyChecker, t: Type) bool {
+        const eq_pid = bc.model.eq_protocol_id orelse return false;
+        if (Typecheck.findConformance(bc.model, eq_pid, t, &.{})) return true;
+        if (t.isTypeVar()) {
+            const ord = t.typeVarOrd();
+            if (ord >= bc.bound_protocols.len) return false;
+            return (bc.bound_protocols[ord] orelse return false) == eq_pid;
+        }
+        return false;
     }
 
     fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {

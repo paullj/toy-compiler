@@ -114,6 +114,11 @@ pub const Op = union(enum) {
     field_addr: struct { base: ValueId, off: u32, ty: Type },
     /// Scalar load from a ptr value → value of `ty`.
     load: struct { addr: ValueId, ty: Type },
+    /// Zero-extended single-byte load from a ptr value → int value (M15). The
+    /// heap-free str byte-compare reads one code unit at `ptr + i` this way; distinct
+    /// from `load` (which is always a 64-bit `ldr`) so store→load forwarding — which
+    /// only matches slot-based `.load` — never rewrites across a `cstr`-ptr byte read.
+    load_byte: ValueId,
     /// Scalar store; no result.
     store: struct { addr: ValueId, val: ValueId, ty: Type },
     /// Aggregate byte copy (dst ptr ← src ptr, sizeof `ty`); no result. codegen
@@ -368,6 +373,7 @@ fn renderInstr(
             try renderType(out, l.ty, layouts, enum_layouts);
             try out.writeAll("\n");
         },
+        .load_byte => |v| try out.print("load_byte %{d}\n", .{v}),
         .store => |s| {
             try out.print("store %{d}, %{d} : ", .{ s.addr, s.val });
             try renderType(out, s.ty, layouts, enum_layouts);
