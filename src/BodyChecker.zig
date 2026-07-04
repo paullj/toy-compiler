@@ -1,6 +1,7 @@
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
+const TokenTag = @import("ast/Token.zig").Tag;
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const LayoutEngine = @import("layout/Engine.zig");
@@ -503,8 +504,22 @@ pub const BodyChecker = struct {
                 const op_text = bc.tokens[n.main_token].text(bc.source);
                 switch (op) {
                     .plus, .minus, .star, .slash => {
+                        // `+`/`-`/`*`/`/` desugar to the arithmetic protocols Add/Sub/Mul/Div
+                        // (M17). Builtin `int` stays inline (a single machine add/sub/mul/sdiv,
+                        // no witness). Otherwise HOMOGENEOUS like `==`/`<`: require the same
+                        // type FIRST, then type to the operand type (`Out = Self`) iff it
+                        // conforms to the operator's protocol — a user struct/enum `impl T has
+                        // Add`, or a `[T has Add]` bound in a generic body. str/bool have NO
+                        // arithmetic impl (str concat allocates, deferred), so they fall to T0028.
                         if (lt.kind == .int and rt.kind == .int) break :blk Type.int;
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                        const ap = bc.arithProtocol(op);
+                        if (!Type.eql(lt, rt)) {
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                        } else if (bc.conformsToArith(lt, ap.pid)) {
+                            break :blk lt;
+                        } else {
+                            try bc.sink.emitFmtCode(.T0028, bc.byteOf(n.main_token), "'{s}' requires an '{s}' impl for type '{s}'", .{ op_text, ap.name, bc.typeName(lt) });
+                        }
                     },
                     .lt, .lt_eq, .gt, .gt_eq => {
                         // `<`/`>`/`<=`/`>=` desugar to a discriminant test on `Ord::cmp`'s
@@ -2064,6 +2079,39 @@ pub const BodyChecker = struct {
             const ord = t.typeVarOrd();
             if (ord >= bc.bound_protocols.len) return false;
             return (bc.bound_protocols[ord] orelse return false) == ord_pid;
+        }
+        return false;
+    }
+
+    /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)
+    /// + display name (M17). One switch keeps operator → protocol a single source of truth
+    /// so the checker and the T0028 message can never drift. A prelude-less caller leaves
+    /// `pid` null (denied by `conformsToArith`); the `else` is unreachable for the four
+    /// arithmetic tokens this is only called with.
+    fn arithProtocol(bc: *const BodyChecker, op: TokenTag) struct { pid: ?u32, name: []const u8 } {
+        return switch (op) {
+            .plus => .{ .pid = bc.model.add_protocol_id, .name = "Add" },
+            .minus => .{ .pid = bc.model.sub_protocol_id, .name = "Sub" },
+            .star => .{ .pid = bc.model.mul_protocol_id, .name = "Mul" },
+            .slash => .{ .pid = bc.model.div_protocol_id, .name = "Div" },
+            else => .{ .pid = null, .name = "Add" },
+        };
+    }
+
+    /// Whether `t` conforms to the arithmetic protocol `pid_opt` (M17) — the predicate the
+    /// `+`/`-`/`*`/`/` operator typing uses for non-int operands. Mirrors `conformsToEq`/
+    /// `conformsToOrd`: a concrete type resolves via the frozen conformance table
+    /// (`findConformance` covers the builtin `int` conformance AND every user `impl T has
+    /// Add`); a `type_var` in a bounded generic body conforms as-axiom when its declared
+    /// bound IS the operator's protocol. A null id (prelude-less caller) denies conformance,
+    /// so the operator emits T0028 rather than miscompiling.
+    fn conformsToArith(bc: *const BodyChecker, t: Type, pid_opt: ?u32) bool {
+        const pid = pid_opt orelse return false;
+        if (Typecheck.findConformance(bc.model, pid, t, &.{})) return true;
+        if (t.isTypeVar()) {
+            const ord = t.typeVarOrd();
+            if (ord >= bc.bound_protocols.len) return false;
+            return (bc.bound_protocols[ord] orelse return false) == pid;
         }
         return false;
     }

@@ -608,17 +608,24 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
     const op = b.in.tokens[n.main_token].tag;
     switch (op) {
         .plus, .minus, .star, .slash => {
-            const lhs = operandValue(try lowerExpr(b, n.lhs));
-            const rhs = operandValue(try lowerExpr(b, n.rhs));
-            const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
-            const ir_op: Ir.Op = switch (op) {
-                .plus => .{ .add = bin },
-                .minus => .{ .sub = bin },
-                .star => .{ .mul = bin },
-                .slash => .{ .sdiv = bin },
-                else => unreachable,
-            };
-            return .{ .value = try b.emit(ir_op, Typecheck.Type.int) };
+            // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
+            // operand desugars to the resolved Add/Sub/Mul/Div witness via `lowerArithValue`
+            // (M17). The checker (T0028) has already proven a same-type conforming operand.
+            const lt = b.in.node_types[(n.lhs).int()];
+            if (isInlineArith(lt.kind)) {
+                const lhs = operandValue(try lowerExpr(b, n.lhs));
+                const rhs = operandValue(try lowerExpr(b, n.rhs));
+                const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
+                const ir_op: Ir.Op = switch (op) {
+                    .plus => .{ .add = bin },
+                    .minus => .{ .sub = bin },
+                    .star => .{ .mul = bin },
+                    .slash => .{ .sdiv = bin },
+                    else => unreachable,
+                };
+                return .{ .value = try b.emit(ir_op, Typecheck.Type.int) };
+            }
+            return try lowerArithValue(b, lt, n.lhs, n.rhs, op);
         },
         .lt, .lt_eq, .gt, .gt_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/struct/enum desugar to a
@@ -701,6 +708,14 @@ const ord_gt: i64 = 2;
 /// emitted bytes are unchanged BY CONSTRUCTION (the M16 "int comparisons unchanged" criterion).
 fn isInlineOrd(k: Typecheck.Kind) bool {
     return k == .int or k == .bool;
+}
+
+/// True for the one arithmetic operand kind that stays an inline machine op (`int`). Every
+/// other kind routes to `lowerArithValue`, so the int emitted bytes are unchanged BY
+/// CONSTRUCTION (the M17 "int `+`/`-`/`*`/`/` unchanged" acceptance criterion). str/bool
+/// never reach lower for arithmetic — the checker rejects them (T0028).
+fn isInlineArith(k: Typecheck.Kind) bool {
+    return k == .int;
 }
 
 /// The slot an aggregate/str operand travels by (str/struct/enum always lower to `.slot`).
@@ -841,6 +856,46 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
         else => {
             try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "comparison operand type unsupported in lower");
             return try b.emit(.{ .iconst = ord_eq }, Typecheck.Type.int);
+        },
+    }
+}
+
+/// Lower `lhs <op> rhs` for a NON-inline arithmetic operand kind (struct/enum), producing the
+/// aggregate result as a `.slot` Operand (M17). `+`/`-`/`*`/`/` map to the resolved
+/// Add/Sub/Mul/Div witness, emitted as `witness(self-by-value, rhs) -> ret_slot`, byte-identical
+/// to the general aggregate-return call path and to the `p.add(q)` method form. int is never
+/// routed here (it stays the inline machine op in `lowerBinary`). The witness `ret_ty` comes off
+/// its own Sig/instance (matching `lowerCmpDiscriminant`); T0024 forces `Out = Self`, so today it
+/// equals `operand_ty`, but reading the sig keeps it correct for a future generic-impl instance.
+fn lowerArithValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, op: TokenTag) error{OutOfMemory}!Ir.Operand {
+    const method: []const u8 = switch (op) {
+        .plus => "add",
+        .minus => "sub",
+        .star => "mul",
+        .slash => "div",
+        else => unreachable,
+    };
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, method, null)) {
+        .one => |m| {
+            const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
+            const callee: Link.SymName = if (m.instance) |ii|
+                .{ .kind = .user_fn, .name = b.in.instances[ii].name }
+            else
+                b.in.names[m.fn_id];
+            const args = try b.gpa.alloc(Ir.Operand, 2);
+            errdefer b.gpa.free(args);
+            args[0] = try lowerExpr(b, lhs_node); // self, by value
+            args[1] = try lowerExpr(b, rhs_node);
+            const slot = try b.addSlot(ret_ty);
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
+            return .{ .slot = slot };
+        },
+        .none, .ambiguous => {
+            // The checker (T0028) proves exactly one arithmetic witness before lower; a miss
+            // here is an internal invariant break — note-and-drop into a fresh slot rather than
+            // miscompile, keeping the IR well-formed.
+            try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "no unique arithmetic witness in lower");
+            return .{ .slot = try b.addSlot(operand_ty) };
         },
     }
 }
@@ -1357,6 +1412,10 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         .labeled => try lowerLabeledValueInto(b, expr, dst_ptr, ty),
         .match_expr => try lowerMatchInto(b, expr, dst_ptr, ty),
         .identifier => try copyAggInto(b, expr, dst_ptr, ty),
+        // An arithmetic operator on struct/enum operands (M17) desugars to an
+        // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
+        // `.slot`, so copy those bytes into the destination like any other agg result.
+        .binary => try copyAggInto(b, expr, dst_ptr, ty),
         else => try b.note(n.main_token, "aggregate expression unsupported in lower"),
     }
 }
@@ -2847,6 +2906,62 @@ test "M16: Ord refines Eq — `!=` on an Ord-only struct lowers via a cmp call +
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp ne") != null); // discriminant != ord_eq(1)
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
+}
+
+const add_impl_src =
+    \\struct V2 { x: int, y: int }
+    \\impl V2 has Add { fn add(self, o: V2) -> V2 { V2{ x: self.x + o.x, y: self.y + o.y } } }
+    \\impl V2 has Sub { fn sub(self, o: V2) -> V2 { V2{ x: self.x - o.x, y: self.y - o.y } } }
+    \\impl V2 has Mul { fn mul(self, o: V2) -> V2 { V2{ x: self.x * o.x, y: self.y * o.y } } }
+    \\impl V2 has Div { fn div(self, o: V2) -> V2 { V2{ x: self.x / o.x, y: self.y / o.y } } }
+    \\
+;
+
+test "M17: struct `+` lowers to a call to the Add witness (aggregate return, no inline add)" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa, add_impl_src ++ "fn use_add(p: V2, q: V2) -> V2 { p + q }\n", "use_add");
+    defer gpa.free(ir);
+    // Dispatches to the `add` witness; its aggregate result lands in a ret_slot. The
+    // top-level `+` itself must NOT emit an inline machine `add` (only the witness BODY
+    // does, but that body is a different fn — `use_add` here holds just the call).
+    try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "add(") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, " -> s") != null); // aggregate ret_slot
+    try testing.expect(std.mem.indexOf(u8, ir, "add %") == null); // no inline machine add
+}
+
+test "M17: struct `-`/`*`/`/` dispatch to the Sub/Mul/Div witness (sibling protocols)" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { use: []const u8, method: []const u8, inline_op: []const u8 }{
+        .{ .use = "fn f(p: V2, q: V2) -> V2 { p - q }\n", .method = "sub(", .inline_op = "sub %" },
+        .{ .use = "fn f(p: V2, q: V2) -> V2 { p * q }\n", .method = "mul(", .inline_op = "mul %" },
+        .{ .use = "fn f(p: V2, q: V2) -> V2 { p / q }\n", .method = "div(", .inline_op = "sdiv %" },
+    };
+    for (cases) |c| {
+        const src = try std.fmt.allocPrint(gpa, "{s}{s}", .{ add_impl_src, c.use });
+        defer gpa.free(src);
+        const ir = try renderLoweredG(gpa, src, "f");
+        defer gpa.free(ir);
+        try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
+        try testing.expect(std.mem.indexOf(u8, ir, c.method) != null);
+        try testing.expect(std.mem.indexOf(u8, ir, c.inline_op) == null); // no inline machine op
+    }
+}
+
+test "M17: int `+`/`-`/`*`/`/` stay a single inline op (regression pin: bytes unchanged, no call)" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "fn f(a: int, b: int) -> int { a + b }\n", .want = "add %" },
+        .{ .src = "fn f(a: int, b: int) -> int { a - b }\n", .want = "sub %" },
+        .{ .src = "fn f(a: int, b: int) -> int { a * b }\n", .want = "mul %" },
+        .{ .src = "fn f(a: int, b: int) -> int { a / b }\n", .want = "sdiv %" },
+    };
+    for (cases) |c| {
+        const ir = try renderLoweredG(gpa, c.src, "f");
+        defer gpa.free(ir);
+        try testing.expect(std.mem.indexOf(u8, ir, c.want) != null);
+        try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
+    }
 }
 
 test "lower-core: arithmetic return" {

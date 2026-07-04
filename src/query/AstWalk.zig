@@ -106,6 +106,13 @@ pub const Event = union(enum) {
     /// folding the `Ord::cmp` witness for a struct/enum operand so `a < b` tracks the SAME
     /// witness identity the desugared cmp call's reloc targets.
     ord_operator: struct { idx: Ast.Index },
+    /// A `+`/`-`/`*`/`/` operator on a `.binary` node `idx` (M17). Emitted AFTER both
+    /// operands, like `.eq_operator`/`.ord_operator`. The hash IGNORES it (so every existing
+    /// fingerprint — incl. int `+` — is preserved and warm caches never churn); only
+    /// `CallVisitor` reacts, folding the resolved Add/Sub/Mul/Div witness for a struct/enum
+    /// operand so `v1 + v2` tracks the SAME witness identity the desugared call's reloc
+    /// targets (editing an `impl V2 has Add` body must invalidate `+` callers).
+    arith_operator: struct { idx: Ast.Index },
 };
 
 /// The error set of `visitor.on`, or the empty set when the visitor has no `on`.
@@ -174,6 +181,9 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             // M16: after the operands, signal a comparison so `CallVisitor` can fold the
             // `Ord::cmp` witness for a struct/enum operand. The hash ignores it.
             if (btag == .lt or btag == .lt_eq or btag == .gt or btag == .gt_eq) try emit(visitor, .{ .ord_operator = .{ .idx = idx } });
+            // M17: after the operands, signal arithmetic so `CallVisitor` can fold the
+            // Add/Sub/Mul/Div witness for a struct/enum operand. The hash ignores it.
+            if (btag == .plus or btag == .minus or btag == .star or btag == .slash) try emit(visitor, .{ .arith_operator = .{ .idx = idx } });
         },
         .call => {
             try walkInner(src, n.lhs, collect, visitor);
@@ -433,7 +443,7 @@ pub const HashVisitor = struct {
             .leaf, .raw_leaf => |t| updateLeaf(self.h, t),
             .count => |c| updateU32(self.h, c),
             .flag => |f| self.h.update(&[_]u8{@intFromBool(f)}),
-            .touch, .callee, .type_ref, .eq_operator, .ord_operator => {},
+            .touch, .callee, .type_ref, .eq_operator, .ord_operator, .arith_operator => {},
         }
     }
 };
@@ -564,6 +574,29 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     const recv = self.frozen.node_types[bn.lhs.int()];
                     if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
                     switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", null)) {
+                        .one => |m| try self.foldWitness(m),
+                        .none, .ambiguous => {},
+                    }
+                },
+                .arith_operator => |e| {
+                    // A `+`/`-`/`*`/`/` on a struct/enum operand (M17) desugars to that type's
+                    // Add/Sub/Mul/Div witness; fold it so the caller tracks the SAME identity the
+                    // desugared call's reloc targets (mirrors the `.ord_operator` fold). An int
+                    // operand inlines to a machine op with NO symbol, so nothing to fold — keeping
+                    // every int-arithmetic fingerprint byte-identical (warm cache). str/bool are
+                    // rejected by the checker and never reach here.
+                    const bn = self.frozen.tree.nodes[e.idx.int()];
+                    if (bn.lhs.int() >= self.frozen.node_types.len) return;
+                    const recv = self.frozen.node_types[bn.lhs.int()];
+                    if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
+                    const method: []const u8 = switch (self.frozen.tokens[bn.main_token].tag) {
+                        .plus => "add",
+                        .minus => "sub",
+                        .star => "mul",
+                        .slash => "div",
+                        else => return,
+                    };
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, null)) {
                         .one => |m| try self.foldWitness(m),
                         .none, .ambiguous => {},
                     }
@@ -846,7 +879,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 /// makes the guard catch a mis-placed `.touch`/`.callee`/`.type_ref` dispatch —
 /// not only a forked traversal order.
 const StreamStep = struct {
-    kind: enum { enter, touch, callee, type_ref, eq_operator, ord_operator },
+    kind: enum { enter, touch, callee, type_ref, eq_operator, ord_operator, arith_operator },
     idx: Ast.Index,
 };
 
@@ -866,6 +899,7 @@ const StreamRecorder = struct {
             .type_ref => |r| try self.out.append(self.gpa, .{ .kind = .type_ref, .idx = r.idx }),
             .eq_operator => |e| try self.out.append(self.gpa, .{ .kind = .eq_operator, .idx = e.idx }),
             .ord_operator => |e| try self.out.append(self.gpa, .{ .kind = .ord_operator, .idx = e.idx }),
+            .arith_operator => |e| try self.out.append(self.gpa, .{ .kind = .arith_operator, .idx = e.idx }),
             .leaf, .raw_leaf, .count, .flag => {},
         }
     }
@@ -990,6 +1024,7 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
     var saw_type_ref = false;
     var saw_eq_operator = false;
     var saw_ord_operator = false;
+    var saw_arith_operator = false;
     for (stream) |st| switch (st.kind) {
         .enter => saw_enter = true,
         .touch => saw_touch = true,
@@ -997,8 +1032,10 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         .type_ref => saw_type_ref = true,
         .eq_operator => saw_eq_operator = true,
         .ord_operator => saw_ord_operator = true,
+        .arith_operator => saw_arith_operator = true,
     };
-    try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref and saw_eq_operator and saw_ord_operator);
+    // The fixture's `d := q.x - p.x` is a `-` binary, so `.arith_operator` fires (M17).
+    try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref and saw_eq_operator and saw_ord_operator and saw_arith_operator);
 
     // (1) NO ORPHAN DISPATCH: every touch/callee/type_ref idx is a node that was
     // entered. A dispatch at a node outside the walked subtree would fail here.
@@ -1079,6 +1116,17 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         try testing.expect(bnode.tag == .binary);
         const btag = b.tokens[bnode.main_token].tag;
         try testing.expect(btag == .lt or btag == .lt_eq or btag == .gt or btag == .gt_eq);
+    }
+
+    // (7) `.arith_operator` PLACEMENT (M17): every `.arith_operator` idx is an entered
+    // `.binary` node whose operator token is `+`/`-`/`*`/`/`. A signal at the wrong node —
+    // or fired for a non-arithmetic binary — fails here.
+    for (stream) |st| {
+        if (st.kind != .arith_operator) continue;
+        const bnode = b.tree.nodes[st.idx.int()];
+        try testing.expect(bnode.tag == .binary);
+        const btag = b.tokens[bnode.main_token].tag;
+        try testing.expect(btag == .plus or btag == .minus or btag == .star or btag == .slash);
     }
 }
 
@@ -1260,6 +1308,37 @@ test "M16: the .ord_operator event is IGNORED by the hash (int < fingerprint unc
     try testing.expectEqual(h1.final(), h2.final());
 }
 
+test "M17: the .arith_operator event is IGNORED by the hash (int + fingerprint unchanged)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(a: int, b: int) -> int { a + b }\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+
+    // Hash 1: the real walk, which emits `.arith_operator` after the operands.
+    var h1 = std.hash.Wyhash.init(0);
+    var hv = HashVisitor{ .h = &h1 };
+    try walk(b.src(), decl, &hv);
+
+    // Hash 2: the SAME walk with `.arith_operator` dropped before folding — the hash as if the
+    // M17 event had never been introduced. Byte-identity proves the operator event never
+    // enters the fingerprint byte-stream, so every existing int arithmetic fp is preserved
+    // and warm caches never churn.
+    var h2 = std.hash.Wyhash.init(0);
+    const Filter = struct {
+        h: HashVisitor,
+        pub fn on(self: *@This(), ev: Event) void {
+            switch (ev) {
+                .arith_operator => {},
+                else => self.h.on(ev),
+            }
+        }
+    };
+    var fv = Filter{ .h = .{ .h = &h2 } };
+    try walk(b.src(), decl, &fv);
+
+    try testing.expectEqual(h1.final(), h2.final());
+}
+
 test "M15: `p == q` folds the SAME Eq witness Sig as `p.eq(q)` (fingerprint agreement)" {
     const gpa = testing.allocator;
     const Graph = @import("../driver/Graph.zig");
@@ -1426,6 +1505,91 @@ test "M16: `a < b` folds the SAME Ord::cmp witness Sig as `a.cmp(b)` (incrementa
 
     // `a < b` folds the SAME `Ord::cmp` witness `a.cmp(b)` dispatches to, so editing the `cmp`
     // body invalidates a `<` caller. Each folds the cmp witness exactly once.
+    try testing.expectEqual(@as(usize, 1), op_sigs.items.len);
+    try testing.expectEqual(@as(usize, 1), meth_sigs.items.len);
+    const a = op_sigs.items[0];
+    const m = meth_sigs.items[0];
+    try testing.expectEqual(a.kind, m.kind);
+    try testing.expectEqualStrings(a.name, m.name);
+    try testing.expectEqual(a.ret.kind, m.ret.kind);
+    try testing.expectEqual(a.params.len, m.params.len);
+}
+
+test "M17: `p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental soundness)" {
+    const gpa = testing.allocator;
+    const Graph = @import("../driver/Graph.zig");
+    const ResolveGraph = @import("../resolve_graph.zig");
+    const TypecheckGraph = @import("../types_graph.zig");
+    const Link = @import("../link/Link.zig");
+
+    const src =
+        \\struct V2 { x: int, y: int }
+        \\impl V2 has Add { fn add(self, o: V2) -> V2 { V2{ x: self.x + o.x, y: self.y + o.y } } }
+        \\fn use_op(p: V2, q: V2) -> V2 { p + q }
+        \\fn use_method(p: V2, q: V2) -> V2 { p.add(q) }
+        \\
+    ;
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    defer res.deinit(gpa);
+    var tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
+    defer tc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), tc.diags.len);
+
+    const names = try gpa.alloc(Link.SymName, res.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (res.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    const frozen = FakeFrozen{
+        .tree = tree,
+        .tokens = tokens,
+        .source = src,
+        .resolutions = res.resolutions[0],
+        .node_types = tc.node_types[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sigs = tc.sigs,
+        .instances = tc.instances,
+        .methods = tc.methods,
+    };
+
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    var op_decl: Ast.Index = Ast.none;
+    var meth_decl: Ast.Index = Ast.none;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs.int())) |idx| {
+        if (tree.nodes[idx.int()].tag != .fn_decl) continue;
+        if (op_decl == Ast.none) op_decl = idx else meth_decl = idx;
+    }
+    try testing.expect(op_decl != Ast.none and meth_decl != Ast.none);
+
+    var op_sigs: std.ArrayList(Sig) = .empty;
+    defer op_sigs.deinit(gpa);
+    var vop = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = &op_sigs };
+    try walk(.{ .tree = tree, .tokens = tokens, .source = src }, op_decl, &vop);
+
+    var meth_sigs: std.ArrayList(Sig) = .empty;
+    defer meth_sigs.deinit(gpa);
+    var vm = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = &meth_sigs };
+    try walk(.{ .tree = tree, .tokens = tokens, .source = src }, meth_decl, &vm);
+
+    // `p + q` folds the SAME `Add::add` witness `p.add(q)` dispatches to, so editing the `add`
+    // body invalidates a `+` caller (the stale-cache-soundness guarantee). Each folds once.
     try testing.expectEqual(@as(usize, 1), op_sigs.items.len);
     try testing.expectEqual(@as(usize, 1), meth_sigs.items.len);
     const a = op_sigs.items[0];

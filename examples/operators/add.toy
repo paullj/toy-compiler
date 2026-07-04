@@ -1,0 +1,31 @@
+# Feature: `+` / `-` / `*` / `/` are operators-as-protocols (M17). They desugar to the
+# prelude arithmetic protocols `Add` / `Sub` / `Mul` / `Div`, each homogeneous
+# (`fn add(self, other: Self) -> Self`); a user struct conforms via `impl V2 has Add`, so
+# `v1 + v2` dispatches to `V2::add` and returns a `V2`. Builtin `int` arithmetic stays a
+# single inline machine op (no call). Exercises all four sibling protocols on a struct.
+# expect: exit 42
+struct V2 { x: int, y: int }
+
+impl V2 has Add {
+    fn add(self, o: V2) -> V2 { V2{ x: self.x + o.x, y: self.y + o.y } }
+}
+
+impl V2 has Sub {
+    fn sub(self, o: V2) -> V2 { V2{ x: self.x - o.x, y: self.y - o.y } }
+}
+
+impl V2 has Mul {
+    fn mul(self, o: V2) -> V2 { V2{ x: self.x * o.x, y: self.y * o.y } }
+}
+
+impl V2 has Div {
+    fn div(self, o: V2) -> V2 { V2{ x: self.x / o.x, y: self.y / o.y } }
+}
+
+fn main() -> int {
+    s := V2{ x: 10, y: 5 } + V2{ x: 2, y: 3 }   # {12, 8} -> 20
+    d := V2{ x: 9, y: 7 } - V2{ x: 4, y: 4 }     # { 5, 3} ->  8
+    p := V2{ x: 3, y: 1 } * V2{ x: 2, y: 2 }     # { 6, 2} ->  8
+    q := V2{ x: 6, y: 3 } / V2{ x: 2, y: 1 }     # { 3, 3} ->  6
+    return s.x + s.y + d.x + d.y + p.x + p.y + q.x + q.y
+}
