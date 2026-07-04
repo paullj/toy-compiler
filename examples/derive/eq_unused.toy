@@ -1,0 +1,10 @@
+# Feature: auto-derive is LAZY (M18). `Q` is a derivable struct that is never compared
+# with `==`/`!=`, so NO derive is requested and ZERO synthetic codegen units are emitted
+# (`toy --emit ir` shows no `Eq$eq$` unit). Unused ⇒ free in binary and compile time.
+struct Q { v: int }
+
+fn main() -> int {
+    q := Q{ v: 42 }
+    return q.v
+}
+# expect: exit 42

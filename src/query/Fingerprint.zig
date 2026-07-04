@@ -27,6 +27,7 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const AstWalk = @import("AstWalk.zig");
+const Derive = @import("../symbols/Derive.zig");
 
 /// The callee identity-and-signature datum (`symbols/Sig.zig`); the `(b)` fold
 /// site in `fingerprint` below is the home for why its `kind` is load-bearing.
@@ -170,6 +171,47 @@ pub fn fingerprint(
         }
     }
 
+    return h.final();
+}
+
+/// The distinct seed for a SOURCE-LESS derive unit (M18). Different from `seed` so a
+/// derive fingerprint can never alias a real fn's body-walk fingerprint even if the
+/// folded bytes happened to coincide.
+const derive_seed: u64 = 0x44_52_56_46; // "DRVF"
+
+/// The NON-AST fingerprint of a source-less auto-derive codegen unit (M18). There is
+/// no `fn_decl` to walk, so the key is built ENTIRELY from the recipe: a distinct
+/// derive seed + the derive kind + the protocol name + the conforming type's
+/// index-free layout descriptor (the SAME encoding the (c)/(d) touched fold uses) +
+/// each resolved field-witness (its `FieldEq` tag + the witness SymName), ordered
+/// (never XOR). So a field-layout edit flips it (via `conform.layout`), and a nested
+/// field gaining/losing an explicit impl flips it (via the witness tag/name change) —
+/// the stale-cache-miscompile guards a real fn gets from (a)/(c)/(e).
+pub fn deriveFingerprint(
+    protocol_name: []const u8,
+    kind: Derive.Kind,
+    conform: TouchedType,
+    field_witnesses: []const Derive.FieldEq,
+) u64 {
+    var h = std.hash.Wyhash.init(derive_seed);
+    h.update(&[_]u8{ @intFromEnum(kind), type_layout_version });
+    AstWalk.updateLeaf(&h, protocol_name);
+    // The conforming type's layout descriptor (mirrors (c)/(d)); a struct/enum folds
+    // its full index-free layout so a field-layout edit flips the unit's key.
+    h.update(&[_]u8{@intFromEnum(conform.kind)});
+    if (conform.kind == .@"struct" or conform.kind == .@"enum") AstWalk.updateLeaf(&h, conform.layout);
+    // The resolved per-field witnesses, ORDERED (count sentinel + per-field tag + the
+    // witness SymName). A nested field gaining an explicit impl changes its `FieldEq`
+    // (tag and/or name), flipping the key — so the override never serves a stale blob.
+    AstWalk.updateU32(&h, @intCast(field_witnesses.len));
+    for (field_witnesses) |fw| {
+        h.update(&[_]u8{@intFromEnum(fw)});
+        switch (fw) {
+            .inline_kind => {},
+            .eq_call => |n| AstWalk.updateLeaf(&h, n),
+            .cmp_eq => |n| AstWalk.updateLeaf(&h, n),
+        }
+    }
     return h.final();
 }
 
@@ -659,6 +701,42 @@ test "conformance fold (e) M14: identical protocol-args hash identically" {
     const h1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc1);
     const h2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc2);
     try testing.expectEqual(h1, h2);
+}
+
+test "deriveFingerprint: a conform-layout edit flips the derive unit's key (M18)" {
+    // Same protocol/kind/witnesses; only the conforming type's layout bytes differ (a
+    // field added). The (c)-style layout fold must separate them, or an edited struct
+    // serves a stale derived-eq blob.
+    const v1 = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
+    const v2 = TouchedType{ .kind = .@"struct", .layout = "P\x00x\x00y" };
+    const h1 = deriveFingerprint("Eq", .eq, v1, &.{ .inline_kind });
+    const h2 = deriveFingerprint("Eq", .eq, v2, &.{ .inline_kind });
+    try testing.expect(h1 != h2);
+}
+
+test "deriveFingerprint: a field-witness swap flips the key (nested override guard, M18)" {
+    // Same layout; a nested aggregate field's resolved witness changes (e.g. the field
+    // type gained an explicit impl, so its witness SymName differs). Must flip the key.
+    const cf = TouchedType{ .kind = .@"struct", .layout = "Outer\x00inner" };
+    const w1 = [_]Derive.FieldEq{.{ .eq_call = "Eq$eq$s0" }};
+    const w2 = [_]Derive.FieldEq{.{ .eq_call = "main.Inner.eq" }};
+    const h1 = deriveFingerprint("Eq", .eq, cf, &w1);
+    const h2 = deriveFingerprint("Eq", .eq, cf, &w2);
+    try testing.expect(h1 != h2);
+    // The FieldEq TAG also folds: an `eq_call` vs a `cmp_eq` witness (Ord-only field)
+    // to the same symbol must diverge.
+    const w3 = [_]Derive.FieldEq{.{ .cmp_eq = "Eq$eq$s0" }};
+    try testing.expect(deriveFingerprint("Eq", .eq, cf, &w1) != deriveFingerprint("Eq", .eq, cf, &w3));
+}
+
+test "deriveFingerprint: identical recipe hashes identically (cache hit) + struct/enum differ" {
+    const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
+    const w = [_]Derive.FieldEq{.{ .eq_call = "Eq$eq$s1" }};
+    try testing.expectEqual(deriveFingerprint("Eq", .eq, cf, &w), deriveFingerprint("Eq", .eq, cf, &w));
+    // A struct-derive vs an enum-derive of the same name/layout-bytes must differ (the
+    // conform.kind marker separates the two id spaces).
+    const en = TouchedType{ .kind = .@"enum", .layout = "P\x00x" };
+    try testing.expect(deriveFingerprint("Eq", .eq, cf, &w) != deriveFingerprint("Eq", .eq, en, &w));
 }
 
 test "conformance fold (e) M14: empty protocol-args is byte-identical to a pre-M14 fold" {

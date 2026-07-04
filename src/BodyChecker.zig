@@ -135,6 +135,17 @@ pub const BodyChecker = struct {
     /// non-generic/unbounded fn. Set by `bodyCheckerFor` from `FnSym.generic_bound_args`.
     bound_protocol_args: []const []const Type = &.{},
 
+    /// Structural derive requests this fn's body recorded (M18): a `==`/`!=` on a
+    /// derivable type with no impl. Moved out into the `BodyResult` after the walk;
+    /// merged fn-id-ordered by `checkBodies`. THREAD-LOCAL (one list per BodyChecker),
+    /// so the parallel Pass C never shares mutable derive state.
+    derive_reqs: std.ArrayList(Typecheck.DeriveReq) = .empty,
+
+    /// The recursive `conforms` query's memo (M18), keyed by `(protocol, kind, type-id)`.
+    /// THREAD-LOCAL (one map per BodyChecker) so the query is race-free under the
+    /// parallel body fan-out; the answer is stable (layouts/conformances frozen).
+    conforms_memo: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
@@ -143,6 +154,8 @@ pub const BodyChecker = struct {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
         bc.sink.deinit();
+        bc.derive_reqs.deinit(bc.gpa);
+        bc.conforms_memo.deinit(bc.gpa);
     }
 
     /// Walk this fn's body: rebuild the slot table, type the body block against the
@@ -543,8 +556,13 @@ pub const BodyChecker = struct {
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (bc.conformsToEq(lt)) {
+                        } else if (try bc.conformsToEq(lt)) {
                             break :blk Type.@"bool";
+                        } else if (try bc.eqDeriveBlocker(lt)) |blocker| {
+                            // M18: a struct that would derive `Eq` but for one non-conforming
+                            // field names that field (T0029). A payload enum / other type
+                            // keeps the M15 "no Eq impl" T0026 below.
+                            try bc.sink.emitFmtCode(.T0029, bc.byteOf(n.main_token), "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
                         } else {
                             try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.typeName(lt) });
                         }
@@ -2055,7 +2073,14 @@ pub const BodyChecker = struct {
     /// body conforms as-axiom when its declared bound IS `Eq`. A prelude-less caller
     /// (`eq_protocol_id == null`) denies conformance, so the operator emits T0026 rather
     /// than miscompiling.
-    fn conformsToEq(bc: *const BodyChecker, t: Type) bool {
+    /// M18: after the `findConformance`/bound-axiom misses, an all-`Eq`-fields struct (or
+    /// empty-payload enum) with NO explicit impl conforms STRUCTURALLY. Record the derive
+    /// request (so the serial synthesis barrier emits the source-less unit) and return
+    /// true so `==`/`!=` types bool. `findConformance`-first keeps an explicit/Ord-
+    /// refinement type off this path (no double-fire). Now fallible (`conforms` + the
+    /// request record allocate) and takes `*BodyChecker` (records into the thread-local
+    /// `derive_reqs`).
+    fn conformsToEq(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
         const eq_pid = bc.model.eq_protocol_id orelse return false;
         if (Typecheck.findConformance(bc.model, eq_pid, t, &.{})) return true;
         if (t.isTypeVar()) {
@@ -2063,7 +2088,30 @@ pub const BodyChecker = struct {
             if (ord >= bc.bound_protocols.len) return false;
             return (bc.bound_protocols[ord] orelse return false) == eq_pid;
         }
+        switch (t.kind) {
+            .@"struct", .@"enum" => {},
+            else => return false,
+        }
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa)) {
+            try bc.recordDeriveReq(eq_pid, t);
+            return true;
+        }
         return false;
+    }
+
+    /// Record a structural derive request once per (protocol, type) in this fn (a fn may
+    /// `==` a type repeatedly; the synthesis barrier dedups across fns too).
+    fn recordDeriveReq(bc: *BodyChecker, pid: u32, t: Type) error{OutOfMemory}!void {
+        for (bc.derive_reqs.items) |r| if (r.protocol_id == pid and Type.eql(r.conform_ty, t)) return;
+        try bc.derive_reqs.append(bc.gpa, .{ .protocol_id = pid, .conform_ty = t });
+    }
+
+    /// The first struct field that blocks a structural `Eq` derive (M18), for the T0029
+    /// message; null when `t` is not a struct, has no eq protocol, or every field conforms.
+    fn eqDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
+        if (t.kind != .@"struct") return null;
+        const eq_pid = bc.model.eq_protocol_id orelse return null;
+        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa);
     }
 
     /// Whether `t` conforms to the prelude `Ord` protocol (M16) — the predicate the

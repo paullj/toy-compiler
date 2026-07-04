@@ -1,0 +1,16 @@
+# Feature: structural `Eq` derive recurses through NESTED aggregate fields (M18). `Outer`
+# has an `Inner` field, so its derived `eq` calls `Inner`'s own derived `eq` (a distinct
+# synthetic unit the barrier's fixpoint also authorized). Both are source-less.
+struct Inner { a: int, b: int }
+struct Outer { p: Inner, tag: int }
+
+fn main() -> int {
+    x := Outer{ p: Inner{ a: 3, b: 4 }, tag: 7 }
+    y := Outer{ p: Inner{ a: 3, b: 4 }, tag: 7 }
+    z := Outer{ p: Inner{ a: 3, b: 5 }, tag: 7 }
+    n := 0
+    if x == y { n = n + 40 }        # equal (nested Inner equal) -> +40
+    if x == z { n = n + 1 } else { n = n + 2 }   # differ in Inner.b -> +2
+    return n
+}
+# expect: exit 42

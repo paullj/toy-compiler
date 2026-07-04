@@ -609,6 +609,18 @@ pub fn CallVisitor(comptime Frozen: type) type {
         /// method (M10) carries the mono `instance` index -> fold the INSTANCE identity
         /// (the real reloc target), not the never-lowered template's `names/sigs[fn_id]`.
         fn foldWitness(self: *Self, m: Typecheck.Method) error{OutOfMemory}!void {
+            // A SOURCE-LESS derived witness (M18): fold the synthetic unit's identity (its
+            // mangled name + `[T,T]->bool` sig) so the caller's fingerprint tracks the
+            // derive — a nested-field override flips the unit's key AND, via this fold, the
+            // caller's. Checked FIRST (a derive Method has `fn_id == 0`). `dv.params` is a
+            // borrowed slice into the stable `derives` table, so storing it is safe.
+            if (m.derive) |di| {
+                if (di < self.frozen.derives.len) {
+                    const dv = &self.frozen.derives[di];
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = dv.name, .params = dv.params, .ret = Typecheck.Type.bool });
+                }
+                return;
+            }
             if (m.instance) |ii| {
                 if (ii < self.frozen.instances.len) {
                     const inst = self.frozen.instances[ii];
@@ -921,6 +933,7 @@ const FakeFrozen = struct {
     sigs: []const Sig = &.{},
     instances: []const Mono.Instance = &.{},
     methods: []const Typecheck.Method = &.{},
+    derives: []const Typecheck.DeriveRecipe = &.{},
 };
 
 test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {

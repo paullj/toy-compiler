@@ -1,0 +1,11 @@
+# Feature: structural `Eq` auto-derive (M18). A struct whose fields all conform to `Eq`
+# gets `==`/`!=` with ZERO source impl — the compiler synthesizes a source-less
+# field-by-field `eq` on demand at the use site. No `derive` keyword; unused ⇒ free.
+struct P { x: int, y: int }
+
+fn main() -> int {
+    a := P{ x: 1, y: 2 }
+    b := P{ x: 1, y: 2 }
+    return if a == b { 42 } else { 0 }
+}
+# expect: exit 42

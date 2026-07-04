@@ -31,6 +31,8 @@ const Resolution = @import("symbols/Resolution.zig").Resolution;
 const Sig = @import("symbols/Sig.zig").Sig;
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
+const Derive = @import("symbols/Derive.zig");
+pub const DeriveRecipe = Derive.Derive;
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const Engine = @import("query/Engine.zig");
@@ -295,6 +297,12 @@ pub const GraphResult = struct {
     /// The program-wide inherent-method table (M8). Each entry's `name` is BORROWED
     /// from the sibling tree/source (never freed here); only the slice is owned.
     methods: []Method = &.{},
+    /// The authorized structural auto-derive recipes (M18), in canonical order. Empty
+    /// for a program with no derived `Eq` use. Each recipe's `name`, `params`, and
+    /// `field_witnesses` OUTER slice are OWNED here; the `FieldEq` name slices +
+    /// `protocol_name` are BORROWED (sibling derive/instance/fn names + prelude/source
+    /// protocol names — all outlive codegen).
+    derives: []DeriveRecipe = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -342,9 +350,25 @@ pub const GraphResult = struct {
         // own a `protocol_args` dupe (freed here), then the backing array.
         freeMethodEntries(gpa, self.methods);
         gpa.free(self.methods);
+        // M18 derive recipes: free each unit's minted `name`, its `params`, and its
+        // `field_witnesses` OUTER slice (the FieldEq name slices are borrowed), then the
+        // backing array.
+        freeDeriveEntries(gpa, self.derives);
+        gpa.free(self.derives);
         self.* = undefined;
     }
 };
+
+/// Free the per-recipe owned data of a derive table (M18): each `name`, `params`, and
+/// `field_witnesses` outer slice. The `FieldEq` name slices + `protocol_name` stay
+/// borrowed (sibling derive/instance/fn names + source protocol names).
+pub fn freeDeriveEntries(gpa: std.mem.Allocator, derives: []const DeriveRecipe) void {
+    for (derives) |d| {
+        gpa.free(@constCast(d.name));
+        if (d.params.len > 0) gpa.free(@constCast(d.params));
+        if (d.field_witnesses.len > 0) gpa.free(@constCast(d.field_witnesses));
+    }
+}
 
 /// One program-wide inherent-method table entry (M8): the receiver `Type`, the
 /// SOURCE method name, and the global fn id the method desugared to. Built serially
@@ -389,6 +413,14 @@ pub const Method = struct {
     /// dupe (freed per-entry via `freeMethodEntries`). Empty for a non-generic protocol or
     /// a non-conformance entry. Folded into the multi-conformance disambiguation key.
     protocol_args: []const Type = &.{},
+    /// A SOURCE-LESS auto-derive witness (M18): the index into `GraphResult.derives` of
+    /// the synthetic unit this method resolves to, or `null` for a real fn / instance /
+    /// builtin entry. Appended in the synthesis barrier for each authorized derive so
+    /// `resolveConformanceMethod(T,"eq")` returns `.one` and lower/`foldWitness` route to
+    /// the synthetic unit's mangled name (checked BEFORE `instance`/`fn_id`). Grows
+    /// `Method` (never `Type`), which is never content-cache-memcpy'd, so `@sizeOf(Type)`
+    /// is unaffected.
+    derive: ?u32 = null,
 };
 
 /// Structural equality of two `Type` vectors (M14): same length and pairwise `Type.eql`.
@@ -530,6 +562,106 @@ pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args:
         if (c.protocol == pid and Type.eql(c.recv, recv) and eqlTypeVec(c.protocol_args, protocol_args)) return true;
     }
     return false;
+}
+
+/// A recorded derive request (M18): "type `conform_ty` should structurally derive
+/// protocol `protocol_id`". A trivially-copyable POD (no owned data) so a per-checker
+/// list moves out by value and the fn-id-ordered merge is a plain concat + dedup — the
+/// determinism basis for the synthesized set (see the synthesis barrier).
+pub const DeriveReq = struct {
+    protocol_id: u32,
+    conform_ty: Type,
+};
+
+/// A struct field that blocks a structural derive (M18): its declared name + type.
+/// Named (not an anonymous struct) so `firstNonConformingField` and the BodyChecker's
+/// use site share ONE nominal type.
+pub const NonConformingField = struct { name: []const u8, ty: Type };
+
+/// Whether the GROUND type `recv` conforms to protocol `pid`, recursively (M18) — the
+/// shared substrate for on-demand structural derive. `findConformance`-FIRST (an
+/// explicit `impl`, a prelude scalar, or the Ord-refinement `(Eq,T)` entry means it
+/// already conforms — the double-fire guard), THEN structural: a struct conforms iff
+/// EVERY field conforms; an enum conforms iff every variant is empty-payload
+/// (M18 = `Eq` only — a payload enum falls through as non-conforming, deferred to M19).
+///
+/// Memoized by `(pid, kind, type-id)` in the caller-owned `memo` (thread-local in Pass
+/// C, local in the synthesis barrier — never shared, so race-free). Always terminates:
+/// everything is ground/monomorphized and recursive types are rejected (T0004), so the
+/// field graph is a finite DAG with no cycles.
+pub fn conforms(
+    structs: []const StructSym,
+    enums: []const EnumSym,
+    conformances: []const Conformance,
+    recv: Type,
+    pid: u32,
+    memo: *std.AutoHashMapUnmanaged(u64, bool),
+    gpa: std.mem.Allocator,
+) error{OutOfMemory}!bool {
+    switch (recv.kind) {
+        .@"struct", .@"enum" => {},
+        else => {
+            // Scalar / non-aggregate: only an explicit/prelude conformance counts (no
+            // structural rule); a `type_var`/`app`/poison never conforms here.
+            for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return true;
+            return false;
+        },
+    }
+    const id: u32 = if (recv.kind == .@"enum") recv.enum_id else recv.struct_id;
+    const key: u64 = (@as(u64, pid) << 40) | (@as(u64, @intFromEnum(recv.kind)) << 32) | @as(u64, id);
+    if (memo.get(key)) |v| return v;
+
+    var ok = false;
+    find: {
+        // Explicit / prelude / Ord-refinement conformance wins — never double-derive.
+        for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) {
+            ok = true;
+            break :find;
+        };
+        if (recv.kind == .@"struct") {
+            if (recv.struct_id < structs.len) {
+                ok = true;
+                for (structs[recv.struct_id].field_types) |ft| {
+                    if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa)) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+        } else { // enum: empty-payload variants only (M18 Eq)
+            if (recv.enum_id < enums.len) {
+                ok = true;
+                for (enums[recv.enum_id].variants) |v| if (v.field_types.len != 0) {
+                    ok = false;
+                    break;
+                };
+            }
+        }
+    }
+    try memo.put(gpa, key, ok);
+    return ok;
+}
+
+/// The first struct field (in declaration order) whose type does NOT conform to `pid`
+/// — the field a T0029 use-site diagnostic names when a struct would derive `Eq` but a
+/// field blocks it. Null when `recv` is not a struct or every field conforms.
+pub fn firstNonConformingField(
+    structs: []const StructSym,
+    enums: []const EnumSym,
+    conformances: []const Conformance,
+    recv: Type,
+    pid: u32,
+    memo: *std.AutoHashMapUnmanaged(u64, bool),
+    gpa: std.mem.Allocator,
+) error{OutOfMemory}!?NonConformingField {
+    if (recv.kind != .@"struct" or recv.struct_id >= structs.len) return null;
+    const s = structs[recv.struct_id];
+    for (s.field_types, 0..) |ft, i| {
+        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa)) {
+            return .{ .name = if (i < s.field_names.len) s.field_names[i] else "?", .ty = ft };
+        }
+    }
+    return null;
 }
 
 /// A declared protocol (M11): a signature-only bundle of method NAMES. Registered
@@ -731,6 +863,17 @@ cur_self_type: ?Type = null,
 /// whole into `GraphResult.instances` by `checkGraph`; the leftover (on an error
 /// path) is freed by `checkGraph`'s defer.
 mono: std.ArrayList(Mono.Instance) = .empty,
+
+/// Structural derive REQUESTS collected from Pass C (M18): "module fn X used `==` on
+/// a derivable type T with no impl". Merged in fn-id order (deterministic) by
+/// `checkBodies` from each `BodyResult`, then consumed by the synthesis barrier (deduped
+/// + canonical-sorted into `derives`). PODs, no owned data; freed at teardown.
+derive_reqs: std.ArrayList(DeriveReq) = .empty,
+
+/// The authorized structural auto-derive recipes (M18), built by the synthesis barrier
+/// at the end of `monomorphize` in canonical order. Transferred whole into
+/// `GraphResult.derives` by `checkGraph`; leftover (error path) freed by the teardown.
+derives: std.ArrayList(DeriveRecipe) = .empty,
 
 /// The composite (`App`) intern table (M4). Heap-allocated in `checkGraph` (stable
 /// address across the run, so every `BodyChecker` can borrow it), freed at teardown.
@@ -1135,6 +1278,11 @@ pub fn checkGraph(
             freeInstanceConformances(gpa, inst.conformances); // M13
         }
         t.mono.deinit(gpa);
+        // M18: derive requests (PODs, no owned data) + any un-transferred derive recipes
+        // (success path empties `t.derives` via `toOwnedSlice`; an error path frees them).
+        t.derive_reqs.deinit(gpa);
+        freeDeriveEntries(gpa, t.derives.items);
+        t.derives.deinit(gpa);
         // M13: the per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
         // The method table's backing array (entries' names are borrowed source
@@ -1235,6 +1383,15 @@ pub fn checkGraph(
         gpa.free(methods);
     }
 
+    // Transfer the derive recipes (M18) out of the live list before the teardown defer
+    // sees them (mirrors instances/methods). `toOwnedSlice` empties `t.derives`; on the
+    // error path here the recipes' owned data is freed (else it would leak).
+    const derives = try t.derives.toOwnedSlice(gpa);
+    errdefer {
+        freeDeriveEntries(gpa, derives);
+        gpa.free(derives);
+    }
+
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
@@ -1253,6 +1410,7 @@ pub fn checkGraph(
         .enum_layouts = enum_layouts,
         .instances = instances,
         .methods = methods,
+        .derives = derives,
     };
 }
 
@@ -1545,9 +1703,163 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         }
     }
 
+    // M18 auto-derive SYNTHESIS BARRIER. Same realloc-safe point as the M10 append
+    // above (nothing reads `model.methods` again): turn Pass C's derive requests into
+    // canonical source-less recipes + their synthetic method-table entries.
+    try t.synthesizeDerives();
+
     // The mono tail may have emitted instance-body diagnostics (and T0014); re-sort
     // the shared stream so the final (scope, byte_offset) order is deterministic.
     t.sink.sort();
+}
+
+/// True when `recv` has an EXPLICIT/prelude/Ord-refinement `(pid, recv)` conformance in
+/// the live table (the double-fire guard: such a type is never structurally derived).
+fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
+    for (t.conformances.items) |c| {
+        if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return true;
+    }
+    return false;
+}
+
+/// The M18 synthesis barrier: turn the (parallel-Pass-C, fn-id-ordered) derive requests
+/// into the canonical `t.derives` recipe table + synthetic `Method` entries.
+///
+/// DETERMINISM: the request set is deduped by `Derive.writeKey`, a fixpoint enqueues each
+/// aggregate field's own derive, then the whole set is CANONICALLY SORTED
+/// (`Derive.lessThan`) BEFORE any name is minted — so the recipes, their synthetic ids/
+/// names, and the codegen enumeration order are a pure function of source (never the
+/// hashmap/thread order Pass C discovered them in). Field witnesses are resolved ONCE
+/// here on the live method table (after ALL synthetic methods are appended), so the
+/// emitter never re-resolves and the fingerprint can fold the resolved identity.
+fn synthesizeDerives(t: *Typecheck) !void {
+    if (t.derive_reqs.items.len == 0) return;
+    const eq_pid = t.eq_protocol_id orelse return;
+    const eq_name = t.protocols.items[eq_pid].name;
+    const gpa = t.gpa;
+
+    // (1)+(2) Worklist to a fixpoint: seed from Pass C's requests, then enqueue each
+    // aggregate field that is itself STRUCTURALLY derived (conforms AND not explicit).
+    // Dedup on the canonical recipe key so a repeated request/field is synthesized once.
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        seen.deinit(gpa);
+    }
+    var work: std.ArrayList(Type) = .empty; // conform types (protocol is always eq in M18)
+    defer work.deinit(gpa);
+
+    const enqueue = struct {
+        fn f(gpa_: std.mem.Allocator, seen_: *std.StringHashMapUnmanaged(void), work_: *std.ArrayList(Type), pid: u32, ty: Type) !void {
+            var kb: std.ArrayList(u8) = .empty;
+            defer kb.deinit(gpa_);
+            try Derive.writeKey(gpa_, &kb, pid, .eq, ty);
+            if (seen_.contains(kb.items)) return;
+            const owned = try kb.toOwnedSlice(gpa_);
+            errdefer gpa_.free(owned);
+            try seen_.put(gpa_, owned, {});
+            try work_.append(gpa_, ty);
+        }
+    }.f;
+
+    for (t.derive_reqs.items) |req| try enqueue(gpa, &seen, &work, eq_pid, req.conform_ty);
+
+    var wi: usize = 0;
+    while (wi < work.items.len) : (wi += 1) {
+        const ty = work.items[wi];
+        if (ty.kind != .@"struct" or ty.struct_id >= t.structs.items.len) continue; // enums have no aggregate fields to chase
+        for (t.structs.items[ty.struct_id].field_types) |ft| {
+            switch (ft.kind) {
+                .@"struct", .@"enum" => {},
+                else => continue,
+            }
+            if (t.hasConformanceLive(eq_pid, ft)) continue; // explicit/Ord field: use its own witness, don't synthesize
+            if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa))
+                try enqueue(gpa, &seen, &work, eq_pid, ft);
+        }
+    }
+
+    // (3) Materialize recipes (names/params/field_witnesses filled after the sort).
+    for (work.items) |ty| {
+        try t.derives.append(gpa, .{
+            .protocol_id = eq_pid,
+            .protocol_name = eq_name,
+            .kind = .eq,
+            .conform_ty = ty,
+        });
+    }
+
+    // (4) Canonical sort — the SOLE ordering driver (never discovery/thread order).
+    std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
+
+    // (5) Mint names + params in sorted order, and append the synthetic `Method` for each
+    // BEFORE resolving field witnesses (so a nested aggregate field resolves to its
+    // sibling recipe's synthetic method). recv=conform_ty, name="eq", derive=index.
+    for (t.derives.items, 0..) |*d, di| {
+        d.name = try Derive.mangle(gpa, d.protocol_name, d.kind, d.conform_ty);
+        d.params = try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty });
+        try t.methods.append(gpa, .{
+            .recv = d.conform_ty,
+            .name = Derive.methodName(d.kind),
+            .fn_id = 0,
+            .recv_generic = false,
+            .protocol_id = eq_pid,
+            .derive = @intCast(di),
+        });
+    }
+    // Minted names are a pure function of (protocol, kind, type-id); distinct recipes
+    // never collide (Debug/ReleaseSafe guard, mirroring the Mono self-collision assert).
+    if (std.debug.runtime_safety) {
+        for (t.derives.items, 0..) |a, i| {
+            for (t.derives.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name, b.name));
+        }
+    }
+
+    // (6) Resolve each struct field's witness on the LIVE method table (now carrying the
+    // synthetic entries). Scalar/str fields compare inline (the emitter dispatches by
+    // layout kind); struct/enum fields dispatch to the resolved eq witness, or an
+    // Ord-only field's cmp witness (`==` as `cmp(..) == eq`).
+    for (t.derives.items) |*d| {
+        if (d.conform_ty.kind != .@"struct") continue; // empty-payload enum: no fields
+        const fields = t.structs.items[d.conform_ty.struct_id].field_types;
+        const fw = try gpa.alloc(Derive.FieldEq, fields.len);
+        errdefer gpa.free(fw);
+        for (fields, 0..) |ft, i| fw[i] = t.resolveFieldEq(ft);
+        d.field_witnesses = fw;
+    }
+}
+
+/// Resolve one struct-field type to its derived-eq recipe (M18): scalars/str compare
+/// inline; a struct/enum field dispatches to its `eq` witness (a sibling derive, a Mono
+/// instance method, or a user impl fn), falling back to its `cmp` witness (an Ord-only
+/// field: `==` as `cmp(..) == Ordering.eq`). Read only on the LIVE method table AFTER all
+/// synthetic entries are appended, so a sibling derive resolves correctly.
+fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldEq {
+    switch (ft.kind) {
+        .@"struct", .@"enum" => {},
+        else => return .inline_kind, // int/bool/str/unit — emitter handles by layout kind
+    }
+    switch (resolveConformanceMethod(t.methods.items, ft, "eq", null)) {
+        .one => |m| return .{ .eq_call = t.witnessName(m) },
+        .none, .ambiguous => {},
+    }
+    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", null)) {
+        .one => |m| return .{ .cmp_eq = t.witnessName(m) },
+        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
+    }
+}
+
+/// The emitted symbol name a resolved witness `Method` lowers to (M18): a synthetic
+/// derive's minted name, a Mono instance's mangled name, else the fn's qualified name.
+/// All three outlive codegen (owned by `GraphResult.derives`/`.instances`, or resolve
+/// result), so a borrowing `FieldEq` slice stays valid.
+fn witnessName(t: *const Typecheck, m: Method) []const u8 {
+    if (m.derive) |di| return t.derives.items[di].name;
+    if (m.instance) |ii| return t.mono.items[ii].name;
+    return if (t.gph_fn_names) |fns| fns[m.fn_id] else "";
 }
 
 /// Scan module `mod`'s nodes for call-position generic calls, reading `node_types`
@@ -1763,6 +2075,10 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     try bc.checkBody(gid, fsub);
     // Merge the instance's diagnostics into the shared stream (sorted at the end).
     try t.sink.merge(&bc.sink);
+    // A derivable-struct `==` reached ONLY from an unbounded generic body is seen for the
+    // first time here (Pass C skips unbounded templates), so drain the structural-Eq
+    // requests recorded during this re-check; `synthesizeDerives` dedups+sorts afterward.
+    try t.derive_reqs.appendSlice(t.gpa, bc.derive_reqs.items);
 
     // M13: build this instance's resolved bound conformances (all satisfied — enqueue
     // gated them, so a bound's `conform_ty` is a concrete `structT`/`enumT`/scalar the
@@ -2141,6 +2457,10 @@ const BodyResult = struct {
     /// emitted a diagnostic — the mono tail must not instantiate it (no per-instance
     /// cascade of a definition-site error).
     poisoned: bool = false,
+    /// Structural derive requests this fn recorded (M18): a `==`/`!=` on a derivable
+    /// type with no impl. OWNED (moved out of the `BodyChecker`); merged into
+    /// `t.derive_reqs` in fn-id order by `checkBodies`, then freed. PODs (no owned data).
+    derive_reqs: []DeriveReq = &.{},
 };
 
 /// THE per-fn body region (Pass C): run every fn's body check as an independent
@@ -2164,6 +2484,11 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // Free every slot's sink on any error path below (merge empties a slot's sink,
     // so a deinit of an already-merged slot is a no-op — no double-free).
     defer for (slots) |*s| s.sink.deinit();
+    // M18: each slot owns a derive-request slice moved out of its BodyChecker; free it
+    // once here (safe on every path — an un-merged / errored slot keeps the empty
+    // default, and freeing a zero-length slice is a no-op). The merge below copies the
+    // PODs into `t.derive_reqs`, so freeing the source afterward is correct.
+    defer for (slots) |*s| gpa.free(s.derive_reqs);
 
     if (t.io) |io| {
         const Ctx = struct {
@@ -2186,6 +2511,11 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // instantiated (see `enqueueInstance`). Freed at teardown.
     t.bound_poisoned = try gpa.alloc(bool, n);
     for (slots, 0..) |s, i| t.bound_poisoned[i] = s.poisoned;
+
+    // Merge each fn's derive requests into the program-wide list in FN-ID ORDER (the
+    // deterministic collection order the synthesis barrier's dedup+sort depends on —
+    // mirrors the poison snapshot above). PODs, so a plain concat.
+    for (slots) |s| try t.derive_reqs.appendSlice(gpa, s.derive_reqs);
 
     // Merge per-fn sinks in fn-id order, then sort once. `merge` reserves capacity
     // first (infallible appends) and empties each slot, so the trailing `defer`
@@ -2243,6 +2573,13 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // Poison a bounded template whose bound-as-axiom check reported anything, so the
     // mono tail skips instantiating it (a definition error fires once, not per instance).
     out.poisoned = f.isGeneric() and out.sink.count() > 0;
+    // M18: move this fn's derive requests into the slot (merged fn-id-ordered by
+    // checkBodies). `toOwnedSlice` empties bc's list so the deferred `bc.deinit` frees
+    // nothing it no longer owns.
+    out.derive_reqs = bc.derive_reqs.toOwnedSlice(bc.gpa) catch |e| {
+        out.err = e;
+        return;
+    };
 }
 
 /// A `pub` fn must not expose a non-`pub` type: if any param/return type resolves
@@ -3258,6 +3595,55 @@ fn enumSyms(t: *const Typecheck) []const EnumSym {
 const testing = std.testing;
 const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
+
+test "M18: conforms truth table (scalar/struct/nested/empty-enum/payload-enum)" {
+    const gpa = testing.allocator;
+    const eq_pid: u32 = 0;
+    // struct#0 {x:int, y:bool} — all scalars conform; struct#1 {inner: struct#0} —
+    // nested aggregate; struct#2 {c: enum#1} — a payload-enum field blocks derive.
+    const s0_ft = [_]Type{ Type.int, Type.@"bool" };
+    const s0_fn = [_][]const u8{ "x", "y" };
+    const s1_ft = [_]Type{Type.structT(0)};
+    const s1_fn = [_][]const u8{"inner"};
+    const s2_ft = [_]Type{Type.enumT(1)};
+    const s2_fn = [_][]const u8{"c"};
+    const structs = [_]StructSym{
+        .{ .decl_node = Ast.none, .name = "S0", .field_types = @constCast(&s0_ft), .field_names = @constCast(&s0_fn) },
+        .{ .decl_node = Ast.none, .name = "S1", .field_types = @constCast(&s1_ft), .field_names = @constCast(&s1_fn) },
+        .{ .decl_node = Ast.none, .name = "S2", .field_types = @constCast(&s2_ft), .field_names = @constCast(&s2_fn) },
+    };
+    // enum#0 all-empty (conforms); enum#1 has a payload variant (does NOT).
+    var e0_vars = [_]VariantSym{ .{ .name = "A", .form = .unit }, .{ .name = "B", .form = .unit } };
+    var e1_pl = [_]Type{Type.int};
+    var e1_vars = [_]VariantSym{ .{ .name = "R", .form = .tuple, .field_types = &e1_pl }, .{ .name = "G", .form = .unit } };
+    const enums = [_]EnumSym{
+        .{ .decl_node = Ast.none, .name = "E0", .variants = &e0_vars },
+        .{ .decl_node = Ast.none, .name = "E1", .variants = &e1_vars },
+    };
+    // Prelude scalar Eq conformances (int/bool); no user struct/enum impl.
+    const confs = [_]Conformance{ .{ .protocol = eq_pid, .recv = Type.int }, .{ .protocol = eq_pid, .recv = Type.@"bool" } };
+
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    const C = struct {
+        fn q(st: []const StructSym, en: []const EnumSym, cf: []const Conformance, ty: Type, m: *std.AutoHashMapUnmanaged(u64, bool), g: std.mem.Allocator) !bool {
+            return conforms(st, en, cf, ty, 0, m, g);
+        }
+    };
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.int, &memo, gpa)); // scalar
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(0), &memo, gpa)); // all-scalar struct
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(1), &memo, gpa)); // nested struct
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(0), &memo, gpa)); // empty-payload enum
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa)); // payload enum
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.structT(2), &memo, gpa)); // struct w/ payload-enum field
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.str, &memo, gpa)); // str has NO prelude Eq in this synthetic table
+
+    // The blocked struct#2 names its first offending field (`c: E1`).
+    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(2), 0, &memo, gpa);
+    try testing.expect(off != null);
+    try testing.expectEqualStrings("c", off.?.name);
+    try testing.expect(Type.eql(Type.enumT(1), off.?.ty));
+}
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
 const TypecheckGraph = @import("types_graph.zig");
@@ -3775,7 +4161,7 @@ test "M15: `==` on a struct with `impl P has Eq` types to bool, zero diags" {
     try testing.expect(found);
 }
 
-test "M15: `==` on a struct with no `Eq` impl is exactly one T0026 at the operator" {
+test "M18: `==` on an all-Eq-fields struct with no impl DERIVES (was M15 T0026)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3787,9 +4173,30 @@ test "M15: `==` on a struct with no `Eq` impl is exactly one T0026 at the operat
         \\
     );
     defer c.deinit(gpa);
+    // M18 turns the M15 error into a source-less structural derive: no diagnostic, and
+    // exactly one synthetic recipe (`Eq` for P, struct id 0 -> `Eq$eq$s0`).
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Eq$eq$s0", c.result.derives[0].name);
+}
+
+test "M18: `==` on a PAYLOAD enum with no impl is still T0026 (payload-enum Eq deferred)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E { A(int), B }
+        \\fn main() -> int {
+        \\ p := E.B
+        \\ q := E.B
+        \\ return if p == q { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // A payload-carrying enum does not structurally conform in M18, and it is not a
+    // struct (so no T0029) -> the operator keeps the M15 "no Eq impl" T0026. No derive.
     try testing.expectEqual(@as(usize, 1), c.result.diags.len);
     try testing.expectEqual(codes.Code.T0026, c.result.diags[0].code);
-    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Eq' impl") != null);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
 test "M15: str `==` and unit `==` type to bool (builtin-scalar Eq), zero diags" {

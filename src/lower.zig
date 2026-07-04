@@ -35,6 +35,7 @@ const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 const Mono = @import("symbols/Mono.zig");
+const Derive = @import("symbols/Derive.zig");
 const Infer = @import("symbols/Infer.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
@@ -87,6 +88,12 @@ pub const Inputs = struct {
     /// unsupported" / lose its mut-self ABI). Every `lower.Inputs` build site MUST set
     /// it — pass `&.{}` only when the program provably has no methods.
     methods: []const Typecheck.Method,
+    /// The authorized structural auto-derive recipes (M18), so `lowerStructEq`'s `.one`
+    /// arm can resolve a derived `Eq` witness (`m.derive`) to the synthetic unit's
+    /// mangled name, and `lowerDeriveEq` can resolve a nested aggregate field's witness.
+    /// Empty for a program with no derives. NO default (same COMPILE-error discipline as
+    /// `methods`): every build site threads it explicitly.
+    derives: []const Derive.Derive,
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -345,18 +352,32 @@ pub fn lowerFn(
         if (!b.termSet()) try brTo(&b, exit, .none);
     }
 
-    // Materialize the builder into a flat Function. Do every fallible allocation
-    // BEFORE tearing the builder down, so the `errdefer b.deinit()` stays a valid
-    // cleanup for the whole builder until we have fully transferred ownership.
+    return try finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
+/// Materialize the builder into a flat `Ir.Function`, transferring ownership of every
+/// index space (slots/values/blocks/params/literals) out of `b` — which is left EMPTY
+/// so the caller's `errdefer b.deinit()` frees nothing it no longer owns. Shared by
+/// `lowerFn` (AST path) and `lowerDeriveEq` (source-less path). Every fallible alloc
+/// happens BEFORE tearing the builder down, so the caller's `errdefer b.deinit()` +
+/// this fn's own `errdefer`s stay valid cleanups until ownership fully transfers.
+fn finishFn(
+    b: *Builder,
+    gpa: std.mem.Allocator,
+    sym: Link.SymName,
+    params: *std.ArrayList(Ir.SlotId),
+    entry: Ir.BlockId,
+    exit: Ir.BlockId,
+) error{OutOfMemory}!Ir.Function {
     const params_owned = try params.toOwnedSlice(gpa);
     errdefer gpa.free(params_owned);
 
     const blocks = try gpa.alloc(Ir.Block, b.blocks.items.len);
     errdefer gpa.free(blocks);
-    // Convert each builder block. On a mid-loop OOM, `errdefer b.deinit()` frees
-    // the still-owned builder blocks; the already-converted ones were emptied by
-    // `toOwnedSlice` (deinit sees empty lists), and `errdefer gpa.free(blocks)`
-    // frees the outer array (the moved-in inner slices leak only on OOM — benign).
+    // Convert each builder block. On a mid-loop OOM, `errdefer b.deinit()` (the caller's)
+    // frees the still-owned builder blocks; the already-converted ones were emptied by
+    // `toOwnedSlice` (deinit sees empty lists), and `errdefer gpa.free(blocks)` frees the
+    // outer array (the moved-in inner slices leak only on OOM — benign).
     for (b.blocks.items, 0..) |*bb, i| {
         blocks[i] = .{
             .params = try bb.params.toOwnedSlice(gpa),
@@ -373,9 +394,9 @@ pub fn lowerFn(
     const values = try b.values.toOwnedSlice(gpa);
     const literals = try b.literals.toOwnedSlice(gpa);
 
-    // All fallible work is done. Disarm `errdefer b.deinit()` by freeing exactly
-    // the builder-owned remnants (the emptied block list, the local map, the loop
-    // stack) here; slots/values/blocks/params/literals have moved into the result.
+    // All fallible work is done. Disarm the caller's `errdefer b.deinit()` by freeing
+    // exactly the builder-owned remnants (the emptied block list, the local map, the
+    // loop stack) here; slots/values/blocks/params/literals have moved into the result.
     b.blocks.deinit(gpa);
     b.local_slots.deinit(gpa);
     b.loops.deinit(gpa);
@@ -389,7 +410,7 @@ pub fn lowerFn(
     return .{
         .name = sym,
         .params = params_owned,
-        .ret_type = ret_type,
+        .ret_type = b.ret_type,
         .slots = slots,
         .values = values,
         .blocks = blocks,
@@ -769,10 +790,9 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
 fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
     switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "eq", null)) {
         .one => |m| {
-            const callee: Link.SymName = if (m.instance) |ii|
-                .{ .kind = .user_fn, .name = b.in.instances[ii].name }
-            else
-                b.in.names[m.fn_id];
+            // A derived `Eq` (M18) / instance / plain fn all resolve through the shared
+            // `witnessCallee` (derive checked first — a derive Method has `fn_id == 0`).
+            const callee: Link.SymName = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
             errdefer b.gpa.free(args);
             args[0] = try lowerExpr(b, lhs_node); // self, by value
@@ -1032,13 +1052,25 @@ fn lowerStrEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOf
         try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "str '==' operand is not a slot in lower");
         return try b.emit(.{ .bconst = false }, bool_ty);
     }
+    const lbase = try b.emit(.{ .slot_addr = ls }, int_ty);
+    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
+    return strEqAtPtrs(b, lbase, rbase);
+}
+
+/// Heap-free str equality of two str aggregates given the ADDRESSES of their
+/// `{ptr@0, len@8}` headers (M15, factored out of `lowerStrEq` for M18): compare
+/// lengths, then bytes at `ptr + i` via `load_byte` in a slot-counter loop, merging the
+/// bool through a join block param. Pure of source (slot-counter + br-arg joins), so
+/// `--verify`-stable. Reused by the auto-derive emitter for a `str` FIELD (base =
+/// `field_addr(self, off)`), where there is no slot to name — only an address.
+fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
 
     // ptr@0 + len@8 of each {ptr,len} aggregate.
-    const lbase = try b.emit(.{ .slot_addr = ls }, int_ty);
     const lp = try b.emit(.{ .load = .{ .addr = lbase, .ty = int_ty } }, int_ty);
     const llen_addr = try b.emit(.{ .field_addr = .{ .base = lbase, .off = 8, .ty = int_ty } }, int_ty);
     const ll = try b.emit(.{ .load = .{ .addr = llen_addr, .ty = int_ty } }, int_ty);
-    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
     const rp = try b.emit(.{ .load = .{ .addr = rbase, .ty = int_ty } }, int_ty);
     const rlen_addr = try b.emit(.{ .field_addr = .{ .base = rbase, .off = 8, .ty = int_ty } }, int_ty);
     const rl = try b.emit(.{ .load = .{ .addr = rlen_addr, .ty = int_ty } }, int_ty);
@@ -1102,6 +1134,175 @@ fn lowerStrEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOf
 
     b.switchTo(join);
     return merge;
+}
+
+/// The emitted callee for a resolved conformance-witness `Method`: a derived unit's
+/// synthetic name (M18), a Mono instance's mangled name (M10), else the fn's global
+/// SymName. `derive` is checked FIRST (a derive Method has `fn_id == 0`, which would
+/// otherwise mis-resolve to `names[0]`). Shared by `lowerStructEq` (top-level `==`) and
+/// `structEqAtSlots` (an aggregate FIELD of a derived struct) so both pick the same
+/// symbol lower's reloc + the fingerprint fold target.
+fn witnessCallee(b: *Builder, m: Typecheck.Method) Link.SymName {
+    if (m.derive) |di| return .{ .kind = .user_fn, .name = b.in.derives[di].name };
+    if (m.instance) |ii| return .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+    return b.in.names[m.fn_id];
+}
+
+/// Struct/enum equality of two operands already MATERIALIZED into slots `lslot`/`rslot`
+/// (M18): resolve the `Eq` witness and call `witness(lslot, rslot) -> bool`, or (an
+/// Ord-only type: the Ord-refinement filled `(Eq,T)` but added no `eq` method) call the
+/// `cmp` witness, read the returned `Ordering` tag, and compare `== eq`. The
+/// slot-operand sibling of `lowerStructEq`/`lowerCmpDiscriminant`, so the auto-derive
+/// emitter's aggregate FIELD path stays in lockstep with the top-level `==` (a wrong
+/// witness here would be a `conforms`/emitter mismatch). Returns a bool value.
+fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "eq", null)) {
+        .one => |m| {
+            const callee = witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 2);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = lslot };
+            args[1] = .{ .slot = rslot };
+            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
+        },
+        .none, .ambiguous => {},
+    }
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", null)) {
+        .one => |m| {
+            // `==` as `cmp(a,b) == Ordering.eq`: the witness returns `Ordering`, whose
+            // ret Sig carries the enum type (the ret_slot ABI + `get_tag` layout).
+            const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
+            const callee = witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 2);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = lslot };
+            args[1] = .{ .slot = rslot };
+            const rslot_ord = try b.addSlot(ret_ty);
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = rslot_ord } }, null);
+            const base = try b.emit(.{ .slot_addr = rslot_ord }, Typecheck.Type.int);
+            const tag = try b.emit(.{ .get_tag = base }, Typecheck.Type.int);
+            const k = try b.emit(.{ .iconst = ord_eq }, Typecheck.Type.int);
+            return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = k } }, Typecheck.Type.@"bool");
+        },
+        .none, .ambiguous => {
+            // The synthesis barrier proved every aggregate field conforms before emitting
+            // this unit, so a miss here is an internal invariant break — note-and-drop to
+            // stay well-formed rather than miscompile.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: no witness for an aggregate field in lower" });
+            b.had_error = true;
+            return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+        },
+    }
+}
+
+/// The bool eq of struct field `i` (at byte `off`, type `fty`) between the two receiver
+/// bases (M18): int/bool inline `icmp eq`; `str` via the `{ptr,len}` byte-loop
+/// (`strEqAtPtrs`); a struct/enum field is copied into fresh temp slots (a `field_addr`
+/// is a ptr VALUE, not a slot operand — the ABI needs the field's own slot) then routed
+/// through `structEqAtSlots`. Unit fields are rejected by T0007, so never occur.
+fn deriveFieldEq(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    switch (fty.kind) {
+        .int, .bool => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
+            return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
+        },
+        .str => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            return try strEqAtPtrs(b, la, ra);
+        },
+        .@"struct", .@"enum" => {
+            const lslot = try b.addSlot(fty);
+            const ld = try b.emit(.{ .slot_addr = lslot }, int_ty);
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = ld, .src = la, .ty = fty } }, null);
+            const rslot = try b.addSlot(fty);
+            const rd = try b.emit(.{ .slot_addr = rslot }, int_ty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = rd, .src = ra, .ty = fty } }, null);
+            return try structEqAtSlots(b, fty, lslot, rslot);
+        },
+        else => {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: unsupported field type in lower" });
+            b.had_error = true;
+            return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+        },
+    }
+}
+
+/// Lower a SOURCE-LESS auto-derive `Eq` unit (M18): the spike's layout-walking emitter.
+/// Two params (the two receiver values, by slot), a single straight-line
+/// multiply-accumulate over the struct's fields (`acc *= field_eq`, then
+/// `ret = acc != 0`) — no `cond_br` except the self-contained str/aggregate sub-graphs,
+/// so it is maximally `--verify`-stable — or, for an empty-payload enum, `get_tag(self)
+/// == get_tag(other)`. PURE of `(recipe, layouts, method table)`: a fixed field-order
+/// walk handing out ids monotonically, reading no map, so a double-lower is byte-identical.
+pub fn lowerDeriveEq(
+    gpa: std.mem.Allocator,
+    in: Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const cty = d.conform_ty;
+
+    var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = bool_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    // Two params, both the conforming type, by slot (self, other).
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_self = try b.addSlot(cty);
+    try params.append(gpa, p_self);
+    const p_other = try b.addSlot(cty);
+    try params.append(gpa, p_other);
+
+    // entry (b0) + the single EXIT block whose one param is the bool return (mirrors
+    // `lowerFn`'s scaffold).
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, bool_ty);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
+    const other_base = try b.emit(.{ .slot_addr = p_other }, int_ty);
+
+    const result: Ir.ValueId = switch (cty.kind) {
+        .@"struct" => blk: {
+            const layout = b.in.layouts[cty.struct_id];
+            var acc = try b.emit(.{ .iconst = 1 }, int_ty);
+            for (layout.field_types, layout.offsets) |fty, off| {
+                const feq = try deriveFieldEq(&b, fty, off, self_base, other_base);
+                acc = try b.emit(.{ .mul = .{ .lhs = acc, .rhs = feq } }, int_ty);
+            }
+            const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+            break :blk try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = acc, .rhs = zero } }, bool_ty);
+        },
+        .@"enum" => blk: {
+            // Empty-payload enum: equal iff the discriminants match (`get_tag` at off 0).
+            const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
+            const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
+            break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
+        },
+        else => blk: {
+            // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: unsupported conform type in lower" });
+            b.had_error = true;
+            break :blk try b.emit(.{ .bconst = false }, bool_ty);
+        },
+    };
+
+    if (!b.termSet()) try brTo(&b, exit, .{ .value = result });
+    return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
 /// True when `sig` is a generic template (some param is a check-time `type_var`).
@@ -2571,6 +2772,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .enum_layouts = tc.enum_layouts,
         .names = names,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
 
     var target: Ast.Index = Ast.none;
@@ -2657,6 +2859,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
         .instances = tc.instances,
         .sigs = tc.sigs,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -2726,6 +2929,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
         .instances = tc.instances,
         .sigs = tc.sigs,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -3038,6 +3242,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         .enum_layouts = tc.enum_layouts,
         .names = &names,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -3080,6 +3285,7 @@ test "lower-core: out-of-range int literal yields a diagnostic" {
         .enum_layouts = tc.enum_layouts,
         .names = &names,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -3148,6 +3354,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .enum_layouts = tc.enum_layouts,
         .names = &names,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -3205,6 +3412,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
         .enum_layouts = tc.enum_layouts,
         .names = &names,
         .methods = tc.methods,
+        .derives = tc.derives,
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
