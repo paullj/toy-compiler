@@ -507,8 +507,18 @@ pub const BodyChecker = struct {
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },
                     .lt, .lt_eq, .gt, .gt_eq => {
-                        if (lt.kind == .int and rt.kind == .int) break :blk Type.@"bool";
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                        // `<`/`>`/`<=`/`>=` desugar to a discriminant test on `Ord::cmp`'s
+                        // result (M16). HOMOGENEOUS like `==`: require the same type FIRST,
+                        // then type to bool iff the operand conforms to `Ord` — a concrete
+                        // int/str/bool prelude conformance or user struct/enum `impl T has Ord`,
+                        // or a `[T has Ord]` bound in a generic body.
+                        if (!Type.eql(lt, rt)) {
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                        } else if (bc.conformsToOrd(lt)) {
+                            break :blk Type.@"bool";
+                        } else {
+                            try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.typeName(lt) });
+                        }
                     },
                     .eq_eq, .bang_eq => {
                         // `==`/`!=` desugar to `Eq::eq` (M15). HOMOGENEOUS: require the same
@@ -2037,6 +2047,23 @@ pub const BodyChecker = struct {
             const ord = t.typeVarOrd();
             if (ord >= bc.bound_protocols.len) return false;
             return (bc.bound_protocols[ord] orelse return false) == eq_pid;
+        }
+        return false;
+    }
+
+    /// Whether `t` conforms to the prelude `Ord` protocol (M16) — the predicate the
+    /// `<`/`>`/`<=`/`>=` operator typing uses. Mirrors `conformsToEq`: a concrete type
+    /// resolves via the frozen conformance table (`findConformance` covers the int/str/bool
+    /// prelude conformances AND every user `impl T has Ord`); a `type_var` in a bounded
+    /// generic body conforms as-axiom when its declared bound IS `Ord`. A prelude-less caller
+    /// (`ord_protocol_id == null`) denies conformance, so the operator emits T0027.
+    fn conformsToOrd(bc: *const BodyChecker, t: Type) bool {
+        const ord_pid = bc.model.ord_protocol_id orelse return false;
+        if (Typecheck.findConformance(bc.model, ord_pid, t, &.{})) return true;
+        if (t.isTypeVar()) {
+            const ord = t.typeVarOrd();
+            if (ord >= bc.bound_protocols.len) return false;
+            return (bc.bound_protocols[ord] orelse return false) == ord_pid;
         }
         return false;
     }

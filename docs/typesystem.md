@@ -293,6 +293,66 @@ consumers (BodyChecker types, `lower` symbols, `AstWalk` fingerprint), so they a
 select the identical witness. A `[T has Convert[U]]` bound resolves at the mono worklist
 by substituting the bound's args through the instance type-args before `findConformance`.
 
+## Operators: comparison via `Ord` (M16)
+
+The four comparison operators desugar to a **single three-way** compare, `Ord::cmp`,
+which returns a prelude enum:
+
+```
+enum Ordering { lt, eq, gt }              // native, AST-less; tag = decl index: lt=0, eq=1, gt=2
+protocol Ord { fn cmp(self, other: Self) -> Ordering }   // homogeneous (Rhs = Self)
+```
+
+Both are delivered by native compiler registration (`registerPrelude`, the `Eq`
+precedent): `Ordering` is an AST-less `EnumSym` hand-laid-out at 8 bytes with
+`state = .done` (so Phase-0b layout early-returns and never derefs its `Ast.none`
+decl node), injected — if-absent, **user-first-wins** — into every module's enum map
+(both the resolver's table and the checker's `enum_ids`) so it is nameable with no
+import. `Ord` takes protocol id 1 (right after `Eq = 0`). Builtin `Ord` conformances
+are pre-seeded for **int / str / bool**.
+
+**Six comparisons from one `cmp`.** The checker types `<`/`>`/`<=`/`>=` to `bool` iff
+the (same-typed) operand `conformsToOrd`; otherwise **T0027** at the operator. `lower`
+computes the int discriminant `d` (0/1/2) and tests it — no separate comparison
+protocol per operator:
+
+| operator | test on the discriminant `d` |
+|----------|------------------------------|
+| `a < b`  | `d == lt (0)` |
+| `a > b`  | `d == gt (2)` |
+| `a <= b` | `d != gt (2)` |
+| `a >= b` | `d != lt (0)` |
+| `a == b` | `d == eq (1)`  *(only when `Eq` is Ord-refined — see below)* |
+| `a != b` | `d != eq (1)`  *(only when `Eq` is Ord-refined)* |
+
+**Per-concrete-type discriminant.** `int`/`bool` never route here — they stay a single
+inline `icmp` (`bool` orders `false < true`), byte-identical to pre-M16. `str` lowers to
+a **heap-free lexicographic 3-way `load_byte` loop** (extending M15's `Eq` byte loop):
+the first differing zero-extended byte decides, a proper prefix is less than its
+extension, equal spans are equal — no witness call. A struct/enum resolves its `cmp`
+witness, calls it into a fresh return slot, and reads `Ordering`'s tag with the proven
+`get_tag` match-dispatch idiom.
+
+**`Ord` refines `Eq`, recorded as exactly one `(Eq, T)` entry.** After coherence, a
+serial pass appends **one** `(Eq, recv)` conformance for each `Ord` receiver that lacks
+an existing `(Eq, recv)` — adding **no** `eq` method — so `==`/`!=` on an Ord-only type
+route through `cmp` (`d == eq`). The precedence is:
+
+1. an **explicit** `impl T has Eq` (authoritative — its `eq` method is dispatched);
+2. else the **Ord-refinement** `eq` ≡ `cmp == Ordering.eq`;
+3. else the structural `Eq` derive (M18).
+
+The refinement writes only the conformance table (never the coherence seen-set) and
+skips any receiver that already has `Eq`, so a genuine `impl T has Eq` **alongside**
+`impl T has Ord` is **not** a T0020 overlap, still leaves exactly one `(Eq, T)` entry,
+and lets M18's structural derive see the slot filled so it never double-fires.
+
+**Total order only.** There is no float type, so every `Ord` is a total order; partial
+orders are out of scope. **Known edge:** a user `enum Ordering` shadow wins the name
+injection (user-first-wins), but the prelude `Ord::cmp` still returns the *prelude*
+`Ordering`, so its variants would not match the user's — out of scope for M16 (no
+example/fixture defines a conflicting `Ordering`).
+
 ## Two-phase checking (and parallelism)
 
 Checking is two phases over one frozen program model:

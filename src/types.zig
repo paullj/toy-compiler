@@ -697,6 +697,18 @@ conformances: std.ArrayList(Conformance) = .empty,
 /// until `registerPrelude` runs (single-file internal callers that skip it stay null).
 eq_protocol_id: ?u32 = null,
 
+/// The global protocol id of the prelude `Ord` protocol (M16), assigned in
+/// `registerPrelude` right after `Eq` (so `Ord` is always id 1). A bare `Ord` reference
+/// that misses the active module map falls back to this id in `protocolIdFromNode`
+/// (mirroring the `Eq` fallback). Null until `registerPrelude` runs.
+ord_protocol_id: ?u32 = null,
+
+/// The global enum id of the prelude `Ordering{lt,eq,gt}` enum (M16), assigned in
+/// `registerPrelude` (an AST-less, hand-laid-out `EnumSym` appended after the user
+/// enums). Injected (if-absent) into every module's `enum_ids` map so `Ordering` is
+/// universally nameable with no import. Null until `registerPrelude` runs.
+ordering_enum_id: ?u32 = null,
+
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
 /// each method's `decodeFnSig` (Pass A); null otherwise (non-method decoding is
@@ -844,6 +856,13 @@ pub const Model = struct {
     /// operand's Eq-conformance check off this; a null id denies conformance (-> T0026)
     /// rather than miscompiling, so the operator path is safe on any prelude-less caller.
     eq_protocol_id: ?u32,
+    /// The prelude `Ord` protocol's global id (M16), or null if `registerPrelude` never
+    /// ran. `conformsToOrd` keys the `<`/`>`/`<=`/`>=` typing off this; a null id denies
+    /// conformance (-> T0027) rather than miscompiling.
+    ord_protocol_id: ?u32,
+    /// The prelude `Ordering` enum's global id (M16), or null if `registerPrelude` never
+    /// ran. Reserved for downstream consumers that need the discriminant enum type.
+    ordering_enum_id: ?u32,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -861,6 +880,8 @@ fn buildModel(t: *Typecheck) Model {
         .protocols = t.protocols.items,
         .conformances = t.conformances.items,
         .eq_protocol_id = t.eq_protocol_id,
+        .ord_protocol_id = t.ord_protocol_id,
+        .ordering_enum_id = t.ordering_enum_id,
     };
 }
 
@@ -1314,6 +1335,15 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // module-then-decl order, BEFORE the parallel Pass-C fan-out — so the emit order is
     // a pure function of source (byte-identical at any `-jN`).
     try t.checkCoherence(mods);
+
+    // Ord-refines-Eq (M16): after coherence, append exactly one `(Eq, recv)` conformance
+    // per `Ord` receiver that lacks an existing `(Eq, recv)` entry — so `==`/`!=` on an
+    // Ord-only type routes through `cmp` (no `eq` method is added) and M18's structural
+    // derive sees the `Eq` slot filled and never double-fires. Explicit `Eq` is
+    // authoritative: a genuine `impl T has Eq` alongside `impl T has Ord` is skipped here
+    // (no T0020). Writes ONLY `t.conformances` (never the freed coherence seen-set), serial
+    // and deterministic (collect-then-append over a frozen prefix in insertion order).
+    try t.deriveEqFromOrd();
 
     // Phase B/C: freeze the Pass-A tables into a read-only Model, then check each
     // fn body against it via a per-fn BodyChecker (skip bodyless `print`). The
@@ -2297,6 +2327,9 @@ fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         if (t.eq_protocol_id) |eid| {
             if (std.mem.eql(u8, name, "Eq")) return eid;
         }
+        if (t.ord_protocol_id) |oid| {
+            if (std.mem.eql(u8, name, "Ord")) return oid;
+        }
         return null;
     }
     if (n.tag == .field_access) {
@@ -2524,6 +2557,45 @@ fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
     }
 }
 
+/// Whether `conf` already records a `(pid, recv)` conformance (any protocol_args).
+fn conformanceExists(conf: []const Conformance, pid: u32, recv: Type) bool {
+    for (conf) |c| if (c.protocol == pid and Type.eql(c.recv, recv)) return true;
+    return false;
+}
+
+/// Whether `types` already contains `recv` (by `Type.eql`).
+fn containsType(types: []const Type, recv: Type) bool {
+    for (types) |ty| if (Type.eql(ty, recv)) return true;
+    return false;
+}
+
+/// The receivers that need an `(Eq, recv)` refinement (M16): each `Ord` receiver in
+/// insertion order, deduped, skipping any that already carries an explicit/prelude
+/// `(Eq, recv)`. PURE (no `Typecheck` state) so the exactly-one-entry invariant is
+/// unit-testable directly on literal conformance lists — the reason we don't widen
+/// `GraphResult` to expose the conformance table.
+fn ordEqRefinementReceivers(gpa: std.mem.Allocator, conf: []const Conformance, ord_pid: u32, eq_pid: u32, out: *std.ArrayList(Type)) !void {
+    for (conf) |c| {
+        if (c.protocol != ord_pid) continue; // `Ord` is homogeneous — protocol_args empty
+        if (conformanceExists(conf, eq_pid, c.recv)) continue; // explicit/prelude Eq wins
+        if (containsType(out.items, c.recv)) continue; // one refinement per receiver
+        try out.append(gpa, c.recv);
+    }
+}
+
+/// Ord-refines-Eq (M16): append exactly one `(Eq, recv)` conformance per `Ord` receiver
+/// lacking an existing `Eq` entry. Scans a STABLE prefix of `t.conformances` then appends,
+/// so a freshly-appended refinement never seeds another (idempotent, insertion-ordered).
+fn deriveEqFromOrd(t: *Typecheck) !void {
+    const ord_pid = t.ord_protocol_id orelse return;
+    const eq_pid = t.eq_protocol_id orelse return;
+    const prefix = t.conformances.items.len;
+    var add: std.ArrayList(Type) = .empty;
+    defer add.deinit(t.gpa);
+    try ordEqRefinementReceivers(t.gpa, t.conformances.items[0..prefix], ord_pid, eq_pid, &add);
+    for (add.items) |recv| try t.conformances.append(t.gpa, .{ .protocol = eq_pid, .recv = recv });
+}
+
 /// Register the struct decls among `decl_nodes` (of the currently-active tree).
 /// `mod` is the owning module id (0 single-file). Global ids are assigned in
 /// append order; per-module duplicate/shadow diagnostics mirror the single-file
@@ -2738,6 +2810,66 @@ fn registerPrelude(t: *Typecheck) !void {
     try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.bool });
     try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.str });
     try t.conformances.append(t.gpa, .{ .protocol = eq_id, .recv = Type.unit });
+
+    // Native `enum Ordering { lt, eq, gt }` (M16): AST-less and hand-laid-out so Phase-0b
+    // `layoutEnum` early-returns on `state == .done` (never derefs `decl_node`), and the
+    // only broad enum-decl deref — the pub-visibility pass — guards `decl_node == Ast.none`.
+    // Its tag is the variant DECL INDEX (lt=0/eq=1/gt=2), the discriminant `lower` reads via
+    // `get_tag` and the six-comparison desugar depends on. `EnumSym`'s tag_size/payload_off/
+    // align already default to 8, so only `size`/`state` need setting. The variant field
+    // arrays keep their `&.{}` defaults (`gpa.free` no-ops on a zero-length slice at teardown);
+    // the `Ordering`/`lt`/`eq`/`gt` name literals are borrowed (never freed).
+    const ord_vars = try t.gpa.alloc(VariantSym, 3);
+    ord_vars[0] = .{ .name = "lt", .form = .unit };
+    ord_vars[1] = .{ .name = "eq", .form = .unit };
+    ord_vars[2] = .{ .name = "gt", .form = .unit };
+    const ordering_id: u32 = @intCast(t.enums.items.len);
+    t.ordering_enum_id = ordering_id;
+    try t.enums.append(t.gpa, .{
+        .decl_node = Ast.none,
+        .name = "Ordering",
+        .mod = 0,
+        .pub_export = true,
+        .variants = ord_vars,
+        .size = 8,
+        .state = .done,
+    });
+    // Universally nameable with no import: inject into every module's enum map, if-absent
+    // so a user `enum Ordering` shadow (already registered) wins (documented edge — the
+    // prelude `Ord.cmp` still returns the prelude `Ordering`, out of scope for M16).
+    for (t.graph.mods) |*m| {
+        if (m.enum_ids.get("Ordering") == null) try m.enum_ids.put(t.gpa, "Ordering", ordering_id);
+    }
+
+    // protocol Ord { fn cmp(self, other: Self) -> Ordering }  (id 1, right after Eq=0).
+    // Homogeneous like `Eq`: `[self, Self]` are both `type_var(0)`; the return is the
+    // prelude `Ordering` enum. All gpa-allocated so teardown frees prelude + user protocols
+    // uniformly.
+    const ord_methods = try t.gpa.alloc([]const u8, 1);
+    ord_methods[0] = "cmp";
+    const ord_params = try t.gpa.alloc([]const Type, 1);
+    const ord_p0 = try t.gpa.alloc(Type, 2);
+    ord_p0[0] = Type.typeVar(0);
+    ord_p0[1] = Type.typeVar(0);
+    ord_params[0] = ord_p0;
+    const ord_rets = try t.gpa.alloc(Type, 1);
+    ord_rets[0] = Type.enumT(ordering_id);
+    const ord_id: u32 = @intCast(t.protocols.items.len);
+    t.ord_protocol_id = ord_id;
+    try t.protocols.append(t.gpa, .{
+        .name = "Ord",
+        .mod = 0,
+        .pub_export = true,
+        .decl_node = Ast.none,
+        .methods = ord_methods,
+        .method_params = ord_params,
+        .method_rets = ord_rets,
+    });
+    // Builtin `Ord` for int (signed cmp)/str (lexicographic)/bool (false<true), in a fixed
+    // literal order so the conformance table stays a pure function of source.
+    try t.conformances.append(t.gpa, .{ .protocol = ord_id, .recv = Type.int });
+    try t.conformances.append(t.gpa, .{ .protocol = ord_id, .recv = Type.str });
+    try t.conformances.append(t.gpa, .{ .protocol = ord_id, .recv = Type.bool });
 }
 
 /// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
@@ -3671,6 +3803,218 @@ test "M12: a duplicate user `impl int has Eq` overlaps the builtin conformance (
     }
     try testing.expectEqual(@as(usize, 1), n20);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "overlapping impl") != null);
+}
+
+test "M16: ordEqRefinementReceivers registers exactly one (Eq,T) per Ord recv; explicit Eq wins" {
+    const gpa = testing.allocator;
+    const P = Type.structT(0);
+    const Q = Type.structT(1);
+    const ord_pid: u32 = 1;
+    const eq_pid: u32 = 0;
+
+    // [(Ord,P)] -> exactly one refinement (P).
+    {
+        const conf = [_]Conformance{.{ .protocol = ord_pid, .recv = P }};
+        var out: std.ArrayList(Type) = .empty;
+        defer out.deinit(gpa);
+        try ordEqRefinementReceivers(gpa, &conf, ord_pid, eq_pid, &out);
+        try testing.expectEqual(@as(usize, 1), out.items.len);
+        try testing.expect(Type.eql(out.items[0], P));
+    }
+    // [(Ord,P),(Eq,P)] -> zero (an explicit/prelude Eq is authoritative).
+    {
+        const conf = [_]Conformance{ .{ .protocol = ord_pid, .recv = P }, .{ .protocol = eq_pid, .recv = P } };
+        var out: std.ArrayList(Type) = .empty;
+        defer out.deinit(gpa);
+        try ordEqRefinementReceivers(gpa, &conf, ord_pid, eq_pid, &out);
+        try testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+    // A duplicate (Ord,P) still refines exactly once (deduped per receiver).
+    {
+        const conf = [_]Conformance{ .{ .protocol = ord_pid, .recv = P }, .{ .protocol = ord_pid, .recv = P } };
+        var out: std.ArrayList(Type) = .empty;
+        defer out.deinit(gpa);
+        try ordEqRefinementReceivers(gpa, &conf, ord_pid, eq_pid, &out);
+        try testing.expectEqual(@as(usize, 1), out.items.len);
+    }
+    // Two distinct Ord receivers -> two refinements, in insertion order (deterministic).
+    {
+        const conf = [_]Conformance{ .{ .protocol = ord_pid, .recv = P }, .{ .protocol = ord_pid, .recv = Q } };
+        var out: std.ArrayList(Type) = .empty;
+        defer out.deinit(gpa);
+        try ordEqRefinementReceivers(gpa, &conf, ord_pid, eq_pid, &out);
+        try testing.expectEqual(@as(usize, 2), out.items.len);
+        try testing.expect(Type.eql(out.items[0], P));
+        try testing.expect(Type.eql(out.items[1], Q));
+    }
+}
+
+test "M16: the prelude Ordering enum has variants lt=0/eq=1/gt=2 (the discriminant lower reads)" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn main() -> int { return 0 }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var found = false;
+    for (c.result.enum_layouts) |el| {
+        if (!std.mem.eql(u8, el.name, "Ordering")) continue;
+        found = true;
+        try testing.expectEqual(@as(usize, 3), el.variants.len);
+        try testing.expectEqualStrings("lt", el.variants[0].name);
+        try testing.expectEqualStrings("eq", el.variants[1].name);
+        try testing.expectEqualStrings("gt", el.variants[2].name);
+        try testing.expectEqual(@as(u32, 8), el.size);
+    }
+    try testing.expect(found);
+}
+
+test "M16: `<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Ord {
+        \\ fn cmp(self, o: P) -> Ordering {
+        \\  if self.x < o.x { Ordering.lt } else if self.x == o.x { Ordering.eq } else { Ordering.gt }
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ a := P{ x: 1 }
+        \\ b := P{ x: 2 }
+        \\ r := 0
+        \\ if a < b { r = r + 1 }
+        \\ if a > b { r = r + 1 }
+        \\ if a <= b { r = r + 1 }
+        \\ if a >= b { r = r + 1 }
+        \\ return r
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Every comparison binary node types to bool (the 4 in main + the `<` inside cmp).
+    const nts = c.result.node_types[0];
+    var n_cmp: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .binary) continue;
+        const tag = c.tokens[n.main_token].tag;
+        if (tag == .lt or tag == .lt_eq or tag == .gt or tag == .gt_eq) {
+            try testing.expectEqual(Kind.bool, nts[i].kind);
+            n_cmp += 1;
+        }
+    }
+    try testing.expect(n_cmp >= 4);
+}
+
+test "M16: int/str/bool `<` type to bool (builtin Ord), zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ i := if 1 < 2 { 1 } else { 0 }
+        \\ s := if "a" < "b" { 1 } else { 0 }
+        \\ b := if false < true { 1 } else { 0 }
+        \\ return i + s + b
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M16: `<` on a struct with no `Ord` impl is exactly one T0027 at the operator" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ p := P{ x: 1 }
+        \\ q := P{ x: 2 }
+        \\ return if p < q { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0027, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Ord' impl") != null);
+}
+
+test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Ord {
+        \\ fn cmp(self, o: P) -> Ordering {
+        \\  if self.x < o.x { Ordering.lt } else if self.x == o.x { Ordering.eq } else { Ordering.gt }
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ a := P{ x: 1 }
+        \\ b := P{ x: 1 }
+        \\ return if a == b { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const nts = c.result.node_types[0];
+    var found = false;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .binary and c.tokens[n.main_token].tag == .eq_eq) {
+            try testing.expectEqual(Kind.bool, nts[i].kind);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "M16: a bounded generic body `fn lt2[T has Ord](a: T, b: T) -> bool { a < b }` checks once" {
+    const gpa = testing.allocator;
+    // A bounded template body IS checked (bound-as-axiom); `T has Ord` gives `T` the `Ord`
+    // axiom, so `a < b` types clean. Exercises the `conformsToOrd` type_var branch.
+    var c = try checkSource(
+        \\fn lt2[T has Ord](a: T, b: T) -> bool { a < b }
+        \\fn main() -> int {
+        \\ return if lt2[int](1, 2) { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M16: `<` in a body bounded by a NON-Ord protocol is T0027 (bound is not the Ord axiom)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Doubler { fn dbl(self) -> int }
+        \\fn bad[T has Doubler](a: T, b: T) -> bool { a < b }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    var n27: usize = 0;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0027) n27 += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), n27);
+}
+
+test "M16: explicit `impl P has Eq` alongside `impl P has Ord` yields no T0020 (explicit authoritative)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
+        \\impl P has Ord {
+        \\ fn cmp(self, o: P) -> Ordering {
+        \\  if self.x < o.x { Ordering.lt } else if self.x == o.x { Ordering.eq } else { Ordering.gt }
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ a := P{ x: 1 }
+        \\ b := P{ x: 2 }
+        \\ return if a < b { if a == a { 42 } else { 0 } } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
 test "M12: a user `impl int has (user protocol)` records a conformance and dispatches, no error" {

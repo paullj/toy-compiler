@@ -1,0 +1,25 @@
+# Feature: `<` / `>` / `<=` / `>=` are operators-as-protocols (M16). They desugar to a
+# three-way `cmp` returning the prelude `enum Ordering { lt, eq, gt }`; a user struct
+# conforms via `impl P has Ord`. All SIX comparisons compose from the ONE `cmp` — and
+# `Ord` refines `Eq`, so `==` / `!=` work too (via `cmp == Ordering.eq`) with no `Eq` impl.
+# expect: exit 42
+struct P { x: int }
+
+impl P has Ord {
+    fn cmp(self, o: P) -> Ordering {
+        if self.x < o.x { Ordering.lt } else if self.x == o.x { Ordering.eq } else { Ordering.gt }
+    }
+}
+
+fn main() -> int {
+    a := P{ x: 1 }
+    b := P{ x: 2 }
+    r := 0
+    if a < b { r = r + 1 }
+    if b > a { r = r + 2 }
+    if a <= a { r = r + 4 }
+    if a >= a { r = r + 8 }
+    if a == a { r = r + 16 }
+    if a != b { r = r + 11 }
+    return r
+}
