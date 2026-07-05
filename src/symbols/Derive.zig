@@ -21,14 +21,16 @@ const Type = @import("../layout/Engine.zig").Type;
 /// Which derive this recipe carries. Append-only (mirrors `Token.Tag`/`Node.Tag`
 /// discipline): M19 adds `.ord`, M20 `.hash`, M22 `.display`. The ordinal folds into
 /// the mangled name + the sort key, so it must stay stable.
-pub const Kind = enum(u8) { eq, ord };
+pub const Kind = enum(u8) { eq, ord, hash };
 
 /// The method a `Kind` synthesizes (a pure function of the kind). Used for the
-/// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method.
+/// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method, `Hash` a
+/// `hash` method.
 pub fn methodName(k: Kind) []const u8 {
     return switch (k) {
         .eq => "eq",
         .ord => "cmp",
+        .hash => "hash",
     };
 }
 
@@ -51,6 +53,10 @@ pub const FieldEq = union(enum) {
     /// call `cmp(field_self, field_other)`, read the returned `Ordering` tag, and use it as
     /// the 3-way field discriminant in the lexicographic chain. Append-only (ordinal 3).
     cmp_call: []const u8,
+    /// An aggregate (struct / enum) field of a `Hash` derive with a `hash` witness (M20):
+    /// call `hash(field_self) -> int` and fold the returned int into the accumulator.
+    /// Append-only (ordinal 4).
+    hash_call: []const u8,
 };
 
 /// One authorized structural-derive recipe. `field_witnesses`, `params`, and `name`
@@ -65,7 +71,8 @@ pub const Derive = struct {
     /// The ground concrete type this derives the protocol for (a `structT`/`enumT`).
     conform_ty: Type,
     /// The synthetic method's return type: `bool` for an `Eq` derive, the prelude
-    /// `Ordering` enum for an `Ord` derive (M19). The emitter types its ret slot / exit
+    /// `Ordering` enum for an `Ord` derive (M19), `int` for a `Hash` derive (M20). The
+    /// emitter types its ret slot / exit
     /// param from this, and a witness-ret lookup reads it for a DERIVED `cmp` field (whose
     /// `fn_id == 0` would otherwise mis-read `sigs[0].ret`). A pure function of `kind`, so
     /// it is not folded into the derive fingerprint (kind already discriminates the key).
@@ -73,9 +80,10 @@ pub const Derive = struct {
     /// Per struct field (in layout/field order) / empty for an empty-payload enum:
     /// the resolved field-eq recipe. OWNED outer slice.
     field_witnesses: []const FieldEq = &.{},
-    /// The synthetic method's params `[conform_ty, conform_ty]` — an OWNED heap slice
-    /// so `AstWalk.CallVisitor.foldWitness` may borrow it into a `Fingerprint.Sig`
-    /// (which stores the slice by reference; a by-value `[2]Type` local would dangle).
+    /// The synthetic method's params: `[conform_ty, conform_ty]` for a homogeneous `Eq`/
+    /// `Ord` derive, `[conform_ty]` (self only) for a `Hash` derive (M20). An OWNED heap
+    /// slice so `AstWalk.CallVisitor.foldWitness` may borrow it into a `Fingerprint.Sig`
+    /// (which stores the slice by reference; a by-value array local would dangle).
     params: []const Type = &.{},
     /// Owning module id (a sentinel; a source-less unit belongs to no real decl, but
     /// codegen threads a module for the per-module tree/resolutions it never reads).
@@ -176,6 +184,23 @@ test "M19: mangle distinguishes Ord `cmp` from Eq `eq` per (kind, type)" {
     try testing.expect(!std.mem.eql(u8, os, es));
 }
 
+test "M20: mangle produces a distinct `Hash$hash$` name per (struct/enum, id)" {
+    const gpa = testing.allocator;
+    const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
+    defer gpa.free(hs);
+    try testing.expectEqualStrings("Hash$hash$s0", hs);
+    const he = try mangle(gpa, "Hash", .hash, Type.enumT(0));
+    defer gpa.free(he);
+    try testing.expectEqualStrings("Hash$hash$e0", he);
+    // The Hash `hash` name is disjoint from the Eq `eq` and Ord `cmp` names for the same id.
+    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
+    defer gpa.free(es);
+    const os = try mangle(gpa, "Ord", .ord, Type.structT(0));
+    defer gpa.free(os);
+    try testing.expect(!std.mem.eql(u8, hs, es));
+    try testing.expect(!std.mem.eql(u8, hs, os));
+}
+
 test "lessThan is a total canonical order (protocol, kind, enum-flag, id)" {
     const s0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
     const s1 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(1) };
@@ -198,6 +223,19 @@ test "M19: lessThan orders eq-kind before ord-kind for the same protocol/type" {
     try testing.expect(!lessThan({}, ord0, eq0));
 }
 
+test "M20: lessThan orders eq < ord < hash for the same protocol/type" {
+    // The kind ordinal (eq=0 < ord=1 < hash=2) is the tiebreaker within one (protocol, type);
+    // a Hash recipe sorts AFTER Eq and Ord so its synthetic id/name is minted last.
+    const eq0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
+    const ord0 = Derive{ .protocol_id = 0, .protocol_name = "Ord", .kind = .ord, .conform_ty = Type.structT(0) };
+    const hash0 = Derive{ .protocol_id = 0, .protocol_name = "Hash", .kind = .hash, .conform_ty = Type.structT(0) };
+    try testing.expect(lessThan({}, eq0, hash0));
+    try testing.expect(lessThan({}, ord0, hash0));
+    try testing.expect(!lessThan({}, hash0, eq0));
+    try testing.expect(!lessThan({}, hash0, ord0));
+    try testing.expect(!lessThan({}, hash0, hash0));
+}
+
 test "writeKey is injective across kind/enum-flag/id" {
     const gpa = testing.allocator;
     var a: std.ArrayList(u8) = .empty;
@@ -217,4 +255,10 @@ test "writeKey is injective across kind/enum-flag/id" {
     defer d.deinit(gpa);
     try writeKey(gpa, &d, 0, .ord, Type.structT(0));
     try testing.expect(!std.mem.eql(u8, a.items, d.items));
+    // M20: the hash kind keys distinctly from both eq and ord for the same (protocol, type).
+    var e: std.ArrayList(u8) = .empty;
+    defer e.deinit(gpa);
+    try writeKey(gpa, &e, 0, .hash, Type.structT(0));
+    try testing.expect(!std.mem.eql(u8, a.items, e.items));
+    try testing.expect(!std.mem.eql(u8, d.items, e.items));
 }

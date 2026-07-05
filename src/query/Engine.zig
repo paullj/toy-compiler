@@ -672,6 +672,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
     var irf = switch (d.kind) {
         .eq => try lower.lowerDeriveEq(gpa, in, d, sym, &diags),
         .ord => try lower.lowerDeriveOrd(gpa, in, d, sym, &diags),
+        .hash => try lower.lowerDeriveHash(gpa, in, d, sym, &diags),
     };
     defer irf.deinit(gpa);
     if (diags.items.len > 0) return error.CodegenDiagnostic;

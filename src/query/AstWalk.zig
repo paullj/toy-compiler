@@ -40,6 +40,10 @@ pub const TouchedType = @import("Fingerprint.zig").TouchedType;
 /// must stay stable or warm caches invalidate.
 const eq_params_int = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int };
 const eq_params_bool = [_]Typecheck.Type{ Typecheck.Type.bool, Typecheck.Type.bool };
+// The builtin scalar `hash` sentinel params (M20): 1-ary (`hash(self) -> int`), so a single
+// receiver-typed element — distinct from the 2-ary `eq` sentinel above by both count + name.
+const hash_params_int = [_]Typecheck.Type{Typecheck.Type.int};
+const hash_params_bool = [_]Typecheck.Type{Typecheck.Type.bool};
 
 /// The read-only inputs a walk needs to spell a leaf. `tree`/`tokens`/`source`
 /// are the same trio every consumer already threads; `leaf`/`tokenText` fold the
@@ -525,14 +529,20 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null)) {
                                 .one => |m| try self.foldWitness(m),
                                 .none, .ambiguous => {
-                                    // A builtin scalar `eq` (M12): it has NO real fn_id/instance
-                                    // (the recognizer lowers to an inline machine op, no symbol),
-                                    // so fold a FIXED sentinel Sig instead. Deterministic + stable
-                                    // across builds, and distinct from any future builtin scalar
-                                    // method by its `eq` name + homogeneous params.
-                                    if (Typecheck.builtinScalarMethod(recv, member) != null) {
-                                        const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
-                                        try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = Typecheck.Type.bool });
+                                    // A builtin scalar `eq`/`hash` (M12/M20): it has NO real
+                                    // fn_id/instance (the recognizer lowers to an inline machine
+                                    // op, no symbol), so fold a FIXED sentinel Sig instead.
+                                    // Deterministic + stable across builds; the member NAME +
+                                    // per-arity params separate `eq` ([Self,Self]->bool) from
+                                    // `hash` ([Self]->int).
+                                    if (Typecheck.builtinScalarMethod(recv, member)) |bm| {
+                                        if (std.mem.eql(u8, member, "hash")) {
+                                            const params: []const Typecheck.Type = if (recv.kind == .bool) &hash_params_bool else &hash_params_int;
+                                            try self.out.append(self.gpa, .{ .kind = .builtin, .name = "hash", .params = params, .ret = bm.ret });
+                                        } else {
+                                            const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
+                                            try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = bm.ret });
+                                        }
                                     }
                                 },
                             }

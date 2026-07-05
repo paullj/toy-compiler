@@ -386,6 +386,44 @@ to both `Eq` and `Ord`, and the "field blocks the derive" diagnostics (T0027 on 
 T0029) are unreachable for a ground program — reachable only via a unit operand or a
 generic body whose type parameter's bound is not the protocol.
 
+## Structural `Hash` auto-derive (M20)
+
+```
+protocol Hash { fn hash(self) -> int }         // 1-ary (self only); id 6, after Div = 5
+```
+
+Structural `Hash` is synthesized on demand at an explicit `.hash()` call — the same
+source-less synthetic-codegen-unit channel M18/M19 use, keyed on the same non-AST
+`(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
+conforms to `Hash` (recursively, via the shared ground `conforms` query) and no explicit
+`impl T has Hash` exists; explicit impls win, and an **unused** derive emits **zero**
+codegen. The builtin scalars conform natively: `int`/`bool` hash to their own value, `str`
+to a heap-free byte polynomial, `unit` to a constant.
+
+**Hash is INDEPENDENT of `Eq`/`Ord`** — it is not a refinement of either (unlike the
+`Ord`→`Eq` fill). A type used with both `==` and `.hash()` synthesizes **two** units (an
+`Eq$eq$…` and a `Hash$hash$…`); there is no shared-slot suppression.
+
+**Fixed seed, deterministic, `Eq`-consistent.** The mixer is a **fixed-seed** multiply-
+accumulate polynomial `h := h*MULT + fieldhash` (a struct folds its fields in layout order;
+an empty-payload enum folds its discriminant; a payload enum folds the discriminant then the
+active variant's payload). The seed is a compile-time constant — **never** randomized or
+per-run — so a derived hash is reproducible run-to-run AND byte-identical across `-jN`. The
+emitter walks the **same field/variant order the `Eq` derive uses**, so structurally-equal
+values hash equal (`Eq`-consistency). ⚠ **Behavior/semver hazard:** reordering a struct's
+fields, or reordering an enum's cases, **silently changes** the derived hash (exactly as it
+changes the derived ordering) — a refactor that permutes declarations is a breaking change
+to every derived hash.
+
+**Op-set constraint (not a shortcut).** The roadmap names a "fixed-seed Wyhash", but the
+current IR op set (`Ir.Op`) has no xor/shift/bitwise op, so a runtime Wyhash is not
+expressible without touching the backend (which the roadmap forbids). The multiply-
+accumulate polynomial is the forced substitute; it satisfies every *locked* constraint
+(fixed seed, deterministic, reproducible run-to-run + `-jN`, `Eq`-consistent). As with
+`Eq`/`Ord`, **every** ground value type conforms to `Hash`, so the "field blocks the derive"
+diagnostic **T0030** is unreachable for a ground program (reachable only via a generic body
+whose type parameter's bound is not `Hash`).
+
 ## Two-phase checking (and parallelism)
 
 Checking is two phases over one frozen program model:

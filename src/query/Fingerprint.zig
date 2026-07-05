@@ -211,6 +211,7 @@ pub fn deriveFingerprint(
             .eq_call => |n| AstWalk.updateLeaf(&h, n),
             .cmp_eq => |n| AstWalk.updateLeaf(&h, n),
             .cmp_call => |n| AstWalk.updateLeaf(&h, n),
+            .hash_call => |n| AstWalk.updateLeaf(&h, n),
         }
     }
     return h.final();
@@ -754,6 +755,24 @@ test "deriveFingerprint M19: an Ord recipe's key differs by kind and flips on a 
     try testing.expect(deriveFingerprint("Ord", .ord, cf, &w1) != deriveFingerprint("Ord", .ord, cf, &w2));
     // Identical Ord recipe hashes identically (cache hit).
     try testing.expectEqual(deriveFingerprint("Ord", .ord, cf, &w1), deriveFingerprint("Ord", .ord, cf, &w1));
+}
+
+test "deriveFingerprint M20: a Hash recipe's key differs by kind and flips on a hash_call swap" {
+    const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
+    // Same protocol name + layout + a scalar witness, but the `.hash` kind separates the
+    // unit from the Eq/Ord units (a `Hash$hash$s0` never aliases an `Eq$eq$s0`/`Ord$cmp$s0`).
+    const eq_key = deriveFingerprint("Eq", .eq, cf, &.{.inline_kind});
+    const ord_key = deriveFingerprint("Ord", .ord, cf, &.{.inline_kind});
+    const hash_key = deriveFingerprint("Hash", .hash, cf, &.{.inline_kind});
+    try testing.expect(hash_key != eq_key);
+    try testing.expect(hash_key != ord_key);
+    // A Hash recipe's aggregate field carries a `hash_call` witness; a witness-SymName swap
+    // (the field gained an explicit `impl has Hash`) flips the key so no stale blob serves.
+    const w1 = [_]Derive.FieldEq{.{ .hash_call = "Hash$hash$s1" }};
+    const w2 = [_]Derive.FieldEq{.{ .hash_call = "main.Inner.hash" }};
+    try testing.expect(deriveFingerprint("Hash", .hash, cf, &w1) != deriveFingerprint("Hash", .hash, cf, &w2));
+    // Identical Hash recipe hashes identically (cache hit).
+    try testing.expectEqual(deriveFingerprint("Hash", .hash, cf, &w1), deriveFingerprint("Hash", .hash, cf, &w1));
 }
 
 test "conformance fold (e) M14: empty protocol-args is byte-identical to a pre-M14 fold" {
