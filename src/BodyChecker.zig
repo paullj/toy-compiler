@@ -1729,20 +1729,48 @@ pub const BodyChecker = struct {
                         },
                         .none => {},
                     }
-                    // A builtin scalar protocol method (M12): `n.eq(m)` on int/bool. Not a
-                    // `t.methods` entry (the recognizer is pure), so `findMethod` misses;
-                    // recognize it here, check arity==1 + the arg is assignable to `Self`
-                    // (the homogeneous `Eq` receiver), and type the call to the method's
-                    // return. A user `impl int has P` was already handled above (its real
-                    // `fn_id` is in the method table), so this only fires for the builtins.
-                    if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
-                        if (args.len != 1) {
+                    // A direct `.hash()` on a struct/enum with NO explicit impl (M20): the
+                    // structural `Hash` derive trigger. Hash has no operator, so (unlike
+                    // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
+                    // the `==` operator's `conformsToEq`/`eqDeriveBlocker` split: an all-`Hash`-
+                    // fields aggregate records the derive + types the call `int`; a struct with
+                    // a non-conforming field names it (T0030); a payload enum with a non-
+                    // conforming payload has no single nameable field, so it falls through to
+                    // T0018. Scalars fall through to `builtinScalarMethod` below.
+                    if (std.mem.eql(u8, member, "hash") and bc.model.hash_protocol_id != null and
+                        (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
+                    {
+                        if (args.len != 0) {
                             for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
-                        } else {
-                            const at = try bc.typeOfExpected(args[0], recv_ty);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            bc.node_types[(node_idx).int()] = Type.int;
+                            return Type.int;
+                        }
+                        if (try bc.conformsToHash(recv_ty)) {
+                            bc.node_types[(node_idx).int()] = Type.int;
+                            return Type.int;
+                        }
+                        if (try bc.hashDeriveBlocker(recv_ty)) |blocker| {
+                            try bc.sink.emitFmtCode(.T0030, bc.byteOf(callee.main_token), "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                            return .invalid;
+                        }
+                        // No structural derive and no nameable blocker: fall through to T0018.
+                    }
+                    // A builtin scalar protocol method (M12/M20): `n.eq(m)` on int/bool, or
+                    // `n.hash()` on any scalar. Not a `t.methods` entry (the recognizer is
+                    // pure), so `findMethod` misses; recognize it here, check arity (`eq` = 1
+                    // non-self arg, `hash` = 0) + each arg assignable to `Self` (the
+                    // homogeneous receiver), and type the call to the method's return. A user
+                    // `impl int has P` was already handled above (its real `fn_id` is in the
+                    // method table), so this only fires for the builtins.
+                    if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
+                        if (args.len != bm.arity) {
+                            for (args) |a| _ = try bc.typeOf(a);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ bm.arity, args.len });
+                        } else for (args) |a| {
+                            const at = try bc.typeOfExpected(a, recv_ty);
                             if (!Type.assignable(recv_ty, at))
-                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
                         }
                         bc.node_types[(node_idx).int()] = bm.ret;
                         return bm.ret;
@@ -2141,6 +2169,45 @@ pub const BodyChecker = struct {
             return true;
         }
         return false;
+    }
+
+    /// Whether `t` conforms to the prelude `Hash` protocol (M20) — the predicate the direct
+    /// `.hash()` method-call trigger uses. Mirrors `conformsToEq`/`conformsToOrd`, but Hash
+    /// is INDEPENDENT of Eq/Ord (no refinement): a concrete type resolves via the frozen
+    /// conformance table (`findConformance` covers the int/bool/str/unit prelude conformances
+    /// AND every user `impl T has Hash`); a `type_var` in a bounded generic body conforms
+    /// as-axiom when its declared bound IS `Hash`. After those misses, a struct/enum whose
+    /// fields all conform to `Hash` with NO explicit impl conforms STRUCTURALLY — record the
+    /// derive request (so the serial barrier synthesizes the source-less `hash`) and return
+    /// true. Now fallible (`conforms` + the request record allocate). A prelude-less caller
+    /// (`hash_protocol_id == null`) denies conformance.
+    fn conformsToHash(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
+        const hash_pid = bc.model.hash_protocol_id orelse return false;
+        if (Typecheck.findConformance(bc.model, hash_pid, t, &.{})) return true;
+        if (t.isTypeVar()) {
+            const ord = t.typeVarOrd();
+            if (ord >= bc.bound_protocols.len) return false;
+            return (bc.bound_protocols[ord] orelse return false) == hash_pid;
+        }
+        switch (t.kind) {
+            .@"struct", .@"enum" => {},
+            else => return false,
+        }
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa)) {
+            try bc.recordDeriveReq(hash_pid, t);
+            return true;
+        }
+        return false;
+    }
+
+    /// The first struct field that blocks a structural `Hash` derive (M20), for the T0030
+    /// message; null when `t` is not a struct, has no hash protocol, or every field conforms.
+    /// Struct-only (mirrors `eqDeriveBlocker`): a payload enum with a non-conforming payload
+    /// has no single nameable field, so it falls through to T0018 instead.
+    fn hashDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
+        if (t.kind != .@"struct") return null;
+        const hash_pid = bc.model.hash_protocol_id orelse return null;
+        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa);
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)

@@ -718,6 +718,7 @@ pub fn renderGraphIr(
         var func = switch (d.kind) {
             .eq => try lower.lowerDeriveEq(gpa, in, d, sym, &diags),
             .ord => try lower.lowerDeriveOrd(gpa, in, d, sym, &diags),
+            .hash => try lower.lowerDeriveHash(gpa, in, d, sym, &diags),
         };
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};

@@ -1,0 +1,18 @@
+# Feature: structural `Hash` derive recurses through NESTED aggregates and `str` fields
+# (M20). `Person`'s derived `hash` calls `Name`'s own derived `hash` (a distinct source-less
+# unit), which folds its two `str` fields with a heap-free byte polynomial. Two structurally-
+# equal `Person`s hash EQUAL (Eq-consistent); a value differing in a nested str hashes
+# differently. All units are source-less; the field order matches the Eq derive.
+struct Name { first: str, last: str }
+struct Person { name: Name, age: int }
+
+fn main() -> int {
+    a := Person{ name: Name{ first: "ann", last: "b" }, age: 30 }
+    b := Person{ name: Name{ first: "ann", last: "b" }, age: 30 }
+    c := Person{ name: Name{ first: "ann", last: "c" }, age: 30 }
+    r := 0
+    if a.hash() == b.hash() { r = r + 40 }        # equal (nested Name + age equal) -> +40
+    if a.hash() == c.hash() { r = r + 1 } else { r = r + 2 }   # differ in Name.last -> +2
+    return r
+}
+# expect: exit 42

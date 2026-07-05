@@ -724,6 +724,22 @@ const ord_lt: i64 = 0;
 const ord_eq: i64 = 1;
 const ord_gt: i64 = 2;
 
+/// Fixed-seed multiply-accumulate constants for the structural `Hash` derive (M20). The
+/// current IR op set (Ir.Op) has NO xor/shift/bitwise op, so a runtime Wyhash is not
+/// expressible without touching the backend (which the roadmap forbids). The FORCED
+/// mixer is a polynomial `h = h*MULT + fieldhash` (a str field folds its bytes with the
+/// same shape). This still satisfies every LOCKED constraint: a FIXED seed (never
+/// randomized/per-run), deterministic, reproducible run-to-run AND byte-identical across
+/// `-jN`, and `Eq`-consistent (the emitter walks the SAME field order `Eq` does). The
+/// constants MUST fit in i64 (`< 2^63`): the fold uses wrapping `*%`/`+%` (`opt/arith.zig`
+/// never traps), and a `> i64` literal would fail to compile. `hash_seed` is the pi
+/// fractional word; `hash_mult` is the FNV-64 prime; the str constants are a distinct pair
+/// (xorshift word) so a str field's byte polynomial does not alias the field mixer.
+const hash_seed: i64 = 0x243F6A8885A308D3;
+const hash_mult: i64 = 0x100000001B3;
+const str_hash_seed: i64 = 0x2545F4914F6CDD1D;
+const str_hash_mult: i64 = 0x100000001B3;
+
 /// True for the two `Ord` operand kinds that stay an inline `icmp` (int signed cmp, bool
 /// false<true). Every other kind (str/struct/enum) routes to `lowerOrdValue`, so the int/bool
 /// emitted bytes are unchanged BY CONSTRUCTION (the M16 "int comparisons unchanged" criterion).
@@ -1634,6 +1650,262 @@ pub fn lowerDeriveOrd(
     return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
+/// Fold one more field/tag into the running hash: `h := h*MULT + add_val` (M20). The
+/// single mixing primitive of the structural `Hash` derive; `MULT` is re-materialized at
+/// each use (a pure iconst the opt folds), so the emitter reads no shared state and a
+/// double-lower is byte-identical. Wraps past i64 via the IR's wrapping `*`/`+` (never
+/// traps), so a large accumulator is safe.
+fn hashCombine(b: *Builder, h: Ir.ValueId, add_val: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const mult = try b.emit(.{ .iconst = hash_mult }, int_ty);
+    const hm = try b.emit(.{ .mul = .{ .lhs = h, .rhs = mult } }, int_ty);
+    return try b.emit(.{ .add = .{ .lhs = hm, .rhs = add_val } }, int_ty);
+}
+
+/// Heap-free per-byte hash of a str aggregate given the ADDRESS of its `{ptr@0, len@8}`
+/// header (M20): fold each byte with a fixed-seed polynomial `h := h*MULT + byte` in a
+/// slot-counter loop, mirroring `strEqAtPtrs`'s `load_byte` walk (slot induction var +
+/// slot accumulator). Pure of source (deterministic block/slot ids), so `--verify`-stable.
+/// An empty string hashes to `str_hash_seed` (the loop runs zero times). Returns the int
+/// hash value in the loop-exit block.
+fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+
+    // ptr@0 + len@8 of the {ptr,len} aggregate.
+    const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+    const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
+
+    // h := str_hash_seed in a slot (the loop accumulator, mirroring the induction var).
+    const hslot = try b.addSlot(int_ty);
+    {
+        const ha = try b.emit(.{ .slot_addr = hslot }, int_ty);
+        const seed = try b.emit(.{ .iconst = str_hash_seed }, int_ty);
+        _ = try b.emit(.{ .store = .{ .addr = ha, .val = seed, .ty = int_ty } }, null);
+    }
+    // i := 0 in a slot (mirrors `lowerFor` / `strEqAtPtrs`).
+    const islot = try b.addSlot(int_ty);
+    {
+        const ia = try b.emit(.{ .slot_addr = islot }, int_ty);
+        const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+        _ = try b.emit(.{ .store = .{ .addr = ia, .val = zero, .ty = int_ty } }, null);
+    }
+
+    const hdr = try b.addBlock();
+    const body = try b.addBlock();
+    const done = try b.addBlock();
+    try brTo(b, hdr, .none);
+
+    // hdr: i >= len ? done (all bytes folded) : fold byte i (body).
+    b.switchTo(hdr);
+    const ia_h = try b.emit(.{ .slot_addr = islot }, int_ty);
+    const iv = try b.emit(.{ .load = .{ .addr = ia_h, .ty = int_ty } }, int_ty);
+    const fin = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = iv, .rhs = len } }, bool_ty);
+    b.setTerm(.{ .cond_br = .{ .cond = fin, .t = done, .f = body } });
+
+    // body: byte = load_byte(ptr + i); h = h*MULT + byte; i += 1; back-edge to hdr.
+    b.switchTo(body);
+    const bx = try b.emit(.{ .add = .{ .lhs = ptr, .rhs = iv } }, int_ty);
+    const byte = try b.emit(.{ .load_byte = bx }, int_ty);
+    const ha_b = try b.emit(.{ .slot_addr = hslot }, int_ty);
+    const cur = try b.emit(.{ .load = .{ .addr = ha_b, .ty = int_ty } }, int_ty);
+    const mult = try b.emit(.{ .iconst = str_hash_mult }, int_ty);
+    const hm = try b.emit(.{ .mul = .{ .lhs = cur, .rhs = mult } }, int_ty);
+    const nh = try b.emit(.{ .add = .{ .lhs = hm, .rhs = byte } }, int_ty);
+    const ha_s = try b.emit(.{ .slot_addr = hslot }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = ha_s, .val = nh, .ty = int_ty } }, null);
+    const one = try b.emit(.{ .iconst = 1 }, int_ty);
+    const next = try b.emit(.{ .add = .{ .lhs = iv, .rhs = one } }, int_ty);
+    const ia_s = try b.emit(.{ .slot_addr = islot }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = ia_s, .val = next, .ty = int_ty } }, null);
+    try brTo(b, hdr, .none);
+
+    // done: the accumulated hash.
+    b.switchTo(done);
+    const ha_f = try b.emit(.{ .slot_addr = hslot }, int_ty);
+    return try b.emit(.{ .load = .{ .addr = ha_f, .ty = int_ty } }, int_ty);
+}
+
+/// The int hash of an aggregate operand already MATERIALIZED into slot `slot` (M20):
+/// resolve the `hash` witness and call `witness(slot) -> int`. The slot-operand sibling of
+/// the top-level derive, so a nested aggregate FIELD stays in lockstep with the callee's own
+/// derived unit. A miss is unreachable for a conforming field (the synthesis barrier proved
+/// it) — note-and-drop rather than miscompile. Returns an int value.
+fn hashAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "hash", null)) {
+        .one => |m| {
+            const callee = witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 1);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = slot };
+            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty);
+        },
+        .none, .ambiguous => {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: no hash witness for an aggregate field in lower" });
+            b.had_error = true;
+            return try b.emit(.{ .iconst = 0 }, int_ty);
+        },
+    }
+}
+
+/// The int hash of struct field `i` (at byte `off`, type `fty`) of receiver base `self_base`
+/// (M20): int/bool hash to their own loaded VALUE (identity — an int is its own hash, a bool
+/// is 0/1); `str` via the `{ptr,len}` byte polynomial (`hashStrAtPtr`); a struct/enum field is
+/// copied into a fresh temp slot then routed through `hashAtSlot`. Unit fields are rejected by
+/// T0007, so never occur. Mirrors `deriveFieldEq`/`deriveFieldCmp` (single receiver — hash is
+/// 1-ary).
+fn deriveFieldHash(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    switch (fty.kind) {
+        .int, .bool => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            return try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
+        },
+        .str => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            return try hashStrAtPtr(b, la);
+        },
+        .@"struct", .@"enum" => {
+            const slot = try b.addSlot(fty);
+            const d = try b.emit(.{ .slot_addr = slot }, int_ty);
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
+            return try hashAtSlot(b, fty, slot);
+        },
+        else => {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: unsupported field type in lower" });
+            b.had_error = true;
+            return try b.emit(.{ .iconst = 0 }, int_ty);
+        },
+    }
+}
+
+/// Fold variant `vi`'s active payload into the running hash `h0` and deliver the result to
+/// `join` (M20): an empty variant delivers `h0` unchanged; else each payload field
+/// multiply-accumulates. Mirrors `emitVariantPayloadEq`.
+fn emitVariantPayloadHash(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, h0: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
+    const v = e.variants[vi];
+    var h = h0;
+    for (v.field_types, v.offsets) |fty, poff| {
+        const fh = try deriveFieldHash(b, fty, e.payload_off + poff, self_base);
+        h = try hashCombine(b, h, fh);
+    }
+    try brTo(b, join, .{ .value = h });
+}
+
+/// Payload-enum structural `Hash` (M20): fold the discriminant into the fixed seed
+/// (`combine(seed, tag)`), then dispatch on the tag (case-declaration order) to fold the
+/// ACTIVE variant's payload into that base. A tag-dispatch ladder + a shared int `join`
+/// merges each variant's result — the SAME structure `deriveEnumEq` uses, so the walked
+/// field order matches `Eq` (equal enum values hash equal). Returns the int hash value.
+fn deriveEnumHash(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const e = b.in.enum_layouts[cty.enum_id];
+
+    const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
+    const seed = try b.emit(.{ .iconst = hash_seed }, int_ty);
+    const h0 = try hashCombine(b, seed, tag);
+
+    const join = try b.addBlock();
+    const merge = try b.addParam(join, int_ty);
+    for (e.variants, 0..) |_, vi| {
+        const last = vi + 1 == e.variants.len;
+        if (last) {
+            try emitVariantPayloadHash(b, e, vi, self_base, h0, join);
+            break;
+        }
+        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
+        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = vk } }, bool_ty);
+        const body = try b.addBlock();
+        const next = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
+        b.switchTo(body);
+        try emitVariantPayloadHash(b, e, vi, self_base, h0, join);
+        b.switchTo(next);
+    }
+
+    b.switchTo(join);
+    return merge;
+}
+
+/// Lower a SOURCE-LESS auto-derive `Hash` unit (M20): a layout-walking emitter returning an
+/// int. ONE param (the receiver, by slot). A struct folds a fixed seed through its fields in
+/// layout order (`h := h*MULT + fieldhash`); an empty-payload enum folds the discriminant
+/// (`combine(seed, tag)`); a payload enum folds the discriminant then the active variant's
+/// payload via a tag-dispatch ladder. PURE of `(recipe, layouts, method table)`: a fixed
+/// field-order walk handing ids monotonically, reading no map — a double-lower is identical,
+/// and the fixed seed makes the hash reproducible run-to-run.
+pub fn lowerDeriveHash(
+    gpa: std.mem.Allocator,
+    in: Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const cty = d.conform_ty;
+
+    var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = int_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    // ONE param (self), by slot — hash is 1-ary.
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_self = try b.addSlot(cty);
+    try params.append(gpa, p_self);
+
+    // entry (b0) + the single EXIT block whose one param is the int return (mirrors
+    // `lowerFn`'s scaffold; an int ret rides the exit param in a register).
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, int_ty);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
+
+    const result: Ir.ValueId = switch (cty.kind) {
+        .@"struct" => blk: {
+            const layout = b.in.layouts[cty.struct_id];
+            var h = try b.emit(.{ .iconst = hash_seed }, int_ty);
+            for (layout.field_types, layout.offsets) |fty, off| {
+                const fh = try deriveFieldHash(&b, fty, off, self_base);
+                h = try hashCombine(&b, h, fh);
+            }
+            break :blk h;
+        },
+        .@"enum" => blk: {
+            const e = b.in.enum_layouts[cty.enum_id];
+            var any_payload = false;
+            for (e.variants) |v| if (v.field_types.len != 0) {
+                any_payload = true;
+                break;
+            };
+            if (!any_payload) {
+                // Empty-payload enum: fold the discriminant into the seed (bare tag hash).
+                const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
+                const seed = try b.emit(.{ .iconst = hash_seed }, int_ty);
+                break :blk try hashCombine(&b, seed, tag);
+            }
+            break :blk try deriveEnumHash(&b, cty, self_base);
+        },
+        else => blk: {
+            // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: unsupported conform type in lower" });
+            b.had_error = true;
+            break :blk try b.emit(.{ .iconst = 0 }, int_ty);
+        },
+    };
+
+    if (!b.termSet()) try brTo(&b, exit, .{ .value = result });
+    return try finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
 /// True when `sig` is a generic template (some param is a check-time `type_var`).
 /// Bare inferred calls resolve to the template's `.func`; genericness is detected
 /// from the callee sig so `lowerCall` selects the reified instance, not the template.
@@ -1673,11 +1945,12 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         // A method on a GENERIC-type instance (M10): the resolver returns the
         // reified-dispatch entry carrying the mono `instance` index — dispatch to THAT
         // instance's mangled symbol (its own per-instance codegen unit), not the
-        // never-lowered template's `names[fn_id]`.
-        callee = if (m.instance) |ii|
-            .{ .kind = .user_fn, .name = b.in.instances[ii].name }
-        else
-            b.in.names[m.fn_id];
+        // never-lowered template's `names[fn_id]`. A SOURCE-LESS derive Method (M18+,
+        // `fn_id == 0`) dispatches to its synthetic unit — a DIRECT `.hash()` call (M20) is
+        // the first derive method reached here (Eq/Ord fire only via operators), so use the
+        // shared `witnessCallee` (derive-first) rather than `names[m.fn_id]` (would be
+        // `names[0]` — a wrong-symbol miscompile).
+        callee = witnessCallee(b, m);
         self_recv = if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
         self_mut = m.mut_self;
     } else if (callee_node.tag == .type_app) {
@@ -1712,6 +1985,30 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
         }
         return try lowerEqValue(b, recv_ty, ba.recv, ba.arg, false);
+    } else if (builtinScalarHashCallee(b, n)) |bh| {
+        // A builtin scalar `.hash()` (M20, completeness layer so `[T has Hash]` works at a
+        // scalar T). No `.call`/symbol — like the scalar `.eq()`, the recognizer is pure:
+        // int/bool hash to their own VALUE (identity — an int is its own hash, a bool is
+        // 0/1); str folds its bytes via the SAME heap-free polynomial the derive uses
+        // (`hashStrAtPtr`); unit hashes to the fixed seed (the sole `()` value).
+        const recv_ty = b.in.node_types[(bh.recv).int()];
+        switch (recv_ty.kind) {
+            .int, .bool => return .{ .value = operandValue(try lowerExpr(b, bh.recv)) },
+            .str => {
+                const op = try lowerExpr(b, bh.recv);
+                const s = operandSlot(op);
+                if (s == Ir.none_slot) {
+                    try b.note(callee_node.main_token, "str '.hash()' operand is not a slot in lower");
+                    return .{ .value = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int) };
+                }
+                const base = try b.emit(.{ .slot_addr = s }, Typecheck.Type.int);
+                return .{ .value = try hashStrAtPtr(b, base) };
+            },
+            else => {
+                _ = try lowerExpr(b, bh.recv); // unit: evaluate for effect, hash a constant
+                return .{ .value = try b.emit(.{ .iconst = hash_seed }, Typecheck.Type.int) };
+            },
+        }
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -1893,6 +2190,23 @@ fn builtinScalarEqCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index, ar
     const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
     if (args.len != 1) return null;
     return .{ .recv = cn.lhs, .arg = args[0] };
+}
+
+/// A builtin scalar `.hash()` call `recv.hash()` (M20): the callee is a `field_access` NOT
+/// bound to a `.func`, the member is `hash`, the receiver types to a scalar the recognizer
+/// accepts, and there are zero args. Returns the receiver node so `lowerCall` can emit the
+/// identity value / byte polynomial / constant inline (no `.call`, no external symbol —
+/// pure a-function-of-source, `--verify`-stable). Null when `n` is not such a call (a
+/// struct/enum `.hash()` was already dispatched to its derive unit by `methodGidOf`).
+fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index } {
+    const cn = b.in.tree.nodes[(n.lhs).int()];
+    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
+    const member = b.in.tokens[cn.main_token].text(b.in.source);
+    if (!std.mem.eql(u8, member, "hash")) return null;
+    const bm = Typecheck.builtinScalarMethod(b.in.node_types[(cn.lhs).int()], member) orelse return null;
+    if (bm.arity != 0) return null;
+    if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
+    return .{ .recv = cn.lhs };
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {

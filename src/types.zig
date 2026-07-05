@@ -545,8 +545,14 @@ pub fn findGenericMethod(methods: []const Method, ctor: u32, is_enum: bool, name
 /// ship `eq` -> bool: `int`/`bool` lower to an inline `icmp`; `str` to a heap-free
 /// byte-compare (M15's `load_byte` loop); `unit` to a trivially-true `bconst` (the two
 /// `()` values are always equal). None gets a `t.fns` entry — each lowers to a machine op.
-pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type } {
-    if ((recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit) and std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool };
+pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, arity: usize } {
+    const is_scalar = recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit;
+    if (!is_scalar) return null;
+    // `eq(self, other) -> bool` (M15) is 2-ary (arity counts the non-self args = 1); `hash
+    // (self) -> int` (M20) is 1-ary (0 non-self args). The `arity` lets the shared
+    // method-dispatch consumers gate arg count without hardcoding a per-method constant.
+    if (std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool, .arity = 1 };
+    if (std.mem.eql(u8, name, "hash")) return .{ .ret = Type.int, .arity = 0 };
     return null;
 }
 
@@ -858,6 +864,15 @@ sub_protocol_id: ?u32 = null,
 mul_protocol_id: ?u32 = null,
 div_protocol_id: ?u32 = null,
 
+/// The global protocol id of the prelude `Hash` protocol (M20), assigned in
+/// `registerPrelude` right after `Div` in fixed append order (so Hash=6 — a pure
+/// function of source). `protocol Hash { fn hash(self) -> int }`, native scalar
+/// conformances for int/bool/str/unit; drives on-demand structural `Hash` derive at a
+/// `.hash()` call / `[T has Hash]` bound. A bare `Hash` reference that misses the active
+/// module map falls back to this id in `protocolIdFromNode` (mirroring the `Eq`/`Ord`
+/// fallbacks). Null until `registerPrelude` runs; a null id denies conformance.
+hash_protocol_id: ?u32 = null,
+
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
 /// each method's `decodeFnSig` (Pass A); null otherwise (non-method decoding is
@@ -1030,6 +1045,10 @@ pub const Model = struct {
     sub_protocol_id: ?u32,
     mul_protocol_id: ?u32,
     div_protocol_id: ?u32,
+    /// The prelude `Hash` protocol's global id (M20), or null if `registerPrelude` never
+    /// ran. `conformsToHash` keys the `.hash()` method-call trigger off this; a null id
+    /// denies conformance (a scalar/struct/enum reports T0018) rather than miscompiling.
+    hash_protocol_id: ?u32,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -1053,6 +1072,7 @@ fn buildModel(t: *Typecheck) Model {
         .sub_protocol_id = t.sub_protocol_id,
         .mul_protocol_id = t.mul_protocol_id,
         .div_protocol_id = t.div_protocol_id,
+        .hash_protocol_id = t.hash_protocol_id,
     };
 }
 
@@ -1742,6 +1762,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
     const eq_pid = t.eq_protocol_id orelse return;
     const eq_name = t.protocols.items[eq_pid].name;
     const ord_pid_opt = t.ord_protocol_id;
+    const hash_pid_opt = t.hash_protocol_id;
     const gpa = t.gpa;
 
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
@@ -1816,6 +1837,42 @@ fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
+    // ---- (2b) Hash fixpoint (M20), INDEPENDENT of Eq/Ord (Hash is not a refinement of
+    // either, so there is no `ordFills`-style skip). Seeded from the `hash_pid` requests,
+    // it chases every aggregate field the same way the Eq/Ord fixpoints do — struct fields
+    // AND every enum variant's payload — skipping any field with a live explicit `Hash`
+    // conformance (it uses its own witness). The SAME `collectComponentTypes` order the
+    // emitter walks, so the derived hash is `Eq`-consistent by construction.
+    var hash_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = hash_seen.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        hash_seen.deinit(gpa);
+    }
+    var hash_work: std.ArrayList(Type) = .empty;
+    defer hash_work.deinit(gpa);
+
+    if (hash_pid_opt) |hash_pid| {
+        for (t.derive_reqs.items) |req| {
+            if (req.protocol_id != hash_pid) continue;
+            try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, req.conform_ty);
+        }
+        var hi: usize = 0;
+        while (hi < hash_work.items.len) : (hi += 1) {
+            comps.clearRetainingCapacity();
+            try t.collectComponentTypes(hash_work.items[hi], &comps);
+            for (comps.items) |ft| {
+                switch (ft.kind) {
+                    .@"struct", .@"enum" => {},
+                    else => continue,
+                }
+                if (t.hasConformanceLive(hash_pid, ft)) continue; // explicit Hash field: reuse its witness
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa))
+                    try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, ft);
+            }
+        }
+    }
+
     // ---- (3) Materialize recipes (names/params/field_witnesses filled after the sort) --
     const ordering_ty: Type = if (t.ordering_enum_id) |oid| Type.enumT(oid) else .{ .kind = .invalid };
     if (ord_pid_opt) |ord_pid| {
@@ -1835,6 +1892,16 @@ fn synthesizeDerives(t: *Typecheck) !void {
         .conform_ty = ty,
         .ret = Type.@"bool",
     });
+    if (hash_pid_opt) |hash_pid| {
+        const hash_name = t.protocols.items[hash_pid].name;
+        for (hash_work.items) |ty| try t.derives.append(gpa, .{
+            .protocol_id = hash_pid,
+            .protocol_name = hash_name,
+            .kind = .hash,
+            .conform_ty = ty,
+            .ret = Type.int,
+        });
+    }
 
     // ---- (4) Canonical sort — the SOLE ordering driver (never discovery/thread order) --
     std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
@@ -1846,7 +1913,13 @@ fn synthesizeDerives(t: *Typecheck) !void {
     // synthetic unit.
     for (t.derives.items, 0..) |*d, di| {
         d.name = try Derive.mangle(gpa, d.protocol_name, d.kind, d.conform_ty);
-        d.params = try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty });
+        // A `Hash` witness takes ONLY `self` (`hash(self) -> int`); `Eq`/`Ord` are
+        // homogeneous 2-ary (`m(self, other) -> _`). The param count feeds the ABI + the
+        // fingerprint Sig fold, so it MUST match the emitter's declared param count.
+        d.params = switch (d.kind) {
+            .hash => try gpa.dupe(Type, &[_]Type{d.conform_ty}),
+            .eq, .ord => try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty }),
+        };
         try t.methods.append(gpa, .{
             .recv = d.conform_ty,
             .name = Derive.methodName(d.kind),
@@ -1922,6 +1995,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldEq {
     for (ftys.items, 0..) |ft, i| fw[i] = switch (d.kind) {
         .eq => t.resolveFieldEq(ft),
         .ord => t.resolveFieldOrd(ft),
+        .hash => t.resolveFieldHash(ft),
     };
     return fw;
 }
@@ -1958,6 +2032,22 @@ fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldEq {
     }
     switch (resolveConformanceMethod(t.methods.items, ft, "cmp", null)) {
         .one => |m| return .{ .cmp_call = t.witnessName(m) },
+        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
+    }
+}
+
+/// Resolve one field type to its derived-hash recipe (M20): scalars/str hash inline (the
+/// emitter's identity value / heap-free byte polynomial); a struct/enum field dispatches to
+/// its `hash` witness (a sibling Hash derive, a Mono instance method, or a user `impl has
+/// Hash` fn). Read only on the LIVE method table AFTER all synthetic entries are appended, so
+/// a sibling derive resolves correctly. A `hash` miss is unreachable for a conforming field.
+fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldEq {
+    switch (ft.kind) {
+        .@"struct", .@"enum" => {},
+        else => return .inline_kind, // int/bool/str — emitter handles by layout kind
+    }
+    switch (resolveConformanceMethod(t.methods.items, ft, "hash", null)) {
+        .one => |m| return .{ .hash_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
 }
@@ -2812,6 +2902,9 @@ fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         if (t.div_protocol_id) |did| {
             if (std.mem.eql(u8, name, "Div")) return did;
         }
+        if (t.hash_protocol_id) |hid| {
+            if (std.mem.eql(u8, name, "Hash")) return hid;
+        }
         return null;
     }
     if (n.tag == .field_access) {
@@ -3390,6 +3483,38 @@ fn registerPrelude(t: *Typecheck) !void {
         });
         try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = Type.int });
     }
+
+    // protocol Hash { fn hash(self) -> int }  (M20, id 6, right after Div=5). Unlike the
+    // homogeneous operator protocols, `hash` takes ONLY `self` (`type_var(0)`) and returns a
+    // concrete `int` — so the decoded sig is `[self]` params + `int` ret. All gpa-allocated so
+    // teardown frees prelude + user protocols uniformly.
+    const hash_methods = try t.gpa.alloc([]const u8, 1);
+    hash_methods[0] = "hash";
+    const hash_params = try t.gpa.alloc([]const Type, 1);
+    const hash_p0 = try t.gpa.alloc(Type, 1);
+    hash_p0[0] = Type.typeVar(0);
+    hash_params[0] = hash_p0;
+    const hash_rets = try t.gpa.alloc(Type, 1);
+    hash_rets[0] = Type.int;
+    const hash_id: u32 = @intCast(t.protocols.items.len);
+    t.hash_protocol_id = hash_id;
+    try t.protocols.append(t.gpa, .{
+        .name = "Hash",
+        .mod = 0,
+        .pub_export = true,
+        .decl_node = Ast.none,
+        .methods = hash_methods,
+        .method_params = hash_params,
+        .method_rets = hash_rets,
+    });
+    // All four builtin scalars conform to `Hash` (M20), in a fixed literal order so the
+    // conformance table stays a pure function of source: int/bool hash to their own value,
+    // str to a heap-free byte polynomial, unit to a constant. Each lowers to a machine op
+    // (identity / byte-loop / iconst), never a witness fn call.
+    try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.int });
+    try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.bool });
+    try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.str });
+    try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.unit });
 }
 
 /// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
@@ -4226,6 +4351,19 @@ test "M15: builtinScalarMethod recognizes `eq` on all four scalars (pure, table-
     // A non-`eq` name and a nominal receiver still recognize nothing.
     try testing.expect(builtinScalarMethod(Type.int, "foo") == null);
     try testing.expect(builtinScalarMethod(Type.structT(0), "eq") == null);
+    // Arity: `eq` is 1-ary (one non-self arg).
+    try testing.expectEqual(@as(usize, 1), builtinScalarMethod(Type.int, "eq").?.arity);
+}
+
+test "M20: builtinScalarMethod recognizes `hash` -> int (arity 0) on all four scalars" {
+    inline for (.{ Type.int, Type.bool, Type.str, Type.unit }) |sc| {
+        const bm = builtinScalarMethod(sc, "hash") orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(Kind.int, bm.ret.kind);
+        try testing.expectEqual(@as(usize, 0), bm.arity); // `hash(self)` takes no non-self args
+    }
+    // A nominal receiver has no builtin `hash` (it derives structurally instead).
+    try testing.expect(builtinScalarMethod(Type.structT(0), "hash") == null);
+    try testing.expect(builtinScalarMethod(Type.enumT(0), "hash") == null);
 }
 
 test "M12: a.eq(b) on int types the call to bool, zero diags, and pollutes no method entry" {
@@ -4636,6 +4774,150 @@ test "M19: nested-struct + struct-with-payload-enum-field both derive Ord recurs
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 3), c.result.derives.len);
     for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.ord, d.kind);
+}
+
+test "M20: `.hash()` on an all-Hash-fields struct with no impl DERIVES exactly one recipe" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\ a := P{ x: 1, y: 2 }
+        \\ return a.hash()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // A direct `.hash()` call records ONE structural Hash derive (struct id 0 -> `Hash$hash$s0`),
+    // no diagnostic. Hash is independent of Eq/Ord — the recipe's ret is `int`.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Hash$hash$s0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.hash, c.result.derives[0].kind);
+    try testing.expectEqual(Kind.int, c.result.derives[0].ret.kind);
+    // A Hash recipe's synthetic method takes ONLY `self` (1 param), unlike homogeneous Eq/Ord.
+    try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
+}
+
+test "M20: `.hash()` on a PAYLOAD enum derives one Hash recipe (Hash$hash$e0)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E { A(int), B }
+        \\fn main() -> int {
+        \\ return E.A(3).hash()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Hash$hash$e0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.hash, c.result.derives[0].kind);
+}
+
+test "M20: `.hash()` recurses through a NESTED aggregate + str field (two recipes)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Name { first: str, last: str }
+        \\struct Person { name: Name, age: int }
+        \\fn main() -> int {
+        \\ a := Person{ name: Name{ first: "a", last: "b" }, age: 1 }
+        \\ return a.hash()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // Person's Hash fixpoint chases its `name: Name` field, deriving Hash for both — two
+    // recipes, both `.hash` kind. (Name = struct id 0, Person = struct id 1.)
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.derives.len);
+    for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.hash, d.kind);
+}
+
+test "M20: an UNUSED derivable struct records zero Hash recipes (lazy)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Q { v: int }
+        \\fn main() -> int {
+        \\ q := Q{ v: 42 }
+        \\ return q.v
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "M20: explicit `impl P has Hash` OVERRIDES the derive (zero synthetic units)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Hash {
+        \\ fn hash(self) -> int { self.x }
+        \\}
+        \\fn main() -> int {
+        \\ a := P{ x: 1 }
+        \\ return a.hash()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // The explicit impl wins at `resolveConformanceMethod`, so no structural derive fires.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "M20: Hash and Eq of the SAME struct are INDEPENDENT recipes (no refinement)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ a := P{ x: 1 }
+        \\ b := P{ x: 2 }
+        \\ return if a == b { 0 } else { a.hash() + b.hash() }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // `==` derives Eq; `.hash()` derives Hash. Hash does NOT fill/refine Eq (unlike Ord),
+    // so BOTH recipes exist — one `Eq$eq$s0` and one `Hash$hash$s0`.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.derives.len);
+    var saw_eq = false;
+    var saw_hash = false;
+    for (c.result.derives) |d| {
+        if (d.kind == .eq) saw_eq = true;
+        if (d.kind == .hash) saw_hash = true;
+    }
+    try testing.expect(saw_eq);
+    try testing.expect(saw_hash);
+}
+
+test "M20: firstNonConformingField names the field blocking a `Hash` derive (T0030 substrate)" {
+    // T0030's message is built from `firstNonConformingField` (the SAME pid-parameterized
+    // substrate T0029 uses). For a pure value-type program every scalar leaf conforms to
+    // `Hash`, so this path is not reachable from source; a synthetic table WITHOUT a `str`
+    // Hash conformance exercises the exact blocker+field-naming logic the message consumes.
+    const gpa = testing.allocator;
+    const hash_pid: u32 = 6; // Hash is prelude id 6; the substrate is pid-agnostic regardless.
+    const s0_ft = [_]Type{Type.str};
+    const s0_fn = [_][]const u8{"name"};
+    const structs = [_]StructSym{
+        .{ .decl_node = Ast.none, .name = "S0", .field_types = @constCast(&s0_ft), .field_names = @constCast(&s0_fn) },
+    };
+    const enums = [_]EnumSym{};
+    // Register Hash for int/bool/unit but DELIBERATELY not str, so the `name: str` field blocks.
+    const confs = [_]Conformance{
+        .{ .protocol = hash_pid, .recv = Type.int },
+        .{ .protocol = hash_pid, .recv = Type.@"bool" },
+        .{ .protocol = hash_pid, .recv = Type.unit },
+    };
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(0), hash_pid, &memo, gpa);
+    try testing.expect(off != null);
+    try testing.expectEqualStrings("name", off.?.name);
+    try testing.expect(Type.eql(Type.str, off.?.ty));
 }
 
 test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {

@@ -1,0 +1,16 @@
+# Feature: an explicit `impl has Hash` OVERRIDES the structural derive (M20). This impl
+# returns a constant regardless of the fields, so `a.hash() == b.hash()` is TRUE even though
+# `a` and `b` differ in `x`. A structural derive would fold `x` and hash them differently —
+# so exit 42 proves the user witness won (the derive never fired; no `Hash$hash$` unit).
+struct P { x: int }
+
+impl P has Hash {
+    fn hash(self) -> int { 7 }
+}
+
+fn main() -> int {
+    a := P{ x: 1 }
+    b := P{ x: 2 }
+    return if a.hash() == b.hash() { 42 } else { 0 }
+}
+# expect: exit 42

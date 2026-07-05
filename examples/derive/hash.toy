@@ -1,0 +1,13 @@
+# Feature: structural `Hash` auto-derive (M20). A struct whose fields all conform to `Hash`
+# gets `.hash()` with ZERO source impl — the compiler synthesizes a source-less field-by-
+# field `hash` on demand at the call site. No `derive` keyword; unused ⇒ free. The derived
+# hash is `Eq`-consistent (two structurally-equal values hash EQUAL) and uses a FIXED seed
+# (reproducible run-to-run and byte-identical across -jN).
+struct P { x: int, y: int }
+
+fn main() -> int {
+    a := P{ x: 1, y: 2 }
+    b := P{ x: 1, y: 2 }
+    return if a.hash() == b.hash() { 42 } else { 0 }
+}
+# expect: exit 42
