@@ -1,0 +1,14 @@
+# Feature: `?` constructor-match constraint (M24). The `?` operand's family must MATCH the
+# enclosing return's family — `?`-ing an `Option` inside a `-> Result` function is a clean
+# compile error (T0033), because an `Option`'s `none` residual cannot be re-emitted as a
+# `Result`. (Cross-constructor bridging and `From`-style error widening are deferred to
+# M25.) This proves the mismatch path is a diagnostic, not a miscompile.
+# expect: compile-error "in a function returning Result"
+fn get(o: Option[int]) -> Result[int, str] {
+  v := o?
+  return Result.ok(v)
+}
+
+fn main() -> int {
+  return 0
+}

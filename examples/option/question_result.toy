@@ -1,0 +1,35 @@
+# Feature: `?` propagates `Result` errors (M24). `total` chains three `?`: two on a
+# `Result[int,str]` and one on a `Result[Point,str]` — a SECOND distinct instance whose
+# `ok` payload is an AGGREGATE (a struct), proving the happy-path extract is a byte copy,
+# not the M23 scalar-only `unwrap`. On `.err`, `?` early-returns the enclosing `err`,
+# copying the `str` error payload UNCHANGED across the (differently-sized) operand and
+# return enum layouts — M24 requires the SAME error type, so it is a plain copy. Any `?`
+# hitting `.err` short-circuits (the tail never runs). Two distinct Result instances plus
+# their discovery order make this a `-j1`==`-jN` determinism case (diff.sh).
+# expect: exit 42
+struct Point { x: int, y: int }
+
+fn parse(a: int) -> Result[int, str] {
+  if a < 0 { return Result[int, str].err("negative") }
+  return Result.ok(a + 1)
+}
+
+fn mk_point(a: int) -> Result[Point, str] {
+  if a == 0 { return Result[Point, str].err("zero") }
+  return Result.ok(Point{ x: a, y: a + 1 })
+}
+
+fn total(a: int, b: int) -> Result[int, str] {
+  x := parse(a)?
+  y := parse(b)?
+  p := mk_point(a + b)?
+  return Result.ok(x + y + p.x + p.y)
+}
+
+fn main() -> int {
+  # total(1, 1): x=2, y=2, p=Point{2,3}, sum = 2+2+2+3 = 9
+  good := match total(1, 1) { .ok(v) -> v, .err(_) -> 0 }
+  # total(-1, 1): parse(-1) is `err`, so the FIRST `?` short-circuits; tail not run.
+  short := match total(0 - 1, 1) { .ok(_) -> 99, .err(_) -> 33 }
+  return good + short   # 9 + 33 = 42
+}

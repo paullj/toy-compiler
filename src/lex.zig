@@ -112,7 +112,7 @@ fn lexToken(l: *Lexer) Token {
 /// insertion when a newline follows it.
 fn canEndStatement(tag: Tag) bool {
     return switch (tag) {
-        .identifier, .number, .string, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace => true,
+        .identifier, .number, .string, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .question => true,
         else => false,
     };
 }
@@ -209,6 +209,7 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         ':' => if (l.eat('=')) .colon_eq else .colon,
         '.' => if (l.eat('.')) .dotdot else .dot,
         '@' => .at,
+        '?' => .question,
         else => unreachable, // `beginsToken` already screened out non-lead bytes
     };
     return l.make(tag, start);
@@ -224,7 +225,7 @@ fn beginsToken(c: u8) bool {
     return switch (c) {
         '"' => true, // string
         ' ', '\t', '\r', '\n', '#' => true, // trivia
-        '+', '-', '*', '/', '=', '!', '<', '>', '&', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@' => true,
+        '+', '-', '*', '/', '=', '!', '<', '>', '&', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@', '?' => true,
         else => false,
     };
 }
@@ -414,6 +415,18 @@ test "brackets lex to l_bracket and r_bracket" {
     // A generic-application stream tiles cleanly with the surrounding tokens.
     try expectTags("f[T]", &.{ .identifier, .l_bracket, .identifier, .r_bracket, .eof });
     try expectSpansTile("fn id[T](x: T) -> T { x }\n");
+}
+
+test "postfix ? lexes to question and can end a statement" {
+    try expectTags("o?", &.{ .identifier, .question, .eof });
+    // `?` is in `canEndStatement`, so a newline after `o?` inserts a terminator —
+    // `v := o?` followed by another statement must not glue the two together.
+    try expectTags(
+        \\v := o?
+        \\w
+    , &.{ .identifier, .colon_eq, .identifier, .question, .newline, .identifier, .eof });
+    // `f()?` composes: the `?` follows the call's `)`.
+    try expectTags("f()?", &.{ .identifier, .l_paren, .r_paren, .question, .eof });
 }
 
 test "loop keywords and dotdot" {

@@ -1,0 +1,12 @@
+# `?` requires the enclosing function to return an Option/Result that can absorb the
+# residual. Here the operand is a valid `Option`, but the function returns `int`, which
+# cannot hold the `none` residual — T0032 (M24).
+
+fn f(o: Option[int]) -> int {
+  v := o?  #~ ERROR [T0032] return an Option or Result
+  return v
+}
+
+fn main() -> int {
+  return 0
+}
