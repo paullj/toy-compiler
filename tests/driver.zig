@@ -527,6 +527,136 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
     }
 }
 
+test "M23: an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
+    // The prelude `Option[T]` (M23) is nameable with no import; `Option[int]` reifies to a
+    // plain concrete enum through the M6 path, so this compiles + runs on the real backend.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-m23-option";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn find(n: int) -> Option[int] {
+        \\  if n > 0 { return Option.some(n) }
+        \\  return Option[int].none
+        \\}
+        \\fn main() -> int {
+        \\  return match find(42) { .some(v) -> v, .none -> 0 }
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "M23: a Result[int,str] construct+match program compiles + runs; exit is the ok payload" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-m23-result";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn checked_div(a: int, b: int) -> Result[int, str] {
+        \\  if b == 0 { return Result[int, str].err("divide by zero") }
+        \\  return Result.ok(a / b)
+        \\}
+        \\fn main() -> int {
+        \\  return match checked_div(84, 2) { .ok(v) -> v, .err(_) -> 1 }
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "M23: a bare `Option.none` with no inferable target reports T0016" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-m23-neg";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  x := Option.none\n  return 0\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0016") != null);
+}
+
+test "M23: an Option is_some/unwrap_or program compiles + runs; exit is the guarded payload" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-m23-option-methods";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn main() -> int {
+        \\  a := Option[int].some(40)
+        \\  base := if a.is_some() { a.unwrap_or(0) } else { 0 }
+        \\  b := Option[int].none
+        \\  return base + b.unwrap_or(2)
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "M23: a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-m23-result-methods";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn main() -> int {
+        \\  r := Result[int, str].ok(40)
+        \\  base := if r.is_ok() { r.unwrap_or(0) } else { 99 }
+        \\  e := Result[int, str].err("boom")
+        \\  return base + e.unwrap_or(2)
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "M23: unwrap on a non-scalar payload is a clean build diagnostic, not a compiler crash" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-m23-agg-unwrap";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    // Aggregate-payload `unwrap_or` used to PANIC codegen (unassigned join block-arg
+    // offset); it must now be rejected at check with T0018 (exit 1), never a crash.
+    const src =
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\  d := P { x: 2 }
+        \\  p := Option[P].none.unwrap_or(d)
+        \\  return p.x
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"build"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0018") != null);
+}
+
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
 /// capturing stdout+stderr merged and the exit code. Returns the captured bytes (the
 /// caller frees) and the term. Skips when the built binary is absent.

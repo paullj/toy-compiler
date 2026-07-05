@@ -55,7 +55,7 @@ pub fn forEachValueUse(func: *const Ir.Function, ctx: anytype, comptime f: fn (@
                 .value => |v| use(ctx, f, v),
                 .slot, .none => {},
             },
-            .@"unreachable" => {},
+            .@"unreachable", .trap => {},
         }
     }
 }
@@ -124,7 +124,7 @@ pub fn remapValues(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(c
                 .value => |*v| v.* = map(ctx, v.*),
                 .slot, .none => {},
             },
-            .@"unreachable" => {},
+            .@"unreachable", .trap => {},
         }
     }
 }
@@ -175,7 +175,7 @@ pub fn remapUses(func: *Ir.Function, ctx: anytype, comptime map: fn (@TypeOf(ctx
                 .value => |*v| v.* = map(ctx, v.*),
                 .slot, .none => {},
             },
-            .@"unreachable" => {},
+            .@"unreachable", .trap => {},
         }
     }
 }

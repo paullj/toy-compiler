@@ -1,0 +1,18 @@
+# Feature: `Result[T,E]` as a PRELUDE generic value enum (M23). Like `Option`, it is a
+# native-registered generic enum template (`Result[T,E] { ok(T), err(E) }`) with two type
+# params, monomorphized to a plain concrete `enum_id` per instance — here `Result[int,str]`
+# (an int payload for `ok`, a str payload for `err`, laid out as one tagged union). The
+# happy path constructs `ok` (T inferred from the arg), the error path an explicit
+# `Result[int,str].err("..")`; `main` matches both arms. No `?` yet (M24) — plain match.
+# expect: exit 42
+fn checked_div(a: int, b: int) -> Result[int, str] {
+  if b == 0 { return Result[int, str].err("divide by zero") }
+  return Result.ok(a / b)
+}
+
+fn main() -> int {
+  return match checked_div(84, 2) {
+    .ok(v) -> v,
+    .err(_) -> 1,
+  }
+}

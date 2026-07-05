@@ -90,7 +90,7 @@ fn successors(term: Ir.Terminator, out: *[2]Ir.BlockId) usize {
             out[1] = c.f;
             break :blk 2;
         },
-        .ret, .@"unreachable" => 0,
+        .ret, .@"unreachable", .trap => 0,
     };
 }
 
@@ -173,7 +173,7 @@ fn elimUnreachable(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats
                 c.t = remap[c.t];
                 c.f = remap[c.f];
             },
-            .ret, .@"unreachable" => {},
+            .ret, .@"unreachable", .trap => {},
         }
     }
     if (func.entry < n) func.entry = remap[func.entry];

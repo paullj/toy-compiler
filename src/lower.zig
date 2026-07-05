@@ -2244,6 +2244,10 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 return .{ .value = try b.emit(.{ .iconst = hash_seed }, Typecheck.Type.int) };
             },
         }
+    } else if (optionResultMethodCallee(b, n)) |om| {
+        // A native inherent method on a reified `Option`/`Result` instance (M23): no
+        // `.call`/symbol — inline the tag test / payload load per the reified layout.
+        return try lowerOptionResultMethod(b, n, om);
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -2394,8 +2398,13 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
     // A method returning an enum ALSO parses as `.call` over an unresolved
     // field_access callee, so it would otherwise be misrouted to variant
     // construction. Distinguish by the receiver being a VALUE with a resolved method.
+    // A native `Option`/`Result` method returning an enum payload (agg-T `unwrap`) ALSO
+    // parses as `.call` over an unresolved field_access and has no `t.methods` entry, so
+    // exclude it explicitly (M23) — else it misroutes as a variant construction. Scalar-T
+    // is unaffected (its result is int/bool, so `ty.kind != .@"enum"` short-circuits).
     return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
-        b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null;
+        b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null and
+        optionResultMethodCallee(b, n) == null;
 }
 
 /// The `Method` a method call `recv.m(args)` dispatches to, or null when `n` is
@@ -2485,6 +2494,114 @@ fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index }
     if (bm.arity != 0) return null;
     if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
     return .{ .recv = cn.lhs };
+}
+
+/// A native inherent method call on a reified `Option`/`Result` instance (M23): the
+/// callee is a `field_access` NOT bound to a `.func`, the receiver types to a reified
+/// enum whose `native_family` is set (the robust per-instance key — a user `enum Option`
+/// mangles to the same `Option$int` yet has `.none`), and the member is one of the 8
+/// names. Returns the receiver node + the recognized op so `lowerCall` can inline the
+/// tag test / payload load (no `.call`, no external symbol — pure a-function-of-source,
+/// `--verify`-stable). Null when `n` is not such a call.
+const OptResultCall = struct { recv: Ast.Index, op: Typecheck.OptResultMethod };
+
+fn optionResultMethodCallee(b: *Builder, n: Ast.Node) ?OptResultCall {
+    const cn = b.in.tree.nodes[(n.lhs).int()];
+    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
+    const recv_ty = b.in.node_types[(cn.lhs).int()];
+    if (recv_ty.kind != .@"enum" or recv_ty.enum_id >= b.in.enum_layouts.len) return null;
+    const fam = b.in.enum_layouts[recv_ty.enum_id].native_family;
+    const member = b.in.tokens[cn.main_token].text(b.in.source);
+    const op = Typecheck.optionResultMethod(fam, member) orelse return null;
+    return .{ .recv = cn.lhs, .op = op };
+}
+
+/// Inline a native `Option`/`Result` method (M23). The receiver is materialized into a
+/// fresh slot (so a temporary construction receiver like `Option[int].some(40).unwrap()`
+/// works, not just a local), giving a base ptr for `get_tag` + the payload load. Variant
+/// 0 is the payload variant, 1 the absence/error (fixed by `registerPrelude`), so
+/// `tag == 0` means present. `is_some`/`is_ok` = `tag == 0`; `is_none`/`is_err` =
+/// `tag == 1`; `unwrap` cond-branches to a `.trap` on absence; `unwrap_or` merges the
+/// payload / the default through a join block-arg. Scalar-payload T only (the M23 accept
+/// set is int/bool); aggregate-payload T is deferred (the classifiers below already
+/// exclude native calls so it won't misroute as a variant construction).
+fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const recv_ty = b.in.node_types[(om.recv).int()];
+    const e = b.in.enum_layouts[recv_ty.enum_id];
+
+    // M23 ships scalar-payload `unwrap`/`unwrap_or` only: a non-scalar payload would
+    // truncate a str/aggregate to one 8-byte load, and an aggregate join block-arg
+    // crashes codegen (unassigned value offset). The checker already rejects this with
+    // T0018, so this is a defensive clean-fail should an aggregate reach `lower`.
+    switch (om.op) {
+        .unwrap, .unwrap_or => {
+            const pty = e.variants[0].field_types[0];
+            if (pty.kind != .int and pty.kind != .bool) {
+                try b.note(n.main_token, "unwrap on a non-scalar Option/Result payload is not yet supported");
+                return .none;
+            }
+        },
+        else => {},
+    }
+
+    const slot = try b.addSlot(recv_ty);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    try lowerExprInto(b, om.recv, base, recv_ty);
+    const tag = try b.emit(.{ .get_tag = base }, int_ty);
+
+    switch (om.op) {
+        .is_tag0, .is_tag1 => {
+            const k: i64 = if (om.op == .is_tag0) 0 else 1;
+            const kv = try b.emit(.{ .iconst = k }, int_ty);
+            return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = kv } }, bool_ty) };
+        },
+        .unwrap => {
+            const payload_ty = e.variants[0].field_types[0];
+            const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+            const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
+            const ok_blk = try b.addBlock();
+            const trap_blk = try b.addBlock();
+            const join = try b.addBlock();
+            const merge = try b.addParam(join, payload_ty);
+            b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
+            b.switchTo(ok_blk);
+            try brTo(b, join, .{ .value = try loadNativePayload(b, e, base) });
+            b.switchTo(trap_blk);
+            b.setTerm(.trap);
+            b.switchTo(join);
+            return .{ .value = merge };
+        },
+        .unwrap_or => {
+            const payload_ty = e.variants[0].field_types[0];
+            const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+            const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
+            const some_blk = try b.addBlock();
+            const none_blk = try b.addBlock();
+            const join = try b.addBlock();
+            const merge = try b.addParam(join, payload_ty);
+            b.setTerm(.{ .cond_br = .{ .cond = present, .t = some_blk, .f = none_blk } });
+            b.switchTo(some_blk);
+            try brTo(b, join, .{ .value = try loadNativePayload(b, e, base) });
+            b.switchTo(none_blk);
+            try brTo(b, join, .{ .value = operandValue(try lowerExpr(b, args[0])) });
+            b.switchTo(join);
+            return .{ .value = merge };
+        },
+    }
+}
+
+/// Load variant 0's (payload) single field from a reified `Option`/`Result` at `base`
+/// (M23): absolute offset `payload_off + variant0.offsets[0]`, typed by its field type.
+/// Scalar payload only; the M23 accept set is int/bool.
+fn loadNativePayload(b: *Builder, e: Typecheck.EnumLayout, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const payload_ty = e.variants[0].field_types[0];
+    const off = e.payload_off + e.variants[0].offsets[0];
+    const pa = try b.emit(.{ .field_addr = .{ .base = base, .off = off, .ty = payload_ty } }, int_ty);
+    return try b.emit(.{ .load = .{ .addr = pa, .ty = payload_ty } }, payload_ty);
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {

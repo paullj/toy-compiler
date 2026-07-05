@@ -556,6 +556,45 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
     return null;
 }
 
+/// A compiler-provided inherent method on the prelude `Option`/`Result` enums (M23):
+/// `is_tag0`/`is_tag1` are the two predicates (typed `bool`), `unwrap`/`unwrap_or` yield
+/// the payload type-arg (variant 0's payload). Like `builtinScalarMethod`, this is a pure
+/// recognizer with NO `t.methods`/`t.fns` entry — the checker types the call and `lower`
+/// inlines the tag test / payload load, so a native method never becomes a phantom table
+/// row (which would desync `names`/`sigs` and churn the method-count tests). The family's
+/// predicate NAMES differ (`is_some`/`is_none` vs `is_ok`/`is_err`) but both map to the
+/// same tag-0/tag-1 test; `unwrap`/`unwrap_or` are shared. Variant order is FIXED by
+/// `registerPrelude` (payload = index 0, absence/error = index 1).
+pub const OptResultMethod = enum { is_tag0, is_tag1, unwrap, unwrap_or };
+
+pub fn optionResultMethod(family: LayoutEngine.NativeEnumFamily, name: []const u8) ?OptResultMethod {
+    switch (family) {
+        .none => return null,
+        .option => {
+            if (std.mem.eql(u8, name, "is_some")) return .is_tag0;
+            if (std.mem.eql(u8, name, "is_none")) return .is_tag1;
+        },
+        .result => {
+            if (std.mem.eql(u8, name, "is_ok")) return .is_tag0;
+            if (std.mem.eql(u8, name, "is_err")) return .is_tag1;
+        },
+    }
+    if (std.mem.eql(u8, name, "unwrap")) return .unwrap;
+    if (std.mem.eql(u8, name, "unwrap_or")) return .unwrap_or;
+    return null;
+}
+
+/// The native-enum family of an `App` ctor (M23): `.option`/`.result` when `ctor` is the
+/// prelude Option/Result TEMPLATE id, else `.none`. The checker keys native-method
+/// recognition off this on an `.app` receiver during Pass C; a user `enum Option` shadow
+/// has its own distinct id (never equals the prelude template id), so the native path
+/// stays silent on it.
+pub fn optResultFamilyOf(model: *const Model, ctor: u32) LayoutEngine.NativeEnumFamily {
+    if (model.option_enum_id) |oid| if (oid == ctor) return .option;
+    if (model.result_enum_id) |rid| if (rid == ctor) return .result;
+    return .none;
+}
+
 /// Whether the ground type `recv` conforms to protocol `pid` (M13). A pure,
 /// thread-order-free linear scan over the frozen `model.conformances` by protocol id
 /// + `Type.eql` — the SAME determinism discipline `findMethod` uses, so bound
@@ -939,6 +978,16 @@ ord_protocol_id: ?u32 = null,
 /// universally nameable with no import. Null until `registerPrelude` runs.
 ordering_enum_id: ?u32 = null,
 
+/// The global enum ids of the prelude generic value enums `Option[T]`/`Result[T,E]`
+/// (M23), assigned in `registerPrelude` (the two AST-less generic TEMPLATE `EnumSym`s
+/// appended at the very end). They key native-method recognition: a `.app` receiver
+/// whose ctor equals one of these carries the compiler-provided `is_some`/`unwrap`/…
+/// inherent methods, and `reifyAppToEnum` stamps each reified instance's
+/// `native_family` off them. Null until `registerPrelude` runs (a prelude-less internal
+/// caller stays null, so the native path never fires there).
+option_enum_id: ?u32 = null,
+result_enum_id: ?u32 = null,
+
 /// The global protocol ids of the prelude arithmetic protocols `Add`/`Sub`/`Mul`/`Div`
 /// (M17), assigned in `registerPrelude` right after `Ord` in fixed append order (so
 /// Add=2, Sub=3, Mul=4, Div=5 — a pure function of source). Each maps one operator
@@ -1135,6 +1184,12 @@ pub const Model = struct {
     /// The prelude `Ordering` enum's global id (M16), or null if `registerPrelude` never
     /// ran. Reserved for downstream consumers that need the discriminant enum type.
     ordering_enum_id: ?u32,
+    /// The prelude `Option`/`Result` template enum ids (M23), or null if `registerPrelude`
+    /// never ran. `optResultFamilyOf` keys native inherent-method recognition off these on
+    /// an `.app` receiver; a null id denies the native path (a scalar/user enum reports
+    /// T0018) rather than miscompiling.
+    option_enum_id: ?u32,
+    result_enum_id: ?u32,
     /// The prelude arithmetic protocol ids (M17): `Add`/`Sub`/`Mul`/`Div`, or null if
     /// `registerPrelude` never ran. `conformsToArith` keys the `+`/`-`/`*`/`/` typing off
     /// the matching one; a null id denies conformance (-> T0028) rather than miscompiling.
@@ -1169,6 +1224,8 @@ fn buildModel(t: *Typecheck) Model {
         .eq_protocol_id = t.eq_protocol_id,
         .ord_protocol_id = t.ord_protocol_id,
         .ordering_enum_id = t.ordering_enum_id,
+        .option_enum_id = t.option_enum_id,
+        .result_enum_id = t.result_enum_id,
         .add_protocol_id = t.add_protocol_id,
         .sub_protocol_id = t.sub_protocol_id,
         .mul_protocol_id = t.mul_protocol_id,
@@ -2599,7 +2656,10 @@ fn reifyAppTo(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
             const mod = if (e.ctor_is_enum) t.enums.items[e.ctor].mod else t.structs.items[e.ctor].mod;
             _ = t.gphSelect(mod);
             const decl_node = if (e.ctor_is_enum) t.enums.items[e.ctor].decl_node else t.structs.items[e.ctor].decl_node;
-            try t.sink.emitCode(.T0017, t.byteOf(t.tree.nodes[decl_node.int()].main_token), "instantiation too deep: generic type nesting exceeds the depth limit");
+            // An AST-less prelude template (Option/Result) has decl_node == Ast.none; anchor
+            // the diagnostic at byte 0 rather than OOB-derefing the tree on maxInt(u32).
+            const at: u32 = if (decl_node == Ast.none) 0 else t.byteOf(t.tree.nodes[decl_node.int()].main_token);
+            try t.sink.emitCode(.T0017, at, "instantiation too deep: generic type nesting exceeds the depth limit");
             t.mono_depth_capped = true;
         }
         return Type.invalid; // NOT memoized: a re-entry re-bails + re-latches (quietly)
@@ -2683,6 +2743,15 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
         .name = name,
         .mod = tmpl.mod,
         .is_generic = false,
+        // Tag the reified instance by the PRELUDE template id (not the mangled name — a
+        // user `enum Option` would mangle to the same `Option$int`), so `lower` recognizes
+        // its native inherent methods per-instance (M23).
+        .native_family = if (t.option_enum_id != null and e.ctor == t.option_enum_id.?)
+            .option
+        else if (t.result_enum_id != null and e.ctor == t.result_enum_id.?)
+            .result
+        else
+            .none,
     });
     const src_variants = tmpl.variants;
     const variants = try t.gpa.alloc(VariantSym, src_variants.len);
@@ -3442,6 +3511,9 @@ fn decodeTemplateFields(t: *Typecheck) !void {
 fn decodeTemplateVariants(t: *Typecheck) !void {
     for (0..t.enums.items.len) |id| {
         if (!t.enums.items[id].is_generic) continue;
+        // The native prelude generic enums (Option/Result) are AST-less and already
+        // variant-decoded in `registerPrelude`; skip the AST deref (else OOB on Ast.none).
+        if (t.enums.items[id].decl_node == Ast.none) continue;
         _ = t.gphSelect(t.enums.items[id].mod);
         t.cur_generic_params = t.enums.items[id].generic_params;
         defer t.cur_generic_params = &.{};
@@ -3741,6 +3813,76 @@ fn registerPrelude(t: *Typecheck) !void {
     try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.bool });
     try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.str });
     try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.unit });
+
+    // Prelude generic value enums (M23): `enum Option[T] { some(T), none }` and
+    // `enum Result[T,E] { ok(T), err(E) }`, hand-built as generic TEMPLATES — the same
+    // shape `registerEnums` + `decodeTemplateVariants` produce for a source template, but
+    // AST-less (the prelude has no tree). Appended at the END of `registerPrelude` so their
+    // enum ids fall after every user enum + `Ordering` (a pure function of source), keeping
+    // reified ids / mangled names / derive units deterministic. Each variant's payload
+    // `field_types` are PATTERNS (`type_var(ord)`), grounded per reified instance by
+    // `substReify` in `reifyAppToEnum` exactly like a user template. `decl_node == Ast.none`
+    // marks them AST-less: `decodeTemplateVariants` skips them (variants are pre-decoded
+    // here) and the reify/layout poison-anchor paths tolerate none. The gpa-allocated slices
+    // (`generic_params`, `variants`, tuple `field_types`) free uniformly at teardown; variant
+    // `name`s + param literals are borrowed (never freed), as with `Ordering`. Variant order
+    // is FIXED (some=0/none=1, ok=0/err=1) — M24/M25 resolve `?` by variant ordinal.
+    const option_gparams = try t.gpa.alloc([]const u8, 1);
+    option_gparams[0] = "T";
+    const option_vars = try t.gpa.alloc(VariantSym, 2);
+    const option_some_ft = try t.gpa.alloc(Type, 1);
+    option_some_ft[0] = Type.typeVar(0);
+    option_vars[0] = .{ .name = "some", .form = .tuple, .field_types = option_some_ft };
+    option_vars[1] = .{ .name = "none", .form = .unit };
+    const option_id: u32 = @intCast(t.enums.items.len);
+    try t.enums.append(t.gpa, .{
+        .decl_node = Ast.none,
+        .name = "Option",
+        .mod = 0,
+        .pub_export = true,
+        .variants = option_vars,
+        .size = 0,
+        .@"align" = 8,
+        .state = .done,
+        .is_generic = true,
+        .generic_params = option_gparams,
+    });
+
+    const result_gparams = try t.gpa.alloc([]const u8, 2);
+    result_gparams[0] = "T";
+    result_gparams[1] = "E";
+    const result_vars = try t.gpa.alloc(VariantSym, 2);
+    const result_ok_ft = try t.gpa.alloc(Type, 1);
+    result_ok_ft[0] = Type.typeVar(0);
+    const result_err_ft = try t.gpa.alloc(Type, 1);
+    result_err_ft[0] = Type.typeVar(1);
+    result_vars[0] = .{ .name = "ok", .form = .tuple, .field_types = result_ok_ft };
+    result_vars[1] = .{ .name = "err", .form = .tuple, .field_types = result_err_ft };
+    const result_id: u32 = @intCast(t.enums.items.len);
+    try t.enums.append(t.gpa, .{
+        .decl_node = Ast.none,
+        .name = "Result",
+        .mod = 0,
+        .pub_export = true,
+        .variants = result_vars,
+        .size = 0,
+        .@"align" = 8,
+        .state = .done,
+        .is_generic = true,
+        .generic_params = result_gparams,
+    });
+
+    t.option_enum_id = option_id;
+    t.result_enum_id = result_id;
+
+    // Universally nameable with no import (the `Ordering`/`print` precedent): inject into
+    // every module's enum map, if-absent so a user `enum Option`/`Result` shadow wins.
+    for (t.graph.mods) |*m| {
+        if (m.enum_ids.get("Option") == null) try m.enum_ids.put(t.gpa, "Option", option_id);
+    }
+    for (t.graph.mods) |*m| {
+        if (m.enum_ids.get("Result") == null) try m.enum_ids.put(t.gpa, "Result", result_id);
+    }
 }
 
 /// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
@@ -4911,6 +5053,255 @@ test "M16: the prelude Ordering enum has variants lt=0/eq=1/gt=2 (the discrimina
         try testing.expectEqual(@as(u32, 8), el.size);
     }
     try testing.expect(found);
+}
+
+test "M23: prelude Option/Result are registered generic enum templates with the right variants" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn main() -> int { return 0 }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var opt: ?EnumLayout = null;
+    var res: ?EnumLayout = null;
+    for (c.result.enum_layouts) |el| {
+        if (std.mem.eql(u8, el.name, "Option")) opt = el;
+        if (std.mem.eql(u8, el.name, "Result")) res = el;
+    }
+    // `Option[T] { some(T), none }`: a tuple `some` (one type_var payload) then a unit `none`.
+    try testing.expect(opt != null);
+    try testing.expectEqual(@as(usize, 2), opt.?.variants.len);
+    try testing.expectEqualStrings("some", opt.?.variants[0].name);
+    try testing.expectEqual(VariantForm.tuple, opt.?.variants[0].form);
+    try testing.expectEqual(@as(usize, 1), opt.?.variants[0].field_types.len);
+    try testing.expect(opt.?.variants[0].field_types[0].isTypeVar());
+    try testing.expectEqualStrings("none", opt.?.variants[1].name);
+    try testing.expectEqual(VariantForm.unit, opt.?.variants[1].form);
+    // `Result[T,E] { ok(T), err(E) }`: two tuple variants whose payloads are distinct type_vars.
+    try testing.expect(res != null);
+    try testing.expectEqual(@as(usize, 2), res.?.variants.len);
+    try testing.expectEqualStrings("ok", res.?.variants[0].name);
+    try testing.expectEqualStrings("err", res.?.variants[1].name);
+    try testing.expectEqual(@as(u32, 0), res.?.variants[0].field_types[0].typeVarOrd());
+    try testing.expectEqual(@as(u32, 1), res.?.variants[1].field_types[0].typeVarOrd());
+}
+
+test "M23: Option[int] and Result[int,str] construct + match with no import; reify to concrete enums" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ x := Option[int].some(7)
+        \\ y := Result[int, str].ok(3)
+        \\ a := match x { .some(v) -> v, .none -> 0 }
+        \\ b := match y { .ok(v) -> v, .err(_) -> 0 }
+        \\ return a + b
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var opt_int = false;
+    var res_int_str = false;
+    for (c.result.enum_layouts) |el| {
+        if (std.mem.eql(u8, el.name, "Option$int")) opt_int = true;
+        if (std.mem.eql(u8, el.name, "Result$int$str")) res_int_str = true;
+    }
+    try testing.expect(opt_int);
+    try testing.expect(res_int_str);
+}
+
+test "M23: a user `enum Option` shadows the prelude (user-first-wins)" {
+    // The prelude injection into each module's enum map is if-absent, so a user decl keeps
+    // the name: `Option.red` here resolves to the USER enum's variants (the prelude Option
+    // has only `some`/`none` and needs a type arg — so a leak-through would NOT type-check).
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        \\enum Option { red, green }
+        \\fn main() -> int { return match Option.red { .red -> 42, .green -> 0 } }
+        \\
+    ));
+}
+
+/// The `Kind` a method call `recv.member(..)` typed to (single-module test helper), or
+/// null if no such call node is present. Scans for a `.call` over a `field_access` whose
+/// member token matches — used by the M23 native-method typing tests.
+fn methodCallKind(c: Checked, member: []const u8) ?Kind {
+    const nts = c.result.node_types[0];
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .call) continue;
+        const callee = c.tree.nodes[(n.lhs).int()];
+        if (callee.tag != .field_access) continue;
+        if (std.mem.eql(u8, c.tokens[callee.main_token].text(c.source), member)) return nts[i].kind;
+    }
+    return null;
+}
+
+test "M23: Option native methods type to bool (predicates) / T (unwrap) with zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ x := Option[int].some(7)
+        \\ p := x.is_some()
+        \\ q := x.is_none()
+        \\ u := x.unwrap()
+        \\ d := x.unwrap_or(0)
+        \\ if p { if q { return u } }
+        \\ return d
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_some").?);
+    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_none").?);
+    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap").?);
+    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap_or").?);
+}
+
+test "M23: Result native methods type to bool (predicates) / T (unwrap) with zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ x := Result[int, str].ok(7)
+        \\ p := x.is_ok()
+        \\ q := x.is_err()
+        \\ u := x.unwrap()
+        \\ d := x.unwrap_or(0)
+        \\ if p { if q { return u } }
+        \\ return d
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_ok").?);
+    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_err").?);
+    // `unwrap`/`unwrap_or` yield the FIRST type-arg (the `ok` payload), int here.
+    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap").?);
+    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap_or").?);
+}
+
+test "M23: unwrap_or with a wrong-typed default is exactly one diagnostic" {
+    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+        \\fn main() -> int {
+        \\ x := Option[int].some(7)
+        \\ return x.unwrap_or("s")
+        \\}
+        \\
+    ));
+}
+
+test "M23: a native predicate called with an argument is exactly one diagnostic (arity)" {
+    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+        \\fn main() -> int {
+        \\ x := Option[int].some(7)
+        \\ b := x.is_some(1)
+        \\ if b { return 1 }
+        \\ return 0
+        \\}
+        \\
+    ));
+}
+
+test "M23: an unknown method on Option is still exactly one T0018" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ x := Option[int].some(7)
+        \\ return x.frobnicate()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+}
+
+test "M23: a native method name on a user `enum Option` shadow is T0018, not the native path" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum Option { red, green }
+        \\fn main() -> int {
+        \\ a := Option.red
+        \\ return a.is_some()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+}
+
+test "M23: unwrap on a str (non-scalar) payload is deferred — exactly one T0018, no crash" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ x := Option[str].some("hi")
+        \\ s := x.unwrap()
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+}
+
+test "M23: unwrap_or on a str (non-scalar) payload is deferred — exactly one T0018" {
+    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+        \\fn main() -> int {
+        \\ x := Option[str].some("hi")
+        \\ s := x.unwrap_or("d")
+        \\ return 0
+        \\}
+        \\
+    ));
+}
+
+test "M23: unwrap on a struct payload is deferred — exactly one T0018, no crash" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ x := Option[P].some(P { x: 40 })
+        \\ p := x.unwrap()
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+}
+
+test "M23: unwrap_or on a struct payload is deferred — exactly one T0018, no crash" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ d := P { x: 2 }
+        \\ p := Option[P].none.unwrap_or(d)
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+}
+
+test "M23: predicates stay native for a non-scalar payload (tag-only, safe)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\ x := Option[P].some(P { x: 40 })
+        \\ b := x.is_some()
+        \\ if b { return 1 }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_some").?);
 }
 
 test "M16: `<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {

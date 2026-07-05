@@ -1,0 +1,19 @@
+# Feature: auto-derive falls out for free on reified `Option` instances (M23 + M19/M22). A
+# reified `Option[int]` / `Option[bool]` is a plain concrete enum, so structural `Display`
+# and `Eq` synthesize on demand with NO conditional-conformance machinery: `print(some(7))`
+# writes `some(7)`, `print(none)` writes `none`, and `==` on two equal `Option[int]`s is
+# true. Two distinct instances (`Option[int]` + `Option[bool]`) plus their derive units
+# exercise discovery-order sensitivity — the `-j1`==`-jN` determinism gate (diff.sh).
+# expect: stdout "some(7)\nnone\nequal"
+# expect: exit 0
+fn main() -> int {
+  a := Option[int].some(7)
+  b := Option[int].some(7)
+  print(a)
+  print("\n")
+  c := Option[bool].none
+  print(c)
+  print("\n")
+  if a == b { print("equal") }
+  return 0
+}

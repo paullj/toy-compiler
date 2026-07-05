@@ -1,0 +1,17 @@
+# Feature: compiler-provided inherent methods on the prelude `Option[T]`/`Result[T,E]`
+# enums (M23). `is_some`/`is_none`/`is_ok`/`is_err` are predicates (`bool`); `unwrap`
+# yields the payload (traps with `brk #0` on the absence/error variant); `unwrap_or`
+# yields the payload or a default. They are source-less native methods (no `t.methods`
+# entry, like the builtin scalar `eq`/`hash`): the checker types them via normal `x.m()`
+# dispatch and `lower` inlines the reified enum's tag test / payload load, so an unused
+# method name emits zero codegen. Scalar-payload T here (int).
+# expect: exit 42
+fn main() -> int {
+  a := Option[int].some(40)
+  base := if a.is_some() { a.unwrap_or(0) } else { 0 }   # 40
+  b := Option[int].none
+  extra := b.unwrap_or(2)                                 # 2
+  r := Result[int, str].ok(0)
+  ok := if r.is_ok() { 0 } else { 99 }                   # 0
+  return base + extra + ok                               # 42
+}
