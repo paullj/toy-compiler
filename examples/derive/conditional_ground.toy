@@ -1,0 +1,18 @@
+# Feature: M21 ground conditional conformance — `Box[int]` conforms to `Ord` AND `Eq`
+# directly (no generic fn in sight), because the recursive `conforms` query descends the
+# App's `int` field. A non-generic struct with a `Box[int]` FIELD compares too: its field
+# is an unreified `App` during Pass C, so the same query makes the outer struct conform
+# instead of wrongly rejecting it (previously a T0029/T0027).
+struct Box[T] { v: T }
+struct S { b: Box[int] }
+
+fn main() -> int {
+    a := Box[int]{ v: 1 }
+    b := Box[int]{ v: 42 }
+    lt := a < b
+    eq := a == a
+    s1 := S{ b: Box[int]{ v: 42 } }
+    s2 := S{ b: Box[int]{ v: 42 } }
+    return if lt && eq && s1 == s2 { b.v } else { 0 }
+}
+# expect: exit 42

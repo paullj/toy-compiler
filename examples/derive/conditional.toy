@@ -1,0 +1,20 @@
+# Feature: M21 conditional conformance — a generic `Box[T]` conforms to `Ord` iff `T`
+# does. `max2[T has Ord]` orders two `Box[T]` with `<`; the bound `T has Ord` discharges
+# `Box[T] has Ord` ONCE at the definition (no impl written), and each concrete instance
+# (`Box[int]`, `Box[Point]`) gets its `cmp` witness synthesized at the mono worklist.
+# NOTE: explicit `max2[int]`/`max2[Point]` — App-pattern function-call inference (matching
+# a `Box[T]` param against a `Box[int]` arg to infer T) is out of M21's scope, so the
+# type args are written explicitly (this deviates from the ROADMAP's literal e2e text).
+struct Box[T] { v: T }
+struct Point { x: int, y: int }
+
+fn max2[T has Ord](a: Box[T], b: Box[T]) -> Box[T] {
+    if a < b { b } else { a }
+}
+
+fn main() -> int {
+    r := max2[int](Box[int]{ v: 1 }, Box[int]{ v: 42 })
+    p := max2[Point](Box[Point]{ v: Point{ x: 40, y: 1 } }, Box[Point]{ v: Point{ x: 40, y: 2 } })
+    return if p.v.x + p.v.y == 42 { r.v } else { 0 }
+}
+# expect: exit 42
