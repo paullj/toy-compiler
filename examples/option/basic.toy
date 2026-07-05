@@ -1,0 +1,21 @@
+# Feature: `Option[T]` as a PRELUDE generic value enum (M23) — no import, no magic builtin
+# tier. `Option[T] { some(T), none }` is native-registered as an ordinary generic enum
+# template and monomorphized through the M6 reify path exactly like a user enum: the
+# instance `Option[int]` reifies to a plain concrete `enum_id` (8-byte tag + int payload).
+# It models absence with no `nil`/`null`: `find` returns `some(n)` when present, else the
+# nullary `none`, and `main` matches to unwrap the payload. The verbatim roadmap shape
+# `if n>0 { some } else { none }` does NOT compile (an if-expression arm gets no expected
+# type, so bare `Option.none` is uninferable — T0016), so use the working early-return form
+# (`return Option.some(n)`) with an explicit `Option[int].none` at the tail.
+# expect: exit 42
+fn find(n: int) -> Option[int] {
+  if n > 0 { return Option.some(n) }
+  return Option[int].none
+}
+
+fn main() -> int {
+  return match find(42) {
+    .some(v) -> v,
+    .none -> 0,
+  }
+}

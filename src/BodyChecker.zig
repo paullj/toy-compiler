@@ -1842,6 +1842,62 @@ pub const BodyChecker = struct {
                         bc.node_types[(node_idx).int()] = ret;
                         return ret;
                     }
+                    // A compiler-provided inherent method on the prelude `Option`/`Result`
+                    // enums (M23): recognized by ctor id, NOT a `t.methods` entry (source-
+                    // less, like the builtin scalar `eq`/`hash`), so `findGenericMethod`
+                    // misses above. `is_some`/`is_none`/`is_ok`/`is_err` -> bool (arity 0);
+                    // `unwrap` -> the payload type-arg (arity 0); `unwrap_or` -> the payload
+                    // type-arg (arity 1, default assignable to it). The receiver is an `App`
+                    // during Pass C (`e.args[0]` is the payload T); `lower` inlines the tag
+                    // test / payload load. Gated on `ctor_is_enum` (struct/enum ids share a
+                    // numeric space). An unknown member falls through to T0018 below.
+                    if (e.ctor_is_enum) {
+                        const fam = Typecheck.optResultFamilyOf(bc.model, e.ctor);
+                        if (Typecheck.optionResultMethod(fam, member)) |op| {
+                            const t_ty: Type = if (e.args.len >= 1) e.args[0] else .invalid;
+                            // Predicates are tag-only, so safe for any payload. `unwrap`/
+                            // `unwrap_or` carry the payload as ONE scalar value through
+                            // `lower` (M23), so only recognize them for a scalar (int/bool)
+                            // payload; a str/struct/enum payload falls through to the T0018
+                            // below — a clean rejection, since aggregate-payload unwrap is
+                            // deferred past M23 (a scalar load would truncate a fat/aggregate
+                            // value, and an aggregate join block-arg crashes codegen).
+                            const native_ok = switch (op) {
+                                .is_tag0, .is_tag1 => true,
+                                .unwrap, .unwrap_or => t_ty.kind == .int or t_ty.kind == .bool,
+                            };
+                            if (native_ok) switch (op) {
+                                .is_tag0, .is_tag1 => {
+                                    if (args.len != 0) {
+                                        for (args) |a| _ = try bc.typeOf(a);
+                                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                                    }
+                                    bc.node_types[(node_idx).int()] = Type.bool;
+                                    return Type.bool;
+                                },
+                                .unwrap => {
+                                    if (args.len != 0) {
+                                        for (args) |a| _ = try bc.typeOf(a);
+                                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                                    }
+                                    bc.node_types[(node_idx).int()] = t_ty;
+                                    return t_ty;
+                                },
+                                .unwrap_or => {
+                                    if (args.len != 1) {
+                                        for (args) |a| _ = try bc.typeOfExpected(a, null);
+                                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                                    } else {
+                                        const at = try bc.typeOfExpected(args[0], if (t_ty.kind == .invalid) null else t_ty);
+                                        if (!Type.assignable(t_ty, at))
+                                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(t_ty), bc.typeName(at) });
+                                    }
+                                    bc.node_types[(node_idx).int()] = t_ty;
+                                    return t_ty;
+                                },
+                            };
+                        }
+                    }
                     // A generic-type value with no such method (M10).
                     for (args) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });

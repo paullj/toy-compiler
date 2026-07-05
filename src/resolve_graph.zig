@@ -312,6 +312,16 @@ fn collectGlobals(g: *GraphResolve) !void {
     for (g.tables) |*t| {
         if (!t.enums.contains("Ordering")) try t.enums.put(g.gpa, "Ordering", true);
     }
+    // The prelude generic value enums `Option`/`Result` (M23) are likewise nameable in every
+    // module with no import (`Option.some(..)` / `Option[int].none` / a bare `.none` under a
+    // target). Register into each module's enum table UNLESS the module declares its own
+    // (user-first-wins), mirroring `Ordering`; Typecheck native-registers the enum itself.
+    for (g.tables) |*t| {
+        if (!t.enums.contains("Option")) try t.enums.put(g.gpa, "Option", true);
+    }
+    for (g.tables) |*t| {
+        if (!t.enums.contains("Result")) try t.enums.put(g.gpa, "Result", true);
+    }
 }
 
 /// Bind each module's import namespaces (last path segment, or the `as` alias) to

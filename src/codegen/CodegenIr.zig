@@ -585,6 +585,7 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
             try emitEpilogue(g);
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
+        .trap => try g.emit(Aarch64.brk0), // M23: abort with SIGILL (unwrap-on-none/err).
     }
 }
 

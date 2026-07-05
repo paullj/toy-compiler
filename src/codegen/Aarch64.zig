@@ -315,6 +315,11 @@ pub const ldpFpLrPost: u32 = 0xA8C17BFD;
 /// ret (returns to x30). → 0xD65F03C0.
 pub const ret: u32 = 0xD65F03C0;
 
+/// brk #0 — a software breakpoint that aborts with SIGILL (M23). The single instruction
+/// emitted for the `.trap` IR terminator (`Option`/`Result` `unwrap`'s failure arm); no
+/// other trap primitive exists on this backend. → 0xD4200000.
+pub const brk0: u32 = 0xD4200000;
+
 /// Materialize an arbitrary i64 `value` into register `rd` using the minimal
 /// movz + movk sequence, writing the words (little-endian) into `out` starting
 /// at `*len` and advancing it. At most 4 words. value 0 → a single
@@ -389,6 +394,7 @@ test "branch/system and frame constants" {
     try testing.expectEqual(@as(u32, 0x910003FD), movFpSp);
     try testing.expectEqual(@as(u32, 0xA8C17BFD), ldpFpLrPost);
     try testing.expectEqual(@as(u32, 0xD65F03C0), ret);
+    try testing.expectEqual(@as(u32, 0xD4200000), brk0); // brk #0
 }
 
 test "pc-relative data addressing + indirect call (M2)" {

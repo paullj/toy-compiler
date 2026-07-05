@@ -147,6 +147,16 @@ pub const Layout = struct {
 /// names), or a struct (named payload fields).
 pub const VariantForm = enum(u8) { unit, tuple, @"struct" };
 
+/// The prelude generic-enum family a reified concrete instance belongs to (M23), or
+/// `.none` for any user/ordinary enum. Set on a reified `Option[T]`/`Result[T,E]`
+/// instance (keyed off the prelude template id in `reifyAppToEnum`, NOT the name — a
+/// user `enum Option` mangles to the same `Option$int` yet is a distinct template) and
+/// copied through to its `EnumLayout`, so `lower` can recognize the compiler-provided
+/// `is_some`/`unwrap`/… inherent methods per-instance and inline the tag test / payload
+/// load. Never serialized (layouts are recomputed each typecheck), so adding it needs no
+/// content-cache version bump.
+pub const NativeEnumFamily = enum(u8) { none, option, result };
+
 /// A resolved enum layout: a value tagged union — an 8-byte tag at offset 0, then
 /// payload storage sized to the largest variant's payload at `payload_off`. Each
 /// variant carries its payload field types + payload-LOCAL offsets (relative to
@@ -166,6 +176,7 @@ pub const EnumLayout = struct {
     payload_off: u32,
     size: u32,
     @"align": u32,
+    native_family: NativeEnumFamily = .none,
 };
 
 /// A struct's resolved symbol: its decl node, name, and (after layout) per-field
@@ -235,6 +246,9 @@ pub const EnumSym = struct {
     /// Mirrors `StructSym.is_generic`/`generic_params`.
     is_generic: bool = false,
     generic_params: []const []const u8 = &.{},
+    /// See `NativeEnumFamily`: `.option`/`.result` on a reified prelude instance, else
+    /// `.none`. Set in `reifyAppToEnum`; copied into the snapshot `EnumLayout`.
+    native_family: NativeEnumFamily = .none,
 };
 
 /// Natural size/align of a scalar/str type (struct sizes come from the table).
@@ -435,7 +449,11 @@ pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
     const prev = env.gphSelect(env.ctx, env.enums.items[id].mod);
     defer _ = env.gphSelect(env.ctx, prev);
 
-    const at = env.byteOf(env.ctx, env.tree(env.ctx).nodes[env.enums.items[id].decl_node.int()].main_token);
+    // A reified prelude-enum instance (Option$int/Result$int$str) inherits decl_node ==
+    // Ast.none from its AST-less template; anchor the (poison-only) diagnostic at byte 0
+    // rather than OOB-derefing the tree on maxInt(u32). A concrete instance never poisons.
+    const decl_node = env.enums.items[id].decl_node;
+    const at: u32 = if (decl_node == Ast.none) 0 else env.byteOf(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
     const name = env.enums.items[id].name;
     const variants = env.enums.items[id].variants;
 
@@ -715,6 +733,7 @@ pub fn snapshotEnumLayouts(gpa: std.mem.Allocator, enums: []const EnumSym) ![]En
             .payload_off = e.payload_off,
             .size = e.size,
             .@"align" = e.@"align",
+            .native_family = e.native_family,
         };
         built += 1;
     }

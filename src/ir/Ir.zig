@@ -152,6 +152,12 @@ pub const Terminator = union(enum) {
     /// Function return. Emitted only by the single EXIT block; `.none` for unit.
     ret: Operand,
     @"unreachable",
+    /// An unconditional hardware trap (M23): codegen emits a single `brk #0`, aborting
+    /// the process with SIGILL. Distinct from `.@"unreachable"` (which emits NOTHING, a
+    /// fall-through preserving the `never` byte budget) so adding it churns no existing
+    /// never-typed FnCode. Terminates its block with no successors (like `ret`); used
+    /// only by `Option`/`Result` `unwrap`'s failure arm.
+    trap,
 };
 
 /// A basic block: a list of block params (the merge slots), straight-line
@@ -426,6 +432,7 @@ fn renderTerm(out: *std.Io.Writer, term: Terminator) anyerror!void {
             }
         },
         .@"unreachable" => try out.writeAll("  unreachable\n"),
+        .trap => try out.writeAll("  trap\n"),
     }
 }
 
