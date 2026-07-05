@@ -857,13 +857,12 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
                     return try b.emit(.{ .iconst = ord_eq }, Typecheck.Type.int);
                 },
             };
-            // The witness returns `Ordering`; its ret Sig carries that enum type (the ret_slot
-            // ABI + get_tag layout). A GENERIC-type instance (M10) reads it from the instance.
-            const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
-            const callee: Link.SymName = if (m.instance) |ii|
-                .{ .kind = .user_fn, .name = b.in.instances[ii].name }
-            else
-                b.in.names[m.fn_id];
+            // The witness returns `Ordering`; its ret carries that enum type (the ret_slot ABI
+            // + get_tag layout). A DERIVED `cmp` (M19, `fn_id == 0`) reads it from the recipe,
+            // a Mono instance (M10) from the instance, else the fn's own sig — all via
+            // `witnessRet`/`witnessCallee` (derive-first), so a source-less Ord witness resolves.
+            const ret_ty = witnessRet(b, m);
+            const callee: Link.SymName = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
             errdefer b.gpa.free(args);
             args[0] = try lowerExpr(b, lhs_node); // self, by value
@@ -928,7 +927,6 @@ fn lowerArithValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index,
 /// prefix of the other, the shorter is less; equal spans compare equal.
 fn lowerStrCmp(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
 
     const lhs_op = try lowerExpr(b, lhs_node);
     const rhs_op = try lowerExpr(b, rhs_node);
@@ -939,12 +937,24 @@ fn lowerStrCmp(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutO
         return try b.emit(.{ .iconst = ord_eq }, int_ty);
     }
 
-    // ptr@0 + len@8 of each {ptr,len} aggregate.
     const lbase = try b.emit(.{ .slot_addr = ls }, int_ty);
+    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
+    return strCmpAtPtrs(b, lbase, rbase);
+}
+
+/// Heap-free lexicographic 3-way str comparison given the ADDRESSES of two `{ptr@0, len@8}`
+/// headers (M19, factored out of `lowerStrCmp` mirroring `strEqAtPtrs`): the byte loop above,
+/// yielding an int discriminant (0=lt/1=eq/2=gt) through a join block param. Pure of source, so
+/// `--verify`-stable. Reused by the auto-derive Ord emitter for a `str` FIELD (base =
+/// `field_addr(self, off)`), where there is no slot to name — only an address.
+fn strCmpAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+
+    // ptr@0 + len@8 of each {ptr,len} aggregate.
     const lp = try b.emit(.{ .load = .{ .addr = lbase, .ty = int_ty } }, int_ty);
     const llen_addr = try b.emit(.{ .field_addr = .{ .base = lbase, .off = 8, .ty = int_ty } }, int_ty);
     const ll = try b.emit(.{ .load = .{ .addr = llen_addr, .ty = int_ty } }, int_ty);
-    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
     const rp = try b.emit(.{ .load = .{ .addr = rbase, .ty = int_ty } }, int_ty);
     const rlen_addr = try b.emit(.{ .field_addr = .{ .base = rbase, .off = 8, .ty = int_ty } }, int_ty);
     const rl = try b.emit(.{ .load = .{ .addr = rlen_addr, .ty = int_ty } }, int_ty);
@@ -1148,6 +1158,17 @@ fn witnessCallee(b: *Builder, m: Typecheck.Method) Link.SymName {
     return b.in.names[m.fn_id];
 }
 
+/// The ret type of a resolved conformance-witness `Method`: a source-less derive's recipe
+/// `ret` (M19 — a derived `cmp`/`eq` witness has `fn_id == 0`, which would otherwise mis-read
+/// `sigs[0].ret` and mis-size the ret_slot / `get_tag` layout), a Mono instance's ret, else
+/// the fn's own sig ret. Shared by every witness CALL that must size a ret_slot from the
+/// witness return type. `derive` is checked FIRST (mirroring `witnessCallee`).
+fn witnessRet(b: *Builder, m: Typecheck.Method) Typecheck.Type {
+    if (m.derive) |di| return b.in.derives[di].ret;
+    if (m.instance) |ii| return b.in.instances[ii].ret;
+    return b.in.sigs[m.fn_id].ret;
+}
+
 /// Struct/enum equality of two operands already MATERIALIZED into slots `lslot`/`rslot`
 /// (M18): resolve the `Eq` witness and call `witness(lslot, rslot) -> bool`, or (an
 /// Ord-only type: the Ord-refinement filled `(Eq,T)` but added no `eq` method) call the
@@ -1169,9 +1190,10 @@ fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.
     }
     switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", null)) {
         .one => |m| {
-            // `==` as `cmp(a,b) == Ordering.eq`: the witness returns `Ordering`, whose
-            // ret Sig carries the enum type (the ret_slot ABI + `get_tag` layout).
-            const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
+            // `==` as `cmp(a,b) == Ordering.eq`: the witness returns `Ordering`, whose ret
+            // carries the enum type (the ret_slot ABI + `get_tag` layout). A DERIVED `cmp`
+            // (M19, `fn_id == 0`) reads it from the recipe via `witnessRet` (derive-first).
+            const ret_ty = witnessRet(b, m);
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
             errdefer b.gpa.free(args);
@@ -1234,6 +1256,228 @@ fn deriveFieldEq(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Value
     }
 }
 
+/// Payload-enum structural `Eq` (M19): equal iff the discriminants match AND, for that
+/// variant, every payload field is equal. A `get_tag` compare gates a tag-dispatch ladder
+/// (fixed variant-decl order) where each variant's payload fields multiply-accumulate to a
+/// bool; every path delivers the bool through the join's merge param. Pure of `(layout,
+/// method table)` — a fixed walk handing ids monotonically — so a double-lower is identical.
+fn deriveEnumEq(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const e = b.in.enum_layouts[cty.enum_id];
+
+    const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
+    const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
+    const tags_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
+
+    const join = try b.addBlock();
+    const merge = try b.addParam(join, bool_ty);
+    const dispatch = try b.addBlock();
+    const false_blk = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = tags_eq, .t = dispatch, .f = false_blk } });
+
+    // Tags differ: not equal.
+    b.switchTo(false_blk);
+    const fv = try b.emit(.{ .bconst = false }, bool_ty);
+    try brTo(b, join, .{ .value = fv });
+
+    // Tags equal: dispatch on the (self) tag to compare that variant's payload for equality.
+    b.switchTo(dispatch);
+    for (e.variants, 0..) |_, vi| {
+        const last = vi + 1 == e.variants.len;
+        if (last) {
+            try emitVariantPayloadEq(b, e, vi, self_base, other_base, join);
+            break;
+        }
+        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
+        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = vk } }, bool_ty);
+        const body = try b.addBlock();
+        const next = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
+        b.switchTo(body);
+        try emitVariantPayloadEq(b, e, vi, self_base, other_base, join);
+        b.switchTo(next);
+    }
+
+    b.switchTo(join);
+    return merge;
+}
+
+/// The bool payload-equality of variant `vi` (at absolute payload offsets), delivered to
+/// `join`: `true` for an empty variant, else a multiply-accumulate over the payload fields.
+fn emitVariantPayloadEq(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, other_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const v = e.variants[vi];
+    if (v.field_types.len == 0) {
+        const tv = try b.emit(.{ .bconst = true }, bool_ty);
+        try brTo(b, join, .{ .value = tv });
+        return;
+    }
+    var acc = try b.emit(.{ .iconst = 1 }, int_ty);
+    for (v.field_types, v.offsets) |fty, poff| {
+        const feq = try deriveFieldEq(b, fty, e.payload_off + poff, self_base, other_base);
+        acc = try b.emit(.{ .mul = .{ .lhs = acc, .rhs = feq } }, int_ty);
+    }
+    const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+    const res = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = acc, .rhs = zero } }, bool_ty);
+    try brTo(b, join, .{ .value = res });
+}
+
+/// The branch-free 3-way discriminant (0=lt/1=eq/2=gt) of two int/bool VALUES:
+/// `(lhs > rhs) - (lhs < rhs) + 1`. Signed `icmp` is correct for int and for bool (0/1).
+fn threeWayInt(b: *Builder, lv: Ir.ValueId, rv: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const gt = try b.emit(.{ .icmp = .{ .cc = .gt, .lhs = lv, .rhs = rv } }, bool_ty);
+    const lt = try b.emit(.{ .icmp = .{ .cc = .lt, .lhs = lv, .rhs = rv } }, bool_ty);
+    const diff = try b.emit(.{ .sub = .{ .lhs = gt, .rhs = lt } }, int_ty);
+    const one = try b.emit(.{ .iconst = 1 }, int_ty);
+    return try b.emit(.{ .add = .{ .lhs = diff, .rhs = one } }, int_ty);
+}
+
+/// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of field `i` (at byte `off`, type
+/// `fty`) between the two receiver bases (M19): int/bool via the branch-free `threeWayInt`;
+/// `str` via the `{ptr,len}` lexicographic byte-loop (`strCmpAtPtrs`); a struct/enum field is
+/// copied into fresh temp slots then routed through `cmpAtSlots`. Unit fields are rejected by
+/// T0007, so never occur. Mirrors `deriveFieldEq`.
+fn deriveFieldCmp(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    switch (fty.kind) {
+        .int, .bool => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
+            return try threeWayInt(b, lv, rv);
+        },
+        .str => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            return try strCmpAtPtrs(b, la, ra);
+        },
+        .@"struct", .@"enum" => {
+            const lslot = try b.addSlot(fty);
+            const ld = try b.emit(.{ .slot_addr = lslot }, int_ty);
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = ld, .src = la, .ty = fty } }, null);
+            const rslot = try b.addSlot(fty);
+            const rd = try b.emit(.{ .slot_addr = rslot }, int_ty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = rd, .src = ra, .ty = fty } }, null);
+            return try cmpAtSlots(b, fty, lslot, rslot);
+        },
+        else => {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: unsupported field type in lower" });
+            b.had_error = true;
+            return try b.emit(.{ .iconst = ord_eq }, int_ty);
+        },
+    }
+}
+
+/// The int 3-way `Ord` discriminant of two operands already MATERIALIZED into slots (M19):
+/// resolve the `cmp` witness, call `cmp(lslot, rslot) -> Ordering`, and `get_tag` its result.
+/// The slot-operand sibling of `lowerCmpDiscriminant`, so the auto-derive Ord emitter's
+/// aggregate FIELD path stays in lockstep with the top-level `<`. Ret sized via `witnessRet`
+/// (a DERIVED `cmp` witness has `fn_id == 0`). Returns an int value.
+fn cmpAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", null)) {
+        .one => |m| {
+            const ret_ty = witnessRet(b, m);
+            const callee = witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 2);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = lslot };
+            args[1] = .{ .slot = rslot };
+            const ord_slot = try b.addSlot(ret_ty);
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = ord_slot } }, null);
+            const base = try b.emit(.{ .slot_addr = ord_slot }, Typecheck.Type.int);
+            return try b.emit(.{ .get_tag = base }, Typecheck.Type.int);
+        },
+        .none, .ambiguous => {
+            // The synthesis barrier proved every aggregate field conforms before emitting
+            // this unit, so a miss here is an internal invariant break — note-and-drop.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: no cmp witness for an aggregate field in lower" });
+            b.had_error = true;
+            return try b.emit(.{ .iconst = ord_eq }, Typecheck.Type.int);
+        },
+    }
+}
+
+/// Emit a lexicographic short-circuit chain over `ftys` (at `base_off + offs[i]`), delivering
+/// the deciding 3-way discriminant to `join` (M19): the FIRST non-`eq` field decides; a tie
+/// falls through to the next; the LAST field's cmp is the answer regardless. An empty field
+/// list delivers `eq`. Reused for a struct (base_off 0) and a variant payload (base_off =
+/// `payload_off`). Pure of `(layout, method table)`, so `--verify`-stable.
+fn deriveLexChain(b: *Builder, ftys: []const Typecheck.Type, offs: []const u32, base_off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    if (ftys.len == 0) {
+        const eqc = try b.emit(.{ .iconst = ord_eq }, int_ty);
+        try brTo(b, join, .{ .value = eqc });
+        return;
+    }
+    for (ftys, offs, 0..) |fty, off, i| {
+        const c = try deriveFieldCmp(b, fty, base_off + off, self_base, other_base);
+        if (i + 1 == ftys.len) {
+            // Last field: its cmp is the whole answer whether eq or not.
+            try brTo(b, join, .{ .value = c });
+            return;
+        }
+        const eqk = try b.emit(.{ .iconst = ord_eq }, int_ty);
+        const is_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = c, .rhs = eqk } }, bool_ty);
+        const cont = try b.addBlock();
+        const decide = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = is_eq, .t = cont, .f = decide } });
+        // decide: this field's cmp decides the ordering.
+        b.switchTo(decide);
+        try brTo(b, join, .{ .value = c });
+        // cont: fields so far tied; keep comparing.
+        b.switchTo(cont);
+    }
+}
+
+/// Payload-enum structural `Ord` (M19): compare discriminants (case-declaration order) first;
+/// on equal tag compare that variant's payload lexicographically — the SE-0266 total order.
+/// Delivers the deciding 3-way discriminant to `join`. A tag-dispatch ladder (fixed
+/// variant-decl order) mirrors `deriveEnumEq`.
+fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const e = b.in.enum_layouts[cty.enum_id];
+
+    const st = try b.emit(.{ .get_tag = self_base }, int_ty);
+    const ot = try b.emit(.{ .get_tag = other_base }, int_ty);
+    const tag_disc = try threeWayInt(b, st, ot);
+    const tags_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = st, .rhs = ot } }, bool_ty);
+
+    const dispatch = try b.addBlock();
+    const tag_decide = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = tags_eq, .t = dispatch, .f = tag_decide } });
+
+    // Tags differ: the tag ordering decides.
+    b.switchTo(tag_decide);
+    try brTo(b, join, .{ .value = tag_disc });
+
+    // Tags equal: dispatch on the (self) tag to compare that variant's payload.
+    b.switchTo(dispatch);
+    for (e.variants, 0..) |v, vi| {
+        const last = vi + 1 == e.variants.len;
+        if (last) {
+            try deriveLexChain(b, v.field_types, v.offsets, e.payload_off, self_base, other_base, join);
+            break;
+        }
+        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
+        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = st, .rhs = vk } }, bool_ty);
+        const body = try b.addBlock();
+        const next = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
+        b.switchTo(body);
+        try deriveLexChain(b, v.field_types, v.offsets, e.payload_off, self_base, other_base, join);
+        b.switchTo(next);
+    }
+}
+
 /// Lower a SOURCE-LESS auto-derive `Eq` unit (M18): the spike's layout-walking emitter.
 /// Two params (the two receiver values, by slot), a single straight-line
 /// multiply-accumulate over the struct's fields (`acc *= field_eq`, then
@@ -1288,10 +1532,21 @@ pub fn lowerDeriveEq(
             break :blk try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = acc, .rhs = zero } }, bool_ty);
         },
         .@"enum" => blk: {
-            // Empty-payload enum: equal iff the discriminants match (`get_tag` at off 0).
-            const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
-            const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
-            break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
+            const e = b.in.enum_layouts[cty.enum_id];
+            var any_payload = false;
+            for (e.variants) |v| if (v.field_types.len != 0) {
+                any_payload = true;
+                break;
+            };
+            if (!any_payload) {
+                // Empty-payload enum: equal iff the discriminants match (`get_tag` at off 0).
+                const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
+                const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
+                break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
+            }
+            // Payload enum (M19): equal iff the tags match AND, for that variant, every
+            // payload field is equal. The tag-dispatch ladder + join deliver the bool.
+            break :blk try deriveEnumEq(&b, cty, self_base, other_base);
         },
         else => blk: {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
@@ -1302,6 +1557,80 @@ pub fn lowerDeriveEq(
     };
 
     if (!b.termSet()) try brTo(&b, exit, .{ .value = result });
+    return try finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
+/// Lower a SOURCE-LESS auto-derive `Ord` unit (M19): a layout-walking emitter returning the
+/// prelude `Ordering` value. Two params (the two receivers, by slot). A shared `join` block
+/// carries the deciding 3-way discriminant; a struct emits a lexicographic short-circuit chain
+/// over its fields (declaration order), a payload enum compares discriminants then the equal
+/// variant's payload lexicographically (SE-0266 total order). At `join` the discriminant is
+/// stored as the `Ordering` value's tag (offset 0) and returned via the exit param (aggregate
+/// sret ABI, exactly as a user `-> Ordering` cmp). PURE of `(recipe, layouts, method table)`:
+/// a fixed walk handing out ids monotonically, reading no map — a double-lower is identical.
+pub fn lowerDeriveOrd(
+    gpa: std.mem.Allocator,
+    in: Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const cty = d.conform_ty;
+    const ord_ty = d.ret; // the prelude `Ordering` enum
+
+    var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = ord_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    // Two params, both the conforming type, by slot (self, other).
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_self = try b.addSlot(cty);
+    try params.append(gpa, p_self);
+    const p_other = try b.addSlot(cty);
+    try params.append(gpa, p_other);
+
+    // entry (b0) + the single EXIT block whose one param is the `Ordering` return (mirrors
+    // `lowerFn`'s scaffold; an aggregate ret rides the exit param via the sret ABI).
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, ord_ty);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
+    const other_base = try b.emit(.{ .slot_addr = p_other }, int_ty);
+
+    // A shared join whose one int param is the deciding 3-way discriminant. Every decision
+    // path branches here; the discriminant IS the `Ordering` tag (lt=0/eq=1/gt=2).
+    const join = try b.addBlock();
+    const disc = try b.addParam(join, int_ty);
+
+    switch (cty.kind) {
+        .@"struct" => {
+            const layout = b.in.layouts[cty.struct_id];
+            try deriveLexChain(&b, layout.field_types, layout.offsets, 0, self_base, other_base, join);
+        },
+        .@"enum" => try deriveEnumCmp(&b, cty, self_base, other_base, join),
+        else => {
+            // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: unsupported conform type in lower" });
+            b.had_error = true;
+            const eqc = try b.emit(.{ .iconst = ord_eq }, int_ty);
+            try brTo(&b, join, .{ .value = eqc });
+        },
+    }
+
+    // join: materialize the `Ordering` value (its tag = the discriminant, stored @0) and
+    // return it through the exit param.
+    b.switchTo(join);
+    const ord_slot = try b.addSlot(ord_ty);
+    const ord_addr = try b.emit(.{ .slot_addr = ord_slot }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = ord_addr, .val = disc, .ty = int_ty } }, null);
+    if (!b.termSet()) try brTo(&b, exit, .{ .slot = ord_slot });
+
     return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
@@ -3110,6 +3439,42 @@ test "M16: Ord refines Eq — `!=` on an Ord-only struct lowers via a cmp call +
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp ne") != null); // discriminant != ord_eq(1)
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
+}
+
+test "M19: derivable struct `<` lowers to the derived cmp call + get_tag + `icmp eq`" {
+    const gpa = testing.allocator;
+    // No `impl P has Ord` — the checker records a derive request and the barrier synthesizes
+    // `Ord$cmp$s0`; `p < q` resolves the DERIVED cmp witness (fn_id==0) and calls it.
+    const ir = try renderLoweredG(gpa,
+        \\struct P { x: int }
+        \\fn use_lt(p: P, q: P) -> bool { p < q }
+        \\
+    , "use_lt");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "call @Ord$cmp$s0") != null); // the derived witness
+    try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null); // read the Ordering tag
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null); // discriminant == ord_lt(0)
+    try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
+}
+
+test "M19: `==` on a derivable-Ord struct lowers via the derived cmp call + `icmp eq`" {
+    const gpa = testing.allocator;
+    // `<` derives Ord, which fills `(Eq, P)`; `==` then routes through the same derived cmp
+    // (no separate Eq witness) — the M16 refinement path over a SOURCE-LESS witness.
+    const ir = try renderLoweredG(gpa,
+        \\struct P { x: int }
+        \\fn use_both(p: P, q: P) -> int {
+        \\ if p < q { return 1 }
+        \\ if p == q { return 2 }
+        \\ return 0
+        \\}
+        \\
+    , "use_both");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "call @Ord$cmp$s0") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "Eq$eq$") == null); // no separate Eq unit referenced
 }
 
 const add_impl_src =

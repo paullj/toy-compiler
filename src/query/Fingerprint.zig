@@ -210,6 +210,7 @@ pub fn deriveFingerprint(
             .inline_kind => {},
             .eq_call => |n| AstWalk.updateLeaf(&h, n),
             .cmp_eq => |n| AstWalk.updateLeaf(&h, n),
+            .cmp_call => |n| AstWalk.updateLeaf(&h, n),
         }
     }
     return h.final();
@@ -737,6 +738,22 @@ test "deriveFingerprint: identical recipe hashes identically (cache hit) + struc
     // conform.kind marker separates the two id spaces).
     const en = TouchedType{ .kind = .@"enum", .layout = "P\x00x" };
     try testing.expect(deriveFingerprint("Eq", .eq, cf, &w) != deriveFingerprint("Eq", .eq, en, &w));
+}
+
+test "deriveFingerprint M19: an Ord recipe's key differs by kind and flips on a cmp_call swap" {
+    const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
+    // Same protocol name + layout + a scalar witness, but `.eq` vs `.ord` kind: the kind
+    // marker separates the two units (an `Eq$eq$s0` and an `Ord$cmp$s0` never alias).
+    const eq_key = deriveFingerprint("Eq", .eq, cf, &.{.inline_kind});
+    const ord_key = deriveFingerprint("Ord", .ord, cf, &.{.inline_kind});
+    try testing.expect(eq_key != ord_key);
+    // An Ord recipe's aggregate field carries a `cmp_call` witness; a witness-SymName swap
+    // (the field gained an explicit `impl has Ord`) flips the key so no stale blob serves.
+    const w1 = [_]Derive.FieldEq{.{ .cmp_call = "Ord$cmp$s1" }};
+    const w2 = [_]Derive.FieldEq{.{ .cmp_call = "main.Inner.cmp" }};
+    try testing.expect(deriveFingerprint("Ord", .ord, cf, &w1) != deriveFingerprint("Ord", .ord, cf, &w2));
+    // Identical Ord recipe hashes identically (cache hit).
+    try testing.expectEqual(deriveFingerprint("Ord", .ord, cf, &w1), deriveFingerprint("Ord", .ord, cf, &w1));
 }
 
 test "conformance fold (e) M14: empty protocol-args is byte-identical to a pre-M14 fold" {

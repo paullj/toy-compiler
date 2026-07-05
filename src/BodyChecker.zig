@@ -542,7 +542,7 @@ pub const BodyChecker = struct {
                         // or a `[T has Ord]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (bc.conformsToOrd(lt)) {
+                        } else if (try bc.conformsToOrd(lt)) {
                             break :blk Type.@"bool";
                         } else {
                             try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.typeName(lt) });
@@ -2114,19 +2114,31 @@ pub const BodyChecker = struct {
         return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa);
     }
 
-    /// Whether `t` conforms to the prelude `Ord` protocol (M16) — the predicate the
+    /// Whether `t` conforms to the prelude `Ord` protocol (M16/M19) — the predicate the
     /// `<`/`>`/`<=`/`>=` operator typing uses. Mirrors `conformsToEq`: a concrete type
     /// resolves via the frozen conformance table (`findConformance` covers the int/str/bool
     /// prelude conformances AND every user `impl T has Ord`); a `type_var` in a bounded
-    /// generic body conforms as-axiom when its declared bound IS `Ord`. A prelude-less caller
+    /// generic body conforms as-axiom when its declared bound IS `Ord`. M19: after those
+    /// misses, a struct/enum whose fields all conform to `Ord` with NO explicit impl conforms
+    /// STRUCTURALLY — record the derive request (so the serial barrier synthesizes the
+    /// source-less `cmp`, which ALSO fills the single `(Eq, T)` slot) and return true. Now
+    /// fallible (`conforms` + the request record allocate). A prelude-less caller
     /// (`ord_protocol_id == null`) denies conformance, so the operator emits T0027.
-    fn conformsToOrd(bc: *const BodyChecker, t: Type) bool {
+    fn conformsToOrd(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
         const ord_pid = bc.model.ord_protocol_id orelse return false;
         if (Typecheck.findConformance(bc.model, ord_pid, t, &.{})) return true;
         if (t.isTypeVar()) {
             const ord = t.typeVarOrd();
             if (ord >= bc.bound_protocols.len) return false;
             return (bc.bound_protocols[ord] orelse return false) == ord_pid;
+        }
+        switch (t.kind) {
+            .@"struct", .@"enum" => {},
+            else => return false,
+        }
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, ord_pid, &bc.conforms_memo, bc.gpa)) {
+            try bc.recordDeriveReq(ord_pid, t);
+            return true;
         }
         return false;
     }

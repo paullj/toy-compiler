@@ -1,7 +1,7 @@
-enum E { A(int), B }
+protocol Doubler { fn dbl(self) -> int }
+
+fn bad[T has Doubler](a: T, b: T) -> bool { a == b }  #~ ERROR [T0026] requires an 'Eq' impl
 
 fn main() -> int {
-    p := E.B
-    q := E.B
-    return if p == q { 1 } else { 0 }  #~ ERROR [T0026] requires an 'Eq' impl
+    return 0
 }

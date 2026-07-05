@@ -1,0 +1,16 @@
+# Feature: structural `Eq` derive now reaches PAYLOAD-carrying enums (M19 closes the M18
+# gap). Two enum values are equal iff their discriminants match AND, for that variant, every
+# payload field is equal. No source impl, no `derive` keyword. Here `A(3) == A(3)` (equal
+# tag + equal payload), `A(3) != A(4)` (equal tag, payload differs), and `A(_) != B` (tags
+# differ) — all via the synthesized field-by-field `eq`.
+enum E { A(int), B }
+
+fn main() -> int {
+    r := 0
+    if E.A(3) == E.A(3) { r = r + 10 }      # equal tag + payload
+    if E.A(3) != E.A(4) { r = r + 16 }      # equal tag, payload differs
+    if E.A(3) != E.B { r = r + 16 }         # differing tags
+    if E.B == E.B { r = r + 0 }             # empty variant equal
+    return r
+}
+# expect: exit 42

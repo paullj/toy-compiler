@@ -617,7 +617,11 @@ pub fn CallVisitor(comptime Frozen: type) type {
             if (m.derive) |di| {
                 if (di < self.frozen.derives.len) {
                     const dv = &self.frozen.derives[di];
-                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = dv.name, .params = dv.params, .ret = Typecheck.Type.bool });
+                    // Fold the recipe's TRUE ret (`bool` for an Eq derive, `Ordering` for an
+                    // Ord derive) rather than a hardcoded bool, so an Ord-derive witness folds
+                    // its real sig. The mangled name already disambiguates, so this is
+                    // correctness-neutral — done for cleanliness.
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = dv.name, .params = dv.params, .ret = dv.ret });
                 }
                 return;
             }

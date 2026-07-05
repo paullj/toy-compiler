@@ -693,9 +693,10 @@ pub fn renderGraphIr(
         first = false;
     }
 
-    // Render each SOURCE-LESS auto-derive unit (M18) via the layout-walking emitter, in
+    // Render each SOURCE-LESS auto-derive unit (M18/M19) via the layout-walking emitter, in
     // canonical order — the same units codegen lowers, so `--emit ir` shows exactly one
-    // `Eq$eq$…` unit per derived type (the zero-codegen / override proofs read this).
+    // `Eq$eq$…`/`Ord$cmp$…` unit per derived type (the zero-codegen / override proofs read
+    // this). Dispatch on the recipe kind, mirroring `Engine.lowerSynthetic`.
     for (tc.derives) |d| {
         const m = &graph.modules[d.mod];
         const sym = Link.SymName{ .kind = .user_fn, .name = d.name };
@@ -708,13 +709,16 @@ pub fn renderGraphIr(
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,
-            .sig = .{ .kind = .user_fn, .name = d.name, .params = d.params, .ret = Typecheck.Type.@"bool" },
+            .sig = .{ .kind = .user_fn, .name = d.name, .params = d.params, .ret = d.ret },
             .instances = tc.instances,
             .sigs = tc.sigs,
             .methods = tc.methods,
             .derives = tc.derives,
         };
-        var func = try lower.lowerDeriveEq(gpa, in, d, sym, &diags);
+        var func = switch (d.kind) {
+            .eq => try lower.lowerDeriveEq(gpa, in, d, sym, &diags),
+            .ord => try lower.lowerDeriveOrd(gpa, in, d, sym, &diags),
+        };
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);

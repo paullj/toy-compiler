@@ -21,13 +21,14 @@ const Type = @import("../layout/Engine.zig").Type;
 /// Which derive this recipe carries. Append-only (mirrors `Token.Tag`/`Node.Tag`
 /// discipline): M19 adds `.ord`, M20 `.hash`, M22 `.display`. The ordinal folds into
 /// the mangled name + the sort key, so it must stay stable.
-pub const Kind = enum(u8) { eq };
+pub const Kind = enum(u8) { eq, ord };
 
 /// The method a `Kind` synthesizes (a pure function of the kind). Used for the
-/// mangled name segment; `Eq` derives an `eq` method.
+/// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method.
 pub fn methodName(k: Kind) []const u8 {
     return switch (k) {
         .eq => "eq",
+        .ord => "cmp",
     };
 }
 
@@ -46,6 +47,10 @@ pub const FieldEq = union(enum) {
     /// An Ord-only aggregate field: no `eq` witness, but a `cmp` witness exists — call
     /// `cmp(field_self, field_other)`, read the returned `Ordering` tag, compare `== eq`.
     cmp_eq: []const u8,
+    /// An aggregate (struct / enum) field of an `Ord` derive with a `cmp` witness (M19):
+    /// call `cmp(field_self, field_other)`, read the returned `Ordering` tag, and use it as
+    /// the 3-way field discriminant in the lexicographic chain. Append-only (ordinal 3).
+    cmp_call: []const u8,
 };
 
 /// One authorized structural-derive recipe. `field_witnesses`, `params`, and `name`
@@ -59,6 +64,12 @@ pub const Derive = struct {
     kind: Kind,
     /// The ground concrete type this derives the protocol for (a `structT`/`enumT`).
     conform_ty: Type,
+    /// The synthetic method's return type: `bool` for an `Eq` derive, the prelude
+    /// `Ordering` enum for an `Ord` derive (M19). The emitter types its ret slot / exit
+    /// param from this, and a witness-ret lookup reads it for a DERIVED `cmp` field (whose
+    /// `fn_id == 0` would otherwise mis-read `sigs[0].ret`). A pure function of `kind`, so
+    /// it is not folded into the derive fingerprint (kind already discriminates the key).
+    ret: Type = .{ .kind = .invalid },
     /// Per struct field (in layout/field order) / empty for an empty-payload enum:
     /// the resolved field-eq recipe. OWNED outer slice.
     field_witnesses: []const FieldEq = &.{},
@@ -151,6 +162,20 @@ test "mangle is distinct per (protocol, kind, type)" {
     try testing.expect(!std.mem.eql(u8, a, b));
 }
 
+test "M19: mangle distinguishes Ord `cmp` from Eq `eq` per (kind, type)" {
+    const gpa = testing.allocator;
+    const oe = try mangle(gpa, "Ord", .ord, Type.enumT(0));
+    defer gpa.free(oe);
+    try testing.expectEqualStrings("Ord$cmp$e0", oe);
+    const os = try mangle(gpa, "Ord", .ord, Type.structT(0));
+    defer gpa.free(os);
+    try testing.expectEqualStrings("Ord$cmp$s0", os);
+    // The Ord `cmp` name is disjoint from the Eq `eq` name for the same struct id.
+    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
+    defer gpa.free(es);
+    try testing.expect(!std.mem.eql(u8, os, es));
+}
+
 test "lessThan is a total canonical order (protocol, kind, enum-flag, id)" {
     const s0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
     const s1 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(1) };
@@ -163,6 +188,14 @@ test "lessThan is a total canonical order (protocol, kind, enum-flag, id)" {
     // antisymmetry / irreflexivity.
     try testing.expect(!lessThan({}, s0, s0));
     try testing.expect(!lessThan({}, e0, e0));
+}
+
+test "M19: lessThan orders eq-kind before ord-kind for the same protocol/type" {
+    // Same protocol id + same type; the kind ordinal (eq=0 < ord=1) is the tiebreaker.
+    const eq0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
+    const ord0 = Derive{ .protocol_id = 0, .protocol_name = "Ord", .kind = .ord, .conform_ty = Type.structT(0) };
+    try testing.expect(lessThan({}, eq0, ord0));
+    try testing.expect(!lessThan({}, ord0, eq0));
 }
 
 test "writeKey is injective across kind/enum-flag/id" {
@@ -179,4 +212,9 @@ test "writeKey is injective across kind/enum-flag/id" {
     defer c.deinit(gpa);
     try writeKey(gpa, &c, 0, .eq, Type.structT(0));
     try testing.expectEqualSlices(u8, a.items, c.items); // same recipe => same key
+    // M19: the same (protocol, type) under distinct kinds (eq vs ord) key distinctly.
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(gpa);
+    try writeKey(gpa, &d, 0, .ord, Type.structT(0));
+    try testing.expect(!std.mem.eql(u8, a.items, d.items));
 }

@@ -1,0 +1,14 @@
+# Feature: structural `Ord` auto-derive (M19). A struct whose fields all conform to `Ord`
+# gets `<`/`>`/`<=`/`>=` with ZERO source impl — the compiler synthesizes a source-less
+# three-way `cmp` on demand. The order is LEXICOGRAPHIC BY FIELD DECLARATION ORDER: `x`
+# ties (1 == 1), so `y` decides (0 < 5) and `a < b` is true. (Reordering the fields would
+# silently change the ordering — see docs/typesystem.md.) A derived `Ord` also fills `Eq`,
+# so `==`/`!=` work too, with NO separate synthetic unit.
+struct P { x: int, y: int }
+
+fn main() -> int {
+    a := P{ x: 1, y: 0 }
+    b := P{ x: 1, y: 5 }
+    return if a < b { 42 } else { 0 }
+}
+# expect: exit 42
