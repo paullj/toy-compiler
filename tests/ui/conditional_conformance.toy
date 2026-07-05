@@ -1,0 +1,15 @@
+# M21 negative: an abstract `Box[T]` cannot discharge `Ord` from a bound that does not
+# supply it. `bad` bounds `T has Doubler` (a custom protocol, not `Ord`), so `a < b` on
+# `Box[T]` fails: the recursive `conforms` query reduces `Box[T]` to `T`, and `T`'s axiom
+# is `Doubler != Ord`. The innermost-failure diagnostic names the offending param `T`.
+protocol Doubler {
+    fn dbl(self) -> int
+}
+
+struct Box[T] { v: T }
+
+fn bad[T has Doubler](a: Box[T], b: Box[T]) -> bool { a < b }  #~ ERROR [T0027] requires an 'Ord' impl for type 'T'
+
+fn main() -> int {
+    return 0
+}

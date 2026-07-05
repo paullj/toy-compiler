@@ -570,6 +570,20 @@ pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args:
     return false;
 }
 
+/// Whether `pid` is one of the three structurally-derivable prelude protocols
+/// (Eq/Ord/Hash) — the only protocols a struct/enum can satisfy WITHOUT an explicit
+/// `impl` (M18-M20). A custom/parameterized protocol always requires an impl, so a bound
+/// on one is never discharged structurally. Gates the M21 structural bound-resolution
+/// fallback in `enqueueInstance` (a `[T has Ord]` bound satisfied by a derive-only struct).
+fn isDerivableProtocol(model: *const Model, pid: u32) bool {
+    inline for (.{ model.eq_protocol_id, model.ord_protocol_id, model.hash_protocol_id }) |maybe| {
+        if (maybe) |p| {
+            if (p == pid) return true;
+        }
+    }
+    return false;
+}
+
 /// A recorded derive request (M18): "type `conform_ty` should structurally derive
 /// protocol `protocol_id`". A trivially-copyable POD (no owned data) so a per-checker
 /// list moves out by value and the fn-id-ordered merge is a plain concat + dedup — the
@@ -604,12 +618,60 @@ pub fn conforms(
     pid: u32,
     memo: *std.AutoHashMapUnmanaged(u64, bool),
     gpa: std.mem.Allocator,
+    composite: *Composite,
+    bound_protocols: []const ?u32,
 ) error{OutOfMemory}!bool {
     switch (recv.kind) {
         .@"struct", .@"enum" => {},
+        .type_var => {
+            // Conditional conformance (M21), the bound-as-axiom leaf: inside a bounded
+            // template's definition check `App(G,[T])` reduces the pattern to `T`, which
+            // conforms iff its declared bound IS `pid`. O(1) — never memoized. Empty
+            // `bound_protocols` (a non-generic/unbounded context) denies, so a stray
+            // `type_var` never spuriously conforms.
+            const ord = recv.typeVarOrd();
+            if (ord >= bound_protocols.len) return false;
+            return (bound_protocols[ord] orelse return false) == pid;
+        },
+        .app => {
+            // Conditional conformance (M21), the recursive step: `App(G,[args])` conforms
+            // iff every ctor field / enum-variant payload PATTERN, with `args` substituted
+            // in, conforms. Memoized by the interned App index (a kind byte distinct from
+            // struct/enum) so nested `Box[Box[Point]]` is not re-queried exponentially.
+            const ai = recv.appIdx();
+            const akey: u64 = (@as(u64, pid) << 40) | (@as(u64, @intFromEnum(recv.kind)) << 32) | @as(u64, ai);
+            if (memo.get(akey)) |v| return v;
+            const e = composite.at(ai);
+            var aok = true;
+            if (e.ctor_is_enum) {
+                if (e.ctor < enums.len) {
+                    outer: for (enums[e.ctor].variants) |v| {
+                        for (v.field_types) |ft| {
+                            const sub = try substPattern(composite, gpa, ft, e.args);
+                            if (!try conforms(structs, enums, conformances, sub, pid, memo, gpa, composite, bound_protocols)) {
+                                aok = false;
+                                break :outer;
+                            }
+                        }
+                    }
+                } else aok = false;
+            } else {
+                if (e.ctor < structs.len) {
+                    for (structs[e.ctor].field_types) |ft| {
+                        const sub = try substPattern(composite, gpa, ft, e.args);
+                        if (!try conforms(structs, enums, conformances, sub, pid, memo, gpa, composite, bound_protocols)) {
+                            aok = false;
+                            break;
+                        }
+                    }
+                } else aok = false;
+            }
+            try memo.put(gpa, akey, aok);
+            return aok;
+        },
         else => {
             // Scalar / non-aggregate: only an explicit/prelude conformance counts (no
-            // structural rule); a `type_var`/`app`/poison never conforms here.
+            // structural rule); a poison never conforms here.
             for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return true;
             return false;
         },
@@ -629,7 +691,7 @@ pub fn conforms(
             if (recv.struct_id < structs.len) {
                 ok = true;
                 for (structs[recv.struct_id].field_types) |ft| {
-                    if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa)) {
+                    if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa, composite, bound_protocols)) {
                         ok = false;
                         break;
                     }
@@ -640,7 +702,7 @@ pub fn conforms(
                 ok = true;
                 outer: for (enums[recv.enum_id].variants) |v| {
                     for (v.field_types) |ft| {
-                        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa)) {
+                        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa, composite, bound_protocols)) {
                             ok = false;
                             break :outer;
                         }
@@ -651,6 +713,29 @@ pub fn conforms(
     }
     try memo.put(gpa, key, ok);
     return ok;
+}
+
+/// Substitute a generic ctor's field/payload PATTERN through a concrete arg tuple for the
+/// M21 conditional-conformance query — a free-function mirror of `Typecheck.substType`
+/// that needs only the composite table (`conforms` has no `*Typecheck`): a `type_var(ord)`
+/// becomes `args[ord]`; a nested `App(ctor,[pat..])` substitutes each arg and re-interns
+/// (so a `Box[T]` field grounds to `Box[int]`, itself re-queried through the App arm);
+/// anything else passes through. Interning here mints transient query-only App indices
+/// (never reified/fingerprinted), so the run-order-dependent index is harmless.
+pub fn substPattern(composite: *Composite, gpa: std.mem.Allocator, pat: Type, args: []const Type) error{OutOfMemory}!Type {
+    if (pat.isTypeVar()) {
+        const ord = pat.typeVarOrd();
+        return if (ord < args.len) args[ord] else Type.invalid;
+    }
+    if (pat.isApp()) {
+        const e = composite.at(pat.appIdx());
+        var buf: [8]Type = undefined;
+        const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else try gpa.alloc(Type, e.args.len);
+        defer if (e.args.len > buf.len) gpa.free(sub);
+        for (e.args, 0..) |a, i| sub[i] = try substPattern(composite, gpa, a, args);
+        return Type.app(try composite.intern(gpa, e.ctor, sub, e.ctor_is_enum));
+    }
+    return pat;
 }
 
 /// The first struct field (in declaration order) whose type does NOT conform to `pid`
@@ -664,11 +749,13 @@ pub fn firstNonConformingField(
     pid: u32,
     memo: *std.AutoHashMapUnmanaged(u64, bool),
     gpa: std.mem.Allocator,
+    composite: *Composite,
+    bound_protocols: []const ?u32,
 ) error{OutOfMemory}!?NonConformingField {
     if (recv.kind != .@"struct" or recv.struct_id >= structs.len) return null;
     const s = structs[recv.struct_id];
     for (s.field_types, 0..) |ft, i| {
-        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa)) {
+        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa, composite, bound_protocols)) {
             return .{ .name = if (i < s.field_names.len) s.field_names[i] else "?", .ty = ft };
         }
     }
@@ -1111,6 +1198,9 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
     // receiver is grounded so the `type_var` dispatch branch never fires.
     bc.bound_protocols = f.generic_bounds;
     bc.bound_protocol_args = f.generic_bound_args;
+    // M21: the generic-param names, so an innermost-failure diagnostic can render an
+    // abstract `App`'s failing `type_var` as its source param name.
+    bc.gph_generic_params = f.generic_params;
     return bc;
 }
 
@@ -1800,7 +1890,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
                     else => continue,
                 }
                 if (t.hasConformanceLive(ord_pid, ft)) continue; // explicit Ord field: reuse its witness
-                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, ord_pid, &memo, gpa))
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, ord_pid, &memo, gpa, t.composite, &.{}))
                     try enqueueDerive(gpa, &ord_seen, &ord_work, ord_pid, .ord, ft);
             }
         }
@@ -1832,7 +1922,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
             }
             if (t.hasConformanceLive(eq_pid, ft)) continue; // explicit Eq field: reuse its witness
             if (try t.ordFills(&ord_seen, ord_pid_opt, ft)) continue; // Ord fills Eq: the field's cmp witness serves `==`
-            if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa))
+            if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa, t.composite, &.{}))
                 try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, ft);
         }
     }
@@ -1867,7 +1957,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
                     else => continue,
                 }
                 if (t.hasConformanceLive(hash_pid, ft)) continue; // explicit Hash field: reuse its witness
-                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa))
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa, t.composite, &.{}))
                     try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, ft);
             }
         }
@@ -2215,6 +2305,8 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
     // `-jN` (the worklist is serial). A satisfied bound's `conform_ty` is concrete, so
     // building the per-instance `ResolvedConformance` in `recheck` is sound.
     const f = model.fns[gid];
+    var cmemo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer cmemo.deinit(t.gpa);
     for (f.generic_bounds, 0..) |maybe_pid, ord| {
         const pid = maybe_pid orelse continue;
         if (ord >= args.len) continue;
@@ -2228,11 +2320,20 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             subst_buf = try t.gpa.alloc(Type, bargs.len);
             for (bargs, 0..) |ba, k| subst_buf[k] = t.substType(ba, args);
         }
-        if (!findConformance(model, pid, args[ord], subst_buf)) {
-            _ = t.gphSelect(mod);
-            try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'", .{ t.typeName(args[ord]), model.protocols[pid].name });
-            return;
-        }
+        if (findConformance(model, pid, args[ord], subst_buf)) continue;
+        // The frozen table holds only EXPLICIT/prelude conformances. A struct/enum that
+        // merely DERIVES Eq/Ord/Hash structurally (no `impl`) satisfies a `[T has Ord]`
+        // bound too (M21) — the same relation the `<`/`==`/`.hash()` operator predicates
+        // use. Fall back to the recursive `conforms` query, gated to a zero-arg DERIVABLE
+        // protocol (structural conformance is undefined for a parameterized/custom one, so
+        // a custom-protocol bound with no impl still correctly emits T0023). The per-
+        // instance re-check records the ground derive request, so the witness is synthesized.
+        if (subst_buf.len == 0 and isDerivableProtocol(model, pid) and
+            try conforms(model.structs, model.enums, model.conformances, args[ord], pid, &cmemo, t.gpa, t.composite, &.{}))
+            continue;
+        _ = t.gphSelect(mod);
+        try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'", .{ t.typeName(args[ord]), model.protocols[pid].name });
+        return;
     }
 
     const owned = try t.gpa.dupe(Type, args);
@@ -2590,6 +2691,11 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         for (inst.params) |p| try t.collectApp(p, &to_reify);
         try t.collectApp(inst.ret, &to_reify);
     }
+    // A conditional-conformance derive request (M21) carries a ground `App` conform_ty
+    // (`Box[int] < ..` records `App(Box,[int])`); collect it so the same reify pass mints
+    // its concrete `struct_id`, and step (3) rewrites the request to that `structT` — else
+    // `synthesizeDerives` (post-reify) would key `Derive.writeKey` off a stale App index.
+    for (t.derive_reqs.items) |r| try t.collectApp(r.conform_ty, &to_reify);
 
     // (2) Reify in (depth, structural-key) order so ids are a pure function of source.
     // Apps reified on-demand during Phase 0b (concrete generic-aggregate fields) are
@@ -2633,6 +2739,9 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         for (@constCast(inst.params)) |*p| t.rewriteApp(p);
         t.rewriteApp(&inst.ret);
     }
+    // M21: rewrite each conditional-conformance derive request's `App` conform_ty to its
+    // reified `structT`/`enumT`, so `synthesizeDerives` sees the concrete type.
+    for (t.derive_reqs.items) |*r| t.rewriteApp(&r.conform_ty);
 }
 
 /// The generics gate, now INERT (M6). Generic FUNCTIONS (M2), generic STRUCTS (M4),
@@ -3869,26 +3978,88 @@ test "M19: conforms truth table (scalar/struct/nested/empty-enum/payload-enum re
 
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
+    var co: Composite = .{};
+    defer co.deinit(gpa);
     const C = struct {
-        fn q(st: []const StructSym, en: []const EnumSym, cf: []const Conformance, ty: Type, m: *std.AutoHashMapUnmanaged(u64, bool), g: std.mem.Allocator) !bool {
-            return conforms(st, en, cf, ty, 0, m, g);
+        fn q(st: []const StructSym, en: []const EnumSym, cf: []const Conformance, ty: Type, m: *std.AutoHashMapUnmanaged(u64, bool), g: std.mem.Allocator, cp: *Composite) !bool {
+            return conforms(st, en, cf, ty, 0, m, g, cp, &.{});
         }
     };
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.int, &memo, gpa)); // scalar
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(0), &memo, gpa)); // all-scalar struct
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(1), &memo, gpa)); // nested struct
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(0), &memo, gpa)); // empty-payload enum
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa)); // int-payload enum (M19: conforms)
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(2), &memo, gpa)); // struct w/ int-payload-enum field
-    try testing.expect(!try C.q(&structs, &enums, &confs, Type.enumT(2), &memo, gpa)); // str-payload enum (str no Eq here)
-    try testing.expect(!try C.q(&structs, &enums, &confs, Type.structT(3), &memo, gpa)); // struct w/ str-payload-enum field
-    try testing.expect(!try C.q(&structs, &enums, &confs, Type.str, &memo, gpa)); // str has NO prelude Eq in this synthetic table
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.int, &memo, gpa, &co)); // scalar
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(0), &memo, gpa, &co)); // all-scalar struct
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(1), &memo, gpa, &co)); // nested struct
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(0), &memo, gpa, &co)); // empty-payload enum
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa, &co)); // int-payload enum (M19: conforms)
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(2), &memo, gpa, &co)); // struct w/ int-payload-enum field
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.enumT(2), &memo, gpa, &co)); // str-payload enum (str no Eq here)
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.structT(3), &memo, gpa, &co)); // struct w/ str-payload-enum field
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.str, &memo, gpa, &co)); // str has NO prelude Eq in this synthetic table
 
     // The blocked struct#3 names its first offending field (`d: E2`).
-    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(3), 0, &memo, gpa);
+    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(3), 0, &memo, gpa, &co, &.{});
     try testing.expect(off != null);
     try testing.expectEqualStrings("d", off.?.name);
     try testing.expect(Type.eql(Type.enumT(2), off.?.ty));
+}
+
+test "M21: conforms handles App types, nested memoization, and the type_var bound axiom" {
+    const gpa = testing.allocator;
+    const ord_pid: u32 = 0;
+    const doubler_pid: u32 = 1;
+
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+
+    // struct Box[T] { v: T } — a generic TEMPLATE whose field is the pattern `type_var(0)`.
+    var box_ft = [_]Type{Type.typeVar(0)};
+    var box_fn = [_][]const u8{"v"};
+    const box_params = [_][]const u8{"T"};
+    // Intern Box[int], Box[Box[int]] (nested), Box[type_var 0] (abstract).
+    const box_int = try co.intern(gpa, 0, &.{Type.int}, false);
+    const box_box_int = try co.intern(gpa, 0, &.{Type.app(box_int)}, false);
+    const box_tv = try co.intern(gpa, 0, &.{Type.typeVar(0)}, false);
+    // struct SBox { b: Box[int] } — non-generic, carrying a concrete App FIELD.
+    var sbox_ft = [_]Type{Type.app(box_int)};
+    var sbox_fn = [_][]const u8{"b"};
+
+    const structs = [_]StructSym{
+        .{ .decl_node = Ast.none, .name = "Box", .field_types = @constCast(&box_ft), .field_names = @constCast(&box_fn), .is_generic = true, .generic_params = &box_params },
+        .{ .decl_node = Ast.none, .name = "SBox", .field_types = @constCast(&sbox_ft), .field_names = @constCast(&sbox_fn) },
+    };
+    const enums = [_]EnumSym{};
+    const confs = [_]Conformance{.{ .protocol = ord_pid, .recv = Type.int }}; // int conforms to Ord
+
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+
+    // Ground: Box[int] conforms to Ord (its `int` field does); a non-derivable pid does not.
+    try testing.expect(try conforms(&structs, &enums, &confs, Type.app(box_int), ord_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(!try conforms(&structs, &enums, &confs, Type.app(box_int), doubler_pid, &memo, gpa, &co, &.{}));
+
+    // Nested Box[Box[int]] conforms; a second identical query is a pure MEMO HIT (no new
+    // entries + same answer), so nesting is not re-descended exponentially.
+    try testing.expect(try conforms(&structs, &enums, &confs, Type.app(box_box_int), ord_pid, &memo, gpa, &co, &.{}));
+    const n = memo.count();
+    try testing.expect(try conforms(&structs, &enums, &confs, Type.app(box_box_int), ord_pid, &memo, gpa, &co, &.{}));
+    try testing.expectEqual(n, memo.count());
+
+    // Abstract Box[T]: discharges from the axiom `T has Ord` iff the bound IS Ord. A fresh
+    // memo per bound context (matching the per-BodyChecker memo/bound invariant) so the
+    // abstract answer is not cached across differing bounds.
+    const bp_ord = [_]?u32{ord_pid};
+    const bp_doubler = [_]?u32{doubler_pid};
+    var memo_ord: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo_ord.deinit(gpa);
+    var memo_dbl: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo_dbl.deinit(gpa);
+    try testing.expect(try conforms(&structs, &enums, &confs, Type.app(box_tv), ord_pid, &memo_ord, gpa, &co, &bp_ord));
+    try testing.expect(!try conforms(&structs, &enums, &confs, Type.app(box_tv), ord_pid, &memo_dbl, gpa, &co, &bp_doubler));
+
+    // The sibling ground gap: a non-generic struct with a concrete generic-struct FIELD
+    // conforms (its `Box[int]` field is an App during the query).
+    var memo_s: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo_s.deinit(gpa);
+    try testing.expect(try conforms(&structs, &enums, &confs, Type.structT(1), ord_pid, &memo_s, gpa, &co, &.{}));
 }
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
@@ -4914,7 +5085,9 @@ test "M20: firstNonConformingField names the field blocking a `Hash` derive (T00
     };
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
-    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(0), hash_pid, &memo, gpa);
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(0), hash_pid, &memo, gpa, &co, &.{});
     try testing.expect(off != null);
     try testing.expectEqualStrings("name", off.?.name);
     try testing.expect(Type.eql(Type.str, off.?.ty));

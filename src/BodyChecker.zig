@@ -135,6 +135,12 @@ pub const BodyChecker = struct {
     /// non-generic/unbounded fn. Set by `bodyCheckerFor` from `FnSym.generic_bound_args`.
     bound_protocol_args: []const []const Type = &.{},
 
+    /// The ordered generic-param NAMES (M21), set by `bodyCheckerFor` from
+    /// `FnSym.generic_params`; empty for a non-generic fn. Read ONLY by the innermost-
+    /// failure diagnostic so an abstract `App`'s `type_var` culprit renders as its param
+    /// name (`T`) rather than the opaque `type_var` tag. Borrowed source slices.
+    gph_generic_params: []const []const u8 = &.{},
+
     /// Structural derive requests this fn's body recorded (M18): a `==`/`!=` on a
     /// derivable type with no impl. Moved out into the `BodyResult` after the walk;
     /// merged fn-id-ordered by `checkBodies`. THREAD-LOCAL (one list per BodyChecker),
@@ -545,7 +551,7 @@ pub const BodyChecker = struct {
                         } else if (try bc.conformsToOrd(lt)) {
                             break :blk Type.@"bool";
                         } else {
-                            try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.typeName(lt) });
+                            try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.ord_protocol_id) });
                         }
                     },
                     .eq_eq, .bang_eq => {
@@ -564,7 +570,7 @@ pub const BodyChecker = struct {
                             // keeps the M15 "no Eq impl" T0026 below.
                             try bc.sink.emitFmtCode(.T0029, bc.byteOf(n.main_token), "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
                         } else {
-                            try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.typeName(lt) });
+                            try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.eq_protocol_id) });
                         }
                     },
                     .amp_amp, .pipe_pipe => {
@@ -2117,14 +2123,31 @@ pub const BodyChecker = struct {
             return (bc.bound_protocols[ord] orelse return false) == eq_pid;
         }
         switch (t.kind) {
-            .@"struct", .@"enum" => {},
+            .@"struct", .@"enum", .app => {},
             else => return false,
         }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa)) {
-            try bc.recordDeriveReq(eq_pid, t);
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
+            // Record a derive request ONLY for a GROUND operand (M21): an abstract `App`
+            // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition check)
+            // is accepted-but-not-recorded — its concrete instance re-check records the
+            // ground `Box[int]`, which reify+synthesize can actually mint a witness for.
+            if (bc.isGround(t)) try bc.recordDeriveReq(eq_pid, t);
             return true;
         }
         return false;
+    }
+
+    /// Whether `t` is fully ground (M21): no `type_var` anywhere. A struct/enum id and any
+    /// scalar are ground; a `type_var` is not; an `App` is ground iff every arg is. Gates
+    /// `recordDeriveReq` so the synthesis barrier only ever sees a concrete (reifiable) type.
+    fn isGround(bc: *BodyChecker, t: Type) bool {
+        if (t.isTypeVar()) return false;
+        if (t.isApp()) {
+            const e = bc.composite.at(t.appIdx());
+            for (e.args) |a| if (!bc.isGround(a)) return false;
+            return true;
+        }
+        return true;
     }
 
     /// Record a structural derive request once per (protocol, type) in this fn (a fn may
@@ -2139,7 +2162,7 @@ pub const BodyChecker = struct {
     fn eqDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
         if (t.kind != .@"struct") return null;
         const eq_pid = bc.model.eq_protocol_id orelse return null;
-        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa);
+        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
     }
 
     /// Whether `t` conforms to the prelude `Ord` protocol (M16/M19) — the predicate the
@@ -2161,11 +2184,11 @@ pub const BodyChecker = struct {
             return (bc.bound_protocols[ord] orelse return false) == ord_pid;
         }
         switch (t.kind) {
-            .@"struct", .@"enum" => {},
+            .@"struct", .@"enum", .app => {},
             else => return false,
         }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, ord_pid, &bc.conforms_memo, bc.gpa)) {
-            try bc.recordDeriveReq(ord_pid, t);
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, ord_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
+            if (bc.isGround(t)) try bc.recordDeriveReq(ord_pid, t);
             return true;
         }
         return false;
@@ -2190,11 +2213,11 @@ pub const BodyChecker = struct {
             return (bc.bound_protocols[ord] orelse return false) == hash_pid;
         }
         switch (t.kind) {
-            .@"struct", .@"enum" => {},
+            .@"struct", .@"enum", .app => {},
             else => return false,
         }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa)) {
-            try bc.recordDeriveReq(hash_pid, t);
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
+            if (bc.isGround(t)) try bc.recordDeriveReq(hash_pid, t);
             return true;
         }
         return false;
@@ -2207,7 +2230,7 @@ pub const BodyChecker = struct {
     fn hashDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
         if (t.kind != .@"struct") return null;
         const hash_pid = bc.model.hash_protocol_id orelse return null;
-        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa);
+        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)
@@ -2241,6 +2264,62 @@ pub const BodyChecker = struct {
             return (bc.bound_protocols[ord] orelse return false) == pid;
         }
         return false;
+    }
+
+    /// The name a T0026/T0027 message uses for a non-conforming operand (M21): a plain
+    /// type renders normally, but an `App` (`Box[T]`/`Box[int]`) recurses to the DEEPEST
+    /// field/payload that actually fails `pid` and names IT — a `type_var` culprit as its
+    /// generic-param name (`T`), so the error points at the real cause instead of the
+    /// opaque outer ctor. Best-effort on the already-failed error path.
+    fn nonConformingName(bc: *BodyChecker, lt: Type, pid_opt: ?u32) []const u8 {
+        const pid = pid_opt orelse return bc.typeName(lt);
+        if (lt.kind != .app) return bc.typeName(lt);
+        const culprit = bc.deepestNonConforming(lt, pid);
+        if (culprit.isTypeVar()) {
+            const ord = culprit.typeVarOrd();
+            if (ord < bc.gph_generic_params.len) return bc.gph_generic_params[ord];
+            return bc.typeName(culprit);
+        }
+        return bc.typeName(culprit);
+    }
+
+    /// Walk `t` to the innermost type that fails to conform to `pid` (M21): an `App`
+    /// substitutes its ctor's field/payload patterns and descends into the first that
+    /// fails; a struct/enum descends into its first non-conforming field/payload; a leaf
+    /// (`type_var`/scalar) is returned as-is. Terminates for the same reason `conforms`
+    /// does (finite acyclic type graph). Degrades to `t` on any allocation failure.
+    fn deepestNonConforming(bc: *BodyChecker, t: Type, pid: u32) Type {
+        if (t.isApp()) {
+            const e = bc.composite.at(t.appIdx());
+            if (e.ctor_is_enum) {
+                if (e.ctor < bc.model.enums.len) {
+                    for (bc.model.enums[e.ctor].variants) |v| for (v.field_types) |ft| {
+                        const sub = Typecheck.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
+                        if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConforming(sub, pid);
+                    };
+                }
+            } else {
+                if (e.ctor < bc.model.structs.len) {
+                    for (bc.model.structs[e.ctor].field_types) |ft| {
+                        const sub = Typecheck.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
+                        if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConforming(sub, pid);
+                    }
+                }
+            }
+            return t;
+        }
+        if (t.kind == .@"struct" and t.struct_id < bc.model.structs.len) {
+            for (bc.model.structs[t.struct_id].field_types) |ft|
+                if (!bc.conformsQuiet(ft, pid)) return bc.deepestNonConforming(ft, pid);
+        } else if (t.kind == .@"enum" and t.enum_id < bc.model.enums.len) {
+            for (bc.model.enums[t.enum_id].variants) |v| for (v.field_types) |ft|
+                if (!bc.conformsQuiet(ft, pid)) return bc.deepestNonConforming(ft, pid);
+        }
+        return t;
+    }
+
+    fn conformsQuiet(bc: *BodyChecker, t: Type, pid: u32) bool {
+        return Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols) catch true;
     }
 
     fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {
