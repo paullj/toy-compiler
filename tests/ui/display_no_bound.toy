@@ -1,0 +1,7 @@
+protocol Doubler { fn dbl(self) -> int }
+
+fn show[T has Doubler](x: T) { print(x) }  #~ ERROR [T0031] does not conform to 'Display'
+
+fn main() {
+    return
+}

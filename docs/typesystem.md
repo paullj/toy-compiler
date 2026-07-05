@@ -424,6 +424,66 @@ accumulate polynomial is the forced substitute; it satisfies every *locked* cons
 diagnostic **T0030** is unreachable for a ground program (reachable only via a generic body
 whose type parameter's bound is not `Hash`).
 
+## Structural `Display` auto-derive — write-to-fd, heap-free (M22)
+
+```
+protocol Display { fn display(self) }           // 1-ary (self only), unit ret; id 7, after Hash = 6
+```
+
+Structural `Display` is synthesized on demand at a `print(x)` call — the same source-less
+synthetic-codegen-unit channel M18–M20 use, keyed on the same non-AST
+`(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
+conforms to `Display` (recursively) and no explicit `impl T has Display` exists; explicit
+impls win, and an **unused** derive emits **zero** codegen (`--emit ir`).
+
+**Writes to the fd — never returns a `str` (heap-free).** `display(self)` returns unit and
+**writes the value's rendering directly to stdout** via the libSystem `write` path. This is
+the *only* heap-free shape of `Display` in this value-only roadmap — a string-returning
+`display() -> str` would allocate and is deferred to the heap roadmap. Three heap-free
+renderers back it, none touching the allocator:
+
+- **`int`** → a hand-written aarch64 builtin `__display_int` (mirroring `print`) that formats
+  digits into a **fixed 32-byte stack buffer** via div/mod-by-10 (no `srem`: `r = n − (n/10)*10`)
+  and calls `write(1, buf, len)`. It never negates the running value, so `i64::MIN` is handled
+  correctly (the sign is emitted from the saved original; each single-digit remainder's abs is
+  safe). Appended at link time only when referenced.
+- **`bool`** → an inline `cond_br` over the `true`/`false` cstring literals.
+- **raw write-bytes** → the existing `print` builtin (`write(1, ptr, len)` over a `str {ptr,len}`);
+  the emitter reuses it to write the struct/enum **name + separators** and to write a `str`
+  field's **raw bytes** (no surrounding quotes — the SAME path a top-level `str` uses).
+
+Aggregate fields call the sibling `display` witness (a nested struct field recurses into its
+own source-less unit).
+
+**`print` is a compiler-magic polymorphic builtin (Q8), NOT a monomorphized generic.** The
+checker special-cases the `print` builtin call: it requires the single argument conform to
+`Display` (recording a ground struct/enum derive request), types the call unit, and keeps
+`print("..")` working unchanged. `lower` dispatches the `print` call **by argument type**
+(`str`→the raw `print` builtin; `int`→`__display_int`; `bool`→inline; struct/enum→the resolved
+`Display` witness). A genuine `print[T has Display](x: T)` (template body, per-type instances,
+mangling) was explicitly rejected as higher-risk. For incremental soundness the caller's
+fingerprint folds the resolved witness identity for a struct/enum arg (and a fixed per-scalar
+sentinel), mirroring the `.eq_operator` fold, so a caller recompiles when its arg gains an
+explicit `impl Display`.
+
+**Format is PROVISIONAL** (user-observable once shipped, but not depended on by any
+determinism-critical path):
+
+| shape | spelling |
+|-------|----------|
+| struct | `Name{field: <v>, field2: <v2>}` — no space after `Name`, `: ` after each field name, `, ` between fields, no trailing space, closing `}` |
+| enum unit variant | `variant` |
+| enum payload variant | `variant(<v0>, <v1>)` — payload fields in declaration order, `, `-separated |
+| `str` value | its raw bytes (no surrounding quotes, matching today's `print(str)`) |
+
+⚠ **Behavior/semver hazard:** renaming a struct/enum or a field, or reordering fields,
+changes the rendered output (and flips the derive unit's cache key via the layout descriptor).
+
+As with `Eq`/`Ord`/`Hash`, **every** ground value type conforms to `Display` (all scalars
+conform; every aggregate of conforming fields derives), so the "does not conform" diagnostic
+**T0031** is unreachable for a ground program — reachable only via a generic body whose type
+parameter's bound is not `Display` (e.g. `fn f[T has Eq](x: T) { print(x) }`).
+
 ## Two-phase checking (and parallelism)
 
 Checking is two phases over one frozen program model:

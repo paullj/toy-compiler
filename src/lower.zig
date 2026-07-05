@@ -1906,6 +1906,241 @@ pub fn lowerDeriveHash(
     return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
+// ==== M22 structural `Display` derive (write-to-fd, heap-free) ========================
+//
+// The Display emitter and the `print(x)` dispatch share ONE raw write path: every
+// literal (type/field/variant name + separators) and every `str` field is written by
+// building a `str {ptr@0,len@8}` slot and calling the `print` builtin (write(1,ptr,len));
+// an `int` calls the hand-asm `__display_int` builtin (stack-buffer decimal renderer); a
+// `bool` inlines a `cond_br` over two literal writes. No allocator is ever referenced —
+// only stack slots, cstring literals, and the `write` syscall.
+
+/// The `print` builtin's stable symbol identity — a raw write-bytes primitive over a
+/// `str {ptr,len}`. A comptime literal name is safe (codegen dupes callee names into
+/// relocs; the Ir.Function only borrows it), matching `CodegenIr.lowerPrint`'s own sym.
+const print_sym: Link.SymName = .{ .kind = .builtin, .name = "print" };
+/// The `__display_int` builtin's stable symbol identity (the heap-free decimal renderer).
+const display_int_sym: Link.SymName = .{ .kind = .builtin, .name = "__display_int" };
+
+/// Call the `print` builtin over the `str` slot `slot` — write its `{ptr,len}` bytes to
+/// fd 1. The single shared raw write path (literals + `str` fields both route here).
+fn emitPrintSlot(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .slot = slot };
+    _ = try b.emit(.{ .call = .{ .callee = print_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
+}
+
+/// Write a COMPILE-TIME byte string directly to fd 1 (M22): register it as a fn literal
+/// (content-hash keyed, deduped), build a transient `str {ptr@0,len@8}` slot pointing at
+/// it, and `print` those bytes. `bytes` is BORROWED (a layout name / a fixed separator);
+/// it is duped into the owned literal table. An empty string is a no-op (no spurious call).
+fn emitWriteLiteral(b: *Builder, bytes: []const u8) error{OutOfMemory}!void {
+    if (bytes.len == 0) return;
+    const int_ty = Typecheck.Type.int;
+    const owned = try b.gpa.dupe(u8, bytes);
+    const h = std.hash.Wyhash.hash(lit_seed, owned);
+    try b.addLiteral(h, owned); // takes ownership of `owned` (frees a within-fn dup)
+    const slot = try b.addSlot(Typecheck.Type.str);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const p = try b.emit(.{ .cstr_ptr = h }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = base, .val = p, .ty = int_ty } }, null);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+    const lenv = try b.emit(.{ .iconst = @intCast(bytes.len) }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = lenv, .ty = int_ty } }, null);
+    try emitPrintSlot(b, slot);
+}
+
+/// Display an `int` VALUE by calling the hand-asm `__display_int` builtin (M22). The value
+/// travels in the first int-arg register; the builtin formats + writes it. Ret unit.
+fn emitDisplayIntValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = v };
+    _ = try b.emit(.{ .call = .{ .callee = display_int_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
+}
+
+/// Display a `bool` VALUE inline (M22): `cond_br` on the value to a `true`/`false` literal
+/// write, then join. Leaves the cursor at the join block so the caller keeps emitting.
+fn emitDisplayBoolValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
+    const t_blk = try b.addBlock();
+    const f_blk = try b.addBlock();
+    const join = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = v, .t = t_blk, .f = f_blk } });
+    b.switchTo(t_blk);
+    try emitWriteLiteral(b, "true");
+    if (!b.termSet()) try brTo(b, join, .none);
+    b.switchTo(f_blk);
+    try emitWriteLiteral(b, "false");
+    if (!b.termSet()) try brTo(b, join, .none);
+    b.switchTo(join);
+}
+
+/// Display an aggregate operand already MATERIALIZED into slot `slot` (M22): resolve the
+/// `display` witness and call `witness(slot) -> ()`, which writes the value's rendering to
+/// fd 1. The slot-operand sibling of the top-level derive, so a nested aggregate FIELD
+/// stays in lockstep with the callee's own derived unit. A miss is unreachable for a
+/// conforming field (the synthesis barrier proved it) — note-and-drop rather than miscompile.
+fn displayAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!void {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", null)) {
+        .one => |m| {
+            const callee = witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 1);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = slot };
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, null);
+        },
+        .none, .ambiguous => {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: no display witness for an aggregate field in lower" });
+            b.had_error = true;
+        },
+    }
+}
+
+/// Display field `i` (at byte `off`, type `fty`) of receiver base `self_base` (M22):
+/// int/bool render inline (via `__display_int` / the bool cond); a `str` field writes its
+/// raw bytes (the SAME `str {ptr,len}` write path a top-level `str` uses — no quotes); a
+/// struct/enum field is copied into a fresh temp slot then routed through `displayAtSlot`.
+/// Unit fields are rejected by T0007, so never occur. Mirrors `deriveFieldHash`.
+fn deriveFieldDisplay(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    switch (fty.kind) {
+        .int => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const v = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
+            try emitDisplayIntValue(b, v);
+        },
+        .bool => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const v = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
+            try emitDisplayBoolValue(b, v);
+        },
+        .str => {
+            // Copy the 16-byte {ptr,len} header into a fresh str slot then `print` it —
+            // ONE shared raw-bytes path, so a nested `str` field renders identically to a
+            // top-level `str` (raw bytes, no surrounding quotes).
+            const slot = try b.addSlot(fty);
+            const d = try b.emit(.{ .slot_addr = slot }, int_ty);
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
+            try emitPrintSlot(b, slot);
+        },
+        .@"struct", .@"enum" => {
+            const slot = try b.addSlot(fty);
+            const d = try b.emit(.{ .slot_addr = slot }, int_ty);
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
+            try displayAtSlot(b, fty, slot);
+        },
+        else => {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported field type in lower" });
+            b.had_error = true;
+        },
+    }
+}
+
+/// Render variant `vi`'s active payload to fd 1 and branch to `join` (M22): write the
+/// bare `variant` name, and for a payload variant `variant(<v0>, <v1>)` (fields in
+/// declaration order, `, `-separated), using ABSOLUTE payload offsets. Mirrors
+/// `emitVariantPayloadEq`'s ladder-arm shape but writes for effect (unit).
+fn emitVariantDisplay(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
+    const v = e.variants[vi];
+    try emitWriteLiteral(b, v.name);
+    if (v.field_types.len != 0) {
+        try emitWriteLiteral(b, "(");
+        for (v.field_types, v.offsets, 0..) |fty, poff, j| {
+            try deriveFieldDisplay(b, fty, e.payload_off + poff, self_base);
+            if (j + 1 != v.field_types.len) try emitWriteLiteral(b, ", ");
+        }
+        try emitWriteLiteral(b, ")");
+    }
+    if (!b.termSet()) try brTo(b, join, .none);
+}
+
+/// Lower a SOURCE-LESS auto-derive `Display` unit (M22): a unit-returning, layout-walking
+/// emitter that WRITES the value's structural rendering directly to the output fd — never a
+/// returned `str`. ONE param (the receiver, by slot). A struct writes `Name{field: <v>, ...}`
+/// (fields in layout order); a payload enum does a `get_tag` dispatch ladder writing a bare
+/// `variant` or `variant(<v0>, <v1>)`; scalar fields render inline (int->__display_int, bool
+/// inline, str->raw bytes), aggregate fields call the sibling `display` witness. PURE of
+/// `(recipe, layouts, method table)`: a fixed field/variant-order walk handing ids
+/// monotonically, reading no map — a double-lower is byte-identical.
+pub fn lowerDeriveDisplay(
+    gpa: std.mem.Allocator,
+    in: Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const unit_ty = Typecheck.Type.unit;
+    const cty = d.conform_ty;
+
+    var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = unit_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    // ONE param (self), by slot — display is 1-ary.
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_self = try b.addSlot(cty);
+    try params.append(gpa, p_self);
+
+    // entry (b0) + a unit EXIT block: no return param, terminator `ret .none` (mirrors
+    // `lowerFn`'s unit scaffold).
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.blocks.items[exit].term = .{ .ret = .none };
+    b.blocks.items[exit].term_set = true;
+
+    const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
+
+    switch (cty.kind) {
+        .@"struct" => {
+            const layout = b.in.layouts[cty.struct_id];
+            try emitWriteLiteral(&b, layout.name);
+            try emitWriteLiteral(&b, "{");
+            for (layout.field_names, layout.field_types, layout.offsets, 0..) |fname, fty, off, i| {
+                try emitWriteLiteral(&b, fname);
+                try emitWriteLiteral(&b, ": ");
+                try deriveFieldDisplay(&b, fty, off, self_base);
+                if (i + 1 != layout.field_types.len) try emitWriteLiteral(&b, ", ");
+            }
+            try emitWriteLiteral(&b, "}");
+        },
+        .@"enum" => {
+            const e = b.in.enum_layouts[cty.enum_id];
+            const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
+            const join = try b.addBlock();
+            for (e.variants, 0..) |_, vi| {
+                const last = vi + 1 == e.variants.len;
+                if (last) {
+                    try emitVariantDisplay(&b, e, vi, self_base, join);
+                    break;
+                }
+                const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
+                const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = vk } }, Typecheck.Type.@"bool");
+                const body = try b.addBlock();
+                const next = try b.addBlock();
+                b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
+                b.switchTo(body);
+                try emitVariantDisplay(&b, e, vi, self_base, join);
+                b.switchTo(next);
+            }
+            b.switchTo(join);
+        },
+        else => {
+            // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported conform type in lower" });
+            b.had_error = true;
+        },
+    }
+
+    if (!b.termSet()) try brTo(&b, exit, .none);
+    return try finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
 /// True when `sig` is a generic template (some param is a check-time `type_var`).
 /// Bare inferred calls resolve to the template's `.func`; genericness is detected
 /// from the callee sig so `lowerCall` selects the reified instance, not the template.
@@ -2016,6 +2251,49 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         if (callee_res != .func) {
             try b.note(n.main_token, "call target unsupported in lower");
             return .none;
+        }
+        // The `print` builtin (M22) is a compiler-magic polymorphic dispatch by the single
+        // arg's type: `str` keeps the raw write-bytes path (falls through below); `int`/
+        // `bool` render inline (heap-free) and a struct/enum routes to its resolved `Display`
+        // witness. The checker already required the arg to conform to `Display`, so a
+        // struct/enum witness always resolves. Intercept BEFORE the plain-name resolution.
+        if (callee_res.func < b.in.names.len) {
+            const nm = b.in.names[callee_res.func];
+            if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print")) {
+                const parg = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                if (parg.len == 1) {
+                    const at = b.in.node_types[(parg[0]).int()];
+                    switch (at.kind) {
+                        .int => {
+                            try emitDisplayIntValue(b, operandValue(try lowerExpr(b, parg[0])));
+                            return .none;
+                        },
+                        .bool => {
+                            try emitDisplayBoolValue(b, operandValue(try lowerExpr(b, parg[0])));
+                            return .none;
+                        },
+                        .@"struct", .@"enum" => {
+                            const op = try lowerExpr(b, parg[0]);
+                            const slot = operandSlot(op);
+                            if (slot == Ir.none_slot) {
+                                try b.note(callee_node.main_token, "print of a struct/enum: arg is not a slot in lower");
+                                return .none;
+                            }
+                            try displayAtSlot(b, at, slot);
+                            return .none;
+                        },
+                        .unit => {
+                            // `print(unit)` renders `()` — evaluate the arg for its effects
+                            // (e.g. a unit-returning call), then write the literal. A unit
+                            // operand must NEVER reach the raw `str` print path (no {ptr,len}).
+                            _ = try lowerExpr(b, parg[0]);
+                            try emitWriteLiteral(b, "()");
+                            return .none;
+                        },
+                        else => {}, // str: the raw write-bytes builtin — fall through.
+                    }
+                }
+            }
         }
         if (callee_node.tag == .identifier and callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func])) {
             // A bare inferred generic call `id(7)` (M3): the plain-identifier callee

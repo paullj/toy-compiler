@@ -212,6 +212,7 @@ pub fn deriveFingerprint(
             .cmp_eq => |n| AstWalk.updateLeaf(&h, n),
             .cmp_call => |n| AstWalk.updateLeaf(&h, n),
             .hash_call => |n| AstWalk.updateLeaf(&h, n),
+            .display_call => |n| AstWalk.updateLeaf(&h, n),
         }
     }
     return h.final();
@@ -773,6 +774,25 @@ test "deriveFingerprint M20: a Hash recipe's key differs by kind and flips on a 
     try testing.expect(deriveFingerprint("Hash", .hash, cf, &w1) != deriveFingerprint("Hash", .hash, cf, &w2));
     // Identical Hash recipe hashes identically (cache hit).
     try testing.expectEqual(deriveFingerprint("Hash", .hash, cf, &w1), deriveFingerprint("Hash", .hash, cf, &w1));
+}
+
+test "deriveFingerprint M22: a Display recipe's key differs by kind and flips on a display_call swap" {
+    const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
+    // Same protocol name + layout + a scalar witness, but the `.display` kind separates the
+    // unit from the Eq/Ord/Hash units (a `Display$display$s0` never aliases the others).
+    const eq_key = deriveFingerprint("Eq", .eq, cf, &.{.inline_kind});
+    const hash_key = deriveFingerprint("Hash", .hash, cf, &.{.inline_kind});
+    const disp_key = deriveFingerprint("Display", .display, cf, &.{.inline_kind});
+    try testing.expect(disp_key != eq_key);
+    try testing.expect(disp_key != hash_key);
+    // A Display recipe's aggregate field carries a `display_call` witness; a witness-SymName
+    // swap (the field gained an explicit `impl has Display`) flips the key so no stale blob
+    // serves — the override/stale-cache guard.
+    const w1 = [_]Derive.FieldEq{.{ .display_call = "Display$display$s1" }};
+    const w2 = [_]Derive.FieldEq{.{ .display_call = "main.Inner.display" }};
+    try testing.expect(deriveFingerprint("Display", .display, cf, &w1) != deriveFingerprint("Display", .display, cf, &w2));
+    // Identical Display recipe hashes identically (cache hit).
+    try testing.expectEqual(deriveFingerprint("Display", .display, cf, &w1), deriveFingerprint("Display", .display, cf, &w1));
 }
 
 test "conformance fold (e) M14: empty protocol-args is byte-identical to a pre-M14 fold" {

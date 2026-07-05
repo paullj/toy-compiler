@@ -66,20 +66,28 @@ pub const Linked = struct {
 /// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
 /// `data_relocs` (free `.import` data-reloc names individually).
 pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
-    // 1) uses_write: any reloc targeting the print builtin.
-    var uses_write = false;
+    // 1) Scan for the hand-asm builtins any fn references: `print` (the raw write-bytes
+    //    primitive) and `__display_int` (the M22 heap-free decimal renderer). Both call the
+    //    libSystem `write` syscall, so referencing EITHER declares the `_write` import
+    //    (`uses_write`); each referenced body is appended below.
+    var uses_print = false;
+    var uses_display_int = false;
     for (fns) |f| {
         for (f.relocs) |rl| switch (rl.target) {
-            .func => |s| if (s.kind == .builtin and std.mem.eql(u8, s.name, "print")) {
-                uses_write = true;
+            .func => |s| if (s.kind == .builtin) {
+                if (std.mem.eql(u8, s.name, "print")) uses_print = true;
+                if (std.mem.eql(u8, s.name, "__display_int")) uses_display_int = true;
             },
             else => {},
         };
     }
+    const uses_write = uses_print or uses_display_int;
 
-    // Build the full fn set: the user fns + (if needed) the print body. We OWN
-    // `fns`' elements now (the caller relinquished them); on any failure free the
-    // ones not yet moved into `all` plus everything in `all`.
+    // Build the full fn set: the user fns + (if referenced) the print / __display_int
+    // bodies, in a FIXED append order (print then __display_int) so the linked image is a
+    // pure function of the fn set (never thread order). We OWN `fns`' elements now (the
+    // caller relinquished them); on any failure free the ones not yet moved into `all` plus
+    // everything in `all`.
     var all: std.ArrayList(Link.FnCode) = .empty;
     var moved: usize = 0;
     errdefer {
@@ -93,9 +101,13 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
         try all.append(gpa, f);
         moved += 1;
     }
-    if (uses_write) {
+    if (uses_print) {
         const pf = try CodegenIr.lowerPrint(gpa);
         try all.append(gpa, pf);
+    }
+    if (uses_display_int) {
+        const df = try CodegenIr.lowerDisplayInt(gpa);
+        try all.append(gpa, df);
     }
 
     // 2) Intern strings program-wide via `internCstrings` (stable collect +

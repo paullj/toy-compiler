@@ -570,13 +570,13 @@ pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args:
     return false;
 }
 
-/// Whether `pid` is one of the three structurally-derivable prelude protocols
-/// (Eq/Ord/Hash) — the only protocols a struct/enum can satisfy WITHOUT an explicit
-/// `impl` (M18-M20). A custom/parameterized protocol always requires an impl, so a bound
-/// on one is never discharged structurally. Gates the M21 structural bound-resolution
+/// Whether `pid` is one of the four structurally-derivable prelude protocols
+/// (Eq/Ord/Hash/Display) — the only protocols a struct/enum can satisfy WITHOUT an
+/// explicit `impl` (M18-M22). A custom/parameterized protocol always requires an impl, so a
+/// bound on one is never discharged structurally. Gates the M21 structural bound-resolution
 /// fallback in `enqueueInstance` (a `[T has Ord]` bound satisfied by a derive-only struct).
 fn isDerivableProtocol(model: *const Model, pid: u32) bool {
-    inline for (.{ model.eq_protocol_id, model.ord_protocol_id, model.hash_protocol_id }) |maybe| {
+    inline for (.{ model.eq_protocol_id, model.ord_protocol_id, model.hash_protocol_id, model.display_protocol_id }) |maybe| {
         if (maybe) |p| {
             if (p == pid) return true;
         }
@@ -960,6 +960,16 @@ div_protocol_id: ?u32 = null,
 /// fallbacks). Null until `registerPrelude` runs; a null id denies conformance.
 hash_protocol_id: ?u32 = null,
 
+/// The global protocol id of the prelude `Display` protocol (M22), assigned in
+/// `registerPrelude` right after `Hash` in fixed append order (so Display=7 — a pure
+/// function of source). `protocol Display { fn display(self) }` (unit ret), native
+/// scalar conformances for int/bool/str/unit; drives on-demand structural `Display`
+/// derive at a `print(x)` site / `[T has Display]` bound. A bare `Display` reference
+/// that misses the active module map falls back to this id in `protocolIdFromNode`
+/// (mirroring the `Eq`/`Ord`/`Hash` fallbacks). Null until `registerPrelude` runs; a
+/// null id denies conformance.
+display_protocol_id: ?u32 = null,
+
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
 /// each method's `decodeFnSig` (Pass A); null otherwise (non-method decoding is
@@ -1136,6 +1146,10 @@ pub const Model = struct {
     /// ran. `conformsToHash` keys the `.hash()` method-call trigger off this; a null id
     /// denies conformance (a scalar/struct/enum reports T0018) rather than miscompiling.
     hash_protocol_id: ?u32,
+    /// The prelude `Display` protocol's global id (M22), or null if `registerPrelude` never
+    /// ran. `conformsToDisplay` keys the `print(x)` builtin trigger off this; a null id
+    /// denies conformance (-> T0031) rather than miscompiling.
+    display_protocol_id: ?u32,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -1160,6 +1174,7 @@ fn buildModel(t: *Typecheck) Model {
         .mul_protocol_id = t.mul_protocol_id,
         .div_protocol_id = t.div_protocol_id,
         .hash_protocol_id = t.hash_protocol_id,
+        .display_protocol_id = t.display_protocol_id,
     };
 }
 
@@ -1853,6 +1868,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
     const eq_name = t.protocols.items[eq_pid].name;
     const ord_pid_opt = t.ord_protocol_id;
     const hash_pid_opt = t.hash_protocol_id;
+    const display_pid_opt = t.display_protocol_id;
     const gpa = t.gpa;
 
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
@@ -1963,6 +1979,43 @@ fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
+    // ---- (2c) Display fixpoint (M22), INDEPENDENT of Eq/Ord/Hash (Display is not a
+    // refinement of any, so there is no `ordFills`-style skip). Seeded from the `print(x)`
+    // requests, it chases every aggregate field the same way the other fixpoints do —
+    // struct fields AND every enum variant's payload — skipping any field with a live
+    // explicit `Display` conformance (it uses its own witness). The SAME
+    // `collectComponentTypes` order the emitter walks, so a nested field's `display` witness
+    // is a sibling recipe.
+    var disp_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = disp_seen.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        disp_seen.deinit(gpa);
+    }
+    var disp_work: std.ArrayList(Type) = .empty;
+    defer disp_work.deinit(gpa);
+
+    if (display_pid_opt) |disp_pid| {
+        for (t.derive_reqs.items) |req| {
+            if (req.protocol_id != disp_pid) continue;
+            try enqueueDerive(gpa, &disp_seen, &disp_work, disp_pid, .display, req.conform_ty);
+        }
+        var wi: usize = 0;
+        while (wi < disp_work.items.len) : (wi += 1) {
+            comps.clearRetainingCapacity();
+            try t.collectComponentTypes(disp_work.items[wi], &comps);
+            for (comps.items) |ft| {
+                switch (ft.kind) {
+                    .@"struct", .@"enum" => {},
+                    else => continue,
+                }
+                if (t.hasConformanceLive(disp_pid, ft)) continue; // explicit Display field: reuse its witness
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, disp_pid, &memo, gpa, t.composite, &.{}))
+                    try enqueueDerive(gpa, &disp_seen, &disp_work, disp_pid, .display, ft);
+            }
+        }
+    }
+
     // ---- (3) Materialize recipes (names/params/field_witnesses filled after the sort) --
     const ordering_ty: Type = if (t.ordering_enum_id) |oid| Type.enumT(oid) else .{ .kind = .invalid };
     if (ord_pid_opt) |ord_pid| {
@@ -1992,6 +2045,16 @@ fn synthesizeDerives(t: *Typecheck) !void {
             .ret = Type.int,
         });
     }
+    if (display_pid_opt) |disp_pid| {
+        const disp_name = t.protocols.items[disp_pid].name;
+        for (disp_work.items) |ty| try t.derives.append(gpa, .{
+            .protocol_id = disp_pid,
+            .protocol_name = disp_name,
+            .kind = .display,
+            .conform_ty = ty,
+            .ret = Type.unit,
+        });
+    }
 
     // ---- (4) Canonical sort — the SOLE ordering driver (never discovery/thread order) --
     std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
@@ -2007,7 +2070,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
         // homogeneous 2-ary (`m(self, other) -> _`). The param count feeds the ABI + the
         // fingerprint Sig fold, so it MUST match the emitter's declared param count.
         d.params = switch (d.kind) {
-            .hash => try gpa.dupe(Type, &[_]Type{d.conform_ty}),
+            .hash, .display => try gpa.dupe(Type, &[_]Type{d.conform_ty}),
             .eq, .ord => try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty }),
         };
         try t.methods.append(gpa, .{
@@ -2086,6 +2149,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldEq {
         .eq => t.resolveFieldEq(ft),
         .ord => t.resolveFieldOrd(ft),
         .hash => t.resolveFieldHash(ft),
+        .display => t.resolveFieldDisplay(ft),
     };
     return fw;
 }
@@ -2138,6 +2202,23 @@ fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldEq {
     }
     switch (resolveConformanceMethod(t.methods.items, ft, "hash", null)) {
         .one => |m| return .{ .hash_call = t.witnessName(m) },
+        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
+    }
+}
+
+/// Resolve one field type to its derived-display recipe (M22): scalars/str render inline
+/// (the emitter writes int via `__display_int`, bool inline, str's raw bytes); a struct/enum
+/// field dispatches to its `display` witness (a sibling Display derive, a Mono instance
+/// method, or a user `impl has Display` fn). Read only on the LIVE method table AFTER all
+/// synthetic entries are appended, so a sibling derive resolves correctly. A `display` miss
+/// is unreachable for a conforming field. Mirrors `resolveFieldHash`.
+fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldEq {
+    switch (ft.kind) {
+        .@"struct", .@"enum" => {},
+        else => return .inline_kind, // int/bool/str — emitter handles by layout kind
+    }
+    switch (resolveConformanceMethod(t.methods.items, ft, "display", null)) {
+        .one => |m| return .{ .display_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
 }
@@ -3014,6 +3095,9 @@ fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         if (t.hash_protocol_id) |hid| {
             if (std.mem.eql(u8, name, "Hash")) return hid;
         }
+        if (t.display_protocol_id) |pid| {
+            if (std.mem.eql(u8, name, "Display")) return pid;
+        }
         return null;
     }
     if (n.tag == .field_access) {
@@ -3624,6 +3708,39 @@ fn registerPrelude(t: *Typecheck) !void {
     try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.bool });
     try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.str });
     try t.conformances.append(t.gpa, .{ .protocol = hash_id, .recv = Type.unit });
+
+    // protocol Display { fn display(self) }  (M22, id 7, right after Hash=6). Like `Hash`,
+    // `display` takes ONLY `self` (`type_var(0)`); unlike `Hash` it returns unit — it WRITES
+    // the value's rendering directly to the output fd (the only heap-free shape of `Display`
+    // in this value-only roadmap), never a returned `str`. The decoded sig is `[self]` params
+    // + `unit` ret. All gpa-allocated so teardown frees prelude + user protocols uniformly.
+    const disp_methods = try t.gpa.alloc([]const u8, 1);
+    disp_methods[0] = "display";
+    const disp_params = try t.gpa.alloc([]const Type, 1);
+    const disp_p0 = try t.gpa.alloc(Type, 1);
+    disp_p0[0] = Type.typeVar(0);
+    disp_params[0] = disp_p0;
+    const disp_rets = try t.gpa.alloc(Type, 1);
+    disp_rets[0] = Type.unit;
+    const disp_id: u32 = @intCast(t.protocols.items.len);
+    t.display_protocol_id = disp_id;
+    try t.protocols.append(t.gpa, .{
+        .name = "Display",
+        .mod = 0,
+        .pub_export = true,
+        .decl_node = Ast.none,
+        .methods = disp_methods,
+        .method_params = disp_params,
+        .method_rets = disp_rets,
+    });
+    // All four builtin scalars conform to `Display` (M22), in a fixed literal order so the
+    // conformance table stays a pure function of source: int renders via a heap-free decimal
+    // renderer, bool as `true`/`false`, str as its raw bytes (no quotes, matching `print(str)`),
+    // unit as `()`. Each lowers to a machine op / builtin call, never a user witness fn.
+    try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.int });
+    try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.bool });
+    try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.str });
+    try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.unit });
 }
 
 /// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
@@ -5093,6 +5210,109 @@ test "M20: firstNonConformingField names the field blocking a `Hash` derive (T00
     try testing.expect(Type.eql(Type.str, off.?.ty));
 }
 
+test "M22: `print(P{..})` on an all-Display-fields struct DERIVES exactly one recipe" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\fn main() {
+        \\ print(P{ x: 4, y: 2 })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // The reworked `print` accepts a Display arg: it records ONE structural Display derive
+    // (struct id 0 -> `Display$display$s0`), no diagnostic, ret unit, `self`-only (1 param).
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Display$display$s0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
+    try testing.expectEqual(Kind.unit, c.result.derives[0].ret.kind);
+    try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
+}
+
+test "M22: `print(enum value)` derives one Display recipe (Display$display$e0)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E { A(int), B }
+        \\fn main() {
+        \\ print(E.A(3))
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Display$display$e0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
+}
+
+test "M22: `print` recurses through a NESTED aggregate (two Display recipes)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Point { x: int, y: int }
+        \\struct Line { from: Point, to: Point }
+        \\fn main() {
+        \\ print(Line{ from: Point{ x: 0, y: 0 }, to: Point{ x: 4, y: 2 } })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // Line's Display fixpoint chases its `Point` fields, deriving Display for both — two
+    // recipes, both `.display` kind. (Point = struct id 0, Line = struct id 1.)
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.derives.len);
+    for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.display, d.kind);
+}
+
+test "M22: an UNUSED Display-eligible struct records zero recipes (lazy)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Q { v: int }
+        \\fn main() {
+        \\ q := Q{ v: 42 }
+        \\ print(q.v)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // `print(q.v)` displays an int (a prelude conformance, no derive); `Q` itself is never
+    // printed, so no `Display$display$s*` unit is synthesized.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "M22: explicit `impl P has Display` OVERRIDES the derive (zero synthetic units)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Display {
+        \\ fn display(self) { print("x") }
+        \\}
+        \\fn main() {
+        \\ print(P{ x: 1 })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // The explicit impl wins at `resolveConformanceMethod`/`findConformance`, so no structural
+    // derive fires.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "M22: `print(\"..\")` still types clean and derives nothing (str path unchanged)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() {
+        \\ print("hi")
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
 test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
@@ -6461,12 +6681,16 @@ test "print of a string literal typechecks clean" {
     ));
 }
 
-test "print of an int is an argument-type error" {
+test "M22: print of an int typechecks clean (Display, no longer an arg-type error)" {
+    // Pre-M22 `print` only took `str`, so `print(42)` was `argument 1: expected str, got int`.
+    // M22 reworks `print` into a polymorphic Display-accepting builtin: `int` conforms to the
+    // prelude `Display`, so `print(42)` is clean (no diagnostic) and derives nothing (int has
+    // a prelude Display conformance, so `findConformance` wins over the structural path).
     const gpa = testing.allocator;
     var c = try checkSource("fn main() {\n print(42)\n return\n}\n");
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqualStrings("argument 1: expected str, got int", c.result.diags[0].message);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
 test "print with no arguments is an arity error" {

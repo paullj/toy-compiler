@@ -21,16 +21,17 @@ const Type = @import("../layout/Engine.zig").Type;
 /// Which derive this recipe carries. Append-only (mirrors `Token.Tag`/`Node.Tag`
 /// discipline): M19 adds `.ord`, M20 `.hash`, M22 `.display`. The ordinal folds into
 /// the mangled name + the sort key, so it must stay stable.
-pub const Kind = enum(u8) { eq, ord, hash };
+pub const Kind = enum(u8) { eq, ord, hash, display };
 
 /// The method a `Kind` synthesizes (a pure function of the kind). Used for the
 /// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method, `Hash` a
-/// `hash` method.
+/// `hash` method, `Display` a `display` method.
 pub fn methodName(k: Kind) []const u8 {
     return switch (k) {
         .eq => "eq",
         .ord => "cmp",
         .hash => "hash",
+        .display => "display",
     };
 }
 
@@ -57,6 +58,10 @@ pub const FieldEq = union(enum) {
     /// call `hash(field_self) -> int` and fold the returned int into the accumulator.
     /// Append-only (ordinal 4).
     hash_call: []const u8,
+    /// An aggregate (struct / enum) field of a `Display` derive with a `display` witness
+    /// (M22): call `display(field_self) -> ()`, which writes the field's rendering directly
+    /// to the output fd. Append-only (ordinal 5).
+    display_call: []const u8,
 };
 
 /// One authorized structural-derive recipe. `field_witnesses`, `params`, and `name`
@@ -234,6 +239,43 @@ test "M20: lessThan orders eq < ord < hash for the same protocol/type" {
     try testing.expect(!lessThan({}, hash0, eq0));
     try testing.expect(!lessThan({}, hash0, ord0));
     try testing.expect(!lessThan({}, hash0, hash0));
+}
+
+test "M22: mangle produces a distinct `Display$display$` name; kind orders last" {
+    const gpa = testing.allocator;
+    const ds = try mangle(gpa, "Display", .display, Type.structT(0));
+    defer gpa.free(ds);
+    try testing.expectEqualStrings("Display$display$s0", ds);
+    const de = try mangle(gpa, "Display", .display, Type.enumT(2));
+    defer gpa.free(de);
+    try testing.expectEqualStrings("Display$display$e2", de);
+    // The Display `display` name is disjoint from the Eq/Ord/Hash names for the same id.
+    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
+    defer gpa.free(es);
+    const os = try mangle(gpa, "Ord", .ord, Type.structT(0));
+    defer gpa.free(os);
+    const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
+    defer gpa.free(hs);
+    try testing.expect(!std.mem.eql(u8, ds, es));
+    try testing.expect(!std.mem.eql(u8, ds, os));
+    try testing.expect(!std.mem.eql(u8, ds, hs));
+    // The kind ordinal (eq=0 < ord=1 < hash=2 < display=3) makes a Display recipe sort LAST
+    // within one (protocol, type), so its synthetic id/name is minted after all others.
+    const eq0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
+    const hash0 = Derive{ .protocol_id = 0, .protocol_name = "Hash", .kind = .hash, .conform_ty = Type.structT(0) };
+    const disp0 = Derive{ .protocol_id = 0, .protocol_name = "Display", .kind = .display, .conform_ty = Type.structT(0) };
+    try testing.expect(lessThan({}, eq0, disp0));
+    try testing.expect(lessThan({}, hash0, disp0));
+    try testing.expect(!lessThan({}, disp0, hash0));
+    try testing.expect(!lessThan({}, disp0, disp0));
+    // writeKey separates the display kind from eq/ord/hash for the same (protocol, type).
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    var d: std.ArrayList(u8) = .empty;
+    defer d.deinit(gpa);
+    try writeKey(gpa, &a, 0, .hash, Type.structT(0));
+    try writeKey(gpa, &d, 0, .display, Type.structT(0));
+    try testing.expect(!std.mem.eql(u8, a.items, d.items));
 }
 
 test "writeKey is injective across kind/enum-flag/id" {
