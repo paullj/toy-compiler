@@ -1,14 +1,14 @@
-# Feature (negative): `==`/`!=` desugar to `Eq::eq` (M15). A type with NO `Eq` impl that
-# ALSO cannot be structurally auto-derived (M18) is a compile-error at the operator
-# (T0026). A payload-carrying enum does NOT structurally conform to `Eq` in M18 (its Eq
-# derive is deferred to M19), so comparing one with no impl still needs an explicit
-# `impl E has Eq { fn eq(self, o: E) -> bool { .. } }`. (An all-Eq-fields STRUCT, by
-# contrast, now derives `Eq` for free — see examples/derive/eq.toy.)
-# expect: compile-error "T0026"
-enum E { A(int), B }
+# Feature (negative): `==`/`!=` desugar to `Eq::eq` (M15). A type that provably does not
+# conform to `Eq` is a compile-error at the operator (T0026). Post-M19, EVERY ground value
+# type conforms structurally (a struct/enum derives `Eq` on demand — see
+# examples/derive/eq_payload_enum.toy), so the ONLY still-reachable T0026 is a generic body
+# whose type parameter is bounded by a protocol that is NOT `Eq`: the bound is the only axiom
+# in scope, so `a == b` cannot desugar. The fix: bound `T` by `Eq`.
+protocol Doubler { fn dbl(self) -> int }
+
+fn bad[T has Doubler](a: T, b: T) -> bool { a == b }
 
 fn main() -> int {
-    p := E.B
-    q := E.B
-    return if p == q { 1 } else { 0 }
+    return 0
 }
+# expect: compile-error "T0026"

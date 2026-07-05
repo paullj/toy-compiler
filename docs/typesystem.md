@@ -353,6 +353,39 @@ injection (user-first-wins), but the prelude `Ord::cmp` still returns the *prelu
 `Ordering`, so its variants would not match the user's — out of scope for M16 (no
 example/fixture defines a conflicting `Ordering`).
 
+## Structural `Ord` auto-derive (M19)
+
+Structural `Ord` is synthesized on demand at a `<`/`>`/`<=`/`>=` use site — the same
+source-less synthetic-codegen-unit channel M18 introduced for `Eq`, keyed on a non-AST
+`(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
+conforms to `Ord` (recursively, via the shared ground `conforms` query) and no explicit
+`impl T has Ord` exists; explicit impls win, and an **unused** derive emits **zero**
+codegen. All six comparisons compose from the single derived `cmp -> Ordering`.
+
+**Order.** A struct is compared **lexicographically in field DECLARATION order** (the
+first field decides; a tie falls to the next). A payload enum is compared by
+**discriminant (case-declaration) order first**, then — on an equal tag — that variant's
+payload **lexicographically** (the SE-0266 total order). ⚠ **Behavior/semver hazard:**
+reordering a struct's fields, or reordering an enum's cases, **silently changes** the
+derived ordering. Nothing pins the order to names, so a refactor that permutes
+declarations is a breaking change to every derived comparison.
+
+**A derived `Ord` fills `Eq`.** Because `Ord` refines `Eq` (the single `(Eq, T)` entry,
+above), a type used with `<` derives an `Ord` `cmp` that ALSO serves `==`/`!=` (via
+`cmp == Ordering.eq`); the barrier registers only the `cmp` method and **suppresses** the
+structural `Eq` recipe for that type, so a type used with both `<` and `==` synthesizes
+**exactly one** unit (the Ord `cmp`) — no double-fire. The same suppression applies to a
+nested field: if a field is used with `<` elsewhere (so it becomes an `Ord` type), an
+enclosing struct's derived `Eq` calls that field's `cmp` rather than minting a second unit.
+
+**Payload-enum `Eq` gap closed.** M18 conformed only *empty-payload* enums to `Eq`; M19's
+`conforms` recurses every variant's payload fields, so an all-`Eq`-payload enum now derives
+`Eq` too (and the derived/enum `Eq` emitter compares the discriminants then, per equal tag,
+the variant's payload field-by-field). Consequently **every** ground value type conforms
+to both `Eq` and `Ord`, and the "field blocks the derive" diagnostics (T0027 on a struct,
+T0029) are unreachable for a ground program — reachable only via a unit operand or a
+generic body whose type parameter's bound is not the protocol.
+
 ## Two-phase checking (and parallelism)
 
 Checking is two phases over one frozen program model:

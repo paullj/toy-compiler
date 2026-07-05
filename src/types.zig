@@ -582,8 +582,9 @@ pub const NonConformingField = struct { name: []const u8, ty: Type };
 /// shared substrate for on-demand structural derive. `findConformance`-FIRST (an
 /// explicit `impl`, a prelude scalar, or the Ord-refinement `(Eq,T)` entry means it
 /// already conforms — the double-fire guard), THEN structural: a struct conforms iff
-/// EVERY field conforms; an enum conforms iff every variant is empty-payload
-/// (M18 = `Eq` only — a payload enum falls through as non-conforming, deferred to M19).
+/// EVERY field conforms; an enum conforms iff EVERY variant's payload fields conform
+/// (M19 — pid-parameterized, so it powers payload-enum `Eq` AND payload-enum/struct `Ord`;
+/// an empty-payload enum trivially conforms since there are no payload fields to check).
 ///
 /// Memoized by `(pid, kind, type-id)` in the caller-owned `memo` (thread-local in Pass
 /// C, local in the synthesis barrier — never shared, so race-free). Always terminates:
@@ -628,13 +629,17 @@ pub fn conforms(
                     }
                 }
             }
-        } else { // enum: empty-payload variants only (M18 Eq)
+        } else { // enum: every variant's payload fields must conform (M19)
             if (recv.enum_id < enums.len) {
                 ok = true;
-                for (enums[recv.enum_id].variants) |v| if (v.field_types.len != 0) {
-                    ok = false;
-                    break;
-                };
+                outer: for (enums[recv.enum_id].variants) |v| {
+                    for (v.field_types) |ft| {
+                        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa)) {
+                            ok = false;
+                            break :outer;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1736,68 +1741,109 @@ fn synthesizeDerives(t: *Typecheck) !void {
     if (t.derive_reqs.items.len == 0) return;
     const eq_pid = t.eq_protocol_id orelse return;
     const eq_name = t.protocols.items[eq_pid].name;
+    const ord_pid_opt = t.ord_protocol_id;
     const gpa = t.gpa;
 
-    // (1)+(2) Worklist to a fixpoint: seed from Pass C's requests, then enqueue each
-    // aggregate field that is itself STRUCTURALLY derived (conforms AND not explicit).
-    // Dedup on the canonical recipe key so a repeated request/field is synthesized once.
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+
+    // ---- (1) Ord fixpoint (M19) -------------------------------------------------------
+    // `ord_seen` doubles as the ord-type SET (keyed `writeKey(ord_pid, .ord, ty)`); the Eq
+    // fixpoint consults it so an Ord type is NEVER given a separate Eq recipe — a derived
+    // `Ord` fills the single `(Eq, T)` slot (M16 precedence), and `==` routes through its
+    // `cmp`. The fixpoint chases struct fields AND every enum variant's payload fields,
+    // skipping any field with a live explicit conformance (it uses its own witness).
+    var ord_seen: std.StringHashMapUnmanaged(void) = .empty;
     defer {
-        var it = seen.keyIterator();
+        var it = ord_seen.keyIterator();
         while (it.next()) |k| gpa.free(k.*);
-        seen.deinit(gpa);
+        ord_seen.deinit(gpa);
     }
-    var work: std.ArrayList(Type) = .empty; // conform types (protocol is always eq in M18)
-    defer work.deinit(gpa);
+    var ord_work: std.ArrayList(Type) = .empty;
+    defer ord_work.deinit(gpa);
+    var comps: std.ArrayList(Type) = .empty;
+    defer comps.deinit(gpa);
 
-    const enqueue = struct {
-        fn f(gpa_: std.mem.Allocator, seen_: *std.StringHashMapUnmanaged(void), work_: *std.ArrayList(Type), pid: u32, ty: Type) !void {
-            var kb: std.ArrayList(u8) = .empty;
-            defer kb.deinit(gpa_);
-            try Derive.writeKey(gpa_, &kb, pid, .eq, ty);
-            if (seen_.contains(kb.items)) return;
-            const owned = try kb.toOwnedSlice(gpa_);
-            errdefer gpa_.free(owned);
-            try seen_.put(gpa_, owned, {});
-            try work_.append(gpa_, ty);
+    if (ord_pid_opt) |ord_pid| {
+        for (t.derive_reqs.items) |req| {
+            if (req.protocol_id != ord_pid) continue;
+            try enqueueDerive(gpa, &ord_seen, &ord_work, ord_pid, .ord, req.conform_ty);
         }
-    }.f;
+        var oi: usize = 0;
+        while (oi < ord_work.items.len) : (oi += 1) {
+            comps.clearRetainingCapacity();
+            try t.collectComponentTypes(ord_work.items[oi], &comps);
+            for (comps.items) |ft| {
+                switch (ft.kind) {
+                    .@"struct", .@"enum" => {},
+                    else => continue,
+                }
+                if (t.hasConformanceLive(ord_pid, ft)) continue; // explicit Ord field: reuse its witness
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, ord_pid, &memo, gpa))
+                    try enqueueDerive(gpa, &ord_seen, &ord_work, ord_pid, .ord, ft);
+            }
+        }
+    }
 
-    for (t.derive_reqs.items) |req| try enqueue(gpa, &seen, &work, eq_pid, req.conform_ty);
+    // ---- (2) Eq fixpoint (M18), SKIPPING any Ord type ---------------------------------
+    var eq_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = eq_seen.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        eq_seen.deinit(gpa);
+    }
+    var eq_work: std.ArrayList(Type) = .empty;
+    defer eq_work.deinit(gpa);
 
-    var wi: usize = 0;
-    while (wi < work.items.len) : (wi += 1) {
-        const ty = work.items[wi];
-        if (ty.kind != .@"struct" or ty.struct_id >= t.structs.items.len) continue; // enums have no aggregate fields to chase
-        for (t.structs.items[ty.struct_id].field_types) |ft| {
+    for (t.derive_reqs.items) |req| {
+        if (req.protocol_id != eq_pid) continue;
+        if (try t.ordFills(&ord_seen, ord_pid_opt, req.conform_ty)) continue; // Ord fills Eq
+        try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, req.conform_ty);
+    }
+    var ei: usize = 0;
+    while (ei < eq_work.items.len) : (ei += 1) {
+        comps.clearRetainingCapacity();
+        try t.collectComponentTypes(eq_work.items[ei], &comps);
+        for (comps.items) |ft| {
             switch (ft.kind) {
                 .@"struct", .@"enum" => {},
                 else => continue,
             }
-            if (t.hasConformanceLive(eq_pid, ft)) continue; // explicit/Ord field: use its own witness, don't synthesize
+            if (t.hasConformanceLive(eq_pid, ft)) continue; // explicit Eq field: reuse its witness
+            if (try t.ordFills(&ord_seen, ord_pid_opt, ft)) continue; // Ord fills Eq: the field's cmp witness serves `==`
             if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa))
-                try enqueue(gpa, &seen, &work, eq_pid, ft);
+                try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, ft);
         }
     }
 
-    // (3) Materialize recipes (names/params/field_witnesses filled after the sort).
-    for (work.items) |ty| {
-        try t.derives.append(gpa, .{
-            .protocol_id = eq_pid,
-            .protocol_name = eq_name,
-            .kind = .eq,
+    // ---- (3) Materialize recipes (names/params/field_witnesses filled after the sort) --
+    const ordering_ty: Type = if (t.ordering_enum_id) |oid| Type.enumT(oid) else .{ .kind = .invalid };
+    if (ord_pid_opt) |ord_pid| {
+        const ord_name = t.protocols.items[ord_pid].name;
+        for (ord_work.items) |ty| try t.derives.append(gpa, .{
+            .protocol_id = ord_pid,
+            .protocol_name = ord_name,
+            .kind = .ord,
             .conform_ty = ty,
+            .ret = ordering_ty,
         });
     }
+    for (eq_work.items) |ty| try t.derives.append(gpa, .{
+        .protocol_id = eq_pid,
+        .protocol_name = eq_name,
+        .kind = .eq,
+        .conform_ty = ty,
+        .ret = Type.@"bool",
+    });
 
-    // (4) Canonical sort — the SOLE ordering driver (never discovery/thread order).
+    // ---- (4) Canonical sort — the SOLE ordering driver (never discovery/thread order) --
     std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
 
-    // (5) Mint names + params in sorted order, and append the synthetic `Method` for each
-    // BEFORE resolving field witnesses (so a nested aggregate field resolves to its
-    // sibling recipe's synthetic method). recv=conform_ty, name="eq", derive=index.
+    // ---- (5) Mint names + params + register the synthetic `Method` for each recipe,
+    // BEFORE resolving field witnesses (so a nested aggregate field resolves to its sibling
+    // recipe's synthetic method). An Ord recipe registers a `cmp` Method{protocol_id=ord};
+    // an Eq recipe an `eq` Method{protocol_id=eq}. `derive=index` routes lower/fold to the
+    // synthetic unit.
     for (t.derives.items, 0..) |*d, di| {
         d.name = try Derive.mangle(gpa, d.protocol_name, d.kind, d.conform_ty);
         d.params = try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty });
@@ -1806,7 +1852,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
             .name = Derive.methodName(d.kind),
             .fn_id = 0,
             .recv_generic = false,
-            .protocol_id = eq_pid,
+            .protocol_id = d.protocol_id,
             .derive = @intCast(di),
         });
     }
@@ -1818,18 +1864,66 @@ fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
-    // (6) Resolve each struct field's witness on the LIVE method table (now carrying the
-    // synthetic entries). Scalar/str fields compare inline (the emitter dispatches by
-    // layout kind); struct/enum fields dispatch to the resolved eq witness, or an
-    // Ord-only field's cmp witness (`==` as `cmp(..) == eq`).
-    for (t.derives.items) |*d| {
-        if (d.conform_ty.kind != .@"struct") continue; // empty-payload enum: no fields
-        const fields = t.structs.items[d.conform_ty.struct_id].field_types;
-        const fw = try gpa.alloc(Derive.FieldEq, fields.len);
-        errdefer gpa.free(fw);
-        for (fields, 0..) |ft, i| fw[i] = t.resolveFieldEq(ft);
-        d.field_witnesses = fw;
+    // ---- (6) Resolve each recipe's field witnesses on the LIVE method table (now carrying
+    // the synthetic entries), for BOTH structs and enums (enum payloads flattened in
+    // variant-decl-then-field order). These fold into the derive fingerprint; the emitter
+    // re-resolves from the same table, so the two stay in lockstep.
+    for (t.derives.items) |*d| d.field_witnesses = try t.resolveDeriveFields(d.*);
+}
+
+/// Enqueue `ty` for derive `(pid, kind)` once, deduped on the canonical recipe key so a
+/// repeated request / nested field is synthesized a single time. `seen` OWNS the key bytes.
+fn enqueueDerive(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), work: *std.ArrayList(Type), pid: u32, kind: Derive.Kind, ty: Type) !void {
+    var kb: std.ArrayList(u8) = .empty;
+    defer kb.deinit(gpa);
+    try Derive.writeKey(gpa, &kb, pid, kind, ty);
+    if (seen.contains(kb.items)) return;
+    const owned = try kb.toOwnedSlice(gpa);
+    errdefer gpa.free(owned);
+    try seen.put(gpa, owned, {});
+    try work.append(gpa, ty);
+}
+
+/// True when `ty` already has (or will have) a DERIVED `Ord` recipe — so its `cmp` fills the
+/// single `(Eq, ty)` slot and the Eq fixpoint must not synthesize a separate Eq unit for it.
+fn ordFills(t: *Typecheck, ord_seen: *const std.StringHashMapUnmanaged(void), ord_pid_opt: ?u32, ty: Type) !bool {
+    const ord_pid = ord_pid_opt orelse return false;
+    var kb: std.ArrayList(u8) = .empty;
+    defer kb.deinit(t.gpa);
+    try Derive.writeKey(t.gpa, &kb, ord_pid, .ord, ty);
+    return ord_seen.contains(kb.items);
+}
+
+/// Append `ty`'s component field types in the CANONICAL derive walk order (the order the
+/// emitter and the witness-fold both use): a struct's fields in declaration order; an enum's
+/// every-variant payload fields in variant-decl-then-field order. A scalar `ty` appends none.
+fn collectComponentTypes(t: *Typecheck, ty: Type, out: *std.ArrayList(Type)) !void {
+    switch (ty.kind) {
+        .@"struct" => if (ty.struct_id < t.structs.items.len)
+            try out.appendSlice(t.gpa, t.structs.items[ty.struct_id].field_types),
+        .@"enum" => if (ty.enum_id < t.enums.items.len)
+            for (t.enums.items[ty.enum_id].variants) |v| try out.appendSlice(t.gpa, v.field_types),
+        else => {},
     }
+}
+
+/// Resolve one recipe's per-field witnesses (M19): the flattened component fields (see
+/// `collectComponentTypes`) each mapped to their `FieldEq` per the recipe kind — `eq` fields
+/// via `resolveFieldEq`, `ord` fields via `resolveFieldOrd`. Returns the borrowed-empty slice
+/// for a no-field recipe (empty struct / empty-payload enum) so teardown's `len > 0` free
+/// guard stays correct. OWNED outer slice (freed by `freeDeriveEntries`).
+fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldEq {
+    var ftys: std.ArrayList(Type) = .empty;
+    defer ftys.deinit(t.gpa);
+    try t.collectComponentTypes(d.conform_ty, &ftys);
+    if (ftys.items.len == 0) return &.{};
+    const fw = try t.gpa.alloc(Derive.FieldEq, ftys.items.len);
+    errdefer t.gpa.free(fw);
+    for (ftys.items, 0..) |ft, i| fw[i] = switch (d.kind) {
+        .eq => t.resolveFieldEq(ft),
+        .ord => t.resolveFieldOrd(ft),
+    };
+    return fw;
 }
 
 /// Resolve one struct-field type to its derived-eq recipe (M18): scalars/str compare
@@ -1848,6 +1942,22 @@ fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldEq {
     }
     switch (resolveConformanceMethod(t.methods.items, ft, "cmp", null)) {
         .one => |m| return .{ .cmp_eq = t.witnessName(m) },
+        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
+    }
+}
+
+/// Resolve one field type to its derived-ord recipe (M19): scalars/str compare inline (the
+/// emitter's branch-free 3-way / lexicographic byte loop); a struct/enum field dispatches to
+/// its `cmp` witness (a sibling Ord derive, a Mono instance method, or a user `impl has Ord`
+/// fn). Read only on the LIVE method table AFTER all synthetic entries are appended, so a
+/// sibling derive resolves correctly. A `cmp` miss is unreachable for a conforming field.
+fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldEq {
+    switch (ft.kind) {
+        .@"struct", .@"enum" => {},
+        else => return .inline_kind, // int/bool/str — emitter handles by layout kind
+    }
+    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", null)) {
+        .one => |m| return .{ .cmp_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
 }
@@ -3596,31 +3706,40 @@ const testing = std.testing;
 const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
 
-test "M18: conforms truth table (scalar/struct/nested/empty-enum/payload-enum)" {
+test "M19: conforms truth table (scalar/struct/nested/empty-enum/payload-enum recurse)" {
     const gpa = testing.allocator;
     const eq_pid: u32 = 0;
-    // struct#0 {x:int, y:bool} — all scalars conform; struct#1 {inner: struct#0} —
-    // nested aggregate; struct#2 {c: enum#1} — a payload-enum field blocks derive.
+    // struct#0 {x:int, y:bool} — all scalars conform; struct#1 {inner: struct#0} — nested;
+    // struct#2 {c: enum#1} — an all-conforming payload-enum field (now conforms, M19);
+    // struct#3 {d: enum#2} — a NON-conforming payload-enum field (str payload, no prelude Eq).
     const s0_ft = [_]Type{ Type.int, Type.@"bool" };
     const s0_fn = [_][]const u8{ "x", "y" };
     const s1_ft = [_]Type{Type.structT(0)};
     const s1_fn = [_][]const u8{"inner"};
     const s2_ft = [_]Type{Type.enumT(1)};
     const s2_fn = [_][]const u8{"c"};
+    const s3_ft = [_]Type{Type.enumT(2)};
+    const s3_fn = [_][]const u8{"d"};
     const structs = [_]StructSym{
         .{ .decl_node = Ast.none, .name = "S0", .field_types = @constCast(&s0_ft), .field_names = @constCast(&s0_fn) },
         .{ .decl_node = Ast.none, .name = "S1", .field_types = @constCast(&s1_ft), .field_names = @constCast(&s1_fn) },
         .{ .decl_node = Ast.none, .name = "S2", .field_types = @constCast(&s2_ft), .field_names = @constCast(&s2_fn) },
+        .{ .decl_node = Ast.none, .name = "S3", .field_types = @constCast(&s3_ft), .field_names = @constCast(&s3_fn) },
     };
-    // enum#0 all-empty (conforms); enum#1 has a payload variant (does NOT).
+    // enum#0 all-empty (conforms); enum#1 has an int payload (M19: recurse -> conforms);
+    // enum#2 has a str payload (str has NO prelude Eq here -> does NOT conform).
     var e0_vars = [_]VariantSym{ .{ .name = "A", .form = .unit }, .{ .name = "B", .form = .unit } };
     var e1_pl = [_]Type{Type.int};
     var e1_vars = [_]VariantSym{ .{ .name = "R", .form = .tuple, .field_types = &e1_pl }, .{ .name = "G", .form = .unit } };
+    var e2_pl = [_]Type{Type.str};
+    var e2_vars = [_]VariantSym{ .{ .name = "X", .form = .tuple, .field_types = &e2_pl }, .{ .name = "Y", .form = .unit } };
     const enums = [_]EnumSym{
         .{ .decl_node = Ast.none, .name = "E0", .variants = &e0_vars },
         .{ .decl_node = Ast.none, .name = "E1", .variants = &e1_vars },
+        .{ .decl_node = Ast.none, .name = "E2", .variants = &e2_vars },
     };
-    // Prelude scalar Eq conformances (int/bool); no user struct/enum impl.
+    // Prelude scalar Eq conformances (int/bool only; str deliberately absent so a str
+    // payload/field is the non-conforming leaf).
     const confs = [_]Conformance{ .{ .protocol = eq_pid, .recv = Type.int }, .{ .protocol = eq_pid, .recv = Type.@"bool" } };
 
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
@@ -3634,15 +3753,17 @@ test "M18: conforms truth table (scalar/struct/nested/empty-enum/payload-enum)" 
     try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(0), &memo, gpa)); // all-scalar struct
     try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(1), &memo, gpa)); // nested struct
     try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(0), &memo, gpa)); // empty-payload enum
-    try testing.expect(!try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa)); // payload enum
-    try testing.expect(!try C.q(&structs, &enums, &confs, Type.structT(2), &memo, gpa)); // struct w/ payload-enum field
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa)); // int-payload enum (M19: conforms)
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(2), &memo, gpa)); // struct w/ int-payload-enum field
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.enumT(2), &memo, gpa)); // str-payload enum (str no Eq here)
+    try testing.expect(!try C.q(&structs, &enums, &confs, Type.structT(3), &memo, gpa)); // struct w/ str-payload-enum field
     try testing.expect(!try C.q(&structs, &enums, &confs, Type.str, &memo, gpa)); // str has NO prelude Eq in this synthetic table
 
-    // The blocked struct#2 names its first offending field (`c: E1`).
-    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(2), 0, &memo, gpa);
+    // The blocked struct#3 names its first offending field (`d: E2`).
+    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(3), 0, &memo, gpa);
     try testing.expect(off != null);
-    try testing.expectEqualStrings("c", off.?.name);
-    try testing.expect(Type.eql(Type.enumT(1), off.?.ty));
+    try testing.expectEqualStrings("d", off.?.name);
+    try testing.expect(Type.eql(Type.enumT(2), off.?.ty));
 }
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
@@ -4180,7 +4301,7 @@ test "M18: `==` on an all-Eq-fields struct with no impl DERIVES (was M15 T0026)"
     try testing.expectEqualStrings("Eq$eq$s0", c.result.derives[0].name);
 }
 
-test "M18: `==` on a PAYLOAD enum with no impl is still T0026 (payload-enum Eq deferred)" {
+test "M19: `==` on a PAYLOAD enum with no impl now DERIVES Eq (M18 gap closed)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum E { A(int), B }
@@ -4192,11 +4313,30 @@ test "M18: `==` on a PAYLOAD enum with no impl is still T0026 (payload-enum Eq d
         \\
     );
     defer c.deinit(gpa);
-    // A payload-carrying enum does not structurally conform in M18, and it is not a
-    // struct (so no T0029) -> the operator keeps the M15 "no Eq impl" T0026. No derive.
-    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqual(codes.Code.T0026, c.result.diags[0].code);
-    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+    // M19: a payload enum's variant payloads recurse in `conforms`, so an all-`Eq`-payload
+    // enum structurally conforms -> one source-less `Eq` recipe (`Eq$eq$e0`), zero diags.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Eq$eq$e0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.eq, c.result.derives[0].kind);
+}
+
+test "M19: `<` on a PAYLOAD enum with no impl DERIVES Ord (discriminant-then-payload)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum N { Z, S(int) }
+        \\fn main() -> int {
+        \\ return if N.Z < N.S(1) { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // One source-less `Ord` recipe (`Ord$cmp$e0`), no separate Eq unit; zero diags.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Ord$cmp$e0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.ord, c.result.derives[0].kind);
+    try testing.expectEqual(Kind.@"enum", c.result.derives[0].ret.kind); // ret is `Ordering`
 }
 
 test "M15: str `==` and unit `==` type to bool (builtin-scalar Eq), zero diags" {
@@ -4399,7 +4539,7 @@ test "M16: int/str/bool `<` type to bool (builtin Ord), zero diags" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M16: `<` on a struct with no `Ord` impl is exactly one T0027 at the operator" {
+test "M19: `<` on a struct with no `Ord` impl now DERIVES Ord (was M16 T0027)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4411,9 +4551,91 @@ test "M16: `<` on a struct with no `Ord` impl is exactly one T0027 at the operat
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqual(codes.Code.T0027, c.result.diags[0].code);
-    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Ord' impl") != null);
+    // M19: an all-`Ord`-fields struct with no explicit impl derives structurally — no
+    // diagnostic, exactly one `Ord` recipe (`Ord$cmp$s0`), which also fills `(Eq, P)`.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Ord$cmp$s0", c.result.derives[0].name);
+    try testing.expectEqual(Derive.Kind.ord, c.result.derives[0].kind);
+}
+
+test "M19: struct used with BOTH `<` and `==` yields ONE Ord unit (no double-fire)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\ a := P{ x: 1, y: 0 }
+        \\ b := P{ x: 1, y: 5 }
+        \\ lt := a < b
+        \\ eq := a == b
+        \\ return if lt { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // A derived `Ord` fills the single `(Eq, P)` slot, so `==` routes through the derived
+    // `cmp` and NO separate `Eq` unit is synthesized — exactly one recipe (the Ord cmp).
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqualStrings("Ord$cmp$s0", c.result.derives[0].name);
+    for (c.result.derives) |d| try testing.expect(d.kind != .eq);
+}
+
+test "M19: explicit `impl P has Ord` OVERRIDES the derive (zero synthetic units)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Ord {
+        \\ fn cmp(self, o: P) -> Ordering {
+        \\  if self.x < o.x { Ordering.lt } else if self.x == o.x { Ordering.eq } else { Ordering.gt }
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ a := P{ x: 1 }
+        \\ b := P{ x: 2 }
+        \\ return if a < b { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "M19: an UNUSED derivable struct emits zero derive recipes" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Q { v: int }
+        \\fn main() -> int {
+        \\ q := Q{ v: 42 }
+        \\ return q.v
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "M19: nested-struct + struct-with-payload-enum-field both derive Ord recursively" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Inner { a: int, b: int }
+        \\enum N { Z, S(int) }
+        \\struct Outer { p: Inner, n: N }
+        \\fn main() -> int {
+        \\ x := Outer{ p: Inner{ a: 1, b: 2 }, n: N.Z }
+        \\ y := Outer{ p: Inner{ a: 1, b: 3 }, n: N.S(4) }
+        \\ return if x < y { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // Outer's Ord fixpoint chases its field `p: Inner` (struct) and `n: N` (payload enum),
+    // deriving `Ord` for all three — one recipe each, none is an Eq unit (Ord fills Eq).
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 3), c.result.derives.len);
+    for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.ord, d.kind);
 }
 
 test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {

@@ -1,7 +1,7 @@
-struct P { x: int }
+protocol Doubler { fn dbl(self) -> int }
+
+fn bad[T has Doubler](a: T, b: T) -> bool { a < b }  #~ ERROR [T0027] requires an 'Ord' impl
 
 fn main() -> int {
-    p := P{ x: 1 }
-    q := P{ x: 2 }
-    return if p < q { 1 } else { 0 }  #~ ERROR [T0027] requires an 'Ord' impl
+    return 0
 }

@@ -1,0 +1,23 @@
+# Feature: structural `Ord`/`Eq` derive recurses through NESTED aggregates, `str` fields,
+# and MULTI-field enum payloads (M19). The derived `cmp` for `Person` calls `Name`'s derived
+# `cmp` (a distinct source-less unit), which lexicographically compares its two `str` fields
+# via a heap-free byte loop; the derived `cmp` for `Tree` compares discriminants then the
+# variant's payload fields left-to-right. `==` on any of them routes through the same derived
+# `cmp` (Ord fills Eq) — no separate synthetic unit.
+struct Name { first: str, last: str }
+struct Person { name: Name, age: int }
+enum Tree { Leaf(int), Node(int, int) }
+
+fn main() -> int {
+    a := Person{ name: Name{ first: "ann", last: "b" }, age: 30 }
+    b := Person{ name: Name{ first: "ann", last: "c" }, age: 10 }
+    r := 0
+    if a < b { r = r + 1 }                                # first name ties, "b" < "c"
+    if a == a { r = r + 2 }                               # nested eq via the derived cmp
+    if a != b { r = r + 4 }                               # differ in last name
+    if Tree.Leaf(9) < Tree.Node(0, 0) { r = r + 8 }       # tag 0 < tag 1
+    if Tree.Node(1, 2) < Tree.Node(1, 3) { r = r + 16 }   # equal tag + first payload -> 2 < 3
+    if Tree.Node(1, 2) == Tree.Node(1, 2) { r = r + 32 }  # payload equality via derived cmp
+    return r
+}
+# expect: exit 63
