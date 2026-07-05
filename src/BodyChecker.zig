@@ -1936,6 +1936,41 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        // The `print` builtin (M22): a compiler-magic polymorphic builtin accepting ANY
+        // `Display`-conforming argument (Q8 — NOT a monomorphized generic). Intercept BEFORE
+        // the generic/arg-assignability check below (which pre-M22 rejected `print(42)` with
+        // "expected str, got int"). Require exactly one arg, require it conform to `Display`
+        // (recording a ground struct/enum derive req so the serial barrier synthesizes the
+        // `display` unit), and type the call `.unit`. `print("..")` still works (str conforms);
+        // a non-conforming arg is T0031, naming the blocking struct field where applicable.
+        if (f.kind == .builtin) {
+            if (args.len != 1) {
+                for (args) |arg| _ = try bc.typeOf(arg);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                bc.node_types[(node_idx).int()] = Type.unit;
+                return Type.unit;
+            }
+            const at = try bc.typeOf(args[0]);
+            const at_tok = bc.tree.nodes[(args[0]).int()].main_token;
+            if (at.kind == .invalid) {
+                // The arg already reported its own error; type the call unit, don't cascade.
+                bc.node_types[(node_idx).int()] = Type.unit;
+                return Type.unit;
+            }
+            if (try bc.conformsToDisplay(at)) {
+                bc.node_types[(node_idx).int()] = Type.unit;
+                return Type.unit;
+            }
+            if (try bc.displayDeriveBlocker(at)) |blocker| {
+                try bc.sink.emitFmtCode(.T0031, bc.byteOf(at_tok), "cannot 'print' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(at), blocker.name, bc.typeName(blocker.ty) });
+            } else {
+                // A `type_var` (a generic param without a `Display` bound) renders as its
+                // source name (`T`), mirroring `nonConformingName`, not the opaque `type_var`.
+                const nm = if (at.isTypeVar() and at.typeVarOrd() < bc.gph_generic_params.len) bc.gph_generic_params[at.typeVarOrd()] else bc.typeName(at);
+                try bc.sink.emitFmtCode(.T0031, bc.byteOf(at_tok), "cannot 'print' a value of type '{s}': it does not conform to 'Display'", .{nm});
+            }
+            return .invalid;
+        }
         // A bare (no-explicit-args) generic call `id(7)` (M3): infer each type-arg by
         // one-sided structural matching of the template's param patterns against the
         // ground argument types, then reuse `applyGenericSig` to check args + type the
@@ -2231,6 +2266,46 @@ pub const BodyChecker = struct {
         if (t.kind != .@"struct") return null;
         const hash_pid = bc.model.hash_protocol_id orelse return null;
         return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
+    }
+
+    /// Whether `t` conforms to the prelude `Display` protocol (M22) — the predicate the
+    /// `print(x)` builtin trigger uses. Mirrors `conformsToHash` (Display is likewise
+    /// INDEPENDENT of Eq/Ord/Hash, no refinement): a concrete type resolves via the frozen
+    /// conformance table (`findConformance` covers the int/bool/str/unit prelude conformances
+    /// AND every user `impl T has Display`); a `type_var` in a bounded generic body conforms
+    /// as-axiom when its declared bound IS `Display` (so `fn f[T has Display](x: T) { print(x) }`
+    /// works). After those misses, a struct/enum whose fields all conform to `Display` with NO
+    /// explicit impl conforms STRUCTURALLY — record the derive request (so the serial barrier
+    /// synthesizes the source-less `display`) and return true. Now fallible (`conforms` + the
+    /// request record allocate). A prelude-less caller (`display_protocol_id == null`) denies.
+    fn conformsToDisplay(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
+        const disp_pid = bc.model.display_protocol_id orelse return false;
+        if (Typecheck.findConformance(bc.model, disp_pid, t, &.{})) return true;
+        if (t.isTypeVar()) {
+            const ord = t.typeVarOrd();
+            if (ord >= bc.bound_protocols.len) return false;
+            return (bc.bound_protocols[ord] orelse return false) == disp_pid;
+        }
+        switch (t.kind) {
+            .@"struct", .@"enum", .app => {},
+            else => return false,
+        }
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, disp_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
+            if (bc.isGround(t)) try bc.recordDeriveReq(disp_pid, t);
+            return true;
+        }
+        return false;
+    }
+
+    /// The first struct field that blocks a structural `Display` derive (M22), for the T0031
+    /// message; null when `t` is not a struct, has no display protocol, or every field
+    /// conforms. Struct-only (mirrors `hashDeriveBlocker`): a payload enum with a
+    /// non-conforming payload has no single nameable field, so it falls through to a generic
+    /// "does not conform" message instead.
+    fn displayDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
+        if (t.kind != .@"struct") return null;
+        const disp_pid = bc.model.display_protocol_id orelse return null;
+        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, disp_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)

@@ -77,6 +77,7 @@ pub const Code = enum(u16) {
     T0028, // missing-arith-impl (`+`/`-`/`*`/`/` used on a value type with no matching `Add`/`Sub`/`Mul`/`Div` conformance — operator desugar, M17)
     T0029, // non-derivable-field (structural `Eq` derive blocked by a struct field whose type does not conform to `Eq` — use-site, M18)
     T0030, // non-hashable-field (structural `Hash` derive blocked by a field whose type does not conform to `Hash` — use-site, M20)
+    T0031, // non-displayable-arg (`print(x)`/structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site, M22)
 
     _,
 };
@@ -145,6 +146,7 @@ pub const table = [_]Entry{
     .{ .code = .T0028, .str = "T0028", .slug = "missing-arith-impl" },
     .{ .code = .T0029, .str = "T0029", .slug = "non-derivable-field" },
     .{ .code = .T0030, .str = "T0030", .slug = "non-hashable-field" },
+    .{ .code = .T0031, .str = "T0031", .slug = "non-displayable-arg" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -284,6 +286,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0030", str(.T0030).?);
     try testing.expectEqualStrings("non-hashable-field", slug(.T0030).?);
     try testing.expectEqual(Code.T0030, fromStr("T0030").?);
+
+    // M22 `print`/structural `Display` derive blocker code.
+    try testing.expectEqualStrings("T0031", str(.T0031).?);
+    try testing.expectEqualStrings("non-displayable-arg", slug(.T0031).?);
+    try testing.expectEqual(Code.T0031, fromStr("T0031").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

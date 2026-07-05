@@ -754,9 +754,135 @@ pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     };
 }
 
+// __display_int(n) builtin body — hand-written, AST/IR-independent (M22). The
+// heap-free `int`->decimal renderer: format the digits of the i64 in x0 into a
+// fixed 32-byte STACK buffer (backward, so no reversal), then tail into
+// write(fd=1, buf, len). Appended at link time (emit.zig) when any fn references
+// `__display_int`; like `print` it uses only the stack + the `write` syscall, so
+// a generated program that displays an int touches NO allocator.
+//
+// Digit extraction avoids i64::MIN overflow by NEVER negating the running value:
+// each step computes q = n/10 (sdiv, truncates toward zero) and the single-digit
+// remainder r = n - q*10 (range -9..9), takes |r| (safe — |r| <= 9), and stores
+// '0'+|r|. The original sign (saved in x9) prepends a '-'. n==0 emits one '0' via
+// the do-while shape. All branch offsets are compile-time-known local words.
+
+/// Build the `__display_int` builtin's FnCode directly (no IR, no frame beyond the
+/// 32-byte digit buffer). Caller owns the result.
+pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer relocs.deinit(gpa);
+
+    const emit = struct {
+        fn f(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, word, .little);
+            try c.appendSlice(a, &buf);
+        }
+    }.f;
+
+    const A = Aarch64;
+    // Prologue + reserve a 32-byte digit buffer at [sp, sp+32); saved fp/lr sit above.
+    try emit(&code, gpa, A.stpFpLrPre); // stp x29,x30,[sp,#-16]!
+    try emit(&code, gpa, A.movFpSp); // mov x29, sp
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 32)); // sub sp, sp, #32
+    try emit(&code, gpa, A.movReg(9, 0)); // x9 = n (saved for the sign test)
+    try emit(&code, gpa, A.movz(11, 10, 0)); // x11 = 10 (divisor)
+    try emit(&code, gpa, A.movz(14, 0x30, 0)); // x14 = '0'
+    try emit(&code, gpa, A.addImm(10, A.SP, 24)); // x10 = &buf_end (write cursor, grows down)
+    // do-while digit loop (LOOP = this sdiv):
+    try emit(&code, gpa, A.sdiv(12, 0, 11)); // x12 = n / 10
+    try emit(&code, gpa, A.mul(13, 12, 11)); // x13 = q * 10
+    try emit(&code, gpa, A.subReg(13, 0, 13)); // x13 = n - q*10  (signed remainder)
+    try emit(&code, gpa, A.cmpImm(13, 0)); // cmp r, #0
+    try emit(&code, gpa, A.bCond(.ge, 2)); // b.ge +2  (skip the neg if r >= 0)
+    try emit(&code, gpa, A.neg(13, 13)); // x13 = -r   (|r|, safe: |r| <= 9)
+    try emit(&code, gpa, A.addReg(13, 13, 14)); // x13 = '0' + digit
+    try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
+    try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = digit char
+    try emit(&code, gpa, A.movReg(0, 12)); // n = q
+    try emit(&code, gpa, A.cbnz(0, -10)); // cbnz n, LOOP  (back 10 words to the sdiv)
+    // Sign: if the original value was negative, prepend '-'.
+    try emit(&code, gpa, A.cmpImm(9, 0)); // cmp orig, #0
+    try emit(&code, gpa, A.bCond(.ge, 4)); // b.ge +4  (skip the 3 sign instrs if >= 0)
+    try emit(&code, gpa, A.movz(13, 0x2D, 0)); // x13 = '-'
+    try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
+    try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = '-'
+    // write(fd=1, buf=cursor, len=buf_end-cursor).
+    try emit(&code, gpa, A.addImm(1, A.SP, 24)); // x1 = &buf_end
+    try emit(&code, gpa, A.subReg(2, 1, 10)); // x2 = len = end - cursor
+    try emit(&code, gpa, A.movReg(1, 10)); // x1 = buf = cursor
+    try emit(&code, gpa, A.movz(0, 1, 0)); // x0 = fd = 1
+    // adrp x16, _write@GOT ; ldr x16,[x16] ; blr x16  (same import path as lowerPrint).
+    var site: u32 = @intCast(code.items.len);
+    const wname1 = try gpa.dupe(u8, "write");
+    errdefer gpa.free(wname1);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname1 } }, .kind = .adrp_page });
+    try emit(&code, gpa, A.adrp(16, 0));
+    site = @intCast(code.items.len);
+    const wname2 = try gpa.dupe(u8, "write");
+    errdefer gpa.free(wname2);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname2 } }, .kind = .ldr_lo12 });
+    try emit(&code, gpa, A.ldrRegUoff(16, 16, 0));
+    try emit(&code, gpa, A.blr(16));
+    // Epilogue.
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 32)); // sub-buffer teardown
+    try emit(&code, gpa, A.ldpFpLrPost); // ldp x29,x30,[sp],#16
+    try emit(&code, gpa, A.ret);
+
+    const name = try gpa.dupe(u8, "__display_int");
+    errdefer gpa.free(name);
+    return .{
+        .sym = .{ .kind = .builtin, .name = name },
+        .code = try code.toOwnedSlice(gpa),
+        .relocs = try relocs.toOwnedSlice(gpa),
+        .literals = &.{},
+    };
+}
+
 // TESTS — hand-build a tiny Ir.Function and assert the emitted byte shape.
 
 const testing = std.testing;
+
+test "ir-codegen: __display_int builtin byte shape (prologue, buffer, digit loop, write, ret)" {
+    const gpa = testing.allocator;
+    var fc = try lowerDisplayInt(gpa);
+    defer fc.deinit(gpa);
+
+    // A hand-asm builtin named `__display_int`.
+    try testing.expectEqualStrings("__display_int", fc.sym.name);
+    try testing.expectEqual(Link.SymKind.builtin, fc.sym.kind);
+    // 4-byte aligned instruction stream; opens with the frame prologue.
+    try testing.expect(fc.code.len % 4 == 0);
+    try testing.expectEqual(Aarch64.stpFpLrPre, std.mem.readInt(u32, fc.code[0..4], .little));
+    // Reserves the 32-byte digit buffer right after `mov x29,sp`.
+    try testing.expectEqual(Aarch64.subImm(Aarch64.SP, Aarch64.SP, 32), std.mem.readInt(u32, fc.code[8..12], .little));
+    // Ends with `ret`; the two instructions before it are the frame teardown.
+    const n = fc.code.len;
+    try testing.expectEqual(Aarch64.ret, std.mem.readInt(u32, fc.code[n - 4 ..][0..4], .little));
+    try testing.expectEqual(Aarch64.ldpFpLrPost, std.mem.readInt(u32, fc.code[n - 8 ..][0..4], .little));
+    try testing.expectEqual(Aarch64.addImm(Aarch64.SP, Aarch64.SP, 32), std.mem.readInt(u32, fc.code[n - 12 ..][0..4], .little));
+    // The body contains the backward loop back-edge (`cbnz x0, -10`) and at least one
+    // byte store (`strb w13,[x10]`) — the digit-emitting core.
+    var saw_cbnz = false;
+    var saw_strb = false;
+    var i: usize = 0;
+    while (i < fc.code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, fc.code[i..][0..4], .little);
+        if (w == Aarch64.cbnz(0, -10)) saw_cbnz = true;
+        if (w == Aarch64.strb(13, 10, 0)) saw_strb = true;
+    }
+    try testing.expect(saw_cbnz);
+    try testing.expect(saw_strb);
+    // Two relocs to the `write` import (adrp_page + ldr_lo12), like `print`.
+    try testing.expectEqual(@as(usize, 2), fc.relocs.len);
+    for (fc.relocs) |r| {
+        try testing.expect(r.target == .import);
+        try testing.expectEqualStrings("write", r.target.import.name);
+    }
+}
 
 // A 1-block `fn f() -> int { ret <iconst v> }` exercising prologue/epilogue,
 // iconst, store-before-br into the exit param, and the scalar return path.

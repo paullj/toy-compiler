@@ -1,0 +1,12 @@
+# Feature: structural `Display` recurses through NESTED aggregates (M22). `Line`'s derived
+# `display` calls `Point`'s own derived `display` (a distinct source-less unit) for each of
+# its `Point` fields — two recipes, both source-less. This is also a multi-recipe
+# discovery-order case for the determinism gate (examples/diff.sh).
+struct Point { x: int, y: int }
+struct Line { from: Point, to: Point }
+
+fn main() {
+    print(Line{ from: Point{ x: 0, y: 0 }, to: Point{ x: 4, y: 2 } })
+}
+# expect: stdout "Line{from: Point{x: 0, y: 0}, to: Point{x: 4, y: 2}}"
+# expect: exit 0

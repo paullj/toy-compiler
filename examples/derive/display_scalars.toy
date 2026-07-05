@@ -1,0 +1,17 @@
+# Feature: heap-free scalar `Display` renderers (M22). `print(int)` formats digits into a
+# fixed STACK buffer (div/mod-by-10, no allocator) then writes them — covering zero, a
+# negative value (leading `-`), and a multi-digit value. `print(bool)` inlines a branch over
+# the `true`/`false` cstrings. The `"\n"` separators exercise the unchanged `print(str)` path.
+fn main() {
+    print(0)
+    print("\n")
+    print(-13)
+    print("\n")
+    print(4200)
+    print("\n")
+    print(true)
+    print("\n")
+    print(false)
+}
+# expect: stdout "0\n-13\n4200\ntrue\nfalse"
+# expect: exit 0

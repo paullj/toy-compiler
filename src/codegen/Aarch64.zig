@@ -155,6 +155,28 @@ pub fn blr(rn: u32) u32 {
     return 0xD63F0000 | (rn << 5);
 }
 
+/// strb wt, [rn, #byteOff] — single-byte store, unsigned offset (the imm12 is UNSCALED
+/// for a byte access, mirroring `ldrbRegUoff`). strb w13,[x10] → 0x3900014D;
+/// strb w0,[x0,#1] → 0x39000400. The M22 int-renderer writes each ASCII digit this way.
+pub fn strb(rt: u32, rn: u32, byteOff: u12) u32 {
+    return 0x39000000 | (@as(u32, byteOff) << 10) | (rn << 5) | rt;
+}
+
+/// cbz rt, #(imm19 words) — branch if rt == 0, PC-relative signed word offset. The M22
+/// renderer never uses it directly but it completes the cbz/cbnz pair; symmetric to
+/// `cbnz`. cbz x0,#0 → 0xB4000000; cbz x0,#-4 → 0xB4FFFF80.
+pub fn cbz(rt: u32, imm19: i19) u32 {
+    return 0xB4000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | rt;
+}
+
+/// b.cond #(imm19 words) — conditional branch, PC-relative signed word offset in
+/// bits[23:5], cond in bits[3:0]. Emits the RESOLVED word directly (compile-time-known
+/// local offset), unlike the `#0`-placeholder + `patchBCond` codegen path. b.ge #+2 →
+/// 0x5400004A; b.ge #+4 → 0x5400008A.
+pub fn bCond(cond: Cond, imm19: i19) u32 {
+    return 0x54000000 | (@as(u32, @as(u19, @bitCast(imm19))) << 5) | @as(u32, @intFromEnum(cond));
+}
+
 /// mov rd, rm — register move (alias of `orr rd, xzr, rm`). mov x2,x1 →
 /// 0xAA0103E2; mov x1,x0 → 0xAA0003E1.
 pub fn movReg(rd: u32, rm: u32) u32 {
@@ -437,6 +459,22 @@ test "conditional + unconditional branches" {
     try testing.expectEqual(@as(u32, 0x17FFFFFE), b(-2)); // b .-8
     try testing.expectEqual(@as(u32, 0x14000004), b(4)); // b .+16
     try testing.expectEqual(@as(u32, 0x17FFFFFC), b(-4)); // b .-16
+}
+
+test "M22 byte-store + conditional-branch encoders" {
+    // strb wt,[xn,#imm] — byte store, unscaled imm12 (mirrors ldrb).
+    try testing.expectEqual(@as(u32, 0x3900014D), strb(13, 10, 0)); // strb w13,[x10]
+    try testing.expectEqual(@as(u32, 0x39000400), strb(0, 0, 1)); // strb w0,[x0,#1]
+    try testing.expectEqual(@as(u32, 0x3900002D), strb(13, 1, 0)); // strb w13,[x1]
+    // cbz — symmetric to cbnz (opcode 0xB4 vs 0xB5).
+    try testing.expectEqual(@as(u32, 0xB4000000), cbz(0, 0)); // cbz x0,.+0
+    try testing.expectEqual(@as(u32, 0xB4FFFF80), cbz(0, -4)); // cbz x0,.-16
+    // b.cond — resolved-offset conditional branch (cond in low 4 bits).
+    try testing.expectEqual(@as(u32, 0x5400004A), bCond(.ge, 2)); // b.ge .+8
+    try testing.expectEqual(@as(u32, 0x5400008A), bCond(.ge, 4)); // b.ge .+16
+    try testing.expectEqual(@as(u32, 0x54000000), bCond(.eq, 0)); // b.eq .+0
+    // A resolved b.cond round-trips through the placeholder patcher (same imm field).
+    try testing.expectEqual(bCond(.lt, -2), patchBCond(bCond(.lt, 0), -2));
 }
 
 test "branch patchers preserve opcode + identity" {

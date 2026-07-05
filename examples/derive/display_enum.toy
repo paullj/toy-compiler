@@ -1,0 +1,15 @@
+# Feature: structural `Display` derive on an ENUM (M22). A `get_tag` dispatch ladder writes
+# a bare `variant` for a unit variant, or `variant(<v0>, <v1>)` for a payload variant
+# (payload fields in declaration order, `, `-separated). Each `print` writes directly to
+# stdout; the `"\n"` separators are ordinary `str` prints (the raw write-bytes path).
+enum Shape { circle(int), square(int, int), point }
+
+fn main() {
+    print(Shape.circle(5))
+    print("\n")
+    print(Shape.square(3, 4))
+    print("\n")
+    print(Shape.point)
+}
+# expect: stdout "circle(5)\nsquare(3, 4)\npoint"
+# expect: exit 0
