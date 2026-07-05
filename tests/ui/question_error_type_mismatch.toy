@@ -1,0 +1,12 @@
+# `?` on a `Result` whose error type differs from the enclosing `Result`'s error type is
+# a mismatch: the `err(e)` residual could not be re-emitted at the enclosing error type
+# without a conversion (M25's `From`-widening is deferred) — T0033 (M24).
+
+fn f(o: Result[int, bool]) -> Result[int, str] {
+  v := o?  #~ ERROR [T0033] error type bool does not match
+  return Result.ok(v)
+}
+
+fn main() -> int {
+  return 0
+}

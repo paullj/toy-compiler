@@ -332,6 +332,16 @@ pub const Node = extern struct {
         /// methods_len}`: the protocol reference is an `identifier`/`field_access`
         /// node, and the method `fn_decl`s live at `extra[start .. start + len]`.
         impl_has_decl,
+
+        // Postfix `?` (M24). Appended at the END (frozen ordinal; `[]Node` is memcpy'd
+        // to/from the content cache; `ParseHeader.version` bumped 11->12 on this change).
+        // A `try_expr` is desugared BELOW the parser (in `lower`/`types`) to a match +
+        // early-return over an `Option`/`Result` operand, so it carries no semantics of
+        // its own in the tree.
+
+        /// Postfix `operand?` — the try operator. `main_token` is the `?`. `lhs` is the
+        /// operand expression. `rhs` is `none`.
+        try_expr,
     };
 };
 
@@ -580,7 +590,10 @@ pub const ParseHeader = extern struct {
     /// bound — where a v10 blob always left `protocol_decl.rhs` `none` and never wrapped a
     /// protocol-ref in a `type_app`. A v10 blob must miss cleanly so a stale parse never
     /// feeds a bare protocol-ref shape into the M14 protocol-args machinery.
-    version: u32 = 11,
+    /// Bumped to 12 for the M24 postfix-`?` parse change: `parsePostfix` may now wrap an
+    /// operand in a `try_expr` node, a `Node.Tag` a v11 blob never held — so a v11 blob
+    /// must miss cleanly rather than misdecode a later tag ordinal.
+    version: u32 = 12,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -641,7 +654,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 11) return null;
+    if (hdr.magic != parse_magic or hdr.version != 12) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -730,6 +743,11 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .unary => {
             try out.print("({s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .try_expr => {
+            try out.writeAll("(try ");
             try renderNode(out, tree, tokens, source, n.lhs);
             try out.writeByte(')');
         },
@@ -1306,6 +1324,43 @@ test "unpack rejects a v10 blob (pre-generic-protocols)" {
     // `type_app` in a protocol-ref slot, so it must miss cleanly.
     std.mem.writeInt(u32, blob[4..8], 10, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "unpack rejects a v11 blob (pre-try-expr)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    // Rewrite `version` to 11: a blob from a compiler predating the M24 postfix-`?` parse
+    // change never carried a `try_expr` node, so it must miss cleanly rather than
+    // misdecode this tag ordinal.
+    std.mem.writeInt(u32, blob[4..8], 11, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "pack/unpack round-trips a tree with a try_expr (v12)" {
+    const gpa = testing.allocator;
+    // A pure byte round-trip exercising the M24 `try_expr` node (lhs = operand, rhs none).
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 1, .lhs = none, .rhs = none }, // `o`
+        .{ .tag = .try_expr, .main_token = 2, .lhs = Index.from(0), .rhs = none }, // `o?`
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 1, 1 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqual(Node.Tag.try_expr, got.nodes[1].tag);
+    try testing.expectEqual(Index.from(0), got.nodes[1].lhs);
 }
 
 test "pack/unpack round-trips a tree with a generic protocol_decl (v11)" {

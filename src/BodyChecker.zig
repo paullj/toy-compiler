@@ -59,6 +59,15 @@ fn isConcreteValue(ty: Type) bool {
     };
 }
 
+/// A human name for an Option/Result family, for the `?` mismatch diagnostic (M24).
+fn familyName(fam: LayoutEngine.NativeEnumFamily) []const u8 {
+    return switch (fam) {
+        .option => "Option",
+        .result => "Result",
+        .none => "a non-Option/Result",
+    };
+}
+
 /// Coverage state for a match, by scrutinee kind. Enum: a per-variant seen bitmap.
 /// Bool: which of true/false a literal arm has covered. Int: nothing (an infinite
 /// domain — exhaustiveness only via `_`).
@@ -586,6 +595,7 @@ pub const BodyChecker = struct {
             .field_access => try bc.typeOfFieldAccess(node_idx, n),
             .enum_init_unit, .enum_init_tuple, .enum_init_struct => try bc.typeOfEnumInit(node_idx, n),
             .match_expr => return bc.typeOfMatch(node_idx, n), // sets node_types itself
+            .try_expr => return bc.typeOfTry(node_idx, n), // sets node_types itself
             .literal_unit => Type.unit,
             .block => try bc.checkBlock(node_idx, true),
             .if_stmt => try bc.typeOfIf(node_idx, n),
@@ -1152,6 +1162,53 @@ pub const BodyChecker = struct {
                 return .ok;
             },
         }
+    }
+
+    /// The `Option`/`Result` family of a type: `.option`/`.result` when it is an `App`
+    /// over the prelude Option/Result template (an enum ctor), else `.none`. A user
+    /// `enum Option` has a distinct ctor id, so this stays `.none` on it.
+    fn optResultFamily(bc: *BodyChecker, ty: Type) LayoutEngine.NativeEnumFamily {
+        if (!ty.isApp()) return .none;
+        const e = bc.composite.at(ty.appIdx());
+        if (!e.ctor_is_enum) return .none;
+        return Typecheck.optResultFamilyOf(bc.model, e.ctor);
+    }
+
+    /// Type a postfix `?` (M24). The operand must be an `Option`/`Result`, and the
+    /// enclosing return type (`cur_ret`) must be a MATCHING one that can absorb the
+    /// residual: the SAME family, and — for `Result` — the SAME error type. The
+    /// `?`-expression's type is the operand's unwrapped payload (variant-0 type-arg).
+    /// The family / error-type checks are kept SEPARATE from payload typing so a
+    /// mismatch never masks (nor is masked by) a payload type — the payload is bound
+    /// best-effort even on a diagnostic path to avoid a cascade at the `:=`/use site.
+    fn typeOfTry(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        const ot = try bc.typeOf(n.lhs);
+        if (ot.kind == .invalid) {
+            bc.node_types[(node_idx).int()] = .invalid;
+            return .invalid; // poison-absorb: the operand was already diagnosed
+        }
+        const op_fam = bc.optResultFamily(ot);
+        const ret_fam = bc.optResultFamily(bc.cur_ret);
+        const payload: Type = if (op_fam != .none) blk: {
+            const args = bc.composite.at(ot.appIdx()).args;
+            break :blk if (args.len >= 1) args[0] else Type.invalid;
+        } else Type.invalid;
+
+        if (op_fam == .none) {
+            try bc.sink.emitFmtCode(.T0032, bc.byteOf(n.main_token), "'?' operand must be an Option or Result, got {s}", .{bc.typeName(ot)});
+        } else if (ret_fam == .none) {
+            try bc.sink.emitFmtCode(.T0032, bc.byteOf(n.main_token), "'?' requires the enclosing function to return an Option or Result, but it returns {s}", .{bc.typeName(bc.cur_ret)});
+        } else if (op_fam != ret_fam) {
+            try bc.sink.emitFmtCode(.T0033, bc.byteOf(n.main_token), "'?' on {s} in a function returning {s}", .{ familyName(op_fam), familyName(ret_fam) });
+        } else if (op_fam == .result) {
+            const op_args = bc.composite.at(ot.appIdx()).args;
+            const ret_args = bc.composite.at(bc.cur_ret.appIdx()).args;
+            if (op_args.len >= 2 and ret_args.len >= 2 and !Type.eql(op_args[1], ret_args[1])) {
+                try bc.sink.emitFmtCode(.T0033, bc.byteOf(n.main_token), "'?' error type {s} does not match the enclosing Result error type {s}", .{ bc.typeName(op_args[1]), bc.typeName(ret_args[1]) });
+            }
+        }
+        bc.node_types[(node_idx).int()] = payload;
+        return payload;
     }
 
     fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {

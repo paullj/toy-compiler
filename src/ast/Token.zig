@@ -153,6 +153,15 @@ pub const Tag = enum(u8) {
     kw_protocol,
     /// `has` — the single conformance relation, leading `impl T has P { .. }`.
     kw_has,
+
+    // Postfix `?` (M24). Appended at the END (frozen ordinal; `[]Token` is memcpy'd
+    // to/from the content cache). Punctuation, NOT a keyword — it lexes from the `?`
+    // byte in `lexSymbol`, so it has NO `keywords` entry (the comptime kw_* guard is
+    // unaffected). `o?` desugars below the parser to a match + early-return over
+    // `Option`/`Result`.
+
+    /// `?` — the postfix try operator (`o?` / `r?`).
+    question,
 };
 
 /// Maps identifier text to its keyword tag, if any.

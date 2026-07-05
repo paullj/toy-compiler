@@ -1,0 +1,11 @@
+# `?` on an `Option` inside a function returning a `Result` is a family mismatch: the
+# `none` residual cannot be re-emitted as a `Result` — T0033 (M24).
+
+fn f(o: Option[int]) -> Result[int, str] {
+  v := o?  #~ ERROR [T0033] in a function returning Result
+  return Result.ok(v)
+}
+
+fn main() -> int {
+  return 0
+}

@@ -1,0 +1,20 @@
+# Feature: the postfix `?` operator (M24) — a PURE control-flow desugar over the M23
+# prelude `Option[T]`/`Result[T,E]` value enums, no protocol and no heap. `v := o?` on
+# an `Option[int]`: if `.none`, early-return `Option.none` from the ENCLOSING fn; if
+# `.some(x)`, bind `v` to the payload and continue. It lowers to a real tag-test +
+# payload-extract + return-edge (NOT the M23 scalar-only `unwrap`), reusing the same exit
+# block a `return` uses. The operand constructor must MATCH the enclosing return exactly
+# (Option? -> Option fn). Here `get(Option.some(41))` unwraps 41, returns `some(42)`, and
+# `main` matches to exit 42.
+# expect: exit 42
+fn get(o: Option[int]) -> Option[int] {
+  v := o?
+  Option.some(v + 1)
+}
+
+fn main() -> int {
+  return match get(Option.some(41)) {
+    .some(v) -> v,
+    .none -> 0,
+  }
+}

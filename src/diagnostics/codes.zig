@@ -78,6 +78,8 @@ pub const Code = enum(u16) {
     T0029, // non-derivable-field (structural `Eq` derive blocked by a struct field whose type does not conform to `Eq` — use-site, M18)
     T0030, // non-hashable-field (structural `Hash` derive blocked by a field whose type does not conform to `Hash` — use-site, M20)
     T0031, // non-displayable-arg (`print(x)`/structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site, M22)
+    T0032, // question-non-optionresult (`?` operand is not an Option/Result, or the enclosing return type cannot absorb the residual — M24)
+    T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch — M24)
 
     _,
 };
@@ -147,6 +149,8 @@ pub const table = [_]Entry{
     .{ .code = .T0029, .str = "T0029", .slug = "non-derivable-field" },
     .{ .code = .T0030, .str = "T0030", .slug = "non-hashable-field" },
     .{ .code = .T0031, .str = "T0031", .slug = "non-displayable-arg" },
+    .{ .code = .T0032, .str = "T0032", .slug = "question-non-optionresult" },
+    .{ .code = .T0033, .str = "T0033", .slug = "question-constructor-mismatch" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -291,6 +295,15 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0031", str(.T0031).?);
     try testing.expectEqualStrings("non-displayable-arg", slug(.T0031).?);
     try testing.expectEqual(Code.T0031, fromStr("T0031").?);
+
+    // M24 `?` operator diagnostics.
+    try testing.expectEqualStrings("T0032", str(.T0032).?);
+    try testing.expectEqualStrings("question-non-optionresult", slug(.T0032).?);
+    try testing.expectEqual(Code.T0032, fromStr("T0032").?);
+
+    try testing.expectEqualStrings("T0033", str(.T0033).?);
+    try testing.expectEqualStrings("question-constructor-mismatch", slug(.T0033).?);
+    try testing.expectEqual(Code.T0033, fromStr("T0033").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

@@ -541,6 +541,7 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
         .labeled => return try lowerLabeledValue(b, node_idx, ty),
         .field_access => return try lowerFieldAccess(b, node_idx, ty),
         .match_expr => return try lowerMatchValue(b, node_idx, ty),
+        .try_expr => return try lowerTryValue(b, node_idx, ty),
         .struct_init, .enum_init_unit, .enum_init_tuple, .enum_init_struct => {
             // An aggregate-producing expression in value context: materialize it
             // into a fresh temp slot and yield Operand.slot.
@@ -2650,6 +2651,7 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         .loop_expr => try lowerLoopValueInto(b, expr, dst_ptr, ty, null),
         .labeled => try lowerLabeledValueInto(b, expr, dst_ptr, ty),
         .match_expr => try lowerMatchInto(b, expr, dst_ptr, ty),
+        .try_expr => try lowerTryInto(b, expr, dst_ptr, ty),
         .identifier => try copyAggInto(b, expr, dst_ptr, ty),
         // An arithmetic operator on struct/enum operands (M17) desugars to an
         // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
@@ -2947,6 +2949,127 @@ fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typ
     // `unreachable`, and continue lowering at `join`.
     try brTo(b, join, .none); // the trailing `next` block branches to join (dead but well-formed)
     b.switchTo(join);
+}
+
+/// A postfix `?` in VALUE context (M24). Mirrors `lowerMatchValue`: materialize the
+/// unwrapped payload via `lowerTryInto` — a scalar loads from a fresh slot; an
+/// aggregate (str/struct/enum) yields `Operand.slot`. The residual (`none`/`err`)
+/// arm early-returns from the enclosing fn inside `lowerTryInto`, so the value that
+/// reaches here is always the happy-path payload.
+fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    switch (ty.kind) {
+        .int, .bool => {
+            const slot = try b.addSlot(ty);
+            const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            try lowerTryInto(b, node_idx, dst, ty);
+            const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
+            return .{ .value = v };
+        },
+        .str, .@"struct", .@"enum" => return try aggregateValue(b, node_idx, ty),
+        else => {
+            try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "'?' payload type unsupported in lower");
+            return .none;
+        },
+    }
+}
+
+/// Lower a postfix `?` writing the unwrapped payload into `dst_ptr` (M24). A pure
+/// control-flow desugar over the reified `Option`/`Result` operand:
+///
+///   spill operand → get_tag → cond_br(tag != 1 ? happy : residual)
+///     residual: build the enclosing return-type residual (`none` = tag only;
+///               `err` = tag + a copy of E) into a fresh `b.ret_type` slot, then
+///               `br` to the exit (reusing the existing return edge).
+///     happy:    extract variant-0's payload into `dst_ptr`; control continues.
+///
+/// Handles AGGREGATE payloads via field_addr + `copy` (NOT the scalar-only M23 native
+/// `unwrap`). Variant 0 is the payload (some/ok), variant 1 the residual (none/err),
+/// fixed by `registerPrelude`.
+fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const op_ty = b.in.node_types[(n.lhs).int()];
+    if (op_ty.kind != .@"enum") {
+        try b.note(n.main_token, "'?' operand did not reify to an Option/Result enum");
+        return;
+    }
+
+    // Spill the operand into a slot (its tag + payload are read by address).
+    const op_op = try lowerExpr(b, n.lhs);
+    const op_slot = try spillScrutinee(b, op_op, op_ty, n.main_token);
+    if (op_slot == Ir.none_slot) return; // diagnostic already emitted
+
+    const ol = b.in.enum_layouts[op_ty.enum_id];
+    const op_base = try b.emit(.{ .slot_addr = op_slot }, int_ty);
+    const tag = try b.emit(.{ .get_tag = op_base }, int_ty);
+    const one = try b.emit(.{ .iconst = 1 }, int_ty);
+    // tag != 1 → happy (tag 0 = some/ok); tag == 1 → residual (none/err).
+    const is_happy = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = tag, .rhs = one } }, Typecheck.Type.@"bool");
+    const happy_bb = try b.addBlock();
+    const residual_bb = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = is_happy, .t = happy_bb, .f = residual_bb } });
+
+    // Residual: build the enclosing return-type residual and early-return it.
+    b.switchTo(residual_bb);
+    try buildResidual(b, op_base, ol, n.main_token);
+
+    // Happy: extract variant-0's payload into the destination; control continues here.
+    b.switchTo(happy_bb);
+    const src = try addrAtOff(b, op_base, ol.payload_off + ol.variants[0].offsets[0], ty);
+    try copyValueByType(b, dst_ptr, src, ty);
+}
+
+/// Build the enclosing return-type residual into a fresh `b.ret_type` slot and
+/// early-return it via the exit block (M24). `Option.none` is the tag alone;
+/// `Result.err` is the tag plus a copy of the error payload from the operand's `err`
+/// variant. The residual is built from the RETURN enum's OWN layout (`rl`) — the
+/// operand and return enums may differ in size — and, because M24 requires the error
+/// type to match EXACTLY, copying E across the two layouts is a plain byte copy with
+/// no conversion. (M25's `From`-widening would hook in here.)
+fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok: u32) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    if (b.ret_type.kind != .@"enum") {
+        try b.note(tok, "'?' enclosing return type did not reify to an Option/Result enum");
+        return;
+    }
+    const rl = b.in.enum_layouts[b.ret_type.enum_id];
+    const ret_slot = try b.addSlot(b.ret_type);
+    const ret_base = try b.emit(.{ .slot_addr = ret_slot }, int_ty);
+
+    // tag = 1 (none/err) at offset 0.
+    const tagv = try b.emit(.{ .iconst = 1 }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = ret_base, .val = tagv, .ty = int_ty } }, null);
+
+    // Result: copy the error payload from the operand's `err` variant into the
+    // return's `err` variant. Option's residual (`none`) is the tag alone.
+    if (rl.native_family == .result) {
+        const ety = rl.variants[1].field_types[0];
+        const src = try addrAtOff(b, op_base, ol.payload_off + ol.variants[1].offsets[0], ety);
+        const dst = try addrAtOff(b, ret_base, rl.payload_off + rl.variants[1].offsets[0], ety);
+        try copyValueByType(b, dst, src, ety);
+    }
+    try brTo(b, b.exit, .{ .slot = ret_slot });
+}
+
+/// Copy the value of `ty` at `src` into `dst`: a scalar load/store (int/bool), an
+/// aggregate byte `copy` (str/struct/enum). Mirrors `bindLeaf`'s scalar-vs-aggregate
+/// split; both sides are ptr values.
+fn copyValueByType(b: *Builder, dst: Ir.ValueId, src: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
+    switch (ty.kind) {
+        .int, .bool => {
+            const v = try b.emit(.{ .load = .{ .addr = src, .ty = ty } }, ty);
+            _ = try b.emit(.{ .store = .{ .addr = dst, .val = v, .ty = ty } }, null);
+        },
+        else => _ = try b.emit(.{ .copy = .{ .dst = dst, .src = src, .ty = ty } }, null),
+    }
+}
+
+/// A ptr value addressing [base + off]. `off == 0` collapses to the bare base ptr
+/// (no zero-offset field_addr). The ptr-value sibling of `slotFieldAddr`.
+fn addrAtOff(b: *Builder, base: Ir.ValueId, off: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.ValueId {
+    if (off == 0) return base;
+    return try b.emit(.{ .field_addr = .{ .base = base, .off = off, .ty = ty } }, Typecheck.Type.int);
 }
 
 /// Spill a scrutinee Operand into a slot, returning the slot id. A scalar is stored

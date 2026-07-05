@@ -418,6 +418,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = n.rhs != Ast.none }); // has sub-pattern
             if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor);
         },
+        // Postfix `?` (M24): the `.enter` tag byte (emitted above) makes `x?` fp-distinct
+        // from `x`; recursing the operand folds its spelling AND discovers its
+        // Option/Result `App` instance for monomorphization. The `?` mints no instance of
+        // its own — the residual is built from the already-reified enclosing return enum.
+        .try_expr => try walkInner(src, n.lhs, collect, visitor),
         .pattern_literal => try emit(visitor, .{ .leaf = leaf }),
         .pattern_or => {
             const alts = Ast.rangeSlice(tree, n.lhs.int());

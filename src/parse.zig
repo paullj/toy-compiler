@@ -1631,6 +1631,13 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             },
             // `.field` access. `..` is a separate token, so `0..5` is unaffected.
             .dot => lhs = try p.parseFieldAccess(lhs),
+            // Postfix `?` (M24): wrap `lhs` in a `try_expr` and continue the loop so
+            // `f()?`, `o?.x`, `o??` compose. Desugared below the parser (lower/types).
+            .question => {
+                const q = p.index;
+                p.bump(.question);
+                lhs = try p.addNode(.{ .tag = .try_expr, .main_token = q, .lhs = lhs, .rhs = Ast.none });
+            },
             // Explicit call type-args `id[int](..)`: wrap ONLY a name / qualified
             // `mod.fn` callee into a `type_app`; the loop then sees the following
             // `(` and builds a normal `call` whose callee is the `type_app`. This
@@ -2361,6 +2368,8 @@ test "root is program and children precede parents" {
                 try testing.expect(n.rhs.int() < self);
             },
             .var_decl, .expr_stmt => try testing.expect(n.lhs.int() < self),
+            // Postfix `?`: the operand is `lhs`, created before the try_expr node.
+            .try_expr => try testing.expect(n.lhs.int() < self),
             .return_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             .param => try testing.expect(n.lhs.int() < self),
             .call => {
@@ -2511,6 +2520,15 @@ test "explicit call type-args wrap the callee in a tyapp" {
 test "nested type application nests tyapp nodes" {
     // Empty arg list renders with no trailing args after the callee.
     try expectSexpr("f[Box[int]]()", "(call (tyapp f (tyapp Box int)))");
+}
+
+test "postfix ? wraps its operand in a try_expr (M24)" {
+    try expectSexpr("o?", "(try o)");
+    // Composes onto a call result and onto a subsequent `.field`.
+    try expectSexpr("parse(a)?", "(try (call parse a))");
+    try expectSexpr("o?.x", "(. (try o) x)");
+    // Double `?` nests left-to-right.
+    try expectSexpr("o??", "(try (try o))");
 }
 
 test "constrained generic param stores the bound protocol-ref in its lhs (M13)" {

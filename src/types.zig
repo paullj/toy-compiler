@@ -5304,6 +5304,126 @@ test "M23: predicates stay native for a non-scalar payload (tag-only, safe)" {
     try testing.expectEqual(Kind.bool, methodCallKind(c, "is_some").?);
 }
 
+/// The `Kind` the (first) `try_expr` node typed to (single-module test helper), or null
+/// if none is present. Used by the M24 `?` typing tests.
+fn tryExprKind(c: Checked) ?Kind {
+    const nts = c.result.node_types[0];
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag == .try_expr) return nts[i].kind;
+    }
+    return null;
+}
+
+test "M24: `?` on Option[int] in an Option fn types to the payload (int), zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn get(o: Option[int]) -> Option[int] {
+        \\ v := o?
+        \\ Option.some(v + 1)
+        \\}
+        \\fn main() -> int { return match get(Option.some(41)) { .some(v) -> v, .none -> 0 } }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(Kind.int, tryExprKind(c).?);
+}
+
+test "M24: `?` on Result[int,str] in a matching Result fn types to the ok payload (int), zero diags" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn use(o: Result[int, str]) -> Result[int, str] {
+        \\ v := o?
+        \\ Result.ok(v + 1)
+        \\}
+        \\fn main() -> int { return match use(Result[int, str].ok(41)) { .ok(v) -> v, .err(_) -> 0 } }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(Kind.int, tryExprKind(c).?);
+}
+
+test "M24: `?` in a fn returning a non-Option/Result is exactly one T0032" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn f(o: Option[int]) -> int {
+        \\ v := o?
+        \\ return v
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0032, c.result.diags[0].code);
+}
+
+test "M24: `?` on a non-Option/Result operand is exactly one T0032" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn f(n: int) -> Option[int] {
+        \\ v := n?
+        \\ return Option.some(v)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0032, c.result.diags[0].code);
+}
+
+test "M24: `?` on an Option inside a Result fn is exactly one T0033 (family mismatch)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn f(o: Option[int]) -> Result[int, str] {
+        \\ v := o?
+        \\ return Result.ok(v)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
+}
+
+test "M24: `?` inside a generic Option fn typechecks clean and monomorphizes the instance" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn passthru[T](o: Option[T]) -> Option[T] {
+        \\ v := o?
+        \\ Option.some(v)
+        \\}
+        \\fn main() -> int { return match passthru[int](Option.some(41)) { .some(v) -> v, .none -> 0 } }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The `passthru$int` instance is monomorphized (its `?` operand grounds Option[int]).
+    var found = false;
+    for (c.result.instances) |inst| {
+        if (std.mem.indexOf(u8, inst.name, "passthru$int") != null) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "M24: `?` on Result[_,E1] in a Result[_,E2] fn is exactly one T0033 (error-type mismatch)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn f(o: Result[int, bool]) -> Result[int, str] {
+        \\ v := o?
+        \\ return Result.ok(v)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
+}
+
 test "M16: `<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
