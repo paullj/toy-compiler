@@ -811,7 +811,6 @@ fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
             // `witnessCallee` (derive checked first — a derive Method has `fn_id == 0`).
             const callee: Link.SymName = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
-            errdefer b.gpa.free(args);
             args[0] = try lowerExpr(b, lhs_node); // self, by value
             args[1] = try lowerExpr(b, rhs_node);
             const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
@@ -881,7 +880,6 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
             const ret_ty = witnessRet(b, m);
             const callee: Link.SymName = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
-            errdefer b.gpa.free(args);
             args[0] = try lowerExpr(b, lhs_node); // self, by value
             args[1] = try lowerExpr(b, rhs_node);
             const slot = try b.addSlot(ret_ty);
@@ -1213,7 +1211,6 @@ fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.
             const ret_ty = witnessRet(b, m);
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
-            errdefer b.gpa.free(args);
             args[0] = .{ .slot = lslot };
             args[1] = .{ .slot = rslot };
             const rslot_ord = try b.addSlot(ret_ty);
@@ -1403,7 +1400,6 @@ fn cmpAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotI
             const ret_ty = witnessRet(b, m);
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
-            errdefer b.gpa.free(args);
             args[0] = .{ .slot = lslot };
             args[1] = .{ .slot = rslot };
             const ord_slot = try b.addSlot(ret_ty);
@@ -3086,7 +3082,6 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
                 const callee = witnessCallee(b, m);
                 const from_ret = witnessRet(b, m);
                 const args = try b.gpa.alloc(Ir.Operand, 1);
-                errdefer b.gpa.free(args);
                 args[0] = arg;
                 const dst = try addrAtOff(b, ret_base, dst_off, ret_err);
                 // Deliver the `from` result into the return's err payload: an aggregate ret
