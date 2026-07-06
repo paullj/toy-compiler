@@ -396,7 +396,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
     // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
-        .kw_fn => try p.parseFnDecl(null, Ast.none, &.{}, false),
+        .kw_fn => try p.parseFnDecl(null, Ast.none, &.{}, false, false),
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
         .kw_protocol => try p.parseProtocolDecl(),
@@ -476,7 +476,13 @@ fn parseImport(p: *Parser) Error!Ast.Index {
 /// (and pack/unpack) stay uniform, and no `parseBlock` is attempted. Only
 /// `parseProtocolDecl` passes true; every other caller (top-level fn, impl method)
 /// passes false and parses a real block.
-fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index, bodyless: bool) Error!Ast.Index {
+///
+/// `self_optional` is true ONLY for a CONFORMANCE impl (`impl T has P`, M25): a method
+/// there may omit the leading `self` (e.g. `fn from(s: Src) -> Self`), so the "a method
+/// must take 'self'" P0006 is suppressed and the params are read as an ordinary run. The
+/// T0024 coherence signature check then governs correctness against the protocol's sig.
+/// Inherent impls and protocol decls pass false (they still require `self`).
+fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index, bodyless: bool, self_optional: bool) Error!Ast.Index {
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
@@ -518,7 +524,12 @@ fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_g
             const self_param = try p.addNode(.{ .tag = .param, .main_token = self_tok, .lhs = recv_ref, .rhs = Ast.none });
             try params.append(p.gpa, self_param);
             _ = p.eat(.comma); // separator before the next param, if any
-        } else if (!has_mut) {
+        } else if (!has_mut and !self_optional) {
+            // A conformance impl (`self_optional`) may declare a SELF-LESS method (M25's
+            // `impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr {..} }`):
+            // the T0024 coherence signature check governs correctness there (a self-less
+            // `from` matches From's self-less protocol sig). An INHERENT impl still requires
+            // `self` — static/associated methods stay out of scope — so the diagnostic holds.
             try p.warn(p.peek(), .P0006, "a method must take 'self' as its first parameter");
         }
     }
@@ -642,7 +653,9 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
         // reject it cleanly rather than mint an unsupported shape.
         if (is_generic) return p.fail(p.peek(), .P0001, "a generic 'impl ... has' receiver is not yet supported");
         const proto_ref = try p.parseProtocolRef();
-        try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods);
+        // A conformance impl permits self-less methods (M25); coherence (T0024) then
+        // governs signature correctness against the protocol's declared sig.
+        try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods, true);
         // Write the method run, then the fixed 3-cell header {protocol_ref, start, len}
         // — decoded by `Ast.implHasAt`. The run precedes the header (start < header), so
         // every method node is created before the `impl_has_decl` node references it.
@@ -655,7 +668,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
 
     // Inherent impl (M8/M10): a qualified receiver is out of scope.
     if (qualified) return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare or generic type name");
-    try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods);
+    try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods, false);
     const header = try p.addRange(methods.items);
     return p.addNode(.{ .tag = .impl_decl, .main_token = recv_tok, .lhs = recv_node, .rhs = header });
 }
@@ -664,7 +677,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
 /// the receiver so its leading `self` is synthesized, appending into `methods`
 /// (newline/comma-separated). Used by both the inherent and conformance impl forms, so
 /// the two cannot drift on member grammar / recovery.
-fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: []const Ast.Index, methods: *std.ArrayList(Ast.Index)) Error!void {
+fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: []const Ast.Index, methods: *std.ArrayList(Ast.Index), self_optional: bool) Error!void {
     try p.expect(.l_brace, "expected '{' after the impl receiver type");
     while (!p.at(.eof)) {
         p.skipNewlines();
@@ -675,7 +688,7 @@ fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: 
         if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.kw_fn)) {
-            const method = try p.parseFnDecl(recv_tok, recv_node, impl_gparams, false);
+            const method = try p.parseFnDecl(recv_tok, recv_node, impl_gparams, false, self_optional);
             try methods.append(p.gpa, method);
             // A method is separated by a newline (loop-top `skipNewlines`) or an
             // optional comma; a `}` ends the block.
@@ -740,7 +753,7 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
         if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.kw_fn)) {
-            const sig = try p.parseFnDecl(name_tok, Ast.none, &.{}, true);
+            const sig = try p.parseFnDecl(name_tok, Ast.none, &.{}, true, false);
             try sigs.append(p.gpa, sig);
             _ = p.eat(.comma);
         } else {
@@ -3733,6 +3746,60 @@ test "parse diagnostics carry P-codes by syntactic category" {
         defer freeTree(gpa, res.tree);
         try testing.expect(res.diags.len >= 1);
         try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+    }
+}
+
+test "M25: a self-less method in a conformance impl parses with no P0006; an inherent one still P0006" {
+    const gpa = testing.allocator;
+
+    // A CONFORMANCE impl (`impl T has P`) permits a self-less method (M25's `From`): no
+    // P0006, and the single declared param is read as an ordinary param (no synthetic self).
+    {
+        const res = try parseResult(gpa,
+            \\enum SmallErr { bad }
+            \\enum BigErr { small }
+            \\impl BigErr has From[SmallErr] {
+            \\ fn from(s: SmallErr) -> BigErr { BigErr.small }
+            \\}
+            \\
+        );
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        for (res.diags) |d| try testing.expect(d.code != .P0006);
+        // Locate the `impl_has_decl` and its single `from` method; assert exactly one param
+        // (the self-less `s: SmallErr`) — no synthesized self prepended.
+        const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+        var saw_from = false;
+        for (Ast.rangeSlice(res.tree, prog.lhs.int())) |decl_idx| {
+            const decl = res.tree.nodes[decl_idx.int()];
+            if (decl.tag != .impl_has_decl) continue;
+            for (Ast.implMethods(res.tree, decl)) |mnode| {
+                const m = res.tree.nodes[mnode.int()];
+                const proto = Ast.protoAt(res.tree, m.lhs.int());
+                try testing.expectEqual(@as(usize, 1), proto.params.len);
+                saw_from = true;
+            }
+        }
+        try testing.expect(saw_from);
+    }
+
+    // An INHERENT impl (`impl T`) still REQUIRES self — a self-less method is P0006, so a
+    // forgotten `self` on a real method is caught (static/associated methods stay out of scope).
+    {
+        const res = try parseResult(gpa,
+            \\struct P { x: int }
+            \\impl P {
+            \\ fn make(x: int) -> int { x }
+            \\}
+            \\
+        );
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        var saw_p0006 = false;
+        for (res.diags) |d| if (d.code == .P0006) {
+            saw_p0006 = true;
+        };
+        try testing.expect(saw_p0006);
     }
 }
 

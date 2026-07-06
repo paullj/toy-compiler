@@ -1,0 +1,42 @@
+# Feature: `?` WIDENS a `Result`'s error via the prelude `From` protocol (M25). When a fn
+# returning `Result[T,BigErr]` uses `?` on a `Result[T,SmallErr]` whose error type DIFFERS,
+# the `err(e)` residual is re-emitted as `BigErr.from(e)` — resolved through the explicit
+# `impl BigErr has From[SmallErr]` conformance (a self-LESS `from(s: SmallErr) -> BigErr`
+# method, permitted only in a conformance impl). `outer` `?`s `inner()` (a `Result[int,
+# SmallErr]`) inside a `Result[int,BigErr]`, so the error widens to `BigErr.small`; `main`
+# matches its `.err` arm to exit 42. `same_err` exercises the M24 IDENTITY case: a `?` on a
+# same-error-type `Result[int,BigErr]` needs NO `From` and stays a plain byte copy. Two
+# distinct Result instances (`Result[int,SmallErr]` + `Result[int,BigErr]`) plus their
+# discovery order make this a `-j1`==`-jN` determinism case (diff.sh).
+# expect: exit 42
+enum SmallErr { bad }
+
+enum BigErr { small, other }
+
+impl BigErr has From[SmallErr] {
+  fn from(s: SmallErr) -> BigErr { BigErr.small }
+}
+
+fn inner() -> Result[int, SmallErr] {
+  return Result[int, SmallErr].err(SmallErr.bad)
+}
+
+fn outer() -> Result[int, BigErr] {
+  v := inner()?
+  return Result.ok(v)
+}
+
+# Identity case (M24): `?` on a Result whose error type ALREADY matches the enclosing
+# return error type — no `From`, a plain err copy. `ok(7)` never hits the residual here.
+fn same_err(r: Result[int, BigErr]) -> Result[int, BigErr] {
+  v := r?
+  return Result.ok(v + 1)
+}
+
+fn main() -> int {
+  keep := match same_err(Result[int, BigErr].ok(7)) { .ok(v) -> v, .err(_) -> 0 }
+  return match outer() {
+    .ok(_) -> keep,
+    .err(_) -> 42,
+  }
+}

@@ -1204,7 +1204,18 @@ pub const BodyChecker = struct {
             const op_args = bc.composite.at(ot.appIdx()).args;
             const ret_args = bc.composite.at(bc.cur_ret.appIdx()).args;
             if (op_args.len >= 2 and ret_args.len >= 2 and !Type.eql(op_args[1], ret_args[1])) {
-                try bc.sink.emitFmtCode(.T0033, bc.byteOf(n.main_token), "'?' error type {s} does not match the enclosing Result error type {s}", .{ bc.typeName(op_args[1]), bc.typeName(ret_args[1]) });
+                // M25: differing error types are allowed to WIDEN via the `From` protocol —
+                // the `err(e)` residual is re-emitted as `RetErr.from(opErr)` iff `RetErr has
+                // From[OpErr]`. The operand (source) error type disambiguates a multi-conformance
+                // `From[Src]` on one target. With no such conformance (or no `From` protocol —
+                // a prelude-less caller), keep the M24 T0033 mismatch. The witness is resolved
+                // in lower via `resolveConformanceMethod`, which selects the SAME conformance.
+                const widened = if (bc.model.from_protocol_id) |from_id|
+                    Typecheck.findConformance(bc.model, from_id, ret_args[1], &.{op_args[1]})
+                else
+                    false;
+                if (!widened)
+                    try bc.sink.emitFmtCode(.T0033, bc.byteOf(n.main_token), "'?' error type {s} does not match the enclosing Result error type {s}", .{ bc.typeName(op_args[1]), bc.typeName(ret_args[1]) });
             }
         }
         bc.node_types[(node_idx).int()] = payload;

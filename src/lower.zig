@@ -3024,9 +3024,9 @@ fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typec
 /// early-return it via the exit block (M24). `Option.none` is the tag alone;
 /// `Result.err` is the tag plus a copy of the error payload from the operand's `err`
 /// variant. The residual is built from the RETURN enum's OWN layout (`rl`) — the
-/// operand and return enums may differ in size — and, because M24 requires the error
-/// type to match EXACTLY, copying E across the two layouts is a plain byte copy with
-/// no conversion. (M25's `From`-widening would hook in here.)
+/// operand and return enums may differ in size. When the error types MATCH, copying E
+/// across the two layouts is a plain byte copy (M24); when they DIFFER, the error is
+/// WIDENED via the `From` witness `RetErr.from(opErr)` (M25).
 fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok: u32) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
     if (b.ret_type.kind != .@"enum") {
@@ -3041,13 +3041,66 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
     const tagv = try b.emit(.{ .iconst = 1 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = ret_base, .val = tagv, .ty = int_ty } }, null);
 
-    // Result: copy the error payload from the operand's `err` variant into the
-    // return's `err` variant. Option's residual (`none`) is the tag alone.
+    // Result: place the error payload into the return's `err` variant. Option's residual
+    // (`none`) is the tag alone. Two cases (M24 + M25):
+    //   * SAME error type -> a plain byte copy of E across the two (differently-sized)
+    //     layouts (M24). Src is sized by the operand's E, dst by the return's E — equal
+    //     here, but sized separately so the M25 branch below shares the same idiom.
+    //   * DIFFERING error types -> WIDEN via `RetErr.from(opErr)` (M25): materialize the
+    //     operand's E into a slot, call the `From` witness `from(opErr) -> RetErr`, and copy
+    //     its result into the return's err payload. The checker (typeOfTry) proved `RetErr has
+    //     From[OpErr]` before this runs; a `.none`/`.ambiguous` resolution is an internal
+    //     invariant break -> note-and-drop rather than miscompile.
     if (rl.native_family == .result) {
-        const ety = rl.variants[1].field_types[0];
-        const src = try addrAtOff(b, op_base, ol.payload_off + ol.variants[1].offsets[0], ety);
-        const dst = try addrAtOff(b, ret_base, rl.payload_off + rl.variants[1].offsets[0], ety);
-        try copyValueByType(b, dst, src, ety);
+        const op_err = ol.variants[1].field_types[0];
+        const ret_err = rl.variants[1].field_types[0];
+        const src_off = ol.payload_off + ol.variants[1].offsets[0];
+        const dst_off = rl.payload_off + rl.variants[1].offsets[0];
+        if (Typecheck.Type.eql(op_err, ret_err)) {
+            const src = try addrAtOff(b, op_base, src_off, op_err);
+            const dst = try addrAtOff(b, ret_base, dst_off, ret_err);
+            try copyValueByType(b, dst, src, ret_err);
+        } else switch (Typecheck.resolveConformanceMethod(b.in.methods, ret_err, "from", &.{op_err})) {
+            .one => |m| {
+                const src = try addrAtOff(b, op_base, src_off, op_err);
+                // The `from` witness takes its `Src` arg by value: a scalar (int/bool) as a
+                // loaded value, an aggregate (str/struct/enum) copied into a fresh slot —
+                // mirroring `lowerExpr`'s scalar->value / aggregate->slot convention.
+                const arg: Ir.Operand = switch (op_err.kind) {
+                    .int, .bool => .{ .value = try b.emit(.{ .load = .{ .addr = src, .ty = op_err } }, op_err) },
+                    else => blk: {
+                        const arg_slot = try b.addSlot(op_err);
+                        const arg_base = try b.emit(.{ .slot_addr = arg_slot }, int_ty);
+                        try copyValueByType(b, arg_base, src, op_err);
+                        break :blk .{ .slot = arg_slot };
+                    },
+                };
+                const callee = witnessCallee(b, m);
+                const from_ret = witnessRet(b, m);
+                const args = try b.gpa.alloc(Ir.Operand, 1);
+                errdefer b.gpa.free(args);
+                args[0] = arg;
+                const dst = try addrAtOff(b, ret_base, dst_off, ret_err);
+                // Deliver the `from` result into the return's err payload: an aggregate ret
+                // lands in a fresh ret_slot then copies out; a scalar ret is the call's value
+                // then a store (mirroring `lowerCall`'s ret placement).
+                switch (from_ret.kind) {
+                    .int, .bool => {
+                        const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, from_ret);
+                        _ = try b.emit(.{ .store = .{ .addr = dst, .val = v, .ty = from_ret } }, null);
+                    },
+                    else => {
+                        const from_slot = try b.addSlot(from_ret);
+                        _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = from_slot } }, null);
+                        const from_base = try b.emit(.{ .slot_addr = from_slot }, int_ty);
+                        try copyValueByType(b, dst, from_base, ret_err);
+                    },
+                }
+            },
+            .none, .ambiguous => {
+                try b.note(tok, "'?' error-widen: no unique From witness in lower");
+            },
+        }
     }
     try brTo(b, b.exit, .{ .slot = ret_slot });
 }
@@ -4363,6 +4416,42 @@ test "M17: int `+`/`-`/`*`/`/` stay a single inline op (regression pin: bytes un
         try testing.expect(std.mem.indexOf(u8, ir, c.want) != null);
         try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
     }
+}
+
+const from_impl_src =
+    \\enum SmallErr { bad }
+    \\enum BigErr { small, other }
+    \\impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr { BigErr.small } }
+    \\fn inner() -> Result[int, SmallErr] { return Result[int, SmallErr].err(SmallErr.bad) }
+    \\fn outer() -> Result[int, BigErr] {
+    \\ v := inner()?
+    \\ return Result.ok(v)
+    \\}
+    \\fn same(r: Result[int, BigErr]) -> Result[int, BigErr] {
+    \\ v := r?
+    \\ return Result.ok(v + 1)
+    \\}
+    \\fn main() -> int { return 0 }
+    \\
+;
+
+test "M25: a `?` that WIDENS the error emits a call to the From witness in the residual" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa, from_impl_src, "outer");
+    defer gpa.free(ir);
+    // The err residual materializes the operand error, calls `BigErr.from(smallErr)`, and
+    // copies the widened error into the return's err payload.
+    try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "from") != null);
+}
+
+test "M25: a `?` on a SAME-error-type Result stays a plain copy (no From witness call)" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa, from_impl_src, "same");
+    defer gpa.free(ir);
+    // The M24 identity path: the err payload is copied unchanged across the two layouts —
+    // no `from` witness is resolved or called.
+    try testing.expect(std.mem.indexOf(u8, ir, "from") == null);
 }
 
 test "lower-core: arithmetic return" {

@@ -1019,6 +1019,18 @@ hash_protocol_id: ?u32 = null,
 /// null id denies conformance.
 display_protocol_id: ?u32 = null,
 
+/// The global protocol id of the prelude `From` protocol (M25), assigned in
+/// `registerPrelude` right after `Display` in fixed append order (so From=8 — a pure
+/// function of source). `protocol From[Src] { fn from(v: Src) -> Self }` — the ONLY
+/// prelude protocol with a self-LESS method (its sole `type_var(1)` param is `Src`, its
+/// `type_var(0)` return is `Self`); it has NO builtin conformance and is NOT structurally
+/// derivable (`From` always needs an explicit impl). `typeOfTry` keys the `?`-error-widen
+/// check off this: a `Result[T,BigErr]` fn may `?` a `Result[T,SmallErr]` iff `BigErr has
+/// From[SmallErr]`. A bare `From` reference that misses the active module map falls back
+/// to this id in `protocolIdFromNode`. Null until `registerPrelude` runs; a null id denies
+/// the widen (keeping the existing T0033 mismatch) rather than miscompiling.
+from_protocol_id: ?u32 = null,
+
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
 /// each method's `decodeFnSig` (Pass A); null otherwise (non-method decoding is
@@ -1205,6 +1217,11 @@ pub const Model = struct {
     /// ran. `conformsToDisplay` keys the `print(x)` builtin trigger off this; a null id
     /// denies conformance (-> T0031) rather than miscompiling.
     display_protocol_id: ?u32,
+    /// The prelude `From` protocol's global id (M25), or null if `registerPrelude` never
+    /// ran. `typeOfTry` keys the `?`-error-widen check off this (`findConformance(From, RetErr,
+    /// [OpErr])`); a null id denies the widen (keeping the existing T0033 mismatch) rather
+    /// than miscompiling.
+    from_protocol_id: ?u32,
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -1232,6 +1249,7 @@ fn buildModel(t: *Typecheck) Model {
         .div_protocol_id = t.div_protocol_id,
         .hash_protocol_id = t.hash_protocol_id,
         .display_protocol_id = t.display_protocol_id,
+        .from_protocol_id = t.from_protocol_id,
     };
 }
 
@@ -3167,6 +3185,9 @@ fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         if (t.display_protocol_id) |pid| {
             if (std.mem.eql(u8, name, "Display")) return pid;
         }
+        if (t.from_protocol_id) |pid| {
+            if (std.mem.eql(u8, name, "From")) return pid;
+        }
         return null;
     }
     if (n.tag == .field_access) {
@@ -3813,6 +3834,38 @@ fn registerPrelude(t: *Typecheck) !void {
     try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.bool });
     try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.str });
     try t.conformances.append(t.gpa, .{ .protocol = disp_id, .recv = Type.unit });
+
+    // protocol From[Src] { fn from(v: Src) -> Self }  (M25, id 8, right after Display=7).
+    // The ONLY prelude protocol whose method is self-LESS: `from` takes a single `Src`
+    // param and returns `Self`, so the decoded sig is `[type_var(1)]` params (Src, the
+    // protocol's one generic arg — NO leading `type_var(0)` self slot) + a `type_var(0)`
+    // (Self) return. `generic_params = ["Src"]` makes it a generic protocol, so the T0024
+    // coherence check grounds `type_var(1)` to the conformance's arg and `type_var(0)` to
+    // the receiver. NO builtin conformance is registered (From always needs an explicit
+    // impl) and it is NOT added to `isDerivableProtocol` (never structurally synthesized).
+    // All gpa-allocated so teardown frees prelude + user protocols uniformly.
+    const from_gparams = try t.gpa.alloc([]const u8, 1);
+    from_gparams[0] = "Src";
+    const from_methods = try t.gpa.alloc([]const u8, 1);
+    from_methods[0] = "from";
+    const from_params = try t.gpa.alloc([]const Type, 1);
+    const from_p0 = try t.gpa.alloc(Type, 1);
+    from_p0[0] = Type.typeVar(1);
+    from_params[0] = from_p0;
+    const from_rets = try t.gpa.alloc(Type, 1);
+    from_rets[0] = Type.typeVar(0);
+    const from_id: u32 = @intCast(t.protocols.items.len);
+    t.from_protocol_id = from_id;
+    try t.protocols.append(t.gpa, .{
+        .name = "From",
+        .mod = 0,
+        .pub_export = true,
+        .decl_node = Ast.none,
+        .methods = from_methods,
+        .method_params = from_params,
+        .method_rets = from_rets,
+        .generic_params = from_gparams,
+    });
 
     // Prelude generic value enums (M23): `enum Option[T] { some(T), none }` and
     // `enum Result[T,E] { ok(T), err(E) }`, hand-built as generic TEMPLATES — the same
@@ -5422,6 +5475,102 @@ test "M24: `?` on Result[_,E1] in a Result[_,E2] fn is exactly one T0033 (error-
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), c.result.diags.len);
     try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
+}
+
+test "M25: `?` widens Result error via `impl BigErr has From[SmallErr]` — zero diags, From witness stamped" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum SmallErr { bad }
+        \\enum BigErr { small, other }
+        \\impl BigErr has From[SmallErr] {
+        \\ fn from(s: SmallErr) -> BigErr { BigErr.small }
+        \\}
+        \\fn inner() -> Result[int, SmallErr] { return Result[int, SmallErr].err(SmallErr.bad) }
+        \\fn outer() -> Result[int, BigErr] {
+        \\ v := inner()?
+        \\ return Result.ok(v)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    // The self-less `from` (no P0006), the From coherence sig (no T0024), and the `?`
+    // error-widen (no T0033) all pass — a clean compile.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // `checkCoherence` stamped the `from` witness with the From conformance's
+    // `(protocol_id, protocol_args=[SmallErr])`, so the multi-conformance resolver can
+    // select it by the operand (source) error type. recv is BigErr, the arg is SmallErr —
+    // two DISTINCT concrete enums (the widen direction).
+    var found_from = false;
+    for (c.result.methods) |m| {
+        if (!std.mem.eql(u8, m.name, "from")) continue;
+        found_from = true;
+        try testing.expect(m.protocol_id != null);
+        try testing.expectEqual(Kind.@"enum", m.recv.kind);
+        try testing.expectEqual(@as(usize, 1), m.protocol_args.len);
+        try testing.expectEqual(Kind.@"enum", m.protocol_args[0].kind);
+        try testing.expect(!Type.eql(m.recv, m.protocol_args[0]));
+    }
+    try testing.expect(found_from);
+}
+
+test "M25: `?` on differing Result errors with NO From impl is exactly one T0033" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum SmallErr { bad }
+        \\enum BigErr { small, other }
+        \\fn f(o: Result[int, SmallErr]) -> Result[int, BigErr] {
+        \\ v := o?
+        \\ return Result.ok(v)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
+}
+
+test "M25: multi-conformance From[Src] on one target error type is disambiguated by the operand error type" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E1 { a }
+        \\enum E2 { b }
+        \\enum Big { x, y }
+        \\impl Big has From[E1] { fn from(s: E1) -> Big { Big.x } }
+        \\impl Big has From[E2] { fn from(s: E2) -> Big { Big.y } }
+        \\fn from_e1() -> Result[int, E1] { return Result[int, E1].err(E1.a) }
+        \\fn from_e2() -> Result[int, E2] { return Result[int, E2].err(E2.b) }
+        \\fn g() -> Result[int, Big] {
+        \\ v := from_e1()?
+        \\ w := from_e2()?
+        \\ return Result.ok(v + w)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    // Two `From[Src]` conformances on `Big` do not collide on coherence (keyed on
+    // (protocol, recv, args)); both `?`s widen, each selecting its witness by the operand
+    // error type. A clean compile proves the disambiguation.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "M25: a From impl whose `from` returns the WRONG type still trips T0024 (coherence)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum SmallErr { bad }
+        \\enum BigErr { small, other }
+        \\impl BigErr has From[SmallErr] {
+        \\ fn from(s: SmallErr) -> SmallErr { SmallErr.bad }
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    // `from` must return `Self` (BigErr); returning SmallErr is a signature incompatibility.
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0024, c.result.diags[0].code);
 }
 
 test "M16: `<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {

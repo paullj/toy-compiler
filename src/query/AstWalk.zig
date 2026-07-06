@@ -124,6 +124,14 @@ pub const Event = union(enum) {
     /// operand so `v1 + v2` tracks the SAME witness identity the desugared call's reloc
     /// targets (editing an `impl V2 has Add` body must invalidate `+` callers).
     arith_operator: struct { idx: Ast.Index },
+    /// A postfix `?` on a `.try_expr` node `idx` (M25). Emitted AFTER the operand, like the
+    /// three operator events. The hash IGNORES it (so every existing `?` fingerprint — incl.
+    /// an Option `?` and a same-error Result `?` — is preserved and warm caches never churn);
+    /// only `CallVisitor` reacts, and ONLY for a WIDENING Result `?` (operand error type differs
+    /// from the enclosing return's), folding the resolved `From` witness so `inner()?` tracks the
+    /// SAME witness identity the desugared widen's reloc targets (adding/removing an
+    /// `impl RetErr has From[OpErr]` invalidates the enclosing fn's codegen unit).
+    try_operator: struct { idx: Ast.Index },
 };
 
 /// The error set of `visitor.on`, or the empty set when the visitor has no `on`.
@@ -422,7 +430,19 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // from `x`; recursing the operand folds its spelling AND discovers its
         // Option/Result `App` instance for monomorphization. The `?` mints no instance of
         // its own — the residual is built from the already-reified enclosing return enum.
-        .try_expr => try walkInner(src, n.lhs, collect, visitor),
+        //
+        // M25: after the operand, signal a `.try_operator` so `CallVisitor` can fold the
+        // resolved `From` witness for a WIDENING Result `?` (operand error type differs from
+        // the enclosing return's error type). The hash IGNORES it, so every existing `?`
+        // fingerprint — an Option `?`, a same-error Result `?` — is byte-identical (warm cache
+        // preserved). CallVisitor reads the enclosing fn's return type from the threaded
+        // `fn_sig` (`walkCalls` now threads it, mirroring `walkTouchedSig`), so adding/removing
+        // an `impl RetErr has From[OpErr]` flips the enclosing fn's codegen key — the same
+        // conformance-fp-fold discipline as the operator witnesses.
+        .try_expr => {
+            try walkInner(src, n.lhs, collect, visitor);
+            try emit(visitor, .{ .try_operator = .{ .idx = idx } });
+        },
         .pattern_literal => try emit(visitor, .{ .leaf = leaf }),
         .pattern_or => {
             const alts = Ast.rangeSlice(tree, n.lhs.int());
@@ -459,7 +479,7 @@ pub const HashVisitor = struct {
             .leaf, .raw_leaf => |t| updateLeaf(self.h, t),
             .count => |c| updateU32(self.h, c),
             .flag => |f| self.h.update(&[_]u8{@intFromBool(f)}),
-            .touch, .callee, .type_ref, .eq_operator, .ord_operator, .arith_operator => {},
+            .touch, .callee, .type_ref, .eq_operator, .ord_operator, .arith_operator, .try_operator => {},
         }
     }
 };
@@ -474,6 +494,12 @@ pub fn CallVisitor(comptime Frozen: type) type {
         gpa: std.mem.Allocator,
         frozen: *const Frozen,
         out: *std.ArrayList(Sig),
+        /// The OWNING fn's typecheck Sig, threaded by `walkCalls` (mirroring `TouchedVisitor`).
+        /// Its `.ret` is the enclosing fn's reified return enum — the source of the target
+        /// error type a widening `?` (M25) converts INTO. Defaulted `null` so the ~7 test
+        /// CallVisitor constructions that don't fold a `?` widen stay unchanged; a `.try_operator`
+        /// with no threaded sig folds nothing (`orelse return`).
+        fn_sig: ?Sig = null,
 
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
@@ -629,6 +655,35 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         else => return,
                     };
                     switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, null)) {
+                        .one => |m| try self.foldWitness(m),
+                        .none, .ambiguous => {},
+                    }
+                },
+                .try_operator => |e| {
+                    // A WIDENING Result `?` (M25) re-emits `err(e)` as `RetErr.from(e)`; fold that
+                    // `From` witness so the enclosing fn's codegen key depends on the resolved
+                    // conformance — via the SAME resolver+args lower's buildResidual uses
+                    // (lower.zig:3063), tracking the SAME witness the widen's reloc targets. Only
+                    // fires for a Result operand whose error type DIFFERS from the enclosing return's:
+                    // the identity case (op_err==ret_err, M24), an Option `?`, and every non-`?` fn
+                    // fold NOTHING, so their fingerprints stay byte-identical (warm cache preserved).
+                    // Every index is guarded — a pre-typecheck / FakeFrozen view (no threaded sig or
+                    // empty tables) folds nothing, mirroring the eq/ord/arith guards above.
+                    const fs = self.fn_sig orelse return;
+                    if (fs.ret.kind != .@"enum" or fs.ret.enum_id >= self.frozen.enum_layouts.len) return;
+                    const tn = self.frozen.tree.nodes[e.idx.int()];
+                    if (tn.lhs.int() >= self.frozen.node_types.len) return;
+                    const op = self.frozen.node_types[tn.lhs.int()];
+                    if (op.kind != .@"enum" or op.enum_id >= self.frozen.enum_layouts.len) return;
+                    const ol = self.frozen.enum_layouts[op.enum_id];
+                    const rl = self.frozen.enum_layouts[fs.ret.enum_id];
+                    if (ol.native_family != .result or rl.native_family != .result) return;
+                    if (ol.variants.len < 2 or rl.variants.len < 2) return;
+                    if (ol.variants[1].field_types.len < 1 or rl.variants[1].field_types.len < 1) return;
+                    const op_err = ol.variants[1].field_types[0];
+                    const ret_err = rl.variants[1].field_types[0];
+                    if (Typecheck.Type.eql(op_err, ret_err)) return;
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, ret_err, "from", &.{op_err})) {
                         .one => |m| try self.foldWitness(m),
                         .none, .ambiguous => {},
                     }
@@ -959,7 +1014,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 /// makes the guard catch a mis-placed `.touch`/`.callee`/`.type_ref` dispatch —
 /// not only a forked traversal order.
 const StreamStep = struct {
-    kind: enum { enter, touch, callee, type_ref, eq_operator, ord_operator, arith_operator },
+    kind: enum { enter, touch, callee, type_ref, eq_operator, ord_operator, arith_operator, try_operator },
     idx: Ast.Index,
 };
 
@@ -980,6 +1035,7 @@ const StreamRecorder = struct {
             .eq_operator => |e| try self.out.append(self.gpa, .{ .kind = .eq_operator, .idx = e.idx }),
             .ord_operator => |e| try self.out.append(self.gpa, .{ .kind = .ord_operator, .idx = e.idx }),
             .arith_operator => |e| try self.out.append(self.gpa, .{ .kind = .arith_operator, .idx = e.idx }),
+            .try_operator => |e| try self.out.append(self.gpa, .{ .kind = .try_operator, .idx = e.idx }),
             .leaf, .raw_leaf, .count, .flag => {},
         }
     }
@@ -1114,6 +1170,7 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         .eq_operator => saw_eq_operator = true,
         .ord_operator => saw_ord_operator = true,
         .arith_operator => saw_arith_operator = true,
+        .try_operator => {}, // this fixture has no `?`, so it never fires (proved by the placement loop below being vacuous)
     };
     // The fixture's `d := q.x - p.x` is a `-` binary, so `.arith_operator` fires (M17).
     try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref and saw_eq_operator and saw_ord_operator and saw_arith_operator);
@@ -1679,4 +1736,158 @@ test "M17: `p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental sou
     try testing.expectEqualStrings(a.name, m.name);
     try testing.expectEqual(a.ret.kind, m.ret.kind);
     try testing.expectEqual(a.params.len, m.params.len);
+}
+
+test "M25: the .try_operator event is IGNORED by the hash (a `?` fingerprint is unchanged)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa,
+        \\fn f(r: Result[int, int]) -> Result[int, int] {
+        \\  v := r?
+        \\  return Result.ok(v)
+        \\}
+    );
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+
+    // Hash 1: the real walk, which emits `.try_operator` after the `?` operand.
+    var h1 = std.hash.Wyhash.init(0);
+    var hv = HashVisitor{ .h = &h1 };
+    try walk(b.src(), decl, &hv);
+
+    // Hash 2: the SAME walk with `.try_operator` dropped before folding — the hash as if the
+    // M25 event had never been introduced. Byte-identity proves the operator event never
+    // enters the fingerprint byte-stream, so every existing `?` fp (Option `?`, same-error
+    // Result `?`, and this widening one) is preserved and warm caches never churn.
+    var h2 = std.hash.Wyhash.init(0);
+    const Filter = struct {
+        h: HashVisitor,
+        pub fn on(self: *@This(), ev: Event) void {
+            switch (ev) {
+                .try_operator => {},
+                else => self.h.on(ev),
+            }
+        }
+    };
+    var fv = Filter{ .h = .{ .h = &h2 } };
+    try walk(b.src(), decl, &fv);
+
+    try testing.expectEqual(h1.final(), h2.final());
+}
+
+test "M25: a WIDENING `?` folds the resolved `From` witness; the identity `?` folds nothing" {
+    const gpa = testing.allocator;
+    const Graph = @import("../driver/Graph.zig");
+    const ResolveGraph = @import("../resolve_graph.zig");
+    const TypecheckGraph = @import("../types_graph.zig");
+    const Link = @import("../link/Link.zig");
+
+    const src =
+        \\enum SmallErr { bad }
+        \\enum BigErr { small, other }
+        \\impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr { BigErr.small } }
+        \\fn inner() -> Result[int, SmallErr] { return Result[int, SmallErr].err(SmallErr.bad) }
+        \\fn outer() -> Result[int, BigErr] {
+        \\  v := inner()?
+        \\  return Result.ok(v)
+        \\}
+        \\fn same_err(r: Result[int, BigErr]) -> Result[int, BigErr] {
+        \\  v := r?
+        \\  return Result.ok(v)
+        \\}
+        \\
+    ;
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    defer res.deinit(gpa);
+    var tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
+    defer tc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), tc.diags.len);
+
+    const names = try gpa.alloc(Link.SymName, res.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (res.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    const frozen = FakeFrozen{
+        .tree = tree,
+        .tokens = tokens,
+        .source = src,
+        .resolutions = res.resolutions[0],
+        .node_types = tc.node_types[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sigs = tc.sigs,
+        .instances = tc.instances,
+        .methods = tc.methods,
+    };
+
+    // Look fns up by NAME (the impl + inner shift source positions), not source order.
+    var outer_decl: Ast.Index = Ast.none;
+    var outer_sig: ?Sig = null;
+    var same_decl: Ast.Index = Ast.none;
+    var same_sig: ?Sig = null;
+    var inner_sig: ?Sig = null;
+    for (res.fns, 0..) |gf, i| {
+        // Names are module-qualified (`main.outer`); match the `.<fn>` suffix.
+        if (std.mem.endsWith(u8, gf.name, ".outer")) {
+            outer_decl = gf.decl_node;
+            outer_sig = tc.sigs[i];
+        } else if (std.mem.endsWith(u8, gf.name, ".same_err")) {
+            same_decl = gf.decl_node;
+            same_sig = tc.sigs[i];
+        } else if (std.mem.endsWith(u8, gf.name, ".inner")) {
+            inner_sig = tc.sigs[i];
+        }
+    }
+    try testing.expect(outer_decl != Ast.none and same_decl != Ast.none and inner_sig != null);
+
+    // The witness the widen must fold, resolved the SAME way lower's buildResidual does:
+    // BigErr's `From[SmallErr]::from`. The reified error types come from the `err` variant
+    // (variants[1]) of each fn's reified return-Result enum — exactly what the fold reads.
+    const rl = tc.enum_layouts[outer_sig.?.ret.enum_id];
+    const ol = tc.enum_layouts[inner_sig.?.ret.enum_id];
+    const ret_err = rl.variants[1].field_types[0];
+    const op_err = ol.variants[1].field_types[0];
+    const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", &.{op_err});
+    try testing.expect(pick == .one);
+    const want_name = if (pick.one.instance) |ii| tc.instances[ii].name else names[pick.one.fn_id].name;
+
+    // outer's `?` WIDENS (SmallErr -> BigErr): its fold stream contains the `from` witness.
+    var outer_sigs: std.ArrayList(Sig) = .empty;
+    defer outer_sigs.deinit(gpa);
+    var vo = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .fn_sig = outer_sig, .out = &outer_sigs };
+    try walk(.{ .tree = tree, .tokens = tokens, .source = src }, outer_decl, &vo);
+
+    // same_err's `?` is the IDENTITY case (BigErr == BigErr): it folds NO `from` witness, so
+    // its (b) callee-sig stream is byte-identical to a `?`-free fn (warm cache preserved).
+    var same_sigs: std.ArrayList(Sig) = .empty;
+    defer same_sigs.deinit(gpa);
+    var vs = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .fn_sig = same_sig, .out = &same_sigs };
+    try walk(.{ .tree = tree, .tokens = tokens, .source = src }, same_decl, &vs);
+
+    var outer_has = false;
+    for (outer_sigs.items) |s| {
+        if (std.mem.eql(u8, s.name, want_name)) outer_has = true;
+    }
+    var same_has = false;
+    for (same_sigs.items) |s| {
+        if (std.mem.eql(u8, s.name, want_name)) same_has = true;
+    }
+    try testing.expect(outer_has);
+    try testing.expect(!same_has);
 }

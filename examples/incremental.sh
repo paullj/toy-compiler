@@ -238,5 +238,93 @@ TOY
 }
 run_cross_module
 
+# 6) `?`-FROM CONFORMANCE TOGGLE (M25) — `outer`'s `?` WIDENS `inner()`'s error via
+#    `impl BigErr has From[SmallErr]`. Base builds; REMOVING the impl makes a warm rebuild a
+#    T0033 compile-error (the widen is NOT stale-served from the cached green `outer`);
+#    RE-ADDING it rebuilds green with __text byte-identical to a --force full build (soundness),
+#    and every fn — incl. the `unrelated` cutoff witness — is served from cache.
+#
+#    HONEST TEETH: typecheck runs FRESH every build (Orchestrator -> checkGraph, uncached), so
+#    remove-impl yields T0033 regardless of the codegen From-witness fold, and concrete-From
+#    op_err/ret_err are independently folded elsewhere — no concrete stale-cache miscompile is
+#    reachable. This scenario proves end-to-end conformance-toggle SOUNDNESS; it does not, alone,
+#    discriminate fold-present from fold-absent for concrete From (that M13-discipline consistency
+#    is pinned by the AstWalk `.try_operator` fold unit test).
+run_from_widen() {
+  local d="$work/from_widen"; mkdir -p "$d"; local src="$d/prog.toy"
+  ( cd "$d" && rm -rf .toy )
+
+  local with_impl='enum SmallErr { bad }
+enum BigErr { small, other }
+impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr { BigErr.small } }
+fn inner() -> Result[int, SmallErr] { return Result[int, SmallErr].err(SmallErr.bad) }
+fn outer() -> Result[int, BigErr] {
+  v := inner()?
+  return Result.ok(v)
+}
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int { return match outer() { .ok(_) -> unrelated(0), .err(_) -> 42 } }
+'
+  local without_impl='enum SmallErr { bad }
+enum BigErr { small, other }
+fn inner() -> Result[int, SmallErr] { return Result[int, SmallErr].err(SmallErr.bad) }
+fn outer() -> Result[int, BigErr] {
+  v := inner()?
+  return Result.ok(v)
+}
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int { return match outer() { .ok(_) -> unrelated(0), .err(_) -> 42 } }
+'
+
+  # (1) cold build (impl present) primes the content-fp cache.
+  printf '%s' "$with_impl" > "$src"
+  ( cd "$d" && "$toyc" -o base.bin prog.toy >/dev/null 2>&1 ) \
+    || { fail_one "from_widen: cold build (impl present) failed"; return; }
+  local full_compiled
+  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force prog.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
+
+  # (2) REMOVE the impl -> warm rebuild MUST fail with T0033 (the widen is not stale-served).
+  printf '%s' "$without_impl" > "$src"
+  local rm_out rm_rc
+  rm_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats prog.toy 2>&1 )"; rm_rc=$?
+  if [ "$rm_rc" -eq 0 ]; then
+    fail_one "from_widen: remove-impl warm rebuild STALE-SUCCEEDED (expected a T0033 compile-error)"
+    return
+  fi
+  if ! grep -q "T0033" <<<"$rm_out"; then
+    fail_one "from_widen: remove-impl failed but WITHOUT T0033 [$rm_out]"
+    return
+  fi
+
+  # (3) RESTORE the impl -> warm rebuild green; its __text must equal a --force full build.
+  printf '%s' "$with_impl" > "$src"
+  local inc_out inc_rc
+  inc_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats prog.toy 2>&1 )"; inc_rc=$?
+  if [ "$inc_rc" -ne 0 ]; then
+    fail_one "from_widen: restore-impl warm rebuild failed (expected green) [$inc_out]"
+    return
+  fi
+  ( cd "$d" && "$toyc" -o force.bin --force prog.toy >/dev/null 2>&1 ) \
+    || { fail_one "from_widen: force build failed"; return; }
+
+  local ih fh
+  ih="$(texthash "$d/inc.bin")"; fh="$(texthash "$d/force.bin")"
+  if [ "$ih" != "$fh" ]; then
+    fail_one "from_widen: SOUNDNESS — inc __text ($ih) != force __text ($fh) [STALE-CACHE MISCOMPILE]"
+    return
+  fi
+
+  # (4) CUTOFF: the restore rebuild serves cached fns (incl. `unrelated`) -> compiled < full.
+  local comp
+  comp="$(compiled_of "$inc_out")"
+  if [ -n "$comp" ] && [ -n "$full_compiled" ] && [ "$comp" -lt "$full_compiled" ]; then
+    echo "  OK   from_widen: remove->T0033; restore SOUND + CUTOFF codegen compiled=$comp < full=$full_compiled"
+    pass=$((pass + 1))
+  else
+    fail_one "from_widen: CUTOFF — codegen compiled=$comp NOT < full=$full_compiled"
+  fi
+}
+run_from_widen
+
 echo "--- incremental battery: $pass scenario(s) sound+cutoff, $fail failed ---"
 [ "$fail" -eq 0 ]
