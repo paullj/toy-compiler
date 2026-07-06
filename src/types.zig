@@ -2340,8 +2340,8 @@ fn collectComponentTypes(t: *Typecheck, ty: Type, out: *std.ArrayList(Type)) !vo
 }
 
 /// Resolve one recipe's per-field witnesses (M19): the flattened component fields (see
-/// `collectComponentTypes`) each mapped to their `FieldWitness` per the recipe kind — `eq` fields
-/// via `resolveFieldEq`, `ord` fields via `resolveFieldOrd`. Returns the borrowed-empty slice
+/// `collectComponentTypes`) each mapped to their `FieldWitness` via `resolveFieldWitness`
+/// parameterized by the recipe kind. Returns the borrowed-empty slice
 /// for a no-field recipe (empty struct / empty-payload enum) so teardown's `len > 0` free
 /// guard stays correct. OWNED outer slice (freed by `freeDeriveEntries`).
 fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitness {
@@ -2352,81 +2352,48 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
     const fw = try t.gpa.alloc(Derive.FieldWitness, ftys.items.len);
     errdefer t.gpa.free(fw);
     for (ftys.items, 0..) |ft, i| fw[i] = switch (d.kind) {
-        .eq => t.resolveFieldEq(ft),
-        .ord => t.resolveFieldOrd(ft),
-        .hash => t.resolveFieldHash(ft),
-        .display => t.resolveFieldDisplay(ft),
+        .eq => t.resolveFieldWitness(.eq, ft),
+        .ord => t.resolveFieldWitness(.ord, ft),
+        .hash => t.resolveFieldWitness(.hash, ft),
+        .display => t.resolveFieldWitness(.display, ft),
     };
     return fw;
 }
 
-/// Resolve one struct-field type to its derived-eq recipe (M18): scalars/str compare
-/// inline; a struct/enum field dispatches to its `eq` witness (a sibling derive, a Mono
-/// instance method, or a user impl fn), falling back to its `cmp` witness (an Ord-only
-/// field: `==` as `cmp(..) == Ordering.eq`). Read only on the LIVE method table AFTER all
-/// synthetic entries are appended, so a sibling derive resolves correctly.
-fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldWitness {
+/// Resolve one struct/enum field type to its `FieldWitness` for a derive of `kind`
+/// (M18-M22): scalars/str/unit are handled inline by the emitter (`inline_kind`); an
+/// aggregate field dispatches to its per-protocol witness (a sibling derive, a Mono
+/// instance method, or a user `impl` fn). An `Eq` derive is the one two-lookup case — it
+/// falls back to the field's `cmp` witness when it has no `eq` (`==` as `cmp(..) ==
+/// Ordering.eq`). Read only on the LIVE method table AFTER all synthetic entries are
+/// appended, so a sibling derive resolves correctly. A witness miss on a conforming field
+/// is unreachable; degrade to `inline_kind`.
+fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type) Derive.FieldWitness {
     switch (ft.kind) {
         .@"struct", .@"enum" => {},
-        else => return .inline_kind, // int/bool/str/unit — emitter handles by layout kind
+        else => return .inline_kind,
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "eq", t.eq_protocol_id, null)) {
-        .one => |m| return .{ .eq_call = t.witnessName(m) },
+    const method, const variant = switch (kind) {
+        .eq => .{ "eq", "eq_call" },
+        .ord => .{ "cmp", "cmp_call" },
+        .hash => .{ "hash", "hash_call" },
+        .display => .{ "display", "display_call" },
+    };
+    const pid = switch (kind) {
+        .eq => t.eq_protocol_id,
+        .ord => t.ord_protocol_id,
+        .hash => t.hash_protocol_id,
+        .display => t.display_protocol_id,
+    };
+    switch (resolveConformanceMethod(t.methods.items, ft, method, pid, null)) {
+        .one => |m| return @unionInit(Derive.FieldWitness, variant, t.witnessName(m)),
         .none, .ambiguous => {},
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", t.ord_protocol_id, null)) {
+    if (kind == .eq) switch (resolveConformanceMethod(t.methods.items, ft, "cmp", t.ord_protocol_id, null)) {
         .one => |m| return .{ .cmp_eq = t.witnessName(m) },
-        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
-    }
-}
-
-/// Resolve one field type to its derived-ord recipe (M19): scalars/str compare inline (the
-/// emitter's branch-free 3-way / lexicographic byte loop); a struct/enum field dispatches to
-/// its `cmp` witness (a sibling Ord derive, a Mono instance method, or a user `impl has Ord`
-/// fn). Read only on the LIVE method table AFTER all synthetic entries are appended, so a
-/// sibling derive resolves correctly. A `cmp` miss is unreachable for a conforming field.
-fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldWitness {
-    switch (ft.kind) {
-        .@"struct", .@"enum" => {},
-        else => return .inline_kind, // int/bool/str — emitter handles by layout kind
-    }
-    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", t.ord_protocol_id, null)) {
-        .one => |m| return .{ .cmp_call = t.witnessName(m) },
-        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
-    }
-}
-
-/// Resolve one field type to its derived-hash recipe (M20): scalars/str hash inline (the
-/// emitter's identity value / heap-free byte polynomial); a struct/enum field dispatches to
-/// its `hash` witness (a sibling Hash derive, a Mono instance method, or a user `impl has
-/// Hash` fn). Read only on the LIVE method table AFTER all synthetic entries are appended, so
-/// a sibling derive resolves correctly. A `hash` miss is unreachable for a conforming field.
-fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldWitness {
-    switch (ft.kind) {
-        .@"struct", .@"enum" => {},
-        else => return .inline_kind, // int/bool/str — emitter handles by layout kind
-    }
-    switch (resolveConformanceMethod(t.methods.items, ft, "hash", t.hash_protocol_id, null)) {
-        .one => |m| return .{ .hash_call = t.witnessName(m) },
-        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
-    }
-}
-
-/// Resolve one field type to its derived-display recipe (M22): scalars/str render inline
-/// (the emitter writes int via `__display_int`, bool inline, str's raw bytes); a struct/enum
-/// field dispatches to its `display` witness (a sibling Display derive, a Mono instance
-/// method, or a user `impl has Display` fn). Read only on the LIVE method table AFTER all
-/// synthetic entries are appended, so a sibling derive resolves correctly. A `display` miss
-/// is unreachable for a conforming field. Mirrors `resolveFieldHash`.
-fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldWitness {
-    switch (ft.kind) {
-        .@"struct", .@"enum" => {},
-        else => return .inline_kind, // int/bool/str — emitter handles by layout kind
-    }
-    switch (resolveConformanceMethod(t.methods.items, ft, "display", t.display_protocol_id, null)) {
-        .one => |m| return .{ .display_call = t.witnessName(m) },
-        .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
-    }
+        .none, .ambiguous => {},
+    };
+    return .inline_kind;
 }
 
 /// The emitted symbol name a resolved witness `Method` lowers to (M18): a synthetic
