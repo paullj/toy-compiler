@@ -335,7 +335,7 @@ pub const GraphResult = struct {
             gpa.free(@constCast(inst.args));
             gpa.free(inst.node_types);
             gpa.free(@constCast(inst.params));
-            gpa.free(@constCast(inst.name));
+            gpa.free(@constCast(inst.name.?));
             // M13/M14: each conformance's `witness_syms` + `protocol_args` OUTER slices +
             // the vector itself are owned (elements are borrowed source / `gph_fn_names` /
             // PODs).
@@ -364,7 +364,7 @@ pub const GraphResult = struct {
 /// borrowed (sibling derive/instance/fn names + source protocol names).
 pub fn freeDeriveEntries(gpa: std.mem.Allocator, derives: []const DeriveRecipe) void {
     for (derives) |d| {
-        gpa.free(@constCast(d.name));
+        gpa.free(@constCast(d.name.?));
         if (d.params.len > 0) gpa.free(@constCast(d.params));
         if (d.field_witnesses.len > 0) gpa.free(@constCast(d.field_witnesses));
     }
@@ -1582,7 +1582,7 @@ pub fn checkGraph(
             gpa.free(@constCast(inst.args));
             gpa.free(inst.node_types);
             gpa.free(@constCast(inst.params));
-            gpa.free(@constCast(inst.name));
+            gpa.free(@constCast(inst.name.?));
             freeInstanceConformances(gpa, inst.conformances); // M13
         }
         gpa.free(instances);
@@ -1880,7 +1880,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // instances therefore never collide (Debug/ReleaseSafe guard).
     if (std.debug.runtime_safety) {
         for (t.mono.items, 0..) |a, i| {
-            for (t.mono.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name, b.name));
+            for (t.mono.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name.?, b.name.?));
         }
     }
 
@@ -2171,7 +2171,7 @@ fn synthesizeDerives(t: *Typecheck) !void {
     // never collide (Debug/ReleaseSafe guard, mirroring the Mono self-collision assert).
     if (std.debug.runtime_safety) {
         for (t.derives.items, 0..) |a, i| {
-            for (t.derives.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name, b.name));
+            for (t.derives.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name.?, b.name.?));
         }
     }
 
@@ -2313,8 +2313,8 @@ fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldEq {
 /// All three outlive codegen (owned by `GraphResult.derives`/`.instances`, or resolve
 /// result), so a borrowing `FieldEq` slice stays valid.
 fn witnessName(t: *const Typecheck, m: Method) []const u8 {
-    if (m.derive) |di| return t.derives.items[di].name;
-    if (m.instance) |ii| return t.mono.items[ii].name;
+    if (m.derive) |di| return t.derives.items[di].name.?;
+    if (m.instance) |ii| return t.mono.items[ii].name.?;
     return if (t.gph_fn_names) |fns| fns[m.fn_id] else "";
 }
 
@@ -2560,7 +2560,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
         .node_types = inst_nt,
         .params = params,
         .ret = ret,
-        .name = undefined, // minted in canonical order after the sort
+        .name = null, // minted in canonical order after the sort
         .mod = f.mod,
         .decl_node = f.decl_node,
         .conformances = confs,
@@ -4489,8 +4489,8 @@ test "M2: the generic-fn demo typechecks clean and monomorphizes one instance pe
     // kind), each with a distinct mangled name and a fully-concrete substituted sig.
     try testing.expectEqual(@as(usize, 2), c.result.instances.len);
     // The template name is module-qualified (`main.id`) for cross-module uniqueness.
-    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
-    try testing.expect(std.mem.startsWith(u8, c.result.instances[1].name, "main.id$s"));
+    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name.?);
+    try testing.expect(std.mem.startsWith(u8, c.result.instances[1].name.?, "main.id$s"));
     try testing.expectEqual(Kind.int, c.result.instances[0].ret.kind);
     try testing.expectEqual(Kind.@"struct", c.result.instances[1].ret.kind);
     // The substituted params/ret are concrete — no `type_var` survives the mono tail.
@@ -4506,7 +4506,7 @@ test "M2: repeated call sites of one (template,args) monomorphize to ONE instanc
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.instances.len);
-    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
+    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name.?);
 }
 
 test "M6: an uninstantiated generic enum (and struct) is clean and reifies NOTHING" {
@@ -4725,7 +4725,7 @@ test "M10: a generic-type method typechecks clean; one template + one reified en
 
     // One monomorphized instance: `<path>.Box.get$int`, returning int.
     try testing.expectEqual(@as(usize, 1), c.result.instances.len);
-    try testing.expect(std.mem.indexOf(u8, c.result.instances[0].name, "get$int") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.instances[0].name.?, "get$int") != null);
     try testing.expectEqual(Kind.int, c.result.instances[0].ret.kind);
     // No `.app`/`type_var` survives into the reified instance sig.
     try testing.expect(!c.result.instances[0].ret.isTypeVar());
@@ -4788,10 +4788,10 @@ test "M10: Box[int] and Box[Point] .get() lower to two DISTINCT instances; an un
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     // Exactly two `get` instances (int + Point); `same` is never called → none.
     try testing.expectEqual(@as(usize, 2), c.result.instances.len);
-    try testing.expect(!std.mem.eql(u8, c.result.instances[0].name, c.result.instances[1].name));
+    try testing.expect(!std.mem.eql(u8, c.result.instances[0].name.?, c.result.instances[1].name.?));
     for (c.result.instances) |inst| {
-        try testing.expect(std.mem.indexOf(u8, inst.name, "same") == null);
-        try testing.expect(std.mem.indexOf(u8, inst.name, "get$") != null);
+        try testing.expect(std.mem.indexOf(u8, inst.name.?, "same") == null);
+        try testing.expect(std.mem.indexOf(u8, inst.name.?, "get$") != null);
     }
 }
 
@@ -4977,7 +4977,7 @@ test "M18: `==` on an all-Eq-fields struct with no impl DERIVES (was M15 T0026)"
     // exactly one synthetic recipe (`Eq` for P, struct id 0 -> `Eq$eq$s0`).
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Eq$eq$s0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Eq$eq$s0", c.result.derives[0].name.?);
 }
 
 test "M19: `==` on a PAYLOAD enum with no impl now DERIVES Eq (M18 gap closed)" {
@@ -4996,7 +4996,7 @@ test "M19: `==` on a PAYLOAD enum with no impl now DERIVES Eq (M18 gap closed)" 
     // enum structurally conforms -> one source-less `Eq` recipe (`Eq$eq$e0`), zero diags.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Eq$eq$e0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Eq$eq$e0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.eq, c.result.derives[0].kind);
 }
 
@@ -5013,7 +5013,7 @@ test "M19: `<` on a PAYLOAD enum with no impl DERIVES Ord (discriminant-then-pay
     // One source-less `Ord` recipe (`Ord$cmp$e0`), no separate Eq unit; zero diags.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Ord$cmp$e0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Ord$cmp$e0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.ord, c.result.derives[0].kind);
     try testing.expectEqual(Kind.@"enum", c.result.derives[0].ret.kind); // ret is `Ordering`
 }
@@ -5515,7 +5515,7 @@ test "M24: `?` inside a generic Option fn typechecks clean and monomorphizes the
     // The `passthru$int` instance is monomorphized (its `?` operand grounds Option[int]).
     var found = false;
     for (c.result.instances) |inst| {
-        if (std.mem.indexOf(u8, inst.name, "passthru$int") != null) found = true;
+        if (std.mem.indexOf(u8, inst.name.?, "passthru$int") != null) found = true;
     }
     try testing.expect(found);
 }
@@ -5699,7 +5699,7 @@ test "M19: `<` on a struct with no `Ord` impl now DERIVES Ord (was M16 T0027)" {
     // diagnostic, exactly one `Ord` recipe (`Ord$cmp$s0`), which also fills `(Eq, P)`.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Ord$cmp$s0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Ord$cmp$s0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.ord, c.result.derives[0].kind);
 }
 
@@ -5721,7 +5721,7 @@ test "M19: struct used with BOTH `<` and `==` yields ONE Ord unit (no double-fir
     // `cmp` and NO separate `Eq` unit is synthesized — exactly one recipe (the Ord cmp).
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Ord$cmp$s0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Ord$cmp$s0", c.result.derives[0].name.?);
     for (c.result.derives) |d| try testing.expect(d.kind != .eq);
 }
 
@@ -5797,7 +5797,7 @@ test "M20: `.hash()` on an all-Hash-fields struct with no impl DERIVES exactly o
     // no diagnostic. Hash is independent of Eq/Ord — the recipe's ret is `int`.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Hash$hash$s0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Hash$hash$s0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.hash, c.result.derives[0].kind);
     try testing.expectEqual(Kind.int, c.result.derives[0].ret.kind);
     // A Hash recipe's synthetic method takes ONLY `self` (1 param), unlike homogeneous Eq/Ord.
@@ -5816,7 +5816,7 @@ test "M20: `.hash()` on a PAYLOAD enum derives one Hash recipe (Hash$hash$e0)" {
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Hash$hash$e0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Hash$hash$e0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.hash, c.result.derives[0].kind);
 }
 
@@ -5942,7 +5942,7 @@ test "M22: `print(P{..})` on an all-Display-fields struct DERIVES exactly one re
     // (struct id 0 -> `Display$display$s0`), no diagnostic, ret unit, `self`-only (1 param).
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Display$display$s0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Display$display$s0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
     try testing.expectEqual(Kind.unit, c.result.derives[0].ret.kind);
     try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
@@ -5960,7 +5960,7 @@ test "M22: `print(enum value)` derives one Display recipe (Display$display$e0)" 
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
-    try testing.expectEqualStrings("Display$display$e0", c.result.derives[0].name);
+    try testing.expectEqualStrings("Display$display$e0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
 }
 
@@ -6953,7 +6953,7 @@ test "M3: a bare (no-explicit-args) generic call infers its type-arg from the ar
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     // `id(7)` infers T=int and monomorphizes to exactly one instance, same as id[int].
     try testing.expectEqual(@as(usize, 1), c.result.instances.len);
-    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name);
+    try testing.expectEqualStrings("main.id$int", c.result.instances[0].name.?);
     try testing.expect(!c.result.instances[0].ret.isTypeVar());
 }
 
@@ -6971,9 +6971,9 @@ test "M3: nested bare inference (snd(true, id(42))) infers all type-args; args a
     // The snd instance's substituted sig is (bool, int) -> int (no surviving type_var).
     var saw_snd = false;
     for (c.result.instances) |inst| {
-        if (std.mem.startsWith(u8, inst.name, "main.snd$")) {
+        if (std.mem.startsWith(u8, inst.name.?, "main.snd$")) {
             saw_snd = true;
-            try testing.expectEqualStrings("main.snd$bool$int", inst.name);
+            try testing.expectEqualStrings("main.snd$bool$int", inst.name.?);
             try testing.expectEqual(@as(usize, 2), inst.params.len);
             try testing.expectEqual(Kind.bool, inst.params[0].kind);
             try testing.expectEqual(Kind.int, inst.params[1].kind);
@@ -6995,7 +6995,7 @@ test "M3: an inferred call and its explicit form DEDUP to ONE instance (byte-for
     try testing.expectEqual(@as(usize, 2), c.result.instances.len);
     var snd_count: usize = 0;
     for (c.result.instances) |inst| {
-        if (std.mem.startsWith(u8, inst.name, "main.snd$")) snd_count += 1;
+        if (std.mem.startsWith(u8, inst.name.?, "main.snd$")) snd_count += 1;
     }
     try testing.expectEqual(@as(usize, 1), snd_count);
 }
@@ -7008,7 +7008,7 @@ test "M3: a diverging (never) argument still infers the var from another concret
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.instances.len);
-    try testing.expectEqualStrings("main.same$int", c.result.instances[0].name);
+    try testing.expectEqualStrings("main.same$int", c.result.instances[0].name.?);
 }
 
 test "M3: a conflicting bare call reports T0015 naming BOTH argument spans; mints no instance" {
@@ -7045,7 +7045,7 @@ test "M3: explicit type args still override inference and satisfy an otherwise-u
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.instances.len);
-    try testing.expectEqualStrings("main.ro$int", c.result.instances[0].name);
+    try testing.expectEqualStrings("main.ro$int", c.result.instances[0].name.?);
 }
 
 test "M2: an uncalled generic fn mints ZERO instances (free in the binary)" {

@@ -743,7 +743,7 @@ pub fn codegenSynthetic(
     slot: anytype,
 ) !void {
     const d = frozen.derives[di];
-    const sym = Link.SymName{ .kind = .user_fn, .name = d.name };
+    const sym = Link.SymName{ .kind = .user_fn, .name = d.name.? };
 
     // The conforming type's index-free layout descriptor (mirrors the touched fold), so a
     // field-layout edit flips the unit's key. Built by the SAME `appendTouched` path.

@@ -913,7 +913,7 @@ fn lowerArithValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index,
         .one => |m| {
             const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
             const callee: Link.SymName = if (m.instance) |ii|
-                .{ .kind = .user_fn, .name = b.in.instances[ii].name }
+                .{ .kind = .user_fn, .name = b.in.instances[ii].name.? }
             else
                 b.in.names[m.fn_id];
             const args = try b.gpa.alloc(Ir.Operand, 2);
@@ -1168,8 +1168,8 @@ fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMem
 /// `structEqAtSlots` (an aggregate FIELD of a derived struct) so both pick the same
 /// symbol lower's reloc + the fingerprint fold target.
 fn witnessCallee(b: *Builder, m: Typecheck.Method) Link.SymName {
-    if (m.derive) |di| return .{ .kind = .user_fn, .name = b.in.derives[di].name };
-    if (m.instance) |ii| return .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+    if (m.derive) |di| return .{ .kind = .user_fn, .name = b.in.derives[di].name.? };
+    if (m.instance) |ii| return .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
     return b.in.names[m.fn_id];
 }
 
@@ -2194,7 +2194,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             try b.note(callee_node.main_token, "unresolved generic instance in lower");
             return .none;
         };
-        callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+        callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
     } else if (builtinScalarEqCallee(b, n)) |ba| {
         // A builtin scalar `.eq()` (M12/M15). int/bool lower to an inline `icmp eq` (no
         // `.call`, no symbol/reloc — the recognizer is pure). str/unit route through the
@@ -2307,7 +2307,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 try b.note(callee_node.main_token, "unresolved generic instance in lower");
                 return .none;
             };
-            callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name };
+            callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
         } else {
             callee = b.in.names[callee_res.func];
         }

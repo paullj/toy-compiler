@@ -93,9 +93,9 @@ pub const Derive = struct {
     /// Owning module id (a sentinel; a source-less unit belongs to no real decl, but
     /// codegen threads a module for the per-module tree/resolutions it never reads).
     mod: u32 = 0,
-    /// The mangled synthetic symbol. Minted in canonical order after the sort;
-    /// `undefined` until then.
-    name: []const u8 = undefined,
+    /// The mangled synthetic symbol, minted in canonical order after the sort. `null`
+    /// until then, so a read (`.name.?`) traps loudly on out-of-order use.
+    name: ?[]const u8 = null,
 };
 
 /// True when `conform_ty` is an enum (the id then lives in `enum_id`, not `struct_id`).

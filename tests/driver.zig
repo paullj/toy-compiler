@@ -1534,8 +1534,8 @@ test "integration (M2): monomorphized generic instances get distinct symbols, ru
         // with DISTINCT mangled symbols.
         const insts = r.typecheck.?.instances;
         try testing.expectEqual(@as(usize, 2), insts.len);
-        try testing.expectEqualStrings("main.id$int", insts[0].name);
-        try testing.expect(!std.mem.eql(u8, insts[0].name, insts[1].name));
+        try testing.expectEqualStrings("main.id$int", insts[0].name.?);
+        try testing.expect(!std.mem.eql(u8, insts[0].name.?, insts[1].name.?));
 
         // Force a fresh lowering: main + 2 instances = exactly 3 codegen units.
         var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .force, .O0);
@@ -1626,7 +1626,7 @@ test "integration (M18): a derived-Eq struct runs to exit 42, mints one source-l
         // Exactly one synthetic recipe (Eq for struct id 0), canonically named.
         const derives = r.typecheck.?.derives;
         try testing.expectEqual(@as(usize, 1), derives.len);
-        try testing.expectEqualStrings("Eq$eq$s0", derives[0].name);
+        try testing.expectEqualStrings("Eq$eq$s0", derives[0].name.?);
 
         var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .force, .O0);
         const lp = switch (lowered) {

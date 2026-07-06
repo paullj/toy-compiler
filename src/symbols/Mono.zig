@@ -60,9 +60,10 @@ pub const Instance = struct {
     /// The template's params/ret with every `type_var` substituted to concrete.
     params: []const Type,
     ret: Type,
-    /// The mangled instance symbol name (e.g. `id$int`). Minted in canonical order
-    /// after the sort; `undefined` until then.
-    name: []const u8,
+    /// The mangled instance symbol name (e.g. `id$int`), minted in canonical order
+    /// after the sort. `null` until then, so a read (`.name.?`) traps loudly on
+    /// out-of-order use.
+    name: ?[]const u8 = null,
     /// Owning module id (the template's module) and the template's decl node.
     mod: u32,
     decl_node: Ast.Index,
