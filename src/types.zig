@@ -447,13 +447,17 @@ pub const MethodPick = union(enum) {
 /// `Type.eql` + name (table = source fn-id order → deterministic):
 ///   * with `explicit_args`: pick the conformance method whose `protocol_args` match
 ///     (a generic protocol's conformances are coherence-deduped, so at most one matches);
-///   * without explicit args and `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to
-///     `findMethod` (the pre-M14 path — inherent, single conformance, prelude, generic
-///     instance) so no existing program's dispatch/fingerprint changes;
+///   * without explicit args, `witness_only == false` (general `v.m(..)` dispatch) and
+///     `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to `findMethod` (the pre-M14 path —
+///     inherent, single conformance, prelude, generic instance) so no existing program's
+///     dispatch/fingerprint changes;
 ///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`.
-/// An inherent method shadowing a single conformance (`<2` conformance matches) keeps the
-/// first, unchanged.
-pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, explicit_args: ?[]const Type) MethodPick {
+/// `witness_only` (operator/derive desugaring: `==`/`<`/`+`/`.hash()`/`print`/`?`-widen)
+/// EXCLUDES inherent (`protocol_id == null`) methods from the scan, so a same-named inherent
+/// method can never be selected as a protocol witness — otherwise `==` would dispatch to it,
+/// skip the operator's arg typing, and miscompile. The inherent method stays callable through
+/// the general `v.m(..)` path (`witness_only == false`).
+pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, witness_only: bool, explicit_args: ?[]const Type) MethodPick {
     if (explicit_args) |ea| {
         for (methods) |m| {
             if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name) and
@@ -467,6 +471,7 @@ pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []con
     var conform_count: usize = 0;
     for (methods) |m| {
         if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name)) {
+            if (witness_only and m.protocol_id == null) continue;
             if (first == null) first = m;
             total += 1;
             if (m.protocol_id != null) conform_count += 1;
@@ -2244,11 +2249,11 @@ fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldEq {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str/unit — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "eq", null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "eq", true, null)) {
         .one => |m| return .{ .eq_call = t.witnessName(m) },
         .none, .ambiguous => {},
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", true, null)) {
         .one => |m| return .{ .cmp_eq = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -2264,7 +2269,7 @@ fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldEq {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", true, null)) {
         .one => |m| return .{ .cmp_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -2280,7 +2285,7 @@ fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldEq {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "hash", null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "hash", true, null)) {
         .one => |m| return .{ .hash_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -2297,7 +2302,7 @@ fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldEq {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "display", null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "display", true, null)) {
         .one => |m| return .{ .display_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -4860,6 +4865,30 @@ test "M15: builtinScalarMethod recognizes `eq` on all four scalars (pure, table-
     try testing.expect(builtinScalarMethod(Type.structT(0), "eq") == null);
     // Arity: `eq` is 1-ary (one non-self arg).
     try testing.expectEqual(@as(usize, 1), builtinScalarMethod(Type.int, "eq").?.arity);
+}
+
+test "resolveConformanceMethod: a same-named inherent method never witnesses a protocol" {
+    // Repro of the `impl P { fn eq(self, n: int) }` shadowing bug: an inherent `eq`
+    // (protocol_id == null) precedes the structural Eq witness in the table. A witness
+    // lookup must bind the CONFORMANCE method (so `==` types its args and does not call
+    // the scalar-arg inherent method with a struct), while general `v.eq(7)` dispatch
+    // still reaches the inherent method.
+    const P = Type.structT(0);
+    const methods = [_]Method{
+        .{ .recv = P, .name = "eq", .fn_id = 1 }, // inherent: protocol_id defaults to null
+        .{ .recv = P, .name = "eq", .fn_id = 2, .protocol_id = 7 }, // the Eq witness
+    };
+    switch (resolveConformanceMethod(&methods, P, "eq", true, null)) {
+        .one => |m| {
+            try testing.expect(m.protocol_id != null);
+            try testing.expectEqual(@as(u32, 2), m.fn_id);
+        },
+        .none, .ambiguous => return error.TestUnexpectedResult,
+    }
+    switch (resolveConformanceMethod(&methods, P, "eq", false, null)) {
+        .one => |m| try testing.expectEqual(@as(u32, 1), m.fn_id),
+        .none, .ambiguous => return error.TestUnexpectedResult,
+    }
 }
 
 test "M20: builtinScalarMethod recognizes `hash` -> int (arity 0) on all four scalars" {

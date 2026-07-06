@@ -805,7 +805,7 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
 /// filled the `(Eq,T)` slot but added no `eq` method), lower `==` as `discriminant == ord_eq`
 /// (`!=` as `discriminant != ord_eq`) via the `cmp` witness. Returns the final bool Operand.
 fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "eq", null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "eq", true, null)) {
         .one => |m| {
             // A derived `Eq` (M18) / instance / plain fn all resolve through the shared
             // `witnessCallee` (derive checked first — a derive Method has `fn_id == 0`).
@@ -822,7 +822,7 @@ fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
             // Ord-refinement `==` (M16): no `eq` witness, but a `cmp` witness exists — `==`
             // is `cmp(a,b) == Ordering.eq`. The checker proved conformance (the refinement
             // filled `(Eq,T)`), so a `cmp` miss here is an internal invariant break.
-            switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "cmp", null)) {
+            switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "cmp", true, null)) {
                 .one => {
                     const d = try lowerCmpDiscriminant(b, operand_ty, lhs_node, rhs_node);
                     const k = try b.emit(.{ .iconst = ord_eq }, Typecheck.Type.int);
@@ -865,7 +865,7 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
     switch (operand_ty.kind) {
         .str => return try lowerStrCmp(b, lhs_node, rhs_node),
         .@"struct", .@"enum" => {
-            const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "cmp", null)) {
+            const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "cmp", true, null)) {
                 .one => |mm| mm,
                 else => {
                     // The checker proves exactly one `Ord` witness before lower; a miss here
@@ -911,7 +911,7 @@ fn lowerArithValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index,
         .slash => "div",
         else => unreachable,
     };
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, method, null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, method, true, null)) {
         .one => |m| {
             const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
             const callee: Link.SymName = if (m.instance) |ii|
@@ -1194,7 +1194,7 @@ fn witnessRet(b: *Builder, m: Typecheck.Method) Typecheck.Type {
 /// emitter's aggregate FIELD path stays in lockstep with the top-level `==` (a wrong
 /// witness here would be a `conforms`/emitter mismatch). Returns a bool value.
 fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "eq", null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "eq", true, null)) {
         .one => |m| {
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
@@ -1205,7 +1205,7 @@ fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.
         },
         .none, .ambiguous => {},
     }
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", true, null)) {
         .one => |m| {
             // `==` as `cmp(a,b) == Ordering.eq`: the witness returns `Ordering`, whose ret
             // carries the enum type (the ret_slot ABI + `get_tag` layout). A DERIVED `cmp`
@@ -1398,7 +1398,7 @@ fn deriveFieldCmp(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Valu
 /// aggregate FIELD path stays in lockstep with the top-level `<`. Ret sized via `witnessRet`
 /// (a DERIVED `cmp` witness has `fn_id == 0`). Returns an int value.
 fn cmpAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "cmp", true, null)) {
         .one => |m| {
             const ret_ty = witnessRet(b, m);
             const callee = witnessCallee(b, m);
@@ -1735,7 +1735,7 @@ fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
 /// it) — note-and-drop rather than miscompile. Returns an int value.
 fn hashAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "hash", null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "hash", true, null)) {
         .one => |m| {
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 1);
@@ -1983,7 +1983,7 @@ fn emitDisplayBoolValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
 /// stays in lockstep with the callee's own derived unit. A miss is unreachable for a
 /// conforming field (the synthesis barrier proved it) — note-and-drop rather than miscompile.
 fn displayAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!void {
-    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", null)) {
+    switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", true, null)) {
         .one => |m| {
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 1);
@@ -2452,7 +2452,7 @@ fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     // The SAME multi-conformance disambiguation the checker + fingerprint use, so all
     // three select the identical witness (a divergence would be a miscompile or `-jN`
     // break). `.ambiguous`/`.none` -> not dispatchable here (the checker already erred).
-    const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, recv, member, explicit_args)) {
+    const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, recv, member, false, explicit_args)) {
         .one => |mm| mm,
         else => return null,
     };
@@ -3068,7 +3068,7 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
             const src = try addrAtOff(b, op_base, src_off, op_err);
             const dst = try addrAtOff(b, ret_base, dst_off, ret_err);
             try copyValueByType(b, dst, src, ret_err);
-        } else switch (Typecheck.resolveConformanceMethod(b.in.methods, ret_err, "from", &.{op_err})) {
+        } else switch (Typecheck.resolveConformanceMethod(b.in.methods, ret_err, "from", true, &.{op_err})) {
             .one => |m| {
                 const src = try addrAtOff(b, op_base, src_off, op_err);
                 // The `from` witness takes its `Src` arg by value: a scalar (int/bool) as a

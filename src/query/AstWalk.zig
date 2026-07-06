@@ -574,7 +574,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             // byte-identical to the pre-M14 `findMethod` for every error-free
                             // program (an ambiguous bare call halts the compile before codegen,
                             // so the fp is never taken); `.ambiguous`/`.none` fold nothing here.
-                            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null)) {
+                            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, false, null)) {
                                 .one => |m| try self.foldWitness(m),
                                 .none, .ambiguous => {
                                     // A builtin scalar `eq`/`hash` (M12/M20): it has NO real
@@ -610,12 +610,12 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     if (bn.lhs.int() >= self.frozen.node_types.len) return;
                     const recv = self.frozen.node_types[bn.lhs.int()];
                     if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "eq", null)) {
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "eq", true, null)) {
                         .one => |m| try self.foldWitness(m),
                         // Ord-refinement `==` (M16): no `eq` witness, but the type's `Ord::cmp`
                         // is the reloc target lower emits — fold IT so an edit to the `cmp` body
                         // invalidates callers. A scalar (no cmp method) folds nothing.
-                        .none, .ambiguous => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", null)) {
+                        .none, .ambiguous => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", true, null)) {
                             .one => |m| try self.foldWitness(m),
                             .none, .ambiguous => {},
                         },
@@ -631,7 +631,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     if (bn.lhs.int() >= self.frozen.node_types.len) return;
                     const recv = self.frozen.node_types[bn.lhs.int()];
                     if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", null)) {
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", true, null)) {
                         .one => |m| try self.foldWitness(m),
                         .none, .ambiguous => {},
                     }
@@ -654,7 +654,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         .slash => "div",
                         else => return,
                     };
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, null)) {
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, true, null)) {
                         .one => |m| try self.foldWitness(m),
                         .none, .ambiguous => {},
                     }
@@ -683,7 +683,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     const op_err = ol.variants[1].field_types[0];
                     const ret_err = rl.variants[1].field_types[0];
                     if (Typecheck.Type.eql(op_err, ret_err)) return;
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, ret_err, "from", &.{op_err})) {
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, ret_err, "from", true, &.{op_err})) {
                         .one => |m| try self.foldWitness(m),
                         .none, .ambiguous => {},
                     }
@@ -745,7 +745,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     try self.out.append(self.gpa, .{ .kind = .builtin, .name = "display_bool", .params = &display_params_bool, .ret = Typecheck.Type.unit });
                     return true;
                 },
-                .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, at, "display", null)) {
+                .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, at, "display", true, null)) {
                     .one => |m| {
                         try self.foldWitness(m);
                         return true;
@@ -775,7 +775,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                 if (tn.int() >= self.frozen.node_types.len) return; // pre-typecheck view
                 buf[i] = self.frozen.node_types[tn.int()];
             }
-            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, buf[0..targ_nodes.len])) {
+            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, false, buf[0..targ_nodes.len])) {
                 .one => |m| try self.foldWitness(m),
                 .none, .ambiguous => {},
             }
@@ -1863,7 +1863,7 @@ test "M25: a WIDENING `?` folds the resolved `From` witness; the identity `?` fo
     const ol = tc.enum_layouts[inner_sig.?.ret.enum_id];
     const ret_err = rl.variants[1].field_types[0];
     const op_err = ol.variants[1].field_types[0];
-    const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", &.{op_err});
+    const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", true, &.{op_err});
     try testing.expect(pick == .one);
     const want_name = if (pick.one.instance) |ii| tc.instances[ii].name else names[pick.one.fn_id].name;
 
