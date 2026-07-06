@@ -728,12 +728,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
         };
-        var func = switch (d.kind) {
-            .eq => try lower.lowerDeriveEq(gpa, in, d, sym, &diags),
-            .ord => try lower.lowerDeriveOrd(gpa, in, d, sym, &diags),
-            .hash => try lower.lowerDeriveHash(gpa, in, d, sym, &diags),
-            .display => try lower.lowerDeriveDisplay(gpa, in, d, sym, &diags),
-        };
+        var func = try lower.lowerDerive(gpa, in, d, sym, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);

@@ -1516,6 +1516,21 @@ fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_
 /// `ret = acc != 0`) — no `cond_br` except the self-contained str/aggregate sub-graphs,
 /// so it is maximally `--verify`-stable — or, for an empty-payload enum, `get_tag(self)
 /// == get_tag(other)`.
+pub fn lowerDerive(
+    gpa: std.mem.Allocator,
+    in: Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    return switch (d.kind) {
+        .eq => lowerDeriveEq(gpa, in, d, sym, out_diags),
+        .ord => lowerDeriveOrd(gpa, in, d, sym, out_diags),
+        .hash => lowerDeriveHash(gpa, in, d, sym, out_diags),
+        .display => lowerDeriveDisplay(gpa, in, d, sym, out_diags),
+    };
+}
+
 pub fn lowerDeriveEq(
     gpa: std.mem.Allocator,
     in: Inputs,
