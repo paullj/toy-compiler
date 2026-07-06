@@ -96,8 +96,11 @@ pub fn walkConformances(gpa: std.mem.Allocator, frozen: anytype, conformances: [
             pargs.deinit(gpa);
         }
         for (rc.protocol_args) |pa| try AstWalk.appendTouched(gpa, frozen, pa, &pargs);
+        // Reserve the out slot BEFORE detaching pargs so the append can't fail once
+        // ownership of pargs_owned + tmp.items[0].layout has left the errdefer's cover.
+        try out.ensureUnusedCapacity(gpa, 1);
         const pargs_owned = try pargs.toOwnedSlice(gpa);
-        try out.append(gpa, .{ .protocol_name = rc.protocol_name, .conform = tmp.items[0], .witness_syms = rc.witness_syms, .protocol_args = pargs_owned });
+        out.appendAssumeCapacity(.{ .protocol_name = rc.protocol_name, .conform = tmp.items[0], .witness_syms = rc.witness_syms, .protocol_args = pargs_owned });
     }
 }
 
