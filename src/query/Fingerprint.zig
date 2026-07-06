@@ -183,7 +183,7 @@ const derive_seed: u64 = 0x44_52_56_46; // "DRVF"
 /// no `fn_decl` to walk, so the key is built ENTIRELY from the recipe: a distinct
 /// derive seed + the derive kind + the protocol name + the conforming type's
 /// index-free layout descriptor (the SAME encoding the (c)/(d) touched fold uses) +
-/// each resolved field-witness (its `FieldEq` tag + the witness SymName), ordered
+/// each resolved field-witness (its `FieldWitness` tag + the witness SymName), ordered
 /// (never XOR). So a field-layout edit flips it (via `conform.layout`), and a nested
 /// field gaining/losing an explicit impl flips it (via the witness tag/name change) —
 /// the stale-cache-miscompile guards a real fn gets from (a)/(c)/(e).
@@ -191,7 +191,7 @@ pub fn deriveFingerprint(
     protocol_name: []const u8,
     kind: Derive.Kind,
     conform: TouchedType,
-    field_witnesses: []const Derive.FieldEq,
+    field_witnesses: []const Derive.FieldWitness,
 ) u64 {
     var h = std.hash.Wyhash.init(derive_seed);
     h.update(&[_]u8{ @intFromEnum(kind), type_layout_version });
@@ -201,7 +201,7 @@ pub fn deriveFingerprint(
     h.update(&[_]u8{@intFromEnum(conform.kind)});
     if (conform.kind == .@"struct" or conform.kind == .@"enum") AstWalk.updateLeaf(&h, conform.layout);
     // The resolved per-field witnesses, ORDERED (count sentinel + per-field tag + the
-    // witness SymName). A nested field gaining an explicit impl changes its `FieldEq`
+    // witness SymName). A nested field gaining an explicit impl changes its `FieldWitness`
     // (tag and/or name), flipping the key — so the override never serves a stale blob.
     AstWalk.updateU32(&h, @intCast(field_witnesses.len));
     for (field_witnesses) |fw| {
@@ -721,20 +721,20 @@ test "deriveFingerprint: a field-witness swap flips the key (nested override gua
     // Same layout; a nested aggregate field's resolved witness changes (e.g. the field
     // type gained an explicit impl, so its witness SymName differs). Must flip the key.
     const cf = TouchedType{ .kind = .@"struct", .layout = "Outer\x00inner" };
-    const w1 = [_]Derive.FieldEq{.{ .eq_call = "Eq$eq$s0" }};
-    const w2 = [_]Derive.FieldEq{.{ .eq_call = "main.Inner.eq" }};
+    const w1 = [_]Derive.FieldWitness{.{ .eq_call = "Eq$eq$s0" }};
+    const w2 = [_]Derive.FieldWitness{.{ .eq_call = "main.Inner.eq" }};
     const h1 = deriveFingerprint("Eq", .eq, cf, &w1);
     const h2 = deriveFingerprint("Eq", .eq, cf, &w2);
     try testing.expect(h1 != h2);
-    // The FieldEq TAG also folds: an `eq_call` vs a `cmp_eq` witness (Ord-only field)
+    // The FieldWitness TAG also folds: an `eq_call` vs a `cmp_eq` witness (Ord-only field)
     // to the same symbol must diverge.
-    const w3 = [_]Derive.FieldEq{.{ .cmp_eq = "Eq$eq$s0" }};
+    const w3 = [_]Derive.FieldWitness{.{ .cmp_eq = "Eq$eq$s0" }};
     try testing.expect(deriveFingerprint("Eq", .eq, cf, &w1) != deriveFingerprint("Eq", .eq, cf, &w3));
 }
 
 test "deriveFingerprint: identical recipe hashes identically (cache hit) + struct/enum differ" {
     const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
-    const w = [_]Derive.FieldEq{.{ .eq_call = "Eq$eq$s1" }};
+    const w = [_]Derive.FieldWitness{.{ .eq_call = "Eq$eq$s1" }};
     try testing.expectEqual(deriveFingerprint("Eq", .eq, cf, &w), deriveFingerprint("Eq", .eq, cf, &w));
     // A struct-derive vs an enum-derive of the same name/layout-bytes must differ (the
     // conform.kind marker separates the two id spaces).
@@ -751,8 +751,8 @@ test "deriveFingerprint M19: an Ord recipe's key differs by kind and flips on a 
     try testing.expect(eq_key != ord_key);
     // An Ord recipe's aggregate field carries a `cmp_call` witness; a witness-SymName swap
     // (the field gained an explicit `impl has Ord`) flips the key so no stale blob serves.
-    const w1 = [_]Derive.FieldEq{.{ .cmp_call = "Ord$cmp$s1" }};
-    const w2 = [_]Derive.FieldEq{.{ .cmp_call = "main.Inner.cmp" }};
+    const w1 = [_]Derive.FieldWitness{.{ .cmp_call = "Ord$cmp$s1" }};
+    const w2 = [_]Derive.FieldWitness{.{ .cmp_call = "main.Inner.cmp" }};
     try testing.expect(deriveFingerprint("Ord", .ord, cf, &w1) != deriveFingerprint("Ord", .ord, cf, &w2));
     // Identical Ord recipe hashes identically (cache hit).
     try testing.expectEqual(deriveFingerprint("Ord", .ord, cf, &w1), deriveFingerprint("Ord", .ord, cf, &w1));
@@ -769,8 +769,8 @@ test "deriveFingerprint M20: a Hash recipe's key differs by kind and flips on a 
     try testing.expect(hash_key != ord_key);
     // A Hash recipe's aggregate field carries a `hash_call` witness; a witness-SymName swap
     // (the field gained an explicit `impl has Hash`) flips the key so no stale blob serves.
-    const w1 = [_]Derive.FieldEq{.{ .hash_call = "Hash$hash$s1" }};
-    const w2 = [_]Derive.FieldEq{.{ .hash_call = "main.Inner.hash" }};
+    const w1 = [_]Derive.FieldWitness{.{ .hash_call = "Hash$hash$s1" }};
+    const w2 = [_]Derive.FieldWitness{.{ .hash_call = "main.Inner.hash" }};
     try testing.expect(deriveFingerprint("Hash", .hash, cf, &w1) != deriveFingerprint("Hash", .hash, cf, &w2));
     // Identical Hash recipe hashes identically (cache hit).
     try testing.expectEqual(deriveFingerprint("Hash", .hash, cf, &w1), deriveFingerprint("Hash", .hash, cf, &w1));
@@ -788,8 +788,8 @@ test "deriveFingerprint M22: a Display recipe's key differs by kind and flips on
     // A Display recipe's aggregate field carries a `display_call` witness; a witness-SymName
     // swap (the field gained an explicit `impl has Display`) flips the key so no stale blob
     // serves — the override/stale-cache guard.
-    const w1 = [_]Derive.FieldEq{.{ .display_call = "Display$display$s1" }};
-    const w2 = [_]Derive.FieldEq{.{ .display_call = "main.Inner.display" }};
+    const w1 = [_]Derive.FieldWitness{.{ .display_call = "Display$display$s1" }};
+    const w2 = [_]Derive.FieldWitness{.{ .display_call = "main.Inner.display" }};
     try testing.expect(deriveFingerprint("Display", .display, cf, &w1) != deriveFingerprint("Display", .display, cf, &w2));
     // Identical Display recipe hashes identically (cache hit).
     try testing.expectEqual(deriveFingerprint("Display", .display, cf, &w1), deriveFingerprint("Display", .display, cf, &w1));

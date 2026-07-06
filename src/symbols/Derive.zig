@@ -40,7 +40,7 @@ pub fn methodName(k: Kind) []const u8 {
 /// never re-resolves and the fingerprint can fold the resolved identity. The `name`
 /// slices are BORROWED (a sibling derive's minted name, a Mono instance's mangled
 /// name, or a resolve-result fn name) — all outlive codegen, none owned here.
-pub const FieldEq = union(enum) {
+pub const FieldWitness = union(enum) {
     /// A scalar (int/bool/str) field the emitter compares inline by layout kind —
     /// no witness symbol. (Unit fields are rejected by T0007, so never occur.)
     inline_kind,
@@ -66,8 +66,8 @@ pub const FieldEq = union(enum) {
 
 /// One authorized structural-derive recipe. `field_witnesses`, `params`, and `name`
 /// are OWNED (freed by the owning `GraphResult`); `protocol_name` borrows the
-/// prelude/source `ProtocolSym.name` (outlives codegen); the `FieldEq` name slices
-/// are borrowed (see `FieldEq`).
+/// prelude/source `ProtocolSym.name` (outlives codegen); the `FieldWitness` name slices
+/// are borrowed (see `FieldWitness`).
 pub const Derive = struct {
     /// The protocol this recipe witnesses (`Eq` in M18).
     protocol_id: u32,
@@ -84,7 +84,7 @@ pub const Derive = struct {
     ret: Type = .{ .kind = .invalid },
     /// Per struct field (in layout/field order) / empty for an empty-payload enum:
     /// the resolved field-eq recipe. OWNED outer slice.
-    field_witnesses: []const FieldEq = &.{},
+    field_witnesses: []const FieldWitness = &.{},
     /// The synthetic method's params: `[conform_ty, conform_ty]` for a homogeneous `Eq`/
     /// `Ord` derive, `[conform_ty]` (self only) for a `Hash` derive (M20). An OWNED heap
     /// slice so `AstWalk.CallVisitor.foldWitness` may borrow it into a `Fingerprint.Sig`

@@ -299,7 +299,7 @@ pub const GraphResult = struct {
     methods: []Method = &.{},
     /// The authorized structural auto-derive recipes (M18), in canonical order. Empty
     /// for a program with no derived `Eq` use. Each recipe's `name`, `params`, and
-    /// `field_witnesses` OUTER slice are OWNED here; the `FieldEq` name slices +
+    /// `field_witnesses` OUTER slice are OWNED here; the `FieldWitness` name slices +
     /// `protocol_name` are BORROWED (sibling derive/instance/fn names + prelude/source
     /// protocol names — all outlive codegen).
     derives: []DeriveRecipe = &.{},
@@ -351,7 +351,7 @@ pub const GraphResult = struct {
         freeMethodEntries(gpa, self.methods);
         gpa.free(self.methods);
         // M18 derive recipes: free each unit's minted `name`, its `params`, and its
-        // `field_witnesses` OUTER slice (the FieldEq name slices are borrowed), then the
+        // `field_witnesses` OUTER slice (the FieldWitness name slices are borrowed), then the
         // backing array.
         freeDeriveEntries(gpa, self.derives);
         gpa.free(self.derives);
@@ -360,7 +360,7 @@ pub const GraphResult = struct {
 };
 
 /// Free the per-recipe owned data of a derive table (M18): each `name`, `params`, and
-/// `field_witnesses` outer slice. The `FieldEq` name slices + `protocol_name` stay
+/// `field_witnesses` outer slice. The `FieldWitness` name slices + `protocol_name` stay
 /// borrowed (sibling derive/instance/fn names + source protocol names).
 pub fn freeDeriveEntries(gpa: std.mem.Allocator, derives: []const DeriveRecipe) void {
     for (derives) |d| {
@@ -2219,16 +2219,16 @@ fn collectComponentTypes(t: *Typecheck, ty: Type, out: *std.ArrayList(Type)) !vo
 }
 
 /// Resolve one recipe's per-field witnesses (M19): the flattened component fields (see
-/// `collectComponentTypes`) each mapped to their `FieldEq` per the recipe kind — `eq` fields
+/// `collectComponentTypes`) each mapped to their `FieldWitness` per the recipe kind — `eq` fields
 /// via `resolveFieldEq`, `ord` fields via `resolveFieldOrd`. Returns the borrowed-empty slice
 /// for a no-field recipe (empty struct / empty-payload enum) so teardown's `len > 0` free
 /// guard stays correct. OWNED outer slice (freed by `freeDeriveEntries`).
-fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldEq {
+fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitness {
     var ftys: std.ArrayList(Type) = .empty;
     defer ftys.deinit(t.gpa);
     try t.collectComponentTypes(d.conform_ty, &ftys);
     if (ftys.items.len == 0) return &.{};
-    const fw = try t.gpa.alloc(Derive.FieldEq, ftys.items.len);
+    const fw = try t.gpa.alloc(Derive.FieldWitness, ftys.items.len);
     errdefer t.gpa.free(fw);
     for (ftys.items, 0..) |ft, i| fw[i] = switch (d.kind) {
         .eq => t.resolveFieldEq(ft),
@@ -2244,7 +2244,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldEq {
 /// instance method, or a user impl fn), falling back to its `cmp` witness (an Ord-only
 /// field: `==` as `cmp(..) == Ordering.eq`). Read only on the LIVE method table AFTER all
 /// synthetic entries are appended, so a sibling derive resolves correctly.
-fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldEq {
+fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldWitness {
     switch (ft.kind) {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str/unit — emitter handles by layout kind
@@ -2264,7 +2264,7 @@ fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldEq {
 /// its `cmp` witness (a sibling Ord derive, a Mono instance method, or a user `impl has Ord`
 /// fn). Read only on the LIVE method table AFTER all synthetic entries are appended, so a
 /// sibling derive resolves correctly. A `cmp` miss is unreachable for a conforming field.
-fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldEq {
+fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldWitness {
     switch (ft.kind) {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
@@ -2280,7 +2280,7 @@ fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldEq {
 /// its `hash` witness (a sibling Hash derive, a Mono instance method, or a user `impl has
 /// Hash` fn). Read only on the LIVE method table AFTER all synthetic entries are appended, so
 /// a sibling derive resolves correctly. A `hash` miss is unreachable for a conforming field.
-fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldEq {
+fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldWitness {
     switch (ft.kind) {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
@@ -2297,7 +2297,7 @@ fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldEq {
 /// method, or a user `impl has Display` fn). Read only on the LIVE method table AFTER all
 /// synthetic entries are appended, so a sibling derive resolves correctly. A `display` miss
 /// is unreachable for a conforming field. Mirrors `resolveFieldHash`.
-fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldEq {
+fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldWitness {
     switch (ft.kind) {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
@@ -2311,7 +2311,7 @@ fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldEq {
 /// The emitted symbol name a resolved witness `Method` lowers to (M18): a synthetic
 /// derive's minted name, a Mono instance's mangled name, else the fn's qualified name.
 /// All three outlive codegen (owned by `GraphResult.derives`/`.instances`, or resolve
-/// result), so a borrowing `FieldEq` slice stays valid.
+/// result), so a borrowing `FieldWitness` slice stays valid.
 fn witnessName(t: *const Typecheck, m: Method) []const u8 {
     if (m.derive) |di| return t.derives.items[di].name.?;
     if (m.instance) |ii| return t.mono.items[ii].name.?;
