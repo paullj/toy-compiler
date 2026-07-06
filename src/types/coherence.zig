@@ -1,8 +1,8 @@
-//! The M11-M16 whole-program conformance-coherence phase, extracted from the `Typecheck`
+//! The whole-program conformance-coherence phase, extracted from the `Typecheck`
 //! mega-struct as free functions over `*Typecheck` (Zig has no struct-field privacy, so
 //! these read the checker's fields directly). `checkCoherence` is the serial pre-Pass-C
 //! barrier that enforces one-impl-per-(protocol, receiver) and completeness; `deriveEqFromOrd`
-//! is the M16 refinement pass that runs right after it. Both are driven once from `runGraph`.
+//! is the refinement pass that runs right after it. Both are driven once from `runGraph`.
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
@@ -14,18 +14,18 @@ const GraphModuleInput = Typecheck.GraphModuleInput;
 
 const testing = std.testing;
 
-/// Whole-program conformance coherence (M11). Walks every `impl .. has ..` in
+/// Whole-program conformance coherence. Walks every `impl .. has ..` in
 /// module-then-decl order (SERIAL, before Pass C) and enforces:
 ///   * exactly one impl per (protocol, receiver type-ctor) — a duplicate (INCLUDING a
 ///     retroactive one in a SIBLING module: no orphan rule) is T0020 at the second impl;
 ///   * `has P` names a declared protocol AND provides every method P requires — an
 ///     undeclared protocol OR a missing method is T0021.
-/// Accepted conformances are recorded onto `t.conformances` (frozen for M13). The
+/// Accepted conformances are recorded onto `t.conformances`. The
 /// `seen` set is `getOrPut`-only (never iterated), so its hash/thread order cannot leak
 /// into the emit stream; emit order is module-id then source order → `-jN`-stable.
 pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
-    // The coherence key is a serialized byte vector `(protocol, recv, protocol-args)`
-    // (M14): variable arity forces bytes (a struct key can't hold the arg slice). The
+    // The coherence key is a serialized byte vector `(protocol, recv, protocol-args)`:
+    // variable arity forces bytes (a struct key can't hold the arg slice). The
     // `seen` set owns its keys (dup'd on insert); freed on return. Never iterated → its
     // hash/thread order can't leak into the emit stream.
     var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -38,7 +38,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
     defer keybuf.deinit(t.gpa);
 
     // Seed `seen` from the builtin conformances already pre-registered by the prelude
-    // (M12) BEFORE walking user impls, so a duplicate user `impl int has Eq` collides
+    // BEFORE walking user impls, so a duplicate user `impl int has Eq` collides
     // (T0020). At this point `t.conformances` holds EXACTLY the prelude entries (the
     // only other appender is this fn's accept path below), so iterating its slice in
     // insertion order is a pure function of source — `-jN`-stable.
@@ -89,7 +89,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
 
             const prot = t.protocols.items[pid];
 
-            // M14: decode + validate this impl's protocol type-args `impl P has Into[int]`.
+            // decode + validate this impl's protocol type-args `impl P has Into[int]`.
             // Arity must match the protocol's generic-param count; each arg must be a
             // concrete non-composite value type (a composite `App` arg is out of scope —
             // its check-time index is run-order-dependent, which would break the coherence
@@ -118,7 +118,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             if (!pargs_ok) continue;
             const pargs = pargs_buf.items;
 
-            // Signature compatibility (M13/M14, T0024): a conforming impl method's signature
+            // Signature compatibility (T0024): a conforming impl method's signature
             // must MATCH the protocol's declared signature, with `Self` grounded to the
             // receiver and each protocol type-param grounded to `pargs` — the soundness
             // prerequisite for bound-as-axiom checking (a bound body types `v.m()` against
@@ -170,7 +170,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     const at_tok = t.tree.nodes[method_node.int()].main_token;
                     try t.sink.emitFmtCode(.T0024, t.byteOf(at_tok), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
                 }
-                // M14: STAMP this witness `Method` entry with the conformance's
+                // STAMP this witness `Method` entry with the conformance's
                 // `(protocol_id, protocol_args)` so the multi-conformance resolver can pick
                 // it by args. Runs BEFORE `buildModel` (the Model aliases `t.methods.items`
                 // AFTER this), and mutates in place (no realloc), so the stamp is
@@ -208,7 +208,7 @@ fn containsType(types: []const Type, recv: Type) bool {
     return false;
 }
 
-/// The receivers that need an `(Eq, recv)` refinement (M16): each `Ord` receiver in
+/// The receivers that need an `(Eq, recv)` refinement: each `Ord` receiver in
 /// insertion order, deduped, skipping any that already carries an explicit/prelude
 /// `(Eq, recv)`. PURE (no `Typecheck` state) so the exactly-one-entry invariant is
 /// unit-testable directly on literal conformance lists — the reason we don't widen
@@ -222,7 +222,7 @@ fn ordEqRefinementReceivers(gpa: std.mem.Allocator, conf: []const Conformance, o
     }
 }
 
-/// Ord-refines-Eq (M16): append exactly one `(Eq, recv)` conformance per `Ord` receiver
+/// Ord-refines-Eq: append exactly one `(Eq, recv)` conformance per `Ord` receiver
 /// lacking an existing `Eq` entry. Scans a STABLE prefix of `t.conformances` then appends,
 /// so a freshly-appended refinement never seeds another (idempotent, insertion-ordered).
 pub fn deriveEqFromOrd(t: *Typecheck) !void {
@@ -255,8 +255,8 @@ fn appendKeyType(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ty: Type) !voi
     try appendKeyU32(gpa, buf, id);
 }
 
-/// Serialize a `(protocol, receiver-type, protocol-args)` conformance key into `buf`
-/// (M14). Variable arity forces a byte key (an `AutoHashMap` struct can't hold a slice),
+/// Serialize a `(protocol, receiver-type, protocol-args)` conformance key into `buf`.
+/// Variable arity forces a byte key (an `AutoHashMap` struct can't hold a slice),
 /// so `checkCoherence`'s `seen` is a `StringHashMap` over these bytes — the SAME
 /// serialized-key discipline `Mono.writeKey` uses for instances. Folding the protocol
 /// args means `impl P has Into[int]` and `impl P has Into[bool]` DON'T collide (distinct

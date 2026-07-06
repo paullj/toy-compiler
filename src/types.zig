@@ -898,7 +898,7 @@ fn conformsRec(
                     }
                 }
             }
-        } else { // enum: every variant's payload fields must conform (M19)
+        } else { // enum: every variant's payload fields must conform
             if (recv.enum_id < enums.len) {
                 ok = true;
                 outer: for (enums[recv.enum_id].variants) |v| {
@@ -1557,7 +1557,7 @@ pub fn checkGraph(
             gpa.free(@constCast(inst.args));
             gpa.free(inst.node_types);
             gpa.free(@constCast(inst.params));
-            freeInstanceConformances(gpa, inst.conformances); // M13
+            freeInstanceConformances(gpa, inst.conformances);
         }
         t.mono.deinit(gpa);
         // M18: derive requests (PODs, no owned data) + any un-transferred derive recipes
@@ -1653,7 +1653,7 @@ pub fn checkGraph(
             gpa.free(inst.node_types);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name.?));
-            freeInstanceConformances(gpa, inst.conformances); // M13
+            freeInstanceConformances(gpa, inst.conformances);
         }
         gpa.free(instances);
     }
@@ -2877,7 +2877,7 @@ test "M19: conforms truth table (scalar/struct/nested/empty-enum/payload-enum re
     try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(0), &memo, gpa, &co)); // all-scalar struct
     try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(1), &memo, gpa, &co)); // nested struct
     try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(0), &memo, gpa, &co)); // empty-payload enum
-    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa, &co)); // int-payload enum (M19: conforms)
+    try testing.expect(try C.q(&structs, &enums, &confs, Type.enumT(1), &memo, gpa, &co)); // int-payload enum (conforms)
     try testing.expect(try C.q(&structs, &enums, &confs, Type.structT(2), &memo, gpa, &co)); // struct w/ int-payload-enum field
     try testing.expect(!try C.q(&structs, &enums, &confs, Type.enumT(2), &memo, gpa, &co)); // str-payload enum (str no Eq here)
     try testing.expect(!try C.q(&structs, &enums, &confs, Type.structT(3), &memo, gpa, &co)); // struct w/ str-payload-enum field

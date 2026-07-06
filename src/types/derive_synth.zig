@@ -1,4 +1,4 @@
-//! The M18-M22 auto-derive synthesis cluster, extracted from the `Typecheck` mega-struct as
+//! The auto-derive synthesis cluster, extracted from the `Typecheck` mega-struct as
 //! free functions over `*Typecheck` (Zig has no struct-field privacy, so these read the
 //! checker's fields directly). The sole entry point is `synthesizeDerives`, driven once from
 //! `monomorphize`; the rest are its resolver/fixpoint helpers.
@@ -22,7 +22,7 @@ fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
     return false;
 }
 
-/// The M18 synthesis barrier: turn the (parallel-Pass-C, fn-id-ordered) derive requests
+/// The synthesis barrier: turn the (parallel-Pass-C, fn-id-ordered) derive requests
 /// into the canonical `t.derives` recipe table + synthetic `Method` entries.
 ///
 /// DETERMINISM: the request set is deduped by `Derive.writeKey`, a fixpoint enqueues each
@@ -45,10 +45,10 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
 
-    // ---- (1) Ord fixpoint (M19) -------------------------------------------------------
+    // Ord fixpoint.
     // `ord_seen` doubles as the ord-type SET (keyed `writeKey(ord_pid, .ord, ty)`); the Eq
     // fixpoint consults it so an Ord type is NEVER given a separate Eq recipe — a derived
-    // `Ord` fills the single `(Eq, T)` slot (M16 precedence), and `==` routes through its
+    // `Ord` fills the single `(Eq, T)` slot (precedence), and `==` routes through its
     // `cmp`. The fixpoint chases struct fields AND every enum variant's payload fields,
     // skipping any field with a live explicit conformance (it uses its own witness).
     var ord_seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -83,7 +83,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
-    // ---- (2) Eq fixpoint (M18), SKIPPING any Ord type ---------------------------------
+    // Eq fixpoint, SKIPPING any Ord type.
     var eq_seen: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = eq_seen.keyIterator();
@@ -114,7 +114,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
-    // ---- (2b) Hash fixpoint (M20), INDEPENDENT of Eq/Ord (Hash is not a refinement of
+    // Hash fixpoint, INDEPENDENT of Eq/Ord (Hash is not a refinement of
     // either, so there is no `ordFills`-style skip). Seeded from the `hash_pid` requests,
     // it chases every aggregate field the same way the Eq/Ord fixpoints do — struct fields
     // AND every enum variant's payload — skipping any field with a live explicit `Hash`
@@ -150,7 +150,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
-    // ---- (2c) Display fixpoint (M22), INDEPENDENT of Eq/Ord/Hash (Display is not a
+    // Display fixpoint, INDEPENDENT of Eq/Ord/Hash (Display is not a
     // refinement of any, so there is no `ordFills`-style skip). Seeded from the `print(x)`
     // requests, it chases every aggregate field the same way the other fixpoints do —
     // struct fields AND every enum variant's payload — skipping any field with a live
@@ -187,7 +187,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
-    // ---- (3) Materialize recipes (names/params/field_witnesses filled after the sort) --
+    // Materialize recipes (names/params/field_witnesses filled after the sort).
     const ordering_ty: Type = if (pre.ordering_enum) |oid| Type.enumT(oid) else .{ .kind = .invalid };
     if (ord_pid_opt) |ord_pid| {
         const ord_name = t.protocols.items[ord_pid].name;
@@ -227,10 +227,10 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         });
     }
 
-    // ---- (4) Canonical sort — the SOLE ordering driver (never discovery/thread order) --
+    // Canonical sort — the SOLE ordering driver (never discovery/thread order).
     std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
 
-    // ---- (5) Mint names + params + register the synthetic `Method` for each recipe,
+    // Mint names + params + register the synthetic `Method` for each recipe,
     // BEFORE resolving field witnesses (so a nested aggregate field resolves to its sibling
     // recipe's synthetic method). An Ord recipe registers a `cmp` Method{protocol_id=ord};
     // an Eq recipe an `eq` Method{protocol_id=eq}. `derive=index` routes lower/fold to the
@@ -260,7 +260,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
-    // ---- (6) Resolve each recipe's field witnesses on the LIVE method table (now carrying
+    // Resolve each recipe's field witnesses on the LIVE method table (now carrying
     // the synthetic entries), for BOTH structs and enums (enum payloads flattened in
     // variant-decl-then-field order). These fold into the derive fingerprint; the emitter
     // re-resolves from the same table, so the two stay in lockstep.
@@ -303,7 +303,7 @@ fn collectComponentTypes(t: *Typecheck, ty: Type, out: *std.ArrayList(Type)) !vo
     }
 }
 
-/// Resolve one recipe's per-field witnesses (M19): the flattened component fields (see
+/// Resolve one recipe's per-field witnesses: the flattened component fields (see
 /// `collectComponentTypes`) each mapped to their `FieldWitness` via `resolveFieldWitness`
 /// parameterized by the recipe kind. Returns the borrowed-empty slice
 /// for a no-field recipe (empty struct / empty-payload enum) so teardown's `len > 0` free
@@ -324,8 +324,8 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
     return fw;
 }
 
-/// Resolve one struct/enum field type to its `FieldWitness` for a derive of `kind`
-/// (M18-M22): scalars/str/unit are handled inline by the emitter (`inline_kind`); an
+/// Resolve one struct/enum field type to its `FieldWitness` for a derive of `kind`:
+/// scalars/str/unit are handled inline by the emitter (`inline_kind`); an
 /// aggregate field dispatches to its per-protocol witness (a sibling derive, a Mono
 /// instance method, or a user `impl` fn). An `Eq` derive is the one two-lookup case — it
 /// falls back to the field's `cmp` witness when it has no `eq` (`==` as `cmp(..) ==
@@ -361,7 +361,7 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
     return .inline_kind;
 }
 
-/// The emitted symbol name a resolved witness `Method` lowers to (M18): a synthetic
+/// The emitted symbol name a resolved witness `Method` lowers to: a synthetic
 /// derive's minted name, a Mono instance's mangled name, else the fn's qualified name.
 /// All three outlive codegen (owned by `GraphResult.derives`/`.instances`, or resolve
 /// result), so a borrowing `FieldWitness` slice stays valid.
