@@ -585,7 +585,7 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
             try emitEpilogue(g);
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
-        .trap => try g.emit(Aarch64.brk0), // M23: abort with SIGILL (unwrap-on-none/err).
+        .trap => try g.emit(Aarch64.brk0), // Abort with SIGILL (unwrap-on-none/err).
     }
 }
 
@@ -755,7 +755,7 @@ pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     };
 }
 
-// __display_int(n) builtin body — hand-written, AST/IR-independent (M22). The
+// __display_int(n) builtin body — hand-written, AST/IR-independent. The
 // heap-free `int`->decimal renderer: format the digits of the i64 in x0 into a
 // fixed 32-byte STACK buffer (backward, so no reversal), then tail into
 // write(fd=1, buf, len). Appended at link time (emit.zig) when any fn references

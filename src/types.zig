@@ -105,7 +105,7 @@ pub const refs = struct {
         // ctor's name (`Box` / `Either`) — its args are not spelled here (no alloc in
         // this borrowing accessor), but that beats leaking the internal kind tag "app"
         // into a user diagnostic. The ctor id space is struct-vs-enum disambiguated by
-        // `ctor_is_enum` (M6), so render an enum-App off `enumSyms`, a struct-App off
+        // `ctor_is_enum`, so render an enum-App off `enumSyms`, a struct-App off
         // `structSyms`.
         if (ty.kind == .app) {
             const e = self.composite.at(ty.appIdx());
@@ -125,7 +125,7 @@ pub const refs = struct {
         const tn = self.tree.nodes[type_node.int()];
         if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
         // A type application `Box[int]` (in type position or a struct-construction lhs)
-        // resolves to a composite `App` (M4): the base is a generic struct ctor, each
+        // resolves to a composite `App`: the base is a generic struct ctor, each
         // arg is recursively resolved (subst-aware), interned to one composite index.
         if (tn.tag == .type_app) return refs.typeFromTypeApp(self, tn);
         // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
@@ -136,7 +136,7 @@ pub const refs = struct {
         if (type_names.get(name)) |b| return b;
         if (self.activeStructMap().get(name)) |id| {
             // A generic struct named WITHOUT type args (`x: Box`) is not a value type —
-            // it needs its args (M4). Diagnose rather than mis-resolve it to `structT`.
+            // it needs its args. Diagnose rather than mis-resolve it to `structT`.
             if (id < self.structSyms().len and self.structSyms()[id].is_generic) {
                 self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
                 return .invalid;
@@ -145,7 +145,7 @@ pub const refs = struct {
         }
         if (self.activeEnumMap().get(name)) |id| {
             // A generic enum named WITHOUT type args (`x: Either`) is not a value type —
-            // it needs its args (M6). Diagnose rather than mis-resolve it to `enumT`
+            // it needs its args. Diagnose rather than mis-resolve it to `enumT`
             // (mirror the generic-struct gate above).
             if (id < self.enumSyms().len and self.enumSyms()[id].is_generic) {
                 self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
@@ -153,7 +153,7 @@ pub const refs = struct {
             }
             return Type.enumT(id);
         }
-        // Inside an inherent method, `Self` names the receiver type (M8). Resolved via
+        // Inside an inherent method, `Self` names the receiver type. Resolved via
         // the checker's `selfType` hook (mirroring `genericParamType`); null outside a
         // method => the normal unknown-type path, so non-method decoding is unchanged.
         if (std.mem.eql(u8, name, "Self")) {
@@ -189,7 +189,7 @@ pub const refs = struct {
     }
 
     /// Resolve a type application `Box[int]` / `Either[int,bool]` (a `type_app` node) to
-    /// a composite `App` (M4/M6). The base must resolve to a GENERIC STRUCT or GENERIC
+    /// a composite `App`. The base must resolve to a GENERIC STRUCT or GENERIC
     /// ENUM ctor; each arg is recursively resolved via `typeFromNode` (so it grounds to a
     /// concrete type inside an instance re-check / a non-generic body, and to a
     /// `type_var` while decoding a template's field/payload patterns), then the
@@ -272,7 +272,7 @@ pub const GraphFnInput = struct {
     is_pub: bool,
     /// Module-qualified symbol name (used in the coherence diagnostic).
     name: []const u8,
-    /// For an inherent method (M8): the receiver type-ref node in the owning
+    /// For an inherent method: the receiver type-ref node in the owning
     /// module's tree, decoded by `decodeFnSig` to build the method table + resolve
     /// `Self`. `Ast.none` for an ordinary fn / builtin.
     recv_type: Ast.Index = Ast.none,
@@ -296,23 +296,23 @@ pub const GraphResult = struct {
     layouts: []Layout,
     /// Program-wide enum table (one EnumLayout per global enum id).
     enum_layouts: []EnumLayout,
-    /// Monomorphized generic instances (M2), in canonical order. Empty for a
+    /// Monomorphized generic instances, in canonical order. Empty for a
     /// program with no reachable generic instances. Owned.
     instances: []Mono.Instance = &.{},
-    /// The program-wide inherent-method table (M8). Each entry's `name` is BORROWED
+    /// The program-wide inherent-method table. Each entry's `name` is BORROWED
     /// from the sibling tree/source (never freed here); only the slice is owned.
     methods: []Method = &.{},
-    /// The generic-type method TEMPLATE table (M10). Each entry's `name` is BORROWED from
+    /// The generic-type method TEMPLATE table. Each entry's `name` is BORROWED from
     /// the sibling tree/source (never freed here); only the slice is owned. Consumed during
     /// checking (dispatch + the mono reification tail); exposed for introspection/tests.
     templates: []TemplateMethod = &.{},
-    /// The authorized structural auto-derive recipes (M18), in canonical order. Empty
+    /// The authorized structural auto-derive recipes, in canonical order. Empty
     /// for a program with no derived `Eq` use. Each recipe's `name`, `params`, and
     /// `field_witnesses` OUTER slice are OWNED here; the `FieldWitness` name slices +
     /// `protocol_name` are BORROWED (sibling derive/instance/fn names + prelude/source
     /// protocol names — all outlive codegen).
     derives: []DeriveRecipe = &.{},
-    /// The prelude protocol ids (M15+), snapshotted off the checker so codegen resolves
+    /// The prelude protocol ids, snapshotted off the checker so codegen resolves
     /// each `==`/`<`/`+`/`.hash()`/`print`/`?`-widen witness by its SPECIFIC protocol (a
     /// sibling protocol reusing the name is excluded). Threaded into every job's `Frozen`
     /// / lower `Inputs`; lower and the fingerprint fold read the SAME bundle.
@@ -350,7 +350,7 @@ pub const GraphResult = struct {
             gpa.free(inst.node_types);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name.?));
-            // M13/M14: each conformance's `witness_syms` + `protocol_args` OUTER slices +
+            // Each conformance's `witness_syms` + `protocol_args` OUTER slices +
             // the vector itself are owned (elements are borrowed source / `gph_fn_names` /
             // PODs).
             for (inst.conformances) |rc| {
@@ -360,12 +360,12 @@ pub const GraphResult = struct {
             gpa.free(@constCast(inst.conformances));
         }
         gpa.free(self.instances);
-        // Method `name`s are borrowed from source (like `Sig.name`); M14: each entry may
+        // Method `name`s are borrowed from source (like `Sig.name`); each entry may
         // own a `protocol_args` dupe (freed here), then the backing array.
         freeMethodEntries(gpa, self.methods);
         gpa.free(self.methods);
         gpa.free(self.templates);
-        // M18 derive recipes: free each unit's minted `name`, its `params`, and its
+        // Derive recipes: free each unit's minted `name`, its `params`, and its
         // `field_witnesses` OUTER slice (the FieldWitness name slices are borrowed), then the
         // backing array.
         freeDeriveEntries(gpa, self.derives);
@@ -374,7 +374,7 @@ pub const GraphResult = struct {
     }
 };
 
-/// Free the per-recipe owned data of a derive table (M18): each `name`, `params`, and
+/// Free the per-recipe owned data of a derive table: each `name`, `params`, and
 /// `field_witnesses` outer slice. The `FieldWitness` name slices + `protocol_name` stay
 /// borrowed (sibling derive/instance/fn names + source protocol names).
 pub fn freeDeriveEntries(gpa: std.mem.Allocator, derives: []const DeriveRecipe) void {
@@ -385,7 +385,7 @@ pub fn freeDeriveEntries(gpa: std.mem.Allocator, derives: []const DeriveRecipe) 
     }
 }
 
-/// One program-wide inherent-method table entry (M8): the receiver `Type`, the
+/// One program-wide inherent-method table entry: the receiver `Type`, the
 /// SOURCE method name, and the global fn id the method desugared to. Built serially
 /// in Pass A (`decodeFnSig`), frozen onto the `Model` before the parallel body pass,
 /// and read read-only by `BodyChecker` dispatch, the fingerprint fold, and `lower`.
@@ -393,12 +393,12 @@ pub const Method = struct {
     recv: Type,
     name: []const u8,
     fn_id: u32,
-    /// `mut self` (M9): the receiver is passed BY ADDRESS and mutated in place, so a
+    /// `mut self`: the receiver is passed BY ADDRESS and mutated in place, so a
     /// call dispatch must enforce the receiver is a mutable place and `lower` must
     /// pass its address instead of a by-value copy. Type-checking is unaffected —
     /// the receiver type in the `Sig` stays the struct/enum (by-value-logical).
     mut_self: bool = false,
-    /// A REIFIED-DISPATCH entry (M10): appended in the mono tail for each reachable
+    /// A REIFIED-DISPATCH entry: appended in the mono tail for each reachable
     /// `(instance, method)` of a generic-type `impl`. `recv` is the reified concrete
     /// `structT`/`enumT` and `instance` indexes `GraphResult.instances`, so post-typecheck
     /// consumers (`lower`, `CallVisitor`) resolve the call to the instance's mangled symbol
@@ -407,18 +407,18 @@ pub const Method = struct {
     /// live in the separate `TemplateMethod` table (which never carries a `recv:Type`), so
     /// `findMethod` post-typecheck can never deref a stale check-time `App`.
     instance: ?u32 = null,
-    /// Generic-protocol conformance stamp (M14): the protocol id this method witnesses
+    /// Generic-protocol conformance stamp: the protocol id this method witnesses
     /// (`impl <recv> has P[args]`), or `null` for an inherent method / a reified generic
     /// dispatch entry / a method not registered through `checkCoherence`. Set IN PLACE by
     /// `checkCoherence` (before the Model snapshot), so a doubly-conforming `(recv, name)`
     /// pair carries distinct `(protocol_id, protocol_args)` per conformance and the
     /// multi-conformance resolver can disambiguate them.
     protocol_id: ?u32 = null,
-    /// The protocol type-args of the conformance this method witnesses (M14), an OWNED
+    /// The protocol type-args of the conformance this method witnesses, an OWNED
     /// dupe (freed per-entry via `freeMethodEntries`). Empty for a non-generic protocol or
     /// a non-conformance entry. Folded into the multi-conformance disambiguation key.
     protocol_args: []const Type = &.{},
-    /// A SOURCE-LESS auto-derive witness (M18): the index into `GraphResult.derives` of
+    /// A SOURCE-LESS auto-derive witness: the index into `GraphResult.derives` of
     /// the synthetic unit this method resolves to, or `null` for a real fn / instance /
     /// builtin entry. Appended in the synthesis barrier for each authorized derive so
     /// `resolveConformanceMethod(T,"eq")` returns `.one` and lower/`foldWitness` route to
@@ -428,7 +428,7 @@ pub const Method = struct {
     derive: ?u32 = null,
 };
 
-/// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }` (M10). Kept in
+/// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }`. Kept in
 /// its OWN table (never `Method`) precisely because it carries NO `recv: Type`: a template's
 /// receiver would be a check-time `App` whose composite index is freed post-typecheck, so
 /// making it un-representable here turns the old prose-only "never deref a template's App
@@ -445,7 +445,7 @@ pub const TemplateMethod = struct {
     mut_self: bool = false,
 };
 
-/// Structural equality of two `Type` vectors (M14): same length and pairwise `Type.eql`.
+/// Structural equality of two `Type` vectors: same length and pairwise `Type.eql`.
 /// Used to compare a conformance's protocol type-args against a use site's explicit args.
 pub fn eqlTypeVec(a: []const Type, b: []const Type) bool {
     if (a.len != b.len) return false;
@@ -453,7 +453,7 @@ pub fn eqlTypeVec(a: []const Type, b: []const Type) bool {
     return true;
 }
 
-/// The outcome of resolving a method call to a conformance witness (M14). `.one` is the
+/// The outcome of resolving a method call to a conformance witness. `.one` is the
 /// selected `Method`; `.ambiguous` means the receiver conforms to one generic protocol
 /// MULTIPLE times and the use site must supply explicit type-args (T0025); `.none` means
 /// no method matched (the caller falls back to builtin-scalar / T0018).
@@ -463,8 +463,8 @@ pub const MethodPick = union(enum) {
     ambiguous,
 };
 
-/// The prelude protocol ids an operator/derive desugaring resolves its witness against
-/// (M15+), bundled so lower / `AstWalk` / `Codegen` thread ONE value from the checker to
+/// The prelude protocol ids an operator/derive desugaring resolves its witness against,
+/// bundled so lower / `AstWalk` / `Codegen` thread ONE value from the checker to
 /// every witness site. Each `==`/`<`/`+`/`.hash()`/`print`/`?`-widen site resolves by the
 /// SPECIFIC id here, so a SIBLING protocol reusing `eq`/`cmp`/… on the same type is never
 /// selected — otherwise two same-named conformance methods make the resolver `.ambiguous`,
@@ -519,14 +519,14 @@ pub fn witnessProtocolId(ids: PreludeProtocolIds, name: []const u8) ?u32 {
 /// `AstWalk` and the checker never carry divergent copies.
 pub const Prelude = struct {
     protocols: PreludeProtocolIds = .{},
-    /// The prelude `Ordering{lt,eq,gt}` enum id (M16); the type `Ord.cmp` returns.
+    /// The prelude `Ordering{lt,eq,gt}` enum id; the type `Ord.cmp` returns.
     ordering_enum: ?u32 = null,
-    /// The prelude `Option[T]`/`Result[T,E]` template enum ids (M23); key native
+    /// The prelude `Option[T]`/`Result[T,E]` template enum ids; key native
     /// inherent-method recognition on an `.app` receiver via `optResultFamily`.
     option_enum: ?u32 = null,
     result_enum: ?u32 = null,
 
-    /// The native-enum family of an `App` ctor (M23): `.option`/`.result` when `ctor` is the
+    /// The native-enum family of an `App` ctor: `.option`/`.result` when `ctor` is the
     /// prelude Option/Result TEMPLATE id, else `.none`. A user `enum Option` shadow has its
     /// own distinct id (never the prelude template id), so the native path stays silent on it.
     pub fn optResultFamily(p: Prelude, ctor: u32) LayoutEngine.NativeEnumFamily {
@@ -537,7 +537,7 @@ pub const Prelude = struct {
 
     /// Whether `pid` is one of the four structurally-derivable prelude protocols
     /// (Eq/Ord/Hash/Display) — the only protocols a struct/enum can satisfy WITHOUT an
-    /// explicit `impl` (M18-M22). A custom/parameterized protocol always requires an impl.
+    /// explicit `impl`. A custom/parameterized protocol always requires an impl.
     pub fn isDerivable(p: Prelude, pid: u32) bool {
         inline for (.{ p.protocols.eq, p.protocols.ord, p.protocols.hash, p.protocols.display }) |maybe| {
             if (maybe) |x| if (x == pid) return true;
@@ -618,7 +618,7 @@ pub fn findConformanceMethod(methods: []const Method, recv: Type, name: []const 
     return null;
 }
 
-/// Free the per-entry owned `protocol_args` of a method table (M14). The `name` slices
+/// Free the per-entry owned `protocol_args` of a method table. The `name` slices
 /// stay borrowed (source); only `protocol_args` is owned (a `checkCoherence` dupe). A
 /// reified generic-dispatch entry defaults to `&.{}`, so freeing it is a no-op.
 pub fn freeMethodEntries(gpa: std.mem.Allocator, methods: []const Method) void {
@@ -638,12 +638,12 @@ pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method
     return null;
 }
 
-/// Look up a generic-type method TEMPLATE entry by its receiver type-constructor
-/// (M10). Keys off `recv_ctor`/`recv_is_enum` (plain ints, never a composite deref)
+/// Look up a generic-type method TEMPLATE entry by its receiver type-constructor.
+/// Keys off `recv_ctor`/`recv_is_enum` (plain ints, never a composite deref)
 /// so it is safe while the composite is alive (Pass A / Pass C / the mono tail) and
 /// deterministic at any `-jN`. Returns the first matching template entry; a concrete
 /// receiver's `(ctor, is_enum)` uniquely picks the owning `impl`'s method set (one
-/// `impl Box[T]` per type until coherence, M11).
+/// `impl Box[T]` per type until coherence).
 pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: bool, name: []const u8) ?TemplateMethod {
     for (templates) |tmpl| {
         if (tmpl.recv_ctor == ctor and tmpl.recv_is_enum == is_enum and std.mem.eql(u8, tmpl.name, name)) return tmpl;
@@ -651,7 +651,7 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
     return null;
 }
 
-/// A builtin scalar protocol-method recognizer (M12/M15): the pure, table-free source
+/// A builtin scalar protocol-method recognizer: the pure, table-free source
 /// of truth for the compiler-registered `Eq` conformance on builtin scalars. Returns the
 /// method's return `Type` for a recognized `(recv, name)`, else null. Shared by all
 /// three method-dispatch consumers — BodyChecker (types the call), lower (emits an
@@ -659,20 +659,20 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
 /// scalar method is NEVER a phantom `t.fns`/`t.methods` entry (that would desync the
 /// `names`/`sigs` parallel arrays and churn the method-count unit tests). All four scalars
 /// ship `eq` -> bool: `int`/`bool` lower to an inline `icmp`; `str` to a heap-free
-/// byte-compare (M15's `load_byte` loop); `unit` to a trivially-true `bconst` (the two
+/// byte-compare (`load_byte` loop); `unit` to a trivially-true `bconst` (the two
 /// `()` values are always equal). None gets a `t.fns` entry — each lowers to a machine op.
 pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, arity: usize } {
     const is_scalar = recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit;
     if (!is_scalar) return null;
-    // `eq(self, other) -> bool` (M15) is 2-ary (arity counts the non-self args = 1); `hash
-    // (self) -> int` (M20) is 1-ary (0 non-self args). The `arity` lets the shared
+    // `eq(self, other) -> bool` is 2-ary (arity counts the non-self args = 1); `hash
+    // (self) -> int` is 1-ary (0 non-self args). The `arity` lets the shared
     // method-dispatch consumers gate arg count without hardcoding a per-method constant.
     if (std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool, .arity = 1 };
     if (std.mem.eql(u8, name, "hash")) return .{ .ret = Type.int, .arity = 0 };
     return null;
 }
 
-/// A compiler-provided inherent method on the prelude `Option`/`Result` enums (M23):
+/// A compiler-provided inherent method on the prelude `Option`/`Result` enums:
 /// `is_tag0`/`is_tag1` are the two predicates (typed `bool`), `unwrap`/`unwrap_or` yield
 /// the payload type-arg (variant 0's payload). Like `builtinScalarMethod`, this is a pure
 /// recognizer with NO `t.methods`/`t.fns` entry — the checker types the call and `lower`
@@ -700,7 +700,7 @@ pub fn optionResultMethod(family: LayoutEngine.NativeEnumFamily, name: []const u
     return null;
 }
 
-/// The native-enum family of an `App` ctor (M23): `.option`/`.result` when `ctor` is the
+/// The native-enum family of an `App` ctor: `.option`/`.result` when `ctor` is the
 /// prelude Option/Result TEMPLATE id, else `.none`. The checker keys native-method
 /// recognition off this on an `.app` receiver during Pass C; a user `enum Option` shadow
 /// has its own distinct id (never equals the prelude template id), so the native path
@@ -709,7 +709,7 @@ pub fn optResultFamilyOf(model: *const Model, ctor: u32) LayoutEngine.NativeEnum
     return if (model.prelude) |p| p.optResultFamily(ctor) else .none;
 }
 
-/// Whether the ground type `recv` conforms to protocol `pid` (M13). A pure,
+/// Whether the ground type `recv` conforms to protocol `pid`. A pure,
 /// thread-order-free linear scan over the frozen `model.conformances` by protocol id
 /// + `Type.eql` — the SAME determinism discipline `findMethod` uses, so bound
 /// resolution at the mono worklist is byte-identical at any `-jN`. A generic-App
@@ -725,14 +725,14 @@ pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args:
 
 /// Whether `pid` is one of the four structurally-derivable prelude protocols
 /// (Eq/Ord/Hash/Display) — the only protocols a struct/enum can satisfy WITHOUT an
-/// explicit `impl` (M18-M22). A custom/parameterized protocol always requires an impl, so a
-/// bound on one is never discharged structurally. Gates the M21 structural bound-resolution
+/// explicit `impl`. A custom/parameterized protocol always requires an impl, so a
+/// bound on one is never discharged structurally. Gates the structural bound-resolution
 /// fallback in `enqueueInstance` (a `[T has Ord]` bound satisfied by a derive-only struct).
 fn isDerivableProtocol(model: *const Model, pid: u32) bool {
     return if (model.prelude) |p| p.isDerivable(pid) else false;
 }
 
-/// A recorded derive request (M18): "type `conform_ty` should structurally derive
+/// A recorded derive request: "type `conform_ty` should structurally derive
 /// protocol `protocol_id`". A trivially-copyable POD (no owned data) so a per-checker
 /// list moves out by value and the fn-id-ordered merge is a plain concat + dedup — the
 /// determinism basis for the synthesized set (see the synthesis barrier).
@@ -741,17 +741,17 @@ pub const DeriveReq = struct {
     conform_ty: Type,
 };
 
-/// A struct field that blocks a structural derive (M18): its declared name + type.
+/// A struct field that blocks a structural derive: its declared name + type.
 /// Named (not an anonymous struct) so `firstNonConformingField` and the BodyChecker's
 /// use site share ONE nominal type.
 pub const NonConformingField = struct { name: []const u8, ty: Type };
 
-/// Whether the GROUND type `recv` conforms to protocol `pid`, recursively (M18) — the
+/// Whether the GROUND type `recv` conforms to protocol `pid`, recursively — the
 /// shared substrate for on-demand structural derive. `findConformance`-FIRST (an
 /// explicit `impl`, a prelude scalar, or the Ord-refinement `(Eq,T)` entry means it
 /// already conforms — the double-fire guard), THEN structural: a struct conforms iff
 /// EVERY field conforms; an enum conforms iff EVERY variant's payload fields conform
-/// (M19 — pid-parameterized, so it powers payload-enum `Eq` AND payload-enum/struct `Ord`;
+/// (pid-parameterized, so it powers payload-enum `Eq` AND payload-enum/struct `Ord`;
 /// an empty-payload enum trivially conforms since there are no payload fields to check).
 ///
 /// Memoized by `(pid, kind, type-id)` in the caller-owned `memo` (thread-local in Pass
@@ -806,7 +806,7 @@ fn conformsRec(
     switch (recv.kind) {
         .@"struct", .@"enum" => {},
         .type_var => {
-            // Conditional conformance (M21), the bound-as-axiom leaf: inside a bounded
+            // Conditional conformance, the bound-as-axiom leaf: inside a bounded
             // template's definition check `App(G,[T])` reduces the pattern to `T`, which
             // conforms iff its declared bound IS `pid`. O(1) — never memoized. Empty
             // `bound_protocols` (a non-generic/unbounded context) denies, so a stray
@@ -816,7 +816,7 @@ fn conformsRec(
             return .{ .ok = (bound_protocols[ord] orelse return .{ .ok = false, .low = no_assumption }) == pid, .low = no_assumption };
         },
         .app => {
-            // Conditional conformance (M21), the recursive step: `App(G,[args])` conforms
+            // Conditional conformance, the recursive step: `App(G,[args])` conforms
             // iff every ctor field / enum-variant payload PATTERN, with `args` substituted
             // in, conforms. Memoized by the interned App index (a kind byte distinct from
             // struct/enum) so nested `Box[Box[Point]]` is not re-queried exponentially.
@@ -923,7 +923,7 @@ fn conformsRec(
 }
 
 /// Substitute a generic ctor's field/payload PATTERN through a concrete arg tuple for the
-/// M21 conditional-conformance query — a free-function mirror of `Typecheck.substType`
+/// conditional-conformance query — a free-function mirror of `Typecheck.substType`
 /// that needs only the composite table (`conforms` has no `*Typecheck`): a `type_var(ord)`
 /// becomes `args[ord]`; a nested `App(ctor,[pat..])` substitutes each arg and re-interns
 /// (so a `Box[T]` field grounds to `Box[int]`, itself re-queried through the App arm);
@@ -969,10 +969,10 @@ pub fn firstNonConformingField(
     return null;
 }
 
-/// A declared protocol (M11): a signature-only bundle of method NAMES. Registered
+/// A declared protocol: a signature-only bundle of method NAMES. Registered
 /// SERIALLY in Phase 0c (`registerProtocols`) in module-then-decl order (its global id
 /// is its index in `t.protocols`), then frozen onto the `Model`. Only method-NAME
-/// completeness is checked in M11 (signature compatibility is a later tier).
+/// completeness is checked here (signature compatibility is a later tier).
 pub const ProtocolSym = struct {
     /// Protocol name (borrowed source slice).
     name: []const u8,
@@ -983,7 +983,7 @@ pub const ProtocolSym = struct {
     /// The `protocol_decl` node in its owning module's tree.
     decl_node: Ast.Index,
     /// The protocol's generic type-params, in declaration order (borrowed source
-    /// slices), the associated-type replacement (M14): `protocol Into[U]` -> `["U"]`.
+    /// slices), the associated-type replacement: `protocol Into[U]` -> `["U"]`.
     /// Empty for a non-generic protocol. The OUTER array is owned by `t.protocols`. When
     /// a method sig is decoded these live at type-var ordinals 1.. (ordinal 0 is `Self`),
     /// so `-> U` decodes to `type_var(1)`; see `registerProtocols`.
@@ -991,7 +991,7 @@ pub const ProtocolSym = struct {
     /// The protocol's required method names, in declaration order (borrowed source
     /// slices). The OUTER array is owned by `t.protocols` (freed at teardown).
     methods: []const []const u8,
-    /// The decoded method SIGNATURES (M13), parallel to `methods` (same declaration
+    /// The decoded method SIGNATURES, parallel to `methods` (same declaration
     /// order). `method_params[i]` is method i's param types INCLUDING the leading
     /// synthetic `self` at index 0 (forced to `Type.typeVar(0)` = `Self`); any other
     /// `Self`-typed param also decodes to `type_var(0)`. `method_rets[i]` is the return
@@ -1003,14 +1003,14 @@ pub const ProtocolSym = struct {
     method_rets: []const Type = &.{},
 };
 
-/// One recorded conformance (M11): `impl <recv> has <protocol>`. Frozen onto the
-/// `Model` (read-only; no M11 Pass-C consumer — it sets up M13's conformance query).
+/// One recorded conformance: `impl <recv> has <protocol>`. Frozen onto the
+/// `Model` (read-only; no Pass-C consumer — it sets up the conformance query).
 /// `recv` is the byte-foldable receiver `Type` (a `structT`/`enumT`), stored verbatim
 /// so a future `Type.eql` conformance lookup is a one-liner.
 pub const Conformance = struct {
     protocol: u32,
     recv: Type,
-    /// The protocol type-args this conformance is keyed on (M14): `impl P has Into[int]`
+    /// The protocol type-args this conformance is keyed on: `impl P has Into[int]`
     /// records `[int]`. Two conformances `Into[int]`/`Into[bool]` on ONE type differ ONLY
     /// here — so the coherence key and `findConformance` fold this vector structurally (a
     /// bare `(protocol, recv)` match would alias them). Restricted to concrete non-`App`
@@ -1036,19 +1036,19 @@ pub const FnSym = struct {
     /// non-generic fn. `params`/`ret` of a template carry `Type.typeVar(ord)` where
     /// `ord` indexes this list; the mono tail substitutes them to concrete types.
     generic_params: []const []const u8 = &.{},
-    /// The resolved bound protocol id per generic param (M13, `[T has P]`), parallel
+    /// The resolved bound protocol id per generic param (`[T has P]`), parallel
     /// to `generic_params` (ordinal-indexed); `null` for an unbounded param. Empty for
     /// a non-generic fn. Populated in `decodeFnSig` via `protocolIdFromNode` (an
     /// undeclared bound protocol -> T0021). Owned by `t.fns` (freed at teardown).
     generic_bounds: []const ?u32 = &.{},
-    /// The bound's protocol type-args per generic param (M14, `[T has P[args]]`), parallel
+    /// The bound's protocol type-args per generic param (`[T has P[args]]`), parallel
     /// to `generic_bounds`: `generic_bound_args[i]` is the decoded arg vector for param i's
     /// bound (empty for an unbounded param or a non-generic protocol). An arg may be a
     /// `type_var` referencing ANOTHER generic param (`[T has Convert[U]]`), substituted
     /// through the instance args at the mono worklist. Both the inner vectors AND the outer
     /// array are OWNED by `t.fns` (freed at teardown).
     generic_bound_args: []const []const Type = &.{},
-    /// For an inherent method (M8): the RESOLVED receiver `Type` (params[0] is the
+    /// For an inherent method: the RESOLVED receiver `Type` (params[0] is the
     /// synthesized `self`). Cached here (a 12-byte POD) rather than re-resolved from
     /// the decl, so the body checker can map `Self` without re-running `typeFromNode`
     /// (which would double-emit). `.invalid` ⟺ this fn is not a method.
@@ -1110,29 +1110,29 @@ enums: std.ArrayList(EnumSym),
 /// (so non-generic decoding is byte-identical).
 cur_generic_params: []const []const u8 = &.{},
 
-/// The program-wide inherent-method table (M8), built SERIALLY in Phase A
+/// The program-wide inherent-method table, built SERIALLY in Phase A
 /// (`decodeFnSig`) in global fn-id order, frozen onto the `Model` before the
 /// parallel body pass. Transferred into `GraphResult.methods` by `checkGraph`.
 methods: std.ArrayList(Method) = .empty,
 
-/// The program-wide generic-type method TEMPLATE table (M10), built SERIALLY in Phase A
+/// The program-wide generic-type method TEMPLATE table, built SERIALLY in Phase A
 /// (`decodeFnSig`) alongside `methods`. Read-only during Pass C / the mono tail; the tail
 /// turns each reachable `(instance, template)` into a concrete reified `methods` entry.
 templates: std.ArrayList(TemplateMethod) = .empty,
 
-/// The program-wide protocol table (M11), built SERIALLY in Phase 0c
+/// The program-wide protocol table, built SERIALLY in Phase 0c
 /// (`registerProtocols`) in module-then-decl order (a protocol's global id is its
 /// index here). Frozen onto the `Model`; freed at teardown (each entry's `methods`
 /// outer array is owned, its name slices borrowed).
 protocols: std.ArrayList(ProtocolSym) = .empty,
 
-/// The recorded conformances (M11), filled by the SERIAL `checkCoherence` phase in
-/// module-then-decl order. Frozen onto the `Model` (M13 consumer); freed at teardown.
-/// M12 pre-seeds the builtin scalar conformances (`(Eq,int)`/`(Eq,bool)`) here in
+/// The recorded conformances, filled by the SERIAL `checkCoherence` phase in
+/// module-then-decl order. Frozen onto the `Model`; freed at teardown.
+/// Pre-seeds the builtin scalar conformances (`(Eq,int)`/`(Eq,bool)`) here in
 /// `registerPrelude` BEFORE any user impl, so `checkCoherence` collides a duplicate.
 conformances: std.ArrayList(Conformance) = .empty,
 
-/// The prelude protocol/enum ids (M12-M25), populated incrementally by `registerPrelude`
+/// The prelude protocol/enum ids, populated incrementally by `registerPrelude`
 /// in fixed append order (Eq=0..From=8; `Ordering`/`Option`/`Result` enums after every user
 /// type — a pure function of source). Each id doubles as the "universal, no import" fallback
 /// in `protocolIdFromNode` for a bare `Eq`/`Ord`/… that names no module protocol. `null` for
@@ -1146,36 +1146,36 @@ prelude: ?Prelude = null,
 /// byte-identical). The body pass sets its own copy on the `BodyChecker`.
 cur_self_type: ?Type = null,
 
-/// Monomorphization instances discovered by the serial mono tail (M2). Transferred
+/// Monomorphization instances discovered by the serial mono tail. Transferred
 /// whole into `GraphResult.instances` by `checkGraph`; the leftover (on an error
 /// path) is freed by `checkGraph`'s defer.
 mono: std.ArrayList(Mono.Instance) = .empty,
 
-/// Structural derive REQUESTS collected from Pass C (M18): "module fn X used `==` on
+/// Structural derive REQUESTS collected from Pass C: "module fn X used `==` on
 /// a derivable type T with no impl". Merged in fn-id order (deterministic) by
 /// `checkBodies` from each `BodyResult`, then consumed by the synthesis barrier (deduped
 /// + canonical-sorted into `derives`). PODs, no owned data; freed at teardown.
 derive_reqs: std.ArrayList(DeriveReq) = .empty,
 
-/// The authorized structural auto-derive recipes (M18), built by the synthesis barrier
+/// The authorized structural auto-derive recipes, built by the synthesis barrier
 /// at the end of `monomorphize` in canonical order. Transferred whole into
 /// `GraphResult.derives` by `checkGraph`; leftover (error path) freed by the teardown.
 derives: std.ArrayList(DeriveRecipe) = .empty,
 
-/// The composite (`App`) intern table (M4). Heap-allocated in `checkGraph` (stable
+/// The composite (`App`) intern table. Heap-allocated in `checkGraph` (stable
 /// address across the run, so every `BodyChecker` can borrow it), freed at teardown.
 /// `App` types are interned here during checking and REIFIED away before the layout
 /// snapshot, so nothing in `GraphResult` references it.
 composite: *Composite = undefined,
 
 /// Maps a composite (`App`) index -> the concrete `Type` it reified to in the
-/// monomorphization tail (M4/M6): a `structT(fresh_struct_id)` for a struct-App, an
+/// monomorphization tail: a `structT(fresh_struct_id)` for a struct-App, an
 /// `enumT(fresh_enum_id)` for an enum-App. Memoizes the `reifyAppTo` dispatcher so each
 /// ground `App` reifies to exactly one concrete type, and so `rewriteApp` can restore
 /// the decided type without re-dispatching. Deinit'd at teardown.
 reify_map: std.AutoHashMapUnmanaged(u32, Type) = .empty,
 
-/// The current `reifyAppTo` recursion depth (M6 termination guard). An unbounded
+/// The current `reifyAppTo` recursion depth (termination guard). An unbounded
 /// generic-enum whose variant payload re-applies itself with a strictly-growing arg
 /// (`enum L[T] { cons(T, L[Box[T]]) }`) recurses forever through
 /// `reifyAppToEnum -> substReify -> reifyAppTo`; each level is a fresh distinct enum id
@@ -1184,18 +1184,18 @@ reify_map: std.AutoHashMapUnmanaged(u32, Type) = .empty,
 /// — covering the same latent hazard for `reifyAppToStruct` for free.
 reify_depth: u32 = 0,
 
-/// OWNS the mangled names minted for reified generic-struct instances (M4). A reified
+/// OWNS the mangled names minted for reified generic-struct instances. A reified
 /// `StructSym.name` is a view into one of these; `snapshotLayouts` dupes it, so these
 /// are freed wholesale at teardown (the struct teardown frees `field_*`/`offsets` but
 /// NOT `name`, which for a source struct is a borrowed source slice).
 reified_names: std.ArrayList([]u8) = .empty,
 
-/// One-shot latch for the T0017 instantiation-depth diagnostic (M4): the guard fires
+/// One-shot latch for the T0017 instantiation-depth diagnostic: the guard fires
 /// at the FIRST too-deep instantiation in the (serial) worklist and then goes quiet,
 /// so an unbounded `f[T] -> f[Box[T]]` yields exactly one diagnostic at `-j1`/`-jN`.
 mono_depth_capped: bool = false,
 
-/// Per-global-fn-id poison flags (M13): true for a BOUNDED generic template whose
+/// Per-global-fn-id poison flags: true for a BOUNDED generic template whose
 /// bound-as-axiom body check (`bodyUnit`) emitted at least one diagnostic. The mono
 /// tail (`enqueueInstance`) skips instantiating a poisoned template so a definition
 /// error is reported ONCE at the template, never re-cascaded per instance. Allocated
@@ -1260,8 +1260,8 @@ pub const GraphCtx = struct {
         struct_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Bare enum name → GLOBAL enum id.
         enum_ids: std.StringHashMapUnmanaged(u32) = .empty,
-        /// Bare protocol name → GLOBAL protocol id (this module's own protocol decls,
-        /// M11). Populated in Phase 0c (`registerProtocols`).
+        /// Bare protocol name → GLOBAL protocol id (this module's own protocol decls).
+        /// Populated in Phase 0c (`registerProtocols`).
         protocol_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Import namespace name → imported module id (graph module id).
         namespaces: std.StringHashMapUnmanaged(u32) = .empty,
@@ -1286,17 +1286,17 @@ pub const Model = struct {
     enums: []const EnumSym,
     graph: *GraphCtx,
     gph_fn_names: ?[]const []const u8,
-    /// The program-wide inherent-method table (M8), frozen from Pass A. Read-only
+    /// The program-wide inherent-method table, frozen from Pass A. Read-only
     /// during the parallel body pass; drives `BodyChecker` method dispatch.
     methods: []const Method,
-    /// The generic-type method TEMPLATE table (M10), frozen from Pass A. Read-only during
+    /// The generic-type method TEMPLATE table, frozen from Pass A. Read-only during
     /// the parallel body pass; drives `BodyChecker` generic-receiver dispatch.
     templates: []const TemplateMethod,
-    /// The program-wide protocol table + recorded conformances (M11), frozen before
-    /// the parallel body pass. Read-only; no M11 Pass-C consumer (sets up M13).
+    /// The program-wide protocol table + recorded conformances, frozen before
+    /// the parallel body pass. Read-only; no Pass-C consumer (sets up the conformance query).
     protocols: []const ProtocolSym,
     conformances: []const Conformance,
-    /// The prelude protocol/enum ids (M12-M25), frozen from the checker, or `null` if
+    /// The prelude protocol/enum ids, frozen from the checker, or `null` if
     /// `registerPrelude` never ran (a narrow internal caller). Every `==`/`<`/arith/
     /// `.hash()`/`print`/`?`/native-method path keys off it; `null` denies conformance
     /// (-> T0026/27/28/…) rather than miscompiling. See `Prelude`; the embedded protocol
@@ -1356,16 +1356,16 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
     // Every diagnostic this BodyChecker emits is tagged with the fn's owning module.
     bc.sink.setScope(f.mod);
     if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
-    // A method (M8): put its receiver type in scope so a `Self` type-ref in a body
+    // A method: put its receiver type in scope so a `Self` type-ref in a body
     // annotation resolves to it. `.invalid` ⟺ not a method (leave the hook null).
     if (f.self_type.kind != .invalid) bc.cur_self_type = f.self_type;
-    // The per-generic-param bound protocol ids (M13), so a bounded template's body can
+    // The per-generic-param bound protocol ids, so a bounded template's body can
     // dispatch `v.m()` on a `type_var` receiver via its bound protocol (bound-as-axiom).
     // Empty for a non-generic/unbounded fn (inert); in the per-instance re-check the
     // receiver is grounded so the `type_var` dispatch branch never fires.
     bc.bound_protocols = f.generic_bounds;
     bc.bound_protocol_args = f.generic_bound_args;
-    // M21: the generic-param names, so an innermost-failure diagnostic can render an
+    // The generic-param names, so an innermost-failure diagnostic can render an
     // abstract `App`'s failing `type_var` as its source param name.
     bc.gph_generic_params = f.generic_params;
     return bc;
@@ -1403,7 +1403,7 @@ pub fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].enum_ids;
 }
 
-/// The active bare-name → global-protocol-id map: the current module's table (M11).
+/// The active bare-name → global-protocol-id map: the current module's table.
 pub fn activeProtocolMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].protocol_ids;
 }
@@ -1513,7 +1513,7 @@ pub fn checkGraph(
         nt_built += 1;
     }
 
-    // The composite (`App`) intern table (M4). Heap-allocated so its address is stable
+    // The composite (`App`) intern table. Heap-allocated so its address is stable
     // across the whole run (every `BodyChecker` borrows `*Composite`); freed below.
     const composite = try gpa.create(Composite);
     composite.* = .{};
@@ -1544,9 +1544,9 @@ pub fn checkGraph(
         for (t.fns.items) |f| {
             gpa.free(f.params);
             if (f.generic_params.len > 0) gpa.free(@constCast(f.generic_params));
-            // M13: the per-param bound protocol-id array (owned; borrows nothing).
+            // The per-param bound protocol-id array (owned; borrows nothing).
             if (f.generic_bounds.len > 0) gpa.free(@constCast(f.generic_bounds));
-            // M14: the per-param bound protocol-args (inner vectors + outer array owned).
+            // The per-param bound protocol-args (inner vectors + outer array owned).
             for (f.generic_bound_args) |ba| if (ba.len > 0) gpa.free(@constCast(ba));
             if (f.generic_bound_args.len > 0) gpa.free(@constCast(f.generic_bound_args));
         }
@@ -1560,25 +1560,25 @@ pub fn checkGraph(
             freeInstanceConformances(gpa, inst.conformances);
         }
         t.mono.deinit(gpa);
-        // M18: derive requests (PODs, no owned data) + any un-transferred derive recipes
+        // Derive requests (PODs, no owned data) + any un-transferred derive recipes
         // (success path empties `t.derives` via `toOwnedSlice`; an error path frees them).
         t.derive_reqs.deinit(gpa);
         freeDeriveEntries(gpa, t.derives.items);
         t.derives.deinit(gpa);
-        // M13: the per-fn bound-poison flags (owned; empty until checkBodies ran).
+        // The per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
         // The method table's backing array (entries' names are borrowed source
-        // slices). M14: each entry may own a `protocol_args` dupe (freed here). On success
+        // slices). Each entry may own a `protocol_args` dupe (freed here). On success
         // `toOwnedSlice` empties it, so both are a no-op there (the result frees them).
         freeMethodEntries(gpa, t.methods.items);
         t.methods.deinit(gpa);
-        // The template table (M10) owns no per-entry heap data (names are borrowed source);
+        // The template table owns no per-entry heap data (names are borrowed source);
         // on success `toOwnedSlice` empties it, so this frees only the backing array.
         t.templates.deinit(gpa);
-        // The protocol table (M11): each entry owns its `methods` outer array (the
+        // The protocol table: each entry owns its `methods` outer array (the
         // name slices are borrowed source); the conformance list owns only its array.
-        // M13: each entry also owns its decoded `method_params` (inner + outer) +
-        // `method_rets` arrays (the element Types are PODs). M14: the `generic_params`
+        // Each entry also owns its decoded `method_params` (inner + outer) +
+        // `method_rets` arrays (the element Types are PODs). The `generic_params`
         // outer array (name slices borrowed).
         for (t.protocols.items) |p| {
             gpa.free(@constCast(p.methods));
@@ -1588,7 +1588,7 @@ pub fn checkGraph(
             if (p.method_rets.len > 0) gpa.free(@constCast(p.method_rets));
         }
         t.protocols.deinit(gpa);
-        // M14: each conformance may own a `protocol_args` dupe.
+        // Each conformance may own a `protocol_args` dupe.
         for (t.conformances.items) |c| if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
         t.conformances.deinit(gpa);
         for (t.enums.items) |e| {
@@ -1598,7 +1598,7 @@ pub fn checkGraph(
                 gpa.free(v.offsets);
             }
             gpa.free(e.variants);
-            // A generic enum template's `generic_params` array is owned (M6); a reified /
+            // A generic enum template's `generic_params` array is owned; a reified /
             // non-generic enum's default `&.{}` frees to a no-op.
             if (e.generic_params.len > 0) gpa.free(@constCast(e.generic_params));
         }
@@ -1609,7 +1609,7 @@ pub fn checkGraph(
             gpa.free(s.field_names);
             gpa.free(s.field_types);
             gpa.free(s.offsets);
-            // A generic template's `generic_params` array is owned (M4); a reified /
+            // A generic template's `generic_params` array is owned; a reified /
             // non-generic struct's default `&.{}` frees to a no-op.
             if (s.generic_params.len > 0) gpa.free(@constCast(s.generic_params));
         }
@@ -1642,7 +1642,7 @@ pub fn checkGraph(
         sigs_built += 1;
     }
 
-    // Transfer the monomorphization instances (M2) out of the live table into the
+    // Transfer the monomorphization instances out of the live table into the
     // result before the layout snapshot. `toOwnedSlice` empties `t.mono` so the
     // teardown defer no longer sees them; an errdefer frees them (incl. their minted
     // names) if a later snapshot fails.
@@ -1658,9 +1658,9 @@ pub fn checkGraph(
         gpa.free(instances);
     }
 
-    // Transfer the method table (M8) out of the live list before the teardown defer
+    // Transfer the method table out of the live list before the teardown defer
     // sees it. `toOwnedSlice` empties `t.methods`; the entries' names stay borrowed.
-    // M14: each entry may own a `protocol_args` dupe, freed on the error path here (the
+    // Each entry may own a `protocol_args` dupe, freed on the error path here (the
     // window after transfer, before the result owns it) — else it would leak.
     const methods = try t.methods.toOwnedSlice(gpa);
     errdefer {
@@ -1668,12 +1668,12 @@ pub fn checkGraph(
         gpa.free(methods);
     }
 
-    // Transfer the template table (M10) out of the live list (mirrors methods); it owns no
+    // Transfer the template table out of the live list (mirrors methods); it owns no
     // per-entry heap data, so the error path frees only the backing array.
     const templates_out = try t.templates.toOwnedSlice(gpa);
     errdefer gpa.free(templates_out);
 
-    // Transfer the derive recipes (M18) out of the live list before the teardown defer
+    // Transfer the derive recipes out of the live list before the teardown defer
     // sees them (mirrors instances/methods). `toOwnedSlice` empties `t.derives`; on the
     // error path here the recipes' owned data is freed (else it would leak).
     const derives = try t.derives.toOwnedSlice(gpa);
@@ -1709,7 +1709,7 @@ pub fn checkGraph(
 /// The graph driver: register all types globally, lay them out, decode all fn
 /// sigs, check pub-signature coherence, then check every fn body.
 fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnInput, entry_mod: u32) !void {
-    // M1 generics gate. Generic syntax PARSES but has no semantics yet, so a serial
+    // Generics gate. Generic syntax PARSES but has no semantics yet, so a serial
     // pre-scan emits T0013 for every generic declaration / type-application and
     // RETURNS before Phase 0 — no Phase-A/body cascade (a `type_app` in type
     // position would otherwise misfire as T0001 "unknown type '['"). The driver's
@@ -1740,12 +1740,12 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         try register.registerEnums(t, Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
 
-    // Prelude (M12): native-register `Eq` (+ its builtin scalar conformances) BEFORE the
+    // Prelude: native-register `Eq` (+ its builtin scalar conformances) BEFORE the
     // per-module protocol loop, so `Eq` is global id 0 and is bare-nameable everywhere
     // with no import (the `print` precedent — no module-graph/fingerprint surface).
     t.prelude = try prelude_reg.register(t.gpa, &t.protocols, &t.conformances, &t.enums, t.graph.mods);
 
-    // Phase 0c (M11): register every module's `protocol` decls into ONE global id
+    // Phase 0c: register every module's `protocol` decls into ONE global id
     // space (module-id order, then decl order — same determinism as structs/enums).
     // Each module's `protocol_ids` (bare name -> global id) is filled so a bare or
     // qualified protocol reference resolves later. Must run before `checkCoherence`.
@@ -1758,7 +1758,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         try register.registerProtocols(t, Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
 
-    // Phase 0a (M4): decode each generic struct TEMPLATE's field types as PATTERNS
+    // Phase 0a: decode each generic struct TEMPLATE's field types as PATTERNS
     // (`v: T` -> `type_var(0)`; `b: Box[T]` -> `App(Box, [type_var 0])`) into its
     // `field_names`/`field_types`, with the template's generic params in scope so a
     // `T` ref decodes to a `type_var`. The mono tail's `substReify` grounds these
@@ -1802,16 +1802,16 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // every other diagnostic, so it is byte-identical at -j1 and -jN.
     try t.checkMainReturn(entry_mod);
 
-    // WHOLE-PROGRAM COHERENCE (M11): walk every `impl .. has ..`, reject a duplicate
+    // WHOLE-PROGRAM COHERENCE: walk every `impl .. has ..`, reject a duplicate
     // (protocol, receiver-ctor) conformance (T0020) — including a retroactive one in a
     // sibling module — and an incomplete/undeclared conformance (T0021). SERIAL, in
     // module-then-decl order, BEFORE the parallel Pass-C fan-out — so the emit order is
     // a pure function of source (byte-identical at any `-jN`).
     try coherence.checkCoherence(t, mods);
 
-    // Ord-refines-Eq (M16): after coherence, append exactly one `(Eq, recv)` conformance
+    // Ord-refines-Eq: after coherence, append exactly one `(Eq, recv)` conformance
     // per `Ord` receiver that lacks an existing `(Eq, recv)` entry — so `==`/`!=` on an
-    // Ord-only type routes through `cmp` (no `eq` method is added) and M18's structural
+    // Ord-only type routes through `cmp` (no `eq` method is added) and structural
     // derive sees the `Eq` slot filled and never double-fires. Explicit `Eq` is
     // authoritative: a genuine `impl T has Eq` alongside `impl T has Ord` is skipped here
     // (no T0020). Writes ONLY `t.conformances` (never the freed coherence seen-set), serial
@@ -1832,7 +1832,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     const model = t.buildModel();
     try t.checkBodies(&model);
 
-    // Monomorphization tail (M2): a SERIAL pass on the LIVE tables, after the
+    // Monomorphization tail: a SERIAL pass on the LIVE tables, after the
     // per-fn Pass-C fan-out has joined and BEFORE `checkGraph` snapshots/frees them.
     // It discovers every reachable `(template, concrete-args)` instance to a
     // fixpoint, re-checks each instance body into its own `node_types`, and mints a
@@ -1844,13 +1844,13 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
 /// OWNED for the duration of the fixpoint (freed with the worklist).
 const Pending = struct { gid: u32, args: []Type };
 
-/// A generous ceiling on the number of monomorphized instances. UNREACHABLE through
-/// M3 (type-args must already be concrete — there is no `App`, so the instance set is
-/// a finite closure of the source's explicit AND bare-inferred call sites); the M4
+/// A generous ceiling on the number of monomorphized instances. UNREACHABLE in practice
+/// (type-args must already be concrete — there is no `App`, so the instance set is
+/// a finite closure of the source's explicit AND bare-inferred call sites); the
 /// depth cap below fires first, so this stays the belt-and-suspenders backstop.
 const mono_instance_cap: usize = 10_000;
 
-/// The M4 termination guard (T0017): the max `App`-nesting depth of a type-arg before
+/// The termination guard (T0017): the max `App`-nesting depth of a type-arg before
 /// an instantiation is rejected. An unbounded `f[T]` transitively instantiating
 /// `f[Box[T]]` forms `App`s of strictly-growing depth (`Box[Box[..[int]..]]`); this
 /// cap makes the serial worklist reject it deterministically (never hang/OOM) while a
@@ -1858,7 +1858,7 @@ const mono_instance_cap: usize = 10_000;
 pub const max_instantiation_depth: u32 = 64;
 
 /// True when `ty` is a concrete value type usable as a monomorphization type-arg.
-/// M4 admits a ground `App` (a generic-struct instance like `Box[int]` used as a
+/// Admits a ground `App` (a generic-struct instance like `Box[int]` used as a
 /// type-arg): it is reified to a concrete `struct_id` in the mono tail. An `App`
 /// reaching a type-arg slot in a CHECKED body is always ground (templates are never
 /// body-checked; an instance re-check grounds its `type_var`s via `bc.subst`). Still
@@ -1870,7 +1870,7 @@ fn isConcreteValue(ty: Type) bool {
     };
 }
 
-/// Substitute a template type through a concrete arg tuple (M4): a `type_var(ord)`
+/// Substitute a template type through a concrete arg tuple: a `type_var(ord)`
 /// becomes `args[ord]`; an `App(ctor, [pat..])` recursively substitutes each arg and
 /// re-interns (so a template param spelled `Box[T]` grounds to `Box[int]`); anything
 /// else passes through unchanged.
@@ -1938,7 +1938,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         try t.scanCalls(model, inst.mod, inst.node_types, &worklist, &seen);
     }
 
-    // M4 reification: mint a fresh concrete `struct_id` for every reachable ground
+    // Reification: mint a fresh concrete `struct_id` for every reachable ground
     // `App` (in all node_types + instance sigs + non-generic fn sigs) and REWRITE
     // every `.app` to that `structT`. Serial, BEFORE the sort/mangle (so instance
     // args are plain `structT` for `Mono.mangle`) and BEFORE the layout snapshot (so
@@ -1961,7 +1961,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         }
     }
 
-    // M10: append a REIFIED-DISPATCH `Method` entry for each reachable
+    // Append a REIFIED-DISPATCH `Method` entry for each reachable
     // (generic-type instance, method). This MUST run at the very end — after the
     // fixpoint, reify, sort, and naming — because the Pass-C `Model` borrows
     // `t.methods.items` (captured before Pass C) and `scanCalls` read it throughout
@@ -1989,7 +1989,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         }
     }
 
-    // M18 auto-derive SYNTHESIS BARRIER. Same realloc-safe point as the M10 append
+    // Auto-derive SYNTHESIS BARRIER. Same realloc-safe point as the append
     // above (nothing reads `model.methods` again): turn Pass C's derive requests into
     // canonical source-less recipes + their synthetic method-table entries.
     try derive_synth.synthesizeDerives(t);
@@ -2012,7 +2012,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         if (n.tag != .call or n.lhs == Ast.none) continue;
         const callee = tree.nodes[n.lhs.int()];
         if (callee.tag == .type_app) {
-            // Explicit-args `id[int](..)` (M2): the type-args are the type-app's
+            // Explicit-args `id[int](..)`: the type-args are the type-app's
             // arg nodes, read straight from node_types.
             const bres = resolutions[callee.lhs.int()];
             if (bres != .func) continue;
@@ -2035,7 +2035,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             if (!ok) continue;
             try t.enqueueInstance(model, gid, args, worklist, seen, mc.tokens[n.main_token].start, mod);
         } else if (callee.tag == .identifier) {
-            // Bare inferred `id(7)` (M3): re-run the SHARED matcher over the value-arg
+            // Bare inferred `id(7)`: re-run the SHARED matcher over the value-arg
             // node_types so discovery selects the exact same instance Pass C created.
             // The never/invalid skip + the `isConcreteValue` gate are identical to Pass
             // C's, so the `(gid, args)` tuple — hence the `Mono.Instance` — agrees.
@@ -2070,7 +2070,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             if (!conc) continue;
             try t.enqueueInstance(model, gid, out, worklist, seen, mc.tokens[n.main_token].start, mod);
         } else if (callee.tag == .field_access) {
-            // A method call on a generic-type instance `b.get()` (M10): the receiver
+            // A method call on a generic-type instance `b.get()`: the receiver
             // types to an `App` (reify runs later in this tail), whose ctor selects the
             // `impl Box[T]` method TEMPLATE. Bind the impl's type-params by matching the
             // template's `Self` pattern-args against the receiver App's concrete args —
@@ -2115,11 +2115,11 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
 /// worklist. Shared by the explicit and inferred `scanCalls` branches so their dedup
 /// path is byte-identical. `at_byte`/`mod` anchor the T0017 termination diagnostic.
 fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at_byte: u32, mod: u32) !void {
-    // M13: a BOUNDED template poisoned by its bound-as-axiom body check (a definition
+    // A BOUNDED template poisoned by its bound-as-axiom body check (a definition
     // error) is never instantiated — the error was reported once at the template; a
     // per-instance re-check would only re-cascade it.
     if (gid < t.bound_poisoned.len and t.bound_poisoned[gid]) return;
-    // M4 termination guard: reject an instantiation whose type-args nest generic
+    // Termination guard: reject an instantiation whose type-args nest generic
     // applications beyond the depth cap — the shape an unbounded `f[T] -> f[Box[T]]`
     // recursion produces. The worklist is serial, so the FIRST breach in canonical
     // processing order fires identically at `-j1`/`-jN`; the latch keeps it to one
@@ -2144,7 +2144,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
     if (gop.found_existing) return;
     gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items); // own the stored key
 
-    // M13: resolve each `[T has P]` bound against the ground type-arg via the frozen
+    // Resolve each `[T has P]` bound against the ground type-arg via the frozen
     // conformance table. A MISSING conformance is a use-site T0023 (naming type +
     // protocol at the call byte) and SKIPS this instantiation — no worklist entry, so
     // no per-instance cascade. The `seen` dedup above already fired once per distinct
@@ -2157,7 +2157,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
     for (f.generic_bounds, 0..) |maybe_pid, ord| {
         const pid = maybe_pid orelse continue;
         if (ord >= args.len) continue;
-        // M14: the bound's protocol type-args are substituted THROUGH the instance args
+        // The bound's protocol type-args are substituted THROUGH the instance args
         // (so `[T has Convert[U]]` grounds `U` to the concrete arg bound to `U`), then the
         // conformance is looked up keyed on `(protocol, recv, protocol-args)`.
         const bargs = if (ord < f.generic_bound_args.len) f.generic_bound_args[ord] else &.{};
@@ -2170,7 +2170,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         if (findConformance(model, pid, args[ord], subst_buf)) continue;
         // The frozen table holds only EXPLICIT/prelude conformances. A struct/enum that
         // merely DERIVES Eq/Ord/Hash structurally (no `impl`) satisfies a `[T has Ord]`
-        // bound too (M21) — the same relation the `<`/`==`/`.hash()` operator predicates
+        // bound too — the same relation the `<`/`==`/`.hash()` operator predicates
         // use. Fall back to the recursive `conforms` query, gated to a zero-arg DERIVABLE
         // protocol (structural conformance is undefined for a parameterized/custom one, so
         // a custom-protocol bound with no impl still correctly emits T0023). The per-
@@ -2228,7 +2228,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     // requests recorded during this re-check; `synthesizeDerives` dedups+sorts afterward.
     try t.derive_reqs.appendSlice(t.gpa, bc.derive_reqs.items);
 
-    // M13: build this instance's resolved bound conformances (all satisfied — enqueue
+    // Build this instance's resolved bound conformances (all satisfied — enqueue
     // gated them, so a bound's `conform_ty` is a concrete `structT`/`enumT`/scalar the
     // later `reifyApps` never rewrites). The (e) fingerprint fold folds their structural
     // identity so a sibling-conformance edit invalidates exactly this instance.
@@ -2248,14 +2248,14 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     };
 }
 
-/// Build a monomorphized instance's resolved `[T has P]` bound conformances (M13/M14),
+/// Build a monomorphized instance's resolved `[T has P]` bound conformances,
 /// one per bounded generic param in generic-param order. Each witness SymName is resolved
 /// in protocol-DECLARED order via `findConformanceMethod` on the ground conforming type,
 /// keyed on the bound's `(protocol, protocol-args)` (substituted through the instance
 /// args) so multi-conformance picks the RIGHT witness (a bare `findMethod` would take the
 /// first `(recv, name)`, aliasing a sibling conformance): the mangled name from
 /// `gph_fn_names` when a real impl method exists, else the bare method name (a
-/// builtin-scalar witness — deterministic, forward-looking to M18). `protocol_name`
+/// builtin-scalar witness — deterministic, forward-looking). `protocol_name`
 /// borrows the source-backed `ProtocolSym.name`; `witness_syms` borrow `gph_fn_names`
 /// (both outlive codegen). `protocol_args` is an OWNED dupe (folded into the (e) fp). Only
 /// the outer slice + each `witness_syms`/`protocol_args` outer slice are OWNED. Empty for
@@ -2279,7 +2279,7 @@ fn buildConformances(t: *Typecheck, model: *const Model, f: FnSym, args: []const
         const pid = maybe_pid orelse continue;
         const recv = args[ord];
         const prot = model.protocols[pid];
-        // The bound's protocol type-args (M14), substituted through the instance args, so
+        // The bound's protocol type-args, substituted through the instance args, so
         // `[T has Convert[U]]` resolves against the concrete arg bound to `U`. OWNED (rides
         // the ResolvedConformance into the (e) fp fold).
         const bargs = if (ord < f.generic_bound_args.len) f.generic_bound_args[ord] else &.{};
@@ -2302,7 +2302,7 @@ fn buildConformances(t: *Typecheck, model: *const Model, f: FnSym, args: []const
     return list;
 }
 
-/// Free an instance's owned conformance vector (M13/M14): each entry's `witness_syms` +
+/// Free an instance's owned conformance vector: each entry's `witness_syms` +
 /// `protocol_args` OUTER slices + the vector itself. Element slices are borrowed (source /
 /// `gph_fn_names`) or PODs (Types) and never freed here.
 fn freeInstanceConformances(gpa: std.mem.Allocator, confs: []const Mono.ResolvedConformance) void {
@@ -2313,8 +2313,8 @@ fn freeInstanceConformances(gpa: std.mem.Allocator, confs: []const Mono.Resolved
     gpa.free(@constCast(confs));
 }
 
-/// The generics gate, now INERT (M6). Generic FUNCTIONS (M2), generic STRUCTS (M4),
-/// and generic ENUMS (M6) — plus `type_app` in both type and call position — are all
+/// The generics gate, now INERT. Generic FUNCTIONS, generic STRUCTS,
+/// and generic ENUMS — plus `type_app` in both type and call position — are all
 /// supported and flow through the full pipeline; there is no longer any generic surface
 /// to short-circuit here. Kept as a no-op (rather than deleting the call site) for
 /// minimal churn and as the seam for any future pre-Phase-0 gate; always returns false.
@@ -2331,11 +2331,11 @@ fn gateGenerics(t: *Typecheck, mods: []const GraphModuleInput) !bool {
 const BodyResult = struct {
     sink: DiagnosticSink,
     err: ?anyerror = null,
-    /// True for a BOUNDED generic template (M13) whose bound-as-axiom body check
+    /// True for a BOUNDED generic template whose bound-as-axiom body check
     /// emitted a diagnostic — the mono tail must not instantiate it (no per-instance
     /// cascade of a definition-site error).
     poisoned: bool = false,
-    /// Structural derive requests this fn recorded (M18): a `==`/`!=` on a derivable
+    /// Structural derive requests this fn recorded: a `==`/`!=` on a derivable
     /// type with no impl. OWNED (moved out of the `BodyChecker`); merged into
     /// `t.derive_reqs` in fn-id order by `checkBodies`, then freed. PODs (no owned data).
     derive_reqs: []DeriveReq = &.{},
@@ -2362,7 +2362,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // Free every slot's sink on any error path below (merge empties a slot's sink,
     // so a deinit of an already-merged slot is a no-op — no double-free).
     defer for (slots) |*s| s.sink.deinit();
-    // M18: each slot owns a derive-request slice moved out of its BodyChecker; free it
+    // Each slot owns a derive-request slice moved out of its BodyChecker; free it
     // once here (safe on every path — an un-merged / errored slot keeps the empty
     // default, and freeing a zero-length slice is a no-op). The merge below copies the
     // PODs into `t.derive_reqs`, so freeing the source afterward is correct.
@@ -2384,7 +2384,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
 
     for (slots) |s| if (s.err) |e| return e;
 
-    // Snapshot the per-fn poison flags (M13) in fn-id order for the mono tail, once the
+    // Snapshot the per-fn poison flags in fn-id order for the mono tail, once the
     // units have joined (serial, deterministic). A poisoned BOUNDED template is not
     // instantiated (see `enqueueInstance`). Freed at teardown.
     t.bound_poisoned = try gpa.alloc(bool, n);
@@ -2413,7 +2413,7 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // A generic TEMPLATE is normally checked only through its concrete instances (the
     // mono tail re-checks each instance body with a substitution) — its `type_var`-typed
     // params/locals have no ABI, so its node_types stay `.invalid`, never lowered. A
-    // BOUNDED template (M13, `[T has P]`) is the exception: it is checked ONCE against
+    // BOUNDED template (`[T has P]`) is the exception: it is checked ONCE against
     // the bound (bound-as-axiom), so a method-on-`T` error is reported at the definition
     // and the body-fp stays instantiation-independent.
     var any_bound = false;
@@ -2451,7 +2451,7 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // Poison a bounded template whose bound-as-axiom check reported anything, so the
     // mono tail skips instantiating it (a definition error fires once, not per instance).
     out.poisoned = f.isGeneric() and out.sink.count() > 0;
-    // M18: move this fn's derive requests into the slot (merged fn-id-ordered by
+    // Move this fn's derive requests into the slot (merged fn-id-ordered by
     // checkBodies). `toOwnedSlice` empties bc's list so the deferred `bc.deinit` frees
     // nothing it no longer owns.
     out.derive_reqs = bc.derive_reqs.toOwnedSlice(bc.gpa) catch |e| {
@@ -2546,14 +2546,14 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
 }
 
 /// Resolve a (bare or qualified) protocol-reference node to a GLOBAL protocol id, or
-/// null if it names no protocol (M11). NON-EMITTING: `checkCoherence` turns a null into
+/// null if it names no protocol. NON-EMITTING: `checkCoherence` turns a null into
 /// a single T0021 at the reference site (Phase A never touches a protocol ref, so there
 /// is no prior emit to double). A bare `identifier` resolves against the active module's
 /// protocol map; a qualified `mod.P` `field_access` resolves the receiver namespace then
 /// the owning module's protocol table, gated on `pub_export`.
 pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
     if (ref_idx == Ast.none) return null;
-    // A generic protocol reference `P[int]` / `mod.P[int]` (M14) parses to a `type_app`;
+    // A generic protocol reference `P[int]` / `mod.P[int]` parses to a `type_app`;
     // resolve its BASE name node (the args are read separately by the caller).
     const node_idx = Ast.protocolRefBase(t.tree, ref_idx);
     const n = t.tree.nodes[node_idx.int()];
@@ -2589,7 +2589,7 @@ pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
 }
 
 /// Resolve an `impl ... has` receiver type-ref node to its `Type` (a `structT`/`enumT`)
-/// WITHOUT emitting (M11). Phase A `decodeFnSig` already resolved the same node (and
+/// WITHOUT emitting. Phase A `decodeFnSig` already resolved the same node (and
 /// emitted any T0001/T0002/T0003 for a bad receiver), so re-resolving here must stay
 /// silent to avoid a double-emit. A bare `identifier` resolves against the active
 /// struct/enum maps; a qualified `mod.T` `field_access` resolves the receiver namespace
@@ -2600,7 +2600,7 @@ pub fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
     if (n.tag == .identifier) {
         const name = t.nameText(n.main_token);
         // A builtin scalar receiver (`impl int has P`) resolves via the same static map
-        // Phase A used (M12), so a user impl on int/bool/str keys into the multi-space
+        // Phase A used, so a user impl on int/bool/str keys into the multi-space
         // coherence check. A struct/enum shadow is impossible (T0011 rejects shadowing).
         if (type_names.get(name)) |ty| return ty;
         if (t.activeStructMap().get(name)) |id| return Type.structT(id);
@@ -2619,7 +2619,7 @@ pub fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
     return null;
 }
 
-/// Ground a protocol-signature type-var to a conformance's concrete types (M13/M14). A
+/// Ground a protocol-signature type-var to a conformance's concrete types. A
 /// protocol's decoded sig uses `type_var(0)` for the `self` slot + any `Self`-typed
 /// param/return, and `type_var(k>=1)` for the protocol's generic params (`protocol
 /// Into[U]` -> `U == type_var(1)`, ordinal-offset so `Self` keeps 0). Ground `tv(0)` to
@@ -2647,13 +2647,13 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     // outer array is owned by `t.fns`; the name slices are borrowed from source.
     var gnames: [][]const u8 = &.{};
     errdefer if (gnames.len > 0) t.gpa.free(gnames);
-    // The resolved bound protocol id per generic param (M13, `[T has P]`), parallel to
+    // The resolved bound protocol id per generic param (`[T has P]`), parallel to
     // `gnames`; null = unbounded. An undeclared bound protocol is T0021 at the bound
     // ref (protocols are registered in Phase 0c, before this Phase A). `protocolIdFromNode`
     // handles a bare `P` (active module map + `Eq` prelude fallback) and a qualified `mod.P`.
     var gbounds: []?u32 = &.{};
     errdefer if (gbounds.len > 0) t.gpa.free(gbounds);
-    // The bound's protocol type-args per param (M14, `[T has P[args]]`), parallel to
+    // The bound's protocol type-args per param (`[T has P[args]]`), parallel to
     // `gbounds`; inner + outer OWNED by `t.fns`. Decoded WITH the fn's generic params in
     // scope (below) so a bound arg spelled as another param (`[T has Convert[U]]`) becomes
     // a `type_var` substituted at the mono worklist.
@@ -2681,7 +2681,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 try t.sink.emitFmtCode(.T0021, t.byteOf(ref_tok), "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
                 break :blk null;
             }) else null;
-            // Decode the bound's protocol type-args (M14). A composite `App` arg is out of
+            // Decode the bound's protocol type-args. A composite `App` arg is out of
             // scope (its check-time index is run-order-dependent — would break the coherence
             // key + fp determinism); reject it and drop the arg. A `type_var` (another
             // param) is fine — it grounds at the mono worklist.
@@ -2702,7 +2702,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         }
     }
 
-    // Inherent method (M8): resolve the receiver type and put it in scope so the
+    // Inherent method: resolve the receiver type and put it in scope so the
     // synthesized `self` param and any `Self` type-ref in the signature decode to it.
     var self_ty: Type = .invalid;
     if (recv_type != Ast.none) {
@@ -2730,12 +2730,12 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         const name = t.nameText(decl.main_token);
         const mut_self = proto.params.len > 0 and Ast.isMutParam(t.tree, t.tokens, proto.params[0]);
         if (self_ty.isApp()) {
-            // A generic receiver `impl Box[T]` (M10): `self_ty` is a check-time `App`.
+            // A generic receiver `impl Box[T]`: `self_ty` is a check-time `App`.
             // Record its ctor into the TEMPLATE table so `findGenericMethod` dispatches
             // off a concrete receiver `App`'s ctor without dereferencing the
             // (post-typecheck-freed) composite. A fully-GROUND receiver App (no `type_var`
             // arg) would be a concrete-type inherent impl (`impl Box[int]`), which is
-            // coherence territory (M11) — reject it cleanly rather than mint an
+            // coherence territory — reject it cleanly rather than mint an
             // uninstantiable template.
             const e = t.composite.at(self_ty.appIdx());
             var any_var = false;
@@ -2785,13 +2785,13 @@ pub fn genericParamType(t: *const Typecheck, name: []const u8) ?Type {
     return null;
 }
 
-/// The receiver type when decoding a method signature (M8), so a `Self` type-ref
+/// The receiver type when decoding a method signature, so a `Self` type-ref
 /// resolves to it via `refs.typeFromNode`. Null outside a method (byte-identical).
 pub fn selfType(t: *const Typecheck) ?Type {
     return t.cur_self_type;
 }
 
-/// Intern a composite `App(ctor, args)` to its table index (M4). The `refs`
+/// Intern a composite `App(ctor, args)` to its table index. The `refs`
 /// type-application resolver calls this via the shared `anytype` cursor; `BodyChecker`
 /// exposes the sibling.
 pub fn internApp(t: *Typecheck, ctor: u32, args: []const Type, ctor_is_enum: bool) !u32 {

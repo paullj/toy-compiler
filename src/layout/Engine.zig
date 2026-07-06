@@ -20,13 +20,13 @@ const Ast = @import("../ast/Ast.zig");
 /// so one mistake produces one diagnostic. `@"struct"` carries a `struct_id`
 /// indexing the per-program struct table.
 ///
-/// `type_var` (M2, APPENDED — ordinals are frozen) is a CHECK-TIME type variable:
+/// `type_var` (APPENDED — ordinals are frozen) is a CHECK-TIME type variable:
 /// it reuses `struct_id` as the generic-parameter ordinal and exists only inside a
 /// generic template's decoded signature. It is substituted away to a concrete kind
 /// during the serial monomorphization tail, BEFORE any `node_types` slot is frozen,
 /// so it never reaches lower/codegen/layout (Debug-asserted there).
 ///
-/// `app` (M4, APPENDED — ordinals frozen) is a CHECK-TIME composite type
+/// `app` (APPENDED — ordinals frozen) is a CHECK-TIME composite type
 /// `Ctor[args..]` (a generic-struct application like `Box[int]`): it reuses
 /// `struct_id` as an index into the interned composite table (`symbols/Composite.zig`).
 /// Every reachable ground `app` is REIFIED to a fresh ordinary `struct_id` (its
@@ -61,7 +61,7 @@ pub const Type = struct {
         return .{ .kind = .@"enum", .enum_id = id };
     }
 
-    /// A check-time type variable for generic-parameter `ordinal` (M2). Reuses
+    /// A check-time type variable for generic-parameter `ordinal`. Reuses
     /// `struct_id` as the ordinal — NO widening, `@sizeOf(Type)` is unchanged.
     pub fn typeVar(ordinal: u32) Type {
         return .{ .kind = .type_var, .struct_id = ordinal };
@@ -76,7 +76,7 @@ pub const Type = struct {
         return t.struct_id;
     }
 
-    /// A check-time composite `Ctor[args..]` type (M4). Reuses `struct_id` as the
+    /// A check-time composite `Ctor[args..]` type. Reuses `struct_id` as the
     /// interned composite-table index (`symbols/Composite.zig`) — NO widening.
     pub fn app(idx: u32) Type {
         return .{ .kind = .app, .struct_id = idx };
@@ -168,7 +168,7 @@ pub const Layout = struct {
 /// names), or a struct (named payload fields).
 pub const VariantForm = enum(u8) { unit, tuple, @"struct" };
 
-/// The prelude generic-enum family a reified concrete instance belongs to (M23), or
+/// The prelude generic-enum family a reified concrete instance belongs to, or
 /// `.none` for any user/ordinary enum. Set on a reified `Option[T]`/`Result[T,E]`
 /// instance (keyed off the prelude template id in `reifyAppToEnum`, NOT the name — a
 /// user `enum Option` mangles to the same `Option$int` yet is a distinct template) and
@@ -221,7 +221,7 @@ pub const StructSym = struct {
     mod: u32 = 0,
     /// Whether the struct decl is `pub` (graph mode; pub-signature coherence).
     pub_export: bool = false,
-    /// A generic TEMPLATE `struct Box[T] { .. }` (M4): its `field_types` carry
+    /// A generic TEMPLATE `struct Box[T] { .. }`: its `field_types` carry
     /// `type_var`/`App` PATTERNS, never a value type, so Phase 0b must SKIP laying it
     /// out (its type-var fields have no ABI). Only its reified concrete instances get
     /// a layout. `generic_params` are the ordered param NAMES (borrowed source slices;
@@ -259,7 +259,7 @@ pub const EnumSym = struct {
     mod: u32 = 0,
     /// Whether the enum decl is `pub` (graph mode; pub-signature coherence).
     pub_export: bool = false,
-    /// A generic TEMPLATE `enum Either[L,R] { .. }` (M6): its variants' payload
+    /// A generic TEMPLATE `enum Either[L,R] { .. }`: its variants' payload
     /// `field_types` carry `type_var`/`App` PATTERNS, never a value type, so Phase 0b
     /// must SKIP laying it out (its type-var payloads have no ABI). Only its reified
     /// concrete instances get a layout. `generic_params` are the ordered param NAMES
@@ -327,11 +327,11 @@ pub const Env = struct {
     tree: *const fn (ctx: *anyopaque) Ast.Tree,
     /// Reify the interned composite `App` at `app_idx` to a fresh concrete type
     /// (registering its `Layout`/`EnumLayout` on the live tables, memoized) and return
-    /// it (M4/M6). Used by `layoutStruct`/`layoutEnum` to turn a concrete generic
+    /// it. Used by `layoutStruct`/`layoutEnum` to turn a concrete generic
     /// field/payload type `b: Box[int]` / `e: Either[int,bool]` (which decodes to an
     /// `App`) into a plain `structT`/`enumT` BEFORE it is stored/laid out, so no `App`
     /// ever lands in a laid aggregate's `field_types`. Returns a `Type` (not a bare
-    /// `struct_id`) so a generic-ENUM field/payload reifies to an `enumT` (M6).
+    /// `struct_id`) so a generic-ENUM field/payload reifies to an `enumT`.
     reifyApp: *const fn (ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type,
 };
 
@@ -376,11 +376,11 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         const fty = env.typeFromNode(env.ctx, field.lhs);
         types[i] = fty;
         // A concrete generic-aggregate field `b: Box[int]` / `e: Either[int,bool]`
-        // decodes to a composite `App` (M4/M6). Reify it on-demand to get the size/align
+        // decodes to a composite `App`. Reify it on-demand to get the size/align
         // for offsets, but KEEP the `App` in `field_types` so Pass-C field/construction
         // checks compare it against the (same-interned) `App` a value expression produces
         // — the mono-tail rewrite turns both into the reified `structT`/`enumT` before
-        // the snapshot. `reifyApp` returns the concrete type directly (M6).
+        // the snapshot. `reifyApp` returns the concrete type directly.
         const size_ty: Type = if (fty.isApp()) try env.reifyApp(env.ctx, fty.appIdx()) else fty;
         if (size_ty.kind == .unit) {
             try env.emitUnitField(env.ctx, env.byteOf(env.ctx, field.main_token), names[i]);
@@ -401,7 +401,7 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     env.structs.items[id].state = .done;
 }
 
-/// Lay out a REIFIED generic-struct instance (M4) whose `field_names`/`field_types`
+/// Lay out a REIFIED generic-struct instance whose `field_names`/`field_types`
 /// are ALREADY populated (by the monomorphization tail's substitution) — there is no
 /// decl in the tree to read fields from. Computes offsets/size/align + poison over the
 /// stored `field_types` via `layoutReferent`, using the SAME per-field offset formula
@@ -433,7 +433,7 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
     env.structs.items[id].state = .done;
 }
 
-/// Lay out a REIFIED generic-enum instance (M6) whose `variants` (name/form/
+/// Lay out a REIFIED generic-enum instance whose `variants` (name/form/
 /// field_names/field_types) are ALREADY populated (by the monomorphization tail's
 /// substitution) — there is no decl in the tree to read variants from. Computes each
 /// variant's payload-local offsets + payload size/align via `layoutReferent`, then the
@@ -622,7 +622,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             } else env.typeFromNode(env.ctx, pnode_idx);
             ftypes[pi] = pty;
             // A concrete generic-aggregate payload `v(Box[int])` / `v(Either[int,bool])`
-            // decodes to a composite `App` (M4/M6). Reify it on-demand for its size/align
+            // decodes to a composite `App`. Reify it on-demand for its size/align
             // but KEEP the `App` in `field_types` (mirroring layoutStruct) so Pass-C
             // construction checks compare it against the same-interned `App`; the mono-tail
             // rewrite turns it into the reified `structT`/`enumT` before the snapshot, so

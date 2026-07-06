@@ -31,7 +31,7 @@ const Mono = @import("../symbols/Mono.zig");
 /// Collect the signatures of every function this fn calls, in body walk order
 /// (matching the fingerprint's walk) so the fingerprint's (b) component lines up.
 ///
-/// `fn_sig` threads in the OWNING fn's signature (mirroring `walkTouchedSig`) so the M25
+/// `fn_sig` threads in the OWNING fn's signature (mirroring `walkTouchedSig`) so the
 /// `?`-widen fold can read the enclosing fn's reified return-Result error type — the target
 /// a widening `?` converts INTO via `From`. It is the fn's typecheck Sig when known; null
 /// elsewhere (a `null` sig folds no `?` witness, so those fingerprints stay byte-identical).
@@ -66,7 +66,7 @@ pub fn freeTouched(gpa: std.mem.Allocator, items: []const Fingerprint.TouchedTyp
 }
 
 /// Build the ordered `TouchedType` list for a monomorphized instance's concrete
-/// type-args (M2), each carrying its full index-free layout descriptor via the
+/// type-args, each carrying its full index-free layout descriptor via the
 /// same `appendTouched` the (c) touched fold uses. Fed into `fingerprint`'s (d)
 /// component so `id[int]` and `id[Point]` diverge and a struct-layout edit to a
 /// type-arg invalidates exactly the dependent instance. Empty for a non-generic
@@ -76,7 +76,7 @@ pub fn walkTypeArgs(gpa: std.mem.Allocator, frozen: anytype, args: []const @impo
 }
 
 /// Build the ordered `Fingerprint.ResolvedConformance` list for a monomorphized
-/// instance's resolved `[T has P]` bounds (M13), fed into `fingerprint`'s (e)
+/// instance's resolved `[T has P]` bounds, fed into `fingerprint`'s (e)
 /// component. Each entry's `conform` is the conforming type's index-free layout
 /// descriptor built by the SAME `appendTouched` the type-arg (d) fold uses (reading
 /// `frozen.layouts`, the codegen-time concrete reified layout); `protocol_name` and
@@ -87,7 +87,7 @@ pub fn walkConformances(gpa: std.mem.Allocator, frozen: anytype, conformances: [
         var tmp: std.ArrayList(Fingerprint.TouchedType) = .empty;
         defer tmp.deinit(gpa);
         try AstWalk.appendTouched(gpa, frozen, rc.conform_ty, &tmp);
-        // (M14) The conformance's protocol type-args, each as an index-free layout
+        // The conformance's protocol type-args, each as an index-free layout
         // descriptor built by the SAME `appendTouched` -> the (e) fold distinguishes
         // `Into[int]` from `Into[bool]`. OWNED (freed via `freeConformances`).
         var pargs: std.ArrayList(Fingerprint.TouchedType) = .empty;

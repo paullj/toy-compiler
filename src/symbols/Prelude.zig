@@ -1,4 +1,4 @@
-//! Native registration of the implicit PRELUDE (M12-M25), mirroring how `print` is a
+//! Native registration of the implicit PRELUDE, mirroring how `print` is a
 //! synthesized compiler entity with no module-graph / content-fingerprint surface. Runs
 //! SERIALLY at the head of Phase 0c, before the per-module `registerProtocols` loop, so
 //! the prelude protocol ids are a pure function of source (no hashmap/thread input).
@@ -131,7 +131,7 @@ fn setSlot(p: *Prelude, slot: Slot, id: u32) void {
     }
 }
 
-/// Native `enum Ordering { lt, eq, gt }` (M16): AST-less and hand-laid-out so Phase-0b
+/// Native `enum Ordering { lt, eq, gt }`: AST-less and hand-laid-out so Phase-0b
 /// `layoutEnum` early-returns on `state == .done`. Its tag is the variant DECL INDEX
 /// (lt=0/eq=1/gt=2), which `get_tag` and the comparison desugar depend on. Universally
 /// nameable with no import (injected if-absent so a user `enum Ordering` shadow wins).
@@ -156,7 +156,7 @@ fn registerOrdering(gpa: std.mem.Allocator, enums: *std.ArrayList(EnumSym), mods
     return ordering_id;
 }
 
-/// Prelude generic value enums (M23): `enum Option[T] { some(T), none }` and
+/// Prelude generic value enums: `enum Option[T] { some(T), none }` and
 /// `enum Result[T,E] { ok(T), err(E) }`, hand-built as generic TEMPLATES (the shape
 /// `registerEnums` + `decodeTemplateVariants` produce, but AST-less). Appended AFTER every
 /// user enum + `Ordering` so their ids stay a pure function of source. Variant order is

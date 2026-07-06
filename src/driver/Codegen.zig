@@ -46,11 +46,11 @@ pub const LinkedProgram = struct {
     entry_off: u32,
     diags: []CodegenIr.Diagnostic,
     owned_msgs: [][]u8,
-    /// Interned `__cstring` bytes (M2). Owned; empty for string-free programs.
+    /// Interned `__cstring` bytes. Owned; empty for string-free programs.
     cstrings: []u8 = &.{},
     /// Cross-segment relocs (adrp/add/ldr to __cstring/__got) rebased to absolute
     /// __text offsets, patched by `Link.applyDataRelocs` after MachO assigns
-    /// vmaddrs. Owned; empty for M1/M3 programs.
+    /// vmaddrs. Owned; empty for reloc-free programs.
     data_relocs: []Link.Reloc = &.{},
     /// Whether the program calls `print` (→ one `_write` import).
     uses_write: bool = false,
@@ -120,7 +120,7 @@ const Frozen = struct {
     /// Opt level / pass selection. Mixed into the codegen cache key so
     /// toggling `-O` lands on a different entry, and threaded into `lowerOne`.
     opt: Opt.Config,
-    /// The whole monomorphization instance table (M2), so `walkCalls`/`lowerCall`
+    /// The whole monomorphization instance table, so `walkCalls`/`lowerCall`
     /// resolve a generic call site to its reified instance. Empty for a program with
     /// no generics; shared read-only across all jobs.
     instances: []const Mono.Instance = &.{},
@@ -131,16 +131,16 @@ const Frozen = struct {
     /// This unit's OWN resolved `[T has P]` bound conformances when it is a bounded
     /// monomorphized instance (`&.{}` for a base or unbounded-template instance) —
     /// folded into the (e) fingerprint component so toggling a sibling conformance
-    /// invalidates exactly the dependent monomorphizations (M13).
+    /// invalidates exactly the dependent monomorphizations.
     conformances: []const Mono.ResolvedConformance = &.{},
-    /// The program-wide inherent-method table (M8), for method-call dispatch in
+    /// The program-wide inherent-method table, for method-call dispatch in
     /// `lowerCall` and the method-sig fold in `CallVisitor`. Shared read-only.
     methods: []const Typecheck.Method = &.{},
-    /// The authorized structural auto-derive recipes (M18): so `lowerStructEq`/`lowerDeriveEq`
+    /// The authorized structural auto-derive recipes: so `lowerStructEq`/`lowerDeriveEq`
     /// resolve a derived witness to its synthetic unit, and `CallVisitor.foldWitness`
     /// folds the derived-Eq witness identity. Shared read-only.
     derives: []const Typecheck.DeriveRecipe = &.{},
-    /// The prelude protocol ids (M15+): so `lowerStructEq`/`CallVisitor` resolve each
+    /// The prelude protocol ids: so `lowerStructEq`/`CallVisitor` resolve each
     /// operator/derive/`?`-widen witness by its SPECIFIC protocol (a sibling protocol
     /// reusing the name is excluded). Copied verbatim from the checker; lower and the
     /// fingerprint fold read the SAME bundle. Shared read-only.
@@ -246,19 +246,19 @@ const GraphFrozen = struct {
     /// Number of base fn units; `fn_decls`/`fn_modules` entries at `[base_count..]`
     /// are monomorphized instances (parallel to `instances`).
     base_count: usize,
-    /// The monomorphization instance table (M2), in canonical order. Appended after
+    /// The monomorphization instance table, in canonical order. Appended after
     /// the base fns as extra lowerable units.
     instances: []const Mono.Instance,
     /// Global fn id of the entry `main` (indexes `names`).
     entry_id: u32,
-    /// The program-wide inherent-method table (M8), threaded into every job's `Frozen`.
+    /// The program-wide inherent-method table, threaded into every job's `Frozen`.
     methods: []const Typecheck.Method = &.{},
-    /// The authorized structural auto-derive recipes (M18), in canonical order. Appended
+    /// The authorized structural auto-derive recipes, in canonical order. Appended
     /// after the base fns + Mono instances as a THIRD class of lowerable units, and
     /// threaded into every job's `Frozen` (a base fn's `==` on a derived type resolves the
     /// synthetic witness through it too).
     derives: []const Typecheck.DeriveRecipe = &.{},
-    /// The prelude protocol ids (M15+), copied into every job's `Frozen` by `frozenFor`, so
+    /// The prelude protocol ids, copied into every job's `Frozen` by `frozenFor`, so
     /// each operator/derive/`?`-widen witness resolves by its SPECIFIC protocol.
     prelude_ids: Typecheck.PreludeProtocolIds = .{},
     /// The count of BASE fns + Mono instances; `fn_decls`/`fn_modules` entries at
@@ -370,7 +370,7 @@ pub fn lowerGraphProgram(
     var entry_id: ?u32 = null;
     for (res.fns, 0..) |gf, gid| {
         if (gf.decl_node == Ast.none) continue; // synthetic print: no body to lower
-        // Skip generic TEMPLATES (M2): their params/ret are `type_var`s with no ABI,
+        // Skip generic TEMPLATES: their params/ret are `type_var`s with no ABI,
         // so they are never lowered directly — only their concrete instances are
         // (appended below). An uncalled generic fn thus emits ZERO codegen units.
         const gm = &graph.modules[gf.module];
@@ -391,7 +391,7 @@ pub fn lowerGraphProgram(
         try fn_decls.append(gpa, inst.decl_node);
         try fn_modules.append(gpa, inst.mod);
     }
-    // The SOURCE-LESS auto-derive units follow the instances (M18), in canonical order.
+    // The SOURCE-LESS auto-derive units follow the instances, in canonical order.
     // Each has a sentinel `decl_node` (never read — the emitter is layout-driven) + the
     // recipe's `mod` (a real module id for the per-module tree/tokens the job's `Frozen`
     // carries but never walks). Routed to `Engine.codegenSynthetic` in `graphFnJobInner`.
@@ -574,7 +574,7 @@ fn graphFnJobInner(
     // layout edit at the importer (cross-module hole).
     var my_sig: ?Fingerprint.Sig = null;
     if (lower_i >= gf.derive_base) {
-        // A SOURCE-LESS auto-derive unit (M18): no fn_decl / no AST fingerprint. Its
+        // A SOURCE-LESS auto-derive unit: no fn_decl / no AST fingerprint. Its
         // identity is the recipe's synthetic mangled name; route to the synthetic engine
         // entry which builds a NON-AST fingerprint from the recipe.
         const di = lower_i - gf.derive_base;
@@ -646,7 +646,7 @@ pub fn renderGraphIr(
     for (res.fns, 0..) |gf, gid| {
         if (gf.decl_node == Ast.none) continue; // skip bodyless print
         const m = &graph.modules[gf.module];
-        // Skip generic templates (M2): rendered only as concrete instances below.
+        // Skip generic templates: rendered only as concrete instances below.
         const gdecl = m.nodes[gf.decl_node.int()];
         if (Ast.protoAt(m.tree(), gdecl.lhs.int()).generic_params.len > 0) continue;
         const is_entry = gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main");
@@ -705,7 +705,7 @@ pub fn renderGraphIr(
         first = false;
     }
 
-    // Render each SOURCE-LESS auto-derive unit (M18/M19) via the layout-walking emitter, in
+    // Render each SOURCE-LESS auto-derive unit via the layout-walking emitter, in
     // canonical order — the same units codegen lowers, so `--emit ir` shows exactly one
     // `Eq$eq$…`/`Ord$cmp$…` unit per derived type (the zero-codegen / override proofs read
     // this). Dispatch on the recipe kind, mirroring `Engine.lowerSynthetic`.

@@ -62,7 +62,7 @@ pub const GlobalFn = struct {
     kind: SymKind,
     /// Whether the decl is `pub` (exported). `main`/`print` are not pub.
     is_pub: bool,
-    /// For an inherent method (M8): the receiver type-ref node (an `identifier`) in
+    /// For an inherent method: the receiver type-ref node (an `identifier`) in
     /// this module's tree — Typecheck resolves it to the receiver `Type` and keys the
     /// program-wide method table off it. `Ast.none` for an ordinary fn / builtin.
     recv_type: Ast.Index = Ast.none,
@@ -230,7 +230,7 @@ fn collectGlobals(g: *GraphResolve) !void {
                     // dispatch through the program-wide method table (built in Pass A).
                     // A conformance method (`impl_has_decl`) DISPATCHES identically — its
                     // protocol-method dispatch is indistinguishable from an inherent one
-                    // (M11) — but its symbol carries a protocol suffix (see below).
+                    // — but its symbol carries a protocol suffix (see below).
                     // `Ast.implMethods` yields the method run for either shape.
                     const recv_name = g.nameOf(mod, decl.main_token);
                     // A conformance method (`impl P has Q`) mangles its symbol +
@@ -273,9 +273,9 @@ fn collectGlobals(g: *GraphResolve) !void {
                             .decl_node = method_idx,
                             .kind = .user_fn,
                             .is_pub = false,
-                            // `decl.lhs` is the receiver type-ref: a bare `identifier`
-                            // (M8), a generic `impl Box[T]` (M10) `type_app`, or a
-                            // qualified `impl mod.T` (M11) `field_access` —
+                            // `decl.lhs` is the receiver type-ref: a bare `identifier`,
+                            // a generic `impl Box[T]` `type_app`, or a
+                            // qualified `impl mod.T` `field_access` —
                             // `decodeFnSig` decodes any of them to the self type.
                             .recv_type = decl.lhs,
                         });
@@ -304,7 +304,7 @@ fn collectGlobals(g: *GraphResolve) !void {
     for (g.tables) |*t| {
         if (!t.fns.contains("print")) try t.fns.put(g.gpa, "print", print_id);
     }
-    // The prelude enums (`Ordering` M16; generic value enums `Option`/`Result` M23) are nameable
+    // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) are nameable
     // in every module with no import (the `print` precedent). Register each into a module's enum
     // table UNLESS the module declares its own (user-first-wins), so their construction/match
     // resolve quietly (left for Typecheck, which native-registers the enums). The typecheck-time
@@ -602,9 +602,9 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         // A type-application callee `id[int](..)`: resolve ONLY the base callee
         // (`n.lhs`). The type-arg Range is NOT descended — resolving a type name
         // like `int` would fire R0001 and stop the pipeline at resolve, pre-empting
-        // the T0013 generics gate at typecheck. Forward-safety for M2.
+        // the T0013 generics gate at typecheck. Forward-safety.
         .type_app => try g.resolveExpr(n.lhs),
-        // Postfix `?` (M24): resolve the operand's names; the `?` itself binds nothing.
+        // Postfix `?`: resolve the operand's names; the `?` itself binds nothing.
         .try_expr => try g.resolveExpr(n.lhs),
         .enum_init_unit => {},
         .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a),
