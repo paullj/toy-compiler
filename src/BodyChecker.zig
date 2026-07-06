@@ -1734,44 +1734,51 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
-    fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-        // A qualified tuple-variant construction `N.V(args)` arrives as a `.call`
-        // whose callee is a `field_access` over an enum type-name identifier. Route
-        // it to the enum-init checker (treating `n` as a tuple construction).
-        const callee = bc.tree.nodes[(n.lhs).int()];
-        if (callee.tag == .field_access) {
-            const recv = bc.tree.nodes[(callee.lhs).int()];
-            if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
-                return bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
-            }
-            // An explicit generic-enum tuple-variant construction `Either[int,bool].left(42)`
-            //: the callee field_access's receiver is a `type_app` resolving to an
-            // enum-`App`. Substitute the variant payload patterns through the App's args
-            // and type the node as the `App` (reified to `enumT` in the mono tail).
-            if (recv.tag == .type_app) {
-                const app_ty = bc.typeFromNode(callee.lhs);
-                if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
-                    const e = bc.composite.at(app_ty.appIdx());
-                    const ty = try bc.checkVariantPayloads(e.ctor, callee.main_token, .tuple, n.rhs, e.args, null);
-                    bc.node_types[(node_idx).int()] = ty;
-                    return ty;
-                }
-                if (!app_ty.isApp()) {
-                    // typeFromNode already diagnosed (unknown/arity/not-generic); type the
-                    // args for effect + poison so nothing cascades.
-                    for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
-                    return .invalid;
-                }
-                // A struct-`App` receiver (`Box[int].m(..)`) is a method call; fall
-                // through to the not-a-function path below.
-            }
-            // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
-            // callee field_access's receiver is the inner `mod.Enum`.
-            if (bc.qualifiedEnumId(callee.lhs)) |enum_id| {
-                const ty = try bc.checkVariant(enum_id, callee.main_token, .tuple, n.rhs);
+    // A qualified tuple-variant construction `N.V(args)` arrives as a `.call` whose
+    // callee is a `field_access` over an enum type-name / type_app / qualified
+    // namespace. Route it to the matching enum-init checker; return null when the
+    // receiver is a value (or a struct-`App`), i.e. a method call the caller dispatches.
+    // The type_app-not-App drain returns a non-null `.invalid` (NOT null) so caller
+    // method dispatch does not re-run `typeOf` on the args and double-diagnose.
+    fn tryEnumConstruction(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
+        const recv = bc.tree.nodes[(callee.lhs).int()];
+        if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
+            return try bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
+        }
+        // An explicit generic-enum tuple-variant construction `Either[int,bool].left(42)`
+        //: the callee field_access's receiver is a `type_app` resolving to an
+        // enum-`App`. Substitute the variant payload patterns through the App's args
+        // and type the node as the `App` (reified to `enumT` in the mono tail).
+        if (recv.tag == .type_app) {
+            const app_ty = bc.typeFromNode(callee.lhs);
+            if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
+                const e = bc.composite.at(app_ty.appIdx());
+                const ty = try bc.checkVariantPayloads(e.ctor, callee.main_token, .tuple, n.rhs, e.args, null);
                 bc.node_types[(node_idx).int()] = ty;
                 return ty;
             }
+            if (!app_ty.isApp()) {
+                // typeFromNode already diagnosed (unknown/arity/not-generic); type the
+                // args for effect + poison so nothing cascades.
+                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
+                return Type.invalid;
+            }
+            // A struct-`App` receiver (`Box[int].m(..)`) is a method call; fall through.
+        }
+        // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
+        // callee field_access's receiver is the inner `mod.Enum`.
+        if (bc.qualifiedEnumId(callee.lhs)) |enum_id| {
+            const ty = try bc.checkVariant(enum_id, callee.main_token, .tuple, n.rhs);
+            bc.node_types[(node_idx).int()] = ty;
+            return ty;
+        }
+        return null;
+    }
+
+    fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        const callee = bc.tree.nodes[(n.lhs).int()];
+        if (callee.tag == .field_access) {
+            if (try bc.tryEnumConstruction(node_idx, n, callee)) |t| return t;
             // A method call `recv.m(args)` on a VALUE receiver. The enum-variant /
             // qualified-call cases above fire only for an enum type-name / type_app /
             // qualified-namespace receiver; a field_access callee whose receiver is a
