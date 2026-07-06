@@ -645,21 +645,14 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
 /// and the runtime invariant sweep only checks span totality + bracket pairing.
 fn parseImplDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_impl, "expected 'impl'");
-    var recv_tok = p.index;
-    try p.expect(.identifier, "expected a type name after 'impl'");
-    var recv_ref = try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
-    // A qualified `impl mod.T` receiver (coherence, M11): build a left-nested
-    // `field_access` chain and move `recv_tok` to the LAST segment (the type name).
+    // A qualified `impl mod.T` receiver (coherence, M11) builds a left-nested
+    // `field_access` chain and keys `recv_tok` off the LAST segment (the type name).
     // Only a conformance impl (`has`) may be qualified; an inherent impl rejects it.
-    var qualified = false;
-    while (p.at(.dot)) {
-        qualified = true;
-        p.bump(.dot);
-        const seg_tok = p.index;
-        try p.expect(.identifier, "expected a type name after '.'");
-        recv_ref = try p.addNode(.{ .tag = .field_access, .main_token = seg_tok, .lhs = recv_ref, .rhs = Ast.none });
-        recv_tok = seg_tok;
-    }
+    const name_tok = p.index;
+    const qname = try p.parseQualifiedName("expected a type name after 'impl'", "expected a type name after '.'");
+    const recv_ref = qname.node;
+    const recv_tok = qname.last_tok;
+    const qualified = recv_tok != name_tok;
     // A generic receiver `impl Box[T]` (M10): `[T]` declares the impl's type-params
     // (each a `generic_param` leaf) and the receiver becomes a `type_app`. The leaves
     // are prepended into every method's generic run (see `parseFnDecl`).
@@ -741,15 +734,7 @@ fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: 
 /// full type: no `()` unit. The built node lands in the `impl_has_decl`'s 3-cell header
 /// or in a `generic_param`'s `lhs` bound slot (`[T has P[int]]`).
 fn parseProtocolRef(p: *Parser) Error!Ast.Index {
-    const first_tok = p.index;
-    try p.expect(.identifier, "expected a protocol name after 'has'");
-    var node = try p.addNode(.{ .tag = .identifier, .main_token = first_tok, .lhs = Ast.none, .rhs = Ast.none });
-    while (p.at(.dot)) {
-        p.bump(.dot);
-        const seg_tok = p.index;
-        try p.expect(.identifier, "expected a protocol name after '.'");
-        node = try p.addNode(.{ .tag = .field_access, .main_token = seg_tok, .lhs = node, .rhs = Ast.none });
-    }
+    var node = (try p.parseQualifiedName("expected a protocol name after 'has'", "expected a protocol name after '.'")).node;
     // A generic protocol reference `P[int, ..]` (M14): reuse the same `type_app` shape a
     // generic type-application uses (`parseTypeApp` wraps the base ref into a `type_app`).
     if (p.at(.l_bracket)) node = try p.parseTypeApp(node);
@@ -796,7 +781,7 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.r_brace, "expected '}' to close the protocol block");
 
     const header = try p.addRange(sigs.items);
-    const generic_hdr = if (generics.items.len == 0) Ast.none else try p.addRange(generics.items);
+    const generic_hdr = try p.optRange(generics.items);
     return p.addNode(.{ .tag = .protocol_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
@@ -842,7 +827,7 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     const header = try p.addRange(fields.items);
     // Generics ride the otherwise-unused `rhs` slot as a Range header (or `none`
     // for a non-generic struct, keeping every existing struct byte-identical).
-    const generic_hdr = if (generics.items.len == 0) Ast.none else try p.addRange(generics.items);
+    const generic_hdr = try p.optRange(generics.items);
     return p.addNode(.{ .tag = .struct_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
@@ -937,7 +922,7 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
 
     const header = try p.addRange(variants.items);
     // Generics ride the otherwise-unused `rhs` slot as a Range header (see struct).
-    const generic_hdr = if (generics.items.len == 0) Ast.none else try p.addRange(generics.items);
+    const generic_hdr = try p.optRange(generics.items);
     return p.addNode(.{ .tag = .enum_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
@@ -1249,6 +1234,27 @@ fn parseTypeApp(p: *Parser, base: Ast.Index) Error!Ast.Index {
     return p.addNode(.{ .tag = .type_app, .main_token = lbracket, .lhs = base, .rhs = header });
 }
 
+/// Parse a bare or dot-qualified name (`A` / `mod.A` / `a.b.C`) into an `identifier`
+/// leaf (bare) or a left-nested `field_access` chain (qualified) — the shared shape a
+/// qualified type / protocol / impl-receiver name uses. `first_err`/`chain_err` are the
+/// diagnostics for a missing name at the head and after a `.`. Returns the built node
+/// and the LAST segment's token (the impl receiver keys its `main_token` off it). Each
+/// child leaf is created before its `field_access` parent, so children precede parents.
+fn parseQualifiedName(p: *Parser, first_err: []const u8, chain_err: []const u8) Error!struct { node: Ast.Index, last_tok: u32 } {
+    const first_tok = p.index;
+    try p.expect(.identifier, first_err);
+    var node = try p.addNode(.{ .tag = .identifier, .main_token = first_tok, .lhs = Ast.none, .rhs = Ast.none });
+    var last_tok = first_tok;
+    while (p.at(.dot)) {
+        p.bump(.dot);
+        const seg_tok = p.index;
+        try p.expect(.identifier, chain_err);
+        node = try p.addNode(.{ .tag = .field_access, .main_token = seg_tok, .lhs = node, .rhs = Ast.none });
+        last_tok = seg_tok;
+    }
+    return .{ .node = node, .last_tok = last_tok };
+}
+
 /// A type reference is written as an identifier (e.g. `int`, `bool`, `str`), the
 /// unit type `()`, or a module-qualified type `mod.Type`. A qualified type
 /// reuses the `field_access` node: receiver = the module-name `identifier` leaf,
@@ -1277,17 +1283,10 @@ fn parseType(p: *Parser) Error!Ast.Index {
         p.bump(.r_paren);
         return p.addNode(.{ .tag = .literal_unit, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
     }
-    const at_tok = p.index;
-    try p.expect(.identifier, "expected a type name");
-    var ty = try p.addNode(.{ .tag = .identifier, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
-    // A `.ident` chain qualifies the type by its owning module (`mod.Type`). The
-    // chain nests left like value field access, so a deeper `a.b.C` is supported
-    // structurally (the resolver decides what is legal).
-    while (p.eat(.dot)) {
-        const field_tok = p.index;
-        try p.expect(.identifier, "expected a type name after '.'");
-        ty = try p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = ty, .rhs = Ast.none });
-    }
+    // A `.ident` chain qualifies the type by its owning module (`mod.Type`), nesting
+    // left like value field access so a deeper `a.b.C` is supported structurally (the
+    // resolver decides what is legal).
+    var ty = (try p.parseQualifiedName("expected a type name", "expected a type name after '.'")).node;
     // A trailing `[..]` applies type arguments in TYPE position (`Box[int]`,
     // `mod.Box[int]`). Parses to a `type_app`; Typecheck rejects it (T0013).
     if (p.at(.l_bracket)) ty = try p.parseTypeApp(ty);
@@ -1936,6 +1935,13 @@ fn addRange(p: *Parser, items: []const Ast.Index) error{OutOfMemory}!Ast.Index {
     try p.extra.append(p.gpa, start);
     try p.extra.append(p.gpa, @intCast(items.len));
     return Ast.Index.from(header);
+}
+
+/// A `Range` header for a generic-param list, or `Ast.none` when empty — so a
+/// non-generic decl leaves its `rhs` slot `none` and stays byte-identical. Shared
+/// by the struct/enum/protocol decls.
+fn optRange(p: *Parser, items: []const Ast.Index) error{OutOfMemory}!Ast.Index {
+    return if (items.len == 0) Ast.none else p.addRange(items);
 }
 
 /// Like `addRange` but for a run of TOKEN indices (an `import_decl`'s path

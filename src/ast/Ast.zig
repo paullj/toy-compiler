@@ -682,6 +682,18 @@ pub fn render(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
     try renderNode(out, tree, tokens, source, root(tree.nodes));
 }
 
+/// Render a ` [X Y]` generic-parameter list, or nothing when empty, so non-generic
+/// decls stay byte-identical. Shared by the struct/enum/protocol/fn render arms.
+fn renderGenericParams(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8, gps: []const Index) std.Io.Writer.Error!void {
+    if (gps.len == 0) return;
+    try out.writeAll(" [");
+    for (gps, 0..) |gp, i| {
+        if (i != 0) try out.writeByte(' ');
+        try renderNode(out, tree, tokens, source, gp);
+    }
+    try out.writeByte(']');
+}
+
 fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8, idx: Index) !void {
     const nodes = tree.nodes;
     const n = nodes[idx.int()];
@@ -713,16 +725,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .protocol_decl => {
             try out.print("(protocol {s}", .{tok_text});
-            // Generic params (M14) ride the `rhs` Range, rendered only when present so
-            // non-generic protocol goldens stay byte-identical (mirrors `struct_decl`).
-            if (n.rhs != none) {
-                try out.writeAll(" [");
-                for (rangeSlice(tree, n.rhs.int()), 0..) |gp, i| {
-                    if (i != 0) try out.writeByte(' ');
-                    try renderNode(out, tree, tokens, source, gp);
-                }
-                try out.writeByte(']');
-            }
+            try renderGenericParams(out, tree, tokens, source, if (n.rhs == none) &.{} else rangeSlice(tree, n.rhs.int()));
             for (rangeSlice(tree, n.lhs.int())) |method| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, method);
@@ -806,15 +809,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .fn_decl => {
             const proto = protoAt(tree, n.lhs.int());
             try out.print("(fn {s}", .{tok_text});
-            // Generics render only when present, so existing goldens are unchanged.
-            if (proto.generic_params.len > 0) {
-                try out.writeAll(" [");
-                for (proto.generic_params, 0..) |gp, i| {
-                    if (i != 0) try out.writeByte(' ');
-                    try renderNode(out, tree, tokens, source, gp);
-                }
-                try out.writeByte(']');
-            }
+            try renderGenericParams(out, tree, tokens, source, proto.generic_params);
             try out.writeAll(" (");
             for (proto.params, 0..) |pidx, i| {
                 if (i != 0) try out.writeByte(' ');
@@ -917,16 +912,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .struct_decl => {
             try out.print("(struct {s}", .{tok_text});
-            // Generics live in the `rhs` slot as a Range header, rendered only when
-            // present (`rhs != none`) so existing non-generic goldens are unchanged.
-            if (n.rhs != none) {
-                try out.writeAll(" [");
-                for (rangeSlice(tree, n.rhs.int()), 0..) |gp, i| {
-                    if (i != 0) try out.writeByte(' ');
-                    try renderNode(out, tree, tokens, source, gp);
-                }
-                try out.writeByte(']');
-            }
+            try renderGenericParams(out, tree, tokens, source, if (n.rhs == none) &.{} else rangeSlice(tree, n.rhs.int()));
             for (rangeSlice(tree, n.lhs.int())) |field| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, field);
@@ -954,15 +940,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .enum_decl => {
             try out.print("(enum {s}", .{tok_text});
-            // Generics live in the `rhs` slot as a Range header (see struct_decl).
-            if (n.rhs != none) {
-                try out.writeAll(" [");
-                for (rangeSlice(tree, n.rhs.int()), 0..) |gp, i| {
-                    if (i != 0) try out.writeByte(' ');
-                    try renderNode(out, tree, tokens, source, gp);
-                }
-                try out.writeByte(']');
-            }
+            try renderGenericParams(out, tree, tokens, source, if (n.rhs == none) &.{} else rangeSlice(tree, n.rhs.int()));
             for (rangeSlice(tree, n.lhs.int())) |v| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, v);
