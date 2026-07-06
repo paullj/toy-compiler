@@ -124,6 +124,27 @@ pub const Type = struct {
         return t.kind == .@"enum";
     }
 
+    /// Append this type's flat leaf key — `(kind, struct_id, enum_id)` at fixed
+    /// width — to `buf`. The single serializer every dedup/structural key routes
+    /// through (`Composite.writeFlatKey`/`writeStructuralKey`, `Mono.writeKey`), so
+    /// the byte encoding stays identical across them.
+    pub fn appendKeyBytes(t: Type, gpa: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
+        try buf.append(gpa, @intFromEnum(t.kind));
+        var w: [4]u8 = undefined;
+        std.mem.writeInt(u32, &w, t.struct_id, .little);
+        try buf.appendSlice(gpa, &w);
+        std.mem.writeInt(u32, &w, t.enum_id, .little);
+        try buf.appendSlice(gpa, &w);
+    }
+
+    /// The canonical leaf ordering over `(kind, struct_id, enum_id)` — the tie-break
+    /// spine of `Mono.lessThan`'s total instance order.
+    pub fn orderLeaf(a: Type, b: Type) std.math.Order {
+        if (a.kind != b.kind) return std.math.order(@intFromEnum(a.kind), @intFromEnum(b.kind));
+        if (a.struct_id != b.struct_id) return std.math.order(a.struct_id, b.struct_id);
+        return std.math.order(a.enum_id, b.enum_id);
+    }
+
     comptime {
         // The byte-foldable `Type` never widens (locked decision): `type_var` reuses
         // `struct_id` as the ordinal, so appending the kind does not grow the struct.

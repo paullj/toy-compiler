@@ -99,9 +99,11 @@ pub fn lessThan(_: void, a: Instance, b: Instance) bool {
     if (a.template_gid != b.template_gid) return a.template_gid < b.template_gid;
     const n = @min(a.args.len, b.args.len);
     for (a.args[0..n], b.args[0..n]) |x, y| {
-        if (x.kind != y.kind) return @intFromEnum(x.kind) < @intFromEnum(y.kind);
-        if (x.struct_id != y.struct_id) return x.struct_id < y.struct_id;
-        if (x.enum_id != y.enum_id) return x.enum_id < y.enum_id;
+        switch (x.orderLeaf(y)) {
+            .lt => return true,
+            .gt => return false,
+            .eq => {},
+        }
     }
     return a.args.len < b.args.len;
 }
@@ -114,13 +116,7 @@ pub fn writeKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), gid: u32, args:
     var w: [4]u8 = undefined;
     std.mem.writeInt(u32, &w, gid, .little);
     try buf.appendSlice(gpa, &w);
-    for (args) |a| {
-        try buf.append(gpa, @intFromEnum(a.kind));
-        std.mem.writeInt(u32, &w, a.struct_id, .little);
-        try buf.appendSlice(gpa, &w);
-        std.mem.writeInt(u32, &w, a.enum_id, .little);
-        try buf.appendSlice(gpa, &w);
-    }
+    for (args) |a| try a.appendKeyBytes(gpa, buf);
 }
 
 /// The mangled instance symbol: `<template>$<arg0>$<arg1>...`. `$` is not a valid
