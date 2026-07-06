@@ -1687,7 +1687,7 @@ pub const BodyChecker = struct {
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
             recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
         {
-            switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, false, explicit)) {
+            switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, explicit)) {
                 .one => |m| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, m),
                 else => {
                     for (args) |a| _ = try bc.typeOf(a);
@@ -1793,7 +1793,7 @@ pub const BodyChecker = struct {
                     // pre-M14 `findMethod` for every existing program (inherent / single
                     // conformance / prelude); `.ambiguous` (a doubly-conforming generic
                     // protocol used with no type-args) is T0025 — never an arbitrary pick.
-                    switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, false, null)) {
+                    switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
                         .one => |m| return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m),
                         .ambiguous => {
                             for (args) |a| _ = try bc.typeOf(a);
