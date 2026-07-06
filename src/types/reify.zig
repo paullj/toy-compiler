@@ -157,12 +157,7 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
         // Tag the reified instance by the PRELUDE template id (not the mangled name — a
         // user `enum Option` would mangle to the same `Option$int`), so `lower` recognizes
         // its native inherent methods per-instance (M23).
-        .native_family = if (t.option_enum_id != null and e.ctor == t.option_enum_id.?)
-            .option
-        else if (t.result_enum_id != null and e.ctor == t.result_enum_id.?)
-            .result
-        else
-            .none,
+        .native_family = if (t.prelude) |p| p.optResultFamily(e.ctor) else .none,
     });
     const src_variants = tmpl.variants;
     const variants = try t.gpa.alloc(VariantSym, src_variants.len);

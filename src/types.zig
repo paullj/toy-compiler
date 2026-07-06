@@ -471,19 +471,10 @@ pub const PreludeProtocolIds = struct {
     from: ?u32 = null,
 };
 
-/// Snapshot the prelude protocol ids off a `Typecheck`/`Model` into a `PreludeProtocolIds`.
+/// Snapshot the prelude protocol ids off a `Typecheck`/`Model` into a `PreludeProtocolIds`
+/// (all-null for a prelude-less caller, which denies every witness resolution downstream).
 pub fn gatherPreludeIds(src: anytype) PreludeProtocolIds {
-    return .{
-        .eq = src.eq_protocol_id,
-        .ord = src.ord_protocol_id,
-        .add = src.add_protocol_id,
-        .sub = src.sub_protocol_id,
-        .mul = src.mul_protocol_id,
-        .div = src.div_protocol_id,
-        .hash = src.hash_protocol_id,
-        .display = src.display_protocol_id,
-        .from = src.from_protocol_id,
-    };
+    return if (src.prelude) |p| p.protocols else .{};
 }
 
 /// The prelude protocol id a desugaring witness method name resolves against (`eq`→Eq,
@@ -503,6 +494,44 @@ pub fn witnessProtocolId(ids: PreludeProtocolIds, name: []const u8) ?u32 {
     if (std.mem.eql(u8, name, "from")) return ids.from;
     return null;
 }
+
+/// The prelude protocol + enum ids the checker discovers in `registerPrelude`, in fixed
+/// append order (Eq=0..From=8; `Ordering`/`Option`/`Result` enums appended after every
+/// user type). Populated incrementally during registration, then frozen onto the `Model`.
+/// The whole aggregate is `?Prelude` on `Typecheck`/`Model`: `null` for a prelude-less
+/// internal caller (one that skips `registerPrelude`), so every operator/derive/native path
+/// keys off `null` and degrades to "no conformance" (-> T0026/27/28/…) rather than
+/// miscompiling. The nine desugaring-witness protocol ids live in an embedded
+/// `PreludeProtocolIds` — the SAME bundle codegen consumes (`gatherPreludeIds`) — so lower /
+/// `AstWalk` and the checker never carry divergent copies.
+pub const Prelude = struct {
+    protocols: PreludeProtocolIds = .{},
+    /// The prelude `Ordering{lt,eq,gt}` enum id (M16); the type `Ord.cmp` returns.
+    ordering_enum: ?u32 = null,
+    /// The prelude `Option[T]`/`Result[T,E]` template enum ids (M23); key native
+    /// inherent-method recognition on an `.app` receiver via `optResultFamily`.
+    option_enum: ?u32 = null,
+    result_enum: ?u32 = null,
+
+    /// The native-enum family of an `App` ctor (M23): `.option`/`.result` when `ctor` is the
+    /// prelude Option/Result TEMPLATE id, else `.none`. A user `enum Option` shadow has its
+    /// own distinct id (never the prelude template id), so the native path stays silent on it.
+    pub fn optResultFamily(p: Prelude, ctor: u32) LayoutEngine.NativeEnumFamily {
+        if (p.option_enum) |oid| if (oid == ctor) return .option;
+        if (p.result_enum) |rid| if (rid == ctor) return .result;
+        return .none;
+    }
+
+    /// Whether `pid` is one of the four structurally-derivable prelude protocols
+    /// (Eq/Ord/Hash/Display) — the only protocols a struct/enum can satisfy WITHOUT an
+    /// explicit `impl` (M18-M22). A custom/parameterized protocol always requires an impl.
+    pub fn isDerivable(p: Prelude, pid: u32) bool {
+        inline for (.{ p.protocols.eq, p.protocols.ord, p.protocols.hash, p.protocols.display }) |maybe| {
+            if (maybe) |x| if (x == pid) return true;
+        }
+        return false;
+    }
+};
 
 /// The ONE disambiguation the three method-dispatch consumers (BodyChecker types, lower
 /// symbols, AstWalk fingerprint) share, so all three select the IDENTICAL witness (a
@@ -665,9 +694,7 @@ pub fn optionResultMethod(family: LayoutEngine.NativeEnumFamily, name: []const u
 /// has its own distinct id (never equals the prelude template id), so the native path
 /// stays silent on it.
 pub fn optResultFamilyOf(model: *const Model, ctor: u32) LayoutEngine.NativeEnumFamily {
-    if (model.option_enum_id) |oid| if (oid == ctor) return .option;
-    if (model.result_enum_id) |rid| if (rid == ctor) return .result;
-    return .none;
+    return if (model.prelude) |p| p.optResultFamily(ctor) else .none;
 }
 
 /// Whether the ground type `recv` conforms to protocol `pid` (M13). A pure,
@@ -690,12 +717,7 @@ pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args:
 /// bound on one is never discharged structurally. Gates the M21 structural bound-resolution
 /// fallback in `enqueueInstance` (a `[T has Ord]` bound satisfied by a derive-only struct).
 fn isDerivableProtocol(model: *const Model, pid: u32) bool {
-    inline for (.{ model.eq_protocol_id, model.ord_protocol_id, model.hash_protocol_id, model.display_protocol_id }) |maybe| {
-        if (maybe) |p| {
-            if (p == pid) return true;
-        }
-    }
-    return false;
+    return if (model.prelude) |p| p.isDerivable(pid) else false;
 }
 
 /// A recorded derive request (M18): "type `conform_ty` should structurally derive
@@ -1093,77 +1115,13 @@ protocols: std.ArrayList(ProtocolSym) = .empty,
 /// `registerPrelude` BEFORE any user impl, so `checkCoherence` collides a duplicate.
 conformances: std.ArrayList(Conformance) = .empty,
 
-/// The global protocol id of the prelude `Eq` protocol (M12), assigned in
-/// `registerPrelude` (Phase 0c, before the per-module `registerProtocols` loop, so it
-/// is always id 0). A bare `Eq` reference that misses the active module map falls back
-/// to this id in `protocolIdFromNode` — the "universal, no import" prelude naming. Null
-/// until `registerPrelude` runs (single-file internal callers that skip it stay null).
-eq_protocol_id: ?u32 = null,
-
-/// The global protocol id of the prelude `Ord` protocol (M16), assigned in
-/// `registerPrelude` right after `Eq` (so `Ord` is always id 1). A bare `Ord` reference
-/// that misses the active module map falls back to this id in `protocolIdFromNode`
-/// (mirroring the `Eq` fallback). Null until `registerPrelude` runs.
-ord_protocol_id: ?u32 = null,
-
-/// The global enum id of the prelude `Ordering{lt,eq,gt}` enum (M16), assigned in
-/// `registerPrelude` (an AST-less, hand-laid-out `EnumSym` appended after the user
-/// enums). Injected (if-absent) into every module's `enum_ids` map so `Ordering` is
-/// universally nameable with no import. Null until `registerPrelude` runs.
-ordering_enum_id: ?u32 = null,
-
-/// The global enum ids of the prelude generic value enums `Option[T]`/`Result[T,E]`
-/// (M23), assigned in `registerPrelude` (the two AST-less generic TEMPLATE `EnumSym`s
-/// appended at the very end). They key native-method recognition: a `.app` receiver
-/// whose ctor equals one of these carries the compiler-provided `is_some`/`unwrap`/…
-/// inherent methods, and `reifyAppToEnum` stamps each reified instance's
-/// `native_family` off them. Null until `registerPrelude` runs (a prelude-less internal
-/// caller stays null, so the native path never fires there).
-option_enum_id: ?u32 = null,
-result_enum_id: ?u32 = null,
-
-/// The global protocol ids of the prelude arithmetic protocols `Add`/`Sub`/`Mul`/`Div`
-/// (M17), assigned in `registerPrelude` right after `Ord` in fixed append order (so
-/// Add=2, Sub=3, Mul=4, Div=5 — a pure function of source). Each maps one operator
-/// (`+`/`-`/`*`/`/`) to a homogeneous `fn m(self, other: Self) -> Self`. A bare
-/// `Add`/… reference that misses the active module map falls back to these ids in
-/// `protocolIdFromNode` (mirroring the `Eq`/`Ord` fallbacks). Null until `registerPrelude`
-/// runs; a null id denies conformance (-> T0028) rather than miscompiling.
-add_protocol_id: ?u32 = null,
-sub_protocol_id: ?u32 = null,
-mul_protocol_id: ?u32 = null,
-div_protocol_id: ?u32 = null,
-
-/// The global protocol id of the prelude `Hash` protocol (M20), assigned in
-/// `registerPrelude` right after `Div` in fixed append order (so Hash=6 — a pure
-/// function of source). `protocol Hash { fn hash(self) -> int }`, native scalar
-/// conformances for int/bool/str/unit; drives on-demand structural `Hash` derive at a
-/// `.hash()` call / `[T has Hash]` bound. A bare `Hash` reference that misses the active
-/// module map falls back to this id in `protocolIdFromNode` (mirroring the `Eq`/`Ord`
-/// fallbacks). Null until `registerPrelude` runs; a null id denies conformance.
-hash_protocol_id: ?u32 = null,
-
-/// The global protocol id of the prelude `Display` protocol (M22), assigned in
-/// `registerPrelude` right after `Hash` in fixed append order (so Display=7 — a pure
-/// function of source). `protocol Display { fn display(self) }` (unit ret), native
-/// scalar conformances for int/bool/str/unit; drives on-demand structural `Display`
-/// derive at a `print(x)` site / `[T has Display]` bound. A bare `Display` reference
-/// that misses the active module map falls back to this id in `protocolIdFromNode`
-/// (mirroring the `Eq`/`Ord`/`Hash` fallbacks). Null until `registerPrelude` runs; a
-/// null id denies conformance.
-display_protocol_id: ?u32 = null,
-
-/// The global protocol id of the prelude `From` protocol (M25), assigned in
-/// `registerPrelude` right after `Display` in fixed append order (so From=8 — a pure
-/// function of source). `protocol From[Src] { fn from(v: Src) -> Self }` — the ONLY
-/// prelude protocol with a self-LESS method (its sole `type_var(1)` param is `Src`, its
-/// `type_var(0)` return is `Self`); it has NO builtin conformance and is NOT structurally
-/// derivable (`From` always needs an explicit impl). `typeOfTry` keys the `?`-error-widen
-/// check off this: a `Result[T,BigErr]` fn may `?` a `Result[T,SmallErr]` iff `BigErr has
-/// From[SmallErr]`. A bare `From` reference that misses the active module map falls back
-/// to this id in `protocolIdFromNode`. Null until `registerPrelude` runs; a null id denies
-/// the widen (keeping the existing T0033 mismatch) rather than miscompiling.
-from_protocol_id: ?u32 = null,
+/// The prelude protocol/enum ids (M12-M25), populated incrementally by `registerPrelude`
+/// in fixed append order (Eq=0..From=8; `Ordering`/`Option`/`Result` enums after every user
+/// type — a pure function of source). Each id doubles as the "universal, no import" fallback
+/// in `protocolIdFromNode` for a bare `Eq`/`Ord`/… that names no module protocol. `null` for
+/// a single-file internal caller that skips `registerPrelude`, so every operator/derive/native
+/// path denies conformance (-> T0026/27/28/…) rather than miscompiling. See `Prelude`.
+prelude: ?Prelude = null,
 
 /// The receiver `Type` of the method currently being decoded/checked, so a `Self`
 /// type-ref resolves to it (via `refs.typeFromNode`'s `selfType` hook). Set around
@@ -1318,44 +1276,19 @@ pub const Model = struct {
     /// the parallel body pass. Read-only; no M11 Pass-C consumer (sets up M13).
     protocols: []const ProtocolSym,
     conformances: []const Conformance,
-    /// The prelude `Eq` protocol's global id (M15), or null if `registerPrelude` never
-    /// ran (a narrow internal caller). The BodyChecker's `==`/`!=` typing keys the
-    /// operand's Eq-conformance check off this; a null id denies conformance (-> T0026)
-    /// rather than miscompiling, so the operator path is safe on any prelude-less caller.
-    eq_protocol_id: ?u32,
-    /// The prelude `Ord` protocol's global id (M16), or null if `registerPrelude` never
-    /// ran. `conformsToOrd` keys the `<`/`>`/`<=`/`>=` typing off this; a null id denies
-    /// conformance (-> T0027) rather than miscompiling.
-    ord_protocol_id: ?u32,
-    /// The prelude `Ordering` enum's global id (M16), or null if `registerPrelude` never
-    /// ran. Reserved for downstream consumers that need the discriminant enum type.
-    ordering_enum_id: ?u32,
-    /// The prelude `Option`/`Result` template enum ids (M23), or null if `registerPrelude`
-    /// never ran. `optResultFamilyOf` keys native inherent-method recognition off these on
-    /// an `.app` receiver; a null id denies the native path (a scalar/user enum reports
-    /// T0018) rather than miscompiling.
-    option_enum_id: ?u32,
-    result_enum_id: ?u32,
-    /// The prelude arithmetic protocol ids (M17): `Add`/`Sub`/`Mul`/`Div`, or null if
-    /// `registerPrelude` never ran. `conformsToArith` keys the `+`/`-`/`*`/`/` typing off
-    /// the matching one; a null id denies conformance (-> T0028) rather than miscompiling.
-    add_protocol_id: ?u32,
-    sub_protocol_id: ?u32,
-    mul_protocol_id: ?u32,
-    div_protocol_id: ?u32,
-    /// The prelude `Hash` protocol's global id (M20), or null if `registerPrelude` never
-    /// ran. `conformsToHash` keys the `.hash()` method-call trigger off this; a null id
-    /// denies conformance (a scalar/struct/enum reports T0018) rather than miscompiling.
-    hash_protocol_id: ?u32,
-    /// The prelude `Display` protocol's global id (M22), or null if `registerPrelude` never
-    /// ran. `conformsToDisplay` keys the `print(x)` builtin trigger off this; a null id
-    /// denies conformance (-> T0031) rather than miscompiling.
-    display_protocol_id: ?u32,
-    /// The prelude `From` protocol's global id (M25), or null if `registerPrelude` never
-    /// ran. `typeOfTry` keys the `?`-error-widen check off this (`findConformance(From, RetErr,
-    /// [OpErr])`); a null id denies the widen (keeping the existing T0033 mismatch) rather
-    /// than miscompiling.
-    from_protocol_id: ?u32,
+    /// The prelude protocol/enum ids (M12-M25), frozen from the checker, or `null` if
+    /// `registerPrelude` never ran (a narrow internal caller). Every `==`/`<`/arith/
+    /// `.hash()`/`print`/`?`/native-method path keys off it; `null` denies conformance
+    /// (-> T0026/27/28/…) rather than miscompiling. See `Prelude`; the embedded protocol
+    /// bundle is fetched via `preludeProtocols`.
+    prelude: ?Prelude,
+
+    /// The nine desugaring-witness protocol ids (all-null for a prelude-less caller). The
+    /// operator/derive typing reads each id through this so a missing prelude denies
+    /// conformance rather than early-returning.
+    pub fn preludeProtocols(model: *const Model) PreludeProtocolIds {
+        return if (model.prelude) |p| p.protocols else .{};
+    }
 };
 
 const BodyChecker = @import("BodyChecker.zig").BodyChecker;
@@ -1372,18 +1305,7 @@ fn buildModel(t: *Typecheck) Model {
         .methods = t.methods.items,
         .protocols = t.protocols.items,
         .conformances = t.conformances.items,
-        .eq_protocol_id = t.eq_protocol_id,
-        .ord_protocol_id = t.ord_protocol_id,
-        .ordering_enum_id = t.ordering_enum_id,
-        .option_enum_id = t.option_enum_id,
-        .result_enum_id = t.result_enum_id,
-        .add_protocol_id = t.add_protocol_id,
-        .sub_protocol_id = t.sub_protocol_id,
-        .mul_protocol_id = t.mul_protocol_id,
-        .div_protocol_id = t.div_protocol_id,
-        .hash_protocol_id = t.hash_protocol_id,
-        .display_protocol_id = t.display_protocol_id,
-        .from_protocol_id = t.from_protocol_id,
+        .prelude = t.prelude,
     };
 }
 
@@ -2616,32 +2538,17 @@ pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         // A user protocol of the same name shadows the prelude (active map is consulted
         // first); a bare `Eq` that names no module protocol falls back to the prelude id.
         if (t.activeProtocolMap().get(name)) |id| return id;
-        if (t.eq_protocol_id) |eid| {
-            if (std.mem.eql(u8, name, "Eq")) return eid;
-        }
-        if (t.ord_protocol_id) |oid| {
-            if (std.mem.eql(u8, name, "Ord")) return oid;
-        }
-        if (t.add_protocol_id) |aid| {
-            if (std.mem.eql(u8, name, "Add")) return aid;
-        }
-        if (t.sub_protocol_id) |sid| {
-            if (std.mem.eql(u8, name, "Sub")) return sid;
-        }
-        if (t.mul_protocol_id) |mid| {
-            if (std.mem.eql(u8, name, "Mul")) return mid;
-        }
-        if (t.div_protocol_id) |did| {
-            if (std.mem.eql(u8, name, "Div")) return did;
-        }
-        if (t.hash_protocol_id) |hid| {
-            if (std.mem.eql(u8, name, "Hash")) return hid;
-        }
-        if (t.display_protocol_id) |pid| {
-            if (std.mem.eql(u8, name, "Display")) return pid;
-        }
-        if (t.from_protocol_id) |pid| {
-            if (std.mem.eql(u8, name, "From")) return pid;
+        if (t.prelude) |p| {
+            const pr = p.protocols;
+            if (pr.eq) |id| if (std.mem.eql(u8, name, "Eq")) return id;
+            if (pr.ord) |id| if (std.mem.eql(u8, name, "Ord")) return id;
+            if (pr.add) |id| if (std.mem.eql(u8, name, "Add")) return id;
+            if (pr.sub) |id| if (std.mem.eql(u8, name, "Sub")) return id;
+            if (pr.mul) |id| if (std.mem.eql(u8, name, "Mul")) return id;
+            if (pr.div) |id| if (std.mem.eql(u8, name, "Div")) return id;
+            if (pr.hash) |id| if (std.mem.eql(u8, name, "Hash")) return id;
+            if (pr.display) |id| if (std.mem.eql(u8, name, "Display")) return id;
+            if (pr.from) |id| if (std.mem.eql(u8, name, "From")) return id;
         }
         return null;
     }
@@ -2698,6 +2605,9 @@ pub fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
 /// duplicate user `impl int has Eq`. The `methods` slice is `gpa`-allocated (never a
 /// comptime literal) so the teardown free loop treats it uniformly with a user protocol.
 fn registerPrelude(t: *Typecheck) !void {
+    // Materialize the aggregate up front so the per-protocol registration below can fill
+    // its ids in place; a caller that skips `registerPrelude` leaves it null.
+    t.prelude = .{};
     const eq_methods = try t.gpa.alloc([]const u8, 1);
     eq_methods[0] = "eq";
     // Decoded signature `eq(self, other: Self) -> bool` (M13): Self = `type_var(0)`, so
@@ -2712,7 +2622,7 @@ fn registerPrelude(t: *Typecheck) !void {
     const eq_rets = try t.gpa.alloc(Type, 1);
     eq_rets[0] = Type.bool;
     const eq_id: u32 = @intCast(t.protocols.items.len);
-    t.eq_protocol_id = eq_id;
+    t.prelude.?.protocols.eq = eq_id;
     try t.protocols.append(t.gpa, .{
         .name = "Eq",
         .mod = 0,
@@ -2744,7 +2654,7 @@ fn registerPrelude(t: *Typecheck) !void {
     ord_vars[1] = .{ .name = "eq", .form = .unit };
     ord_vars[2] = .{ .name = "gt", .form = .unit };
     const ordering_id: u32 = @intCast(t.enums.items.len);
-    t.ordering_enum_id = ordering_id;
+    t.prelude.?.ordering_enum = ordering_id;
     try t.enums.append(t.gpa, .{
         .decl_node = Ast.none,
         .name = "Ordering",
@@ -2775,7 +2685,7 @@ fn registerPrelude(t: *Typecheck) !void {
     const ord_rets = try t.gpa.alloc(Type, 1);
     ord_rets[0] = Type.enumT(ordering_id);
     const ord_id: u32 = @intCast(t.protocols.items.len);
-    t.ord_protocol_id = ord_id;
+    t.prelude.?.protocols.ord = ord_id;
     try t.protocols.append(t.gpa, .{
         .name = "Ord",
         .mod = 0,
@@ -2800,10 +2710,10 @@ fn registerPrelude(t: *Typecheck) !void {
     // heap roadmap), so `str + str`/`bool + bool` fall to T0028 rather than a silent heap op.
     // All slices gpa-allocated (never comptime literals) so teardown frees them uniformly.
     const arith = [_]struct { proto: []const u8, method: []const u8, id: *?u32 }{
-        .{ .proto = "Add", .method = "add", .id = &t.add_protocol_id },
-        .{ .proto = "Sub", .method = "sub", .id = &t.sub_protocol_id },
-        .{ .proto = "Mul", .method = "mul", .id = &t.mul_protocol_id },
-        .{ .proto = "Div", .method = "div", .id = &t.div_protocol_id },
+        .{ .proto = "Add", .method = "add", .id = &t.prelude.?.protocols.add },
+        .{ .proto = "Sub", .method = "sub", .id = &t.prelude.?.protocols.sub },
+        .{ .proto = "Mul", .method = "mul", .id = &t.prelude.?.protocols.mul },
+        .{ .proto = "Div", .method = "div", .id = &t.prelude.?.protocols.div },
     };
     for (arith) |a| {
         const methods = try t.gpa.alloc([]const u8, 1);
@@ -2842,7 +2752,7 @@ fn registerPrelude(t: *Typecheck) !void {
     const hash_rets = try t.gpa.alloc(Type, 1);
     hash_rets[0] = Type.int;
     const hash_id: u32 = @intCast(t.protocols.items.len);
-    t.hash_protocol_id = hash_id;
+    t.prelude.?.protocols.hash = hash_id;
     try t.protocols.append(t.gpa, .{
         .name = "Hash",
         .mod = 0,
@@ -2875,7 +2785,7 @@ fn registerPrelude(t: *Typecheck) !void {
     const disp_rets = try t.gpa.alloc(Type, 1);
     disp_rets[0] = Type.unit;
     const disp_id: u32 = @intCast(t.protocols.items.len);
-    t.display_protocol_id = disp_id;
+    t.prelude.?.protocols.display = disp_id;
     try t.protocols.append(t.gpa, .{
         .name = "Display",
         .mod = 0,
@@ -2914,7 +2824,7 @@ fn registerPrelude(t: *Typecheck) !void {
     const from_rets = try t.gpa.alloc(Type, 1);
     from_rets[0] = Type.typeVar(0);
     const from_id: u32 = @intCast(t.protocols.items.len);
-    t.from_protocol_id = from_id;
+    t.prelude.?.protocols.from = from_id;
     try t.protocols.append(t.gpa, .{
         .name = "From",
         .mod = 0,
@@ -2984,8 +2894,8 @@ fn registerPrelude(t: *Typecheck) !void {
         .generic_params = result_gparams,
     });
 
-    t.option_enum_id = option_id;
-    t.result_enum_id = result_id;
+    t.prelude.?.option_enum = option_id;
+    t.prelude.?.result_enum = result_id;
 
     // Universally nameable with no import (the `Ordering`/`print` precedent): inject into
     // every module's enum map, if-absent so a user `enum Option`/`Result` shadow wins.
