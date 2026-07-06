@@ -304,23 +304,15 @@ fn collectGlobals(g: *GraphResolve) !void {
     for (g.tables) |*t| {
         if (!t.fns.contains("print")) try t.fns.put(g.gpa, "print", print_id);
     }
-    // The prelude `enum Ordering { lt, eq, gt }` (M16) is nameable in every module with no
-    // import (the `print` precedent). Register it into each module's enum table UNLESS the
-    // module declares its own `Ordering` (user-first-wins), so `Ordering.lt` construction and
-    // a match on it resolve quietly (left for Typecheck, which native-registers the enum). The
-    // typecheck-time `enum_ids` injection in `registerPrelude` mirrors this on its own tables.
+    // The prelude enums (`Ordering` M16; generic value enums `Option`/`Result` M23) are nameable
+    // in every module with no import (the `print` precedent). Register each into a module's enum
+    // table UNLESS the module declares its own (user-first-wins), so their construction/match
+    // resolve quietly (left for Typecheck, which native-registers the enums). The typecheck-time
+    // `enum_ids` injection in `registerPrelude` mirrors this on its own tables.
     for (g.tables) |*t| {
-        if (!t.enums.contains("Ordering")) try t.enums.put(g.gpa, "Ordering", true);
-    }
-    // The prelude generic value enums `Option`/`Result` (M23) are likewise nameable in every
-    // module with no import (`Option.some(..)` / `Option[int].none` / a bare `.none` under a
-    // target). Register into each module's enum table UNLESS the module declares its own
-    // (user-first-wins), mirroring `Ordering`; Typecheck native-registers the enum itself.
-    for (g.tables) |*t| {
-        if (!t.enums.contains("Option")) try t.enums.put(g.gpa, "Option", true);
-    }
-    for (g.tables) |*t| {
-        if (!t.enums.contains("Result")) try t.enums.put(g.gpa, "Result", true);
+        for ([_][]const u8{ "Ordering", "Option", "Result" }) |name| {
+            if (!t.enums.contains(name)) try t.enums.put(g.gpa, name, true);
+        }
     }
 }
 
