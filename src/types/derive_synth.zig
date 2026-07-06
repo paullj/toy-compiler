@@ -248,7 +248,6 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             .recv = d.conform_ty,
             .name = Derive.methodName(d.kind),
             .fn_id = 0,
-            .recv_generic = false,
             .protocol_id = d.protocol_id,
             .derive = @intCast(di),
         });
