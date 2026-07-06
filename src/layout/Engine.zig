@@ -366,10 +366,10 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     errdefer env.gpa.free(types);
     const offsets = try env.gpa.alloc(u32, n);
     errdefer env.gpa.free(offsets);
+    const sizing = try env.gpa.alloc(Type, n);
+    defer env.gpa.free(sizing);
 
-    var running: u32 = 0;
-    var max_align: u32 = 1;
-    var poisoned = false;
+    var unit_poison = false;
     for (field_nodes, 0..) |field_idx, i| {
         const field = tree.nodes[field_idx.int()];
         names[i] = env.nameText(env.ctx, field.main_token);
@@ -382,28 +382,22 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         // — the mono-tail rewrite turns both into the reified `structT`/`enumT` before
         // the snapshot. `reifyApp` returns the concrete type directly (M6).
         const size_ty: Type = if (fty.isApp()) try env.reifyApp(env.ctx, fty.appIdx()) else fty;
-        var fsize: u32 = 0;
-        var falign: u32 = 1;
         if (size_ty.kind == .unit) {
             try env.emitUnitField(env.ctx, env.byteOf(env.ctx, field.main_token), names[i]);
-            poisoned = true;
-        } else if (size_ty.kind != .invalid) {
-            const sz = try layoutReferent(env, size_ty, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name, &poisoned);
-            fsize = sz.size;
-            falign = sz.@"align";
+            unit_poison = true;
         }
-        const off = roundUp(running, falign);
-        offsets[i] = off;
-        running = off + fsize;
-        if (falign > max_align) max_align = falign;
+        sizing[i] = size_ty;
     }
+
+    const acc = try accumulateOffsets(env, sizing, offsets, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name);
+    const poisoned = acc.poisoned or unit_poison or empty_poison;
 
     env.structs.items[id].field_names = names;
     env.structs.items[id].field_types = types;
     env.structs.items[id].offsets = offsets;
-    env.structs.items[id].@"align" = max_align;
-    env.structs.items[id].size = if (poisoned or empty_poison) 0 else roundUp(running, max_align);
-    env.structs.items[id].poisoned = poisoned or empty_poison;
+    env.structs.items[id].@"align" = acc.@"align";
+    env.structs.items[id].size = if (poisoned) 0 else acc.size;
+    env.structs.items[id].poisoned = poisoned;
     env.structs.items[id].state = .done;
 }
 
@@ -430,27 +424,12 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
     const offsets = try env.gpa.alloc(u32, types.len);
     errdefer env.gpa.free(offsets);
 
-    var running: u32 = 0;
-    var max_align: u32 = 1;
-    var poisoned = false;
-    for (types, 0..) |fty, i| {
-        var fsize: u32 = 0;
-        var falign: u32 = 1;
-        if (fty.kind != .invalid and fty.kind != .unit) {
-            const sz = try layoutReferent(env, fty, at, name, &poisoned);
-            fsize = sz.size;
-            falign = sz.@"align";
-        }
-        const off = roundUp(running, falign);
-        offsets[i] = off;
-        running = off + fsize;
-        if (falign > max_align) max_align = falign;
-    }
+    const acc = try accumulateOffsets(env, types, offsets, at, name);
 
     env.structs.items[id].offsets = offsets;
-    env.structs.items[id].@"align" = max_align;
-    env.structs.items[id].size = if (poisoned) 0 else roundUp(running, max_align);
-    env.structs.items[id].poisoned = poisoned;
+    env.structs.items[id].@"align" = acc.@"align";
+    env.structs.items[id].size = if (acc.poisoned) 0 else acc.size;
+    env.structs.items[id].poisoned = acc.poisoned;
     env.structs.items[id].state = .done;
 }
 
@@ -484,27 +463,13 @@ pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
     for (variants) |*v| {
         const foffs = try env.gpa.alloc(u32, v.field_types.len);
         errdefer env.gpa.free(foffs);
-        var running: u32 = 0;
-        var palign: u32 = 1;
-        for (v.field_types, 0..) |fty, pi| {
-            var psize: u32 = 0;
-            var pa: u32 = 1;
-            if (fty.kind != .invalid and fty.kind != .unit) {
-                const sz = try layoutReferent(env, fty, at, name, &poisoned);
-                psize = sz.size;
-                pa = sz.@"align";
-            }
-            const off = roundUp(running, pa);
-            foffs[pi] = off;
-            running = off + psize;
-            if (pa > palign) palign = pa;
-        }
-        const payload_size = roundUp(running, palign);
+        const acc = try accumulatePayload(env, v.field_types, foffs, at, name);
+        poisoned = poisoned or acc.poisoned;
         v.offsets = foffs;
-        v.payload_size = payload_size;
-        v.payload_align = palign;
-        if (payload_size > max_payload_size) max_payload_size = payload_size;
-        if (palign > max_payload_align) max_payload_align = palign;
+        v.payload_size = acc.size;
+        v.payload_align = acc.@"align";
+        if (acc.size > max_payload_size) max_payload_size = acc.size;
+        if (acc.@"align" > max_payload_align) max_payload_align = acc.@"align";
     }
 
     const tag_size: u32 = 8;
@@ -544,6 +509,45 @@ fn layoutReferent(env: Env, ty: Type, at: u32, requester: []const u8, requester_
         },
         else => return .{ .size = scalarSize(ty.kind), .@"align" = scalarAlign(ty.kind) },
     }
+}
+
+const Accum = struct { size: u32, @"align": u32, poisoned: bool };
+
+/// The one per-field ABI offset formula, shared by the direct (`layoutStruct`) and
+/// reified (`layoutReified`) struct paths so their reg-pair↔indirect boundary can never
+/// drift apart. Each `sizing_types[i]` is placed at the next `roundUp(running, align)`
+/// byte into `offsets_out[i]`; the aggregate `size = roundUp(total, max_align)` and
+/// `align` fall out. A `laying` struct/enum referent poisons via `layoutReferent`
+/// (surfaced in `.poisoned`); a `unit`/`invalid` sizing type contributes nothing. The
+/// caller must have already reified any `App` and emitted any unit diagnostic — the
+/// kernel is diagnostic-free (bar the recursion diagnostic intrinsic to `layoutReferent`).
+fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, at: u32, requester: []const u8) error{OutOfMemory}!Accum {
+    std.debug.assert(offsets_out.len == sizing_types.len);
+    var running: u32 = 0;
+    var max_align: u32 = 1;
+    var poisoned = false;
+    for (sizing_types, 0..) |sty, i| {
+        var fsize: u32 = 0;
+        var falign: u32 = 1;
+        if (sty.kind != .invalid and sty.kind != .unit) {
+            const sz = try layoutReferent(env, sty, at, requester, &poisoned);
+            fsize = sz.size;
+            falign = sz.@"align";
+        }
+        const off = roundUp(running, falign);
+        offsets_out[i] = off;
+        running = off + fsize;
+        if (falign > max_align) max_align = falign;
+    }
+    return .{ .size = roundUp(running, max_align), .@"align" = max_align, .poisoned = poisoned };
+}
+
+/// An enum variant's payload lays out with the exact same formula as struct fields
+/// (payload-LOCAL offsets, size = roundUp(total, max_align)); the distinct name keeps the
+/// two enum payload callers (`layoutEnum`/`layoutReifiedEnum`) reading naturally while
+/// sharing the one kernel.
+fn accumulatePayload(env: Env, sizing_types: []const Type, offsets_out: []u32, at: u32, requester: []const u8) error{OutOfMemory}!Accum {
+    return accumulateOffsets(env, sizing_types, offsets_out, at, requester);
 }
 
 /// Lay out enum `id`: an 8-byte tag at offset 0, then payload storage sized to the
@@ -606,8 +610,8 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
         const foffs = try env.gpa.alloc(u32, np);
         errdefer env.gpa.free(foffs);
 
-        var running: u32 = 0;
-        var palign: u32 = 1;
+        const sizing = try env.gpa.alloc(Type, np);
+        defer env.gpa.free(sizing);
         for (payload_nodes, 0..) |pnode_idx, pi| {
             // A tuple payload node is a type-ref; a struct payload node is a `param`
             // (name + type-ref in lhs).
@@ -624,34 +628,26 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             // rewrite turns it into the reified `structT`/`enumT` before the snapshot, so
             // no `App` survives into the enum layout/fingerprint.
             const size_ty: Type = if (pty.isApp()) try env.reifyApp(env.ctx, pty.appIdx()) else pty;
-            var psize: u32 = 0;
-            var pa: u32 = 1;
             if (size_ty.kind == .unit) {
                 try env.emitUnitPayload(env.ctx, env.byteOf(env.ctx, vnode.main_token), vname);
                 poisoned = true;
-            } else if (size_ty.kind != .invalid) {
-                const sz = try layoutReferent(env, size_ty, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name, &poisoned);
-                psize = sz.size;
-                pa = sz.@"align";
             }
-            const off = roundUp(running, pa);
-            foffs[pi] = off;
-            running = off + psize;
-            if (pa > palign) palign = pa;
+            sizing[pi] = size_ty;
         }
-        const payload_size = roundUp(running, palign);
+        const acc = try accumulatePayload(env, sizing, foffs, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name);
+        poisoned = poisoned or acc.poisoned;
         variants[vi] = .{
             .name = vname,
             .form = form,
             .field_names = fnames,
             .field_types = ftypes,
             .offsets = foffs,
-            .payload_size = payload_size,
-            .payload_align = palign,
+            .payload_size = acc.size,
+            .payload_align = acc.@"align",
         };
         vbuilt += 1;
-        if (payload_size > max_payload_size) max_payload_size = payload_size;
-        if (palign > max_payload_align) max_payload_align = palign;
+        if (acc.size > max_payload_size) max_payload_size = acc.size;
+        if (acc.@"align" > max_payload_align) max_payload_align = acc.@"align";
     }
 
     const tag_size: u32 = 8;
