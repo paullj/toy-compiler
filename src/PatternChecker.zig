@@ -264,7 +264,7 @@ fn orCoversTyApp(bc: *BodyChecker, or_idx: Ast.Index, ty: Type) error{OutOfMemor
     const eid = bc.scrutEnumId(ty) orelse return false;
     const e = bc.model.enums[eid];
     const targs = bc.composite.at(ty.appIdx()).args;
-    var seen = [_]bool{false} ** 64; // matches ControlFlow's cap
+    var seen = [_]bool{false} ** ControlFlow.max_cover_variants;
     if (e.variants.len > seen.len) return false;
     for (alts) |a| {
         const ap = bc.tree.nodes[(a).int()];
