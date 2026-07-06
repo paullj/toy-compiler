@@ -2,7 +2,7 @@
 //!
 //! A source file is a sequence of function declarations; each function has a
 //! parameter list, an optional `-> Type`, and a brace-delimited block of
-//! statements (`name:= expr`, `name = expr`, `return expr?`, or a bare
+//! statements (`name := expr`, `name = expr`, `return expr?`, or a bare
 //! expression statement). Statements are separated by the lexer-inserted
 //! `.newline` terminator (Go-style ASI); a terminator before `}` or EOF is
 //! optional. Expressions are parsed by precedence climbing, extended with a
@@ -109,8 +109,8 @@ const pattern_first = setOf(&.{ .identifier, .number, .kw_true, .kw_false, .dot 
 const stmt_first = expr_first.unionWith(setOf(&.{ .kw_while, .kw_for, .kw_break, .kw_continue, .kw_return }));
 /// FOLLOW(param) ∪ decl_anchors: own closer `)`, `->` (ret), `{` (body start).
 const param_recovery = setOf(&.{ .r_paren, .arrow, .l_brace }).unionWith(decl_anchors);
-/// FOLLOW(elem) ∪ decl_anchors for `(...)` comma lists. No newline: newlines
-/// are NOT skipped inside `()` today — a newline there stays garbage (deleted).
+/// FOLLOW(elem) ∪ decl_anchors for `( ... )` comma lists. No newline: newlines
+/// are NOT skipped inside `( )` today — a newline there stays garbage (deleted).
 const tuple_recovery = setOf(&.{ .r_paren, .comma }).unionWith(decl_anchors);
 /// FOLLOW(field) ∪ decl_anchors for `{ ... }` item lists. Comma AND newline are
 /// both legal separators inside braces (loop-top `skipNewlines` handles newline).
@@ -121,7 +121,7 @@ const variant_recovery = field_recovery;
 const arm_recovery = field_recovery;
 /// FOLLOW(generic param/arg) ∪ decl_anchors for a `[ .. ]` generic list: own
 /// closer `]`, separator `,`. No newline (a `[ .. ]` list stays on one line, like
-/// the `(..)` param list).
+/// the `( .. )` param list).
 const generic_recovery = setOf(&.{ .r_bracket, .comma }).unionWith(decl_anchors);
 /// `findNextStmt`'s STOP set (at the block's brace-depth). Must contain `.newline`
 /// so a post-recovery `expectTerminator` does NOT spuriously cascade (resync lands
@@ -158,7 +158,7 @@ comptime {
 /// grammar has no nested declarations, so `fn`/`struct`/`enum`/`import`/`pub`
 /// never legitimately appears inside a balanced brace/paren region. Depth-gating
 /// this stop (as the nested-block-aware `findNextStmt` must) would let an
-/// UNbalanced stray `{` — e.g. the trailing `{` of `fn f())) {` — inflate the
+/// UNbalanced stray `{` — e.g. the trailing `{` of `fn f( ) ) ) {` — inflate the
 /// counter and swallow the next real `fn g`. Making decls a hard anchor keeps
 /// recovery landing on the next declaration regardless.
 fn findNextDecl(p: *Parser) void {
@@ -188,7 +188,7 @@ fn findNextStmt(p: *Parser) void {
             // boundary — the same resync signal `expectTerminator`'s success arms
             // give — so clear the cascade latch: the NEXT statement's first error
             // must report. (When `expectTerminator` itself fails on a still-
-            // unconsumed closer like `return)`, the block loop recovers via THIS
+            // unconsumed closer like `return )`, the block loop recovers via THIS
             // scan instead of the terminator's clear arm, so the clear has to live
             // here too or an independent error on the following line is swallowed.)
             // A stmt-FIRST/decl stop is deliberately NOT a clear: it can be the tail
@@ -1653,7 +1653,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
         // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
         // of a block/struct-literal), DELETING it (advanceWithError) would break
         // that construct's closing `expect` and cascade — one missing operand
-        // (`g(1 +)`, or a trailing `:=`/`+` before `}`) would spray a diagnostic
+        // (`g(1 + )`, or a trailing `:=`/`+` before `}`) would spray a diagnostic
         // per unfinished ancestor. So report the missing expression and return an
         // `error_node` WITHOUT consuming: the enclosing arg/group/block loop then
         // sees its closer (its anchor branch breaks, its `expect` consumes it),
@@ -1712,7 +1712,7 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             // `Name { ... }` literal / variant construction — only when blocks are
             // allowed and `lhs` is a bare name (struct), an inferred `.V`
             // (struct-variant), or a `field_access` (qualified `N.V`). The call/
-            // group `()` reset `no_block`, so `f(P{x:1})` works.
+            // group `( )` reset `no_block`, so `f(P{x:1})` works.
             .l_brace => {
                 if (p.no_block) break;
                 const ltag = p.nodes.items[lhs.int()].tag;
@@ -1818,7 +1818,7 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     p.bump(.l_paren);
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
-    // The call's `()` open a fresh expression context, so re-allow blocks/if-exprs
+    // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
@@ -2092,7 +2092,7 @@ fn advanceWithError(p: *Parser, code: Code, message: []const u8) Error!Ast.Index
 //       parse (>=1 diagnostic, i.e. an `error_node` in the tree) imbalance is
 //       allowed — recovery captured the syntax error. So the invariant is
 //       "balanced OR the parse produced error nodes", which must NOT false-trip on
-//       the adversarial-recovery corpus (e.g. `fn f())) {`).
+//       the adversarial-recovery corpus (e.g. `fn f( ) ) ) {`).
 
 /// The post-parse invariant sweep (see the section header). Asserts (panics) on a
 /// violation; only compiled where `std.debug.runtime_safety` is true.
@@ -3020,7 +3020,7 @@ test "trailing-expression body parses with a trailing expr_stmt" {
 }
 
 test "block/if expr in a call argument inside an if condition (call reopens block context)" {
-    // `no_block` is set parsing the condition, but the call's `()` open a fresh
+    // `no_block` is set parsing the condition, but the call's `( )` open a fresh
     // expression context — the `{ 1 }` argument must parse, not error.
     try expectProgram(
         "fn g(x: int) -> int { x }\nfn main() -> int {\n if g({ 1 }) > 0 { 7 } else { 8 }\n}\n",
@@ -3412,7 +3412,7 @@ fn renderResult(res: Result, source: []const u8, buf: []u8) ![]const u8 {
 }
 
 test "two independent errors in one file both report and both decls survive" {
-    // `return)` in a, `return)` in b — two INDEPENDENT broken statements, one per
+    // `return )` in a, `return )` in b — two INDEPENDENT broken statements, one per
     // decl. Each stray `)` in return-value position is the cascade signature (a
     // structural closer in a statement value slot): before the cascade fix each site
     // sprayed TWO diagnostics ("expected an expression" + "expected a newline or
@@ -3443,7 +3443,7 @@ test "two independent errors in one file both report and both decls survive" {
 }
 
 test "a stray ')' in return-value position yields exactly one diagnostic (no cascade)" {
-    // The confirmed cascade defect: `return)` — a structural closer where an
+    // The confirmed cascade defect: `return )` — a structural closer where an
     // expression is expected. parsePrefix reports "expected an expression" and
     // returns an error_node WITHOUT consuming the `)`; before the cascade latch the
     // unconsumed `)` then tripped expectTerminator into a SECOND spurious "expected a
@@ -3463,7 +3463,7 @@ test "a stray ')' in return-value position yields exactly one diagnostic (no cas
 }
 
 test "a stray ')' after '=' assignment value yields exactly one diagnostic (no cascade)" {
-    // The same cascade signature across a different statement form: `x =)`. Proves
+    // The same cascade signature across a different statement form: `x = )`. Proves
     // the fix is systematic (not special-cased to `return`), collapsing the
     // parsePrefix + expectTerminator pair over the unconsumed `)` to ONE diagnostic.
     const gpa = testing.allocator;
@@ -3477,7 +3477,7 @@ test "a stray ')' after '=' assignment value yields exactly one diagnostic (no c
 }
 
 test "two adjacent broken statements (no good stmt between) each report — no over-suppression" {
-    // Over-suppression regression guard. `return)` on line 2 and `x =)` on line 3
+    // Over-suppression regression guard. `return )` on line 2 and `x = )` on line 3
     // are two INDEPENDENT sites on distinct lines with NO valid statement between
     // them. The first site's stray `)` is left unconsumed, so recovery goes through
     // `findNextStmt` (not `expectTerminator`'s clean newline arm). If the cascade
@@ -3502,7 +3502,7 @@ test "two adjacent broken statements (no good stmt between) each report — no o
 }
 
 test "a valid statement between two broken sites still yields exactly two diagnostics" {
-    // The complementary guard: a well-formed statement (`y:= 1`) between the two
+    // The complementary guard: a well-formed statement (`y := 1`) between the two
     // broken sites must NOT itself add a diagnostic, and both broken sites must
     // still report — exactly two total. Proves the latch clears cleanly across a
     // successful statement without either over-reporting or over-suppressing.
@@ -3516,7 +3516,7 @@ test "a valid statement between two broken sites still yields exactly two diagno
     for (res.diags) |d| try testing.expectEqualStrings("expected an expression", d.message);
 }
 
-test "adversarial `fn f())) {` terminates (no hang) and yields a tree" {
+test "adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
     // The anti-hang backstop: this must RETURN (a hanging test is the failure),
     // yield a non-empty program tree, and report at least one diagnostic.
     const gpa = testing.allocator;
@@ -3545,7 +3545,7 @@ test "adversarial garbage recovers to a following well-formed decl" {
 }
 
 test "a broken statement recovers to the next statement" {
-    // `return)` is a broken statement (stray `)`); `y:= 2` and the final
+    // `return )` is a broken statement (stray `)`); `y := 2` and the final
     // `return` must still parse — a broken statement does not poison its siblings.
     const gpa = testing.allocator;
     const source = "fn f() {\n  return )\n  y := 2\n  return\n}\n";
@@ -3563,7 +3563,7 @@ test "a broken statement recovers to the next statement" {
 }
 
 test "a broken decl recovers to the next decl" {
-    // `fn a({ }` is a malformed decl; `fn b` must still parse.
+    // `fn a( { }` is a malformed decl; `fn b` must still parse.
     const gpa = testing.allocator;
     const source = "fn a( { }\nfn b() -> int { 0 }\n";
     const res = try parseResult(gpa, source);
@@ -3592,7 +3592,7 @@ test "one root error yields exactly one diagnostic (no cascade)" {
 }
 
 test "a missing call operand before ')' yields exactly one diagnostic (no closer-delete cascade)" {
-    // `g(1 +)` — the RHS of `+` is missing and the next token is the call's own
+    // `g(1 + )` — the RHS of `+` is missing and the next token is the call's own
     // `)`. parsePrefix must NOT delete that `)` (doing so would break the call's
     // closing `expect`, then the block's, spraying a diagnostic per open ancestor).
     // It returns an error_node without consuming, so the arg loop sees `)`, breaks,
@@ -3609,7 +3609,7 @@ test "a missing call operand before ')' yields exactly one diagnostic (no closer
 }
 
 test "a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete cascade)" {
-    // `x:= \n}` — the trailing `:=` suppresses the newline, so the initializer's
+    // `x := \n}` — the trailing `:=` suppresses the newline, so the initializer's
     // parsePrefix lands on the block's `}`. Deleting it would swallow the block
     // closer and add a spurious "expected '}'"; instead the error_node is returned
     // without consuming, `expectTerminator` accepts the implicit `}`, and the block
@@ -3625,7 +3625,7 @@ test "a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete
 }
 
 test "a broken call argument list reports and resyncs without hanging" {
-    // `g(1,, 3)` — the doubled comma is a tuple_recovery anchor, so the arg loop
+    // `g(1, , 3)` — the doubled comma is a tuple_recovery anchor, so the arg loop
     // breaks and the trailing `expect(.r_paren)` fails at the stray comma; the
     // block-statement loop then resyncs to the next statement (`3`). The call is
     // abandoned rather than repaired in place, but recovery is bounded: parsing
@@ -3795,7 +3795,7 @@ const codes = @import("diagnostics/codes.zig");
 test "parse diagnostics carry P-codes by syntactic category" {
     const gpa = testing.allocator;
 
-    // Expression position: `return)` => expected-expression => P0002.
+    // Expression position: `return )` => expected-expression => P0002.
     {
         const res = try parseResult(gpa, "fn a() -> int {\n  return )\n}\n");
         defer gpa.free(@constCast(res.diags));
@@ -3952,7 +3952,7 @@ test "a clean parse has balanced brackets and no error node" {
     checkBracketPairing(res.tree, tokens, res.diags);
 }
 
-test "the adversarial `fn f())) {` recovers with imbalance TOLERATED" {
+test "the adversarial `fn f( ) ) ) {` recovers with imbalance TOLERATED" {
     // The load-bearing case: the token stream is bracket-IMBALANCED (three `)` vs
     // one `(`, one unclosed `{`), yet the parse must not false-trip the pairing
     // invariant because it recovered (>=1 diagnostic / error_node). `parse()` runs

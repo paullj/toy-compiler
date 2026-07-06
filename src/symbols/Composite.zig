@@ -74,6 +74,8 @@ pub fn deinit(c: *Composite, gpa: std.mem.Allocator) void {
 /// own interned index (via `struct_id`), and a `.type_var` arg its ordinal — so the
 /// key is injective within a run (inner `App`s interned first).
 fn writeFlatKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ctor: u32, args: []const Type, ctor_is_enum: bool) !void {
+    // Struct and enum ctor ids share one index space, so the leading discriminator
+    // byte keeps struct#N and enum#N from aliasing to the same key.
     try buf.append(gpa, @intFromBool(ctor_is_enum));
     var w: [4]u8 = undefined;
     std.mem.writeInt(u32, &w, ctor, .little);

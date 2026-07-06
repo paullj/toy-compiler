@@ -108,7 +108,7 @@ pub const Node = extern struct {
         /// Postfix `callee(args...)`. `main_token` is `(`. `lhs` is the callee
         /// expression node. `rhs` is the `extra` header of an args `Range`.
         call,
-        /// `name:= expr`. `main_token` is the name identifier. `lhs` is the
+        /// `name := expr`. `main_token` is the name identifier. `lhs` is the
         /// initializer expression. `rhs` is `none`.
         var_decl,
         /// `name = expr`. `main_token` is the name identifier. `lhs` is the
@@ -390,7 +390,7 @@ pub const Range = struct { start: u32, len: u32 };
 /// `extra`: `{ret_type_node, params_start, params_len, generic_start, generic_len}`.
 /// The layout is ADDITIVE: cells 0-2 are unchanged, so every existing decode site
 /// that reads `.ret_type`/`.params` is byte-identical; cells 3-4 carry the
-/// (usually empty) generic-param run appended in .
+/// (usually empty) generic-param run appended.
 pub const FnProto = struct {
     /// type-ref node naming the return type, or `none` for unit `()`.
     ret_type: Index,
