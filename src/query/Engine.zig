@@ -540,9 +540,6 @@ pub fn codegen(
     tmp_tag: usize,
     slot: anytype,
 ) !void {
-    const cache = self.cache;
-    const mode = self.mode;
-
     // Gather this fn's callee sigs (in walk order) and touched types for the
     // fingerprint. The walk order is the body's call order; `walkCalls` mirrors
     // `Fingerprint`'s walk so the supplied order matches.
@@ -585,16 +582,57 @@ pub fn codegen(
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).
     const key = Key.codegen(target, fp, frozen.opt, sym);
 
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        frozen: @TypeOf(frozen),
+        fn_decl: Ast.Index,
+        sym: Link.SymName,
+        is_entry: bool,
+        my_sig: ?Fingerprint.Sig,
+    };
+    return self.serve(gpa, io, key, tmp_tag, slot, Ctx{
+        .gpa = gpa,
+        .frozen = frozen,
+        .fn_decl = fn_decl,
+        .sym = sym,
+        .is_entry = is_entry,
+        .my_sig = my_sig,
+    }, struct {
+        fn f(c: Ctx, opt_out: ?*OptOut) !Link.FnCode {
+            return lowerOne(c.gpa, c.frozen, c.fn_decl, c.sym, c.is_entry, c.my_sig, opt_out);
+        }
+    }.f);
+}
+
+/// The cache/verify/fresh-lower state machine both codegen paths share. Given a
+/// folded content `key` and a `lowerFresh(ctx, opt_out)` closure, it honors
+/// `self.mode`:
+///   * `.verify` — always re-lower fresh and audit the packed bytes against a
+///     reference (a cache HIT compares the stored blob for cache-soundness; a MISS
+///     lowers a SECOND time and requires the two fresh lowerings agree, for pure
+///     determinism). The checks are REAL runtime comparisons returning an error on
+///     mismatch — NOT `std.debug.assert`, which compiles out under ReleaseFast/Small
+///     and would make the whole safety net silently no-op in a release build.
+///   * `.normal` — serve the prior blob on a content-fp cache hit, else lower fresh.
+///   * `.force` — skip the cache and lower fresh.
+/// The `--timings` probe laps are gated on `self.probe != null`, so a plain build
+/// reads no clock.
+fn serve(
+    self: Engine,
+    gpa: std.mem.Allocator,
+    io: Io,
+    key: anytype,
+    tmp_tag: usize,
+    slot: anytype,
+    ctx: anytype,
+    comptime lowerFresh: anytype,
+) !void {
+    const cache = self.cache;
+    const mode = self.mode;
+
     if (mode == .verify) {
-        // Determinism + cache-soundness gate. ALWAYS re-lower the fn fresh and
-        // check its packed FnCode bytes against a reference:
-        //   * cache HIT  -> compare against the stored blob (cache soundness).
-        //   * cache MISS -> compare against a SECOND fresh lowering (determinism).
-        // The checks are REAL runtime comparisons that return an error on mismatch —
-        // NOT `std.debug.assert`, which compiles out under ReleaseFast/Small and would
-        // make the whole safety net silently no-op in a release build.
         var opt_out: OptOut = .{};
-        var fresh = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
+        var fresh = try lowerFresh(ctx, &opt_out);
         errdefer fresh.deinit(gpa);
         const fb = try Link.pack(gpa, fresh);
         defer gpa.free(fb);
@@ -605,14 +643,11 @@ pub fn codegen(
             if (!std.mem.eql(u8, fb, blob)) return error.VerifyCacheMismatch;
             was_cached = true;
         } else {
-            // Cold: no reference blob to compare against, so lower a second time
-            // and require the two fresh lowerings agree (pure determinism).
-            var fresh2 = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, null);
+            var fresh2 = try lowerFresh(ctx, null);
             defer fresh2.deinit(gpa);
             const fb2 = try Link.pack(gpa, fresh2);
             defer gpa.free(fb2);
             if (!std.mem.eql(u8, fb, fb2)) return error.VerifyNondeterministic;
-            // Populate the cache so subsequent fns/runs see a primed entry.
             cache.put(u8, io, key, tmp_tag, fb) catch {};
         }
         // A verify build re-lowers fresh, so it has honest opt stats even on a
@@ -636,7 +671,7 @@ pub fn codegen(
 
     var opt_out: OptOut = .{};
     const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
-    var fc = try lowerOne(gpa, frozen, fn_decl, sym, is_entry, my_sig, &opt_out);
+    var fc = try lowerFresh(ctx, &opt_out);
     if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
     errdefer fc.deinit(gpa);
     if (Link.pack(gpa, fc) catch null) |b| {
@@ -707,8 +742,6 @@ pub fn codegenSynthetic(
     tmp_tag: usize,
     slot: anytype,
 ) !void {
-    const cache = self.cache;
-    const mode = self.mode;
     const d = frozen.derives[di];
     const sym = Link.SymName{ .kind = .user_fn, .name = d.name };
 
@@ -725,48 +758,22 @@ pub fn codegenSynthetic(
     const fp = Fingerprint.deriveFingerprint(d.protocol_name, d.kind, conform, d.field_witnesses);
     const key = Key.codegen(target, fp, frozen.opt, sym);
 
-    if (mode == .verify) {
-        var opt_out: OptOut = .{};
-        var fresh = try lowerSynthetic(gpa, frozen, d, sym, &opt_out);
-        errdefer fresh.deinit(gpa);
-        const fb = try Link.pack(gpa, fresh);
-        defer gpa.free(fb);
-
-        var was_cached = false;
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
-            defer gpa.free(blob);
-            if (!std.mem.eql(u8, fb, blob)) return error.VerifyCacheMismatch;
-            was_cached = true;
-        } else {
-            var fresh2 = try lowerSynthetic(gpa, frozen, d, sym, null);
-            defer fresh2.deinit(gpa);
-            const fb2 = try Link.pack(gpa, fresh2);
-            defer gpa.free(fb2);
-            if (!std.mem.eql(u8, fb, fb2)) return error.VerifyNondeterministic;
-            cache.put(u8, io, key, tmp_tag, fb) catch {};
+    const Ctx = struct {
+        gpa: std.mem.Allocator,
+        frozen: @TypeOf(frozen),
+        d: @TypeOf(d),
+        sym: Link.SymName,
+    };
+    return self.serve(gpa, io, key, tmp_tag, slot, Ctx{
+        .gpa = gpa,
+        .frozen = frozen,
+        .d = d,
+        .sym = sym,
+    }, struct {
+        fn f(c: Ctx, opt_out: ?*OptOut) !Link.FnCode {
+            return lowerSynthetic(c.gpa, c.frozen, c.d, c.sym, opt_out);
         }
-        slot.* = .{ .fc = fresh, .cached = was_cached, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
-        return;
-    }
-
-    if (mode != .force) {
-        if (cache.get(u8, gpa, io, key) catch null) |blob| {
-            defer gpa.free(blob);
-            if (Link.unpack(gpa, blob) catch null) |fc| {
-                slot.* = .{ .fc = fc, .cached = true };
-                return;
-            }
-        }
-    }
-
-    var opt_out: OptOut = .{};
-    var fc = try lowerSynthetic(gpa, frozen, d, sym, &opt_out);
-    errdefer fc.deinit(gpa);
-    if (Link.pack(gpa, fc) catch null) |b| {
-        defer gpa.free(b);
-        cache.put(u8, io, key, tmp_tag, b) catch {};
-    }
-    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
+    }.f);
 }
 
 const testing = std.testing;
