@@ -13,6 +13,13 @@
 //! a callee BODY change must NOT recompile its callers (their fingerprint
 //! is unchanged), but a callee SIGNATURE change MUST (their fingerprint flips).
 //!
+//! EMPTY-COMPONENT INVARIANT: every OPTIONAL fold (the monomorphization type-args,
+//! the resolved bound conformances, and each conformance's protocol type-args) is
+//! gated on `len > 0`, so an absent component folds NOTHING. A fn that lacks it
+//! hashes byte-identically to a compiler that never had the component at all, so its
+//! warm-cache entry survives. Each such fold is ORDERED (count sentinel + per-element
+//! leaves), never XOR, never a build-local index.
+//!
 //! The (a) body walk is defined ONCE in `AstWalk`; here `AstWalk.HashVisitor`
 //! folds its event stream. The walk's two correctness invariants (which this fold
 //! relies on) live with the walk:
@@ -42,7 +49,7 @@ pub const TouchedType = struct {
     layout: []const u8 = &.{},
 };
 
-/// A resolved `[T has P]` bound witnessing an instance's conformance (M13), folded
+/// A resolved `[T has P]` bound witnessing an instance's conformance, folded
 /// as the ordered `(e)` component below. `conform` is the conforming type's index-free
 /// layout descriptor (built by the SAME `appendTouched` the type-arg fold uses);
 /// `witness_syms` are the witnessing method SymNames in protocol-declared order — NOT
@@ -53,11 +60,11 @@ pub const ResolvedConformance = struct {
     protocol_name: []const u8,
     conform: TouchedType,
     witness_syms: []const []const u8,
-    /// The protocol type-args of this conformance (M14, `Into[int]` -> `[int]`), each an
+    /// The protocol type-args of this conformance (`Into[int]` -> `[int]`), each an
     /// index-free layout descriptor built by the SAME `appendTouched` the type-arg fold
     /// uses. Folded ordered (never XOR) into the (e) component so an `Into[int]` ->
     /// `Into[bool]` edit flips the dependent instance's fingerprint (stale-witness guard).
-    /// Empty for a non-generic protocol -> that conformance folds byte-identically to M13.
+    /// Empty for a non-generic protocol (see the empty-component invariant).
     protocol_args: []const TouchedType = &.{},
 };
 
@@ -80,21 +87,16 @@ pub fn fingerprint(
     fn_decl: Ast.Index,
     callee_sigs: []const Sig,
     touched: []const TouchedType,
-    /// (d) The concrete type-args of a monomorphized instance (M2), in
-    /// generic-param order — each an index-free layout descriptor built by
-    /// `appendTouched`. Empty for every non-generic (non-instance) fn: the fold is
-    /// then SKIPPED ENTIRELY, so an existing fn's fingerprint is byte-identical and
-    /// the warm cache is preserved. Two instances of one template get distinct
-    /// fingerprints even when the template body/sig folds are identical.
+    /// (d) The concrete type-args of a monomorphized instance, in generic-param
+    /// order — each an index-free layout descriptor built by `appendTouched`. Two
+    /// instances of one template get distinct fingerprints even when the template
+    /// body/sig folds are identical.
     type_args: []const TouchedType,
-    /// (e) The resolved `[T has P]` bound conformances of a monomorphized instance
-    /// (M13), in generic-param order — each folding the witnessing impl's STRUCTURAL
-    /// identity (protocol name + conforming-type layout + witness SymNames), NOT its
-    /// body-fp. Empty for every non-bounded (fn/instance): the fold is then SKIPPED
-    /// ENTIRELY, so every existing fp is byte-identical and the warm cache is
-    /// preserved. This is the incremental-correctness core the M15+ operator branch
-    /// depends on: toggling a sibling-module conformance flips exactly the dependent
-    /// monomorphizations' keys.
+    /// (e) The resolved `[T has P]` bound conformances of a monomorphized instance,
+    /// in generic-param order — each folding the witnessing impl's STRUCTURAL identity
+    /// (protocol name + conforming-type layout + witness SymNames), NOT its body-fp.
+    /// This is the incremental-correctness core: toggling a sibling-module conformance
+    /// flips exactly the dependent monomorphizations' keys.
     conformances: []const ResolvedConformance,
 ) u64 {
     var h = std.hash.Wyhash.init(seed);
@@ -129,11 +131,10 @@ pub fn fingerprint(
         if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
     }
 
-    // (d) monomorphization type-args. Folded ONLY when present (an instance), so a
-    // non-generic fn's fold is byte-identical — the warm cache survives M2. Ordered
-    // (a `[T,U]` reorder flips it) with a full per-arg layout descriptor so `id[int]`
-    // and `id[Point]` diverge and a struct-layout edit to a type-arg invalidates
-    // exactly the dependent instance. Never XOR, never the interned index.
+    // (d) monomorphization type-args (see the empty-component invariant). A `[T,U]`
+    // reorder flips it, and a full per-arg layout descriptor makes `id[int]` and
+    // `id[Point]` diverge and a struct-layout edit to a type-arg invalidate exactly
+    // the dependent instance.
     if (type_args.len > 0) {
         AstWalk.updateU32(&h, @intCast(type_args.len));
         for (type_args) |ty| {
@@ -142,14 +143,12 @@ pub fn fingerprint(
         }
     }
 
-    // (e) resolved bound conformances (M13). Folded ONLY when present (a bounded
-    // instance), so every non-bounded fp is byte-identical (warm cache preserved).
-    // ORDERED (count sentinel + per-conformance leaves in generic-param order, then
-    // witness SymNames in protocol-declared order); never XOR, never a build-local
-    // index — only the source-borrowed protocol NAME, the conforming type's layout
-    // descriptor (mirroring (c)/(d)), and the witnessing method mangled SymNames. This
-    // is the stale-cache-miscompile guard: a conformance edit (witness or conforming
-    // layout) flips exactly the dependent monomorphization's key.
+    // (e) resolved bound conformances (see the empty-component invariant). Per
+    // conformance, in generic-param order: the source-borrowed protocol NAME, the
+    // conforming type's layout descriptor (mirroring (c)/(d)), then the witnessing
+    // method mangled SymNames in protocol-declared order. This is the
+    // stale-cache-miscompile guard: a conformance edit (witness or conforming layout)
+    // flips exactly the dependent monomorphization's key.
     if (conformances.len > 0) {
         AstWalk.updateU32(&h, @intCast(conformances.len));
         for (conformances) |rc| {
@@ -158,9 +157,8 @@ pub fn fingerprint(
             if (rc.conform.kind == .@"struct" or rc.conform.kind == .@"enum") AstWalk.updateLeaf(&h, rc.conform.layout);
             AstWalk.updateU32(&h, @intCast(rc.witness_syms.len));
             for (rc.witness_syms) |w| AstWalk.updateLeaf(&h, w);
-            // (M14) The conformance's protocol type-args, ordered + structural (mirroring
-            // (d)); gated `len > 0` so a non-generic-protocol conformance folds
-            // byte-identically to M13 (warm cache preserved). NEVER XOR / interned index.
+            // The conformance's protocol type-args, structural (mirroring (d));
+            // see the empty-component invariant.
             if (rc.protocol_args.len > 0) {
                 AstWalk.updateU32(&h, @intCast(rc.protocol_args.len));
                 for (rc.protocol_args) |pa| {
@@ -174,12 +172,12 @@ pub fn fingerprint(
     return h.final();
 }
 
-/// The distinct seed for a SOURCE-LESS derive unit (M18). Different from `seed` so a
+/// The distinct seed for a SOURCE-LESS derive unit. Different from `seed` so a
 /// derive fingerprint can never alias a real fn's body-walk fingerprint even if the
 /// folded bytes happened to coincide.
 const derive_seed: u64 = 0x44_52_56_46; // "DRVF"
 
-/// The NON-AST fingerprint of a source-less auto-derive codegen unit (M18). There is
+/// The NON-AST fingerprint of a source-less auto-derive codegen unit. There is
 /// no `fn_decl` to walk, so the key is built ENTIRELY from the recipe: a distinct
 /// derive seed + the derive kind + the protocol name + the conforming type's
 /// index-free layout descriptor (the SAME encoding the (c)/(d) touched fold uses) +
@@ -551,7 +549,7 @@ test "adding a nested sub-pattern flips the hash" {
     try testing.expect(fp(&a, 1) != fp(&b, 1));
 }
 
-test "type-args fold: id[int] and id[Point] get distinct fingerprints (M2)" {
+test "type-args fold: id[int] and id[Point] get distinct fingerprints" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn id(x: int) -> int {\n return x\n}\n");
     defer b.deinit(gpa);
@@ -572,7 +570,7 @@ test "type-args fold: empty type_args is byte-identical to no fold (warm cache p
     const decl = b.fnDecl(0);
     // The (d) fold is CONDITIONAL on a non-empty slice, so an empty type_args folds
     // NOTHING and a non-generic fn's fingerprint is stable across calls — the warm
-    // cache survives M2. (A pre-M2 blob keyed on the same fp still hits.)
+    // cache survives (a blob keyed on the same fp still hits).
     const a = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     const c = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     try testing.expectEqual(a, c);
@@ -622,8 +620,8 @@ test "conformance fold (e): empty conformances is byte-identical to no fold (war
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
     // The (e) fold is CONDITIONAL on a non-empty slice, so an empty conformances folds
-    // NOTHING — a non-bounded fn's fingerprint is byte-identical to the pre-M13 fold,
-    // preserving the warm cache. Both a plain call and the (d)+(e) call must agree.
+    // NOTHING — a non-bounded fn's fingerprint is byte-identical to a compiler with no
+    // conformance fold, preserving the warm cache. A plain call and the (d)+(e) call agree.
     const none1 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     const none2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &.{});
     try testing.expectEqual(none1, none2);
@@ -673,7 +671,7 @@ test "conformance fold (e): identical conformances hash identically (cache hit)"
     try testing.expectEqual(h1, h2);
 }
 
-test "conformance fold (e) M14: a protocol-args change (Into[int] -> Into[bool]) flips the fp" {
+test "conformance fold (e) a protocol-args change (Into[int] -> Into[bool]) flips the fp" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
     defer b.deinit(gpa);
@@ -691,7 +689,7 @@ test "conformance fold (e) M14: a protocol-args change (Into[int] -> Into[bool])
     try testing.expect(h_int != h_bool);
 }
 
-test "conformance fold (e) M14: identical protocol-args hash identically" {
+test "conformance fold (e) identical protocol-args hash identically" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
     defer b.deinit(gpa);
@@ -706,7 +704,7 @@ test "conformance fold (e) M14: identical protocol-args hash identically" {
     try testing.expectEqual(h1, h2);
 }
 
-test "deriveFingerprint: a conform-layout edit flips the derive unit's key (M18)" {
+test "deriveFingerprint: a conform-layout edit flips the derive unit's key" {
     // Same protocol/kind/witnesses; only the conforming type's layout bytes differ (a
     // field added). The (c)-style layout fold must separate them, or an edited struct
     // serves a stale derived-eq blob.
@@ -717,7 +715,7 @@ test "deriveFingerprint: a conform-layout edit flips the derive unit's key (M18)
     try testing.expect(h1 != h2);
 }
 
-test "deriveFingerprint: a field-witness swap flips the key (nested override guard, M18)" {
+test "deriveFingerprint: a field-witness swap flips the key (nested override guard)" {
     // Same layout; a nested aggregate field's resolved witness changes (e.g. the field
     // type gained an explicit impl, so its witness SymName differs). Must flip the key.
     const cf = TouchedType{ .kind = .@"struct", .layout = "Outer\x00inner" };
@@ -742,7 +740,7 @@ test "deriveFingerprint: identical recipe hashes identically (cache hit) + struc
     try testing.expect(deriveFingerprint("Eq", .eq, cf, &w) != deriveFingerprint("Eq", .eq, en, &w));
 }
 
-test "deriveFingerprint M19: an Ord recipe's key differs by kind and flips on a cmp_call swap" {
+test "deriveFingerprint an Ord recipe's key differs by kind and flips on a cmp_call swap" {
     const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
     // Same protocol name + layout + a scalar witness, but `.eq` vs `.ord` kind: the kind
     // marker separates the two units (an `Eq$eq$s0` and an `Ord$cmp$s0` never alias).
@@ -758,7 +756,7 @@ test "deriveFingerprint M19: an Ord recipe's key differs by kind and flips on a 
     try testing.expectEqual(deriveFingerprint("Ord", .ord, cf, &w1), deriveFingerprint("Ord", .ord, cf, &w1));
 }
 
-test "deriveFingerprint M20: a Hash recipe's key differs by kind and flips on a hash_call swap" {
+test "deriveFingerprint a Hash recipe's key differs by kind and flips on a hash_call swap" {
     const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
     // Same protocol name + layout + a scalar witness, but the `.hash` kind separates the
     // unit from the Eq/Ord units (a `Hash$hash$s0` never aliases an `Eq$eq$s0`/`Ord$cmp$s0`).
@@ -776,7 +774,7 @@ test "deriveFingerprint M20: a Hash recipe's key differs by kind and flips on a 
     try testing.expectEqual(deriveFingerprint("Hash", .hash, cf, &w1), deriveFingerprint("Hash", .hash, cf, &w1));
 }
 
-test "deriveFingerprint M22: a Display recipe's key differs by kind and flips on a display_call swap" {
+test "deriveFingerprint a Display recipe's key differs by kind and flips on a display_call swap" {
     const cf = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
     // Same protocol name + layout + a scalar witness, but the `.display` kind separates the
     // unit from the Eq/Ord/Hash units (a `Display$display$s0` never aliases the others).
@@ -795,14 +793,14 @@ test "deriveFingerprint M22: a Display recipe's key differs by kind and flips on
     try testing.expectEqual(deriveFingerprint("Display", .display, cf, &w1), deriveFingerprint("Display", .display, cf, &w1));
 }
 
-test "conformance fold (e) M14: empty protocol-args is byte-identical to a pre-M14 fold" {
+test "conformance fold (e) empty protocol-args folds nothing (byte-identical)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
     const w = [_][]const u8{"lib.P.dbl"};
     // A non-generic-protocol conformance leaves `protocol_args` empty; the `len > 0` gate
-    // must make its (e) fold byte-identical to an M13 conformance that never had the field.
+    // must make its (e) fold byte-identical to a conformance that never had the field.
     const rc_default = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w }};
     const rc_empty = [1]ResolvedConformance{.{ .protocol_name = "Doubler", .conform = .{ .kind = .@"struct", .layout = "P\x00x" }, .witness_syms = &w, .protocol_args = &.{} }};
     const h_default = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_default);

@@ -108,7 +108,7 @@ pub const Node = extern struct {
         /// Postfix `callee(args...)`. `main_token` is `(`. `lhs` is the callee
         /// expression node. `rhs` is the `extra` header of an args `Range`.
         call,
-        /// `name := expr`. `main_token` is the name identifier. `lhs` is the
+        /// `name:= expr`. `main_token` is the name identifier. `lhs` is the
         /// initializer expression. `rhs` is `none`.
         var_decl,
         /// `name = expr`. `main_token` is the name identifier. `lhs` is the
@@ -278,14 +278,14 @@ pub const Node = extern struct {
         /// `.error_node` is `unreachable`.
         error_node,
 
-        // Generics front-end (M1). Appended at the END (frozen ordinals; `[]Node`
+        // Generics front-end. Appended at the END (frozen ordinals; `[]Node`
         // is memcpy'd to/from the content cache; `ParseHeader.version` bumped on
         // this change). Both PARSE into a well-formed tree but Typecheck rejects
         // them wholesale with T0013 before any lower/codegen — no semantics attach.
 
         /// A declared type parameter `T` in a `[T, U]` generic-param list.
         /// `main_token` is the param name identifier. `rhs` is `none`. `lhs` is
-        /// `none` for an unbounded param, or (M13) a bound protocol-reference node
+        /// `none` for an unbounded param, or a bound protocol-reference node
         /// (`identifier` / `field_access` dot-chain) for `[T has P]` / `[T has mod.P]`.
         generic_param,
         /// A type application `Base[Arg, ..]` — in TYPE position (`Box[int]`) or
@@ -295,7 +295,7 @@ pub const Node = extern struct {
         /// over the type-argument nodes.
         type_app,
 
-        // Inherent methods (M8). Appended at the END (frozen ordinal; `[]Node` is
+        // Inherent methods. Appended at the END (frozen ordinal; `[]Node` is
         // memcpy'd to/from the content cache; `ParseHeader.version` bumped 6->7 on
         // this change). An `impl` block desugars each method to an ordinary
         // `fn_decl` with a synthesized `self: <Receiver>` first param, so lower /
@@ -307,7 +307,7 @@ pub const Node = extern struct {
         /// `Range` over the method `fn_decl` nodes (in declaration order).
         impl_decl,
 
-        // Protocols + conformance (M11). Appended at the END (frozen ordinals;
+        // Protocols + conformance. Appended at the END (frozen ordinals;
         // `[]Node` is memcpy'd to/from the content cache; `ParseHeader.version`
         // bumped 8->9 on this change). A protocol declares signature-only methods;
         // an `impl T has P` block conforms a concrete type to a protocol. Each
@@ -318,8 +318,8 @@ pub const Node = extern struct {
         /// `main_token` is the protocol-name identifier token. `lhs` is the `extra`
         /// header of a `Range` over the bodyless method-signature `fn_decl` nodes.
         /// `rhs` is the `extra` header of a `Range` over the protocol's generic-param
-        /// `generic_param` nodes (M14, mirroring struct/enum templates), or `none` for
-        /// a non-generic protocol (keeping every M11/M13 protocol byte-identical). The
+        /// `generic_param` nodes (mirroring struct/enum templates), or `none` for
+        /// a non-generic protocol (keeping every protocol byte-identical). The
         /// method sigs never enter the fn table (collectGlobals ignores `protocol_decl`),
         /// so their synthesized `self` type-ref is inert.
         protocol_decl,
@@ -333,7 +333,7 @@ pub const Node = extern struct {
         /// node, and the method `fn_decl`s live at `extra[start .. start + len]`.
         impl_has_decl,
 
-        // Postfix `?` (M24). Appended at the END (frozen ordinal; `[]Node` is memcpy'd
+        // Postfix `?`. Appended at the END (frozen ordinal; `[]Node` is memcpy'd
         // to/from the content cache; `ParseHeader.version` bumped 11->12 on this change).
         // A `try_expr` is desugared BELOW the parser (in `lower`/`types`) to a match +
         // early-return over an `Option`/`Result` operand, so it carries no semantics of
@@ -390,7 +390,7 @@ pub const Range = struct { start: u32, len: u32 };
 /// `extra`: `{ret_type_node, params_start, params_len, generic_start, generic_len}`.
 /// The layout is ADDITIVE: cells 0-2 are unchanged, so every existing decode site
 /// that reads `.ret_type`/`.params` is byte-identical; cells 3-4 carry the
-/// (usually empty) generic-param run appended in M1.
+/// (usually empty) generic-param run appended in .
 pub const FnProto = struct {
     /// type-ref node naming the return type, or `none` for unit `()`.
     ret_type: Index,
@@ -445,7 +445,7 @@ pub fn protoAt(tree: Tree, header: u32) FnProto {
 }
 
 /// True when the `param` node at `param_idx` is a `mut`-qualified receiver: the
-/// token immediately before its name is `kw_mut` (M9). Token-adjacency detection
+/// token immediately before its name is `kw_mut`. Token-adjacency detection
 /// mirrors the by-text `self`/`_` recognition — no dedicated node/cell, so no
 /// `ParseHeader.version` bump. `tokens` is passed explicitly because a `Tree` holds
 /// only nodes/extra, never the token stream.
@@ -509,7 +509,7 @@ pub fn implMethods(tree: Tree, node: Node) []const Index {
     };
 }
 
-/// The bound protocol-reference node of a `generic_param` (`[T has P]`, M13), stored
+/// The bound protocol-reference node of a `generic_param` (`[T has P]`), stored
 /// in its `lhs` slot — an `identifier` (bare `P`) or a `field_access` chain (`mod.P`).
 /// Null for an unbounded param (`lhs == none`) or a non-`generic_param` node.
 pub fn genericParamBound(tree: Tree, node: Index) ?Index {
@@ -528,7 +528,7 @@ pub fn implProtocol(tree: Tree, node: Node) ?Index {
 }
 
 /// The generic-parameter `generic_param` node indices of a `protocol_decl` (`protocol
-/// Into[U]`, M14), stored as a `Range` in its `rhs` slot — empty for a non-generic
+/// Into[U]`), stored as a `Range` in its `rhs` slot — empty for a non-generic
 /// protocol (`rhs == none`) or a non-`protocol_decl` node. Mirrors the struct/enum
 /// template read (their generic params ride the `rhs` `Range` too).
 pub fn protocolGenericParams(tree: Tree, node: Index) []const Index {
@@ -537,7 +537,7 @@ pub fn protocolGenericParams(tree: Tree, node: Index) []const Index {
     return rangeSlice(tree, n.rhs.int());
 }
 
-/// Unwrap a protocol-reference node (`P` / `mod.P` / `P[int]` / `mod.P[int]`, M14) to
+/// Unwrap a protocol-reference node (`P` / `mod.P` / `P[int]` / `mod.P[int]`) to
 /// its BASE name node — the `identifier`/`field_access` a bare/qualified ref already
 /// is, or the `type_app`'s `lhs` for a generic protocol-ref. `protocolIdFromNode`
 /// resolves the base; `protocolRefArgs` reads the type-args. A bare ref is its own base.
@@ -546,7 +546,7 @@ pub fn protocolRefBase(tree: Tree, node: Index) Index {
     return if (n.tag == .type_app) n.lhs else node;
 }
 
-/// The type-argument node indices of a protocol-reference (`P[int]` -> `[int]`, M14),
+/// The type-argument node indices of a protocol-reference (`P[int]` -> `[int]`),
 /// or empty for a bare/qualified ref (no `[..]`). The args are a `Range` in the
 /// `type_app`'s `rhs`; each element is an ordinary type-ref node resolved by
 /// `typeFromNode`.
@@ -562,37 +562,10 @@ pub const parse_magic: u32 = 0x544f5950;
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
     magic: u32,
-    /// Bumped to 4 to add the trailing `pub_bits` section; older v3 blobs
-    /// (no `pub_bits`) miss cleanly via the version check in `unpack`. Bumped to 5
-    /// when the `error_node` Tag ordinal was appended, so a blob produced by an
-    /// older compiler is rejected rather than reused across the Tag change. Bumped
-    /// to 6 for the M1 generics front-end: the `FnProto` header grew 3->5 cells and
-    /// the `generic_param`/`type_app` Tag ordinals were appended, so a v5 3-cell
-    /// proto read by the 5-cell `protoAt` would alias neighbouring `extra` bytes —
-    /// a v5 blob must miss cleanly. Bumped to 7 for the M8 `impl_decl` Tag ordinal
-    /// appended at the end: a v6 blob predating that tag must miss cleanly rather
-    /// than misdecode a cell whose meaning the new tag changed. Bumped to 8 for the
-    /// M10 generic-impl parse change: an `impl_decl`'s `lhs` may now be a `type_app`
-    /// (`impl Box[T]`) and a method carries an impl-derived `generic_param` run in its
-    /// FnProto (cells 3-4), so a v7 blob — which never produced either shape — must
-    /// miss cleanly rather than feed a stale AST into the M10 method-monomorphizer.
-    /// Bumped to 9 for the M11 protocols front-end: the `protocol_decl` and
-    /// `impl_has_decl` Tag ordinals were appended, and `impl_has_decl` stores a new
-    /// 3-cell header in its `rhs`, so a v8 blob predating these tags must miss cleanly
-    /// rather than misdecode a node whose tag/cell meaning the new tags changed.
-    /// Bumped to 10 for the M13 constrained-generics parse change: a `generic_param`'s
-    /// `lhs` may now carry a bound protocol-ref node (`[T has P]`), where a v9 blob
-    /// always left it `none` — a v9 blob must miss cleanly so a stale parse never feeds
-    /// an unbounded generic-param shape into the M13 bound-resolution machinery.
-    /// Bumped to 11 for the M14 generic-protocols parse change: `protocol_decl`'s `rhs`
-    /// may now carry a generic-param Range (`protocol Into[U]`), and a `type_app` may now
-    /// appear in an `impl .. has P[int]` protocol slot and a `[T has P[int]]` generic-param
-    /// bound — where a v10 blob always left `protocol_decl.rhs` `none` and never wrapped a
-    /// protocol-ref in a `type_app`. A v10 blob must miss cleanly so a stale parse never
-    /// feeds a bare protocol-ref shape into the M14 protocol-args machinery.
-    /// Bumped to 12 for the M24 postfix-`?` parse change: `parsePostfix` may now wrap an
-    /// operand in a `try_expr` node, a `Node.Tag` a v11 blob never held — so a v11 blob
-    /// must miss cleanly rather than misdecode a later tag ordinal.
+    /// Bump on ANY change to the packed encoding — a new/reordered `Node.Tag`
+    /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
+    /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
+    /// misses cleanly instead of misdecoding bytes whose meaning shifted.
     version: u32 = 12,
     node_count: u32,
     extra_count: u32,
@@ -1202,7 +1175,7 @@ test "unpack rejects a v7 blob (pre-generic-impl)" {
     const blob = try pack(gpa, tree);
     defer gpa.free(blob);
     // Rewrite the header `version` field (the second u32) to 7: a blob from a
-    // compiler predating the M10 generic-impl parse change must miss cleanly, not
+    // compiler predating the generic-impl parse change must miss cleanly, not
     // misdecode an `impl`'s receiver / a method's generic run.
     std.mem.writeInt(u32, blob[4..8], 7, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
@@ -1244,7 +1217,7 @@ test "unpack rejects a v8 blob (pre-protocols)" {
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
     const blob = try pack(gpa, tree);
     defer gpa.free(blob);
-    // Rewrite `version` to 8: a blob from a compiler predating the M11 protocol tags
+    // Rewrite `version` to 8: a blob from a compiler predating the protocol tags
     // must miss cleanly, not misdecode an `impl_has_decl`'s 3-cell header.
     std.mem.writeInt(u32, blob[4..8], 8, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
@@ -1281,7 +1254,7 @@ test "unpack rejects a v9 blob (pre-generic-bounds)" {
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
     const blob = try pack(gpa, tree);
     defer gpa.free(blob);
-    // Rewrite `version` to 9: a blob from a compiler predating the M13 generic-bound
+    // Rewrite `version` to 9: a blob from a compiler predating the generic-bound
     // parse change never left a bound in `generic_param.lhs`, so it must miss cleanly.
     std.mem.writeInt(u32, blob[4..8], 9, @import("builtin").cpu.arch.endian());
     try testing.expect((try unpack(gpa, blob)) == null);
@@ -1297,7 +1270,7 @@ test "unpack rejects a v10 blob (pre-generic-protocols)" {
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
     const blob = try pack(gpa, tree);
     defer gpa.free(blob);
-    // Rewrite `version` to 10: a blob from a compiler predating the M14 generic-protocol
+    // Rewrite `version` to 10: a blob from a compiler predating the generic-protocol
     // parse change never carried a `protocol_decl.rhs` generic-param Range nor a
     // `type_app` in a protocol-ref slot, so it must miss cleanly.
     std.mem.writeInt(u32, blob[4..8], 10, @import("builtin").cpu.arch.endian());
@@ -1314,7 +1287,7 @@ test "unpack rejects a v11 blob (pre-try-expr)" {
     const tree = Tree{ .nodes = &nodes, .extra = &extra };
     const blob = try pack(gpa, tree);
     defer gpa.free(blob);
-    // Rewrite `version` to 11: a blob from a compiler predating the M24 postfix-`?` parse
+    // Rewrite `version` to 11: a blob from a compiler predating the postfix-`?` parse
     // change never carried a `try_expr` node, so it must miss cleanly rather than
     // misdecode this tag ordinal.
     std.mem.writeInt(u32, blob[4..8], 11, @import("builtin").cpu.arch.endian());
@@ -1323,7 +1296,7 @@ test "unpack rejects a v11 blob (pre-try-expr)" {
 
 test "pack/unpack round-trips a tree with a try_expr (v12)" {
     const gpa = testing.allocator;
-    // A pure byte round-trip exercising the M24 `try_expr` node (lhs = operand, rhs none).
+    // A pure byte round-trip exercising the `try_expr` node (lhs = operand, rhs none).
     var nodes = [_]Node{
         .{ .tag = .identifier, .main_token = 1, .lhs = none, .rhs = none }, // `o`
         .{ .tag = .try_expr, .main_token = 2, .lhs = Index.from(0), .rhs = none }, // `o?`
@@ -1343,7 +1316,7 @@ test "pack/unpack round-trips a tree with a try_expr (v12)" {
 
 test "pack/unpack round-trips a tree with a generic protocol_decl (v11)" {
     const gpa = testing.allocator;
-    // A pure byte round-trip exercising the M14 `protocol_decl.rhs` generic-param Range.
+    // A pure byte round-trip exercising the `protocol_decl.rhs` generic-param Range.
     var nodes = [_]Node{
         .{ .tag = .generic_param, .main_token = 1, .lhs = none, .rhs = none }, // `U`
         .{ .tag = .protocol_decl, .main_token = 0, .lhs = Index.from(3), .rhs = Index.from(5) },

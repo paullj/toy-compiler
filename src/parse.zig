@@ -2,7 +2,7 @@
 //!
 //! A source file is a sequence of function declarations; each function has a
 //! parameter list, an optional `-> Type`, and a brace-delimited block of
-//! statements (`name := expr`, `name = expr`, `return expr?`, or a bare
+//! statements (`name:= expr`, `name = expr`, `return expr?`, or a bare
 //! expression statement). Statements are separated by the lexer-inserted
 //! `.newline` terminator (Go-style ASI); a terminator before `}` or EOF is
 //! optional. Expressions are parsed by precedence climbing, extended with a
@@ -109,8 +109,8 @@ const pattern_first = setOf(&.{ .identifier, .number, .kw_true, .kw_false, .dot 
 const stmt_first = expr_first.unionWith(setOf(&.{ .kw_while, .kw_for, .kw_break, .kw_continue, .kw_return }));
 /// FOLLOW(param) ∪ decl_anchors: own closer `)`, `->` (ret), `{` (body start).
 const param_recovery = setOf(&.{ .r_paren, .arrow, .l_brace }).unionWith(decl_anchors);
-/// FOLLOW(elem) ∪ decl_anchors for `( ... )` comma lists. No newline: newlines
-/// are NOT skipped inside `( )` today — a newline there stays garbage (deleted).
+/// FOLLOW(elem) ∪ decl_anchors for `(...)` comma lists. No newline: newlines
+/// are NOT skipped inside `()` today — a newline there stays garbage (deleted).
 const tuple_recovery = setOf(&.{ .r_paren, .comma }).unionWith(decl_anchors);
 /// FOLLOW(field) ∪ decl_anchors for `{ ... }` item lists. Comma AND newline are
 /// both legal separators inside braces (loop-top `skipNewlines` handles newline).
@@ -121,7 +121,7 @@ const variant_recovery = field_recovery;
 const arm_recovery = field_recovery;
 /// FOLLOW(generic param/arg) ∪ decl_anchors for a `[ .. ]` generic list: own
 /// closer `]`, separator `,`. No newline (a `[ .. ]` list stays on one line, like
-/// the `( .. )` param list).
+/// the `(..)` param list).
 const generic_recovery = setOf(&.{ .r_bracket, .comma }).unionWith(decl_anchors);
 /// `findNextStmt`'s STOP set (at the block's brace-depth). Must contain `.newline`
 /// so a post-recovery `expectTerminator` does NOT spuriously cascade (resync lands
@@ -158,7 +158,7 @@ comptime {
 /// grammar has no nested declarations, so `fn`/`struct`/`enum`/`import`/`pub`
 /// never legitimately appears inside a balanced brace/paren region. Depth-gating
 /// this stop (as the nested-block-aware `findNextStmt` must) would let an
-/// UNbalanced stray `{` — e.g. the trailing `{` of `fn f( ) ) ) {` — inflate the
+/// UNbalanced stray `{` — e.g. the trailing `{` of `fn f())) {` — inflate the
 /// counter and swallow the next real `fn g`. Making decls a hard anchor keeps
 /// recovery landing on the next declaration regardless.
 fn findNextDecl(p: *Parser) void {
@@ -188,7 +188,7 @@ fn findNextStmt(p: *Parser) void {
             // boundary — the same resync signal `expectTerminator`'s success arms
             // give — so clear the cascade latch: the NEXT statement's first error
             // must report. (When `expectTerminator` itself fails on a still-
-            // unconsumed closer like `return )`, the block loop recovers via THIS
+            // unconsumed closer like `return)`, the block loop recovers via THIS
             // scan instead of the terminator's clear arm, so the clear has to live
             // here too or an independent error on the following line is swallowed.)
             // A stmt-FIRST/decl stop is deliberately NOT a clear: it can be the tail
@@ -388,7 +388,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
         return;
     }
     // `impl` blocks have no `pub` modifier either: a method's export follows its
-    // receiver type, not an `impl`-level keyword (M8 keeps methods module-private).
+    // receiver type, not an `impl`-level keyword (keeps methods module-private).
     if (p.at(.kw_impl)) {
         try decls.append(p.gpa, try p.parseImplDecl());
         return;
@@ -473,12 +473,12 @@ fn parseImport(p: *Parser) Error!Ast.Index {
 ///     `recv_tok` is the impl's receiver type-name token, so a leading bare `self` (a
 ///     plain identifier recognized by TEXT — the `_`-wildcard precedent) is consumed and
 ///     synthesized into `params[0] = self: <Receiver>`. Its type-ref is `self_type_ref`
-///     when the impl supplies one (a `type_app` `Box[T]` for a generic receiver, M10),
-///     else a fresh `identifier` on the receiver token (a bare M8 impl — byte-identical).
+///     when the impl supplies one (a `type_app` `Box[T]` for a generic receiver),
+///     else a fresh `identifier` on the receiver token (a bare impl — byte-identical).
 ///     `impl_gparams` are the impl's generic-param nodes (`[T]`), PREPENDED into this
 ///     method's FnProto generic run so the method becomes a bona-fide generic template
 ///     (its `protoAt().generic_params.len > 0`), monomorphized per (type-instance,
-///     method) exactly like a generic fn. Only `conformance_method` (`impl T has P`, M25)
+///     method) exactly like a generic fn. Only `conformance_method` (`impl T has P`)
 ///     may OMIT the leading `self` (e.g. `fn from(s: Src) -> Self`): the "a method must
 ///     take 'self'" P0006 is suppressed and the T0024 coherence check governs correctness
 ///     against the protocol's sig. `inherent_method` still requires `self`.
@@ -529,14 +529,14 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
 
     var params: std.ArrayList(Ast.Index) = .empty;
     defer params.deinit(p.gpa);
-    // A method's leading `self` receiver (M8): a bare `self` with no `:` annotation
+    // A method's leading `self` receiver: a bare `self` with no `:` annotation
     // (peek2 != colon) is the by-value receiver — synthesize `params[0] = self:
     // <Receiver>` (child nodes created before the fn_decl, so children precede
     // parents). Its type-ref is a synthetic `identifier` on the impl's receiver
     // token. A method with no leading `self` is a static/associated fn, which is out
-    // of scope (M8): report P0006 and keep parsing the rest for recovery.
+    // of scope: report P0006 and keep parsing the rest for recovery.
     if (self_recv_tok) |recv_tok| {
-        // A `mut self` receiver (M9): consume the leading `mut` ONLY when it qualifies
+        // A `mut self` receiver: consume the leading `mut` ONLY when it qualifies
         // `self`, leaving `main_token` on the `self` token so `tokens[self_tok-1]` is
         // `kw_mut` (how `Ast.isMutParam` later detects mut-ness — no node-shape change).
         // A `mut` on a non-self first param is out of scope: report P0006 once and drop
@@ -548,16 +548,16 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         if (p.at(.identifier) and std.mem.eql(u8, p.peek().text(p.src), "self") and p.peek2().tag != .colon) {
             const self_tok = p.index;
             p.bump(.identifier);
-            // A generic impl (M10) hands down its `type_app` receiver (`Box[T]`) so the
-            // self param decodes to an `App`; a bare M8 impl synthesizes a fresh
+            // A generic impl hands down its `type_app` receiver (`Box[T]`) so the
+            // self param decodes to an `App`; a bare impl synthesizes a fresh
             // `identifier` on the receiver token (byte-identical to the old shape).
             const recv_ref = if (self_type_ref != Ast.none) self_type_ref else try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
             const self_param = try p.addNode(.{ .tag = .param, .main_token = self_tok, .lhs = recv_ref, .rhs = Ast.none });
             try params.append(p.gpa, self_param);
             _ = p.eat(.comma); // separator before the next param, if any
         } else if (!has_mut and !self_optional) {
-            // A conformance impl (`self_optional`) may declare a SELF-LESS method (M25's
-            // `impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr {..} }`):
+            // A conformance impl (`self_optional`) may declare a SELF-LESS method
+            // (`impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr {..} }`):
             // the T0024 coherence signature check governs correctness there (a self-less
             // `from` matches From's self-less protocol sig). An INHERENT impl still requires
             // `self` — static/associated methods stay out of scope — so the diagnostic holds.
@@ -604,7 +604,7 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     // An empty generics run leaves `generic_start` at the current extra length and
     // `generic_len` 0, which `protoAt` decodes to an empty (safe) slice.
     //
-    // A generic impl's params (`[T]`, M10) come FIRST in the run, then the method's
+    // A generic impl's params (`[T]`) come FIRST in the run, then the method's
     // own `[U]` (parsed above but NOT yet inference-bound — deferred; only the impl's
     // params are matched at a call site). Both `impl_gparams` and `generics` are empty
     // for a bare impl / a top-level fn, so the run stays byte-identical there.
@@ -627,14 +627,14 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
 }
 
-/// `impl Type { fn m(self, ..) -> R { .. } }` — an inherent-method block (M8/M10) —
-/// OR `impl T has P { fn m.. {} }` — a protocol-conformance block (M11). The receiver
-/// is a bare type name (`impl P`, M8), a GENERIC type application (`impl Box[T]`, M10 —
+/// `impl Type { fn m(self, ..) -> R { .. } }` — an inherent-method block —
+/// OR `impl T has P { fn m.. {} }` — a protocol-conformance block. The receiver
+/// is a bare type name (`impl P`), a GENERIC type application (`impl Box[T]` —
 /// inherent only), or (conformance only) a QUALIFIED name (`impl mod.T has mod.P`).
 /// `has` selects the conformance form: the protocol reference is a bare/qualified name
-/// node, a generic (`type_app`) receiver is rejected (bounds are M13), and the block is
+/// node, a generic (`type_app`) receiver is rejected, and the block is
 /// an `impl_has_decl`. WITHOUT `has`, a qualified receiver is still rejected (inherent
-/// impls stay bare-or-generic, M8/M10). The member loop is shared (`parseImplBody`);
+/// impls stay bare-or-generic). The member loop is shared (`parseImplBody`);
 /// each method is parsed with the receiver so its leading `self` is synthesized.
 ///
 /// NODE SHARING (deliberate, safe): for a generic impl the ONE `type_app` node is both
@@ -645,7 +645,7 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
 /// and the runtime invariant sweep only checks span totality + bracket pairing.
 fn parseImplDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_impl, "expected 'impl'");
-    // A qualified `impl mod.T` receiver (coherence, M11) builds a left-nested
+    // A qualified `impl mod.T` receiver (coherence) builds a left-nested
     // `field_access` chain and keys `recv_tok` off the LAST segment (the type name).
     // Only a conformance impl (`has`) may be qualified; an inherent impl rejects it.
     const name_tok = p.index;
@@ -653,7 +653,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
     const recv_ref = qname.node;
     const recv_tok = qname.last_tok;
     const qualified = recv_tok != name_tok;
-    // A generic receiver `impl Box[T]` (M10): `[T]` declares the impl's type-params
+    // A generic receiver `impl Box[T]`: `[T]` declares the impl's type-params
     // (each a `generic_param` leaf) and the receiver becomes a `type_app`. The leaves
     // are prepended into every method's generic run (see `parseFnDecl`).
     var impl_gparams: std.ArrayList(Ast.Index) = .empty;
@@ -671,13 +671,13 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
     var methods: std.ArrayList(Ast.Index) = .empty;
     defer methods.deinit(p.gpa);
 
-    // A conformance impl `impl T has P { .. }` (M11).
+    // A conformance impl `impl T has P { .. }`.
     if (p.eat(.kw_has)) {
-        // A generic (`Box[T]`) receiver is a BOUND (`impl Box[T] has P`), which is M13;
-        // reject it cleanly rather than mint an unsupported shape.
+        // A generic (`Box[T]`) receiver is a BOUND (`impl Box[T] has P`); reject it
+        // cleanly rather than mint an unsupported shape.
         if (is_generic) return p.fail(p.peek(), .P0001, "a generic 'impl ... has' receiver is not yet supported");
         const proto_ref = try p.parseProtocolRef();
-        // A conformance impl permits self-less methods (M25); coherence (T0024) then
+        // A conformance impl permits self-less methods; coherence (T0024) then
         // governs signature correctness against the protocol's declared sig.
         try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods, true);
         // Write the method run, then the fixed 3-cell header {protocol_ref, start, len}
@@ -690,7 +690,7 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
         return p.addNode(.{ .tag = .impl_has_decl, .main_token = recv_tok, .lhs = recv_node, .rhs = header });
     }
 
-    // Inherent impl (M8/M10): a qualified receiver is out of scope.
+    // Inherent impl: a qualified receiver is out of scope.
     if (qualified) return p.fail(p.peek(), .P0001, "an inherent 'impl' receiver must be a bare or generic type name");
     try p.parseImplBody(recv_tok, recv_node, impl_gparams.items, &methods, false);
     const header = try p.addRange(methods.items);
@@ -729,19 +729,19 @@ fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: 
 /// Parse a bare or dot-qualified protocol reference (`P` / `mod.P` / `a.b.P`) into an
 /// `identifier` (bare) or a left-nested `field_access` chain (qualified) — the same
 /// shape a qualified type-name uses, so the checker resolves it via the module tables.
-/// A trailing `[..]` (generic protocol, M14) wraps the ref in a `type_app` (`P[int]` ->
+/// A trailing `[..]` (generic protocol) wraps the ref in a `type_app` (`P[int]` ->
 /// `type_app(P, [int])`), the SAME shape a generic type-application uses. NOT otherwise a
 /// full type: no `()` unit. The built node lands in the `impl_has_decl`'s 3-cell header
 /// or in a `generic_param`'s `lhs` bound slot (`[T has P[int]]`).
 fn parseProtocolRef(p: *Parser) Error!Ast.Index {
     var node = (try p.parseQualifiedName("expected a protocol name after 'has'", "expected a protocol name after '.'")).node;
-    // A generic protocol reference `P[int, ..]` (M14): reuse the same `type_app` shape a
+    // A generic protocol reference `P[int, ..]`: reuse the same `type_app` shape a
     // generic type-application uses (`parseTypeApp` wraps the base ref into a `type_app`).
     if (p.at(.l_bracket)) node = try p.parseTypeApp(node);
     return node;
 }
 
-/// `protocol P { fn m(self, ..) -> R }` — a signature-only protocol declaration (M11).
+/// `protocol P { fn m(self, ..) -> R }` — a signature-only protocol declaration.
 /// Each member is a BODYLESS method signature parsed via `parseFnDecl(.., bodyless=true)`
 /// with the protocol name as the synthetic receiver token (so a leading `self` is
 /// consumed and its type-ref renders as the protocol name — inert, never decoded: a
@@ -752,7 +752,7 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
     const name_tok = p.index;
     try p.expect(.identifier, "expected a protocol name");
 
-    // Optional generic-param list `[X, ..]` between the name and the body `{` (M14),
+    // Optional generic-param list `[X, ..]` between the name and the body `{`,
     // parsed by the SAME `parseGenericParams` a generic struct/enum/fn uses. Rides the
     // otherwise-`none` `rhs` slot as a Range header, keeping non-generic protocols
     // byte-identical.
@@ -1183,7 +1183,7 @@ fn parseGenericParams(p: *Parser, out: *std.ArrayList(Ast.Index)) Error!void {
         if (p.at(.identifier)) {
             const name_tok = p.index;
             p.bump(.identifier);
-            // A constrained param `T has P` / `T has P[int]` (M13/M14): the bound
+            // A constrained param `T has P` / `T has P[int]`: the bound
             // protocol-ref (created BEFORE the owning `generic_param` node, so children
             // precede parents) is stored in `lhs`; an unbounded `T` leaves it `none`.
             // Reuses the same `parseProtocolRef` an `impl .. has P` uses (bare or
@@ -1653,7 +1653,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
         // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
         // of a block/struct-literal), DELETING it (advanceWithError) would break
         // that construct's closing `expect` and cascade — one missing operand
-        // (`g(1 + )`, or a trailing `:=`/`+` before `}`) would spray a diagnostic
+        // (`g(1 +)`, or a trailing `:=`/`+` before `}`) would spray a diagnostic
         // per unfinished ancestor. So report the missing expression and return an
         // `error_node` WITHOUT consuming: the enclosing arg/group/block loop then
         // sees its closer (its anchor branch breaks, its `expect` consumes it),
@@ -1690,7 +1690,7 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             },
             // `.field` access. `..` is a separate token, so `0..5` is unaffected.
             .dot => lhs = try p.parseFieldAccess(lhs),
-            // Postfix `?` (M24): wrap `lhs` in a `try_expr` and continue the loop so
+            // Postfix `?`: wrap `lhs` in a `try_expr` and continue the loop so
             // `f()?`, `o?.x`, `o??` compose. Desugared below the parser (lower/types).
             .question => {
                 const q = p.index;
@@ -1712,13 +1712,13 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             // `Name { ... }` literal / variant construction — only when blocks are
             // allowed and `lhs` is a bare name (struct), an inferred `.V`
             // (struct-variant), or a `field_access` (qualified `N.V`). The call/
-            // group `( )` reset `no_block`, so `f(P{x:1})` works.
+            // group `()` reset `no_block`, so `f(P{x:1})` works.
             .l_brace => {
                 if (p.no_block) break;
                 const ltag = p.nodes.items[lhs.int()].tag;
                 switch (ltag) {
                     .identifier => lhs = try p.parseStructLiteral(lhs),
-                    // Generic-struct construction `Box[int] { ... }` (M4): the `[..]`
+                    // Generic-struct construction `Box[int] { ... }`: the `[..]`
                     // was already wrapped into a `type_app` by the `.l_bracket` arm, so
                     // build a `struct_init` whose lhs is that `type_app` (no new
                     // Node.Tag ⇒ ParseHeader.version unchanged). The `type_app` + its
@@ -1818,7 +1818,7 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     p.bump(.l_paren);
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
-    // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
+    // The call's `()` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
@@ -2092,7 +2092,7 @@ fn advanceWithError(p: *Parser, code: Code, message: []const u8) Error!Ast.Index
 //       parse (>=1 diagnostic, i.e. an `error_node` in the tree) imbalance is
 //       allowed — recovery captured the syntax error. So the invariant is
 //       "balanced OR the parse produced error nodes", which must NOT false-trip on
-//       the adversarial-recovery corpus (e.g. `fn f( ) ) ) {`).
+//       the adversarial-recovery corpus (e.g. `fn f())) {`).
 
 /// The post-parse invariant sweep (see the section header). Asserts (panics) on a
 /// violation; only compiled where `std.debug.runtime_safety` is true.
@@ -2523,7 +2523,7 @@ test "root is program and children precede parents" {
             // `import_decl` overloads `lhs`/`rhs` as TOKEN indices (path segments,
             // alias) like break/continue — no node children to order.
             .import_decl => {},
-            // A declared type parameter: its name token, plus (M13) an optional bound
+            // A declared type parameter: its name token, plus an optional bound
             // protocol-ref in `lhs` (`[T has P]`), created before this node.
             .generic_param => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             // `Base[Arg, ..]`: the base is `lhs`, the type-args are a Range in `rhs`.
@@ -2538,7 +2538,7 @@ test "root is program and children precede parents" {
                 for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
             },
             // `protocol P[X] { fn .. }`: the method sigs are a Range in `lhs`; the
-            // optional generic-param Range (M14) rides `rhs` (or `none`).
+            // optional generic-param Range rides `rhs` (or `none`).
             .protocol_decl => {
                 for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
                 if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
@@ -2555,7 +2555,7 @@ test "root is program and children precede parents" {
     }
 }
 
-// --- M1 generics front-end: parse-only (no semantics; Typecheck rejects them) ---
+// --- generics front-end: parse-only (no semantics; Typecheck rejects them) ---
 
 test "generic fn parses with a [T] segment" {
     try expectProgram("fn id[T](x: T) -> T { x }\n", "(program (fn id [T] ((param x T)) T (block x)))");
@@ -2588,7 +2588,7 @@ test "nested type application nests tyapp nodes" {
     try expectSexpr("f[Box[int]]()", "(call (tyapp f (tyapp Box int)))");
 }
 
-test "postfix ? wraps its operand in a try_expr (M24)" {
+test "postfix ? wraps its operand in a try_expr" {
     try expectSexpr("o?", "(try o)");
     // Composes onto a call result and onto a subsequent `.field`.
     try expectSexpr("parse(a)?", "(try (call parse a))");
@@ -2597,7 +2597,7 @@ test "postfix ? wraps its operand in a try_expr (M24)" {
     try expectSexpr("o??", "(try (try o))");
 }
 
-test "constrained generic param stores the bound protocol-ref in its lhs (M13)" {
+test "constrained generic param stores the bound protocol-ref in its lhs" {
     const gpa = testing.allocator;
     const src = "fn twice[T has Doubler](v: T) -> int { 0 }\n";
     const tokens = try Lexer.tokenize(gpa, src);
@@ -2615,7 +2615,7 @@ test "constrained generic param stores the bound protocol-ref in its lhs (M13)" 
     try testing.expectEqualStrings("Doubler", tokens[bn.main_token].text(src));
 }
 
-test "unbounded generic param leaves its lhs none (M13)" {
+test "unbounded generic param leaves its lhs none" {
     const gpa = testing.allocator;
     const src = "fn id[T](x: T) -> T { x }\n";
     const tokens = try Lexer.tokenize(gpa, src);
@@ -2629,14 +2629,14 @@ test "unbounded generic param leaves its lhs none (M13)" {
     try testing.expectEqual(@as(?Ast.Index, null), Ast.genericParamBound(tree, proto.generic_params[0]));
 }
 
-test "M14: a generic protocol stores its type-params in the rhs slot" {
+test "a generic protocol stores its type-params in the rhs slot" {
     try expectProgram(
         "protocol Into[U] {\n fn into(self) -> U\n }\n",
         "(program (protocol Into [U] (fn into ((param self Into)) U (block))))",
     );
 }
 
-test "M14: a non-generic protocol leaves its rhs none (byte-identical to M11)" {
+test "a non-generic protocol leaves its rhs none" {
     try expectProgram(
         "protocol Named {\n fn name(self) -> int\n }\n",
         "(program (protocol Named (fn name ((param self Named)) int (block))))",
@@ -2653,7 +2653,7 @@ test "M14: a non-generic protocol leaves its rhs none (byte-identical to M11)" {
     try testing.expectEqual(@as(usize, 0), Ast.protocolGenericParams(tree, decl).len);
 }
 
-test "M14: impl P has Into[int] builds a type_app protocol-ref" {
+test "impl P has Into[int] builds a type_app protocol-ref" {
     const gpa = testing.allocator;
     const src = "impl P has Into[int] {\n fn into(self) -> int { self.x }\n }\n";
     const tokens = try Lexer.tokenize(gpa, src);
@@ -2672,7 +2672,7 @@ test "M14: impl P has Into[int] builds a type_app protocol-ref" {
     try testing.expectEqualStrings("int", tokens[tree.nodes[args[0].int()].main_token].text(src));
 }
 
-test "M14: [T has Into[int]] bound builds a type_app protocol-ref" {
+test "[T has Into[int]] bound builds a type_app protocol-ref" {
     const gpa = testing.allocator;
     const src = "fn use[T has Into[int]](v: T) -> int { 0 }\n";
     const tokens = try Lexer.tokenize(gpa, src);
@@ -2689,7 +2689,7 @@ test "M14: [T has Into[int]] bound builds a type_app protocol-ref" {
     try testing.expectEqual(@as(usize, 1), Ast.protocolRefArgs(tree, bound).len);
 }
 
-// --- M8 inherent methods: impl block parsing ---
+// --- inherent methods: impl block parsing ---
 
 test "impl block parses a method with a synthesized self param" {
     try expectProgram(
@@ -2721,7 +2721,7 @@ test "mut self parses to the same synthesized self-param shape (no node change)"
     );
 }
 
-test "M10: a generic impl parses; the receiver is a type_app and the method's self type-ref is it" {
+test "a generic impl parses; the receiver is a type_app and the method's self type-ref is it" {
     // The method carries the impl's `[T]` in its FnProto generic run and its `self`
     // type-ref is the receiver `type_app` `Box[T]` (so it decodes to an App).
     try expectProgram(
@@ -2730,7 +2730,7 @@ test "M10: a generic impl parses; the receiver is a type_app and the method's se
     );
 }
 
-test "M10: the generic impl's receiver type_app is SHARED as impl.lhs and each method's self type-ref" {
+test "the generic impl's receiver type_app is SHARED as impl.lhs and each method's self type-ref" {
     const gpa = testing.allocator;
     const source = "struct Box[T] { v: T }\nimpl Box[T] { fn get(self) -> T { self.v } }\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2758,7 +2758,7 @@ test "M10: the generic impl's receiver type_app is SHARED as impl.lhs and each m
     try testing.expectEqual(impl.lhs, tree.nodes[proto.params[0].int()].lhs);
 }
 
-test "M10: a qualified `impl mod.T` receiver is still rejected (P0001)" {
+test "a qualified `impl mod.T` receiver is still rejected (P0001)" {
     const gpa = testing.allocator;
     const source = "impl a.b { fn m(self) -> int { 0 } }\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2769,7 +2769,7 @@ test "M10: a qualified `impl mod.T` receiver is still rejected (P0001)" {
     try testing.expect(res.diags.len >= 1);
 }
 
-test "M11: a protocol decl parses signature-only methods (empty body)" {
+test "a protocol decl parses signature-only methods (empty body)" {
     // The self param's type-ref renders as the protocol name (inert — never decoded),
     // and the bodyless signature carries a synthesized empty `(block)`.
     try expectProgram(
@@ -2778,21 +2778,21 @@ test "M11: a protocol decl parses signature-only methods (empty body)" {
     );
 }
 
-test "M11: a protocol decl with multiple signatures" {
+test "a protocol decl with multiple signatures" {
     try expectProgram(
         "protocol Shape {\n fn area(self) -> int\n fn sides(self) -> int\n}\n",
         "(program (protocol Shape (fn area ((param self Shape)) int (block)) (fn sides ((param self Shape)) int (block))))",
     );
 }
 
-test "M11: an impl-has decl parses (recv then protocol then methods)" {
+test "an impl-has decl parses (recv then protocol then methods)" {
     try expectProgram(
         "struct P { x: int }\nimpl P has Named { fn name(self) -> int { self.x } }\n",
         "(program (struct P (param x int)) (impl-has P Named (fn name ((param self P)) int (block (. self x)))))",
     );
 }
 
-test "M11: a qualified impl-has parses (qualified receiver AND protocol)" {
+test "a qualified impl-has parses (qualified receiver AND protocol)" {
     // Both the receiver `lib.W` and the protocol `lib.Show` render as field_access
     // chains; the self param's type-ref is the shared qualified receiver node.
     try expectProgram(
@@ -2801,7 +2801,7 @@ test "M11: a qualified impl-has parses (qualified receiver AND protocol)" {
     );
 }
 
-test "M11: a generic `impl Box[T] has P` receiver is rejected (P0001)" {
+test "a generic `impl Box[T] has P` receiver is rejected (P0001)" {
     const gpa = testing.allocator;
     const source = "impl Box[T] has P { fn m(self) -> int { 0 } }\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -2812,7 +2812,7 @@ test "M11: a generic `impl Box[T] has P` receiver is rejected (P0001)" {
     try testing.expect(res.diags.len >= 1);
 }
 
-test "M11: `pub protocol` records the pub export" {
+test "`pub protocol` records the pub export" {
     try expectProgram(
         "pub protocol Named { fn name(self) -> int }\n",
         "(program (pub (protocol Named (fn name ((param self Named)) int (block)))))",
@@ -2856,7 +2856,7 @@ test "isMutParam is true for `mut self`, false for plain self / a non-self first
 
 test "a mut on a non-self first param is rejected (P0006), mut self is not" {
     const gpa = testing.allocator;
-    // `mut x` on a top-level fn is out of scope (M9): the reserved `mut` keyword makes
+    // `mut x` on a top-level fn is out of scope: the reserved `mut` keyword makes
     // the param loop's identifier expectation fail → a diagnostic. A `mut self` method
     // parses cleanly.
     const bad = "fn f(mut x: int) -> int { x }\n";
@@ -2928,7 +2928,7 @@ test "generic nodes precede their parents (children-before-parents on generics)"
     try testing.expect(saw_type_app);
 }
 
-test "generic-struct construction Box[int]{ v: 1 } builds struct_init over a type_app (M4)" {
+test "generic-struct construction Box[int]{ v: 1 } builds struct_init over a type_app" {
     const gpa = testing.allocator;
     const source = "fn main() -> int {\n b := Box[int]{ v: 1 }\n b.v\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -3020,7 +3020,7 @@ test "trailing-expression body parses with a trailing expr_stmt" {
 }
 
 test "block/if expr in a call argument inside an if condition (call reopens block context)" {
-    // `no_block` is set parsing the condition, but the call's `( )` open a fresh
+    // `no_block` is set parsing the condition, but the call's `()` open a fresh
     // expression context — the `{ 1 }` argument must parse, not error.
     try expectProgram(
         "fn g(x: int) -> int { x }\nfn main() -> int {\n if g({ 1 }) > 0 { 7 } else { 8 }\n}\n",
@@ -3412,7 +3412,7 @@ fn renderResult(res: Result, source: []const u8, buf: []u8) ![]const u8 {
 }
 
 test "two independent errors in one file both report and both decls survive" {
-    // `return )` in a, `return )` in b — two INDEPENDENT broken statements, one per
+    // `return)` in a, `return)` in b — two INDEPENDENT broken statements, one per
     // decl. Each stray `)` in return-value position is the cascade signature (a
     // structural closer in a statement value slot): before the cascade fix each site
     // sprayed TWO diagnostics ("expected an expression" + "expected a newline or
@@ -3443,7 +3443,7 @@ test "two independent errors in one file both report and both decls survive" {
 }
 
 test "a stray ')' in return-value position yields exactly one diagnostic (no cascade)" {
-    // The confirmed cascade defect: `return )` — a structural closer where an
+    // The confirmed cascade defect: `return)` — a structural closer where an
     // expression is expected. parsePrefix reports "expected an expression" and
     // returns an error_node WITHOUT consuming the `)`; before the cascade latch the
     // unconsumed `)` then tripped expectTerminator into a SECOND spurious "expected a
@@ -3463,7 +3463,7 @@ test "a stray ')' in return-value position yields exactly one diagnostic (no cas
 }
 
 test "a stray ')' after '=' assignment value yields exactly one diagnostic (no cascade)" {
-    // The same cascade signature across a different statement form: `x = )`. Proves
+    // The same cascade signature across a different statement form: `x =)`. Proves
     // the fix is systematic (not special-cased to `return`), collapsing the
     // parsePrefix + expectTerminator pair over the unconsumed `)` to ONE diagnostic.
     const gpa = testing.allocator;
@@ -3477,7 +3477,7 @@ test "a stray ')' after '=' assignment value yields exactly one diagnostic (no c
 }
 
 test "two adjacent broken statements (no good stmt between) each report — no over-suppression" {
-    // Over-suppression regression guard. `return )` on line 2 and `x = )` on line 3
+    // Over-suppression regression guard. `return)` on line 2 and `x =)` on line 3
     // are two INDEPENDENT sites on distinct lines with NO valid statement between
     // them. The first site's stray `)` is left unconsumed, so recovery goes through
     // `findNextStmt` (not `expectTerminator`'s clean newline arm). If the cascade
@@ -3502,7 +3502,7 @@ test "two adjacent broken statements (no good stmt between) each report — no o
 }
 
 test "a valid statement between two broken sites still yields exactly two diagnostics" {
-    // The complementary guard: a well-formed statement (`y := 1`) between the two
+    // The complementary guard: a well-formed statement (`y:= 1`) between the two
     // broken sites must NOT itself add a diagnostic, and both broken sites must
     // still report — exactly two total. Proves the latch clears cleanly across a
     // successful statement without either over-reporting or over-suppressing.
@@ -3516,7 +3516,7 @@ test "a valid statement between two broken sites still yields exactly two diagno
     for (res.diags) |d| try testing.expectEqualStrings("expected an expression", d.message);
 }
 
-test "adversarial `fn f( ) ) ) {` terminates (no hang) and yields a tree" {
+test "adversarial `fn f())) {` terminates (no hang) and yields a tree" {
     // The anti-hang backstop: this must RETURN (a hanging test is the failure),
     // yield a non-empty program tree, and report at least one diagnostic.
     const gpa = testing.allocator;
@@ -3545,7 +3545,7 @@ test "adversarial garbage recovers to a following well-formed decl" {
 }
 
 test "a broken statement recovers to the next statement" {
-    // `return )` is a broken statement (stray `)`); `y := 2` and the final
+    // `return)` is a broken statement (stray `)`); `y:= 2` and the final
     // `return` must still parse — a broken statement does not poison its siblings.
     const gpa = testing.allocator;
     const source = "fn f() {\n  return )\n  y := 2\n  return\n}\n";
@@ -3563,7 +3563,7 @@ test "a broken statement recovers to the next statement" {
 }
 
 test "a broken decl recovers to the next decl" {
-    // `fn a( { }` is a malformed decl; `fn b` must still parse.
+    // `fn a({ }` is a malformed decl; `fn b` must still parse.
     const gpa = testing.allocator;
     const source = "fn a( { }\nfn b() -> int { 0 }\n";
     const res = try parseResult(gpa, source);
@@ -3592,7 +3592,7 @@ test "one root error yields exactly one diagnostic (no cascade)" {
 }
 
 test "a missing call operand before ')' yields exactly one diagnostic (no closer-delete cascade)" {
-    // `g(1 + )` — the RHS of `+` is missing and the next token is the call's own
+    // `g(1 +)` — the RHS of `+` is missing and the next token is the call's own
     // `)`. parsePrefix must NOT delete that `)` (doing so would break the call's
     // closing `expect`, then the block's, spraying a diagnostic per open ancestor).
     // It returns an error_node without consuming, so the arg loop sees `)`, breaks,
@@ -3609,7 +3609,7 @@ test "a missing call operand before ')' yields exactly one diagnostic (no closer
 }
 
 test "a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete cascade)" {
-    // `x := \n}` — the trailing `:=` suppresses the newline, so the initializer's
+    // `x:= \n}` — the trailing `:=` suppresses the newline, so the initializer's
     // parsePrefix lands on the block's `}`. Deleting it would swallow the block
     // closer and add a spurious "expected '}'"; instead the error_node is returned
     // without consuming, `expectTerminator` accepts the implicit `}`, and the block
@@ -3625,7 +3625,7 @@ test "a trailing ':=' before '}' yields exactly one diagnostic (no closer-delete
 }
 
 test "a broken call argument list reports and resyncs without hanging" {
-    // `g(1, , 3)` — the doubled comma is a tuple_recovery anchor, so the arg loop
+    // `g(1,, 3)` — the doubled comma is a tuple_recovery anchor, so the arg loop
     // breaks and the trailing `expect(.r_paren)` fails at the stray comma; the
     // block-statement loop then resyncs to the next statement (`3`). The call is
     // abandoned rather than repaired in place, but recovery is bounded: parsing
@@ -3795,7 +3795,7 @@ const codes = @import("diagnostics/codes.zig");
 test "parse diagnostics carry P-codes by syntactic category" {
     const gpa = testing.allocator;
 
-    // Expression position: `return )` => expected-expression => P0002.
+    // Expression position: `return)` => expected-expression => P0002.
     {
         const res = try parseResult(gpa, "fn a() -> int {\n  return )\n}\n");
         defer gpa.free(@constCast(res.diags));
@@ -3830,10 +3830,10 @@ test "parse diagnostics carry P-codes by syntactic category" {
     }
 }
 
-test "M25: a self-less method in a conformance impl parses with no P0006; an inherent one still P0006" {
+test "a self-less method in a conformance impl parses with no P0006; an inherent one still P0006" {
     const gpa = testing.allocator;
 
-    // A CONFORMANCE impl (`impl T has P`) permits a self-less method (M25's `From`): no
+    // A CONFORMANCE impl (`impl T has P`) permits a self-less method (`From`): no
     // P0006, and the single declared param is read as an ordinary param (no synthetic self).
     {
         const res = try parseResult(gpa,
@@ -3952,7 +3952,7 @@ test "a clean parse has balanced brackets and no error node" {
     checkBracketPairing(res.tree, tokens, res.diags);
 }
 
-test "the adversarial `fn f( ) ) ) {` recovers with imbalance TOLERATED" {
+test "the adversarial `fn f())) {` recovers with imbalance TOLERATED" {
     // The load-bearing case: the token stream is bracket-IMBALANCED (three `)` vs
     // one `(`, one unclosed `{`), yet the parse must not false-trip the pairing
     // invariant because it recovered (>=1 diagnostic / error_node). `parse()` runs
