@@ -78,13 +78,7 @@ fn writeFlatKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ctor: u32, args
     var w: [4]u8 = undefined;
     std.mem.writeInt(u32, &w, ctor, .little);
     try buf.appendSlice(gpa, &w);
-    for (args) |a| {
-        try buf.append(gpa, @intFromEnum(a.kind));
-        std.mem.writeInt(u32, &w, a.struct_id, .little);
-        try buf.appendSlice(gpa, &w);
-        std.mem.writeInt(u32, &w, a.enum_id, .little);
-        try buf.appendSlice(gpa, &w);
-    }
+    for (args) |a| try a.appendKeyBytes(gpa, buf);
 }
 
 /// Intern `(ctor, args)` to a stable composite index; structurally-equal calls return
@@ -129,12 +123,7 @@ pub fn writeStructuralKey(c: *Composite, gpa: std.mem.Allocator, ty: Type, buf: 
         for (e.args) |a| try c.writeStructuralKey(gpa, a, buf);
         try buf.append(gpa, 0xBB); // app-close marker (arity/nesting delimiter)
     } else {
-        try buf.append(gpa, @intFromEnum(ty.kind));
-        var w: [4]u8 = undefined;
-        std.mem.writeInt(u32, &w, ty.struct_id, .little);
-        try buf.appendSlice(gpa, &w);
-        std.mem.writeInt(u32, &w, ty.enum_id, .little);
-        try buf.appendSlice(gpa, &w);
+        try ty.appendKeyBytes(gpa, buf);
     }
 }
 
