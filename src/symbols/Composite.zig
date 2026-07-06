@@ -1,4 +1,4 @@
-//! Composite (`App`) type intern table — CHECK-TIME only (M4). A peer data module,
+//! Composite (`App`) type intern table — CHECK-TIME only. A peer data module,
 //! sibling of `Mono.zig`.
 //!
 //! An `App` is a generic-struct application `Ctor[args..]` (e.g. `Box[int]`). It is a
@@ -32,7 +32,7 @@ const Composite = @This();
 
 /// One interned composite. `args` is OWNED (freed at teardown); its elements are
 /// concrete/`type_var`/nested-`App` types in generic-param order. `ctor_is_enum`
-/// (M6) disambiguates the `ctor` id space: struct ids and enum ids are independent,
+/// disambiguates the `ctor` id space: struct ids and enum ids are independent,
 /// so a struct-App `S[..]` and an enum-App `E[..]` with the SAME `ctor` number must
 /// never share a dedup/structural key (else one would reify as the other). It folds
 /// into both `writeFlatKey` (interning) and `writeStructuralKey` (reify order).
@@ -131,7 +131,7 @@ pub fn writeStructuralKey(c: *Composite, gpa: std.mem.Allocator, ty: Type, buf: 
 
 /// The `App`-nesting depth of `ty`: a non-`App` is 0; `App(c, args)` is
 /// `1 + max(depth(arg))`. Finite (each interned `App` is a finite structure). Drives
-/// the M4 termination guard (T0017) — an unbounded `f[T] -> f[Box[T]]` chain forms
+/// the termination guard (T0017) — an unbounded `f[T] -> f[Box[T]]` chain forms
 /// ever-deeper `App`s and is rejected before it can hang/OOM.
 pub fn appDepth(c: *Composite, ty: Type) u32 {
     if (!ty.isApp()) return 0;

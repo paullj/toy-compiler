@@ -565,11 +565,11 @@ pub fn codegen(
     }
     try Walks.walkTypeArgs(gpa, frozen, frozen.type_args, &type_args);
 
-    // (e) The resolved bound conformances of a bounded monomorphized instance (M13),
+    // (e) The resolved bound conformances of a bounded monomorphized instance,
     // folded structurally so toggling a sibling-module conformance invalidates exactly
     // the dependent monomorphizations. Empty for every non-bounded unit -> the fold is
     // skipped and its fp is byte-identical (warm cache preserved). This is the SINGLE
-    // Engine.codegen threading point the M13 contract names.
+    // Engine.codegen threading point the contract names.
     var confs: std.ArrayList(Fingerprint.ResolvedConformance) = .empty;
     defer {
         Walks.freeConformances(gpa, confs.items);
@@ -684,7 +684,7 @@ fn serve(
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
 }
 
-/// Lower one SOURCE-LESS auto-derive unit (recipe→Ir→OPT→FnCode), M18. The IR is built
+/// Lower one SOURCE-LESS auto-derive unit (recipe→Ir→OPT→FnCode). The IR is built
 /// from the recipe + layouts (no AST) and never escapes — one-tier, like `lowerOne`.
 fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link.SymName, opt_out: ?*OptOut) !Link.FnCode {
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
@@ -723,7 +723,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
     return fc;
 }
 
-/// The per-derive-unit codegen query (M18): a source-less sibling of `codegen`. Builds a
+/// The per-derive-unit codegen query: a source-less sibling of `codegen`. Builds a
 /// NON-AST fingerprint from the recipe (`Fingerprint.deriveFingerprint` over the
 /// conforming type's layout + the resolved field witnesses), folds the SAME
 /// `Key.codegen(target, fp, opt, sym)` key (UNCHANGED — `symMix` separates it from real

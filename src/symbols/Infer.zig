@@ -1,4 +1,4 @@
-//! Local type-arg inference matcher (M3) — a peer data module beside `Mono.zig`
+//! Local type-arg inference matcher — a peer data module beside `Mono.zig`
 //! and `Sig.zig`.
 //!
 //! This is the SINGLE home for the one-sided structural match that turns a bare
@@ -11,8 +11,8 @@
 //!
 //! This is the DESIGNATED-DROPPABLE layer of the generics spine: it is pure and
 //! allocation-light (`match` allocates nothing), stores no `type_var` anywhere, and
-//! is invoked only from small guarded branches, so the M2 monomorphization core stays
-//! honorable if M3 is ever removed.
+//! is invoked only from small guarded branches, so the monomorphization core stays
+//! honorable if it is ever removed.
 //!
 //! NO HM, no persistent unification vars crossing fn boundaries: the matcher runs and
 //! is discarded at the call node. First-binding-wins per type-var ordinal (ascending
@@ -76,7 +76,7 @@ pub const FillOutcome = union(enum) {
     unbound: struct { ord: u32 },
 };
 
-/// M7 target-fill reconcile, applied AFTER `match` at a CONSTRUCTION check site ONLY
+/// Target-fill reconcile, applied AFTER `match` at a CONSTRUCTION check site ONLY
 /// (enum/struct). It is NOT one of the four call-discovery consumers of `match`:
 /// enum/struct instances are discovered from `node_types` by `reifyApps`, never
 /// re-inferred, so filling here cannot drift them — that is why this lives beside

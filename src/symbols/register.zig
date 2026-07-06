@@ -33,7 +33,7 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
             continue;
         }
         // A generic template `struct Box[T] { .. }` carries its generic-param run in
-        // `decl.rhs` (M4). Collect the ordered param NAMES so template field-type refs
+        // `decl.rhs`. Collect the ordered param NAMES so template field-type refs
         // decode to `type_var`s (Phase 0a) and `typeFromTypeApp` can arity-check; mark
         // it `is_generic` so Phase 0b SKIPS laying out its type-var fields.
         var is_generic = false;
@@ -51,7 +51,7 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
     }
 }
 
-/// Phase 0a (M4): decode each generic struct TEMPLATE's field types as PATTERNS into
+/// Phase 0a: decode each generic struct TEMPLATE's field types as PATTERNS into
 /// its `field_names`/`field_types`, with the template's generic params in scope so a
 /// `T`-spelled ref decodes to `type_var(ord)` and a `Box[T]` field to
 /// `App(Box, [type_var 0])`. These patterns are the input to `substReify`, which
@@ -82,7 +82,7 @@ pub fn decodeTemplateFields(t: *Typecheck) !void {
     }
 }
 
-/// Phase 0a (M6): decode each generic ENUM TEMPLATE's variants into `VariantSym`s whose
+/// Phase 0a: decode each generic ENUM TEMPLATE's variants into `VariantSym`s whose
 /// payload `field_types` are PATTERNS (`left(L)` -> `type_var(0)`; `w(Box[T])` ->
 /// `App(Box,[type_var 0])`), with the template's generic params in scope so an
 /// `L`-spelled ref decodes to `type_var(ord)`. These patterns are the input to
@@ -170,7 +170,7 @@ pub fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !vo
             continue;
         }
         // A generic template `enum Either[L,R] { .. }` carries its generic-param run in
-        // `decl.rhs` (M6, mirror registerStructs). Collect the ordered param NAMES so
+        // `decl.rhs` (mirror registerStructs). Collect the ordered param NAMES so
         // variant-payload type-refs decode to `type_var`s (Phase 0a) and
         // `typeFromTypeApp` can arity-check; mark it `is_generic` so Phase 0b SKIPS
         // laying out its type-var payloads.
@@ -189,7 +189,7 @@ pub fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !vo
     }
 }
 
-/// Phase 0c (M11): register the `protocol` decls among `decl_nodes` (of the active
+/// Phase 0c: register the `protocol` decls among `decl_nodes` (of the active
 /// tree) into ONE global id space. Global ids are assigned in append order
 /// (module-then-decl); the bare name → global id binding goes into the active protocol
 /// map (this module's table). Each protocol's required method NAMES are collected
@@ -209,12 +209,12 @@ pub fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32)
         const sig_nodes = Ast.rangeSlice(t.tree, decl.lhs.int());
         const names = try t.gpa.alloc([]const u8, sig_nodes.len);
         for (sig_nodes, 0..) |snode, i| names[i] = t.nameText(t.tree.nodes[snode.int()].main_token);
-        // Generic type-params (M14): `protocol Into[U]` -> `["U"]`. Stored un-offset on
+        // Generic type-params: `protocol Into[U]` -> `["U"]`. Stored un-offset on
         // the `ProtocolSym` (for arity checks); the OUTER array is owned by `t.protocols`.
         const gp_nodes = Ast.protocolGenericParams(t.tree, decl_idx);
         const generic_params = try t.gpa.alloc([]const u8, gp_nodes.len);
         for (gp_nodes, 0..) |gp, i| generic_params[i] = t.nameText(t.tree.nodes[gp.int()].main_token);
-        // Decode each method SIGNATURE (M13/M14), Self- and protocol-param-aware. Force
+        // Decode each method SIGNATURE, Self- and protocol-param-aware. Force
         // the synthetic `self` slot to `Type.typeVar(0)` (decoding it would resolve the
         // protocol-name type-ref and spuriously T0001); a `Self`-typed later param resolves
         // to `type_var(0)` via the `cur_self_type` hook. A protocol generic param resolves

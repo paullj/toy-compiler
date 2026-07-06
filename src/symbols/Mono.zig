@@ -1,4 +1,4 @@
-//! Monomorphization instance table — a peer data module (M2).
+//! Monomorphization instance table — a peer data module.
 //!
 //! An `Instance` is one reachable `(generic template, concrete-arg-tuple)` pair
 //! reified to an ordinary concrete per-fn codegen unit. The type checker's serial
@@ -17,7 +17,7 @@ const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Type = @import("../layout/Engine.zig").Type;
 
-/// One resolved bound `[T has P]` on a monomorphized instance (M13): the witnessing
+/// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
 /// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
 /// is the structural datum folded (ordered, never XOR) into the instance's content
 /// fingerprint so toggling a sibling-module conformance invalidates EXACTLY the
@@ -32,7 +32,7 @@ const Type = @import("../layout/Engine.zig").Type;
 ///   * `witness_syms` element slices borrow `gph_fn_names` (resolve-result-backed,
 ///     outlives codegen); the OUTER `witness_syms` slice is OWNED by the Instance.
 ///   * `conform_ty` is a 12-byte POD (the ground conforming `structT`/`enumT`/scalar).
-///   * `protocol_args` (M14) are the bound's protocol type-args (`[T has Into[int]]` ->
+///   * `protocol_args` are the bound's protocol type-args (`[T has Into[int]]` ->
 ///     `[int]`), substituted through the instance args — 12-byte POD Types. Empty for a
 ///     non-generic protocol. The OUTER slice is OWNED by the Instance. Folded structurally
 ///     into the (e) fingerprint component so an `Into[int]` -> `Into[bool]` edit can't
@@ -67,8 +67,8 @@ pub const Instance = struct {
     /// Owning module id (the template's module) and the template's decl node.
     mod: u32,
     decl_node: Ast.Index,
-    /// The resolved bounds `[T has P]` witnessing conformances for this instance
-    /// (M13), one per bounded generic param, in generic-param order. Empty (`&.{}`)
+    /// The resolved bounds `[T has P]` witnessing conformances for this instance,
+    /// one per bounded generic param, in generic-param order. Empty (`&.{}`)
     /// for an unbounded template's instance so its fingerprint fold is byte-identical
     /// (warm cache preserved). The OUTER slice + each entry's `witness_syms` outer
     /// slice are OWNED by the owning `GraphResult`; see `ResolvedConformance`.
@@ -192,7 +192,7 @@ test "an instance carries its resolved conformances (M13/M14)" {
     try testing.expectEqualStrings("Into", inst.conformances[0].protocol_name);
     try testing.expect(Type.eql(Type.structT(3), inst.conformances[0].conform_ty));
     try testing.expectEqualStrings("lib.P.into$Into$int", inst.conformances[0].witness_syms[0]);
-    // M14: the bound's protocol type-args ride the conformance (folded into the (e) fp).
+    // The bound's protocol type-args ride the conformance (folded into the (e) fp).
     try testing.expectEqual(@as(usize, 1), inst.conformances[0].protocol_args.len);
     try testing.expect(Type.eql(Type.int, inst.conformances[0].protocol_args[0]));
     // An instance built WITHOUT conformances defaults to the empty slice (warm-cache
