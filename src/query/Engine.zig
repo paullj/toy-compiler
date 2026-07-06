@@ -548,7 +548,7 @@ pub fn codegen(
     // `Fingerprint`'s walk so the supplied order matches.
     var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
     defer callee_sigs.deinit(gpa);
-    try Walks.walkCalls(gpa, frozen, fn_decl, &callee_sigs);
+    try Walks.walkCalls(gpa, frozen, fn_decl, my_sig, &callee_sigs);
     var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
     defer {
         Walks.freeTouched(gpa, touched.items);

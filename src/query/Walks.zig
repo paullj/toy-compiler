@@ -30,9 +30,14 @@ const Mono = @import("../symbols/Mono.zig");
 
 /// Collect the signatures of every function this fn calls, in body walk order
 /// (matching the fingerprint's walk) so the fingerprint's (b) component lines up.
-pub fn walkCalls(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, out: *std.ArrayList(Fingerprint.Sig)) !void {
+///
+/// `fn_sig` threads in the OWNING fn's signature (mirroring `walkTouchedSig`) so the M25
+/// `?`-widen fold can read the enclosing fn's reified return-Result error type — the target
+/// a widening `?` converts INTO via `From`. It is the fn's typecheck Sig when known; null
+/// elsewhere (a `null` sig folds no `?` witness, so those fingerprints stay byte-identical).
+pub fn walkCalls(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, fn_sig: ?Fingerprint.Sig, out: *std.ArrayList(Fingerprint.Sig)) !void {
     const Frozen = @TypeOf(frozen.*);
-    var v = AstWalk.CallVisitor(Frozen){ .gpa = gpa, .frozen = frozen, .out = out };
+    var v = AstWalk.CallVisitor(Frozen){ .gpa = gpa, .frozen = frozen, .fn_sig = fn_sig, .out = out };
     try AstWalk.walk(.{ .tree = frozen.tree, .tokens = frozen.tokens, .source = frozen.source }, idx, &v);
 }
 

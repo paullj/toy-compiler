@@ -1,0 +1,16 @@
+# `?` on a `Result[int,SmallErr]` inside a fn returning `Result[int,BigErr]` with NO
+# `impl BigErr has From[SmallErr]`: the error types differ and there is no `From`
+# conformance to widen through, so the `err(e)` residual can't be re-emitted at the
+# enclosing error type — T0033 (M25's missing-From path still diagnoses).
+
+enum SmallErr { bad }
+enum BigErr { small, other }
+
+fn f(o: Result[int, SmallErr]) -> Result[int, BigErr] {
+  v := o?  #~ ERROR [T0033] error type SmallErr does not match
+  return Result.ok(v)
+}
+
+fn main() -> int {
+  return 0
+}
