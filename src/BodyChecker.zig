@@ -557,7 +557,7 @@ pub const BodyChecker = struct {
                         // or a `[T has Ord]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsToOrd(lt)) {
+                        } else if (try bc.conformsTo(lt, bc.model.ord_protocol_id, true)) {
                             break :blk Type.@"bool";
                         } else {
                             try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.ord_protocol_id) });
@@ -571,9 +571,9 @@ pub const BodyChecker = struct {
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsToEq(lt)) {
+                        } else if (try bc.conformsTo(lt, bc.model.eq_protocol_id, true)) {
                             break :blk Type.@"bool";
-                        } else if (try bc.eqDeriveBlocker(lt)) |blocker| {
+                        } else if (try bc.deriveBlocker(lt, bc.model.eq_protocol_id)) |blocker| {
                             // M18: a struct that would derive `Eq` but for one non-conforming
                             // field names that field (T0029). A payload enum / other type
                             // keeps the M15 "no Eq impl" T0026 below.
@@ -1806,7 +1806,7 @@ pub const BodyChecker = struct {
                     // A direct `.hash()` on a struct/enum with NO explicit impl (M20): the
                     // structural `Hash` derive trigger. Hash has no operator, so (unlike
                     // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
-                    // the `==` operator's `conformsToEq`/`eqDeriveBlocker` split: an all-`Hash`-
+                    // the `==` operator's `conformsTo`/`deriveBlocker` split: an all-`Hash`-
                     // fields aggregate records the derive + types the call `int`; a struct with
                     // a non-conforming field names it (T0030); a payload enum with a non-
                     // conforming payload has no single nameable field, so it falls through to
@@ -1820,11 +1820,11 @@ pub const BodyChecker = struct {
                             bc.node_types[(node_idx).int()] = Type.int;
                             return Type.int;
                         }
-                        if (try bc.conformsToHash(recv_ty)) {
+                        if (try bc.conformsTo(recv_ty, bc.model.hash_protocol_id, true)) {
                             bc.node_types[(node_idx).int()] = Type.int;
                             return Type.int;
                         }
-                        if (try bc.hashDeriveBlocker(recv_ty)) |blocker| {
+                        if (try bc.deriveBlocker(recv_ty, bc.model.hash_protocol_id)) |blocker| {
                             try bc.sink.emitFmtCode(.T0030, bc.byteOf(callee.main_token), "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
                             return .invalid;
                         }
@@ -2081,11 +2081,11 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
-            if (try bc.conformsToDisplay(at)) {
+            if (try bc.conformsTo(at, bc.model.display_protocol_id, true)) {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
-            if (try bc.displayDeriveBlocker(at)) |blocker| {
+            if (try bc.deriveBlocker(at, bc.model.display_protocol_id)) |blocker| {
                 try bc.sink.emitFmtCode(.T0031, bc.byteOf(at_tok), "cannot 'print' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(at), blocker.name, bc.typeName(blocker.ty) });
             } else {
                 // A `type_var` (a generic param without a `Display` bound) renders as its
@@ -2259,38 +2259,38 @@ pub const BodyChecker = struct {
         return ret;
     }
 
-    /// Whether `t` conforms to the prelude `Eq` protocol (M15) — the predicate the
-    /// `==`/`!=` operator typing uses. A concrete type resolves via the frozen
-    /// conformance table (`findConformance` covers the int/bool/str/unit prelude
-    /// conformances AND every user `impl T has Eq`); a `type_var` in a bounded generic
-    /// body conforms as-axiom when its declared bound IS `Eq`. A prelude-less caller
-    /// (`eq_protocol_id == null`) denies conformance, so the operator emits T0026 rather
-    /// than miscompiling.
-    /// M18: after the `findConformance`/bound-axiom misses, an all-`Eq`-fields struct (or
-    /// empty-payload enum) with NO explicit impl conforms STRUCTURALLY. Record the derive
-    /// request (so the serial synthesis barrier emits the source-less unit) and return
-    /// true so `==`/`!=` types bool. `findConformance`-first keeps an explicit/Ord-
-    /// refinement type off this path (no double-fire). Now fallible (`conforms` + the
-    /// request record allocate) and takes `*BodyChecker` (records into the thread-local
-    /// `derive_reqs`).
-    fn conformsToEq(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
-        const eq_pid = bc.model.eq_protocol_id orelse return false;
-        if (Typecheck.findConformance(bc.model, eq_pid, t, &.{})) return true;
+    /// Whether `t` conforms to the derivable prelude protocol `pid_opt` — the shared
+    /// predicate behind the `==`/`!=` (`Eq`, M15), `<`/`>`/`<=`/`>=` (`Ord`, M16/M19),
+    /// `.hash()` (`Hash`, M20), and `print(x)` (`Display`, M22) operator/trigger typings.
+    /// A concrete type resolves via the frozen conformance table (`findConformance` covers
+    /// the int/bool/str/unit prelude conformances AND every user `impl T has P`); a
+    /// `type_var` in a bounded generic body conforms as-axiom when its declared bound IS
+    /// `pid`. A prelude-less caller (`pid_opt == null`) denies conformance, so the operator
+    /// emits its T002x rather than miscompiling.
+    /// After those misses, a struct (or enum) whose fields all conform with NO explicit impl
+    /// conforms STRUCTURALLY. When `record_derive`, record the derive request (so the serial
+    /// synthesis barrier emits the source-less witness) and return true. `findConformance`-
+    /// first keeps an explicit/refinement type off this path (no double-fire). Fallible
+    /// (`conforms` + the request record allocate) and takes `*BodyChecker` (records into the
+    /// thread-local `derive_reqs`).
+    fn conformsTo(bc: *BodyChecker, t: Type, pid_opt: ?u32, record_derive: bool) error{OutOfMemory}!bool {
+        const pid = pid_opt orelse return false;
+        if (Typecheck.findConformance(bc.model, pid, t, &.{})) return true;
         if (t.isTypeVar()) {
             const ord = t.typeVarOrd();
             if (ord >= bc.bound_protocols.len) return false;
-            return (bc.bound_protocols[ord] orelse return false) == eq_pid;
+            return (bc.bound_protocols[ord] orelse return false) == pid;
         }
         switch (t.kind) {
             .@"struct", .@"enum", .app => {},
             else => return false,
         }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
+        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
             // Record a derive request ONLY for a GROUND operand (M21): an abstract `App`
             // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition check)
             // is accepted-but-not-recorded — its concrete instance re-check records the
             // ground `Box[int]`, which reify+synthesize can actually mint a witness for.
-            if (bc.isGround(t)) try bc.recordDeriveReq(eq_pid, t);
+            if (record_derive and bc.isGround(t)) try bc.recordDeriveReq(pid, t);
             return true;
         }
         return false;
@@ -2316,120 +2316,15 @@ pub const BodyChecker = struct {
         try bc.derive_reqs.append(bc.gpa, .{ .protocol_id = pid, .conform_ty = t });
     }
 
-    /// The first struct field that blocks a structural `Eq` derive (M18), for the T0029
-    /// message; null when `t` is not a struct, has no eq protocol, or every field conforms.
-    fn eqDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
+    /// The first struct field that blocks a structural derive of `pid_opt` (Eq/M18 T0029,
+    /// Hash/M20 T0030, Display/M22 T0031), for the message that names it; null when `t` is
+    /// not a struct, has no such protocol, or every field conforms. Struct-only: a payload
+    /// enum with a non-conforming payload has no single nameable field, so it falls through
+    /// to the generic "does not conform" message instead.
+    fn deriveBlocker(bc: *BodyChecker, t: Type, pid_opt: ?u32) error{OutOfMemory}!?Typecheck.NonConformingField {
         if (t.kind != .@"struct") return null;
-        const eq_pid = bc.model.eq_protocol_id orelse return null;
-        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, eq_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
-    }
-
-    /// Whether `t` conforms to the prelude `Ord` protocol (M16/M19) — the predicate the
-    /// `<`/`>`/`<=`/`>=` operator typing uses. Mirrors `conformsToEq`: a concrete type
-    /// resolves via the frozen conformance table (`findConformance` covers the int/str/bool
-    /// prelude conformances AND every user `impl T has Ord`); a `type_var` in a bounded
-    /// generic body conforms as-axiom when its declared bound IS `Ord`. M19: after those
-    /// misses, a struct/enum whose fields all conform to `Ord` with NO explicit impl conforms
-    /// STRUCTURALLY — record the derive request (so the serial barrier synthesizes the
-    /// source-less `cmp`, which ALSO fills the single `(Eq, T)` slot) and return true. Now
-    /// fallible (`conforms` + the request record allocate). A prelude-less caller
-    /// (`ord_protocol_id == null`) denies conformance, so the operator emits T0027.
-    fn conformsToOrd(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
-        const ord_pid = bc.model.ord_protocol_id orelse return false;
-        if (Typecheck.findConformance(bc.model, ord_pid, t, &.{})) return true;
-        if (t.isTypeVar()) {
-            const ord = t.typeVarOrd();
-            if (ord >= bc.bound_protocols.len) return false;
-            return (bc.bound_protocols[ord] orelse return false) == ord_pid;
-        }
-        switch (t.kind) {
-            .@"struct", .@"enum", .app => {},
-            else => return false,
-        }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, ord_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
-            if (bc.isGround(t)) try bc.recordDeriveReq(ord_pid, t);
-            return true;
-        }
-        return false;
-    }
-
-    /// Whether `t` conforms to the prelude `Hash` protocol (M20) — the predicate the direct
-    /// `.hash()` method-call trigger uses. Mirrors `conformsToEq`/`conformsToOrd`, but Hash
-    /// is INDEPENDENT of Eq/Ord (no refinement): a concrete type resolves via the frozen
-    /// conformance table (`findConformance` covers the int/bool/str/unit prelude conformances
-    /// AND every user `impl T has Hash`); a `type_var` in a bounded generic body conforms
-    /// as-axiom when its declared bound IS `Hash`. After those misses, a struct/enum whose
-    /// fields all conform to `Hash` with NO explicit impl conforms STRUCTURALLY — record the
-    /// derive request (so the serial barrier synthesizes the source-less `hash`) and return
-    /// true. Now fallible (`conforms` + the request record allocate). A prelude-less caller
-    /// (`hash_protocol_id == null`) denies conformance.
-    fn conformsToHash(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
-        const hash_pid = bc.model.hash_protocol_id orelse return false;
-        if (Typecheck.findConformance(bc.model, hash_pid, t, &.{})) return true;
-        if (t.isTypeVar()) {
-            const ord = t.typeVarOrd();
-            if (ord >= bc.bound_protocols.len) return false;
-            return (bc.bound_protocols[ord] orelse return false) == hash_pid;
-        }
-        switch (t.kind) {
-            .@"struct", .@"enum", .app => {},
-            else => return false,
-        }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
-            if (bc.isGround(t)) try bc.recordDeriveReq(hash_pid, t);
-            return true;
-        }
-        return false;
-    }
-
-    /// The first struct field that blocks a structural `Hash` derive (M20), for the T0030
-    /// message; null when `t` is not a struct, has no hash protocol, or every field conforms.
-    /// Struct-only (mirrors `eqDeriveBlocker`): a payload enum with a non-conforming payload
-    /// has no single nameable field, so it falls through to T0018 instead.
-    fn hashDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
-        if (t.kind != .@"struct") return null;
-        const hash_pid = bc.model.hash_protocol_id orelse return null;
-        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, hash_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
-    }
-
-    /// Whether `t` conforms to the prelude `Display` protocol (M22) — the predicate the
-    /// `print(x)` builtin trigger uses. Mirrors `conformsToHash` (Display is likewise
-    /// INDEPENDENT of Eq/Ord/Hash, no refinement): a concrete type resolves via the frozen
-    /// conformance table (`findConformance` covers the int/bool/str/unit prelude conformances
-    /// AND every user `impl T has Display`); a `type_var` in a bounded generic body conforms
-    /// as-axiom when its declared bound IS `Display` (so `fn f[T has Display](x: T) { print(x) }`
-    /// works). After those misses, a struct/enum whose fields all conform to `Display` with NO
-    /// explicit impl conforms STRUCTURALLY — record the derive request (so the serial barrier
-    /// synthesizes the source-less `display`) and return true. Now fallible (`conforms` + the
-    /// request record allocate). A prelude-less caller (`display_protocol_id == null`) denies.
-    fn conformsToDisplay(bc: *BodyChecker, t: Type) error{OutOfMemory}!bool {
-        const disp_pid = bc.model.display_protocol_id orelse return false;
-        if (Typecheck.findConformance(bc.model, disp_pid, t, &.{})) return true;
-        if (t.isTypeVar()) {
-            const ord = t.typeVarOrd();
-            if (ord >= bc.bound_protocols.len) return false;
-            return (bc.bound_protocols[ord] orelse return false) == disp_pid;
-        }
-        switch (t.kind) {
-            .@"struct", .@"enum", .app => {},
-            else => return false,
-        }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, disp_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
-            if (bc.isGround(t)) try bc.recordDeriveReq(disp_pid, t);
-            return true;
-        }
-        return false;
-    }
-
-    /// The first struct field that blocks a structural `Display` derive (M22), for the T0031
-    /// message; null when `t` is not a struct, has no display protocol, or every field
-    /// conforms. Struct-only (mirrors `hashDeriveBlocker`): a payload enum with a
-    /// non-conforming payload has no single nameable field, so it falls through to a generic
-    /// "does not conform" message instead.
-    fn displayDeriveBlocker(bc: *BodyChecker, t: Type) error{OutOfMemory}!?Typecheck.NonConformingField {
-        if (t.kind != .@"struct") return null;
-        const disp_pid = bc.model.display_protocol_id orelse return null;
-        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, disp_pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
+        const pid = pid_opt orelse return null;
+        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)
