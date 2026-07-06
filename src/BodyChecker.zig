@@ -1788,241 +1788,7 @@ pub const BodyChecker = struct {
             const recv_is_func = bc.resolutions[(n.lhs).int()] == .func;
             const recv_res = bc.resolutions[(callee.lhs).int()];
             if (!recv_is_func and recv_res != .module) {
-                const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
-                if (recv_ty.kind == .invalid) return .invalid; // receiver already errored → no cascade
-                if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
-                    recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
-                {
-                    const member = bc.nameText(callee.main_token);
-                    const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-                    // Resolve the witness via the shared multi-conformance resolver
-                    // (the SAME rule lower + AstWalk use). `.one` is byte-identical to the
-                    // `findMethod` for every existing program (inherent / single
-                    // conformance / prelude); `.ambiguous` (a doubly-conforming generic
-                    // protocol used with no type-args) is T0025 — never an arbitrary pick.
-                    switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
-                        .one => |m| return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m),
-                        .ambiguous => {
-                            for (args) |a| _ = try bc.typeOf(a);
-                            try bc.emitAmbiguousConformance(callee.main_token, recv_ty, member);
-                            return .invalid;
-                        },
-                        .none => {},
-                    }
-                    // A direct `.hash()` on a struct/enum with NO explicit impl: the
-                    // structural `Hash` derive trigger. Hash has no operator, so (unlike
-                    // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
-                    // the `==` operator's `conformsTo`/`deriveBlocker` split: an all-`Hash`-
-                    // fields aggregate records the derive + types the call `int`; a struct with
-                    // a non-conforming field names it (T0030); a payload enum with a non-
-                    // conforming payload has no single nameable field, so it falls through to
-                    // T0018. Scalars fall through to `builtinScalarMethod` below.
-                    if (std.mem.eql(u8, member, "hash") and bc.model.hash_protocol_id != null and
-                        (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
-                    {
-                        if (args.len != 0) {
-                            for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
-                            bc.node_types[(node_idx).int()] = Type.int;
-                            return Type.int;
-                        }
-                        if (try bc.conformsTo(recv_ty, bc.model.hash_protocol_id, true)) {
-                            bc.node_types[(node_idx).int()] = Type.int;
-                            return Type.int;
-                        }
-                        if (try bc.deriveBlocker(recv_ty, bc.model.hash_protocol_id)) |blocker| {
-                            try bc.sink.emitFmtCode(.T0030, bc.byteOf(callee.main_token), "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
-                            return .invalid;
-                        }
-                        // No structural derive and no nameable blocker: fall through to T0018.
-                    }
-                    // A builtin scalar protocol method: `n.eq(m)` on int/bool, or
-                    // `n.hash()` on any scalar. Not a `t.methods` entry (the recognizer is
-                    // pure), so `findMethod` misses; recognize it here, check arity (`eq` = 1
-                    // non-self arg, `hash` = 0) + each arg assignable to `Self` (the
-                    // homogeneous receiver), and type the call to the method's return. A user
-                    // `impl int has P` was already handled above (its real `fn_id` is in the
-                    // method table), so this only fires for the builtins.
-                    if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
-                        if (args.len != bm.arity) {
-                            for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ bm.arity, args.len });
-                        } else for (args) |a| {
-                            const at = try bc.typeOfExpected(a, recv_ty);
-                            if (!Type.assignable(recv_ty, at))
-                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
-                        }
-                        bc.node_types[(node_idx).int()] = bm.ret;
-                        return bm.ret;
-                    }
-                    // A concrete struct/enum/scalar value with no such method.
-                    for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
-                    return .invalid;
-                } else if (recv_ty.kind == .app) {
-                    // A method call on a generic-type instance `b.get()`: the
-                    // receiver is an `App` (`Box[int]`; reify runs later in the mono
-                    // tail). Its ctor selects the `impl Box[T]` method TEMPLATE and the
-                    // impl's type-params bind by matching the template's `Self`
-                    // pattern-args against the receiver App's concrete args — the SAME
-                    // `Infer.match` scanCalls/lower run. Only the impl's params bind; a
-                    // method's OWN `[U]` generics are NOT inferred (deferred).
-                    const member = bc.nameText(callee.main_token);
-                    const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-                    const e = bc.composite.at(recv_ty.appIdx());
-                    if (Typecheck.findGenericMethod(bc.model.methods, e.ctor, e.ctor_is_enum, member)) |m| {
-                        const mf = bc.model.fns[m.fn_id];
-                        const n_gp: u32 = @intCast(mf.generic_params.len);
-                        const targs = try bc.gpa.alloc(Type, n_gp);
-                        defer bc.gpa.free(targs);
-                        const bnd = try bc.gpa.alloc(bool, n_gp);
-                        defer bc.gpa.free(bnd);
-                        const fp = try bc.gpa.alloc(usize, n_gp);
-                        defer bc.gpa.free(fp);
-                        const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
-                        var bound_ok = pat.len == e.args.len;
-                        if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
-                            .ok => {},
-                            else => bound_ok = false, // an unbound impl param: poison, no cascade
-                        };
-                        // A `mut self` method mutates the receiver in place, so it may
-                        // only be called on a mutable place (reuse the mut-self gate + T0019).
-                        if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
-                            try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
-                        }
-                        const self_off: usize = @min(mf.params.len, 1);
-                        const want = mf.params.len - self_off;
-                        if (args.len != want) {
-                            for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
-                            if (!bound_ok) return .invalid;
-                            const ret = substTy(bc, mf.ret, targs);
-                            bc.node_types[(node_idx).int()] = ret;
-                            return ret;
-                        }
-                        if (!bound_ok) {
-                            for (args) |a| _ = try bc.typeOfExpected(a, null);
-                            return .invalid;
-                        }
-                        for (args, mf.params[self_off..], 0..) |a, pty, i| {
-                            const want_ty = substTy(bc, pty, targs);
-                            const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
-                            if (!Type.assignable(want_ty, at)) {
-                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
-                            }
-                        }
-                        const ret = substTy(bc, mf.ret, targs);
-                        bc.node_types[(node_idx).int()] = ret;
-                        return ret;
-                    }
-                    // A compiler-provided inherent method on the prelude `Option`/`Result`
-                    // enums: recognized by ctor id, NOT a `t.methods` entry (source-
-                    // less, like the builtin scalar `eq`/`hash`), so `findGenericMethod`
-                    // misses above. `is_some`/`is_none`/`is_ok`/`is_err` -> bool (arity 0);
-                    // `unwrap` -> the payload type-arg (arity 0); `unwrap_or` -> the payload
-                    // type-arg (arity 1, default assignable to it). The receiver is an `App`
-                    // during Pass C (`e.args[0]` is the payload T); `lower` inlines the tag
-                    // test / payload load. Gated on `ctor_is_enum` (struct/enum ids share a
-                    // numeric space). An unknown member falls through to T0018 below.
-                    if (e.ctor_is_enum) {
-                        const fam = Typecheck.optResultFamilyOf(bc.model, e.ctor);
-                        if (Typecheck.optionResultMethod(fam, member)) |op| {
-                            const t_ty: Type = if (e.args.len >= 1) e.args[0] else .invalid;
-                            // Predicates are tag-only, so safe for any payload. `unwrap`/
-                            // `unwrap_or` carry the payload as ONE scalar value through
-                            // `lower`, so only recognize them for a scalar (int/bool)
-                            // payload; a str/struct/enum payload falls through to the T0018
-                            // below — a clean rejection, since aggregate-payload unwrap is
-                            // deferred (a scalar load would truncate a fat/aggregate
-                            // value, and an aggregate join block-arg crashes codegen).
-                            const native_ok = switch (op) {
-                                .is_tag0, .is_tag1 => true,
-                                .unwrap, .unwrap_or => t_ty.kind == .int or t_ty.kind == .bool,
-                            };
-                            if (native_ok) switch (op) {
-                                .is_tag0, .is_tag1 => {
-                                    if (args.len != 0) {
-                                        for (args) |a| _ = try bc.typeOf(a);
-                                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
-                                    }
-                                    bc.node_types[(node_idx).int()] = Type.bool;
-                                    return Type.bool;
-                                },
-                                .unwrap => {
-                                    if (args.len != 0) {
-                                        for (args) |a| _ = try bc.typeOf(a);
-                                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
-                                    }
-                                    bc.node_types[(node_idx).int()] = t_ty;
-                                    return t_ty;
-                                },
-                                .unwrap_or => {
-                                    if (args.len != 1) {
-                                        for (args) |a| _ = try bc.typeOfExpected(a, null);
-                                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
-                                    } else {
-                                        const at = try bc.typeOfExpected(args[0], if (t_ty.kind == .invalid) null else t_ty);
-                                        if (!Type.assignable(t_ty, at))
-                                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(t_ty), bc.typeName(at) });
-                                    }
-                                    bc.node_types[(node_idx).int()] = t_ty;
-                                    return t_ty;
-                                },
-                            };
-                        }
-                    }
-                    // A generic-type value with no such method.
-                    for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
-                    return .invalid;
-                } else if (recv_ty.isTypeVar()) {
-                    // A method call `v.m(..)` on a `type_var` receiver (bound-as-axiom):
-                    // this only happens while checking a BOUNDED generic template's body.
-                    // ONLY the methods of the param's declared bound `[T has P]` are
-                    // callable; resolve `m` against the bound protocol's decoded signature
-                    // (Self -> the bounded type_var). A non-protocol/unbounded method call
-                    // is T0018. (In a per-instance re-check the receiver is grounded, so
-                    // this branch never fires — the struct/scalar branch above does.)
-                    const member = bc.nameText(callee.main_token);
-                    const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-                    const ord = recv_ty.typeVarOrd();
-                    const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
-                    if (pid_opt) |pid| {
-                        const p = bc.model.protocols[pid];
-                        // The bound's protocol type-args (`[T has Into[int]]` -> `[int]`)
-                        // ground the protocol's OWN generic params (`tv(1..)`); `Self`
-                        // (`tv(0)`) grounds to the bounded `type_var` receiver itself.
-                        const pargs: []const Type = if (ord < bc.bound_protocol_args.len) bc.bound_protocol_args[ord] else &.{};
-                        var mi: ?usize = null;
-                        for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
-                            mi = k;
-                            break;
-                        };
-                        if (mi) |k| {
-                            const psig = p.method_params[k]; // [self, ...]
-                            const self_off: usize = @min(psig.len, 1);
-                            const want = psig.len - self_off;
-                            if (args.len != want) {
-                                for (args) |a| _ = try bc.typeOf(a);
-                                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
-                            } else for (args, psig[self_off..], 0..) |a, pty, i| {
-                                const wt = Typecheck.groundProtoType(pty, recv_ty, pargs);
-                                const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
-                                if (!Type.assignable(wt, at))
-                                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
-                            }
-                            const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, pargs);
-                            bc.node_types[(node_idx).int()] = ret;
-                            return ret;
-                        }
-                        for (args) |a| _ = try bc.typeOf(a);
-                        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
-                        return .invalid;
-                    }
-                    for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on unbounded type parameter", .{member});
-                    return .invalid;
-                }
+                if (try bc.dispatchValueMethod(node_idx, n, callee)) |t| return t;
             }
         }
         // An explicit-protocol-args method call `v.into[int](..)`: the callee is a
@@ -2172,6 +1938,259 @@ pub const BodyChecker = struct {
             }
         }
         return f.ret;
+    }
+
+    fn dispatchValueMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
+        const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
+        if (recv_ty.kind == .invalid) return Type.invalid; // receiver already errored → no cascade
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
+            recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
+        {
+            return try bc.dispatchConcreteMethod(node_idx, n, callee, recv_ty);
+        } else if (recv_ty.kind == .app) {
+            return try bc.dispatchAppMethod(node_idx, n, callee, recv_ty);
+        } else if (recv_ty.isTypeVar()) {
+            return try bc.dispatchTypeVarMethod(node_idx, n, callee, recv_ty);
+        }
+        // No final else: an unhandled receiver kind (.never/.func) falls through to the
+        // callee_res != .func path in typeOfCall.
+        return null;
+    }
+
+    fn dispatchConcreteMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
+        const member = bc.nameText(callee.main_token);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        // Resolve the witness via the shared multi-conformance resolver
+        // (the SAME rule lower + AstWalk use). `.one` is byte-identical to the
+        // `findMethod` for every existing program (inherent / single
+        // conformance / prelude); `.ambiguous` (a doubly-conforming generic
+        // protocol used with no type-args) is T0025 — never an arbitrary pick.
+        switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
+            .one => |m| return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m),
+            .ambiguous => {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.emitAmbiguousConformance(callee.main_token, recv_ty, member);
+                return .invalid;
+            },
+            .none => {},
+        }
+        // A direct `.hash()` on a struct/enum with NO explicit impl: the
+        // structural `Hash` derive trigger. Hash has no operator, so (unlike
+        // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
+        // the `==` operator's `conformsTo`/`deriveBlocker` split: an all-`Hash`-
+        // fields aggregate records the derive + types the call `int`; a struct with
+        // a non-conforming field names it (T0030); a payload enum with a non-
+        // conforming payload has no single nameable field, so it falls through to
+        // T0018. Scalars fall through to `builtinScalarMethod` below.
+        if (std.mem.eql(u8, member, "hash") and bc.model.hash_protocol_id != null and
+            (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
+        {
+            if (args.len != 0) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                bc.node_types[(node_idx).int()] = Type.int;
+                return Type.int;
+            }
+            if (try bc.conformsTo(recv_ty, bc.model.hash_protocol_id, true)) {
+                bc.node_types[(node_idx).int()] = Type.int;
+                return Type.int;
+            }
+            if (try bc.deriveBlocker(recv_ty, bc.model.hash_protocol_id)) |blocker| {
+                try bc.sink.emitFmtCode(.T0030, bc.byteOf(callee.main_token), "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                return .invalid;
+            }
+            // No structural derive and no nameable blocker: fall through to T0018.
+        }
+        // A builtin scalar protocol method: `n.eq(m)` on int/bool, or
+        // `n.hash()` on any scalar. Not a `t.methods` entry (the recognizer is
+        // pure), so `findMethod` misses; recognize it here, check arity (`eq` = 1
+        // non-self arg, `hash` = 0) + each arg assignable to `Self` (the
+        // homogeneous receiver), and type the call to the method's return. A user
+        // `impl int has P` was already handled above (its real `fn_id` is in the
+        // method table), so this only fires for the builtins.
+        if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
+            if (args.len != bm.arity) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ bm.arity, args.len });
+            } else for (args) |a| {
+                const at = try bc.typeOfExpected(a, recv_ty);
+                if (!Type.assignable(recv_ty, at))
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
+            }
+            bc.node_types[(node_idx).int()] = bm.ret;
+            return bm.ret;
+        }
+        // A concrete struct/enum/scalar value with no such method.
+        for (args) |a| _ = try bc.typeOf(a);
+        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+        return .invalid;
+    }
+
+    fn dispatchAppMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
+        // A method call on a generic-type instance `b.get()`: the
+        // receiver is an `App` (`Box[int]`; reify runs later in the mono
+        // tail). Its ctor selects the `impl Box[T]` method TEMPLATE and the
+        // impl's type-params bind by matching the template's `Self`
+        // pattern-args against the receiver App's concrete args — the SAME
+        // `Infer.match` scanCalls/lower run. Only the impl's params bind; a
+        // method's OWN `[U]` generics are NOT inferred (deferred).
+        const member = bc.nameText(callee.main_token);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        const e = bc.composite.at(recv_ty.appIdx());
+        if (Typecheck.findGenericMethod(bc.model.methods, e.ctor, e.ctor_is_enum, member)) |m| {
+            const mf = bc.model.fns[m.fn_id];
+            const n_gp: u32 = @intCast(mf.generic_params.len);
+            const targs = try bc.gpa.alloc(Type, n_gp);
+            defer bc.gpa.free(targs);
+            const bnd = try bc.gpa.alloc(bool, n_gp);
+            defer bc.gpa.free(bnd);
+            const fp = try bc.gpa.alloc(usize, n_gp);
+            defer bc.gpa.free(fp);
+            const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
+            var bound_ok = pat.len == e.args.len;
+            if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
+                .ok => {},
+                else => bound_ok = false, // an unbound impl param: poison, no cascade
+            };
+            // A `mut self` method mutates the receiver in place, so it may
+            // only be called on a mutable place (reuse the mut-self gate + T0019).
+            if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
+                try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+            }
+            const self_off: usize = @min(mf.params.len, 1);
+            const want = mf.params.len - self_off;
+            if (args.len != want) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+                if (!bound_ok) return .invalid;
+                const ret = substTy(bc, mf.ret, targs);
+                bc.node_types[(node_idx).int()] = ret;
+                return ret;
+            }
+            if (!bound_ok) {
+                for (args) |a| _ = try bc.typeOfExpected(a, null);
+                return .invalid;
+            }
+            for (args, mf.params[self_off..], 0..) |a, pty, i| {
+                const want_ty = substTy(bc, pty, targs);
+                const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
+                if (!Type.assignable(want_ty, at)) {
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
+                }
+            }
+            const ret = substTy(bc, mf.ret, targs);
+            bc.node_types[(node_idx).int()] = ret;
+            return ret;
+        }
+        // A compiler-provided inherent method on the prelude `Option`/`Result`
+        // enums: recognized by ctor id, NOT a `t.methods` entry (source-
+        // less, like the builtin scalar `eq`/`hash`), so `findGenericMethod`
+        // misses above. `is_some`/`is_none`/`is_ok`/`is_err` -> bool (arity 0);
+        // `unwrap` -> the payload type-arg (arity 0); `unwrap_or` -> the payload
+        // type-arg (arity 1, default assignable to it). The receiver is an `App`
+        // during Pass C (`e.args[0]` is the payload T); `lower` inlines the tag
+        // test / payload load. Gated on `ctor_is_enum` (struct/enum ids share a
+        // numeric space). An unknown member falls through to T0018 below.
+        if (e.ctor_is_enum) {
+            const fam = Typecheck.optResultFamilyOf(bc.model, e.ctor);
+            if (Typecheck.optionResultMethod(fam, member)) |op| {
+                const t_ty: Type = if (e.args.len >= 1) e.args[0] else .invalid;
+                // Predicates are tag-only, so safe for any payload. `unwrap`/
+                // `unwrap_or` carry the payload as ONE scalar value through
+                // `lower`, so only recognize them for a scalar (int/bool)
+                // payload; a str/struct/enum payload falls through to the T0018
+                // below — a clean rejection, since aggregate-payload unwrap is
+                // deferred (a scalar load would truncate a fat/aggregate
+                // value, and an aggregate join block-arg crashes codegen).
+                const native_ok = switch (op) {
+                    .is_tag0, .is_tag1 => true,
+                    .unwrap, .unwrap_or => t_ty.kind == .int or t_ty.kind == .bool,
+                };
+                if (native_ok) switch (op) {
+                    .is_tag0, .is_tag1 => {
+                        if (args.len != 0) {
+                            for (args) |a| _ = try bc.typeOf(a);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        }
+                        bc.node_types[(node_idx).int()] = Type.bool;
+                        return Type.bool;
+                    },
+                    .unwrap => {
+                        if (args.len != 0) {
+                            for (args) |a| _ = try bc.typeOf(a);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        }
+                        bc.node_types[(node_idx).int()] = t_ty;
+                        return t_ty;
+                    },
+                    .unwrap_or => {
+                        if (args.len != 1) {
+                            for (args) |a| _ = try bc.typeOfExpected(a, null);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                        } else {
+                            const at = try bc.typeOfExpected(args[0], if (t_ty.kind == .invalid) null else t_ty);
+                            if (!Type.assignable(t_ty, at))
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(t_ty), bc.typeName(at) });
+                        }
+                        bc.node_types[(node_idx).int()] = t_ty;
+                        return t_ty;
+                    },
+                };
+            }
+        }
+        // A generic-type value with no such method.
+        for (args) |a| _ = try bc.typeOf(a);
+        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+        return .invalid;
+    }
+
+    fn dispatchTypeVarMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
+        // A method call `v.m(..)` on a `type_var` receiver (bound-as-axiom):
+        // this only happens while checking a BOUNDED generic template's body.
+        // ONLY the methods of the param's declared bound `[T has P]` are
+        // callable; resolve `m` against the bound protocol's decoded signature
+        // (Self -> the bounded type_var). A non-protocol/unbounded method call
+        // is T0018. (In a per-instance re-check the receiver is grounded, so
+        // this branch never fires — the struct/scalar branch above does.)
+        const member = bc.nameText(callee.main_token);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        const ord = recv_ty.typeVarOrd();
+        const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
+        if (pid_opt) |pid| {
+            const p = bc.model.protocols[pid];
+            // The bound's protocol type-args (`[T has Into[int]]` -> `[int]`)
+            // ground the protocol's OWN generic params (`tv(1..)`); `Self`
+            // (`tv(0)`) grounds to the bounded `type_var` receiver itself.
+            const pargs: []const Type = if (ord < bc.bound_protocol_args.len) bc.bound_protocol_args[ord] else &.{};
+            var mi: ?usize = null;
+            for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
+                mi = k;
+                break;
+            };
+            if (mi) |k| {
+                const psig = p.method_params[k]; // [self, ...]
+                const self_off: usize = @min(psig.len, 1);
+                const want = psig.len - self_off;
+                if (args.len != want) {
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+                } else for (args, psig[self_off..], 0..) |a, pty, i| {
+                    const wt = Typecheck.groundProtoType(pty, recv_ty, pargs);
+                    const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
+                    if (!Type.assignable(wt, at))
+                        try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
+                }
+                const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, pargs);
+                bc.node_types[(node_idx).int()] = ret;
+                return ret;
+            }
+            for (args) |a| _ = try bc.typeOf(a);
+            try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
+            return .invalid;
+        }
+        for (args) |a| _ = try bc.typeOf(a);
+        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on unbounded type parameter", .{member});
+        return .invalid;
     }
 
     /// Type an explicit-args generic call `id[A,B](..)`. The callee `type_app`'s base
