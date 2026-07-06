@@ -505,9 +505,9 @@ pub fn lowerGraphProgram(
     for (lower_ids.items, 0..) |gid, i| lowered_names[i] = names[gid];
     // Instance units carry their mangled SymName (borrowed from the instance table,
     // which outlives relink). Parallel to the appended instance codegen units.
-    for (tc.instances, 0..) |inst, k| lowered_names[base_count + k] = .{ .kind = .user_fn, .name = inst.name };
+    for (tc.instances, 0..) |inst, k| lowered_names[base_count + k] = .{ .kind = .user_fn, .name = inst.name.? };
     // Derive units carry their synthetic mangled SymName (borrowed from `tc.derives`).
-    for (tc.derives, 0..) |d, k| lowered_names[derive_base + k] = .{ .kind = .user_fn, .name = d.name };
+    for (tc.derives, 0..) |d, k| lowered_names[derive_base + k] = .{ .kind = .user_fn, .name = d.name.? };
 
     const link_t0: i128 = if (link_ns != null) nowNs(io) else 0;
     const out = relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
@@ -580,8 +580,8 @@ fn graphFnJobInner(
         // A monomorphized instance: its identity is the mangled SymName and its sig
         // is the SUBSTITUTED (fully concrete) params/ret. Never the entry.
         const inst = gf.instances[lower_i - gf.base_count];
-        sym = .{ .kind = .user_fn, .name = inst.name };
-        my_sig = .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret };
+        sym = .{ .kind = .user_fn, .name = inst.name.? };
+        my_sig = .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret };
     }
 
     // The cross-module callee identity + touched layouts ride in through the
@@ -668,7 +668,7 @@ pub fn renderGraphIr(
     // substituted sig), in canonical order — the same units codegen lowers.
     for (tc.instances) |inst| {
         const m = &graph.modules[inst.mod];
-        const sym = Link.SymName{ .kind = .user_fn, .name = inst.name };
+        const sym = Link.SymName{ .kind = .user_fn, .name = inst.name.? };
         const in = lower.Inputs{
             .tree = m.tree(),
             .tokens = m.tokens,
@@ -678,7 +678,7 @@ pub fn renderGraphIr(
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,
-            .sig = .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret },
+            .sig = .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret },
             .instances = tc.instances,
             .sigs = tc.sigs,
             .methods = tc.methods,
@@ -699,7 +699,7 @@ pub fn renderGraphIr(
     // this). Dispatch on the recipe kind, mirroring `Engine.lowerSynthetic`.
     for (tc.derives) |d| {
         const m = &graph.modules[d.mod];
-        const sym = Link.SymName{ .kind = .user_fn, .name = d.name };
+        const sym = Link.SymName{ .kind = .user_fn, .name = d.name.? };
         const in = lower.Inputs{
             .tree = m.tree(),
             .tokens = m.tokens,
@@ -709,7 +709,7 @@ pub fn renderGraphIr(
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,
-            .sig = .{ .kind = .user_fn, .name = d.name, .params = d.params, .ret = d.ret },
+            .sig = .{ .kind = .user_fn, .name = d.name.?, .params = d.params, .ret = d.ret },
             .instances = tc.instances,
             .sigs = tc.sigs,
             .methods = tc.methods,

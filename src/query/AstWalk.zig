@@ -671,14 +671,14 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // Ord derive) rather than a hardcoded bool, so an Ord-derive witness folds
                     // its real sig. The mangled name already disambiguates, so this is
                     // correctness-neutral — done for cleanliness.
-                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = dv.name, .params = dv.params, .ret = dv.ret });
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = dv.name.?, .params = dv.params, .ret = dv.ret });
                 }
                 return;
             }
             if (m.instance) |ii| {
                 if (ii < self.frozen.instances.len) {
                     const inst = self.frozen.instances[ii];
-                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
                 }
             } else if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
                 const nm = self.frozen.names[m.fn_id];
@@ -756,7 +756,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
             const ii = Mono.find(self.frozen.instances, bres.func, args) orelse return;
             const inst = self.frozen.instances[ii];
-            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
         }
 
         /// Bare inferred generic callee (M3): infer the type-args from the enclosing
@@ -777,7 +777,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
             defer self.gpa.free(targs);
             const ii = Mono.find(self.frozen.instances, gid, targs) orelse return;
             const inst = self.frozen.instances[ii];
-            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name, .params = inst.params, .ret = inst.ret });
+            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
         }
     };
 }
@@ -1807,7 +1807,7 @@ test "M25: a WIDENING `?` folds the resolved `From` witness; the identity `?` fo
     const op_err = ol.variants[1].field_types[0];
     const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", true, &.{op_err});
     try testing.expect(pick == .one);
-    const want_name = if (pick.one.instance) |ii| tc.instances[ii].name else names[pick.one.fn_id].name;
+    const want_name = if (pick.one.instance) |ii| tc.instances[ii].name.? else names[pick.one.fn_id].name;
 
     // outer's `?` WIDENS (SmallErr -> BigErr): its fold stream contains the `from` witness.
     var outer_sigs: std.ArrayList(Sig) = .empty;
