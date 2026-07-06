@@ -65,7 +65,7 @@ const EnumSym = LayoutEngine.EnumSym;
 /// Source spelling of a type reference → `Type`. Anything else is unknown (a
 /// struct name, or an error). The unit type `()` is spelled with parens, not an
 /// identifier, so it is NOT here (handled in `typeFromNode` via `literal_unit`).
-const type_names = std.StaticStringMap(Type).initComptime(.{
+pub const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "int", Type.int },
     .{ "bool", Type.bool },
     .{ "str", Type.str },
@@ -1427,7 +1427,7 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
 /// Switch the active tree/tokens/source/resolutions + bare-name maps to module
 /// `mod`. Returns the previous active module so the caller can restore it (layout
 /// recursion crosses module boundaries).
-fn gphSelect(t: *Typecheck, mod: u32) u32 {
+pub fn gphSelect(t: *Typecheck, mod: u32) u32 {
     const prev = t.graph_mod;
     const g = t.graph;
     const mc = &g.mods[mod];
@@ -1447,17 +1447,17 @@ fn gphSelect(t: *Typecheck, mod: u32) u32 {
 }
 
 /// The active bare-name → global-struct-id map: the current module's table.
-fn activeStructMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
+pub fn activeStructMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].struct_ids;
 }
 
 /// The active bare-name → global-enum-id map: the current module's table.
-fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
+pub fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].enum_ids;
 }
 
 /// The active bare-name → global-protocol-id map: the current module's table (M11).
-fn activeProtocolMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
+pub fn activeProtocolMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].protocol_ids;
 }
 
@@ -1465,7 +1465,7 @@ fn activeProtocolMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
 /// the layout recursion needs, wired to the existing methods. The `emit*` thunks
 /// forward to `sink.emitFmt` with the SAME literal format strings the layout code
 /// used in-line, so the emitted diagnostics stay byte-identical.
-fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
+pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
     const T = struct {
         fn castGph(ctx: *anyopaque, mod: u32) u32 {
             return gphSelect(@ptrCast(@alignCast(ctx)), mod);
@@ -1899,7 +1899,7 @@ const mono_instance_cap: usize = 10_000;
 /// `f[Box[T]]` forms `App`s of strictly-growing depth (`Box[Box[..[int]..]]`); this
 /// cap makes the serial worklist reject it deterministically (never hang/OOM) while a
 /// legitimately deep-but-finite generic program (nesting well under 64) still compiles.
-const max_instantiation_depth: u32 = 64;
+pub const max_instantiation_depth: u32 = 64;
 
 /// True when `ty` is a concrete value type usable as a monomorphization type-arg.
 /// M4 admits a ground `App` (a generic-struct instance like `Box[int]` used as a
@@ -3286,7 +3286,7 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
 /// is no prior emit to double). A bare `identifier` resolves against the active module's
 /// protocol map; a qualified `mod.P` `field_access` resolves the receiver namespace then
 /// the owning module's protocol table, gated on `pub_export`.
-fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
+pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
     if (ref_idx == Ast.none) return null;
     // A generic protocol reference `P[int]` / `mod.P[int]` (M14) parses to a `type_app`;
     // resolve its BASE name node (the args are read separately by the caller).
@@ -3344,7 +3344,7 @@ fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
 /// silent to avoid a double-emit. A bare `identifier` resolves against the active
 /// struct/enum maps; a qualified `mod.T` `field_access` resolves the receiver namespace
 /// then the owning module's tables. Null on any miss (Phase A already reported it).
-fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
+pub fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
     if (node_idx == Ast.none) return null;
     const n = t.tree.nodes[node_idx.int()];
     if (n.tag == .identifier) {
@@ -4330,7 +4330,7 @@ fn appendPrint(t: *Typecheck) !void {
     try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .kind = .builtin, .params = params, .ret = .unit });
 }
 
-fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
+pub fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
     return refs.typeFromNode(t, type_node);
 }
 
@@ -4366,11 +4366,11 @@ fn typeName(t: *const Typecheck, ty: Type) []const u8 {
     return refs.typeName(t, ty);
 }
 
-fn nameText(t: *const Typecheck, tok: u32) []const u8 {
+pub fn nameText(t: *const Typecheck, tok: u32) []const u8 {
     return refs.nameText(t, tok);
 }
 
-fn byteOf(t: *const Typecheck, tok: u32) u32 {
+pub fn byteOf(t: *const Typecheck, tok: u32) u32 {
     return refs.byteOf(t, tok);
 }
 
