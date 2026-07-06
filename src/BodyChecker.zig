@@ -1622,7 +1622,6 @@ pub const BodyChecker = struct {
                 try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(fa.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
             }
         }
-        // params[0] is the synthesized `self`; value args match params[1..].
         const self_off: usize = @min(mf.params.len, 1);
         const want = mf.params.len - self_off;
         if (args.len != want) {
@@ -1884,7 +1883,6 @@ pub const BodyChecker = struct {
                         if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
                             try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
                         }
-                        // params[0] is the synthesized `self`; value args match params[1..].
                         const self_off: usize = @min(mf.params.len, 1);
                         const want = mf.params.len - self_off;
                         if (args.len != want) {

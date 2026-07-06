@@ -1320,12 +1320,10 @@ fn deriveEnumEq(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_b
     const false_blk = try b.addBlock();
     b.setTerm(.{ .cond_br = .{ .cond = tags_eq, .t = dispatch, .f = false_blk } });
 
-    // Tags differ: not equal.
     b.switchTo(false_blk);
     const fv = try b.emit(.{ .bconst = false }, bool_ty);
     try brTo(b, join, .{ .value = fv });
 
-    // Tags equal: dispatch on the (self) tag to compare that variant's payload for equality.
     b.switchTo(dispatch);
     try emitVariantLadder(b, e, lt, .{ .e = e, .self_base = self_base, .other_base = other_base, .join = join }, struct {
         fn f(bb: *Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
@@ -1488,11 +1486,9 @@ fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_
     const tag_decide = try b.addBlock();
     b.setTerm(.{ .cond_br = .{ .cond = tags_eq, .t = dispatch, .f = tag_decide } });
 
-    // Tags differ: the tag ordering decides.
     b.switchTo(tag_decide);
     try brTo(b, join, .{ .value = tag_disc });
 
-    // Tags equal: dispatch on the (self) tag to compare that variant's payload.
     b.switchTo(dispatch);
     try emitVariantLadder(b, e, st, .{ .e = e, .self_base = self_base, .other_base = other_base, .join = join }, struct {
         fn f(bb: *Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
@@ -1502,13 +1498,17 @@ fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_
     }.f);
 }
 
+// The source-less auto-derive emitters (`Eq`/`Ord`/`Hash`/`Display`) share a determinism
+// contract: each is PURE of `(recipe, layouts, method table)` — a fixed field/variant-order
+// walk that hands out ids monotonically and reads no map, so a double-lower is byte-identical
+// under `-jN`.
+
 /// Lower a SOURCE-LESS auto-derive `Eq` unit (M18): the spike's layout-walking emitter.
 /// Two params (the two receiver values, by slot), a single straight-line
 /// multiply-accumulate over the struct's fields (`acc *= field_eq`, then
 /// `ret = acc != 0`) — no `cond_br` except the self-contained str/aggregate sub-graphs,
 /// so it is maximally `--verify`-stable — or, for an empty-payload enum, `get_tag(self)
-/// == get_tag(other)`. PURE of `(recipe, layouts, method table)`: a fixed field-order
-/// walk handing out ids monotonically, reading no map, so a double-lower is byte-identical.
+/// == get_tag(other)`.
 pub fn lowerDeriveEq(
     gpa: std.mem.Allocator,
     in: Inputs,
@@ -1523,7 +1523,6 @@ pub fn lowerDeriveEq(
     var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = bool_ty, .diags = out_diags };
     errdefer b.deinit();
 
-    // Two params, both the conforming type, by slot (self, other).
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
     const p_self = try b.addSlot(cty);
@@ -1531,8 +1530,6 @@ pub fn lowerDeriveEq(
     const p_other = try b.addSlot(cty);
     try params.append(gpa, p_other);
 
-    // entry (b0) + the single EXIT block whose one param is the bool return (mirrors
-    // `lowerFn`'s scaffold).
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
@@ -1590,8 +1587,7 @@ pub fn lowerDeriveEq(
 /// over its fields (declaration order), a payload enum compares discriminants then the equal
 /// variant's payload lexicographically (SE-0266 total order). At `join` the discriminant is
 /// stored as the `Ordering` value's tag (offset 0) and returned via the exit param (aggregate
-/// sret ABI, exactly as a user `-> Ordering` cmp). PURE of `(recipe, layouts, method table)`:
-/// a fixed walk handing out ids monotonically, reading no map — a double-lower is identical.
+/// sret ABI, exactly as a user `-> Ordering` cmp).
 pub fn lowerDeriveOrd(
     gpa: std.mem.Allocator,
     in: Inputs,
@@ -1606,7 +1602,6 @@ pub fn lowerDeriveOrd(
     var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = ord_ty, .diags = out_diags };
     errdefer b.deinit();
 
-    // Two params, both the conforming type, by slot (self, other).
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
     const p_self = try b.addSlot(cty);
@@ -1614,8 +1609,6 @@ pub fn lowerDeriveOrd(
     const p_other = try b.addSlot(cty);
     try params.append(gpa, p_other);
 
-    // entry (b0) + the single EXIT block whose one param is the `Ordering` return (mirrors
-    // `lowerFn`'s scaffold; an aggregate ret rides the exit param via the sret ABI).
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
@@ -1832,9 +1825,7 @@ fn deriveEnumHash(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId) error
 /// int. ONE param (the receiver, by slot). A struct folds a fixed seed through its fields in
 /// layout order (`h := h*MULT + fieldhash`); an empty-payload enum folds the discriminant
 /// (`combine(seed, tag)`); a payload enum folds the discriminant then the active variant's
-/// payload via a tag-dispatch ladder. PURE of `(recipe, layouts, method table)`: a fixed
-/// field-order walk handing ids monotonically, reading no map — a double-lower is identical,
-/// and the fixed seed makes the hash reproducible run-to-run.
+/// payload via a tag-dispatch ladder. The fixed seed makes the hash reproducible run-to-run.
 pub fn lowerDeriveHash(
     gpa: std.mem.Allocator,
     in: Inputs,
@@ -1848,14 +1839,11 @@ pub fn lowerDeriveHash(
     var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = int_ty, .diags = out_diags };
     errdefer b.deinit();
 
-    // ONE param (self), by slot — hash is 1-ary.
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
     const p_self = try b.addSlot(cty);
     try params.append(gpa, p_self);
 
-    // entry (b0) + the single EXIT block whose one param is the int return (mirrors
-    // `lowerFn`'s scaffold; an int ret rides the exit param in a register).
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
@@ -1903,8 +1891,6 @@ pub fn lowerDeriveHash(
     return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
-// ==== M22 structural `Display` derive (write-to-fd, heap-free) ========================
-//
 // The Display emitter and the `print(x)` dispatch share ONE raw write path: every
 // literal (type/field/variant name + separators) and every `str` field is written by
 // building a `str {ptr@0,len@8}` slot and calling the `print` builtin (write(1,ptr,len));
@@ -2059,9 +2045,7 @@ fn emitVariantDisplay(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_base
 /// returned `str`. ONE param (the receiver, by slot). A struct writes `Name{field: <v>, ...}`
 /// (fields in layout order); a payload enum does a `get_tag` dispatch ladder writing a bare
 /// `variant` or `variant(<v0>, <v1>)`; scalar fields render inline (int->__display_int, bool
-/// inline, str->raw bytes), aggregate fields call the sibling `display` witness. PURE of
-/// `(recipe, layouts, method table)`: a fixed field/variant-order walk handing ids
-/// monotonically, reading no map — a double-lower is byte-identical.
+/// inline, str->raw bytes), aggregate fields call the sibling `display` witness.
 pub fn lowerDeriveDisplay(
     gpa: std.mem.Allocator,
     in: Inputs,
@@ -2076,14 +2060,11 @@ pub fn lowerDeriveDisplay(
     var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = unit_ty, .diags = out_diags };
     errdefer b.deinit();
 
-    // ONE param (self), by slot — display is 1-ary.
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
     const p_self = try b.addSlot(cty);
     try params.append(gpa, p_self);
 
-    // entry (b0) + a unit EXIT block: no return param, terminator `ret .none` (mirrors
-    // `lowerFn`'s unit scaffold).
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
