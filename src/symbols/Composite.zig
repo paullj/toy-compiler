@@ -74,7 +74,7 @@ pub fn deinit(c: *Composite, gpa: std.mem.Allocator) void {
 /// own interned index (via `struct_id`), and a `.type_var` arg its ordinal — so the
 /// key is injective within a run (inner `App`s interned first).
 fn writeFlatKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ctor: u32, args: []const Type, ctor_is_enum: bool) !void {
-    try buf.append(gpa, @intFromBool(ctor_is_enum)); // disambiguate the struct/enum ctor id space
+    try buf.append(gpa, @intFromBool(ctor_is_enum));
     var w: [4]u8 = undefined;
     std.mem.writeInt(u32, &w, ctor, .little);
     try buf.appendSlice(gpa, &w);
@@ -91,7 +91,7 @@ pub fn intern(c: *Composite, gpa: std.mem.Allocator, ctor: u32, args: []const Ty
     try writeFlatKey(gpa, &keybuf, ctor, args, ctor_is_enum);
     const gop = try c.dedup.getOrPut(gpa, keybuf.items);
     if (gop.found_existing) return gop.value_ptr.*;
-    gop.key_ptr.* = try gpa.dupe(u8, keybuf.items); // own the stored key
+    gop.key_ptr.* = try gpa.dupe(u8, keybuf.items);
     const idx: u32 = @intCast(c.entries.items.len);
     gop.value_ptr.* = idx;
     const owned = try gpa.dupe(Type, args);
