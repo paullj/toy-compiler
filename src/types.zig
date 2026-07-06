@@ -6308,7 +6308,7 @@ test "M13: a bounded generic compiles ONCE against the bound and monomorphizes o
     try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances.len);
     try testing.expectEqualStrings("Doubler", c.result.instances[0].conformances[0].protocol_name);
     try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances[0].witness_syms.len);
-    try testing.expectEqualStrings("main.P.dbl", c.result.instances[0].conformances[0].witness_syms[0]);
+    try testing.expectEqualStrings("main.P.dbl$Doubler", c.result.instances[0].conformances[0].witness_syms[0]);
 }
 
 test "M13: a non-conforming type at a bounded call is a use-site T0023 and skips the instance" {

@@ -1,0 +1,12 @@
+protocol Show { fn render(self) -> int }
+protocol Debug { fn render(self) -> int }
+
+struct P { x: int }
+
+impl P has Show { fn render(self) -> int { return 1 } }
+impl P has Debug { fn render(self) -> int { return 2 } }
+
+fn main() -> int {
+    p := P{ x: 1 }
+    return p.render()  #~ ERROR [T0025] ambiguous
+}

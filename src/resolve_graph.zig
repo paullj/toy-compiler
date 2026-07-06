@@ -228,32 +228,32 @@ fn collectGlobals(g: *GraphResolve) !void {
                     // codegen unit) but is NOT bare-callable (never inserted into
                     // `tables[mod].fns`) — a method is reached only via `x.m(..)`
                     // dispatch through the program-wide method table (built in Pass A).
-                    // A conformance method (`impl_has_decl`) registers IDENTICALLY: its
+                    // A conformance method (`impl_has_decl`) DISPATCHES identically — its
                     // protocol-method dispatch is indistinguishable from an inherent one
-                    // (M11). `Ast.implMethods` yields the method run for either shape.
+                    // (M11) — but its symbol carries a protocol suffix (see below).
+                    // `Ast.implMethods` yields the method run for either shape.
                     const recv_name = g.nameOf(mod, decl.main_token);
-                    // M14: a GENERIC-protocol conformance (`impl P has Into[int]`) mangles
-                    // the method symbol + duplicate-check key with the protocol identity +
-                    // its type-args, so `Into[int]` and `Into[bool]` don't collide on the
-                    // shared `P.into` symbol (a linker duplicate) nor trip a spurious R0002.
-                    // A non-generic-protocol conformance / inherent impl keeps the bare
-                    // `<recv>.<method>` name — byte-identical to M11/M13.
+                    // A conformance method (`impl P has Q`) mangles its symbol +
+                    // duplicate-check key with the protocol identity (its name, plus any
+                    // type-args), so two conformances sharing a method name on one receiver
+                    // don't collide on the `<recv>.<method>` symbol (a linker duplicate) nor
+                    // trip a spurious R0002 that would pre-empt the T0025 multi-conformance
+                    // resolver. Generic protocols additionally distinguish `Into[int]` from
+                    // `Into[bool]` by their type-args. An inherent impl (`impl P`) keeps the
+                    // bare `<recv>.<method>` name.
                     var proto_suffix: []const u8 = "";
                     defer if (proto_suffix.len > 0) g.gpa.free(proto_suffix);
                     if (decl.tag == .impl_has_decl) {
                         if (Ast.implProtocol(t, decl)) |proto_ref| {
-                            const pargs = Ast.protocolRefArgs(t, proto_ref);
-                            if (pargs.len > 0) {
-                                var sb: std.ArrayList(u8) = .empty;
-                                errdefer sb.deinit(g.gpa);
+                            var sb: std.ArrayList(u8) = .empty;
+                            errdefer sb.deinit(g.gpa);
+                            try sb.append(g.gpa, '$');
+                            try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[Ast.protocolRefBase(t, proto_ref).int()].main_token));
+                            for (Ast.protocolRefArgs(t, proto_ref)) |an| {
                                 try sb.append(g.gpa, '$');
-                                try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[Ast.protocolRefBase(t, proto_ref).int()].main_token));
-                                for (pargs) |an| {
-                                    try sb.append(g.gpa, '$');
-                                    try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[an.int()].main_token));
-                                }
-                                proto_suffix = try sb.toOwnedSlice(g.gpa);
+                                try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[an.int()].main_token));
                             }
+                            proto_suffix = try sb.toOwnedSlice(g.gpa);
                         }
                     }
                     for (Ast.implMethods(t, decl)) |method_idx| {
@@ -1353,4 +1353,37 @@ test "print is available unqualified in every module with one shared id" {
         }
     };
     try withResolvedGraph(".toy-test-res-print", files, "main.toy", Check.run);
+}
+
+test "two non-generic conformances sharing a method name register distinctly (no R0002)" {
+    const files = &[_]FixtureFile{
+        .{ .path = "solo.toy", .source =
+        \\protocol Show { fn render(self) -> int }
+        \\protocol Debug { fn render(self) -> int }
+        \\struct P { x: int }
+        \\impl P has Show { fn render(self) -> int { return 1 } }
+        \\impl P has Debug { fn render(self) -> int { return 2 } }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            for (r.diags) |d| try testing.expect(d.code != .R0002);
+            // Both conformance methods must own a distinct mangled symbol; the protocol
+            // identity is what keeps them apart on the shared `P.render` receiver+name.
+            var show: ?[]const u8 = null;
+            var debug: ?[]const u8 = null;
+            for (r.fns) |f| {
+                if (std.mem.indexOf(u8, f.name, "P.render") == null) continue;
+                if (std.mem.endsWith(u8, f.name, "Show")) show = f.name;
+                if (std.mem.endsWith(u8, f.name, "Debug")) debug = f.name;
+            }
+            try testing.expect(show != null);
+            try testing.expect(debug != null);
+            try testing.expect(!std.mem.eql(u8, show.?, debug.?));
+        }
+    };
+    try withResolvedGraph(".toy-test-res-multiconf", files, "solo.toy", Check.run);
 }
