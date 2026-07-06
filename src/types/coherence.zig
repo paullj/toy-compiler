@@ -226,8 +226,9 @@ fn ordEqRefinementReceivers(gpa: std.mem.Allocator, conf: []const Conformance, o
 /// lacking an existing `Eq` entry. Scans a STABLE prefix of `t.conformances` then appends,
 /// so a freshly-appended refinement never seeds another (idempotent, insertion-ordered).
 pub fn deriveEqFromOrd(t: *Typecheck) !void {
-    const ord_pid = t.ord_protocol_id orelse return;
-    const eq_pid = t.eq_protocol_id orelse return;
+    const pre = t.prelude orelse return;
+    const ord_pid = pre.protocols.ord orelse return;
+    const eq_pid = pre.protocols.eq orelse return;
     const prefix = t.conformances.items.len;
     var add: std.ArrayList(Type) = .empty;
     defer add.deinit(t.gpa);

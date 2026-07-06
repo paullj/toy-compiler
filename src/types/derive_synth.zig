@@ -34,11 +34,12 @@ fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
 /// emitter never re-resolves and the fingerprint can fold the resolved identity.
 pub fn synthesizeDerives(t: *Typecheck) !void {
     if (t.derive_reqs.items.len == 0) return;
-    const eq_pid = t.eq_protocol_id orelse return;
+    const pre = t.prelude orelse return;
+    const eq_pid = pre.protocols.eq orelse return;
     const eq_name = t.protocols.items[eq_pid].name;
-    const ord_pid_opt = t.ord_protocol_id;
-    const hash_pid_opt = t.hash_protocol_id;
-    const display_pid_opt = t.display_protocol_id;
+    const ord_pid_opt = pre.protocols.ord;
+    const hash_pid_opt = pre.protocols.hash;
+    const display_pid_opt = pre.protocols.display;
     const gpa = t.gpa;
 
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
@@ -187,7 +188,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     }
 
     // ---- (3) Materialize recipes (names/params/field_witnesses filled after the sort) --
-    const ordering_ty: Type = if (t.ordering_enum_id) |oid| Type.enumT(oid) else .{ .kind = .invalid };
+    const ordering_ty: Type = if (pre.ordering_enum) |oid| Type.enumT(oid) else .{ .kind = .invalid };
     if (ord_pid_opt) |ord_pid| {
         const ord_name = t.protocols.items[ord_pid].name;
         for (ord_work.items) |ty| try t.derives.append(gpa, .{
@@ -343,17 +344,18 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .hash => .{ "hash", "hash_call" },
         .display => .{ "display", "display_call" },
     };
+    const pr = Typecheck.gatherPreludeIds(t);
     const pid = switch (kind) {
-        .eq => t.eq_protocol_id,
-        .ord => t.ord_protocol_id,
-        .hash => t.hash_protocol_id,
-        .display => t.display_protocol_id,
+        .eq => pr.eq,
+        .ord => pr.ord,
+        .hash => pr.hash,
+        .display => pr.display,
     };
     switch (resolveConformanceMethod(t.methods.items, ft, method, pid, null)) {
         .one => |m| return @unionInit(Derive.FieldWitness, variant, witnessName(t, m)),
         .none, .ambiguous => {},
     }
-    if (kind == .eq) switch (resolveConformanceMethod(t.methods.items, ft, "cmp", t.ord_protocol_id, null)) {
+    if (kind == .eq) switch (resolveConformanceMethod(t.methods.items, ft, "cmp", pr.ord, null)) {
         .one => |m| return .{ .cmp_eq = witnessName(t, m) },
         .none, .ambiguous => {},
     };

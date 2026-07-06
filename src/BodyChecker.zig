@@ -557,10 +557,10 @@ pub const BodyChecker = struct {
                         // or a `[T has Ord]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsTo(lt, bc.model.ord_protocol_id, true)) {
+                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, true)) {
                             break :blk Type.@"bool";
                         } else {
-                            try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.ord_protocol_id) });
+                            try bc.sink.emitFmtCode(.T0027, bc.byteOf(n.main_token), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
                         }
                     },
                     .eq_eq, .bang_eq => {
@@ -571,15 +571,15 @@ pub const BodyChecker = struct {
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsTo(lt, bc.model.eq_protocol_id, true)) {
+                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, true)) {
                             break :blk Type.@"bool";
-                        } else if (try bc.deriveBlocker(lt, bc.model.eq_protocol_id)) |blocker| {
+                        } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
                             // A struct that would derive `Eq` but for one non-conforming
                             // field names that field (T0029). A payload enum / other type
                             // keeps the "no Eq impl" T0026 below.
                             try bc.sink.emitFmtCode(.T0029, bc.byteOf(n.main_token), "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
                         } else {
-                            try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.eq_protocol_id) });
+                            try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().eq) });
                         }
                     },
                     .amp_amp, .pipe_pipe => {
@@ -1210,7 +1210,7 @@ pub const BodyChecker = struct {
                 // `From[Src]` on one target. With no such conformance (or no `From` protocol —
                 // a prelude-less caller), keep the T0033 mismatch. The witness is resolved
                 // in lower via `resolveConformanceMethod`, which selects the SAME conformance.
-                const widened = if (bc.model.from_protocol_id) |from_id|
+                const widened = if (bc.model.preludeProtocols().from) |from_id|
                     Typecheck.findConformance(bc.model, from_id, ret_args[1], &.{op_args[1]})
                 else
                     false;
@@ -1860,11 +1860,11 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
-            if (try bc.conformsTo(at, bc.model.display_protocol_id, true)) {
+            if (try bc.conformsTo(at, bc.model.preludeProtocols().display, true)) {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
-            if (try bc.deriveBlocker(at, bc.model.display_protocol_id)) |blocker| {
+            if (try bc.deriveBlocker(at, bc.model.preludeProtocols().display)) |blocker| {
                 try bc.sink.emitFmtCode(.T0031, bc.byteOf(at_tok), "cannot 'print' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(at), blocker.name, bc.typeName(blocker.ty) });
             } else {
                 // A `type_var` (a generic param without a `Display` bound) renders as its
@@ -1990,7 +1990,7 @@ pub const BodyChecker = struct {
         // a non-conforming field names it (T0030); a payload enum with a non-
         // conforming payload has no single nameable field, so it falls through to
         // T0018. Scalars fall through to `builtinScalarMethod` below.
-        if (std.mem.eql(u8, member, "hash") and bc.model.hash_protocol_id != null and
+        if (std.mem.eql(u8, member, "hash") and bc.model.preludeProtocols().hash != null and
             (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
         {
             if (args.len != 0) {
@@ -1999,11 +1999,11 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
-            if (try bc.conformsTo(recv_ty, bc.model.hash_protocol_id, true)) {
+            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().hash, true)) {
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
-            if (try bc.deriveBlocker(recv_ty, bc.model.hash_protocol_id)) |blocker| {
+            if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().hash)) |blocker| {
                 try bc.sink.emitFmtCode(.T0030, bc.byteOf(callee.main_token), "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
                 return .invalid;
             }
@@ -2366,10 +2366,10 @@ pub const BodyChecker = struct {
     /// arithmetic tokens this is only called with.
     fn arithProtocol(bc: *const BodyChecker, op: TokenTag) struct { pid: ?u32, name: []const u8 } {
         return switch (op) {
-            .plus => .{ .pid = bc.model.add_protocol_id, .name = "Add" },
-            .minus => .{ .pid = bc.model.sub_protocol_id, .name = "Sub" },
-            .star => .{ .pid = bc.model.mul_protocol_id, .name = "Mul" },
-            .slash => .{ .pid = bc.model.div_protocol_id, .name = "Div" },
+            .plus => .{ .pid = bc.model.preludeProtocols().add, .name = "Add" },
+            .minus => .{ .pid = bc.model.preludeProtocols().sub, .name = "Sub" },
+            .star => .{ .pid = bc.model.preludeProtocols().mul, .name = "Mul" },
+            .slash => .{ .pid = bc.model.preludeProtocols().div, .name = "Div" },
             else => .{ .pid = null, .name = "Add" },
         };
     }
