@@ -302,6 +302,10 @@ pub const GraphResult = struct {
     /// The program-wide inherent-method table (M8). Each entry's `name` is BORROWED
     /// from the sibling tree/source (never freed here); only the slice is owned.
     methods: []Method = &.{},
+    /// The generic-type method TEMPLATE table (M10). Each entry's `name` is BORROWED from
+    /// the sibling tree/source (never freed here); only the slice is owned. Consumed during
+    /// checking (dispatch + the mono reification tail); exposed for introspection/tests.
+    templates: []TemplateMethod = &.{},
     /// The authorized structural auto-derive recipes (M18), in canonical order. Empty
     /// for a program with no derived `Eq` use. Each recipe's `name`, `params`, and
     /// `field_witnesses` OUTER slice are OWNED here; the `FieldWitness` name slices +
@@ -360,6 +364,7 @@ pub const GraphResult = struct {
         // own a `protocol_args` dupe (freed here), then the backing array.
         freeMethodEntries(gpa, self.methods);
         gpa.free(self.methods);
+        gpa.free(self.templates);
         // M18 derive recipes: free each unit's minted `name`, its `params`, and its
         // `field_witnesses` OUTER slice (the FieldWitness name slices are borrowed), then the
         // backing array.
@@ -393,24 +398,14 @@ pub const Method = struct {
     /// pass its address instead of a by-value copy. Type-checking is unaffected —
     /// the receiver type in the `Sig` stays the struct/enum (by-value-logical).
     mut_self: bool = false,
-    /// A method on a GENERIC type instance (M10). Two entry flavours share this table:
-    ///
-    /// - TEMPLATE entry (`recv_generic == true`, `instance == null`): registered in
-    ///   Pass A for `impl Box[T] { .. }`. `recv` is a check-time `App` whose index
-    ///   points into the composite intern table — VALID only while checking (Pass A /
-    ///   Pass C / the mono `scanCalls`); it must NEVER be dereferenced post-typecheck.
-    ///   Dispatch keys off `recv_ctor`/`recv_is_enum` via `findGenericMethod`, which
-    ///   compares ints only (no composite deref). `Type.eql(App, structT)` is a pure
-    ///   12-byte compare that returns false on the kind mismatch, so `findMethod` (used
-    ///   post-typecheck) never selects — nor dereferences — a template entry.
-    /// - REIFIED-DISPATCH entry (`recv_generic == false`, `instance != null`): appended
-    ///   in the mono tail for each reachable `(instance, method)`. `recv` is the reified
-    ///   concrete `structT`/`enumT` and `instance` indexes `GraphResult.instances`, so
-    ///   post-typecheck consumers (`lower`, `CallVisitor`) resolve the call to the
-    ///   instance's mangled symbol via `findMethod` on the reified receiver.
-    recv_ctor: u32 = 0,
-    recv_is_enum: bool = false,
-    recv_generic: bool = false,
+    /// A REIFIED-DISPATCH entry (M10): appended in the mono tail for each reachable
+    /// `(instance, method)` of a generic-type `impl`. `recv` is the reified concrete
+    /// `structT`/`enumT` and `instance` indexes `GraphResult.instances`, so post-typecheck
+    /// consumers (`lower`, `CallVisitor`) resolve the call to the instance's mangled symbol
+    /// via `findMethod` on the reified receiver. `null` for an inherent / conformance /
+    /// derive entry. `recv` is ALWAYS a concrete type here — generic `impl Box[T]` templates
+    /// live in the separate `TemplateMethod` table (which never carries a `recv:Type`), so
+    /// `findMethod` post-typecheck can never deref a stale check-time `App`.
     instance: ?u32 = null,
     /// Generic-protocol conformance stamp (M14): the protocol id this method witnesses
     /// (`impl <recv> has P[args]`), or `null` for an inherent method / a reified generic
@@ -431,6 +426,23 @@ pub const Method = struct {
     /// `Method` (never `Type`), which is never content-cache-memcpy'd, so `@sizeOf(Type)`
     /// is unaffected.
     derive: ?u32 = null,
+};
+
+/// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }` (M10). Kept in
+/// its OWN table (never `Method`) precisely because it carries NO `recv: Type`: a template's
+/// receiver would be a check-time `App` whose composite index is freed post-typecheck, so
+/// making it un-representable here turns the old prose-only "never deref a template's App
+/// recv" rule into a type-level guarantee. Dispatch keys off `(recv_ctor, recv_is_enum)`
+/// (plain ints, never a composite deref) via `findGenericMethod`, so it is deterministic at
+/// any `-jN` and safe while the composite is alive (Pass A / Pass C / the mono tail). Read
+/// only during checking; the mono tail turns each reachable `(instance, template)` into a
+/// concrete reified `Method`. `name` is BORROWED from source; the table owns no heap data.
+pub const TemplateMethod = struct {
+    recv_ctor: u32,
+    recv_is_enum: bool,
+    name: []const u8,
+    fn_id: u32,
+    mut_self: bool = false,
 };
 
 /// Structural equality of two `Type` vectors (M14): same length and pairwise `Type.eql`.
@@ -615,11 +627,10 @@ pub fn freeMethodEntries(gpa: std.mem.Allocator, methods: []const Method) void {
 
 /// Look up an inherent method by receiver type + source name. A linear scan over
 /// `Type.eql` (pure content comparison of kind+id) + name equality — no hashmap /
-/// thread order, so every consumer selects the SAME method at any `-jN`. A generic
-/// TEMPLATE entry (`recv` is a check-time `App`) is never selected by a concrete
-/// `structT`/`enumT` recv (kind mismatch), so this is safe post-typecheck (when the
-/// composite the template `App` indexes is freed); use `findGenericMethod` for the
-/// check-time generic-receiver dispatch instead.
+/// thread order, so every consumer selects the SAME method at any `-jN`. Every entry's
+/// `recv` is a concrete type (generic `impl Box[T]` templates live in `TemplateMethod`,
+/// keyed by ctor int), so this never dereferences a stale check-time `App` — use
+/// `findGenericMethod` for the check-time generic-receiver dispatch instead.
 pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method {
     for (methods) |mth| {
         if (Type.eql(mth.recv, recv) and std.mem.eql(u8, mth.name, name)) return mth;
@@ -633,9 +644,9 @@ pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method
 /// deterministic at any `-jN`. Returns the first matching template entry; a concrete
 /// receiver's `(ctor, is_enum)` uniquely picks the owning `impl`'s method set (one
 /// `impl Box[T]` per type until coherence, M11).
-pub fn findGenericMethod(methods: []const Method, ctor: u32, is_enum: bool, name: []const u8) ?Method {
-    for (methods) |mth| {
-        if (mth.recv_generic and mth.recv_ctor == ctor and mth.recv_is_enum == is_enum and std.mem.eql(u8, mth.name, name)) return mth;
+pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: bool, name: []const u8) ?TemplateMethod {
+    for (templates) |tmpl| {
+        if (tmpl.recv_ctor == ctor and tmpl.recv_is_enum == is_enum and std.mem.eql(u8, tmpl.name, name)) return tmpl;
     }
     return null;
 }
@@ -1104,6 +1115,11 @@ cur_generic_params: []const []const u8 = &.{},
 /// parallel body pass. Transferred into `GraphResult.methods` by `checkGraph`.
 methods: std.ArrayList(Method) = .empty,
 
+/// The program-wide generic-type method TEMPLATE table (M10), built SERIALLY in Phase A
+/// (`decodeFnSig`) alongside `methods`. Read-only during Pass C / the mono tail; the tail
+/// turns each reachable `(instance, template)` into a concrete reified `methods` entry.
+templates: std.ArrayList(TemplateMethod) = .empty,
+
 /// The program-wide protocol table (M11), built SERIALLY in Phase 0c
 /// (`registerProtocols`) in module-then-decl order (a protocol's global id is its
 /// index here). Frozen onto the `Model`; freed at teardown (each entry's `methods`
@@ -1273,6 +1289,9 @@ pub const Model = struct {
     /// The program-wide inherent-method table (M8), frozen from Pass A. Read-only
     /// during the parallel body pass; drives `BodyChecker` method dispatch.
     methods: []const Method,
+    /// The generic-type method TEMPLATE table (M10), frozen from Pass A. Read-only during
+    /// the parallel body pass; drives `BodyChecker` generic-receiver dispatch.
+    templates: []const TemplateMethod,
     /// The program-wide protocol table + recorded conformances (M11), frozen before
     /// the parallel body pass. Read-only; no M11 Pass-C consumer (sets up M13).
     protocols: []const ProtocolSym,
@@ -1304,6 +1323,7 @@ fn buildModel(t: *Typecheck) Model {
         .graph = t.graph,
         .gph_fn_names = t.gph_fn_names,
         .methods = t.methods.items,
+        .templates = t.templates.items,
         .protocols = t.protocols.items,
         .conformances = t.conformances.items,
         .prelude = t.prelude,
@@ -1552,6 +1572,9 @@ pub fn checkGraph(
         // `toOwnedSlice` empties it, so both are a no-op there (the result frees them).
         freeMethodEntries(gpa, t.methods.items);
         t.methods.deinit(gpa);
+        // The template table (M10) owns no per-entry heap data (names are borrowed source);
+        // on success `toOwnedSlice` empties it, so this frees only the backing array.
+        t.templates.deinit(gpa);
         // The protocol table (M11): each entry owns its `methods` outer array (the
         // name slices are borrowed source); the conformance list owns only its array.
         // M13: each entry also owns its decoded `method_params` (inner + outer) +
@@ -1645,6 +1668,11 @@ pub fn checkGraph(
         gpa.free(methods);
     }
 
+    // Transfer the template table (M10) out of the live list (mirrors methods); it owns no
+    // per-entry heap data, so the error path frees only the backing array.
+    const templates_out = try t.templates.toOwnedSlice(gpa);
+    errdefer gpa.free(templates_out);
+
     // Transfer the derive recipes (M18) out of the live list before the teardown defer
     // sees them (mirrors instances/methods). `toOwnedSlice` empties `t.derives`; on the
     // error path here the recipes' owned data is freed (else it would leak).
@@ -1672,6 +1700,7 @@ pub fn checkGraph(
         .enum_layouts = enum_layouts,
         .instances = instances,
         .methods = methods,
+        .templates = templates_out,
         .derives = derives,
         .prelude_ids = gatherPreludeIds(t),
     };
@@ -1937,28 +1966,22 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // fixpoint, reify, sort, and naming — because the Pass-C `Model` borrows
     // `t.methods.items` (captured before Pass C) and `scanCalls` read it throughout
     // the fixpoint; appending here (once nothing reads `model.methods` again) is the
-    // only realloc-safe point. Snapshot the generic TEMPLATE entries first (a value
-    // copy of small PODs), so the append's ArrayList realloc can't dangle the
-    // iterator. Iterate the already-canonically-sorted `t.mono`, so the reified
-    // entries are a pure function of source; each entry's `recv` is the reified
-    // concrete `structT`/`enumT` (the instance's substituted-then-reified self,
-    // `inst.params[0]`), which is what `findMethod` keys off in lower / `CallVisitor`.
-    var templates: std.ArrayList(Method) = .empty;
-    defer templates.deinit(t.gpa);
-    for (t.methods.items) |mth| {
-        if (mth.recv_generic) try templates.append(t.gpa, mth);
-    }
-    if (templates.items.len > 0) {
+    // only realloc-safe point. Templates live in the separate `t.templates` array,
+    // so appending reified entries to `t.methods` cannot dangle the template iterator.
+    // Iterate the already-canonically-sorted `t.mono`, so the reified entries are a
+    // pure function of source; each entry's `recv` is the reified concrete
+    // `structT`/`enumT` (the instance's substituted-then-reified self, `inst.params[0]`),
+    // which is what `findMethod` keys off in lower / `CallVisitor`.
+    if (t.templates.items.len > 0) {
         for (t.mono.items, 0..) |inst, i| {
             if (inst.params.len == 0) continue;
-            for (templates.items) |tmpl| {
+            for (t.templates.items) |tmpl| {
                 if (tmpl.fn_id != inst.template_gid) continue;
                 try t.methods.append(t.gpa, .{
                     .recv = inst.params[0],
                     .name = tmpl.name,
                     .fn_id = tmpl.fn_id,
                     .mut_self = tmpl.mut_self,
-                    .recv_generic = false,
                     .instance = @intCast(i),
                 });
                 break;
@@ -2058,7 +2081,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             if (!recv.isApp()) continue;
             const re = t.composite.at(recv.appIdx());
             const member = mc.tokens[callee.main_token].text(mc.source);
-            const m = findGenericMethod(model.methods, re.ctor, re.ctor_is_enum, member) orelse continue;
+            const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member) orelse continue;
             const mf = model.fns[m.fn_id];
             if (!mf.self_type.isApp()) continue;
             const pat = t.composite.at(mf.self_type.appIdx()).args;
@@ -2704,20 +2727,17 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     // Register the method into the program-wide table (SERIAL, fn-id order). The name
     // is BORROWED from source (like `Sig.name`); the table is frozen before Pass C.
     if (recv_type != Ast.none) {
-        // A generic receiver `impl Box[T]` (M10): `self_ty` is a check-time `App`.
-        // Record its ctor so `findGenericMethod` can dispatch off a concrete receiver
-        // `App`'s ctor without dereferencing the (post-typecheck-freed) composite. A
-        // fully-GROUND receiver App (no `type_var` arg) would be a concrete-type
-        // inherent impl (`impl Box[int]`), which is coherence territory (M11) — reject
-        // it cleanly rather than mint an uninstantiable template.
-        var recv_ctor: u32 = 0;
-        var recv_is_enum = false;
-        var recv_generic = false;
+        const name = t.nameText(decl.main_token);
+        const mut_self = proto.params.len > 0 and Ast.isMutParam(t.tree, t.tokens, proto.params[0]);
         if (self_ty.isApp()) {
+            // A generic receiver `impl Box[T]` (M10): `self_ty` is a check-time `App`.
+            // Record its ctor into the TEMPLATE table so `findGenericMethod` dispatches
+            // off a concrete receiver `App`'s ctor without dereferencing the
+            // (post-typecheck-freed) composite. A fully-GROUND receiver App (no `type_var`
+            // arg) would be a concrete-type inherent impl (`impl Box[int]`), which is
+            // coherence territory (M11) — reject it cleanly rather than mint an
+            // uninstantiable template.
             const e = t.composite.at(self_ty.appIdx());
-            recv_ctor = e.ctor;
-            recv_is_enum = e.ctor_is_enum;
-            recv_generic = true;
             var any_var = false;
             for (e.args) |a| if (a.isTypeVar()) {
                 any_var = true;
@@ -2726,16 +2746,21 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 try t.sink.emit(t.byteOf(decl.main_token), "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')");
                 return;
             }
+            try t.templates.append(t.gpa, .{
+                .recv_ctor = e.ctor,
+                .recv_is_enum = e.ctor_is_enum,
+                .name = name,
+                .fn_id = gid,
+                .mut_self = mut_self,
+            });
+        } else {
+            try t.methods.append(t.gpa, .{
+                .recv = self_ty,
+                .name = name,
+                .fn_id = gid,
+                .mut_self = mut_self,
+            });
         }
-        try t.methods.append(t.gpa, .{
-            .recv = self_ty,
-            .name = t.nameText(decl.main_token),
-            .fn_id = gid,
-            .mut_self = proto.params.len > 0 and Ast.isMutParam(t.tree, t.tokens, proto.params[0]),
-            .recv_ctor = recv_ctor,
-            .recv_is_enum = recv_is_enum,
-            .recv_generic = recv_generic,
-        });
     }
 }
 
@@ -3275,20 +3300,17 @@ test "M10: a generic-type method typechecks clean; one template + one reified en
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 
-    // Exactly one generic TEMPLATE entry (recv is a check-time App) and exactly one
-    // REIFIED-DISPATCH entry (recv a concrete struct, carrying the mono instance idx).
-    var templates: usize = 0;
+    // Exactly one generic TEMPLATE entry (keyed by ctor int, no recv Type) and exactly
+    // one REIFIED-DISPATCH entry (recv a concrete struct, carrying the mono instance idx).
+    try testing.expectEqual(@as(usize, 1), c.result.templates.len);
+    try testing.expectEqualStrings("get", c.result.templates[0].name);
     var reified: usize = 0;
     for (c.result.methods) |m| {
-        if (m.recv_generic) {
-            templates += 1;
-            try testing.expectEqualStrings("get", m.name);
-        } else if (m.instance != null) {
+        if (m.instance != null) {
             reified += 1;
             try testing.expectEqual(Kind.@"struct", m.recv.kind);
         }
     }
-    try testing.expectEqual(@as(usize, 1), templates);
     try testing.expectEqual(@as(usize, 1), reified);
 
     // One monomorphized instance: `<path>.Box.get$int`, returning int.
@@ -3322,16 +3344,11 @@ test "M10: an UNCALLED generic-type method emits zero instances and zero reified
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
-    var templates: usize = 0;
+    try testing.expectEqual(@as(usize, 1), c.result.templates.len);
     var reified: usize = 0;
     for (c.result.methods) |m| {
-        if (m.recv_generic) {
-            templates += 1;
-        } else if (m.instance != null) {
-            reified += 1;
-        }
+        if (m.instance != null) reified += 1;
     }
-    try testing.expectEqual(@as(usize, 1), templates);
     try testing.expectEqual(@as(usize, 0), reified);
 }
 
@@ -3420,7 +3437,7 @@ test "M10: an inherent impl on a CONCRETE type instance (impl Box[int]) is rejec
     try testing.expect(c.result.diags.len >= 1);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "concrete type instance") != null);
     // No generic-template method entry was registered for the rejected impl.
-    for (c.result.methods) |m| try testing.expect(!m.recv_generic);
+    try testing.expectEqual(@as(usize, 0), c.result.templates.len);
 }
 
 test "M15: builtinScalarMethod recognizes `eq` on all four scalars (pure, table-free)" {

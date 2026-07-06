@@ -1693,7 +1693,7 @@ pub const BodyChecker = struct {
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const e = bc.composite.at(recv_ty.appIdx());
-        if (Typecheck.findGenericMethod(bc.model.methods, e.ctor, e.ctor_is_enum, member)) |m| {
+        if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member)) |m| {
             const mf = bc.model.fns[m.fn_id];
             const n_gp: u32 = @intCast(mf.generic_params.len);
             const targs = try bc.gpa.alloc(Type, n_gp);
