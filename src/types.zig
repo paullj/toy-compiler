@@ -2868,6 +2868,10 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         for (inst.args) |a| try t.collectApp(a, &to_reify);
         for (inst.params) |p| try t.collectApp(p, &to_reify);
         try t.collectApp(inst.ret, &to_reify);
+        // A bounded instance's `[T has P]` conformance carries a `conform_ty` copy (a
+        // separate Type from `inst.args`), so collecting args alone leaves a ground `App`
+        // un-reified there; collect it too, exactly as derive_reqs.conform_ty below.
+        for (inst.conformances) |rc| try t.collectApp(rc.conform_ty, &to_reify);
     }
     // A conditional-conformance derive request (M21) carries a ground `App` conform_ty
     // (`Box[int] < ..` records `App(Box,[int])`); collect it so the same reify pass mints
@@ -2916,6 +2920,7 @@ fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         for (@constCast(inst.args)) |*a| t.rewriteApp(a);
         for (@constCast(inst.params)) |*p| t.rewriteApp(p);
         t.rewriteApp(&inst.ret);
+        for (@constCast(inst.conformances)) |*rc| t.rewriteApp(&rc.conform_ty);
     }
     // M21: rewrite each conditional-conformance derive request's `App` conform_ty to its
     // reified `structT`/`enumT`, so `synthesizeDerives` sees the concrete type.
@@ -6309,6 +6314,31 @@ test "M13: a bounded generic compiles ONCE against the bound and monomorphizes o
     try testing.expectEqualStrings("Doubler", c.result.instances[0].conformances[0].protocol_name);
     try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances[0].witness_syms.len);
     try testing.expectEqualStrings("main.P.dbl$Doubler", c.result.instances[0].conformances[0].witness_syms[0]);
+}
+
+test "M13: reify grounds a bounded instance's conform_ty when the type-arg is a generic-aggregate App" {
+    const gpa = testing.allocator;
+    // `Box[int]` structurally satisfies the `Eq` bound (its int field is Eq), so `eq2` is
+    // instantiated with `conform_ty = App(Box,[int])`. After reify, the conform_ty copy
+    // must be grounded to the reified struct in lockstep with `inst.args[0]`, never left an
+    // un-reified App.
+    var c = try checkSource(
+        \\struct Box[T] { v: T }
+        \\fn eq2[T has Eq](a: T, b: T) -> bool { a == b }
+        \\fn main() -> int {
+        \\ b := Box[int]{ v: 1 }
+        \\ d := Box[int]{ v: 2 }
+        \\ return if eq2(b, d) { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    const inst = c.result.instances[0];
+    try testing.expectEqual(@as(usize, 1), inst.conformances.len);
+    try testing.expect(inst.conformances[0].conform_ty.kind != .app);
+    try testing.expect(Type.eql(inst.args[0], inst.conformances[0].conform_ty));
 }
 
 test "M13: a non-conforming type at a bounded call is a use-site T0023 and skips the instance" {
