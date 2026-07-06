@@ -15,6 +15,7 @@ pub const Driver = @import("driver/Driver.zig");
 pub const Graph = @import("driver/Graph.zig");
 pub const DriverCodegen = @import("driver/Codegen.zig");
 pub const Check = @import("driver/Check.zig");
+pub const Decide = @import("driver/Decide.zig");
 pub const DiagnosticSink = @import("diagnostics/Sink.zig");
 pub const nearmiss = @import("diagnostics/nearmiss.zig");
 pub const diagnostics = struct {
@@ -79,6 +80,7 @@ test {
     _ = Driver;
     _ = Graph;
     _ = Check;
+    _ = Decide;
     _ = DiagnosticSink;
     _ = nearmiss;
     _ = diagnostics.Diagnostic;

@@ -40,7 +40,7 @@ const AppCli = @import("Cli.zig");
 const Report = @import("Report.zig");
 const DiagRender = @import("DiagRender.zig");
 const Check = toyc.Check;
-const codes = toyc.diagnostics.codes;
+const Decide = toyc.Decide;
 const SevCfg = toyc.diagnostics.severity_config;
 const sty_err = DiagRender.sty_err;
 const sty_ok = DiagRender.sty_ok;
@@ -251,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
     const run_after = st.command == .run;
     // Worker threads the build will use (for the "built with N threads" line).
     const threads: usize = if (st.job_count != 0) st.job_count else (std.Thread.getCpuCount() catch 1);
-    if (build_exe and !isAarch64Macos(st.target)) argErr(out, level, "code emission only supports aarch64-macos in M1");
+    if (build_exe and !Decide.isAarch64Macos(st.target)) argErr(out, level, "code emission only supports aarch64-macos in M1");
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
@@ -375,13 +375,13 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |name| {
             if (name.len == 0) return argErrCode(out, level, "--opt expects a comma-separated pass list (fold,branch,dce,forward)");
-            const pass = passByName(name) orelse return argErrCode(out, level, "--opt: unknown pass (expected fold,branch,dce,forward)");
+            const pass = Decide.passByName(name) orelse return argErrCode(out, level, "--opt: unknown pass (expected fold,branch,dce,forward)");
             st.opt.set(pass, true);
         }
     }
     // --no-opt=<pass>: turn each named pass OFF from the current config.
     for (p.no_opt) |name| {
-        const pass = passByName(name) orelse return argErrCode(out, level, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
+        const pass = Decide.passByName(name) orelse return argErrCode(out, level, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
         st.opt.set(pass, false);
     }
     // Severity overrides. Build the borrowed rule slice in FIXED severity order:
@@ -393,15 +393,15 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     // (exit 1), mirroring --opt validation. RENDER-ONLY: never flips the exit status.
     // Field `error` is a Zig keyword => access it as `p.@"error"`.
     for (p.@"error") |m| {
-        if (!validSpec(m)) return argErrCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return argErrCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .err });
     }
     for (p.warn) |m| {
-        if (!validSpec(m)) return argErrCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return argErrCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .warning });
     }
     for (p.ignore) |m| {
-        if (!validSpec(m)) return argErrCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return argErrCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
     }
     st.sev = .{ .rules = sev_rules.items };
@@ -432,15 +432,15 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: 
     // last-match-wins. An unknown code OR band letter is a USAGE error -> exit 2 (not the
     // build path's 1): `usageCode` prints the styled `error:` line and returns 2.
     for (p.@"error") |m| {
-        if (!validSpec(m)) return usageCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return usageCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .err });
     }
     for (p.warn) |m| {
-        if (!validSpec(m)) return usageCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return usageCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .warning });
     }
     for (p.ignore) |m| {
-        if (!validSpec(m)) return usageCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return usageCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
     }
     st.sev = .{ .rules = sev_rules.items };
@@ -456,48 +456,6 @@ fn usageCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8
     return 2;
 }
 
-/// True when `m` names a diagnostic override target: a known code string ("R0001")
-/// or a single band letter (L/P/R/T). Used to validate --error/--warn/--ignore specs.
-fn validSpec(m: []const u8) bool {
-    return codes.fromStr(m) != null or (m.len == 1 and (m[0] == 'L' or m[0] == 'P' or m[0] == 'R' or m[0] == 'T'));
-}
-
-/// Map a `--opt`/`--no-opt` pass name to its `Opt.Pass`, or null if unknown.
-fn passByName(name: []const u8) ?Opt.Pass {
-    if (std.mem.eql(u8, name, "fold")) return .fold;
-    if (std.mem.eql(u8, name, "branch")) return .branch;
-    if (std.mem.eql(u8, name, "dce")) return .dce;
-    if (std.mem.eql(u8, name, "forward")) return .forward;
-    return null;
-}
-
-/// True if `target` names the aarch64-macos triple we can emit for (or `native`,
-/// which on this host is aarch64-macos). Accepts the common spellings.
-fn isAarch64Macos(target: []const u8) bool {
-    const ok = [_][]const u8{
-        "native",
-        "aarch64-macos",
-        "arm64-macos",
-        "aarch64-apple-macos",
-        "aarch64-apple-darwin",
-    };
-    for (ok) |t| if (std.mem.eql(u8, target, t)) return true;
-    return false;
-}
-
-/// The basename of a path (after the last '/'), used as the code-signing
-/// identifier. Falls back to the whole string when there is no separator.
-fn basename(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[i + 1 ..];
-    return path;
-}
-
-/// Strip a trailing `.toy` source extension for the default output binary name.
-fn stemOf(name: []const u8) []const u8 {
-    if (std.mem.endsWith(u8, name, ".toy")) return name[0 .. name.len - ".toy".len];
-    return name;
-}
-
 /// The default executable output when no `-o`/`--output` is given:
 /// `.toy/<stamp>/build/<entry-stem>`. Creates the build dir on demand; the path is
 /// written into `buf` (caller-owned, must outlive the write).
@@ -506,7 +464,7 @@ fn defaultOutputPath(io: Io, buf: []u8, entry: []const u8) ![]const u8 {
     var dir_buf: [Driver.cache_root.len + 1 + version.stamp_max + "/build".len]u8 = undefined;
     const build_dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/build", .{ Driver.cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     try Io.Dir.cwd().createDirPath(io, build_dir);
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ build_dir, stemOf(basename(entry)) }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ build_dir, Decide.stemOf(Decide.basename(entry)) }) catch unreachable;
 }
 
 /// Print the always-on `built with <threads> thread(s) in <n> <unit>` line. Single
@@ -543,16 +501,16 @@ fn runBinary(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, level: Style.Color
     defer gpa.free(abs);
 
     var child = std.process.spawn(io, .{ .argv = &.{abs} }) catch |e| {
-        try styledLine(out, level, sty_err, "run: failed to launch {s}: {t}", .{ basename(path), e });
+        try styledLine(out, level, sty_err, "run: failed to launch {s}: {t}", .{ Decide.basename(path), e });
         try out.flush();
         return 1;
     };
     const term_status = child.wait(io) catch |e| {
-        try styledLine(out, level, sty_err, "run: error awaiting {s}: {t}", .{ basename(path), e });
+        try styledLine(out, level, sty_err, "run: error awaiting {s}: {t}", .{ Decide.basename(path), e });
         try out.flush();
         return 1;
     };
-    const name = basename(path);
+    const name = Decide.basename(path);
     switch (term_status) {
         .exited => |code| {
             try styledLine(out, level, if (code == 0) sty_ok else sty_err, "{s} exited with code {d}", .{ name, code });
@@ -876,7 +834,7 @@ fn emitExecutable(
     const image = try Codegen.buildImage(
         io,
         gpa,
-        basename(resolved_out),
+        Decide.basename(resolved_out),
         lp.text,
         lp.entry_off,
         lp.cstrings,
@@ -1176,7 +1134,7 @@ fn runCheck(
     // messages outlive every render below.
     var tc: ?TypecheckGraph.GraphResult = null;
     defer if (tc) |*t| t.deinit(gpa);
-    const diags: []const toyc.DiagnosticSink.Diagnostic = if (resolveHasError(res.diags))
+    const diags: []const toyc.DiagnosticSink.Diagnostic = if (Decide.resolveHasError(res.diags))
         res.diags
     else blk: {
         tc = TypecheckGraph.checkGraph(gpa, &graph, &res, cio, 0) catch |e| {
@@ -1207,7 +1165,7 @@ fn runCheck(
         // correctly. Schema byte-identical to the single-file form.
         const counts = try Check.emitNdjsonGraph(out, gpa, &graph, diags, sev);
         try out.flush();
-        return checkExit(counts, exit_zero, error_on_warning);
+        return Decide.checkExit(counts, exit_zero, error_on_warning);
     }
     // Human form: pretty per-module snippets (reusing the multi-module renderer, which
     // builds ONE SourceMap per scope) + a program-wide `N error(s), M warning(s)` summary.
@@ -1215,7 +1173,7 @@ fn runCheck(
     const counts = Check.tallyGraph(diags, sev);
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
-    return checkExit(counts, exit_zero, error_on_warning);
+    return Decide.checkExit(counts, exit_zero, error_on_warning);
 }
 
 /// Report the diagnostics belonging to the ENTRY file — a tainted entry parse, or a
@@ -1247,7 +1205,7 @@ fn reportEntryFile(
             counts.warnings += c.warnings;
         }
         try out.flush();
-        return checkExit(counts, exit_zero, error_on_warning);
+        return Decide.checkExit(counts, exit_zero, error_on_warning);
     }
     const e = g.entry();
     try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, parse_diags, resolve_diags, type_diags, sev);
@@ -1258,29 +1216,7 @@ fn reportEntryFile(
     }
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
-    return checkExit(counts, exit_zero, error_on_warning);
-}
-
-/// True when any diagnostic in `diags` carries an error-severity REGISTRY DEFAULT — the
-/// gate that decides whether the graph is resolved enough to typecheck. Deliberately
-/// reads the POD default (NOT the render-time config): the ability to typecheck
-/// depends on whether resolution actually succeeded, which `--warn`/`--ignore` (a
-/// presentation choice) must never change. So a `--ignore`d resolve error still blocks
-/// typecheck, exactly as it does in a `build`.
-fn resolveHasError(diags: []const toyc.DiagnosticSink.Diagnostic) bool {
-    for (diags) |d| if (d.severity == .err) return true;
-    return false;
-}
-
-/// Map a `check` tally to the process exit code: 0 clean (or `--exit-zero`), 1 when at
-/// least one diagnostic resolved to an error — or, under `--error-on-warning`, when at
-/// least one warning survives. `--exit-zero` DOMINATES (editors that read the stream, not
-/// the status). IO/CLI failures (exit 2) are handled by the caller before reaching here.
-fn checkExit(counts: Check.Counts, exit_zero: bool, error_on_warning: bool) u8 {
-    if (exit_zero) return 0;
-    if (counts.hasErrors()) return 1;
-    if (error_on_warning and counts.warnings > 0) return 1;
-    return 0;
+    return Decide.checkExit(counts, exit_zero, error_on_warning);
 }
 
 /// `toy explain <CODE>`: print the code's embedded documentation. A known code prints
