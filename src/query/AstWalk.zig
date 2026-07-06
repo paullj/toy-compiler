@@ -1318,13 +1318,13 @@ test "[CROSS-MODULE TYPE-REF] threaded fn_sig folds the sig's type, not a bare-n
     try testing.expectEqualSlices(u8, expect_buf.items, found.?);
 }
 
-test "the .eq_operator event is IGNORED by the hash (int == fingerprint unchanged)" {
+test "the .operator event is IGNORED by the hash (int == fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> bool { a == b }\n");
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
 
-    // Hash 1: the real walk, which emits `.eq_operator` after the operands.
+    // Hash 1: the real walk, which emits `.operator` after the operands.
     var h1 = std.hash.Wyhash.init(0);
     var hv = HashVisitor{ .h = &h1 };
     try walk(b.src(), decl, &hv);
@@ -1349,13 +1349,13 @@ test "the .eq_operator event is IGNORED by the hash (int == fingerprint unchange
     try testing.expectEqual(h1.final(), h2.final());
 }
 
-test "the .ord_operator event is IGNORED by the hash (int < fingerprint unchanged)" {
+test "the .operator event is IGNORED by the hash (int < fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> bool { a < b }\n");
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
 
-    // Hash 1: the real walk, which emits `.ord_operator` after the operands.
+    // Hash 1: the real walk, which emits `.operator` after the operands.
     var h1 = std.hash.Wyhash.init(0);
     var hv = HashVisitor{ .h = &h1 };
     try walk(b.src(), decl, &hv);
@@ -1380,13 +1380,13 @@ test "the .ord_operator event is IGNORED by the hash (int < fingerprint unchange
     try testing.expectEqual(h1.final(), h2.final());
 }
 
-test "the .arith_operator event is IGNORED by the hash (int + fingerprint unchanged)" {
+test "the .operator event is IGNORED by the hash (int + fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> int { a + b }\n");
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
 
-    // Hash 1: the real walk, which emits `.arith_operator` after the operands.
+    // Hash 1: the real walk, which emits `.operator` after the operands.
     var h1 = std.hash.Wyhash.init(0);
     var hv = HashVisitor{ .h = &h1 };
     try walk(b.src(), decl, &hv);

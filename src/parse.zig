@@ -742,8 +742,9 @@ fn parseProtocolRef(p: *Parser) Error!Ast.Index {
 }
 
 /// `protocol P { fn m(self, ..) -> R }` — a signature-only protocol declaration.
-/// Each member is a BODYLESS method signature parsed via `parseFnDecl(.., bodyless=true)`
-/// with the protocol name as the synthetic receiver token (so a leading `self` is
+/// Each member is a signature-only method parsed via `parseFnDecl(.., .protocol_sig)`
+/// (bodyless is derived from `kind == .protocol_sig`), with the protocol name as the
+/// synthetic receiver token (so a leading `self` is
 /// consumed and its type-ref renders as the protocol name — inert, never decoded: a
 /// protocol's method sigs never enter the fn table). The member loop mirrors the
 /// impl-body loop (newline/comma-separated `fn`s).
