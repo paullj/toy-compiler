@@ -140,6 +140,11 @@ const Frozen = struct {
     /// resolve a derived witness to its synthetic unit, and `CallVisitor.foldWitness`
     /// folds the derived-Eq witness identity. Shared read-only.
     derives: []const Typecheck.DeriveRecipe = &.{},
+    /// The prelude protocol ids (M15+): so `lowerStructEq`/`CallVisitor` resolve each
+    /// operator/derive/`?`-widen witness by its SPECIFIC protocol (a sibling protocol
+    /// reusing the name is excluded). Copied verbatim from the checker; lower and the
+    /// fingerprint fold read the SAME bundle. Shared read-only.
+    prelude_ids: Typecheck.PreludeProtocolIds = .{},
 };
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
@@ -253,6 +258,9 @@ const GraphFrozen = struct {
     /// threaded into every job's `Frozen` (a base fn's `==` on a derived type resolves the
     /// synthetic witness through it too).
     derives: []const Typecheck.DeriveRecipe = &.{},
+    /// The prelude protocol ids (M15+), copied into every job's `Frozen` by `frozenFor`, so
+    /// each operator/derive/`?`-widen witness resolves by its SPECIFIC protocol.
+    prelude_ids: Typecheck.PreludeProtocolIds = .{},
     /// The count of BASE fns + Mono instances; `fn_decls`/`fn_modules` entries at
     /// `[derive_base..]` are the source-less derive units (parallel to `derives`).
     derive_base: usize = 0,
@@ -295,6 +303,7 @@ const GraphFrozen = struct {
             .conformances = confs,
             .methods = gf.methods,
             .derives = gf.derives,
+            .prelude_ids = gf.prelude_ids,
         };
     }
 };
@@ -438,6 +447,7 @@ pub fn lowerGraphProgram(
         .entry_id = eid,
         .methods = tc.methods,
         .derives = tc.derives,
+        .prelude_ids = tc.prelude_ids,
         .derive_base = derive_base,
         .opt = opt,
         .probe = probe,
@@ -654,6 +664,7 @@ pub fn renderGraphIr(
             .sigs = tc.sigs,
             .methods = tc.methods,
             .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -683,6 +694,7 @@ pub fn renderGraphIr(
             .sigs = tc.sigs,
             .methods = tc.methods,
             .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
@@ -714,6 +726,7 @@ pub fn renderGraphIr(
             .sigs = tc.sigs,
             .methods = tc.methods,
             .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
         };
         var func = switch (d.kind) {
             .eq => try lower.lowerDeriveEq(gpa, in, d, sym, &diags),

@@ -315,3 +315,70 @@ test "differential: the real `toy check` and `toy build` exit codes AGREE on the
         try testing.expect(exitCode(bld) == null or exitCode(bld).? != 0);
     }
 }
+
+/// A protocol reusing an operator/derive witness name (`eq`/`cmp`) on a type that ALSO gets
+/// the structural derive: the operator must bind the DERIVE witness by protocol id, not go
+/// `.ambiguous`. The checker types `==`/`<` off conformance EXISTENCE (the derive satisfies
+/// it), so if lower selected the witness by NAME it would see two same-named conformance
+/// methods, resolve `.ambiguous`, and ABORT codegen on a program `check` accepted. Both
+/// programs must `check` clean AND run to 111 (the derive result), ignoring the sibling.
+const sibling_eq_src =
+    \\protocol Weird { fn eq(self, other: Self) -> bool }
+    \\struct Point { x: int, y: int }
+    \\impl Point has Weird { fn eq(self, other: Point) -> bool { return false } }
+    \\fn main() -> int {
+    \\  a := Point{x: 1, y: 2}
+    \\  b := Point{x: 1, y: 2}
+    \\  return if a == b { 111 } else { 222 }
+    \\}
+    \\
+;
+
+const sibling_cmp_src =
+    \\protocol Weird { fn cmp(self, other: Self) -> int }
+    \\struct Point { x: int, y: int }
+    \\impl Point has Weird { fn cmp(self, other: Point) -> int { return 999 } }
+    \\fn main() -> int {
+    \\  a := Point{x: 1, y: 2}
+    \\  b := Point{x: 3, y: 4}
+    \\  return if a < b { 111 } else { 222 }
+    \\}
+    \\
+;
+
+test "sibling protocol reusing eq/cmp: check is clean (in-process, always-on)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{ sibling_eq_src, sibling_cmp_src }, .{ ".toy-test-sibling-eq", ".toy-test-sibling-cmp" }) |src, dir| {
+        try writeFixture(io, dir, &.{.{ "main.toy", src }});
+        defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const outcome = try checkEntry(gpa, io, dir ++ "/main.toy");
+        try testing.expect(!outcome.structural);
+        try testing.expectEqual(@as(usize, 0), outcome.errors);
+    }
+}
+
+test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 111), not a codegen abort" {
+    // The end-to-end guard for the check/lower divergence: `check` accepted these, so a
+    // name-selected witness would `.ambiguous` in lower and abort `build`. Needs macOS
+    // codegen + the built `toy`; skips cleanly otherwise (the in-process check above is
+    // the always-on guard).
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+
+    inline for (.{ sibling_eq_src, sibling_cmp_src }, .{ ".toy-test-sibling-eq-run", ".toy-test-sibling-cmp-run" }) |src, dir| {
+        try writeFixture(io, dir, &.{.{ "main.toy", src }});
+        defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const chk = try spawnExit(gpa, io, &.{ "check", dir ++ "/main.toy" });
+        const runt = try spawnExit(gpa, io, &.{ "run", dir ++ "/main.toy" });
+        try testing.expectEqual(@as(?u8, 0), exitCode(chk));
+        try testing.expectEqual(@as(?u8, 111), exitCode(runt));
+    }
+}

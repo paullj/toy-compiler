@@ -569,7 +569,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             // every error-free program (an ambiguous bare call halts the compile
                             // before codegen,
                             // so the fp is never taken); `.ambiguous`/`.none` fold nothing here.
-                            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, false, null)) {
+                            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null, null)) {
                                 .one => |m| try self.foldWitness(m),
                                 .none, .ambiguous => {
                                     // A builtin scalar `eq`/`hash`: it has NO real
@@ -607,7 +607,8 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     const recv = self.frozen.node_types[bn.lhs.int()];
                     if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
                     for (opMethods(self.frozen.tokens[bn.main_token].tag)) |method| {
-                        switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, true, null)) {
+                        const pid = Typecheck.witnessProtocolId(self.frozen.prelude_ids, method);
+                        switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, pid, null)) {
                             .one => |m| return self.foldWitness(m),
                             .none, .ambiguous => {},
                         }
@@ -636,7 +637,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     const op_err = ol.variants[1].field_types[0];
                     const ret_err = rl.variants[1].field_types[0];
                     if (Typecheck.Type.eql(op_err, ret_err)) return;
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, ret_err, "from", true, &.{op_err})) {
+                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, ret_err, "from", self.frozen.prelude_ids.from, &.{op_err})) {
                         .one => |m| try self.foldWitness(m),
                         .none, .ambiguous => {},
                     }
@@ -698,7 +699,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     try self.out.append(self.gpa, .{ .kind = .builtin, .name = "display_bool", .params = &display_params_bool, .ret = Typecheck.Type.unit });
                     return true;
                 },
-                .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, at, "display", true, null)) {
+                .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, at, "display", self.frozen.prelude_ids.display, null)) {
                     .one => |m| {
                         try self.foldWitness(m);
                         return true;
@@ -728,7 +729,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                 if (tn.int() >= self.frozen.node_types.len) return; // pre-typecheck view
                 buf[i] = self.frozen.node_types[tn.int()];
             }
-            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, false, buf[0..targ_nodes.len])) {
+            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null, buf[0..targ_nodes.len])) {
                 .one => |m| try self.foldWitness(m),
                 .none, .ambiguous => {},
             }
@@ -1009,6 +1010,7 @@ const FakeFrozen = struct {
     instances: []const Mono.Instance = &.{},
     methods: []const Typecheck.Method = &.{},
     derives: []const Typecheck.DeriveRecipe = &.{},
+    prelude_ids: Typecheck.PreludeProtocolIds = .{},
 };
 
 test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {
@@ -1461,6 +1463,7 @@ test "`p == q` folds the SAME Eq witness Sig as `p.eq(q)` (fingerprint agreement
         .sigs = tc.sigs,
         .instances = tc.instances,
         .methods = tc.methods,
+        .prelude_ids = tc.prelude_ids,
     };
 
     // The only TOP-LEVEL fn_decls are use_op then use_method (the impl's `eq` is nested
@@ -1552,6 +1555,7 @@ test "`a < b` folds the SAME Ord::cmp witness Sig as `a.cmp(b)` (incremental sou
         .sigs = tc.sigs,
         .instances = tc.instances,
         .methods = tc.methods,
+        .prelude_ids = tc.prelude_ids,
     };
 
     const prog = tree.nodes[Ast.root(tree.nodes).int()];
@@ -1637,6 +1641,7 @@ test "`p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental soundnes
         .sigs = tc.sigs,
         .instances = tc.instances,
         .methods = tc.methods,
+        .prelude_ids = tc.prelude_ids,
     };
 
     const prog = tree.nodes[Ast.root(tree.nodes).int()];
@@ -1766,6 +1771,7 @@ test "a WIDENING `?` folds the resolved `From` witness; the identity `?` folds n
         .sigs = tc.sigs,
         .instances = tc.instances,
         .methods = tc.methods,
+        .prelude_ids = tc.prelude_ids,
     };
 
     // Look fns up by NAME (the impl + inner shift source positions), not source order.
@@ -1795,7 +1801,7 @@ test "a WIDENING `?` folds the resolved `From` witness; the identity `?` folds n
     const ol = tc.enum_layouts[inner_sig.?.ret.enum_id];
     const ret_err = rl.variants[1].field_types[0];
     const op_err = ol.variants[1].field_types[0];
-    const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", true, &.{op_err});
+    const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", tc.prelude_ids.from, &.{op_err});
     try testing.expect(pick == .one);
     const want_name = if (pick.one.instance) |ii| tc.instances[ii].name.? else names[pick.one.fn_id].name;
 

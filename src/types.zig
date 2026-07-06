@@ -303,6 +303,11 @@ pub const GraphResult = struct {
     /// `protocol_name` are BORROWED (sibling derive/instance/fn names + prelude/source
     /// protocol names — all outlive codegen).
     derives: []DeriveRecipe = &.{},
+    /// The prelude protocol ids (M15+), snapshotted off the checker so codegen resolves
+    /// each `==`/`<`/`+`/`.hash()`/`print`/`?`-widen witness by its SPECIFIC protocol (a
+    /// sibling protocol reusing the name is excluded). Threaded into every job's `Frozen`
+    /// / lower `Inputs`; lower and the fingerprint fold read the SAME bundle.
+    prelude_ids: PreludeProtocolIds = .{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -441,28 +446,86 @@ pub const MethodPick = union(enum) {
     ambiguous,
 };
 
+/// The prelude protocol ids an operator/derive desugaring resolves its witness against
+/// (M15+), bundled so lower / `AstWalk` / `Codegen` thread ONE value from the checker to
+/// every witness site. Each `==`/`<`/`+`/`.hash()`/`print`/`?`-widen site resolves by the
+/// SPECIFIC id here, so a SIBLING protocol reusing `eq`/`cmp`/… on the same type is never
+/// selected — otherwise two same-named conformance methods make the resolver `.ambiguous`,
+/// which the checker (keying off conformance EXISTENCE) never sees, and codegen aborts a
+/// program `toy check` accepted. Lower and the fingerprint fold MUST pass the IDENTICAL id
+/// or warm-cache/`-jN` determinism breaks. A null id (a prelude-less internal caller)
+/// degrades to name-only resolution — safe, since no prelude conformance can exist then.
+pub const PreludeProtocolIds = struct {
+    eq: ?u32 = null,
+    ord: ?u32 = null,
+    add: ?u32 = null,
+    sub: ?u32 = null,
+    mul: ?u32 = null,
+    div: ?u32 = null,
+    hash: ?u32 = null,
+    display: ?u32 = null,
+    from: ?u32 = null,
+};
+
+/// Snapshot the prelude protocol ids off a `Typecheck`/`Model` into a `PreludeProtocolIds`.
+pub fn gatherPreludeIds(src: anytype) PreludeProtocolIds {
+    return .{
+        .eq = src.eq_protocol_id,
+        .ord = src.ord_protocol_id,
+        .add = src.add_protocol_id,
+        .sub = src.sub_protocol_id,
+        .mul = src.mul_protocol_id,
+        .div = src.div_protocol_id,
+        .hash = src.hash_protocol_id,
+        .display = src.display_protocol_id,
+        .from = src.from_protocol_id,
+    };
+}
+
+/// The prelude protocol id a desugaring witness method name resolves against (`eq`→Eq,
+/// `cmp`→Ord, `add`/`sub`/`mul`/`div`→arith, `hash`→Hash, `display`→Display, `from`→From),
+/// or null when the name is not a prelude witness. Centralizes the name→protocol map that
+/// the arithmetic operator (its method name computed from the token) and the AstWalk operator
+/// fold share, so lower and the fingerprint fold pass the IDENTICAL id.
+pub fn witnessProtocolId(ids: PreludeProtocolIds, name: []const u8) ?u32 {
+    if (std.mem.eql(u8, name, "eq")) return ids.eq;
+    if (std.mem.eql(u8, name, "cmp")) return ids.ord;
+    if (std.mem.eql(u8, name, "add")) return ids.add;
+    if (std.mem.eql(u8, name, "sub")) return ids.sub;
+    if (std.mem.eql(u8, name, "mul")) return ids.mul;
+    if (std.mem.eql(u8, name, "div")) return ids.div;
+    if (std.mem.eql(u8, name, "hash")) return ids.hash;
+    if (std.mem.eql(u8, name, "display")) return ids.display;
+    if (std.mem.eql(u8, name, "from")) return ids.from;
+    return null;
+}
+
 /// The ONE disambiguation the three method-dispatch consumers (BodyChecker types, lower
 /// symbols, AstWalk fingerprint) share, so all three select the IDENTICAL witness (a
 /// divergence would be a miscompile or a `-jN` determinism break). A linear scan over
 /// `Type.eql` + name (table = source fn-id order → deterministic):
 ///   * with `explicit_args`: pick the conformance method whose `protocol_args` match
-///     (a generic protocol's conformances are coherence-deduped, so at most one matches);
-///   * without explicit args, `witness_only == false` (general `v.m(..)` dispatch) and
+///     (a generic protocol's conformances are coherence-deduped, so at most one matches),
+///     additionally filtered to `witness_pid` when given;
+///   * without explicit args, `witness_pid == null` (general `v.m(..)` dispatch) and
 ///     `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to `findMethod` (the pre-M14 path —
 ///     inherent, single conformance, prelude, generic instance) so no existing program's
 ///     dispatch/fingerprint changes;
 ///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`.
-/// `witness_only` (operator/derive desugaring: `==`/`<`/`+`/`.hash()`/`print`/`?`-widen)
-/// EXCLUDES inherent (`protocol_id == null`) methods from the scan, so a same-named inherent
-/// method can never be selected as a protocol witness — otherwise `==` would dispatch to it,
-/// skip the operator's arg typing, and miscompile. The inherent method stays callable through
-/// the general `v.m(..)` path (`witness_only == false`).
-pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, witness_only: bool, explicit_args: ?[]const Type) MethodPick {
+/// `witness_pid` (operator/derive desugaring: `==`/`<`/`+`/`.hash()`/`print`/`?`-widen) keeps
+/// ONLY methods witnessing that SPECIFIC protocol — so a same-named inherent method (no
+/// `protocol_id`) AND a sibling protocol reusing the name are both excluded, and the operator
+/// binds its own protocol's witness or nothing. Those methods stay callable through the
+/// general `v.m(..)` path (`witness_pid == null`).
+pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, witness_pid: ?u32, explicit_args: ?[]const Type) MethodPick {
     if (explicit_args) |ea| {
         for (methods) |m| {
             if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name) and
                 m.protocol_id != null and eqlTypeVec(m.protocol_args, ea))
+            {
+                if (witness_pid) |want| if (m.protocol_id.? != want) continue;
                 return .{ .one = m };
+            }
         }
         return .none;
     }
@@ -471,7 +534,10 @@ pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []con
     var conform_count: usize = 0;
     for (methods) |m| {
         if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name)) {
-            if (witness_only and m.protocol_id == null) continue;
+            if (witness_pid) |want| {
+                const got = m.protocol_id orelse continue;
+                if (got != want) continue;
+            }
             if (first == null) first = m;
             total += 1;
             if (m.protocol_id != null) conform_count += 1;
@@ -1626,6 +1692,7 @@ pub fn checkGraph(
         .instances = instances,
         .methods = methods,
         .derives = derives,
+        .prelude_ids = gatherPreludeIds(t),
     };
 }
 
@@ -2249,11 +2316,11 @@ fn resolveFieldEq(t: *const Typecheck, ft: Type) Derive.FieldWitness {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str/unit — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "eq", true, null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "eq", t.eq_protocol_id, null)) {
         .one => |m| return .{ .eq_call = t.witnessName(m) },
         .none, .ambiguous => {},
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", true, null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", t.ord_protocol_id, null)) {
         .one => |m| return .{ .cmp_eq = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -2269,7 +2336,7 @@ fn resolveFieldOrd(t: *const Typecheck, ft: Type) Derive.FieldWitness {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", true, null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "cmp", t.ord_protocol_id, null)) {
         .one => |m| return .{ .cmp_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -2285,7 +2352,7 @@ fn resolveFieldHash(t: *const Typecheck, ft: Type) Derive.FieldWitness {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "hash", true, null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "hash", t.hash_protocol_id, null)) {
         .one => |m| return .{ .hash_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -2302,7 +2369,7 @@ fn resolveFieldDisplay(t: *const Typecheck, ft: Type) Derive.FieldWitness {
         .@"struct", .@"enum" => {},
         else => return .inline_kind, // int/bool/str — emitter handles by layout kind
     }
-    switch (resolveConformanceMethod(t.methods.items, ft, "display", true, null)) {
+    switch (resolveConformanceMethod(t.methods.items, ft, "display", t.display_protocol_id, null)) {
         .one => |m| return .{ .display_call = t.witnessName(m) },
         .none, .ambiguous => return .inline_kind, // unreachable for a conforming field; degrade safely
     }
@@ -4872,25 +4939,45 @@ test "M15: builtinScalarMethod recognizes `eq` on all four scalars (pure, table-
     try testing.expectEqual(@as(usize, 1), builtinScalarMethod(Type.int, "eq").?.arity);
 }
 
-test "resolveConformanceMethod: a same-named inherent method never witnesses a protocol" {
-    // Repro of the `impl P { fn eq(self, n: int) }` shadowing bug: an inherent `eq`
-    // (protocol_id == null) precedes the structural Eq witness in the table. A witness
-    // lookup must bind the CONFORMANCE method (so `==` types its args and does not call
-    // the scalar-arg inherent method with a struct), while general `v.eq(7)` dispatch
-    // still reaches the inherent method.
+test "resolveConformanceMethod: an operator witness binds only its own protocol; a sibling makes general dispatch ambiguous" {
+    // Both the `impl P { fn eq(self, n: int) }` inherent-shadow bug AND the sibling-protocol
+    // bug: an inherent `eq` (protocol_id == null) and a `Weird` protocol's `eq` (a DIFFERENT
+    // protocol_id) both share the name with the Eq witness. Resolving the Eq OPERATOR witness
+    // (witness_pid == the Eq id) must bind ONLY the Eq conformance — the inherent would skip
+    // the operator's arg typing, and the sibling would (without the id) make the resolver
+    // `.ambiguous`, aborting codegen on a program the checker accepted. Each sibling is still
+    // reachable by ITS id, and general `v.eq(..)` dispatch over two same-named conformances is
+    // `.ambiguous` (T0025) — exactly the outcome the operator sites dodge by passing the id.
     const P = Type.structT(0);
+    const eq_id: u32 = 7;
+    const weird_id: u32 = 9;
     const methods = [_]Method{
         .{ .recv = P, .name = "eq", .fn_id = 1 }, // inherent: protocol_id defaults to null
-        .{ .recv = P, .name = "eq", .fn_id = 2, .protocol_id = 7 }, // the Eq witness
+        .{ .recv = P, .name = "eq", .fn_id = 2, .protocol_id = eq_id }, // the Eq witness
+        .{ .recv = P, .name = "eq", .fn_id = 3, .protocol_id = weird_id }, // a sibling protocol
     };
-    switch (resolveConformanceMethod(&methods, P, "eq", true, null)) {
+    switch (resolveConformanceMethod(&methods, P, "eq", eq_id, null)) {
         .one => |m| {
-            try testing.expect(m.protocol_id != null);
+            try testing.expectEqual(@as(?u32, eq_id), m.protocol_id);
             try testing.expectEqual(@as(u32, 2), m.fn_id);
         },
         .none, .ambiguous => return error.TestUnexpectedResult,
     }
-    switch (resolveConformanceMethod(&methods, P, "eq", false, null)) {
+    switch (resolveConformanceMethod(&methods, P, "eq", weird_id, null)) {
+        .one => |m| try testing.expectEqual(@as(u32, 3), m.fn_id),
+        .none, .ambiguous => return error.TestUnexpectedResult,
+    }
+    // General dispatch (null pid) over two sibling conformances is ambiguous — the checker
+    // reports T0025; the operator path never sees this because it filters by protocol id.
+    try testing.expect(resolveConformanceMethod(&methods, P, "eq", null, null) == .ambiguous);
+
+    // With a SINGLE conformance, general dispatch reaches the first same-named method (the
+    // inherent) — the pre-M14 `findMethod` behavior a plain `v.eq(7)` call still relies on.
+    const single = [_]Method{
+        .{ .recv = P, .name = "eq", .fn_id = 1 },
+        .{ .recv = P, .name = "eq", .fn_id = 2, .protocol_id = eq_id },
+    };
+    switch (resolveConformanceMethod(&single, P, "eq", null, null)) {
         .one => |m| try testing.expectEqual(@as(u32, 1), m.fn_id),
         .none, .ambiguous => return error.TestUnexpectedResult,
     }
