@@ -1224,6 +1224,21 @@ fn parseTypeApp(p: *Parser, base: Ast.Index) Error!Ast.Index {
 /// from value field access by its type position. `/` never appears in a type —
 /// only `.` — so this stays unambiguous with the `import` path grammar.
 fn parseType(p: *Parser) Error!Ast.Index {
+    // Recursion-depth guard at the single type chokepoint: parseType<->parseTypeApp
+    // mutually recurse on nested generic type-applications (`Box[Box[..[int]..]]`, also
+    // reachable through parseProtocolRef via `[T has P[P[..]]]` bounds), a chain that
+    // never funnels through the parseExpr/parseBlock guards. Past the cap emit one
+    // backstop and return a bounded error_node, consuming to a type-list boundary so the
+    // surrounding parseTypeApp loop terminates via its `]`/eof guard (and its
+    // forward-progress assert holds) instead of overflowing the stack. Compiled in ALL modes.
+    p.depth += 1;
+    defer p.depth -= 1;
+    if (p.depth > MAX_EXPR_DEPTH) {
+        try p.backstop(p.peek(), .P0005, "type nested too deeply");
+        const et = p.index;
+        while (!p.at(.eof) and !p.at(.r_bracket) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
+        return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
+    }
     if (p.at(.l_paren) and p.peek2().tag == .r_paren) {
         const at_tok = p.index;
         p.bump(.l_paren);
@@ -3645,6 +3660,34 @@ test "deep statement nesting is capped instead of overflowing the stack" {
         }
         try testing.expect(found);
     }
+}
+
+test "deep generic type nesting is capped instead of overflowing the stack" {
+    // parseType<->parseTypeApp recurse on nested type-applications without funneling
+    // through the parseExpr/parseBlock guards. A `Box[Box[..[int]..]]` far past
+    // MAX_EXPR_DEPTH must RETURN (no SIGBUS) with a "type nested too deeply" diagnostic
+    // and a present tree.
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "fn f(x: ");
+    const n = 1000;
+    var i: usize = 0;
+    while (i < n) : (i += 1) try buf.appendSlice(gpa, "Box[");
+    try buf.appendSlice(gpa, "int");
+    try buf.appendNTimes(gpa, ']', n);
+    try buf.appendSlice(gpa, ") {}\n");
+
+    const res = try parseResult(gpa, buf.items);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    try testing.expect(res.tree.nodes.len > 0);
+    var found = false;
+    for (res.diags) |d| {
+        if (d.code == .P0005 and std.mem.eql(u8, d.message, "type nested too deeply")) found = true;
+    }
+    try testing.expect(found);
 }
 
 test "match arm starting on a separator makes forward progress (no hang)" {
