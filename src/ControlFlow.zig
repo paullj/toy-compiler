@@ -11,6 +11,13 @@ const Type = LayoutEngine.Type;
 const VariantSym = LayoutEngine.VariantSym;
 const EnumSym = LayoutEngine.EnumSym;
 
+/// Bound on the stack-allocated variant-coverage bitmap the exhaustiveness walks use.
+/// It is a soundness-safe cap, not a hard limit: every walk that reads it falls back to
+/// "not exhaustive" (`return false`) when an enum has more variants, so a larger enum is
+/// merely treated conservatively, never miscompiled. `PatternChecker`'s App-aware mirror
+/// (`orCoversTyApp`) reads this SAME constant so the two coverage paths cannot drift.
+pub const max_cover_variants = 64;
+
 /// The read-only slice of checker state the control-flow walks read. Copied by
 /// value into each entry point; the walks thread it down unchanged.
 pub const Ctx = struct {
@@ -201,7 +208,7 @@ pub fn matchDiverges(ctx: Ctx, node_idx: Ast.Index) bool {
     if (arms.len == 0) return false;
     var has_wildcard = false;
     const e = ctx.enums[st.enum_id];
-    var seen = [_]bool{false} ** 64; // enum variant count is small
+    var seen = [_]bool{false} ** max_cover_variants;
     for (arms) |arm_idx| {
         const arm = ctx.tree.nodes[arm_idx.int()];
         const h = Ast.armHeaderAt(ctx.tree, arm.rhs.int());
@@ -295,7 +302,7 @@ pub fn orCoversType(ctx: Ctx, or_idx: Ast.Index, ty: Type) bool {
     for (alts) |a| if (irrefutable(ctx, a, ty)) return true;
     if (ty.kind == .@"enum") {
         const e = ctx.enums[ty.enum_id];
-        var seen = [_]bool{false} ** 64;
+        var seen = [_]bool{false} ** max_cover_variants;
         if (e.variants.len > seen.len) return false;
         for (alts) |a| {
             const ap = ctx.tree.nodes[a.int()];
@@ -672,4 +679,57 @@ test "wildcard arm makes a match exhaustive" {
     };
     // `_` covers the missing B; both bodies diverge → diverges.
     try testing.expect(matchDiverges(c, match));
+}
+
+/// Build a match over an `N`-variant enum where every variant has its own
+/// diverging arm (`.Vk => { return }`), and report whether `matchDiverges` sees it
+/// as exhaustive. The scrutinee is textually total, so the ONLY thing that can make
+/// this false is the `max_cover_variants` bitmap cap. Names are two-letter, unique
+/// per variant, backed by a source buffer the pattern tokens slice into.
+fn allVariantsDivergeExhaustive(comptime N: usize) !bool {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    var src: [N * 2]u8 = undefined;
+    var tokens: [N]Token = undefined;
+    var variants: [N]VariantSym = undefined;
+    for (0..N) |k| {
+        src[k * 2] = @intCast('A' + k / 26);
+        src[k * 2 + 1] = @intCast('A' + k % 26);
+        tokens[k] = .{ .tag = .identifier, .start = @intCast(k * 2), .end = @intCast(k * 2 + 2) };
+        variants[k] = .{ .name = src[k * 2 ..][0..2], .form = .unit };
+    }
+    const enums = [_]EnumSym{
+        .{ .decl_node = Ast.Index.from(0), .name = "E", .variants = &variants },
+    };
+
+    var arm_list: [N]Ast.Index = undefined;
+    for (0..N) |k| {
+        const pat = try b.add(.{ .tag = .pattern_variant, .main_token = @intCast(k), .lhs = Ast.none, .rhs = Ast.none });
+        const body = try b.block(&.{try b.ret()});
+        arm_list[k] = try b.add(.{ .tag = .match_arm, .main_token = 0, .lhs = pat, .rhs = try b.pair(Ast.none, body) });
+    }
+    const scrut = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const arms = try b.range(&arm_list);
+    const match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms });
+    b.node_types.items[scrut.int()] = Type.enumT(0);
+
+    const c: Ctx = .{
+        .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },
+        .resolutions = b.resolutions.items,
+        .node_types = b.node_types.items,
+        .enums = &enums,
+        .tokens = &tokens,
+        .source = &src,
+    };
+    return matchDiverges(c, match);
+}
+
+test "variant coverage is exact at the cap and conservative past it" {
+    // At exactly `max_cover_variants`, a textually-total all-diverging match is seen
+    // as exhaustive (every bitmap slot fits). One variant past the cap, the walk falls
+    // back to "not exhaustive" (`e.variants.len > seen.len`) rather than reading out of
+    // bounds — a soundness-safe under-approximation, never a miscompile.
+    try testing.expect(try allVariantsDivergeExhaustive(max_cover_variants));
+    try testing.expect(!try allVariantsDivergeExhaustive(max_cover_variants + 1));
 }
