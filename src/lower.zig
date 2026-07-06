@@ -4178,7 +4178,7 @@ test "M15: struct == lowers to a call to the Eq witness (no inline icmp)" {
     defer gpa.free(ir);
     // Dispatches to the witness call; the struct compare itself has no inline icmp.
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
-    try testing.expect(std.mem.indexOf(u8, ir, "eq(") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "eq$Eq(") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp") == null);
 }
 
@@ -4257,7 +4257,7 @@ test "M16: struct `<` lowers to the cmp witness call + get_tag + `icmp eq` (no b
     const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_lt(p: P, q: P) -> bool { p < q }\n", "use_lt");
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null); // the cmp witness
-    try testing.expect(std.mem.indexOf(u8, ir, "cmp(") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "cmp$Ord(") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null); // read the Ordering tag
     try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null); // discriminant == ord_lt(0)
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
@@ -4318,7 +4318,7 @@ test "M16: Ord refines Eq — `==` on an Ord-only struct lowers via a cmp call +
     const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_eq(p: P, q: P) -> bool { p == q }\n", "use_eq");
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null); // the cmp witness (no `eq` witness)
-    try testing.expect(std.mem.indexOf(u8, ir, "cmp(") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "cmp$Ord(") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null); // discriminant == ord_eq(1)
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
@@ -4387,7 +4387,7 @@ test "M17: struct `+` lowers to a call to the Add witness (aggregate return, no 
     // top-level `+` itself must NOT emit an inline machine `add` (only the witness BODY
     // does, but that body is a different fn — `use_add` here holds just the call).
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
-    try testing.expect(std.mem.indexOf(u8, ir, "add(") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "add$Add(") != null);
     try testing.expect(std.mem.indexOf(u8, ir, " -> s") != null); // aggregate ret_slot
     try testing.expect(std.mem.indexOf(u8, ir, "add %") == null); // no inline machine add
 }
@@ -4395,9 +4395,9 @@ test "M17: struct `+` lowers to a call to the Add witness (aggregate return, no 
 test "M17: struct `-`/`*`/`/` dispatch to the Sub/Mul/Div witness (sibling protocols)" {
     const gpa = testing.allocator;
     const cases = [_]struct { use: []const u8, method: []const u8, inline_op: []const u8 }{
-        .{ .use = "fn f(p: V2, q: V2) -> V2 { p - q }\n", .method = "sub(", .inline_op = "sub %" },
-        .{ .use = "fn f(p: V2, q: V2) -> V2 { p * q }\n", .method = "mul(", .inline_op = "mul %" },
-        .{ .use = "fn f(p: V2, q: V2) -> V2 { p / q }\n", .method = "div(", .inline_op = "sdiv %" },
+        .{ .use = "fn f(p: V2, q: V2) -> V2 { p - q }\n", .method = "sub$Sub(", .inline_op = "sub %" },
+        .{ .use = "fn f(p: V2, q: V2) -> V2 { p * q }\n", .method = "mul$Mul(", .inline_op = "mul %" },
+        .{ .use = "fn f(p: V2, q: V2) -> V2 { p / q }\n", .method = "div$Div(", .inline_op = "sdiv %" },
     };
     for (cases) |c| {
         const src = try std.fmt.allocPrint(gpa, "{s}{s}", .{ add_impl_src, c.use });
