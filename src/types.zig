@@ -717,9 +717,11 @@ pub const NonConformingField = struct { name: []const u8, ty: Type };
 /// an empty-payload enum trivially conforms since there are no payload fields to check).
 ///
 /// Memoized by `(pid, kind, type-id)` in the caller-owned `memo` (thread-local in Pass
-/// C, local in the synthesis barrier — never shared, so race-free). Always terminates:
-/// everything is ground/monomorphized and recursive types are rejected (T0004), so the
-/// field graph is a finite DAG with no cycles.
+/// C, local in the synthesis barrier — never shared, so race-free). `memo` caches only
+/// SETTLED verdicts, so conformance is a pure function of source. A generic template may
+/// be self- OR mutually-recursive (`next: Node[T]`, `A[T]`↔`B[T]`), so termination rides
+/// a per-query in-progress stack that coinductively assumes conformance on a back-edge;
+/// see `conformsRec` for why an assumed verdict is never written back to `memo`.
 pub fn conforms(
     structs: []const StructSym,
     enums: []const EnumSym,
@@ -731,6 +733,38 @@ pub fn conforms(
     composite: *Composite,
     bound_protocols: []const ?u32,
 ) error{OutOfMemory}!bool {
+    var stack: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer stack.deinit(gpa);
+    const r = try conformsRec(structs, enums, conformances, recv, pid, memo, &stack, 0, gpa, composite, bound_protocols);
+    return r.ok;
+}
+
+/// A depth of `no_assumption` in `ConfStep.low` means the verdict rests on no live
+/// coinductive assumption, so it is safe to settle into `memo`.
+const no_assumption: u32 = std.math.maxInt(u32);
+
+/// A `conformsRec` verdict plus `low`: the shallowest recursion depth of an in-progress
+/// (coinductively-assumed) node the verdict leaned on, or `no_assumption` if it leaned on
+/// none. A node settles its `memo` entry only when `low >= own_depth` — Tarjan-style, it
+/// is then the node that closed the cycle, so no STRICT-ancestor assumption is still live
+/// and the verdict cannot change. Members deeper in a multi-node cycle carry `low` from a
+/// shallower ancestor, stay unsettled, and are recomputed on demand instead of caching a
+/// verdict that was true only under the entry's assumption (the R1 poisoning bug).
+const ConfStep = struct { ok: bool, low: u32 };
+
+fn conformsRec(
+    structs: []const StructSym,
+    enums: []const EnumSym,
+    conformances: []const Conformance,
+    recv: Type,
+    pid: u32,
+    memo: *std.AutoHashMapUnmanaged(u64, bool),
+    stack: *std.AutoHashMapUnmanaged(u64, u32),
+    depth: u32,
+    gpa: std.mem.Allocator,
+    composite: *Composite,
+    bound_protocols: []const ?u32,
+) error{OutOfMemory}!ConfStep {
     switch (recv.kind) {
         .@"struct", .@"enum" => {},
         .type_var => {
@@ -740,8 +774,8 @@ pub fn conforms(
             // `bound_protocols` (a non-generic/unbounded context) denies, so a stray
             // `type_var` never spuriously conforms.
             const ord = recv.typeVarOrd();
-            if (ord >= bound_protocols.len) return false;
-            return (bound_protocols[ord] orelse return false) == pid;
+            if (ord >= bound_protocols.len) return .{ .ok = false, .low = no_assumption };
+            return .{ .ok = (bound_protocols[ord] orelse return .{ .ok = false, .low = no_assumption }) == pid, .low = no_assumption };
         },
         .app => {
             // Conditional conformance (M21), the recursive step: `App(G,[args])` conforms
@@ -750,20 +784,23 @@ pub fn conforms(
             // struct/enum) so nested `Box[Box[Point]]` is not re-queried exponentially.
             const ai = recv.appIdx();
             const akey: u64 = (@as(u64, pid) << 40) | (@as(u64, @intFromEnum(recv.kind)) << 32) | @as(u64, ai);
-            if (memo.get(akey)) |v| return v;
-            // A self-referential generic template (`next: Node[T]`) re-interns to the
-            // same App index, so descending it recurses forever without an in-progress
-            // marker. Mirror the layout engine's `.laying` state: coinductively assume
-            // conformance before descending, then overwrite with the real result.
-            try memo.put(gpa, akey, true);
+            if (memo.get(akey)) |v| return .{ .ok = v, .low = no_assumption };
+            // Back-edge onto a node still being computed (`A[T]` reached again via `B[T]`):
+            // coinductively assume conformance, tagging the verdict with THAT node's depth
+            // so every node between here and it learns its answer was assumption-dependent.
+            if (stack.get(akey)) |d| return .{ .ok = true, .low = d };
+            try stack.put(gpa, akey, depth);
             const e = composite.at(ai);
             var aok = true;
+            var low: u32 = no_assumption;
             if (e.ctor_is_enum) {
                 if (e.ctor < enums.len) {
                     outer: for (enums[e.ctor].variants) |v| {
                         for (v.field_types) |ft| {
                             const sub = try substPattern(composite, gpa, ft, e.args);
-                            if (!try conforms(structs, enums, conformances, sub, pid, memo, gpa, composite, bound_protocols)) {
+                            const r = try conformsRec(structs, enums, conformances, sub, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                            if (r.low < low) low = r.low;
+                            if (!r.ok) {
                                 aok = false;
                                 break :outer;
                             }
@@ -774,28 +811,37 @@ pub fn conforms(
                 if (e.ctor < structs.len) {
                     for (structs[e.ctor].field_types) |ft| {
                         const sub = try substPattern(composite, gpa, ft, e.args);
-                        if (!try conforms(structs, enums, conformances, sub, pid, memo, gpa, composite, bound_protocols)) {
+                        const r = try conformsRec(structs, enums, conformances, sub, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                        if (r.low < low) low = r.low;
+                        if (!r.ok) {
                             aok = false;
                             break;
                         }
                     }
                 } else aok = false;
             }
-            try memo.put(gpa, akey, aok);
-            return aok;
+            _ = stack.remove(akey);
+            if (low >= depth) {
+                try memo.put(gpa, akey, aok);
+                return .{ .ok = aok, .low = no_assumption };
+            }
+            return .{ .ok = aok, .low = low };
         },
         else => {
             // Scalar / non-aggregate: only an explicit/prelude conformance counts (no
             // structural rule); a poison never conforms here.
-            for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return true;
-            return false;
+            for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return .{ .ok = true, .low = no_assumption };
+            return .{ .ok = false, .low = no_assumption };
         },
     }
     const id: u32 = if (recv.kind == .@"enum") recv.enum_id else recv.struct_id;
     const key: u64 = (@as(u64, pid) << 40) | (@as(u64, @intFromEnum(recv.kind)) << 32) | @as(u64, id);
-    if (memo.get(key)) |v| return v;
+    if (memo.get(key)) |v| return .{ .ok = v, .low = no_assumption };
+    if (stack.get(key)) |d| return .{ .ok = true, .low = d };
+    try stack.put(gpa, key, depth);
 
     var ok = false;
+    var low: u32 = no_assumption;
     find: {
         // Explicit / prelude / Ord-refinement conformance wins — never double-derive.
         for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) {
@@ -806,7 +852,9 @@ pub fn conforms(
             if (recv.struct_id < structs.len) {
                 ok = true;
                 for (structs[recv.struct_id].field_types) |ft| {
-                    if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa, composite, bound_protocols)) {
+                    const r = try conformsRec(structs, enums, conformances, ft, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                    if (r.low < low) low = r.low;
+                    if (!r.ok) {
                         ok = false;
                         break;
                     }
@@ -817,7 +865,9 @@ pub fn conforms(
                 ok = true;
                 outer: for (enums[recv.enum_id].variants) |v| {
                     for (v.field_types) |ft| {
-                        if (!try conforms(structs, enums, conformances, ft, pid, memo, gpa, composite, bound_protocols)) {
+                        const r = try conformsRec(structs, enums, conformances, ft, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                        if (r.low < low) low = r.low;
+                        if (!r.ok) {
                             ok = false;
                             break :outer;
                         }
@@ -826,8 +876,12 @@ pub fn conforms(
             }
         }
     }
-    try memo.put(gpa, key, ok);
-    return ok;
+    _ = stack.remove(key);
+    if (low >= depth) {
+        try memo.put(gpa, key, ok);
+        return .{ .ok = ok, .low = no_assumption };
+    }
+    return .{ .ok = ok, .low = low };
 }
 
 /// Substitute a generic ctor's field/payload PATTERN through a concrete arg tuple for the
@@ -4473,6 +4527,38 @@ test "M21: structural conformance on a recursive generic template terminates" {
         \\fn f[T](a:Node[T],b:Node[T])->bool{return a<b}
         \\fn main()->int{return 0}
     ));
+}
+
+test "R1: conformance across a multi-node template cycle is expression-order-independent" {
+    // `A[T]`↔`B[T]` mutually recurse; neither is `Ord`. Both `x<x` and `y<y` must fire
+    // T0027 regardless of which is checked first: the coinductive assumption that closes
+    // the cycle must never settle a poisoned `true` for the non-entry member on the shared
+    // per-fn memo, or the count would depend on statement order (a non-pure verdict).
+    const first_x =
+        \\protocol Foo{fn foo(self)->int}
+        \\struct A[T]{b:B[T],val:T}
+        \\struct B[T]{a:A[T]}
+        \\fn f[T has Foo](x:A[T],y:B[T])->int{
+        \\  p:=x<x
+        \\  q:=y<y
+        \\  return 0
+        \\}
+        \\fn main()->int{return 0}
+    ;
+    const first_y =
+        \\protocol Foo{fn foo(self)->int}
+        \\struct A[T]{b:B[T],val:T}
+        \\struct B[T]{a:A[T]}
+        \\fn f[T has Foo](x:A[T],y:B[T])->int{
+        \\  q:=y<y
+        \\  p:=x<x
+        \\  return 0
+        \\}
+        \\fn main()->int{return 0}
+    ;
+    const nx = try checkDiagCount(first_x);
+    try testing.expectEqual(nx, try checkDiagCount(first_y));
+    try testing.expect(nx != 0);
 }
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
