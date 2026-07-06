@@ -396,7 +396,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
     // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
-        .kw_fn => try p.parseFnDecl(null, Ast.none, &.{}, false, false),
+        .kw_fn => try p.parseFnDecl(.top_level),
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
         .kw_protocol => try p.parseProtocolDecl(),
@@ -458,31 +458,62 @@ fn parseImport(p: *Parser) Error!Ast.Index {
     });
 }
 
-/// Parse a `fn` declaration. `self_recv_tok`, when set, is the impl block's
-/// receiver type-name token: this fn is a method, so a leading bare `self` (a plain
-/// identifier recognized by TEXT — the `_`-wildcard precedent) is consumed and
-/// synthesized into `params[0] = self: <Receiver>`. The self param's type-ref is
-/// `self_type_ref` when the impl supplies one (a `type_app` `Box[T]` for a generic
-/// receiver, M10), else a fresh `identifier` on the receiver token (a bare M8 impl —
-/// kept byte-identical). `impl_gparams` are the impl's generic-param nodes (`[T]`),
-/// PREPENDED into this method's FnProto generic run so the method becomes a bona-fide
-/// generic template (its `protoAt().generic_params.len > 0`), monomorphized per
-/// (type-instance, method) exactly like a generic fn — empty for a bare impl / a
-/// top-level fn (byte-identical). A top-level `fn` passes `null`/`none`/`&.{}` and
-/// rejects a `self` receiver implicitly (it would just parse as a param named `self`).
+/// The four legal shapes a `fn` decl can take, one per call site. Modelled as a tagged
+/// union so the receiver payload attaches ONLY to the two method forms and the derived
+/// body-less / self-optional / self-synthesis behaviour comes from the tag — an illegal
+/// combination is unrepresentable rather than merely discouraged by a comment.
 ///
-/// `bodyless` is true for a protocol method SIGNATURE (`fn m(self, ..) -> R` with no
-/// `{ .. }`): the body is a synthesized empty `block` node so downstream shape checks
-/// (and pack/unpack) stay uniform, and no `parseBlock` is attempted. Only
-/// `parseProtocolDecl` passes true; every other caller (top-level fn, impl method)
-/// passes false and parses a real block.
-///
-/// `self_optional` is true ONLY for a CONFORMANCE impl (`impl T has P`, M25): a method
-/// there may omit the leading `self` (e.g. `fn from(s: Src) -> Self`), so the "a method
-/// must take 'self'" P0006 is suppressed and the params are read as an ordinary run. The
-/// T0024 coherence signature check then governs correctness against the protocol's sig.
-/// Inherent impls and protocol decls pass false (they still require `self`).
-fn parseFnDecl(p: *Parser, self_recv_tok: ?u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index, bodyless: bool, self_optional: bool) Error!Ast.Index {
+///   - `top_level`: an ordinary `fn`; no receiver, so a bare `self` just parses as a
+///     param named `self`. Parses a real body.
+///   - `protocol_sig`: a protocol method SIGNATURE (`fn m(self, ..) -> R` with no
+///     `{ .. }`). `proto_tok` is the protocol name, used as the synthetic `self`
+///     receiver token; the body is a synthesized empty `block` node (bodyless) so
+///     downstream shape checks and pack/unpack stay uniform.
+///   - `inherent_method` / `conformance_method`: an impl method carrying a `Recv`.
+///     `recv_tok` is the impl's receiver type-name token, so a leading bare `self` (a
+///     plain identifier recognized by TEXT — the `_`-wildcard precedent) is consumed and
+///     synthesized into `params[0] = self: <Receiver>`. Its type-ref is `self_type_ref`
+///     when the impl supplies one (a `type_app` `Box[T]` for a generic receiver, M10),
+///     else a fresh `identifier` on the receiver token (a bare M8 impl — byte-identical).
+///     `impl_gparams` are the impl's generic-param nodes (`[T]`), PREPENDED into this
+///     method's FnProto generic run so the method becomes a bona-fide generic template
+///     (its `protoAt().generic_params.len > 0`), monomorphized per (type-instance,
+///     method) exactly like a generic fn. Only `conformance_method` (`impl T has P`, M25)
+///     may OMIT the leading `self` (e.g. `fn from(s: Src) -> Self`): the "a method must
+///     take 'self'" P0006 is suppressed and the T0024 coherence check governs correctness
+///     against the protocol's sig. `inherent_method` still requires `self`.
+const FnKind = union(enum) {
+    top_level,
+    protocol_sig: struct { proto_tok: u32 },
+    inherent_method: Recv,
+    conformance_method: Recv,
+
+    const Recv = struct { recv_tok: u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index };
+};
+
+fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
+    const self_recv_tok: ?u32 = switch (kind) {
+        .top_level => null,
+        .protocol_sig => |ps| ps.proto_tok,
+        .inherent_method, .conformance_method => |recv| recv.recv_tok,
+    };
+    const self_type_ref: Ast.Index = switch (kind) {
+        .inherent_method, .conformance_method => |recv| recv.self_type_ref,
+        else => Ast.none,
+    };
+    const impl_gparams: []const Ast.Index = switch (kind) {
+        .inherent_method, .conformance_method => |recv| recv.impl_gparams,
+        else => &.{},
+    };
+    const bodyless = switch (kind) {
+        .protocol_sig => true,
+        else => false,
+    };
+    const self_optional = switch (kind) {
+        .conformance_method => true,
+        else => false,
+    };
+
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
@@ -688,7 +719,8 @@ fn parseImplBody(p: *Parser, recv_tok: u32, recv_node: Ast.Index, impl_gparams: 
         if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.kw_fn)) {
-            const method = try p.parseFnDecl(recv_tok, recv_node, impl_gparams, false, self_optional);
+            const recv: FnKind.Recv = .{ .recv_tok = recv_tok, .self_type_ref = recv_node, .impl_gparams = impl_gparams };
+            const method = try p.parseFnDecl(if (self_optional) .{ .conformance_method = recv } else .{ .inherent_method = recv });
             try methods.append(p.gpa, method);
             // A method is separated by a newline (loop-top `skipNewlines`) or an
             // optional comma; a `}` ends the block.
@@ -753,7 +785,7 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
         if (!p.at(.kw_fn) and decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.kw_fn)) {
-            const sig = try p.parseFnDecl(name_tok, Ast.none, &.{}, true, false);
+            const sig = try p.parseFnDecl(.{ .protocol_sig = .{ .proto_tok = name_tok } });
             try sigs.append(p.gpa, sig);
             _ = p.eat(.comma);
         } else {
