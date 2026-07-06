@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const Token = @import("../ast/Token.zig").Token;
+const TokenTag = @import("../ast/Token.zig").Tag;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const Mono = @import("../symbols/Mono.zig");
@@ -105,25 +106,16 @@ pub const Event = union(enum) {
     /// type-ref node, matching where the touched walk folds the OWNING sig's
     /// param/return type (carrying the cross-module-correct global id).
     type_ref: struct { idx: Ast.Index, ordinal: u32, is_ret: bool },
-    /// An `==`/`!=` operator on a `.binary` node `idx` (M15). Emitted AFTER both operands,
-    /// like `.callee` fires after a call's callee subtree. The hash IGNORES it (the byte
-    /// stream is unchanged, so every existing fingerprint — incl. int `==` — is preserved
-    /// and warm caches never churn); only `CallVisitor` reacts, folding the `Eq` witness
-    /// for a struct/enum operand so `p == q` tracks the SAME witness identity as `p.eq(q)`.
-    eq_operator: struct { idx: Ast.Index },
-    /// A `<`/`>`/`<=`/`>=` operator on a `.binary` node `idx` (M16). Emitted AFTER both
-    /// operands, like `.eq_operator`. The hash IGNORES it (so every existing fingerprint —
-    /// incl. int `<` — is preserved and warm caches never churn); only `CallVisitor` reacts,
-    /// folding the `Ord::cmp` witness for a struct/enum operand so `a < b` tracks the SAME
-    /// witness identity the desugared cmp call's reloc targets.
-    ord_operator: struct { idx: Ast.Index },
-    /// A `+`/`-`/`*`/`/` operator on a `.binary` node `idx` (M17). Emitted AFTER both
-    /// operands, like `.eq_operator`/`.ord_operator`. The hash IGNORES it (so every existing
-    /// fingerprint — incl. int `+` — is preserved and warm caches never churn); only
-    /// `CallVisitor` reacts, folding the resolved Add/Sub/Mul/Div witness for a struct/enum
-    /// operand so `v1 + v2` tracks the SAME witness identity the desugared call's reloc
-    /// targets (editing an `impl V2 has Add` body must invalidate `+` callers).
-    arith_operator: struct { idx: Ast.Index },
+    /// A desugaring binary operator on a `.binary` node `idx`: `==`/`!=` (Eq/Ord), a
+    /// comparison `<`/`>`/`<=`/`>=` (Ord), or arithmetic `+`/`-`/`*`/`/` (Add/Sub/Mul/Div).
+    /// Emitted AFTER both operands, like `.callee` fires after a call's callee subtree, and
+    /// only for a token that has a candidate method (see `opMethod`). The hash IGNORES it (the
+    /// byte stream is unchanged, so every existing fingerprint — incl. int `==`/`<`/`+` — is
+    /// preserved and warm caches never churn); only `CallVisitor` reacts, folding the resolved
+    /// witness for a struct/enum operand so `p == q`/`a < b`/`v1 + v2` tracks the SAME witness
+    /// identity the desugared call's reloc targets (editing an `impl … has …` body invalidates
+    /// operator callers).
+    operator: struct { idx: Ast.Index },
     /// A postfix `?` on a `.try_expr` node `idx` (M25). Emitted AFTER the operand, like the
     /// three operator events. The hash IGNORES it (so every existing `?` fingerprint — incl.
     /// an Option `?` and a same-error Result `?` — is preserved and warm caches never churn);
@@ -192,17 +184,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .leaf = leaf });
             try walkInner(src, n.lhs, collect, visitor); // lhs THEN rhs: a-b != b-a
             try walkInner(src, n.rhs, collect, visitor);
-            // M15: after the operands (mirroring `.callee`'s post-subtree placement),
-            // signal an `==`/`!=` so `CallVisitor` can fold the `Eq` witness. Gated on
-            // the operator token so a `-`/`<` binary emits nothing; the hash ignores it.
-            const btag = src.tokens[n.main_token].tag;
-            if (btag == .eq_eq or btag == .bang_eq) try emit(visitor, .{ .eq_operator = .{ .idx = idx } });
-            // M16: after the operands, signal a comparison so `CallVisitor` can fold the
-            // `Ord::cmp` witness for a struct/enum operand. The hash ignores it.
-            if (btag == .lt or btag == .lt_eq or btag == .gt or btag == .gt_eq) try emit(visitor, .{ .ord_operator = .{ .idx = idx } });
-            // M17: after the operands, signal arithmetic so `CallVisitor` can fold the
-            // Add/Sub/Mul/Div witness for a struct/enum operand. The hash ignores it.
-            if (btag == .plus or btag == .minus or btag == .star or btag == .slash) try emit(visitor, .{ .arith_operator = .{ .idx = idx } });
+            // After the operands (mirroring `.callee`'s post-subtree placement), signal a
+            // desugaring operator so `CallVisitor` can fold the resolved witness. Gated on the
+            // token having a candidate method, so a non-desugaring binary emits nothing; the
+            // hash ignores it either way.
+            if (opMethods(src.tokens[n.main_token].tag).len > 0) try emit(visitor, .{ .operator = .{ .idx = idx } });
         },
         .call => {
             try walkInner(src, n.lhs, collect, visitor);
@@ -452,6 +438,23 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
     }
 }
 
+/// Candidate desugaring method names for a binary operator token, in resolution order
+/// (first `.one` witness wins). Empty for a non-desugaring token — which is also the gate
+/// deciding whether `walkInner` emits a `.operator` event at all. `==`/`!=` try `eq` then
+/// fall back to `cmp` (an Ord-refinement `==` has no `eq`, but its `Ord::cmp` is the reloc
+/// target); comparisons map to `cmp`; arithmetic to its per-token method.
+fn opMethods(tag: TokenTag) []const []const u8 {
+    return switch (tag) {
+        .eq_eq, .bang_eq => &.{ "eq", "cmp" },
+        .lt, .lt_eq, .gt, .gt_eq => &.{"cmp"},
+        .plus => &.{"add"},
+        .minus => &.{"sub"},
+        .star => &.{"mul"},
+        .slash => &.{"div"},
+        else => &.{},
+    };
+}
+
 pub fn updateU32(h: *std.hash.Wyhash, v: u32) void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, v, .little);
@@ -479,7 +482,7 @@ pub const HashVisitor = struct {
             .leaf, .raw_leaf => |t| updateLeaf(self.h, t),
             .count => |c| updateU32(self.h, c),
             .flag => |f| self.h.update(&[_]u8{@intFromBool(f)}),
-            .touch, .callee, .type_ref, .eq_operator, .ord_operator, .arith_operator, .try_operator => {},
+            .touch, .callee, .type_ref, .operator, .try_operator => {},
         }
     }
 };
@@ -550,7 +553,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         // resolved Display witness), not on the fixed `print` Sig. Fold by the
                         // arg kind so a caller recompiles when the resolved witness changes
                         // (e.g. the arg struct gains an explicit `impl Display`) — the same
-                        // incremental-soundness discipline as the `.eq_operator` witness fold.
+                        // incremental-soundness discipline as the `.operator` witness fold.
                         // `str`/`unit` keep the raw `print` write path, so folding the `print`
                         // Sig for them leaves those fingerprints byte-identical (warm cache).
                         if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print") and
@@ -597,66 +600,26 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         }
                     }
                 },
-                .eq_operator => |e| {
-                    // An `==`/`!=` on a struct/enum operand (M15) desugars to that type's
-                    // `Eq::eq`; fold the witness so the caller tracks the SAME identity the
-                    // desugared call's reloc targets — mirroring the `p.eq(q)` method fold
-                    // above (SAME `.one` resolver -> SAME Sig). A scalar operand (int/bool/
-                    // str/unit) inlines to a machine op with NO symbol, so there is nothing
-                    // to fold; skipping it keeps every scalar-`==` fingerprint byte-identical
-                    // (warm cache preserved). A pre-typecheck view (idx/lhs out of range or
-                    // an invalid recv) folds nothing.
+                .operator => |e| {
+                    // A desugaring operator on a struct/enum operand desugars to that type's
+                    // witness — `==`/`!=` to `Eq::eq` (or, for an Ord-refinement operand with no
+                    // `eq`, its `Ord::cmp`), a comparison to `Ord::cmp`, arithmetic to its
+                    // Add/Sub/Mul/Div method. Fold the FIRST resolving witness so the caller
+                    // tracks the SAME identity the desugared call's reloc targets — the SAME
+                    // `.one` resolver the `recv.m(..)` method fold above uses. A scalar operand
+                    // (int/bool/str/unit) inlines to a machine op with NO symbol, so nothing to
+                    // fold; skipping it keeps every scalar-operator fingerprint byte-identical
+                    // (warm cache preserved). A pre-typecheck view (lhs out of range or an
+                    // invalid recv) folds nothing.
                     const bn = self.frozen.tree.nodes[e.idx.int()];
                     if (bn.lhs.int() >= self.frozen.node_types.len) return;
                     const recv = self.frozen.node_types[bn.lhs.int()];
                     if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "eq", true, null)) {
-                        .one => |m| try self.foldWitness(m),
-                        // Ord-refinement `==` (M16): no `eq` witness, but the type's `Ord::cmp`
-                        // is the reloc target lower emits — fold IT so an edit to the `cmp` body
-                        // invalidates callers. A scalar (no cmp method) folds nothing.
-                        .none, .ambiguous => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", true, null)) {
-                            .one => |m| try self.foldWitness(m),
+                    for (opMethods(self.frozen.tokens[bn.main_token].tag)) |method| {
+                        switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, true, null)) {
+                            .one => |m| return self.foldWitness(m),
                             .none, .ambiguous => {},
-                        },
-                    }
-                },
-                .ord_operator => |e| {
-                    // A `<`/`>`/`<=`/`>=` on a struct/enum operand (M16) desugars to that type's
-                    // `Ord::cmp`; fold the witness so the caller tracks the SAME identity the
-                    // desugared cmp call's reloc targets (mirrors the `.eq_operator` fold). A
-                    // scalar operand (int/str/bool) inlines with NO symbol, so nothing to fold —
-                    // keeping every scalar-comparison fingerprint byte-identical (warm cache).
-                    const bn = self.frozen.tree.nodes[e.idx.int()];
-                    if (bn.lhs.int() >= self.frozen.node_types.len) return;
-                    const recv = self.frozen.node_types[bn.lhs.int()];
-                    if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "cmp", true, null)) {
-                        .one => |m| try self.foldWitness(m),
-                        .none, .ambiguous => {},
-                    }
-                },
-                .arith_operator => |e| {
-                    // A `+`/`-`/`*`/`/` on a struct/enum operand (M17) desugars to that type's
-                    // Add/Sub/Mul/Div witness; fold it so the caller tracks the SAME identity the
-                    // desugared call's reloc targets (mirrors the `.ord_operator` fold). An int
-                    // operand inlines to a machine op with NO symbol, so nothing to fold — keeping
-                    // every int-arithmetic fingerprint byte-identical (warm cache). str/bool are
-                    // rejected by the checker and never reach here.
-                    const bn = self.frozen.tree.nodes[e.idx.int()];
-                    if (bn.lhs.int() >= self.frozen.node_types.len) return;
-                    const recv = self.frozen.node_types[bn.lhs.int()];
-                    if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
-                    const method: []const u8 = switch (self.frozen.tokens[bn.main_token].tag) {
-                        .plus => "add",
-                        .minus => "sub",
-                        .star => "mul",
-                        .slash => "div",
-                        else => return,
-                    };
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, true, null)) {
-                        .one => |m| try self.foldWitness(m),
-                        .none, .ambiguous => {},
+                        }
                     }
                 },
                 .try_operator => |e| {
@@ -1014,7 +977,7 @@ fn build(gpa: std.mem.Allocator, source: []const u8) !Built {
 /// makes the guard catch a mis-placed `.touch`/`.callee`/`.type_ref` dispatch —
 /// not only a forked traversal order.
 const StreamStep = struct {
-    kind: enum { enter, touch, callee, type_ref, eq_operator, ord_operator, arith_operator, try_operator },
+    kind: enum { enter, touch, callee, type_ref, operator, try_operator },
     idx: Ast.Index,
 };
 
@@ -1032,9 +995,7 @@ const StreamRecorder = struct {
             .touch => |t| try self.out.append(self.gpa, .{ .kind = .touch, .idx = t.idx }),
             .callee => |c| try self.out.append(self.gpa, .{ .kind = .callee, .idx = c.idx }),
             .type_ref => |r| try self.out.append(self.gpa, .{ .kind = .type_ref, .idx = r.idx }),
-            .eq_operator => |e| try self.out.append(self.gpa, .{ .kind = .eq_operator, .idx = e.idx }),
-            .ord_operator => |e| try self.out.append(self.gpa, .{ .kind = .ord_operator, .idx = e.idx }),
-            .arith_operator => |e| try self.out.append(self.gpa, .{ .kind = .arith_operator, .idx = e.idx }),
+            .operator => |e| try self.out.append(self.gpa, .{ .kind = .operator, .idx = e.idx }),
             .try_operator => |e| try self.out.append(self.gpa, .{ .kind = .try_operator, .idx = e.idx }),
             .leaf, .raw_leaf, .count, .flag => {},
         }
@@ -1159,21 +1120,25 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
     var saw_touch = false;
     var saw_callee = false;
     var saw_type_ref = false;
-    var saw_eq_operator = false;
-    var saw_ord_operator = false;
-    var saw_arith_operator = false;
+    // The fixture exercises all three operator categories: `q == s` (eq), `m > 0` (ord),
+    // `q.x - p.x` (arith) — all now one `.operator` event, distinguished by token tag.
+    var saw_eq_op = false;
+    var saw_ord_op = false;
+    var saw_arith_op = false;
     for (stream) |st| switch (st.kind) {
         .enter => saw_enter = true,
         .touch => saw_touch = true,
         .callee => saw_callee = true,
         .type_ref => saw_type_ref = true,
-        .eq_operator => saw_eq_operator = true,
-        .ord_operator => saw_ord_operator = true,
-        .arith_operator => saw_arith_operator = true,
+        .operator => switch (b.tokens[b.tree.nodes[st.idx.int()].main_token].tag) {
+            .eq_eq, .bang_eq => saw_eq_op = true,
+            .lt, .lt_eq, .gt, .gt_eq => saw_ord_op = true,
+            .plus, .minus, .star, .slash => saw_arith_op = true,
+            else => {},
+        },
         .try_operator => {}, // this fixture has no `?`, so it never fires (proved by the placement loop below being vacuous)
     };
-    // The fixture's `d := q.x - p.x` is a `-` binary, so `.arith_operator` fires (M17).
-    try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref and saw_eq_operator and saw_ord_operator and saw_arith_operator);
+    try testing.expect(saw_enter and saw_touch and saw_callee and saw_type_ref and saw_eq_op and saw_ord_op and saw_arith_op);
 
     // (1) NO ORPHAN DISPATCH: every touch/callee/type_ref idx is a node that was
     // entered. A dispatch at a node outside the walked subtree would fail here.
@@ -1234,37 +1199,14 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         try testing.expect(is_proto_type);
     }
 
-    // (5) `.eq_operator` PLACEMENT (M15): every `.eq_operator` idx is an entered
-    // `.binary` node whose operator token is `==`/`!=`. A signal at the wrong node — or
-    // fired for a non-eq binary — fails here.
+    // (5) `.operator` PLACEMENT: every `.operator` idx is an entered `.binary` node whose
+    // operator token has a candidate desugaring method. A signal at the wrong node — or
+    // fired for a non-desugaring binary — fails here.
     for (stream) |st| {
-        if (st.kind != .eq_operator) continue;
+        if (st.kind != .operator) continue;
         const bnode = b.tree.nodes[st.idx.int()];
         try testing.expect(bnode.tag == .binary);
-        const btag = b.tokens[bnode.main_token].tag;
-        try testing.expect(btag == .eq_eq or btag == .bang_eq);
-    }
-
-    // (6) `.ord_operator` PLACEMENT (M16): every `.ord_operator` idx is an entered
-    // `.binary` node whose operator token is `<`/`>`/`<=`/`>=`. A signal at the wrong node —
-    // or fired for a non-comparison binary — fails here.
-    for (stream) |st| {
-        if (st.kind != .ord_operator) continue;
-        const bnode = b.tree.nodes[st.idx.int()];
-        try testing.expect(bnode.tag == .binary);
-        const btag = b.tokens[bnode.main_token].tag;
-        try testing.expect(btag == .lt or btag == .lt_eq or btag == .gt or btag == .gt_eq);
-    }
-
-    // (7) `.arith_operator` PLACEMENT (M17): every `.arith_operator` idx is an entered
-    // `.binary` node whose operator token is `+`/`-`/`*`/`/`. A signal at the wrong node —
-    // or fired for a non-arithmetic binary — fails here.
-    for (stream) |st| {
-        if (st.kind != .arith_operator) continue;
-        const bnode = b.tree.nodes[st.idx.int()];
-        try testing.expect(bnode.tag == .binary);
-        const btag = b.tokens[bnode.main_token].tag;
-        try testing.expect(btag == .plus or btag == .minus or btag == .star or btag == .slash);
+        try testing.expect(opMethods(b.tokens[bnode.main_token].tag).len > 0);
     }
 }
 
@@ -1395,8 +1337,8 @@ test "M15: the .eq_operator event is IGNORED by the hash (int == fingerprint unc
     var hv = HashVisitor{ .h = &h1 };
     try walk(b.src(), decl, &hv);
 
-    // Hash 2: the SAME walk fed to a visitor that DROPS `.eq_operator` before folding —
-    // i.e. the hash as if the M15 event had never been introduced. Byte-identity proves
+    // Hash 2: the SAME walk fed to a visitor that DROPS `.operator` before folding —
+    // i.e. the hash as if the operator event had never been introduced. Byte-identity proves
     // the operator event never enters the fingerprint byte-stream, so every existing
     // int/bool/str/unit `==` fp is preserved and warm caches never churn.
     var h2 = std.hash.Wyhash.init(0);
@@ -1404,7 +1346,7 @@ test "M15: the .eq_operator event is IGNORED by the hash (int == fingerprint unc
         h: HashVisitor,
         pub fn on(self: *@This(), ev: Event) void {
             switch (ev) {
-                .eq_operator => {},
+                .operator => {},
                 else => self.h.on(ev),
             }
         }
@@ -1426,8 +1368,8 @@ test "M16: the .ord_operator event is IGNORED by the hash (int < fingerprint unc
     var hv = HashVisitor{ .h = &h1 };
     try walk(b.src(), decl, &hv);
 
-    // Hash 2: the SAME walk with `.ord_operator` dropped before folding — the hash as if the
-    // M16 event had never been introduced. Byte-identity proves the operator event never
+    // Hash 2: the SAME walk with `.operator` dropped before folding — the hash as if the
+    // operator event had never been introduced. Byte-identity proves the operator event never
     // enters the fingerprint byte-stream, so every existing int/str/bool comparison fp is
     // preserved and warm caches never churn.
     var h2 = std.hash.Wyhash.init(0);
@@ -1435,7 +1377,7 @@ test "M16: the .ord_operator event is IGNORED by the hash (int < fingerprint unc
         h: HashVisitor,
         pub fn on(self: *@This(), ev: Event) void {
             switch (ev) {
-                .ord_operator => {},
+                .operator => {},
                 else => self.h.on(ev),
             }
         }
@@ -1457,8 +1399,8 @@ test "M17: the .arith_operator event is IGNORED by the hash (int + fingerprint u
     var hv = HashVisitor{ .h = &h1 };
     try walk(b.src(), decl, &hv);
 
-    // Hash 2: the SAME walk with `.arith_operator` dropped before folding — the hash as if the
-    // M17 event had never been introduced. Byte-identity proves the operator event never
+    // Hash 2: the SAME walk with `.operator` dropped before folding — the hash as if the
+    // operator event had never been introduced. Byte-identity proves the operator event never
     // enters the fingerprint byte-stream, so every existing int arithmetic fp is preserved
     // and warm caches never churn.
     var h2 = std.hash.Wyhash.init(0);
@@ -1466,7 +1408,7 @@ test "M17: the .arith_operator event is IGNORED by the hash (int + fingerprint u
         h: HashVisitor,
         pub fn on(self: *@This(), ev: Event) void {
             switch (ev) {
-                .arith_operator => {},
+                .operator => {},
                 else => self.h.on(ev),
             }
         }
