@@ -2060,8 +2060,9 @@ pub const BodyChecker = struct {
     /// Walk `t` to the innermost type that fails to conform to `pid`: an `App`
     /// substitutes its ctor's field/payload patterns and descends into the first that
     /// fails; a struct/enum descends into its first non-conforming field/payload; a leaf
-    /// (`type_var`/scalar) is returned as-is. Terminates for the same reason `conforms`
-    /// does (finite acyclic type graph). Degrades to `t` on any allocation failure.
+    /// (`type_var`/scalar) is returned as-is. Terminates via the `seen` App-index guard:
+    /// the type graph is cyclic (a recursive template re-interns to one App index), so
+    /// re-entry on that index is cut. Degrades to `t` on any allocation failure.
     fn deepestNonConforming(bc: *BodyChecker, t: Type, pid: u32) Type {
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen.deinit(bc.gpa);

@@ -7,9 +7,8 @@ const ControlFlow = @import("ControlFlow.zig");
 
 // The pattern/match subsystem, carved out of `BodyChecker` as free functions over
 // a `*BodyChecker`. `substTy` stays in BodyChecker (it is shared by the struct/method
-// paths too); the accessors these functions call (`typeOf`/`scrutEnumId`/`typeName`/
-// `nameText`/`byteOf`/`merge`/`typeOfExpected`/`setSlot`/`cflow`/`activeEnumMap`) are
-// `pub` on BodyChecker for the same reason.
+// paths too); the accessors these functions reach for are `pub` on BodyChecker for the
+// same reason, and the compiler enforces that pub-ness.
 const BC = @import("BodyChecker.zig");
 const BodyChecker = BC.BodyChecker;
 
