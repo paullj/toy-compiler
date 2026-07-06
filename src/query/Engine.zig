@@ -24,7 +24,6 @@ const Key = @import("Key.zig");
 const CodegenIr = @import("../codegen/CodegenIr.zig");
 const Ast = @import("../ast/Ast.zig");
 const Fingerprint = @import("Fingerprint.zig");
-const Walks = @import("Walks.zig");
 const AstWalk = @import("AstWalk.zig");
 const Link = @import("../link/Link.zig");
 const Ir = @import("../ir/Ir.zig");
@@ -546,13 +545,13 @@ pub fn codegen(
     // `Fingerprint`'s walk so the supplied order matches.
     var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
     defer callee_sigs.deinit(gpa);
-    try Walks.walkCalls(gpa, frozen, fn_decl, my_sig, &callee_sigs);
+    try AstWalk.walkCalls(gpa, frozen, fn_decl, my_sig, &callee_sigs);
     var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
     defer {
-        Walks.freeTouched(gpa, touched.items);
+        AstWalk.freeTouched(gpa, touched.items);
         touched.deinit(gpa);
     }
-    try Walks.walkTouchedSig(gpa, frozen, fn_decl, my_sig, &touched);
+    try AstWalk.walkTouchedSig(gpa, frozen, fn_decl, my_sig, &touched);
 
     // (d) The concrete type-args of a monomorphized instance (empty for a
     // non-generic fn, so the fold is skipped and its fp is byte-identical). Built
@@ -560,10 +559,10 @@ pub fn codegen(
     // to a type-arg invalidates exactly the dependent instance.
     var type_args: std.ArrayList(Fingerprint.TouchedType) = .empty;
     defer {
-        Walks.freeTouched(gpa, type_args.items);
+        AstWalk.freeTouched(gpa, type_args.items);
         type_args.deinit(gpa);
     }
-    try Walks.walkTypeArgs(gpa, frozen, frozen.type_args, &type_args);
+    try AstWalk.walkTypeArgs(gpa, frozen, frozen.type_args, &type_args);
 
     // (e) The resolved bound conformances of a bounded monomorphized instance,
     // folded structurally so toggling a sibling-module conformance invalidates exactly
@@ -572,10 +571,10 @@ pub fn codegen(
     // Engine.codegen threading point the contract names.
     var confs: std.ArrayList(Fingerprint.ResolvedConformance) = .empty;
     defer {
-        Walks.freeConformances(gpa, confs.items);
+        AstWalk.freeConformances(gpa, confs.items);
         confs.deinit(gpa);
     }
-    try Walks.walkConformances(gpa, frozen, frozen.conformances, &confs);
+    try AstWalk.walkConformances(gpa, frozen, frozen.conformances, &confs);
 
     const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items, confs.items);
     // The uniform codegen key: the content fingerprint xor'd with the opt level
@@ -746,7 +745,7 @@ pub fn codegenSynthetic(
     // field-layout edit flips the unit's key. Built by the SAME `appendTouched` path.
     var conform_list: std.ArrayList(Fingerprint.TouchedType) = .empty;
     defer {
-        Walks.freeTouched(gpa, conform_list.items);
+        AstWalk.freeTouched(gpa, conform_list.items);
         conform_list.deinit(gpa);
     }
     try AstWalk.appendTouched(gpa, frozen, d.conform_ty, &conform_list);
