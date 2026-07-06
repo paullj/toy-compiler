@@ -1433,6 +1433,16 @@ test "integration: emitted binary runs with the right exit code" {
         // (m12) FRAME canary: f(g(...)) where the inner match returns a >16B enum
         // via sret with a guarded arm, the outer sums it. pick guarded by s→true.
         .{ .src = "enum Sel { C, D }\nenum Big { A { p: int, q: int, r: int }, B(int) }\nfn pick(s: Sel) -> Big { match s { .C if 3 > 1 -> Big.A { p: 10, q: 20, r: 12 }, _ -> Big.B(0) } }\nfn consume(b: Big) -> int { match b { .A { p, q, r } -> p + q + r, .B(v) -> v } }\nfn main() -> int {\n return consume(pick(Sel.C))\n}\n", .name = "match_guard_sret_arg", .expect = 42 },
+        // (m13) A match STATEMENT whose every arm body `return`s: the match type is
+        // `never`, so lowering must emit each arm's return and seal the (unreachable)
+        // join rather than fall through to the fn exit with no value.
+        .{ .src = "enum Opt { some(int), none }\nfn pick(o: Opt) -> int {\n match o { .some(v) -> { return v }, .none -> { return 0 } }\n}\nfn main() -> int { return pick(Opt.some(42)) }\n", .name = "match_arm_return", .expect = 42 },
+        // (m14) Same over a GENERIC enum instance — the App scrutinee reifies but the
+        // arm-return lowering path is identical, so it must run to the payload too.
+        .{ .src = "enum Opt[T] { some(T), none }\nfn pick(o: Opt[int]) -> int {\n match o { .some(v) -> { return v }, .none -> { return 0 } }\n}\nfn main() -> int { return pick(Opt[int].some(42)) }\n", .name = "match_arm_return_generic", .expect = 42 },
+        // (m15) MIXED arms: one yields a value, one `return`s — the match type stays
+        // `int`, exercising the scalar produce-into path's diverging-arm guard.
+        .{ .src = "enum Opt { some(int), none }\nfn pick(o: Opt) -> int {\n x := match o { .some(v) -> v, .none -> { return 7 } }\n return x + 1\n}\nfn main() -> int { return pick(Opt.some(41)) }\n", .name = "match_arm_return_mixed", .expect = 42 },
 
         // Methods (M8) — each RUN proves STATIC method dispatch + self-by-value: a
         // wrong callee / a dropped or misplaced self arg would fault or mis-total.

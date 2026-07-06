@@ -2598,11 +2598,16 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
     const n = b.in.tree.nodes[(expr).int()];
     switch (ty.kind) {
         .int, .bool => {
-            const v = operandValue(try lowerExpr(b, expr));
-            _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = v, .ty = ty } }, null);
+            const op = try lowerExpr(b, expr);
+            // A diverging producer (e.g. a match arm body that `return`s) already set
+            // the block terminator; a store into that dead tail is malformed IR.
+            if (!b.termSet()) _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = operandValue(op), .ty = ty } }, null);
             return;
         },
-        .unit => {
+        .unit, .never => {
+            // `never` means the expression diverges (e.g. a match arm whose body
+            // `return`s). Lower it for its control-flow effect: it sets its own
+            // terminator, so there is no value to produce into `dst_ptr`.
             _ = try lowerExpr(b, expr);
             return;
         },
@@ -2938,6 +2943,10 @@ fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typ
     // `unreachable`, and continue lowering at `join`.
     try brTo(b, join, .none); // the trailing `next` block branches to join (dead but well-formed)
     b.switchTo(join);
+    // A `never`-typed match: every arm diverged, so `join` is unreachable. Seal it as
+    // unreachable so the caller's fall-through does not append a value-less `br` to the
+    // fn exit (which carries a typed result param).
+    if (ty.kind == .never) b.blocks.items[join].term_set = true;
 }
 
 /// A postfix `?` in VALUE context. Mirrors `lowerMatchValue`: materialize the
