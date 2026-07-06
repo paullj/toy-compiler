@@ -1,4 +1,4 @@
-//! The M4/M6 App-reification engine, extracted from the `Typecheck` mega-struct as free
+//! The App-reification engine, extracted from the `Typecheck` mega-struct as free
 //! functions over `*Typecheck` (Zig has no struct-field privacy, so these read the
 //! checker's fields directly). `reifyApps` is the whole-program driver run from
 //! `monomorphize`: it collects every reachable ground `App`, reifies each to a concrete
@@ -15,7 +15,7 @@ const Typecheck = @import("../types.zig");
 const Type = Typecheck.Type;
 const VariantSym = LayoutEngine.VariantSym;
 
-/// One entry in the reification sort (M4): a composite `App` index + its precomputed
+/// One entry in the reification sort: a composite `App` index + its precomputed
 /// nesting depth + its INDEX-INDEPENDENT structural key. Sorting by `(depth, key)`
 /// makes reified-`struct_id` assignment a pure function of source (inner `App`s get
 /// lower ids than outer; independent `App`s ordered by structural key), so the ids —
@@ -46,7 +46,7 @@ fn rewriteApp(t: *Typecheck, ty: *Type) void {
     }
 }
 
-/// Reify a composite `App` to the concrete `Type` it stands for (M4/M6) — the single
+/// Reify a composite `App` to the concrete `Type` it stands for — the single
 /// dispatcher + memo + termination guard. Memoizes on the composite index so each
 /// ground `App` reifies to exactly one concrete type; dispatches to `reifyAppToStruct`
 /// (-> `structT`) or `reifyAppToEnum` (-> `enumT`) on the `ctor_is_enum` discriminator.
@@ -80,7 +80,7 @@ pub fn reifyAppTo(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
     return Type.structT(try reifyAppToStruct(t, app_idx));
 }
 
-/// Reify a struct-`App` (`Box[int]`) to a fresh concrete `struct_id` (M4), memoized by
+/// Reify a struct-`App` (`Box[int]`) to a fresh concrete `struct_id`, memoized by
 /// the `reifyAppTo` dispatcher (which owns the memo check + depth guard). Grounds the
 /// `App`'s own args (a nested `App` arg -> its reified concrete type via `reifyAppTo`,
 /// bottom-up, so a mixed nest `Box[Either[int,bool]]` grounds its enum arg to `enumT`),
@@ -124,7 +124,7 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
     return sid;
 }
 
-/// Reify an enum-`App` (`Either[int,bool]`) to a fresh concrete `enum_id` (M6),
+/// Reify an enum-`App` (`Either[int,bool]`) to a fresh concrete `enum_id`,
 /// memoized by the `reifyAppTo` dispatcher. Mirrors `reifyAppToStruct`: grounds the
 /// `App`'s own args (via `reifyAppTo`), copies the template EnumSym, claims a fresh
 /// `enum_id` via a placeholder append (so a nested reify lands past it), substitutes
@@ -156,7 +156,7 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
         .is_generic = false,
         // Tag the reified instance by the PRELUDE template id (not the mangled name — a
         // user `enum Option` would mangle to the same `Option$int`), so `lower` recognizes
-        // its native inherent methods per-instance (M23).
+        // its native inherent methods per-instance.
         .native_family = if (t.prelude) |p| p.optResultFamily(e.ctor) else .none,
     });
     const src_variants = tmpl.variants;
@@ -181,8 +181,8 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
     return Type.enumT(eid);
 }
 
-/// Substitute a template field-type PATTERN through a reified instance's concrete args
-/// (M4), always yielding a CONCRETE type: a `type_var(ord)` becomes `cargs[ord]`; a
+/// Substitute a template field-type PATTERN through a reified instance's concrete args,
+/// always yielding a CONCRETE type: a `type_var(ord)` becomes `cargs[ord]`; a
 /// nested `App(c, [pat..])` (a field like `b: Box[T]`) grounds its args, re-interns,
 /// and reifies to `structT` (bottom-up, so `layoutReified` only ever sees `structT`);
 /// anything else passes through.
@@ -199,7 +199,7 @@ fn substReify(t: *Typecheck, ty: Type, cargs: []const Type) error{OutOfMemory}!T
         for (e.args, 0..) |a, i| sub[i] = try substReify(t, a, cargs);
         const new_idx = try t.internApp(e.ctor, sub, e.ctor_is_enum);
         // Dispatch struct-vs-enum on the interned discriminator: a `Box[T]` field grounds
-        // to `structT`, an `Either[T,U]`/`L[Box[T]]` payload to `enumT` (M6). The
+        // to `structT`, an `Either[T,U]`/`L[Box[T]]` payload to `enumT`. The
         // `reifyAppTo` depth guard makes an unbounded enum type-growth chain terminate.
         return reifyAppTo(t, new_idx);
     }
@@ -207,7 +207,7 @@ fn substReify(t: *Typecheck, ty: Type, cargs: []const Type) error{OutOfMemory}!T
 }
 
 /// Reify every reachable ground `App` to a concrete `structT`/`enumT` and rewrite all
-/// `.app` occurrences to it (M4/M6). See the call site in `monomorphize` for why this
+/// `.app` occurrences to it. See the call site in `monomorphize` for why this
 /// runs where it does. `nts` is the per-module node_types (`t.gph_node_types`).
 pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // (1) Collect every reachable ground `App` index (+ nested) from the slot sets an
@@ -233,7 +233,7 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // A non-generic enum with a concrete generic-aggregate payload (`enum E {
     // v(Box[int]) }` / `enum E { v(Either[int,bool]) }`) carries a ground `App` in a
     // variant's `field_types`; collect it so the same reify+rewrite erases it before the
-    // enum snapshot/fingerprint. A generic ENUM TEMPLATE (M6) carries `type_var`/
+    // enum snapshot/fingerprint. A generic ENUM TEMPLATE carries `type_var`/
     // App-over-type_var PATTERNS in its variant payloads (never ground, never lowered) —
     // skip it, exactly as generic structs are skipped above; a reified enum's payloads
     // are already concrete (grounded by `substReify`), so `collectApp` is a no-op there.
@@ -251,7 +251,7 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         // un-reified there; collect it too, exactly as derive_reqs.conform_ty below.
         for (inst.conformances) |rc| try collectApp(t, rc.conform_ty, &to_reify);
     }
-    // A conditional-conformance derive request (M21) carries a ground `App` conform_ty
+    // A conditional-conformance derive request carries a ground `App` conform_ty
     // (`Box[int] < ..` records `App(Box,[int])`); collect it so the same reify pass mints
     // its concrete `struct_id`, and step (3) rewrites the request to that `structT` — else
     // `synthesizeDerives` (post-reify) would key `Derive.writeKey` off a stale App index.
@@ -300,7 +300,7 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         rewriteApp(t, &inst.ret);
         for (@constCast(inst.conformances)) |*rc| rewriteApp(t, &rc.conform_ty);
     }
-    // M21: rewrite each conditional-conformance derive request's `App` conform_ty to its
+    // rewrite each conditional-conformance derive request's `App` conform_ty to its
     // reified `structT`/`enumT`, so `synthesizeDerives` sees the concrete type.
     for (t.derive_reqs.items) |*r| rewriteApp(t, &r.conform_ty);
 }

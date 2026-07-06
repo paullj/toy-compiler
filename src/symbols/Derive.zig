@@ -1,4 +1,4 @@
-//! Auto-derive recipe table — a peer data module (M18).
+//! Auto-derive recipe table — a peer data module.
 //!
 //! A `Derive` is one authorized structural-derive `(protocol, concrete type)` pair
 //! reified to a SOURCE-LESS synthetic per-fn codegen unit (no AST). The type
@@ -19,7 +19,7 @@ const std = @import("std");
 const Type = @import("../layout/Engine.zig").Type;
 
 /// Which derive this recipe carries. Append-only (mirrors `Token.Tag`/`Node.Tag`
-/// discipline): M19 adds `.ord`, M20 `.hash`, M22 `.display`. The ordinal folds into
+/// discipline): successive kinds are `.ord`, `.hash`, `.display`. The ordinal folds into
 /// the mangled name + the sort key, so it must stay stable.
 pub const Kind = enum(u8) { eq, ord, hash, display };
 
@@ -50,16 +50,16 @@ pub const FieldWitness = union(enum) {
     /// An Ord-only aggregate field: no `eq` witness, but a `cmp` witness exists — call
     /// `cmp(field_self, field_other)`, read the returned `Ordering` tag, compare `== eq`.
     cmp_eq: []const u8,
-    /// An aggregate (struct / enum) field of an `Ord` derive with a `cmp` witness (M19):
+    /// An aggregate (struct / enum) field of an `Ord` derive with a `cmp` witness:
     /// call `cmp(field_self, field_other)`, read the returned `Ordering` tag, and use it as
     /// the 3-way field discriminant in the lexicographic chain. Append-only (ordinal 3).
     cmp_call: []const u8,
-    /// An aggregate (struct / enum) field of a `Hash` derive with a `hash` witness (M20):
+    /// An aggregate (struct / enum) field of a `Hash` derive with a `hash` witness:
     /// call `hash(field_self) -> int` and fold the returned int into the accumulator.
     /// Append-only (ordinal 4).
     hash_call: []const u8,
-    /// An aggregate (struct / enum) field of a `Display` derive with a `display` witness
-    /// (M22): call `display(field_self) -> ()`, which writes the field's rendering directly
+    /// An aggregate (struct / enum) field of a `Display` derive with a `display` witness:
+    /// call `display(field_self) -> ()`, which writes the field's rendering directly
     /// to the output fd. Append-only (ordinal 5).
     display_call: []const u8,
 };
@@ -69,14 +69,14 @@ pub const FieldWitness = union(enum) {
 /// prelude/source `ProtocolSym.name` (outlives codegen); the `FieldWitness` name slices
 /// are borrowed (see `FieldWitness`).
 pub const Derive = struct {
-    /// The protocol this recipe witnesses (`Eq` in M18).
+    /// The protocol this recipe witnesses (`Eq`).
     protocol_id: u32,
     protocol_name: []const u8,
     kind: Kind,
     /// The ground concrete type this derives the protocol for (a `structT`/`enumT`).
     conform_ty: Type,
     /// The synthetic method's return type: `bool` for an `Eq` derive, the prelude
-    /// `Ordering` enum for an `Ord` derive (M19), `int` for a `Hash` derive (M20). The
+    /// `Ordering` enum for an `Ord` derive, `int` for a `Hash` derive. The
     /// emitter types its ret slot / exit
     /// param from this, and a witness-ret lookup reads it for a DERIVED `cmp` field (whose
     /// `fn_id == 0` would otherwise mis-read `sigs[0].ret`). A pure function of `kind`, so
@@ -86,7 +86,7 @@ pub const Derive = struct {
     /// the resolved field-eq recipe. OWNED outer slice.
     field_witnesses: []const FieldWitness = &.{},
     /// The synthetic method's params: `[conform_ty, conform_ty]` for a homogeneous `Eq`/
-    /// `Ord` derive, `[conform_ty]` (self only) for a `Hash` derive (M20). An OWNED heap
+    /// `Ord` derive, `[conform_ty]` (self only) for a `Hash` derive. An OWNED heap
     /// slice so `AstWalk.CallVisitor.foldWitness` may borrow it into a `Fingerprint.Sig`
     /// (which stores the slice by reference; a by-value array local would dangle).
     params: []const Type = &.{},
@@ -292,12 +292,12 @@ test "writeKey is injective across kind/enum-flag/id" {
     defer c.deinit(gpa);
     try writeKey(gpa, &c, 0, .eq, Type.structT(0));
     try testing.expectEqualSlices(u8, a.items, c.items); // same recipe => same key
-    // M19: the same (protocol, type) under distinct kinds (eq vs ord) key distinctly.
+    // the same (protocol, type) under distinct kinds (eq vs ord) key distinctly.
     var d: std.ArrayList(u8) = .empty;
     defer d.deinit(gpa);
     try writeKey(gpa, &d, 0, .ord, Type.structT(0));
     try testing.expect(!std.mem.eql(u8, a.items, d.items));
-    // M20: the hash kind keys distinctly from both eq and ord for the same (protocol, type).
+    // the hash kind keys distinctly from both eq and ord for the same (protocol, type).
     var e: std.ArrayList(u8) = .empty;
     defer e.deinit(gpa);
     try writeKey(gpa, &e, 0, .hash, Type.structT(0));
