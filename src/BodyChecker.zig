@@ -27,7 +27,7 @@ const refs = Typecheck.refs;
 /// The form a construction NODE supplies (independent of the declared variant).
 const InitForm = enum { unit, tuple, @"struct" };
 
-/// Substitute a template type through a concrete type-arg tuple (M2/M4): a
+/// Substitute a template type through a concrete type-arg tuple: a
 /// `type_var(ord)` becomes `targs[ord]`; an `App(ctor, [pat..])` recursively
 /// substitutes each arg and re-interns (so a template's field pattern `Box[T]`
 /// grounds to `Box[int]`); any concrete type passes through. Needs the intern table,
@@ -49,8 +49,8 @@ fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
     return ty;
 }
 
-/// True when `ty` is a concrete value type usable as a monomorphization type-arg. M4
-/// admits a ground `App` (a generic-struct instance used as a type-arg). Mirrors
+/// True when `ty` is a concrete value type usable as a monomorphization type-arg. This
+/// predicate admits a ground `App` (a generic-struct instance used as a type-arg). Mirrors
 /// `Typecheck.isConcreteValue`.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
@@ -59,7 +59,7 @@ fn isConcreteValue(ty: Type) bool {
     };
 }
 
-/// A human name for an Option/Result family, for the `?` mismatch diagnostic (M24).
+/// A human name for an Option/Result family, for the `?` mismatch diagnostic.
 fn familyName(fam: LayoutEngine.NativeEnumFamily) []const u8 {
     return switch (fam) {
         .option => "Option",
@@ -112,7 +112,7 @@ pub const BodyChecker = struct {
 
     gph_fn_names: ?[]const []const u8 = null,
 
-    /// The shared composite (`App`) intern table (M4), borrowed from the owning
+    /// The shared composite (`App`) intern table, borrowed from the owning
     /// `Typecheck` (stable heap address). Generic-struct construction/field-access
     /// forms + reads back `App`s here; the mono tail reifies them away afterward.
     composite: *Composite,
@@ -124,12 +124,12 @@ pub const BodyChecker = struct {
     /// byte-identical. Borrowed for the duration of one re-check.
     subst: ?Subst = null,
 
-    /// The receiver type when checking an inherent method's body (M8), set by
+    /// The receiver type when checking an inherent method's body, set by
     /// `bodyCheckerFor` from the method's `FnSym.self_type`; null for a non-method.
     /// Consumed by the `Self` type-ref hook (`selfType`).
     cur_self_type: ?Type = null,
 
-    /// The per-generic-param bound protocol ids (M13, `[T has P]`), indexed by type-var
+    /// The per-generic-param bound protocol ids (`[T has P]`), indexed by type-var
     /// ordinal — `bound_protocols[ord]` is the protocol bounding param `ord`, or null if
     /// unbounded. Set by `bodyCheckerFor` from `FnSym.generic_bounds`; empty (inert) for
     /// a non-generic/unbounded fn. Consumed ONLY by the bound-as-axiom `type_var`-receiver
@@ -137,26 +137,26 @@ pub const BodyChecker = struct {
     /// re-check the receiver is grounded, so that branch never fires.
     bound_protocols: []const ?u32 = &.{},
 
-    /// The per-generic-param bound protocol type-args (M14, `[T has P[args]]`), parallel to
+    /// The per-generic-param bound protocol type-args (`[T has P[args]]`), parallel to
     /// `bound_protocols`. `bound_protocol_args[ord]` grounds the bound protocol's own
     /// type-params in the bound-as-axiom `type_var`-receiver dispatch (so `v.into[int]()`
     /// on a bounded `T` types the protocol method with `U == int`). Empty (inert) for a
     /// non-generic/unbounded fn. Set by `bodyCheckerFor` from `FnSym.generic_bound_args`.
     bound_protocol_args: []const []const Type = &.{},
 
-    /// The ordered generic-param NAMES (M21), set by `bodyCheckerFor` from
+    /// The ordered generic-param NAMES, set by `bodyCheckerFor` from
     /// `FnSym.generic_params`; empty for a non-generic fn. Read ONLY by the innermost-
     /// failure diagnostic so an abstract `App`'s `type_var` culprit renders as its param
     /// name (`T`) rather than the opaque `type_var` tag. Borrowed source slices.
     gph_generic_params: []const []const u8 = &.{},
 
-    /// Structural derive requests this fn's body recorded (M18): a `==`/`!=` on a
+    /// Structural derive requests this fn's body recorded: a `==`/`!=` on a
     /// derivable type with no impl. Moved out into the `BodyResult` after the walk;
     /// merged fn-id-ordered by `checkBodies`. THREAD-LOCAL (one list per BodyChecker),
     /// so the parallel Pass C never shares mutable derive state.
     derive_reqs: std.ArrayList(Typecheck.DeriveReq) = .empty,
 
-    /// The recursive `conforms` query's memo (M18), keyed by `(protocol, kind, type-id)`.
+    /// The recursive `conforms` query's memo, keyed by `(protocol, kind, type-id)`.
     /// THREAD-LOCAL (one map per BodyChecker) so the query is race-free under the
     /// parallel body fan-out; the answer is stable (layouts/conformances frozen).
     conforms_memo: std.AutoHashMapUnmanaged(u64, bool) = .empty,
@@ -533,7 +533,7 @@ pub const BodyChecker = struct {
                 switch (op) {
                     .plus, .minus, .star, .slash => {
                         // `+`/`-`/`*`/`/` desugar to the arithmetic protocols Add/Sub/Mul/Div
-                        // (M17). Builtin `int` stays inline (a single machine add/sub/mul/sdiv,
+                        //. Builtin `int` stays inline (a single machine add/sub/mul/sdiv,
                         // no witness). Otherwise HOMOGENEOUS like `==`/`<`: require the same
                         // type FIRST, then type to the operand type (`Out = Self`) iff it
                         // conforms to the operator's protocol — a user struct/enum `impl T has
@@ -551,7 +551,7 @@ pub const BodyChecker = struct {
                     },
                     .lt, .lt_eq, .gt, .gt_eq => {
                         // `<`/`>`/`<=`/`>=` desugar to a discriminant test on `Ord::cmp`'s
-                        // result (M16). HOMOGENEOUS like `==`: require the same type FIRST,
+                        // result. HOMOGENEOUS like `==`: require the same type FIRST,
                         // then type to bool iff the operand conforms to `Ord` — a concrete
                         // int/str/bool prelude conformance or user struct/enum `impl T has Ord`,
                         // or a `[T has Ord]` bound in a generic body.
@@ -564,7 +564,7 @@ pub const BodyChecker = struct {
                         }
                     },
                     .eq_eq, .bang_eq => {
-                        // `==`/`!=` desugar to `Eq::eq` (M15). HOMOGENEOUS: require the same
+                        // `==`/`!=` desugar to `Eq::eq`. HOMOGENEOUS: require the same
                         // type FIRST (so a cross-type compare stays "same type" even if both
                         // sides individually conform), then type to bool iff the operand
                         // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
@@ -574,9 +574,9 @@ pub const BodyChecker = struct {
                         } else if (try bc.conformsTo(lt, bc.model.eq_protocol_id, true)) {
                             break :blk Type.@"bool";
                         } else if (try bc.deriveBlocker(lt, bc.model.eq_protocol_id)) |blocker| {
-                            // M18: a struct that would derive `Eq` but for one non-conforming
+                            // A struct that would derive `Eq` but for one non-conforming
                             // field names that field (T0029). A payload enum / other type
-                            // keeps the M15 "no Eq impl" T0026 below.
+                            // keeps the "no Eq impl" T0026 below.
                             try bc.sink.emitFmtCode(.T0029, bc.byteOf(n.main_token), "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
                         } else {
                             try bc.sink.emitFmtCode(.T0026, bc.byteOf(n.main_token), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.eq_protocol_id) });
@@ -615,7 +615,7 @@ pub const BodyChecker = struct {
         const lhs = bc.tree.nodes[(n.lhs).int()];
         // Resolve the constructed type: a plain identifier `P { .. }` names a
         // non-generic struct; a `type_app` lhs `Box[int] { .. }` names a generic-struct
-        // INSTANCE (M4) — a composite `App`. `targs` are the concrete type-args the
+        // INSTANCE — a composite `App`. `targs` are the concrete type-args the
         // template's field PATTERNS are substituted through (empty for a plain struct).
         var ctor_id: u32 = undefined;
         var targs: []const Type = &.{};
@@ -643,8 +643,8 @@ pub const BodyChecker = struct {
                 return .invalid;
             };
             // A generic struct constructed WITHOUT type args (`Box{ v: 1 }`) infers its
-            // type-params (M5) by matching field VALUE types against the declared field
-            // PATTERNS (the M3 matcher over M4's `App`). The inferred `App` is
+            // type-params by matching field VALUE types against the declared field
+            // PATTERNS (the matcher over the interned `App`). The inferred `App` is
             // content-addressed, so it selects the SAME reified struct as an explicit
             // `Box[int]{..}` and dedups to one codegen unit.
             if (id < bc.model.structs.len and bc.model.structs[id].is_generic) {
@@ -685,7 +685,7 @@ pub const BodyChecker = struct {
                 defer bc.gpa.free(fp);
                 switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp)) {
                     // A field-vs-field conflict is authoritative, reported at the two
-                    // supplier spans — M7's target type never overrides it.
+                    // supplier spans — the target type never overrides it.
                     .conflict => |c| {
                         const later = bc.tree.nodes[(supplier[c.second_pos]).int()].main_token;
                         const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
@@ -694,7 +694,7 @@ pub const BodyChecker = struct {
                     },
                     // Target-fill any still-open param from the expected type
                     // (`p: Phantom[int] = Phantom{..}`); an arg-vs-expected disagreement
-                    // surfaces as T0015. Byte-identical to pre-M7 when no target exists.
+                    // surfaces as T0015. Byte-identical when no target exists.
                     .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, bc.expectedAppArgs(id, false), gsym.generic_params, lhs.main_token)) {
                         .ok => {
                             const app = Type.app(try bc.internApp(id, out, false));
@@ -716,11 +716,11 @@ pub const BodyChecker = struct {
     }
 
     /// The field-init check shared by all three struct-construction paths (non-generic
-    /// plain, explicit `Box[int]{..}`, and the M5-inferred `Box{..}`). When `pretyped`
+    /// plain, explicit `Box[int]{..}`, and the inferred `Box{..}`). When `pretyped`
     /// is non-null it supplies the already-computed value type per init (source order),
     /// so the inferred path — which must type each value ONCE to run inference — does not
     /// re-walk (and thus re-diagnose) the value expressions; `pretyped == null` types
-    /// each value here and is byte-identical to the pre-M5 tail.
+    /// each value here and is byte-identical to the earlier tail.
     fn checkStructFieldInits(
         bc: *BodyChecker,
         n: Ast.Node,
@@ -756,7 +756,7 @@ pub const BodyChecker = struct {
                 seen[j] = true;
                 // Substitute the (possibly generic) declared field type through the
                 // instance's type-args; a non-generic struct has `targs.len == 0`, so
-                // `substTy` is the identity and this is byte-identical to pre-M4.
+                // `substTy` is the identity and this is byte-identical.
                 const fty = substTy(bc, sym.field_types[j], targs);
                 if (!Type.assignable(fty, vt)) {
                     try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
@@ -799,7 +799,7 @@ pub const BodyChecker = struct {
             bc.node_types[(node_idx).int()] = ty;
             return ty;
         }
-        // An explicit generic-enum UNIT-variant `Opt[int].none` (M6): the receiver is a
+        // An explicit generic-enum UNIT-variant `Opt[int].none`: the receiver is a
         // `type_app` resolving to an enum-`App`. Construct the unit variant through the
         // App's args and type the node as the `App` (reified to `enumT` in the mono tail).
         // Placed BEFORE the value `typeOf(n.lhs)` so a `type_app` receiver never mis-routes
@@ -815,7 +815,7 @@ pub const BodyChecker = struct {
         }
         const base = try bc.typeOf(n.lhs);
         if (base.kind == .invalid) return .invalid;
-        // A field access over a generic-struct INSTANCE `b.v` where `b: Box[int]` (M4):
+        // A field access over a generic-struct INSTANCE `b.v` where `b: Box[int]`:
         // the base is a composite `App`; resolve the field's DECLARED (pattern) type
         // through the App's type-args so `v` on `Box[int]` types as `int`.
         if (base.isApp()) {
@@ -851,7 +851,7 @@ pub const BodyChecker = struct {
         };
         const args: Ast.Index = if (n.tag == .enum_init_unit) Ast.none else n.rhs;
         // Resolve the enum id: qualified (lhs is the type-name identifier), an explicit
-        // generic-enum instance (lhs is a `type_app`, M6), or inferred (the one-shot
+        // generic-enum instance (lhs is a `type_app`), or inferred (the one-shot
         // expected type must be an enum).
         var enum_id: u32 = undefined;
         if (n.lhs != Ast.none) {
@@ -883,9 +883,9 @@ pub const BodyChecker = struct {
                 return .invalid;
             };
             // The expected type may be a plain `enumT` or a generic-enum instance `App`
-            // (M6). `checkVariant` infers the enum's type-params from the payload for the
+            //. `checkVariant` infers the enum's type-params from the payload for the
             // generic case (a nullary `.none` under a generic expected is uninferable ->
-            // T0016; target-typing it is M7).
+            // T0016; target-typing it is deferred).
             enum_id = bc.scrutEnumId(exp) orelse {
                 try bc.typeArgsForEffect(node_form, args);
                 if (exp.kind != .invalid)
@@ -915,12 +915,12 @@ pub const BodyChecker = struct {
 
     /// The entry every enum-construction site funnels through. For a non-generic enum it
     /// delegates straight to `checkVariantPayloads` with empty type-args (byte-identical
-    /// to the pre-M6 body). For a generic enum constructed WITHOUT explicit type args
-    /// (`Wrap.w(5)`, `Opt.none`), it infers the enum's type-params (M5-style) by matching
+    /// to the earlier body). For a generic enum constructed WITHOUT explicit type args
+    /// (`Wrap.w(5)`, `Opt.none`), it infers the enum's type-params by matching
     /// the payload VALUE types against the variant's declared payload PATTERNS, then
     /// delegates with the inferred args. A payload that binds only SOME params
     /// (`Either.left(x)`) or a nullary variant (`Opt.none`) is uninferable — routed to
-    /// T0016 (the M6/M7 boundary: target-type inference for those is M7). Explicit
+    /// T0016 (target-type inference for those is deferred). Explicit
     /// `Either[int,bool].left(..)` never reaches here (it calls `checkVariantPayloads`
     /// directly with the App's args).
     fn checkVariant(bc: *BodyChecker, enum_id: u32, vtok: u32, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!Type {
@@ -987,7 +987,7 @@ pub const BodyChecker = struct {
         defer bc.gpa.free(fp);
         switch (Infer.match(n_gp, variant.field_types, aligned, out, bnd, fp)) {
             // An arg-vs-arg conflict (two payload values disagree) is authoritative and
-            // reported at the payload spans — M7's target type never overrides it.
+            // reported at the payload spans — the target type never overrides it.
             .conflict => |c| {
                 try bc.sink.emitFmtCode(.T0015, bc.byteOf(vtok), "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
                 return .invalid;
@@ -1016,10 +1016,10 @@ pub const BodyChecker = struct {
     }
 
     /// Check one variant construction's payload against the variant's declared payload
-    /// (M6-generalized). `targs` are the enum instance's concrete type-args — each
+    /// `targs` are the enum instance's concrete type-args — each
     /// declared payload pattern is substituted through them via `substTy` before the
     /// assignability check (empty for a non-generic enum ⇒ `substTy` is the identity ⇒
-    /// byte-identical to the pre-M6 body). Returns the enum-`App` for a generic enum (so
+    /// byte-identical to the earlier body). Returns the enum-`App` for a generic enum (so
     /// the node types as `App`, later reified to `enumT`) or `enumT(enum_id)` for a
     /// non-generic one. `pretyped` (source order, aligned with the payload nodes) skips
     /// re-walking payload values the inference path already typed.
@@ -1101,7 +1101,7 @@ pub const BodyChecker = struct {
 
     /// The GLOBAL enum id a match scrutinee / variant-pattern expected type refers to:
     /// a plain `enumT` yields its id directly; a generic-enum instance `App`
-    /// (`Either[int,bool]`, M6) yields its enum ctor id (coverage/exhaustiveness run over
+    /// (`Either[int,bool]`) yields its enum ctor id (coverage/exhaustiveness run over
     /// the TEMPLATE's variants — same names/arity as the reified instance; payload types
     /// are substituted through the App's args at bind sites). A struct-App or scalar is
     /// not an enum here.
@@ -1115,9 +1115,9 @@ pub const BodyChecker = struct {
     }
 
     /// The target type-args when `bc.expected` is an `App` of exactly THIS ctor with
-    /// matching enum/struct-ness (M7 target typing). Anything else — a scalar, the
+    /// matching enum/struct-ness (target typing). Anything else — a scalar, the
     /// wrong ctor, a plain `enumT`, or no expected type — yields null, so the
-    /// `fillExpected` reconcile is a no-op and behavior is byte-identical to pre-M7.
+    /// `fillExpected` reconcile is a no-op and behavior is byte-identical.
     /// This ctor-gate is the sole guard against a stale/unrelated expected type wrongly
     /// filling; a same-ctor `App` always has `args.len == generic_params.len`, so the
     /// arity matches at the two construction sites.
@@ -1174,7 +1174,7 @@ pub const BodyChecker = struct {
         return Typecheck.optResultFamilyOf(bc.model, e.ctor);
     }
 
-    /// Type a postfix `?` (M24). The operand must be an `Option`/`Result`, and the
+    /// Type a postfix `?`. The operand must be an `Option`/`Result`, and the
     /// enclosing return type (`cur_ret`) must be a MATCHING one that can absorb the
     /// residual: the SAME family, and — for `Result` — the SAME error type. The
     /// `?`-expression's type is the operand's unwrapped payload (variant-0 type-arg).
@@ -1204,11 +1204,11 @@ pub const BodyChecker = struct {
             const op_args = bc.composite.at(ot.appIdx()).args;
             const ret_args = bc.composite.at(bc.cur_ret.appIdx()).args;
             if (op_args.len >= 2 and ret_args.len >= 2 and !Type.eql(op_args[1], ret_args[1])) {
-                // M25: differing error types are allowed to WIDEN via the `From` protocol —
+                // Differing error types are allowed to WIDEN via the `From` protocol —
                 // the `err(e)` residual is re-emitted as `RetErr.from(opErr)` iff `RetErr has
                 // From[OpErr]`. The operand (source) error type disambiguates a multi-conformance
                 // `From[Src]` on one target. With no such conformance (or no `From` protocol —
-                // a prelude-less caller), keep the M24 T0033 mismatch. The witness is resolved
+                // a prelude-less caller), keep the T0033 mismatch. The witness is resolved
                 // in lower via `resolveConformanceMethod`, which selects the SAME conformance.
                 const widened = if (bc.model.from_protocol_id) |from_id|
                     Typecheck.findConformance(bc.model, from_id, ret_args[1], &.{op_args[1]})
@@ -1233,7 +1233,7 @@ pub const BodyChecker = struct {
             return .invalid;
         }
         // A generic-enum instance scrutinee is an `App` (reified to `enumT` in the mono
-        // tail); its coverage runs over the template enum's variants (M6).
+        // tail); its coverage runs over the template enum's variants.
         const enum_id = bc.scrutEnumId(st);
         if (enum_id == null and st.kind != .int and st.kind != .bool) {
             for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
@@ -1347,9 +1347,9 @@ pub const BodyChecker = struct {
 
     fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov, has_wildcard: *bool, count_cov: bool) error{OutOfMemory}!void {
         const pat = bc.tree.nodes[(pat_idx).int()];
-        // A generic-enum instance scrutinee is an `App` (M6); its enum id + instance
+        // A generic-enum instance scrutinee is an `App`; its enum id + instance
         // type-args come off the composite entry. A plain `enumT` has no type-args, so
-        // `substTy(..., &.{})` below is the identity — byte-identical to pre-M6.
+        // `substTy(..., &.{})` below is the identity — byte-identical to the earlier behavior.
         const enum_id = bc.scrutEnumId(expected) orelse {
             if (expected.kind != .invalid)
                 try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
@@ -1429,9 +1429,9 @@ pub const BodyChecker = struct {
         }
     }
 
-    /// App-aware `irrefutable` (M7). A non-`App` type delegates verbatim to
+    /// App-aware `irrefutable`. A non-`App` type delegates verbatim to
     /// `bc.irrefutable` (= `ControlFlow.irrefutable`), so every scalar / plain-`enumT` /
-    /// `structT` payload is byte-identical to pre-M7. For an `App` payload (a substituted
+    /// `structT` payload is byte-identical. For an `App` payload (a substituted
     /// generic-enum/struct instance — the case `ControlFlow` cannot resolve because its
     /// `Ctx` has no composite table) we handle the pattern here: a nested variant/or
     /// pattern resolves the enum via `scrutEnumId` + the App's own type-args and recurses.
@@ -1479,10 +1479,10 @@ pub const BodyChecker = struct {
     }
 
     /// `variantPayloadIrrefutable` over a variant whose payload types have been
-    /// SUBSTITUTED through the enum instance's `targs` (M6). For `targs.len == 0` (a
+    /// SUBSTITUTED through the enum instance's `targs`. For `targs.len == 0` (a
     /// non-generic / plain-`enumT` scrutinee) this delegates to the borrowed-variant
-    /// call, byte-identical to pre-M6. For a generic instance each binder is checked via
-    /// the App-aware `irrefutableTy` against its substituted field type (M7) — this is
+    /// call, byte-identical to the earlier behavior. For a generic instance each binder is checked via
+    /// the App-aware `irrefutableTy` against its substituted field type — this is
     /// what makes a nested variant/or pattern over a substituted generic-enum-instance
     /// (`App`) payload compute correctly rather than always-refutable.
     fn variantPayloadIrrefutableSubst(bc: *BodyChecker, pat_idx: Ast.Index, variant: VariantSym, targs: []const Type) error{OutOfMemory}!bool {
@@ -1608,7 +1608,7 @@ pub const BodyChecker = struct {
     }
 
     /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
-    /// (M8+): the `mut self` place gate, arity, and per-arg assignability, typing the call
+    ///: the `mut self` place gate, arity, and per-arg assignability, typing the call
     /// node as the method's return. `fa` is the `field_access` (`main_token` = member,
     /// `lhs` = receiver). Shared by the bare-dispatch path and the explicit-protocol-args
     /// (`v.m[int]()`) path so both type identically. `args` is `n`'s value-arg range.
@@ -1640,7 +1640,7 @@ pub const BodyChecker = struct {
         return mf.ret;
     }
 
-    /// Emit the T0025 ambiguity diagnostic (M14): the receiver conforms to one generic
+    /// Emit the T0025 ambiguity diagnostic: the receiver conforms to one generic
     /// protocol MULTIPLE times and the use site gave no disambiguating type-args. Names the
     /// conflicting conformances in table (source fn-id) order — deterministic at any `-jN`.
     fn emitAmbiguousConformance(bc: *BodyChecker, at_tok: u32, recv: Type, member: []const u8) error{OutOfMemory}!void {
@@ -1664,7 +1664,7 @@ pub const BodyChecker = struct {
         try bc.sink.emitFmtCode(.T0025, bc.byteOf(at_tok), "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
     }
 
-    /// Type an explicit-protocol-args method call `v.m[int](args)` (M14): the callee is a
+    /// Type an explicit-protocol-args method call `v.m[int](args)`: the callee is a
     /// `type_app` over a `field_access`. The type-arg node_types are written (so lower /
     /// AstWalk read them back to select the SAME witness), then the receiver is dispatched:
     /// a concrete struct/enum/scalar disambiguates the witness by the explicit args; a
@@ -1745,7 +1745,7 @@ pub const BodyChecker = struct {
                 return bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
             }
             // An explicit generic-enum tuple-variant construction `Either[int,bool].left(42)`
-            // (M6): the callee field_access's receiver is a `type_app` resolving to an
+            //: the callee field_access's receiver is a `type_app` resolving to an
             // enum-`App`. Substitute the variant payload patterns through the App's args
             // and type the node as the `App` (reified to `enumT` in the mono tail).
             if (recv.tag == .type_app) {
@@ -1762,7 +1762,7 @@ pub const BodyChecker = struct {
                     for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
                     return .invalid;
                 }
-                // A struct-`App` receiver (`Box[int].m(..)`) is a method call — M8+; fall
+                // A struct-`App` receiver (`Box[int].m(..)`) is a method call; fall
                 // through to the not-a-function path below.
             }
             // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
@@ -1772,7 +1772,7 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = ty;
                 return ty;
             }
-            // A method call `recv.m(args)` on a VALUE receiver (M8). The enum-variant /
+            // A method call `recv.m(args)` on a VALUE receiver. The enum-variant /
             // qualified-call cases above fire only for an enum type-name / type_app /
             // qualified-namespace receiver; a field_access callee whose receiver is a
             // plain VALUE of a concrete struct/enum is method dispatch. A qualified fn
@@ -1788,9 +1788,9 @@ pub const BodyChecker = struct {
                 {
                     const member = bc.nameText(callee.main_token);
                     const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-                    // M14: resolve the witness via the shared multi-conformance resolver
+                    // Resolve the witness via the shared multi-conformance resolver
                     // (the SAME rule lower + AstWalk use). `.one` is byte-identical to the
-                    // pre-M14 `findMethod` for every existing program (inherent / single
+                    // `findMethod` for every existing program (inherent / single
                     // conformance / prelude); `.ambiguous` (a doubly-conforming generic
                     // protocol used with no type-args) is T0025 — never an arbitrary pick.
                     switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
@@ -1802,7 +1802,7 @@ pub const BodyChecker = struct {
                         },
                         .none => {},
                     }
-                    // A direct `.hash()` on a struct/enum with NO explicit impl (M20): the
+                    // A direct `.hash()` on a struct/enum with NO explicit impl: the
                     // structural `Hash` derive trigger. Hash has no operator, so (unlike
                     // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
                     // the `==` operator's `conformsTo`/`deriveBlocker` split: an all-`Hash`-
@@ -1829,7 +1829,7 @@ pub const BodyChecker = struct {
                         }
                         // No structural derive and no nameable blocker: fall through to T0018.
                     }
-                    // A builtin scalar protocol method (M12/M20): `n.eq(m)` on int/bool, or
+                    // A builtin scalar protocol method: `n.eq(m)` on int/bool, or
                     // `n.hash()` on any scalar. Not a `t.methods` entry (the recognizer is
                     // pure), so `findMethod` misses; recognize it here, check arity (`eq` = 1
                     // non-self arg, `hash` = 0) + each arg assignable to `Self` (the
@@ -1848,12 +1848,12 @@ pub const BodyChecker = struct {
                         bc.node_types[(node_idx).int()] = bm.ret;
                         return bm.ret;
                     }
-                    // A concrete struct/enum/scalar value with no such method (M8/M12).
+                    // A concrete struct/enum/scalar value with no such method.
                     for (args) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
                     return .invalid;
                 } else if (recv_ty.kind == .app) {
-                    // A method call on a generic-type instance `b.get()` (M10): the
+                    // A method call on a generic-type instance `b.get()`: the
                     // receiver is an `App` (`Box[int]`; reify runs later in the mono
                     // tail). Its ctor selects the `impl Box[T]` method TEMPLATE and the
                     // impl's type-params bind by matching the template's `Self`
@@ -1879,7 +1879,7 @@ pub const BodyChecker = struct {
                             else => bound_ok = false, // an unbound impl param: poison, no cascade
                         };
                         // A `mut self` method mutates the receiver in place, so it may
-                        // only be called on a mutable place (reuse the M9 gate + T0019).
+                        // only be called on a mutable place (reuse the mut-self gate + T0019).
                         if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
                             try bc.sink.emitFmtCode(.T0019, bc.byteOf(bc.tree.nodes[(callee.lhs).int()].main_token), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
                         }
@@ -1909,7 +1909,7 @@ pub const BodyChecker = struct {
                         return ret;
                     }
                     // A compiler-provided inherent method on the prelude `Option`/`Result`
-                    // enums (M23): recognized by ctor id, NOT a `t.methods` entry (source-
+                    // enums: recognized by ctor id, NOT a `t.methods` entry (source-
                     // less, like the builtin scalar `eq`/`hash`), so `findGenericMethod`
                     // misses above. `is_some`/`is_none`/`is_ok`/`is_err` -> bool (arity 0);
                     // `unwrap` -> the payload type-arg (arity 0); `unwrap_or` -> the payload
@@ -1923,10 +1923,10 @@ pub const BodyChecker = struct {
                             const t_ty: Type = if (e.args.len >= 1) e.args[0] else .invalid;
                             // Predicates are tag-only, so safe for any payload. `unwrap`/
                             // `unwrap_or` carry the payload as ONE scalar value through
-                            // `lower` (M23), so only recognize them for a scalar (int/bool)
+                            // `lower`, so only recognize them for a scalar (int/bool)
                             // payload; a str/struct/enum payload falls through to the T0018
                             // below — a clean rejection, since aggregate-payload unwrap is
-                            // deferred past M23 (a scalar load would truncate a fat/aggregate
+                            // deferred (a scalar load would truncate a fat/aggregate
                             // value, and an aggregate join block-arg crashes codegen).
                             const native_ok = switch (op) {
                                 .is_tag0, .is_tag1 => true,
@@ -1964,12 +1964,12 @@ pub const BodyChecker = struct {
                             };
                         }
                     }
-                    // A generic-type value with no such method (M10).
+                    // A generic-type value with no such method.
                     for (args) |a| _ = try bc.typeOf(a);
                     try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
                     return .invalid;
                 } else if (recv_ty.isTypeVar()) {
-                    // A method call `v.m(..)` on a `type_var` receiver (M13 bound-as-axiom):
+                    // A method call `v.m(..)` on a `type_var` receiver (bound-as-axiom):
                     // this only happens while checking a BOUNDED generic template's body.
                     // ONLY the methods of the param's declared bound `[T has P]` are
                     // callable; resolve `m` against the bound protocol's decoded signature
@@ -1982,7 +1982,7 @@ pub const BodyChecker = struct {
                     const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
                     if (pid_opt) |pid| {
                         const p = bc.model.protocols[pid];
-                        // M14: the bound's protocol type-args (`[T has Into[int]]` -> `[int]`)
+                        // The bound's protocol type-args (`[T has Into[int]]` -> `[int]`)
                         // ground the protocol's OWN generic params (`tv(1..)`); `Self`
                         // (`tv(0)`) grounds to the bounded `type_var` receiver itself.
                         const pargs: []const Type = if (ord < bc.bound_protocol_args.len) bc.bound_protocol_args[ord] else &.{};
@@ -2018,14 +2018,14 @@ pub const BodyChecker = struct {
                 }
             }
         }
-        // An explicit-protocol-args method call `v.into[int](..)` (M14): the callee is a
+        // An explicit-protocol-args method call `v.into[int](..)`: the callee is a
         // `type_app` OVER a `field_access` NOT bound to a `.func` (a qualified generic fn
         // `mod.f[int]()` binds its field_access to `.func` and stays a generic FUNCTION
         // call). Intercept BEFORE the generic-function `type_app` path.
         if (callee.tag == .type_app and bc.tree.nodes[(callee.lhs).int()].tag == .field_access and
             bc.resolutions[(callee.lhs).int()] != .func)
             return bc.typeOfExplicitMethodCall(node_idx, n, callee);
-        // An explicit-args generic call `id[int](7)` (M2): the callee is a `type_app`
+        // An explicit-args generic call `id[int](7)`: the callee is a `type_app`
         // whose base identifier carries the template's `.func`. A pure per-call
         // operation (substitute the params/ret through the explicit args, check the
         // value args) that writes only concrete types into `node_types`.
@@ -2058,9 +2058,9 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        // The `print` builtin (M22): a compiler-magic polymorphic builtin accepting ANY
+        // The `print` builtin: a compiler-magic polymorphic builtin accepting ANY
         // `Display`-conforming argument (Q8 — NOT a monomorphized generic). Intercept BEFORE
-        // the generic/arg-assignability check below (which pre-M22 rejected `print(42)` with
+        // the generic/arg-assignability check below (which previously rejected `print(42)` with
         // "expected str, got int"). Require exactly one arg, require it conform to `Display`
         // (recording a ground struct/enum derive req so the serial barrier synthesizes the
         // `display` unit), and type the call `.unit`. `print("..")` still works (str conforms);
@@ -2093,18 +2093,18 @@ pub const BodyChecker = struct {
             }
             return .invalid;
         }
-        // A bare (no-explicit-args) generic call `id(7)` (M3): infer each type-arg by
+        // A bare (no-explicit-args) generic call `id(7)`: infer each type-arg by
         // one-sided structural matching of the template's param patterns against the
         // ground argument types, then reuse `applyGenericSig` to check args + type the
         // node. The matcher runs and is discarded here — no `type_var` is ever stored.
         // Explicit `id[int](7)` is handled above (typeOfGenericCall) and still overrides.
         if (f.isGeneric()) {
-            // M3 infers type-args only for a PLAIN-IDENTIFIER callee `id(7)`. A bare
+            // Type-args are inferred only for a PLAIN-IDENTIFIER callee `id(7)`. A bare
             // qualified generic call `mod.id(7)` (field_access callee) is NOT inferred:
             // the three post-typecheck consumers (scanCalls/lower/CallVisitor) key the
             // bare path on a plain identifier too, so accepting it here would type the
             // node concretely but mint NO instance (a `Mono.find` miss in lower). Require
-            // explicit type args instead — the same clean reject as pre-M3.
+            // explicit type args instead — the same clean reject as before.
             if (callee.tag != .identifier) {
                 for (args) |arg| _ = try bc.typeOf(arg);
                 try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "generic call requires explicit type arguments, e.g. f[int](..)");
@@ -2181,7 +2181,7 @@ pub const BodyChecker = struct {
         if (base_res != .func) {
             for (args) |arg| _ = try bc.typeOf(arg);
             // The base of a `[..]` callee that is not a fn: nothing else takes type
-            // args in M2 (no generic types in value position), so it is a plain
+            // args (no generic types in value position), so it is a plain
             // not-a-function.
             try bc.sink.emit(bc.byteOf(n.main_token), "called value is not a function");
             return .invalid;
@@ -2211,7 +2211,7 @@ pub const BodyChecker = struct {
                 all_concrete = false; // an unknown type already reported by typeFromNode
             } else if (!isConcreteValue(ty)) {
                 // `type_var`/`unit` are not monomorphizable type-args. A ground `App`
-                // (`Box[int]`) now IS (M4) — it reifies to a concrete struct in the mono
+                // (`Box[int]`) now IS — it reifies to a concrete struct in the mono
                 // tail — so `isConcreteValue` admits it and it is stored + reified later.
                 try bc.sink.emitCode(.T0013, bc.byteOf(bc.tree.nodes[(tn).int()].main_token), "type argument must be a concrete value type");
                 all_concrete = false;
@@ -2238,11 +2238,11 @@ pub const BodyChecker = struct {
     /// The shared tail of both generic-call paths (explicit `id[int](7)` and inferred
     /// `id(7)`): check each value arg against the SUBSTITUTED param, type the call node
     /// as the substituted return, and return it. `targs` is the concrete type-arg tuple
-    /// (explicit args, or the M3-inferred args). `pretyped` is the inferred path's
+    /// (explicit args, or the inferred args). `pretyped` is the inferred path's
     /// already-synthesized arg types — passing them avoids re-walking the args (which
     /// would double-emit inner-arg diagnostics, a diag-count nondeterminism); `null`
     /// re-types each arg in check mode against its substituted param, byte-identical to
-    /// the M2 explicit loop.
+    /// the explicit loop.
     fn applyGenericSig(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, f: FnSym, targs: []const Type, pretyped: ?[]const Type) error{OutOfMemory}!Type {
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         for (args, f.params, 0..) |arg, pty, i| {
@@ -2258,8 +2258,8 @@ pub const BodyChecker = struct {
     }
 
     /// Whether `t` conforms to the derivable prelude protocol `pid_opt` — the shared
-    /// predicate behind the `==`/`!=` (`Eq`, M15), `<`/`>`/`<=`/`>=` (`Ord`, M16/M19),
-    /// `.hash()` (`Hash`, M20), and `print(x)` (`Display`, M22) operator/trigger typings.
+    /// predicate behind the `==`/`!=` (`Eq`), `<`/`>`/`<=`/`>=` (`Ord`),
+    /// `.hash()` (`Hash`), and `print(x)` (`Display`) operator/trigger typings.
     /// A concrete type resolves via the frozen conformance table (`findConformance` covers
     /// the int/bool/str/unit prelude conformances AND every user `impl T has P`); a
     /// `type_var` in a bounded generic body conforms as-axiom when its declared bound IS
@@ -2284,7 +2284,7 @@ pub const BodyChecker = struct {
             else => return false,
         }
         if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
-            // Record a derive request ONLY for a GROUND operand (M21): an abstract `App`
+            // Record a derive request ONLY for a GROUND operand: an abstract `App`
             // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition check)
             // is accepted-but-not-recorded — its concrete instance re-check records the
             // ground `Box[int]`, which reify+synthesize can actually mint a witness for.
@@ -2294,7 +2294,7 @@ pub const BodyChecker = struct {
         return false;
     }
 
-    /// Whether `t` is fully ground (M21): no `type_var` anywhere. A struct/enum id and any
+    /// Whether `t` is fully ground: no `type_var` anywhere. A struct/enum id and any
     /// scalar are ground; a `type_var` is not; an `App` is ground iff every arg is. Gates
     /// `recordDeriveReq` so the synthesis barrier only ever sees a concrete (reifiable) type.
     fn isGround(bc: *BodyChecker, t: Type) bool {
@@ -2314,8 +2314,8 @@ pub const BodyChecker = struct {
         try bc.derive_reqs.append(bc.gpa, .{ .protocol_id = pid, .conform_ty = t });
     }
 
-    /// The first struct field that blocks a structural derive of `pid_opt` (Eq/M18 T0029,
-    /// Hash/M20 T0030, Display/M22 T0031), for the message that names it; null when `t` is
+    /// The first struct field that blocks a structural derive of `pid_opt` (Eq T0029,
+    /// Hash T0030, Display T0031), for the message that names it; null when `t` is
     /// not a struct, has no such protocol, or every field conforms. Struct-only: a payload
     /// enum with a non-conforming payload has no single nameable field, so it falls through
     /// to the generic "does not conform" message instead.
@@ -2326,7 +2326,7 @@ pub const BodyChecker = struct {
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)
-    /// + display name (M17). One switch keeps operator → protocol a single source of truth
+    /// + display name. One switch keeps operator → protocol a single source of truth
     /// so the checker and the T0028 message can never drift. A prelude-less caller leaves
     /// `pid` null (denied by `conformsToArith`); the `else` is unreachable for the four
     /// arithmetic tokens this is only called with.
@@ -2340,7 +2340,7 @@ pub const BodyChecker = struct {
         };
     }
 
-    /// Whether `t` conforms to the arithmetic protocol `pid_opt` (M17) — the predicate the
+    /// Whether `t` conforms to the arithmetic protocol `pid_opt` — the predicate the
     /// `+`/`-`/`*`/`/` operator typing uses for non-int operands. Mirrors `conformsToEq`/
     /// `conformsToOrd`: a concrete type resolves via the frozen conformance table
     /// (`findConformance` covers the builtin `int` conformance AND every user `impl T has
@@ -2358,7 +2358,7 @@ pub const BodyChecker = struct {
         return false;
     }
 
-    /// The name a T0026/T0027 message uses for a non-conforming operand (M21): a plain
+    /// The name a T0026/T0027 message uses for a non-conforming operand: a plain
     /// type renders normally, but an `App` (`Box[T]`/`Box[int]`) recurses to the DEEPEST
     /// field/payload that actually fails `pid` and names IT — a `type_var` culprit as its
     /// generic-param name (`T`), so the error points at the real cause instead of the
@@ -2375,7 +2375,7 @@ pub const BodyChecker = struct {
         return bc.typeName(culprit);
     }
 
-    /// Walk `t` to the innermost type that fails to conform to `pid` (M21): an `App`
+    /// Walk `t` to the innermost type that fails to conform to `pid`: an `App`
     /// substitutes its ctor's field/payload patterns and descends into the first that
     /// fails; a struct/enum descends into its first non-conforming field/payload; a leaf
     /// (`type_var`/scalar) is returned as-is. Terminates for the same reason `conforms`
@@ -2459,7 +2459,7 @@ pub const BodyChecker = struct {
     /// Whether `node_idx` names a mutable, addressable place: an identifier bound to
     /// a `.local` (all locals — incl. the `self` receiver — are mutable), or a
     /// `field_access` chain rooted at one. A temporary/rvalue (a construction, a call
-    /// result, a literal) is NOT a place. Gates a `mut self` method call (M9, T0019).
+    /// result, a literal) is NOT a place. Gates a `mut self` method call (T0019).
     fn isMutablePlace(bc: *const BodyChecker, node_idx: Ast.Index) bool {
         const n = bc.tree.nodes[(node_idx).int()];
         return switch (n.tag) {
@@ -2486,14 +2486,14 @@ pub const BodyChecker = struct {
         return null;
     }
 
-    /// The receiver type when checking an inherent method's body (M8), so a `Self`
+    /// The receiver type when checking an inherent method's body, so a `Self`
     /// type-ref in a body annotation resolves to it via `refs.typeFromNode`. Null
-    /// outside a method (byte-identical to pre-M8 non-method checking).
+    /// outside a method (byte-identical to non-method checking).
     pub fn selfType(bc: *const BodyChecker) ?Type {
         return bc.cur_self_type;
     }
 
-    /// Intern a composite `App(ctor, args)` (M4). The shared `refs` type-application
+    /// Intern a composite `App(ctor, args)`. The shared `refs` type-application
     /// resolver calls this via the `anytype` cursor.
     pub fn internApp(bc: *BodyChecker, ctor: u32, args: []const Type, ctor_is_enum: bool) !u32 {
         return bc.composite.intern(bc.gpa, ctor, args, ctor_is_enum);
