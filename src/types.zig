@@ -680,6 +680,11 @@ pub fn conforms(
             const ai = recv.appIdx();
             const akey: u64 = (@as(u64, pid) << 40) | (@as(u64, @intFromEnum(recv.kind)) << 32) | @as(u64, ai);
             if (memo.get(akey)) |v| return v;
+            // A self-referential generic template (`next: Node[T]`) re-interns to the
+            // same App index, so descending it recurses forever without an in-progress
+            // marker. Mirror the layout engine's `.laying` state: coinductively assume
+            // conformance before descending, then overwrite with the real result.
+            try memo.put(gpa, akey, true);
             const e = composite.at(ai);
             var aok = true;
             if (e.ctor_is_enum) {
@@ -4372,6 +4377,25 @@ test "M21: conforms handles App types, nested memoization, and the type_var boun
     var memo_s: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo_s.deinit(gpa);
     try testing.expect(try conforms(&structs, &enums, &confs, Type.structT(1), ord_pid, &memo_s, gpa, &co, &.{}));
+}
+
+test "M21: structural conformance on a recursive generic template terminates" {
+    // `next: Node[T]` re-interns to the same App index, so without a coinductive
+    // in-progress marker the conformance walk recurses until the stack overflows.
+    // Reaching the assertions at all proves termination; the counts pin that a
+    // recursive template behaves like its non-recursive analog (clean).
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        \\struct Node[T]{val:T,next:Node[T]}
+        \\fn f[T has Ord](a:Node[T],b:Node[T])->bool{return a<b}
+        \\fn main()->int{return 0}
+    ));
+    // Recursive field FIRST exercises the `deepestNonConforming` error-path walk,
+    // which independently re-descends the self-referential App.
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
+        \\struct Node[T]{next:Node[T],val:T}
+        \\fn f[T](a:Node[T],b:Node[T])->bool{return a<b}
+        \\fn main()->int{return 0}
+    ));
 }
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");

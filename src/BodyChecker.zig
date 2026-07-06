@@ -2488,20 +2488,31 @@ pub const BodyChecker = struct {
     /// (`type_var`/scalar) is returned as-is. Terminates for the same reason `conforms`
     /// does (finite acyclic type graph). Degrades to `t` on any allocation failure.
     fn deepestNonConforming(bc: *BodyChecker, t: Type, pid: u32) Type {
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(bc.gpa);
+        return bc.deepestNonConformingGuarded(t, pid, &seen);
+    }
+
+    fn deepestNonConformingGuarded(bc: *BodyChecker, t: Type, pid: u32, seen: *std.AutoHashMapUnmanaged(u32, void)) Type {
         if (t.isApp()) {
-            const e = bc.composite.at(t.appIdx());
+            // A self-referential generic (`next: Node[T]`) re-interns to the same App
+            // index; a plain non-conforming struct can put the recursive field before
+            // the failing one, so guard re-entry to keep the walk terminating.
+            const ai = t.appIdx();
+            if ((seen.getOrPut(bc.gpa, ai) catch return t).found_existing) return t;
+            const e = bc.composite.at(ai);
             if (e.ctor_is_enum) {
                 if (e.ctor < bc.model.enums.len) {
                     for (bc.model.enums[e.ctor].variants) |v| for (v.field_types) |ft| {
                         const sub = Typecheck.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
-                        if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConforming(sub, pid);
+                        if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConformingGuarded(sub, pid, seen);
                     };
                 }
             } else {
                 if (e.ctor < bc.model.structs.len) {
                     for (bc.model.structs[e.ctor].field_types) |ft| {
                         const sub = Typecheck.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
-                        if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConforming(sub, pid);
+                        if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConformingGuarded(sub, pid, seen);
                     }
                 }
             }
@@ -2509,10 +2520,10 @@ pub const BodyChecker = struct {
         }
         if (t.kind == .@"struct" and t.struct_id < bc.model.structs.len) {
             for (bc.model.structs[t.struct_id].field_types) |ft|
-                if (!bc.conformsQuiet(ft, pid)) return bc.deepestNonConforming(ft, pid);
+                if (!bc.conformsQuiet(ft, pid)) return bc.deepestNonConformingGuarded(ft, pid, seen);
         } else if (t.kind == .@"enum" and t.enum_id < bc.model.enums.len) {
             for (bc.model.enums[t.enum_id].variants) |v| for (v.field_types) |ft|
-                if (!bc.conformsQuiet(ft, pid)) return bc.deepestNonConforming(ft, pid);
+                if (!bc.conformsQuiet(ft, pid)) return bc.deepestNonConformingGuarded(ft, pid, seen);
         }
         return t;
     }
