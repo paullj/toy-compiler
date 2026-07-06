@@ -24,10 +24,8 @@ const testing = std.testing;
 /// `seen` set is `getOrPut`-only (never iterated), so its hash/thread order cannot leak
 /// into the emit stream; emit order is module-id then source order → `-jN`-stable.
 pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
-    // The coherence key is a serialized byte vector `(protocol, recv, protocol-args)`:
-    // variable arity forces bytes (a struct key can't hold the arg slice). The
-    // `seen` set owns its keys (dup'd on insert); freed on return. Never iterated → its
-    // hash/thread order can't leak into the emit stream.
+    // `seen` maps a serialized coherence key (see `writeCoherenceKey`) to presence; it
+    // owns its keys (dup'd on insert), freed on return.
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = seen.keyIterator();
