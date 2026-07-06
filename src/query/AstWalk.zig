@@ -33,7 +33,7 @@ const Infer = @import("../symbols/Infer.zig");
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 pub const TouchedType = @import("Fingerprint.zig").TouchedType;
 
-/// Fixed sentinel params for the builtin scalar `eq` fold (M12). FILE-SCOPE (not a stack
+/// Fixed sentinel params for the builtin scalar `eq` fold. FILE-SCOPE (not a stack
 /// temporary) because `Fingerprint.fingerprint` reads each folded `Sig.params` AFTER the
 /// call walk returns — a `&.{recv,recv}` local would dangle. `eq` is homogeneous, so the
 /// params mirror the receiver Kind; choosing per-kind (int vs bool) is strictly more
@@ -41,11 +41,11 @@ pub const TouchedType = @import("Fingerprint.zig").TouchedType;
 /// must stay stable or warm caches invalidate.
 const eq_params_int = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int };
 const eq_params_bool = [_]Typecheck.Type{ Typecheck.Type.bool, Typecheck.Type.bool };
-// The builtin scalar `hash` sentinel params (M20): 1-ary (`hash(self) -> int`), so a single
+// The builtin scalar `hash` sentinel params: 1-ary (`hash(self) -> int`), so a single
 // receiver-typed element — distinct from the 2-ary `eq` sentinel above by both count + name.
 const hash_params_int = [_]Typecheck.Type{Typecheck.Type.int};
 const hash_params_bool = [_]Typecheck.Type{Typecheck.Type.bool};
-// The `print` builtin scalar-dispatch sentinel params (M22): `print(x)` on an `int` folds a
+// The `print` builtin scalar-dispatch sentinel params: `print(x)` on an `int` folds a
 // fixed `__display_int` sentinel; on a `bool`, a fixed `display_bool` sentinel — so a
 // `print(x)` site's fingerprint distinguishes the arg KIND (int vs bool vs str vs a
 // struct/enum's resolved Display witness) for incremental soundness, mirroring the builtin
@@ -75,8 +75,9 @@ pub const Source = struct {
 /// LHS->RHS emission order. `enter` brackets each node so consumers that read
 /// `frozen[idx]` key off `enter.idx`; the fold primitives (`leaf`/`raw_leaf`/
 /// `count`/`flag`) map 1:1 to the bytes `Fingerprint` folds. `touch`/`callee`/
-/// `type_ref` are position-specific events the hash IGNORES (so its byte stream is
-/// unchanged) and only `TouchedVisitor`/`CallVisitor` react to.
+/// `type_ref`/`operator`/`try_operator` are position-specific events the hash
+/// IGNORES (its byte stream is unchanged, so every existing fingerprint is preserved
+/// and warm caches never churn); only `TouchedVisitor`/`CallVisitor` react to them.
 pub const Event = union(enum) {
     /// Entry of the node at `idx` (tag `tag`), emitted before any child. The tag
     /// byte the hash folds is the visitor's job (see `HashVisitor.on`).
@@ -99,7 +100,7 @@ pub const Event = union(enum) {
     /// subtree and BEFORE the args, matching where the old callee walk recorded
     /// the sig (so nested calls in the callee record first). `call` is the enclosing
     /// `.call` node itself — the reader needs it to reach the value-arg nodes when a
-    /// bare inferred generic callee must fold its resolved INSTANCE sig (M3).
+    /// bare inferred generic callee must fold its resolved INSTANCE sig.
     callee: struct { idx: Ast.Index, call: Ast.Index },
     /// A `fn_decl` param/return type-ref position. `ordinal` indexes the proto's
     /// params; `is_ret` picks the return. Emitted immediately before recursing the
@@ -109,19 +110,15 @@ pub const Event = union(enum) {
     /// A desugaring binary operator on a `.binary` node `idx`: `==`/`!=` (Eq/Ord), a
     /// comparison `<`/`>`/`<=`/`>=` (Ord), or arithmetic `+`/`-`/`*`/`/` (Add/Sub/Mul/Div).
     /// Emitted AFTER both operands, like `.callee` fires after a call's callee subtree, and
-    /// only for a token that has a candidate method (see `opMethod`). The hash IGNORES it (the
-    /// byte stream is unchanged, so every existing fingerprint — incl. int `==`/`<`/`+` — is
-    /// preserved and warm caches never churn); only `CallVisitor` reacts, folding the resolved
-    /// witness for a struct/enum operand so `p == q`/`a < b`/`v1 + v2` tracks the SAME witness
-    /// identity the desugared call's reloc targets (editing an `impl … has …` body invalidates
-    /// operator callers).
+    /// only for a token that has a candidate method (see `opMethod`). `CallVisitor` folds the
+    /// resolved witness for a struct/enum operand so `p == q`/`a < b`/`v1 + v2` tracks the SAME
+    /// witness identity the desugared call's reloc targets (editing an `impl … has …` body
+    /// invalidates operator callers).
     operator: struct { idx: Ast.Index },
-    /// A postfix `?` on a `.try_expr` node `idx` (M25). Emitted AFTER the operand, like the
-    /// three operator events. The hash IGNORES it (so every existing `?` fingerprint — incl.
-    /// an Option `?` and a same-error Result `?` — is preserved and warm caches never churn);
-    /// only `CallVisitor` reacts, and ONLY for a WIDENING Result `?` (operand error type differs
-    /// from the enclosing return's), folding the resolved `From` witness so `inner()?` tracks the
-    /// SAME witness identity the desugared widen's reloc targets (adding/removing an
+    /// A postfix `?` on a `.try_expr` node `idx`. Emitted AFTER the operand, like the three
+    /// operator events. `CallVisitor` reacts ONLY for a WIDENING Result `?` (operand error type
+    /// differs from the enclosing return's), folding the resolved `From` witness so `inner()?`
+    /// tracks the SAME witness identity the desugared widen's reloc targets (adding/removing an
     /// `impl RetErr has From[OpErr]` invalidates the enclosing fn's codegen unit).
     try_operator: struct { idx: Ast.Index },
 };
@@ -186,8 +183,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try walkInner(src, n.rhs, collect, visitor);
             // After the operands (mirroring `.callee`'s post-subtree placement), signal a
             // desugaring operator so `CallVisitor` can fold the resolved witness. Gated on the
-            // token having a candidate method, so a non-desugaring binary emits nothing; the
-            // hash ignores it either way.
+            // token having a candidate method, so a non-desugaring binary emits nothing.
             if (opMethods(src.tokens[n.main_token].tag).len > 0) try emit(visitor, .{ .operator = .{ .idx = idx } });
         },
         .call => {
@@ -222,20 +218,19 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         .fn_decl => {
             try emit(visitor, .{ .leaf = leaf });
             const proto = Ast.protoAt(tree, n.lhs.int());
-            // M2 carryover: fold the ordered generic-param NAMES so editing a
-            // generic signature (add / remove / reorder `[T,U]`) flips the template
-            // fingerprint (and thus every instance built from it). Conditional on
-            // non-empty, so a non-generic fn folds NOTHING new and stays byte-identical.
+            // Fold the ordered generic-param NAMES so editing a generic signature
+            // (add / remove / reorder `[T,U]`) flips the template fingerprint (and thus
+            // every instance built from it). Gated on non-empty, so a non-generic fn
+            // folds nothing new.
             if (proto.generic_params.len > 0) {
                 try emit(visitor, .{ .count = @intCast(proto.generic_params.len) });
                 for (proto.generic_params) |gp| {
                     try emit(visitor, .{ .leaf = src.leaf(gp) });
-                    // M13: fold a `[T has P]` bound protocol-ref so `[T]`->`[T has P]`
-                    // and a bound-name change flip the template body-fp (hence every
-                    // instance). Unbounded params (lhs == none) emit NOTHING new, so a
-                    // non-generic AND an existing unbounded-generic fp stay byte-identical
-                    // (warm cache preserved); the count sentinel above already prevents a
-                    // `[T has P]` (count 1) from aliasing a `[T,U]` (count 2).
+                    // Fold a `[T has P]` bound protocol-ref so `[T]`->`[T has P]` and a
+                    // bound-name change flip the template body-fp (hence every instance).
+                    // Unbounded params (lhs == none) emit nothing new; the count sentinel
+                    // above already prevents a `[T has P]` (count 1) from aliasing a
+                    // `[T,U]` (count 2).
                     const bound = tree.nodes[gp.int()].lhs;
                     if (bound != Ast.none) try walkInner(src, bound, collect, visitor);
                 }
@@ -270,8 +265,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // Never a fingerprint root / never reached inside a fn-body walk. An
         // `impl_decl`/`impl_has_decl` is a top-level decl (its methods are walked as
         // ordinary `fn_decl` fingerprint roots) and a `protocol_decl`'s bodyless sigs
-        // never enter the fn table, so all three fold nothing here. The
-        // protocol/conformance -> fingerprint dependence is deferred to M13.
+        // never enter the fn table, so all three fold nothing here.
         .program, .import_decl, .impl_decl, .protocol_decl, .impl_has_decl => {},
         // Zero-sized leaf: the tag byte IS its content. Reached as a value literal
         // and as a `()` type-ref (under param/fn_decl ret).
@@ -394,7 +388,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // A poison leaf: inert, no children. The `.enter` tag byte (emitted above)
         // is its whole contribution to the fingerprint, like `pattern_wildcard`.
         .error_node => {},
-        // Generics (M1). Unreachable for non-generic source and gated before
+        // Generics. Unreachable for non-generic source and gated before
         // codegen for generic source (T0013), so these fold nothing load-bearing —
         // but the walk must stay exhaustive and deterministic.
         .generic_param => try emit(visitor, .{ .leaf = leaf }),
@@ -412,19 +406,16 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = n.rhs != Ast.none }); // has sub-pattern
             if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor);
         },
-        // Postfix `?` (M24): the `.enter` tag byte (emitted above) makes `x?` fp-distinct
+        // Postfix `?`: the `.enter` tag byte (emitted above) makes `x?` fp-distinct
         // from `x`; recursing the operand folds its spelling AND discovers its
         // Option/Result `App` instance for monomorphization. The `?` mints no instance of
         // its own — the residual is built from the already-reified enclosing return enum.
         //
-        // M25: after the operand, signal a `.try_operator` so `CallVisitor` can fold the
-        // resolved `From` witness for a WIDENING Result `?` (operand error type differs from
-        // the enclosing return's error type). The hash IGNORES it, so every existing `?`
-        // fingerprint — an Option `?`, a same-error Result `?` — is byte-identical (warm cache
-        // preserved). CallVisitor reads the enclosing fn's return type from the threaded
-        // `fn_sig` (`walkCalls` now threads it, mirroring `walkTouchedSig`), so adding/removing
-        // an `impl RetErr has From[OpErr]` flips the enclosing fn's codegen key — the same
-        // conformance-fp-fold discipline as the operator witnesses.
+        // The `.try_operator` after the operand lets `CallVisitor` fold the resolved `From`
+        // witness for a WIDENING Result `?` (operand error type differs from the enclosing
+        // return's). CallVisitor reads the enclosing fn's return type from the threaded `fn_sig`
+        // (`walkCalls` threads it, mirroring `walkTouchedSig`), so adding/removing an
+        // `impl RetErr has From[OpErr]` flips the enclosing fn's codegen key.
         .try_expr => {
             try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .try_operator = .{ .idx = idx } });
@@ -499,7 +490,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
         out: *std.ArrayList(Sig),
         /// The OWNING fn's typecheck Sig, threaded by `walkCalls` (mirroring `TouchedVisitor`).
         /// Its `.ret` is the enclosing fn's reified return enum — the source of the target
-        /// error type a widening `?` (M25) converts INTO. Defaulted `null` so the ~7 test
+        /// error type a widening `?` converts INTO. Defaulted `null` so the ~7 test
         /// CallVisitor constructions that don't fold a `?` widen stay unchanged; a `.try_operator`
         /// with no threaded sig folds nothing (`orelse return`).
         fn_sig: ?Sig = null,
@@ -507,7 +498,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
                 .callee => |c| {
-                    // A generic call `id[int](..)` (M2): the callee node is a
+                    // A generic call `id[int](..)`: the callee node is a
                     // `type_app` whose base identifier carries the template's `.func`.
                     // Resolve (template gid + the concrete type-args the checker wrote
                     // into node_types) to the reified instance's mangled name +
@@ -515,7 +506,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // reloc targets. `Mono.find` is a deterministic scan.
                     const cn = self.frozen.tree.nodes[c.idx.int()];
                     if (cn.tag == .type_app) {
-                        // An explicit-protocol-args method call `v.into[int]()` (M14): a
+                        // An explicit-protocol-args method call `v.into[int]()`: a
                         // `type_app` over a `field_access` NOT bound to a `.func` (a
                         // qualified generic fn binds its field_access to `.func`). Fold the
                         // resolved witness (mirroring the bare method fold below), so the
@@ -537,7 +528,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // the caller's hash.
                     if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
                         const sig = self.frozen.sigs[res.func];
-                        // A bare inferred generic call `id(7)` (M3): a PLAIN-IDENTIFIER
+                        // A bare inferred generic call `id(7)`: a PLAIN-IDENTIFIER
                         // callee resolving to a generic template (its sig params carry
                         // type_vars). Fold the resolved INSTANCE sig — not the template —
                         // so the caller folds the SAME identity the reloc targets (mirroring
@@ -548,7 +539,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             return;
                         }
                         const nm = self.frozen.names[res.func];
-                        // The `print` builtin (M22): its reloc target depends on the single
+                        // The `print` builtin: its reloc target depends on the single
                         // arg's TYPE (int->__display_int, bool->inline, struct/enum->the
                         // resolved Display witness), not on the fixed `print` Sig. Fold by the
                         // arg kind so a caller recompiles when the resolved witness changes
@@ -561,7 +552,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
                         return;
                     }
-                    // A method call `recv.m(..)` on a VALUE receiver (M8): the callee is
+                    // A method call `recv.m(..)` on a VALUE receiver: the callee is
                     // a `field_access` NOT bound to a `.func`, and the receiver types to
                     // a concrete struct/enum. Fold the resolved method's Sig so editing
                     // the method's signature/return flips every caller's fingerprint
@@ -574,13 +565,14 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
                             // The SAME multi-conformance resolver the checker + lower use, so
                             // the folded witness matches the reloc target. `.one` is
-                            // byte-identical to the pre-M14 `findMethod` for every error-free
-                            // program (an ambiguous bare call halts the compile before codegen,
+                            // byte-identical to the earlier single-conformance `findMethod` for
+                            // every error-free program (an ambiguous bare call halts the compile
+                            // before codegen,
                             // so the fp is never taken); `.ambiguous`/`.none` fold nothing here.
                             switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, false, null)) {
                                 .one => |m| try self.foldWitness(m),
                                 .none, .ambiguous => {
-                                    // A builtin scalar `eq`/`hash` (M12/M20): it has NO real
+                                    // A builtin scalar `eq`/`hash`: it has NO real
                                     // fn_id/instance (the recognizer lowers to an inline machine
                                     // op, no symbol), so fold a FIXED sentinel Sig instead.
                                     // Deterministic + stable across builds; the member NAME +
@@ -607,10 +599,9 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // Add/Sub/Mul/Div method. Fold the FIRST resolving witness so the caller
                     // tracks the SAME identity the desugared call's reloc targets — the SAME
                     // `.one` resolver the `recv.m(..)` method fold above uses. A scalar operand
-                    // (int/bool/str/unit) inlines to a machine op with NO symbol, so nothing to
-                    // fold; skipping it keeps every scalar-operator fingerprint byte-identical
-                    // (warm cache preserved). A pre-typecheck view (lhs out of range or an
-                    // invalid recv) folds nothing.
+                    // (int/bool/str/unit) inlines to a machine op with NO symbol, so there is
+                    // nothing to fold. A pre-typecheck view (lhs out of range or an invalid recv)
+                    // folds nothing.
                     const bn = self.frozen.tree.nodes[e.idx.int()];
                     if (bn.lhs.int() >= self.frozen.node_types.len) return;
                     const recv = self.frozen.node_types[bn.lhs.int()];
@@ -623,15 +614,14 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     }
                 },
                 .try_operator => |e| {
-                    // A WIDENING Result `?` (M25) re-emits `err(e)` as `RetErr.from(e)`; fold that
+                    // A WIDENING Result `?` re-emits `err(e)` as `RetErr.from(e)`; fold that
                     // `From` witness so the enclosing fn's codegen key depends on the resolved
                     // conformance — via the SAME resolver+args lower's buildResidual uses
                     // (lower.zig:3063), tracking the SAME witness the widen's reloc targets. Only
                     // fires for a Result operand whose error type DIFFERS from the enclosing return's:
-                    // the identity case (op_err==ret_err, M24), an Option `?`, and every non-`?` fn
-                    // fold NOTHING, so their fingerprints stay byte-identical (warm cache preserved).
-                    // Every index is guarded — a pre-typecheck / FakeFrozen view (no threaded sig or
-                    // empty tables) folds nothing, mirroring the eq/ord/arith guards above.
+                    // the identity case (op_err==ret_err), an Option `?`, and every non-`?` fn fold
+                    // NOTHING. Every index is guarded — a pre-typecheck / FakeFrozen view (no threaded
+                    // sig or empty tables) folds nothing, mirroring the eq/ord/arith guards above.
                     const fs = self.fn_sig orelse return;
                     if (fs.ret.kind != .@"enum" or fs.ret.enum_id >= self.frozen.enum_layouts.len) return;
                     const tn = self.frozen.tree.nodes[e.idx.int()];
@@ -655,11 +645,11 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
         }
 
-        /// Fold a resolved method witness's identity+sig (M8+). A GENERIC-type instance
-        /// method (M10) carries the mono `instance` index -> fold the INSTANCE identity
+        /// Fold a resolved method witness's identity+sig. A GENERIC-type instance
+        /// method carries the mono `instance` index -> fold the INSTANCE identity
         /// (the real reloc target), not the never-lowered template's `names/sigs[fn_id]`.
         fn foldWitness(self: *Self, m: Typecheck.Method) error{OutOfMemory}!void {
-            // A SOURCE-LESS derived witness (M18): fold the synthetic unit's identity (its
+            // A SOURCE-LESS derived witness: fold the synthetic unit's identity (its
             // mangled name + `[T,T]->bool` sig) so the caller's fingerprint tracks the
             // derive — a nested-field override flips the unit's key AND, via this fold, the
             // caller's. Checked FIRST (a derive Method has `fn_id == 0`). `dv.params` is a
@@ -687,7 +677,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
         }
 
-        /// Fold the `print` builtin callee by its single arg's type (M22), returning TRUE when
+        /// Fold the `print` builtin callee by its single arg's type, returning TRUE when
         /// it folded an arg-kind-specific identity so the caller skips the plain `print` fold.
         /// `int` -> a fixed `__display_int` sentinel; `bool` -> a fixed `display_bool` sentinel;
         /// a struct/enum -> its resolved `Display` witness (via `foldWitness`, so gaining an
@@ -719,7 +709,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
         }
 
-        /// Fold an explicit-protocol-args method callee `v.into[int]()` (M14): resolve the
+        /// Fold an explicit-protocol-args method callee `v.into[int]()`: resolve the
         /// witness by the type-arg node_types (the SAME rule the checker + lower use), so
         /// the fingerprint tracks the SAME witness the reloc targets.
         fn foldMethodCalleeExplicit(self: *Self, cn: Ast.Node) error{OutOfMemory}!void {
@@ -759,7 +749,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
             try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
         }
 
-        /// Bare inferred generic callee (M3): infer the type-args from the enclosing
+        /// Bare inferred generic callee: infer the type-args from the enclosing
         /// call's value-arg node_types (the SAME matcher Pass C / scanCalls ran), find
         /// the reified instance, and fold its INSTANCE sig. A miss (pre-typecheck view,
         /// arity/conflict/unbound, or an unminted instance) folds nothing — identical to
@@ -1326,7 +1316,7 @@ test "[CROSS-MODULE TYPE-REF] threaded fn_sig folds the sig's type, not a bare-n
     try testing.expectEqualSlices(u8, expect_buf.items, found.?);
 }
 
-test "M15: the .eq_operator event is IGNORED by the hash (int == fingerprint unchanged)" {
+test "the .eq_operator event is IGNORED by the hash (int == fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> bool { a == b }\n");
     defer b.deinit(gpa);
@@ -1357,7 +1347,7 @@ test "M15: the .eq_operator event is IGNORED by the hash (int == fingerprint unc
     try testing.expectEqual(h1.final(), h2.final());
 }
 
-test "M16: the .ord_operator event is IGNORED by the hash (int < fingerprint unchanged)" {
+test "the .ord_operator event is IGNORED by the hash (int < fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> bool { a < b }\n");
     defer b.deinit(gpa);
@@ -1388,7 +1378,7 @@ test "M16: the .ord_operator event is IGNORED by the hash (int < fingerprint unc
     try testing.expectEqual(h1.final(), h2.final());
 }
 
-test "M17: the .arith_operator event is IGNORED by the hash (int + fingerprint unchanged)" {
+test "the .arith_operator event is IGNORED by the hash (int + fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> int { a + b }\n");
     defer b.deinit(gpa);
@@ -1419,7 +1409,7 @@ test "M17: the .arith_operator event is IGNORED by the hash (int + fingerprint u
     try testing.expectEqual(h1.final(), h2.final());
 }
 
-test "M15: `p == q` folds the SAME Eq witness Sig as `p.eq(q)` (fingerprint agreement)" {
+test "`p == q` folds the SAME Eq witness Sig as `p.eq(q)` (fingerprint agreement)" {
     const gpa = testing.allocator;
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
@@ -1506,7 +1496,7 @@ test "M15: `p == q` folds the SAME Eq witness Sig as `p.eq(q)` (fingerprint agre
     try testing.expectEqual(a.params.len, m.params.len);
 }
 
-test "M16: `a < b` folds the SAME Ord::cmp witness Sig as `a.cmp(b)` (incremental soundness)" {
+test "`a < b` folds the SAME Ord::cmp witness Sig as `a.cmp(b)` (incremental soundness)" {
     const gpa = testing.allocator;
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
@@ -1595,7 +1585,7 @@ test "M16: `a < b` folds the SAME Ord::cmp witness Sig as `a.cmp(b)` (incrementa
     try testing.expectEqual(a.params.len, m.params.len);
 }
 
-test "M17: `p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental soundness)" {
+test "`p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental soundness)" {
     const gpa = testing.allocator;
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
@@ -1680,7 +1670,7 @@ test "M17: `p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental sou
     try testing.expectEqual(a.params.len, m.params.len);
 }
 
-test "M25: the .try_operator event is IGNORED by the hash (a `?` fingerprint is unchanged)" {
+test "the .try_operator event is IGNORED by the hash (a `?` fingerprint is unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa,
         \\fn f(r: Result[int, int]) -> Result[int, int] {
@@ -1697,7 +1687,7 @@ test "M25: the .try_operator event is IGNORED by the hash (a `?` fingerprint is 
     try walk(b.src(), decl, &hv);
 
     // Hash 2: the SAME walk with `.try_operator` dropped before folding — the hash as if the
-    // M25 event had never been introduced. Byte-identity proves the operator event never
+    // event had never been introduced. Byte-identity proves the operator event never
     // enters the fingerprint byte-stream, so every existing `?` fp (Option `?`, same-error
     // Result `?`, and this widening one) is preserved and warm caches never churn.
     var h2 = std.hash.Wyhash.init(0);
@@ -1716,7 +1706,7 @@ test "M25: the .try_operator event is IGNORED by the hash (a `?` fingerprint is 
     try testing.expectEqual(h1.final(), h2.final());
 }
 
-test "M25: a WIDENING `?` folds the resolved `From` witness; the identity `?` folds nothing" {
+test "a WIDENING `?` folds the resolved `From` witness; the identity `?` folds nothing" {
     const gpa = testing.allocator;
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
