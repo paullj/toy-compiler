@@ -1270,6 +1270,36 @@ fn deriveFieldEq(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Value
     }
 }
 
+/// The enum tag-dispatch ladder shared by every payload-enum derive: walk variants in fixed
+/// decl order, gating each on `icmp .eq tag_val, vi`; the last variant is the else-fallthrough.
+/// `perVariant(b, ctx, vi)` emits that variant's body (each derive delivers its own result to a
+/// join). Kept in one place so Eq/Cmp/Hash/Display can never disagree on variant walk order.
+fn emitVariantLadder(
+    b: *Builder,
+    e: Typecheck.EnumLayout,
+    tag_val: Ir.ValueId,
+    ctx: anytype,
+    comptime perVariant: anytype,
+) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    for (e.variants, 0..) |_, vi| {
+        const last = vi + 1 == e.variants.len;
+        if (last) {
+            try perVariant(b, ctx, vi);
+            break;
+        }
+        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
+        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag_val, .rhs = vk } }, bool_ty);
+        const body = try b.addBlock();
+        const next = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
+        b.switchTo(body);
+        try perVariant(b, ctx, vi);
+        b.switchTo(next);
+    }
+}
+
 /// Payload-enum structural `Eq` (M19): equal iff the discriminants match AND, for that
 /// variant, every payload field is equal. A `get_tag` compare gates a tag-dispatch ladder
 /// (fixed variant-decl order) where each variant's payload fields multiply-accumulate to a
@@ -1297,21 +1327,11 @@ fn deriveEnumEq(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_b
 
     // Tags equal: dispatch on the (self) tag to compare that variant's payload for equality.
     b.switchTo(dispatch);
-    for (e.variants, 0..) |_, vi| {
-        const last = vi + 1 == e.variants.len;
-        if (last) {
-            try emitVariantPayloadEq(b, e, vi, self_base, other_base, join);
-            break;
+    try emitVariantLadder(b, e, lt, .{ .e = e, .self_base = self_base, .other_base = other_base, .join = join }, struct {
+        fn f(bb: *Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
+            try emitVariantPayloadEq(bb, c.e, vi, c.self_base, c.other_base, c.join);
         }
-        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
-        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = vk } }, bool_ty);
-        const body = try b.addBlock();
-        const next = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
-        b.switchTo(body);
-        try emitVariantPayloadEq(b, e, vi, self_base, other_base, join);
-        b.switchTo(next);
-    }
+    }.f);
 
     b.switchTo(join);
     return merge;
@@ -1474,21 +1494,12 @@ fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_
 
     // Tags equal: dispatch on the (self) tag to compare that variant's payload.
     b.switchTo(dispatch);
-    for (e.variants, 0..) |v, vi| {
-        const last = vi + 1 == e.variants.len;
-        if (last) {
-            try deriveLexChain(b, v.field_types, v.offsets, e.payload_off, self_base, other_base, join);
-            break;
+    try emitVariantLadder(b, e, st, .{ .e = e, .self_base = self_base, .other_base = other_base, .join = join }, struct {
+        fn f(bb: *Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
+            const v = c.e.variants[vi];
+            try deriveLexChain(bb, v.field_types, v.offsets, c.e.payload_off, c.self_base, c.other_base, c.join);
         }
-        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
-        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = st, .rhs = vk } }, bool_ty);
-        const body = try b.addBlock();
-        const next = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
-        b.switchTo(body);
-        try deriveLexChain(b, v.field_types, v.offsets, e.payload_off, self_base, other_base, join);
-        b.switchTo(next);
-    }
+    }.f);
 }
 
 /// Lower a SOURCE-LESS auto-derive `Eq` unit (M18): the spike's layout-walking emitter.
@@ -1799,7 +1810,6 @@ fn emitVariantPayloadHash(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_
 /// field order matches `Eq` (equal enum values hash equal). Returns the int hash value.
 fn deriveEnumHash(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
     const e = b.in.enum_layouts[cty.enum_id];
 
     const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
@@ -1808,21 +1818,11 @@ fn deriveEnumHash(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId) error
 
     const join = try b.addBlock();
     const merge = try b.addParam(join, int_ty);
-    for (e.variants, 0..) |_, vi| {
-        const last = vi + 1 == e.variants.len;
-        if (last) {
-            try emitVariantPayloadHash(b, e, vi, self_base, h0, join);
-            break;
+    try emitVariantLadder(b, e, tag, .{ .e = e, .self_base = self_base, .h0 = h0, .join = join }, struct {
+        fn f(bb: *Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
+            try emitVariantPayloadHash(bb, c.e, vi, c.self_base, c.h0, c.join);
         }
-        const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
-        const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = vk } }, bool_ty);
-        const body = try b.addBlock();
-        const next = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
-        b.switchTo(body);
-        try emitVariantPayloadHash(b, e, vi, self_base, h0, join);
-        b.switchTo(next);
-    }
+    }.f);
 
     b.switchTo(join);
     return merge;
@@ -2110,21 +2110,11 @@ pub fn lowerDeriveDisplay(
             const e = b.in.enum_layouts[cty.enum_id];
             const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
             const join = try b.addBlock();
-            for (e.variants, 0..) |_, vi| {
-                const last = vi + 1 == e.variants.len;
-                if (last) {
-                    try emitVariantDisplay(&b, e, vi, self_base, join);
-                    break;
+            try emitVariantLadder(&b, e, tag, .{ .e = e, .self_base = self_base, .join = join }, struct {
+                fn f(bb: *Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
+                    try emitVariantDisplay(bb, c.e, vi, c.self_base, c.join);
                 }
-                const vk = try b.emit(.{ .iconst = @intCast(vi) }, int_ty);
-                const is_vi = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = vk } }, Typecheck.Type.@"bool");
-                const body = try b.addBlock();
-                const next = try b.addBlock();
-                b.setTerm(.{ .cond_br = .{ .cond = is_vi, .t = body, .f = next } });
-                b.switchTo(body);
-                try emitVariantDisplay(&b, e, vi, self_base, join);
-                b.switchTo(next);
-            }
+            }.f);
             b.switchTo(join);
         },
         else => {
