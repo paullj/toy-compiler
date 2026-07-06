@@ -463,7 +463,7 @@ checker special-cases the `print` builtin call: it requires the single argument 
 `Display` witness). A genuine `print[T has Display](x: T)` (template body, per-type instances,
 mangling) was explicitly rejected as higher-risk. For incremental soundness the caller's
 fingerprint folds the resolved witness identity for a struct/enum arg (and a fixed per-scalar
-sentinel), mirroring the `.eq_operator` fold, so a caller recompiles when its arg gains an
+sentinel), mirroring the `.operator` fold, so a caller recompiles when its arg gains an
 explicit `impl Display`.
 
 **Format is PROVISIONAL** (user-observable once shipped, but not depended on by any
