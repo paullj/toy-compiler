@@ -63,21 +63,21 @@ pub const Inputs = struct {
     /// owning module's id, including a qualified cross-module `b: rect.Rect` resolved
     /// by `Typecheck.typeFromQualified`); `typeFromRef` is only the fallback.
     sig: ?Sig = null,
-    /// The monomorphization instance table (M2). A generic call `id[int](..)` in
+    /// The monomorphization instance table. A generic call `id[int](..)` in
     /// this body resolves its callee to the reified instance's mangled SymName by
     /// matching `(template gid + the concrete type-args read from node_types)`
     /// against this table. Empty for a program with no generics. Resolution reads
     /// only concrete `node_types` — no substitution map is threaded here (the mono
     /// tail already substituted every `type_var` away before `node_types` froze).
     instances: []const Mono.Instance = &.{},
-    /// Program-wide callee signatures by global fn id (M3). A bare inferred generic
+    /// Program-wide callee signatures by global fn id. A bare inferred generic
     /// call `id(7)` resolves its callee to a generic template's `.func`; that is
     /// detectable because the template's `sigs[func].params` carry `type_var`s. When
     /// so, `lowerCall` re-runs the shared `Infer` matcher over the value-arg
     /// `node_types` to select the SAME `Mono.Instance` Pass C created, instead of
     /// emitting the template symbol. Empty for a program with no generics.
     sigs: []const Sig = &.{},
-    /// The program-wide inherent-method table (M8). A call whose callee is a
+    /// The program-wide inherent-method table. A call whose callee is a
     /// `field_access` over a VALUE receiver dispatches through this: the receiver's
     /// concrete type + the member name select the method's global fn id (the mangled
     /// SymName in `names`), and the receiver is prepended as the `self` arg. Empty for
@@ -88,13 +88,13 @@ pub const Inputs = struct {
     /// unsupported" / lose its mut-self ABI). Every `lower.Inputs` build site MUST set
     /// it — pass `&.{}` only when the program provably has no methods.
     methods: []const Typecheck.Method,
-    /// The authorized structural auto-derive recipes (M18), so `lowerStructEq`'s `.one`
+    /// The authorized structural auto-derive recipes, so `lowerStructEq`'s `.one`
     /// arm can resolve a derived `Eq` witness (`m.derive`) to the synthetic unit's
     /// mangled name, and `lowerDeriveEq` can resolve a nested aggregate field's witness.
     /// Empty for a program with no derives. NO default (same COMPILE-error discipline as
     /// `methods`): every build site threads it explicitly.
     derives: []const Derive.Derive,
-    /// The prelude protocol ids (M15+), so each operator/derive/`?`-widen witness site
+    /// The prelude protocol ids, so each operator/derive/`?`-widen witness site
     /// resolves by its SPECIFIC protocol — a sibling protocol reusing `eq`/`cmp`/… on the
     /// operand type cannot be selected (which would make the resolver `.ambiguous` and abort
     /// codegen on a checked program). MUST equal the id the fingerprint fold uses (same
@@ -127,7 +127,7 @@ const Builder = struct {
     /// The exit block's param value (or `none_value` for a unit function).
     ret_param: Ir.ValueId = Ir.none_value,
 
-    /// The slot holding the `mut self` receiver's ADDRESS (M9), or `none_slot` for
+    /// The slot holding the `mut self` receiver's ADDRESS, or `none_slot` for
     /// any non-mut fn. A mut-self param slot is typed `int` (an 8B pointer) rather
     /// than the struct, so its scalar/1-GPR ABI carries the caller's slot address;
     /// `rootAddr` loads through it so `self`/`self.f` reach the caller's storage.
@@ -313,7 +313,7 @@ pub fn lowerFn(
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
     for (proto.params, 0..) |_, i| {
-        // A `mut self` receiver (M9): type param-0's slot as `int` (an 8B pointer to
+        // A `mut self` receiver: type param-0's slot as `int` (an 8B pointer to
         // the caller's live slot), NOT the struct. This bypasses `paramType` — which
         // would return the struct type from the Sig — so the existing scalar-param ABI
         // carries the address in one GPR, with no Abi/Codegen change. `rootAddr` then
@@ -453,7 +453,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             const slot = try localSlot(b, stmt.lhs, place_ty);
             // Whole-`self` reassignment inside a `mut self` method (`self = expr`): the
             // slot holds a POINTER, so produce the RHS through it into the caller's
-            // storage rather than overwriting the local pointer (M9).
+            // storage rather than overwriting the local pointer.
             if (slot == b.mut_self_slot) {
                 try lowerExprInto(b, stmt.rhs, try rootAddr(b, slot), place_ty);
                 return;
@@ -512,7 +512,7 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
     if (node_idx == Ast.none) return .none;
     const n = b.in.tree.nodes[(node_idx).int()];
     const ty = b.in.node_types[(node_idx).int()];
-    // A check-time `type_var` (M2) / composite `App` (M4) is substituted/reified to a
+    // A check-time `type_var` / composite `App` is substituted/reified to a
     // concrete kind BEFORE lowering; if one reaches here, the mono tail missed a
     // node_types slot — trip loudly in Debug/ReleaseSafe rather than miscompile.
     std.debug.assert(ty.kind != .type_var and ty.kind != .app);
@@ -595,7 +595,7 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
         .str, .@"struct", .@"enum" => {
             // Whole-`self` value read inside a `mut self` method (`return self`, or
             // passing `self` by value): the slot holds a POINTER, not the struct, so
-            // copy the pointee into a fresh temp and yield that (M9). An ordinary
+            // copy the pointee into a fresh temp and yield that. An ordinary
             // aggregate local is passed by slot directly (no copy).
             if (slot == b.mut_self_slot) {
                 const tmp = try b.addSlot(ty);
@@ -639,7 +639,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
         .plus, .minus, .star, .slash => {
             // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
             // operand desugars to the resolved Add/Sub/Mul/Div witness via `lowerArithValue`
-            // (M17). The checker (T0028) has already proven a same-type conforming operand.
+            //. The checker (T0028) has already proven a same-type conforming operand.
             const lt = b.in.node_types[(n.lhs).int()];
             if (isInlineArith(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
@@ -658,7 +658,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
         },
         .lt, .lt_eq, .gt, .gt_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/struct/enum desugar to a
-            // discriminant test on `Ord::cmp` via `lowerOrdValue` (M16).
+            // discriminant test on `Ord::cmp` via `lowerOrdValue`.
             const lt = b.in.node_types[(n.lhs).int()];
             if (isInlineOrd(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
@@ -670,7 +670,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
         },
         .eq_eq, .bang_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/unit/struct/enum
-            // desugar to `Eq::eq` via `lowerEqValue` (M15).
+            // desugar to `Eq::eq` via `lowerEqValue`.
             const lt = b.in.node_types[(n.lhs).int()];
             if (isInlineEq(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
@@ -721,18 +721,18 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 
 /// True for the two `Eq` operand kinds that stay an inline `icmp` (int/bool). Every other
 /// kind (unit/str/struct/enum) routes to `lowerEqValue`, so the int/bool emitted bytes are
-/// unchanged BY CONSTRUCTION (the M15 "int/bool == unchanged" acceptance criterion).
+/// unchanged BY CONSTRUCTION (the "int/bool == unchanged" acceptance criterion).
 fn isInlineEq(k: Typecheck.Kind) bool {
     return k == .int or k == .bool;
 }
 
 /// The prelude `Ordering{lt,eq,gt}` variant DECL indices (registerPrelude order), i.e. the
-/// tag `get_tag` reads. `<`/`>`/`<=`/`>=` desugar to a discriminant test against these (M16).
+/// tag `get_tag` reads. `<`/`>`/`<=`/`>=` desugar to a discriminant test against these.
 const ord_lt: i64 = 0;
 const ord_eq: i64 = 1;
 const ord_gt: i64 = 2;
 
-/// Fixed-seed multiply-accumulate constants for the structural `Hash` derive (M20). The
+/// Fixed-seed multiply-accumulate constants for the structural `Hash` derive. The
 /// current IR op set (Ir.Op) has NO xor/shift/bitwise op, so a runtime Wyhash is not
 /// expressible without touching the backend (which the roadmap forbids). The FORCED
 /// mixer is a polynomial `h = h*MULT + fieldhash` (a str field folds its bytes with the
@@ -750,14 +750,14 @@ const str_hash_mult: i64 = 0x100000001B3;
 
 /// True for the two `Ord` operand kinds that stay an inline `icmp` (int signed cmp, bool
 /// false<true). Every other kind (str/struct/enum) routes to `lowerOrdValue`, so the int/bool
-/// emitted bytes are unchanged BY CONSTRUCTION (the M16 "int comparisons unchanged" criterion).
+/// emitted bytes are unchanged BY CONSTRUCTION (the "int comparisons unchanged" criterion).
 fn isInlineOrd(k: Typecheck.Kind) bool {
     return k == .int or k == .bool;
 }
 
 /// True for the one arithmetic operand kind that stays an inline machine op (`int`). Every
 /// other kind routes to `lowerArithValue`, so the int emitted bytes are unchanged BY
-/// CONSTRUCTION (the M17 "int `+`/`-`/`*`/`/` unchanged" acceptance criterion). str/bool
+/// CONSTRUCTION (the "int `+`/`-`/`*`/`/` unchanged" acceptance criterion). str/bool
 /// never reach lower for arithmetic — the checker rejects them (T0028).
 fn isInlineArith(k: Typecheck.Kind) bool {
     return k == .int;
@@ -772,7 +772,7 @@ fn operandSlot(op: Ir.Operand) Ir.SlotId {
 }
 
 /// Lower `lhs == rhs` (or `!=` when `negate`) for a NON-inline operand kind
-/// (unit/str/struct/enum), producing a bool value Operand (M15). int/bool are never routed
+/// (unit/str/struct/enum), producing a bool value Operand. int/bool are never routed
 /// here — they stay the inline `icmp` in `lowerBinary`/`genCond`, unchanged.
 ///   * unit  -> lower both operands for effect, then `bconst true` (the two `()` values are
 ///              always equal).
@@ -782,7 +782,7 @@ fn operandSlot(op: Ir.Operand) Ir.SlotId {
 /// `!=` wraps the resulting bool in a `bnot`.
 fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
     // A struct/enum threads `negate` into `lowerStructEq` so the Ord-refinement `==` path
-    // (M16) can emit `icmp ne` directly AND the M15 eq-witness path stays byte-identical
+    // can emit `icmp ne` directly AND the eq-witness path stays byte-identical
     // (call then optional `bnot`, same value-id order). unit/str keep the uniform outer `bnot`.
     switch (operand_ty.kind) {
         .@"struct", .@"enum" => return try lowerStructEq(b, operand_ty, lhs_node, rhs_node, negate),
@@ -806,15 +806,15 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
     return .{ .value = raw };
 }
 
-/// Emit `==`/`!=` (`!=` when `negate`) for a struct/enum operand (M15/M16). If the type has
+/// Emit `==`/`!=` (`!=` when `negate`) for a struct/enum operand. If the type has
 /// an explicit `Eq` witness, dispatch to it (byte-identical to `p.eq(q)`) then optionally
-/// `bnot` — the M15 path, unchanged. If NOT (an Ord-only type, where the Ord-refinement
+/// `bnot` — the eq-witness path, unchanged. If NOT (an Ord-only type, where the Ord-refinement
 /// filled the `(Eq,T)` slot but added no `eq` method), lower `==` as `discriminant == ord_eq`
 /// (`!=` as `discriminant != ord_eq`) via the `cmp` witness. Returns the final bool Operand.
 fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
     switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "eq", b.in.prelude_ids.eq, null)) {
         .one => |m| {
-            // A derived `Eq` (M18) / instance / plain fn all resolve through the shared
+            // A derived `Eq` / instance / plain fn all resolve through the shared
             // `witnessCallee` (derive checked first — a derive Method has `fn_id == 0`).
             const callee: Link.SymName = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
@@ -825,7 +825,7 @@ fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
             return .{ .value = v };
         },
         .none, .ambiguous => {
-            // Ord-refinement `==` (M16): no `eq` witness, but a `cmp` witness exists — `==`
+            // Ord-refinement `==`: no `eq` witness, but a `cmp` witness exists — `==`
             // is `cmp(a,b) == Ordering.eq`. The checker proved conformance (the refinement
             // filled `(Eq,T)`), so a `cmp` miss here is an internal invariant break.
             switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, "cmp", b.in.prelude_ids.ord, null)) {
@@ -847,7 +847,7 @@ fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
 }
 
 /// Lower `lhs <op> rhs` for a NON-inline `Ord` operand kind (str/struct/enum), producing a
-/// bool value Operand (M16). Computes the 3-way `cmp` discriminant, then tests it: `<` -> the
+/// bool value Operand. Computes the 3-way `cmp` discriminant, then tests it: `<` -> the
 /// discriminant equals `ord_lt`; `>` -> equals `ord_gt`; `<=` -> NOT `ord_gt`; `>=` -> NOT
 /// `ord_lt`. int/bool are never routed here — they stay the inline `icmp`, unchanged.
 fn lowerOrdValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, op: TokenTag) error{OutOfMemory}!Ir.Operand {
@@ -863,7 +863,7 @@ fn lowerOrdValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
     return .{ .value = try b.emit(.{ .icmp = .{ .cc = spec.cc, .lhs = d, .rhs = k } }, Typecheck.Type.@"bool") };
 }
 
-/// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of `lhs`/`rhs` (M16):
+/// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of `lhs`/`rhs`:
 ///   * str -> a heap-free lexicographic `load_byte` loop (`lowerStrCmp`), NO witness call.
 ///   * struct/enum -> the `cmp` witness call into a fresh ret_slot, then `get_tag` at
 ///     offset 0 (the proven match-dispatch idiom) reads the returned `Ordering`'s tag.
@@ -881,8 +881,8 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
                 },
             };
             // The witness returns `Ordering`; its ret carries that enum type (the ret_slot ABI
-            // + get_tag layout). A DERIVED `cmp` (M19, `fn_id == 0`) reads it from the recipe,
-            // a Mono instance (M10) from the instance, else the fn's own sig — all via
+            // + get_tag layout). A DERIVED `cmp` (`fn_id == 0`) reads it from the recipe,
+            // a Mono instance from the instance, else the fn's own sig — all via
             // `witnessRet`/`witnessCallee` (derive-first), so a source-less Ord witness resolves.
             const ret_ty = witnessRet(b, m);
             const callee: Link.SymName = witnessCallee(b, m);
@@ -902,7 +902,7 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
 }
 
 /// Lower `lhs <op> rhs` for a NON-inline arithmetic operand kind (struct/enum), producing the
-/// aggregate result as a `.slot` Operand (M17). `+`/`-`/`*`/`/` map to the resolved
+/// aggregate result as a `.slot` Operand. `+`/`-`/`*`/`/` map to the resolved
 /// Add/Sub/Mul/Div witness, emitted as `witness(self-by-value, rhs) -> ret_slot`, byte-identical
 /// to the general aggregate-return call path and to the `p.add(q)` method form. int is never
 /// routed here (it stays the inline machine op in `lowerBinary`). The witness `ret_ty` comes off
@@ -941,7 +941,7 @@ fn lowerArithValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index,
     }
 }
 
-/// Heap-free lexicographic 3-way str comparison (M16), extending `lowerStrEq`'s `load_byte`
+/// Heap-free lexicographic 3-way str comparison, extending `lowerStrEq`'s `load_byte`
 /// idiom: walk both byte spans in lockstep in a slot-counter loop, yielding an int
 /// discriminant (0=lt/1=eq/2=gt) through a join block param. A pure function of source
 /// (slot-counter + br-arg joins), so it is `--verify`-stable. Zero-extended bytes (0..255)
@@ -965,7 +965,7 @@ fn lowerStrCmp(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutO
 }
 
 /// Heap-free lexicographic 3-way str comparison given the ADDRESSES of two `{ptr@0, len@8}`
-/// headers (M19, factored out of `lowerStrCmp` mirroring `strEqAtPtrs`): the byte loop above,
+/// headers (factored out of `lowerStrCmp` mirroring `strEqAtPtrs`): the byte loop above,
 /// yielding an int discriminant (0=lt/1=eq/2=gt) through a join block param. Pure of source, so
 /// `--verify`-stable. Reused by the auto-derive Ord emitter for a `str` FIELD (base =
 /// `field_addr(self, off)`), where there is no slot to name — only an address.
@@ -1065,7 +1065,7 @@ fn strCmpAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMe
     return merge;
 }
 
-/// Heap-free str equality (M15): compare lengths, then bytes at `ptr + i` via `load_byte`
+/// Heap-free str equality: compare lengths, then bytes at `ptr + i` via `load_byte`
 /// in a slot-counter loop, merging the bool result through a join block param. Built with
 /// the exact `lowerFor` (slot counter) + `lowerAndOrValue` (br-arg block-param join) idioms
 /// so it is a pure function of source (deterministic, `--verify`-stable). Returns the bool
@@ -1090,7 +1090,7 @@ fn lowerStrEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOf
 }
 
 /// Heap-free str equality of two str aggregates given the ADDRESSES of their
-/// `{ptr@0, len@8}` headers (M15, factored out of `lowerStrEq` for M18): compare
+/// `{ptr@0, len@8}` headers (factored out of `lowerStrEq`): compare
 /// lengths, then bytes at `ptr + i` via `load_byte` in a slot-counter loop, merging the
 /// bool through a join block param. Pure of source (slot-counter + br-arg joins), so
 /// `--verify`-stable. Reused by the auto-derive emitter for a `str` FIELD (base =
@@ -1169,7 +1169,7 @@ fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMem
 }
 
 /// The emitted callee for a resolved conformance-witness `Method`: a derived unit's
-/// synthetic name (M18), a Mono instance's mangled name (M10), else the fn's global
+/// synthetic name, a Mono instance's mangled name, else the fn's global
 /// SymName. `derive` is checked FIRST (a derive Method has `fn_id == 0`, which would
 /// otherwise mis-resolve to `names[0]`). Shared by `lowerStructEq` (top-level `==`) and
 /// `structEqAtSlots` (an aggregate FIELD of a derived struct) so both pick the same
@@ -1181,7 +1181,7 @@ fn witnessCallee(b: *Builder, m: Typecheck.Method) Link.SymName {
 }
 
 /// The ret type of a resolved conformance-witness `Method`: a source-less derive's recipe
-/// `ret` (M19 — a derived `cmp`/`eq` witness has `fn_id == 0`, which would otherwise mis-read
+/// `ret` (a derived `cmp`/`eq` witness has `fn_id == 0`, which would otherwise mis-read
 /// `sigs[0].ret` and mis-size the ret_slot / `get_tag` layout), a Mono instance's ret, else
 /// the fn's own sig ret. Shared by every witness CALL that must size a ret_slot from the
 /// witness return type. `derive` is checked FIRST (mirroring `witnessCallee`).
@@ -1192,7 +1192,7 @@ fn witnessRet(b: *Builder, m: Typecheck.Method) Typecheck.Type {
 }
 
 /// Struct/enum equality of two operands already MATERIALIZED into slots `lslot`/`rslot`
-/// (M18): resolve the `Eq` witness and call `witness(lslot, rslot) -> bool`, or (an
+///: resolve the `Eq` witness and call `witness(lslot, rslot) -> bool`, or (an
 /// Ord-only type: the Ord-refinement filled `(Eq,T)` but added no `eq` method) call the
 /// `cmp` witness, read the returned `Ordering` tag, and compare `== eq`. The
 /// slot-operand sibling of `lowerStructEq`/`lowerCmpDiscriminant`, so the auto-derive
@@ -1214,7 +1214,7 @@ fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.
         .one => |m| {
             // `==` as `cmp(a,b) == Ordering.eq`: the witness returns `Ordering`, whose ret
             // carries the enum type (the ret_slot ABI + `get_tag` layout). A DERIVED `cmp`
-            // (M19, `fn_id == 0`) reads it from the recipe via `witnessRet` (derive-first).
+            // (`fn_id == 0`) reads it from the recipe via `witnessRet` (derive-first).
             const ret_ty = witnessRet(b, m);
             const callee = witnessCallee(b, m);
             const args = try b.gpa.alloc(Ir.Operand, 2);
@@ -1239,7 +1239,7 @@ fn structEqAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.
 }
 
 /// The bool eq of struct field `i` (at byte `off`, type `fty`) between the two receiver
-/// bases (M18): int/bool inline `icmp eq`; `str` via the `{ptr,len}` byte-loop
+/// bases: int/bool inline `icmp eq`; `str` via the `{ptr,len}` byte-loop
 /// (`strEqAtPtrs`); a struct/enum field is copied into fresh temp slots (a `field_addr`
 /// is a ptr VALUE, not a slot operand — the ABI needs the field's own slot) then routed
 /// through `structEqAtSlots`. Unit fields are rejected by T0007, so never occur.
@@ -1307,7 +1307,7 @@ fn emitVariantLadder(
     }
 }
 
-/// Payload-enum structural `Eq` (M19): equal iff the discriminants match AND, for that
+/// Payload-enum structural `Eq`: equal iff the discriminants match AND, for that
 /// variant, every payload field is equal. A `get_tag` compare gates a tag-dispatch ladder
 /// (fixed variant-decl order) where each variant's payload fields multiply-accumulate to a
 /// bool; every path delivers the bool through the join's merge param. Pure of `(layout,
@@ -1376,7 +1376,7 @@ fn threeWayInt(b: *Builder, lv: Ir.ValueId, rv: Ir.ValueId) error{OutOfMemory}!I
 }
 
 /// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of field `i` (at byte `off`, type
-/// `fty`) between the two receiver bases (M19): int/bool via the branch-free `threeWayInt`;
+/// `fty`) between the two receiver bases: int/bool via the branch-free `threeWayInt`;
 /// `str` via the `{ptr,len}` lexicographic byte-loop (`strCmpAtPtrs`); a struct/enum field is
 /// copied into fresh temp slots then routed through `cmpAtSlots`. Unit fields are rejected by
 /// T0007, so never occur. Mirrors `deriveFieldEq`.
@@ -1414,7 +1414,7 @@ fn deriveFieldCmp(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Valu
     }
 }
 
-/// The int 3-way `Ord` discriminant of two operands already MATERIALIZED into slots (M19):
+/// The int 3-way `Ord` discriminant of two operands already MATERIALIZED into slots:
 /// resolve the `cmp` witness, call `cmp(lslot, rslot) -> Ordering`, and `get_tag` its result.
 /// The slot-operand sibling of `lowerCmpDiscriminant`, so the auto-derive Ord emitter's
 /// aggregate FIELD path stays in lockstep with the top-level `<`. Ret sized via `witnessRet`
@@ -1443,7 +1443,7 @@ fn cmpAtSlots(b: *Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotI
 }
 
 /// Emit a lexicographic short-circuit chain over `ftys` (at `base_off + offs[i]`), delivering
-/// the deciding 3-way discriminant to `join` (M19): the FIRST non-`eq` field decides; a tie
+/// the deciding 3-way discriminant to `join`: the FIRST non-`eq` field decides; a tie
 /// falls through to the next; the LAST field's cmp is the answer regardless. An empty field
 /// list delivers `eq`. Reused for a struct (base_off 0) and a variant payload (base_off =
 /// `payload_off`). Pure of `(layout, method table)`, so `--verify`-stable.
@@ -1475,7 +1475,7 @@ fn deriveLexChain(b: *Builder, ftys: []const Typecheck.Type, offs: []const u32, 
     }
 }
 
-/// Payload-enum structural `Ord` (M19): compare discriminants (case-declaration order) first;
+/// Payload-enum structural `Ord`: compare discriminants (case-declaration order) first;
 /// on equal tag compare that variant's payload lexicographically — the SE-0266 total order.
 /// Delivers the deciding 3-way discriminant to `join`. A tag-dispatch ladder (fixed
 /// variant-decl order) mirrors `deriveEnumEq`.
@@ -1510,7 +1510,7 @@ fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_
 // walk that hands out ids monotonically and reads no map, so a double-lower is byte-identical
 // under `-jN`.
 
-/// Lower a SOURCE-LESS auto-derive `Eq` unit (M18): the spike's layout-walking emitter.
+/// Lower a SOURCE-LESS auto-derive `Eq` unit: the spike's layout-walking emitter.
 /// Two params (the two receiver values, by slot), a single straight-line
 /// multiply-accumulate over the struct's fields (`acc *= field_eq`, then
 /// `ret = acc != 0`) — no `cond_br` except the self-contained str/aggregate sub-graphs,
@@ -1572,7 +1572,7 @@ pub fn lowerDeriveEq(
                 const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
                 break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
             }
-            // Payload enum (M19): equal iff the tags match AND, for that variant, every
+            // Payload enum: equal iff the tags match AND, for that variant, every
             // payload field is equal. The tag-dispatch ladder + join deliver the bool.
             break :blk try deriveEnumEq(&b, cty, self_base, other_base);
         },
@@ -1588,7 +1588,7 @@ pub fn lowerDeriveEq(
     return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
-/// Lower a SOURCE-LESS auto-derive `Ord` unit (M19): a layout-walking emitter returning the
+/// Lower a SOURCE-LESS auto-derive `Ord` unit: a layout-walking emitter returning the
 /// prelude `Ordering` value. Two params (the two receivers, by slot). A shared `join` block
 /// carries the deciding 3-way discriminant; a struct emits a lexicographic short-circuit chain
 /// over its fields (declaration order), a payload enum compares discriminants then the equal
@@ -1658,7 +1658,7 @@ pub fn lowerDeriveOrd(
     return try finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
-/// Fold one more field/tag into the running hash: `h := h*MULT + add_val` (M20). The
+/// Fold one more field/tag into the running hash: `h := h*MULT + add_val`. The
 /// single mixing primitive of the structural `Hash` derive; `MULT` is re-materialized at
 /// each use (a pure iconst the opt folds), so the emitter reads no shared state and a
 /// double-lower is byte-identical. Wraps past i64 via the IR's wrapping `*`/`+` (never
@@ -1671,7 +1671,7 @@ fn hashCombine(b: *Builder, h: Ir.ValueId, add_val: Ir.ValueId) error{OutOfMemor
 }
 
 /// Heap-free per-byte hash of a str aggregate given the ADDRESS of its `{ptr@0, len@8}`
-/// header (M20): fold each byte with a fixed-seed polynomial `h := h*MULT + byte` in a
+/// header: fold each byte with a fixed-seed polynomial `h := h*MULT + byte` in a
 /// slot-counter loop, mirroring `strEqAtPtrs`'s `load_byte` walk (slot induction var +
 /// slot accumulator). Pure of source (deterministic block/slot ids), so `--verify`-stable.
 /// An empty string hashes to `str_hash_seed` (the loop runs zero times). Returns the int
@@ -1735,7 +1735,7 @@ fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     return try b.emit(.{ .load = .{ .addr = ha_f, .ty = int_ty } }, int_ty);
 }
 
-/// The int hash of an aggregate operand already MATERIALIZED into slot `slot` (M20):
+/// The int hash of an aggregate operand already MATERIALIZED into slot `slot`:
 /// resolve the `hash` witness and call `witness(slot) -> int`. The slot-operand sibling of
 /// the top-level derive, so a nested aggregate FIELD stays in lockstep with the callee's own
 /// derived unit. A miss is unreachable for a conforming field (the synthesis barrier proved
@@ -1759,7 +1759,7 @@ fn hashAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemor
 }
 
 /// The int hash of struct field `i` (at byte `off`, type `fty`) of receiver base `self_base`
-/// (M20): int/bool hash to their own loaded VALUE (identity — an int is its own hash, a bool
+///: int/bool hash to their own loaded VALUE (identity — an int is its own hash, a bool
 /// is 0/1); `str` via the `{ptr,len}` byte polynomial (`hashStrAtPtr`); a struct/enum field is
 /// copied into a fresh temp slot then routed through `hashAtSlot`. Unit fields are rejected by
 /// T0007, so never occur. Mirrors `deriveFieldEq`/`deriveFieldCmp` (single receiver — hash is
@@ -1791,7 +1791,7 @@ fn deriveFieldHash(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
 }
 
 /// Fold variant `vi`'s active payload into the running hash `h0` and deliver the result to
-/// `join` (M20): an empty variant delivers `h0` unchanged; else each payload field
+/// `join`: an empty variant delivers `h0` unchanged; else each payload field
 /// multiply-accumulates. Mirrors `emitVariantPayloadEq`.
 fn emitVariantPayloadHash(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, h0: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
     const v = e.variants[vi];
@@ -1803,7 +1803,7 @@ fn emitVariantPayloadHash(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_
     try brTo(b, join, .{ .value = h });
 }
 
-/// Payload-enum structural `Hash` (M20): fold the discriminant into the fixed seed
+/// Payload-enum structural `Hash`: fold the discriminant into the fixed seed
 /// (`combine(seed, tag)`), then dispatch on the tag (case-declaration order) to fold the
 /// ACTIVE variant's payload into that base. A tag-dispatch ladder + a shared int `join`
 /// merges each variant's result — the SAME structure `deriveEnumEq` uses, so the walked
@@ -1828,7 +1828,7 @@ fn deriveEnumHash(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId) error
     return merge;
 }
 
-/// Lower a SOURCE-LESS auto-derive `Hash` unit (M20): a layout-walking emitter returning an
+/// Lower a SOURCE-LESS auto-derive `Hash` unit: a layout-walking emitter returning an
 /// int. ONE param (the receiver, by slot). A struct folds a fixed seed through its fields in
 /// layout order (`h := h*MULT + fieldhash`); an empty-payload enum folds the discriminant
 /// (`combine(seed, tag)`); a payload enum folds the discriminant then the active variant's
@@ -1921,7 +1921,7 @@ fn emitPrintSlot(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
     _ = try b.emit(.{ .call = .{ .callee = print_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
 }
 
-/// Write a COMPILE-TIME byte string directly to fd 1 (M22): register it as a fn literal
+/// Write a COMPILE-TIME byte string directly to fd 1: register it as a fn literal
 /// (content-hash keyed, deduped), build a transient `str {ptr@0,len@8}` slot pointing at
 /// it, and `print` those bytes. `bytes` is BORROWED (a layout name / a fixed separator);
 /// it is duped into the owned literal table. An empty string is a no-op (no spurious call).
@@ -1941,7 +1941,7 @@ fn emitWriteLiteral(b: *Builder, bytes: []const u8) error{OutOfMemory}!void {
     try emitPrintSlot(b, slot);
 }
 
-/// Display an `int` VALUE by calling the hand-asm `__display_int` builtin (M22). The value
+/// Display an `int` VALUE by calling the hand-asm `__display_int` builtin. The value
 /// travels in the first int-arg register; the builtin formats + writes it. Ret unit.
 fn emitDisplayIntValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
     const args = try b.gpa.alloc(Ir.Operand, 1);
@@ -1950,7 +1950,7 @@ fn emitDisplayIntValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
     _ = try b.emit(.{ .call = .{ .callee = display_int_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
 }
 
-/// Display a `bool` VALUE inline (M22): `cond_br` on the value to a `true`/`false` literal
+/// Display a `bool` VALUE inline: `cond_br` on the value to a `true`/`false` literal
 /// write, then join. Leaves the cursor at the join block so the caller keeps emitting.
 fn emitDisplayBoolValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
     const t_blk = try b.addBlock();
@@ -1966,7 +1966,7 @@ fn emitDisplayBoolValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void {
     b.switchTo(join);
 }
 
-/// Display an aggregate operand already MATERIALIZED into slot `slot` (M22): resolve the
+/// Display an aggregate operand already MATERIALIZED into slot `slot`: resolve the
 /// `display` witness and call `witness(slot) -> ()`, which writes the value's rendering to
 /// fd 1. The slot-operand sibling of the top-level derive, so a nested aggregate FIELD
 /// stays in lockstep with the callee's own derived unit. A miss is unreachable for a
@@ -1987,7 +1987,7 @@ fn displayAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMe
     }
 }
 
-/// Display field `i` (at byte `off`, type `fty`) of receiver base `self_base` (M22):
+/// Display field `i` (at byte `off`, type `fty`) of receiver base `self_base`:
 /// int/bool render inline (via `__display_int` / the bool cond); a `str` field writes its
 /// raw bytes (the SAME `str {ptr,len}` write path a top-level `str` uses — no quotes); a
 /// struct/enum field is copied into a fresh temp slot then routed through `displayAtSlot`.
@@ -2029,7 +2029,7 @@ fn deriveFieldDisplay(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.
     }
 }
 
-/// Render variant `vi`'s active payload to fd 1 and branch to `join` (M22): write the
+/// Render variant `vi`'s active payload to fd 1 and branch to `join`: write the
 /// bare `variant` name, and for a payload variant `variant(<v0>, <v1>)` (fields in
 /// declaration order, `, `-separated), using ABSOLUTE payload offsets. Mirrors
 /// `emitVariantPayloadEq`'s ladder-arm shape but writes for effect (unit).
@@ -2047,7 +2047,7 @@ fn emitVariantDisplay(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_base
     if (!b.termSet()) try brTo(b, join, .none);
 }
 
-/// Lower a SOURCE-LESS auto-derive `Display` unit (M22): a unit-returning, layout-walking
+/// Lower a SOURCE-LESS auto-derive `Display` unit: a unit-returning, layout-walking
 /// emitter that WRITES the value's structural rendering directly to the output fd — never a
 /// returned `str`. ONE param (the receiver, by slot). A struct writes `Name{field: <v>, ...}`
 /// (fields in layout order); a payload enum does a `get_tag` dispatch ladder writing a bare
@@ -2138,25 +2138,25 @@ fn genericParamCount(sig: Sig) u32 {
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
-    // A method call `recv.m(args)` (M8): dispatch to the method's mangled symbol and
+    // A method call `recv.m(args)`: dispatch to the method's mangled symbol and
     // PREPEND the receiver as the `self` arg (arg 0). `self_recv` set ⟺ this is a
     // method call; the receiver expr is lowered as arg 0 below.
     var self_recv: Ast.Index = Ast.none;
-    // A `mut self` method (M9): pass the receiver's ADDRESS (a place) as arg 0 instead
+    // A `mut self` method: pass the receiver's ADDRESS (a place) as arg 0 instead
     // of a by-value copy, so the callee mutates the caller's storage.
     var self_mut = false;
     if (methodGidOf(b, n)) |m| {
-        // Method dispatch (M8/M14): callee = the method's mangled global symbol; the
+        // Method dispatch: callee = the method's mangled global symbol; the
         // receiver is prepended as `self` in the arg build below. TRIED FIRST so an
         // explicit-protocol-args method call `v.into[int]()` (a `type_app` over a
         // `field_access`) is not misread as a generic FUNCTION call by the `type_app`
         // branch below. The receiver is the field_access's lhs — reached through the
         // `type_app` for the explicit-args shape, else the callee (field_access) directly.
-        // A method on a GENERIC-type instance (M10): the resolver returns the
+        // A method on a GENERIC-type instance: the resolver returns the
         // reified-dispatch entry carrying the mono `instance` index — dispatch to THAT
         // instance's mangled symbol (its own per-instance codegen unit), not the
-        // never-lowered template's `names[fn_id]`. A SOURCE-LESS derive Method (M18+,
-        // `fn_id == 0`) dispatches to its synthetic unit — a DIRECT `.hash()` call (M20) is
+        // never-lowered template's `names[fn_id]`. A SOURCE-LESS derive Method (
+        // `fn_id == 0`) dispatches to its synthetic unit — a DIRECT `.hash()` call is
         // the first derive method reached here (Eq/Ord fire only via operators), so use the
         // shared `witnessCallee` (derive-first) rather than `names[m.fn_id]` (would be
         // `names[0]` — a wrong-symbol miscompile).
@@ -2164,7 +2164,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         self_recv = if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
         self_mut = m.mut_self;
     } else if (callee_node.tag == .type_app) {
-        // A generic call `id[int](..)` (M2): the callee is a `type_app` whose base
+        // A generic call `id[int](..)`: the callee is a `type_app` whose base
         // identifier carries the template gid. Resolve to the reified instance's
         // mangled SymName by matching (gid + the concrete type-args the checker
         // wrote into node_types) against the instance table — a pure read of
@@ -2184,7 +2184,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         };
         callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
     } else if (builtinScalarEqCallee(b, n)) |ba| {
-        // A builtin scalar `.eq()` (M12/M15). int/bool lower to an inline `icmp eq` (no
+        // A builtin scalar `.eq()`. int/bool lower to an inline `icmp eq` (no
         // `.call`, no symbol/reloc — the recognizer is pure). str/unit route through the
         // SAME `lowerEqValue` the `==` operator uses (heap-free byte-compare / trivially
         // -true bconst), so `a.eq(b)` and `a == b` emit identical IR.
@@ -2196,7 +2196,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         }
         return try lowerEqValue(b, recv_ty, ba.recv, ba.arg, false);
     } else if (builtinScalarHashCallee(b, n)) |bh| {
-        // A builtin scalar `.hash()` (M20, completeness layer so `[T has Hash]` works at a
+        // A builtin scalar `.hash()` (completeness layer so `[T has Hash]` works at a
         // scalar T). No `.call`/symbol — like the scalar `.eq()`, the recognizer is pure:
         // int/bool hash to their own VALUE (identity — an int is its own hash, a bool is
         // 0/1); str folds its bytes via the SAME heap-free polynomial the derive uses
@@ -2220,7 +2220,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             },
         }
     } else if (optionResultMethodCallee(b, n)) |om| {
-        // A native inherent method on a reified `Option`/`Result` instance (M23): no
+        // A native inherent method on a reified `Option`/`Result` instance: no
         // `.call`/symbol — inline the tag test / payload load per the reified layout.
         return try lowerOptionResultMethod(b, n, om);
     } else {
@@ -2231,7 +2231,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             try b.note(n.main_token, "call target unsupported in lower");
             return .none;
         }
-        // The `print` builtin (M22) is a compiler-magic polymorphic dispatch by the single
+        // The `print` builtin is a compiler-magic polymorphic dispatch by the single
         // arg's type: `str` keeps the raw write-bytes path (falls through below); `int`/
         // `bool` render inline (heap-free) and a struct/enum routes to its resolved `Display`
         // witness. The checker already required the arg to conform to `Display`, so a
@@ -2275,7 +2275,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             }
         }
         if (callee_node.tag == .identifier and callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func])) {
-            // A bare inferred generic call `id(7)` (M3): the plain-identifier callee
+            // A bare inferred generic call `id(7)`: the plain-identifier callee
             // resolves to a generic template (its sig params carry `type_var`s). Re-run
             // the SHARED matcher over the value-arg node_types to pick the SAME instance
             // Pass C / scanCalls selected, then use its mangled name (mirroring the
@@ -2303,7 +2303,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     const result_ty = b.in.node_types[(node_idx).int()];
 
     // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot). For a
-    // method call the receiver is the FIRST arg (`self`, by value — reusing the M2
+    // method call the receiver is the FIRST arg (`self`, by value — reusing the
     // struct-arg reg-pair/sret path), followed by the source args in order.
     const arg_nodes = Ast.rangeSlice(b.in.tree, (n.rhs).int());
     const self_n: usize = if (self_recv != Ast.none) 1 else 0;
@@ -2375,7 +2375,7 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
     // construction. Distinguish by the receiver being a VALUE with a resolved method.
     // A native `Option`/`Result` method returning an enum payload (agg-T `unwrap`) ALSO
     // parses as `.call` over an unresolved field_access and has no `t.methods` entry, so
-    // exclude it explicitly (M23) — else it misroutes as a variant construction. Scalar-T
+    // exclude it explicitly — else it misroutes as a variant construction. Scalar-T
     // is unaffected (its result is int/bool, so `ty.kind != .@"enum"` short-circuits).
     return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
         b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null and
@@ -2388,11 +2388,11 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
 /// with a matching entry in the method table. A pure content-keyed lookup (no
 /// hashmap/thread order), so it is identical at any `-jN`. Returns the whole
 /// `Method` (not just `fn_id`) so the caller reads `mut_self` for the by-address
-/// receiver ABI (M9); `null`-semantics are unchanged for the ctor-call classifier.
+/// receiver ABI; `null`-semantics are unchanged for the ctor-call classifier.
 fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     // Two callee shapes are method dispatch: a bare `field_access` `v.m` (explicit args
     // null), and an explicit-protocol-args `type_app` over a `field_access` `v.m[int]`
-    // (M14). A qualified fn / qualified generic fn binds its field_access to `.func` and
+    //. A qualified fn / qualified generic fn binds its field_access to `.func` and
     // is NOT a method — exclude both shapes on that.
     var cn = b.in.tree.nodes[(n.lhs).int()];
     var fa_idx = n.lhs;
@@ -2414,7 +2414,7 @@ fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     }
     const recv = b.in.node_types[(cn.lhs).int()];
     // Dispatch through the real Method path for any nominal OR builtin scalar receiver
-    // (M12): a user `impl int has P` registered a real `fn_id` on `recv = Type.int`, so
+    //: a user `impl int has P` registered a real `fn_id` on `recv = Type.int`, so
     // the resolver selects it. A builtin scalar `eq` has NO method entry (the recognizer
     // is pure) → this misses → `lowerCall`'s `builtinScalarEqCallee` branch fires. Reject
     // only the non-dispatchable kinds (invalid/never/type_var/app never reach lower).
@@ -2438,7 +2438,7 @@ fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     return m;
 }
 
-/// A builtin scalar `eq` call `recv.eq(arg)` (M12): the callee is a `field_access` NOT
+/// A builtin scalar `eq` call `recv.eq(arg)`: the callee is a `field_access` NOT
 /// bound to a `.func`, the receiver types to a scalar the recognizer accepts, and there
 /// is exactly one arg (the checker already gated arity). Returns the receiver + arg
 /// nodes so `lowerCall` can emit an inline `icmp eq` (no `.call`, no external symbol, so
@@ -2454,7 +2454,7 @@ fn builtinScalarEqCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index, ar
     return .{ .recv = cn.lhs, .arg = args[0] };
 }
 
-/// A builtin scalar `.hash()` call `recv.hash()` (M20): the callee is a `field_access` NOT
+/// A builtin scalar `.hash()` call `recv.hash()`: the callee is a `field_access` NOT
 /// bound to a `.func`, the member is `hash`, the receiver types to a scalar the recognizer
 /// accepts, and there are zero args. Returns the receiver node so `lowerCall` can emit the
 /// identity value / byte polynomial / constant inline (no `.call`, no external symbol —
@@ -2471,7 +2471,7 @@ fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index }
     return .{ .recv = cn.lhs };
 }
 
-/// A native inherent method call on a reified `Option`/`Result` instance (M23): the
+/// A native inherent method call on a reified `Option`/`Result` instance: the
 /// callee is a `field_access` NOT bound to a `.func`, the receiver types to a reified
 /// enum whose `native_family` is set (the robust per-instance key — a user `enum Option`
 /// mangles to the same `Option$int` yet has `.none`), and the member is one of the 8
@@ -2491,13 +2491,13 @@ fn optionResultMethodCallee(b: *Builder, n: Ast.Node) ?OptResultCall {
     return .{ .recv = cn.lhs, .op = op };
 }
 
-/// Inline a native `Option`/`Result` method (M23). The receiver is materialized into a
+/// Inline a native `Option`/`Result` method. The receiver is materialized into a
 /// fresh slot (so a temporary construction receiver like `Option[int].some(40).unwrap()`
 /// works, not just a local), giving a base ptr for `get_tag` + the payload load. Variant
 /// 0 is the payload variant, 1 the absence/error (fixed by `registerPrelude`), so
 /// `tag == 0` means present. `is_some`/`is_ok` = `tag == 0`; `is_none`/`is_err` =
 /// `tag == 1`; `unwrap` cond-branches to a `.trap` on absence; `unwrap_or` merges the
-/// payload / the default through a join block-arg. Scalar-payload T only (the M23 accept
+/// payload / the default through a join block-arg. Scalar-payload T only (the accept
 /// set is int/bool); aggregate-payload T is deferred (the classifiers below already
 /// exclude native calls so it won't misroute as a variant construction).
 fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{OutOfMemory}!Ir.Operand {
@@ -2506,7 +2506,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
     const recv_ty = b.in.node_types[(om.recv).int()];
     const e = b.in.enum_layouts[recv_ty.enum_id];
 
-    // M23 ships scalar-payload `unwrap`/`unwrap_or` only: a non-scalar payload would
+    // The native path ships scalar-payload `unwrap`/`unwrap_or` only: a non-scalar payload would
     // truncate a str/aggregate to one 8-byte load, and an aggregate join block-arg
     // crashes codegen (unassigned value offset). The checker already rejects this with
     // T0018, so this is a defensive clean-fail should an aggregate reach `lower`.
@@ -2569,8 +2569,8 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
 }
 
 /// Load variant 0's (payload) single field from a reified `Option`/`Result` at `base`
-/// (M23): absolute offset `payload_off + variant0.offsets[0]`, typed by its field type.
-/// Scalar payload only; the M23 accept set is int/bool.
+///: absolute offset `payload_off + variant0.offsets[0]`, typed by its field type.
+/// Scalar payload only; the accept set is int/bool.
 fn loadNativePayload(b: *Builder, e: Typecheck.EnumLayout, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
     const payload_ty = e.variants[0].field_types[0];
@@ -2627,7 +2627,7 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         .match_expr => try lowerMatchInto(b, expr, dst_ptr, ty),
         .try_expr => try lowerTryInto(b, expr, dst_ptr, ty),
         .identifier => try copyAggInto(b, expr, dst_ptr, ty),
-        // An arithmetic operator on struct/enum operands (M17) desugars to an
+        // An arithmetic operator on struct/enum operands desugars to an
         // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
         // `.slot`, so copy those bytes into the destination like any other agg result.
         .binary => try copyAggInto(b, expr, dst_ptr, ty),
@@ -2732,7 +2732,7 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
 }
 
 /// The address of a slot's CONTENTS. For an ordinary slot that is `slot_addr(slot)`.
-/// For the `mut self` receiver slot (M9) the slot holds a POINTER to the caller's
+/// For the `mut self` receiver slot the slot holds a POINTER to the caller's
 /// place, so the address of the receiver's storage is that pointer — a `load` of
 /// `slot_addr(slot)`. Every non-mut fn has `mut_self_slot == none_slot`, which no
 /// live slot equals, so this collapses to a bare `slot_addr` (byte-identical).
@@ -2925,7 +2925,7 @@ fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typ
     b.switchTo(join);
 }
 
-/// A postfix `?` in VALUE context (M24). Mirrors `lowerMatchValue`: materialize the
+/// A postfix `?` in VALUE context. Mirrors `lowerMatchValue`: materialize the
 /// unwrapped payload via `lowerTryInto` — a scalar loads from a fresh slot; an
 /// aggregate (str/struct/enum) yields `Operand.slot`. The residual (`none`/`err`)
 /// arm early-returns from the enclosing fn inside `lowerTryInto`, so the value that
@@ -2956,7 +2956,7 @@ fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{Out
     }
 }
 
-/// Lower a postfix `?` writing the unwrapped payload into `dst_ptr` (M24). A pure
+/// Lower a postfix `?` writing the unwrapped payload into `dst_ptr`. A pure
 /// control-flow desugar over the reified `Option`/`Result` operand:
 ///
 ///   spill operand → get_tag → cond_br(tag != 1 ? happy : residual)
@@ -2965,7 +2965,7 @@ fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{Out
 ///               `br` to the exit (reusing the existing return edge).
 ///     happy:    extract variant-0's payload into `dst_ptr`; control continues.
 ///
-/// Handles AGGREGATE payloads via field_addr + `copy` (NOT the scalar-only M23 native
+/// Handles AGGREGATE payloads via field_addr + `copy` (NOT the scalar-only native
 /// `unwrap`). Variant 0 is the payload (some/ok), variant 1 the residual (none/err),
 /// fixed by `registerPrelude`.
 fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
@@ -3003,12 +3003,12 @@ fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typec
 }
 
 /// Build the enclosing return-type residual into a fresh `b.ret_type` slot and
-/// early-return it via the exit block (M24). `Option.none` is the tag alone;
+/// early-return it via the exit block. `Option.none` is the tag alone;
 /// `Result.err` is the tag plus a copy of the error payload from the operand's `err`
 /// variant. The residual is built from the RETURN enum's OWN layout (`rl`) — the
 /// operand and return enums may differ in size. When the error types MATCH, copying E
-/// across the two layouts is a plain byte copy (M24); when they DIFFER, the error is
-/// WIDENED via the `From` witness `RetErr.from(opErr)` (M25).
+/// across the two layouts is a plain byte copy; when they DIFFER, the error is
+/// WIDENED via the `From` witness `RetErr.from(opErr)`.
 fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok: u32) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
     if (b.ret_type.kind != .@"enum") {
@@ -3024,11 +3024,11 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
     _ = try b.emit(.{ .store = .{ .addr = ret_base, .val = tagv, .ty = int_ty } }, null);
 
     // Result: place the error payload into the return's `err` variant. Option's residual
-    // (`none`) is the tag alone. Two cases (M24 + M25):
+    // (`none`) is the tag alone. Two cases:
     //   * SAME error type -> a plain byte copy of E across the two (differently-sized)
-    //     layouts (M24). Src is sized by the operand's E, dst by the return's E — equal
-    //     here, but sized separately so the M25 branch below shares the same idiom.
-    //   * DIFFERING error types -> WIDEN via `RetErr.from(opErr)` (M25): materialize the
+    //     layouts. Src is sized by the operand's E, dst by the return's E — equal
+    //     here, but sized separately so the widening branch below shares the same idiom.
+    //   * DIFFERING error types -> WIDEN via `RetErr.from(opErr)`: materialize the
     //     operand's E into a slot, call the `From` witness `from(opErr) -> RetErr`, and copy
     //     its result into the return's err payload. The checker (typeOfTry) proved `RetErr has
     //     From[OpErr]` before this runs; a `.none`/`.ambiguous` resolution is an internal
@@ -3632,7 +3632,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                 .lt, .lt_eq, .gt, .gt_eq => {
                     // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
                     // str/struct/enum desugar via `lowerOrdValue`, then cond_br on the
-                    // produced bool (its current block is the desugar's tail) (M16).
+                    // produced bool (its current block is the desugar's tail).
                     const lt = b.in.node_types[(n.lhs).int()];
                     if (isInlineOrd(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
@@ -3748,13 +3748,13 @@ fn returnType(in: Inputs, proto: Ast.FnProto) Typecheck.Type {
     if (in.tree.nodes[(proto.ret_type).int()].tag == .literal_unit) return Typecheck.Type.unit;
     // Prefer the typecheck-resolved sig for EVERY kind: it carries the GLOBAL
     // struct/enum id (incl. a cross-module qualified `mod.Type`) so the ABI decision
-    // is taken on the correct layout, AND — for a monomorphized instance (M2) — it
+    // is taken on the correct layout, AND — for a monomorphized instance — it
     // is the SUBSTITUTED concrete type, so a ret spelled `T` (whose token would
     // otherwise fall to `typeFromRef`'s `int` default, miscompiling `id[bool]`/
     // `id[str]`) is resolved correctly. Byte-identical for a non-generic fn, whose
     // `s.ret` equals what `typeFromRef` would compute for the concrete spelling.
     if (in.sig) |s| {
-        std.debug.assert(!s.ret.isTypeVar() and !s.ret.isApp()); // reified-away before lower (M2/M4)
+        std.debug.assert(!s.ret.isTypeVar() and !s.ret.isApp()); // reified-away before lower
         return s.ret;
     }
     return typeFromRef(in, proto.ret_type);
@@ -3768,7 +3768,7 @@ fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
     // GLOBAL id for aggregates AND the SUBSTITUTED concrete type for an instance's
     // `T`-spelled param, so `id[bool]`/`id[str]` are not lost to the `int` default.
     if (in.sig) |s| if (slot < s.params.len) {
-        std.debug.assert(!s.params[slot].isTypeVar() and !s.params[slot].isApp()); // reified-away before lower (M2/M4)
+        std.debug.assert(!s.params[slot].isTypeVar() and !s.params[slot].isApp()); // reified-away before lower
         return s.params[slot];
     };
     if (param_node.int() < in.node_types.len) {
@@ -3997,7 +3997,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
 /// Like `expectLowered`, but resolves fns through the GRAPH-GLOBAL fn table
 /// (`res.fns`) so a method (declared inside an `impl`, absent from the program's
 /// direct children) — and a fn that CALLS one — lower with `names`/`sig` indexed by
-/// global fn id. Mirrors `Codegen.renderGraphIr`'s single-module path. The M9
+/// global fn id. Mirrors `Codegen.renderGraphIr`'s single-module path. The
 /// mut-self lowering lives on the method path, which the top-level `expectLowered`
 /// cannot reach.
 fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void {
@@ -4073,7 +4073,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
 }
 
 /// Like `expectLoweredG`, but returns the rendered IR as a gpa-owned string so a test
-/// can assert on SUBSTRINGS (used for the M15 desugar shapes, where the exact id
+/// can assert on SUBSTRINGS (used for the desugar shapes, where the exact id
 /// numbering is not the point). Caller frees the returned slice.
 fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) ![]u8 {
     const Lexer = @import("lex.zig");
@@ -4329,7 +4329,7 @@ test "M19: derivable struct `<` lowers to the derived cmp call + get_tag + `icmp
 test "M19: `==` on a derivable-Ord struct lowers via the derived cmp call + `icmp eq`" {
     const gpa = testing.allocator;
     // `<` derives Ord, which fills `(Eq, P)`; `==` then routes through the same derived cmp
-    // (no separate Eq witness) — the M16 refinement path over a SOURCE-LESS witness.
+    // (no separate Eq witness) — the refinement path over a SOURCE-LESS witness.
     const ir = try renderLoweredG(gpa,
         \\struct P { x: int }
         \\fn use_both(p: P, q: P) -> int {
@@ -4433,7 +4433,7 @@ test "M25: a `?` on a SAME-error-type Result stays a plain copy (no From witness
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, from_impl_src, "same");
     defer gpa.free(ir);
-    // The M24 identity path: the err payload is copied unchanged across the two layouts —
+    // The identity path: the err payload is copied unchanged across the two layouts —
     // no `from` witness is resolved or called.
     try testing.expect(std.mem.indexOf(u8, ir, "from") == null);
 }
