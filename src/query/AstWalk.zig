@@ -31,7 +31,8 @@ const Mono = @import("../symbols/Mono.zig");
 const Infer = @import("../symbols/Infer.zig");
 
 pub const Sig = @import("../symbols/Sig.zig").Sig;
-pub const TouchedType = @import("Fingerprint.zig").TouchedType;
+const Fingerprint = @import("Fingerprint.zig");
+pub const TouchedType = Fingerprint.TouchedType;
 
 /// Fixed sentinel params for the builtin scalar `eq` fold. FILE-SCOPE (not a stack
 /// temporary) because `Fingerprint.fingerprint` reads each folded `Sig.params` AFTER the
@@ -794,7 +795,7 @@ fn genericParamCount(sig: Sig) u32 {
 /// node's `node_types[idx]` (guarded `idx < len`); at a `.type_ref` event the
 /// OWNING fn's sig param/return type (falling back to a bare-name re-scan when no
 /// sig is threaded). Owns the layout slices it appends (free via
-/// `Walks.freeTouched`). Generic over the frozen view.
+/// `freeTouched`). Generic over the frozen view.
 pub fn TouchedVisitor(comptime Frozen: type) type {
     return struct {
         const Self = @This();
@@ -864,6 +865,89 @@ pub fn appendTouched(gpa: std.mem.Allocator, frozen: anytype, ty: Typecheck.Type
         return;
     }
     try out.append(gpa, .{ .kind = ty.kind });
+}
+
+/// Collect the signatures of every function `idx` calls, in body walk order (the
+/// order `Fingerprint.fingerprint`'s (b) component expects) by riding the one AST
+/// walk here — so there is no second hand-mirrored walk to drift from the fold.
+///
+/// `fn_sig` threads in the OWNING fn's signature so the `?`-widen fold can read the
+/// enclosing fn's reified return-Result error type — the target a widening `?` converts
+/// INTO via `From`. It is the fn's typecheck Sig when known; null elsewhere (a `null` sig
+/// folds no `?` witness, so those fingerprints stay byte-identical).
+pub fn walkCalls(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, fn_sig: ?Sig, out: *std.ArrayList(Sig)) !void {
+    const Frozen = @TypeOf(frozen.*);
+    var v = CallVisitor(Frozen){ .gpa = gpa, .frozen = frozen, .fn_sig = fn_sig, .out = out };
+    try walk(.{ .tree = frozen.tree, .tokens = frozen.tokens, .source = frozen.source }, idx, &v);
+}
+
+/// Collect the types `idx` touches (its node types under the subtree, in walk order),
+/// each as a `TouchedType` carrying — for an aggregate — an index-free layout descriptor
+/// so a field-layout edit flips every using fn's hash. Feeds the fingerprint's (c)
+/// component. Caller frees each `layout` slice (see `freeTouched`).
+///
+/// `fn_sig` threads in the OWNING fn's signature so the fn_decl case folds the
+/// ABI-correct param/return types. Its `params`/`ret` carry the GLOBAL struct/enum ids the
+/// typechecker resolved — including a CROSS-MODULE qualified type-ref `b: rect.Rect` which
+/// a bare-name scan would otherwise mis-resolve to the FIRST same-named type in the
+/// program-wide layout table. Folding the sig types makes a pub-type LAYOUT edit reach
+/// EXACTLY the importers that name it.
+pub fn walkTouchedSig(gpa: std.mem.Allocator, frozen: anytype, idx: Ast.Index, fn_sig: ?Sig, out: *std.ArrayList(TouchedType)) error{OutOfMemory}!void {
+    const Frozen = @TypeOf(frozen.*);
+    var v = TouchedVisitor(Frozen){ .gpa = gpa, .frozen = frozen, .fn_sig = fn_sig, .out = out };
+    try walk(.{ .tree = frozen.tree, .tokens = frozen.tokens, .source = frozen.source }, idx, &v);
+}
+
+/// Free the layout slices owned by a `walkTouchedSig` result.
+pub fn freeTouched(gpa: std.mem.Allocator, items: []const TouchedType) void {
+    for (items) |t| if (t.layout.len > 0) gpa.free(t.layout);
+}
+
+/// Build the ordered `TouchedType` list for a monomorphized instance's concrete
+/// type-args, each carrying its full index-free layout descriptor via the same
+/// `appendTouched` the (c) touched fold uses. Fed into `fingerprint`'s (d) component so
+/// `id[int]` and `id[Point]` diverge and a struct-layout edit to a type-arg invalidates
+/// exactly the dependent instance. Empty for a non-generic fn. Caller frees via `freeTouched`.
+pub fn walkTypeArgs(gpa: std.mem.Allocator, frozen: anytype, args: []const @import("../layout/Engine.zig").Type, out: *std.ArrayList(TouchedType)) error{OutOfMemory}!void {
+    for (args) |a| try appendTouched(gpa, frozen, a, out);
+}
+
+/// Build the ordered `Fingerprint.ResolvedConformance` list for a monomorphized
+/// instance's resolved `[T has P]` bounds, fed into `fingerprint`'s (e) component. Each
+/// entry's `conform` is the conforming type's index-free layout descriptor built by the
+/// SAME `appendTouched` the type-arg (d) fold uses; `protocol_name` and `witness_syms` are
+/// borrowed from the `Mono.ResolvedConformance` (both outlive codegen). Empty for a
+/// non-bounded instance. Caller frees via `freeConformances`.
+pub fn walkConformances(gpa: std.mem.Allocator, frozen: anytype, conformances: []const Mono.ResolvedConformance, out: *std.ArrayList(Fingerprint.ResolvedConformance)) error{OutOfMemory}!void {
+    for (conformances) |rc| {
+        var tmp: std.ArrayList(TouchedType) = .empty;
+        defer tmp.deinit(gpa);
+        try appendTouched(gpa, frozen, rc.conform_ty, &tmp);
+        // The conformance's protocol type-args, each as an index-free layout descriptor
+        // built by the SAME `appendTouched` -> the (e) fold distinguishes `Into[int]` from
+        // `Into[bool]`. OWNED (freed via `freeConformances`).
+        var pargs: std.ArrayList(TouchedType) = .empty;
+        errdefer {
+            freeTouched(gpa, pargs.items);
+            pargs.deinit(gpa);
+        }
+        for (rc.protocol_args) |pa| try appendTouched(gpa, frozen, pa, &pargs);
+        // Reserve the out slot BEFORE detaching pargs so the append can't fail once
+        // ownership of pargs_owned + tmp.items[0].layout has left the errdefer's cover.
+        try out.ensureUnusedCapacity(gpa, 1);
+        const pargs_owned = try pargs.toOwnedSlice(gpa);
+        out.appendAssumeCapacity(.{ .protocol_name = rc.protocol_name, .conform = tmp.items[0], .witness_syms = rc.witness_syms, .protocol_args = pargs_owned });
+    }
+}
+
+/// Free the conform-layout + protocol-arg-layout slices owned by a `walkConformances`
+/// result (the outer list is caller-owned; `protocol_name`/`witness_syms` are borrowed).
+pub fn freeConformances(gpa: std.mem.Allocator, items: []const Fingerprint.ResolvedConformance) void {
+    for (items) |c| {
+        if (c.conform.layout.len > 0) gpa.free(c.conform.layout);
+        freeTouched(gpa, c.protocol_args);
+        if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
+    }
 }
 
 /// Index-free struct layout descriptor: name + per-field (name, kind, offset),
@@ -1212,7 +1296,6 @@ fn isPatternTag(tag: Ast.Node.Tag) bool {
 }
 
 test "[LEAK GUARD] TouchedVisitor layout slices round-trip through freeTouched" {
-    const Walks = @import("Walks.zig");
     const gpa = testing.allocator;
     // A fn touching a struct AND an enum so appendTouched allocates layout slices;
     // testing.allocator fails the test on any leak.
@@ -1246,7 +1329,7 @@ test "[LEAK GUARD] TouchedVisitor layout slices round-trip through freeTouched" 
 
     var touched: std.ArrayList(TouchedType) = .empty;
     defer touched.deinit(gpa);
-    defer Walks.freeTouched(gpa, touched.items);
+    defer freeTouched(gpa, touched.items);
 
     var frozen = FakeFrozen{ .tree = b.tree, .tokens = b.tokens, .source = b.source, .layouts = &layouts, .enum_layouts = &enum_layouts };
     // A sig naming the struct param and enum return drives both layout builders

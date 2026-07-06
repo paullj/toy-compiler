@@ -41,7 +41,6 @@ pub const Opt = @import("opt/Opt.zig");
 pub const lower = @import("lower.zig");
 pub const Fingerprint = @import("query/Fingerprint.zig");
 pub const AstWalk = @import("query/AstWalk.zig");
-pub const Walks = @import("query/Walks.zig");
 pub const Link = @import("link/Link.zig");
 pub const MachO = @import("link/MachO.zig");
 pub const CodeSign = @import("link/CodeSign.zig");
@@ -104,7 +103,6 @@ test {
     _ = lower;
     _ = Fingerprint;
     _ = AstWalk;
-    _ = Walks;
     _ = Link;
     _ = MachO;
     _ = CodeSign;
