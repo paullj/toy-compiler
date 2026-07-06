@@ -2967,6 +2967,14 @@ fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{Out
             return .{ .value = v };
         },
         .str, .@"struct", .@"enum" => return try aggregateValue(b, node_idx, ty),
+        .unit, .never => {
+            // The tag-test and residual early-return still matter; only the happy-path
+            // payload copy is a zero-size no-op. Mirror lowerMatchValue's .unit arm.
+            const slot = try b.addSlot(Typecheck.Type.int);
+            const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            try lowerTryInto(b, node_idx, dst, ty);
+            return .none;
+        },
         else => {
             try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "'?' payload type unsupported in lower");
             return .none;
@@ -4452,6 +4460,24 @@ test "M25: a `?` on a SAME-error-type Result stays a plain copy (no From witness
     // The M24 identity path: the err payload is copied unchanged across the two layouts —
     // no `from` witness is resolved or called.
     try testing.expect(std.mem.indexOf(u8, ir, "from") == null);
+}
+
+test "M24: `?` on a unit-payload Result still emits the residual early-return (no codegen diagnostic)" {
+    const gpa = testing.allocator;
+    // renderLoweredG asserts zero diagnostics; before the fix lowerTryValue had no `.unit`
+    // arm and dropped a note here, so a checker-accepted program aborted at codegen.
+    const ir = try renderLoweredG(gpa,
+        \\fn inner() -> Result[(), int] { return Result[(), int].err(7) }
+        \\fn outer() -> Result[int, int] {
+        \\ inner()?
+        \\ return Result.ok(0)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    , "outer");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "cond_br") != null);
 }
 
 test "lower-core: arithmetic return" {
