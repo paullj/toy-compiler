@@ -1803,6 +1803,14 @@ pub const BodyChecker = struct {
         // operation (substitute the params/ret through the explicit args, check the
         // value args) that writes only concrete types into `node_types`.
         if (callee.tag == .type_app) return bc.typeOfGenericCall(node_idx, n, callee);
+        return bc.typeOfDirectCall(node_idx, n);
+    }
+
+    /// The plain fn-callee tail of a call `f(args)`: the callee resolves directly
+    /// to a function (the construction / value-method / explicit-method / generic
+    /// dispatch cases in typeOfCall all declined). Recomputes the callee node.
+    fn typeOfDirectCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        const callee = bc.tree.nodes[(n.lhs).int()];
         const callee_res = bc.resolutions[(n.lhs).int()];
         if (callee_res != .func) {
             // Type the args anyway so their own errors surface, then poison.
