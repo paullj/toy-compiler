@@ -652,6 +652,22 @@ test "literals: the most-negative signed literal (int8 -128, int INT_MIN) is acc
     try testing.expect(std.mem.indexOf(u8, res.out, "T0034") == null);
 }
 
+test "literals: an unannotated literal past 2^64-1 reports T0034 (not a codegen note)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-int-unannotated-overflow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  x := 18446744073709551616\n  return 0\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0034") != null);
+    // The verdict now lives at the checker; the old codegen-time note is gone.
+    try testing.expect(std.mem.indexOf(u8, res.out, "out of range for codegen") == null);
+}
+
 test "literals: one past the signed min (int8 -129) still reports T0034" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

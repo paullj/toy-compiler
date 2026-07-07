@@ -61,22 +61,6 @@ pub const VariantForm = LayoutEngine.VariantForm;
 pub const VariantLayout = LayoutEngine.VariantLayout;
 pub const EnumLayout = LayoutEngine.EnumLayout;
 
-/// Pack a numeric-literal token into `buf`, dropping `_` digit separators, and return
-/// the packed slice (or null if it overflows `buf`). The single base-0 literal grammar
-/// shared by the checker's range gate (`BodyChecker.litMagnitude`, decoded as u128) and
-/// codegen lowering (`lower.parseInt`, decoded as u64) — one source so the two can never
-/// disagree on which literals are well-formed and desync the range check from codegen.
-pub fn stripIntSeparators(raw: []const u8, buf: []u8) ?[]const u8 {
-    var n: usize = 0;
-    for (raw) |c| {
-        if (c == '_') continue;
-        if (n >= buf.len) return null;
-        buf[n] = c;
-        n += 1;
-    }
-    return buf[0..n];
-}
-
 // Internal aliases for the checker's own scratch tables. These ARE the engine's
 // table types (the `Model` aliases them; `BodyChecker` reads `.state`/`.poisoned`/
 // `.field_*`/`.variants` through them at fingerprint + exhaustiveness time).

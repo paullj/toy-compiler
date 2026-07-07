@@ -19,6 +19,7 @@ const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const PatternChecker = @import("PatternChecker.zig");
+const Literal = @import("types/literal.zig");
 const Model = Typecheck.Model;
 const FnSym = Typecheck.FnSym;
 const LoopCtx = Typecheck.LoopCtx;
@@ -462,26 +463,6 @@ pub const BodyChecker = struct {
         return Type.invalid;
     }
 
-    /// The magnitude of a numeric-literal token (base-aware via `parseInt` base 0,
-    /// `_`-stripped) as a u128, or null if it does not parse or is absurdly long. u128
-    /// spans the full `uint64` range, so an over-range check is exact for every width.
-    fn litMagnitude(text: []const u8) ?u128 {
-        var buf: [128]u8 = undefined;
-        const s = Typecheck.stripIntSeparators(text, &buf) orelse return null;
-        return std.fmt.parseInt(u128, s, 0) catch null;
-    }
-
-    /// The maximum in-range magnitude for integer type `t`, derived from its bit width
-    /// (`Type.intBits`): signed spans `2^(bits-1)-1`, unsigned `2^bits-1`. Signed literals
-    /// (a negative `-128: int8`) are a documented M1 limitation — handled in M2.
-    fn maxMagnitude(t: Type) u128 {
-        const bits = t.intBits();
-        return if (t.int_desc.signed)
-            (@as(u128, 1) << @intCast(bits - 1)) - 1
-        else
-            (@as(u128, 1) << @intCast(bits)) - 1;
-    }
-
     /// Type a numeric literal token. Defaults to platform `int`, but adopts an
     /// `expected` integer WIDTH (`x: int8 = 100`, or a narrow-int match scrutinee) and
     /// range-checks the magnitude against it. Adopts the width even on a range error so
@@ -489,13 +470,21 @@ pub const BodyChecker = struct {
     /// mismatch. The single source shared by the expression `literal_number` arm and the
     /// PatternChecker numeric-pattern path (both must adopt + range-check identically).
     pub fn typeNumericLiteral(bc: *BodyChecker, main_token: u32, expected: ?Type) error{OutOfMemory}!Type {
+        const raw = bc.tokens[main_token].text(bc.source);
         if (expected) |e| if (e.isInteger()) {
-            const raw = bc.tokens[main_token].text(bc.source);
-            const in_range = if (litMagnitude(raw)) |v| v <= maxMagnitude(e) else false;
-            if (!in_range)
+            if (!Literal.fitsWidth(raw, e, false))
                 try bc.sink.emitFmtCode(.T0034, bc.byteOf(main_token), "literal out of range for type '{s}'", .{bc.typeName(e)});
             return e;
         };
+        // Unannotated default is platform `int`: route the range verdict through the
+        // SAME decode codegen uses (`Literal.value`), so a literal past 2^64-1 — which
+        // no 64-bit `iconst` can represent — is caught here instead of escaping to a
+        // codegen-time note. Adopt `int` on error, matching the annotated arm (no cascade).
+        // Only the truly unannotated case: a non-integer `expected` (e.g. `s: str = <over-u64>`,
+        // or an over-u64 pattern against a bool scrutinee) keeps relying on its own mismatch
+        // diagnostic — emitting T0034 there too would recreate the paired report this avoids.
+        if (expected == null and Literal.value(raw) == null)
+            try bc.sink.emitFmtCode(.T0034, bc.byteOf(main_token), "literal out of range for type '{s}'", .{bc.typeName(Type.int)});
         return Type.int;
     }
 
@@ -547,8 +536,7 @@ pub const BodyChecker = struct {
                     if (bc.expected) |e| if (e.isSigned()) {
                         const lit_tok = bc.tree.nodes[n.lhs.int()].main_token;
                         const raw = bc.tokens[lit_tok].text(bc.source);
-                        const in_range = if (litMagnitude(raw)) |v| v <= maxMagnitude(e) + 1 else false;
-                        if (!in_range)
+                        if (!Literal.fitsWidth(raw, e, true))
                             try bc.sink.emitFmtCode(.T0034, bc.byteOf(lit_tok), "literal out of range for type '{s}'", .{bc.typeName(e)});
                         bc.node_types[n.lhs.int()] = e;
                         break :blk e;
