@@ -1509,6 +1509,35 @@ test "integration: emitted binary runs with the right exit code" {
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n return if 1 <= x { 42 } else { 0 }\n}\n", .name = "uint64_le_unsigned", .expect = 42 },
         // UNSIGNED `>=` (M2, uge→hs): 2^63 >= 1 unsigned true, signed false. → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n return if x >= 1 { 42 } else { 0 }\n}\n", .name = "uint64_ge_unsigned", .expect = 42 },
+
+        // Into[T] WIDENING (M3): `small.into()` widens uint8→uint losslessly, driven by
+        // the `wide:` annotation. 200 round-trips → 42.
+        .{ .src = "fn main() -> int {\n small: uint8 = 200\n wide: uint = small.into()\n return if wide == 200 { 42 } else { 0 }\n}\n", .name = "into_widen", .expect = 42 },
+        // TryInto[T] OK (M3): 200 fits uint8 so `try_into().unwrap()` yields Ok(200) → 42.
+        .{ .src = "fn main() -> int {\n wide: uint = 200\n back: uint8 = wide.try_into().unwrap()\n return if back == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ok", .expect = 42 },
+        // TryInto[T] ERR (M3, same-sign narrowing): 300 does NOT fit uint8 ⇒ Err ⇒
+        // `unwrap_or(0)` gives 0. The negative range gate. → 0.
+        .{ .src = "fn main() -> int {\n wide2: uint = 300\n narrow: uint8 = wide2.try_into().unwrap_or(0)\n return if narrow == 0 { 0 } else { 1 }\n}\n", .name = "tryinto_err", .expect = 0 },
+        // TryInto[T] SIGN-FLIP ERR (M3, cross-sign block): -1→uint has `fits` true (same
+        // 64 bits) but v<0 signed ⇒ Err ⇒ `unwrap_or(9)` = 9. The exact case the
+        // sign-check block exists for. → 42.
+        .{ .src = "fn main() -> int {\n n: int = -1\n u: uint = n.try_into().unwrap_or(9)\n return if u == 9 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_err", .expect = 42 },
+        // TryInto[T] SIGN-FLIP OK (M3, cross-sign, same width, non-negative): 5→uint is
+        // Ok(5). → 42.
+        .{ .src = "fn main() -> int {\n n: int = 5\n u: uint = n.try_into().unwrap()\n return if u == 5 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_ok", .expect = 42 },
+        // Into[T] SIGNED WIDEN of a NEGATIVE value (M3): int16 -5 -> int drives the sxth
+        // sign-extend arm of `normalizeWidth` (the unsigned cases only exercise uxt). The
+        // widened register must read as -5 in the full 64-bit width. → 42.
+        .{ .src = "fn main() -> int {\n a: int16 = -5\n w: int = a.into()\n return if w == -5 { 42 } else { 0 }\n}\n", .name = "into_signed_widen_neg", .expect = 42 },
+        // Into[T] target from a RETURN type (M3): `a.into()` widens uint8->uint with the
+        // conversion target derived from `widen`'s return type, not a let-annotation. → 42.
+        .{ .src = "fn widen(a: uint8) -> uint {\n return a.into()\n}\nfn main() -> int {\n return if widen(200) == 200 { 42 } else { 0 }\n}\n", .name = "into_ret_pos", .expect = 42 },
+        // TryInto[T] target from a RETURN type (M3): the `try_into().unwrap()` payload
+        // target flows from `narrow`'s uint8 return type. 200 fits → Ok(200). → 42.
+        .{ .src = "fn narrow(w: uint) -> uint8 {\n return w.try_into().unwrap()\n}\nfn main() -> int {\n return if narrow(200) == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ret_pos", .expect = 42 },
+        // Into[T] target from a CALL-ARGUMENT slot (M3): `small.into()` widens uint8->uint
+        // with the target derived from `takes`'s param type. → 42.
+        .{ .src = "fn takes(u: uint) -> int {\n return if u == 200 { 42 } else { 0 }\n}\nfn main() -> int {\n small: uint8 = 200\n return takes(small.into())\n}\n", .name = "into_arg_slot", .expect = 42 },
     };
 
     for (cases, 0..) |c, i| {

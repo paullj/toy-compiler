@@ -4,7 +4,8 @@
 //! the prelude protocol ids are a pure function of source (no hashmap/thread input).
 //!
 //! The `ProtoSpec` table drives the whole protocol set in ONE append order that is
-//! LOAD-BEARING: `Eq=0, Ord=1, Add=2, Sub=3, Mul=4, Div=5, Hash=6, Display=7, From=8`.
+//! LOAD-BEARING: `Eq=0, Ord=1, Add=2, Sub=3, Mul=4, Div=5, Hash=6, Display=7, From=8,
+//! Into=9, TryInto=10` (`ConvErr` enum appended after `Result`).
 //! Codegen, operator lowering and the fingerprint fold all resolve witnesses by these
 //! ids, so the order must never shift. `Ordering` is built BEFORE the loop because
 //! `Ord.cmp`'s return type references its enum id; `Option`/`Result` are built AFTER so
@@ -26,11 +27,12 @@ const EnumSym = LayoutEngine.EnumSym;
 const ModuleCtx = Typecheck.GraphCtx.ModuleCtx;
 
 /// Which `Prelude.protocols` field a spec records its assigned id into.
-const Slot = enum { eq, ord, add, sub, mul, div, hash, display, from };
+const Slot = enum { eq, ord, add, sub, mul, div, hash, display, from, into, try_into };
 
 /// A prelude protocol's return-type shape. `ordering` is resolved to `Type.enumT(id)`
 /// against the runtime `Ordering` id; the rest are concrete or `Self` (`type_var(0)`).
-const Ret = enum { self_t, bool_t, int_t, unit_t, ordering_t };
+/// `dst_t` is the protocol's first generic arg (`Dst`, `type_var(1)`).
+const Ret = enum { self_t, bool_t, int_t, unit_t, ordering_t, dst_t };
 
 const ProtoSpec = struct {
     slot: Slot,
@@ -63,6 +65,13 @@ const specs = [_]ProtoSpec{
     .{ .slot = .hash, .name = "Hash", .method = "hash", .params = self_only, .ret = .int_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit } },
     .{ .slot = .display, .name = "Display", .method = "display", .params = self_only, .ret = .unit_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit } },
     .{ .slot = .from, .name = "From", .method = "from", .params = from_params, .ret = .self_t, .generic_params = &.{"Src"} },
+    .{ .slot = .into, .name = "Into", .method = "into", .params = self_only, .ret = .dst_t, .generic_params = &.{"Dst"} },
+    // `TryInto.try_into`'s declared ret `dst_t` (=`Dst`) is a deliberate PLACEHOLDER: the
+    // true `Result[Dst, ConvErr]` cannot be minted at registration (no `Composite`
+    // interner here) and is synthesized per call site (BodyChecker). M3 ships no user
+    // `impl .. has TryInto`, so `method_rets[try_into]` is never read; a future milestone
+    // wiring `try_into` through the explicit-args/bound path MUST fix this first.
+    .{ .slot = .try_into, .name = "TryInto", .method = "try_into", .params = self_only, .ret = .dst_t, .generic_params = &.{"Dst"} },
 };
 
 /// Register the whole prelude into the checker's global tables and return the discovered
@@ -92,6 +101,7 @@ pub fn register(
             .int_t => Type.int,
             .unit_t => Type.unit,
             .ordering_t => Type.enumT(ordering_id),
+            .dst_t => Type.typeVar(1),
         };
         const gparams: []const []const u8 = if (spec.generic_params.len > 0)
             try gpa.dupe([]const u8, spec.generic_params)
@@ -114,6 +124,7 @@ pub fn register(
     }
 
     try registerOptionResult(gpa, enums, mods, &prelude);
+    prelude.conv_err_enum = try registerConvErr(gpa, enums);
     return prelude;
 }
 
@@ -128,7 +139,43 @@ fn setSlot(p: *Prelude, slot: Slot, id: u32) void {
         .hash => p.protocols.hash = id,
         .display => p.protocols.display = id,
         .from => p.protocols.from = id,
+        .into => p.protocols.into = id,
+        .try_into => p.protocols.try_into = id,
     }
+}
+
+/// Native `enum ConvErr { out_of_range }`: the checker-internal error payload of a
+/// `try_into`'s synthesized `Result[Dst, ConvErr]`. Hand-laid-out (`state == .done`) like
+/// `Ordering`. Appended AFTER `Result` so no existing enum id shifts, and deliberately
+/// NOT injected into any module's `enum_ids` — it is never named in source, only minted
+/// by the `try_into` recognizer, so a user `enum ConvErr` never collides with it.
+fn registerConvErr(gpa: std.mem.Allocator, enums: *std.ArrayList(EnumSym)) !u32 {
+    return appendNativeUnitEnum(gpa, enums, "ConvErr", &.{"out_of_range"});
+}
+
+/// Append a native, AST-less all-unit-variant enum (`state == .done`, `size == 8`) whose
+/// tag is the variant DECL INDEX. The shared shape behind `Ordering` and `ConvErr`;
+/// generic value enums (`Option`/`Result`) don't fit (tuple payloads) and stay bespoke.
+/// Returns the new enum id. Injection into `mods.enum_ids` is left to the caller.
+fn appendNativeUnitEnum(
+    gpa: std.mem.Allocator,
+    enums: *std.ArrayList(EnumSym),
+    name: []const u8,
+    variant_names: []const []const u8,
+) !u32 {
+    const vars = try gpa.alloc(VariantSym, variant_names.len);
+    for (variant_names, 0..) |vn, i| vars[i] = .{ .name = vn, .form = .unit };
+    const id: u32 = @intCast(enums.items.len);
+    try enums.append(gpa, .{
+        .decl_node = Ast.none,
+        .name = name,
+        .mod = 0,
+        .pub_export = true,
+        .variants = vars,
+        .size = 8,
+        .state = .done,
+    });
+    return id;
 }
 
 /// Native `enum Ordering { lt, eq, gt }`: AST-less and hand-laid-out so Phase-0b
@@ -136,20 +183,7 @@ fn setSlot(p: *Prelude, slot: Slot, id: u32) void {
 /// (lt=0/eq=1/gt=2), which `get_tag` and the comparison desugar depend on. Universally
 /// nameable with no import (injected if-absent so a user `enum Ordering` shadow wins).
 fn registerOrdering(gpa: std.mem.Allocator, enums: *std.ArrayList(EnumSym), mods: []ModuleCtx) !u32 {
-    const ord_vars = try gpa.alloc(VariantSym, 3);
-    ord_vars[0] = .{ .name = "lt", .form = .unit };
-    ord_vars[1] = .{ .name = "eq", .form = .unit };
-    ord_vars[2] = .{ .name = "gt", .form = .unit };
-    const ordering_id: u32 = @intCast(enums.items.len);
-    try enums.append(gpa, .{
-        .decl_node = Ast.none,
-        .name = "Ordering",
-        .mod = 0,
-        .pub_export = true,
-        .variants = ord_vars,
-        .size = 8,
-        .state = .done,
-    });
+    const ordering_id = try appendNativeUnitEnum(gpa, enums, "Ordering", &.{ "lt", "eq", "gt" });
     for (mods) |*m| {
         if (m.enum_ids.get("Ordering") == null) try m.enum_ids.put(gpa, "Ordering", ordering_id);
     }
@@ -221,4 +255,42 @@ fn registerOptionResult(
     for (mods) |*m| {
         if (m.enum_ids.get("Result") == null) try m.enum_ids.put(gpa, "Result", result_id);
     }
+}
+
+const testing = std.testing;
+
+test "M3: Into=9/TryInto=10 after From; ConvErr appended after Result" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var protocols: std.ArrayList(ProtocolSym) = .empty;
+    var conformances: std.ArrayList(Conformance) = .empty;
+    var enums: std.ArrayList(EnumSym) = .empty;
+    var mods = [_]ModuleCtx{};
+
+    const prelude = try register(gpa, &protocols, &conformances, &enums, &mods);
+
+    // Appended after From=8, preserving every existing id.
+    try testing.expectEqual(@as(?u32, 8), prelude.protocols.from);
+    try testing.expectEqual(@as(?u32, 9), prelude.protocols.into);
+    try testing.expectEqual(@as(?u32, 10), prelude.protocols.try_into);
+
+    // Each carries generic_params={"Dst"} and registers NO builtin conformance rows.
+    inline for (.{ prelude.protocols.into.?, prelude.protocols.try_into.? }) |pid| {
+        const p = protocols.items[pid];
+        try testing.expectEqual(@as(usize, 1), p.generic_params.len);
+        try testing.expect(std.mem.eql(u8, p.generic_params[0], "Dst"));
+        for (conformances.items) |c| try testing.expect(c.protocol != pid);
+    }
+
+    // ConvErr is appended AFTER Result (highest enum id) with one unit variant, so no
+    // existing Ordering/Option/Result id shifts.
+    try testing.expect(prelude.conv_err_enum != null);
+    try testing.expect(prelude.conv_err_enum.? > prelude.result_enum.?);
+    try testing.expect(prelude.conv_err_enum.? > prelude.option_enum.?);
+    try testing.expectEqual(@as(u32, @intCast(enums.items.len - 1)), prelude.conv_err_enum.?);
+    const ce = enums.items[prelude.conv_err_enum.?];
+    try testing.expectEqual(@as(usize, 1), ce.variants.len);
+    try testing.expect(std.mem.eql(u8, ce.variants[0].name, "out_of_range"));
 }

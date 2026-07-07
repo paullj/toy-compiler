@@ -2241,6 +2241,10 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         // A native inherent method on a reified `Option`/`Result` instance: no
         // `.call`/symbol — inline the tag test / payload load per the reified layout.
         return try lowerOptionResultMethod(b, n, om);
+    } else if (builtinConvCallee(b, n)) |cv| {
+        // A target-directed `.into()`/`.try_into()` int conversion: no `.call`/symbol —
+        // inline the mask/extend or the range-checked `Result` build.
+        return try lowerConvMethod(b, node_idx, cv);
     } else {
         // The callee identifier resolves to a `.func` index into `names` (this also
         // covers the `print` builtin, whose name index points at the synthetic entry).
@@ -2395,9 +2399,13 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
     // parses as `.call` over an unresolved field_access and has no `t.methods` entry, so
     // exclude it explicitly — else it misroutes as a variant construction. Scalar-T
     // is unaffected (its result is int/bool, so `ty.kind != .@"enum"` short-circuits).
+    // A `.try_into()` returning `Result[T, ConvErr]` ALSO parses as `.call` over an
+    // unresolved field_access with no `t.methods` entry and is not an
+    // `optionResultMethodCallee`, so exclude it too — else it misroutes as a variant
+    // construction (silent miscompile).
     return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
         b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null and
-        optionResultMethodCallee(b, n) == null;
+        optionResultMethodCallee(b, n) == null and builtinConvCallee(b, n) == null;
 }
 
 /// The `Method` a method call `recv.m(args)` dispatches to, or null when `n` is
@@ -2487,6 +2495,26 @@ fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index }
     if (bm.arity != 0) return null;
     if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
     return .{ .recv = cn.lhs };
+}
+
+/// A target-directed `.into()` / `.try_into()` conversion call on an integer receiver
+/// (M3): the callee is a `field_access` NOT bound to a `.func`, the receiver types to an
+/// integer, the member is `into`/`try_into`, and there are zero args (the checker already
+/// gated arity + the target). Returns the receiver node + member so `lowerCall` can emit
+/// the inline mask/extend (`into`) or the range-checked `Result` build (`try_into`) — no
+/// `.call`, no external symbol, so it is a pure function of source (`--verify`-stable).
+/// Null when `n` is not such a call. A user `protocol Into` on a STRUCT never matches
+/// (integer-receiver guard), so it stays on the normal method-dispatch path.
+const ConvCall = struct { recv: Ast.Index, member: []const u8 };
+
+fn builtinConvCallee(b: *Builder, n: Ast.Node) ?ConvCall {
+    const cn = b.in.tree.nodes[(n.lhs).int()];
+    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
+    if (!b.in.node_types[(cn.lhs).int()].isInteger()) return null;
+    const member = b.in.tokens[cn.main_token].text(b.in.source);
+    if (!std.mem.eql(u8, member, "into") and !std.mem.eql(u8, member, "try_into")) return null;
+    if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
+    return .{ .recv = cn.lhs, .member = member };
 }
 
 /// A native inherent method call on a reified `Option`/`Result` instance: the
@@ -2584,6 +2612,81 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             return .{ .value = merge };
         },
     }
+}
+
+/// Re-canonicalize `v` to `ty`'s width via the existing `add v, 0` → `normalizeWidth`
+/// idiom (uxt/sxt), reused by both conversion arms (`into`'s source-width widen and
+/// `try_into`'s destination-width mask). No new IR op, so `--emit ir` goldens are stable.
+fn recanonToWidth(b: *Builder, v: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!Ir.ValueId {
+    const zero = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int);
+    return b.emit(.{ .add = .{ .lhs = v, .rhs = zero } }, ty);
+}
+
+/// Lower a target-directed int conversion (`.into()` / `.try_into()`). `into` widens
+/// losslessly: `add v, 0` typed to the SOURCE width re-canonicalizes the value (uxt/sxt
+/// via `normalizeWidth`), which is exactly the correct value in the wider destination.
+/// `try_into` builds a `Result[T, ConvErr]` into a fresh slot: `Ok(masked)` iff `masked`
+/// (v truncated+re-extended to T) equals v — and, for a cross-signedness pair, v is also
+/// non-negative read as signed — else `Err(ConvErr.out_of_range)`. The reified layout of
+/// the call's own result enum drives every tag/offset, so no prelude id is read here.
+fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const recv_ty = b.in.node_types[(cv.recv).int()];
+    const v = operandValue(try lowerExpr(b, cv.recv));
+
+    if (std.mem.eql(u8, cv.member, "into")) {
+        return .{ .value = try recanonToWidth(b, v, recv_ty) };
+    }
+
+    const call_ty = b.in.node_types[(node_idx).int()];
+    const e = b.in.enum_layouts[call_ty.enum_id];
+    const dst_T = e.variants[0].field_types[0];
+
+    const slot = try b.addSlot(call_ty);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+
+    const masked = try recanonToWidth(b, v, dst_T);
+    const fits = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = masked, .rhs = v } }, bool_ty);
+
+    const ok_blk = try b.addBlock();
+    const err_blk = try b.addBlock();
+    const join = try b.addBlock();
+
+    if (recv_ty.isSigned() == dst_T.isSigned()) {
+        b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
+    } else {
+        // Cross-signedness: `fits` alone misses the 64-bit int↔uint case (low bits
+        // coincide) and a large unsigned whose low bits sign-extend negative. Also require
+        // v to be non-negative read as signed.
+        const sign_blk = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = fits, .t = sign_blk, .f = err_blk } });
+        b.switchTo(sign_blk);
+        const z2 = try b.emit(.{ .iconst = 0 }, int_ty);
+        const nn = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = z2 } }, bool_ty);
+        b.setTerm(.{ .cond_br = .{ .cond = nn, .t = ok_blk, .f = err_blk } });
+    }
+
+    b.switchTo(ok_blk);
+    const ok_tag = try b.emit(.{ .iconst = 0 }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = base, .val = ok_tag, .ty = int_ty } }, null);
+    const ok_off = e.payload_off + e.variants[0].offsets[0];
+    const ok_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = ok_off, .ty = dst_T } }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = ok_addr, .val = masked, .ty = dst_T } }, null);
+    try brTo(b, join, .none);
+
+    b.switchTo(err_blk);
+    const err_tag = try b.emit(.{ .iconst = 1 }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = base, .val = err_tag, .ty = int_ty } }, null);
+    const err_off = e.payload_off + e.variants[1].offsets[0];
+    const err_fty = e.variants[1].field_types[0];
+    const err_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = err_off, .ty = err_fty } }, int_ty);
+    const conv_err_tag = try b.emit(.{ .iconst = 0 }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = err_addr, .val = conv_err_tag, .ty = int_ty } }, null);
+    try brTo(b, join, .none);
+
+    b.switchTo(join);
+    return .{ .slot = slot };
 }
 
 /// Load variant 0's (payload) single field from a reified `Option`/`Result` at `base`
