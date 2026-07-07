@@ -3839,20 +3839,17 @@ fn condFromToken(tag: TokenTag) Ir.Cond {
 /// no longer line up with the literal table — cached blobs rot.
 const lit_seed: u64 = 0x10c5_7e87;
 
-/// Parse a number-literal token text into i64, stripping `_` separators. Returns
-/// null if it does not fit i64 (range-checked). The
-/// asymmetry vs the NON-range-checked pattern-literal parse is preserved for a
-/// later match stage.
+/// Parse a number-literal token into the 64-bit `iconst` bit pattern, stripping `_`
+/// separators. A `literal_number` token is always a non-negative magnitude (unary `-`
+/// is a separate node), so it is decoded as u64 and bit-cast: this round-trips the FULL
+/// `uint64` range, since the checker admits `uint`/`uint64` literals up to 2^64-1 while
+/// signed widths are capped at 2^63-1. Decoding as i64 instead would reject a legal
+/// `uint64 = 0xFFFF...` at codegen even though the range check (u128) passed it. Base 0
+/// auto-detects `0x`/`0o`/`0b`; a bare leading-zero decimal stays decimal.
 fn parseInt(raw: []const u8) ?i64 {
-    var buf: [24]u8 = undefined;
-    var n: usize = 0;
-    for (raw) |c| {
-        if (c == '_') continue;
-        if (n >= buf.len) return null;
-        buf[n] = c;
-        n += 1;
-    }
-    return std.fmt.parseInt(i64, buf[0..n], 10) catch null;
+    var buf: [128]u8 = undefined;
+    const s = Typecheck.stripIntSeparators(raw, &buf) orelse return null;
+    return @bitCast(std.fmt.parseInt(u64, s, 0) catch return null);
 }
 
 /// Parse a (possibly `_`-separated) decimal int literal as written in source, for
@@ -5059,4 +5056,20 @@ test "M9: whole-self value read copies the pointee into a fresh temp" {
             "  ret %0\n" ++
             "}\n",
     );
+}
+
+test "M1: parseInt round-trips the full uint64 range into the iconst bit pattern" {
+    // Signed magnitudes and the platform max are byte-identical to the old i64 decode.
+    try testing.expectEqual(@as(?i64, 42), parseInt("42"));
+    try testing.expectEqual(@as(?i64, 0x2A), parseInt("0x2A"));
+    try testing.expectEqual(@as(?i64, 42), parseInt("0b0010_1010"));
+    try testing.expectEqual(@as(?i64, std.math.maxInt(i64)), parseInt("9223372036854775807"));
+    // uint64 literals in [2^63, 2^64) — which the checker admits for `uint`/`uint64` —
+    // now decode to the correct 64-bit pattern instead of overflowing to null.
+    try testing.expectEqual(@as(?i64, @bitCast(@as(u64, 1) << 63)), parseInt("0x8000000000000000"));
+    try testing.expectEqual(@as(?i64, -1), parseInt("0xFFFFFFFFFFFFFFFF")); // 2^64-1 as i64 bits
+    try testing.expectEqual(@as(?i64, -1), parseInt("18446744073709551615"));
+    // Still null past 2^64-1 (no width can admit it) and on a garbage token.
+    try testing.expectEqual(@as(?i64, null), parseInt("18446744073709551616"));
+    try testing.expectEqual(@as(?i64, null), parseInt("0xZZ"));
 }

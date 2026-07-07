@@ -55,10 +55,27 @@ const LayoutEngine = @import("layout/Engine.zig");
 // reading `Typecheck.Type`/`.Layout`/`.EnumLayout` etc. unchanged.
 pub const Kind = LayoutEngine.Kind;
 pub const Type = LayoutEngine.Type;
+pub const IntDesc = LayoutEngine.IntDesc;
 pub const Layout = LayoutEngine.Layout;
 pub const VariantForm = LayoutEngine.VariantForm;
 pub const VariantLayout = LayoutEngine.VariantLayout;
 pub const EnumLayout = LayoutEngine.EnumLayout;
+
+/// Pack a numeric-literal token into `buf`, dropping `_` digit separators, and return
+/// the packed slice (or null if it overflows `buf`). The single base-0 literal grammar
+/// shared by the checker's range gate (`BodyChecker.litMagnitude`, decoded as u128) and
+/// codegen lowering (`lower.parseInt`, decoded as u64) — one source so the two can never
+/// disagree on which literals are well-formed and desync the range check from codegen.
+pub fn stripIntSeparators(raw: []const u8, buf: []u8) ?[]const u8 {
+    var n: usize = 0;
+    for (raw) |c| {
+        if (c == '_') continue;
+        if (n >= buf.len) return null;
+        buf[n] = c;
+        n += 1;
+    }
+    return buf[0..n];
+}
 
 // Internal aliases for the checker's own scratch tables. These ARE the engine's
 // table types (the `Model` aliases them; `BodyChecker` reads `.state`/`.poisoned`/
@@ -72,6 +89,15 @@ const EnumSym = LayoutEngine.EnumSym;
 /// identifier, so it is NOT here (handled in `typeFromNode` via `literal_unit`).
 pub const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "int", Type.int },
+    .{ "uint", Type.uint },
+    .{ "int8", Type.int8 },
+    .{ "int16", Type.int16 },
+    .{ "int32", Type.int32 },
+    .{ "int64", Type.int64 },
+    .{ "uint8", Type.uint8 },
+    .{ "uint16", Type.uint16 },
+    .{ "uint32", Type.uint32 },
+    .{ "uint64", Type.uint64 },
     .{ "bool", Type.bool },
     .{ "str", Type.str },
 });
@@ -115,6 +141,9 @@ pub const refs = struct {
                 if (e.ctor < self.structSyms().len) return self.structSyms()[e.ctor].name;
             }
         }
+        // An integer type renders its sign/width spelling (`int8`/`uint`/…), not the
+        // bare `int` kind tag — the single source both passes share.
+        if (ty.kind == .int) return ty.intName();
         return @tagName(ty.kind);
     }
 
@@ -718,9 +747,23 @@ pub fn optResultFamilyOf(model: *const Model, ctor: u32) LayoutEngine.NativeEnum
 /// "not conforming" answer.
 pub fn findConformance(model: *const Model, pid: u32, recv: Type, protocol_args: []const Type) bool {
     for (model.conformances) |c| {
+        // Exact match first (a user `impl int8 has P` row, or any concrete receiver).
         if (c.protocol == pid and Type.eql(c.recv, recv) and eqlTypeVec(c.protocol_args, protocol_args)) return true;
+        // Then the integer-width normalization (see `intMatchesPlatformRow`): keeps the
+        // row table minimal (no per-width rows).
+        if (intMatchesPlatformRow(recv, c.recv) and c.protocol == pid and eqlTypeVec(c.protocol_args, protocol_args)) return true;
     }
     return false;
+}
+
+/// The builtin-protocol integer-width normalization: a width receiver (`int8`/`uint32`/…)
+/// matches the canonical platform `Type.int` conformance row. The builtin `conf` rows list
+/// only `Type.int`, and every width shares one uniform builtin-protocol verdict (Eq/Ord/
+/// Hash/Display/Add/…), so a width conforms exactly where `int` does. Single-sourced across
+/// `findConformance` and `conformsRec`'s scalar arm so the two verdicts cannot drift — the
+/// memo-key soundness argument (a width collapses to the `(pid,.int,…)` slot) rests on it.
+fn intMatchesPlatformRow(recv: Type, row_recv: Type) bool {
+    return recv.isInteger() and Type.eql(row_recv, Type.int);
 }
 
 /// Whether `pid` is one of the four structurally-derivable prelude protocols
@@ -756,7 +799,12 @@ pub const NonConformingField = struct { name: []const u8, ty: Type };
 ///
 /// Memoized by `(pid, kind, type-id)` in the caller-owned `memo` (thread-local in Pass
 /// C, local in the synthesis barrier — never shared, so race-free). `memo` caches only
-/// SETTLED verdicts, so conformance is a pure function of source. A generic template may
+/// SETTLED verdicts, so conformance is a pure function of source. NOTE the memo key
+/// omits the integer sign/width byte, so every integer width collapses to one
+/// `(pid, .int, no_struct)` slot — this is BENIGN because a scalar `.int` receiver
+/// returns in the `else` arm (via `Type.int`-normalization) BEFORE the memo is written,
+/// and every width shares one uniform builtin-protocol verdict, so the collision is
+/// absent rather than wrong (pinned by the uniform-verdict test). A generic template may
 /// be self- OR mutually-recursive (`next: Node[T]`, `A[T]`↔`B[T]`), so termination rides
 /// a per-query in-progress stack that coinductively assumes conformance on a back-edge;
 /// see `conformsRec` for why an assumed verdict is never written back to `memo`.
@@ -867,8 +915,15 @@ fn conformsRec(
         },
         else => {
             // Scalar / non-aggregate: only an explicit/prelude conformance counts (no
-            // structural rule); a poison never conforms here.
-            for (conformances) |c| if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return .{ .ok = true, .low = no_assumption };
+            // structural rule); a poison never conforms here. An integer WIDTH normalizes
+            // to the canonical platform `Type.int` row (mirroring `findConformance`) — dead
+            // for top-level scalar operators (they resolve via `findConformance` before ever
+            // reaching `conforms`), but the correct recursive answer for a future struct/enum
+            // field of a width type deriving Eq/Ord.
+            for (conformances) |c| {
+                if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return .{ .ok = true, .low = no_assumption };
+                if (intMatchesPlatformRow(recv, c.recv) and c.protocol == pid and c.protocol_args.len == 0) return .{ .ok = true, .low = no_assumption };
+            }
             return .{ .ok = false, .low = no_assumption };
         },
     }
@@ -2888,6 +2943,46 @@ test "M19: conforms truth table (scalar/struct/nested/empty-enum/payload-enum re
     try testing.expect(off != null);
     try testing.expectEqualStrings("d", off.?.name);
     try testing.expect(Type.eql(Type.enumT(2), off.?.ty));
+}
+
+test "M1: integer widths share one uniform builtin-protocol conformance verdict" {
+    const gpa = testing.allocator;
+    const eq_pid: u32 = 0;
+    const ord_pid: u32 = 1;
+    // Only the canonical platform `Type.int` rows exist (mirroring the real prelude).
+    const confs = [_]Conformance{
+        .{ .protocol = eq_pid, .recv = Type.int },
+        .{ .protocol = ord_pid, .recv = Type.int },
+    };
+    var model: Model = undefined;
+    model.conformances = &confs;
+
+    // Every width normalizes to the platform int row: same Eq/Ord verdict as plain int.
+    const widths = [_]Type{ Type.int8, Type.int64, Type.uint8, Type.uint32, Type.uint, Type.int };
+    for (widths) |w| {
+        try testing.expect(findConformance(&model, eq_pid, w, &.{}));
+        try testing.expect(findConformance(&model, ord_pid, w, &.{}));
+    }
+    // A protocol with NO int row denies for every width (uniform on the negative side too).
+    const missing_pid: u32 = 7;
+    for (widths) |w| try testing.expect(!findConformance(&model, missing_pid, w, &.{}));
+
+    // The recursive `conforms` path agrees for widths (its else-arm normalization).
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+    try testing.expect(try conforms(&.{}, &.{}, &confs, Type.int8, eq_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(try conforms(&.{}, &.{}, &confs, Type.uint32, ord_pid, &memo, gpa, &co, &.{}));
+
+    // A builtin scalar method still resolves for a width receiver (gate is kind==.int).
+    try testing.expect(builtinScalarMethod(Type.int8, "eq") != null);
+    try testing.expect(builtinScalarMethod(Type.uint64, "hash") != null);
+
+    // type_names resolves each width spelling to its constant.
+    try testing.expect(Type.eql(type_names.get("uint8").?, Type.uint8));
+    try testing.expect(Type.eql(type_names.get("int16").?, Type.int16));
+    try testing.expect(Type.eql(type_names.get("uint").?, Type.uint));
 }
 
 test "M21: conforms handles App types, nested memoization, and the type_var bound axiom" {

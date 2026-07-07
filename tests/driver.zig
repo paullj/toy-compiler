@@ -1454,6 +1454,29 @@ test "integration: emitted binary runs with the right exit code" {
         // (me3) a >16B receiver (3 ints) passed by value as `self` via the indirect-arg
         // (sret-class) path; the method sums its fields → 6.
         .{ .src = "struct V3 { a: int, b: int, c: int }\nimpl V3 { fn total(self) -> int { self.a + self.b + self.c } }\nfn main() -> int {\n v := V3{ a: 1, b: 2, c: 3 }\n return v.total()\n}\n", .name = "method_bigself", .expect = 6 },
+
+        // Integer literal bases (M1): each decodes to 42 through an independent oracle
+        // (hex 0x2A / octal 0o52 / binary 0b0010_1010). Base-0 parse + width lowering.
+        .{ .src = "fn main() -> int {\n return 0x2A\n}\n", .name = "hexlit", .expect = 42 },
+        .{ .src = "fn main() -> int {\n return 0o52\n}\n", .name = "octlit", .expect = 42 },
+        .{ .src = "fn main() -> int {\n return 0b0010_1010\n}\n", .name = "binlit", .expect = 42 },
+        // uint8 width + Eq across two bases + `_` grouping: 0b0010_1010 == 0o52 == 42.
+        .{ .src = "fn main() -> int {\n x: uint8 = 0b0010_1010\n y: uint8 = 0o52\n return if x == y { 42 } else { 0 }\n}\n", .name = "uint8_bases", .expect = 42 },
+        // Homogeneous-width result type (M1): `c: int8 = a + b` must type as int8 (was
+        // platform int under the old arm) so the annotated bind holds; 100+20=120 > 20.
+        .{ .src = "fn main() -> int {\n a: int8 = 100\n b: int8 = 20\n c: int8 = a + b\n return if c > b { 42 } else { 0 }\n}\n", .name = "resultwidth", .expect = 42 },
+        // Bare-literal sibling adoption (M1/E3): `a + 1` adopts a's int8 width; 41+1=42.
+        .{ .src = "fn main() -> int {\n a: int8 = 41\n c: int8 = a + 1\n d: int8 = 42\n return if c == d { 42 } else { 0 }\n}\n", .name = "bare_sibling", .expect = 42 },
+        // Symmetric left-literal sibling adoption (M1): `1 + a` must adopt a's int8 width
+        // exactly as `a + 1` does — pins the l_lit branch of the binary arm.
+        .{ .src = "fn main() -> int {\n a: int8 = 41\n c: int8 = 1 + a\n d: int8 = 42\n return if c == d { 42 } else { 0 }\n}\n", .name = "bare_sibling_left", .expect = 42 },
+        // Both operands bare literals under a width annotation (M1): `c: int8 = 1 + 2`
+        // re-types each literal under the outer int8 expected so the annotated bind holds.
+        .{ .src = "fn main() -> int {\n c: int8 = 40 + 2\n d: int8 = 42\n return if c == d { 42 } else { 0 }\n}\n", .name = "both_lit_width", .expect = 42 },
+        // uint64 literal above 2^63 (M1): the checker admits it (u128 range gate) and
+        // lowering now round-trips the full u64 into the iconst via bitcast — a plain i64
+        // decode would have rejected it at codegen. 2^64-1 compares equal to itself → 42.
+        .{ .src = "fn main() -> int {\n x: uint64 = 0xFFFFFFFFFFFFFFFF\n return if x == 0xFFFFFFFFFFFFFFFF { 42 } else { 0 }\n}\n", .name = "uint64_full_range", .expect = 42 },
     };
 
     for (cases, 0..) |c, i| {
