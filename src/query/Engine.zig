@@ -29,6 +29,7 @@ const Link = @import("../link/Link.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
+const DeriveEmit = @import("../lower/derive_emit.zig");
 const Phase = @import("Phase.zig");
 
 const Engine = @This();
@@ -705,7 +706,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
         .derives = frozen.derives,
         .prelude_ids = frozen.prelude_ids,
     };
-    var irf = try lower.lowerDerive(gpa, in, d, sym, &diags);
+    var irf = try DeriveEmit.lower(gpa, in, d, sym, &diags);
     defer irf.deinit(gpa);
     if (diags.items.len > 0) return error.CodegenDiagnostic;
 

@@ -40,6 +40,7 @@ pub const FrameLayout = @import("codegen/frame/FrameLayout.zig");
 pub const Ir = @import("ir/Ir.zig");
 pub const Opt = @import("opt/Opt.zig");
 pub const lower = @import("lower.zig");
+pub const DeriveEmit = @import("lower/derive_emit.zig");
 pub const Fingerprint = @import("query/Fingerprint.zig");
 pub const AstWalk = @import("query/AstWalk.zig");
 pub const Link = @import("link/Link.zig");
@@ -102,6 +103,7 @@ test {
     _ = Ir;
     _ = Opt;
     _ = lower;
+    _ = DeriveEmit; // discovers derive_emit.zig's boundary tests
     _ = Fingerprint;
     _ = AstWalk;
     _ = Link;
