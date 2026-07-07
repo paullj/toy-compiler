@@ -1,0 +1,15 @@
+# Feature: derived `Ord` on an UNSIGNED integer field compares unsigned. `hi` has the
+# high bit set (2^63), so as a signed value it reads negative; a derived `cmp` that
+# compared the `uint64` field with a signed `icmp` would rank `hi` BELOW `lo` and make
+# `a < b` wrongly true. The field's unsignedness must select the unsigned magnitude
+# conds, so 2^63 > 1 and `a < b` is false -> 0.
+struct W { v: uint64 }
+
+fn main() -> int {
+    hi: uint64 = 0x8000000000000000
+    lo: uint64 = 1
+    a := W{ v: hi }
+    b := W{ v: lo }
+    return if a < b { 1 } else { 0 }
+}
+# expect: exit 0
