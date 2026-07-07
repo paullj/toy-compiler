@@ -80,6 +80,7 @@ pub const Code = enum(u16) {
     T0031, // non-displayable-arg (`print(x)`/structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site, M22)
     T0032, // question-non-optionresult (`?` operand is not an Option/Result, or the enclosing return type cannot absorb the residual — M24)
     T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch — M24)
+    T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width — M1)
 
     _,
 };
@@ -151,6 +152,7 @@ pub const table = [_]Entry{
     .{ .code = .T0031, .str = "T0031", .slug = "non-displayable-arg" },
     .{ .code = .T0032, .str = "T0032", .slug = "question-non-optionresult" },
     .{ .code = .T0033, .str = "T0033", .slug = "question-constructor-mismatch" },
+    .{ .code = .T0034, .str = "T0034", .slug = "literal-out-of-range" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -304,6 +306,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0033", str(.T0033).?);
     try testing.expectEqualStrings("question-constructor-mismatch", slug(.T0033).?);
     try testing.expectEqual(Code.T0033, fromStr("T0033").?);
+
+    // M1 integer-literal range code.
+    try testing.expectEqualStrings("T0034", str(.T0034).?);
+    try testing.expectEqualStrings("literal-out-of-range", slug(.T0034).?);
+    try testing.expectEqual(Code.T0034, fromStr("T0034").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

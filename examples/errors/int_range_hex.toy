@@ -1,0 +1,8 @@
+# Feature (negative): the per-width range check is base-aware. `0xC8` is 200, which does
+# not fit `int8` (max 127), so a base-prefixed literal overflows identically to decimal
+# `200` — exercising the base-0 parse on the T0034 error side.
+fn main() -> int {
+    a: int8 = 0xC8
+    return 0
+}
+# expect: compile-error "out of range"

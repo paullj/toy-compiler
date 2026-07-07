@@ -46,6 +46,13 @@ pub const Sig = @import("../symbols/Sig.zig").Sig;
 /// struct's fields changes `layout`, flipping every using fn's hash.
 pub const TouchedType = struct {
     kind: Typecheck.Kind,
+    /// The integer sign/width descriptor byte (only meaningful when `kind == .int`).
+    /// Defaults to platform `int`, so a non-int touched type folds a stable zero and a
+    /// pre-M1 blob's `int` re-hashes identically. Folding it closes the width hole: the
+    /// codegen fingerprint does NOT route through `Type.appendKeyBytes`, so without this
+    /// an `int`->`int8` body edit would not re-fingerprint (latent at M1's width-blind
+    /// lowering, a stale-__text miscompile once M2's codegen is width-dependent).
+    int_desc: u8 = @as(u8, @bitCast(Typecheck.IntDesc{})),
     layout: []const u8 = &.{},
 };
 
@@ -70,7 +77,7 @@ pub const ResolvedConformance = struct {
 
 /// Bumped when the in-memory layout encoding of any type changes, so a stale blob
 /// from a prior layout is invalidated.
-const type_layout_version: u8 = 3;
+const type_layout_version: u8 = 4;
 
 const seed: u64 = 0x46_50_52_4e; // "FPRN"
 
@@ -127,7 +134,7 @@ pub fn fingerprint(
     // edit to its fields (names/types/offsets/size) flips every using fn's hash.
     AstWalk.updateU32(&h, @intCast(touched.len));
     for (touched) |ty| {
-        h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version });
+        h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version, ty.int_desc });
         if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
     }
 
@@ -138,7 +145,7 @@ pub fn fingerprint(
     if (type_args.len > 0) {
         AstWalk.updateU32(&h, @intCast(type_args.len));
         for (type_args) |ty| {
-            h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version });
+            h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version, ty.int_desc });
             if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
         }
     }
@@ -153,7 +160,7 @@ pub fn fingerprint(
         AstWalk.updateU32(&h, @intCast(conformances.len));
         for (conformances) |rc| {
             AstWalk.updateLeaf(&h, rc.protocol_name);
-            h.update(&[_]u8{ @intFromEnum(rc.conform.kind), type_layout_version });
+            h.update(&[_]u8{ @intFromEnum(rc.conform.kind), type_layout_version, rc.conform.int_desc });
             if (rc.conform.kind == .@"struct" or rc.conform.kind == .@"enum") AstWalk.updateLeaf(&h, rc.conform.layout);
             AstWalk.updateU32(&h, @intCast(rc.witness_syms.len));
             for (rc.witness_syms) |w| AstWalk.updateLeaf(&h, w);
@@ -162,7 +169,7 @@ pub fn fingerprint(
             if (rc.protocol_args.len > 0) {
                 AstWalk.updateU32(&h, @intCast(rc.protocol_args.len));
                 for (rc.protocol_args) |pa| {
-                    h.update(&[_]u8{ @intFromEnum(pa.kind), type_layout_version });
+                    h.update(&[_]u8{ @intFromEnum(pa.kind), type_layout_version, pa.int_desc });
                     if (pa.kind == .@"struct" or pa.kind == .@"enum") AstWalk.updateLeaf(&h, pa.layout);
                 }
             }
@@ -196,7 +203,7 @@ pub fn deriveFingerprint(
     AstWalk.updateLeaf(&h, protocol_name);
     // The conforming type's layout descriptor (mirrors (c)/(d)); a struct/enum folds
     // its full index-free layout so a field-layout edit flips the unit's key.
-    h.update(&[_]u8{@intFromEnum(conform.kind)});
+    h.update(&[_]u8{ @intFromEnum(conform.kind), conform.int_desc });
     if (conform.kind == .@"struct" or conform.kind == .@"enum") AstWalk.updateLeaf(&h, conform.layout);
     // The resolved per-field witnesses, ORDERED (count sentinel + per-field tag + the
     // witness SymName). A nested field gaining an explicit impl changes its `FieldWitness`
@@ -547,6 +554,26 @@ test "adding a nested sub-pattern flips the hash" {
     var b = try build(gpa, "enum E { C(int), N }\nfn f(e: E) -> int {\n match e { .C(0) -> 1, .C(r) -> r, .N -> 0 }\n}\n");
     defer b.deinit(gpa);
     try testing.expect(fp(&a, 1) != fp(&b, 1));
+}
+
+test "touched int width folds in: int8 and int64 hash differently (M1 codegen-cache soundness)" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    // Two touched types differing ONLY in the int_desc byte must diverge, else an
+    // int->int8 body edit serves a stale codegen blob once lowering is width-dependent.
+    const as_i8 = [1]TouchedType{.{ .kind = .int, .int_desc = @as(u8, @bitCast(Typecheck.IntDesc{ .width = .w8 })) }};
+    const as_i64 = [1]TouchedType{.{ .kind = .int, .int_desc = @as(u8, @bitCast(Typecheck.IntDesc{ .width = .w64 })) }};
+    const as_plat = [1]TouchedType{.{ .kind = .int }};
+    const h8 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &as_i8, &.{}, &.{});
+    const h64 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &as_i64, &.{}, &.{});
+    const hp = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &as_plat, &.{}, &.{});
+    try testing.expect(h8 != h64);
+    try testing.expect(h8 != hp);
+    // A default-descriptor int touched type is stable (warm-cache hit for plain int).
+    const hp2 = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &as_plat, &.{}, &.{});
+    try testing.expectEqual(hp, hp2);
 }
 
 test "type-args fold: id[int] and id[Point] get distinct fingerprints" {

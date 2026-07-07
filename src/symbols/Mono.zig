@@ -134,7 +134,7 @@ pub fn mangle(gpa: std.mem.Allocator, template_name: []const u8, args: []const T
     for (args) |a| {
         try buf.append(gpa, '$');
         switch (a.kind) {
-            .int => try buf.appendSlice(gpa, "int"),
+            .int => try buf.appendSlice(gpa, a.intName()),
             .bool => try buf.appendSlice(gpa, "bool"),
             .str => try buf.appendSlice(gpa, "str"),
             .unit => try buf.appendSlice(gpa, "unit"),
@@ -160,6 +160,23 @@ test "mangle is index-free-ish and distinct per arg tuple" {
     const c = try mangle(gpa, "pair", &.{ Type.int, Type.bool });
     defer gpa.free(c);
     try testing.expectEqualStrings("pair$int$bool", c);
+}
+
+test "mangle encodes integer width/sign distinctly (M1)" {
+    const gpa = testing.allocator;
+    const i8m = try mangle(gpa, "id", &.{Type.int8});
+    defer gpa.free(i8m);
+    try testing.expectEqualStrings("id$int8", i8m);
+    const u32m = try mangle(gpa, "id", &.{Type.uint32});
+    defer gpa.free(u32m);
+    try testing.expectEqualStrings("id$uint32", u32m);
+    const im = try mangle(gpa, "id", &.{Type.int});
+    defer gpa.free(im);
+    // Plain int is byte-identical to before; the widths never collide with it.
+    try testing.expectEqualStrings("id$int", im);
+    try testing.expect(!std.mem.eql(u8, i8m, im));
+    try testing.expect(!std.mem.eql(u8, u32m, im));
+    try testing.expect(!std.mem.eql(u8, i8m, u32m));
 }
 
 test "find matches on gid + args by Type.eql" {

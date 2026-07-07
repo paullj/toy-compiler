@@ -1,0 +1,7 @@
+# Feature (negative): an integer literal is range-checked against its annotated width.
+# 200 does not fit `int8` (max 127), so it is rejected at the declaration (T0034).
+fn main() -> int {
+    a: int8 = 200
+    return 0
+}
+# expect: compile-error "out of range"

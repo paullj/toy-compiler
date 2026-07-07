@@ -147,6 +147,26 @@ fn lexIdentifier(l: *Lexer, start: u32) Token {
 
 fn lexNumber(l: *Lexer, start: u32) Token {
     l.index += 1;
+    // A `0x`/`0o`/`0b` prefix (only valid immediately after a leading `0`) switches to
+    // the matching digit set. A stray invalid char just ends the token — M1 adds no
+    // malformed-number token; a bad literal (`0xZZ`) mis-spans and surfaces downstream.
+    if (l.source[start] == '0' and l.index < l.source.len) {
+        const base: ?u8 = switch (l.source[l.index]) {
+            'x', 'X' => 16,
+            'o', 'O' => 8,
+            'b', 'B' => 2,
+            else => null,
+        };
+        if (base) |b| {
+            l.index += 1; // consume the base letter
+            while (l.index < l.source.len) {
+                const c = l.source[l.index];
+                if (!isBaseDigit(c, b) and c != '_') break;
+                l.index += 1;
+            }
+            return l.make(.number, start);
+        }
+    }
     while (l.index < l.source.len) {
         const c = l.source[l.index];
         if (!isDigit(c) and c != '_') break;
@@ -245,6 +265,15 @@ fn make(l: *const Lexer, tag: Tag, start: u32) Token {
 
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
+}
+
+fn isBaseDigit(c: u8, base: u8) bool {
+    return switch (base) {
+        2 => c == '0' or c == '1',
+        8 => c >= '0' and c <= '7',
+        16 => isDigit(c) or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+        else => false,
+    };
 }
 
 fn isIdentStart(c: u8) bool {
@@ -394,6 +423,14 @@ test "short declaration with hash comment and string" {
         \\x := 1_000  # a comment
         \\msg := "hi"
     , &.{ .identifier, .colon_eq, .number, .newline, .identifier, .colon_eq, .string, .eof });
+}
+
+test "base-prefixed integer literals lex as a single number" {
+    try expectTags("0x2A", &.{ .number, .eof });
+    try expectTags("0o52", &.{ .number, .eof });
+    try expectTags("0b0010_1010", &.{ .number, .eof });
+    // A leading-zero decimal is NOT a base prefix; it stays one decimal number.
+    try expectTags("042", &.{ .number, .eof });
 }
 
 test "newline inserts terminator only after statement-ending tokens" {

@@ -462,11 +462,45 @@ pub const BodyChecker = struct {
         return Type.invalid;
     }
 
+    /// The magnitude of a numeric-literal token (base-aware via `parseInt` base 0,
+    /// `_`-stripped) as a u128, or null if it does not parse or is absurdly long. u128
+    /// spans the full `uint64` range, so an over-range check is exact for every width.
+    fn litMagnitude(text: []const u8) ?u128 {
+        var buf: [128]u8 = undefined;
+        const s = Typecheck.stripIntSeparators(text, &buf) orelse return null;
+        return std.fmt.parseInt(u128, s, 0) catch null;
+    }
+
+    /// The maximum in-range magnitude for integer type `t`. Exhaustive over `IntWidth`
+    /// (no `else` arm) so a new width class must be handled explicitly. Signed literals
+    /// (a negative `-128: int8`) are a documented M1 limitation — handled in M2.
+    fn maxMagnitude(t: Type) u128 {
+        return switch (t.int_desc.width) {
+            .plat, .w64 => if (t.int_desc.signed) (@as(u128, 1) << 63) - 1 else (@as(u128, 1) << 64) - 1,
+            .w8 => if (t.int_desc.signed) 127 else 255,
+            .w16 => if (t.int_desc.signed) 32767 else 65535,
+            .w32 => if (t.int_desc.signed) (@as(u128, 1) << 31) - 1 else (@as(u128, 1) << 32) - 1,
+        };
+    }
+
     pub fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
         if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
         const ty: Type = switch (n.tag) {
-            .literal_number => Type.int,
+            .literal_number => blk: {
+                // Default to platform `int`, but adopt an expected integer WIDTH
+                // (`x: int8 = 100`) and range-check the magnitude against it. Adopt the
+                // width even on a range error so the downstream assignability check stays
+                // silent — one T0034, never a paired mismatch.
+                if (bc.expected) |e| if (e.isInteger()) {
+                    const raw = bc.tokens[n.main_token].text(bc.source);
+                    const in_range = if (litMagnitude(raw)) |v| v <= maxMagnitude(e) else false;
+                    if (!in_range)
+                        try bc.sink.emitFmtCode(.T0034, bc.byteOf(n.main_token), "literal out of range for type '{s}'", .{bc.typeName(e)});
+                    break :blk e;
+                };
+                break :blk Type.int;
+            },
             .literal_bool => Type.@"bool",
             .literal_string => Type.str,
             .identifier => switch (bc.resolutions[(node_idx).int()]) {
@@ -504,7 +538,7 @@ pub const BodyChecker = struct {
                 const op = bc.tokens[n.main_token].tag;
                 switch (op) {
                     .minus => {
-                        if (operand.kind == .int) break :blk Type.int;
+                        if (operand.isInteger()) break :blk operand;
                         try bc.sink.emit(bc.byteOf(n.main_token), "operand of '-' must be int");
                     },
                     .bang => {
@@ -516,9 +550,30 @@ pub const BodyChecker = struct {
                 break :blk Type.invalid;
             },
             .binary => blk: {
-                const lt = try bc.typeOf(n.lhs);
-                const rt = try bc.typeOf(n.rhs);
+                // Type each operand with NO expected type (the only `typeOf` consumer of
+                // `bc.expected` is the literal arm, so scoping it off here is safe), then
+                // let a bare-literal operand adopt its typed sibling's width — so `a + 1`
+                // (a: int8) adopts int8 and `a + 300` fires T0034 exactly once via the
+                // sibling path, never also via the outer expected.
+                const saved = bc.expected;
+                bc.expected = null;
+                var lt = try bc.typeOf(n.lhs);
+                var rt = try bc.typeOf(n.rhs);
+                bc.expected = saved;
                 if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
+                const l_lit = bc.tree.nodes[n.lhs.int()].tag == .literal_number;
+                const r_lit = bc.tree.nodes[n.rhs.int()].tag == .literal_number;
+                if (r_lit and !l_lit and lt.isInteger()) rt = try bc.typeOfExpected(n.rhs, lt);
+                if (l_lit and !r_lit and rt.isInteger()) lt = try bc.typeOfExpected(n.lhs, rt);
+                // Both operands bare literals (`c: int8 = 1 + 2`): no typed sibling to
+                // adopt from, so re-type each under the OUTER expected width (running the
+                // per-literal range check) — else both stay platform `int`, the homogeneous
+                // arm yields `int`, and the annotated bind is wrongly rejected. A no-op for
+                // a platform-`int` target, so `x: int = 1 + 2` is unaffected.
+                if (l_lit and r_lit) if (saved) |e| if (e.isInteger()) {
+                    lt = try bc.typeOfExpected(n.lhs, e);
+                    rt = try bc.typeOfExpected(n.rhs, e);
+                };
                 const op = bc.tokens[n.main_token].tag;
                 const op_text = bc.tokens[n.main_token].text(bc.source);
                 switch (op) {
@@ -530,7 +585,7 @@ pub const BodyChecker = struct {
                         // conforms to the operator's protocol — a user struct/enum `impl T has
                         // Add`, or a `[T has Add]` bound in a generic body. str/bool have NO
                         // arithmetic impl (str concat allocates, deferred), so they fall to T0028.
-                        if (lt.kind == .int and rt.kind == .int) break :blk Type.int;
+                        if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
                         const ap = bc.arithProtocol(op);
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
