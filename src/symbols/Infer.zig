@@ -20,7 +20,7 @@
 //! source positions); a var left unbound after all params is uninferable.
 
 const std = @import("std");
-const Type = @import("../layout/Engine.zig").Type;
+const Type = @import("../layout/Type.zig").Type;
 
 pub const Outcome = union(enum) {
     ok,

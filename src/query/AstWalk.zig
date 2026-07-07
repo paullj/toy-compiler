@@ -907,7 +907,7 @@ pub fn freeTouched(gpa: std.mem.Allocator, items: []const TouchedType) void {
 /// `appendTouched` the (c) touched fold uses. Fed into `fingerprint`'s (d) component so
 /// `id[int]` and `id[Point]` diverge and a struct-layout edit to a type-arg invalidates
 /// exactly the dependent instance. Empty for a non-generic fn. Caller frees via `freeTouched`.
-pub fn walkTypeArgs(gpa: std.mem.Allocator, frozen: anytype, args: []const @import("../layout/Engine.zig").Type, out: *std.ArrayList(TouchedType)) error{OutOfMemory}!void {
+pub fn walkTypeArgs(gpa: std.mem.Allocator, frozen: anytype, args: []const @import("../layout/Type.zig").Type, out: *std.ArrayList(TouchedType)) error{OutOfMemory}!void {
     for (args) |a| try appendTouched(gpa, frozen, a, out);
 }
 

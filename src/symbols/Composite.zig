@@ -26,7 +26,7 @@
 //! slice header stays valid after the lock is released even if the entry array reallocs).
 
 const std = @import("std");
-const Type = @import("../layout/Engine.zig").Type;
+const Type = @import("../layout/Type.zig").Type;
 
 const Composite = @This();
 

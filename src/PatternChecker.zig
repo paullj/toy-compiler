@@ -1,7 +1,7 @@
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
 const LayoutEngine = @import("layout/Engine.zig");
-const Type = LayoutEngine.Type;
+const Type = @import("layout/Type.zig").Type;
 const VariantSym = LayoutEngine.VariantSym;
 const ControlFlow = @import("ControlFlow.zig");
 

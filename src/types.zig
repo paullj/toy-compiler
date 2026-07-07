@@ -53,9 +53,9 @@ const LayoutEngine = @import("layout/Engine.zig");
 
 // Re-export the algebra/layout value types so every downstream importer keeps
 // reading `Typecheck.Type`/`.Layout`/`.EnumLayout` etc. unchanged.
-pub const Kind = LayoutEngine.Kind;
-pub const Type = LayoutEngine.Type;
-pub const IntDesc = LayoutEngine.IntDesc;
+pub const Kind = @import("layout/Type.zig").Kind;
+pub const Type = @import("layout/Type.zig").Type;
+pub const IntDesc = @import("layout/Type.zig").IntDesc;
 pub const Layout = LayoutEngine.Layout;
 pub const VariantForm = LayoutEngine.VariantForm;
 pub const VariantLayout = LayoutEngine.VariantLayout;
