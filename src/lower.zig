@@ -618,7 +618,9 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
     switch (op) {
         .minus => {
             const v = try lowerExpr(b, n.lhs);
-            return .{ .value = try b.emit(.{ .neg = operandValue(v) }, Typecheck.Type.int) };
+            // The checked type of the negation node carries its integer width, so
+            // codegen re-canonicalizes a narrow `neg` (sxtb/and) at the right size.
+            return .{ .value = try b.emit(.{ .neg = operandValue(v) }, b.in.node_types[(node_idx).int()]) };
         },
         .bang => {
             const v = try lowerExpr(b, n.lhs);
@@ -626,7 +628,6 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
         },
         else => {
             try b.note(n.main_token, "unary operator unsupported in lower");
-            _ = node_idx;
             return .none;
         },
     }
@@ -649,10 +650,12 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                     .plus => .{ .add = bin },
                     .minus => .{ .sub = bin },
                     .star => .{ .mul = bin },
-                    .slash => .{ .sdiv = bin },
+                    .slash => if (lt.isUnsignedInt()) Ir.Op{ .udiv = bin } else Ir.Op{ .sdiv = bin },
                     else => unreachable,
                 };
-                return .{ .value = try b.emit(ir_op, Typecheck.Type.int) };
+                // `lt` is the operand width; the checker proved `eql(lt,rt)` and
+                // returns it as the result type, so it is also the result width.
+                return .{ .value = try b.emit(ir_op, lt) };
             }
             return try lowerArithValue(b, lt, n.lhs, n.rhs, op);
         },
@@ -663,7 +666,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             if (isInlineOrd(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
-                const cc = condFromToken(op);
+                const cc = condFromToken(op, lt.isUnsignedInt());
                 return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
             }
             return try lowerOrdValue(b, lt, n.lhs, n.rhs, op);
@@ -675,7 +678,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             if (isInlineEq(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
-                const cc = condFromToken(op);
+                const cc = condFromToken(op, lt.isUnsignedInt());
                 return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
             }
             return try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq);
@@ -3661,7 +3664,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                     if (isInlineOrd(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
                         const rhs = operandValue(try lowerExpr(b, n.rhs));
-                        const cc = condFromToken(op);
+                        const cc = condFromToken(op, lt.isUnsignedInt());
                         const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool");
                         b.setTerm(.{ .cond_br = .{ .cond = c, .t = true_bb, .f = false_bb } });
                     } else {
@@ -3677,7 +3680,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                     if (isInlineEq(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
                         const rhs = operandValue(try lowerExpr(b, n.rhs));
-                        const cc = condFromToken(op);
+                        const cc = condFromToken(op, lt.isUnsignedInt());
                         const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool");
                         b.setTerm(.{ .cond_br = .{ .cond = c, .t = true_bb, .f = false_bb } });
                     } else {
@@ -3821,13 +3824,15 @@ fn typeFromRef(in: Inputs, ref: Ast.Index) Typecheck.Type {
     return Typecheck.Type.int;
 }
 
-/// Map a comparison token to its signed IR condition.
-fn condFromToken(tag: TokenTag) Ir.Cond {
+/// Map a comparison token to its IR condition. `unsigned` (baked from the operand
+/// type at lower-time) selects the unsigned magnitude conds so the choice survives
+/// operand-rewriting opt passes; eq/ne are sign-agnostic.
+fn condFromToken(tag: TokenTag, unsigned: bool) Ir.Cond {
     return switch (tag) {
-        .lt => .lt,
-        .lt_eq => .le,
-        .gt => .gt,
-        .gt_eq => .ge,
+        .lt => if (unsigned) .ult else .lt,
+        .lt_eq => if (unsigned) .ule else .le,
+        .gt => if (unsigned) .ugt else .gt,
+        .gt_eq => if (unsigned) .uge else .ge,
         .eq_eq => .eq,
         .bang_eq => .ne,
         else => unreachable,

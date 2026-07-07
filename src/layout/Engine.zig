@@ -156,6 +156,10 @@ pub const Type = struct {
         return t.kind == .int and t.int_desc.signed;
     }
 
+    pub fn isUnsignedInt(t: Type) bool {
+        return t.kind == .int and !t.int_desc.signed;
+    }
+
     pub fn isPlatformInt(t: Type) bool {
         return t.kind == .int and t.int_desc.width == .plat;
     }

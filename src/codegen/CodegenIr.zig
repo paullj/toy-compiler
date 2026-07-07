@@ -328,6 +328,10 @@ fn condToAarch64(cc: Ir.Cond) Aarch64.Cond {
         .le => .le,
         .gt => .gt,
         .ge => .ge,
+        .ult => .lo,
+        .ule => .ls,
+        .ugt => .hi,
+        .uge => .hs,
     };
 }
 
@@ -346,9 +350,11 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         .sub => |b| try genArith(g, ins.result, b, .sub),
         .mul => |b| try genArith(g, ins.result, b, .mul),
         .sdiv => |b| try genArith(g, ins.result, b, .sdiv),
+        .udiv => |b| try genArith(g, ins.result, b, .udiv),
         .neg => |v| {
             try g.loadValue(S0, v);
             try g.emit(Aarch64.neg(S0, S0));
+            try normalizeWidth(g, S0, g.func.values[ins.result].type);
             try g.storeValue(S0, ins.result);
         },
         .bnot => |v| {
@@ -404,7 +410,7 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
     }
 }
 
-const ArithKind = enum { add, sub, mul, sdiv };
+const ArithKind = enum { add, sub, mul, sdiv, udiv };
 
 fn genArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ArithKind) error{OutOfMemory}!void {
     try g.loadValue(S0, b.lhs);
@@ -414,9 +420,26 @@ fn genArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ArithKind) error{OutOf
         .sub => Aarch64.subReg(S0, S0, S1),
         .mul => Aarch64.mul(S0, S0, S1),
         .sdiv => Aarch64.sdiv(S0, S0, S1),
+        .udiv => Aarch64.udiv(S0, S0, S1),
     };
     try g.emit(word);
+    try normalizeWidth(g, S0, g.func.values[result].type);
     try g.storeValue(S0, result);
+}
+
+/// Re-canonicalize a narrow-integer result in `reg` to its full 64-bit form after
+/// a full-width op may have left high bits stale: sign-extend a signed narrow,
+/// zero-extend (mask) an unsigned narrow. No-op for non-integers and platform/w64
+/// ints, so existing programs emit byte-identically. Exhaustive over `IntWidth`
+/// (no `else`) and value-domain-identical to `arith.wrapTo` (opt-on ≡ opt-off).
+fn normalizeWidth(g: *Gen, reg: u32, ty: Ir.Type) error{OutOfMemory}!void {
+    if (!ty.isInteger()) return;
+    switch (ty.int_desc.width) {
+        .plat, .w64 => {},
+        .w8 => try g.emit(if (ty.int_desc.signed) Aarch64.sxtb(reg, reg) else Aarch64.andLowBits(reg, reg, 7)),
+        .w16 => try g.emit(if (ty.int_desc.signed) Aarch64.sxth(reg, reg) else Aarch64.andLowBits(reg, reg, 15)),
+        .w32 => try g.emit(if (ty.int_desc.signed) Aarch64.sxtw(reg, reg) else Aarch64.andLowBits(reg, reg, 31)),
+    }
 }
 
 /// `cstr_ptr h`: materialize a `__cstring` address via adrp+add (placeholders +
@@ -1138,4 +1161,88 @@ test "ir-codegen: a reg-pair aggregate passed as an Operand.value loads both wor
         }
     }
     try testing.expect(has_ldr_x1_sp);
+}
+
+// Lower `fn f() -> ty { ret (iconst 100 + iconst 100) : ty }` and return the code.
+fn lowerAddOfWidth(gpa: std.mem.Allocator, ty: Type) !Link.FnCode {
+    var values = try gpa.alloc(Ir.ValueDef, 4);
+    values[0] = .{ .type = ty }; // exit param
+    values[1] = .{ .type = ty };
+    values[2] = .{ .type = ty };
+    values[3] = .{ .type = ty }; // add result
+
+    var entry_instrs = try gpa.alloc(Ir.Instr, 3);
+    entry_instrs[0] = .{ .result = 1, .op = .{ .iconst = 100 } };
+    entry_instrs[1] = .{ .result = 2, .op = .{ .iconst = 100 } };
+    entry_instrs[2] = .{ .result = 3, .op = .{ .add = .{ .lhs = 1, .rhs = 2 } } };
+    const entry_args = try gpa.alloc(Ir.Operand, 1);
+    entry_args[0] = .{ .value = 3 };
+
+    var blocks = try gpa.alloc(Ir.Block, 2);
+    blocks[0] = .{
+        .params = try gpa.alloc(Ir.ValueId, 0),
+        .instrs = entry_instrs,
+        .term = .{ .br = .{ .dest = 1, .args = entry_args } },
+    };
+    const exit_params = try gpa.alloc(Ir.ValueId, 1);
+    exit_params[0] = 0;
+    blocks[1] = .{
+        .params = exit_params,
+        .instrs = try gpa.alloc(Ir.Instr, 0),
+        .term = .{ .ret = .{ .value = 0 } },
+    };
+
+    var func = Ir.Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(Ir.SlotId, 0),
+        .ret_type = ty,
+        .slots = try gpa.alloc(Ir.Slot, 0),
+        .values = values,
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 1,
+        .literals = try gpa.alloc(Ir.Literal, 0),
+    };
+    defer func.deinit(gpa);
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    return lowerIr(gpa, &func, &.{}, &.{}, false, &diags);
+}
+
+fn codeHasWord(fc: Link.FnCode, w: u32) bool {
+    var i: usize = 0;
+    while (i + 4 <= fc.code.len) : (i += 4) {
+        if (std.mem.readInt(u32, fc.code[i..][0..4], .little) == w) return true;
+    }
+    return false;
+}
+
+test "ir-codegen: genArith width-normalizes narrow results (and platform int does not)" {
+    const gpa = testing.allocator;
+
+    // int8 add re-canonicalizes with sxtb.
+    var fc8 = try lowerAddOfWidth(gpa, Type.int8);
+    defer fc8.deinit(gpa);
+    try testing.expect(codeHasWord(fc8, Aarch64.sxtb(S0, S0)));
+
+    // uint8 add zero-extends with `and #0xff`.
+    var fcu8 = try lowerAddOfWidth(gpa, Type.uint8);
+    defer fcu8.deinit(gpa);
+    try testing.expect(codeHasWord(fcu8, Aarch64.andLowBits(S0, S0, 7)));
+
+    // Platform int add emits NEITHER — byte-identity guard for existing programs.
+    var fci = try lowerAddOfWidth(gpa, Type.int);
+    defer fci.deinit(gpa);
+    try testing.expect(!codeHasWord(fci, Aarch64.sxtb(S0, S0)));
+    try testing.expect(!codeHasWord(fci, Aarch64.andLowBits(S0, S0, 7)));
+}
+
+test "ir-codegen: condToAarch64 maps unsigned conds to the unsigned aarch64 forms" {
+    // A transposition here (e.g. .ule => .lo) compiles green with no unsigned
+    // compare program in the suite, so pin the four mappings directly.
+    try testing.expectEqual(Aarch64.Cond.lo, condToAarch64(.ult));
+    try testing.expectEqual(Aarch64.Cond.ls, condToAarch64(.ule));
+    try testing.expectEqual(Aarch64.Cond.hi, condToAarch64(.ugt));
+    try testing.expectEqual(Aarch64.Cond.hs, condToAarch64(.uge));
 }

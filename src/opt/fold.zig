@@ -58,7 +58,7 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                 .bconst => |v| {
                     if (res != Ir.none_value) known[res] = .{ .bool = v };
                 },
-                .add, .sub, .mul, .sdiv => |bin| {
+                .add, .sub, .mul, .sdiv, .udiv => |bin| {
                     const l = constInt(known, bin.lhs) orelse continue;
                     const r = constInt(known, bin.rhs) orelse continue;
                     const kind: arith.BinKind = switch (ins.op) {
@@ -66,19 +66,16 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                         .sub => .sub,
                         .mul => .mul,
                         .sdiv => .sdiv,
+                        .udiv => .udiv,
                         else => unreachable,
                     };
-                    const folded = arith.foldBin(kind, l, r);
-                    ins.op = .{ .iconst = folded };
-                    if (res != Ir.none_value) known[res] = .{ .int = folded };
+                    commitFoldedInt(func, known, ins, res, arith.foldBin(kind, l, r));
                     stats.consts_folded += 1;
                     changed = true;
                 },
                 .neg => |v| {
                     const x = constInt(known, v) orelse continue;
-                    const folded = arith.neg(x);
-                    ins.op = .{ .iconst = folded };
-                    if (res != Ir.none_value) known[res] = .{ .int = folded };
+                    commitFoldedInt(func, known, ins, res, arith.neg(x));
                     stats.consts_folded += 1;
                     changed = true;
                 },
@@ -107,6 +104,16 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
     }
 
     return changed;
+}
+
+// Rewrite an integer-producing instruction to its folded `iconst`, wrapping to
+// the RESULT value's own width — forwarding rewrites operands, never a result
+// id/type, so this stays sound at -O1 (mirrors CodegenIr.normalizeWidth).
+fn commitFoldedInt(func: *Ir.Function, known: []Known, ins: *Ir.Instr, res: Ir.ValueId, x: i64) void {
+    const ty = if (res != Ir.none_value) func.values[res].type else Ir.Type.int;
+    const wrapped = arith.wrapTo(ty, x);
+    ins.op = .{ .iconst = wrapped };
+    if (res != Ir.none_value) known[res] = .{ .int = wrapped };
 }
 
 fn constInt(known: []const Known, v: Ir.ValueId) ?i64 {
@@ -325,4 +332,83 @@ test "block-param (merge) value is NOT treated as const" {
     const changed = try run(gpa, &func, &st);
     try testing.expect(!changed);
     try testing.expect(func.blocks[1].instrs[1].op == .add);
+}
+
+test "fold wraps narrow arith to the result width (matches codegen normalize)" {
+    const gpa = testing.allocator;
+    // int8 100 + 100 -> 200 wraps to -56; uint8 200 + 100 -> 300 masks to 44.
+    const values = [_]Ir.ValueDef{
+        .{ .type = Ir.Type.int8 },
+        .{ .type = Ir.Type.int8 },
+        .{ .type = Ir.Type.int8 },
+        .{ .type = Ir.Type.uint8 },
+        .{ .type = Ir.Type.uint8 },
+        .{ .type = Ir.Type.uint8 },
+    };
+    const instrs = [_]Ir.Instr{
+        .{ .result = 0, .op = .{ .iconst = 100 } },
+        .{ .result = 1, .op = .{ .iconst = 100 } },
+        .{ .result = 2, .op = .{ .add = .{ .lhs = 0, .rhs = 1 } } },
+        .{ .result = 3, .op = .{ .iconst = 200 } },
+        .{ .result = 4, .op = .{ .iconst = 100 } },
+        .{ .result = 5, .op = .{ .add = .{ .lhs = 3, .rhs = 4 } } },
+    };
+    var func = try buildFn(gpa, &values, &instrs, .{ .ret = .{ .value = 2 } });
+    defer func.deinit(gpa);
+
+    var st: Opt.Stats = .{};
+    _ = try run(gpa, &func, &st);
+    try expectIconst(func.blocks[0].instrs[2], -56);
+    try expectIconst(func.blocks[0].instrs[5], 44);
+}
+
+test "fold wraps narrow neg to the result width (matches codegen normalize)" {
+    const gpa = testing.allocator;
+    // int8 -(-128) -> 128 wraps back to -128 (sign leg); uint8 -(5) -> -5 masks to 251 (mask leg).
+    const values = [_]Ir.ValueDef{
+        .{ .type = Ir.Type.int8 },
+        .{ .type = Ir.Type.int8 },
+        .{ .type = Ir.Type.uint8 },
+        .{ .type = Ir.Type.uint8 },
+    };
+    const instrs = [_]Ir.Instr{
+        .{ .result = 0, .op = .{ .iconst = -128 } },
+        .{ .result = 1, .op = .{ .neg = 0 } },
+        .{ .result = 2, .op = .{ .iconst = 5 } },
+        .{ .result = 3, .op = .{ .neg = 2 } },
+    };
+    var func = try buildFn(gpa, &values, &instrs, .{ .ret = .{ .value = 3 } });
+    defer func.deinit(gpa);
+
+    var st: Opt.Stats = .{};
+    _ = try run(gpa, &func, &st);
+    try expectIconst(func.blocks[0].instrs[1], -128);
+    try expectIconst(func.blocks[0].instrs[3], 251);
+}
+
+test "fold udiv is unsigned; unsigned icmp folds via cc" {
+    const gpa = testing.allocator;
+    const two_63 = std.math.minInt(i64);
+    // uint64: 2^63 / 2 == 2^62 ; and (2^63 > 1) unsigned == true.
+    const values = [_]Ir.ValueDef{
+        .{ .type = Ir.Type.uint64 },
+        .{ .type = Ir.Type.uint64 },
+        .{ .type = Ir.Type.uint64 },
+        .{ .type = Ir.Type.uint64 },
+        .{ .type = Ir.Type.bool },
+    };
+    const instrs = [_]Ir.Instr{
+        .{ .result = 0, .op = .{ .iconst = two_63 } },
+        .{ .result = 1, .op = .{ .iconst = 2 } },
+        .{ .result = 2, .op = .{ .udiv = .{ .lhs = 0, .rhs = 1 } } },
+        .{ .result = 3, .op = .{ .iconst = 1 } },
+        .{ .result = 4, .op = .{ .icmp = .{ .cc = .ugt, .lhs = 0, .rhs = 3 } } },
+    };
+    var func = try buildFn(gpa, &values, &instrs, .{ .ret = .{ .value = 2 } });
+    defer func.deinit(gpa);
+
+    var st: Opt.Stats = .{};
+    _ = try run(gpa, &func, &st);
+    try expectIconst(func.blocks[0].instrs[2], 0x4000000000000000);
+    try expectBconst(func.blocks[0].instrs[4], true);
 }
