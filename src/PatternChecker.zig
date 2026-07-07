@@ -123,7 +123,14 @@ fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov,
             }
         },
         .pattern_literal => {
-            const lt: Type = if (bc.tokens[pat.main_token].tag == .number) Type.int else Type.@"bool";
+            // Type a numeric pattern via the shared literal helper, adopting the
+            // scrutinee as the expected width: a narrow-int scrutinee (`match x:int8`)
+            // adopts int8 + range-checks the pattern literal, while a non-integer
+            // scrutinee yields platform `int` so the mismatch diagnostic below still fires.
+            const lt: Type = if (bc.tokens[pat.main_token].tag == .number)
+                try bc.typeNumericLiteral(pat.main_token, expected)
+            else
+                Type.@"bool";
             if (expected.kind != .invalid and !Type.eql(lt, expected))
                 try bc.sink.emitFmt(bc.byteOf(pat.main_token), "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
             // A bool literal records its case toward coverage; int never covers.

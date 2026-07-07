@@ -1,0 +1,17 @@
+# Feature: `int8` and `uint8` are DISTINCT types, so conforming each to the same protocol
+# is coherent — not an overlapping impl. The coherence key must carry the sign/width
+# descriptor, else both impls fold to one key and the second is rejected as a collision.
+protocol Foo {
+    fn foo(self) -> int
+}
+
+impl int8 has Foo {
+    fn foo(self) -> int { 1 }
+}
+
+impl uint8 has Foo {
+    fn foo(self) -> int { 2 }
+}
+
+fn main() -> int { 0 }
+# expect: exit 0

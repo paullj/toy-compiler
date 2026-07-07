@@ -1,0 +1,10 @@
+# Feature: the most-negative signed literal is writable. A negated literal whose magnitude
+# equals the signed MIN (`-128` for int8, `-9223372036854775808` for int) has a magnitude
+# one past the positive max, so it is range-checked against `max+1` when negated into a
+# signed width rather than rejected as out of range.
+fn main() -> int {
+    a: int8 = -128
+    b: int = -9223372036854775808
+    return 0
+}
+# expect: exit 0

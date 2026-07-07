@@ -1,0 +1,11 @@
+# Feature: a `match` on a narrow-int scrutinee accepts int literal patterns. The pattern
+# literal `0` adopts the scrutinee width (`int8`) instead of defaulting to platform `int`,
+# so it is not rejected as a type mismatch; it matches and yields 1.
+fn main() -> int {
+    x: int8 = 0
+    return match x {
+        0 -> 1,
+        _ -> 2
+    }
+}
+# expect: exit 1

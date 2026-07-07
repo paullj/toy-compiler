@@ -1,0 +1,11 @@
+# Feature: a non-decimal (hex) literal in a `match` pattern decodes base-aware. `0x2A`
+# is 42, so the arm matches the scrutinee and yields 1. A decimal-only pattern decoder
+# would read `0x2A` as 0 and silently fall through to the wildcard.
+fn main() -> int {
+    x := 42
+    return match x {
+        0x2A -> 1,
+        _ -> 0
+    }
+}
+# expect: exit 1

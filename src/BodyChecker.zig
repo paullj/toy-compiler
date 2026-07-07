@@ -483,24 +483,28 @@ pub const BodyChecker = struct {
         };
     }
 
+    /// Type a numeric literal token. Defaults to platform `int`, but adopts an
+    /// `expected` integer WIDTH (`x: int8 = 100`, or a narrow-int match scrutinee) and
+    /// range-checks the magnitude against it. Adopts the width even on a range error so
+    /// the downstream assignability check stays silent — one T0034, never a paired
+    /// mismatch. The single source shared by the expression `literal_number` arm and the
+    /// PatternChecker numeric-pattern path (both must adopt + range-check identically).
+    pub fn typeNumericLiteral(bc: *BodyChecker, main_token: u32, expected: ?Type) error{OutOfMemory}!Type {
+        if (expected) |e| if (e.isInteger()) {
+            const raw = bc.tokens[main_token].text(bc.source);
+            const in_range = if (litMagnitude(raw)) |v| v <= maxMagnitude(e) else false;
+            if (!in_range)
+                try bc.sink.emitFmtCode(.T0034, bc.byteOf(main_token), "literal out of range for type '{s}'", .{bc.typeName(e)});
+            return e;
+        };
+        return Type.int;
+    }
+
     pub fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
         if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
         const ty: Type = switch (n.tag) {
-            .literal_number => blk: {
-                // Default to platform `int`, but adopt an expected integer WIDTH
-                // (`x: int8 = 100`) and range-check the magnitude against it. Adopt the
-                // width even on a range error so the downstream assignability check stays
-                // silent — one T0034, never a paired mismatch.
-                if (bc.expected) |e| if (e.isInteger()) {
-                    const raw = bc.tokens[n.main_token].text(bc.source);
-                    const in_range = if (litMagnitude(raw)) |v| v <= maxMagnitude(e) else false;
-                    if (!in_range)
-                        try bc.sink.emitFmtCode(.T0034, bc.byteOf(n.main_token), "literal out of range for type '{s}'", .{bc.typeName(e)});
-                    break :blk e;
-                };
-                break :blk Type.int;
-            },
+            .literal_number => try bc.typeNumericLiteral(n.main_token, bc.expected),
             .literal_bool => Type.@"bool",
             .literal_string => Type.str,
             .identifier => switch (bc.resolutions[(node_idx).int()]) {
@@ -533,9 +537,26 @@ pub const BodyChecker = struct {
                 },
             },
             .unary => blk: {
+                const op = bc.tokens[n.main_token].tag;
+                // The most-negative signed literal (`-128: int8`, `-9223372036854775808:
+                // int`) has a magnitude one past the positive max, so range-checking the
+                // bare operand first would spuriously reject it. When negating a literal
+                // into a SIGNED width, range-check the magnitude against `maxMagnitude+1`
+                // (the signed-min magnitude) and pin the operand's node type so lowering
+                // (which parses the positive magnitude then negates + width-wraps) agrees.
+                if (op == .minus and n.lhs != Ast.none and bc.tree.nodes[n.lhs.int()].tag == .literal_number) {
+                    if (bc.expected) |e| if (e.isSigned()) {
+                        const lit_tok = bc.tree.nodes[n.lhs.int()].main_token;
+                        const raw = bc.tokens[lit_tok].text(bc.source);
+                        const in_range = if (litMagnitude(raw)) |v| v <= maxMagnitude(e) + 1 else false;
+                        if (!in_range)
+                            try bc.sink.emitFmtCode(.T0034, bc.byteOf(lit_tok), "literal out of range for type '{s}'", .{bc.typeName(e)});
+                        bc.node_types[n.lhs.int()] = e;
+                        break :blk e;
+                    };
+                }
                 const operand = try bc.typeOf(n.lhs);
                 if (operand.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
-                const op = bc.tokens[n.main_token].tag;
                 switch (op) {
                     .minus => {
                         if (operand.isInteger()) break :blk operand;

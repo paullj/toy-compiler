@@ -251,6 +251,10 @@ fn appendKeyType(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ty: Type) !voi
         else => 0,
     };
     try appendKeyU32(gpa, buf, id);
+    // The sign/width descriptor distinguishes int widths, so `impl int8 has Foo` and
+    // `impl uint8 has Foo` DON'T collide — mirrors `Type.appendKeyBytes`. Self-delimited
+    // off the kind byte, so every non-int key stays byte-identical.
+    if (ty.kind == .int) try buf.append(gpa, @as(u8, @bitCast(ty.int_desc)));
 }
 
 /// Serialize a `(protocol, receiver-type, protocol-args)` conformance key into `buf`.
@@ -258,7 +262,8 @@ fn appendKeyType(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), ty: Type) !voi
 /// so `checkCoherence`'s `seen` is a `StringHashMap` over these bytes — the SAME
 /// serialized-key discipline `Mono.writeKey` uses for instances. Folding the protocol
 /// args means `impl P has Into[int]` and `impl P has Into[bool]` DON'T collide (distinct
-/// bytes), but two identical `Into[int]` still do (T0020). Internal to `checkCoherence`
+/// bytes); likewise distinct int widths/signs (`int8` vs `uint8`) via `appendKeyType`'s
+/// int_desc byte, but two identical `Into[int]` still do (T0020). Internal to `checkCoherence`
 /// (never persisted / fingerprinted), so the layout is free to change.
 fn writeCoherenceKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), pid: u32, recv: Type, protocol_args: []const Type) !void {
     buf.clearRetainingCapacity();
@@ -310,4 +315,31 @@ test "M16: ordEqRefinementReceivers registers exactly one (Eq,T) per Ord recv; e
         try testing.expect(Type.eql(out.items[0], P));
         try testing.expect(Type.eql(out.items[1], Q));
     }
+}
+
+test "coherence key distinguishes int widths/signs: int8 vs uint8 vs int don't collide" {
+    const gpa = testing.allocator;
+    var k_int8: std.ArrayList(u8) = .empty;
+    defer k_int8.deinit(gpa);
+    var k_uint8: std.ArrayList(u8) = .empty;
+    defer k_uint8.deinit(gpa);
+    var k_int: std.ArrayList(u8) = .empty;
+    defer k_int.deinit(gpa);
+
+    const pid: u32 = 3;
+    try writeCoherenceKey(gpa, &k_int8, pid, Type.int8, &.{});
+    try writeCoherenceKey(gpa, &k_uint8, pid, Type.uint8, &.{});
+    try writeCoherenceKey(gpa, &k_int, pid, Type.int, &.{});
+
+    // Same protocol + kind byte but distinct sign/width descriptor => distinct keys, so
+    // `impl int8 has P` and `impl uint8 has P` are NOT flagged as overlapping.
+    try testing.expect(!std.mem.eql(u8, k_int8.items, k_uint8.items));
+    try testing.expect(!std.mem.eql(u8, k_int8.items, k_int.items));
+    try testing.expect(!std.mem.eql(u8, k_uint8.items, k_int.items));
+
+    // Two identical int8 receivers still collide (same bytes) — the T0020 gate holds.
+    var k_int8b: std.ArrayList(u8) = .empty;
+    defer k_int8b.deinit(gpa);
+    try writeCoherenceKey(gpa, &k_int8b, pid, Type.int8, &.{});
+    try testing.expect(std.mem.eql(u8, k_int8.items, k_int8b.items));
 }

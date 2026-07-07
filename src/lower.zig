@@ -1367,12 +1367,15 @@ fn emitVariantPayloadEq(b: *Builder, e: Typecheck.EnumLayout, vi: usize, self_ba
 }
 
 /// The branch-free 3-way discriminant (0=lt/1=eq/2=gt) of two int/bool VALUES:
-/// `(lhs > rhs) - (lhs < rhs) + 1`. Signed `icmp` is correct for int and for bool (0/1).
-fn threeWayInt(b: *Builder, lv: Ir.ValueId, rv: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+/// `(lhs > rhs) - (lhs < rhs) + 1`. `unsigned` selects the unsigned magnitude conds:
+/// a derived `Ord` on a `uint64` field must compare unsigned or a high-bit-set value
+/// mis-orders as negative. Signed conds are correct for signed ints, bools (0/1), and
+/// the small non-negative enum tags.
+fn threeWayInt(b: *Builder, lv: Ir.ValueId, rv: Ir.ValueId, unsigned: bool) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.@"bool";
-    const gt = try b.emit(.{ .icmp = .{ .cc = .gt, .lhs = lv, .rhs = rv } }, bool_ty);
-    const lt = try b.emit(.{ .icmp = .{ .cc = .lt, .lhs = lv, .rhs = rv } }, bool_ty);
+    const gt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ugt else .gt, .lhs = lv, .rhs = rv } }, bool_ty);
+    const lt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ult else .lt, .lhs = lv, .rhs = rv } }, bool_ty);
     const diff = try b.emit(.{ .sub = .{ .lhs = gt, .rhs = lt } }, int_ty);
     const one = try b.emit(.{ .iconst = 1 }, int_ty);
     return try b.emit(.{ .add = .{ .lhs = diff, .rhs = one } }, int_ty);
@@ -1391,7 +1394,7 @@ fn deriveFieldCmp(b: *Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Valu
             const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
             const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
             const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
-            return try threeWayInt(b, lv, rv);
+            return try threeWayInt(b, lv, rv, fty.isUnsignedInt());
         },
         .str => {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
@@ -1489,7 +1492,7 @@ fn deriveEnumCmp(b: *Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_
 
     const st = try b.emit(.{ .get_tag = self_base }, int_ty);
     const ot = try b.emit(.{ .get_tag = other_base }, int_ty);
-    const tag_disc = try threeWayInt(b, st, ot);
+    const tag_disc = try threeWayInt(b, st, ot, false);
     const tags_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = st, .rhs = ot } }, bool_ty);
 
     const dispatch = try b.addBlock();
@@ -3960,16 +3963,12 @@ fn parseInt(raw: []const u8) ?i64 {
     return @bitCast(std.fmt.parseInt(u64, s, 0) catch return null);
 }
 
-/// Parse a (possibly `_`-separated) decimal int literal as written in source, for
-/// a PATTERN literal. NON-range-checked — the
-/// asymmetry vs the range-checked `parseInt` for `literal_number` is intentional.
+/// Parse an int literal as written in source, for a PATTERN literal. Delegates to the
+/// base-aware `parseInt` (base 0 auto-detects `0x`/`0o`/`0b`, strips `_`) so a
+/// `0x2A`/`0o52` pattern decodes to the same value as the scrutinee it is matched
+/// against; a hand-rolled decimal loop silently mis-decoded every non-decimal base.
 fn parseIntLit(text: []const u8) i64 {
-    var v: i64 = 0;
-    for (text) |c| {
-        if (c == '_') continue;
-        v = v * 10 + @as(i64, c - '0');
-    }
-    return v;
+    return parseInt(text) orelse 0;
 }
 
 /// Decode a string-literal token into its runtime bytes (quotes stripped, escapes
@@ -5180,4 +5179,60 @@ test "M1: parseInt round-trips the full uint64 range into the iconst bit pattern
     // Still null past 2^64-1 (no width can admit it) and on a garbage token.
     try testing.expectEqual(@as(?i64, null), parseInt("18446744073709551616"));
     try testing.expectEqual(@as(?i64, null), parseInt("0xZZ"));
+}
+
+test "parseIntLit (pattern literal) decodes base-aware, matching the scrutinee value" {
+    try testing.expectEqual(@as(i64, 42), parseIntLit("42"));
+    // The bug this fixes: a non-decimal base was mis-decoded by the old decimal loop.
+    try testing.expectEqual(@as(i64, 42), parseIntLit("0x2A"));
+    try testing.expectEqual(@as(i64, 42), parseIntLit("0o52"));
+    try testing.expectEqual(@as(i64, 42), parseIntLit("0b0010_1010"));
+    try testing.expectEqual(@as(i64, 1000), parseIntLit("1_000"));
+}
+
+const ThreeWayConds = struct { ugt: bool = false, ult: bool = false, gt: bool = false, lt: bool = false };
+
+fn threeWayConds(b: *const Builder, blk: Ir.BlockId) ThreeWayConds {
+    var r: ThreeWayConds = .{};
+    for (b.blocks.items[blk].instrs.items) |ins| switch (ins.op) {
+        .icmp => |c| switch (c.cc) {
+            .ugt => r.ugt = true,
+            .ult => r.ult = true,
+            .gt => r.gt = true,
+            .lt => r.lt = true,
+            else => {},
+        },
+        else => {},
+    };
+    return r;
+}
+
+test "threeWayInt: unsigned=true emits ugt/ult; unsigned=false stays signed gt/lt" {
+    const gpa = testing.allocator;
+    // threeWayInt only touches emit/blocks/values, never `in` — a bare Builder suffices.
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    {
+        var b: Builder = .{ .gpa = gpa, .in = undefined, .diags = &diags };
+        defer b.deinit();
+        const blk = try b.addBlock();
+        b.switchTo(blk);
+        const lv = try b.emit(.{ .iconst = 1 }, Typecheck.Type.int);
+        const rv = try b.emit(.{ .iconst = 2 }, Typecheck.Type.int);
+        _ = try threeWayInt(&b, lv, rv, true);
+        const c = threeWayConds(&b, blk);
+        try testing.expect(c.ugt and c.ult and !c.gt and !c.lt);
+    }
+    {
+        var b: Builder = .{ .gpa = gpa, .in = undefined, .diags = &diags };
+        defer b.deinit();
+        const blk = try b.addBlock();
+        b.switchTo(blk);
+        const lv = try b.emit(.{ .iconst = 1 }, Typecheck.Type.int);
+        const rv = try b.emit(.{ .iconst = 2 }, Typecheck.Type.int);
+        _ = try threeWayInt(&b, lv, rv, false);
+        const c = threeWayConds(&b, blk);
+        try testing.expect(c.gt and c.lt and !c.ugt and !c.ult);
+    }
 }

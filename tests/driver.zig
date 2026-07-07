@@ -589,6 +589,99 @@ test "M23: a bare `Option.none` with no inferable target reports T0016" {
     try testing.expect(std.mem.indexOf(u8, res.out, "T0016") != null);
 }
 
+test "coherence: distinct int widths (int8 vs uint8) conform to the same protocol without a T0020 collision" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-coherence-int-widths";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\protocol Foo { fn foo(self) -> int }
+        \\impl int8 has Foo { fn foo(self) -> int { 1 } }
+        \\impl uint8 has Foo { fn foo(self) -> int { 2 } }
+        \\fn main() -> int { 0 }
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0020") == null);
+}
+
+test "coherence: two identical int8 impls DO still collide (rejected)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-coherence-dup-int8";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    // Two impls of the SAME (int8, Foo) are still illegal — here the duplicate-method
+    // check (R0002) fires before the coherence barrier, but either way it is rejected.
+    const src =
+        \\protocol Foo { fn foo(self) -> int }
+        \\impl int8 has Foo { fn foo(self) -> int { 1 } }
+        \\impl int8 has Foo { fn foo(self) -> int { 2 } }
+        \\fn main() -> int { 0 }
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "int8") != null);
+}
+
+test "literals: the most-negative signed literal (int8 -128, int INT_MIN) is accepted" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-int-min-literal";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn main() -> int {
+        \\  a: int8 = -128
+        \\  b: int = -9223372036854775808
+        \\  return 0
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0034") == null);
+}
+
+test "literals: one past the signed min (int8 -129) still reports T0034" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-int-min-overflow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  a: int8 = -129\n  return 0\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0034") != null);
+}
+
+test "match: an out-of-range literal pattern on a narrow-int scrutinee reports T0034 once" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-match-narrow-oor";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  x: int8 = 0\n  return match x { 300 -> 1, _ -> 2 }\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "T0034") != null);
+    // Single diagnostic — the width-adopt keeps the assignability mismatch silent.
+    try testing.expect(std.mem.indexOf(u8, res.out, "does not match scrutinee") == null);
+}
+
 test "M23: an Option is_some/unwrap_or program compiles + runs; exit is the guarded payload" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -1538,6 +1631,26 @@ test "integration: emitted binary runs with the right exit code" {
         // Into[T] target from a CALL-ARGUMENT slot (M3): `small.into()` widens uint8->uint
         // with the target derived from `takes`'s param type. → 42.
         .{ .src = "fn takes(u: uint) -> int {\n return if u == 200 { 42 } else { 0 }\n}\nfn main() -> int {\n small: uint8 = 200\n return takes(small.into())\n}\n", .name = "into_arg_slot", .expect = 42 },
+
+        // Derived `Ord` on an UNSIGNED field compares UNSIGNED. hi has the high bit set
+        // (2^63), so a signed field compare would rank it below lo and make `a < b` true;
+        // unsigned, 2^63 > 1, so `a < b` is FALSE → 0.
+        .{ .src = "struct W { v: uint64 }\nfn main() -> int {\n hi: uint64 = 0x8000000000000000\n lo: uint64 = 1\n a := W{ v: hi }\n b := W{ v: lo }\n return if a < b { 1 } else { 0 }\n}\n", .name = "derive_ord_unsigned_lt", .expect = 0 },
+        // Positive direction of the same: `a > b` IS true unsigned (2^63 > 1) → 42.
+        .{ .src = "struct W { v: uint64 }\nfn main() -> int {\n hi: uint64 = 0x8000000000000000\n lo: uint64 = 1\n a := W{ v: hi }\n b := W{ v: lo }\n return if a > b { 42 } else { 0 }\n}\n", .name = "derive_ord_unsigned_gt", .expect = 42 },
+        // A HEX literal in a `match` pattern decodes base-aware: 0x2A == 42 matches → 1.
+        // A decimal-only pattern decoder would read 0x2A as 0 and fall to the wildcard.
+        .{ .src = "fn main() -> int {\n x := 42\n return match x { 0x2A -> 1, _ -> 0 }\n}\n", .name = "match_hex_pattern", .expect = 1 },
+        // Same hex pattern that must NOT match (scrutinee 7 ≠ 0x2A) → wildcard → 0.
+        .{ .src = "fn main() -> int {\n x := 7\n return match x { 0x2A -> 1, _ -> 0 }\n}\n", .name = "match_hex_pattern_miss", .expect = 0 },
+        // A narrow-int scrutinee accepts int literal patterns: the pattern `0` adopts the
+        // int8 width instead of platform int, matches → 1.
+        .{ .src = "fn main() -> int {\n x: int8 = 0\n return match x { 0 -> 1, _ -> 2 }\n}\n", .name = "match_narrow_int", .expect = 1 },
+        // Same narrow-int match falling to the wildcard (5 ≠ 0) → 2.
+        .{ .src = "fn main() -> int {\n x: int8 = 5\n return match x { 0 -> 1, _ -> 2 }\n}\n", .name = "match_narrow_int_wild", .expect = 2 },
+        // The most-negative signed literals are writable (magnitude one past the positive
+        // max). -128:int8 stored to a field loads back < 0 → 42.
+        .{ .src = "struct S { v: int8 }\nfn main() -> int {\n a: int8 = -128\n s := S{ v: a }\n return if s.v < 0 { 42 } else { 0 }\n}\n", .name = "int_min_int8", .expect = 42 },
     };
 
     for (cases, 0..) |c, i| {
