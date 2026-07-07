@@ -1,0 +1,7 @@
+# expect: exit 42
+fn main() -> int {
+    small: uint8 = 200
+    wide: uint   = small.into()
+    back: uint8  = wide.try_into().unwrap()
+    return if back == 200 { 42 } else { 0 }
+}

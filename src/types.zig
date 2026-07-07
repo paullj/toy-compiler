@@ -511,6 +511,8 @@ pub const PreludeProtocolIds = struct {
     hash: ?u32 = null,
     display: ?u32 = null,
     from: ?u32 = null,
+    into: ?u32 = null,
+    try_into: ?u32 = null,
 };
 
 /// Snapshot the prelude protocol ids off a `Typecheck`/`Model` into a `PreludeProtocolIds`
@@ -534,6 +536,8 @@ pub fn witnessProtocolId(ids: PreludeProtocolIds, name: []const u8) ?u32 {
     if (std.mem.eql(u8, name, "hash")) return ids.hash;
     if (std.mem.eql(u8, name, "display")) return ids.display;
     if (std.mem.eql(u8, name, "from")) return ids.from;
+    if (std.mem.eql(u8, name, "into")) return ids.into;
+    if (std.mem.eql(u8, name, "try_into")) return ids.try_into;
     return null;
 }
 
@@ -554,6 +558,9 @@ pub const Prelude = struct {
     /// inherent-method recognition on an `.app` receiver via `optResultFamily`.
     option_enum: ?u32 = null,
     result_enum: ?u32 = null,
+    /// The checker-internal `ConvErr{out_of_range}` enum id — the error payload of a
+    /// `try_into`'s synthesized `Result[Dst, ConvErr]`. Never named in source.
+    conv_err_enum: ?u32 = null,
 
     /// The native-enum family of an `App` ctor: `.option`/`.result` when `ctor` is the
     /// prelude Option/Result TEMPLATE id, else `.none`. A user `enum Option` shadow has its
@@ -699,6 +706,42 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
     if (std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool, .arity = 1 };
     if (std.mem.eql(u8, name, "hash")) return .{ .ret = Type.int, .arity = 0 };
     return null;
+}
+
+/// The kind of an int↔int conversion the `Into`/`TryInto` recognizer accepts.
+pub const ConvKind = enum { widen, narrow };
+
+/// The pure, table-free recognizer for the target-directed `.into()` (lossless
+/// widening/identity) and `.try_into()` (fallible any-int-to-int) conversion surface.
+/// Shared by the checker (types the call) and lower (emits the inline op) so a
+/// conversion is NEVER a phantom `t.methods` row (which would desync `names`/`sigs`) and
+/// the two consumers cannot diverge at any `-jN`. `recv` is the receiver type, `expected`
+/// the target inferred from context (a let-annotation / return / arg slot / the `T` of a
+/// chained `unwrap`). Returns null unless BOTH are integers, so a struct/enum receiver
+/// leaves the existing `.ambiguous`/T0025/T0018 dispatch untouched.
+///   * `into`: same-signedness AND `expected` at least as wide as `recv` ⇒ `.widen`
+///     targeting `expected`; narrowing/sign-change via `into` is null (→ T0018).
+///   * `try_into`: any integer `expected` ⇒ `.narrow` targeting `expected` (the desired
+///     payload `T`). A widening/identity `try_into` is accepted and always yields `Ok`.
+pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8) ?struct { kind: ConvKind, target: Type } {
+    if (!recv.isInteger() or !expected.isInteger()) return null;
+    if (std.mem.eql(u8, member, "into")) {
+        if (recv.isSigned() == expected.isSigned() and intBits(expected) >= intBits(recv))
+            return .{ .kind = .widen, .target = expected };
+        return null;
+    }
+    if (std.mem.eql(u8, member, "try_into")) return .{ .kind = .narrow, .target = expected };
+    return null;
+}
+
+/// The bit width of an integer `Type` (platform `int`/`uint` counts as 64).
+fn intBits(t: Type) u16 {
+    return switch (t.int_desc.width) {
+        .plat, .w64 => 64,
+        .w8 => 8,
+        .w16 => 16,
+        .w32 => 32,
+    };
 }
 
 /// A compiler-provided inherent method on the prelude `Option`/`Result` enums:
@@ -2628,6 +2671,8 @@ pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
             if (pr.hash) |id| if (std.mem.eql(u8, name, "Hash")) return id;
             if (pr.display) |id| if (std.mem.eql(u8, name, "Display")) return id;
             if (pr.from) |id| if (std.mem.eql(u8, name, "From")) return id;
+            if (pr.into) |id| if (std.mem.eql(u8, name, "Into")) return id;
+            if (pr.try_into) |id| if (std.mem.eql(u8, name, "TryInto")) return id;
         }
         return null;
     }
@@ -6634,4 +6679,75 @@ test "an enum node carries an @\"enum\" type with the right id" {
         }
     }
     try testing.expect(found);
+}
+
+test "M3: builtinConvMethod verdict table (widen/narrow/reject)" {
+    // into: same-sign widening/identity accepted, narrowing/sign-change rejected.
+    try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.uint8, Type.uint, "into").?.kind);
+    try testing.expectEqual(Type.uint, builtinConvMethod(Type.uint8, Type.uint, "into").?.target);
+    try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.int, Type.int64, "into").?.kind); // plat==w64
+    try testing.expect(builtinConvMethod(Type.uint, Type.uint8, "into") == null); // narrowing
+    try testing.expect(builtinConvMethod(Type.uint8, Type.int, "into") == null); // sign-change
+    // try_into: any int→int accepted (target = expected payload T).
+    try testing.expectEqual(ConvKind.narrow, builtinConvMethod(Type.uint, Type.uint8, "try_into").?.kind);
+    try testing.expectEqual(Type.uint8, builtinConvMethod(Type.uint, Type.uint8, "try_into").?.target);
+    try testing.expectEqual(ConvKind.narrow, builtinConvMethod(Type.int, Type.uint, "try_into").?.kind);
+    // Non-integer receiver / expected → null (leaves struct/enum dispatch untouched).
+    try testing.expect(builtinConvMethod(Type.bool, Type.uint8, "try_into") == null);
+    try testing.expect(builtinConvMethod(Type.uint8, Type.bool, "into") == null);
+}
+
+test "M3: witnessProtocolId resolves into/try_into to the bundle ids" {
+    const ids: PreludeProtocolIds = .{ .into = 9, .try_into = 10 };
+    try testing.expectEqual(@as(?u32, 9), witnessProtocolId(ids, "into"));
+    try testing.expectEqual(@as(?u32, 10), witnessProtocolId(ids, "try_into"));
+}
+
+test "M3: chained `wide.try_into().unwrap()` leaks the int target to try_into" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\  wide: uint = 200
+        \\  back: uint8 = wide.try_into().unwrap()
+        \\  return if back == 200 { 42 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+
+    var saw_try_into = false;
+    var saw_unwrap = false;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .call) continue;
+        const callee = c.tree.nodes[n.lhs.int()];
+        if (callee.tag != .field_access) continue;
+        const member = c.tokens[callee.main_token].text(c.source);
+        const ty = c.result.node_types[0][i];
+        if (std.mem.eql(u8, member, "try_into")) {
+            saw_try_into = true;
+            // Result[uint8, ConvErr] — an aggregate, never a bare scalar/invalid.
+            try testing.expect(ty.kind == .@"enum" or ty.kind == .app);
+        } else if (std.mem.eql(u8, member, "unwrap")) {
+            saw_unwrap = true;
+            try testing.expectEqual(Type.uint8, ty);
+        }
+    }
+    try testing.expect(saw_try_into and saw_unwrap);
+}
+
+test "M3: narrowing via `into` is rejected (no silent lossy conversion)" {
+    const gpa = testing.allocator;
+    // uint -> uint8 is narrowing, so `into` (lossless-only) must NOT resolve: the recognizer
+    // returns null and the call falls through to T0018 rather than silently truncating.
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\  wide: uint = 300
+        \\  x: uint8 = wide.into()
+        \\  return if x == 44 { 0 } else { 1 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len > 0);
 }

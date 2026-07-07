@@ -1685,6 +1685,31 @@ pub const BodyChecker = struct {
             },
             .none => {},
         }
+        // Target-directed `.into()` / `.try_into()` on an integer receiver (M3): resolve
+        // the destination from `bc.expected`. `into` widens losslessly (returns the value
+        // typed to the target); `try_into` narrows fallibly (returns a synthesized
+        // `Result[T, ConvErr]`). A bare call with no expected, or a rejected pair (e.g.
+        // narrowing via `into`), falls through to T0018 below — never a wrong conversion.
+        if (recv_ty.isInteger() and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
+            if (bc.expected) |exp| {
+                if (Typecheck.builtinConvMethod(recv_ty, exp, member)) |cm| {
+                    if (args.len != 0) {
+                        for (args) |a| _ = try bc.typeOf(a);
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                    }
+                    const ret: Type = switch (cm.kind) {
+                        .widen => cm.target,
+                        .narrow => Type.app(try bc.internApp(
+                            bc.model.prelude.?.result_enum.?,
+                            &.{ cm.target, Type.enumT(bc.model.prelude.?.conv_err_enum.?) },
+                            true,
+                        )),
+                    };
+                    bc.node_types[(node_idx).int()] = ret;
+                    return ret;
+                }
+            }
+        }
         // A direct `.hash()` on a struct/enum with NO explicit impl: the
         // structural `Hash` derive trigger. Hash has no operator, so (unlike
         // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
