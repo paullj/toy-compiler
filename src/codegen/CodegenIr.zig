@@ -1246,3 +1246,77 @@ test "ir-codegen: condToAarch64 maps unsigned conds to the unsigned aarch64 form
     try testing.expectEqual(Aarch64.Cond.hi, condToAarch64(.ugt));
     try testing.expectEqual(Aarch64.Cond.hs, condToAarch64(.uge));
 }
+
+// The value transform an emitted normalizeWidth word performs, decoded from the
+// ISA meaning of the exact encoders codegen uses — derived independently of
+// `arith.wrapTo` so a divergence between the two width tables surfaces here.
+const WidthXform = enum { identity, sxtb, sxth, sxtw, mask8, mask16, mask32 };
+
+fn decodeWidthWord(words: []const u8) WidthXform {
+    if (words.len == 0) return .identity;
+    std.debug.assert(words.len == 4);
+    const w = std.mem.readInt(u32, words[0..4], .little);
+    if (w == Aarch64.sxtb(S0, S0)) return .sxtb;
+    if (w == Aarch64.sxth(S0, S0)) return .sxth;
+    if (w == Aarch64.sxtw(S0, S0)) return .sxtw;
+    if (w == Aarch64.andLowBits(S0, S0, 7)) return .mask8;
+    if (w == Aarch64.andLowBits(S0, S0, 15)) return .mask16;
+    if (w == Aarch64.andLowBits(S0, S0, 31)) return .mask32;
+    @panic("normalizeWidth emitted an unrecognized word");
+}
+
+fn applyWidthXform(x: WidthXform, v: i64) i64 {
+    return switch (x) {
+        .identity => v,
+        .sxtb => @as(i64, @as(i8, @truncate(v))),
+        .sxth => @as(i64, @as(i16, @truncate(v))),
+        .sxtw => @as(i64, @as(i32, @truncate(v))),
+        .mask8 => v & 0xFF,
+        .mask16 => v & 0xFFFF,
+        .mask32 => v & 0xFFFFFFFF,
+    };
+}
+
+// Ties codegen's `normalizeWidth` (an instruction table) to `arith.wrapTo` (a
+// value table) that CodegenIr.zig:434 claims mirror each other. The test-local
+// import keeps the production graph free of a codegen→opt edge. For every
+// int-width × sign (plus a non-integer identity arm), the value meaning of the
+// instruction codegen emits must equal what wrapTo computes; any future
+// divergence (a width added to one table, or a sign/zero-extend chosen
+// differently) becomes a unit failure rather than a differential-only catch.
+test "ir-codegen: normalizeWidth value-domain matches arith.wrapTo across all widths" {
+    const arith = @import("../opt/arith.zig");
+
+    var g = Gen{
+        .gpa = testing.allocator,
+        .func = undefined,
+        .layouts = undefined,
+        .enum_layouts = undefined,
+        .is_entry = undefined,
+        .fl = undefined,
+        .params = undefined,
+        .block_labels = undefined,
+    };
+    defer g.code.deinit(g.gpa);
+
+    const cases = [_]Type{
+        Type.int,   Type.uint,
+        Type.int8,  Type.uint8,
+        Type.int16, Type.uint16,
+        Type.int32, Type.uint32,
+        Type.int64, Type.uint64,
+        Type.@"bool", // non-integer → identity arm
+    };
+    const probes = [_]i64{
+        0x1122_3344_5566_7788, -1, 0x80, 0x8000, 0x8000_0000, 0,
+    };
+
+    for (cases) |ty| {
+        g.code.clearRetainingCapacity();
+        try normalizeWidth(&g, S0, ty);
+        const xform = decodeWidthWord(g.code.items);
+        for (probes) |p| {
+            try testing.expectEqual(arith.wrapTo(ty, p), applyWidthXform(xform, p));
+        }
+    }
+}
