@@ -7,7 +7,7 @@ const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const LayoutEngine = @import("layout/Engine.zig");
-const Type = LayoutEngine.Type;
+const Type = @import("layout/Type.zig").Type;
 const VariantSym = LayoutEngine.VariantSym;
 const EnumSym = LayoutEngine.EnumSym;
 

@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const LayoutEngine = @import("../layout/Engine.zig");
-const Type = LayoutEngine.Type;
+const Type = @import("../layout/Type.zig").Type;
 
 /// Pack a numeric-literal token into `buf`, dropping `_` digit separators, and return
 /// the packed slice (or null if it overflows `buf`). The one base-0 grammar both the

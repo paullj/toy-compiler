@@ -16,7 +16,7 @@
 //! function of source, never hashmap/thread order.
 
 const std = @import("std");
-const Type = @import("../layout/Engine.zig").Type;
+const Type = @import("../layout/Type.zig").Type;
 
 /// Which derive this recipe carries. Append-only (mirrors `Token.Tag`/`Node.Tag`
 /// discipline): successive kinds are `.ord`, `.hash`, `.display`. The ordinal folds into

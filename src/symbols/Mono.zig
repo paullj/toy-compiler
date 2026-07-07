@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
-const Type = @import("../layout/Engine.zig").Type;
+const Type = @import("../layout/Type.zig").Type;
 
 /// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
 /// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
