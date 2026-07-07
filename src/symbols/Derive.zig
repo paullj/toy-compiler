@@ -99,14 +99,15 @@ pub const Derive = struct {
 };
 
 /// True when `conform_ty` is an enum (the id then lives in `enum_id`, not `struct_id`).
+/// Routes through `Type.idField` so the enum-vs-struct id-space split is single-sourced.
 fn isEnum(t: Type) bool {
-    return t.kind == .@"enum";
+    return Type.idField(t.kind) == .enum_id;
 }
 
-/// The ground type-id used as the canonical ordering / dedup key: `enum_id` for an
-/// enum recipe, else `struct_id`.
+/// The ground type-id used as the canonical ordering / dedup key: the nominal id, read
+/// through the field `Type.idField` selects (`enum_id` for an enum recipe, else `struct_id`).
 fn typeId(t: Type) u32 {
-    return if (isEnum(t)) t.enum_id else t.struct_id;
+    return t.nominalId();
 }
 
 /// The canonical total order: by protocol id, then derive kind, then enum-vs-struct,
@@ -126,6 +127,10 @@ pub fn lessThan(_: void, a: Derive, b: Derive) bool {
 /// injective — two distinct recipes never share a key (the kind + enum flag + id are
 /// fixed-width). Used by the synthesis worklist dedup.
 pub fn writeKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), protocol_id: u32, kind: Kind, conform_ty: Type) !void {
+    // Derive recipes only ever target struct/enum nominal types; the key deliberately
+    // omits the int descriptor, which is only sound because no `.int` conformer reaches
+    // here. Pin that so the omission is principled, not an accidental drop.
+    std.debug.assert(!Type.carriesIntDesc(conform_ty.kind));
     var w: [4]u8 = undefined;
     std.mem.writeInt(u32, &w, protocol_id, .little);
     try buf.appendSlice(gpa, &w);
@@ -143,6 +148,9 @@ pub fn writeKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), protocol_id: u3
 /// fingerprint via the derive-fingerprint's layout fold, so the name never needs the
 /// layout.
 pub fn mangle(gpa: std.mem.Allocator, protocol_name: []const u8, kind: Kind, conform_ty: Type) ![]u8 {
+    // See `writeKey`: the mangled name drops the int descriptor for the same reason
+    // (no `.int` conformer ever reaches derive synthesis).
+    std.debug.assert(!Type.carriesIntDesc(conform_ty.kind));
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, protocol_name);

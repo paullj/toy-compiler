@@ -44,6 +44,12 @@ pub const IntWidth = enum(u3) { plat, w8, w16, w32, w64 };
 /// fingerprint/dedup/order serializers.
 pub const IntDesc = packed struct(u8) { signed: bool = true, width: IntWidth = .plat, _pad: u4 = 0 };
 
+/// Which struct field of a `Type` carries a given kind's nominal identity. The single
+/// home for the per-kind id-selection every identity serializer (`eql`, the flat/order
+/// keys, the coherence key, the derive/mono mangles) must agree on: `.none` kinds have
+/// no nominal id.
+pub const IdField = enum { none, struct_id, enum_id };
+
 /// A type. A byte-foldable struct (not a tagged union) so it preserves `@memset`,
 /// `node_types` triviality, and a stable fingerprint basis. A `@"struct"` kind
 /// carries an index into the struct table; a `@"enum"` kind an index into the
@@ -113,13 +119,43 @@ pub const Type = struct {
         return t.struct_id;
     }
 
+    /// Which field carries this kind's nominal identity. Exhaustive (no `else`) so a
+    /// NEW `Kind` is a build error here rather than a silent identity drop in one of the
+    /// serializers that route through this. `type_var`/`app` alias `struct_id` (the id
+    /// space they reuse), so this hides that aliasing from every caller.
+    pub fn idField(kind: Kind) IdField {
+        return switch (kind) {
+            .@"struct", .type_var, .app => .struct_id,
+            .@"enum" => .enum_id,
+            .invalid, .unit, .int, .bool, .str, .never => .none,
+        };
+    }
+
+    /// This type's nominal id (0 for a `.none` kind), read through the field `idField`
+    /// selects — the one accessor every serializer's per-kind id read collapses to.
+    pub fn nominalId(t: Type) u32 {
+        return switch (idField(t.kind)) {
+            .none => 0,
+            .struct_id => t.struct_id,
+            .enum_id => t.enum_id,
+        };
+    }
+
+    /// Whether this kind's identity includes the `int_desc` sign/width byte. The single
+    /// home for the int-only descriptor rule the coherence key once dropped: an identity
+    /// serializer either folds `int_desc` for exactly these kinds or under-discriminates.
+    pub fn carriesIntDesc(kind: Kind) bool {
+        return kind == .int;
+    }
+
     pub fn eql(a: Type, b: Type) bool {
-        return a.kind == b.kind and
-            (a.kind != .@"struct" or a.struct_id == b.struct_id) and
-            (a.kind != .@"enum" or a.enum_id == b.enum_id) and
-            (a.kind != .type_var or a.struct_id == b.struct_id) and
-            (a.kind != .app or a.struct_id == b.struct_id) and
-            (a.kind != .int or @as(u8, @bitCast(a.int_desc)) == @as(u8, @bitCast(b.int_desc)));
+        if (a.kind != b.kind) return false;
+        if (carriesIntDesc(a.kind) and @as(u8, @bitCast(a.int_desc)) != @as(u8, @bitCast(b.int_desc)))
+            return false;
+        return switch (idField(a.kind)) {
+            .none => true,
+            .struct_id, .enum_id => a.nominalId() == b.nominalId(),
+        };
     }
 
     /// The one assignability relation: is a value of type `got` acceptable where a
@@ -199,7 +235,7 @@ pub const Type = struct {
         // The sign/width descriptor only for `.int` (self-delimiting off the leading
         // kind byte), so every non-int key stays byte-identical while `int8`/`int64`
         // never fold to one interned/dedup/mangle key.
-        if (t.kind == .int) try buf.append(gpa, @as(u8, @bitCast(t.int_desc)));
+        if (carriesIntDesc(t.kind)) try buf.append(gpa, @as(u8, @bitCast(t.int_desc)));
         var w: [4]u8 = undefined;
         std.mem.writeInt(u32, &w, t.struct_id, .little);
         try buf.appendSlice(gpa, &w);
@@ -214,7 +250,7 @@ pub const Type = struct {
         // Two integer widths sharing the `.int` kind tie-break on the descriptor byte,
         // so `Mono.lessThan` stays a total order across widths (else the `-jN` mono sort
         // is nondeterministic).
-        if (a.kind == .int and @as(u8, @bitCast(a.int_desc)) != @as(u8, @bitCast(b.int_desc)))
+        if (carriesIntDesc(a.kind) and @as(u8, @bitCast(a.int_desc)) != @as(u8, @bitCast(b.int_desc)))
             return std.math.order(@as(u8, @bitCast(a.int_desc)), @as(u8, @bitCast(b.int_desc)));
         if (a.struct_id != b.struct_id) return std.math.order(a.struct_id, b.struct_id);
         return std.math.order(a.enum_id, b.enum_id);

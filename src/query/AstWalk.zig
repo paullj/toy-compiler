@@ -863,7 +863,14 @@ pub fn appendTouched(gpa: std.mem.Allocator, frozen: anytype, ty: Typecheck.Type
         try out.append(gpa, .{ .kind = .@"enum", .layout = try buf.toOwnedSlice(gpa) });
         return;
     }
-    try out.append(gpa, .{ .kind = ty.kind, .int_desc = @as(u8, @bitCast(ty.int_desc)) });
+    // Only an `.int` carries a meaningful descriptor; every other kind folds the stable
+    // default byte (single-sourced via `carriesIntDesc`, so this can't drift from the
+    // other identity serializers' int-only rule).
+    const int_desc: u8 = if (Typecheck.Type.carriesIntDesc(ty.kind))
+        @bitCast(ty.int_desc)
+    else
+        @bitCast(Typecheck.IntDesc{});
+    try out.append(gpa, .{ .kind = ty.kind, .int_desc = int_desc });
 }
 
 /// Collect the signatures of every function `idx` calls, in body walk order (the
