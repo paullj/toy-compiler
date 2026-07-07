@@ -67,9 +67,40 @@ pub fn sdiv(rd: u32, rn: u32, rm: u32) u32 {
     return 0x9AC00C00 | (rm << 16) | (rn << 5) | rd;
 }
 
+/// udiv rd, rn, rm (unsigned division; arm64 udiv by 0 yields 0, no trap). Mirrors
+/// `sdiv` with bit10 cleared. udiv x0,x0,x0 → 0x9AC00800.
+pub fn udiv(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x9AC00800 | (rm << 16) | (rn << 5) | rd;
+}
+
 /// neg rd, rm — alias of `sub rd, xzr, rm`. neg x4,x0 → 0xCB0003E4.
 pub fn neg(rd: u32, rm: u32) u32 {
     return subReg(rd, XZR, rm);
+}
+
+/// sxtb rd, rn — sign-extend low byte to 64-bit (SBFM alias). sxtb x0,x0 →
+/// 0x93401C00. Used to re-canonicalize a signed narrow (int8) result after a
+/// full-width op wraps it.
+pub fn sxtb(rd: u32, rn: u32) u32 {
+    return 0x93401C00 | (rn << 5) | rd;
+}
+
+/// sxth rd, rn — sign-extend low halfword to 64-bit. sxth x0,x0 → 0x93403C00.
+pub fn sxth(rd: u32, rn: u32) u32 {
+    return 0x93403C00 | (rn << 5) | rd;
+}
+
+/// sxtw rd, rn — sign-extend low word to 64-bit. sxtw x0,x0 → 0x93407C00.
+pub fn sxtw(rd: u32, rn: u32) u32 {
+    return 0x93407C00 | (rn << 5) | rd;
+}
+
+/// and rd, rn, #mask — AND with a low-bits bitmask immediate (N=1, immr=0; `imms`
+/// = mask width − 1). imms 7/15/31 encode #0xff / #0xffff / #0xffffffff, the
+/// zero-extend masks for an unsigned narrow (uint8/16/32) result. and x0,x0,#0xff
+/// → 0x92401C00; and x0,x0,#0xffff → 0x92403C00; and x0,x0,#0xffffffff → 0x92407C00.
+pub fn andLowBits(rd: u32, rn: u32, imms: u6) u32 {
+    return 0x92400000 | (@as(u32, imms) << 10) | (rn << 5) | rd;
 }
 
 /// str rt, [sp, #byteOff] — 64-bit store; byteOff must be a multiple of 8 (the
@@ -217,13 +248,17 @@ pub fn patchLdrUoff(word: u32, byteOff: u32) u32 {
 // complement, so a `#0` placeholder is emitted then rewritten by the patchers.
 // Every word below was assembler-verified on this host (see the tests).
 
-/// AArch64 condition codes. Only the ones M4 needs: equality (eq/ne) and the
-/// SIGNED magnitude comparisons (ge/lt/gt/le) — our ints are i64, so we must use
-/// the signed forms, NOT the unsigned hs/lo/hi/ls. Values are the 4-bit cond
-/// field encoding (e.g. b.cond carries cond in bits[3:0]).
+/// AArch64 condition codes. Equality (eq/ne), the SIGNED magnitude comparisons
+/// (ge/lt/gt/le), and — since M2 dispatches unsigned integer compares by operand
+/// signedness — the UNSIGNED magnitude comparisons (hs/lo/hi/ls). Values are the
+/// 4-bit cond field encoding (e.g. b.cond carries cond in bits[3:0]).
 pub const Cond = enum(u4) {
     eq = 0x0, // equal (Z==1)
     ne = 0x1, // not equal (Z==0)
+    hs = 0x2, // unsigned >=
+    lo = 0x3, // unsigned <
+    hi = 0x8, // unsigned >
+    ls = 0x9, // unsigned <=
     ge = 0xA, // signed >=
     lt = 0xB, // signed <
     gt = 0xC, // signed >
@@ -241,6 +276,10 @@ pub fn invert(c: Cond) Cond {
         .ge => .lt,
         .gt => .le,
         .le => .gt,
+        .lo => .hs,
+        .hs => .lo,
+        .hi => .ls,
+        .ls => .hi,
     };
 }
 
@@ -374,6 +413,25 @@ test "data-processing register" {
     try testing.expectEqual(@as(u32, 0x9AC10C00), sdiv(0, 0, 1)); // sdiv x0,x0,x1
     try testing.expectEqual(@as(u32, 0xCB0003E4), neg(4, 0)); // neg x4,x0
     try testing.expectEqual(@as(u32, 0xCB0003E0), neg(0, 0)); // neg x0,x0
+}
+
+test "M2 width-correct encoders (udiv + sign-extend + low-bits mask)" {
+    try testing.expectEqual(@as(u32, 0x9AC00800), udiv(0, 0, 0)); // udiv x0,x0,x0
+    try testing.expectEqual(@as(u32, 0x9AC10803), udiv(3, 0, 1)); // udiv x3,x0,x1
+    try testing.expectEqual(@as(u32, 0x93401C00), sxtb(0, 0)); // sxtb x0,x0
+    try testing.expectEqual(@as(u32, 0x93403C00), sxth(0, 0)); // sxth x0,x0
+    try testing.expectEqual(@as(u32, 0x93407C00), sxtw(0, 0)); // sxtw x0,x0
+    try testing.expectEqual(@as(u32, 0x92401C00), andLowBits(0, 0, 7)); // and x0,x0,#0xff
+    try testing.expectEqual(@as(u32, 0x92403C00), andLowBits(0, 0, 15)); // and x0,x0,#0xffff
+    try testing.expectEqual(@as(u32, 0x92407C00), andLowBits(0, 0, 31)); // and x0,x0,#0xffffffff
+}
+
+test "unsigned condition codes invert and cset" {
+    try testing.expectEqual(Cond.lo, invert(.hs));
+    try testing.expectEqual(Cond.hs, invert(.lo));
+    try testing.expectEqual(Cond.ls, invert(.hi));
+    try testing.expectEqual(Cond.hi, invert(.ls));
+    try testing.expectEqual(@as(u32, 0x9A9F97E0), cset(0, .hi)); // cset x0,hi
 }
 
 test "load/store sp-relative" {

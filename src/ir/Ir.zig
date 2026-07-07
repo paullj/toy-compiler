@@ -35,9 +35,12 @@ pub const none_value: ValueId = std.math.maxInt(u32);
 pub const none_slot: SlotId = std.math.maxInt(u32);
 pub const none_block: BlockId = std.math.maxInt(u32);
 
-/// Target-independent comparison condition (signed semantics). codegen maps this
-/// to `Aarch64.Cond`; lower maps the source comparison token to this.
-pub const Cond = enum(u8) { eq, ne, lt, le, gt, ge };
+/// Target-independent comparison condition. Signedness is carried BY the cond
+/// (the `u*` variants are unsigned), baked at lower-time from the operand type, so
+/// it survives operand-rewriting opt passes (store→load forwarding). codegen maps
+/// this to `Aarch64.Cond`; lower maps the source comparison token + signedness to
+/// this. Append-only: existing ordinals (eq=0..ge=5) are frozen (`--emit ir` golden).
+pub const Cond = enum(u8) { eq, ne, lt, le, gt, ge, ult, ule, ugt, uge };
 
 /// An operand of a call / terminator. Scalars travel by `value`; str/struct/enum
 /// aggregates travel by `slot` (passed by reference, ABI decided in codegen);
@@ -100,6 +103,7 @@ pub const Op = union(enum) {
     sub: Bin,
     mul: Bin,
     sdiv: Bin,
+    udiv: Bin,
 
     neg: ValueId,
     bnot: ValueId,
@@ -343,6 +347,10 @@ fn condName(cc: Cond) []const u8 {
         .le => "le",
         .gt => "gt",
         .ge => "ge",
+        .ult => "ult",
+        .ule => "ule",
+        .ugt => "ugt",
+        .uge => "uge",
     };
 }
 
@@ -365,6 +373,7 @@ fn renderInstr(
         .sub => |b| try out.print("sub %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .mul => |b| try out.print("mul %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .sdiv => |b| try out.print("sdiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .udiv => |b| try out.print("udiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .neg => |v| try out.print("neg %{d}\n", .{v}),
         .bnot => |v| try out.print("bnot %{d}\n", .{v}),
         .icmp => |c| try out.print("icmp {s} %{d}, %{d}\n", .{ condName(c.cc), c.lhs, c.rhs }),

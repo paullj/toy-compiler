@@ -1,0 +1,11 @@
+# Feature: width-correct wrapping codegen (M2). `a + b` on two `int8` computes at the
+# operand width, so 100 + 100 = 200 overflows int8 and WRAPS to -56 (sxtb re-canonicalizes
+# the full-width sum). The signed compare `c < b` (-56 < 100) is true ONLY after that wrap;
+# under M1's plain 64-bit lowering the sum stays 200 and the `if` yields 0.
+# expect: exit 42
+fn main() -> int {
+    a: int8 = 100
+    b: int8 = 100
+    c: int8 = a + b
+    return if c < b { 42 } else { 0 }
+}
