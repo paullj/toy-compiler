@@ -560,8 +560,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // (stale-cache soundness — mirrors the plain-func fold above).
                     if (cn.tag == .field_access and res != .func and cn.lhs.int() < self.frozen.node_types.len) {
                         const recv = self.frozen.node_types[cn.lhs.int()];
-                        if (recv.kind == .@"struct" or recv.kind == .@"enum" or
-                            recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit)
+                        if (recv.kind == .@"struct" or recv.kind == .@"enum" or recv.isScalar())
                         {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
                             // The SAME multi-conformance resolver the checker + lower use, so

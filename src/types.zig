@@ -698,8 +698,7 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
 /// byte-compare (`load_byte` loop); `unit` to a trivially-true `bconst` (the two
 /// `()` values are always equal). None gets a `t.fns` entry — each lowers to a machine op.
 pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, arity: usize } {
-    const is_scalar = recv.kind == .int or recv.kind == .bool or recv.kind == .str or recv.kind == .unit;
-    if (!is_scalar) return null;
+    if (!recv.isScalar()) return null;
     // `eq(self, other) -> bool` is 2-ary (arity counts the non-self args = 1); `hash
     // (self) -> int` is 1-ary (0 non-self args). The `arity` lets the shared
     // method-dispatch consumers gate arg count without hardcoding a per-method constant.
@@ -726,22 +725,12 @@ pub const ConvKind = enum { widen, narrow };
 pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8) ?struct { kind: ConvKind, target: Type } {
     if (!recv.isInteger() or !expected.isInteger()) return null;
     if (std.mem.eql(u8, member, "into")) {
-        if (recv.isSigned() == expected.isSigned() and intBits(expected) >= intBits(recv))
+        if (recv.isSigned() == expected.isSigned() and expected.intBits() >= recv.intBits())
             return .{ .kind = .widen, .target = expected };
         return null;
     }
     if (std.mem.eql(u8, member, "try_into")) return .{ .kind = .narrow, .target = expected };
     return null;
-}
-
-/// The bit width of an integer `Type` (platform `int`/`uint` counts as 64).
-fn intBits(t: Type) u16 {
-    return switch (t.int_desc.width) {
-        .plat, .w64 => 64,
-        .w8 => 8,
-        .w16 => 16,
-        .w32 => 32,
-    };
 }
 
 /// A compiler-provided inherent method on the prelude `Option`/`Result` enums:
