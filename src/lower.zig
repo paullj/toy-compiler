@@ -38,6 +38,7 @@ const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
 const Infer = @import("symbols/Infer.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
+const Literal = @import("types/literal.zig");
 
 /// The read-only front-end inputs a lowering needs. Mirrors the slice of
 /// `Driver.Frozen` that codegen consumes today; bundling them keeps the call
@@ -518,10 +519,11 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
     std.debug.assert(ty.kind != .type_var and ty.kind != .app);
     switch (n.tag) {
         .literal_number => {
-            const v = parseInt(b.in.tokens[n.main_token].text(b.in.source)) orelse {
-                try b.note(n.main_token, "integer literal out of range for codegen (i64)");
+            // A literal past 2^64-1 is now a T0034 at the checker, which gates codegen,
+            // so this fallback is unreachable for a checked program; keep the `iconst 0`
+            // so an unchecked lower test can't crash.
+            const v = Literal.value(b.in.tokens[n.main_token].text(b.in.source)) orelse
                 return .{ .value = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int) };
-            };
             return .{ .value = try b.emit(.{ .iconst = v }, Typecheck.Type.int) };
         },
         .literal_bool => {
@@ -3950,67 +3952,25 @@ fn condFromToken(tag: TokenTag, unsigned: bool) Ir.Cond {
 /// no longer line up with the literal table — cached blobs rot.
 const lit_seed: u64 = 0x10c5_7e87;
 
-/// Parse a number-literal token into the 64-bit `iconst` bit pattern, stripping `_`
-/// separators. A `literal_number` token is always a non-negative magnitude (unary `-`
-/// is a separate node), so it is decoded as u64 and bit-cast: this round-trips the FULL
-/// `uint64` range, since the checker admits `uint`/`uint64` literals up to 2^64-1 while
-/// signed widths are capped at 2^63-1. Decoding as i64 instead would reject a legal
-/// `uint64 = 0xFFFF...` at codegen even though the range check (u128) passed it. Base 0
-/// auto-detects `0x`/`0o`/`0b`; a bare leading-zero decimal stays decimal.
-fn parseInt(raw: []const u8) ?i64 {
-    var buf: [128]u8 = undefined;
-    const s = Typecheck.stripIntSeparators(raw, &buf) orelse return null;
-    return @bitCast(std.fmt.parseInt(u64, s, 0) catch return null);
-}
-
-/// Parse an int literal as written in source, for a PATTERN literal. Delegates to the
-/// base-aware `parseInt` (base 0 auto-detects `0x`/`0o`/`0b`, strips `_`) so a
-/// `0x2A`/`0o52` pattern decodes to the same value as the scrutinee it is matched
-/// against; a hand-rolled decimal loop silently mis-decoded every non-decimal base.
+/// Parse an int literal as written in source, for a PATTERN literal. Delegates to
+/// `Literal.value` (base-0 decode, `_` stripped) so a `0x2A`/`0o52` pattern decodes to
+/// the same value as the scrutinee it is matched against.
 fn parseIntLit(text: []const u8) i64 {
-    return parseInt(text) orelse 0;
+    return Literal.value(text) orelse 0;
 }
 
-/// Decode a string-literal token into its runtime bytes (quotes stripped, escapes
-/// `\n \t \\ \"` decoded). Returns null + a diagnostic on a malformed token /
-/// unknown escape. Caller owns the returned slice. Mirrors
-/// Codegen.decodeStringLiteral byte-for-byte so the content hash matches.
+/// Decode a string-literal token into its runtime bytes via `Literal.decodeString`,
+/// mapping the malformed-token kinds to their notes. Returns null on a bad token.
+/// Caller owns the returned slice.
 fn decodeStringLiteral(b: *Builder, tok: u32) error{OutOfMemory}!?[]u8 {
     const raw = b.in.tokens[tok].text(b.in.source);
-    if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') {
-        try b.note(tok, "malformed string literal");
-        return null;
+    switch (try Literal.decodeString(b.gpa, raw)) {
+        .ok => |bytes| return bytes,
+        .malformed => try b.note(tok, "malformed string literal"),
+        .dangling_backslash => try b.note(tok, "string literal ends with a dangling backslash"),
+        .unknown_escape => try b.note(tok, "unknown escape in string literal"),
     }
-    const body = raw[1 .. raw.len - 1];
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(b.gpa);
-    var i: usize = 0;
-    while (i < body.len) : (i += 1) {
-        const c = body[i];
-        if (c != '\\') {
-            try out.append(b.gpa, c);
-            continue;
-        }
-        i += 1;
-        if (i >= body.len) {
-            out.deinit(b.gpa);
-            try b.note(tok, "string literal ends with a dangling backslash");
-            return null;
-        }
-        const decoded: u8 = switch (body[i]) {
-            'n' => 0x0A,
-            't' => 0x09,
-            '\\' => '\\',
-            '"' => '"',
-            else => {
-                out.deinit(b.gpa);
-                try b.note(tok, "unknown escape in string literal");
-                return null;
-            },
-        };
-        try out.append(b.gpa, decoded);
-    }
-    return try out.toOwnedSlice(b.gpa);
+    return null;
 }
 
 const testing = std.testing;
@@ -4669,49 +4629,6 @@ test "lower-core: while loop with break/continue is well-formed" {
     try testing.expect(func.blocks.len >= 5); // entry + exit + header/body/done
 }
 
-test "lower-core: out-of-range int literal yields a diagnostic" {
-    const gpa = testing.allocator;
-    const Lexer = @import("lex.zig");
-    const Parser = @import("parse.zig");
-    const src = "fn f() -> int { return 99999999999999999999 }\n";
-    const tokens = try Lexer.tokenize(gpa, src);
-    defer gpa.free(tokens);
-    const tree = try Parser.expectTree(gpa, tokens, src);
-    defer {
-        gpa.free(tree.nodes);
-        gpa.free(tree.extra);
-    }
-    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
-    defer fe.deinit(gpa);
-    const rr = fe.resolve;
-    const tc = fe.typecheck;
-    const prog = tree.nodes[(Ast.root(tree.nodes)).int()];
-    var fn_decl: Ast.Index = Ast.none;
-    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, (prog.lhs).int())) |idx| {
-        if (tree.nodes[(idx).int()].tag == .fn_decl) fn_decl = idx;
-    }
-    var names = [_]Link.SymName{.{ .kind = .user_fn, .name = try gpa.dupe(u8, "f") }};
-    defer gpa.free(names[0].name);
-    const in = Inputs{
-        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
-        .tokens = tokens,
-        .source = src,
-        .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .layouts = tc.layouts,
-        .enum_layouts = tc.enum_layouts,
-        .names = &names,
-        .methods = tc.methods,
-        .derives = tc.derives,
-        .prelude_ids = tc.prelude_ids,
-    };
-    var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-    var func = try lowerFn(gpa, in, fn_decl, names[0], false, &diags);
-    defer func.deinit(gpa);
-    try testing.expect(diags.items.len >= 1);
-}
-
 test "lower-aggregates: struct construct + field read" {
     try expectLowered(
         "struct P { x: int, y: int }\nfn f() -> int { p := P { x: 6, y: 7 }\n return p.x }\n",
@@ -5163,31 +5080,6 @@ test "M9: whole-self value read copies the pointee into a fresh temp" {
             "  ret %0\n" ++
             "}\n",
     );
-}
-
-test "M1: parseInt round-trips the full uint64 range into the iconst bit pattern" {
-    // Signed magnitudes and the platform max are byte-identical to the old i64 decode.
-    try testing.expectEqual(@as(?i64, 42), parseInt("42"));
-    try testing.expectEqual(@as(?i64, 0x2A), parseInt("0x2A"));
-    try testing.expectEqual(@as(?i64, 42), parseInt("0b0010_1010"));
-    try testing.expectEqual(@as(?i64, std.math.maxInt(i64)), parseInt("9223372036854775807"));
-    // uint64 literals in [2^63, 2^64) — which the checker admits for `uint`/`uint64` —
-    // now decode to the correct 64-bit pattern instead of overflowing to null.
-    try testing.expectEqual(@as(?i64, @bitCast(@as(u64, 1) << 63)), parseInt("0x8000000000000000"));
-    try testing.expectEqual(@as(?i64, -1), parseInt("0xFFFFFFFFFFFFFFFF")); // 2^64-1 as i64 bits
-    try testing.expectEqual(@as(?i64, -1), parseInt("18446744073709551615"));
-    // Still null past 2^64-1 (no width can admit it) and on a garbage token.
-    try testing.expectEqual(@as(?i64, null), parseInt("18446744073709551616"));
-    try testing.expectEqual(@as(?i64, null), parseInt("0xZZ"));
-}
-
-test "parseIntLit (pattern literal) decodes base-aware, matching the scrutinee value" {
-    try testing.expectEqual(@as(i64, 42), parseIntLit("42"));
-    // The bug this fixes: a non-decimal base was mis-decoded by the old decimal loop.
-    try testing.expectEqual(@as(i64, 42), parseIntLit("0x2A"));
-    try testing.expectEqual(@as(i64, 42), parseIntLit("0o52"));
-    try testing.expectEqual(@as(i64, 42), parseIntLit("0b0010_1010"));
-    try testing.expectEqual(@as(i64, 1000), parseIntLit("1_000"));
 }
 
 const ThreeWayConds = struct { ugt: bool = false, ult: bool = false, gt: bool = false, lt: bool = false };
