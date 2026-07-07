@@ -29,6 +29,7 @@ pub const Resolve = @import("resolve.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
 pub const Derive = @import("symbols/Derive.zig");
+pub const Mono = @import("symbols/Mono.zig");
 pub const ControlFlow = @import("ControlFlow.zig");
 pub const TypecheckGraph = @import("types_graph.zig");
 pub const LayoutEngine = @import("layout/Engine.zig");

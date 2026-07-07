@@ -24,6 +24,9 @@ const Graph = toyc.Graph;
 const Opt = toyc.Opt;
 const lower = toyc.lower;
 const version = toyc.version;
+const Mono = toyc.Mono;
+const AstWalk = toyc.AstWalk;
+const Fingerprint = toyc.Fingerprint;
 
 const cache_root = Driver.cache_root;
 const cache_dir_buf_len = Driver.cache_dir_buf_len;
@@ -2814,4 +2817,71 @@ test "reorder: swapping fn order is all cache hits and keeps correct linkage" {
     var child = try std.process.spawn(io, .{ .argv = &.{abs} });
     const term = try child.wait(io);
     try testing.expectEqual(std.process.Child.Term{ .exited = 7 }, term);
+}
+
+test "R4 keystone: every int-aware identity serializer folds int_desc in lockstep" {
+    // The cross-serializer property R4 exists to pin: the four independent encoders of a
+    // Type's identity (the flat dedup key, the coherence key, the Mono mangle, and the
+    // fingerprint's TouchedType) must AGREE on which int variants are distinct. An encoder
+    // that dropped int_desc (the coherence bug) would fold two widths into one here and
+    // fail the biconditional. Since every int variant is pairwise distinct, this asserts
+    // each encoder separates exactly the pairs the others do.
+    const gpa = testing.allocator;
+    const Type = Typecheck.Type;
+    const ints = [_]Type{
+        Type.int,   Type.uint,
+        Type.int8,  Type.int16,  Type.int32,  Type.int64,
+        Type.uint8, Type.uint16, Type.uint32, Type.uint64,
+    };
+
+    // appendTouched only reads `frozen` on the struct/enum branches; an int never reaches
+    // them, so empty layout tables are a sound throwaway.
+    const throwaway: struct {
+        layouts: []const Typecheck.Layout = &.{},
+        enum_layouts: []const Typecheck.EnumLayout = &.{},
+    } = .{};
+
+    for (ints, 0..) |a, i| {
+        for (ints, 0..) |b, j| {
+            const same = (i == j);
+
+            var ka: std.ArrayList(u8) = .empty;
+            defer ka.deinit(gpa);
+            var kb: std.ArrayList(u8) = .empty;
+            defer kb.deinit(gpa);
+            try a.appendKeyBytes(gpa, &ka);
+            try b.appendKeyBytes(gpa, &kb);
+            try testing.expectEqual(same, std.mem.eql(u8, ka.items, kb.items));
+
+            var ca: std.ArrayList(u8) = .empty;
+            defer ca.deinit(gpa);
+            var cb: std.ArrayList(u8) = .empty;
+            defer cb.deinit(gpa);
+            try Typecheck.coherence.appendKeyType(gpa, &ca, a);
+            try Typecheck.coherence.appendKeyType(gpa, &cb, b);
+            try testing.expectEqual(same, std.mem.eql(u8, ca.items, cb.items));
+
+            const ma = try Mono.mangle(gpa, "id", &.{a});
+            defer gpa.free(ma);
+            const mb = try Mono.mangle(gpa, "id", &.{b});
+            defer gpa.free(mb);
+            try testing.expectEqual(same, std.mem.eql(u8, ma, mb));
+
+            var ta: std.ArrayList(Fingerprint.TouchedType) = .empty;
+            defer ta.deinit(gpa);
+            var tb: std.ArrayList(Fingerprint.TouchedType) = .empty;
+            defer tb.deinit(gpa);
+            try AstWalk.appendTouched(gpa, &throwaway, a, &ta);
+            try AstWalk.appendTouched(gpa, &throwaway, b, &tb);
+            const touched_same = ta.items[0].kind == tb.items[0].kind and
+                ta.items[0].int_desc == tb.items[0].int_desc;
+            try testing.expectEqual(same, touched_same);
+        }
+    }
+
+    // Derive's mangle/key legitimately OMIT int_desc: its domain is struct/enum recipes,
+    // neither of which carries the descriptor. Documents why that omission is sound (and
+    // is the invariant Derive.writeKey/mangle now assert).
+    try testing.expect(!Type.carriesIntDesc(.@"struct"));
+    try testing.expect(!Type.carriesIntDesc(.@"enum"));
 }

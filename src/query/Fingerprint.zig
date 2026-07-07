@@ -81,6 +81,15 @@ const type_layout_version: u8 = 4;
 
 const seed: u64 = 0x46_50_52_4e; // "FPRN"
 
+/// Fold one `TouchedType`'s identity into `h`: its kind + the layout-version stamp + the
+/// int descriptor byte, then (for an aggregate) its full index-free layout descriptor.
+/// The single home for the touched-type fold the (c)/(d)/(e) components all share, so a
+/// change to what an identity fold covers happens once, not four hand-mirrored times.
+fn foldTouched(h: *std.hash.Wyhash, ty: TouchedType) void {
+    h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version, ty.int_desc });
+    if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(h, ty.layout);
+}
+
 /// Compute the transitive content fingerprint of the function at `fn_decl`.
 ///
 ///   * `callee_sigs` — the signature of every function the body calls, in the
@@ -133,10 +142,7 @@ pub fn fingerprint(
     // (c) touched type layouts. A struct folds its full layout descriptor so an
     // edit to its fields (names/types/offsets/size) flips every using fn's hash.
     AstWalk.updateU32(&h, @intCast(touched.len));
-    for (touched) |ty| {
-        h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version, ty.int_desc });
-        if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
-    }
+    for (touched) |ty| foldTouched(&h, ty);
 
     // (d) monomorphization type-args (see the empty-component invariant). A `[T,U]`
     // reorder flips it, and a full per-arg layout descriptor makes `id[int]` and
@@ -144,10 +150,7 @@ pub fn fingerprint(
     // the dependent instance.
     if (type_args.len > 0) {
         AstWalk.updateU32(&h, @intCast(type_args.len));
-        for (type_args) |ty| {
-            h.update(&[_]u8{ @intFromEnum(ty.kind), type_layout_version, ty.int_desc });
-            if (ty.kind == .@"struct" or ty.kind == .@"enum") AstWalk.updateLeaf(&h, ty.layout);
-        }
+        for (type_args) |ty| foldTouched(&h, ty);
     }
 
     // (e) resolved bound conformances (see the empty-component invariant). Per
@@ -160,18 +163,14 @@ pub fn fingerprint(
         AstWalk.updateU32(&h, @intCast(conformances.len));
         for (conformances) |rc| {
             AstWalk.updateLeaf(&h, rc.protocol_name);
-            h.update(&[_]u8{ @intFromEnum(rc.conform.kind), type_layout_version, rc.conform.int_desc });
-            if (rc.conform.kind == .@"struct" or rc.conform.kind == .@"enum") AstWalk.updateLeaf(&h, rc.conform.layout);
+            foldTouched(&h, rc.conform);
             AstWalk.updateU32(&h, @intCast(rc.witness_syms.len));
             for (rc.witness_syms) |w| AstWalk.updateLeaf(&h, w);
             // The conformance's protocol type-args, structural (mirroring (d));
             // see the empty-component invariant.
             if (rc.protocol_args.len > 0) {
                 AstWalk.updateU32(&h, @intCast(rc.protocol_args.len));
-                for (rc.protocol_args) |pa| {
-                    h.update(&[_]u8{ @intFromEnum(pa.kind), type_layout_version, pa.int_desc });
-                    if (pa.kind == .@"struct" or pa.kind == .@"enum") AstWalk.updateLeaf(&h, pa.layout);
-                }
+                for (rc.protocol_args) |pa| foldTouched(&h, pa);
             }
         }
     }

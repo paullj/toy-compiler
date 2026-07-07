@@ -138,8 +138,8 @@ pub fn mangle(gpa: std.mem.Allocator, template_name: []const u8, args: []const T
             .bool => try buf.appendSlice(gpa, "bool"),
             .str => try buf.appendSlice(gpa, "str"),
             .unit => try buf.appendSlice(gpa, "unit"),
-            .@"struct" => try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "s{d}", .{a.struct_id}) catch unreachable),
-            .@"enum" => try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "e{d}", .{a.enum_id}) catch unreachable),
+            .@"struct" => try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "s{d}", .{a.nominalId()}) catch unreachable),
+            .@"enum" => try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "e{d}", .{a.nominalId()}) catch unreachable),
             else => try buf.appendSlice(gpa, "x"),
         }
     }
