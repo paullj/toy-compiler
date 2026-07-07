@@ -21,6 +21,7 @@ const CodegenIr = @import("../codegen/CodegenIr.zig");
 const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
+const DeriveEmit = @import("../lower/derive_emit.zig");
 const Fingerprint = @import("../query/Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
@@ -728,7 +729,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
         };
-        var func = try lower.lowerDerive(gpa, in, d, sym, &diags);
+        var func = try DeriveEmit.lower(gpa, in, d, sym, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);
