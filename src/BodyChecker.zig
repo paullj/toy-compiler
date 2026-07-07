@@ -471,16 +471,15 @@ pub const BodyChecker = struct {
         return std.fmt.parseInt(u128, s, 0) catch null;
     }
 
-    /// The maximum in-range magnitude for integer type `t`. Exhaustive over `IntWidth`
-    /// (no `else` arm) so a new width class must be handled explicitly. Signed literals
+    /// The maximum in-range magnitude for integer type `t`, derived from its bit width
+    /// (`Type.intBits`): signed spans `2^(bits-1)-1`, unsigned `2^bits-1`. Signed literals
     /// (a negative `-128: int8`) are a documented M1 limitation — handled in M2.
     fn maxMagnitude(t: Type) u128 {
-        return switch (t.int_desc.width) {
-            .plat, .w64 => if (t.int_desc.signed) (@as(u128, 1) << 63) - 1 else (@as(u128, 1) << 64) - 1,
-            .w8 => if (t.int_desc.signed) 127 else 255,
-            .w16 => if (t.int_desc.signed) 32767 else 65535,
-            .w32 => if (t.int_desc.signed) (@as(u128, 1) << 31) - 1 else (@as(u128, 1) << 32) - 1,
-        };
+        const bits = t.intBits();
+        return if (t.int_desc.signed)
+            (@as(u128, 1) << @intCast(bits - 1)) - 1
+        else
+            (@as(u128, 1) << @intCast(bits)) - 1;
     }
 
     /// Type a numeric literal token. Defaults to platform `int`, but adopts an
@@ -1408,8 +1407,7 @@ pub const BodyChecker = struct {
         }
         const recv_ty = try bc.typeOf(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
-        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
-            recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar())
         {
             switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, explicit)) {
                 .one => |m| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, m),
@@ -1675,8 +1673,7 @@ pub const BodyChecker = struct {
     fn dispatchValueMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
         const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return Type.invalid; // receiver already errored → no cascade
-        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or
-            recv_ty.kind == .int or recv_ty.kind == .bool or recv_ty.kind == .str or recv_ty.kind == .unit)
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar())
         {
             return try bc.dispatchConcreteMethod(node_idx, n, callee, recv_ty);
         } else if (recv_ty.kind == .app) {

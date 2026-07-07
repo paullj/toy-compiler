@@ -164,6 +164,21 @@ pub const Type = struct {
         return t.kind == .int and t.int_desc.width == .plat;
     }
 
+    /// The bit width of an integer `Type` (platform `int`/`uint` counts as 64).
+    pub fn intBits(t: Type) u16 {
+        return switch (t.int_desc.width) {
+            .plat, .w64 => 64,
+            .w8 => 8,
+            .w16 => 16,
+            .w32 => 32,
+        };
+    }
+
+    /// A builtin scalar type — one with no laid-out referent (`int`/`bool`/`str`/`unit`).
+    pub fn isScalar(t: Type) bool {
+        return t.kind == .int or t.kind == .bool or t.kind == .str or t.kind == .unit;
+    }
+
     /// The source spelling of an integer type (`int`/`uint`/`int8`.../`uint64`).
     /// Exhaustive over `IntWidth` (no `else` arm) so a new width class is a build
     /// error here rather than a silently-wrong name. Static strings — no alloc, so a
