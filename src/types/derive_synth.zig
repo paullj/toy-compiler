@@ -10,7 +10,7 @@ const Method = Typecheck.Method;
 const DeriveRecipe = Typecheck.DeriveRecipe;
 const Derive = @import("../symbols/Derive.zig");
 
-const conforms = Typecheck.conforms;
+const conforms = Typecheck.conform.structural;
 const resolveConformanceMethod = Typecheck.resolveConformanceMethod;
 
 /// True when `recv` has an EXPLICIT/prelude/Ord-refinement `(pid, recv)` conformance in
