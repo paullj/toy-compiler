@@ -1,0 +1,10 @@
+# Feature: builtin `&`/`|`/`^` on uint8 (M4); width-normalized results.
+# expect: exit 42
+fn main() -> int {
+    x: uint8 = 0b1010_1010     # 170
+    y: uint8 = 0b0100_1111     # 79
+    a: uint8 = x ^ y           # 229
+    b: uint8 = x & y           # 10
+    c: uint8 = x | y           # 239
+    return if a == 229 { if b == 10 { if c == 239 { 42 } else { 0 } } else { 0 } } else { 0 }
+}

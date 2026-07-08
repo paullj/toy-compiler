@@ -103,6 +103,61 @@ pub fn andLowBits(rd: u32, rn: u32, imms: u6) u32 {
     return 0x92400000 | (@as(u32, imms) << 10) | (rn << 5) | rd;
 }
 
+/// and rd, rn, rm — bitwise AND (logical-shifted-reg, LSL#0). and x0,x0,x1 → 0x8A010000.
+pub fn andReg(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x8A000000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// orr rd, rn, rm — bitwise OR. orr x0,x0,x1 → 0xAA010000.
+pub fn orrReg(rd: u32, rn: u32, rm: u32) u32 {
+    return 0xAA000000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// eor rd, rn, rm — bitwise XOR. eor x0,x0,x1 → 0xCA010000.
+pub fn eorReg(rd: u32, rn: u32, rm: u32) u32 {
+    return 0xCA000000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// orn rd, rn, rm — OR-NOT (ORR with N=1). orn x0,xzr,x1 → 0xAA2103E0.
+pub fn orn(rd: u32, rn: u32, rm: u32) u32 {
+    return 0xAA200000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// mvn rd, rm — bitwise complement, alias of `orn rd, xzr, rm` (mirrors `neg`=`sub
+/// rd,xzr,rm`). mvn x0,x0 → 0xAA2003E0.
+pub fn mvn(rd: u32, rm: u32) u32 {
+    return orn(rd, XZR, rm);
+}
+
+/// lslv rd, rn, rm — logical shift left by register (masks amt mod 64). lslv
+/// x0,x0,x1 → 0x9AC12000.
+pub fn lslv(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x9AC02000 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// lsrv rd, rn, rm — logical shift right by register. lsrv x0,x0,x1 → 0x9AC12400.
+pub fn lsrv(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x9AC02400 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// asrv rd, rn, rm — arithmetic shift right by register. asrv x0,x0,x1 → 0x9AC12800.
+pub fn asrv(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x9AC02800 | (rm << 16) | (rn << 5) | rd;
+}
+
+/// asr rd, rn, #shift — arithmetic shift right by immediate (SBFM Xd,Xn,#shift,#63).
+/// Used with #63 to broadcast the sign bit for the Go ashr amt>=width fill.
+/// asr x0,x0,#63 → 0x937FFC00.
+pub fn asrImm(rd: u32, rn: u32, shift: u6) u32 {
+    return 0x93400000 | (@as(u32, shift) << 16) | (@as(u32, 63) << 10) | (rn << 5) | rd;
+}
+
+/// csel rd, rn, rm, cond — rd = cond ? rn : rm; cond in bits[15:12].
+/// csel x0,xzr,x0,hs → 0x9A8023E0.
+pub fn csel(rd: u32, rn: u32, rm: u32, c: Cond) u32 {
+    return 0x9A800000 | (rm << 16) | (@as(u32, @intFromEnum(c)) << 12) | (rn << 5) | rd;
+}
+
 /// str rt, [sp, #byteOff] — 64-bit store; byteOff must be a multiple of 8 (the
 /// encoded imm12 is the scaled word index). str x0,[sp,#8] → 0xF90007E0.
 pub fn strSp(rt: u32, byteOff: u32) u32 {
@@ -424,6 +479,22 @@ test "M2 width-correct encoders (udiv + sign-extend + low-bits mask)" {
     try testing.expectEqual(@as(u32, 0x92401C00), andLowBits(0, 0, 7)); // and x0,x0,#0xff
     try testing.expectEqual(@as(u32, 0x92403C00), andLowBits(0, 0, 15)); // and x0,x0,#0xffff
     try testing.expectEqual(@as(u32, 0x92407C00), andLowBits(0, 0, 31)); // and x0,x0,#0xffffffff
+}
+
+test "M4 bitwise, shift, and select encoders" {
+    try testing.expectEqual(@as(u32, 0x8A010000), andReg(0, 0, 1)); // and x0,x0,x1
+    try testing.expectEqual(@as(u32, 0xAA010000), orrReg(0, 0, 1)); // orr x0,x0,x1
+    try testing.expectEqual(@as(u32, 0xCA010000), eorReg(0, 0, 1)); // eor x0,x0,x1
+    try testing.expectEqual(@as(u32, 0xAA2103E0), orn(0, XZR, 1)); // orn x0,xzr,x1
+    try testing.expectEqual(@as(u32, 0xAA2003E0), mvn(0, 0)); // mvn x0,x0
+    try testing.expectEqual(@as(u32, 0x9AC02000), lslv(0, 0, 0)); // lslv x0,x0,x0
+    try testing.expectEqual(@as(u32, 0x9AC12000), lslv(0, 0, 1)); // lslv x0,x0,x1
+    try testing.expectEqual(@as(u32, 0x9AC12400), lsrv(0, 0, 1)); // lsrv x0,x0,x1
+    try testing.expectEqual(@as(u32, 0x9AC12800), asrv(0, 0, 1)); // asrv x0,x0,x1
+    try testing.expectEqual(@as(u32, 0x937FFC00), asrImm(0, 0, 63)); // asr x0,x0,#63
+    try testing.expectEqual(@as(u32, 0x937FFC02), asrImm(2, 0, 63)); // asr x2,x0,#63
+    try testing.expectEqual(@as(u32, 0x9A8023E0), csel(0, XZR, 0, .hs)); // csel x0,xzr,x0,hs
+    try testing.expectEqual(@as(u32, 0x9A8123E0), csel(0, XZR, 1, .hs)); // csel x0,xzr,x1,hs
 }
 
 test "unsigned condition codes invert and cset" {

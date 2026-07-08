@@ -632,6 +632,10 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
             const v = try lowerExpr(b, n.lhs);
             return .{ .value = try b.emit(.{ .bnot = operandValue(v) }, Typecheck.Type.@"bool") };
         },
+        .tilde => {
+            const v = try lowerExpr(b, n.lhs);
+            return .{ .value = try b.emit(.{ .bcompl = operandValue(v) }, b.in.node_types[(node_idx).int()]) };
+        },
         else => {
             try b.note(n.main_token, "unary operator unsupported in lower");
             return .none;
@@ -690,6 +694,21 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             return try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq);
         },
         .amp_amp, .pipe_pipe => return try lowerAndOrValue(b, n, op),
+        .amp, .pipe, .caret, .lt_lt, .gt_gt => {
+            const lt = b.in.node_types[(n.lhs).int()];
+            const lhs = operandValue(try lowerExpr(b, n.lhs));
+            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
+            const ir_op: Ir.Op = switch (op) {
+                .amp => .{ .band = bin },
+                .pipe => .{ .bor = bin },
+                .caret => .{ .bxor = bin },
+                .lt_lt => .{ .shl = bin },
+                .gt_gt => if (lt.isUnsignedInt()) Ir.Op{ .lshr = bin } else Ir.Op{ .ashr = bin },
+                else => unreachable,
+            };
+            return .{ .value = try b.emit(ir_op, lt) };
+        },
         else => {
             try b.note(n.main_token, "binary operator unsupported in lower");
             return .none;

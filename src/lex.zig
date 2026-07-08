@@ -215,9 +215,11 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         '/' => .slash,
         '=' => if (l.eat('=')) .eq_eq else .eq,
         '!' => if (l.eat('=')) .bang_eq else .bang,
-        '<' => if (l.eat('=')) .lt_eq else .lt,
-        '>' => if (l.eat('=')) .gt_eq else .gt,
-        '&' => if (l.eat('&')) .amp_amp else .invalid,
+        '<' => if (l.eat('<')) .lt_lt else if (l.eat('=')) .lt_eq else .lt,
+        '>' => if (l.eat('>')) .gt_gt else if (l.eat('=')) .gt_eq else .gt,
+        '&' => if (l.eat('&')) .amp_amp else .amp,
+        '^' => .caret,
+        '~' => .tilde,
         '|' => if (l.eat('|')) .pipe_pipe else .pipe,
         '(' => .l_paren,
         ')' => .r_paren,
@@ -245,7 +247,7 @@ fn beginsToken(c: u8) bool {
     return switch (c) {
         '"' => true, // string
         ' ', '\t', '\r', '\n', '#' => true, // trivia
-        '+', '-', '*', '/', '=', '!', '<', '>', '&', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@', '?' => true,
+        '+', '-', '*', '/', '=', '!', '<', '>', '&', '^', '~', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@', '?' => true,
         else => false,
     };
 }
@@ -305,10 +307,18 @@ test "logical && and || are two-char operators" {
     try expectTags("a && b || c", &.{ .identifier, .amp_amp, .identifier, .pipe_pipe, .identifier, .eof });
 }
 
-test "lone & is invalid; lone | is a pattern separator" {
-    try expectTags("&", &.{ .invalid, .eof });
+test "lone & is bitwise-and; lone | is a pattern separator" {
+    try expectTags("&", &.{ .amp, .eof });
+    try expectTags("&&", &.{ .amp_amp, .eof });
     try expectTags("|", &.{ .pipe, .eof });
     try expectTags("||", &.{ .pipe_pipe, .eof });
+}
+
+test "bitwise and shift operators lex to their tags" {
+    try expectTags("& ^ ~ << >>", &.{ .amp, .caret, .tilde, .lt_lt, .gt_gt, .eof });
+    try expectTags("a << b >> c", &.{ .identifier, .lt_lt, .identifier, .gt_gt, .identifier, .eof });
+    // `<<`/`>>` do not swallow a following `=`; `<=`/`>=` still lex.
+    try expectTags("< <= << > >= >>", &.{ .lt, .lt_eq, .lt_lt, .gt, .gt_eq, .gt_gt, .eof });
 }
 
 test "unterminated string at EOF is one string_unterminated token spanning to EOF" {
@@ -347,7 +357,7 @@ test "unterminated string at newline stops before the newline" {
 }
 
 test "a run of unknown bytes coalesces into one invalid token" {
-    // `$` `%` `^` begin no token and are not trivia, so a run of them is a single
+    // `$` `%` begin no token and are not trivia, so a run of them is a single
     // `.invalid` rather than one token per byte.
     const src = "$$$";
     const tokens = try tokenize(testing.allocator, src);
@@ -355,8 +365,9 @@ test "a run of unknown bytes coalesces into one invalid token" {
     try testing.expectEqual(@as(usize, 2), tokens.len); // one .invalid + .eof
     try testing.expectEqual(Tag.invalid, tokens[0].tag);
     try testing.expectEqualStrings("$$$", tokens[0].text(src));
-    // A run bounded by real tokens on both sides is still one coalesced span.
-    try expectTags("a %^~ b", &.{ .identifier, .invalid, .identifier, .eof });
+    // A run of unrecognized bytes bounded by real tokens is still one coalesced
+    // span; the recognized `~` after it stops the run.
+    try expectTags("a %$~ b", &.{ .identifier, .invalid, .tilde, .identifier, .eof });
 }
 
 /// Assert the debug span-tiling invariant holds directly: spans are monotone with

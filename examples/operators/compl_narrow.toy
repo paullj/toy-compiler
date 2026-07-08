@@ -1,0 +1,10 @@
+# Feature: `~` (M4) is a distinct op (mvn), width-normalized to the operand type —
+# NOT the boolean `!`. ~0x30 on uint8 is 0xCF (207); ~0x00FF on uint16 is 0xFF00.
+# expect: exit 42
+fn main() -> int {
+    c: uint8  = 0x30           # 48
+    d: uint8  = ~c             # 207
+    e: uint16 = 0x00FF
+    g: uint16 = ~e             # 65280
+    return if d == 207 { if g == 65280 { 42 } else { 0 } } else { 0 }
+}

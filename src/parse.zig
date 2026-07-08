@@ -1594,7 +1594,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
     const tok = p.peek();
     const at_tok = p.index;
     switch (tok.tag) {
-        .minus, .bang => {
+        .minus, .bang, .tilde => {
             p.advance();
             const operand = try p.parseExpr(prefix_bp);
             return p.addNode(.{ .tag = .unary, .main_token = at_tok, .lhs = operand, .rhs = Ast.none });
@@ -1850,16 +1850,21 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
 const infix_bp_table = std.enums.directEnumArrayDefault(token.Tag, i16, -1, 0, .{
     .pipe_pipe = 1,
     .amp_amp = 2,
-    .eq_eq = 3,
-    .bang_eq = 3,
-    .lt = 4,
-    .lt_eq = 4,
-    .gt = 4,
-    .gt_eq = 4,
-    .plus = 5,
-    .minus = 5,
-    .star = 6,
-    .slash = 6,
+    .pipe = 3, // bitwise OR
+    .caret = 4, // bitwise XOR
+    .amp = 5, // bitwise AND
+    .eq_eq = 6,
+    .bang_eq = 6,
+    .lt = 7,
+    .lt_eq = 7,
+    .gt = 7,
+    .gt_eq = 7,
+    .lt_lt = 8, // shifts
+    .gt_gt = 8,
+    .plus = 9,
+    .minus = 9,
+    .star = 10,
+    .slash = 10,
 });
 
 /// Infix binding power, or null if the tag is not an infix operator. Higher
@@ -1876,9 +1881,10 @@ fn infixBp(tag: token.Tag) ?u8 {
 fn checkInfixTable() ?[]const u8 {
     const infix_ops = [_]token.Tag{
         .pipe_pipe, .amp_amp,
+        .pipe,      .caret,     .amp,
         .eq_eq,     .bang_eq,
-        .lt,        .lt_eq,
-        .gt,        .gt_eq,
+        .lt,        .lt_eq,     .gt,   .gt_eq,
+        .lt_lt,     .gt_gt,
         .plus,      .minus,
         .star,      .slash,
     };
@@ -1906,7 +1912,7 @@ comptime {
 }
 
 /// Prefix operators bind tighter than any infix operator.
-const prefix_bp: u8 = 7;
+const prefix_bp: u8 = 11;
 
 fn leaf(p: *Parser, tag: Node.Tag, tok_index: u32) Error!Ast.Index {
     p.advance();

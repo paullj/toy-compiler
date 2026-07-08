@@ -162,6 +162,14 @@ pub const Tag = enum(u8) {
 
     /// `?` — the postfix try operator (`o?` / `r?`).
     question,
+
+    // Bitwise / shift punctuation (M4). Appended at the END (frozen ordinals;
+    // `[]Token` is memcpy'd to/from the content cache). NOT keywords.
+    amp, // &
+    caret, // ^
+    tilde, // ~
+    lt_lt, // <<
+    gt_gt, // >>
 };
 
 /// Maps identifier text to its keyword tag, if any.

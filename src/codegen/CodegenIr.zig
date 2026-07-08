@@ -407,10 +407,22 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         },
         .cstr_ptr => |h| try genCstrPtr(g, ins.result, h),
         .call => |c| try genCall(g, ins.result, c),
+        .band => |b| try genArith(g, ins.result, b, .band),
+        .bor => |b| try genArith(g, ins.result, b, .bor),
+        .bxor => |b| try genArith(g, ins.result, b, .bxor),
+        .shl => |b| try genShift(g, ins.result, b, .shl),
+        .lshr => |b| try genShift(g, ins.result, b, .lshr),
+        .ashr => |b| try genShift(g, ins.result, b, .ashr),
+        .bcompl => |v| {
+            try g.loadValue(S0, v);
+            try g.emit(Aarch64.mvn(S0, S0));
+            try normalizeWidth(g, S0, g.func.values[ins.result].type);
+            try g.storeValue(S0, ins.result);
+        },
     }
 }
 
-const ArithKind = enum { add, sub, mul, sdiv, udiv };
+const ArithKind = enum { add, sub, mul, sdiv, udiv, band, bor, bxor };
 
 fn genArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ArithKind) error{OutOfMemory}!void {
     try g.loadValue(S0, b.lhs);
@@ -421,9 +433,47 @@ fn genArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ArithKind) error{OutOf
         .mul => Aarch64.mul(S0, S0, S1),
         .sdiv => Aarch64.sdiv(S0, S0, S1),
         .udiv => Aarch64.udiv(S0, S0, S1),
+        .band => Aarch64.andReg(S0, S0, S1),
+        .bor => Aarch64.orrReg(S0, S0, S1),
+        .bxor => Aarch64.eorReg(S0, S0, S1),
     };
     try g.emit(word);
     try normalizeWidth(g, S0, g.func.values[result].type);
+    try g.storeValue(S0, result);
+}
+
+const ShiftKind = enum { shl, lshr, ashr };
+
+/// Go-semantics shift via a runtime guard. aarch64 lslv/lsrv/asrv mask the amount
+/// mod 64, so amt >= width (in particular amt >= 64, which the mask folds back
+/// below width) would keep bits instead of zeroing / sign-filling. The
+/// `cmp amt,#width; csel` (compared UNSIGNED, `hs`) forces the >=width result, so
+/// -O0 here ≡ -O1 (arith.foldShift) for EVERY amount. `asr #63` broadcasts the
+/// sign bit for the signed fill (the operand is stored sign-extended to 64 bits).
+fn genShift(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ShiftKind) error{OutOfMemory}!void {
+    const ty = g.func.values[result].type;
+    const width: u12 = @intCast(ty.intBits()); // 8/16/32/64, all fit u12
+    try g.loadValue(S0, b.lhs);
+    try g.loadValue(S1, b.rhs);
+    switch (kind) {
+        .shl => {
+            try g.emit(Aarch64.lslv(S0, S0, S1));
+            try g.emit(Aarch64.cmpImm(S1, width));
+            try g.emit(Aarch64.csel(S0, Aarch64.XZR, S0, .hs));
+        },
+        .lshr => {
+            try g.emit(Aarch64.lsrv(S0, S0, S1));
+            try g.emit(Aarch64.cmpImm(S1, width));
+            try g.emit(Aarch64.csel(S0, Aarch64.XZR, S0, .hs));
+        },
+        .ashr => {
+            try g.emit(Aarch64.asrv(S2, S0, S1)); // raw (masked) result → S2
+            try g.emit(Aarch64.asrImm(S0, S0, 63)); // sign-fill → S0 (lhs already consumed into S2)
+            try g.emit(Aarch64.cmpImm(S1, width));
+            try g.emit(Aarch64.csel(S0, S0, S2, .hs)); // amt>=width ? sign-fill : raw
+        },
+    }
+    try normalizeWidth(g, S0, ty);
     try g.storeValue(S0, result);
 }
 
