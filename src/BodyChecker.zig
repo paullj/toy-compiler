@@ -15,6 +15,7 @@ const EnumSym = LayoutEngine.EnumSym;
 // them here. The import is mutual (types.zig constructs a `BodyChecker` per fn), which
 // Zig resolves lazily — there is no by-value type cycle (`model` is a pointer).
 const Typecheck = @import("types.zig");
+const Conform = Typecheck.conform;
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const ControlFlow = @import("ControlFlow.zig");
@@ -1265,7 +1266,7 @@ pub const BodyChecker = struct {
                 // a prelude-less caller), keep the T0033 mismatch. The witness is resolved
                 // in lower via `resolveConformanceMethod`, which selects the SAME conformance.
                 const widened = if (bc.model.preludeProtocols().from) |from_id|
-                    Typecheck.findConformance(bc.model, from_id, ret_args[1], &.{op_args[1]})
+                    Conform.existence(bc.model, from_id, ret_args[1], &.{op_args[1]})
                 else
                     false;
                 if (!widened)
@@ -2028,38 +2029,31 @@ pub const BodyChecker = struct {
     /// Whether `t` conforms to the derivable prelude protocol `pid_opt` — the shared
     /// predicate behind the `==`/`!=` (`Eq`), `<`/`>`/`<=`/`>=` (`Ord`),
     /// `.hash()` (`Hash`), and `print(x)` (`Display`) operator/trigger typings.
-    /// A concrete type resolves via the frozen conformance table (`findConformance` covers
+    /// A concrete type resolves via the frozen conformance table (`Conform.existence` covers
     /// the int/bool/str/unit prelude conformances AND every user `impl T has P`); a
     /// `type_var` in a bounded generic body conforms as-axiom when its declared bound IS
     /// `pid`. A prelude-less caller (`pid_opt == null`) denies conformance, so the operator
     /// emits its T002x rather than miscompiling.
     /// After those misses, a struct (or enum) whose fields all conform with NO explicit impl
     /// conforms STRUCTURALLY. When `record_derive`, record the derive request (so the serial
-    /// synthesis barrier emits the source-less witness) and return true. `findConformance`-
-    /// first keeps an explicit/refinement type off this path (no double-fire). Fallible
-    /// (`conforms` + the request record allocate) and takes `*BodyChecker` (records into the
-    /// thread-local `derive_reqs`).
+    /// synthesis barrier emits the source-less witness) and return true. `Conform.classify`
+    /// tries the direct (existence ∨ axiom) tier first, keeping an explicit/refinement type
+    /// off the structural path (no double-fire). Fallible (`Conform.structural` + the request
+    /// record allocate) and takes `*BodyChecker` (records into the thread-local `derive_reqs`).
     fn conformsTo(bc: *BodyChecker, t: Type, pid_opt: ?u32, record_derive: bool) error{OutOfMemory}!bool {
         const pid = pid_opt orelse return false;
-        if (Typecheck.findConformance(bc.model, pid, t, &.{})) return true;
-        if (t.isTypeVar()) {
-            const ord = t.typeVarOrd();
-            if (ord >= bc.bound_protocols.len) return false;
-            return (bc.bound_protocols[ord] orelse return false) == pid;
+        switch (try Conform.classify(bc.model, bc.composite, bc.bound_protocols, &bc.conforms_memo, bc.gpa, t, pid)) {
+            .none => return false,
+            .direct => return true,
+            .structural => {
+                // Record a derive request ONLY for a GROUND operand: an abstract `App`
+                // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition
+                // check) is accepted-but-not-recorded — its concrete instance re-check
+                // records the ground `Box[int]`, which reify+synthesize can mint a witness for.
+                if (record_derive and bc.isGround(t)) try bc.recordDeriveReq(pid, t);
+                return true;
+            },
         }
-        switch (t.kind) {
-            .@"struct", .@"enum", .app => {},
-            else => return false,
-        }
-        if (try Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols)) {
-            // Record a derive request ONLY for a GROUND operand: an abstract `App`
-            // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition check)
-            // is accepted-but-not-recorded — its concrete instance re-check records the
-            // ground `Box[int]`, which reify+synthesize can actually mint a witness for.
-            if (record_derive and bc.isGround(t)) try bc.recordDeriveReq(pid, t);
-            return true;
-        }
-        return false;
     }
 
     /// Whether `t` is fully ground: no `type_var` anywhere. A struct/enum id and any
@@ -2090,7 +2084,7 @@ pub const BodyChecker = struct {
     fn deriveBlocker(bc: *BodyChecker, t: Type, pid_opt: ?u32) error{OutOfMemory}!?Typecheck.NonConformingField {
         if (t.kind != .@"struct") return null;
         const pid = pid_opt orelse return null;
-        return Typecheck.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
+        return Conform.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)
@@ -2109,21 +2103,17 @@ pub const BodyChecker = struct {
     }
 
     /// Whether `t` conforms to the arithmetic protocol `pid_opt` — the predicate the
-    /// `+`/`-`/`*`/`/` operator typing uses for non-int operands. Mirrors `conformsToEq`/
-    /// `conformsToOrd`: a concrete type resolves via the frozen conformance table
-    /// (`findConformance` covers the builtin `int` conformance AND every user `impl T has
-    /// Add`); a `type_var` in a bounded generic body conforms as-axiom when its declared
-    /// bound IS the operator's protocol. A null id (prelude-less caller) denies conformance,
-    /// so the operator emits T0028 rather than miscompiling.
+    /// `+`/`-`/`*`/`/` operator typing uses for non-int operands. Calls `Conform.direct`
+    /// (existence ∨ axiom) and NOT `Conform.classify`: a concrete type resolves via the
+    /// frozen conformance table (`Conform.existence` covers the builtin `int` conformance AND
+    /// every user `impl T has Add`); a `type_var` in a bounded generic body conforms as-axiom
+    /// when its declared bound IS the operator's protocol. Arithmetic protocols are NOT
+    /// structurally derivable, so there is deliberately no structural tier here. A null id
+    /// (prelude-less caller) denies conformance, so the operator emits T0028 rather than
+    /// miscompiling.
     fn conformsToArith(bc: *const BodyChecker, t: Type, pid_opt: ?u32) bool {
         const pid = pid_opt orelse return false;
-        if (Typecheck.findConformance(bc.model, pid, t, &.{})) return true;
-        if (t.isTypeVar()) {
-            const ord = t.typeVarOrd();
-            if (ord >= bc.bound_protocols.len) return false;
-            return (bc.bound_protocols[ord] orelse return false) == pid;
-        }
-        return false;
+        return Conform.direct(bc.model, t, pid, bc.bound_protocols);
     }
 
     /// The name a T0026/T0027 message uses for a non-conforming operand: a plain
@@ -2166,14 +2156,14 @@ pub const BodyChecker = struct {
             if (e.ctor_is_enum) {
                 if (e.ctor < bc.model.enums.len) {
                     for (bc.model.enums[e.ctor].variants) |v| for (v.field_types) |ft| {
-                        const sub = Typecheck.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
+                        const sub = Conform.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
                         if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConformingGuarded(sub, pid, seen);
                     };
                 }
             } else {
                 if (e.ctor < bc.model.structs.len) {
                     for (bc.model.structs[e.ctor].field_types) |ft| {
-                        const sub = Typecheck.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
+                        const sub = Conform.substPattern(bc.composite, bc.gpa, ft, e.args) catch return t;
                         if (!bc.conformsQuiet(sub, pid)) return bc.deepestNonConformingGuarded(sub, pid, seen);
                     }
                 }
@@ -2191,7 +2181,7 @@ pub const BodyChecker = struct {
     }
 
     fn conformsQuiet(bc: *BodyChecker, t: Type, pid: u32) bool {
-        return Typecheck.conforms(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols) catch true;
+        return Conform.structural(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols) catch true;
     }
 
     pub fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {
