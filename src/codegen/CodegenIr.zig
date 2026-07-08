@@ -351,6 +351,8 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         .mul => |b| try genArith(g, ins.result, b, .mul),
         .sdiv => |b| try genArith(g, ins.result, b, .sdiv),
         .udiv => |b| try genArith(g, ins.result, b, .udiv),
+        .smod => |b| try genRem(g, ins.result, b, .smod),
+        .umod => |b| try genRem(g, ins.result, b, .umod),
         .neg => |v| {
             try g.loadValue(S0, v);
             try g.emit(Aarch64.neg(S0, S0));
@@ -438,6 +440,21 @@ fn genArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ArithKind) error{OutOf
         .bxor => Aarch64.eorReg(S0, S0, S1),
     };
     try g.emit(word);
+    try normalizeWidth(g, S0, g.func.values[result].type);
+    try g.storeValue(S0, result);
+}
+
+const RemKind = enum { smod, umod };
+
+/// Integer remainder r = a - (a/b)*b: divide into S2, then `msub`. Signed vs
+/// unsigned rides on `sdiv`/`udiv` (mirroring genArith); `normalizeWidth`
+/// re-canonicalizes a narrow result exactly as the divide path does. S2 is the
+/// standard scratch (genShift uses it identically within one instruction).
+fn genRem(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: RemKind) error{OutOfMemory}!void {
+    try g.loadValue(S0, b.lhs); // a
+    try g.loadValue(S1, b.rhs); // b
+    try g.emit(if (kind == .smod) Aarch64.sdiv(S2, S0, S1) else Aarch64.udiv(S2, S0, S1)); // q = a/b
+    try g.emit(Aarch64.msub(S0, S2, S1, S0)); // r = a - q*b
     try normalizeWidth(g, S0, g.func.values[result].type);
     try g.storeValue(S0, result);
 }
@@ -659,6 +676,7 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
         .trap => try g.emit(Aarch64.brk0), // Abort with SIGILL (unwrap-on-none/err).
+        .panic => try g.emit(Aarch64.brk0), // M5: SIGILL; M14 retargets to bl __panic(reason).
     }
 }
 

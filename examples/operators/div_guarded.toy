@@ -1,0 +1,4 @@
+# Feature: `/` now carries a runtime zero-divisor guard; a nonzero divisor is
+# unchanged (same value, no panic).
+# expect: exit 3
+fn main() -> int { return 10 / 3 }

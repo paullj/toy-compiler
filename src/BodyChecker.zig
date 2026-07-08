@@ -645,7 +645,7 @@ pub const BodyChecker = struct {
                         if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
                     },
-                    .amp, .pipe, .caret, .lt_lt, .gt_gt => {
+                    .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },

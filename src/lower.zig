@@ -643,6 +643,23 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
     }
 }
 
+/// Split the current block on `rhs == 0`: zero -> a no-return `.panic(reason)`
+/// block, nonzero -> a fresh continuation the builder is left positioned in. Value-
+/// free by design (no join/merge param) — the panic path never produces a value, so
+/// the divide emitted afterward in `cont` is an ordinary SSA value dominating its
+/// uses. Modeled on the `unwrap` trap-block; block ids are handed out in a fixed
+/// per-call order so `--verify` re-lower stays byte-identical.
+fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Terminator.PanicReason) error{OutOfMemory}!void {
+    const zero = try b.emit(.{ .iconst = 0 }, ty);
+    const is_zero = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = rhs, .rhs = zero } }, Typecheck.Type.@"bool");
+    const cont = try b.addBlock();
+    const panic_blk = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = is_zero, .t = panic_blk, .f = cont } });
+    b.switchTo(panic_blk);
+    b.setTerm(.{ .panic = reason });
+    b.switchTo(cont);
+}
+
 fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     _ = node_idx;
     const op = b.in.tokens[n.main_token].tag;
@@ -656,11 +673,16 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
                 const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
+                // `/` gains a runtime zero-divisor guard; `+`/`-`/`*` stay byte-identical.
+                if (op == .slash) {
+                    try emitZeroGuard(b, rhs, lt, .div_by_zero);
+                    const ir_op: Ir.Op = if (lt.isUnsignedInt()) Ir.Op{ .udiv = bin } else Ir.Op{ .sdiv = bin };
+                    return .{ .value = try b.emit(ir_op, lt) };
+                }
                 const ir_op: Ir.Op = switch (op) {
                     .plus => .{ .add = bin },
                     .minus => .{ .sub = bin },
                     .star => .{ .mul = bin },
-                    .slash => if (lt.isUnsignedInt()) Ir.Op{ .udiv = bin } else Ir.Op{ .sdiv = bin },
                     else => unreachable,
                 };
                 // `lt` is the operand width; the checker proved `eql(lt,rt)` and
@@ -707,6 +729,19 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                 .gt_gt => if (lt.isUnsignedInt()) Ir.Op{ .lshr = bin } else Ir.Op{ .ashr = bin },
                 else => unreachable,
             };
+            return .{ .value = try b.emit(ir_op, lt) };
+        },
+        .percent => {
+            const lt = b.in.node_types[(n.lhs).int()];
+            if (!isInlineArith(lt.kind)) {
+                try b.note(n.main_token, "'%' requires integer operands in lower");
+                return .none;
+            }
+            const lhs = operandValue(try lowerExpr(b, n.lhs));
+            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            try emitZeroGuard(b, rhs, lt, .rem_by_zero);
+            const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
+            const ir_op: Ir.Op = if (lt.isUnsignedInt()) Ir.Op{ .umod = bin } else Ir.Op{ .smod = bin };
             return .{ .value = try b.emit(ir_op, lt) };
         },
         else => {

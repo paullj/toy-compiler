@@ -61,6 +61,13 @@ pub fn mul(rd: u32, rn: u32, rm: u32) u32 {
     return 0x9B007C00 | (rm << 16) | (rn << 5) | rd;
 }
 
+/// msub rd, rn, rm, ra -> rd = ra - rn*rm (MADD family, bit15 set). Used by smod/
+/// umod for r = a - (a/b)*b. Words verified on-host (`as -arch arm64` + `otool`):
+/// msub x0,x1,x2,x3 -> 0x9B028C20, msub x3,x0,x1,x2 -> 0x9B018803.
+pub fn msub(rd: u32, rn: u32, rm: u32, ra: u32) u32 {
+    return 0x9B008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd;
+}
+
 /// sdiv rd, rn, rm (signed division; arm64 sdiv by 0 yields 0, no trap). sdiv
 /// x3,x0,x1 → 0x9AC10C03.
 pub fn sdiv(rd: u32, rn: u32, rm: u32) u32 {
@@ -468,6 +475,9 @@ test "data-processing register" {
     try testing.expectEqual(@as(u32, 0x9AC10C00), sdiv(0, 0, 1)); // sdiv x0,x0,x1
     try testing.expectEqual(@as(u32, 0xCB0003E4), neg(4, 0)); // neg x4,x0
     try testing.expectEqual(@as(u32, 0xCB0003E0), neg(0, 0)); // neg x0,x0
+    try testing.expectEqual(@as(u32, 0x9B028C20), msub(0, 1, 2, 3)); // msub x0,x1,x2,x3
+    try testing.expectEqual(@as(u32, 0x9B018803), msub(3, 0, 1, 2)); // msub x3,x0,x1,x2
+    try testing.expectEqual(@as(u32, 0x9B018040), msub(0, 2, 1, 0)); // msub x0,x2,x1,x0 (the genRem shape)
 }
 
 test "M2 width-correct encoders (udiv + sign-extend + low-bits mask)" {

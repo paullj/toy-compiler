@@ -1,0 +1,3 @@
+# Feature: `%` is truncated remainder with the sign of the DIVIDEND (signed smod).
+# expect: exit 254
+fn main() -> int { return (0 - 17) % 5 }

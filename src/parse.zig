@@ -1865,6 +1865,7 @@ const infix_bp_table = std.enums.directEnumArrayDefault(token.Tag, i16, -1, 0, .
     .minus = 9,
     .star = 10,
     .slash = 10,
+    .percent = 10,
 });
 
 /// Infix binding power, or null if the tag is not an infix operator. Higher
@@ -1886,7 +1887,7 @@ fn checkInfixTable() ?[]const u8 {
         .lt,        .lt_eq,     .gt,   .gt_eq,
         .lt_lt,     .gt_gt,
         .plus,      .minus,
-        .star,      .slash,
+        .star,      .slash,     .percent,
     };
     // Every listed operator has a positive bp.
     for (infix_ops) |op| {

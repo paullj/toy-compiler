@@ -104,6 +104,8 @@ pub const Op = union(enum) {
     mul: Bin,
     sdiv: Bin,
     udiv: Bin,
+    smod: Bin,
+    umod: Bin,
 
     neg: ValueId,
     bnot: ValueId,
@@ -175,6 +177,12 @@ pub const Terminator = union(enum) {
     /// never-typed FnCode. Terminates its block with no successors (like `ret`); used
     /// only by `Option`/`Result` `unwrap`'s failure arm.
     trap,
+    /// A runtime panic with a known cause. Codegens to the same `brk #0` as `.trap`
+    /// in M5 (message + backtrace deferred to M14); the reason rides the terminator
+    /// so M14 maps reason -> message with no lower re-plumbing. No successors.
+    panic: PanicReason,
+
+    pub const PanicReason = enum { div_by_zero, rem_by_zero };
 };
 
 /// A basic block: a list of block params (the merge slots), straight-line
@@ -387,6 +395,8 @@ fn renderInstr(
         .mul => |b| try out.print("mul %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .sdiv => |b| try out.print("sdiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .udiv => |b| try out.print("udiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .smod => |b| try out.print("smod %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .umod => |b| try out.print("umod %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .neg => |v| try out.print("neg %{d}\n", .{v}),
         .bnot => |v| try out.print("bnot %{d}\n", .{v}),
         .icmp => |c| try out.print("icmp {s} %{d}, %{d}\n", .{ condName(c.cc), c.lhs, c.rhs }),
@@ -462,6 +472,7 @@ fn renderTerm(out: *std.Io.Writer, term: Terminator) anyerror!void {
         },
         .@"unreachable" => try out.writeAll("  unreachable\n"),
         .trap => try out.writeAll("  trap\n"),
+        .panic => |r| try out.print("  panic {s}\n", .{@tagName(r)}),
     }
 }
 

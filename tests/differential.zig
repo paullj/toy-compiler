@@ -259,6 +259,18 @@ fn exitCode(term: std.process.Child.Term) ?u8 {
     };
 }
 
+/// Spawn an already-built binary by absolute path and return its Term. `spawnExit`
+/// only ever spawns `toy`; this runs a compiled toy PROGRAM directly so a `brk #0`
+/// abort surfaces as `Term.signal` (exitCode==null) — `toy run` would cook it into a
+/// clean 128+signo instead.
+fn spawnBinaryTerm(gpa: std.mem.Allocator, io: Io, abs_path: []const u8) !std.process.Child.Term {
+    var child = try std.process.spawn(io, .{ .argv = &.{abs_path}, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    gpa.free(got);
+    return child.wait(io);
+}
+
 test "differential: the real `toy check` and `toy build` exit codes AGREE on the three fixtures" {
     // The literal CLI differential: spawn both subcommands and compare exit codes.
     // `build` runs codegen, so it needs macOS + the built binary; skip cleanly
@@ -380,5 +392,37 @@ test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 
         const runt = try spawnExit(gpa, io, &.{ "run", dir ++ "/main.toy" });
         try testing.expectEqual(@as(?u8, 0), exitCode(chk));
         try testing.expectEqual(@as(?u8, 111), exitCode(runt));
+    }
+}
+
+test "M5: div/mod by zero aborts (SIGILL) at BOTH -O0 and -O1; nonzero controls exit normally" {
+    // The panic has no `# expect:` corpus channel, and `toy run` cooks SIGILL into a
+    // clean 128+signo, so this builds each fixture and spawns the BUILT BINARY
+    // directly. The -O1 abort legs are the SOLE proof that fold's const-0 skip held
+    // (that -O1 did not fold `/0`/`%0` to a value and erase the panic).
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+
+    const fixtures = .{
+        .{ .dir = ".toy-test-m5-div0", .src = "fn main() -> int { return 10 / 0 }\n", .want = @as(?u8, null) },
+        .{ .dir = ".toy-test-m5-mod0", .src = "fn main() -> int { return 10 % 0 }\n", .want = @as(?u8, null) },
+        .{ .dir = ".toy-test-m5-ctldiv", .src = "fn main() -> int { return 10 / 3 }\n", .want = @as(?u8, 3) },
+        .{ .dir = ".toy-test-m5-ctlmod", .src = "fn main() -> int { return 17 % 5 }\n", .want = @as(?u8, 2) },
+    };
+    inline for (fixtures) |fx| {
+        defer Io.Dir.cwd().deleteTree(io, fx.dir) catch {};
+        inline for (.{ "-O0", "-O1" }) |lvl| {
+            try writeFixture(io, fx.dir, &.{.{ "main.toy", fx.src }});
+            const bld = try spawnExit(gpa, io, &.{ "build", lvl, fx.dir ++ "/main.toy", "-o", fx.dir ++ "/prog" ++ lvl });
+            try testing.expectEqual(@as(?u8, 0), exitCode(bld)); // compiled cleanly
+            const abs = try Io.Dir.cwd().realPathFileAlloc(io, fx.dir ++ "/prog" ++ lvl, gpa);
+            defer gpa.free(abs);
+            const term = try spawnBinaryTerm(gpa, io, abs);
+            try testing.expectEqual(fx.want, exitCode(term)); // null == aborted; N == clean exit N
+        }
     }
 }
