@@ -78,20 +78,34 @@ fn constBool(value_const: []const ?bool, v: Ir.ValueId) ?bool {
     return value_const[v];
 }
 
+/// The successor block-id slots of a terminator, yielded as `*Ir.BlockId` in fixed
+/// order. The single terminator switch that both the reachability read (`successors`)
+/// and the compaction remap write go through — the block-id analog of walk.zig's
+/// value-use spine (which deliberately excludes block ids), so a terminator's
+/// successor handling lives in one place, not two switches kept in lockstep.
+fn eachSuccessor(term: *Ir.Terminator, ctx: anytype, comptime each: anytype) void {
+    switch (term.*) {
+        .br => |*br| each(ctx, &br.dest),
+        .cond_br => |*c| {
+            each(ctx, &c.t);
+            each(ctx, &c.f);
+        },
+        .ret, .@"unreachable", .trap, .panic => {},
+    }
+}
+
 /// Successor block ids of a terminator, written into `out` (cap 2), returns count.
 fn successors(term: Ir.Terminator, out: *[2]Ir.BlockId) usize {
-    return switch (term) {
-        .br => |br| blk: {
-            out[0] = br.dest;
-            break :blk 1;
-        },
-        .cond_br => |c| blk: {
-            out[0] = c.t;
-            out[1] = c.f;
-            break :blk 2;
-        },
-        .ret, .@"unreachable", .trap, .panic => 0,
-    };
+    var t = term;
+    const Ctx = struct { out: *[2]Ir.BlockId, n: usize };
+    var ctx = Ctx{ .out = out, .n = 0 };
+    eachSuccessor(&t, &ctx, struct {
+        fn each(c: *Ctx, p: *Ir.BlockId) void {
+            c.out[c.n] = p.*;
+            c.n += 1;
+        }
+    }.each);
+    return ctx.n;
 }
 
 /// Drop blocks unreachable from `func.entry`. Returns true if any were dropped.
@@ -167,14 +181,11 @@ fn elimUnreachable(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats
 
     // Rewrite surviving terminators' block refs and entry/exit through remap.
     for (func.blocks) |*b| {
-        switch (b.term) {
-            .br => |*br| br.dest = remap[br.dest],
-            .cond_br => |*c| {
-                c.t = remap[c.t];
-                c.f = remap[c.f];
-            },
-            .ret, .@"unreachable", .trap, .panic => {},
-        }
+        eachSuccessor(&b.term, remap, struct {
+            fn each(m: []const Ir.BlockId, p: *Ir.BlockId) void {
+                p.* = m[p.*];
+            }
+        }.each);
     }
     if (func.entry < n) func.entry = remap[func.entry];
     if (func.exit < n and remap[func.exit] != Ir.none_block) func.exit = remap[func.exit];
