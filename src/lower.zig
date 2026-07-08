@@ -732,11 +732,10 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             return .{ .value = try b.emit(ir_op, lt) };
         },
         .percent => {
+            // Integer-only builtin like the bitwise arm above (no Div-style witness path),
+            // so it trusts the checker (T "operands of '%' must be int") rather than
+            // re-guarding the operand kind.
             const lt = b.in.node_types[(n.lhs).int()];
-            if (!isInlineArith(lt.kind)) {
-                try b.note(n.main_token, "'%' requires integer operands in lower");
-                return .none;
-            }
             const lhs = operandValue(try lowerExpr(b, n.lhs));
             const rhs = operandValue(try lowerExpr(b, n.rhs));
             try emitZeroGuard(b, rhs, lt, .rem_by_zero);
