@@ -1,0 +1,6 @@
+# expect: compile-error "cycle"
+type A = B
+type B = A
+fn main() -> int {
+    return 0
+}

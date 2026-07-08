@@ -1,0 +1,8 @@
+# expect: exit 42
+fn thru(x: uint8) -> uint8 { x }
+fn main() -> int {
+    b: byte = 200
+    w: uint = thru(b).into()             # byte value -> uint8 param (same Type); uint8 -> uint widen
+    v: byte = w.try_into().unwrap()      # uint -> byte(=uint8) narrow
+    return if v == 200 { 42 } else { 0 }
+}

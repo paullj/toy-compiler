@@ -1,0 +1,5 @@
+# expect: compile-error "cycle"
+type A = A
+fn main() -> int {
+    return 0
+}

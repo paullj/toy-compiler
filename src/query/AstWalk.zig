@@ -267,7 +267,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         // `impl_decl`/`impl_has_decl` is a top-level decl (its methods are walked as
         // ordinary `fn_decl` fingerprint roots) and a `protocol_decl`'s bodyless sigs
         // never enter the fn table, so all three fold nothing here.
-        .program, .import_decl, .impl_decl, .protocol_decl, .impl_has_decl => {},
+        .program, .import_decl, .impl_decl, .protocol_decl, .impl_has_decl, .type_alias_decl => {},
         // Zero-sized leaf: the tag byte IS its content. Reached as a value literal
         // and as a `()` type-ref (under param/fn_decl ret).
         .literal_unit => {},

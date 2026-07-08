@@ -96,7 +96,7 @@ fn setOf(comptime tags: []const token.Tag) TagSet {
 }
 
 /// FIRST(top-level decl): the exact arms of `parseDecls`' dispatch.
-const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl, .kw_protocol });
+const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl, .kw_protocol, .kw_type });
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
@@ -400,6 +400,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
         .kw_protocol => try p.parseProtocolDecl(),
+        .kw_type => try p.parseTypeAlias(),
         else => return p.fail(p.peek(), .P0003, if (is_pub)
             "expected a function, struct, or enum declaration after 'pub'"
         else
@@ -830,6 +831,20 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     // for a non-generic struct, keeping every existing struct byte-identical).
     const generic_hdr = try p.optRange(generics.items);
     return p.addNode(.{ .tag = .struct_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
+}
+
+/// `type Name = <type-ref>` — a module-local transparent alias (M7). Reuses `.eq`
+/// (distinct from the `as` import-alias token) and the shared type-ref parser
+/// (`parseType`, which carries the recursion-depth guard), so the target may be a
+/// bare/qualified name or `()`. `main_token` = the alias name; `lhs` = the target
+/// type-ref; `rhs` = none. Registration resolves it to the target's own `Type`.
+fn parseTypeAlias(p: *Parser) Error!Ast.Index {
+    try p.expect(.kw_type, "expected 'type'");
+    const name_tok = p.index;
+    try p.expect(.identifier, "expected a type alias name");
+    try p.expect(.eq, "expected '=' after the type alias name");
+    const target = try p.parseType();
+    return p.addNode(.{ .tag = .type_alias_decl, .main_token = name_tok, .lhs = target, .rhs = Ast.none });
 }
 
 /// `enum N { Empty, Circle(int), Rect { w: int, h: int } }`. Variants are
@@ -2559,6 +2574,8 @@ test "root is program and children precede parents" {
                 try testing.expect(h.protocol.int() < self);
                 for (h.methods) |c| try testing.expect(c.int() < self);
             },
+            // `type N = T`: the target type-ref is `lhs`, created before this node.
+            .type_alias_decl => try testing.expect(n.lhs.int() < self),
         }
     }
 }

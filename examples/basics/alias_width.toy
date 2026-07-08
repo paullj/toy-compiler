@@ -1,0 +1,7 @@
+# expect: exit 7
+type Small = uint8
+fn main() -> int {
+    s: Small = 7
+    w: uint = s.into()                   # Small(=uint8) -> uint widen: alias interchangeable with uint8
+    return if w == 7 { 7 } else { 0 }
+}

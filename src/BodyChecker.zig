@@ -2277,4 +2277,8 @@ pub const BodyChecker = struct {
     pub fn activeEnumMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
         return &bc.model.graph.mods[bc.graph_mod].enum_ids;
     }
+
+    pub fn activeAliasMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(Type) {
+        return &bc.model.graph.mods[bc.graph_mod].alias_ids;
+    }
 };

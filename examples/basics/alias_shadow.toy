@@ -1,0 +1,6 @@
+# expect: exit 42
+type byte = int
+fn main() -> int {
+    b: byte = -5                         # legal ONLY if byte==int; if byte were uint8 this is T0034
+    return b + 47
+}

@@ -342,6 +342,14 @@ pub const Node = extern struct {
         /// Postfix `operand?` — the try operator. `main_token` is the `?`. `lhs` is the
         /// operand expression. `rhs` is `none`.
         try_expr,
+
+        /// `type Name = <target>` — a module-local transparent alias (M7). Appended at
+        /// END (frozen ordinal; `[]Node` is memcpy'd to/from the content cache;
+        /// `ParseHeader.version` bumped 12->13). `main_token` is the alias NAME; `lhs`
+        /// is the target type-ref node (identifier / field_access / type_app /
+        /// literal_unit); `rhs` is `none`. It mints NO `Type` — registration resolves
+        /// the name to the target's own `Type`, so no alias-ness reaches lower/codegen.
+        type_alias_decl,
     };
 };
 
@@ -566,7 +574,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 12,
+    version: u32 = 13,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -627,7 +635,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 12) return null;
+    if (hdr.magic != parse_magic or hdr.version != 13) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -686,6 +694,11 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, arg);
             }
+            try out.writeByte(')');
+        },
+        .type_alias_decl => {
+            try out.print("(alias {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.lhs);
             try out.writeByte(')');
         },
         .impl_decl => {

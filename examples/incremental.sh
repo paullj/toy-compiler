@@ -326,5 +326,27 @@ fn main() -> int { return match outer() { .ok(_) -> unrelated(0), .err(_) -> 42 
 }
 run_from_widen
 
+# alias target flip: the dependent fn's resolved param Type changes (structT id flips),
+# so it re-lowers; SOUNDNESS = inc __text == force __text (no stale alias-resolved body).
+run_scenario alias_target \
+'struct Wrap { v: int }
+struct Wrap2 { v: int }
+type Cur = Wrap
+fn unwrap_v(c: Cur) -> int { return c.v }
+fn main() -> int {
+    w := Wrap { v: 42 }
+    return unwrap_v(w)
+}
+' \
+'struct Wrap { v: int }
+struct Wrap2 { v: int }
+type Cur = Wrap2
+fn unwrap_v(c: Cur) -> int { return c.v }
+fn main() -> int {
+    w := Wrap2 { v: 42 }
+    return unwrap_v(w)
+}
+' 0
+
 echo "--- incremental battery: $pass scenario(s) sound+cutoff, $fail failed ---"
 [ "$fail" -eq 0 ]
