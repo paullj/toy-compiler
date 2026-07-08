@@ -23,13 +23,6 @@ const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
 const arith = @import("../opt/arith.zig");
 const testing = std.testing;
 
-/// The `Hash` derive's field multiplier (the FNV-64 prime), re-materialized at each
-/// `hashCombine` use (a pure iconst the opt folds), so the emitter reads no shared state.
-/// Lives beside its sole user; the paired `hash_seed` (and the frozen-constant rationale)
-/// stay `pub` in `lower.zig` because the builtin `.hash()` path shares that seed. MUST fit
-/// in i64 — the fold wraps via the IR's `*%`/`+%` (never traps).
-const hash_mult: i64 = 0x100000001B3;
-
 /// Struct/enum equality of two operands already MATERIALIZED into slots `lslot`/`rslot`
 ///: resolve the `Eq` witness and call `witness(lslot, rslot) -> bool`, or (an
 /// Ord-only type: the Ord-refinement filled `(Eq,T)` but added no `eq` method) call the
@@ -515,18 +508,6 @@ fn lowerDeriveOrd(
     return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
-/// Fold one more field/tag into the running hash: `h := h*MULT + add_val`. The
-/// single mixing primitive of the structural `Hash` derive; `MULT` is re-materialized at
-/// each use (a pure iconst the opt folds), so the emitter reads no shared state and a
-/// double-lower is byte-identical. Wraps past i64 via the IR's wrapping `*`/`+` (never
-/// traps), so a large accumulator is safe.
-fn hashCombine(b: *L.Builder, h: Ir.ValueId, add_val: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
-    const int_ty = Typecheck.Type.int;
-    const mult = try b.emit(.{ .iconst = hash_mult }, int_ty);
-    const hm = try b.emit(.{ .mul = .{ .lhs = h, .rhs = mult } }, int_ty);
-    return try b.emit(.{ .add = .{ .lhs = hm, .rhs = add_val } }, int_ty);
-}
-
 /// The int hash of an aggregate operand already MATERIALIZED into slot `slot`:
 /// resolve the `hash` witness and call `witness(slot) -> int`. The slot-operand sibling of
 /// the top-level derive, so a nested aggregate FIELD stays in lockstep with the callee's own
@@ -583,14 +564,14 @@ fn deriveFieldHash(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.V
 }
 
 /// Fold variant `vi`'s active payload into the running hash `h0` and deliver the result to
-/// `join`: an empty variant delivers `h0` unchanged; else each payload field
-/// multiply-accumulates. Mirrors `emitVariantPayloadEq`.
+/// `join`: an empty variant delivers `h0` unchanged; else each payload field is folded
+/// through the fxhash `hashMix`. Mirrors `emitVariantPayloadEq`.
 fn emitVariantPayloadHash(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, h0: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
     const v = e.variants[vi];
     var h = h0;
     for (v.field_types, v.offsets) |fty, poff| {
         const fh = try deriveFieldHash(b, fty, e.payload_off + poff, self_base);
-        h = try hashCombine(b, h, fh);
+        h = try L.hashMix(b, h, fh);
     }
     try L.brTo(b, join, .{ .value = h });
 }
@@ -606,7 +587,7 @@ fn deriveEnumHash(b: *L.Builder, cty: Typecheck.Type, self_base: Ir.ValueId) err
 
     const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
     const seed = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
-    const h0 = try hashCombine(b, seed, tag);
+    const h0 = try L.hashMix(b, seed, tag);
 
     const join = try b.addBlock();
     const merge = try b.addParam(join, int_ty);
@@ -622,7 +603,7 @@ fn deriveEnumHash(b: *L.Builder, cty: Typecheck.Type, self_base: Ir.ValueId) err
 
 /// Lower a SOURCE-LESS auto-derive `Hash` unit: a layout-walking emitter returning an
 /// int. ONE param (the receiver, by slot). A struct folds a fixed seed through its fields in
-/// layout order (`h := h*MULT + fieldhash`); an empty-payload enum folds the discriminant
+/// layout order (folding each field hash through the fxhash `hashMix`); an empty-payload enum folds the discriminant
 /// (`combine(seed, tag)`); a payload enum folds the discriminant then the active variant's
 /// payload via a tag-dispatch ladder. The fixed seed makes the hash reproducible run-to-run.
 fn lowerDeriveHash(
@@ -659,7 +640,7 @@ fn lowerDeriveHash(
             var h = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
             for (layout.field_types, layout.offsets) |fty, off| {
                 const fh = try deriveFieldHash(&b, fty, off, self_base);
-                h = try hashCombine(&b, h, fh);
+                h = try L.hashMix(&b, h, fh);
             }
             break :blk h;
         },
@@ -674,7 +655,7 @@ fn lowerDeriveHash(
                 // Empty-payload enum: fold the discriminant into the seed (bare tag hash).
                 const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
                 const seed = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
-                break :blk try hashCombine(&b, seed, tag);
+                break :blk try L.hashMix(&b, seed, tag);
             }
             break :blk try deriveEnumHash(&b, cty, self_base);
         },
@@ -891,7 +872,7 @@ fn intStructInputs(layouts: []const Typecheck.Layout) L.Inputs {
     };
 }
 
-test "derive Hash: mixer chain is h*MULT+field, binding constants + operand order to arith.foldBin" {
+test "derive Hash: mixer is fxhash (rotl(h,5)^word)*%K — constants/shifts/lshr + operand order pinned" {
     const gpa = testing.allocator;
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -906,33 +887,58 @@ test "derive Hash: mixer chain is h*MULT+field, binding constants + operand orde
     defer func.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), diags.items.len);
 
-    // Trace the accumulator back from the returned value: h2 = (h1 * MULT) + fld1,
-    // h1 = (seed * MULT) + fld0.
+    // One fxhash round unwound from an accumulator `out`: out = (rotl(h,5) ^ word) *% K,
+    // rotl(h,5) = shl(h,5) | lshr(h,59). Returns the inbound accumulator, the emitted K, and
+    // the word value so the caller chains rounds. The `.lshr` unwrap is the LOCK #8 guard: an
+    // `.ashr` regression fails the union-field access here.
+    const Round = struct {
+        h_in: Ir.ValueId,
+        k: i64,
+        word: Ir.ValueId,
+        fn of(f: *const Ir.Function, out: Ir.ValueId) !@This() {
+            const mul = defOf(f, out).?.mul;
+            const bx = defOf(f, mul.lhs).?.bxor;
+            const bor = defOf(f, bx.lhs).?.bor;
+            const shl = defOf(f, bor.lhs).?.shl;
+            const lshr = defOf(f, bor.rhs).?.lshr;
+            try testing.expectEqual(@as(i64, 5), defOf(f, shl.rhs).?.iconst);
+            try testing.expectEqual(@as(i64, 59), defOf(f, lshr.rhs).?.iconst);
+            try testing.expectEqual(shl.lhs, lshr.lhs); // both rotates read the SAME accumulator
+            try testing.expect(std.meta.activeTag(defOf(f, bx.rhs).?) == .load); // word = raw field load
+            return .{ .h_in = shl.lhs, .k = defOf(f, mul.rhs).?.iconst, .word = bx.rhs };
+        }
+    };
+
     const h2 = retValue(&func).?;
-    const add1 = defOf(&func, h2).?.add;
-    const mul1 = defOf(&func, add1.lhs).?.mul;
-    const mult1 = defOf(&func, mul1.rhs).?.iconst;
-    const add0 = defOf(&func, mul1.lhs).?.add;
-    const mul0 = defOf(&func, add0.lhs).?.mul;
-    const mult0 = defOf(&func, mul0.rhs).?.iconst;
-    const seed = defOf(&func, mul0.lhs).?.iconst;
+    const r1 = try Round.of(&func, h2); // field b (off 8)
+    const r0 = try Round.of(&func, r1.h_in); // field a (off 0)
+    const seed = defOf(&func, r0.h_in).?.iconst;
 
-    // The per-field addends are the raw field loads (h*MULT + field, not field-then-mul).
-    try testing.expect(std.meta.activeTag(defOf(&func, add0.rhs).?) == .load);
-    try testing.expect(std.meta.activeTag(defOf(&func, add1.rhs).?) == .load);
+    // Pin the emitted constants to INDEPENDENT literals (NOT L.hash_k / L.hash_seed): a drift
+    // of either symbol emits the new value and fails here, catching a silent constant change.
+    try testing.expectEqual(@as(i64, 0x243F6A8885A308D3), seed);
+    try testing.expectEqual(@as(i64, 0x517cc1b727220a95), r0.k);
+    try testing.expectEqual(@as(i64, 0x517cc1b727220a95), r1.k);
 
-    // Constants are the frozen seed/mult — a swapped operand order or drifted constant fails.
-    try testing.expectEqual(L.hash_seed, seed);
-    try testing.expectEqual(hash_mult, mult0);
-    try testing.expectEqual(hash_mult, mult1);
-
-    // Folding the emitted constants with arith.foldBin (mul-before-add per field) equals an
-    // independent Zig reference over arbitrary field values.
+    // Cross-check the FORMULA two independent ways over arbitrary words: fold the emitted seed
+    // with the opt-stage `arith` helpers (native lshr, width 64) vs a raw-u64 fxhash reference.
+    // A wrong shift amount, .ashr, swapped order, or FNV shape diverges.
     const v0: i64 = 7;
     const v1: i64 = 11;
-    const folded = arith.foldBin(.add, arith.foldBin(.mul, arith.foldBin(.add, arith.foldBin(.mul, seed, mult0), v0), mult1), v1);
-    const ref = ((L.hash_seed *% hash_mult) +% v0) *% hash_mult +% v1;
-    try testing.expectEqual(ref, folded);
+    const mixFold = struct {
+        fn f(h: i64, w: i64) i64 {
+            const rot = arith.foldBin(.bor, arith.foldShift(.shl, h, 5, 64), arith.foldShift(.lshr, h, 59, 64));
+            return arith.foldBin(.mul, arith.foldBin(.bxor, rot, w), 0x517cc1b727220a95);
+        }
+    }.f;
+    const fxRef = struct {
+        fn f(h: i64, w: i64) i64 {
+            const u: u64 = @bitCast(h);
+            const rot: i64 = @bitCast((u << 5) | (u >> 59));
+            return (rot ^ w) *% 0x517cc1b727220a95;
+        }
+    }.f;
+    try testing.expectEqual(fxRef(fxRef(seed, v0), v1), mixFold(mixFold(seed, v0), v1));
 }
 
 test "derive Eq/Ord/Hash walk struct fields in the same layout order" {
