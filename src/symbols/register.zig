@@ -6,6 +6,7 @@
 //! variants as `type_var` PATTERNS (the input to `substReify`). Driven from `runGraph`'s
 //! Phase 0.
 
+const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Typecheck = @import("../types.zig");
@@ -260,4 +261,106 @@ pub fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32)
         });
         try t.activeProtocolMap().put(t.gpa, name, id);
     }
+}
+
+/// One recorded `type X = Y` awaiting resolution (module-local). `tok` is the alias-name
+/// token (for the cycle diagnostic); `state` drives the tri-color cycle guard.
+const AliasEntry = struct {
+    name: []const u8,
+    target: Ast.Index,
+    tok: u32,
+    state: enum { unvisited, resolving, done } = .unvisited,
+};
+
+/// Register this module's `type X = Y` transparent aliases into `alias_ids` (bare name
+/// -> RESOLVED target `Type`), and seed the prelude `byte = uint8` if-absent so a user
+/// `type`/`struct`/`enum byte` shadows it (the `enum Ordering` if-absent precedent). Runs
+/// AFTER structs+enums so an alias may target a user struct/enum. Aliases mint NO new
+/// `Type`/id/mangle: `typeFromNode` returns the target's own `Type`.
+pub fn registerAliases(t: *Typecheck, decl_nodes: []const Ast.Index) !void {
+    const map = t.activeAliasMap();
+    // Seed `byte` only if no `byte` already lives in ANY namespace consulted at or
+    // before the alias-map lookup: a user `struct`/`enum byte` (struct/enum maps) must
+    // win, and a user `type byte` (recorded below) overwrites the seed in the resolve pass.
+    if (map.get("byte") == null and
+        t.activeStructMap().get("byte") == null and
+        t.activeEnumMap().get("byte") == null)
+    {
+        try map.put(t.gpa, "byte", Type.uint8);
+    }
+
+    var entries: std.ArrayList(AliasEntry) = .empty;
+    defer entries.deinit(t.gpa);
+    // Alias name -> entry index. Backs both duplicate detection and chain following in
+    // O(1); a linear scan of `entries` per link would make resolving a long chain O(N^2).
+    var by_name: std.StringHashMapUnmanaged(u32) = .empty;
+    defer by_name.deinit(t.gpa);
+
+    for (decl_nodes) |decl_idx| {
+        const decl = t.tree.nodes[decl_idx.int()];
+        if (decl.tag != .type_alias_decl) continue;
+        const name = t.nameText(decl.main_token);
+        if (type_names.get(name) != null) {
+            try t.sink.emitFmtCode(.T0011, t.byteOf(decl.main_token), "type alias '{s}' shadows a builtin type", .{name});
+            continue;
+        }
+        if (t.activeStructMap().get(name) != null or t.activeEnumMap().get(name) != null or by_name.contains(name)) {
+            try t.sink.emitFmtCode(.T0012, t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
+            continue;
+        }
+        try by_name.put(t.gpa, name, @intCast(entries.items.len));
+        try entries.append(t.gpa, .{ .name = name, .target = decl.lhs, .tok = decl.main_token });
+    }
+
+    for (0..entries.items.len) |i| _ = try resolveAlias(t, entries.items, i, map, &by_name);
+}
+
+/// Resolve `entries[start]` to a concrete `Type`, writing it (and every alias on the
+/// chain it heads) into `map`. Follows the alias->alias chain ITERATIVELY via an
+/// explicit `path` worklist rather than recursion, so an arbitrarily long linear chain
+/// (`type A0 = A1 ... = int`) resolves in bounded stack instead of overflowing it — the
+/// same anti-crash discipline `parseType` applies to deep type nesting. Tri-color state
+/// still detects a cycle: re-entry to a `.resolving` node emits one T0035 and resolves
+/// the whole path to `.invalid`. All alias following is confined here — the map stores
+/// resolved `Type`s, so `typeFromNode` is a pure lookup and Pass C stays const.
+fn resolveAlias(t: *Typecheck, entries: []AliasEntry, start: usize, map: *std.StringHashMapUnmanaged(Type), by_name: *const std.StringHashMapUnmanaged(u32)) error{OutOfMemory}!Type {
+    var path: std.ArrayList(usize) = .empty;
+    defer path.deinit(t.gpa);
+
+    var i = start;
+    const result: Type = while (true) {
+        switch (entries[i].state) {
+            .done => break map.get(entries[i].name).?,
+            .resolving => {
+                try t.sink.emitFmtCode(.T0035, t.byteOf(entries[i].tok), "type alias '{s}' forms a cycle", .{entries[i].name});
+                break Type.invalid;
+            },
+            .unvisited => {},
+        }
+        entries[i].state = .resolving;
+        try path.append(t.gpa, i);
+        if (aliasLink(t, by_name, entries[i].target)) |j| {
+            i = j;
+        } else break t.typeFromNode(entries[i].target);
+    };
+
+    for (path.items) |k| {
+        try map.put(t.gpa, entries[k].name, result);
+        entries[k].state = .done;
+    }
+    return result;
+}
+
+/// If a target node is a bare identifier naming ANOTHER user alias in this module,
+/// return that alias's entry index (the chain continues there); otherwise null — a
+/// builtin, the seeded `byte`, a struct/enum, `()`, or a `T[..]` app, all resolved
+/// directly by `typeFromNode`.
+fn aliasLink(t: *Typecheck, by_name: *const std.StringHashMapUnmanaged(u32), node: Ast.Index) ?usize {
+    if (node == Ast.none) return null;
+    const n = t.tree.nodes[node.int()];
+    if (n.tag != .identifier) return null;
+    const nm = t.nameText(n.main_token);
+    if (type_names.get(nm) != null) return null;
+    if (by_name.get(nm)) |j| return j;
+    return null;
 }

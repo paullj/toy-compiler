@@ -1,0 +1,5 @@
+# expect: compile-error "shadows a builtin"
+type int = bool
+fn main() -> int {
+    return 0
+}

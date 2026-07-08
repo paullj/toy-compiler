@@ -1,0 +1,8 @@
+# expect: exit 42
+struct Point { x: int, y: int }
+type P = Point
+fn getx(p: P) -> int { p.x }
+fn main() -> int {
+    q := Point { x: 42, y: 9 }           # construct by the real name (alias-as-ctor is out of scope)
+    return getx(q)                       # Point value -> P param: identical Type
+}

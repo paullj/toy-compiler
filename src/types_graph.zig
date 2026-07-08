@@ -56,6 +56,7 @@ pub fn checkGraph(
             mc.enum_ids.deinit(gpa);
             mc.protocol_ids.deinit(gpa);
             mc.namespaces.deinit(gpa);
+            mc.alias_ids.deinit(gpa);
         }
         gpa.free(ctx.mods);
     }

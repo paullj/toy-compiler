@@ -147,6 +147,7 @@ pub const refs = struct {
         const tok = tn.main_token;
         const name = refs.nameText(self, tok);
         if (type_names.get(name)) |b| return b;
+        if (self.activeAliasMap().get(name)) |ty| return ty;
         if (self.activeStructMap().get(name)) |id| {
             // A generic struct named WITHOUT type args (`x: Box`) is not a value type —
             // it needs its args. Diagnose rather than mis-resolve it to `structT`.
@@ -1080,6 +1081,11 @@ pub const GraphCtx = struct {
         protocol_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Import namespace name → imported module id (graph module id).
         namespaces: std.StringHashMapUnmanaged(u32) = .empty,
+        /// Bare alias name -> RESOLVED target `Type` (this module's `type X = Y` decls
+        /// + the if-absent-seeded prelude `byte = uint8`). A pure lookup in
+        /// `typeFromNode`; all cycle risk is confined to the one-shot resolve pass that
+        /// fills this. Aliases mint no id, so this map is never read by lower/codegen/fp.
+        alias_ids: std.StringHashMapUnmanaged(Type) = .empty,
     };
 
     /// Resolve an import namespace receiver name in module `mod` to the imported
@@ -1216,6 +1222,11 @@ pub fn activeStructMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
 /// The active bare-name → global-enum-id map: the current module's table.
 pub fn activeEnumMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
     return &t.graph.mods[t.graph_mod].enum_ids;
+}
+
+/// The active bare-name -> resolved alias `Type` map: the current module's table.
+pub fn activeAliasMap(t: *Typecheck) *std.StringHashMapUnmanaged(Type) {
+    return &t.graph.mods[t.graph_mod].alias_ids;
 }
 
 /// The active bare-name → global-protocol-id map: the current module's table.
@@ -1553,6 +1564,20 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
         if (prog.tag != .program) continue;
         try register.registerEnums(t, Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
+    }
+
+    // Phase 0-alias (M7): register each module's transparent `type X = Y` aliases and
+    // seed the prelude `byte = uint8` (if-absent). AFTER structs+enums (a target may be
+    // either), BEFORE layout (0b) / fn-sig decode (A) so field/param/ret refs resolve
+    // through a full alias map. BEFORE prelude, so a `type X = Ordering` (a prelude enum)
+    // is out of scope — the M7 corpus never needs it.
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod);
+        if (t.tree.nodes.len == 0) continue;
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
+        if (prog.tag != .program) continue;
+        try register.registerAliases(t, Ast.rangeSlice(t.tree, prog.lhs.int()));
     }
 
     // Prelude: native-register `Eq` (+ its builtin scalar conformances) BEFORE the

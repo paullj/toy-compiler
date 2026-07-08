@@ -1,0 +1,7 @@
+# expect: exit 42
+type Celsius = int
+fn double(c: Celsius) -> Celsius { c + c }   # arithmetic shared across the alias boundary
+fn main() -> int {
+    t: Celsius = 21
+    return double(t)                          # Celsius interchangeable with int -> 42
+}

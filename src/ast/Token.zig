@@ -174,6 +174,10 @@ pub const Tag = enum(u8) {
     // Modulo (M5). Appended at the END (frozen ordinal; `[]Token` is memcpy'd
     // to/from the content cache). NOT a keyword.
     percent, // %
+
+    // `type` keyword (M7). Appended at END (frozen ordinal; `[]Token` is memcpy'd
+    // to/from the content cache). A keyword, so it MUST have a `keywords` row below.
+    kw_type, // `type Name = T`
 };
 
 /// Maps identifier text to its keyword tag, if any.
@@ -200,6 +204,7 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "mut", .kw_mut },
     .{ "protocol", .kw_protocol },
     .{ "has", .kw_has },
+    .{ "type", .kw_type },
 });
 
 comptime {

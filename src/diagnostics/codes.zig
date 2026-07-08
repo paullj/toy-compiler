@@ -81,6 +81,7 @@ pub const Code = enum(u16) {
     T0032, // question-non-optionresult (`?` operand is not an Option/Result, or the enclosing return type cannot absorb the residual — M24)
     T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch — M24)
     T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width — M1)
+    T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain — M7)
 
     _,
 };
@@ -153,6 +154,7 @@ pub const table = [_]Entry{
     .{ .code = .T0032, .str = "T0032", .slug = "question-non-optionresult" },
     .{ .code = .T0033, .str = "T0033", .slug = "question-constructor-mismatch" },
     .{ .code = .T0034, .str = "T0034", .slug = "literal-out-of-range" },
+    .{ .code = .T0035, .str = "T0035", .slug = "alias-cycle" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -311,6 +313,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0034", str(.T0034).?);
     try testing.expectEqualStrings("literal-out-of-range", slug(.T0034).?);
     try testing.expectEqual(Code.T0034, fromStr("T0034").?);
+
+    // M7 alias-cycle code.
+    try testing.expectEqualStrings("T0035", str(.T0035).?);
+    try testing.expectEqualStrings("alias-cycle", slug(.T0035).?);
+    try testing.expectEqual(Code.T0035, fromStr("T0035").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
