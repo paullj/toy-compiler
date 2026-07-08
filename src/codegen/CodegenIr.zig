@@ -356,8 +356,7 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         .neg => |v| {
             try g.loadValue(S0, v);
             try g.emit(Aarch64.neg(S0, S0));
-            try normalizeWidth(g, S0, g.func.values[ins.result].type);
-            try g.storeValue(S0, ins.result);
+            try storeNormalized(g, ins.result, S0);
         },
         .bnot => |v| {
             try g.loadValue(S0, v);
@@ -418,10 +417,19 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         .bcompl => |v| {
             try g.loadValue(S0, v);
             try g.emit(Aarch64.mvn(S0, S0));
-            try normalizeWidth(g, S0, g.func.values[ins.result].type);
-            try g.storeValue(S0, ins.result);
+            try storeNormalized(g, ins.result, S0);
         },
     }
+}
+
+/// Re-canonicalize a narrow-integer result to its width then store it — the codegen
+/// mirror of the opt side's `commitFoldedInt`. Every narrow-int-producing op must
+/// normalize before storing (signed narrow sign-extends, unsigned narrow masks) so a
+/// later full-width use reads a canonical value; routing all producers through one
+/// helper keeps that invariant hard to forget.
+fn storeNormalized(g: *Gen, result: Ir.ValueId, reg: u32) error{OutOfMemory}!void {
+    try normalizeWidth(g, reg, g.func.values[result].type);
+    try g.storeValue(reg, result);
 }
 
 const ArithKind = enum { add, sub, mul, sdiv, udiv, band, bor, bxor };
@@ -440,8 +448,7 @@ fn genArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ArithKind) error{OutOf
         .bxor => Aarch64.eorReg(S0, S0, S1),
     };
     try g.emit(word);
-    try normalizeWidth(g, S0, g.func.values[result].type);
-    try g.storeValue(S0, result);
+    try storeNormalized(g, result, S0);
 }
 
 const RemKind = enum { smod, umod };
@@ -455,8 +462,7 @@ fn genRem(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: RemKind) error{OutOfMemo
     try g.loadValue(S1, b.rhs); // b
     try g.emit(if (kind == .smod) Aarch64.sdiv(S2, S0, S1) else Aarch64.udiv(S2, S0, S1)); // q = a/b
     try g.emit(Aarch64.msub(S0, S2, S1, S0)); // r = a - q*b
-    try normalizeWidth(g, S0, g.func.values[result].type);
-    try g.storeValue(S0, result);
+    try storeNormalized(g, result, S0);
 }
 
 const ShiftKind = enum { shl, lshr, ashr };
@@ -490,8 +496,7 @@ fn genShift(g: *Gen, result: Ir.ValueId, b: Ir.Bin, kind: ShiftKind) error{OutOf
             try g.emit(Aarch64.csel(S0, S0, S2, .hs)); // amt>=width ? sign-fill : raw
         },
     }
-    try normalizeWidth(g, S0, ty);
-    try g.storeValue(S0, result);
+    try storeNormalized(g, result, S0);
 }
 
 /// Re-canonicalize a narrow-integer result in `reg` to its full 64-bit form after
