@@ -1,0 +1,10 @@
+# Feature: pins the fxhash str byte-fold (hashStrAtPtr, M6) end-to-end so a regression in the
+# str mixer wrapper (str_hash_seed, byte loop) is caught — the eq-consistency demos pass on
+# either mixer. GOLDEN = mix(hash_seed, mix(str_hash_seed, 97)) = 0x7619B7B07B9E0651 (positive).
+struct S { s: str }
+
+fn main() -> int {
+    v := S{ s: "a" }
+    return if v.hash() == 8510034939509343825 { 42 } else { 0 }
+}
+# expect: exit 42

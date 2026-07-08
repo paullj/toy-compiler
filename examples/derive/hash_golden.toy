@@ -1,0 +1,12 @@
+# Feature: the structural Hash derive uses the fxhash mixer h := (rotl(h,5) ^ word) *% K
+# (M6), NOT the old FNV h*MULT+word. Pins the CONCRETE hash of P{1,2} so a regression to FNV
+# or a wrong K/shift/rotate/ashr is caught end-to-end. GOLDEN derived from the formula
+# (h2 = mix(mix(hash_seed,1),2) = 0xEBCDDCEBD65748F0).
+struct P { x: int, y: int }
+
+fn main() -> int {
+    p := P{ x: 1, y: 2 }
+    golden := 0 - 1455264199099332368
+    return if p.hash() == golden { 42 } else { 0 }
+}
+# expect: exit 42

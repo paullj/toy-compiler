@@ -795,22 +795,37 @@ pub const ord_lt: i64 = 0;
 pub const ord_eq: i64 = 1;
 pub const ord_gt: i64 = 2;
 
-/// Fixed-seed multiply-accumulate constants for the structural `Hash` derive. The
-/// current IR op set (Ir.Op) has NO xor/shift/bitwise op, so a runtime Wyhash is not
-/// expressible without touching the backend (which the roadmap forbids). The FORCED
-/// mixer is a polynomial `h = h*MULT + fieldhash` (a str field folds its bytes with the
-/// same shape). This still satisfies every LOCKED constraint: a FIXED seed (never
-/// randomized/per-run), deterministic, reproducible run-to-run AND byte-identical across
-/// `-jN`, and `Eq`-consistent (the emitter walks the SAME field order `Eq` does). The
-/// constants MUST fit in i64 (`< 2^63`): the fold uses wrapping `*%`/`+%` (`opt/arith.zig`
-/// never traps), and a `> i64` literal would fail to compile. `hash_seed` is the pi
-/// fractional word (shared: also the seed the builtin `.hash()` path uses); the field
-/// multiplier `hash_mult` (the FNV-64 prime) lives beside its sole user `hashCombine` in
-/// `lower/derive_emit.zig`; the str constants are a distinct pair (xorshift word) so a str
-/// field's byte polynomial does not alias the field mixer.
+/// Fixed-seed constants for the structural `Hash` derive's fxhash mixer
+/// `h := (rotl(h,5) ^ word) *% K` (see `hashMix`). M4 added the logical shift + xor +
+/// bitwise ops, so the mixer is now a real fxhash step, replacing the old no-bitwise FNV
+/// polynomial. Every LOCKED constraint still holds: a FIXED seed (never randomized/per-run),
+/// deterministic, reproducible run-to-run AND byte-identical across `-jN`, and `Eq`-consistent
+/// (the emitter walks the SAME field order `Eq` does). The constants MUST fit i64 (`< 2^63`):
+/// the mixer wraps via the IR's `*%` (`opt/arith.zig` never traps). `hash_seed` is the pi
+/// fractional word (shared: also the seed the builtin `.hash()` path uses); `str_hash_seed`
+/// is a distinct word so a str field's byte fold does not alias the field seed; `hash_k` is
+/// the fxhash odd multiplier, shared by BOTH mixer sites via `hashMix`.
 pub const hash_seed: i64 = 0x243F6A8885A308D3;
 const str_hash_seed: i64 = 0x2545F4914F6CDD1D;
-const str_hash_mult: i64 = 0x100000001B3;
+pub const hash_k: i64 = 0x517cc1b727220a95;
+
+/// The one fxhash mixing step, shared by BOTH `Hash` sites — this file's `hashStrAtPtr`
+/// byte fold and `derive_emit`'s struct/enum field/tag fold: `h := (rotl(h,5) ^ word) *% K`.
+/// The right rotate half is emitted as `.lshr` (LOGICAL): `h` is typed `int` (signed), so
+/// `.ashr` would sign-fill a negative accumulator and diverge from fxhash. `K` is
+/// re-materialized as a pure iconst at each call, so the emitter reads no shared mutable state
+/// and a double-lower is byte-identical under `-jN`. All ops wrap (never trap).
+pub fn hashMix(b: *Builder, h: Ir.ValueId, word: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const c5 = try b.emit(.{ .iconst = 5 }, int_ty);
+    const c59 = try b.emit(.{ .iconst = 59 }, int_ty);
+    const rot_lo = try b.emit(.{ .shl = .{ .lhs = h, .rhs = c5 } }, int_ty);
+    const rot_hi = try b.emit(.{ .lshr = .{ .lhs = h, .rhs = c59 } }, int_ty);
+    const rot = try b.emit(.{ .bor = .{ .lhs = rot_lo, .rhs = rot_hi } }, int_ty);
+    const x = try b.emit(.{ .bxor = .{ .lhs = rot, .rhs = word } }, int_ty);
+    const k = try b.emit(.{ .iconst = hash_k }, int_ty);
+    return try b.emit(.{ .mul = .{ .lhs = x, .rhs = k } }, int_ty);
+}
 
 /// True for the two `Ord` operand kinds that stay an inline `icmp` (int signed cmp, bool
 /// false<true). Every other kind (str/struct/enum) routes to `lowerOrdValue`, so the int/bool
@@ -1256,8 +1271,8 @@ pub fn witnessRet(b: *Builder, m: Typecheck.Method) Typecheck.Type {
 }
 
 /// Heap-free per-byte hash of a str aggregate given the ADDRESS of its `{ptr@0, len@8}`
-/// header: fold each byte with a fixed-seed polynomial `h := h*MULT + byte` in a
-/// slot-counter loop, mirroring `strEqAtPtrs`'s `load_byte` walk (slot induction var +
+/// header: fold each byte through the fxhash mixer `h := (rotl(h,5) ^ byte) *% K` (see
+/// `hashMix`) in a slot-counter loop, mirroring `strEqAtPtrs`'s `load_byte` walk (slot induction var +
 /// slot accumulator). Pure of source (deterministic block/slot ids), so `--verify`-stable.
 /// An empty string hashes to `str_hash_seed` (the loop runs zero times). Returns the int
 /// hash value in the loop-exit block.
@@ -1297,15 +1312,13 @@ pub fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId
     const fin = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = iv, .rhs = len } }, bool_ty);
     b.setTerm(.{ .cond_br = .{ .cond = fin, .t = done, .f = body } });
 
-    // body: byte = load_byte(ptr + i); h = h*MULT + byte; i += 1; back-edge to hdr.
+    // body: byte = load_byte(ptr + i); h = (rotl(h,5) ^ byte) *% K; i += 1; back-edge to hdr.
     b.switchTo(body);
     const bx = try b.emit(.{ .add = .{ .lhs = ptr, .rhs = iv } }, int_ty);
     const byte = try b.emit(.{ .load_byte = bx }, int_ty);
     const ha_b = try b.emit(.{ .slot_addr = hslot }, int_ty);
     const cur = try b.emit(.{ .load = .{ .addr = ha_b, .ty = int_ty } }, int_ty);
-    const mult = try b.emit(.{ .iconst = str_hash_mult }, int_ty);
-    const hm = try b.emit(.{ .mul = .{ .lhs = cur, .rhs = mult } }, int_ty);
-    const nh = try b.emit(.{ .add = .{ .lhs = hm, .rhs = byte } }, int_ty);
+    const nh = try hashMix(b, cur, byte);
     const ha_s = try b.emit(.{ .slot_addr = hslot }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = ha_s, .val = nh, .ty = int_ty } }, null);
     const one = try b.emit(.{ .iconst = 1 }, int_ty);
