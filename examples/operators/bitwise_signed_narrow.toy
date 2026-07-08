@@ -1,0 +1,17 @@
+# Signed narrow-int bitwise ops (~ & | ^) SIGN-EXTEND their result in normalizeWidth
+# (arith.wrapTo's signed w8 branch), unlike the unsigned masks in bitwise_ops.toy. The
+# `|`/`^` cases below set bit 7, so a mask-instead-of-sign-extend regression would exit
+# non-42 under the O0==O1 differential.
+# expect: exit 42
+fn main() -> int {
+    a: int8 = 0 - 2                 # 0xFE
+    b: int8 = 3                     # 0x03
+    cmpl: int8 = ~a                 # ~0xFE = 0x01 -> 1
+    conj: int8 = a & b              # 0xFE & 0x03 = 0x02 -> 2
+    disj: int8 = a | b              # 0xFE | 0x03 = 0xFF -> sign-extend to -1
+    xr:   int8 = a ^ b              # 0xFE ^ 0x03 = 0xFD -> sign-extend to -3
+    m1: int8 = 0 - 1
+    m3: int8 = 0 - 3
+    ok := cmpl == 1 && conj == 2 && disj == m1 && xr == m3
+    return if ok { 42 } else { 0 }
+}
