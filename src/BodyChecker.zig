@@ -554,6 +554,10 @@ pub const BodyChecker = struct {
                         if (operand.kind == .bool) break :blk Type.@"bool";
                         try bc.sink.emit(bc.byteOf(n.main_token), "operand of '!' must be bool");
                     },
+                    .tilde => {
+                        if (operand.isInteger()) break :blk operand;
+                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '~' must be int");
+                    },
                     else => {},
                 }
                 break :blk Type.invalid;
@@ -640,6 +644,10 @@ pub const BodyChecker = struct {
                     .amp_amp, .pipe_pipe => {
                         if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
+                    },
+                    .amp, .pipe, .caret, .lt_lt, .gt_gt => {
+                        if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },
                     else => {},
                 }

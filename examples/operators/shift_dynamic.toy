@@ -1,0 +1,8 @@
+# Feature: the shift guard works at runtime too. Inside `shr` the amount is a
+# parameter (never folded), so genShift's cmp+csel runs; 64 >= width 8 -> 0.
+# expect: exit 42
+fn shr(v: uint8, n: uint8) -> uint8 { return v >> n }
+fn main() -> int {
+    r: uint8 = shr(0xFF, 64)
+    return if r == 0 { 42 } else { 0 }
+}

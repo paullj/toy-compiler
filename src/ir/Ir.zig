@@ -136,6 +136,19 @@ pub const Op = union(enum) {
     cstr_ptr: u64,
 
     call: Call,
+
+    band: Bin,
+    bor: Bin,
+    bxor: Bin,
+    /// Logical left shift. Go semantics (amt>=width → 0), guarded in codegen.
+    shl: Bin,
+    /// Logical (unsigned) right shift; amt>=width → 0.
+    lshr: Bin,
+    /// Arithmetic (signed) right shift; amt>=width → sign-fill.
+    ashr: Bin,
+    /// Bitwise complement of an int (`~`): `mvn` + width-normalize. DISTINCT from
+    /// `bnot` (which is `!bool` = cmp #0 + cset eq).
+    bcompl: ValueId,
 };
 
 /// One instruction: an op plus its result value id (`none_value` when the op
@@ -412,6 +425,13 @@ fn renderInstr(
             }
             try out.writeAll(")\n");
         },
+        .band => |b| try out.print("band %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .bor => |b| try out.print("bor %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .bxor => |b| try out.print("bxor %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .shl => |b| try out.print("shl %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .lshr => |b| try out.print("lshr %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .ashr => |b| try out.print("ashr %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .bcompl => |v| try out.print("bcompl %{d}\n", .{v}),
     }
 }
 

@@ -1,0 +1,14 @@
+# Feature: Go shift semantics (M4): amount >= width yields 0 (shl/lshr) or sign-fill
+# (ashr), NOT the aarch64 mod-64 masked result. `a << 64` / `a >> 64` on uint8 mask
+# 64%64=0 on a bare lslv/lsrv (would keep 255); the csel guard forces 0, so -O0 == -O1.
+# expect: exit 42
+fn main() -> int {
+    a: uint8 = 0xFF
+    z1: uint8 = a >> 8         # amount == width -> 0
+    z2: uint8 = a << 64        # amount 64 wraps mod 64 on a bare lslv (255); guard -> 0
+    z3: uint8 = a >> 64        # amount 64 wraps mod 64 on a bare lsrv (255); guard -> 0
+    s: int8 = -1
+    f: int8 = s >> 8           # signed: sign-fill -> -1
+    neg1: int8 = -1
+    return if z1 == 0 { if z2 == 0 { if z3 == 0 { if f == neg1 { 42 } else { 0 } } else { 0 } } else { 0 } } else { 0 }
+}

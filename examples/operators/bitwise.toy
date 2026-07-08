@@ -1,0 +1,8 @@
+# expect: exit 42
+fn main() -> int {
+    a: uint8 = 0b1100_0000                    # 192
+    b: uint8 = a >> 2                          # logical -> 48
+    c: uint8 = (a & 0x0F) | b                  # 0 | 48 = 48
+    d: uint8 = ~c                              # bit-complement, masked -> 207
+    return if d == 207 { 42 } else { 0 }
+}

@@ -1,0 +1,7 @@
+# Feature: bitwise operators are integer-only; a bool operand is an uncoded error
+# (mirrors `&&`/`||`).
+# expect: compile-error "operands of '&' must be int"
+fn main() -> int {
+    b := true & false
+    return 0
+}

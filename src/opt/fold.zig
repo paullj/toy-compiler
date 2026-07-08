@@ -58,7 +58,7 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                 .bconst => |v| {
                     if (res != Ir.none_value) known[res] = .{ .bool = v };
                 },
-                .add, .sub, .mul, .sdiv, .udiv => |bin| {
+                .add, .sub, .mul, .sdiv, .udiv, .band, .bor, .bxor => |bin| {
                     const l = constInt(known, bin.lhs) orelse continue;
                     const r = constInt(known, bin.rhs) orelse continue;
                     const kind: arith.BinKind = switch (ins.op) {
@@ -67,9 +67,32 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                         .mul => .mul,
                         .sdiv => .sdiv,
                         .udiv => .udiv,
+                        .band => .band,
+                        .bor => .bor,
+                        .bxor => .bxor,
                         else => unreachable,
                     };
                     commitFoldedInt(func, known, ins, res, arith.foldBin(kind, l, r));
+                    stats.consts_folded += 1;
+                    changed = true;
+                },
+                .shl, .lshr, .ashr => |bin| {
+                    const l = constInt(known, bin.lhs) orelse continue;
+                    const r = constInt(known, bin.rhs) orelse continue;
+                    const ty = if (res != Ir.none_value) func.values[res].type else Ir.Type.int;
+                    const kind: arith.ShiftKind = switch (ins.op) {
+                        .shl => .shl,
+                        .lshr => .lshr,
+                        .ashr => .ashr,
+                        else => unreachable,
+                    };
+                    commitFoldedInt(func, known, ins, res, arith.foldShift(kind, l, r, ty.intBits()));
+                    stats.consts_folded += 1;
+                    changed = true;
+                },
+                .bcompl => |v| {
+                    const x = constInt(known, v) orelse continue;
+                    commitFoldedInt(func, known, ins, res, arith.bcompl(x));
                     stats.consts_folded += 1;
                     changed = true;
                 },
@@ -384,6 +407,38 @@ test "fold wraps narrow neg to the result width (matches codegen normalize)" {
     _ = try run(gpa, &func, &st);
     try expectIconst(func.blocks[0].instrs[1], -128);
     try expectIconst(func.blocks[0].instrs[3], 251);
+}
+
+test "fold bitwise + guarded shift + bcompl on hand-built IR" {
+    const gpa = testing.allocator;
+    const values = [_]Ir.ValueDef{
+        .{ .type = Ir.Type.uint8 }, .{ .type = Ir.Type.uint8 }, .{ .type = Ir.Type.uint8 },
+        .{ .type = Ir.Type.uint8 }, .{ .type = Ir.Type.uint8 }, .{ .type = Ir.Type.uint8 },
+        .{ .type = Ir.Type.int8 },  .{ .type = Ir.Type.int8 },  .{ .type = Ir.Type.int8 },
+        .{ .type = Ir.Type.uint8 }, .{ .type = Ir.Type.uint8 },
+    };
+    const instrs = [_]Ir.Instr{
+        .{ .result = 0, .op = .{ .iconst = 0xAA } },
+        .{ .result = 1, .op = .{ .iconst = 0x0F } },
+        .{ .result = 2, .op = .{ .bxor = .{ .lhs = 0, .rhs = 1 } } }, // 0xA5
+        .{ .result = 3, .op = .{ .iconst = 0xFF } },
+        .{ .result = 4, .op = .{ .iconst = 64 } },
+        .{ .result = 5, .op = .{ .lshr = .{ .lhs = 3, .rhs = 4 } } }, // uint8 255>>64 -> 0
+        .{ .result = 6, .op = .{ .iconst = -1 } },
+        .{ .result = 7, .op = .{ .iconst = 8 } },
+        .{ .result = 8, .op = .{ .ashr = .{ .lhs = 6, .rhs = 7 } } }, // int8 -1>>8 -> -1
+        .{ .result = 9, .op = .{ .iconst = 48 } },
+        .{ .result = 10, .op = .{ .bcompl = 9 } }, // ~48 -> 207
+    };
+    var func = try buildFn(gpa, &values, &instrs, .{ .ret = .{ .value = 10 } });
+    defer func.deinit(gpa);
+    var st: Opt.Stats = .{};
+    _ = try run(gpa, &func, &st);
+    const got = func.blocks[0].instrs;
+    try expectIconst(got[2], 0xA5);
+    try expectIconst(got[5], 0);
+    try expectIconst(got[8], -1);
+    try expectIconst(got[10], 207);
 }
 
 test "fold udiv is unsigned; unsigned icmp folds via cc" {

@@ -15,7 +15,7 @@
 const std = @import("std");
 const Ir = @import("../ir/Ir.zig");
 
-pub const BinKind = enum { add, sub, mul, sdiv, udiv };
+pub const BinKind = enum { add, sub, mul, sdiv, udiv, band, bor, bxor };
 
 /// Fold a binary integer op on two constant i64 operands, matching aarch64.
 pub fn foldBin(kind: BinKind, l: i64, r: i64) i64 {
@@ -25,7 +25,38 @@ pub fn foldBin(kind: BinKind, l: i64, r: i64) i64 {
         .mul => l *% r,
         .sdiv => sdiv(l, r),
         .udiv => udiv(l, r),
+        .band => l & r,
+        .bor => l | r,
+        .bxor => l ^ r,
     };
+}
+
+pub const ShiftKind = enum { shl, lshr, ashr };
+
+/// Go-semantics shift fold — the value-domain mirror of `CodegenIr.genShift`.
+/// The amount is compared UNSIGNED against `width` (matching the `csel …,hs`
+/// guard): amt>=width → 0 (shl/lshr) or sign-fill (ashr, = `l >> 63`). Below width
+/// the amount is < 64, so a plain native shift in the u64/i64 domain. Returns the
+/// raw 64-bit value; the caller applies `wrapTo` (≡ codegen's `normalizeWidth`).
+pub fn foldShift(kind: ShiftKind, l: i64, r: i64, width: u16) i64 {
+    if (@as(u64, @bitCast(r)) >= width) {
+        return switch (kind) {
+            .shl, .lshr => 0,
+            .ashr => l >> 63,
+        };
+    }
+    const amt: u6 = @intCast(r); // r < width <= 64 ⇒ r in [0,63]
+    return switch (kind) {
+        .shl => @bitCast(@as(u64, @bitCast(l)) << amt),
+        .lshr => @bitCast(@as(u64, @bitCast(l)) >> amt),
+        .ashr => l >> amt,
+    };
+}
+
+/// Bitwise complement matching aarch64 `mvn` (full 64-bit `~`); the caller
+/// width-normalizes via `wrapTo`.
+pub fn bcompl(v: i64) i64 {
+    return ~v;
 }
 
 /// SIGNED division matching aarch64 `sdiv`: /0 → 0, INT_MIN/-1 → INT_MIN, else
@@ -164,4 +195,36 @@ test "unsigned icmp contrasts signed on bit63-set operands" {
     try std.testing.expect(icmp(.ult, 1, min));
     try std.testing.expect(icmp(.uge, min, min));
     try std.testing.expect(icmp(.ule, 1, min));
+}
+
+test "foldShift Go semantics — below width, signed vs unsigned, and >= width" {
+    // Below width: logical vs arithmetic right shift on a bit7-set value.
+    try std.testing.expectEqual(@as(i64, 64), foldShift(.lshr, 0x80, 1, 8));
+    try std.testing.expectEqual(@as(i64, -64), foldShift(.ashr, -128, 1, 8));
+    // bit63-set value: lshr != ashr.
+    const bit63 = std.math.minInt(i64);
+    try std.testing.expectEqual(@as(i64, 0x4000000000000000), foldShift(.lshr, bit63, 1, 64));
+    try std.testing.expectEqual(@as(i64, @bitCast(@as(u64, 0xC000000000000000))), foldShift(.ashr, bit63, 1, 64));
+    // amt >= width: shl/lshr -> 0, ashr -> sign-fill.
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.lshr, 0xFF, 8, 8));
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.shl, 0xFF, 8, 8));
+    try std.testing.expectEqual(@as(i64, -1), foldShift(.ashr, -1, 8, 8));
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.ashr, 5, 8, 8));
+    // amt >= 64 (the mask-wrap region — the guard's raison d'être).
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.lshr, 0xFF, 64, 8));
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.shl, 0xFF, 64, 8));
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.lshr, -1, 64, 64));
+    try std.testing.expectEqual(@as(i64, -1), foldShift(.ashr, -1, 64, 64));
+    // negative amount (huge unsigned) -> >= width.
+    try std.testing.expectEqual(@as(i64, 0), foldShift(.lshr, 0xFF, -1, 8));
+    try std.testing.expectEqual(@as(i64, -1), foldShift(.ashr, -1, -1, 64));
+}
+
+test "foldBin bitwise and bcompl, then narrow wrapTo" {
+    try std.testing.expectEqual(@as(i64, 0x0A), foldBin(.band, 0xAA, 0x0F));
+    try std.testing.expectEqual(@as(i64, 0xAF), foldBin(.bor, 0xAA, 0x0F));
+    try std.testing.expectEqual(@as(i64, 0xA5), foldBin(.bxor, 0xAA, 0x0F));
+    try std.testing.expectEqual(~@as(i64, 48), bcompl(48));
+    try std.testing.expectEqual(@as(i64, 207), wrapTo(Ir.Type.uint8, bcompl(48))); // demo's ~c
+    try std.testing.expectEqual(@as(i64, 65280), wrapTo(Ir.Type.uint16, bcompl(0x00FF)));
 }

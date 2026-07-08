@@ -28,11 +28,11 @@ const Ir = @import("../ir/Ir.zig");
 fn eachInstrUseOperand(op: *Ir.Op, ctx: anytype, comptime each: anytype) void {
     switch (op.*) {
         .iconst, .bconst, .unit, .slot_addr, .cstr_ptr => {},
-        .add, .sub, .mul, .sdiv, .udiv => |*bin| {
+        .add, .sub, .mul, .sdiv, .udiv, .band, .bor, .bxor, .shl, .lshr, .ashr => |*bin| {
             each(ctx, &bin.lhs);
             each(ctx, &bin.rhs);
         },
-        .neg, .bnot, .get_tag, .load_byte => |*v| each(ctx, v),
+        .neg, .bnot, .get_tag, .load_byte, .bcompl => |*v| each(ctx, v),
         .icmp => |*c| {
             each(ctx, &c.lhs);
             each(ctx, &c.rhs);
@@ -160,7 +160,7 @@ const testing = std.testing;
 /// takes a literal `none_value` operand to pin `none_value` routing. `values`/
 /// `slots` are left empty: the walk never dereferences them.
 fn buildUseFixture(a: std.mem.Allocator) !Ir.Function {
-    var instrs = try a.alloc(Ir.Instr, 20);
+    var instrs = try a.alloc(Ir.Instr, 27);
     instrs[0] = .{ .result = 100, .op = .{ .add = .{ .lhs = 1, .rhs = 2 } } };
     instrs[1] = .{ .result = 101, .op = .{ .sub = .{ .lhs = 3, .rhs = 4 } } };
     instrs[2] = .{ .result = 102, .op = .{ .mul = .{ .lhs = 5, .rhs = 6 } } };
@@ -191,6 +191,13 @@ fn buildUseFixture(a: std.mem.Allocator) !Ir.Function {
         .args = call_args,
         .ret_slot = Ir.none_slot,
     } } };
+    instrs[20] = .{ .result = 117, .op = .{ .band = .{ .lhs = 40, .rhs = 41 } } };
+    instrs[21] = .{ .result = 118, .op = .{ .bor = .{ .lhs = 42, .rhs = 43 } } };
+    instrs[22] = .{ .result = 119, .op = .{ .bxor = .{ .lhs = 44, .rhs = 45 } } };
+    instrs[23] = .{ .result = 120, .op = .{ .shl = .{ .lhs = 46, .rhs = 47 } } };
+    instrs[24] = .{ .result = 121, .op = .{ .lshr = .{ .lhs = 48, .rhs = 49 } } };
+    instrs[25] = .{ .result = 122, .op = .{ .ashr = .{ .lhs = 50, .rhs = 51 } } };
+    instrs[26] = .{ .result = 123, .op = .{ .bcompl = 52 } };
 
     var br_args = try a.alloc(Ir.Operand, 3);
     br_args[0] = .{ .value = 30 };
@@ -229,6 +236,9 @@ const expected_uses = [_]Ir.ValueId{
     20, 21, // copy
     22, // get_tag
     23, 24, // call (slot + none args skipped)
+    40, 41, 42, 43, 44, 45, // band/bor/bxor
+    46, 47, 48, 49, 50, 51, // shl/lshr/ashr
+    52, // bcompl
     30, // br arg (slot + none skipped)
     31, // cond_br cond
     32, // ret value

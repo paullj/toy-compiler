@@ -1,0 +1,11 @@
+# Feature: `>>` dispatches by lhs signedness (M4): signed is arithmetic (asr,
+# sign-fill), unsigned is logical (lsr, zero-fill). Same 0x80 bit pattern diverges.
+# expect: exit 42
+fn main() -> int {
+    s: int8 = -128            # 0x80
+    a: int8 = s >> 1          # asr -> -64
+    want_a: int8 = -64
+    u: uint8 = 0x80           # 128
+    b: uint8 = u >> 1         # lsr -> 64
+    return if a == want_a { if b == 64 { 42 } else { 0 } } else { 0 }
+}
