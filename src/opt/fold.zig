@@ -58,15 +58,26 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                 .bconst => |v| {
                     if (res != Ir.none_value) known[res] = .{ .bool = v };
                 },
-                .add, .sub, .mul, .sdiv, .udiv, .band, .bor, .bxor => |bin| {
+                .add, .sub, .mul, .sdiv, .udiv, .smod, .umod, .band, .bor, .bxor => |bin| {
                     const l = constInt(known, bin.lhs) orelse continue;
                     const r = constInt(known, bin.rhs) orelse continue;
+                    // A constant-0 divisor must NOT fold: the op has to survive so
+                    // codegen's runtime guard fires the panic. Folding it would make
+                    // -O1 yield a value while -O0 aborts (an -O0!=-O1 divergence AND a
+                    // silent non-panic at -O1). This makes the abort a LOCAL guarantee
+                    // (guard + this skip), not an emergent product of branch-fold+DCE.
+                    switch (ins.op) {
+                        .sdiv, .udiv, .smod, .umod => if (r == 0) continue,
+                        else => {},
+                    }
                     const kind: arith.BinKind = switch (ins.op) {
                         .add => .add,
                         .sub => .sub,
                         .mul => .mul,
                         .sdiv => .sdiv,
                         .udiv => .udiv,
+                        .smod => .smod,
+                        .umod => .umod,
                         .band => .band,
                         .bor => .bor,
                         .bxor => .bxor,
@@ -224,10 +235,10 @@ test "fold add of two iconsts -> iconst, with propagation chain in one pass" {
     try expectIconst(got[5], 12);
 }
 
-test "fold sdiv by zero is 0; INT_MIN/-1 is INT_MIN (matches aarch64, no trap)" {
+test "fold: a constant-0 divisor does NOT fold (op survives for the panic guard); INT_MIN/-1 still folds" {
     const gpa = testing.allocator;
     const min = std.math.minInt(i64);
-    // %0=5; %1=0; %2=sdiv %0,%1  ;  %3=INT_MIN; %4=-1; %5=sdiv %3,%4
+    // %0=5; %1=0; %2=sdiv %0,%1 (must NOT fold); %3=INT_MIN; %4=-1; %5=sdiv %3,%4 (folds).
     const values = [_]Ir.ValueDef{.{ .type = Ir.Type.int }} ** 6;
     const instrs = [_]Ir.Instr{
         .{ .result = 0, .op = .{ .iconst = 5 } },
@@ -242,8 +253,50 @@ test "fold sdiv by zero is 0; INT_MIN/-1 is INT_MIN (matches aarch64, no trap)" 
 
     var st: Opt.Stats = .{};
     _ = try run(gpa, &func, &st);
-    try expectIconst(func.blocks[0].instrs[2], 0);
-    try expectIconst(func.blocks[0].instrs[5], min);
+    try testing.expect(func.blocks[0].instrs[2].op == .sdiv); // const-0 divisor: op survives
+    try expectIconst(func.blocks[0].instrs[5], min); // INT_MIN/-1 still folds
+}
+
+test "fold: const-0 divisor never folds for sdiv/udiv/smod/umod; a nonzero divisor folds each" {
+    const gpa = testing.allocator;
+    { // Zero divisor: none may fold.
+        const values = [_]Ir.ValueDef{.{ .type = Ir.Type.int }} ** 6;
+        const instrs = [_]Ir.Instr{
+            .{ .result = 0, .op = .{ .iconst = 10 } },
+            .{ .result = 1, .op = .{ .iconst = 0 } },
+            .{ .result = 2, .op = .{ .sdiv = .{ .lhs = 0, .rhs = 1 } } },
+            .{ .result = 3, .op = .{ .udiv = .{ .lhs = 0, .rhs = 1 } } },
+            .{ .result = 4, .op = .{ .smod = .{ .lhs = 0, .rhs = 1 } } },
+            .{ .result = 5, .op = .{ .umod = .{ .lhs = 0, .rhs = 1 } } },
+        };
+        var func = try buildFn(gpa, &values, &instrs, .{ .ret = .{ .value = 2 } });
+        defer func.deinit(gpa);
+        var st: Opt.Stats = .{};
+        _ = try run(gpa, &func, &st);
+        try testing.expect(func.blocks[0].instrs[2].op == .sdiv);
+        try testing.expect(func.blocks[0].instrs[3].op == .udiv);
+        try testing.expect(func.blocks[0].instrs[4].op == .smod);
+        try testing.expect(func.blocks[0].instrs[5].op == .umod);
+    }
+    { // Nonzero divisor 5: 17/5=3, 17%5=2 — all fold.
+        const values = [_]Ir.ValueDef{.{ .type = Ir.Type.int }} ** 6;
+        const instrs = [_]Ir.Instr{
+            .{ .result = 0, .op = .{ .iconst = 17 } },
+            .{ .result = 1, .op = .{ .iconst = 5 } },
+            .{ .result = 2, .op = .{ .sdiv = .{ .lhs = 0, .rhs = 1 } } },
+            .{ .result = 3, .op = .{ .udiv = .{ .lhs = 0, .rhs = 1 } } },
+            .{ .result = 4, .op = .{ .smod = .{ .lhs = 0, .rhs = 1 } } },
+            .{ .result = 5, .op = .{ .umod = .{ .lhs = 0, .rhs = 1 } } },
+        };
+        var func = try buildFn(gpa, &values, &instrs, .{ .ret = .{ .value = 2 } });
+        defer func.deinit(gpa);
+        var st: Opt.Stats = .{};
+        _ = try run(gpa, &func, &st);
+        try expectIconst(func.blocks[0].instrs[2], 3);
+        try expectIconst(func.blocks[0].instrs[3], 3);
+        try expectIconst(func.blocks[0].instrs[4], 2);
+        try expectIconst(func.blocks[0].instrs[5], 2);
+    }
 }
 
 test "fold neg(INT_MIN) wraps to INT_MIN; wrapping add overflow" {

@@ -170,6 +170,10 @@ pub const Tag = enum(u8) {
     tilde, // ~
     lt_lt, // <<
     gt_gt, // >>
+
+    // Modulo (M5). Appended at the END (frozen ordinal; `[]Token` is memcpy'd
+    // to/from the content cache). NOT a keyword.
+    percent, // %
 };
 
 /// Maps identifier text to its keyword tag, if any.

@@ -15,7 +15,7 @@
 const std = @import("std");
 const Ir = @import("../ir/Ir.zig");
 
-pub const BinKind = enum { add, sub, mul, sdiv, udiv, band, bor, bxor };
+pub const BinKind = enum { add, sub, mul, sdiv, udiv, smod, umod, band, bor, bxor };
 
 /// Fold a binary integer op on two constant i64 operands, matching aarch64.
 pub fn foldBin(kind: BinKind, l: i64, r: i64) i64 {
@@ -25,6 +25,8 @@ pub fn foldBin(kind: BinKind, l: i64, r: i64) i64 {
         .mul => l *% r,
         .sdiv => sdiv(l, r),
         .udiv => udiv(l, r),
+        .smod => smod(l, r),
+        .umod => umod(l, r),
         .band => l & r,
         .bor => l | r,
         .bxor => l ^ r,
@@ -74,6 +76,23 @@ pub fn sdiv(l: i64, r: i64) i64 {
 pub fn udiv(l: i64, r: i64) i64 {
     if (r == 0) return 0;
     return @bitCast(@as(u64, @bitCast(l)) / @as(u64, @bitCast(r)));
+}
+
+/// SIGNED remainder matching aarch64 `sdiv`+`msub` (r = a - (a/b)*b): sign of the
+/// dividend, truncated. /0 -> 0 and INT_MIN%-1 -> 0 (the msub cancels:
+/// INT_MIN -% (INT_MIN *% -1) == 0), both special-cased before `@rem` (which traps
+/// on them). /0 is caller-gated (fold skips it), so this stays total like `sdiv`.
+pub fn smod(l: i64, r: i64) i64 {
+    if (r == 0) return 0;
+    if (l == std.math.minInt(i64) and r == -1) return 0;
+    return @rem(l, r);
+}
+
+/// UNSIGNED remainder matching aarch64 `udiv`+`msub`. /0 -> 0 (caller-gated).
+/// Operands are the raw 64-bit bit patterns reinterpreted as `u64`.
+pub fn umod(l: i64, r: i64) i64 {
+    if (r == 0) return 0;
+    return @bitCast(@as(u64, @bitCast(l)) % @as(u64, @bitCast(r)));
 }
 
 /// Unary negate matching aarch64 `sub xd, xzr, xm` (wrapping).
@@ -131,6 +150,22 @@ test "sdiv by zero is 0 (no trap)" {
 test "INT_MIN / -1 is INT_MIN (no overflow trap)" {
     const min = std.math.minInt(i64);
     try std.testing.expectEqual(min, sdiv(min, -1));
+}
+
+test "smod: sign of the dividend, truncated (matches sdiv+msub)" {
+    try std.testing.expectEqual(@as(i64, -2), smod(-17, 5));
+    try std.testing.expectEqual(@as(i64, 2), smod(17, -5));
+    try std.testing.expectEqual(@as(i64, 2), smod(17, 5));
+    try std.testing.expectEqual(@as(i64, 0), smod(std.math.minInt(i64), -1)); // msub cancels
+    try std.testing.expectEqual(@as(i64, 0), smod(5, 0)); // caller-gated; total fn
+}
+
+test "umod: unsigned remainder (raw bit patterns)" {
+    try std.testing.expectEqual(@as(i64, 1), umod(7, 2));
+    try std.testing.expectEqual(@as(i64, 0), umod(8, 2));
+    // top-bit-set operand: as u64, 0x8000_0000_0000_0000 % 3 == 2.
+    try std.testing.expectEqual(@as(i64, 2), umod(std.math.minInt(i64), 3));
+    try std.testing.expectEqual(@as(i64, 0), umod(5, 0)); // caller-gated
 }
 
 test "sdiv truncates toward zero" {

@@ -1,0 +1,8 @@
+# Feature: `%` on uint8 dispatches to unsigned umod (udiv+msub); width-normalized.
+# expect: exit 42
+fn main() -> int {
+    x: uint8 = 200
+    y: uint8 = 7
+    r: uint8 = x % y
+    return if r == 4 { 42 } else { 0 }
+}

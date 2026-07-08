@@ -213,6 +213,7 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         '-' => if (l.eat('>')) .arrow else .minus,
         '*' => .star,
         '/' => .slash,
+        '%' => .percent,
         '=' => if (l.eat('=')) .eq_eq else .eq,
         '!' => if (l.eat('=')) .bang_eq else .bang,
         '<' => if (l.eat('<')) .lt_lt else if (l.eat('=')) .lt_eq else .lt,
@@ -247,7 +248,7 @@ fn beginsToken(c: u8) bool {
     return switch (c) {
         '"' => true, // string
         ' ', '\t', '\r', '\n', '#' => true, // trivia
-        '+', '-', '*', '/', '=', '!', '<', '>', '&', '^', '~', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@', '?' => true,
+        '+', '-', '*', '/', '%', '=', '!', '<', '>', '&', '^', '~', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@', '?' => true,
         else => false,
     };
 }
@@ -357,7 +358,7 @@ test "unterminated string at newline stops before the newline" {
 }
 
 test "a run of unknown bytes coalesces into one invalid token" {
-    // `$` `%` begin no token and are not trivia, so a run of them is a single
+    // `$` begins no token and is not trivia, so a run of them is a single
     // `.invalid` rather than one token per byte.
     const src = "$$$";
     const tokens = try tokenize(testing.allocator, src);
@@ -367,7 +368,7 @@ test "a run of unknown bytes coalesces into one invalid token" {
     try testing.expectEqualStrings("$$$", tokens[0].text(src));
     // A run of unrecognized bytes bounded by real tokens is still one coalesced
     // span; the recognized `~` after it stops the run.
-    try expectTags("a %$~ b", &.{ .identifier, .invalid, .tilde, .identifier, .eof });
+    try expectTags("a %$~ b", &.{ .identifier, .percent, .invalid, .tilde, .identifier, .eof });
 }
 
 /// Assert the debug span-tiling invariant holds directly: spans are monotone with
