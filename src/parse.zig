@@ -799,6 +799,30 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     defer generics.deinit(p.gpa);
     if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
 
+    if (p.at(.l_paren)) {
+        p.bump(.l_paren);
+        var types: std.ArrayList(Ast.Index) = .empty;
+        defer types.deinit(p.gpa);
+        while (!p.at(.r_paren) and !p.at(.eof)) {
+            const t_entry = p.index;
+            if (type_first.contains(p.peek().tag)) {
+                try types.append(p.gpa, try p.parseType());
+                if (!p.eat(.comma)) {
+                    if (p.at(.r_paren)) break;
+                }
+            } else if (tuple_recovery.contains(p.peek().tag)) {
+                break;
+            } else {
+                _ = try p.advanceWithError(.P0006, "expected a type");
+            }
+            std.debug.assert(p.index > t_entry or p.at(.r_paren) or p.at(.eof));
+        }
+        try p.expect(.r_paren, "expected ')' to close a tuple struct");
+        const header = try p.addRange(types.items);
+        const generic_hdr = try p.optRange(generics.items);
+        return p.addNode(.{ .tag = .tuple_struct_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
+    }
+
     try p.expect(.l_brace, "expected '{' after struct name");
 
     var fields: std.ArrayList(Ast.Index) = .empty;
@@ -1181,6 +1205,11 @@ fn parseStructLiteral(p: *Parser, name_ident: Ast.Index) Error!Ast.Index {
 /// `recv.field`. Consumes the `.` then the field-name identifier.
 fn parseFieldAccess(p: *Parser, recv: Ast.Index) Error!Ast.Index {
     p.bump(.dot);
+    if (p.at(.number)) {
+        const num_tok = p.index;
+        p.bump(.number);
+        return p.addNode(.{ .tag = .tuple_field, .main_token = num_tok, .lhs = recv, .rhs = Ast.none });
+    }
     const field_tok = p.index;
     try p.expect(.identifier, "expected a field name after '.'");
     return p.addNode(.{ .tag = .field_access, .main_token = field_tok, .lhs = recv, .rhs = Ast.none });
@@ -2285,6 +2314,35 @@ test "trailing newline terminator is allowed" {
     try expectSexpr("a * b\n", "(* a b)");
 }
 
+test "p.0 parses to tuple_field, p.x to field_access, p.0.1 chains" {
+    const gpa = testing.allocator;
+    // `p.0` is tuple_field; `p.x` is field_access. Assert the node TAGS (the renderer
+    // prints both with the same `(. recv tok)` shape), so the KIND distinction, not the
+    // text, is the load-bearing check.
+    const single = [_]struct { src: []const u8, tag: Ast.Node.Tag }{
+        .{ .src = "p.0", .tag = .tuple_field },
+        .{ .src = "p.x", .tag = .field_access },
+    };
+    for (single) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, c.src, &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        try testing.expectEqual(c.tag, tree.nodes[Ast.root(tree.nodes).int()].tag);
+    }
+    // `p.0.1` nests as a tuple_field whose lhs is a tuple_field (proves `0.1` did NOT
+    // lex as one float — the middle `.` splits it into two dotted accesses).
+    const tokens = try Lexer.tokenize(gpa, "p.0.1");
+    defer gpa.free(tokens);
+    var diag: ?Diagnostic = null;
+    const tree = (try parseExprOnly(gpa, tokens, "p.0.1", &diag)) orelse return error.UnexpectedParseFailure;
+    defer freeTree(gpa, tree);
+    const outer = tree.nodes[Ast.root(tree.nodes).int()];
+    try testing.expectEqual(Ast.Node.Tag.tuple_field, outer.tag);
+    try testing.expectEqual(Ast.Node.Tag.tuple_field, tree.nodes[outer.lhs.int()].tag);
+}
+
 test "parse error reports an offset and leaves a diagnostic" {
     // The missing operand after `+` no longer bails — `parsePrefix`'s else-arm
     // repairs it with a single-token DELETION (an `error_node` over the offending
@@ -2576,6 +2634,14 @@ test "root is program and children precede parents" {
             },
             // `type N = T`: the target type-ref is `lhs`, created before this node.
             .type_alias_decl => try testing.expect(n.lhs.int() < self),
+            // `struct N(T0, ..)`: the positional type-refs are a Range in `lhs`;
+            // the optional generic-param Range rides `rhs` (or `none`).
+            .tuple_struct_decl => {
+                for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
+                if (n.rhs != Ast.none) for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
+            },
+            // `recv.N`: the receiver is `lhs`, created before this node.
+            .tuple_field => try testing.expect(n.lhs.int() < self),
         }
     }
 }

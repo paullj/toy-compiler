@@ -1,0 +1,7 @@
+# Feature: a tuple struct with all-Eq fields derives `==`/`!=` structurally (M8 over M18).
+# expect: exit 42
+struct Point(int, int)
+
+fn main() -> int {
+    return if Point(1, 2) == Point(1, 2) && Point(1, 2) != Point(1, 3) { 42 } else { 0 }
+}

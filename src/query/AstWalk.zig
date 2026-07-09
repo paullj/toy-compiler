@@ -317,6 +317,16 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .leaf = leaf });
             try walkInner(src, n.lhs, collect, visitor);
         },
+        .tuple_struct_decl => {
+            try emit(visitor, .{ .leaf = leaf });
+            const types = Ast.rangeSlice(tree, n.lhs.int());
+            try emit(visitor, .{ .count = @intCast(types.len) });
+            for (types) |ty| try walkInner(src, ty, collect, visitor);
+        },
+        .tuple_field => {
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.lhs, collect, visitor);
+        },
         .enum_decl => {
             try emit(visitor, .{ .leaf = leaf });
             const variants = Ast.rangeSlice(tree, n.lhs.int());

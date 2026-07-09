@@ -23,7 +23,7 @@ const type_names = Typecheck.type_names;
 pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !void {
     for (decl_nodes) |decl_idx| {
         const decl = t.tree.nodes[decl_idx.int()];
-        if (decl.tag != .struct_decl) continue;
+        if (decl.tag != .struct_decl and decl.tag != .tuple_struct_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
             try t.sink.emitFmtCode(.T0011, t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
@@ -32,6 +32,17 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
         if (t.activeStructMap().get(name) != null) {
             try t.sink.emitFmtCode(.T0012, t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
             continue;
+        }
+        if (decl.tag == .tuple_struct_decl) {
+            if (decl.rhs != Ast.none) {
+                try t.sink.emitFmt(t.byteOf(decl.main_token), "generic tuple structs are not yet supported", .{});
+                continue;
+            }
+            if (Ast.rangeSlice(t.tree, decl.lhs.int()).len > LayoutEngine.tuple_field_cap) {
+                try t.sink.emitFmt(t.byteOf(decl.main_token), "tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
+                // Registered anyway so references resolve; layoutStruct clamps the name
+                // index so the (already-errored, codegen-gated) program never OOBs.
+            }
         }
         // A generic template `struct Box[T] { .. }` carries its generic-param run in
         // `decl.rhs`. Collect the ordered param NAMES so template field-type refs
@@ -47,7 +58,7 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
             gparams = names;
         }
         const id: u32 = @intCast(t.structs.items.len);
-        try t.structs.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx), .is_generic = is_generic, .generic_params = gparams });
+        try t.structs.append(t.gpa, .{ .decl_node = decl_idx, .name = name, .mod = mod, .pub_export = t.tree.isPub(decl_idx), .is_generic = is_generic, .generic_params = gparams, .is_tuple = decl.tag == .tuple_struct_decl });
         try t.activeStructMap().put(t.gpa, name, id);
     }
 }

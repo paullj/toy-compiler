@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — a tuple-struct value of the wrong type.
+# expect: compile-error "expected int, got str"
+struct Pair(int, int)
+fn main() -> int {
+    p := Pair("x", 2)
+    return 0
+}

@@ -1,0 +1,10 @@
+# Feature: a tuple struct with all-Hash fields derives `.hash()` structurally (M8 over
+# M20). Two structurally-equal tuples hash EQUAL (Eq-consistent, fixed seed).
+# expect: exit 42
+struct Pair(int, int)
+
+fn main() -> int {
+    a := Pair(1, 2)
+    b := Pair(1, 2)
+    return if a.hash() == b.hash() { 42 } else { 0 }
+}

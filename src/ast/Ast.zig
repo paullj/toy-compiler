@@ -350,6 +350,20 @@ pub const Node = extern struct {
         /// literal_unit); `rhs` is `none`. It mints NO `Type` — registration resolves
         /// the name to the target's own `Type`, so no alias-ness reaches lower/codegen.
         type_alias_decl,
+
+        /// `struct Name(T0, T1, ..)` — a tuple/newtype struct; fields are named
+        /// "0","1",.. (numeric). Appended at END (frozen ordinal; version 13->14).
+        /// `main_token` = the struct-name identifier. `lhs` = the `extra` header of a
+        /// `Range` over the positional type-ref nodes (each entry IS a type-ref node
+        /// DIRECTLY — not a `.param`, unlike `struct_decl`). `rhs` = the generics Range
+        /// header or `none`. Reuses the struct id space (a tuple struct IS a struct).
+        tuple_struct_decl,
+        /// `recv.N` — positional tuple-field access. Appended at END (version 13->14).
+        /// `main_token` = the `.number` token (its source text IS the field name,
+        /// e.g. "0"). `lhs` = the receiver expression (nests for `p.0.1`). `rhs` =
+        /// `none`. DISTINCT from `field_access` so the checker/lower match by KIND;
+        /// the grammar accepts a number after `.` only through this node.
+        tuple_field,
     };
 };
 
@@ -574,7 +588,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 13,
+    version: u32 = 14,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -635,7 +649,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 13) return null;
+    if (hdr.magic != parse_magic or hdr.version != 14) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -920,6 +934,20 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeByte(')');
         },
         .field_access => {
+            try out.writeAll("(. ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.print(" {s})", .{tok_text});
+        },
+        .tuple_struct_decl => {
+            try out.print("(struct.tuple {s}", .{tok_text});
+            try renderGenericParams(out, tree, tokens, source, if (n.rhs == none) &.{} else rangeSlice(tree, n.rhs.int()));
+            for (rangeSlice(tree, n.lhs.int())) |ty| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, ty);
+            }
+            try out.writeByte(')');
+        },
+        .tuple_field => {
             try out.writeAll("(. ");
             try renderNode(out, tree, tokens, source, n.lhs);
             try out.print(" {s})", .{tok_text});
@@ -1346,6 +1374,44 @@ test "pack/unpack round-trips a tree with a generic protocol_decl (v11)" {
     defer gpa.free(got.extra);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
     try testing.expectEqual(@as(usize, 1), protocolGenericParams(got, Index.from(1)).len);
+}
+
+test "unpack rejects a v13 blob (pre-tuple-structs)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(0), .rhs = none },
+    };
+    var extra = [_]u32{ 0, 1, 0 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    // A blob predating the tuple-struct tags never carried a `tuple_struct_decl`/
+    // `tuple_field` ordinal, so it must miss cleanly under v14.
+    std.mem.writeInt(u32, blob[4..8], 13, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
+}
+
+test "pack/unpack round-trips tuple_struct_decl and tuple_field (v14)" {
+    const gpa = testing.allocator;
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 1, .lhs = none, .rhs = none }, // field type-ref `int`
+        .{ .tag = .tuple_struct_decl, .main_token = 0, .lhs = Index.from(3), .rhs = none },
+        .{ .tag = .identifier, .main_token = 2, .lhs = none, .rhs = none }, // receiver `p`
+        .{ .tag = .tuple_field, .main_token = 3, .lhs = Index.from(2), .rhs = none }, // `p.0`
+        .{ .tag = .program, .main_token = 0, .lhs = Index.from(5), .rhs = none },
+    };
+    // extra: {start=0,len=1} for the decl's type range at header 3; program range at 5.
+    var extra = [_]u32{ 0, 1, 0, 0, 0, 1, 1 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqual(Node.Tag.tuple_struct_decl, got.nodes[1].tag);
+    try testing.expectEqual(Node.Tag.tuple_field, got.nodes[3].tag);
 }
 
 test "contentFp ignores Node padding (cold-build fp determinism foundation)" {

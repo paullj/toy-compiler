@@ -23,6 +23,12 @@ const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
 const arith = @import("../opt/arith.zig");
 const testing = std.testing;
 
+/// A layout is a tuple struct iff its first field name leads with a digit — a record
+/// field name is a lexer identifier (never digit-leading), a tuple field name is `"0"…`.
+fn isTupleLayout(l: anytype) bool {
+    return l.field_names.len > 0 and l.field_names[0].len > 0 and std.ascii.isDigit(l.field_names[0][0]);
+}
+
 /// Struct/enum equality of two operands already MATERIALIZED into slots `lslot`/`rslot`
 ///: resolve the `Eq` witness and call `witness(lslot, rslot) -> bool`, or (an
 /// Ord-only type: the Ord-refinement filled `(Eq,T)` but added no `eq` method) call the
@@ -769,14 +775,23 @@ fn lowerDeriveDisplay(
         .@"struct" => {
             const layout = b.in.layouts[cty.struct_id];
             try L.emitWriteLiteral(&b, layout.name);
-            try L.emitWriteLiteral(&b, "{");
-            for (layout.field_names, layout.field_types, layout.offsets, 0..) |fname, fty, off, i| {
-                try L.emitWriteLiteral(&b, fname);
-                try L.emitWriteLiteral(&b, ": ");
-                try deriveFieldDisplay(&b, fty, off, self_base);
-                if (i + 1 != layout.field_types.len) try L.emitWriteLiteral(&b, ", ");
+            if (isTupleLayout(layout)) {
+                try L.emitWriteLiteral(&b, "(");
+                for (layout.field_types, layout.offsets, 0..) |fty, off, i| {
+                    try deriveFieldDisplay(&b, fty, off, self_base);
+                    if (i + 1 != layout.field_types.len) try L.emitWriteLiteral(&b, ", ");
+                }
+                try L.emitWriteLiteral(&b, ")");
+            } else {
+                try L.emitWriteLiteral(&b, "{");
+                for (layout.field_names, layout.field_types, layout.offsets, 0..) |fname, fty, off, i| {
+                    try L.emitWriteLiteral(&b, fname);
+                    try L.emitWriteLiteral(&b, ": ");
+                    try deriveFieldDisplay(&b, fty, off, self_base);
+                    if (i + 1 != layout.field_types.len) try L.emitWriteLiteral(&b, ", ");
+                }
+                try L.emitWriteLiteral(&b, "}");
             }
-            try L.emitWriteLiteral(&b, "}");
         },
         .@"enum" => {
             const e = b.in.enum_layouts[cty.enum_id];

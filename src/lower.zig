@@ -451,7 +451,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .assign => {
             const target = b.in.tree.nodes[(stmt.lhs).int()];
             const place_ty = b.in.node_types[(stmt.lhs).int()];
-            if (target.tag == .field_access) {
+            if (target.tag == .field_access or target.tag == .tuple_field) {
                 try lowerFieldStore(b, stmt.lhs, stmt.rhs, place_ty);
                 return;
             }
@@ -546,13 +546,16 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             if (isQualifiedVariantCtorCall(b, n, ty)) {
                 return try aggregateValue(b, node_idx, ty);
             }
+            if (isTupleStructCtorCall(b, n, ty)) {
+                return try aggregateValue(b, node_idx, ty);
+            }
             return try lowerCall(b, node_idx, n);
         },
         .block => return try lowerBlockValue(b, node_idx, ty),
         .if_stmt => return try lowerIfValue(b, node_idx, ty),
         .loop_expr => return try lowerLoopValue(b, node_idx, ty, null),
         .labeled => return try lowerLabeledValue(b, node_idx, ty),
-        .field_access => return try lowerFieldAccess(b, node_idx, ty),
+        .field_access, .tuple_field => return try lowerFieldAccess(b, node_idx, ty),
         .match_expr => return try lowerMatchValue(b, node_idx, ty),
         .try_expr => return try lowerTryValue(b, node_idx, ty),
         .struct_init, .enum_init_unit, .enum_init_tuple, .enum_init_struct => {
@@ -1695,6 +1698,29 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
         optionResultMethodCallee(b, n) == null and builtinConvCallee(b, n) == null;
 }
 
+/// A tuple-struct constructor call `N(args)` in lower. A struct-typed `.call` over an
+/// UNRESOLVED identifier callee is necessarily a validated tuple ctor (the checker
+/// rejected record `N(..)`/arity/type errors and gated codegen). A struct-returning fn
+/// is `.func`; a method has a field_access callee; a record uses `N{..}`; a value binding
+/// shadowing the type name resolves `.local` and was already poisoned by the checker.
+fn isTupleStructCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool {
+    return ty.kind == .@"struct" and b.in.tree.nodes[(n.lhs).int()].tag == .identifier and
+        b.in.resolutions[(n.lhs).int()] == .unresolved;
+}
+
+/// Write a `Name(v0, v1, ..)` tuple-struct construction into `dst_ptr`: each positional
+/// arg at `layout.offsets[i]` (declaration order). Positional twin of `lowerStructInitInto`.
+fn lowerTupleStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const layout = b.in.layouts[b.in.node_types[(node_idx).int()].struct_id];
+    const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+    std.debug.assert(args.len == layout.field_types.len); // guaranteed by the check-error gate
+    for (args, 0..) |arg, i| {
+        const faddr = try b.emit(.{ .field_addr = .{ .base = dst_ptr, .off = layout.offsets[i], .ty = layout.field_types[i] } }, Typecheck.Type.int);
+        try lowerExprInto(b, arg, faddr, layout.field_types[i]);
+    }
+}
+
 /// The `Method` a method call `recv.m(args)` dispatches to, or null when `n` is
 /// not a method call. A method callee is a `field_access` NOT bound to a `.func`
 /// (that is a qualified module call) whose receiver types to a concrete struct/enum
@@ -2026,8 +2052,11 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
                 try copyAggInto(b, expr, dst_ptr, ty);
             }
         },
+        .tuple_field => try copyAggInto(b, expr, dst_ptr, ty),
         .call => {
-            if (isQualifiedVariantCtorCall(b, n, ty)) {
+            if (isTupleStructCtorCall(b, n, ty)) {
+                try lowerTupleStructInitInto(b, expr, dst_ptr);
+            } else if (isQualifiedVariantCtorCall(b, n, ty)) {
                 try lowerEnumInitInto(b, expr, dst_ptr, ty);
             } else {
                 try copyAggInto(b, expr, dst_ptr, ty);
@@ -2167,7 +2196,7 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
             const slot = try localSlot(b, node_idx, b.in.node_types[(node_idx).int()]);
             return try rootAddr(b, slot);
         },
-        .field_access => {
+        .field_access, .tuple_field => {
             const base_addr = try lowerPlaceAddr(b, n.lhs);
             if (base_addr == Ir.none_value) return Ir.none_value;
             const base_ty = b.in.node_types[(n.lhs).int()];
@@ -2660,7 +2689,7 @@ fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
     const n = b.in.tree.nodes[(node_idx).int()];
     return switch (n.tag) {
         .identifier => b.in.resolutions[(node_idx).int()] == .local,
-        .field_access => isLocalRootedPlace(b, n.lhs),
+        .field_access, .tuple_field => isLocalRootedPlace(b, n.lhs),
         else => false,
     };
 }

@@ -18,6 +18,18 @@ const Ast = @import("../ast/Ast.zig");
 const Type = @import("Type.zig").Type;
 const Kind = @import("Type.zig").Kind;
 
+/// Positional field names for tuple structs, borrowed by `layoutStruct` (never freed
+/// individually — the StructSym teardown frees only the outer `field_names` array, and
+/// `snapshotLayouts` dupes each name into an owned Layout copy). Cap is generous; a
+/// larger tuple is rejected at registration (see register.zig).
+pub const tuple_field_names = blk: {
+    @setEvalBranchQuota(10_000);
+    var arr: [64][]const u8 = undefined;
+    for (&arr, 0..) |*slot, i| slot.* = std.fmt.comptimePrint("{d}", .{i});
+    break :blk arr;
+};
+pub const tuple_field_cap: usize = tuple_field_names.len;
+
 /// A resolved struct layout: a self-contained, index-free-ish snapshot threaded
 /// into Codegen/Fingerprint. Field types still reference the struct table by id
 /// (for nested structs), but offsets/size/align are precomputed here. Owned.
@@ -94,6 +106,11 @@ pub const StructSym = struct {
     /// the outer array is owned by the checker's `structs` table).
     is_generic: bool = false,
     generic_params: []const []const u8 = &.{},
+    /// A tuple/newtype struct `struct N(T0,..)`: fields are positional (named
+    /// "0","1",..). Set at registration from `decl.tag`. Drives construction routing
+    /// (`N(args)` is positional, not `N{..}`) and `.N` access in the checker. Layout /
+    /// derive / Display reuse the record machinery over the numeric field names.
+    is_tuple: bool = false,
 };
 
 /// One variant in the scratch enum table (during layout). `field_names`/`name`
@@ -235,11 +252,14 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     const sizing = try env.gpa.alloc(Type, n);
     defer env.gpa.free(sizing);
 
+    const is_tuple = decl.tag == .tuple_struct_decl;
     var unit_poison = false;
     for (field_nodes, 0..) |field_idx, i| {
         const field = tree.nodes[field_idx.int()];
-        names[i] = env.nameText(env.ctx, field.main_token);
-        const fty = env.typeFromNode(env.ctx, field.lhs);
+        // A tuple struct's field NODE is the type-ref directly (no `.param`); its name
+        // is positional. A record field is a `.param` (name in main_token, type in lhs).
+        names[i] = if (is_tuple) tuple_field_names[@min(i, tuple_field_names.len - 1)] else env.nameText(env.ctx, field.main_token);
+        const fty = env.typeFromNode(env.ctx, if (is_tuple) field_idx else field.lhs);
         types[i] = fty;
         // A concrete generic-aggregate field `b: Box[int]` / `e: Either[int,bool]`
         // decodes to a composite `App`. Reify it on-demand to get the size/align
