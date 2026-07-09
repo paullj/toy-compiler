@@ -1,0 +1,10 @@
+# Feature: nested tuple-field access `o.0.0` — a tuple_field whose receiver is itself a
+# tuple_field. Proves `0.0` does NOT lex as one float (the middle `.` splits the accesses).
+# expect: exit 42
+struct Inner(int)
+struct Outer(Inner)
+
+fn main() -> int {
+    o := Outer(Inner(42))
+    return o.0.0
+}

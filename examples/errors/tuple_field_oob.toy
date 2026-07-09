@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — positional access past the last tuple field.
+# expect: compile-error "has no field .2"
+struct Pair(int, int)
+fn main() -> int {
+    p := Pair(1, 2)
+    return p.2
+}

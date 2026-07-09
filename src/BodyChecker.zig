@@ -290,7 +290,7 @@ pub const BodyChecker = struct {
                         bc.slotType(bc.resolutions[(stmt.lhs).int()].local)
                     else
                         .invalid,
-                    .field_access => try bc.typeOf(stmt.lhs),
+                    .field_access, .tuple_field => try bc.typeOf(stmt.lhs),
                     else => .invalid,
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
@@ -656,6 +656,7 @@ pub const BodyChecker = struct {
             .call => try bc.typeOfCall(node_idx, n),
             .struct_init => try bc.typeOfStructInit(node_idx, n),
             .field_access => try bc.typeOfFieldAccess(node_idx, n),
+            .tuple_field => try bc.typeOfTupleField(n),
             .enum_init_unit, .enum_init_tuple, .enum_init_struct => try bc.typeOfEnumInit(node_idx, n),
             .match_expr => return PatternChecker.typeOfMatch(bc, node_idx, n), // sets node_types itself
             .try_expr => return bc.typeOfTry(node_idx, n), // sets node_types itself
@@ -902,6 +903,25 @@ pub const BodyChecker = struct {
         }
         try bc.sink.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
         return .invalid;
+    }
+
+    fn typeOfTupleField(bc: *BodyChecker, n: Ast.Node) error{OutOfMemory}!Type {
+        const base = try bc.typeOf(n.lhs);
+        if (base.kind == .invalid) return .invalid; // R4: no cascade on an already-poisoned base
+        if (!base.isStruct() or !bc.model.structs[base.struct_id].is_tuple) {
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "'.{s}' positional access requires a tuple struct, got {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
+            return .invalid;
+        }
+        const sym = bc.model.structs[base.struct_id];
+        const idx = std.fmt.parseInt(usize, bc.nameText(n.main_token), 10) catch {
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "invalid tuple-field index '.{s}'", .{bc.nameText(n.main_token)});
+            return .invalid;
+        };
+        if (idx >= sym.field_types.len) {
+            try bc.sink.emitFmt(bc.byteOf(n.main_token), "tuple struct '{s}' has no field .{d}", .{ sym.name, idx });
+            return .invalid;
+        }
+        return sym.field_types[idx];
     }
 
     fn typeOfEnumInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
@@ -1158,6 +1178,24 @@ pub const BodyChecker = struct {
                     if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
                 }
             },
+        }
+        return result;
+    }
+
+    fn checkTupleStructInit(bc: *BodyChecker, n: Ast.Node, sid: u32) error{OutOfMemory}!Type {
+        const sym = bc.model.structs[sid];
+        const name_tok = bc.tree.nodes[(n.lhs).int()].main_token;
+        const result = Type.structT(sid);
+        const elems = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (n.rhs).int());
+        if (elems.len != sym.field_types.len) {
+            for (elems) |a| _ = try bc.typeOf(a); // surface inner arg errors first
+            try bc.sink.emitFmt(bc.byteOf(name_tok), "tuple struct '{s}' expects {d} value(s), got {d}", .{ sym.name, sym.field_types.len, elems.len });
+            return result;
+        }
+        for (elems, sym.field_types) |a, fty| {
+            const at = try bc.typeOfExpected(a, fty); // expected type drives literal narrowing (C1/C2 widths)
+            if (!Type.assignable(fty, at))
+                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "tuple struct '{s}': expected {s}, got {s}", .{ sym.name, bc.typeName(fty), bc.typeName(at) });
         }
         return result;
     }
@@ -1522,6 +1560,19 @@ pub const BodyChecker = struct {
         // operation (substitute the params/ret through the explicit args, check the
         // value args) that writes only concrete types into `node_types`.
         if (callee.tag == .type_app) return bc.typeOfGenericCall(node_idx, n, callee);
+        // A tuple-struct constructor `N(args)`: an UNRESOLVED identifier callee naming a
+        // tuple struct is positional construction. A struct name binds nothing in
+        // lookupName, so its callee stays `.unresolved`; gating on that (not merely
+        // `!= .func`) means a `.local`/`.param` value shadowing the type name falls
+        // through to typeOfDirectCall's "called value is not a function" instead of being
+        // silently misrouted to construction. A record struct keeps the "use named
+        // construction" reject in typeOfDirectCall; enum-variant construction has a
+        // field_access callee (never here).
+        if (callee.tag == .identifier and bc.resolutions[(n.lhs).int()] == .unresolved) {
+            if (bc.activeStructMap().get(bc.nameText(callee.main_token))) |sid| {
+                if (bc.model.structs[sid].is_tuple) return try bc.checkTupleStructInit(n, sid);
+            }
+        }
         return bc.typeOfDirectCall(node_idx, n);
     }
 
@@ -2231,7 +2282,7 @@ pub const BodyChecker = struct {
         const n = bc.tree.nodes[(node_idx).int()];
         return switch (n.tag) {
             .identifier => bc.resolutions[(node_idx).int()] == .local,
-            .field_access => bc.isMutablePlace(n.lhs),
+            .field_access, .tuple_field => bc.isMutablePlace(n.lhs),
             else => false,
         };
     }

@@ -1,0 +1,9 @@
+# Feature: a tuple/newtype struct derives `Display` structurally — `Name(v0, v1)`
+# (positional, `, `-separated), the tuple twin of the record `Name{f: v}` form.
+# expect: stdout "Meters(42)"
+# expect: exit 0
+struct Meters(int)
+
+fn main() {
+    print(Meters(42))
+}

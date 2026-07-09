@@ -1,0 +1,11 @@
+# Feature: a newtype tuple struct over a sized-int field. `Byte(200)` range-checks the
+# literal against uint8 (C1/C2); `.0` reads the field; `==` derives over the uint8 field.
+# expect: exit 42
+struct Byte(uint8)
+
+fn main() -> int {
+    b := Byte(200)
+    c := Byte(200)
+    v: uint = b.0.into()                     # uint8 field -> uint widen
+    return if v == 200 && b == c { 42 } else { 0 }
+}

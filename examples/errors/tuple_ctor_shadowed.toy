@@ -1,0 +1,10 @@
+# Feature: SHOULD FAIL — a local value shadowing a tuple-struct name is not callable.
+# expect: compile-error "called value is not a function"
+# The `:=` binding shadows the type name, so `Pair(1, 2)` is a call on a value, not
+# positional construction — the tuple-ctor routing gates on an UNRESOLVED callee.
+struct Pair(int, int)
+fn main() -> int {
+  Pair := 99
+  p := Pair(1, 2)
+  return p.0 + p.1
+}

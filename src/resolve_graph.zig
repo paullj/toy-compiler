@@ -180,7 +180,7 @@ fn collectGlobals(g: *GraphResolve) !void {
             const decl = m.nodes[decl_idx.int()];
             const is_pub = t.isPub(decl_idx);
             switch (decl.tag) {
-                .struct_decl => {
+                .struct_decl, .tuple_struct_decl => {
                     const name = g.nameOf(mod, decl.main_token);
                     try g.tables[mod].structs.put(g.gpa, name, is_pub);
                 },
@@ -416,6 +416,12 @@ fn resolveModule(g: *GraphResolve, mod: u32) !void {
                     try g.resolveTypeRef(field.lhs);
                 }
             },
+            .tuple_struct_decl => {
+                const decl = m.nodes[decl_idx.int()];
+                for (Ast.rangeSlice(t, decl.lhs.int())) |type_idx| {
+                    try g.resolveTypeRef(type_idx);
+                }
+            },
             // Resolve each method body like any fn: its synthesized `self` param
             // binds as a local (slot 0) via the ordinary param loop in `resolveFn`.
             // A conformance impl (`impl_has_decl`) resolves identically; its qualified
@@ -505,7 +511,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         },
         .assign => {
             const target = g.nodes()[stmt.lhs.int()];
-            if (target.tag == .field_access) {
+            if (target.tag == .field_access or target.tag == .tuple_field) {
                 try g.resolveExpr(stmt.lhs);
             } else {
                 const resn = g.lookupName(target.main_token);
@@ -599,6 +605,7 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
             for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs);
         },
         .field_access => try g.resolveFieldAccess(node_idx, n),
+        .tuple_field => try g.resolveExpr(n.lhs),
         // A type-application callee `id[int](..)`: resolve ONLY the base callee
         // (`n.lhs`). The type-arg Range is NOT descended — resolving a type name
         // like `int` would fire R0001 and stop the pipeline at resolve, pre-empting

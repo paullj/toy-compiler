@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — a tuple-struct constructor given too many values.
+# expect: compile-error "expects 2 value(s), got 3"
+struct Pair(int, int)
+fn main() -> int {
+    p := Pair(1, 2, 3)
+    return 0
+}

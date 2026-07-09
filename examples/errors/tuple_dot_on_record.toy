@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — positional `.0` on a RECORD struct (only tuple structs allow it).
+# expect: compile-error "requires a tuple struct"
+struct R { x: int }
+fn main() -> int {
+    r := R { x: 1 }
+    return r.0
+}
