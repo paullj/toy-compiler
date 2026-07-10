@@ -54,8 +54,8 @@ pub const Cli = struct {
     root: Command,
 };
 
-// Single update site for the auto-injected flags. M6 wires -h/--help and M7
-// wires -V/--version; a user Option claiming any of these would silently shadow
+// Single update site for the auto-injected flags. -h/--help and -V/--version are
+// wired automatically; a user Option claiming any of these would silently shadow
 // or double-register the injected one, so we reject it at the data-model boundary.
 const reserved_long = [_][:0]const u8{ "help", "version" };
 const reserved_short = [_]u8{ 'h', 'V' };

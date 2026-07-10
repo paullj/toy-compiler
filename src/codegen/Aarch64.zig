@@ -11,7 +11,7 @@
 //! then `objdump -d` — the disassembly's hex column is the ground truth the
 //! tests assert (see the comments next to each constant/function).
 //!
-//! Scope is the M1 subset only: movz/movk (+ an i64 materializer), reg/reg moves,
+//! Scope is the initial subset only: movz/movk (+ an i64 materializer), reg/reg moves,
 //! add/sub (reg and imm12), mul, sdiv, neg, the frame stp/ldp pair, ldr/str
 //! unsigned-offset against sp, sp add/sub, bl, and ret.
 
@@ -199,7 +199,7 @@ pub fn bl(imm26: i26) u32 {
     return 0x94000000 | bits;
 }
 
-// These four encoders are how M2 reaches data the linker only sizes at the very
+// These four encoders are how codegen reaches data the linker only sizes at the very
 // end: a string in `__cstring` and the `_write` slot in `__got`. `adrp` forms a
 // 4 KiB-page-relative base, `addImm` adds the in-page byte offset (for a cstring
 // literal address), `ldrRegUoff` loads the GOT slot, and `blr` calls it. The
@@ -228,7 +228,7 @@ pub fn ldrRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
 /// ldrb wt, [rn, #byteOff] — zero-extended single-byte load, unsigned offset (the
 /// imm12 is UNSCALED for a byte access, so `byteOff` is a raw byte displacement,
 /// unlike `ldrRegUoff`'s /8 scaling). ldrb w0,[x0] → 0x39400000; ldrb w0,[x0,#1] →
-/// 0x39400400. The M15 str byte-compare reads `ptr[i]` with this.
+/// 0x39400400. The str byte-compare reads `ptr[i]` with this.
 pub fn ldrbRegUoff(rt: u32, rn: u32, byteOff: u12) u32 {
     return 0x39400000 | (@as(u32, byteOff) << 10) | (rn << 5) | rt;
 }
@@ -236,7 +236,7 @@ pub fn ldrbRegUoff(rt: u32, rn: u32, byteOff: u12) u32 {
 /// str rt, [rn, #byteOff] — 64-bit store, unsigned scaled offset, arbitrary base
 /// register `rn`. byteOff must be a multiple of 8. str x0,[x8] → 0xF9000100;
 /// str x1,[x8,#8] → 0xF9000501. Symmetric to `ldrRegUoff`; used for the
-/// indirect/x8 sret store-through-pointer and struct byte-copies (M9).
+/// indirect/x8 sret store-through-pointer and struct byte-copies.
 pub fn strRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 8 == 0);
     const scaled: u32 = byteOff / 8;
@@ -250,12 +250,12 @@ pub fn blr(rn: u32) u32 {
 
 /// strb wt, [rn, #byteOff] — single-byte store, unsigned offset (the imm12 is UNSCALED
 /// for a byte access, mirroring `ldrbRegUoff`). strb w13,[x10] → 0x3900014D;
-/// strb w0,[x0,#1] → 0x39000400. The M22 int-renderer writes each ASCII digit this way.
+/// strb w0,[x0,#1] → 0x39000400. The int-renderer writes each ASCII digit this way.
 pub fn strb(rt: u32, rn: u32, byteOff: u12) u32 {
     return 0x39000000 | (@as(u32, byteOff) << 10) | (rn << 5) | rt;
 }
 
-/// cbz rt, #(imm19 words) — branch if rt == 0, PC-relative signed word offset. The M22
+/// cbz rt, #(imm19 words) — branch if rt == 0, PC-relative signed word offset. The
 /// renderer never uses it directly but it completes the cbz/cbnz pair; symmetric to
 /// `cbnz`. cbz x0,#0 → 0xB4000000; cbz x0,#-4 → 0xB4FFFF80.
 pub fn cbz(rt: u32, imm19: i19) u32 {
@@ -302,7 +302,7 @@ pub fn patchLdrUoff(word: u32, byteOff: u32) u32 {
     return ldrRegUoff(rt, rn, byteOff);
 }
 
-// WHY: M4 needs to test values and jump. Comparisons set NZCV via SUBS-to-XZR
+// WHY: codegen needs to test values and jump. Comparisons set NZCV via SUBS-to-XZR
 // (`cmp`), a condition turns NZCV into 0/1 (`cset`) in VALUE context or steers a
 // `b.cond`/`cbz`/`cbnz` in CONTROL context, and `b` is the unconditional jump.
 // Branch targets are intra-function byte offsets resolved by Codegen backpatch
@@ -311,7 +311,7 @@ pub fn patchLdrUoff(word: u32, byteOff: u32) u32 {
 // Every word below was assembler-verified on this host (see the tests).
 
 /// AArch64 condition codes. Equality (eq/ne), the SIGNED magnitude comparisons
-/// (ge/lt/gt/le), and — since M2 dispatches unsigned integer compares by operand
+/// (ge/lt/gt/le), and — since codegen dispatches unsigned integer compares by operand
 /// signedness — the UNSIGNED magnitude comparisons (hs/lo/hi/ls). Values are the
 /// 4-bit cond field encoding (e.g. b.cond carries cond in bits[3:0]).
 pub const Cond = enum(u4) {
@@ -416,7 +416,7 @@ pub const ldpFpLrPost: u32 = 0xA8C17BFD;
 /// ret (returns to x30). → 0xD65F03C0.
 pub const ret: u32 = 0xD65F03C0;
 
-/// brk #0 — a software breakpoint that aborts with SIGILL (M23). The single instruction
+/// brk #0 — a software breakpoint that aborts with SIGILL. The single instruction
 /// emitted for the `.trap` IR terminator (`Option`/`Result` `unwrap`'s failure arm); no
 /// other trap primitive exists on this backend. → 0xD4200000.
 pub const brk0: u32 = 0xD4200000;
@@ -480,7 +480,7 @@ test "data-processing register" {
     try testing.expectEqual(@as(u32, 0x9B018040), msub(0, 2, 1, 0)); // msub x0,x2,x1,x0 (the genRem shape)
 }
 
-test "M2 width-correct encoders (udiv + sign-extend + low-bits mask)" {
+test "width-correct encoders (udiv + sign-extend + low-bits mask)" {
     try testing.expectEqual(@as(u32, 0x9AC00800), udiv(0, 0, 0)); // udiv x0,x0,x0
     try testing.expectEqual(@as(u32, 0x9AC10803), udiv(3, 0, 1)); // udiv x3,x0,x1
     try testing.expectEqual(@as(u32, 0x93401C00), sxtb(0, 0)); // sxtb x0,x0
@@ -491,7 +491,7 @@ test "M2 width-correct encoders (udiv + sign-extend + low-bits mask)" {
     try testing.expectEqual(@as(u32, 0x92407C00), andLowBits(0, 0, 31)); // and x0,x0,#0xffffffff
 }
 
-test "M4 bitwise, shift, and select encoders" {
+test "bitwise, shift, and select encoders" {
     try testing.expectEqual(@as(u32, 0x8A010000), andReg(0, 0, 1)); // and x0,x0,x1
     try testing.expectEqual(@as(u32, 0xAA010000), orrReg(0, 0, 1)); // orr x0,x0,x1
     try testing.expectEqual(@as(u32, 0xCA010000), eorReg(0, 0, 1)); // eor x0,x0,x1
@@ -536,7 +536,7 @@ test "branch/system and frame constants" {
     try testing.expectEqual(@as(u32, 0xD4200000), brk0); // brk #0
 }
 
-test "pc-relative data addressing + indirect call (M2)" {
+test "pc-relative data addressing + indirect call" {
     try testing.expectEqual(@as(u32, 0x90000008), adrp(8, 0)); // adrp x8, 0
     try testing.expectEqual(@as(u32, 0x90000010), adrp(16, 0)); // adrp x16, 0
     try testing.expectEqual(@as(u32, 0x90000030), adrp(16, 4)); // adrp x16, +4 pages
@@ -547,13 +547,13 @@ test "pc-relative data addressing + indirect call (M2)" {
     try testing.expectEqual(@as(u32, 0xAA0003E1), movReg(1, 0)); // mov x1, x0
 }
 
-test "str via arbitrary base register (M9 indirect/x8 sret + struct copy)" {
+test "str via arbitrary base register (indirect/x8 sret + struct copy)" {
     try testing.expectEqual(@as(u32, 0xF9000100), strRegUoff(0, 8, 0)); // str x0, [x8]
     try testing.expectEqual(@as(u32, 0xF9000501), strRegUoff(1, 8, 8)); // str x1, [x8, #8]
     try testing.expectEqual(@as(u32, 0xF9000909), strRegUoff(9, 8, 16)); // str x9, [x8, #16]
 }
 
-test "ldrb zero-extended byte load (M15 str byte-compare)" {
+test "ldrb zero-extended byte load (str byte-compare)" {
     try testing.expectEqual(@as(u32, 0x39400000), ldrbRegUoff(0, 0, 0)); // ldrb w0,[x0]
     try testing.expectEqual(@as(u32, 0x39400400), ldrbRegUoff(0, 0, 1)); // ldrb w0,[x0,#1]
     try testing.expectEqual(@as(u32, 0x39401441), ldrbRegUoff(1, 2, 5)); // ldrb w1,[x2,#5]
@@ -606,7 +606,7 @@ test "conditional + unconditional branches" {
     try testing.expectEqual(@as(u32, 0x17FFFFFC), b(-4)); // b .-16
 }
 
-test "M22 byte-store + conditional-branch encoders" {
+test "byte-store + conditional-branch encoders" {
     // strb wt,[xn,#imm] — byte store, unscaled imm12 (mirrors ldrb).
     try testing.expectEqual(@as(u32, 0x3900014D), strb(13, 10, 0)); // strb w13,[x10]
     try testing.expectEqual(@as(u32, 0x39000400), strb(0, 0, 1)); // strb w0,[x0,#1]

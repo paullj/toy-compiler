@@ -1,4 +1,4 @@
-# Feature: structural `Hash` auto-derive (M20). A struct whose fields all conform to `Hash`
+# Feature: structural `Hash` auto-derive. A struct whose fields all conform to `Hash`
 # gets `.hash()` with ZERO source impl — the compiler synthesizes a source-less field-by-
 # field `hash` on demand at the call site. No `derive` keyword; unused ⇒ free. The derived
 # hash is `Eq`-consistent (two structurally-equal values hash EQUAL) and uses a FIXED seed

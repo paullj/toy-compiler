@@ -149,7 +149,7 @@ fn lexIdentifier(l: *Lexer, start: u32) Token {
 fn lexNumber(l: *Lexer, start: u32) Token {
     l.index += 1;
     // A `0x`/`0o`/`0b` prefix (only valid immediately after a leading `0`) switches to
-    // the matching digit set. A stray invalid char just ends the token — M1 adds no
+    // the matching digit set. A stray invalid char just ends the token — there is no
     // malformed-number token; a bad literal (`0xZZ`) mis-spans and surfaces downstream.
     if (l.source[start] == '0' and l.index < l.source.len) {
         const base: ?u8 = switch (l.source[l.index]) {

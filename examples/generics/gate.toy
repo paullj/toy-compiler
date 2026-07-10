@@ -1,8 +1,9 @@
-# Feature: the M6/M7 boundary. M6 monomorphizes generic enums that can be instantiated
-# from their PAYLOAD (explicit `Either[int,bool].left(42)` or M5-style `Wrap.w(5)`), but
+# Feature: the payload-vs-target-type inference boundary. Payload monomorphization
+# reifies generic enums that can be instantiated
+# from their PAYLOAD (explicit `Either[int,bool].left(42)` or the bare `Wrap.w(5)`), but
 # a NULLARY generic-enum variant carries no payload to infer the type-params from —
 # `Opt.none` cannot bind `T`. Pinning it from a target type (`x: Opt[int] = Opt.none`)
-# is M7 (target-type inference), so M6 rejects it with T0016 "cannot infer".
+# needs target-type inference, so payload reification rejects it with T0016 "cannot infer".
 # expect: compile-error "cannot infer"
 enum Opt[T] { some(T), none }
 fn main() -> int {

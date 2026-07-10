@@ -1,5 +1,5 @@
 # Feature: a newtype tuple struct over a sized-int field. `Byte(200)` range-checks the
-# literal against uint8 (C1/C2); `.0` reads the field; `==` derives over the uint8 field.
+# literal against uint8; `.0` reads the field; `==` derives over the uint8 field.
 # expect: exit 42
 struct Byte(uint8)
 

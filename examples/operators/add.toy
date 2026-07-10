@@ -1,4 +1,4 @@
-# Feature: `+` / `-` / `*` / `/` are operators-as-protocols (M17). They desugar to the
+# Feature: `+` / `-` / `*` / `/` are operators-as-protocols. They desugar to the
 # prelude arithmetic protocols `Add` / `Sub` / `Mul` / `Div`, each homogeneous
 # (`fn add(self, other: Self) -> Self`); a user struct conforms via `impl V2 has Add`, so
 # `v1 + v2` dispatches to `V2::add` and returns a `V2`. Builtin `int` arithmetic stays a

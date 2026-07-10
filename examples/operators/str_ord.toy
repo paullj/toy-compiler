@@ -1,4 +1,4 @@
-# Feature: builtin `Ord` for `str` (M16). `<` / `>` / `<=` / `>=` on strings lower to a
+# Feature: builtin `Ord` for `str`. `<` / `>` / `<=` / `>=` on strings lower to a
 # heap-free lexicographic 3-way `load_byte` loop (no witness call): the first differing
 # byte decides, a proper prefix is less than its extension, and equal strings compare
 # equal. Exercises differ-at-byte, both prefix directions, and the equal case.

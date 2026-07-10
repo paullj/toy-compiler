@@ -1,5 +1,5 @@
 # Feature: sized integer types (`int8`/`uint8`), homogeneous-width arithmetic result
-# type, base-16 literals, and per-width Ord conformance (M1).
+# type, base-16 literals, and per-width Ord conformance.
 # expect: exit 42
 # a=100, b=20, c=a+b=120 (all int8); h=0x2A=42, g=0x0A=10 (uint8). Every comparison is
 # true, so the value-`if` yields 42. `c: int8 = a + b` exercises the homogeneous-width

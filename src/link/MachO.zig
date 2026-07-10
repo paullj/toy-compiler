@@ -1,6 +1,6 @@
 //! Assemble a runnable arm64 macOS Mach-O executable from a `__text` code blob.
 //!
-//! WHY: M1 emits and "links" the executable itself — no system linker. This file
+//! WHY: the compiler emits and "links" the executable itself — no system linker. This file
 //! is the linker: it lays out the single page of code we generated into a PIE
 //! `MH_EXECUTE` image with the minimal set of load commands the macOS kernel and
 //! dyld actually require to run a process.
@@ -14,7 +14,7 @@
 //!   LC_DYLD_CHAINED_FIXUPS (empty 56-byte blob), LC_LOAD_DYLINKER /usr/lib/dyld,
 //!   LC_MAIN, LC_LOAD_DYLIB libSystem, LC_CODE_SIGNATURE (always LAST).
 //!
-//! M2 adds a SECOND layout for programs that emit output. When the lowered
+//! A SECOND layout serves programs that emit output. When the lowered
 //! program carries interned `__cstring` bytes and/or imports (it called `print`),
 //! `assemble` takes the MULTI-SEGMENT path:
 //!   __PAGEZERO, __TEXT(+__text +__cstring), __DATA_CONST(+__got), __LINKEDIT,
@@ -74,7 +74,7 @@ const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 // __DATA_CONST is read-only after dyld binds it.
 const SG_READ_ONLY: u32 = 0x10;
 
-/// One dyld-imported external symbol. M2 always uses exactly one: `_write` from
+/// One dyld-imported external symbol. There is always exactly one: `_write` from
 /// libSystem (the only LC_LOAD_DYLIB, so its dylib ordinal is 1).
 pub const Import = struct {
     name: []const u8,
@@ -172,7 +172,7 @@ pub const Layout = struct {
 /// left for `CodeSign.sign` to fill. Caller owns `image`.
 ///
 /// `cstrings` are the interned read-only string bytes (Codegen's blob), and
-/// `imports` the dyld symbols to bind. When BOTH are empty this is a pure M1/M3
+/// `imports` the dyld symbols to bind. When BOTH are empty this is a pure code-only
 /// program and we take the unchanged single-__TEXT layout; otherwise the
 /// multi-segment path (__cstring section + __DATA_CONST/__got + a real
 /// chained-fixups blob). `assemble` neither patches cross-segment relocs nor
@@ -191,7 +191,7 @@ pub fn assemble(
     return assembleMulti(gpa, identifier, code, entry_text_off, cstrings, imports);
 }
 
-/// The unchanged M1/M3 single-segment layout (no __cstring, no imports). Kept
+/// The unchanged single-segment layout (no __cstring, no imports). Kept
 /// byte-identical so existing binaries/tests stay green.
 fn assembleEmpty(gpa: std.mem.Allocator, identifier: []const u8, code: []const u8, entry_text_off: u32) !Layout {
     // Code immediately follows the header + load commands, 4-byte aligned.

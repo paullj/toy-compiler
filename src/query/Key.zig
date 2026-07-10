@@ -8,10 +8,10 @@
 //!     => distinct Wyhash stream. lex/parse share `input = Wyhash(source)` but
 //!     differ by phase byte.
 //!   * codegen's `input` is `fp ^ optMix(opt) ^ symMix(sym)` — a DIFFERENT u64
-//!     namespace, a different phase byte, AND target-sensitive ([C10]).
+//!     namespace, a different phase byte, AND target-sensitive.
 //!   * single-file vs graph codegen needs NO extra bit: `symMix` folds the
 //!     emitted `SymName` (bare `add` vs qualified `m.add` => different input),
-//!     the existing [C6] M14 invariant.
+//!     the existing module-qualified-name invariant.
 //!
 //! This module ONLY consolidates the `fp ^ optMix ^ symMix` arithmetic (formerly
 //! duplicated in Driver) into one place. The seeds and `digest()` are sacred:
@@ -52,10 +52,10 @@ pub fn optMix(cfg: Opt.Config) u64 {
 
 /// Mix a function's OWN emitted `SymName{kind,name}` into the codegen cache key.
 ///
-/// WHY (M14, [C6] cache soundness): the fingerprint folds a fn's body and its
+/// WHY (cache soundness): the fingerprint folds a fn's body and its
 /// CALLEES' identities, but NOT the fn's own internal name — and a leaf fn (no
 /// callees) with identical source produces an identical fingerprint regardless of
-/// the name it is emitted under. In M14 the SAME `fn add` body is emitted bare
+/// the name it is emitted under. The SAME `fn add` body is emitted bare
 /// (`add`) single-file but module-qualified (`m.add`) in a graph build; that name
 /// IS baked into the cached `FnCode.sym` (and into every caller's reloc target).
 /// Without folding it, a graph build would serve a single-file build's cached

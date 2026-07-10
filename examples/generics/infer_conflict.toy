@@ -1,4 +1,4 @@
-# Feature: conflicting type-arg inference is a hard error (M3, T0015).
+# Feature: conflicting type-arg inference is a hard error (T0015).
 # `same[T](a: T, b: T)` binds T from BOTH args; `same(1, true)` matches T against
 # int (arg 1) then bool (arg 2) — inference cannot pick one, so the call is rejected
 # with T0015 naming both argument spans. Explicit `same[int](1, 1)` would override.

@@ -1,4 +1,4 @@
-# Feature: monomorphized generic functions over value types (M2 [PRIMARY SPIKE]).
+# Feature: monomorphized generic functions over value types.
 # `id[T]` is instantiated at two concrete type-args: `int` and the struct `P`.
 # Each reachable instance reifies to an ordinary concrete per-fn codegen unit with
 # a distinct mangled symbol (id$int, id$s<N>); no runtime dictionaries, no sharing.

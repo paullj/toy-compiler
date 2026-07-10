@@ -69,7 +69,7 @@ const specs = [_]ProtoSpec{
     .{ .slot = .into, .name = "Into", .method = "into", .params = self_only, .ret = .dst_t, .generic_params = &.{"Dst"} },
     // `TryInto.try_into`'s declared ret `dst_t` (=`Dst`) is a deliberate PLACEHOLDER: the
     // true `Result[Dst, ConvErr]` cannot be minted at registration (no `Composite`
-    // interner here) and is synthesized per call site (BodyChecker). M3 ships no user
+    // interner here) and is synthesized per call site (BodyChecker). There is no user
     // `impl .. has TryInto`, so `method_rets[try_into]` is never read; a future milestone
     // wiring `try_into` through the explicit-args/bound path MUST fix this first.
     .{ .slot = .try_into, .name = "TryInto", .method = "try_into", .params = self_only, .ret = .dst_t, .generic_params = &.{"Dst"} },
@@ -308,7 +308,7 @@ fn registerOptionResult(
 
 const testing = std.testing;
 
-test "M3: Into=9/TryInto=10 after From; ConvErr appended after Result" {
+test "Into=9/TryInto=10 after From; ConvErr appended after Result" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
@@ -345,7 +345,7 @@ test "M3: Into=9/TryInto=10 after From; ConvErr appended after Result" {
     try testing.expect(std.mem.eql(u8, ce.variants[0].name, "out_of_range"));
 }
 
-test "M9: char is a hand-laid-out tuple struct(uint32), size 8, done" {
+test "char is a hand-laid-out tuple struct(uint32), size 8, done" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();

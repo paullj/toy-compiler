@@ -1,4 +1,4 @@
-# Feature: Go shift semantics (M4): amount >= width yields 0 (shl/lshr) or sign-fill
+# Feature: Go shift semantics: amount >= width yields 0 (shl/lshr) or sign-fill
 # (ashr), NOT the aarch64 mod-64 masked result. `a << 64` / `a >> 64` on uint8 mask
 # 64%64=0 on a bare lslv/lsrv (would keep 255); the csel guard forces 0, so -O0 == -O1.
 # expect: exit 42

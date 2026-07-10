@@ -1,4 +1,4 @@
-# Feature: an explicit `impl has Eq` OVERRIDES the structural derive (M18). This impl
+# Feature: an explicit `impl has Eq` OVERRIDES the structural derive. This impl
 # calls two `P`s equal regardless of their fields, so `a == b` (with x differing) returns
 # TRUE and the program exits 42. A structural derive would compare `x` and return 0 — so
 # exit 42 proves the user witness won (the derive never fired; no synthetic unit emitted).

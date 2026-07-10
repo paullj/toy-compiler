@@ -29,10 +29,10 @@ const Cache = @This();
 /// cache keys are exactly its CACHEABLE subset (`Phase.Kind.cacheable`: lex/parse/
 /// codegen). Re-exported under this name so the cache reads as "phases".
 ///
-/// codegen (M5+; M12 Ast→Ir→aarch64) is cached by a transitive content fingerprint,
+/// codegen (Ast→Ir→aarch64) is cached by a transitive content fingerprint,
 /// not a source hash, and is target-sensitive (the blob is aarch64 machine code).
 /// The IR is built INSIDE that query and never cached separately — the cache stays
-/// ONE-TIER ([C8]).
+/// ONE-TIER.
 pub const Phase = Phase_.Kind;
 
 /// Identifies a single cacheable unit of work.
@@ -48,7 +48,7 @@ pub const Key = struct {
         return .{ .phase = phase, .target = target, .input = std.hash.Wyhash.hash(0, source) };
     }
 
-    /// Key a phase directly by a precomputed content fingerprint (M5 codegen),
+    /// Key a phase directly by a precomputed content fingerprint (codegen),
     /// rather than by rehashing a source byte range. `digest()` folds `input`
     /// verbatim, so the fingerprint IS the cache identity.
     pub fn fromFingerprint(phase: Phase, target: []const u8, fp: u64) Key {
@@ -726,7 +726,7 @@ test "cacheable/targetSensitive classify the unified enum's tiers" {
     try testing.expect(!Phase.signature.cacheable());
     try testing.expect(!Phase.body.cacheable());
     try testing.expect(!Phase.layout.cacheable());
-    // Only codegen depends on the target ([C10]); the rest share one entry across
+    // Only codegen depends on the target; the rest share one entry across
     // targets (lex/parse) or never reach the on-disk key at all.
     try testing.expect(Phase.codegen.targetSensitive());
     try testing.expect(!Phase.lex.targetSensitive());

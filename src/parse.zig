@@ -857,7 +857,7 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     return p.addNode(.{ .tag = .struct_decl, .main_token = name_tok, .lhs = header, .rhs = generic_hdr });
 }
 
-/// `type Name = <type-ref>` — a module-local transparent alias (M7). Reuses `.eq`
+/// `type Name = <type-ref>` — a module-local transparent alias. Reuses `.eq`
 /// (distinct from the `as` import-alias token) and the shared type-ref parser
 /// (`parseType`, which carries the recursion-depth guard), so the target may be a
 /// bare/qualified name or `()`. `main_token` = the alias name; `lhs` = the target

@@ -1,4 +1,4 @@
-# Feature: M21 nested conditional conformance — `Box[Box[Point]]` conforms to `Ord`
+# Feature: nested conditional conformance — `Box[Box[Point]]` conforms to `Ord`
 # (`Box[T]` iff `T`, recursively down to `Point`'s `int` fields). The `conforms` query is
 # memoized by the interned App index so the nested lookup is not re-queried exponentially,
 # and the multi-level reify + synthesis is deterministic.

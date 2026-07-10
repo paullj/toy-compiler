@@ -1,4 +1,4 @@
-# Feature: heap-free scalar `Display` renderers (M22). `print(int)` formats digits into a
+# Feature: heap-free scalar `Display` renderers. `print(int)` formats digits into a
 # fixed STACK buffer (div/mod-by-10, no allocator) then writes them — covering zero, a
 # negative value (leading `-`), and a multi-digit value. `print(bool)` inlines a branch over
 # the `true`/`false` cstrings. The `"\n"` separators exercise the unchanged `print(str)` path.

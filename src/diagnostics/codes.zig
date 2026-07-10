@@ -60,29 +60,29 @@ pub const Code = enum(u16) {
     T0011, // shadows-builtin
     T0012, // duplicate-struct
     T0013, // generics-unsupported
-    T0014, // mono-depth (monomorphization instance/depth limit — M2 belt-and-suspenders)
-    T0015, // type-arg-inference-conflict (a type-var bound to two different concrete types — M3)
-    T0016, // type-args-not-inferable (a generic type-param left unbound after matching — M3)
-    T0017, // instantiation-too-deep (unbounded generic-data instantiation depth — M4)
-    T0018, // no-such-method (a method call names a receiver type that has no such method — M8)
-    T0019, // mut-self-not-place (a `mut self` method called on a temporary/non-place receiver — M9)
-    T0020, // overlapping-impl (two impls of the same protocol for the same type-ctor — coherence, M11)
-    T0021, // no-conformance (an `impl .. has P` omits a required method, or `has` names an undeclared protocol — M11)
-    T0022, // mut-self-on-scalar (a `mut self` method called on a builtin scalar receiver — the by-address self ABI has no place to write back — M12)
-    T0023, // unsatisfied-bound (a monomorphization type-arg does not conform to its generic param's `[T has P]` bound — use-site, M13)
-    T0024, // conformance-signature-mismatch (a conforming impl method's signature does not match the protocol's declared signature — coherence, M13)
-    T0025, // ambiguous-conformance (a use site of a type that conforms to one generic protocol multiple times omits the disambiguating type-args — M14)
-    T0026, // missing-eq-impl (`==`/`!=` used on a value type with no `Eq` conformance — operator desugar, M15)
-    T0027, // missing-ord-impl (`<`/`>`/`<=`/`>=` used on a value type with no `Ord` conformance — operator desugar, M16)
-    T0028, // missing-arith-impl (`+`/`-`/`*`/`/` used on a value type with no matching `Add`/`Sub`/`Mul`/`Div` conformance — operator desugar, M17)
-    T0029, // non-derivable-field (structural `Eq` derive blocked by a struct field whose type does not conform to `Eq` — use-site, M18)
-    T0030, // non-hashable-field (structural `Hash` derive blocked by a field whose type does not conform to `Hash` — use-site, M20)
-    T0031, // non-displayable-arg (`print(x)`/structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site, M22)
-    T0032, // question-non-optionresult (`?` operand is not an Option/Result, or the enclosing return type cannot absorb the residual — M24)
-    T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch — M24)
-    T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width — M1)
-    T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain — M7)
-    T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x` — M9)
+    T0014, // mono-depth (monomorphization instance/depth limit — belt-and-suspenders)
+    T0015, // type-arg-inference-conflict (a type-var bound to two different concrete types)
+    T0016, // type-args-not-inferable (a generic type-param left unbound after matching)
+    T0017, // instantiation-too-deep (unbounded generic-data instantiation depth)
+    T0018, // no-such-method (a method call names a receiver type that has no such method)
+    T0019, // mut-self-not-place (a `mut self` method called on a temporary/non-place receiver)
+    T0020, // overlapping-impl (two impls of the same protocol for the same type-ctor — coherence)
+    T0021, // no-conformance (an `impl .. has P` omits a required method, or `has` names an undeclared protocol)
+    T0022, // mut-self-on-scalar (a `mut self` method called on a builtin scalar receiver — the by-address self ABI has no place to write back)
+    T0023, // unsatisfied-bound (a monomorphization type-arg does not conform to its generic param's `[T has P]` bound — use-site)
+    T0024, // conformance-signature-mismatch (a conforming impl method's signature does not match the protocol's declared signature — coherence)
+    T0025, // ambiguous-conformance (a use site of a type that conforms to one generic protocol multiple times omits the disambiguating type-args)
+    T0026, // missing-eq-impl (`==`/`!=` used on a value type with no `Eq` conformance — operator desugar)
+    T0027, // missing-ord-impl (`<`/`>`/`<=`/`>=` used on a value type with no `Ord` conformance — operator desugar)
+    T0028, // missing-arith-impl (`+`/`-`/`*`/`/` used on a value type with no matching `Add`/`Sub`/`Mul`/`Div` conformance — operator desugar)
+    T0029, // non-derivable-field (structural `Eq` derive blocked by a struct field whose type does not conform to `Eq` — use-site)
+    T0030, // non-hashable-field (structural `Hash` derive blocked by a field whose type does not conform to `Hash` — use-site)
+    T0031, // non-displayable-arg (`print(x)`/structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site)
+    T0032, // question-non-optionresult (`?` operand is not an Option/Result, or the enclosing return type cannot absorb the residual)
+    T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch)
+    T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width)
+    T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain)
+    T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x`)
 
     _,
 };
@@ -259,7 +259,7 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqual(Severity.err, defaultSeverity(.P0001));
     try testing.expectEqual(Code.P0005, fromStr("P0005").?);
 
-    // Type band (T####) — the M13 bound + conformance codes.
+    // Type band (T####) — the bound + conformance codes.
     try testing.expectEqualStrings("T0023", str(.T0023).?);
     try testing.expectEqualStrings("unsatisfied-bound", slug(.T0023).?);
     try testing.expectEqualStrings("T0024", str(.T0024).?);
@@ -267,42 +267,42 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqual(Code.T0023, fromStr("T0023").?);
     try testing.expectEqual(Code.T0024, fromStr("T0024").?);
 
-    // M14 generic-protocol ambiguity code.
+    // Generic-protocol ambiguity code.
     try testing.expectEqualStrings("T0025", str(.T0025).?);
     try testing.expectEqualStrings("ambiguous-conformance", slug(.T0025).?);
     try testing.expectEqual(Code.T0025, fromStr("T0025").?);
 
-    // M15 operator `Eq` code.
+    // Operator `Eq` code.
     try testing.expectEqualStrings("T0026", str(.T0026).?);
     try testing.expectEqualStrings("missing-eq-impl", slug(.T0026).?);
     try testing.expectEqual(Code.T0026, fromStr("T0026").?);
 
-    // M16 operator `Ord` code.
+    // Operator `Ord` code.
     try testing.expectEqualStrings("T0027", str(.T0027).?);
     try testing.expectEqualStrings("missing-ord-impl", slug(.T0027).?);
     try testing.expectEqual(Code.T0027, fromStr("T0027").?);
 
-    // M17 operator `Add`/`Sub`/`Mul`/`Div` code.
+    // Operator `Add`/`Sub`/`Mul`/`Div` code.
     try testing.expectEqualStrings("T0028", str(.T0028).?);
     try testing.expectEqualStrings("missing-arith-impl", slug(.T0028).?);
     try testing.expectEqual(Code.T0028, fromStr("T0028").?);
 
-    // M18 structural `Eq` derive blocker code.
+    // Structural `Eq` derive blocker code.
     try testing.expectEqualStrings("T0029", str(.T0029).?);
     try testing.expectEqualStrings("non-derivable-field", slug(.T0029).?);
     try testing.expectEqual(Code.T0029, fromStr("T0029").?);
 
-    // M20 structural `Hash` derive blocker code.
+    // Structural `Hash` derive blocker code.
     try testing.expectEqualStrings("T0030", str(.T0030).?);
     try testing.expectEqualStrings("non-hashable-field", slug(.T0030).?);
     try testing.expectEqual(Code.T0030, fromStr("T0030").?);
 
-    // M22 `print`/structural `Display` derive blocker code.
+    // `print`/structural `Display` derive blocker code.
     try testing.expectEqualStrings("T0031", str(.T0031).?);
     try testing.expectEqualStrings("non-displayable-arg", slug(.T0031).?);
     try testing.expectEqual(Code.T0031, fromStr("T0031").?);
 
-    // M24 `?` operator diagnostics.
+    // `?` operator diagnostics.
     try testing.expectEqualStrings("T0032", str(.T0032).?);
     try testing.expectEqualStrings("question-non-optionresult", slug(.T0032).?);
     try testing.expectEqual(Code.T0032, fromStr("T0032").?);
@@ -311,17 +311,17 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("question-constructor-mismatch", slug(.T0033).?);
     try testing.expectEqual(Code.T0033, fromStr("T0033").?);
 
-    // M1 integer-literal range code.
+    // Integer-literal range code.
     try testing.expectEqualStrings("T0034", str(.T0034).?);
     try testing.expectEqualStrings("literal-out-of-range", slug(.T0034).?);
     try testing.expectEqual(Code.T0034, fromStr("T0034").?);
 
-    // M7 alias-cycle code.
+    // Alias-cycle code.
     try testing.expectEqualStrings("T0035", str(.T0035).?);
     try testing.expectEqualStrings("alias-cycle", slug(.T0035).?);
     try testing.expectEqual(Code.T0035, fromStr("T0035").?);
 
-    // M9 malformed-char-literal code.
+    // Malformed-char-literal code.
     try testing.expectEqualStrings("T0036", str(.T0036).?);
     try testing.expectEqualStrings("malformed-char-literal", slug(.T0036).?);
     try testing.expectEqual(Code.T0036, fromStr("T0036").?);

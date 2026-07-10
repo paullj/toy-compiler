@@ -1,5 +1,5 @@
-# Feature: the implicit prelude protocol `Eq` (M12) conforms builtin scalars with no
-# import. `a.eq(b)` on int resolves via M11 method dispatch, typechecks to bool, and
+# Feature: the implicit prelude protocol `Eq` conforms builtin scalars with no
+# import. `a.eq(b)` on int resolves via method dispatch, typechecks to bool, and
 # lowers to an inline `icmp eq` — so this runs e2e on the current backend.
 # expect: exit 42
 fn main() -> int {

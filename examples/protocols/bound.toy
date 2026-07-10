@@ -1,4 +1,4 @@
-# Feature: a constrained generic `fn twice[T has Doubler](v: T)` (M13). The bound
+# Feature: a constrained generic `fn twice[T has Doubler](v: T)`. The bound
 # `[T has Doubler]` is checked ONCE against the protocol (bound-as-axiom): `v.dbl()`
 # resolves through `Doubler`'s signature, so the body compiles independent of any
 # instantiation. At the call `twice(P{..})` the bound resolves against `P`'s

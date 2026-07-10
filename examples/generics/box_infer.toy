@@ -1,6 +1,6 @@
-# Feature: inferred generic-struct construction (M5). `Box{ v: 1 }` omits the type
+# Feature: inferred generic-struct construction. `Box{ v: 1 }` omits the type
 # arg and infers `T` by matching the field VALUE type against the declared field
-# pattern (the M3 matcher over M4's `App`). The inferred `Box[int]` is content-addressed
+# pattern (the matcher over the `App` composite). The inferred `Box[int]` is content-addressed
 # to the SAME reified struct as the explicit `Box[int]{..}`, so both dedup to one
 # codegen unit; construction/access typecheck against the same interned instance.
 # expect: exit 42

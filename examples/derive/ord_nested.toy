@@ -1,5 +1,5 @@
 # Feature: structural `Ord`/`Eq` derive recurses through NESTED aggregates, `str` fields,
-# and MULTI-field enum payloads (M19). The derived `cmp` for `Person` calls `Name`'s derived
+# and MULTI-field enum payloads. The derived `cmp` for `Person` calls `Name`'s derived
 # `cmp` (a distinct source-less unit), which lexicographically compares its two `str` fields
 # via a heap-free byte loop; the derived `cmp` for `Tree` compares discriminants then the
 # variant's payload fields left-to-right. `==` on any of them routes through the same derived

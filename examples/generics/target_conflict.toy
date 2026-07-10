@@ -1,5 +1,5 @@
 # Feature: arg-derived vs expected-derived type-arg conflict is a deterministic error
-# (M7, T0015). Arg-derived bindings are AUTHORITATIVE — here the payload `true` binds
+# (T0015). Arg-derived bindings are AUTHORITATIVE — here the payload `true` binds
 # `T = bool`, but the annotation expects `Opt[int]`. Rather than silently letting the
 # downstream assignability check fire, the disagreement is reported right at the
 # construction as a type-parameter conflict.

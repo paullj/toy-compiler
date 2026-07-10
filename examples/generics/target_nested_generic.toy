@@ -1,7 +1,7 @@
-# Feature: irrefutability of a SUBSTITUTED generic-enum-instance payload (M6 carryover,
-# fixed in M7). `Wrap[T]`'s payload is `One[T]`; under `x: Wrap[int]` the pattern
+# Feature: irrefutability of a SUBSTITUTED generic-enum-instance payload (a carryover
+# bug, fixed later). `Wrap[T]`'s payload is `One[T]`; under `x: Wrap[int]` the pattern
 # `.w(.only(n))` nests a variant pattern over the substituted payload `One[int]` — which
-# is a composite `App`, not a plain `enumT`. The pre-M7 exhaustiveness walk treated an
+# is a composite `App`, not a plain `enumT`. The earlier exhaustiveness walk treated an
 # `App` payload as always-refutable and spuriously reported "non-exhaustive: missing
 # variant w"; the App-aware walk resolves `One[int]` as single-variant and total, so the
 # single-arm match is exhaustive.

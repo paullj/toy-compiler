@@ -1,10 +1,10 @@
 //! AArch64 (AAPCS64) calling-convention decisions — the ONE place that turns
 //! target-independent typed values into physical register/stack assignments
-//! (LOCK #3). The IR carries no registers, no frame offsets, no calling
+//! The IR carries no registers, no frame offsets, no calling
 //! convention; this module decides reg-pair vs indirect, x8 sret, and the
 //! NGRN/NSAA walk, given only a `Type` slice + the read-only layout tables.
 //!
-//! WHY a dedicated module: the M11 codegen smeared the SAME NGRN/NSAA walk
+//! WHY a dedicated module: the old codegen smeared the SAME NGRN/NSAA walk
 //! across THREE sites that drifted independently — the prologue param
 //! marshalling, `genCallInner`'s outbound args, and `measureOutgoingExpr`'s
 //! stack-byte budget. Any disagreement landed an argument at the wrong offset
@@ -16,9 +16,9 @@
 //! PURITY: every function here is pure over `Type` + `layouts`/`enum_layouts`
 //! (read-only). The plan-producing functions allocate a result slice only; no
 //! IO, no globals, no hashmaps over pointers. This is what keeps the dual-path
-//! VERIFY byte-identity re-lower sound (Driver [C11]).
+//! VERIFY byte-identity re-lower sound.
 //!
-//! AAPCS64 RULES reproduced EXACTLY from the M11 codegen (do NOT change):
+//! AAPCS64 RULES reproduced EXACTLY from the old codegen (do NOT change):
 //!   * scalar (int/bool) → 1 GPR if NGRN<8 else 8 stack bytes (NSAA).
 //!   * aggregate <=16B (str / small struct/enum) → a run of `ebs` (1 or 2)
 //!     eightbytes: if NGRN+ebs<=8 it takes regs {NGRN..}, NGRN+=ebs; else it
@@ -139,7 +139,7 @@ pub fn classifyRet(ty: Type, layouts: []const Layout, enum_layouts: []const Enum
 }
 
 /// The single source of truth for the AAPCS64 argument-placement walk. Both
-/// `planParams` and `planCall` route through here so the three M11 walks
+/// `planParams` and `planCall` route through here so the three walks
 /// (prologue / genCallInner / measureOutgoingExpr) can never drift again.
 ///
 /// Fills `out_locs[i]` for each `types_[i]` and returns the total NSAA byte

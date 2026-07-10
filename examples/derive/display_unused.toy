@@ -1,4 +1,4 @@
-# Feature: an UNUSED Display-eligible type synthesizes NO code (M22, lazy derive). `Unused`
+# Feature: an UNUSED Display-eligible type synthesizes NO code (lazy derive). `Unused`
 # could derive `Display` (all fields conform), but it is never `print`ed as a whole — only
 # its `int` field is — so no `Display$display$s*` unit is emitted (verify via `--emit ir`).
 # The lone `print(u.a)` renders an int via the heap-free `__display_int` builtin.

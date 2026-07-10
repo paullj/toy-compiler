@@ -1,6 +1,6 @@
-//! Spill-everything frame layout (LOCK #4).
+//! Spill-everything frame layout.
 //!
-//! Replaces the FOUR M11 frame-sizing walkers (countSlots*/collectSlots*,
+//! Replaces the FOUR frame-sizing walkers (countSlots*/collectSlots*,
 //! measureOutgoing*, measureDepth*/measureExpr, buildSlotTable temp logic) with
 //! ONE deterministic pass over the lowered `Ir.Function`. The rule is dead
 //! simple: every IR `Slot` AND every SSA `Value` gets its OWN stack slot, laid
@@ -24,7 +24,7 @@
 //!                       scalar 8).
 //!   [ value region   ]  each Ir.ValueDef: one slot, roundUp8(size) (scalars 8;
 //!                       an aggregate-typed value — should not occur under
-//!                       LOCK #2, aggregates live in slots — still gets a sized
+//!                       the value model, aggregates live in slots — still gets a sized
 //!                       cell defensively).
 //!   [ sret save slot ]  one 8-byte cell IF the return is a >16B aggregate (the
 //!                       incoming x8 is spilled here once; the body's calls
@@ -33,9 +33,9 @@
 //!
 //! DETERMINISM: pure, slice-indexed, no hashmaps / pointer iteration / globals.
 //! Same IR + layouts => same offsets => same bytes. This underpins the VERIFY
-//! byte-identity re-lower ([C11]).
+//! byte-identity re-lower.
 //!
-//! GUARDS (preserved from M11, surfaced as errors so codegen can emit the SAME
+//! GUARDS (preserved from the old codegen, surfaced as errors so codegen can emit the SAME
 //! diagnostic strings):
 //!   * frame > 4095          -> error.FrameTooLarge        ("function frame too
 //!                              large for codegen (too many locals)")

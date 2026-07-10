@@ -1,5 +1,5 @@
 # Feature: auto-derive fires when the ONLY `==` on a derivable struct is inside an
-# unbounded generic body (M18). Pass C skips unbounded templates, so the structural-Eq
+# unbounded generic body. Pass C skips unbounded templates, so the structural-Eq
 # request is first recorded during the mono-tail per-instance re-check; that re-check must
 # forward the request or `synthesizeDerives` mints no unit and the instance's `==` fails
 # to resolve at codegen.

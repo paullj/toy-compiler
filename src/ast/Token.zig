@@ -127,7 +127,7 @@ pub const Tag = enum(u8) {
     /// `]` — closes a generic-param list / type-application / call type-args.
     r_bracket,
 
-    // Inherent methods (M8). Appended at the END (frozen ordinal; `[]Token` is
+    // Inherent methods. Appended at the END (frozen ordinal; `[]Token` is
     // memcpy'd to/from the content cache). `impl` opens a keyword-led inherent-
     // method block `impl Type { fn .. }`. `self`/`Self` stay plain identifiers
     // recognized contextually by text (the `_` wildcard precedent) — NOT keywords.
@@ -135,7 +135,7 @@ pub const Tag = enum(u8) {
     /// `impl` — opens an inherent-method block for a concrete type.
     kw_impl,
 
-    // Mutating receiver (M9). Appended at the END (frozen ordinal; `[]Token` is
+    // Mutating receiver. Appended at the END (frozen ordinal; `[]Token` is
     // memcpy'd to/from the content cache). `mut` qualifies a method's `self`
     // receiver (`fn m(mut self, ..)`) so the receiver is passed by address and
     // mutated in place. It is a reserved keyword only in that position; the parser
@@ -144,7 +144,7 @@ pub const Tag = enum(u8) {
     /// `mut` — qualifies a `self` receiver as a by-address, in-place-mutating one.
     kw_mut,
 
-    // Protocols (M11). Appended at the END (frozen ordinals; `[]Token` is memcpy'd
+    // Protocols. Appended at the END (frozen ordinals; `[]Token` is memcpy'd
     // to/from the content cache). `protocol` opens a signature-only protocol decl;
     // `has` leads a conformance impl `impl T has P { .. }`. Both are reserved
     // keywords; the current corpus never uses either as an identifier.
@@ -154,7 +154,7 @@ pub const Tag = enum(u8) {
     /// `has` — the single conformance relation, leading `impl T has P { .. }`.
     kw_has,
 
-    // Postfix `?` (M24). Appended at the END (frozen ordinal; `[]Token` is memcpy'd
+    // Postfix `?`. Appended at the END (frozen ordinal; `[]Token` is memcpy'd
     // to/from the content cache). Punctuation, NOT a keyword — it lexes from the `?`
     // byte in `lexSymbol`, so it has NO `keywords` entry (the comptime kw_* guard is
     // unaffected). `o?` desugars below the parser to a match + early-return over
@@ -163,7 +163,7 @@ pub const Tag = enum(u8) {
     /// `?` — the postfix try operator (`o?` / `r?`).
     question,
 
-    // Bitwise / shift punctuation (M4). Appended at the END (frozen ordinals;
+    // Bitwise / shift punctuation. Appended at the END (frozen ordinals;
     // `[]Token` is memcpy'd to/from the content cache). NOT keywords.
     amp, // &
     caret, // ^
@@ -171,15 +171,15 @@ pub const Tag = enum(u8) {
     lt_lt, // <<
     gt_gt, // >>
 
-    // Modulo (M5). Appended at the END (frozen ordinal; `[]Token` is memcpy'd
+    // Modulo. Appended at the END (frozen ordinal; `[]Token` is memcpy'd
     // to/from the content cache). NOT a keyword.
     percent, // %
 
-    // `type` keyword (M7). Appended at END (frozen ordinal; `[]Token` is memcpy'd
+    // `type` keyword. Appended at END (frozen ordinal; `[]Token` is memcpy'd
     // to/from the content cache). A keyword, so it MUST have a `keywords` row below.
     kw_type, // `type Name = T`
 
-    // Char literals (M9). Appended at the END (frozen ordinals; `[]Token` is memcpy'd
+    // Char literals. Appended at the END (frozen ordinals; `[]Token` is memcpy'd
     // to/from the content cache). A `'`-quoted single Unicode scalar; the span covers
     // the two quotes and the (possibly multibyte / escaped) content between them —
     // `lexChar` mirrors `lexString`'s `\`-skip-2 scan but on `'`. NOT keywords.

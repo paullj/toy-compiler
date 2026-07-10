@@ -586,7 +586,7 @@ pub const Prelude = struct {
 ///     (a generic protocol's conformances are coherence-deduped, so at most one matches),
 ///     additionally filtered to `witness_pid` when given;
 ///   * without explicit args, `witness_pid == null` (general `v.m(..)` dispatch) and
-///     `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to `findMethod` (the pre-M14 path —
+///     `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to `findMethod` (the legacy path —
 ///     inherent, single conformance, prelude, generic instance) so no existing program's
 ///     dispatch/fingerprint changes;
 ///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`.
@@ -704,7 +704,7 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
 }
 
 /// The kind of a conversion the `Into`/`TryInto` recognizer accepts. `widen`/`narrow`
-/// are the int↔int cases (M3); the four `char_*`/`*_char` cases are M9's char surface.
+/// are the int↔int cases; the four `char_*`/`*_char` cases are the char surface.
 pub const ConvKind = enum { widen, narrow, char_to_int, byte_to_char, int_to_char, char_to_byte };
 
 /// Whether `t` is the compiler-provided `char` struct (`char_id` from the prelude). The
@@ -1613,11 +1613,11 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         try register.registerEnums(t, Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
 
-    // Phase 0-alias (M7): register each module's transparent `type X = Y` aliases and
+    // Phase 0-alias: register each module's transparent `type X = Y` aliases and
     // seed the prelude `byte = uint8` (if-absent). AFTER structs+enums (a target may be
     // either), BEFORE layout (0b) / fn-sig decode (A) so field/param/ret refs resolve
     // through a full alias map. BEFORE prelude, so a `type X = Ordering` (a prelude enum)
-    // is out of scope — the M7 corpus never needs it.
+    // is out of scope — the corpus never needs it.
     for (mods, 0..) |_, mi| {
         const mod: u32 = @intCast(mi);
         _ = t.gphSelect(mod);
@@ -2329,7 +2329,7 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // A bounded template's `type_var`-typed nodes must NOT land in the shared module
     // node_types (reify/codegen would choke on an ungrounded `type_var`). Type it into a
     // SCRATCH buffer so the module's slots stay `.invalid` for template nodes exactly as
-    // pre-M13; the scratch is discarded (a template is never a codegen unit — only its
+    // before; the scratch is discarded (a template is never a codegen unit — only its
     // reified instances are, and each instance re-check writes its OWN node_types).
     var scratch: []Type = &.{};
     if (f.isGeneric()) {
@@ -2734,7 +2734,7 @@ const testing = std.testing;
 const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
 
-test "M1: integer widths — width spelling + builtin scalar-method gate" {
+test "integer widths — width spelling + builtin scalar-method gate" {
     // The conformance-agreement half of this test (existence + structural both accept every
     // int width) moved to `conform.zig`'s keystone (which additionally pins the witness leaf).
     // What remains is the two facts that live in THIS module: `type_names` maps each width
@@ -2748,7 +2748,7 @@ test "M1: integer widths — width spelling + builtin scalar-method gate" {
     try testing.expect(Type.eql(type_names.get("uint").?, Type.uint));
 }
 
-test "M21: structural conformance on a recursive generic template terminates" {
+test "structural conformance on a recursive generic template terminates" {
     // `next: Node[T]` re-interns to the same App index, so without a coinductive
     // in-progress marker the conformance walk recurses until the stack overflows.
     // Reaching the assertions at all proves termination; the counts pin that a
@@ -2870,9 +2870,9 @@ test "clean program typechecks with zero diagnostics" {
     ));
 }
 
-test "M2: the generic-fn demo typechecks clean and monomorphizes one instance per type-arg" {
+test "the generic-fn demo typechecks clean and monomorphizes one instance per type-arg" {
     const gpa = testing.allocator;
-    // The M1 gate is NARROWED in M2: a generic FN + an explicit-args CALL now compile.
+    // The earlier gate is NARROWED here: a generic FN + an explicit-args CALL now compile.
     var c = try checkSource("fn id[T](x: T) -> T { x }\nstruct P { x: int, y: int }\nfn main() -> int {\n a := id[int](7)\n p := id[P](P{ x: 20, y: 15 })\n return a + p.x + p.y\n}\n");
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
@@ -2891,7 +2891,7 @@ test "M2: the generic-fn demo typechecks clean and monomorphizes one instance pe
     }
 }
 
-test "M2: repeated call sites of one (template,args) monomorphize to ONE instance (dedup)" {
+test "repeated call sites of one (template,args) monomorphize to ONE instance (dedup)" {
     const gpa = testing.allocator;
     var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int {\n a := id[int](1)\n b := id[int](2)\n c := id[int](3)\n return a + b + c\n}\n");
     defer c.deinit(gpa);
@@ -2900,9 +2900,9 @@ test "M2: repeated call sites of one (template,args) monomorphize to ONE instanc
     try testing.expectEqualStrings("main.id$int", c.result.instances[0].name.?);
 }
 
-test "M6: an uninstantiated generic enum (and struct) is clean and reifies NOTHING" {
+test "an uninstantiated generic enum (and struct) is clean and reifies NOTHING" {
     const gpa = testing.allocator;
-    // A generic enum decl is NO LONGER gated (M6 un-gates it); UNinstantiated it is
+    // A generic enum decl is NO LONGER gated; UNinstantiated it is
     // clean and emits ZERO reified enums (never a value type). The template `Opt`
     // occupies enum id 0 with `type_var` payload patterns, never laid out / lowered.
     var e = try checkSource("enum Opt[T] { some(T), none }\nfn main() -> int { return 0 }\n");
@@ -2914,11 +2914,11 @@ test "M6: an uninstantiated generic enum (and struct) is clean and reifies NOTHI
         if (std.mem.indexOfScalar(u8, el.name, '$') != null) reified += 1;
     }
     try testing.expectEqual(@as(usize, 0), reified);
-    // The un-gated generic STRUCT case stays clean too (M4 regression).
+    // The un-gated generic STRUCT case stays clean too (regression guard).
     try testing.expectEqual(@as(usize, 0), try checkDiagCount("struct Box[T] { v: T }\nfn main() -> int { return 0 }\n"));
 }
 
-test "M8: an inherent method typechecks clean; the call types to the method return; one method-table entry" {
+test "an inherent method typechecks clean; the call types to the method return; one method-table entry" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int, y: int }
@@ -2947,7 +2947,7 @@ test "M8: an inherent method typechecks clean; the call types to the method retu
     try testing.expect(found);
 }
 
-test "M8: a call to a missing method emits exactly one T0018 naming the receiver + method" {
+test "a call to a missing method emits exactly one T0018 naming the receiver + method" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -2964,7 +2964,7 @@ test "M8: a call to a missing method emits exactly one T0018 naming the receiver
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "P") != null);
 }
 
-test "M8: `Self` in a method signature resolves to the receiver type" {
+test "`Self` in a method signature resolves to the receiver type" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -2984,7 +2984,7 @@ test "M8: `Self` in a method signature resolves to the receiver type" {
     try testing.expectEqual(Kind.@"struct", c.result.sigs[gid].ret.kind);
 }
 
-test "M9: decodeFnSig sets Method.mut_self for `mut self` but not plain `self`; the Sig stays by-value" {
+test "decodeFnSig sets Method.mut_self for `mut self` but not plain `self`; the Sig stays by-value" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int, y: int }
@@ -3014,7 +3014,7 @@ test "M9: decodeFnSig sets Method.mut_self for `mut self` but not plain `self`; 
     }
 }
 
-test "M9: a mut-self method on a temporary emits T0019; on a local / a field of a local it does not" {
+test "a mut-self method on a temporary emits T0019; on a local / a field of a local it does not" {
     const gpa = testing.allocator;
     // On a temporary (the fresh construction): rejected.
     {
@@ -3051,7 +3051,7 @@ test "M9: a mut-self method on a temporary emits T0019; on a local / a field of 
     }
 }
 
-test "M12: a mut-self method on a builtin scalar receiver is rejected (T0022), even on a mutable local" {
+test "a mut-self method on a builtin scalar receiver is rejected (T0022), even on a mutable local" {
     const gpa = testing.allocator;
     // On a mutable local `int` place: the place check would pass, but the by-address
     // self ABI has no write-back path for a scalar, so exactly one T0022 fires (not
@@ -3084,7 +3084,7 @@ test "M12: a mut-self method on a builtin scalar receiver is rejected (T0022), e
     }
 }
 
-test "M10: a generic-type method typechecks clean; one template + one reified entry; call types to T" {
+test "a generic-type method typechecks clean; one template + one reified entry; call types to T" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Box[T] { v: T }
@@ -3131,7 +3131,7 @@ test "M10: a generic-type method typechecks clean; one template + one reified en
     try testing.expect(found);
 }
 
-test "M10: an UNCALLED generic-type method emits zero instances and zero reified-dispatch entries" {
+test "an UNCALLED generic-type method emits zero instances and zero reified-dispatch entries" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Box[T] { v: T }
@@ -3150,7 +3150,7 @@ test "M10: an UNCALLED generic-type method emits zero instances and zero reified
     try testing.expectEqual(@as(usize, 0), reified);
 }
 
-test "M10: Box[int] and Box[Point] .get() lower to two DISTINCT instances; an uncalled sibling method emits none" {
+test "Box[int] and Box[Point] .get() lower to two DISTINCT instances; an uncalled sibling method emits none" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Point { x: int, y: int }
@@ -3178,7 +3178,7 @@ test "M10: Box[int] and Box[Point] .get() lower to two DISTINCT instances; an un
     }
 }
 
-test "M10: a mut-self generic-type method carries mut_self on the template AND the reified entry" {
+test "a mut-self generic-type method carries mut_self on the template AND the reified entry" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Box[T] { v: T }
@@ -3203,7 +3203,7 @@ test "M10: a mut-self generic-type method carries mut_self on the template AND t
     try testing.expectEqual(@as(usize, 2), c.result.instances.len);
 }
 
-test "M10: calling a missing method on a generic-type instance emits T0018" {
+test "calling a missing method on a generic-type instance emits T0018" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Box[T] { v: T }
@@ -3220,8 +3220,8 @@ test "M10: calling a missing method on a generic-type instance emits T0018" {
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "nope") != null);
 }
 
-test "M10: an inherent impl on a CONCRETE type instance (impl Box[int]) is rejected, not monomorphized" {
-    // Coherence territory (M11): `impl Box[int]` has a fully-ground receiver App (no
+test "an inherent impl on a CONCRETE type instance (impl Box[int]) is rejected, not monomorphized" {
+    // Coherence territory: `impl Box[int]` has a fully-ground receiver App (no
     // type_var), so it is rejected at decode with a clear diagnostic and mints no
     // method — never a silent poison.
     const gpa = testing.allocator;
@@ -3238,12 +3238,12 @@ test "M10: an inherent impl on a CONCRETE type instance (impl Box[int]) is rejec
     try testing.expectEqual(@as(usize, 0), c.result.templates.len);
 }
 
-test "M15: builtinScalarMethod recognizes `eq` on all four scalars (pure, table-free)" {
+test "builtinScalarMethod recognizes `eq` on all four scalars (pure, table-free)" {
     try testing.expect(builtinScalarMethod(Type.int, "eq") != null);
     try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.int, "eq").?.ret.kind);
     try testing.expect(builtinScalarMethod(Type.bool, "eq") != null);
     try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.bool, "eq").?.ret.kind);
-    // M15: str (heap-free byte-compare) and unit (trivially true) now recognize `eq` -> bool.
+    // str (heap-free byte-compare) and unit (trivially true) now recognize `eq` -> bool.
     try testing.expect(builtinScalarMethod(Type.str, "eq") != null);
     try testing.expectEqual(Kind.bool, builtinScalarMethod(Type.str, "eq").?.ret.kind);
     try testing.expect(builtinScalarMethod(Type.unit, "eq") != null);
@@ -3288,7 +3288,7 @@ test "resolveConformanceMethod: an operator witness binds only its own protocol;
     try testing.expect(resolveConformanceMethod(&methods, P, "eq", null, null) == .ambiguous);
 
     // With a SINGLE conformance, general dispatch reaches the first same-named method (the
-    // inherent) — the pre-M14 `findMethod` behavior a plain `v.eq(7)` call still relies on.
+    // inherent) — the legacy `findMethod` behavior a plain `v.eq(7)` call still relies on.
     const single = [_]Method{
         .{ .recv = P, .name = "eq", .fn_id = 1 },
         .{ .recv = P, .name = "eq", .fn_id = 2, .protocol_id = eq_id },
@@ -3299,7 +3299,7 @@ test "resolveConformanceMethod: an operator witness binds only its own protocol;
     }
 }
 
-test "M20: builtinScalarMethod recognizes `hash` -> int (arity 0) on all four scalars" {
+test "builtinScalarMethod recognizes `hash` -> int (arity 0) on all four scalars" {
     inline for (.{ Type.int, Type.bool, Type.str, Type.unit }) |sc| {
         const bm = builtinScalarMethod(sc, "hash") orelse return error.TestUnexpectedResult;
         try testing.expectEqual(Kind.int, bm.ret.kind);
@@ -3310,7 +3310,7 @@ test "M20: builtinScalarMethod recognizes `hash` -> int (arity 0) on all four sc
     try testing.expect(builtinScalarMethod(Type.enumT(0), "hash") == null);
 }
 
-test "M12: a.eq(b) on int types the call to bool, zero diags, and pollutes no method entry" {
+test "a.eq(b) on int types the call to bool, zero diags, and pollutes no method entry" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -3337,7 +3337,7 @@ test "M12: a.eq(b) on int types the call to bool, zero diags, and pollutes no me
     try testing.expect(found);
 }
 
-test "M15: `==` on a struct with `impl P has Eq` types to bool, zero diags" {
+test "`==` on a struct with `impl P has Eq` types to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3364,7 +3364,7 @@ test "M15: `==` on a struct with `impl P has Eq` types to bool, zero diags" {
     try testing.expect(found);
 }
 
-test "M18: `==` on an all-Eq-fields struct with no impl DERIVES (was M15 T0026)" {
+test "`==` on an all-Eq-fields struct with no impl DERIVES (was T0026)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3376,14 +3376,14 @@ test "M18: `==` on an all-Eq-fields struct with no impl DERIVES (was M15 T0026)"
         \\
     );
     defer c.deinit(gpa);
-    // M18 turns the M15 error into a source-less structural derive: no diagnostic, and
+    // The former error is now a source-less structural derive: no diagnostic, and
     // exactly one synthetic recipe (`Eq` for P, struct id 0 -> `Eq$eq$s0`).
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
     try testing.expectEqualStrings("Eq$eq$s0", c.result.derives[0].name.?);
 }
 
-test "M19: `==` on a PAYLOAD enum with no impl now DERIVES Eq (M18 gap closed)" {
+test "`==` on a PAYLOAD enum with no impl now DERIVES Eq (gap closed)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum E { A(int), B }
@@ -3395,7 +3395,7 @@ test "M19: `==` on a PAYLOAD enum with no impl now DERIVES Eq (M18 gap closed)" 
         \\
     );
     defer c.deinit(gpa);
-    // M19: a payload enum's variant payloads recurse in `conforms`, so an all-`Eq`-payload
+    // A payload enum's variant payloads recurse in `conforms`, so an all-`Eq`-payload
     // enum structurally conforms -> one source-less `Eq` recipe (`Eq$eq$e0`), zero diags.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
@@ -3403,7 +3403,7 @@ test "M19: `==` on a PAYLOAD enum with no impl now DERIVES Eq (M18 gap closed)" 
     try testing.expectEqual(Derive.Kind.eq, c.result.derives[0].kind);
 }
 
-test "M19: `<` on a PAYLOAD enum with no impl DERIVES Ord (discriminant-then-payload)" {
+test "`<` on a PAYLOAD enum with no impl DERIVES Ord (discriminant-then-payload)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum N { Z, S(int) }
@@ -3421,7 +3421,7 @@ test "M19: `<` on a PAYLOAD enum with no impl DERIVES Ord (discriminant-then-pay
     try testing.expectEqual(Kind.@"enum", c.result.derives[0].ret.kind); // ret is `Ordering`
 }
 
-test "M15: str `==` and unit `==` type to bool (builtin-scalar Eq), zero diags" {
+test "str `==` and unit `==` type to bool (builtin-scalar Eq), zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn nothing() { return }
@@ -3436,7 +3436,7 @@ test "M15: str `==` and unit `==` type to bool (builtin-scalar Eq), zero diags" 
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M15: a bounded generic body `fn eq2[T has Eq](a: T, b: T) -> bool { a == b }` checks once" {
+test "a bounded generic body `fn eq2[T has Eq](a: T, b: T) -> bool { a == b }` checks once" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn eq2[T has Eq](a: T, b: T) -> bool { a == b }
@@ -3449,7 +3449,7 @@ test "M15: a bounded generic body `fn eq2[T has Eq](a: T, b: T) -> bool { a == b
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M15: `==` in a body bounded by a NON-Eq protocol is T0026 (bound is not the Eq axiom)" {
+test "`==` in a body bounded by a NON-Eq protocol is T0026 (bound is not the Eq axiom)" {
     const gpa = testing.allocator;
     // A bounded template body IS checked (bound-as-axiom); an UNBOUNDED one is skipped
     // (types.zig `unbounded template: skip as before`), so the type_var-conforms branch
@@ -3469,7 +3469,7 @@ test "M15: `==` in a body bounded by a NON-Eq protocol is T0026 (bound is not th
     try testing.expectEqual(@as(usize, 1), n26);
 }
 
-test "M15: a cross-type `==` (both Eq) stays a homogeneity error, never T0026" {
+test "a cross-type `==` (both Eq) stays a homogeneity error, never T0026" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3491,7 +3491,7 @@ test "M15: a cross-type `==` (both Eq) stays a homogeneity error, never T0026" {
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "same type") != null);
 }
 
-test "M12: a duplicate user `impl int has Eq` overlaps the builtin conformance (one T0020)" {
+test "a duplicate user `impl int has Eq` overlaps the builtin conformance (one T0020)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\impl int has Eq { fn eq(self, o: int) -> bool { true } }
@@ -3507,7 +3507,7 @@ test "M12: a duplicate user `impl int has Eq` overlaps the builtin conformance (
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "overlapping impl") != null);
 }
 
-test "M16: the prelude Ordering enum has variants lt=0/eq=1/gt=2 (the discriminant lower reads)" {
+test "the prelude Ordering enum has variants lt=0/eq=1/gt=2 (the discriminant lower reads)" {
     const gpa = testing.allocator;
     var c = try checkSource("fn main() -> int { return 0 }\n");
     defer c.deinit(gpa);
@@ -3525,7 +3525,7 @@ test "M16: the prelude Ordering enum has variants lt=0/eq=1/gt=2 (the discrimina
     try testing.expect(found);
 }
 
-test "M23: prelude Option/Result are registered generic enum templates with the right variants" {
+test "prelude Option/Result are registered generic enum templates with the right variants" {
     const gpa = testing.allocator;
     var c = try checkSource("fn main() -> int { return 0 }\n");
     defer c.deinit(gpa);
@@ -3554,7 +3554,7 @@ test "M23: prelude Option/Result are registered generic enum templates with the 
     try testing.expectEqual(@as(u32, 1), res.?.variants[1].field_types[0].typeVarOrd());
 }
 
-test "M23: Option[int] and Result[int,str] construct + match with no import; reify to concrete enums" {
+test "Option[int] and Result[int,str] construct + match with no import; reify to concrete enums" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -3578,7 +3578,7 @@ test "M23: Option[int] and Result[int,str] construct + match with no import; rei
     try testing.expect(res_int_str);
 }
 
-test "M23: a user `enum Option` shadows the prelude (user-first-wins)" {
+test "a user `enum Option` shadows the prelude (user-first-wins)" {
     // The prelude injection into each module's enum map is if-absent, so a user decl keeps
     // the name: `Option.red` here resolves to the USER enum's variants (the prelude Option
     // has only `some`/`none` and needs a type arg — so a leak-through would NOT type-check).
@@ -3591,7 +3591,7 @@ test "M23: a user `enum Option` shadows the prelude (user-first-wins)" {
 
 /// The `Kind` a method call `recv.member(..)` typed to (single-module test helper), or
 /// null if no such call node is present. Scans for a `.call` over a `field_access` whose
-/// member token matches — used by the M23 native-method typing tests.
+/// member token matches — used by the native-method typing tests.
 fn methodCallKind(c: Checked, member: []const u8) ?Kind {
     const nts = c.result.node_types[0];
     for (c.tree.nodes, 0..) |n, i| {
@@ -3603,7 +3603,7 @@ fn methodCallKind(c: Checked, member: []const u8) ?Kind {
     return null;
 }
 
-test "M23: Option native methods type to bool (predicates) / T (unwrap) with zero diags" {
+test "Option native methods type to bool (predicates) / T (unwrap) with zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -3625,7 +3625,7 @@ test "M23: Option native methods type to bool (predicates) / T (unwrap) with zer
     try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap_or").?);
 }
 
-test "M23: Result native methods type to bool (predicates) / T (unwrap) with zero diags" {
+test "Result native methods type to bool (predicates) / T (unwrap) with zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -3648,7 +3648,7 @@ test "M23: Result native methods type to bool (predicates) / T (unwrap) with zer
     try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap_or").?);
 }
 
-test "M23: unwrap_or with a wrong-typed default is exactly one diagnostic" {
+test "unwrap_or with a wrong-typed default is exactly one diagnostic" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[int].some(7)
@@ -3658,7 +3658,7 @@ test "M23: unwrap_or with a wrong-typed default is exactly one diagnostic" {
     ));
 }
 
-test "M23: a native predicate called with an argument is exactly one diagnostic (arity)" {
+test "a native predicate called with an argument is exactly one diagnostic (arity)" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[int].some(7)
@@ -3670,7 +3670,7 @@ test "M23: a native predicate called with an argument is exactly one diagnostic 
     ));
 }
 
-test "M23: an unknown method on Option is still exactly one T0018" {
+test "an unknown method on Option is still exactly one T0018" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -3684,7 +3684,7 @@ test "M23: an unknown method on Option is still exactly one T0018" {
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
-test "M23: a native method name on a user `enum Option` shadow is T0018, not the native path" {
+test "a native method name on a user `enum Option` shadow is T0018, not the native path" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum Option { red, green }
@@ -3699,7 +3699,7 @@ test "M23: a native method name on a user `enum Option` shadow is T0018, not the
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
-test "M23: unwrap on a str (non-scalar) payload is deferred — exactly one T0018, no crash" {
+test "unwrap on a str (non-scalar) payload is deferred — exactly one T0018, no crash" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -3714,7 +3714,7 @@ test "M23: unwrap on a str (non-scalar) payload is deferred — exactly one T001
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
-test "M23: unwrap_or on a str (non-scalar) payload is deferred — exactly one T0018" {
+test "unwrap_or on a str (non-scalar) payload is deferred — exactly one T0018" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[str].some("hi")
@@ -3725,7 +3725,7 @@ test "M23: unwrap_or on a str (non-scalar) payload is deferred — exactly one T
     ));
 }
 
-test "M23: unwrap on a struct payload is deferred — exactly one T0018, no crash" {
+test "unwrap on a struct payload is deferred — exactly one T0018, no crash" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3741,7 +3741,7 @@ test "M23: unwrap on a struct payload is deferred — exactly one T0018, no cras
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
-test "M23: unwrap_or on a struct payload is deferred — exactly one T0018, no crash" {
+test "unwrap_or on a struct payload is deferred — exactly one T0018, no crash" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3757,7 +3757,7 @@ test "M23: unwrap_or on a struct payload is deferred — exactly one T0018, no c
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
-test "M23: predicates stay native for a non-scalar payload (tag-only, safe)" {
+test "predicates stay native for a non-scalar payload (tag-only, safe)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -3775,7 +3775,7 @@ test "M23: predicates stay native for a non-scalar payload (tag-only, safe)" {
 }
 
 /// The `Kind` the (first) `try_expr` node typed to (single-module test helper), or null
-/// if none is present. Used by the M24 `?` typing tests.
+/// if none is present. Used by the `?` typing tests.
 fn tryExprKind(c: Checked) ?Kind {
     const nts = c.result.node_types[0];
     for (c.tree.nodes, 0..) |n, i| {
@@ -3784,7 +3784,7 @@ fn tryExprKind(c: Checked) ?Kind {
     return null;
 }
 
-test "M24: `?` on Option[int] in an Option fn types to the payload (int), zero diags" {
+test "`?` on Option[int] in an Option fn types to the payload (int), zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn get(o: Option[int]) -> Option[int] {
@@ -3799,7 +3799,7 @@ test "M24: `?` on Option[int] in an Option fn types to the payload (int), zero d
     try testing.expectEqual(Kind.int, tryExprKind(c).?);
 }
 
-test "M24: `?` on Result[int,str] in a matching Result fn types to the ok payload (int), zero diags" {
+test "`?` on Result[int,str] in a matching Result fn types to the ok payload (int), zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn use(o: Result[int, str]) -> Result[int, str] {
@@ -3814,7 +3814,7 @@ test "M24: `?` on Result[int,str] in a matching Result fn types to the ok payloa
     try testing.expectEqual(Kind.int, tryExprKind(c).?);
 }
 
-test "M24: `?` in a fn returning a non-Option/Result is exactly one T0032" {
+test "`?` in a fn returning a non-Option/Result is exactly one T0032" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn f(o: Option[int]) -> int {
@@ -3829,7 +3829,7 @@ test "M24: `?` in a fn returning a non-Option/Result is exactly one T0032" {
     try testing.expectEqual(codes.Code.T0032, c.result.diags[0].code);
 }
 
-test "M24: `?` on a non-Option/Result operand is exactly one T0032" {
+test "`?` on a non-Option/Result operand is exactly one T0032" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn f(n: int) -> Option[int] {
@@ -3844,7 +3844,7 @@ test "M24: `?` on a non-Option/Result operand is exactly one T0032" {
     try testing.expectEqual(codes.Code.T0032, c.result.diags[0].code);
 }
 
-test "M24: `?` on an Option inside a Result fn is exactly one T0033 (family mismatch)" {
+test "`?` on an Option inside a Result fn is exactly one T0033 (family mismatch)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn f(o: Option[int]) -> Result[int, str] {
@@ -3859,7 +3859,7 @@ test "M24: `?` on an Option inside a Result fn is exactly one T0033 (family mism
     try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
 }
 
-test "M24: `?` inside a generic Option fn typechecks clean and monomorphizes the instance" {
+test "`?` inside a generic Option fn typechecks clean and monomorphizes the instance" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn passthru[T](o: Option[T]) -> Option[T] {
@@ -3879,7 +3879,7 @@ test "M24: `?` inside a generic Option fn typechecks clean and monomorphizes the
     try testing.expect(found);
 }
 
-test "M24: `?` on Result[_,E1] in a Result[_,E2] fn is exactly one T0033 (error-type mismatch)" {
+test "`?` on Result[_,E1] in a Result[_,E2] fn is exactly one T0033 (error-type mismatch)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn f(o: Result[int, bool]) -> Result[int, str] {
@@ -3894,7 +3894,7 @@ test "M24: `?` on Result[_,E1] in a Result[_,E2] fn is exactly one T0033 (error-
     try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
 }
 
-test "M25: `?` widens Result error via `impl BigErr has From[SmallErr]` — zero diags, From witness stamped" {
+test "`?` widens Result error via `impl BigErr has From[SmallErr]` — zero diags, From witness stamped" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum SmallErr { bad }
@@ -3931,7 +3931,7 @@ test "M25: `?` widens Result error via `impl BigErr has From[SmallErr]` — zero
     try testing.expect(found_from);
 }
 
-test "M25: `?` on differing Result errors with NO From impl is exactly one T0033" {
+test "`?` on differing Result errors with NO From impl is exactly one T0033" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum SmallErr { bad }
@@ -3948,7 +3948,7 @@ test "M25: `?` on differing Result errors with NO From impl is exactly one T0033
     try testing.expectEqual(codes.Code.T0033, c.result.diags[0].code);
 }
 
-test "M25: multi-conformance From[Src] on one target error type is disambiguated by the operand error type" {
+test "multi-conformance From[Src] on one target error type is disambiguated by the operand error type" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum E1 { a }
@@ -3973,7 +3973,7 @@ test "M25: multi-conformance From[Src] on one target error type is disambiguated
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M25: a From impl whose `from` returns the WRONG type still trips T0024 (coherence)" {
+test "a From impl whose `from` returns the WRONG type still trips T0024 (coherence)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum SmallErr { bad }
@@ -3990,7 +3990,7 @@ test "M25: a From impl whose `from` returns the WRONG type still trips T0024 (co
     try testing.expectEqual(codes.Code.T0024, c.result.diags[0].code);
 }
 
-test "M16: `<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {
+test "`<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4027,7 +4027,7 @@ test "M16: `<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zer
     try testing.expect(n_cmp >= 4);
 }
 
-test "M16: int/str/bool `<` type to bool (builtin Ord), zero diags" {
+test "int/str/bool `<` type to bool (builtin Ord), zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -4042,7 +4042,7 @@ test "M16: int/str/bool `<` type to bool (builtin Ord), zero diags" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M19: `<` on a struct with no `Ord` impl now DERIVES Ord (was M16 T0027)" {
+test "`<` on a struct with no `Ord` impl now DERIVES Ord (was T0027)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4054,7 +4054,7 @@ test "M19: `<` on a struct with no `Ord` impl now DERIVES Ord (was M16 T0027)" {
         \\
     );
     defer c.deinit(gpa);
-    // M19: an all-`Ord`-fields struct with no explicit impl derives structurally — no
+    // An all-`Ord`-fields struct with no explicit impl derives structurally — no
     // diagnostic, exactly one `Ord` recipe (`Ord$cmp$s0`), which also fills `(Eq, P)`.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
@@ -4062,7 +4062,7 @@ test "M19: `<` on a struct with no `Ord` impl now DERIVES Ord (was M16 T0027)" {
     try testing.expectEqual(Derive.Kind.ord, c.result.derives[0].kind);
 }
 
-test "M19: struct used with BOTH `<` and `==` yields ONE Ord unit (no double-fire)" {
+test "struct used with BOTH `<` and `==` yields ONE Ord unit (no double-fire)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int, y: int }
@@ -4084,7 +4084,7 @@ test "M19: struct used with BOTH `<` and `==` yields ONE Ord unit (no double-fir
     for (c.result.derives) |d| try testing.expect(d.kind != .eq);
 }
 
-test "M19: explicit `impl P has Ord` OVERRIDES the derive (zero synthetic units)" {
+test "explicit `impl P has Ord` OVERRIDES the derive (zero synthetic units)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4105,7 +4105,7 @@ test "M19: explicit `impl P has Ord` OVERRIDES the derive (zero synthetic units)
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M19: an UNUSED derivable struct emits zero derive recipes" {
+test "an UNUSED derivable struct emits zero derive recipes" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Q { v: int }
@@ -4120,7 +4120,7 @@ test "M19: an UNUSED derivable struct emits zero derive recipes" {
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M19: nested-struct + struct-with-payload-enum-field both derive Ord recursively" {
+test "nested-struct + struct-with-payload-enum-field both derive Ord recursively" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Inner { a: int, b: int }
@@ -4141,7 +4141,7 @@ test "M19: nested-struct + struct-with-payload-enum-field both derive Ord recurs
     for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.ord, d.kind);
 }
 
-test "M20: `.hash()` on an all-Hash-fields struct with no impl DERIVES exactly one recipe" {
+test "`.hash()` on an all-Hash-fields struct with no impl DERIVES exactly one recipe" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int, y: int }
@@ -4163,7 +4163,7 @@ test "M20: `.hash()` on an all-Hash-fields struct with no impl DERIVES exactly o
     try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
 }
 
-test "M20: `.hash()` on a PAYLOAD enum derives one Hash recipe (Hash$hash$e0)" {
+test "`.hash()` on a PAYLOAD enum derives one Hash recipe (Hash$hash$e0)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum E { A(int), B }
@@ -4179,7 +4179,7 @@ test "M20: `.hash()` on a PAYLOAD enum derives one Hash recipe (Hash$hash$e0)" {
     try testing.expectEqual(Derive.Kind.hash, c.result.derives[0].kind);
 }
 
-test "M20: `.hash()` recurses through a NESTED aggregate + str field (two recipes)" {
+test "`.hash()` recurses through a NESTED aggregate + str field (two recipes)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Name { first: str, last: str }
@@ -4198,7 +4198,7 @@ test "M20: `.hash()` recurses through a NESTED aggregate + str field (two recipe
     for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.hash, d.kind);
 }
 
-test "M20: an UNUSED derivable struct records zero Hash recipes (lazy)" {
+test "an UNUSED derivable struct records zero Hash recipes (lazy)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Q { v: int }
@@ -4213,7 +4213,7 @@ test "M20: an UNUSED derivable struct records zero Hash recipes (lazy)" {
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M20: explicit `impl P has Hash` OVERRIDES the derive (zero synthetic units)" {
+test "explicit `impl P has Hash` OVERRIDES the derive (zero synthetic units)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4232,7 +4232,7 @@ test "M20: explicit `impl P has Hash` OVERRIDES the derive (zero synthetic units
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M20: Hash and Eq of the SAME struct are INDEPENDENT recipes (no refinement)" {
+test "Hash and Eq of the SAME struct are INDEPENDENT recipes (no refinement)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4258,7 +4258,7 @@ test "M20: Hash and Eq of the SAME struct are INDEPENDENT recipes (no refinement
     try testing.expect(saw_hash);
 }
 
-test "M20: firstNonConformingField names the field blocking a `Hash` derive (T0030 substrate)" {
+test "firstNonConformingField names the field blocking a `Hash` derive (T0030 substrate)" {
     // T0030's message is built from `firstNonConformingField` (the SAME pid-parameterized
     // substrate T0029 uses). For a pure value-type program every scalar leaf conforms to
     // `Hash`, so this path is not reachable from source; a synthetic table WITHOUT a `str`
@@ -4287,7 +4287,7 @@ test "M20: firstNonConformingField names the field blocking a `Hash` derive (T00
     try testing.expect(Type.eql(Type.str, off.?.ty));
 }
 
-test "M22: `print(P{..})` on an all-Display-fields struct DERIVES exactly one recipe" {
+test "`print(P{..})` on an all-Display-fields struct DERIVES exactly one recipe" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int, y: int }
@@ -4307,7 +4307,7 @@ test "M22: `print(P{..})` on an all-Display-fields struct DERIVES exactly one re
     try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
 }
 
-test "M22: `print(enum value)` derives one Display recipe (Display$display$e0)" {
+test "`print(enum value)` derives one Display recipe (Display$display$e0)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum E { A(int), B }
@@ -4323,7 +4323,7 @@ test "M22: `print(enum value)` derives one Display recipe (Display$display$e0)" 
     try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
 }
 
-test "M22: `print` recurses through a NESTED aggregate (two Display recipes)" {
+test "`print` recurses through a NESTED aggregate (two Display recipes)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Point { x: int, y: int }
@@ -4341,7 +4341,7 @@ test "M22: `print` recurses through a NESTED aggregate (two Display recipes)" {
     for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.display, d.kind);
 }
 
-test "M22: an UNUSED Display-eligible struct records zero recipes (lazy)" {
+test "an UNUSED Display-eligible struct records zero recipes (lazy)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Q { v: int }
@@ -4358,7 +4358,7 @@ test "M22: an UNUSED Display-eligible struct records zero recipes (lazy)" {
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M22: explicit `impl P has Display` OVERRIDES the derive (zero synthetic units)" {
+test "explicit `impl P has Display` OVERRIDES the derive (zero synthetic units)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4377,7 +4377,7 @@ test "M22: explicit `impl P has Display` OVERRIDES the derive (zero synthetic un
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M22: `print(\"..\")` still types clean and derives nothing (str path unchanged)" {
+test "`print(\"..\")` still types clean and derives nothing (str path unchanged)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() {
@@ -4390,7 +4390,7 @@ test "M22: `print(\"..\")` still types clean and derives nothing (str path uncha
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M10/C4: `print('A')` derives ONE shared char Display witness (UTF-8 encoder, not inlined)" {
+test "`print('A')` derives ONE shared char Display witness (UTF-8 encoder, not inlined)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() {
@@ -4411,7 +4411,7 @@ test "M10/C4: `print('A')` derives ONE shared char Display witness (UTF-8 encode
     try testing.expectEqual(c.result.char_struct.?, c.result.derives[0].conform_ty.struct_id);
 }
 
-test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {
+test "Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4440,7 +4440,7 @@ test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero dia
     try testing.expect(found);
 }
 
-test "M16: a bounded generic body `fn lt2[T has Ord](a: T, b: T) -> bool { a < b }` checks once" {
+test "a bounded generic body `fn lt2[T has Ord](a: T, b: T) -> bool { a < b }` checks once" {
     const gpa = testing.allocator;
     // A bounded template body IS checked (bound-as-axiom); `T has Ord` gives `T` the `Ord`
     // axiom, so `a < b` types clean. Exercises the `conformsToOrd` type_var branch.
@@ -4455,7 +4455,7 @@ test "M16: a bounded generic body `fn lt2[T has Ord](a: T, b: T) -> bool { a < b
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M16: `<` in a body bounded by a NON-Ord protocol is T0027 (bound is not the Ord axiom)" {
+test "`<` in a body bounded by a NON-Ord protocol is T0027 (bound is not the Ord axiom)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Doubler { fn dbl(self) -> int }
@@ -4471,7 +4471,7 @@ test "M16: `<` in a body bounded by a NON-Ord protocol is T0027 (bound is not th
     try testing.expectEqual(@as(usize, 1), n27);
 }
 
-test "M16: explicit `impl P has Eq` alongside `impl P has Ord` yields no T0020 (explicit authoritative)" {
+test "explicit `impl P has Eq` alongside `impl P has Ord` yields no T0020 (explicit authoritative)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4492,7 +4492,7 @@ test "M16: explicit `impl P has Eq` alongside `impl P has Ord` yields no T0020 (
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M17: `+`/`-`/`*`/`/` on a struct with the matching impl type to the operand type, zero diags" {
+test "`+`/`-`/`*`/`/` on a struct with the matching impl type to the operand type, zero diags" {
     const gpa = testing.allocator;
     // 0 diags proves each `(Add/Sub/Mul/Div, V2)` conformance resolves (the operator would
     // otherwise be T0028); every top-level arithmetic binary types to the operand struct
@@ -4519,7 +4519,7 @@ test "M17: `+`/`-`/`*`/`/` on a struct with the matching impl type to the operan
     try testing.expect(n_arith >= 4);
 }
 
-test "M17: int `+`/`-`/`*`/`/` type to int (builtin, inline), zero diags" {
+test "int `+`/`-`/`*`/`/` type to int (builtin, inline), zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int { return 1 + 2 - 3 * 4 / 5 }
@@ -4529,7 +4529,7 @@ test "M17: int `+`/`-`/`*`/`/` type to int (builtin, inline), zero diags" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M17: `+` on a struct with no `Add` impl is exactly one T0028 at the operator" {
+test "`+` on a struct with no `Add` impl is exactly one T0028 at the operator" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct V2 { x: int, y: int }
@@ -4547,7 +4547,7 @@ test "M17: `+` on a struct with no `Add` impl is exactly one T0028 at the operat
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Add' impl") != null);
 }
 
-test "M17: `str + str` is T0028 (no builtin Add for str — never a silent allocation)" {
+test "`str + str` is T0028 (no builtin Add for str — never a silent allocation)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int { s := "a" + "b"
@@ -4564,7 +4564,7 @@ test "M17: `str + str` is T0028 (no builtin Add for str — never a silent alloc
     try testing.expectEqual(@as(usize, 1), n28);
 }
 
-test "M17: `bool + bool` is T0028 (no builtin Add for bool)" {
+test "`bool + bool` is T0028 (no builtin Add for bool)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn f(a: bool, b: bool) -> bool { a + b }
@@ -4579,7 +4579,7 @@ test "M17: `bool + bool` is T0028 (no builtin Add for bool)" {
     try testing.expectEqual(@as(usize, 1), n28);
 }
 
-test "M17: a cross-type `+` (int + str) stays a homogeneity error, never T0028" {
+test "a cross-type `+` (int + str) stays a homogeneity error, never T0028" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -4594,7 +4594,7 @@ test "M17: a cross-type `+` (int + str) stays a homogeneity error, never T0028" 
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "same type") != null);
 }
 
-test "M17: a user `impl P has Add` whose method returns non-Self is T0024 (Out=Self enforced)" {
+test "a user `impl P has Add` whose method returns non-Self is T0024 (Out=Self enforced)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int }
@@ -4609,7 +4609,7 @@ test "M17: a user `impl P has Add` whose method returns non-Self is T0024 (Out=S
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Add") != null);
 }
 
-test "M12: a user `impl int has (user protocol)` records a conformance and dispatches, no error" {
+test "a user `impl int has (user protocol)` records a conformance and dispatches, no error" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Dbl { fn dbl(self) -> int }
@@ -4629,7 +4629,7 @@ test "M12: a user `impl int has (user protocol)` records a conformance and dispa
     try testing.expectEqual(Kind.int, c.result.methods[0].recv.kind);
 }
 
-test "M12: the prelude `Eq` is nameable by BARE name with no import (user struct conformance)" {
+test "the prelude `Eq` is nameable by BARE name with no import (user struct conformance)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct S { x: int }
@@ -4648,7 +4648,7 @@ test "M12: the prelude `Eq` is nameable by BARE name with no import (user struct
     try testing.expectEqual(@as(usize, 1), c.result.methods.len);
 }
 
-test "M12: builtin `eq` arity / arg-type mismatch and unknown scalar method errors" {
+test "builtin `eq` arity / arg-type mismatch and unknown scalar method errors" {
     const gpa = testing.allocator;
     {
         // Arity: `a.eq()` wants exactly one argument.
@@ -4665,7 +4665,7 @@ test "M12: builtin `eq` arity / arg-type mismatch and unknown scalar method erro
         try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "expected int") != null);
     }
     {
-        // Unknown method on a scalar is a clean T0018 (was a raw non-coded diagnostic pre-M12).
+        // Unknown method on a scalar is a clean T0018 (was a raw non-coded diagnostic).
         var c = try checkSource("fn main() -> int {\n a := 1\n return if a.foo() { 1 } else { 0 }\n}\n");
         defer c.deinit(gpa);
         try testing.expectEqual(@as(usize, 1), c.result.diags.len);
@@ -4673,7 +4673,7 @@ test "M12: builtin `eq` arity / arg-type mismatch and unknown scalar method erro
     }
 }
 
-test "M13: a bounded generic compiles ONCE against the bound and monomorphizes over a conforming type" {
+test "a bounded generic compiles ONCE against the bound and monomorphizes over a conforming type" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Doubler { fn dbl(self) -> int }
@@ -4696,7 +4696,7 @@ test "M13: a bounded generic compiles ONCE against the bound and monomorphizes o
     try testing.expectEqualStrings("main.P.dbl$Doubler", c.result.instances[0].conformances[0].witness_syms[0]);
 }
 
-test "M13: reify grounds a bounded instance's conform_ty when the type-arg is a generic-aggregate App" {
+test "reify grounds a bounded instance's conform_ty when the type-arg is a generic-aggregate App" {
     const gpa = testing.allocator;
     // `Box[int]` structurally satisfies the `Eq` bound (its int field is Eq), so `eq2` is
     // instantiated with `conform_ty = App(Box,[int])`. After reify, the conform_ty copy
@@ -4721,7 +4721,7 @@ test "M13: reify grounds a bounded instance's conform_ty when the type-arg is a 
     try testing.expect(Type.eql(inst.args[0], inst.conformances[0].conform_ty));
 }
 
-test "M13: a non-conforming type at a bounded call is a use-site T0023 and skips the instance" {
+test "a non-conforming type at a bounded call is a use-site T0023 and skips the instance" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Doubler { fn dbl(self) -> int }
@@ -4741,7 +4741,7 @@ test "M13: a non-conforming type at a bounded call is a use-site T0023 and skips
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
 }
 
-test "M13: a conforming impl whose method signature diverges from the protocol is T0024" {
+test "a conforming impl whose method signature diverges from the protocol is T0024" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Doubler { fn dbl(self) -> int }
@@ -4757,7 +4757,7 @@ test "M13: a conforming impl whose method signature diverges from the protocol i
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Doubler") != null);
 }
 
-test "M13: calling a method NOT in the bound protocol from a bounded body is T0018 (bound-as-axiom)" {
+test "calling a method NOT in the bound protocol from a bounded body is T0018 (bound-as-axiom)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Doubler { fn dbl(self) -> int }
@@ -4781,7 +4781,7 @@ test "M13: calling a method NOT in the bound protocol from a bounded body is T00
     try testing.expectEqual(@as(usize, 0), c.result.instances.len); // poisoned: not instantiated
 }
 
-test "M13: an undeclared bound protocol on a generic param is T0021 at the bound ref" {
+test "an undeclared bound protocol on a generic param is T0021 at the bound ref" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn twice[T has Ghost](v: T) -> int { 0 }
@@ -4793,7 +4793,7 @@ test "M13: an undeclared bound protocol on a generic param is T0021 at the bound
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Ghost") != null);
 }
 
-test "M14: a doubly-conforming generic protocol registers TWO methods with NO T0020" {
+test "a doubly-conforming generic protocol registers TWO methods with NO T0020" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Into[U] { fn into(self) -> U }
@@ -4824,7 +4824,7 @@ test "M14: a doubly-conforming generic protocol registers TWO methods with NO T0
     try testing.expect(saw_int and saw_bool);
 }
 
-test "M14: a concrete doubly-conforming use with no type-args emits exactly one T0025" {
+test "a concrete doubly-conforming use with no type-args emits exactly one T0025" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Into[U] { fn into(self) -> U }
@@ -4854,7 +4854,7 @@ test "M14: a concrete doubly-conforming use with no type-args emits exactly one 
     try testing.expect(int_at < bool_at); // source order (Into[int] declared first)
 }
 
-test "M14: an explicit-args concrete use v.into[int]() selects the Into[int] witness, no error" {
+test "an explicit-args concrete use v.into[int]() selects the Into[int] witness, no error" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Into[U] { fn into(self) -> U }
@@ -4871,7 +4871,7 @@ test "M14: an explicit-args concrete use v.into[int]() selects the Into[int] wit
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M14: the generic-protocol e2e monomorphizes one bounded instance carrying its protocol_args" {
+test "the generic-protocol e2e monomorphizes one bounded instance carrying its protocol_args" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Into[U] { fn into(self) -> U }
@@ -4897,7 +4897,7 @@ test "M14: the generic-protocol e2e monomorphizes one bounded instance carrying 
     try testing.expect(std.mem.indexOf(u8, inst.conformances[0].witness_syms[0], "int") != null);
 }
 
-test "M14: a single generic conformance resolves with no explicit args (byte-identical dispatch)" {
+test "a single generic conformance resolves with no explicit args (byte-identical dispatch)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Into[U] { fn into(self) -> U }
@@ -4915,7 +4915,7 @@ test "M14: a single generic conformance resolves with no explicit args (byte-ide
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
-test "M14: a [T has Convert[U]] bound resolves after substituting U at the mono worklist" {
+test "a [T has Convert[U]] bound resolves after substituting U at the mono worklist" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\protocol Convert[U] { fn conv(self) -> U }
@@ -4937,7 +4937,7 @@ test "M14: a [T has Convert[U]] bound resolves after substituting U at the mono 
     try testing.expectEqual(Kind.int, c.result.instances[0].conformances[0].protocol_args[0].kind);
 }
 
-test "M4: Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {
+test "Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn main() -> int {\n b := Box[int]{ v: 41 }\n c := Box[int]{ v: 1 }\n return b.v + c.v\n}\n");
     defer c.deinit(gpa);
@@ -4959,7 +4959,7 @@ test "M4: Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {
     for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
 }
 
-test "M4: Box[int] and Box[bool] reify to TWO distinct concrete layouts" {
+test "Box[int] and Box[bool] reify to TWO distinct concrete layouts" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn use(x: bool) -> int { return 0 }\nfn main() -> int {\n a := Box[int]{ v: 7 }\n b := Box[bool]{ v: true }\n return a.v + use(b.v)\n}\n");
     defer c.deinit(gpa);
@@ -4973,7 +4973,7 @@ test "M4: Box[int] and Box[bool] reify to TWO distinct concrete layouts" {
     try testing.expect(saw_int and saw_bool);
 }
 
-test "M4: unbounded f[T]->f[Box[T]] is rejected with T0017 and TERMINATES (no hang)" {
+test "unbounded f[T]->f[Box[T]] is rejected with T0017 and TERMINATES (no hang)" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn go[T](x: T) { go[Box[T]](Box[Box[T]]{ v: x }) }\nfn main() { go[int](0) }\n");
     defer c.deinit(gpa);
@@ -4986,7 +4986,7 @@ test "M4: unbounded f[T]->f[Box[T]] is rejected with T0017 and TERMINATES (no ha
     try testing.expectEqual(@as(usize, 1), t0017);
 }
 
-test "M4: a non-generic struct with a concrete generic-struct field compiles + reifies" {
+test "a non-generic struct with a concrete generic-struct field compiles + reifies" {
     const gpa = testing.allocator;
     // `S` is non-generic but embeds `Box[int]`; the field `App` is reified to a
     // `structT` and rewritten away, and construction/access typecheck against the
@@ -5007,7 +5007,7 @@ test "M4: a non-generic struct with a concrete generic-struct field compiles + r
     try testing.expectEqual(Kind.@"struct", s_layout.?.field_types[0].kind);
 }
 
-test "M4: a non-generic enum with a concrete generic-struct payload reifies (no App survives the enum snapshot)" {
+test "a non-generic enum with a concrete generic-struct payload reifies (no App survives the enum snapshot)" {
     const gpa = testing.allocator;
     // Regression (check-vs-build differential): `enum E { some(Box[int]) }` carries a
     // ground `App` in its variant payload. Before the fix, layoutEnum sized the `.app`
@@ -5041,7 +5041,7 @@ test "M4: a non-generic enum with a concrete generic-struct payload reifies (no 
     try testing.expect(saw_some_box);
 }
 
-test "M4: a legitimately deep-but-finite generic-struct nest still compiles" {
+test "a legitimately deep-but-finite generic-struct nest still compiles" {
     const gpa = testing.allocator;
     // Box[Box[Box[int]]] is finite (depth 3, well under the cap) — no T0017.
     var c = try checkSource("struct Box[T] { v: T }\nfn main() -> int {\n b := Box[Box[Box[int]]]{ v: Box[Box[int]]{ v: Box[int]{ v: 42 } } }\n return b.v.v.v\n}\n");
@@ -5055,7 +5055,7 @@ test "M4: a legitimately deep-but-finite generic-struct nest still compiles" {
     try testing.expectEqual(@as(usize, 3), reified_count);
 }
 
-test "M4: a generic struct with a generic-struct field reifies correctly with the wrapper declared FIRST" {
+test "a generic struct with a generic-struct field reifies correctly with the wrapper declared FIRST" {
     const gpa = testing.allocator;
     // Regression: `reifyAppToStruct` must claim its `struct_id` slot BEFORE `substReify`
     // recurses into the field's `App`. With `Wrapper` declared before `Box`, `Wrapper`'s
@@ -5083,7 +5083,7 @@ test "M4: a generic struct with a generic-struct field reifies correctly with th
     for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
 }
 
-test "M5: Box{v:1} infers Box[int] and dedups with explicit Box[int] to ONE reified struct" {
+test "Box{v:1} infers Box[int] and dedups with explicit Box[int] to ONE reified struct" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn main() -> int {\n b := Box[int]{ v: 41 }\n c := Box{ v: 1 }\n return b.v + c.v\n}\n");
     defer c.deinit(gpa);
@@ -5104,11 +5104,11 @@ test "M5: Box{v:1} infers Box[int] and dedups with explicit Box[int] to ONE reif
     try testing.expectEqual(@as(usize, 1), reified.?.field_types.len);
     try testing.expectEqual(Kind.int, reified.?.field_types[0].kind);
     try testing.expectEqual(@as(u32, 0), reified.?.offsets[0]);
-    // No `.app`/`.type_var` survives any node_types slot (the M4 invariant).
+    // No `.app`/`.type_var` survives any node_types slot (the reification invariant).
     for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
 }
 
-test "M5: an inferred Box{v:true} reifies a distinct Box$bool layout" {
+test "an inferred Box{v:true} reifies a distinct Box$bool layout" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn use(x: bool) -> int { return 0 }\nfn main() -> int {\n c := Box{ v: true }\n return use(c.v)\n}\n");
     defer c.deinit(gpa);
@@ -5120,7 +5120,7 @@ test "M5: an inferred Box{v:true} reifies a distinct Box$bool layout" {
     try testing.expect(saw_bool);
 }
 
-test "M5: conflicting inferred field types report exactly one T0015" {
+test "conflicting inferred field types report exactly one T0015" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Pair[T] { a: T, b: T }\nfn main() -> int {\n p := Pair{ a: 1, b: true }\n return 0\n}\n");
     defer c.deinit(gpa);
@@ -5131,7 +5131,7 @@ test "M5: conflicting inferred field types report exactly one T0015" {
     try testing.expectEqual(@as(usize, 1), n15);
 }
 
-test "M5: a phantom (uninferable) struct type-param routes to T0016" {
+test "a phantom (uninferable) struct type-param routes to T0016" {
     const gpa = testing.allocator;
     var c = try checkSource("struct P[T] { x: int }\nfn main() -> int {\n p := P{ x: 1 }\n return 0\n}\n");
     defer c.deinit(gpa);
@@ -5142,7 +5142,7 @@ test "M5: a phantom (uninferable) struct type-param routes to T0016" {
     try testing.expect(saw16);
 }
 
-test "M5: missing-field-with-inference still infers T then reports the missing field" {
+test "missing-field-with-inference still infers T then reports the missing field" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Pair[T] { a: T, b: T }\nfn main() -> int {\n p := Pair{ a: 1 }\n return 0\n}\n");
     defer c.deinit(gpa);
@@ -5159,7 +5159,7 @@ test "M5: missing-field-with-inference still infers T then reports the missing f
     try testing.expect(saw_missing);
 }
 
-test "M5: a unit-typed inferred field value is gated with T0013 before internApp" {
+test "a unit-typed inferred field value is gated with T0013 before internApp" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn nop() {}\nfn main() -> int {\n c := Box{ v: nop() }\n return 0\n}\n");
     defer c.deinit(gpa);
@@ -5170,7 +5170,7 @@ test "M5: a unit-typed inferred field value is gated with T0013 before internApp
     try testing.expect(saw13);
 }
 
-test "M6: the Either e2e typechecks clean and reifies exactly one concrete enum" {
+test "the Either e2e typechecks clean and reifies exactly one concrete enum" {
     const gpa = testing.allocator;
     var c = try checkSource("enum Either[L,R] { left(L), right(R) }\nfn main() -> int {\n e := Either[int,bool].left(42)\n return match e { .left(n) -> n, .right(_) -> 0 }\n}\n");
     defer c.deinit(gpa);
@@ -5208,7 +5208,7 @@ test "M6: the Either e2e typechecks clean and reifies exactly one concrete enum"
     for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(ty.kind != .app and ty.kind != .type_var);
 }
 
-test "M6: a reified enum's payload offsets/size match a hand-written non-generic twin" {
+test "a reified enum's payload offsets/size match a hand-written non-generic twin" {
     const gpa = testing.allocator;
     // `Pair[int,int]` (reg-pair payload, size 16) vs `Wrap[str]` (str payload: a 16-byte
     // aggregate => size 24, the indirect boundary). Compare each reified layout against a
@@ -5253,7 +5253,7 @@ test "M6: a reified enum's payload offsets/size match a hand-written non-generic
     try testing.expectEqual(w_c.?.payload_off, w_g.?.payload_off);
 }
 
-test "M6: Opt.none with no target reports exactly one T0016 (deterministic)" {
+test "Opt.none with no target reports exactly one T0016 (deterministic)" {
     const gpa = testing.allocator;
     var c = try checkSource("enum Opt[T] { some(T), none }\nfn main() -> int {\n x := Opt.none\n return 0\n}\n");
     defer c.deinit(gpa);
@@ -5266,7 +5266,7 @@ test "M6: Opt.none with no target reports exactly one T0016 (deterministic)" {
     for (c.result.enum_layouts) |el| try testing.expect(std.mem.indexOfScalar(u8, el.name, '$') == null);
 }
 
-test "M6: a construction payload-type mismatch reports one clean error (proves L->int subst)" {
+test "a construction payload-type mismatch reports one clean error (proves L->int subst)" {
     const gpa = testing.allocator;
     // `Either[int,bool].left(true)`: `left`'s payload pattern `L` substitutes to `int`,
     // so passing a `bool` is a mismatch — proving the substitution actually happened.
@@ -5279,7 +5279,7 @@ test "M6: a construction payload-type mismatch reports one clean error (proves L
     try testing.expect(saw);
 }
 
-test "M6: an M5-style inferred construction Wrap.w(5) dedups with explicit Wrap[int].w(5)" {
+test "an inferred construction Wrap.w(5) dedups with explicit Wrap[int].w(5)" {
     const gpa = testing.allocator;
     var c = try checkSource("enum Wrap[T] { w(T) }\nfn use(x: Wrap[int]) -> int { return 0 }\nfn main() -> int {\n a := use(Wrap[int].w(5))\n b := use(Wrap.w(6))\n return a + b\n}\n");
     defer c.deinit(gpa);
@@ -5293,7 +5293,7 @@ test "M6: an M5-style inferred construction Wrap.w(5) dedups with explicit Wrap[
     try testing.expectEqual(@as(usize, 1), count);
 }
 
-test "M6: a non-generic struct field of a generic-enum instance reifies + rewrites away" {
+test "a non-generic struct field of a generic-enum instance reifies + rewrites away" {
     const gpa = testing.allocator;
     // `struct S { o: Opt[int] }` embeds a concrete generic-enum instance; the field `App`
     // is reified to the concrete `Opt$int` enum and rewritten to a plain `enumT`.
@@ -5310,7 +5310,7 @@ test "M6: a non-generic struct field of a generic-enum instance reifies + rewrit
     for (s_layout.?.field_types) |ft| try testing.expect(ft.kind != .app and ft.kind != .type_var);
 }
 
-test "M6: unbounded generic-enum type-growth is rejected with T0017 and TERMINATES" {
+test "unbounded generic-enum type-growth is rejected with T0017 and TERMINATES" {
     const gpa = testing.allocator;
     // `enum L[T] { cons(T, L[Box[T]]), nil }` used as a ground type grows the payload
     // App forever (L[int] -> L[Box[int]] -> L[Box[Box[int]]] -> ...). Each level is a
@@ -5326,7 +5326,7 @@ test "M6: unbounded generic-enum type-growth is rejected with T0017 and TERMINAT
     try testing.expectEqual(@as(usize, 1), t0017);
 }
 
-test "M3: a bare (no-explicit-args) generic call infers its type-arg from the argument" {
+test "a bare (no-explicit-args) generic call infers its type-arg from the argument" {
     const gpa = testing.allocator;
     var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return id(7) }\n");
     defer c.deinit(gpa);
@@ -5337,7 +5337,7 @@ test "M3: a bare (no-explicit-args) generic call infers its type-arg from the ar
     try testing.expect(!c.result.instances[0].ret.isTypeVar());
 }
 
-test "M3: nested bare inference (snd(true, id(42))) infers all type-args; args are concrete" {
+test "nested bare inference (snd(true, id(42))) infers all type-args; args are concrete" {
     const gpa = testing.allocator;
     var c = try checkSource("fn snd[T,U](a: T, b: U) -> U { b }\nfn id[T](x: T) -> T { x }\nfn main() -> int { return snd(true, id(42)) }\n");
     defer c.deinit(gpa);
@@ -5363,7 +5363,7 @@ test "M3: nested bare inference (snd(true, id(42))) infers all type-args; args a
     try testing.expect(saw_snd);
 }
 
-test "M3: an inferred call and its explicit form DEDUP to ONE instance (byte-for-byte parity)" {
+test "an inferred call and its explicit form DEDUP to ONE instance (byte-for-byte parity)" {
     const gpa = testing.allocator;
     // Both `snd(true, id(42))` (inferred bool,int) and `snd[bool,int](true, 42)`
     // resolve to the SAME (gid, args) tuple, so they collapse to ONE `snd$bool$int`
@@ -5380,7 +5380,7 @@ test "M3: an inferred call and its explicit form DEDUP to ONE instance (byte-for
     try testing.expectEqual(@as(usize, 1), snd_count);
 }
 
-test "M3: a diverging (never) argument still infers the var from another concrete arg" {
+test "a diverging (never) argument still infers the var from another concrete arg" {
     const gpa = testing.allocator;
     // same[T](a:T,b:T): never at 0 binds nothing; int at 1 binds T=int. Check-only
     // (a break-less loop cannot run to an exit code).
@@ -5391,7 +5391,7 @@ test "M3: a diverging (never) argument still infers the var from another concret
     try testing.expectEqualStrings("main.same$int", c.result.instances[0].name.?);
 }
 
-test "M3: a conflicting bare call reports T0015 naming BOTH argument spans; mints no instance" {
+test "a conflicting bare call reports T0015 naming BOTH argument spans; mints no instance" {
     const gpa = testing.allocator;
     var c = try checkSource("fn same[T](a: T, b: T) -> T { a }\nfn main() -> int { return same(1, true) }\n");
     defer c.deinit(gpa);
@@ -5406,7 +5406,7 @@ test "M3: a conflicting bare call reports T0015 naming BOTH argument spans; mint
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
 }
 
-test "M3: a return-only generic call reports T0016 (explicit args required)" {
+test "a return-only generic call reports T0016 (explicit args required)" {
     const gpa = testing.allocator;
     var c = try checkSource("fn ro[T]() -> T { loop {} }\nfn main() -> int {\n ro()\n return 0\n}\n");
     defer c.deinit(gpa);
@@ -5418,7 +5418,7 @@ test "M3: a return-only generic call reports T0016 (explicit args required)" {
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
 }
 
-test "M3: explicit type args still override inference and satisfy an otherwise-uninferable call" {
+test "explicit type args still override inference and satisfy an otherwise-uninferable call" {
     const gpa = testing.allocator;
     // The return-only `ro[T]` is uninferable bare, but explicit `ro[int]()` compiles.
     var c = try checkSource("fn ro[T]() -> T { loop {} }\nfn main() -> int { return ro[int]() }\n");
@@ -5428,7 +5428,7 @@ test "M3: explicit type args still override inference and satisfy an otherwise-u
     try testing.expectEqualStrings("main.ro$int", c.result.instances[0].name.?);
 }
 
-test "M2: an uncalled generic fn mints ZERO instances (free in the binary)" {
+test "an uncalled generic fn mints ZERO instances (free in the binary)" {
     const gpa = testing.allocator;
     var c = try checkSource("fn id[T](x: T) -> T { x }\nfn main() -> int { return 0 }\n");
     defer c.deinit(gpa);
@@ -5804,9 +5804,9 @@ test "print of a string literal typechecks clean" {
     ));
 }
 
-test "M22: print of an int typechecks clean (Display, no longer an arg-type error)" {
-    // Pre-M22 `print` only took `str`, so `print(42)` was `argument 1: expected str, got int`.
-    // M22 reworks `print` into a polymorphic Display-accepting builtin: `int` conforms to the
+test "print of an int typechecks clean (Display, no longer an arg-type error)" {
+    // `print` formerly only took `str`, so `print(42)` was `argument 1: expected str, got int`.
+    // `print` is now a polymorphic Display-accepting builtin: `int` conforms to the
     // prelude `Display`, so `print(42)` is clean (no diagnostic) and derives nothing (int has
     // a prelude Display conformance, so `findConformance` wins over the structural path).
     const gpa = testing.allocator;
@@ -6360,7 +6360,7 @@ test "an enum node carries an @\"enum\" type with the right id" {
     try testing.expect(found);
 }
 
-test "M3: builtinConvMethod verdict table (widen/narrow/reject)" {
+test "builtinConvMethod verdict table (widen/narrow/reject)" {
     // into: same-sign widening/identity accepted, narrowing/sign-change rejected.
     try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.uint8, Type.uint, "into", null).?.kind);
     try testing.expectEqual(Type.uint, builtinConvMethod(Type.uint8, Type.uint, "into", null).?.target);
@@ -6376,7 +6376,7 @@ test "M3: builtinConvMethod verdict table (widen/narrow/reject)" {
     try testing.expect(builtinConvMethod(Type.uint8, Type.bool, "into", null) == null);
 }
 
-test "M9: builtinConvMethod char verdicts (char↔int/byte)" {
+test "builtinConvMethod char verdicts (char↔int/byte)" {
     const ch: u32 = 7; // any struct id stands in for `char`
     const char_ty = Type.structT(ch);
     // char -> int (into): lossless into any int ≥ 32 bits, either sign.
@@ -6394,13 +6394,13 @@ test "M9: builtinConvMethod char verdicts (char↔int/byte)" {
     try testing.expect(builtinConvMethod(char_ty, Type.int, "into", null) == null);
 }
 
-test "M3: witnessProtocolId resolves into/try_into to the bundle ids" {
+test "witnessProtocolId resolves into/try_into to the bundle ids" {
     const ids: PreludeProtocolIds = .{ .into = 9, .try_into = 10 };
     try testing.expectEqual(@as(?u32, 9), witnessProtocolId(ids, "into"));
     try testing.expectEqual(@as(?u32, 10), witnessProtocolId(ids, "try_into"));
 }
 
-test "M3: chained `wide.try_into().unwrap()` leaks the int target to try_into" {
+test "chained `wide.try_into().unwrap()` leaks the int target to try_into" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
@@ -6433,7 +6433,7 @@ test "M3: chained `wide.try_into().unwrap()` leaks the int target to try_into" {
     try testing.expect(saw_try_into and saw_unwrap);
 }
 
-test "M3: narrowing via `into` is rejected (no silent lossy conversion)" {
+test "narrowing via `into` is rejected (no silent lossy conversion)" {
     const gpa = testing.allocator;
     // uint -> uint8 is narrowing, so `into` (lossless-only) must NOT resolve: the recognizer
     // returns null and the call falls through to T0018 rather than silently truncating.

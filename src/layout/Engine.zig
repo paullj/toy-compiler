@@ -890,7 +890,7 @@ fn countDiag(h: *Harness, want: []const u8) usize {
     return c;
 }
 
-test "engine: layoutReified matches a hand-written struct's offsets/size/align (M4)" {
+test "engine: layoutReified matches a hand-written struct's offsets/size/align" {
     // A reified generic instance is laid out from pre-populated field_types (no decl
     // fields in the tree); its ABI math must equal the tree-driven `layoutStruct`.
     var h = Harness.init(testing.allocator);
@@ -931,7 +931,7 @@ test "engine: layoutReified matches a hand-written struct's offsets/size/align (
     try testing.expectEqual(@as(u32, 16), s2.size);
 }
 
-test "engine: layoutReifiedEnum matches a hand-written enum's tag/payload_off/size (M6)" {
+test "engine: layoutReifiedEnum matches a hand-written enum's tag/payload_off/size" {
     // A reified generic-enum instance is laid out from PRE-POPULATED concrete variants
     // (no decl variants in the tree); its ABI math must equal tree-driven `layoutEnum`.
     var h = Harness.init(testing.allocator);

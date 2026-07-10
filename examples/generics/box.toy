@@ -1,4 +1,4 @@
-# Feature: monomorphized generic STRUCTS with explicit type args (M4 [SECONDARY SPIKE]).
+# Feature: monomorphized generic STRUCTS with explicit type args.
 # `Box[T]` is a generic struct; `Box[int]` reifies to an ordinary concrete struct
 # (one int field, size 8) via the composite `App` type + the serial reification tail,
 # so codegen/fingerprint/cache see only a plain struct — no runtime dictionaries, no

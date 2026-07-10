@@ -1,5 +1,5 @@
-# Feature: a tuple struct with all-Hash fields derives `.hash()` structurally (M8 over
-# M20). Two structurally-equal tuples hash EQUAL (Eq-consistent, fixed seed).
+# Feature: a tuple struct with all-Hash fields derives `.hash()` structurally.
+# Two structurally-equal tuples hash EQUAL (Eq-consistent, fixed seed).
 # expect: exit 42
 struct Pair(int, int)
 

@@ -1,5 +1,5 @@
-# Feature (negative): `==`/`!=` desugar to `Eq::eq` (M15). A type that provably does not
-# conform to `Eq` is a compile-error at the operator (T0026). Post-M19, EVERY ground value
+# Feature (negative): `==`/`!=` desugar to `Eq::eq`. A type that provably does not
+# conform to `Eq` is a compile-error at the operator (T0026). Now EVERY ground value
 # type conforms structurally (a struct/enum derives `Eq` on demand — see
 # examples/derive/eq_payload_enum.toy), so the ONLY still-reachable T0026 is a generic body
 # whose type parameter is bounded by a protocol that is NOT `Eq`: the bound is the only axiom

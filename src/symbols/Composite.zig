@@ -165,7 +165,7 @@ test "intern is content-addressed: structurally-equal Apps share an index" {
     try testing.expectEqual(outer1, outer2);
 }
 
-test "M6: a struct-App and an enum-App with the SAME ctor intern to DIFFERENT indices" {
+test "a struct-App and an enum-App with the SAME ctor intern to DIFFERENT indices" {
     const gpa = testing.allocator;
     var c: Composite = .{};
     defer c.deinit(gpa);

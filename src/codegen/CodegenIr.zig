@@ -7,13 +7,13 @@
 //! label/fixup backpatch algorithm as the AST path, so branch encoding stays
 //! identical.
 //!
-//! VALUE MODEL (LOCK #2/#4): every SSA value AND every slot has its OWN frame
+//! VALUE MODEL: every SSA value AND every slot has its OWN frame
 //! cell (FrameLayout). An instruction loads its operands from their cells into
 //! scratch regs (x9/x10/x11), computes, and stores the result into the result
 //! value's cell. This is dead-simple and trivially correct; slot-coloring is a
 //! deferred optimization.
 //!
-//! BLOCK ARGS = STORE-BEFORE-BR ("phi = memory", LOCK #2): a `br dest(args)`
+//! BLOCK ARGS = STORE-BEFORE-BR ("phi = memory"): a `br dest(args)`
 //! edge stores each arg value into the destination block's param cell, THEN
 //! branches. Multi-arg edges load ALL sources into scratch first, then store,
 //! so a swap-style edge (param values feeding each other) is clobber-safe.
@@ -22,7 +22,7 @@
 //!
 //! DETERMINISM: blocks are walked in BlockId order; one label per block, placed
 //! and backpatched. Pure over the IR + read-only layout tables. Same IR + same
-//! layouts ⇒ same bytes (underpins VERIFY byte-identity, [C11]).
+//! layouts ⇒ same bytes (underpins VERIFY byte-identity).
 
 const std = @import("std");
 const Ir = @import("../ir/Ir.zig");
@@ -681,7 +681,7 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
         .trap => try g.emit(Aarch64.brk0), // Abort with SIGILL (unwrap-on-none/err).
-        .panic => try g.emit(Aarch64.brk0), // M5: SIGILL; M14 retargets to bl __panic(reason).
+        .panic => try g.emit(Aarch64.brk0), // SIGILL for now; will retarget to bl __panic(reason).
     }
 }
 
@@ -713,7 +713,7 @@ fn writeOperandTo(g: *Gen, pvid: Ir.ValueId, pty: Type, arg: Ir.Operand) error{O
         // An aggregate merge param: copy bytes from the source into the param's
         // frame cell. Both a `.slot` source and an aggregate `.value` source hold
         // the aggregate BYTES DIRECTLY in their frame cell (an aggregate value is
-        // spilled in place, never a pointer to the bytes — LOCK #2/#4), so the
+        // spilled in place, never a pointer to the bytes), so the
         // copy source is `SP + off` in both cases.
         const dst_off = g.valueOff(pvid);
         switch (arg) {

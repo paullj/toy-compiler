@@ -1,5 +1,5 @@
-# Feature: `+` on a value type with NO `Add` impl is a compile error at the operator (M17,
-# T0028). Unlike `Eq`/`Ord`, arithmetic has no structural auto-derive, so a user struct
+# Feature: `+` on a value type with NO `Add` impl is a compile error at the operator
+# (T0028). Unlike `Eq`/`Ord`, arithmetic has no structural auto-derive, so a user struct
 # must always spell out `impl V2 has Add` — otherwise `+` has no witness to desugar to.
 # expect: compile-error "requires an 'Add' impl"
 struct V2 { x: int, y: int }

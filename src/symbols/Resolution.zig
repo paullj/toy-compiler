@@ -17,7 +17,7 @@ pub const Resolution = union(enum) {
     /// table by it — the table is built in the same id space the resolver used.
     func: u32,
     /// An imported module namespace bound by an `import` decl (the `.` 4th
-    /// meaning, M14). Carries the GRAPH-GLOBAL module id of the imported module.
+    /// meaning). Carries the GRAPH-GLOBAL module id of the imported module.
     /// Written onto the *receiver* identifier of a `mod.member` field-access; the
     /// member itself (e.g. the callee `mod.fn`) is resolved on the field_access
     /// node to a `.func` (cross-module) or stays quiet for a qualified type/enum

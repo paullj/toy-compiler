@@ -1,8 +1,8 @@
-# Feature: structural `Ord` derive on a PAYLOAD enum (M19). Order is DISCRIMINANT (case
+# Feature: structural `Ord` derive on a PAYLOAD enum. Order is DISCRIMINANT (case
 # declaration) order first, then payload lexicographically — the SE-0266 total order. So
 # `Z < S(_)` (case 0 before case 1) and `S(1) < S(2)` (equal tag, payload decides). The
 # derived `cmp` also fills `Eq`, so `==` works via it. Exercises the discriminant-then-payload
-# walk and closes the M18 payload-enum gap in one type.
+# walk and closes the payload-enum gap in one type.
 enum N { Z, S(int) }
 
 fn main() -> int {

@@ -17,7 +17,7 @@
 //! struct/enum construction, field access, and `match` are LATER stages: they
 //! surface a clean diagnostic here so the IR stays well-formed.
 //!
-//! VALUE MODEL (LOCK #2): every scalar temporary is an SSA `Value` (defined once);
+//! VALUE MODEL: every scalar temporary is an SSA `Value` (defined once);
 //! merge values (if/loop/labeled-block/the fn return value) are carried as block
 //! params. A block param is itself a memory slot, written store-before-br at each
 //! predecessor (`phi = memory`) — but we emit that as `Terminator.br` carrying
@@ -804,8 +804,8 @@ pub const ord_eq: i64 = 1;
 pub const ord_gt: i64 = 2;
 
 /// Fixed-seed constants for the structural `Hash` derive's fxhash mixer
-/// `h := (rotl(h,5) ^ word) *% K` (see `hashMix`). M4 added the logical shift + xor +
-/// bitwise ops, so the mixer is now a real fxhash step, replacing the old no-bitwise FNV
+/// `h := (rotl(h,5) ^ word) *% K` (see `hashMix`). Adding the logical shift + xor +
+/// bitwise ops made the mixer a real fxhash step, replacing the old no-bitwise FNV
 /// polynomial. Every LOCKED constraint still holds: a FIXED seed (never randomized/per-run),
 /// deterministic, reproducible run-to-run AND byte-identical across `-jN`, and `Eq`-consistent
 /// (the emitter walks the SAME field order `Eq` does). The constants MUST fit i64 (`< 2^63`):
@@ -1463,7 +1463,7 @@ fn packLE(b: *Builder, bytes: []const Ir.ValueId) error{OutOfMemory}!Ir.ValueId 
 /// (cp<=0x7F / <=0x7FF / <=0xFFFF else 4-byte) packs the bytes LITTLE-ENDIAN into one word and
 /// does ONE `.store` into an 8-byte scratch slot: `.store` is a 64-bit STR (no store_byte op),
 /// so the high padding is written but never read — the `str` len is the true band width. The
-/// codepoint is a proven-valid scalar (M9's decode/try_into gates: 0..0x10FFFF, no surrogates)
+/// codepoint is a proven-valid scalar (the decode/try_into gates: 0..0x10FFFF, no surrogates)
 /// AND the char literal's 64-bit store zeroed the slot's high 4 bytes, so the loaded value has
 /// bit63 clear: unsigned band tests need no validity branch. Pure IR (fixed block/value ids,
 /// reads no map) → -jN- and O0≡O1-stable. Leaves the cursor at the join block.
@@ -1933,8 +1933,8 @@ fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index }
     return .{ .recv = cn.lhs };
 }
 
-/// A target-directed `.into()` / `.try_into()` conversion call on an integer receiver
-/// (M3): the callee is a `field_access` NOT bound to a `.func`, the receiver types to an
+/// A target-directed `.into()` / `.try_into()` conversion call on an integer receiver:
+/// the callee is a `field_access` NOT bound to a `.func`, the receiver types to an
 /// integer, the member is `into`/`try_into`, and there are zero args (the checker already
 /// gated arity + the target). Returns the receiver node + member so `lowerCall` can emit
 /// the inline mask/extend (`into`) or the range-checked `Result` build (`try_into`) — no
@@ -2134,7 +2134,7 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
             _ = try b.emit(.{ .store = .{ .addr = base, .val = v, .ty = Typecheck.Type.uint32 } }, null);
             return .{ .slot = slot };
         }
-        // int -> int widen (M3): `add v, 0` typed to the SOURCE width re-canonicalizes.
+        // int -> int widen: `add v, 0` typed to the SOURCE width re-canonicalizes.
         const v = operandValue(try lowerExpr(b, cv.recv));
         return .{ .value = try recanonToWidth(b, v, recv_ty) };
     }
@@ -2151,7 +2151,7 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     if (to_char) return convCallWitness(b, .conv_int_char, v, call_ty);
     if (recv_is_char) return convCallWitness(b, .conv_char_byte, v, call_ty);
 
-    // int→int narrow (M3/C1): a per-(width,signedness) family — no single program-global
+    // int→int narrow: a per-(width,signedness) family — no single program-global
     // witness — so it stays inline (see derive_synth: only the 2 char cases become recipes).
     const slot = try b.addSlot(call_ty);
     const base = try b.emit(.{ .slot_addr = slot }, int_ty);
@@ -3809,7 +3809,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
     return gpa.dupe(u8, w.buffered());
 }
 
-test "M15: struct == lowers to a call to the Eq witness (no inline icmp)" {
+test "struct == lowers to a call to the Eq witness (no inline icmp)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa,
         \\struct P { x: int }
@@ -3824,7 +3824,7 @@ test "M15: struct == lowers to a call to the Eq witness (no inline icmp)" {
     try testing.expect(std.mem.indexOf(u8, ir, "icmp") == null);
 }
 
-test "M15: str == lowers to a heap-free len-compare + per-byte load_byte loop" {
+test "str == lowers to a heap-free len-compare + per-byte load_byte loop" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa,
         \\fn cmp(a: str, b: str) -> bool { a == b }
@@ -3836,7 +3836,7 @@ test "M15: str == lowers to a heap-free len-compare + per-byte load_byte loop" {
     try testing.expect(std.mem.indexOf(u8, ir, "call") == null); // no witness fn, no heap
 }
 
-test "M15: unit == folds to bconst true" {
+test "unit == folds to bconst true" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa,
         \\fn nothing() { return }
@@ -3847,7 +3847,7 @@ test "M15: unit == folds to bconst true" {
     try testing.expect(std.mem.indexOf(u8, ir, "bconst true") != null);
 }
 
-test "M15: != wraps the Eq result in bnot" {
+test "!= wraps the Eq result in bnot" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa,
         \\struct P { x: int }
@@ -3860,7 +3860,7 @@ test "M15: != wraps the Eq result in bnot" {
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") != null);
 }
 
-test "M15: int == stays a single inline icmp eq (regression pin: bytes unchanged)" {
+test "int == stays a single inline icmp eq (regression pin: bytes unchanged)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa,
         \\fn cmp(a: int, b: int) -> bool { a == b }
@@ -3873,7 +3873,7 @@ test "M15: int == stays a single inline icmp eq (regression pin: bytes unchanged
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
 }
 
-test "M15: int != stays a single inline icmp ne (regression pin: no bnot)" {
+test "int != stays a single inline icmp ne (regression pin: no bnot)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa,
         \\fn cmp(a: int, b: int) -> bool { a != b }
@@ -3894,7 +3894,7 @@ const ord_impl_src =
     \\
 ;
 
-test "M16: struct `<` lowers to the cmp witness call + get_tag + `icmp eq` (no bnot)" {
+test "struct `<` lowers to the cmp witness call + get_tag + `icmp eq` (no bnot)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_lt(p: P, q: P) -> bool { p < q }\n", "use_lt");
     defer gpa.free(ir);
@@ -3906,7 +3906,7 @@ test "M16: struct `<` lowers to the cmp witness call + get_tag + `icmp eq` (no b
     try testing.expect(std.mem.indexOf(u8, ir, "load_byte") == null); // struct, not str
 }
 
-test "M16: struct `>=` lowers to the cmp witness call + get_tag + `icmp ne`" {
+test "struct `>=` lowers to the cmp witness call + get_tag + `icmp ne`" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_ge(p: P, q: P) -> bool { p >= q }\n", "use_ge");
     defer gpa.free(ir);
@@ -3916,7 +3916,7 @@ test "M16: struct `>=` lowers to the cmp witness call + get_tag + `icmp ne`" {
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
 }
 
-test "M16: int `<`/`<=`/`>`/`>=` stay a single inline icmp (regression pin: bytes unchanged)" {
+test "int `<`/`<=`/`>`/`>=` stay a single inline icmp (regression pin: bytes unchanged)" {
     const gpa = testing.allocator;
     const cases = [_]struct { src: []const u8, want: []const u8 }{
         .{ .src = "fn f(a: int, b: int) -> bool { a < b }\n", .want = "icmp lt" },
@@ -3935,7 +3935,7 @@ test "M16: int `<`/`<=`/`>`/`>=` stay a single inline icmp (regression pin: byte
     }
 }
 
-test "M16: str `<` lowers to a heap-free lexicographic load_byte loop (no witness call)" {
+test "str `<` lowers to a heap-free lexicographic load_byte loop (no witness call)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, "fn use_lt(a: str, b: str) -> bool { a < b }\n", "use_lt");
     defer gpa.free(ir);
@@ -3945,7 +3945,7 @@ test "M16: str `<` lowers to a heap-free lexicographic load_byte loop (no witnes
     try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null); // discriminant == ord_lt(0)
 }
 
-test "M16: bool `<` stays an inline icmp (false<true), no call/load_byte" {
+test "bool `<` stays an inline icmp (false<true), no call/load_byte" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, "fn f(a: bool, b: bool) -> bool { a < b }\n", "f");
     defer gpa.free(ir);
@@ -3955,7 +3955,7 @@ test "M16: bool `<` stays an inline icmp (false<true), no call/load_byte" {
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") == null);
 }
 
-test "M16: Ord refines Eq — `==` on an Ord-only struct lowers via a cmp call + `icmp eq`" {
+test "Ord refines Eq — `==` on an Ord-only struct lowers via a cmp call + `icmp eq`" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_eq(p: P, q: P) -> bool { p == q }\n", "use_eq");
     defer gpa.free(ir);
@@ -3966,7 +3966,7 @@ test "M16: Ord refines Eq — `==` on an Ord-only struct lowers via a cmp call +
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
 }
 
-test "M16: Ord refines Eq — `!=` on an Ord-only struct lowers via a cmp call + `icmp ne` (no bnot)" {
+test "Ord refines Eq — `!=` on an Ord-only struct lowers via a cmp call + `icmp ne` (no bnot)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_ne(p: P, q: P) -> bool { p != q }\n", "use_ne");
     defer gpa.free(ir);
@@ -3976,7 +3976,7 @@ test "M16: Ord refines Eq — `!=` on an Ord-only struct lowers via a cmp call +
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
 }
 
-test "M19: derivable struct `<` lowers to the derived cmp call + get_tag + `icmp eq`" {
+test "derivable struct `<` lowers to the derived cmp call + get_tag + `icmp eq`" {
     const gpa = testing.allocator;
     // No `impl P has Ord` — the checker records a derive request and the barrier synthesizes
     // `Ord$cmp$s0`; `p < q` resolves the DERIVED cmp witness (fn_id==0) and calls it.
@@ -3992,7 +3992,7 @@ test "M19: derivable struct `<` lowers to the derived cmp call + get_tag + `icmp
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
 }
 
-test "M19: `==` on a derivable-Ord struct lowers via the derived cmp call + `icmp eq`" {
+test "`==` on a derivable-Ord struct lowers via the derived cmp call + `icmp eq`" {
     const gpa = testing.allocator;
     // `<` derives Ord, which fills `(Eq, P)`; `==` then routes through the same derived cmp
     // (no separate Eq witness) — the refinement path over a SOURCE-LESS witness.
@@ -4021,7 +4021,7 @@ const add_impl_src =
     \\
 ;
 
-test "M17: struct `+` lowers to a call to the Add witness (aggregate return, no inline add)" {
+test "struct `+` lowers to a call to the Add witness (aggregate return, no inline add)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, add_impl_src ++ "fn use_add(p: V2, q: V2) -> V2 { p + q }\n", "use_add");
     defer gpa.free(ir);
@@ -4034,7 +4034,7 @@ test "M17: struct `+` lowers to a call to the Add witness (aggregate return, no 
     try testing.expect(std.mem.indexOf(u8, ir, "add %") == null); // no inline machine add
 }
 
-test "M17: struct `-`/`*`/`/` dispatch to the Sub/Mul/Div witness (sibling protocols)" {
+test "struct `-`/`*`/`/` dispatch to the Sub/Mul/Div witness (sibling protocols)" {
     const gpa = testing.allocator;
     const cases = [_]struct { use: []const u8, method: []const u8, inline_op: []const u8 }{
         .{ .use = "fn f(p: V2, q: V2) -> V2 { p - q }\n", .method = "sub$Sub(", .inline_op = "sub %" },
@@ -4052,7 +4052,7 @@ test "M17: struct `-`/`*`/`/` dispatch to the Sub/Mul/Div witness (sibling proto
     }
 }
 
-test "M17: int `+`/`-`/`*`/`/` stay a single inline op (regression pin: bytes unchanged, no call)" {
+test "int `+`/`-`/`*`/`/` stay a single inline op (regression pin: bytes unchanged, no call)" {
     const gpa = testing.allocator;
     const cases = [_]struct { src: []const u8, want: []const u8 }{
         .{ .src = "fn f(a: int, b: int) -> int { a + b }\n", .want = "add %" },
@@ -4085,7 +4085,7 @@ const from_impl_src =
     \\
 ;
 
-test "M25: a `?` that WIDENS the error emits a call to the From witness in the residual" {
+test "a `?` that WIDENS the error emits a call to the From witness in the residual" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, from_impl_src, "outer");
     defer gpa.free(ir);
@@ -4095,7 +4095,7 @@ test "M25: a `?` that WIDENS the error emits a call to the From witness in the r
     try testing.expect(std.mem.indexOf(u8, ir, "from") != null);
 }
 
-test "M25: a `?` on a SAME-error-type Result stays a plain copy (no From witness call)" {
+test "a `?` on a SAME-error-type Result stays a plain copy (no From witness call)" {
     const gpa = testing.allocator;
     const ir = try renderLoweredG(gpa, from_impl_src, "same");
     defer gpa.free(ir);
@@ -4104,7 +4104,7 @@ test "M25: a `?` on a SAME-error-type Result stays a plain copy (no From witness
     try testing.expect(std.mem.indexOf(u8, ir, "from") == null);
 }
 
-test "M24: `?` on a unit-payload Result still emits the residual early-return (no codegen diagnostic)" {
+test "`?` on a unit-payload Result still emits the residual early-return (no codegen diagnostic)" {
     const gpa = testing.allocator;
     // renderLoweredG asserts zero diagnostics; before the fix lowerTryValue had no `.unit`
     // arm and dropped a note here, so a checker-accepted program aborted at codegen.
@@ -4579,7 +4579,7 @@ test "lower-diagnostics: an unknown string escape fails to lower" {
     try expectLowerDiag("fn f() {\n s := \"\\q\"\n}\n", "f");
 }
 
-test "M9: a mut-self method body loads self through the pointer slot (s0:int)" {
+test "a mut-self method body loads self through the pointer slot (s0:int)" {
     try expectLoweredG(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n" ++
@@ -4609,7 +4609,7 @@ test "M9: a mut-self method body loads self through the pointer slot (s0:int)" {
     );
 }
 
-test "M9: the caller passes the receiver place ADDRESS as arg 0 (a scalar value)" {
+test "the caller passes the receiver place ADDRESS as arg 0 (a scalar value)" {
     try expectLoweredG(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n" ++
@@ -4638,7 +4638,7 @@ test "M9: the caller passes the receiver place ADDRESS as arg 0 (a scalar value)
     );
 }
 
-test "M9: whole-self value read copies the pointee into a fresh temp" {
+test "whole-self value read copies the pointee into a fresh temp" {
     try expectLoweredG(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn ident(mut self) -> P { return self } }\n" ++

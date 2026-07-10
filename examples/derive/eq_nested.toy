@@ -1,4 +1,4 @@
-# Feature: structural `Eq` derive recurses through NESTED aggregate fields (M18). `Outer`
+# Feature: structural `Eq` derive recurses through NESTED aggregate fields. `Outer`
 # has an `Inner` field, so its derived `eq` calls `Inner`'s own derived `eq` (a distinct
 # synthetic unit the barrier's fixpoint also authorized). Both are source-less.
 struct Inner { a: int, b: int }

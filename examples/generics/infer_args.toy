@@ -1,4 +1,4 @@
-# Feature: local type-arg inference from argument types (M3).
+# Feature: local type-arg inference from argument types.
 # The bare calls `snd(true, id(42))` and `id(42)` carry NO explicit `[T]` — each
 # type-arg is inferred by one-sided structural matching of the template's param
 # patterns against the ground argument types (T<-bool, U<-int for snd; T<-int for

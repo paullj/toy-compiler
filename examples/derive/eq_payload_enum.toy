@@ -1,4 +1,4 @@
-# Feature: structural `Eq` derive now reaches PAYLOAD-carrying enums (M19 closes the M18
+# Feature: structural `Eq` derive now reaches PAYLOAD-carrying enums (closing the earlier
 # gap). Two enum values are equal iff their discriminants match AND, for that variant, every
 # payload field is equal. No source impl, no `derive` keyword. Here `A(3) == A(3)` (equal
 # tag + equal payload), `A(3) != A(4)` (equal tag, payload differs), and `A(_) != B` (tags

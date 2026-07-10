@@ -162,7 +162,7 @@ test "mangle is index-free-ish and distinct per arg tuple" {
     try testing.expectEqualStrings("pair$int$bool", c);
 }
 
-test "mangle encodes integer width/sign distinctly (M1)" {
+test "mangle encodes integer width/sign distinctly" {
     const gpa = testing.allocator;
     const i8m = try mangle(gpa, "id", &.{Type.int8});
     defer gpa.free(i8m);
@@ -190,7 +190,7 @@ test "find matches on gid + args by Type.eql" {
     try testing.expectEqual(@as(?usize, null), find(&insts, 1, &.{Type.int}));
 }
 
-test "an instance carries its resolved conformances (M13/M14)" {
+test "an instance carries its resolved conformances" {
     const witness = [_][]const u8{"lib.P.into$Into$int"};
     const pargs = [_]Type{Type.int};
     const confs = [_]ResolvedConformance{.{ .protocol_name = "Into", .conform_ty = Type.structT(3), .witness_syms = &witness, .protocol_args = &pargs }};

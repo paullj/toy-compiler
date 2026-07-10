@@ -1,4 +1,4 @@
-# Feature: structural `Ord` auto-derive (M19). A struct whose fields all conform to `Ord`
+# Feature: structural `Ord` auto-derive. A struct whose fields all conform to `Ord`
 # gets `<`/`>`/`<=`/`>=` with ZERO source impl — the compiler synthesizes a source-less
 # three-way `cmp` on demand. The order is LEXICOGRAPHIC BY FIELD DECLARATION ORDER: `x`
 # ties (1 == 1), so `y` decides (0 < 5) and `a < b` is true. (Reordering the fields would
