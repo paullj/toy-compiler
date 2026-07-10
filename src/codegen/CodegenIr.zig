@@ -751,6 +751,33 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     }
 }
 
+/// Same seed as lower.zig's `lit_seed`, so a panic message that ALSO appears as a
+/// display literal dedups to one `__cstring` blob entry; distinct hashes are harmless.
+const panic_lit_seed: u64 = 0x10c5_7e87;
+
+/// Retarget a `.panic`/`.trap` terminator to `panic(msg)`: intern `msg` as a
+/// `__cstring` on THIS FnCode, put its ptr in x0 (adrp+add, `.cstr` relocs) and its
+/// byte-length in x1 (every message < 64 KiB -> one `movz`), then `bl panic` (a
+/// `.call26` reloc to the builtin, appended once at link time). The block has no
+/// successors; a `brk #0` backstop follows the never-returning call.
+fn emitPanicCall(g: *Gen, msg: []const u8) error{OutOfMemory}!void {
+    const h = std.hash.Wyhash.hash(panic_lit_seed, msg);
+    try addLiteral(g, h, try g.gpa.dupe(u8, msg));
+    var site: u32 = @intCast(g.code.items.len);
+    try g.relocs.append(g.gpa, .{ .site = site, .target = .{ .cstr = h }, .kind = .adrp_page });
+    try g.emit(Aarch64.adrp(0, 0)); // adrp x0, msg@page
+    site = @intCast(g.code.items.len);
+    try g.relocs.append(g.gpa, .{ .site = site, .target = .{ .cstr = h }, .kind = .add_lo12 });
+    try g.emit(Aarch64.addImm(0, 0, 0)); // add x0, x0, #msg@lo12
+    try g.emit(Aarch64.movz(1, @intCast(msg.len), 0)); // x1 = len
+    const name = try g.gpa.dupe(u8, "panic");
+    errdefer g.gpa.free(name);
+    site = @intCast(g.code.items.len);
+    try g.relocs.append(g.gpa, .{ .site = site, .target = .{ .func = .{ .kind = .builtin, .name = name } }, .kind = .call26, .addend = 0 });
+    try g.emit(Aarch64.bl(0)); // bl panic
+    try g.emit(Aarch64.brk0); // unreachable backstop (panic never returns)
+}
+
 fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
     switch (term) {
         .br => |br| {
@@ -773,8 +800,11 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
             try emitEpilogue(g);
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
-        .trap => try g.emit(Aarch64.brk0), // Abort with SIGILL (unwrap-on-none/err).
-        .panic => try g.emit(Aarch64.brk0), // SIGILL for now; will retarget to bl __panic(reason).
+        .trap => try emitPanicCall(g, "unwrap of empty Option/Result\n"),
+        .panic => |reason| try emitPanicCall(g, switch (reason) {
+            .div_by_zero => "division by zero\n",
+            .rem_by_zero => "remainder by zero\n",
+        }),
     }
 }
 
@@ -1041,6 +1071,62 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     };
 }
 
+// panic(str) builtin body — hand-written, AST/IR-independent. Appended once at link
+// time (emit.zig) when any fn references `panic`. Writes the message {ptr,len} to fd 2
+// (STDERR) via the `write` syscall, then exits the process NONZERO via SYS_exit(1)
+// (raw `svc`, no libc): a deterministic, uncatchable abort. Never returns — the FP
+// frame record is still opened so a future backtrace can walk it; the trailing brk #0
+// is an unreachable backstop after the non-returning svc.
+pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer relocs.deinit(gpa);
+
+    const emit = struct {
+        fn f(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, word, .little);
+            try c.appendSlice(a, &buf);
+        }
+    }.f;
+
+    try emit(&code, gpa, Aarch64.stpFpLrPre); // stp x29,x30,[sp,#-16]!
+    try emit(&code, gpa, Aarch64.movFpSp); // mov x29, sp
+    // Shuffle (ptr,len) into write's (buf,len) = (x1,x2), then fd=2 in w0. Order
+    // matters: move len (x1->x2) BEFORE overwriting x1 with ptr (x0->x1).
+    try emit(&code, gpa, Aarch64.movReg(2, 1)); // len -> x2
+    try emit(&code, gpa, Aarch64.movReg(1, 0)); // ptr -> x1
+    try emit(&code, gpa, Aarch64.movz(0, 2, 0)); // fd = 2 (STDERR)
+    // adrp x16, _write@GOT (placeholder; .adrp_page reloc to import "write")
+    var site: u32 = @intCast(code.items.len);
+    const wname1 = try gpa.dupe(u8, "write");
+    errdefer gpa.free(wname1);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname1 } }, .kind = .adrp_page });
+    try emit(&code, gpa, Aarch64.adrp(16, 0));
+    // ldr x16, [x16] (placeholder; .ldr_lo12 reloc, same import)
+    site = @intCast(code.items.len);
+    const wname2 = try gpa.dupe(u8, "write");
+    errdefer gpa.free(wname2);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname2 } }, .kind = .ldr_lo12 });
+    try emit(&code, gpa, Aarch64.ldrRegUoff(16, 16, 0));
+    try emit(&code, gpa, Aarch64.blr(16)); // blr x16
+    // SYS_exit(1): x0 = status 1 (nonzero), x16 = 1 (SYS_exit), svc #0x80. Never returns.
+    try emit(&code, gpa, Aarch64.movz(0, 1, 0)); // x0 = 1
+    try emit(&code, gpa, Aarch64.movz(16, 1, 0)); // x16 = SYS_exit
+    try emit(&code, gpa, Aarch64.svc0x80); // svc #0x80
+    try emit(&code, gpa, Aarch64.brk0); // unreachable backstop
+
+    const name = try gpa.dupe(u8, "panic");
+    errdefer gpa.free(name);
+    return .{
+        .sym = .{ .kind = .builtin, .name = name },
+        .code = try code.toOwnedSlice(gpa),
+        .relocs = try relocs.toOwnedSlice(gpa),
+        .literals = &.{},
+    };
+}
+
 // TESTS — hand-build a tiny Ir.Function and assert the emitted byte shape.
 
 const testing = std.testing;
@@ -1081,6 +1167,28 @@ test "ir-codegen: __display_int builtin byte shape (prologue, buffer, digit loop
         try testing.expect(r.target == .import);
         try testing.expectEqualStrings("write", r.target.import.name);
     }
+}
+
+test "lowerPanic: writes fd 2 then SYS_exit(1); two _write import relocs; brk backstop" {
+    const gpa = testing.allocator;
+    var fc = try lowerPanic(gpa);
+    defer fc.deinit(gpa);
+    try testing.expectEqual(Link.SymKind.builtin, fc.sym.kind);
+    try testing.expectEqualStrings("panic", fc.sym.name);
+    const w = struct {
+        fn at(code: []const u8, i: usize) u32 {
+            return std.mem.readInt(u32, code[i * 4 ..][0..4], .little);
+        }
+    }.at;
+    try testing.expectEqual(Aarch64.stpFpLrPre, w(fc.code, 0));
+    try testing.expectEqual(Aarch64.movz(0, 2, 0), w(fc.code, 4)); // fd = 2 (stderr)
+    try testing.expectEqual(Aarch64.movz(0, 1, 0), w(fc.code, 8)); // exit code 1
+    try testing.expectEqual(Aarch64.movz(16, 1, 0), w(fc.code, 9)); // SYS_exit
+    try testing.expectEqual(Aarch64.svc0x80, w(fc.code, 10));
+    try testing.expectEqual(Aarch64.brk0, w(fc.code, 11));
+    try testing.expectEqual(@as(usize, 2), fc.relocs.len);
+    try testing.expectEqualStrings("write", fc.relocs[0].target.import.name);
+    try testing.expectEqualStrings("write", fc.relocs[1].target.import.name);
 }
 
 // A 1-block `fn f() -> int { ret <iconst v> }` exercising prologue/epilogue,

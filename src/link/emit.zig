@@ -72,16 +72,20 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     //    (`uses_write`); each referenced body is appended below.
     var uses_print = false;
     var uses_display_int = false;
+    var uses_panic = false;
     for (fns) |f| {
         for (f.relocs) |rl| switch (rl.target) {
             .func => |s| if (s.kind == .builtin) {
                 if (std.mem.eql(u8, s.name, "print")) uses_print = true;
                 if (std.mem.eql(u8, s.name, "__display_int")) uses_display_int = true;
+                if (std.mem.eql(u8, s.name, "panic")) uses_panic = true;
             },
             else => {},
         };
     }
-    const uses_write = uses_print or uses_display_int;
+    // `panic` itself calls `write`, so referencing it declares the `_write` import
+    // even in a program that never prints.
+    const uses_write = uses_print or uses_display_int or uses_panic;
 
     // Build the full fn set: the user fns + (if referenced) the print / __display_int
     // bodies, in a FIXED append order (print then __display_int) so the linked image is a
@@ -108,6 +112,10 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     if (uses_display_int) {
         const df = try CodegenIr.lowerDisplayInt(gpa);
         try all.append(gpa, df);
+    }
+    if (uses_panic) {
+        const pf = try CodegenIr.lowerPanic(gpa);
+        try all.append(gpa, pf);
     }
 
     // 2) Intern strings program-wide via `internCstrings` (stable collect +
