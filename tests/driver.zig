@@ -563,6 +563,57 @@ test "print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra b
     try testing.expectEqualSlices(u8, "\x41\xC3\xB1\xE2\x82\xAC\xF0\x9F\x98\x80", got);
 }
 
+test "print(int) renders decimal for 0 / negative / i64 max / i64 MIN (never-negate loop); print(str) separates" {
+    // BEHAVIORAL coverage for the two hand-asm builtins whose unit tests only assert
+    // instruction SHAPE: __display_int's i64::MIN-safe digit loop (it must NOT negate the
+    // running value) and print's str write. i64::MIN is the critical case — negating it
+    // overflows. Asserts exact stdout bytes.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-display-int-edges";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const main_path = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data =
+        \\fn main() {
+        \\    print(0)
+        \\    print("\n")
+        \\    print(-1)
+        \\    print("\n")
+        \\    print(9223372036854775807)
+        \\    print("\n")
+        \\    print(-9223372036854775808)
+        \\    print("\n")
+        \\}
+        \\
+    });
+
+    const out_bin = dir_name ++ "/prog";
+    {
+        const res = try spawnToy(gpa, io, &.{ "build", main_path, "-o", out_bin });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, out_bin, gpa);
+    defer gpa.free(bin_abs);
+    var child = try std.process.spawn(io, .{ .argv = &.{bin_abs}, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try testing.expectEqualSlices(u8, "0\n-1\n9223372036854775807\n-9223372036854775808\n", got);
+}
+
 test "char Display is a shared witness — >6 boundary codepoints compile + byte-exact UTF-8" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
