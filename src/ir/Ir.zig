@@ -42,6 +42,11 @@ pub const none_block: BlockId = std.math.maxInt(u32);
 /// this. Append-only: existing ordinals (eq=0..ge=5) are frozen (`--emit ir` golden).
 pub const Cond = enum(u8) { eq, ne, lt, le, gt, ge, ult, ule, ugt, uge };
 
+/// Target-independent float comparison condition. Distinct from `Cond` (no
+/// signedness axis; the codegen mapping to `Aarch64.Cond` picks the NaN-safe
+/// forms), so the int-cond `--emit ir` golden is untouched.
+pub const FCond = enum(u8) { eq, ne, lt, le, gt, ge };
+
 /// An operand of a call / terminator. Scalars travel by `value`; str/struct/enum
 /// aggregates travel by `slot` (passed by reference, ABI decided in codegen);
 /// `none` is the unit operand (materializes to nothing).
@@ -151,6 +156,15 @@ pub const Op = union(enum) {
     /// Bitwise complement of an int (`~`): `mvn` + width-normalize. DISTINCT from
     /// `bnot` (which is `!bool` = cmp #0 + cset eq).
     bcompl: ValueId,
+
+    /// f64 constant (the raw bit pattern is materialized into a GPR value cell).
+    fconst: f64,
+    fadd: Bin,
+    fsub: Bin,
+    fmul: Bin,
+    fdiv: Bin,
+    /// Float comparison → bool value. NaN-safe cond mapping lives in codegen.
+    fcmp: struct { cc: FCond, lhs: ValueId, rhs: ValueId },
 };
 
 /// One instruction: an op plus its result value id (`none_value` when the op
@@ -331,6 +345,7 @@ fn renderType(
         .bool => try out.writeAll("bool"),
         .str => try out.writeAll("str"),
         .never => try out.writeAll("never"),
+        .float => try out.writeAll("float"),
         .@"struct" => {
             if (ty.struct_id < layouts.len) {
                 try out.writeAll(layouts[ty.struct_id].name);
@@ -372,6 +387,17 @@ fn condName(cc: Cond) []const u8 {
         .ule => "ule",
         .ugt => "ugt",
         .uge => "uge",
+    };
+}
+
+fn fcondName(cc: FCond) []const u8 {
+    return switch (cc) {
+        .eq => "eq",
+        .ne => "ne",
+        .lt => "lt",
+        .le => "le",
+        .gt => "gt",
+        .ge => "ge",
     };
 }
 
@@ -442,6 +468,12 @@ fn renderInstr(
         .lshr => |b| try out.print("lshr %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .ashr => |b| try out.print("ashr %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .bcompl => |v| try out.print("bcompl %{d}\n", .{v}),
+        .fconst => |f| try out.print("fconst 0x{X}\n", .{@as(u64, @bitCast(f))}),
+        .fadd => |b| try out.print("fadd %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .fsub => |b| try out.print("fsub %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .fmul => |b| try out.print("fmul %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .fdiv => |b| try out.print("fdiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
+        .fcmp => |c| try out.print("fcmp {s} %{d}, %{d}\n", .{ fcondName(c.cc), c.lhs, c.rhs }),
     }
 }
 
@@ -565,6 +597,58 @@ test "render: arithmetic + slots + call" {
         "  %1 = iconst 3\n" ++
         "  %2 = add %0, %1\n" ++
         "  ret %2\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(want, w.buffered());
+}
+
+test "render: float const/arith/compare render deterministically (hex fconst)" {
+    const gpa = std.testing.allocator;
+
+    var values = try gpa.alloc(ValueDef, 4);
+    values[0] = .{ .type = Type.float };
+    values[1] = .{ .type = Type.float };
+    values[2] = .{ .type = Type.float };
+    values[3] = .{ .type = Type.@"bool" };
+
+    var instrs = try gpa.alloc(Instr, 4);
+    instrs[0] = .{ .result = 0, .op = .{ .fconst = 3.0 } };
+    instrs[1] = .{ .result = 1, .op = .{ .fconst = 4.0 } };
+    instrs[2] = .{ .result = 2, .op = .{ .fadd = .{ .lhs = 0, .rhs = 1 } } };
+    instrs[3] = .{ .result = 3, .op = .{ .fcmp = .{ .cc = .gt, .lhs = 2, .rhs = 0 } } };
+
+    var blocks = try gpa.alloc(Block, 1);
+    blocks[0] = .{
+        .params = try gpa.alloc(ValueId, 0),
+        .instrs = instrs,
+        .term = .{ .ret = .{ .value = 3 } },
+    };
+
+    var func = Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(SlotId, 0),
+        .ret_type = Type.@"bool",
+        .slots = try gpa.alloc(Slot, 0),
+        .values = values,
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+    };
+    defer func.deinit(gpa);
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try render(&w, &func, &.{}, &.{});
+
+    // 3.0 == 0x4008000000000000, 4.0 == 0x4010000000000000 (IEEE-754 f64 bits).
+    const want =
+        "fn f() -> bool {\n" ++
+        "  slots:\n" ++
+        "b0:\n" ++
+        "  %0 = fconst 0x4008000000000000\n" ++
+        "  %1 = fconst 0x4010000000000000\n" ++
+        "  %2 = fadd %0, %1\n" ++
+        "  %3 = fcmp gt %2, %0\n" ++
+        "  ret %3\n" ++
         "}\n";
     try std.testing.expectEqualStrings(want, w.buffered());
 }

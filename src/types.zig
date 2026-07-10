@@ -84,6 +84,7 @@ pub const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "uint64", Type.uint64 },
     .{ "bool", Type.bool },
     .{ "str", Type.str },
+    .{ "float", Type.float },
 });
 
 /// Shared type-reference resolution + token/diagnostic helpers, generic over the

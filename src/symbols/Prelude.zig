@@ -57,7 +57,7 @@ const from_params: []const Type = &.{Type.typeVar(1)};
 // covers every scalar; arithmetic is int-ONLY (str concat allocates, deferred). Ord omits
 // unit (no ordering). From registers NO builtin conformance (always needs an explicit impl).
 const specs = [_]ProtoSpec{
-    .{ .slot = .eq, .name = "Eq", .method = "eq", .params = homogeneous, .ret = .bool_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit } },
+    .{ .slot = .eq, .name = "Eq", .method = "eq", .params = homogeneous, .ret = .bool_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit, Type.float } },
     .{ .slot = .ord, .name = "Ord", .method = "cmp", .params = homogeneous, .ret = .ordering_t, .conf = &.{ Type.int, Type.str, Type.bool } },
     .{ .slot = .add, .name = "Add", .method = "add", .params = homogeneous, .ret = .self_t, .conf = &.{Type.int} },
     .{ .slot = .sub, .name = "Sub", .method = "sub", .params = homogeneous, .ret = .self_t, .conf = &.{Type.int} },
@@ -307,6 +307,21 @@ fn registerOptionResult(
 }
 
 const testing = std.testing;
+
+test "float conforms to Eq only among the builtin protocols" {
+    const hasFloat = struct {
+        fn f(conf: []const Type) bool {
+            for (conf) |t| if (t.kind == .float) return true;
+            return false;
+        }
+    }.f;
+    // float is Eq-only in this tier: value-typed `==`/`!=` work, but Ord/Add/Sub/
+    // Mul/Div/Hash/Display/From/Into/TryInto register NO builtin float conformance.
+    for (specs) |s| {
+        const want = s.slot == .eq;
+        try testing.expectEqual(want, hasFloat(s.conf));
+    }
+}
 
 test "Into=9/TryInto=10 after From; ConvErr appended after Result" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

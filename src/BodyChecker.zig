@@ -523,6 +523,7 @@ pub const BodyChecker = struct {
         const n = bc.tree.nodes[(node_idx).int()];
         const ty: Type = switch (n.tag) {
             .literal_number => try bc.typeNumericLiteral(n.main_token, bc.expected),
+            .literal_float => Type.float,
             .literal_bool => Type.@"bool",
             .literal_string => Type.str,
             .literal_char => try bc.typeCharLiteral(n.main_token),
@@ -678,6 +679,16 @@ pub const BodyChecker = struct {
                     .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                    },
+                    .plus_dot, .minus_dot, .star_dot, .slash_dot => {
+                        // The dotted operators are float-ONLY inline machine ops (no protocol
+                        // desugar): the non-dotted `+`/`<` on a float falls to T0028/T0027.
+                        if (lt.kind == .float and Type.eql(lt, rt)) break :blk lt;
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must both be float", .{op_text});
+                    },
+                    .lt_dot, .gt_dot, .le_dot, .ge_dot => {
+                        if (lt.kind == .float and Type.eql(lt, rt)) break :blk Type.@"bool";
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must both be float", .{op_text});
                     },
                     else => {},
                 }

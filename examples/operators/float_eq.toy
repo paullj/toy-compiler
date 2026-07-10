@@ -1,0 +1,9 @@
+# float is Eq-only: == / != work; NaN != NaN per IEEE (float is never Ord/Hash).
+# expect: exit 42
+fn main() -> int {
+    eq := 3.0 == 3.0
+    ne := 3.0 != 4.0
+    nan := 0.0 /. 0.0
+    nan_ne := nan != nan                      # IEEE: NaN != NaN is true
+    return if eq { if ne { if nan_ne { 42 } else { 1 } } else { 2 } } else { 3 }
+}

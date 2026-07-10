@@ -85,6 +85,13 @@ fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
             const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
             return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
         },
+        .float => {
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
+            const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
+            const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
+            return try b.emit(.{ .fcmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
+        },
         .str => {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
             const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);

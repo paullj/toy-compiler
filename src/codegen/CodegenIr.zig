@@ -44,6 +44,12 @@ const S0: u32 = 9;
 const S1: u32 = 10;
 const S2: u32 = 11;
 
+// Scratch D-registers (SIMD&FP file, caller-saved) for the float load/compute/store
+// pattern. Distinct index space from the GPR scratch above; D-regs appear ONLY in
+// genFloatArith/fcmp — float values otherwise ride GPR cells via storeValue.
+const D0: u32 = 16;
+const D1: u32 = 17;
+
 const LabelId = u32;
 const UNPLACED: u32 = std.math.maxInt(u32);
 const BranchWidth = enum { imm19, imm26 };
@@ -148,6 +154,15 @@ const Gen = struct {
     fn storeValue(g: *Gen, reg: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
         if (vid == Ir.none_value) return;
         try g.emit(Aarch64.strSp(reg, g.valueOff(vid)));
+    }
+    /// Load a float SSA value's cell into D-register `d`.
+    fn loadFpValue(g: *Gen, d: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
+        try g.emit(Aarch64.ldrFpSp(d, g.valueOff(vid)));
+    }
+    /// Store D-register `d` into a float SSA value's cell.
+    fn storeFpValue(g: *Gen, d: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
+        if (vid == Ir.none_value) return;
+        try g.emit(Aarch64.strFpSp(d, g.valueOff(vid)));
     }
 };
 
@@ -335,6 +350,36 @@ fn condToAarch64(cc: Ir.Cond) Aarch64.Cond {
     };
 }
 
+/// The NaN-safe aarch64 cond for a float compare against FCMP's NZCV (unordered →
+/// C=1,V=1). `<`/`<=` use `mi`/`ls` (NOT `lt`/`le`, which are TRUE on unordered);
+/// `>`/`>=`/`==` are already false on unordered, `!=` true — matching IEEE
+/// (any comparison with NaN is false except `!=`).
+fn fcondToAarch64(cc: Ir.FCond) Aarch64.Cond {
+    return switch (cc) {
+        .eq => .eq,
+        .ne => .ne,
+        .lt => .mi,
+        .le => .ls,
+        .gt => .gt,
+        .ge => .ge,
+    };
+}
+
+const FloatArithKind = enum { fadd, fsub, fmul, fdiv };
+
+fn genFloatArith(g: *Gen, result: Ir.ValueId, b: Ir.Bin, comptime kind: FloatArithKind) error{OutOfMemory}!void {
+    try g.loadFpValue(D0, b.lhs);
+    try g.loadFpValue(D1, b.rhs);
+    try g.emit(switch (kind) {
+        .fadd => Aarch64.fadd(D0, D0, D1),
+        .fsub => Aarch64.fsub(D0, D0, D1),
+        .fmul => Aarch64.fmul(D0, D0, D1),
+        .fdiv => Aarch64.fdiv(D0, D0, D1),
+    });
+    // No normalizeWidth: f64 is never narrowed.
+    try g.storeFpValue(D0, result);
+}
+
 fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
     switch (ins.op) {
         .iconst => |v| {
@@ -418,6 +463,21 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
             try g.loadValue(S0, v);
             try g.emit(Aarch64.mvn(S0, S0));
             try storeNormalized(g, ins.result, S0);
+        },
+        .fconst => |f| {
+            try g.emitImm64(S0, @bitCast(f)); // f64 bit-pattern into a GPR
+            try g.storeValue(S0, ins.result); // value cell holds the raw bits
+        },
+        .fadd => |b| try genFloatArith(g, ins.result, b, .fadd),
+        .fsub => |b| try genFloatArith(g, ins.result, b, .fsub),
+        .fmul => |b| try genFloatArith(g, ins.result, b, .fmul),
+        .fdiv => |b| try genFloatArith(g, ins.result, b, .fdiv),
+        .fcmp => |c| {
+            try g.loadFpValue(D0, c.lhs);
+            try g.loadFpValue(D1, c.rhs);
+            try g.emit(Aarch64.fcmp(D0, D1));
+            try g.emit(Aarch64.cset(S0, fcondToAarch64(c.cc))); // bool → GPR cell
+            try g.storeValue(S0, ins.result);
         },
     }
 }
@@ -1318,6 +1378,17 @@ test "ir-codegen: condToAarch64 maps unsigned conds to the unsigned aarch64 form
     try testing.expectEqual(Aarch64.Cond.ls, condToAarch64(.ule));
     try testing.expectEqual(Aarch64.Cond.hi, condToAarch64(.ugt));
     try testing.expectEqual(Aarch64.Cond.hs, condToAarch64(.uge));
+}
+
+test "ir-codegen: fcondToAarch64 uses the NaN-safe forms for < and <=" {
+    // `<`/`<=` must be `mi`/`ls`, NOT `lt`/`le` (which are TRUE on unordered).
+    // A transposition compiles green with no NaN program pinning it, so pin directly.
+    try testing.expectEqual(Aarch64.Cond.eq, fcondToAarch64(.eq));
+    try testing.expectEqual(Aarch64.Cond.ne, fcondToAarch64(.ne));
+    try testing.expectEqual(Aarch64.Cond.mi, fcondToAarch64(.lt));
+    try testing.expectEqual(Aarch64.Cond.ls, fcondToAarch64(.le));
+    try testing.expectEqual(Aarch64.Cond.gt, fcondToAarch64(.gt));
+    try testing.expectEqual(Aarch64.Cond.ge, fcondToAarch64(.ge));
 }
 
 // The value transform an emitted normalizeWidth word performs, decoded from the

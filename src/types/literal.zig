@@ -58,6 +58,15 @@ pub fn value(raw: []const u8) ?i64 {
     return @bitCast(std.fmt.parseInt(u64, s, 0) catch return null);
 }
 
+/// The f64 value of a float-literal token, stripping `_` separators. Mirrors
+/// `value` (128-byte pack buffer); null on malformed / too-long. `parseFloat`
+/// owns the fraction/exponent grammar the lexer already spanned.
+pub fn floatValue(raw: []const u8) ?f64 {
+    var buf: [128]u8 = undefined;
+    const s = stripSeparators(raw, &buf) orelse return null;
+    return std.fmt.parseFloat(f64, s) catch null;
+}
+
 /// Per-width range verdict for a numeric-literal token against integer type `t`. A
 /// literal wider than u64 never fits any width. `negated and t.isSigned()` grants the
 /// +1 signed-min allowance (`-128: int8`, `-9223372036854775808: int`), whose magnitude
@@ -258,6 +267,16 @@ test "value: base-aware decode round-trips the full uint64 range into the iconst
     // Null past 2^64-1 (no width can admit it) and on a garbage token.
     try testing.expectEqual(@as(?i64, null), value("18446744073709551616"));
     try testing.expectEqual(@as(?i64, null), value("0xZZ"));
+}
+
+test "floatValue: separator-stripping decode, null on malformed" {
+    try testing.expectEqual(@as(?f64, 3.0), floatValue("3.0"));
+    try testing.expectEqual(@as(?f64, 0.5), floatValue("0.5"));
+    try testing.expectEqual(@as(?f64, 1000.0), floatValue("1e3"));
+    try testing.expectEqual(@as(?f64, 1000.5), floatValue("1_000.5"));
+    try testing.expectEqual(@as(?f64, 0.015), floatValue("1.5e-2"));
+    try testing.expectEqual(@as(?f64, null), floatValue("1.2.3"));
+    try testing.expectEqual(@as(?f64, null), floatValue("abc"));
 }
 
 test "fitsWidth: per-width range verdict, base-aware, with the negated signed-min allowance" {

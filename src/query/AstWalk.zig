@@ -172,7 +172,7 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
     if (collect) try emit(visitor, .{ .touch = .{ .idx = idx } });
     const leaf = src.leaf(idx);
     switch (n.tag) {
-        .literal_number, .literal_string, .literal_bool, .literal_char, .identifier => try emit(visitor, .{ .leaf = leaf }),
+        .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier => try emit(visitor, .{ .leaf = leaf }),
 
         .unary => {
             try emit(visitor, .{ .leaf = leaf });

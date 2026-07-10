@@ -499,7 +499,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 /// never value-then-copy).
 fn storeInto(b: *Builder, slot: Ir.SlotId, expr: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const v = try lowerExpr(b, expr);
             const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = operandValue(v), .ty = ty } }, null);
@@ -533,6 +533,10 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             const v = Literal.value(b.in.tokens[n.main_token].text(b.in.source)) orelse
                 return .{ .value = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int) };
             return .{ .value = try b.emit(.{ .iconst = v }, Typecheck.Type.int) };
+        },
+        .literal_float => {
+            const f = Literal.floatValue(b.in.tokens[n.main_token].text(b.in.source)) orelse 0.0;
+            return .{ .value = try b.emit(.{ .fconst = f }, Typecheck.Type.float) };
         },
         .literal_bool => {
             const t = b.in.tokens[n.main_token].tag == .kw_true;
@@ -602,7 +606,7 @@ fn lowerStrLiteral(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Opera
 fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const slot = try localSlot(b, node_idx, ty);
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
             return .{ .value = v };
@@ -752,6 +756,32 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             const ir_op: Ir.Op = if (lt.isUnsignedInt()) Ir.Op{ .umod = bin } else Ir.Op{ .smod = bin };
             return .{ .value = try b.emit(ir_op, lt) };
         },
+        .plus_dot, .minus_dot, .star_dot, .slash_dot => {
+            const lhs = operandValue(try lowerExpr(b, n.lhs));
+            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
+            // No zero-guard for `/.`: IEEE-754 division yields ±inf/NaN, never traps.
+            const ir_op: Ir.Op = switch (op) {
+                .plus_dot => .{ .fadd = bin },
+                .minus_dot => .{ .fsub = bin },
+                .star_dot => .{ .fmul = bin },
+                .slash_dot => .{ .fdiv = bin },
+                else => unreachable,
+            };
+            return .{ .value = try b.emit(ir_op, Typecheck.Type.float) };
+        },
+        .lt_dot, .gt_dot, .le_dot, .ge_dot => {
+            const lhs = operandValue(try lowerExpr(b, n.lhs));
+            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const cc: Ir.FCond = switch (op) {
+                .lt_dot => .lt,
+                .gt_dot => .gt,
+                .le_dot => .le,
+                .ge_dot => .ge,
+                else => unreachable,
+            };
+            return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+        },
         else => {
             try b.note(n.main_token, "binary operator unsupported in lower");
             return .none;
@@ -873,6 +903,12 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
     // (call then optional `bnot`, same value-id order). unit/str keep the uniform outer `bnot`.
     switch (operand_ty.kind) {
         .@"struct", .@"enum" => return try lowerStructEq(b, operand_ty, lhs_node, rhs_node, negate),
+        .float => {
+            const lhs = operandValue(try lowerExpr(b, lhs_node));
+            const rhs = operandValue(try lowerExpr(b, rhs_node));
+            const cc: Ir.FCond = if (negate) .ne else .eq;
+            return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+        },
         else => {},
     }
     const raw: Ir.ValueId = switch (operand_ty.kind) {
@@ -2253,7 +2289,7 @@ fn loadNativePayload(b: *Builder, e: Typecheck.EnumLayout, base: Ir.ValueId) err
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[(expr).int()];
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const op = try lowerExpr(b, expr);
             // A diverging producer (e.g. a match arm body that `return`s) already set
             // the block terminator; a store into that dead tail is malformed IR.
@@ -2399,7 +2435,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
     const addr = try lowerPlaceAddr(b, node_idx);
     if (addr == Ir.none_value) return .none;
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
             return .{ .value = v };
         },
@@ -2429,7 +2465,7 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
         return;
     }
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const v = operandValue(try lowerExpr(b, value));
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = v, .ty = ty } }, null);
         },
@@ -2570,7 +2606,7 @@ fn lowerEnumInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: 
 /// from the slot to a value; an aggregate yields Operand.slot.
 fn lowerMatchValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const slot = try b.addSlot(ty);
             const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             try lowerMatchInto(b, node_idx, dst, ty);
@@ -2643,7 +2679,7 @@ fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typ
 /// reaches here is always the happy-path payload.
 fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const slot = try b.addSlot(ty);
             const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             try lowerTryInto(b, node_idx, dst, ty);
@@ -2802,7 +2838,7 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
 /// split; both sides are ptr values.
 fn copyValueByType(b: *Builder, dst: Ir.ValueId, src: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const v = try b.emit(.{ .load = .{ .addr = src, .ty = ty } }, ty);
             _ = try b.emit(.{ .store = .{ .addr = dst, .val = v, .ty = ty } }, null);
         },
@@ -2933,7 +2969,7 @@ fn bindLeaf(b: *Builder, bind_idx: Ast.Index, base: Ir.SlotId, off: u32, ty: Typ
     const src = try slotFieldAddr(b, base, off, ty);
     const dst = try b.emit(.{ .slot_addr = dst_slot }, Typecheck.Type.int);
     switch (ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const v = try b.emit(.{ .load = .{ .addr = src, .ty = ty } }, ty);
             _ = try b.emit(.{ .store = .{ .addr = dst, .val = v, .ty = ty } }, null);
         },

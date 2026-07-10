@@ -77,7 +77,7 @@ pub const ResolvedConformance = struct {
 
 /// Bumped when the in-memory layout encoding of any type changes, so a stale blob
 /// from a prior layout is invalidated.
-const type_layout_version: u8 = 4;
+const type_layout_version: u8 = 5;
 
 const seed: u64 = 0x46_50_52_4e; // "FPRN"
 

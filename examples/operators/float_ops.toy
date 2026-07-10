@@ -1,0 +1,13 @@
+# Every dotted operator: +. -. *. /. and <. >. <=. >=.
+# expect: exit 42
+fn main() -> int {
+    a := 3.0 +. 4.0 == 7.0
+    s := 10.0 -. 4.0 == 6.0
+    m := 2.5 *. 4.0 == 10.0
+    d := 10.0 /. 4.0 == 2.5
+    lt := 1.0 <. 2.0
+    gt := 3.0 >. 2.0
+    le := 2.0 <=. 2.0
+    ge := 2.0 >=. 2.0
+    return if a { if s { if m { if d { if lt { if gt { if le { if ge { 42 } else { 0 } } else { 0 } } else { 0 } } else { 0 } } else { 0 } } else { 0 } } else { 0 } } else { 0 }
+}
