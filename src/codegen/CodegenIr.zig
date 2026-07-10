@@ -1293,7 +1293,24 @@ fn patchBCondTo(buf: []u8, site: u32, target: u32) void {
 /// Backpatch an unconditional `b` placeholder at byte `site` to branch to `target`.
 fn patchBTo(buf: []u8, site: u32, target: u32) void {
     const delta: i26 = @intCast(@divExact(@as(i64, target) - @as(i64, site), 4));
-    std.mem.writeInt(u32, buf[site..][0..4], Aarch64.b(delta), .little);
+    const word = std.mem.readInt(u32, buf[site..][0..4], .little);
+    std.mem.writeInt(u32, buf[site..][0..4], Aarch64.patchB(word, delta), .little);
+}
+
+test "panic backpatch wrappers resolve signed word deltas, preserving opcode/rt/cond" {
+    var buf: [16]u8 = undefined;
+    // cbz x20 @ site 0 → target 8: +2 words, opcode + rt preserved.
+    std.mem.writeInt(u32, buf[0..4], Aarch64.cbz(20, 0), .little);
+    patchCbzTo(&buf, 0, 8);
+    try testing.expectEqual(Aarch64.cbz(20, 2), std.mem.readInt(u32, buf[0..4], .little));
+    // b.hi @ site 4 → target 12: +2 words, condition preserved.
+    std.mem.writeInt(u32, buf[4..8], Aarch64.bCond(.hi, 0), .little);
+    patchBCondTo(&buf, 4, 12);
+    try testing.expectEqual(Aarch64.bCond(.hi, 2), std.mem.readInt(u32, buf[4..8], .little));
+    // b @ site 12 → target 4: −2 words (backward).
+    std.mem.writeInt(u32, buf[12..16], Aarch64.b(0), .little);
+    patchBTo(&buf, 12, 4);
+    try testing.expectEqual(Aarch64.b(-2), std.mem.readInt(u32, buf[12..16], .little));
 }
 
 // TESTS — hand-build a tiny Ir.Function and assert the emitted byte shape.
