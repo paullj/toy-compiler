@@ -262,6 +262,7 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // would deref a stale App index as `enum_id`).
     if (t.conv_int_char_result) |r| try collectApp(t, r, &to_reify);
     if (t.conv_char_byte_result) |r| try collectApp(t, r, &to_reify);
+    if (t.conv_float_int_result) |r| try collectApp(t, r, &to_reify);
 
     // (2) Reify in (depth, structural-key) order so ids are a pure function of source.
     // Apps reified on-demand during Phase 0b (concrete generic-aggregate fields) are
@@ -313,4 +314,5 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // witness recipes carry (their emitter reads `d.ret.enum_id`).
     if (t.conv_int_char_result) |*r| rewriteApp(t, r);
     if (t.conv_char_byte_result) |*r| rewriteApp(t, r);
+    if (t.conv_float_int_result) |*r| rewriteApp(t, r);
 }

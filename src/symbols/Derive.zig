@@ -23,7 +23,7 @@ const Type = @import("../layout/Type.zig").Type;
 /// char conversions `.conv_int_char`/`.conv_char_byte` (source-less `TryInto` witnesses,
 /// not real conformance methods — see `derive_synth`). The ordinal folds into the mangled
 /// name + the sort key, so it must stay stable.
-pub const Kind = enum(u8) { eq, ord, hash, display, conv_int_char, conv_char_byte };
+pub const Kind = enum(u8) { eq, ord, hash, display, conv_int_char, conv_char_byte, conv_float_int };
 
 /// The method a `Kind` synthesizes (a pure function of the kind). Used for the
 /// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method, `Hash` a
@@ -37,6 +37,7 @@ pub fn methodName(k: Kind) []const u8 {
         .display => "display",
         .conv_int_char => "int_to_char",
         .conv_char_byte => "char_to_byte",
+        .conv_float_int => "float_to_int",
     };
 }
 
@@ -309,7 +310,14 @@ test "mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" 
     try testing.expect(!std.mem.eql(u8, ic, ds));
     try testing.expect(!std.mem.eql(u8, ic, es));
     try testing.expect(!std.mem.eql(u8, cb, ds));
-    // writeKey separates the two conv kinds for the same (protocol, type).
+    // The float->int witness anchors on `Type.float` (no char struct); `carriesIntDesc(.float)`
+    // is false, so mangle/writeKey accept it and mint the `s0` name distinct from the char convs.
+    const fi = try mangle(gpa, "TryInto", .conv_float_int, Type.float);
+    defer gpa.free(fi);
+    try testing.expectEqualStrings("TryInto$float_to_int$s0", fi);
+    try testing.expect(!std.mem.eql(u8, fi, ic));
+    try testing.expect(!std.mem.eql(u8, fi, cb));
+    // writeKey separates the conv kinds for the same (protocol, type).
     var a: std.ArrayList(u8) = .empty;
     defer a.deinit(gpa);
     var b: std.ArrayList(u8) = .empty;

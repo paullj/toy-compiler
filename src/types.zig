@@ -706,7 +706,7 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
 
 /// The kind of a conversion the `Into`/`TryInto` recognizer accepts. `widen`/`narrow`
 /// are the int↔int cases; the four `char_*`/`*_char` cases are the char surface.
-pub const ConvKind = enum { widen, narrow, char_to_int, byte_to_char, int_to_char, char_to_byte };
+pub const ConvKind = enum { widen, narrow, char_to_int, byte_to_char, int_to_char, char_to_byte, int_to_float, float_to_int };
 
 /// Whether `t` is the compiler-provided `char` struct (`char_id` from the prelude). The
 /// single source of the "is this char" predicate; the checker and lower delegate here.
@@ -741,9 +741,18 @@ pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8, char_id
         if (recv.isInteger() and expected.isInteger() and
             recv.isSigned() == expected.isSigned() and expected.intBits() >= recv.intBits())
             return .{ .kind = .widen, .target = expected };
+        // int -> float: lossless in range; scvtf rounds |x|>2^53 to nearest, never fails.
+        // Signed / sub-64-bit only: a 64-bit unsigned >= 2^63 would scvtf negative (T0018).
+        if (recv.isInteger() and expected.kind == .float and (recv.isSigned() or recv.intBits() < 64))
+            return .{ .kind = .int_to_float, .target = expected };
         return null;
     }
     if (std.mem.eql(u8, member, "try_into")) {
+        // float -> int: fallible (NaN / +-inf / |f|>=2^63 -> Err). Target restricted to plain
+        // `int`: the shared witness is program-global with ONE captured Result[int,ConvErr] and a
+        // fixed 8-byte int store; a narrower/unsigned target would need a per-target witness (T0018).
+        if (recv.kind == .float and Type.eql(expected, Type.int))
+            return .{ .kind = .float_to_int, .target = expected };
         // int -> char: range-check a valid Unicode scalar (surrogate / > 0x10FFFF fail).
         if (recv.isInteger() and exp_char) return .{ .kind = .int_to_char, .target = expected };
         // char -> byte: range-check the codepoint fits `uint8` (≤ 0xFF).
@@ -1019,6 +1028,7 @@ derive_reqs: std.ArrayList(DeriveReq) = .empty,
 /// mono re-check; all values are the same interned enum, so the merge is order-free.
 conv_int_char_result: ?Type = null,
 conv_char_byte_result: ?Type = null,
+conv_float_int_result: ?Type = null,
 
 /// The authorized structural auto-derive recipes, built by the synthesis barrier
 /// at the end of `monomorphize` in canonical order. Transferred whole into
@@ -2119,6 +2129,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     // OR-merge its captured Result so the synthesis barrier still reifies the witness.
     if (t.conv_int_char_result == null) t.conv_int_char_result = bc.conv_int_char_result;
     if (t.conv_char_byte_result == null) t.conv_char_byte_result = bc.conv_char_byte_result;
+    if (t.conv_float_int_result == null) t.conv_float_int_result = bc.conv_float_int_result;
 
     // Build this instance's resolved bound conformances (all satisfied — enqueue
     // gated them, so a bound's `conform_ty` is a concrete `structT`/`enumT`/scalar the
@@ -2235,6 +2246,7 @@ const BodyResult = struct {
     /// into `t.conv_*_result` by `checkBodies` (gate for the shared-witness synthesis).
     conv_int_char_result: ?Type = null,
     conv_char_byte_result: ?Type = null,
+    conv_float_int_result: ?Type = null,
 };
 
 /// THE per-fn body region (Pass C): run every fn's body check as an independent
@@ -2296,6 +2308,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     for (slots) |s| {
         if (t.conv_int_char_result == null) t.conv_int_char_result = s.conv_int_char_result;
         if (t.conv_char_byte_result == null) t.conv_char_byte_result = s.conv_char_byte_result;
+        if (t.conv_float_int_result == null) t.conv_float_int_result = s.conv_float_int_result;
     }
 
     // Merge per-fn sinks in fn-id order, then sort once. `merge` reserves capacity
@@ -2363,6 +2376,7 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     };
     out.conv_int_char_result = bc.conv_int_char_result;
     out.conv_char_byte_result = bc.conv_char_byte_result;
+    out.conv_float_int_result = bc.conv_float_int_result;
 }
 
 /// A `pub` fn must not expose a non-`pub` type: if any param/return type resolves
@@ -6375,6 +6389,22 @@ test "builtinConvMethod verdict table (widen/narrow/reject)" {
     // Non-integer receiver / expected → null (leaves struct/enum dispatch untouched).
     try testing.expect(builtinConvMethod(Type.bool, Type.uint8, "try_into", null) == null);
     try testing.expect(builtinConvMethod(Type.uint8, Type.bool, "into", null) == null);
+}
+
+test "builtinConvMethod int↔float verdicts" {
+    // int -> float (into): signed or sub-64-bit unsigned -> lossless scvtf.
+    try testing.expectEqual(ConvKind.int_to_float, builtinConvMethod(Type.int, Type.float, "into", null).?.kind);
+    try testing.expectEqual(Type.float, builtinConvMethod(Type.int, Type.float, "into", null).?.target);
+    try testing.expectEqual(ConvKind.int_to_float, builtinConvMethod(Type.uint8, Type.float, "into", null).?.kind);
+    // A 64-bit unsigned (>= 2^63 would scvtf negative) is deferred (T0018), not miscompiled.
+    try testing.expect(builtinConvMethod(Type.uint, Type.float, "into", null) == null);
+    // float -> int (try_into): target restricted to plain `int`; a narrower/unsigned target defers.
+    try testing.expectEqual(ConvKind.float_to_int, builtinConvMethod(Type.float, Type.int, "try_into", null).?.kind);
+    try testing.expectEqual(Type.int, builtinConvMethod(Type.float, Type.int, "try_into", null).?.target);
+    try testing.expect(builtinConvMethod(Type.float, Type.uint8, "try_into", null) == null);
+    // float.into() to int and int.try_into() to float are NOT this surface.
+    try testing.expect(builtinConvMethod(Type.float, Type.int, "into", null) == null);
+    try testing.expect(builtinConvMethod(Type.int, Type.float, "try_into", null) == null);
 }
 
 test "builtinConvMethod char verdicts (char↔int/byte)" {

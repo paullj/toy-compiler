@@ -1,0 +1,6 @@
+# expect: exit 42
+fn main() -> int {
+    n := 0 - 5
+    f: float = n.into()
+    return if f == (0.0 -. 5.0) { 42 } else { 0 }
+}

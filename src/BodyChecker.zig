@@ -155,6 +155,7 @@ pub const BodyChecker = struct {
     /// the `BodyResult` after the walk. POD, so no teardown.
     conv_int_char_result: ?Type = null,
     conv_char_byte_result: ?Type = null,
+    conv_float_int_result: ?Type = null,
 
     /// The recursive `conforms` query's memo, keyed by `(protocol, kind, type-id)`.
     /// THREAD-LOCAL (one map per BodyChecker) so the query is race-free under the
@@ -1762,7 +1763,7 @@ pub const BodyChecker = struct {
     fn dispatchValueMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
         const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return Type.invalid; // receiver already errored → no cascade
-        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar())
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar() or recv_ty.kind == .float)
         {
             return try bc.dispatchConcreteMethod(node_idx, n, callee, recv_ty);
         } else if (recv_ty.kind == .app) {
@@ -1800,7 +1801,7 @@ pub const BodyChecker = struct {
         // struct receiver with no such method falls through to T0018 — never a wrong pick.
         const char_id = if (bc.model.prelude) |p| p.char_struct else null;
         const recv_is_char = Typecheck.isCharTy(recv_ty, char_id);
-        if ((recv_ty.isInteger() or recv_is_char) and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
+        if ((recv_ty.isInteger() or recv_is_char or recv_ty.kind == .float) and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
             if (bc.expected) |exp| {
                 if (Typecheck.builtinConvMethod(recv_ty, exp, member, char_id)) |cm| {
                     if (args.len != 0) {
@@ -1808,8 +1809,8 @@ pub const BodyChecker = struct {
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                     }
                     const ret: Type = switch (cm.kind) {
-                        .widen, .char_to_int, .byte_to_char => cm.target,
-                        .narrow, .int_to_char, .char_to_byte => Type.app(try bc.internApp(
+                        .widen, .char_to_int, .byte_to_char, .int_to_float => cm.target,
+                        .narrow, .int_to_char, .char_to_byte, .float_to_int => Type.app(try bc.internApp(
                             bc.model.prelude.?.result_enum.?,
                             &.{ cm.target, Type.enumT(bc.model.prelude.?.conv_err_enum.?) },
                             true,
@@ -1822,6 +1823,7 @@ pub const BodyChecker = struct {
                     switch (cm.kind) {
                         .int_to_char => bc.conv_int_char_result = ret,
                         .char_to_byte => bc.conv_char_byte_result = ret,
+                        .float_to_int => bc.conv_float_int_result = ret,
                         else => {},
                     }
                     bc.node_types[(node_idx).int()] = ret;

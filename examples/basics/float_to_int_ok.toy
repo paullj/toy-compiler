@@ -1,0 +1,5 @@
+# expect: exit 42
+fn main() -> int {
+    m: int = (42.0).try_into().unwrap()
+    return if m == 42 { 42 } else { 0 }
+}

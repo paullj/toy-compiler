@@ -497,6 +497,18 @@ pub fn strFpSp(dt: u32, byteOff: u32) u32 {
     return 0xFD000000 | ((byteOff / 8) << 10) | (SP << 5) | dt;
 }
 
+/// SCVTF Dd, Xn — signed 64-bit int in a GPR → f64 in a D reg (round-to-nearest-even, FPCR default).
+pub fn scvtf(dd: u32, xn: u32) u32 {
+    return 0x9E620000 | (xn << 5) | dd;
+}
+
+/// FCVTZS Xd, Dn — f64 → signed 64-bit int, truncating toward zero. SATURATES on NaN /
+/// out-of-range; the float→int witness fcmp-range-guards BEFORE emitting this, so it only
+/// runs on in-range finite inputs (the fallible-narrow ruling wants Err, not saturation).
+pub fn fcvtzs(xd: u32, dn: u32) u32 {
+    return 0x9E780000 | (dn << 5) | xd;
+}
+
 // Tests — each expected word is the objdump hex for the matching mnemonic,
 // assembled on this host with `as -arch arm64` (see the file doc comment).
 
@@ -513,6 +525,10 @@ test "fp encoders" {
     try testing.expectEqual(@as(u32, 0x1E712200), fcmp(16, 17)); // fcmp d16,d17
     try testing.expectEqual(@as(u32, 0xFD4007F0), ldrFpSp(16, 8)); // ldr d16,[sp,#8]
     try testing.expectEqual(@as(u32, 0xFD0007F0), strFpSp(16, 8)); // str d16,[sp,#8]
+    try testing.expectEqual(@as(u32, 0x9E620010), scvtf(16, 0)); // scvtf d16, x0
+    try testing.expectEqual(@as(u32, 0x9E620020), scvtf(0, 1)); // scvtf d0, x1
+    try testing.expectEqual(@as(u32, 0x9E780200), fcvtzs(0, 16)); // fcvtzs x0, d16
+    try testing.expectEqual(@as(u32, 0x9E780062), fcvtzs(2, 3)); // fcvtzs x2, d3
     try testing.expectEqual(@as(u32, 0x9A9F57E0), cset(0, .mi)); // cset x0,mi
     try testing.expectEqual(@as(u32, 0x9A9F47E0), cset(0, .pl)); // cset x0,pl
     try testing.expectEqual(Cond.pl, invert(.mi));
