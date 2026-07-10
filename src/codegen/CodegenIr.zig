@@ -226,7 +226,7 @@ pub fn lowerIr(
         g.code.deinit(gpa);
         for (g.relocs.items) |r| switch (r.target) {
             .func, .import => |s| gpa.free(s.name),
-            .cstr => {},
+            .cstr, .none => {},
         };
         g.relocs.deinit(gpa);
         for (g.literals.items) |l| gpa.free(l.bytes);
@@ -934,12 +934,68 @@ fn addLiteral(g: *Gen, hash: u64, bytes: []u8) error{OutOfMemory}!void {
 // program at link time (emit.zig) when any fn references `print`. Shuffles the
 // (ptr,len) str pair into write(fd=1, buf, len) and tail-calls libc `write`.
 
-/// Append one little-endian AArch64 instruction word to a hand-emitted builtin's
-/// code buffer. Shared by the `lowerPrint`/`lowerDisplayInt`/`lowerPanic` bodies.
+// A tiny shared harness for the hand-emitted `write`-calling builtins
+// (`lowerPrint`/`lowerDisplayInt`/`lowerPanic`). Each still writes its own body; these
+// own only the boilerplate every one repeats verbatim — opening a frame, the `write`
+// GOT-import preamble (byte-identical bar the destination register), the error-path
+// reloc-name cleanup, and packaging the finished FnCode.
+
+/// Append one little-endian AArch64 instruction word to a builtin's code buffer.
 fn emitWord(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &buf, word, .little);
     try c.appendSlice(a, &buf);
+}
+
+/// Open a standard frame: `stp x29,x30,[sp,#-16]! ; mov x29,sp`. A valid frame chain
+/// is required both to call `write` and for `panic` to walk it.
+fn emitFramePrologue(code: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    try emitWord(code, gpa, Aarch64.stpFpLrPre);
+    try emitWord(code, gpa, Aarch64.movFpSp);
+}
+
+/// Emit the `write` GOT-import preamble — `adrp x16, write@GOT ; ldr xRd,[x16]` — and
+/// append its two `.import` relocs (patched to the `__got` slot after layout). The fn
+/// pointer lands in xRd; the caller issues `blr xRd`. Each name is freed on this fn's
+/// own error path; on success `relocs` owns them (freed via `deinitBuiltinRelocs` or,
+/// once packaged, `FnCode.deinit`).
+fn emitWriteImport(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, rd: u32) error{OutOfMemory}!void {
+    {
+        const nm = try gpa.dupe(u8, "write");
+        errdefer gpa.free(nm);
+        try relocs.append(gpa, .{ .site = @intCast(code.items.len), .target = .{ .import = .{ .kind = .import, .name = nm } }, .kind = .adrp_page });
+    }
+    try emitWord(code, gpa, Aarch64.adrp(16, 0));
+    {
+        const nm = try gpa.dupe(u8, "write");
+        errdefer gpa.free(nm);
+        try relocs.append(gpa, .{ .site = @intCast(code.items.len), .target = .{ .import = .{ .kind = .import, .name = nm } }, .kind = .ldr_lo12 });
+    }
+    try emitWord(code, gpa, Aarch64.ldrRegUoff(rd, 16, 0));
+}
+
+/// Free a partially-built builtin's reloc target names + the reloc array (deinit of the
+/// array alone does NOT free the interned `.func`/`.import` names). The builtins'
+/// error-path errdefer; on success ownership passes to the FnCode.
+fn deinitBuiltinRelocs(relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator) void {
+    for (relocs.items) |r| switch (r.target) {
+        .func, .import => |s| gpa.free(s.name),
+        .cstr, .none => {},
+    };
+    relocs.deinit(gpa);
+}
+
+/// Package a hand-emitted builtin: name it `builtin` and take ownership of its code +
+/// relocs. On failure the caller's `code`/`relocs` errdefers reclaim the buffers.
+fn finishBuiltin(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, name_str: []const u8) error{OutOfMemory}!Link.FnCode {
+    const name = try gpa.dupe(u8, name_str);
+    errdefer gpa.free(name);
+    return .{
+        .sym = .{ .kind = .builtin, .name = name },
+        .code = try code.toOwnedSlice(gpa),
+        .relocs = try relocs.toOwnedSlice(gpa),
+        .literals = &.{},
+    };
 }
 
 /// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
@@ -948,41 +1004,22 @@ pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     var code: std.ArrayList(u8) = .empty;
     errdefer code.deinit(gpa);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
-    errdefer relocs.deinit(gpa);
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
 
     const emit = emitWord;
 
-    try emit(&code, gpa, Aarch64.stpFpLrPre); // stp x29, x30, [sp, #-16]!
-    try emit(&code, gpa, Aarch64.movFpSp); // mov x29, sp
+    try emitFramePrologue(&code, gpa);
     // Shuffle (ptr,len) into write's (buf,len) = (x1,x2), then fd=1 in w0. Order
     // matters: move len (x1→x2) BEFORE overwriting x1 with ptr (x0→x1).
     try emit(&code, gpa, Aarch64.movReg(2, 1)); // len → x2
     try emit(&code, gpa, Aarch64.movReg(1, 0)); // ptr → x1
     try emit(&code, gpa, Aarch64.movz(0, 1, 0)); // fd = 1
-    // adrp x16, _write@GOT  (placeholder; .adrp_page reloc to import "write")
-    var site: u32 = @intCast(code.items.len);
-    const wname1 = try gpa.dupe(u8, "write");
-    errdefer gpa.free(wname1);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname1 } }, .kind = .adrp_page });
-    try emit(&code, gpa, Aarch64.adrp(16, 0)); // adrp x16, _write@GOT
-    // ldr x16, [x16]  (placeholder; .ldr_lo12 reloc, same import)
-    site = @intCast(code.items.len);
-    const wname2 = try gpa.dupe(u8, "write");
-    errdefer gpa.free(wname2);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname2 } }, .kind = .ldr_lo12 });
-    try emit(&code, gpa, Aarch64.ldrRegUoff(16, 16, 0)); // ldr x16, [x16]
+    try emitWriteImport(&code, &relocs, gpa, 16); // x16 = &write
     try emit(&code, gpa, Aarch64.blr(16)); // blr x16
     try emit(&code, gpa, Aarch64.ldpFpLrPost); // ldp x29, x30, [sp], #16
     try emit(&code, gpa, Aarch64.ret); // ret
 
-    const name = try gpa.dupe(u8, "print");
-    errdefer gpa.free(name);
-    return .{
-        .sym = .{ .kind = .builtin, .name = name },
-        .code = try code.toOwnedSlice(gpa),
-        .relocs = try relocs.toOwnedSlice(gpa),
-        .literals = &.{},
-    };
+    return finishBuiltin(&code, &relocs, gpa, "print");
 }
 
 // __display_int(n) builtin body — hand-written, AST/IR-independent. The
@@ -1004,14 +1041,13 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     var code: std.ArrayList(u8) = .empty;
     errdefer code.deinit(gpa);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
-    errdefer relocs.deinit(gpa);
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
 
     const emit = emitWord;
 
     const A = Aarch64;
     // Prologue + reserve a 32-byte digit buffer at [sp, sp+32); saved fp/lr sit above.
-    try emit(&code, gpa, A.stpFpLrPre); // stp x29,x30,[sp,#-16]!
-    try emit(&code, gpa, A.movFpSp); // mov x29, sp
+    try emitFramePrologue(&code, gpa);
     try emit(&code, gpa, A.subImm(A.SP, A.SP, 32)); // sub sp, sp, #32
     try emit(&code, gpa, A.movReg(9, 0)); // x9 = n (saved for the sign test)
     try emit(&code, gpa, A.movz(11, 10, 0)); // x11 = 10 (divisor)
@@ -1040,31 +1076,14 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.subReg(2, 1, 10)); // x2 = len = end - cursor
     try emit(&code, gpa, A.movReg(1, 10)); // x1 = buf = cursor
     try emit(&code, gpa, A.movz(0, 1, 0)); // x0 = fd = 1
-    // adrp x16, _write@GOT ; ldr x16,[x16] ; blr x16  (same import path as lowerPrint).
-    var site: u32 = @intCast(code.items.len);
-    const wname1 = try gpa.dupe(u8, "write");
-    errdefer gpa.free(wname1);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname1 } }, .kind = .adrp_page });
-    try emit(&code, gpa, A.adrp(16, 0));
-    site = @intCast(code.items.len);
-    const wname2 = try gpa.dupe(u8, "write");
-    errdefer gpa.free(wname2);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname2 } }, .kind = .ldr_lo12 });
-    try emit(&code, gpa, A.ldrRegUoff(16, 16, 0));
+    try emitWriteImport(&code, &relocs, gpa, 16); // x16 = &write
     try emit(&code, gpa, A.blr(16));
     // Epilogue.
     try emit(&code, gpa, A.addImm(A.SP, A.SP, 32)); // sub-buffer teardown
     try emit(&code, gpa, A.ldpFpLrPost); // ldp x29,x30,[sp],#16
     try emit(&code, gpa, A.ret);
 
-    const name = try gpa.dupe(u8, "__display_int");
-    errdefer gpa.free(name);
-    return .{
-        .sym = .{ .kind = .builtin, .name = name },
-        .code = try code.toOwnedSlice(gpa),
-        .relocs = try relocs.toOwnedSlice(gpa),
-        .literals = &.{},
-    };
+    return finishBuiltin(&code, &relocs, gpa, "__display_int");
 }
 
 // panic(str) builtin body — hand-written, AST/IR-independent. Appended once at link
@@ -1086,13 +1105,12 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     var code: std.ArrayList(u8) = .empty;
     errdefer code.deinit(gpa);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
-    errdefer relocs.deinit(gpa);
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
 
     const emit = emitWord;
 
     // Prologue + 64-byte scratch buffer for the hex line (`0x` + 16 nibbles + `\n`).
-    try emit(&code, gpa, A.stpFpLrPre); // stp x29,x30,[sp,#-16]!
-    try emit(&code, gpa, A.movFpSp); // mov x29, sp
+    try emitFramePrologue(&code, gpa);
     try emit(&code, gpa, A.subImm(A.SP, A.SP, 64)); // scratch buffer
     try emit(&code, gpa, A.addImm(22, A.SP, 0)); // x22 = buffer base
 
@@ -1102,16 +1120,7 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.movReg(2, 1)); // len -> x2
     try emit(&code, gpa, A.movReg(1, 0)); // ptr -> x1
     try emit(&code, gpa, A.movz(0, 2, 0)); // fd = 2 (STDERR)
-    var site: u32 = @intCast(code.items.len);
-    const wname1 = try gpa.dupe(u8, "write");
-    errdefer gpa.free(wname1);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname1 } }, .kind = .adrp_page });
-    try emit(&code, gpa, A.adrp(16, 0)); // adrp x16, write@GOT
-    site = @intCast(code.items.len);
-    const wname2 = try gpa.dupe(u8, "write");
-    errdefer gpa.free(wname2);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname2 } }, .kind = .ldr_lo12 });
-    try emit(&code, gpa, A.ldrRegUoff(26, 16, 0)); // x26 = &write
+    try emitWriteImport(&code, &relocs, gpa, 26); // x26 = &write
     try emit(&code, gpa, A.blr(26)); // write the message
 
     // One '\n' separator: messages carry no trailing newline, so this keeps the
@@ -1124,18 +1133,15 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.blr(26)); // write '\n'
 
     // Self-locate text_base into x19 (see the doc comment). The two movw relocs bake
-    // the `adr`'s own absolute __text offset (addend = adr_site - mov_site).
+    // the `adr`'s own absolute __text offset (addend = adr_site - mov_site); they need
+    // no target (the baked value is site-relative), so they carry `.none`.
     const adr_pos: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.adr(9, 0)); // x9 = text_base + adr_off
-    site = @intCast(code.items.len);
-    const pn0 = try gpa.dupe(u8, "panic");
-    errdefer gpa.free(pn0);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .func = .{ .kind = .builtin, .name = pn0 } }, .kind = .movw_g0, .addend = @as(i64, adr_pos) - @as(i64, site) });
+    var site: u32 = @intCast(code.items.len);
+    try relocs.append(gpa, .{ .site = site, .target = .none, .kind = .movw_g0, .addend = @as(i64, adr_pos) - @as(i64, site) });
     try emit(&code, gpa, A.movz(10, 0, 0)); // x10 = adr_off (lo)
     site = @intCast(code.items.len);
-    const pn1 = try gpa.dupe(u8, "panic");
-    errdefer gpa.free(pn1);
-    try relocs.append(gpa, .{ .site = site, .target = .{ .func = .{ .kind = .builtin, .name = pn1 } }, .kind = .movw_g1, .addend = @as(i64, adr_pos) - @as(i64, site) });
+    try relocs.append(gpa, .{ .site = site, .target = .none, .kind = .movw_g1, .addend = @as(i64, adr_pos) - @as(i64, site) });
     try emit(&code, gpa, A.movk(10, 0, 1)); // x10 |= adr_off (hi)
     try emit(&code, gpa, A.subReg(19, 9, 10)); // x19 = text_base
 
@@ -1271,14 +1277,7 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     patchCbzTo(buf, strlen_cbz, strlen_done);
     patchBTo(buf, strlen_b, strlen_top);
 
-    const name = try gpa.dupe(u8, "panic");
-    errdefer gpa.free(name);
-    return .{
-        .sym = .{ .kind = .builtin, .name = name },
-        .code = try code.toOwnedSlice(gpa),
-        .relocs = try relocs.toOwnedSlice(gpa),
-        .literals = &.{},
-    };
+    return finishBuiltin(&code, &relocs, gpa, "panic");
 }
 
 /// Backpatch a `cbz`/`cbnz` placeholder at byte `site` to branch to byte `target`

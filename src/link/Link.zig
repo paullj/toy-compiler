@@ -41,10 +41,14 @@ pub const SymName = symbols.SymName;
 ///   * `.import` — an external symbol, named by its stable `SymName` (always
 ///                 `{.import,"write"}`). Reached through its `__got` slot
 ///                 (adrp+ldr+blr); patched by `applyDataRelocs`.
+///   * `.none`   — no target. For a reloc whose patched value is derived purely from
+///                 its own site + addend (the `.movw_g0`/`.movw_g1` self-locate), so
+///                 there is nothing to name or free.
 pub const SymbolId = union(enum) {
     func: SymName,
     cstr: u64,
     import: SymName,
+    none,
 };
 
 /// The kind of patch a relocation requests.
@@ -114,7 +118,7 @@ pub const FnCode = struct {
         gpa.free(fc.code);
         for (fc.relocs) |r| switch (r.target) {
             .func, .import => |s| gpa.free(s.name),
-            .cstr => {},
+            .cstr, .none => {},
         };
         gpa.free(fc.relocs);
         for (fc.literals) |l| gpa.free(l.bytes);
@@ -620,6 +624,7 @@ fn dataRelocJob(
         .cstr => |off| cstring_vmaddr + off,
         .import => |s| got_vmaddr + @as(u64, import_slots.get(s.name).?) * 8,
         .func => unreachable, // funcs are patched intra-module by `link`
+        .none => unreachable, // `.none` only rides `.movw_*`, patched in `link`
     };
     const word = std.mem.readInt(u32, text[rl.site..][0..4], .little);
     const patched: u32 = switch (rl.kind) {
@@ -695,7 +700,7 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
     var names_len: usize = 0;
     for (fc.relocs) |r| switch (r.target) {
         .func, .import => |s| names_len += s.name.len,
-        .cstr => {},
+        .cstr, .none => {},
     };
     var lits_len: usize = 0;
     for (fc.literals) |l| lits_len += l.bytes.len;
@@ -757,6 +762,7 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
                 rec.name_len = @intCast(s.name.len);
                 name_cursor += @intCast(s.name.len);
             },
+            .none => rec.tgt_tag = 3,
         }
         @memcpy(buf[off .. off + @sizeOf(RelocRec)], std.mem.asBytes(&rec));
         off += @sizeOf(RelocRec);
@@ -767,7 +773,7 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
             @memcpy(buf[off .. off + s.name.len], s.name);
             off += s.name.len;
         },
-        .cstr => {},
+        .cstr, .none => {},
     };
 
     // LitRec array + lits pool.
@@ -828,7 +834,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
     errdefer {
         for (relocs[0..built]) |r| switch (r.target) {
             .func, .import => |s| gpa.free(s.name),
-            .cstr => {},
+            .cstr, .none => {},
         };
         gpa.free(relocs);
     }
@@ -847,6 +853,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
                 break :blk if (rec.tgt_tag == 0) SymbolId{ .func = sn } else SymbolId{ .import = sn };
             },
             1 => SymbolId{ .cstr = rec.cstr_hash },
+            3 => SymbolId.none,
             else => return null,
         };
         out_rl.* = .{ .site = rec.site, .target = target, .kind = kind, .addend = rec.addend };
