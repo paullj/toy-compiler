@@ -76,10 +76,7 @@ pub const LinkedProgram = struct {
         gpa.free(self.cstrings);
         // `.import` data-reloc targets carry an owned name copy (the source
         // FnCodes were freed by the relink tail); `.cstr` targets are offsets.
-        for (self.data_relocs) |rl| switch (rl.target) {
-            .import => |s| gpa.free(s.name),
-            .func, .cstr, .none => {},
-        };
+        for (self.data_relocs) |rl| if (rl.target.name()) |nm| gpa.free(nm);
         gpa.free(self.data_relocs);
         self.* = undefined;
     }

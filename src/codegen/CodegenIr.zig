@@ -224,10 +224,7 @@ pub fn lowerIr(
     }
     errdefer {
         g.code.deinit(gpa);
-        for (g.relocs.items) |r| switch (r.target) {
-            .func, .import => |s| gpa.free(s.name),
-            .cstr, .none => {},
-        };
+        for (g.relocs.items) |r| if (r.target.name()) |nm| gpa.free(nm);
         g.relocs.deinit(gpa);
         for (g.literals.items) |l| gpa.free(l.bytes);
         g.literals.deinit(gpa);
@@ -978,10 +975,7 @@ fn emitWriteImport(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc),
 /// array alone does NOT free the interned `.func`/`.import` names). The builtins'
 /// error-path errdefer; on success ownership passes to the FnCode.
 fn deinitBuiltinRelocs(relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator) void {
-    for (relocs.items) |r| switch (r.target) {
-        .func, .import => |s| gpa.free(s.name),
-        .cstr, .none => {},
-    };
+    for (relocs.items) |r| if (r.target.name()) |nm| gpa.free(nm);
     relocs.deinit(gpa);
 }
 

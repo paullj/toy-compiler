@@ -28,67 +28,15 @@ const symbols = @import("../symbols/Sym.zig");
 pub const SymKind = symbols.SymKind;
 pub const SymName = symbols.SymName;
 
-/// A symbolic reference to a definition. NEVER an address — the linker (for
-/// `.func`/intra-module) or the post-vmaddr pass (for the cross-segment cases)
-/// maps it to a final address.
-///
-///   * `.func`   — a function, named by its stable `SymName` (matches the
-///                 callee's identity). Patched by `link` (PC-relative `bl`).
-///   * `.cstr`   — a string literal. While lowered (and on disk) this holds the
-///                 literal's CONTENT HASH; the serial relink tail rewrites it to
-///                 a byte offset into the program-wide `__cstring` blob, after
-///                 which `applyDataRelocs` reads it as that offset.
-///   * `.import` — an external symbol, named by its stable `SymName` (always
-///                 `{.import,"write"}`). Reached through its `__got` slot
-///                 (adrp+ldr+blr); patched by `applyDataRelocs`.
-///   * `.none`   — no target. For a reloc whose patched value is derived purely from
-///                 its own site + addend (the `.movw_g0`/`.movw_g1` self-locate), so
-///                 there is nothing to name or free.
-pub const SymbolId = union(enum) {
-    func: SymName,
-    cstr: u64,
-    import: SymName,
-    none,
-};
-
-/// The kind of patch a relocation requests.
-///
-///   * `.call26`    — an AArch64 `bl`: imm26 = (target − site)/4. Intra-module,
-///                    patched by `link`.
-///   * `.adrp_page` — an `adrp`: page delta = (target>>12) − (site>>12). Used for
-///                    BOTH `.cstr` and `.import` targets (the SymbolId picks which
-///                    final vmaddr feeds in). Patched by `applyDataRelocs`.
-///   * `.add_lo12`  — an `add (imm12)`: the low-12 bits of the cstring vmaddr.
-///   * `.ldr_lo12`  — an `ldr (unsigned offset)`: the low-12 bits of the GOT-slot
-///                    vmaddr (only for `.import` targets).
-///   * `.movw_g0` / `.movw_g1` — bake a SELF-RELATIVE __text offset into a
-///                    `movz`/`movk` imm16 (low / high halfword). The baked value
-///                    is `site_abs + addend` — the reloc site's absolute __text
-///                    offset shifted by `addend` to name a nearby instruction (the
-///                    __panic self-locate `adr`). Patched intra-module by `link`
-///                    like `.call26`: it is a link-time OFFSET, not a runtime
-///                    address, so it needs no relocation under PIE/ASLR. The
-///                    `.target` is unused (a self `.func` placeholder).
-pub const RelocKind = enum {
-    call26,
-    adrp_page,
-    add_lo12,
-    ldr_lo12,
-    movw_g0,
-    movw_g1,
-};
-
-/// One patch to apply during linking. `site` is the byte offset of the word to
-/// patch within its owning function's `code`. `addend` shifts the resolved value:
-/// 0 for `.call26`/`.adrp_page`/`.add_lo12`/`.ldr_lo12`; for `.movw_g0`/`.movw_g1`
-/// it names an instruction relative to the reloc site (the __panic self-locate
-/// `adr`), so the baked value is `site_abs + addend`.
-pub const Reloc = struct {
-    site: u32,
-    target: SymbolId,
-    kind: RelocKind,
-    addend: i64 = 0,
-};
+// The relocation vocabulary + the kind→bytes machinery live in the `reloc` peer module
+// (so understanding one relocation is one file, not the whole backend). Re-exported here
+// so every `Link.Reloc`/`Link.SymbolId`/`Link.RelocKind` callsite keeps compiling; `link`
+// keeps only the orchestration and calls `reloc.patchIntra`/`reloc.patchCross`.
+const reloc = @import("reloc.zig");
+pub const SymbolId = reloc.SymbolId;
+pub const RelocKind = reloc.RelocKind;
+pub const Reloc = reloc.Reloc;
+pub const symtab_base_hash = reloc.symtab_base_hash;
 
 /// One decoded string literal a function references, keyed by its content hash
 /// (the same hash a `.cstr` reloc target carries). `bytes` are the decoded
@@ -116,10 +64,7 @@ pub const FnCode = struct {
     pub fn deinit(fc: *FnCode, gpa: std.mem.Allocator) void {
         gpa.free(fc.sym.name);
         gpa.free(fc.code);
-        for (fc.relocs) |r| switch (r.target) {
-            .func, .import => |s| gpa.free(s.name),
-            .cstr, .none => {},
-        };
+        for (fc.relocs) |r| if (r.target.name()) |nm| gpa.free(nm);
         gpa.free(fc.relocs);
         for (fc.literals) |l| gpa.free(l.bytes);
         gpa.free(fc.literals);
@@ -250,13 +195,6 @@ pub const Linked = struct {
     /// set (offsets are stable-sort-ranked), so it is `-jN` byte-identical.
     sym_table: []u8 = &.{},
 };
-
-/// The content-hash sentinel a `.cstr` reloc carries to name the backtrace symbol
-/// table's base. The relink tail reserves it in `off_by_hash` (→ the table's byte
-/// offset in the appended `__cstring` blob), so `__panic` reaches the table via the
-/// same adrp+add path a string literal uses. Not a real hash (astronomically
-/// unlikely to collide; the relink tail rejects an actual collision).
-pub const symtab_base_hash: u64 = 0x5717_ab1e_ba5e_0000;
 
 /// Raised when a `.call26` displacement does not fit AArch64's signed imm26
 /// (±128 MiB in words). It cannot occur within one 0x4000 __TEXT page, but we
@@ -523,30 +461,23 @@ fn fnLinkJob(
     var call_i: usize = call_base[i];
     for (f.relocs) |rl| {
         const site_abs: u32 = base + rl.site;
-        switch (rl.kind) {
-            .call26 => {
-                const th = call_targets[call_i];
-                call_i += 1;
-                const target_abs: i64 = @as(i64, offsets[th]) + rl.addend;
-                const delta: i64 = target_abs - @as(i64, site_abs);
-                std.debug.assert(@mod(delta, 4) == 0); // BL targets are word-aligned
-                const imm: i64 = @divExact(delta, 4);
-                if (imm < -(@as(i64, 1) << 25) or imm > (@as(i64, 1) << 25) - 1) {
-                    if (slot.err == null) slot.err = error.CallTargetTooFar;
-                    continue;
-                }
-                const word = Aarch64.bl(@intCast(imm));
-                std.mem.writeInt(u32, text[site_abs..][0..4], word, .little);
+        switch (rl.kind.phase()) {
+            // Intra-module: patch in place now. Only `.call26` needs a resolved target
+            // offset (its callee's handle → `offsets`); the movw self-locate is
+            // site-relative, so `target_off` is unused there.
+            .intra => {
+                const target_off: u32 = if (rl.kind == .call26) blk: {
+                    const off = offsets[call_targets[call_i]];
+                    call_i += 1;
+                    break :blk off;
+                } else 0;
+                reloc.patchIntra(text, rl.kind, site_abs, target_off, rl.addend) catch |e| {
+                    if (slot.err == null) slot.err = e;
+                };
             },
-            .movw_g0, .movw_g1 => {
-                // Bake a self-relative __text OFFSET (site_abs + addend) into the
-                // movz/movk imm16 — intra-module, no runtime reloc (PIE-safe).
-                const val: u32 = @intCast(@as(i64, site_abs) + rl.addend);
-                const imm: u16 = if (rl.kind == .movw_g0) @truncate(val) else @truncate(val >> 16);
-                const word = std.mem.readInt(u32, text[site_abs..][0..4], .little);
-                std.mem.writeInt(u32, text[site_abs..][0..4], Aarch64.patchMovImm16(word, imm), .little);
-            },
-            .adrp_page, .add_lo12, .ldr_lo12 => {
+            // Cross-segment: defer to `applyDataRelocs` (needs vmaddrs), rebased to an
+            // absolute __text site.
+            .cross => {
                 slot.relocs.append(gpa, .{
                     .site = site_abs,
                     .target = rl.target,
@@ -623,25 +554,11 @@ fn dataRelocJob(
         // The relink tail already rewrote the content hash to a blob offset.
         .cstr => |off| cstring_vmaddr + off,
         .import => |s| got_vmaddr + @as(u64, import_slots.get(s.name).?) * 8,
-        .func => unreachable, // funcs are patched intra-module by `link`
-        .none => unreachable, // `.none` only rides `.movw_*`, patched in `link`
+        // Only cross-segment targets (`.cstr`/`.import`) reach `applyDataRelocs`.
+        .func, .none => unreachable,
     };
     const word = std.mem.readInt(u32, text[rl.site..][0..4], .little);
-    const patched: u32 = switch (rl.kind) {
-        .adrp_page => blk: {
-            const pages: i64 = @as(i64, @intCast(target_vmaddr >> 12)) -
-                @as(i64, @intCast(site_vmaddr >> 12));
-            break :blk Aarch64.patchAdrp(word, @intCast(pages));
-        },
-        .add_lo12 => Aarch64.patchAddImm12(word, @intCast(target_vmaddr & 0xFFF)),
-        .ldr_lo12 => blk: {
-            std.debug.assert(target_vmaddr & 7 == 0);
-            break :blk Aarch64.patchLdrUoff(word, @intCast(target_vmaddr & 0xFFF));
-        },
-        // Intra-module, patched in place by `link`; never reaches data_relocs.
-        .call26, .movw_g0, .movw_g1 => unreachable,
-    };
-    std.mem.writeInt(u32, text[rl.site..][0..4], patched, .little);
+    std.mem.writeInt(u32, text[rl.site..][0..4], reloc.patchCross(word, rl.kind, site_vmaddr, target_vmaddr), .little);
 }
 
 // A lowered `FnCode` is the cache payload. `Reloc.target` is a tagged union
@@ -698,9 +615,8 @@ comptime {
 /// re-lowered blob to the cached one.
 pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
     var names_len: usize = 0;
-    for (fc.relocs) |r| switch (r.target) {
-        .func, .import => |s| names_len += s.name.len,
-        .cstr, .none => {},
+    for (fc.relocs) |r| if (r.target.name()) |nm| {
+        names_len += nm.len;
     };
     var lits_len: usize = 0;
     for (fc.literals) |l| lits_len += l.bytes.len;
@@ -768,12 +684,9 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
         off += @sizeOf(RelocRec);
     }
     // Names pool.
-    for (fc.relocs) |r| switch (r.target) {
-        .func, .import => |s| {
-            @memcpy(buf[off .. off + s.name.len], s.name);
-            off += s.name.len;
-        },
-        .cstr, .none => {},
+    for (fc.relocs) |r| if (r.target.name()) |nm| {
+        @memcpy(buf[off .. off + nm.len], nm);
+        off += nm.len;
     };
 
     // LitRec array + lits pool.
@@ -832,10 +745,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
     // On a mid-loop failure, free only the names duped so far + the array.
     var built: usize = 0;
     errdefer {
-        for (relocs[0..built]) |r| switch (r.target) {
-            .func, .import => |s| gpa.free(s.name),
-            .cstr, .none => {},
-        };
+        for (relocs[0..built]) |r| if (r.target.name()) |nm| gpa.free(nm);
         gpa.free(relocs);
     }
     for (relocs, 0..) |*out_rl, i| {
