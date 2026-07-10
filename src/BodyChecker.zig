@@ -949,7 +949,7 @@ pub const BodyChecker = struct {
 
     fn typeOfTupleField(bc: *BodyChecker, n: Ast.Node) error{OutOfMemory}!Type {
         const base = try bc.typeOf(n.lhs);
-        if (base.kind == .invalid) return .invalid; // R4: no cascade on an already-poisoned base
+        if (base.kind == .invalid) return .invalid; // no cascade on an already-poisoned base
         if (!base.isStruct() or !bc.model.structs[base.struct_id].is_tuple) {
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "'.{s}' positional access requires a tuple struct, got {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
             return .invalid;

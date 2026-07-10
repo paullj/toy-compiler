@@ -150,7 +150,7 @@ const no_assumption: u32 = std.math.maxInt(u32);
 /// is then the node that closed the cycle, so no STRICT-ancestor assumption is still live
 /// and the verdict cannot change. Members deeper in a multi-node cycle carry `low` from a
 /// shallower ancestor, stay unsettled, and are recomputed on demand instead of caching a
-/// verdict that was true only under the entry's assumption (the R1 poisoning bug).
+/// verdict that was true only under the entry's assumption (the poisoning bug).
 const ConfStep = struct { ok: bool, low: u32 };
 
 fn conformsRec(

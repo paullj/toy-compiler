@@ -1,4 +1,4 @@
-# Feature: tuple-field STORES `p.0 = v` (R6), including a nested `o.0.0 = v` chain —
+# Feature: tuple-field STORES `p.0 = v`, including a nested `o.0.0 = v` chain —
 # routed through the record field-store machinery over the numeric field names.
 # expect: exit 44
 struct Pair(int, int)

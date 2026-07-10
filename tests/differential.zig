@@ -446,7 +446,7 @@ test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 
 }
 
 test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtrace dump to STDERR and exit nonzero at BOTH -O levels; nonzero controls exit normally" {
-    // `__panic` writes the message to fd 2, then a rung-A backtrace — one `0x<hex>`
+    // `__panic` writes the message to fd 2, then a symbolized backtrace — one `0x<hex>`
     // line per frame walked off the x29 chain (each is the call site's slide-independent
     // __text offset) — then SYS_exit(1): a clean nonzero exit, no SIGILL/brk. A panicking
     // program yields >= 2 frames (the panic-site fn + at least its caller up to the C

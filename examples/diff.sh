@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Correctness + determinism harness (M12, post-flip). The M12 AST→codegen path
+# Correctness + determinism harness (post-flip). The AST→codegen path
 # has been DELETED; the IR path (lex→parse→resolve→types→lower→codegen→link) is
 # now the one and only backend. This harness therefore no longer diffs two paths
 # — instead it asserts, for every corpus program:

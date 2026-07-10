@@ -1,6 +1,6 @@
 # examples/modules
 
-Multi-file (M14) programs. Unlike the single-file corpus in `examples/`, each
+Multi-file programs. Unlike the single-file corpus in `examples/`, each
 program here is a **directory** whose entry file is `main.toy`; the compiler
 discovers the rest of the module graph by following that entry's transitive
 imports (`import a/b` -> `<root>/a/b.toy`, root = the entry file's directory).

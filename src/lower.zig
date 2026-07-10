@@ -487,7 +487,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .break_stmt => try lowerBreak(b, stmt_idx),
         .continue_stmt => try lowerContinue(b, stmt_idx),
         // A poison leaf must never reach lower: a tainted tree is gated out before
-        // codegen (a later milestone), and it is not produced anywhere yet.
+        // codegen, and it is not produced anywhere yet.
         .error_node => unreachable,
         else => try b.note(stmt.main_token, "statement unsupported in lower"),
     }
@@ -574,7 +574,7 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             return try aggregateValue(b, node_idx, ty);
         },
         // A poison leaf must never reach lower: a tainted tree is gated out before
-        // codegen (a later milestone), and it is not produced anywhere yet.
+        // codegen, and it is not produced anywhere yet.
         .error_node => unreachable,
         else => {
             try b.note(n.main_token, "expression unsupported in lower");

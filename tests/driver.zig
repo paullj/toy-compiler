@@ -3214,8 +3214,8 @@ test "reorder: swapping fn order is all cache hits and keeps correct linkage" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 7 }, term);
 }
 
-test "R4 keystone: every int-aware identity serializer folds int_desc in lockstep" {
-    // The cross-serializer property R4 exists to pin: the four independent encoders of a
+test "cross-serializer parity: every int-aware identity serializer folds int_desc in lockstep" {
+    // The cross-serializer property this pins: the four independent encoders of a
     // Type's identity (the flat dedup key, the coherence key, the Mono mangle, and the
     // fingerprint's TouchedType) must AGREE on which int variants are distinct. An encoder
     // that dropped int_desc (the coherence bug) would fold two widths into one here and

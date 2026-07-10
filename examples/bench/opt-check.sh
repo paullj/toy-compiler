@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# M13 worthwhile-proof harness. Proves the IR optimization passes actually work
+# worthwhile-proof harness. Proves the IR optimization passes actually work
 # AND are worthwhile (not merely "implemented + tests pass"). Three checks:
 #
 #   (b) DIFFERENTIAL CORRECTNESS over the FULL corpus: every .toy compiled twice
 #       (-O0 and -O1, both --force), run, and asserted exit_off == exit_on AND
 #       stdout_off == stdout_on. The file's `# expect: exit N`/`stdout "..."` is
-#       the M12 oracle (the -O0 path == the pre-opt M12 path), and #expect is
+#       the oracle (the -O0 path == the pre-opt path), and #expect is
 #       checked under -O0 FIRST so a wrong expected value cannot mask a bug.
 #       compile-error files must be rejected at BOTH opt levels.
 #
@@ -48,7 +48,7 @@ stat_field() { # <statsblock> <fieldname>  -> value (e.g. emitted_instrs, folded
 }
 
 # ---------------------------------------------------------------------------
-echo "=== (b) FULL-CORPUS DIFFERENTIAL  opt-ON == opt-OFF (== #expect M12 oracle) ==="
+echo "=== (b) FULL-CORPUS DIFFERENTIAL  opt-ON == opt-OFF (== #expect oracle) ==="
 corpus_pass=0; corpus_fail=0
 while IFS= read -r src; do
   rel="${src#"$root"/}"
@@ -81,7 +81,7 @@ while IFS= read -r src; do
   o1="$(timeout 30 "$b1")"; r1=$?
 
   ok=1
-  # #expect under -O0 FIRST (independent M12 oracle).
+  # #expect under -O0 FIRST (independent oracle).
   if [ -n "$exp_exit" ] && [ "$r0" -ne "$exp_exit" ]; then fail "$rel: O0 exit $r0 != #expect $exp_exit"; ok=0; fi
   if [ -n "$exp_stdout" ] && [ "$o0" != "$exp_stdout" ]; then fail "$rel: O0 stdout != #expect"; ok=0; fi
   # opt-ON == opt-OFF differential.

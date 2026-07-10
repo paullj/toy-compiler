@@ -225,8 +225,8 @@ pub const CharDecode = union(enum) {
 
 /// Decode a char-literal token (`raw` includes the surrounding quotes) into exactly ONE
 /// Unicode scalar: an escape (`decodeEscape`, must consume the whole body) OR a single raw
-/// UTF-8 codepoint (multibyte SOURCE content — a raw `'€'` decodes here to `0x20AC`, not in
-/// a later milestone). Reuses the shared escape table so `'\n'`/`'\u{20AC}'`/`'\x41'`
+/// UTF-8 codepoint (multibyte SOURCE content — a raw `'€'` decodes here to `0x20AC`).
+/// Reuses the shared escape table so `'\n'`/`'\u{20AC}'`/`'\x41'`
 /// decode identically to their string-literal counterparts.
 pub fn decodeChar(raw: []const u8) CharDecode {
     if (raw.len < 2 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return .malformed;

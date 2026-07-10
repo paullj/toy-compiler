@@ -181,7 +181,7 @@ fn relink(
     }
 
     var lp = linkAndTail(io, gpa, fns.items, names, entry_fn) catch |e| switch (e) {
-        error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range for M1 codegen", .byte_offset = null } },
+        error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range", .byte_offset = null } },
         error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .byte_offset = null } },
         else => |err| return err,
     };
@@ -417,7 +417,7 @@ pub fn lowerGraphProgram(
         const main_decl = em.nodes[res.fns[eid].decl_node.int()];
         const main_proto = Ast.protoAt(em.tree(), main_decl.lhs.int());
         if (main_proto.params.len > 0) return .{ .err = .{
-            .message = "parameters on main unsupported in M1 codegen",
+            .message = "parameters on main are unsupported",
             .byte_offset = em.tokens[main_decl.main_token].start,
             .module = graph.entry_index,
         } };

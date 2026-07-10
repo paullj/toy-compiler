@@ -34,7 +34,7 @@ const term = toyc.term;
 const Style = term.Style;
 const Terminal = term.Terminal;
 const AppCli = @import("Cli.zig");
-// The extracted status-table + diagnostics-rendering clusters (sibling files). The
+// The extracted status-table + diagnostics-rendering modules (sibling files). The
 // shared status palette (`sty_*`) lives in DiagRender — the lower layer both this and
 // Report style with — so the dependency runs main -> Report -> DiagRender (no cycle).
 const Report = @import("Report.zig");
@@ -251,7 +251,7 @@ pub fn main(init: std.process.Init) !void {
     const run_after = st.command == .run;
     // Worker threads the build will use (for the "built with N threads" line).
     const threads: usize = if (st.job_count != 0) st.job_count else (std.Thread.getCpuCount() catch 1);
-    if (build_exe and !Decide.isAarch64Macos(st.target)) argErr(out, level, "code emission only supports aarch64-macos in M1");
+    if (build_exe and !Decide.isAarch64Macos(st.target)) argErr(out, level, "code emission only supports aarch64-macos");
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
