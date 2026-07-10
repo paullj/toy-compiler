@@ -763,6 +763,15 @@ fn lowerDeriveDisplay(
     b.blocks.items[exit].term = .{ .ret = .none };
     b.blocks.items[exit].term_set = true;
 
+    if (L.isCharTy(&b, cty)) {
+        // char's Display OVERRIDES the structural tuple walk with the hand-written UTF-8
+        // encoder — the same override the per-site inline shunt used to provide, now emitted
+        // ONCE here and CALLed from every char-display site (the frame-overflow fix).
+        try L.lowerCharDisplay(&b, p_self);
+        if (!b.termSet()) try L.brTo(&b, exit, .none);
+        return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+    }
+
     const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
 
     switch (cty.kind) {

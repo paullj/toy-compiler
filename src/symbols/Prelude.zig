@@ -127,16 +127,13 @@ pub fn register(
         for (spec.conf) |recv| try conformances.append(gpa, .{ .protocol = pid, .recv = recv });
     }
 
-    // char's Display is a hand-written UTF-8 ENCODER (lower.lowerCharDisplay), NOT a
-    // structural `char(65)` derive. An explicit conformance row (as int/bool/str/unit have,
-    // carrying no Method) makes `conformsTo(char, Display)` .direct, so BodyChecker records
-    // no Display derive request and the structural tuple unit is never synthesized. Appended
-    // after the specs loop so no protocol/struct/enum id shifts (conformances key on
-    // (protocol, recv) via Type.eql, never by index).
-    try conformances.append(gpa, .{
-        .protocol = prelude.protocols.display.?,
-        .recv = Type.structT(prelude.char_struct.?),
-    });
+    // char's Display is a DERIVED witness whose emitter body is OVERRIDDEN to the hand-written
+    // UTF-8 encoder (lower.lowerCharDisplay, via lowerDeriveDisplay's char guard). We
+    // deliberately register NO explicit (Display, char) row: char = `struct char(uint32)`
+    // conforms to Display structurally (uint32 normalizes to the (Display, int) row), so
+    // displaying a char records a normal Display derive request, minting ONE shared
+    // `Display$display$s<id>` unit that every site CALLs — instead of inlining the ~70-value
+    // encoder at each site (frame overflow past ~6 char displays in one function).
 
     try registerOptionResult(gpa, enums, mods, &prelude);
     prelude.conv_err_enum = try registerConvErr(gpa, enums);

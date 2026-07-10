@@ -1,0 +1,14 @@
+# expect: stdout "AAAAAAAAAA"
+# expect: exit 0
+fn main() {
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+    print('A')
+}
