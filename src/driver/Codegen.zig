@@ -78,7 +78,7 @@ pub const LinkedProgram = struct {
         // FnCodes were freed by the relink tail); `.cstr` targets are offsets.
         for (self.data_relocs) |rl| switch (rl.target) {
             .import => |s| gpa.free(s.name),
-            .func, .cstr => {},
+            .func, .cstr, .none => {},
         };
         gpa.free(self.data_relocs);
         self.* = undefined;
