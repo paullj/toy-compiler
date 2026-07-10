@@ -4362,7 +4362,7 @@ test "M22: `print(\"..\")` still types clean and derives nothing (str path uncha
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "M10: `print('A')` derives nothing — char's explicit Display conformance suppresses the structural char(N) unit" {
+test "M10/C4: `print('A')` derives ONE shared char Display witness (UTF-8 encoder, not inlined)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() {
@@ -4371,10 +4371,16 @@ test "M10: `print('A')` derives nothing — char's explicit Display conformance 
         \\
     );
     defer c.deinit(gpa);
-    // The explicit prelude Display+char conformance wins at findConformance, so no structural
-    // derive fires: BodyChecker records no Display derive request for char.
+    // char no longer carries a bare Display row, so displaying it records a normal structural
+    // Display derive: ONE `Display$display$s<charId>` recipe whose emitter is overridden to the
+    // UTF-8 encoder. Every char-display site CALLs it (vs the former per-site inline encoder
+    // that overflowed the frame past ~6 displays). Suppression ("A" not "char(65)") is upheld
+    // by the overriding emitter — guarded end-to-end by examples/io/char_suppress.toy.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
-    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
+    try testing.expect(c.result.derives[0].conform_ty.kind == .@"struct");
+    try testing.expectEqual(c.result.char_struct.?, c.result.derives[0].conform_ty.struct_id);
 }
 
 test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {

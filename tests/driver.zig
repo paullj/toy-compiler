@@ -563,6 +563,55 @@ test "M10: print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no ex
     try testing.expectEqualSlices(u8, "\x41\xC3\xB1\xE2\x82\xAC\xF0\x9F\x98\x80", got);
 }
 
+test "C4: char Display is a shared witness — >6 boundary codepoints compile + byte-exact UTF-8" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-c4-charbands";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // 7 char displays (> the pre-fix frame-overflow threshold of 6) spanning every UTF-8
+    // length band and BOTH edges of each: U+7F|U+80, U+7FF|U+800, U+FFFF|U+10000, U+10FFFF.
+    const main_path = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data =
+        \\fn main() {
+        \\    print('\u{7F}')
+        \\    print('\u{80}')
+        \\    print('\u{7FF}')
+        \\    print('\u{800}')
+        \\    print('\u{FFFF}')
+        \\    print('\u{10000}')
+        \\    print('\u{10FFFF}')
+        \\}
+        \\
+    });
+
+    const out_bin = dir_name ++ "/prog";
+    {
+        const res = try spawnToy(gpa, io, &.{ "build", main_path, "-o", out_bin });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term); // pre-fix: CodegenDiagnostic
+    }
+
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, out_bin, gpa);
+    defer gpa.free(bin_abs);
+    var child = try std.process.spawn(io, .{ .argv = &.{bin_abs}, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    // 7F | C2 80 | DF BF | E0 A0 80 | EF BF BF | F0 90 80 80 | F4 8F BF BF  = 19 bytes exactly.
+    try testing.expectEqualSlices(u8, "\x7F\xC2\x80\xDF\xBF\xE0\xA0\x80\xEF\xBF\xBF\xF0\x90\x80\x80\xF4\x8F\xBF\xBF", got);
+}
+
 test "M23: an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
     // The prelude `Option[T]` (M23) is nameable with no import; `Option[int]` reifies to a
     // plain concrete enum through the M6 path, so this compiles + runs on the real backend.

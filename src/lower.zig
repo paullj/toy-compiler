@@ -1415,7 +1415,6 @@ pub fn emitDisplayBoolValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void 
 /// stays in lockstep with the callee's own derived unit. A miss is unreachable for a
 /// conforming field (the synthesis barrier proved it) — note-and-drop rather than miscompile.
 pub fn displayAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!void {
-    if (isCharTy(b, ty)) return lowerCharDisplay(b, slot);
     switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", b.in.prelude_ids.display, null)) {
         .one => |m| {
             const callee = witnessCallee(b, m);
@@ -1457,8 +1456,10 @@ fn packLE(b: *Builder, bytes: []const Ir.ValueId) error{OutOfMemory}!Ir.ValueId 
 }
 
 /// Display a `char` VALUE (materialized in `slot`) by UTF-8-ENCODING its codepoint and
-/// writing the <=4 bytes to fd 1 — the hand-written witness that overrides char's structural
-/// `char(65)` derive (suppressed by the prelude Display conformance row). A 3-test band ladder
+/// writing the <=4 bytes to fd 1 — the OVERRIDE body of char's derived Display witness
+/// (`Display$display$s<id>`), replacing the structural `char(65)` tuple walk. Emitted ONCE
+/// (in that shared unit) and CALLed from every char-display site; formerly inlined per site.
+/// A 3-test band ladder
 /// (cp<=0x7F / <=0x7FF / <=0xFFFF else 4-byte) packs the bytes LITTLE-ENDIAN into one word and
 /// does ONE `.store` into an 8-byte scratch slot: `.store` is a 64-bit STR (no store_byte op),
 /// so the high padding is written but never read — the `str` len is the true band width. The
@@ -1466,7 +1467,7 @@ fn packLE(b: *Builder, bytes: []const Ir.ValueId) error{OutOfMemory}!Ir.ValueId 
 /// AND the char literal's 64-bit store zeroed the slot's high 4 bytes, so the loaded value has
 /// bit63 clear: unsigned band tests need no validity branch. Pure IR (fixed block/value ids,
 /// reads no map) → -jN- and O0≡O1-stable. Leaves the cursor at the join block.
-fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
+pub fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.@"bool";
 
@@ -1955,7 +1956,7 @@ fn builtinConvCallee(b: *Builder, n: Ast.Node) ?ConvCall {
 
 /// Whether `ty` is the compiler-provided `char` struct (the id the checker used, threaded
 /// via `Inputs.char_struct`). Null (a prelude-less test caller) means no type is char.
-fn isCharTy(b: *const Builder, ty: Typecheck.Type) bool {
+pub fn isCharTy(b: *const Builder, ty: Typecheck.Type) bool {
     return ty.kind == .@"struct" and b.in.char_struct != null and ty.struct_id == b.in.char_struct.?;
 }
 
