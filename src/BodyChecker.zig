@@ -913,15 +913,15 @@ pub const BodyChecker = struct {
             return .invalid;
         }
         const sym = bc.model.structs[base.struct_id];
-        const idx = std.fmt.parseInt(usize, bc.nameText(n.main_token), 10) catch {
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "invalid tuple-field index '.{s}'", .{bc.nameText(n.main_token)});
-            return .invalid;
-        };
-        if (idx >= sym.field_types.len) {
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "tuple struct '{s}' has no field .{d}", .{ sym.name, idx });
-            return .invalid;
+        // Match the field-name STRING (the canonical "0".."63") exactly as lower does, so a
+        // non-canonical spelling (`p.01`, `p.0_1`) is rejected here rather than type-checking
+        // as index N while lower — which string-matches — resolves it to field 0.
+        const name = bc.nameText(n.main_token);
+        for (sym.field_names, sym.field_types) |fname, fty| {
+            if (std.mem.eql(u8, fname, name)) return fty;
         }
-        return sym.field_types[idx];
+        try bc.sink.emitFmt(bc.byteOf(n.main_token), "tuple struct '{s}' has no field .{s}", .{ sym.name, name });
+        return .invalid;
     }
 
     fn typeOfEnumInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
