@@ -123,7 +123,7 @@ fn main() -> int {
 }
 ' 1
 
-# 3b) GENERIC MONOMORPHIZATION (M2) — editing a struct used as a TYPE-ARG recompiles
+# 3b) GENERIC MONOMORPHIZATION — editing a struct used as a TYPE-ARG recompiles
 #     EXACTLY the dependent instance (id[P]) + its constructing caller (main). The
 #     other instance id[int] and the unrelated fn cut off. Adding a field to P also
 #     crosses the 16-byte reg-pair→sret ABI boundary, so the SOUNDNESS cmp is a real
@@ -148,7 +148,7 @@ fn main() -> int {
 }
 ' 1
 
-# 3c) BOUNDED CONFORMANCE (M13) — a bounded generic `twice[T has Doubler]` instantiated
+# 3c) BOUNDED CONFORMANCE — a bounded generic `twice[T has Doubler]` instantiated
 #     at BOTH X and Y, each conforming via `impl .. has Doubler`. Editing the conforming
 #     type X (add a field) must recompile EXACTLY the dependent monomorphization
 #     (twice$X) + X.dbl + main; the other instance twice$Y, Y.dbl, and the unrelated fn
@@ -238,7 +238,7 @@ TOY
 }
 run_cross_module
 
-# 6) `?`-FROM CONFORMANCE TOGGLE (M25) — `outer`'s `?` WIDENS `inner()`'s error via
+# 6) `?`-FROM CONFORMANCE TOGGLE — `outer`'s `?` WIDENS `inner()`'s error via
 #    `impl BigErr has From[SmallErr]`. Base builds; REMOVING the impl makes a warm rebuild a
 #    T0033 compile-error (the widen is NOT stale-served from the cached green `outer`);
 #    RE-ADDING it rebuilds green with __text byte-identical to a --force full build (soundness),
@@ -248,7 +248,7 @@ run_cross_module
 #    remove-impl yields T0033 regardless of the codegen From-witness fold, and concrete-From
 #    op_err/ret_err are independently folded elsewhere — no concrete stale-cache miscompile is
 #    reachable. This scenario proves end-to-end conformance-toggle SOUNDNESS; it does not, alone,
-#    discriminate fold-present from fold-absent for concrete From (that M13-discipline consistency
+#    discriminate fold-present from fold-absent for concrete From (that discipline-consistency
 #    is pinned by the AstWalk `.try_operator` fold unit test).
 run_from_widen() {
   local d="$work/from_widen"; mkdir -p "$d"; local src="$d/prog.toy"

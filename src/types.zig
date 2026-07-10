@@ -2782,7 +2782,7 @@ test "structural conformance on a recursive generic template terminates" {
     ));
 }
 
-test "R1: conformance across a multi-node template cycle is expression-order-independent" {
+test "conformance across a multi-node template cycle is expression-order-independent" {
     // `A[T]`↔`B[T]` mutually recurse; neither is `Ord`. Both `x<x` and `y<y` must fire
     // T0027 regardless of which is checked first: the coinductive assumption that closes
     // the cycle must never settle a poisoned `true` for the non-entry member on the shared

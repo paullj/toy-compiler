@@ -1,4 +1,4 @@
-//! The auto-derive synthesis cluster, extracted from the `Typecheck` mega-struct as
+//! The auto-derive synthesis routines, extracted from the `Typecheck` mega-struct as
 //! free functions over `*Typecheck` (Zig has no struct-field privacy, so these read the
 //! checker's fields directly). The sole entry point is `synthesizeDerives`, driven once from
 //! `monomorphize`; the rest are its resolver/fixpoint helpers.

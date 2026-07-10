@@ -46,7 +46,7 @@ Checking is two cooperating modes over a known, concrete world:
   against the slot it flows into (a parameter, a field, a return).
 
 In the code these are `typeOf` (synth) and `typeOfExpected` / `typeOfBlockExpected`
-(check). This milestone formalizes the previously ad-hoc one-shot `expected`
+(check). This formalizes the previously ad-hoc one-shot `expected`
 parameter into this synth/check split; it adds no inference power.
 
 ## Assignability — the one relation
@@ -150,13 +150,12 @@ These rules are unchanged by the formalization and remain authoritative:
 * **pub-signature coherence** — a `pub` symbol's signature is consistent across
   the program.
 
-## Generics syntax reservation (M1)
+## Generics syntax reservation
 
 The generics front-end (`fn f[T, U](..)`, `struct Box[T]`, `enum E[T]`, a type
-application `Box[int]`, explicit call type-args `f[int](..)`) landed append-only in
-M1. Generic **functions** (M2) and generic **structs** (M4) now have semantics (see
+application `Box[int]`, explicit call type-args `f[int](..)`) landed append-only. Generic **functions** and generic **structs** now have semantics (see
 below); only a generic **enum** decl still emits **T0013 "generics not yet
-supported"** (M6).
+supported"**.
 
 The `[..]` bracket is disambiguated by **position**, and this rule is reserved so a
 future value-index never collides:
@@ -171,16 +170,16 @@ future value-index never collides:
 future form so it can never collide with type-application. Only an `identifier` or a
 `field_access` base is wrapped; any other `[..]` is a syntax error today.
 
-A third `[..]` position lands in M4: **construction position** — a `[..]` on a name
+A third `[..]` position is **construction position** — a `[..]` on a name
 followed by `{ .. }` (`Box[int]{ v: 1 }`) builds a `struct_init` whose lhs is the
 `type_app` (no new `Node.Tag`, so `ParseHeader.version` is unchanged).
 
-## Generic structs + the composite `App` type (M4)
+## Generic structs + the composite `App` type
 
-Generic **functions** (M2) and generic **structs** (M4) are monomorphized to
+Generic **functions** and generic **structs** are monomorphized to
 concrete value types — there are no runtime dictionaries, no code sharing, and the
 byte-foldable `Type` never widens. Only a generic **enum** decl remains gated with
-T0013 (M6).
+T0013.
 
 A generic-struct application `Box[int]` is a **check-time composite type**:
 `Kind.app` (appended, frozen ordinal) reusing `Type.struct_id` as an index into a
@@ -204,7 +203,7 @@ LAYOUT (name + fields + offsets), never the id, so which id an instance lands on
 invisible to the cache.
 
 **Explicit type args only.** `Box[int]{ .. }` must name its args; construction-site
-inference (`Box{ v: 1 }`) is deferred to M5.
+inference (`Box{ v: 1 }`) is deferred.
 
 **Termination guard (T0017).** Generic structs are the first construct that makes
 unbounded instantiation expressible: `fn go[T](x: T) { go[Box[T]](..) }` forms
@@ -213,17 +212,17 @@ that depth and rejects the program with **T0017 "instantiation too deep"** —
 deterministically at `-j1`/`-jN`, never hanging or running out of memory — while a
 legitimately deep-but-finite generic program still compiles.
 
-## Protocols, the prelude, and builtin-scalar conformance (M11/M12)
+## Protocols, the prelude, and builtin-scalar conformance
 
 `has` is the single conformance relation: `impl T has P { .. }` conforms `T` to a
 declared `protocol P`. Coherence is checked **whole-program, serially** (before the
 parallel body pass): exactly one impl per `(protocol, type)`, no orphan rules — a
 duplicate (even in a sibling module) is **T0020**, a missing method or undeclared
 protocol is **T0021**. A protocol stores its method NAMES only; the per-impl
-signature-compatibility check (params/return vs the protocol) is **deferred to M13**
+signature-compatibility check (params/return vs the protocol) is **deferred**
 (the builtin `Eq` below is signature-correct by construction).
 
-**Prelude (M12).** Protocol/type names that must be universally in scope with no
+**Prelude.** Protocol/type names that must be universally in scope with no
 import (`Eq`, later `Ord`/`Option`/...) are delivered by **native compiler
 registration** — the same mechanism as the synthesized `print`, chosen over an
 embedded `.toy` module so there is **no new module-graph or content-fingerprint
@@ -234,7 +233,7 @@ in `protocolIdFromNode` (a user protocol of the same name shadows it via first-l
 **Multi-space conformance key.** The coherence key spans `(protocol, recv.kind, recv_id)`
 — builtin scalar Kinds (int/bool/str/unit — which carry no `struct_id`/`enum_id`) as well
 as struct/enum nominals (`recv_id` is 0 for scalars, which the kind byte distinguishes).
-(M14 extends this key with the protocol type-args; see the generic-protocols section.)
+(extended with the protocol type-args; see the generic-protocols section.)
 `registerPrelude` pre-seeds the builtin scalar conformances into the conformance table
 and `checkCoherence` seeds its `seen` set from them, so a user `impl int has Eq`
 collides with the builtin (T0020). A user impl **may** target a builtin scalar
@@ -249,7 +248,7 @@ backend work) and `unit` (`()` is not a `type_names` scalar) are **deferred**; t
 still spans all four Kinds, so a future user `impl str has Eq` keys correctly and no
 builtin blocks it.
 
-## Generic protocols + multi-conformance (M14)
+## Generic protocols + multi-conformance
 
 A protocol may carry **type parameters** — `protocol Into[U] { fn into(self) -> U }` —
 the associated-type replacement. A conformance names the args: `impl P has Into[int]`.
@@ -266,9 +265,9 @@ serialized byte vector (variable arity forces bytes, over a `StringHashMap`) fol
 protocol id, the receiver kind/id, and each arg's kind/id. So `Into[int]` and
 `Into[bool]` on one type do **not** collide, but two identical `Into[int]` still do
 (**T0020**). `findConformance` compares the same vector, and the resolved args fold
-**structurally** (ordered, never XOR) into the M13 `(e)` fingerprint component — so an
+**structurally** (ordered, never XOR) into the `(e)` fingerprint component — so an
 `Into[int]` → `Into[bool]` edit flips exactly the dependent monomorphizations' keys
-(no stale-witness miscompile). M14 restricts protocol-args to already-concrete non-`App`
+(no stale-witness miscompile). Protocol-args are restricted to already-concrete non-`App`
 value types (scalar/struct/enum); a composite `App` arg's check-time index is
 run-order-dependent, so it is rejected (would break key + fp determinism).
 
@@ -288,12 +287,12 @@ disambiguate, the compiler does **not** pick arbitrarily — it is a use-site er
 any `-jN`). An explicit `p.into[int]()` (parsed as `call(type_app(field_access, [int]))`)
 selects the matching conformance. A type conforming **once** (a non-generic protocol OR a
 single generic conformance) resolves with **no** explicit args — byte-identical dispatch
-to M11/M13. The single disambiguator `resolveConformanceMethod` is shared by all three
+to the single-conformance path. The single disambiguator `resolveConformanceMethod` is shared by all three
 consumers (BodyChecker types, `lower` symbols, `AstWalk` fingerprint), so they always
 select the identical witness. A `[T has Convert[U]]` bound resolves at the mono worklist
 by substituting the bound's args through the instance type-args before `findConformance`.
 
-## Operators: comparison via `Ord` (M16)
+## Operators: comparison via `Ord`
 
 The four comparison operators desugar to a **single three-way** compare, `Ord::cmp`,
 which returns a prelude enum:
@@ -326,8 +325,8 @@ protocol per operator:
 | `a != b` | `d != eq (1)`  *(only when `Eq` is Ord-refined)* |
 
 **Per-concrete-type discriminant.** `int`/`bool` never route here — they stay a single
-inline `icmp` (`bool` orders `false < true`), byte-identical to pre-M16. `str` lowers to
-a **heap-free lexicographic 3-way `load_byte` loop** (extending M15's `Eq` byte loop):
+inline `icmp` (`bool` orders `false < true`), byte-identical to the prior behavior. `str` lowers to
+a **heap-free lexicographic 3-way `load_byte` loop** (extending the `Eq` byte loop):
 the first differing zero-extended byte decides, a proper prefix is less than its
 extension, equal spans are equal — no witness call. A struct/enum resolves its `cmp`
 witness, calls it into a fresh return slot, and reads `Ordering`'s tag with the proven
@@ -340,23 +339,23 @@ route through `cmp` (`d == eq`). The precedence is:
 
 1. an **explicit** `impl T has Eq` (authoritative — its `eq` method is dispatched);
 2. else the **Ord-refinement** `eq` ≡ `cmp == Ordering.eq`;
-3. else the structural `Eq` derive (M18).
+3. else the structural `Eq` derive.
 
 The refinement writes only the conformance table (never the coherence seen-set) and
 skips any receiver that already has `Eq`, so a genuine `impl T has Eq` **alongside**
 `impl T has Ord` is **not** a T0020 overlap, still leaves exactly one `(Eq, T)` entry,
-and lets M18's structural derive see the slot filled so it never double-fires.
+and lets the structural derive see the slot filled so it never double-fires.
 
 **Total order only.** There is no float type, so every `Ord` is a total order; partial
 orders are out of scope. **Known edge:** a user `enum Ordering` shadow wins the name
 injection (user-first-wins), but the prelude `Ord::cmp` still returns the *prelude*
-`Ordering`, so its variants would not match the user's — out of scope for M16 (no
+`Ordering`, so its variants would not match the user's — out of scope here (no
 example/fixture defines a conflicting `Ordering`).
 
-## Structural `Ord` auto-derive (M19)
+## Structural `Ord` auto-derive
 
 Structural `Ord` is synthesized on demand at a `<`/`>`/`<=`/`>=` use site — the same
-source-less synthetic-codegen-unit channel M18 introduced for `Eq`, keyed on a non-AST
+source-less synthetic-codegen-unit channel introduced for `Eq`, keyed on a non-AST
 `(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
 conforms to `Ord` (recursively, via the shared ground `conforms` query) and no explicit
 `impl T has Ord` exists; explicit impls win, and an **unused** derive emits **zero**
@@ -378,7 +377,7 @@ structural `Eq` recipe for that type, so a type used with both `<` and `==` synt
 nested field: if a field is used with `<` elsewhere (so it becomes an `Ord` type), an
 enclosing struct's derived `Eq` calls that field's `cmp` rather than minting a second unit.
 
-**Payload-enum `Eq` gap closed.** M18 conformed only *empty-payload* enums to `Eq`; M19's
+**Payload-enum `Eq` gap closed.** The earlier `Eq` derive conformed only *empty-payload* enums; this derive.s
 `conforms` recurses every variant's payload fields, so an all-`Eq`-payload enum now derives
 `Eq` too (and the derived/enum `Eq` emitter compares the discriminants then, per equal tag,
 the variant's payload field-by-field). Consequently **every** ground value type conforms
@@ -386,14 +385,14 @@ to both `Eq` and `Ord`, and the "field blocks the derive" diagnostics (T0027 on 
 T0029) are unreachable for a ground program — reachable only via a unit operand or a
 generic body whose type parameter's bound is not the protocol.
 
-## Structural `Hash` auto-derive (M20)
+## Structural `Hash` auto-derive
 
 ```
 protocol Hash { fn hash(self) -> int }         // 1-ary (self only); id 6, after Div = 5
 ```
 
 Structural `Hash` is synthesized on demand at an explicit `.hash()` call — the same
-source-less synthetic-codegen-unit channel M18/M19 use, keyed on the same non-AST
+source-less synthetic-codegen-unit channel the `Eq`/`Ord` derives use, keyed on the same non-AST
 `(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
 conforms to `Hash` (recursively, via the shared ground `conforms` query) and no explicit
 `impl T has Hash` exists; explicit impls win, and an **unused** derive emits **zero**
@@ -424,14 +423,14 @@ accumulate polynomial is the forced substitute; it satisfies every *locked* cons
 diagnostic **T0030** is unreachable for a ground program (reachable only via a generic body
 whose type parameter's bound is not `Hash`).
 
-## Structural `Display` auto-derive — write-to-fd, heap-free (M22)
+## Structural `Display` auto-derive — write-to-fd, heap-free
 
 ```
 protocol Display { fn display(self) }           // 1-ary (self only), unit ret; id 7, after Hash = 6
 ```
 
 Structural `Display` is synthesized on demand at a `print(x)` call — the same source-less
-synthetic-codegen-unit channel M18–M20 use, keyed on the same non-AST
+synthetic-codegen-unit channel the earlier derives use, keyed on the same non-AST
 `(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
 conforms to `Display` (recursively) and no explicit `impl T has Display` exists; explicit
 impls win, and an **unused** derive emits **zero** codegen (`--emit ir`).

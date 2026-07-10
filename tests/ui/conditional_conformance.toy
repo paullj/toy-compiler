@@ -1,4 +1,4 @@
-# M21 negative: an abstract `Box[T]` cannot discharge `Ord` from a bound that does not
+# negative: an abstract `Box[T]` cannot discharge `Ord` from a bound that does not
 # supply it. `bad` bounds `T has Doubler` (a custom protocol, not `Ord`), so `a < b` on
 # `Box[T]` fails: the recursive `conforms` query reduces `Box[T]` to `T`, and `T`'s axiom
 # is `Doubler != Ord`. The innermost-failure diagnostic names the offending param `T`.

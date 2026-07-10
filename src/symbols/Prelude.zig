@@ -70,7 +70,7 @@ const specs = [_]ProtoSpec{
     // `TryInto.try_into`'s declared ret `dst_t` (=`Dst`) is a deliberate PLACEHOLDER: the
     // true `Result[Dst, ConvErr]` cannot be minted at registration (no `Composite`
     // interner here) and is synthesized per call site (BodyChecker). There is no user
-    // `impl .. has TryInto`, so `method_rets[try_into]` is never read; a future milestone
+    // `impl .. has TryInto`, so `method_rets[try_into]` is never read; future work
     // wiring `try_into` through the explicit-args/bound path MUST fix this first.
     .{ .slot = .try_into, .name = "TryInto", .method = "try_into", .params = self_only, .ret = .dst_t, .generic_params = &.{"Dst"} },
 };

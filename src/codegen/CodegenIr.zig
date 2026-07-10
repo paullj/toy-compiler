@@ -1082,7 +1082,7 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 
 // panic(str) builtin body — hand-written, AST/IR-independent. Appended once at link
 // time (emit.zig) when any fn references `panic`. Writes the message {ptr,len} to fd 2
-// (STDERR), then a SYMBOLIZED-backtrace rung-A dump — one `0x<offset>` line per frame
+// (STDERR), then a symbolized-backtrace dump — one `0x<offset> <name>` line per frame
 // walked off the x29 FP chain — then exits NONZERO via SYS_exit(1) (raw `svc`, no libc):
 // a deterministic, uncatchable abort. Never returns; the trailing brk #0 is an
 // unreachable backstop.
