@@ -57,11 +57,21 @@ pub const SymbolId = union(enum) {
 ///   * `.add_lo12`  — an `add (imm12)`: the low-12 bits of the cstring vmaddr.
 ///   * `.ldr_lo12`  — an `ldr (unsigned offset)`: the low-12 bits of the GOT-slot
 ///                    vmaddr (only for `.import` targets).
+///   * `.movw_g0` / `.movw_g1` — bake a SELF-RELATIVE __text offset into a
+///                    `movz`/`movk` imm16 (low / high halfword). The baked value
+///                    is `site_abs + addend` — the reloc site's absolute __text
+///                    offset shifted by `addend` to name a nearby instruction (the
+///                    __panic self-locate `adr`). Patched intra-module by `link`
+///                    like `.call26`: it is a link-time OFFSET, not a runtime
+///                    address, so it needs no relocation under PIE/ASLR. The
+///                    `.target` is unused (a self `.func` placeholder).
 pub const RelocKind = enum {
     call26,
     adrp_page,
     add_lo12,
     ldr_lo12,
+    movw_g0,
+    movw_g1,
 };
 
 /// One patch to apply during linking. `site` is the byte offset of the word to
@@ -457,6 +467,14 @@ fn fnLinkJob(
                 const word = Aarch64.bl(@intCast(imm));
                 std.mem.writeInt(u32, text[site_abs..][0..4], word, .little);
             },
+            .movw_g0, .movw_g1 => {
+                // Bake a self-relative __text OFFSET (site_abs + addend) into the
+                // movz/movk imm16 — intra-module, no runtime reloc (PIE-safe).
+                const val: u32 = @intCast(@as(i64, site_abs) + rl.addend);
+                const imm: u16 = if (rl.kind == .movw_g0) @truncate(val) else @truncate(val >> 16);
+                const word = std.mem.readInt(u32, text[site_abs..][0..4], .little);
+                std.mem.writeInt(u32, text[site_abs..][0..4], Aarch64.patchMovImm16(word, imm), .little);
+            },
             .adrp_page, .add_lo12, .ldr_lo12 => {
                 slot.relocs.append(gpa, .{
                     .site = site_abs,
@@ -548,7 +566,8 @@ fn dataRelocJob(
             std.debug.assert(target_vmaddr & 7 == 0);
             break :blk Aarch64.patchLdrUoff(word, @intCast(target_vmaddr & 0xFFF));
         },
-        .call26 => unreachable, // already patched by `link`
+        // Intra-module, patched in place by `link`; never reaches data_relocs.
+        .call26, .movw_g0, .movw_g1 => unreachable,
     };
     std.mem.writeInt(u32, text[rl.site..][0..4], patched, .little);
 }
@@ -750,7 +769,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
         var rec: RelocRec = undefined;
         const rec_at = recs_off + i * @sizeOf(RelocRec);
         @memcpy(std.mem.asBytes(&rec), bytes[rec_at .. rec_at + @sizeOf(RelocRec)]);
-        if (rec.kind > @intFromEnum(RelocKind.ldr_lo12)) return null;
+        if (rec.kind > @intFromEnum(RelocKind.movw_g1)) return null;
         const kind: RelocKind = @enumFromInt(rec.kind);
         const target: SymbolId = switch (rec.tgt_tag) {
             0, 2 => blk: {
