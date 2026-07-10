@@ -216,6 +216,15 @@ pub fn adrp(rd: u32, page_delta: i21) u32 {
     return 0x90000000 | ((@as(u32, u) & 3) << 29) | (((@as(u32, u) >> 2) & 0x7FFFF) << 5) | rd;
 }
 
+/// adr rd, #imm21 — form a PC-relative address by a signed 21-bit *byte* offset
+/// (immlo = imm[1:0] at bits[30:29], immhi = imm[20:2] at bits[23:5]). Used to
+/// self-locate __text at runtime (`adr rd, .` → the instruction's own address).
+/// adr x9,. → 0x10000009; adr x0,#4 → 0x10000020; adr x11,#-8 → 0x10FFFFCB.
+pub fn adr(rd: u32, imm21: i21) u32 {
+    const u: u21 = @bitCast(imm21);
+    return 0x10000000 | ((@as(u32, u) & 3) << 29) | (((@as(u32, u) >> 2) & 0x7FFFF) << 5) | rd;
+}
+
 /// ldr rt, [rn, #byteOff] — 64-bit load, unsigned scaled offset, arbitrary base
 /// register `rn`. byteOff must be a multiple of 8. ldr x16,[x16] → 0xF9400210;
 /// ldr x16,[x16,#0x18] → 0xF9400E10.
@@ -292,6 +301,14 @@ pub fn patchAddImm12(word: u32, imm12: u12) u32 {
     const rd: u32 = word & 0x1F;
     const rn: u32 = (word >> 5) & 0x1F;
     return addImm(rd, rn, imm12);
+}
+
+/// Re-encode a `movz`/`movk` placeholder with a resolved 16-bit immediate,
+/// keeping its opcode + shift-lane (hw) + rd (the imm16 field is bits[20:5]).
+/// The linker uses this to bake a link-time text offset into the __panic
+/// self-locate sequence. patchMovImm16(movz(10,0,0), 0x1234) → movz x10,#0x1234.
+pub fn patchMovImm16(word: u32, imm16: u16) u32 {
+    return (word & 0xFFE0001F) | (@as(u32, imm16) << 5);
 }
 
 /// Re-encode an `ldr (unsigned-offset)` placeholder with the resolved byte
@@ -636,6 +653,13 @@ test "pc-relative data addressing + indirect call" {
     try testing.expectEqual(@as(u32, 0xD63F0200), blr(16)); // blr x16
     try testing.expectEqual(@as(u32, 0xAA0103E2), movReg(2, 1)); // mov x2, x1
     try testing.expectEqual(@as(u32, 0xAA0003E1), movReg(1, 0)); // mov x1, x0
+    // adr — assembler-verified on this host (`as -arch arm64` + objdump).
+    try testing.expectEqual(@as(u32, 0x10000009), adr(9, 0)); // adr x9, .
+    try testing.expectEqual(@as(u32, 0x10000020), adr(0, 4)); // adr x0, #4
+    try testing.expectEqual(@as(u32, 0x10FFFFCB), adr(11, -8)); // adr x11, #-8
+    // patchMovImm16 bakes a 16-bit immediate, preserving opcode/hw/rd.
+    try testing.expectEqual(movz(10, 0x1234, 0), patchMovImm16(movz(10, 0, 0), 0x1234));
+    try testing.expectEqual(movk(10, 0xBEEF, 1), patchMovImm16(movk(10, 0, 1), 0xBEEF));
 }
 
 test "str via arbitrary base register (indirect/x8 sret + struct copy)" {

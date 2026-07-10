@@ -800,10 +800,10 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
             try emitEpilogue(g);
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
-        .trap => try emitPanicCall(g, "unwrap of empty Option/Result\n"),
+        .trap => try emitPanicCall(g, "unwrap of empty Option/Result"),
         .panic => |reason| try emitPanicCall(g, switch (reason) {
-            .div_by_zero => "division by zero\n",
-            .rem_by_zero => "remainder by zero\n",
+            .div_by_zero => "division by zero",
+            .rem_by_zero => "remainder by zero",
         }),
     }
 }
@@ -1073,11 +1073,20 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 
 // panic(str) builtin body — hand-written, AST/IR-independent. Appended once at link
 // time (emit.zig) when any fn references `panic`. Writes the message {ptr,len} to fd 2
-// (STDERR) via the `write` syscall, then exits the process NONZERO via SYS_exit(1)
-// (raw `svc`, no libc): a deterministic, uncatchable abort. Never returns — the FP
-// frame record is still opened so a future backtrace can walk it; the trailing brk #0
-// is an unreachable backstop after the non-returning svc.
+// (STDERR), then a SYMBOLIZED-backtrace rung-A dump — one `0x<offset>` line per frame
+// walked off the x29 FP chain — then exits NONZERO via SYS_exit(1) (raw `svc`, no libc):
+// a deterministic, uncatchable abort. Never returns; the trailing brk #0 is an
+// unreachable backstop.
+//
+// Each frame line is `ra - text_base - 4` in hex — the CALL SITE's slide-independent
+// __text offset (post-processable by `atos`). `text_base` is self-located at runtime:
+// `adr x9,.` yields this instruction's runtime address and the linker bakes that
+// instruction's static __text offset into the following movz/movk (self-relative
+// `.movw_g0`/`.movw_g1` relocs), so `text_base = adr_addr - baked_offset` holds under
+// PIE/ASLR. Loop invariants (text_base, fp cursor, counter, buffer base, shift consts)
+// live in x19-x24/x26 — callee-saved, so they survive each `write` call.
 pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
     var code: std.ArrayList(u8) = .empty;
     errdefer code.deinit(gpa);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
@@ -1091,31 +1100,115 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
         }
     }.f;
 
-    try emit(&code, gpa, Aarch64.stpFpLrPre); // stp x29,x30,[sp,#-16]!
-    try emit(&code, gpa, Aarch64.movFpSp); // mov x29, sp
-    // Shuffle (ptr,len) into write's (buf,len) = (x1,x2), then fd=2 in w0. Order
-    // matters: move len (x1->x2) BEFORE overwriting x1 with ptr (x0->x1).
-    try emit(&code, gpa, Aarch64.movReg(2, 1)); // len -> x2
-    try emit(&code, gpa, Aarch64.movReg(1, 0)); // ptr -> x1
-    try emit(&code, gpa, Aarch64.movz(0, 2, 0)); // fd = 2 (STDERR)
-    // adrp x16, _write@GOT (placeholder; .adrp_page reloc to import "write")
+    // Prologue + 64-byte scratch buffer for the hex line (`0x` + 16 nibbles + `\n`).
+    try emit(&code, gpa, A.stpFpLrPre); // stp x29,x30,[sp,#-16]!
+    try emit(&code, gpa, A.movFpSp); // mov x29, sp
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 64)); // scratch buffer
+    try emit(&code, gpa, A.addImm(22, A.SP, 0)); // x22 = buffer base
+
+    // write(2, msg_ptr, msg_len): incoming x0=ptr, x1=len. Move len (x1->x2) BEFORE
+    // overwriting x1 with ptr (x0->x1). Load &write from its GOT slot ONCE into the
+    // callee-saved x26, then `blr x26` for the message and every frame line.
+    try emit(&code, gpa, A.movReg(2, 1)); // len -> x2
+    try emit(&code, gpa, A.movReg(1, 0)); // ptr -> x1
+    try emit(&code, gpa, A.movz(0, 2, 0)); // fd = 2 (STDERR)
     var site: u32 = @intCast(code.items.len);
     const wname1 = try gpa.dupe(u8, "write");
     errdefer gpa.free(wname1);
     try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname1 } }, .kind = .adrp_page });
-    try emit(&code, gpa, Aarch64.adrp(16, 0));
-    // ldr x16, [x16] (placeholder; .ldr_lo12 reloc, same import)
+    try emit(&code, gpa, A.adrp(16, 0)); // adrp x16, write@GOT
     site = @intCast(code.items.len);
     const wname2 = try gpa.dupe(u8, "write");
     errdefer gpa.free(wname2);
     try relocs.append(gpa, .{ .site = site, .target = .{ .import = .{ .kind = .import, .name = wname2 } }, .kind = .ldr_lo12 });
-    try emit(&code, gpa, Aarch64.ldrRegUoff(16, 16, 0));
-    try emit(&code, gpa, Aarch64.blr(16)); // blr x16
-    // SYS_exit(1): x0 = status 1 (nonzero), x16 = 1 (SYS_exit), svc #0x80. Never returns.
-    try emit(&code, gpa, Aarch64.movz(0, 1, 0)); // x0 = 1
-    try emit(&code, gpa, Aarch64.movz(16, 1, 0)); // x16 = SYS_exit
-    try emit(&code, gpa, Aarch64.svc0x80); // svc #0x80
-    try emit(&code, gpa, Aarch64.brk0); // unreachable backstop
+    try emit(&code, gpa, A.ldrRegUoff(26, 16, 0)); // x26 = &write
+    try emit(&code, gpa, A.blr(26)); // write the message
+
+    // One '\n' separator: messages carry no trailing newline, so this keeps the
+    // first frame line off the message regardless of the message's contents.
+    try emit(&code, gpa, A.movz(9, '\n', 0));
+    try emit(&code, gpa, A.strb(9, 22, 0)); // buffer[0] = '\n'
+    try emit(&code, gpa, A.movz(2, 1, 0)); // len 1
+    try emit(&code, gpa, A.movReg(1, 22)); // buf
+    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(&code, gpa, A.blr(26)); // write '\n'
+
+    // Self-locate text_base into x19 (see the doc comment). The two movw relocs bake
+    // the `adr`'s own absolute __text offset (addend = adr_site - mov_site).
+    const adr_pos: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.adr(9, 0)); // x9 = text_base + adr_off
+    site = @intCast(code.items.len);
+    const pn0 = try gpa.dupe(u8, "panic");
+    errdefer gpa.free(pn0);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .func = .{ .kind = .builtin, .name = pn0 } }, .kind = .movw_g0, .addend = @as(i64, adr_pos) - @as(i64, site) });
+    try emit(&code, gpa, A.movz(10, 0, 0)); // x10 = adr_off (lo)
+    site = @intCast(code.items.len);
+    const pn1 = try gpa.dupe(u8, "panic");
+    errdefer gpa.free(pn1);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .func = .{ .kind = .builtin, .name = pn1 } }, .kind = .movw_g1, .addend = @as(i64, adr_pos) - @as(i64, site) });
+    try emit(&code, gpa, A.movk(10, 0, 1)); // x10 |= adr_off (hi)
+    try emit(&code, gpa, A.subReg(19, 9, 10)); // x19 = text_base
+
+    // Walk state: x20 = fp cursor (this frame), x21 = frame cap, x23/x24 = hex shifts.
+    try emit(&code, gpa, A.movReg(20, A.FP)); // x20 = x29
+    try emit(&code, gpa, A.movz(21, 64, 0)); // x21 = 64 (frame cap)
+    try emit(&code, gpa, A.movz(23, 4, 0)); // x23 = 4
+    try emit(&code, gpa, A.movz(24, 60, 0)); // x24 = 60
+
+    const loop_top: u32 = @intCast(code.items.len);
+    const cbz_fp: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(20, 0)); // fp == 0 -> DONE
+    const cbz_cnt: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(21, 0)); // counter == 0 -> DONE
+    try emit(&code, gpa, A.ldrRegUoff(25, 20, 8)); // x25 = ra = *(fp+8)
+    try emit(&code, gpa, A.subReg(25, 25, 19)); // ra - text_base
+    try emit(&code, gpa, A.subImm(25, 25, 4)); // -> call site
+    // Prefix "0x" into the buffer.
+    try emit(&code, gpa, A.movz(9, '0', 0));
+    try emit(&code, gpa, A.strb(9, 22, 0));
+    try emit(&code, gpa, A.movz(9, 'x', 0));
+    try emit(&code, gpa, A.strb(9, 22, 1));
+    try emit(&code, gpa, A.addImm(11, 22, 2)); // x11 = write cursor
+    try emit(&code, gpa, A.movz(12, 16, 0)); // x12 = 16 nibbles
+    const hex_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.lsrv(13, 25, 24)); // top nibble = val >> 60
+    try emit(&code, gpa, A.lslv(25, 25, 23)); // val <<= 4
+    try emit(&code, gpa, A.andLowBits(13, 13, 3)); // & 0xF
+    try emit(&code, gpa, A.cmpImm(13, 10));
+    try emit(&code, gpa, A.addImm(14, 13, '0')); // '0' + n
+    try emit(&code, gpa, A.addImm(15, 13, 'a' - 10)); // 'a'-10 + n
+    try emit(&code, gpa, A.csel(14, 14, 15, .lo)); // n < 10 ? digit : letter
+    try emit(&code, gpa, A.strb(14, 11, 0));
+    try emit(&code, gpa, A.addImm(11, 11, 1));
+    try emit(&code, gpa, A.subImm(12, 12, 1));
+    const cbnz_hex: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbnz(12, 0)); // more nibbles -> HEX
+    try emit(&code, gpa, A.movz(14, '\n', 0));
+    try emit(&code, gpa, A.strb(14, 11, 0));
+    try emit(&code, gpa, A.addImm(11, 11, 1));
+    // write(2, buffer, cursor - base).
+    try emit(&code, gpa, A.subReg(2, 11, 22)); // len
+    try emit(&code, gpa, A.movReg(1, 22)); // buf
+    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(&code, gpa, A.blr(26)); // write the frame line
+    try emit(&code, gpa, A.ldrRegUoff(20, 20, 0)); // fp = *fp
+    try emit(&code, gpa, A.subImm(21, 21, 1)); // counter--
+    const b_loop: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // -> LOOP
+
+    const done_pos: u32 = @intCast(code.items.len);
+    // SYS_exit(1): x0 = status, x16 = SYS_exit, svc #0x80. Never returns.
+    try emit(&code, gpa, A.movz(0, 1, 0));
+    try emit(&code, gpa, A.movz(16, 1, 0));
+    try emit(&code, gpa, A.svc0x80);
+    try emit(&code, gpa, A.brk0); // unreachable backstop
+
+    // Backpatch the intra-fn branches (signed word deltas).
+    const buf = code.items;
+    patchCbzTo(buf, cbz_fp, done_pos);
+    patchCbzTo(buf, cbz_cnt, done_pos);
+    patchCbzTo(buf, cbnz_hex, hex_top);
+    std.mem.writeInt(u32, buf[b_loop..][0..4], A.b(@intCast(@divExact(@as(i64, loop_top) - @as(i64, b_loop), 4))), .little);
 
     const name = try gpa.dupe(u8, "panic");
     errdefer gpa.free(name);
@@ -1125,6 +1218,14 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
         .relocs = try relocs.toOwnedSlice(gpa),
         .literals = &.{},
     };
+}
+
+/// Backpatch a `cbz`/`cbnz` placeholder at byte `site` to branch to byte `target`
+/// (preserving opcode + rt), given the resolved word delta.
+fn patchCbzTo(buf: []u8, site: u32, target: u32) void {
+    const delta: i19 = @intCast(@divExact(@as(i64, target) - @as(i64, site), 4));
+    const word = std.mem.readInt(u32, buf[site..][0..4], .little);
+    std.mem.writeInt(u32, buf[site..][0..4], Aarch64.patchCbz(word, delta), .little);
 }
 
 // TESTS — hand-build a tiny Ir.Function and assert the emitted byte shape.
@@ -1169,26 +1270,42 @@ test "ir-codegen: __display_int builtin byte shape (prologue, buffer, digit loop
     }
 }
 
-test "lowerPanic: writes fd 2 then SYS_exit(1); two _write import relocs; brk backstop" {
+test "lowerPanic: prologue, self-locate movw relocs, hex frame loop, then SYS_exit(1)" {
     const gpa = testing.allocator;
     var fc = try lowerPanic(gpa);
     defer fc.deinit(gpa);
     try testing.expectEqual(Link.SymKind.builtin, fc.sym.kind);
     try testing.expectEqualStrings("panic", fc.sym.name);
-    const w = struct {
-        fn at(code: []const u8, i: usize) u32 {
-            return std.mem.readInt(u32, code[i * 4 ..][0..4], .little);
-        }
-    }.at;
-    try testing.expectEqual(Aarch64.stpFpLrPre, w(fc.code, 0));
-    try testing.expectEqual(Aarch64.movz(0, 2, 0), w(fc.code, 4)); // fd = 2 (stderr)
-    try testing.expectEqual(Aarch64.movz(0, 1, 0), w(fc.code, 8)); // exit code 1
-    try testing.expectEqual(Aarch64.movz(16, 1, 0), w(fc.code, 9)); // SYS_exit
-    try testing.expectEqual(Aarch64.svc0x80, w(fc.code, 10));
-    try testing.expectEqual(Aarch64.brk0, w(fc.code, 11));
-    try testing.expectEqual(@as(usize, 2), fc.relocs.len);
+    try testing.expect(fc.code.len % 4 == 0);
+    // Opens with the frame prologue.
+    try testing.expectEqual(Aarch64.stpFpLrPre, std.mem.readInt(u32, fc.code[0..4], .little));
+    // Ends with the never-returning SYS_exit(1) + brk backstop.
+    const n = fc.code.len;
+    try testing.expectEqual(Aarch64.brk0, std.mem.readInt(u32, fc.code[n - 4 ..][0..4], .little));
+    try testing.expectEqual(Aarch64.svc0x80, std.mem.readInt(u32, fc.code[n - 8 ..][0..4], .little));
+    // The self-locate `adr x9, .` and the hex-loop `csel x14,x14,x15,lo` are present.
+    var saw_adr = false;
+    var saw_csel = false;
+    var i: usize = 0;
+    while (i < fc.code.len) : (i += 4) {
+        const word = std.mem.readInt(u32, fc.code[i..][0..4], .little);
+        if (word == Aarch64.adr(9, 0)) saw_adr = true;
+        if (word == Aarch64.csel(14, 14, 15, .lo)) saw_csel = true;
+    }
+    try testing.expect(saw_adr);
+    try testing.expect(saw_csel);
+    // Four relocs: two `write` imports (adrp_page + ldr_lo12) reached via the GOT,
+    // then the two self-relative movw relocs that bake the text-base offset.
+    try testing.expectEqual(@as(usize, 4), fc.relocs.len);
+    try testing.expectEqual(Link.RelocKind.adrp_page, fc.relocs[0].kind);
     try testing.expectEqualStrings("write", fc.relocs[0].target.import.name);
+    try testing.expectEqual(Link.RelocKind.ldr_lo12, fc.relocs[1].kind);
     try testing.expectEqualStrings("write", fc.relocs[1].target.import.name);
+    try testing.expectEqual(Link.RelocKind.movw_g0, fc.relocs[2].kind);
+    try testing.expectEqual(Link.RelocKind.movw_g1, fc.relocs[3].kind);
+    // The movw addends name the `adr` site relative to each mov site (−4, −8).
+    try testing.expectEqual(@as(i64, -4), fc.relocs[2].addend);
+    try testing.expectEqual(@as(i64, -8), fc.relocs[3].addend);
 }
 
 // A 1-block `fn f() -> int { ret <iconst v> }` exercising prologue/epilogue,

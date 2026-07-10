@@ -445,12 +445,15 @@ test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 
     }
 }
 
-test "panic: div/mod/unwrap traps + user panic() write to STDERR and exit nonzero at BOTH -O levels; nonzero controls exit normally" {
-    // `__panic` writes the message to fd 2 then SYS_exit(1) — a clean nonzero exit,
-    // no longer a SIGILL/brk. The -O1 legs are the SOLE proof fold's const-0 skip held
-    // (that -O1 did not fold `/0`/`%0` to a value and erase the panic). The control legs
-    // (nonzero divisor) run to their normal exit — their panic block is now `bl panic`
-    // but never reached (or DCE'd at -O1 for the const divisor).
+test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtrace dump to STDERR and exit nonzero at BOTH -O levels; nonzero controls exit normally" {
+    // `__panic` writes the message to fd 2, then a rung-A backtrace — one `0x<hex>`
+    // line per frame walked off the x29 chain (each is the call site's slide-independent
+    // __text offset) — then SYS_exit(1): a clean nonzero exit, no SIGILL/brk. A panicking
+    // program yields >= 2 frames (the panic-site fn + at least its caller up to the C
+    // runtime). The -O1 legs are the SOLE proof fold's const-0 skip held (that -O1 did
+    // not fold `/0`/`%0` to a value and erase the panic). The control legs (nonzero
+    // divisor) run to their normal exit with NO backtrace — their panic block is now
+    // `bl panic` but never reached (or DCE'd at -O1 for the const divisor).
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -477,7 +480,24 @@ test "panic: div/mod/unwrap traps + user panic() write to STDERR and exit nonzer
             const r = try spawnBinaryTermStderr(gpa, io, abs);
             defer gpa.free(r.stderr);
             try testing.expectEqual(fx.want, exitCode(r.term)); // clean nonzero exit (1), not a signal
-            if (fx.err.len > 0) try testing.expect(std.mem.indexOf(u8, r.stderr, fx.err) != null);
+            const frames = countBacktraceFrames(r.stderr);
+            if (fx.err.len > 0) {
+                try testing.expect(std.mem.indexOf(u8, r.stderr, fx.err) != null);
+                try testing.expect(frames >= 2); // panic dumps >= 2 walked frames
+            } else {
+                try testing.expectEqual(@as(usize, 0), frames); // a clean run prints no backtrace
+            }
         }
     }
+}
+
+/// Count backtrace frame lines (`0x<hex>`) in a panic's stderr. Each frame the
+/// `__panic` FP-chain walk emits is its own `0x`-prefixed line.
+fn countBacktraceFrames(stderr: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "0x")) n += 1;
+    }
+    return n;
 }
