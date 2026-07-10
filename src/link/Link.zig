@@ -75,8 +75,10 @@ pub const RelocKind = enum {
 };
 
 /// One patch to apply during linking. `site` is the byte offset of the word to
-/// patch within its owning function's `code`. `addend` is part of the shape for
-/// future relocation kinds; it is 0 for every reloc today.
+/// patch within its owning function's `code`. `addend` shifts the resolved value:
+/// 0 for `.call26`/`.adrp_page`/`.add_lo12`/`.ldr_lo12`; for `.movw_g0`/`.movw_g1`
+/// it names an instruction relative to the reloc site (the __panic self-locate
+/// `adr`), so the baked value is `site_abs + addend`.
 pub const Reloc = struct {
     site: u32,
     target: SymbolId,
@@ -932,6 +934,57 @@ fn linkTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) Li
     var si: SymInterner = .{};
     defer si.deinit(gpa);
     return link(threaded.io(), gpa, fns, &si, fname(entry), false);
+}
+
+/// Like `linkTest` but requests the backtrace symbol table (`emit_symtab = true`).
+fn linkSymTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) LinkError!Linked {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    var si: SymInterner = .{};
+    defer si.deinit(gpa);
+    return link(threaded.io(), gpa, fns, &si, fname(entry), true);
+}
+
+test "buildSymTable: header + (off,name) rows sorted, trailing text-size sentinel, names round-trip" {
+    const gpa = testing.allocator;
+    // Sizes 3,1,2 words → distinct offsets 0, 12, 16; total __text = 24. Source order
+    // already ascends by offset (prefix sum), so the sort's job here is placing the
+    // `{text_size, ""}` sentinel last and giving a total order.
+    var fns = [_]FnCode{
+        try makeFn(gpa, 0, 3, &.{}),
+        try makeFn(gpa, 1, 1, &.{}),
+        try makeFn(gpa, 2, 2, &.{}),
+    };
+    defer freeFns(gpa, &fns);
+
+    const linked = try linkSymTest(gpa, &fns, 0);
+    defer gpa.free(linked.text);
+    defer gpa.free(linked.data_relocs);
+    defer gpa.free(linked.sym_table);
+
+    const tab = linked.sym_table;
+    const count = std.mem.readInt(u64, tab[0..8], .little);
+    try testing.expectEqual(@as(u64, 4), count); // 3 fns + sentinel
+
+    // Rows ascend by offset; each row's name_off points at a NUL-terminated name.
+    var prev_off: u64 = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const off = std.mem.readInt(u64, tab[8 + i * 16 ..][0..8], .little);
+        const noff = std.mem.readInt(u64, tab[8 + i * 16 + 8 ..][0..8], .little);
+        try testing.expect(off >= prev_off);
+        prev_off = off;
+        try testing.expect(noff < tab.len);
+        const name = std.mem.sliceTo(tab[noff..], 0);
+        // Every non-sentinel row names one of the fns "f0".."f2"; the sentinel is empty.
+        if (i + 1 < count) try testing.expect(name.len == 2 and name[0] == 'f');
+    }
+
+    // The last row is the sentinel: offset == total __text size, empty name.
+    const last_off = std.mem.readInt(u64, tab[8 + (count - 1) * 16 ..][0..8], .little);
+    const last_noff = std.mem.readInt(u64, tab[8 + (count - 1) * 16 + 8 ..][0..8], .little);
+    try testing.expectEqual(@as(u64, linked.text.len), last_off);
+    try testing.expectEqual(@as(u8, 0), tab[last_noff]); // empty string → immediate NUL
 }
 
 test "layout offsets follow source order and are contiguous" {
