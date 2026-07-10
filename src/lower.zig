@@ -2335,10 +2335,13 @@ fn charLiteralCodepoint(b: *Builder, tok: u32) error{OutOfMemory}!u32 {
     };
 }
 
-/// Write a char literal `'x'` into `dst_ptr`: a field-width store of the decoded codepoint
-/// into `char`'s single `uint32` field (offset 0). `char` occupies an 8-byte slot, but
-/// every char access reads only this `uint32` field (the codepoint load, derived
-/// Eq/Ord/Hash, the conversions), so the upper 4 bytes are dead and left unwritten.
+/// Write a char literal `'x'` into `dst_ptr`: store the decoded codepoint into `char`'s
+/// single `uint32` field (offset 0). `char` occupies an 8-byte slot; codegen lowers every
+/// `.store` to a 64-bit `str` (it ignores the IR `.ty`) and the codepoint `iconst` has its
+/// upper 32 bits clear, so the whole slot IS written with the high 4 bytes zeroed — a
+/// load-bearing invariant that `loadCharCodepoint`, the derived Eq/Ord/Hash, and the
+/// conversions rely on when they read the full 8-byte field (so it must not be narrowed
+/// to a sub-word store).
 fn lowerCharLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[(expr).int()];
     const cp = try charLiteralCodepoint(b, n.main_token);
