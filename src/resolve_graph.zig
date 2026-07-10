@@ -422,6 +422,10 @@ fn resolveModule(g: *GraphResolve, mod: u32) !void {
                     try g.resolveTypeRef(type_idx);
                 }
             },
+            // An alias target may name a qualified cross-module type (`type S = geom.Rect`);
+            // resolve it here so the R0005 pub-visibility check fires, exactly as for a
+            // struct/tuple-struct field type-ref (else an alias launders a non-`pub` type).
+            .type_alias_decl => try g.resolveTypeRef(m.nodes[decl_idx.int()].lhs),
             // Resolve each method body like any fn: its synthesized `self` param
             // binds as a local (slot 0) via the ordinary param loop in `resolveFn`.
             // A conformance impl (`impl_has_decl`) resolves identically; its qualified
