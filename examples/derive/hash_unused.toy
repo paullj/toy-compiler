@@ -1,4 +1,4 @@
-# Feature: auto-derive is LAZY (M20). `Q` is a derivable struct whose `.hash()` is never
+# Feature: auto-derive is LAZY. `Q` is a derivable struct whose `.hash()` is never
 # called, so NO derive is requested and ZERO synthetic codegen units are emitted
 # (`toy --emit ir` shows no `Hash$hash$` unit). Unused ⇒ free in binary and compile time.
 struct Q { v: int }

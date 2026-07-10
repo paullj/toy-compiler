@@ -1,4 +1,4 @@
-# Feature: an explicit `impl has Display` OVERRIDES the structural derive (M22). This impl
+# Feature: an explicit `impl has Display` OVERRIDES the structural derive. This impl
 # writes a custom rendering instead of the structural `P{x: ..}` form, so the output is
 # `<custom>` — proving the user witness won (the derive never fired; no `Display$display$s*`
 # unit is synthesized). `resolveConformanceMethod` finds the explicit impl first.

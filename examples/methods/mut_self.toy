@@ -1,4 +1,4 @@
-# Feature: a `mut self` method mutates the receiver in place (M9). The receiver is
+# Feature: a `mut self` method mutates the receiver in place. The receiver is
 # passed BY ADDRESS (not the by-value copy a plain `self` gets), so `self.x = ...`
 # writes the caller's original `p`. P is 16B (a reg-pair value normally), proving
 # the by-address path bypasses the reg-pair value ABI.

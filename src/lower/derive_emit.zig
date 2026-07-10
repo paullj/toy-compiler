@@ -1005,7 +1005,7 @@ test "derive Hash: mixer is fxhash (rotl(h,5)^word)*%K — constants/shifts/lshr
 
     // One fxhash round unwound from an accumulator `out`: out = (rotl(h,5) ^ word) *% K,
     // rotl(h,5) = shl(h,5) | lshr(h,59). Returns the inbound accumulator, the emitted K, and
-    // the word value so the caller chains rounds. The `.lshr` unwrap is the LOCK #8 guard: an
+    // the word value so the caller chains rounds. The `.lshr` unwrap is the guard: an
     // `.ashr` regression fails the union-field access here.
     const Round = struct {
         h_in: Ir.ValueId,

@@ -1,4 +1,4 @@
-# Feature: monomorphized generic ENUMS (M6). `Either[L,R]` is a generic enum; the
+# Feature: monomorphized generic ENUMS. `Either[L,R]` is a generic enum; the
 # instance `Either[int,bool]` is reified to an ordinary concrete `enum_id` (an 8-byte
 # tag + a payload sized per instance) via the composite `App` type + the serial
 # reification tail — so lower/codegen/Abi see only a plain tagged union, no `App`.

@@ -1,4 +1,4 @@
-# Feature: whole-program conformance coherence (M11). `main` imports BOTH `lib` (which
+# Feature: whole-program conformance coherence. `main` imports BOTH `lib` (which
 # conforms W to Show) and `dup` (which conforms lib.W to lib.Show a second time), so the
 # graph carries two impls of the same (protocol, type) — a compile-error, even though
 # neither impl lives in `main` itself (no orphan rule; coherence is whole-program).

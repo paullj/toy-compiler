@@ -1,4 +1,4 @@
-# Feature: a GENERIC protocol `Into[U]` (type-params replace associated types, M14). One
+# Feature: a GENERIC protocol `Into[U]` (type-params replace associated types). One
 # type `P` conforms TWICE with different args (`Into[int]` and `Into[bool]`) — the new
 # multi-conformance capability. A bounded generic `use[T has Into[int]]` dispatches
 # `v.into[int]()` with explicit protocol type-args, selecting the `Into[int]` witness

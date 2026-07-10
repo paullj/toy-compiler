@@ -1,4 +1,4 @@
-# Feature: `<` / `>` / `<=` / `>=` are operators-as-protocols (M16). They desugar to a
+# Feature: `<` / `>` / `<=` / `>=` are operators-as-protocols. They desugar to a
 # three-way `cmp` returning the prelude `enum Ordering { lt, eq, gt }`; a user struct
 # conforms via `impl P has Ord`. All SIX comparisons compose from the ONE `cmp` — and
 # `Ord` refines `Eq`, so `==` / `!=` work too (via `cmp == Ordering.eq`) with no `Eq` impl.

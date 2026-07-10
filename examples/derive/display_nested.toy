@@ -1,4 +1,4 @@
-# Feature: structural `Display` recurses through NESTED aggregates (M22). `Line`'s derived
+# Feature: structural `Display` recurses through NESTED aggregates. `Line`'s derived
 # `display` calls `Point`'s own derived `display` (a distinct source-less unit) for each of
 # its `Point` fields — two recipes, both source-less. This is also a multi-recipe
 # discovery-order case for the determinism gate (examples/diff.sh).

@@ -127,7 +127,7 @@ pub fn byteCol(self: *const Source, offset: u32) usize {
 
 /// 1-based DISPLAY column of `offset`: how many terminal cells precede it on its
 /// line, +1. Tabs expand to the next `tab_width` multiple; wide glyphs count 2;
-/// combining marks count 0 (all via M9 `width`). `tab_width == 0` is coerced to
+/// combining marks count 0 (all via `width`). `tab_width == 0` is coerced to
 /// 1 so the tab-stop math can never divide by zero or stall.
 pub fn displayCol(self: *const Source, offset: u32, tab_width: usize) usize {
     const off = @min(offset, castLen(self.bytes.len));
@@ -159,7 +159,7 @@ pub fn lineText(self: *const Source, offset: u32) []const u8 {
 }
 
 /// Byte offset where a 1-based line begins (== `line_starts[line-1]`). Asserts
-/// `1 <= line_1based <= lineCount()`; lets M12 slice a range of lines directly.
+/// `1 <= line_1based <= lineCount()`; lets a caller slice a range of lines directly.
 pub fn lineStart(self: *const Source, line_1based: usize) u32 {
     std.debug.assert(line_1based >= 1 and line_1based <= self.line_starts.len);
     return self.line_starts[line_1based - 1];

@@ -1,5 +1,5 @@
 # Feature: declare a signature-only `protocol`, conform a concrete type to it via
-# `impl T has P { .. }`, and dispatch the protocol method on a value (M11). The call
+# `impl T has P { .. }`, and dispatch the protocol method on a value. The call
 # `p.name()` resolves to the has-impl method exactly like an inherent method.
 # expect: exit 42
 protocol Named {

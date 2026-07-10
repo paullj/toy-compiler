@@ -1,4 +1,4 @@
-# Feature: structural `Display` derive on an ENUM (M22). A `get_tag` dispatch ladder writes
+# Feature: structural `Display` derive on an ENUM. A `get_tag` dispatch ladder writes
 # a bare `variant` for a unit variant, or `variant(<v0>, <v1>)` for a payload variant
 # (payload fields in declaration order, `, `-separated). Each `print` writes directly to
 # stdout; the `"\n"` separators are ordinary `str` prints (the raw write-bytes path).

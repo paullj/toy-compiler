@@ -1,4 +1,4 @@
-# Feature: SHOULD FAIL — generic tuple structs are deferred past the M8 MVP.
+# Feature: SHOULD FAIL — generic tuple structs are deferred past the tuple-struct MVP.
 # expect: compile-error "generic tuple structs are not yet supported"
 struct Pair[T](T, T)
 fn main() -> int {

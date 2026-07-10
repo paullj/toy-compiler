@@ -1,6 +1,6 @@
-# Feature: `Option[T]` as a PRELUDE generic value enum (M23) — no import, no magic builtin
+# Feature: `Option[T]` as a PRELUDE generic value enum — no import, no magic builtin
 # tier. `Option[T] { some(T), none }` is native-registered as an ordinary generic enum
-# template and monomorphized through the M6 reify path exactly like a user enum: the
+# template and monomorphized through the reify path exactly like a user enum: the
 # instance `Option[int]` reifies to a plain concrete `enum_id` (8-byte tag + int payload).
 # It models absence with no `nil`/`null`: `find` returns `some(n)` when present, else the
 # nullary `none`, and `main` matches to unwrap the payload. The verbatim roadmap shape

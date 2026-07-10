@@ -1,4 +1,4 @@
-# Feature: an explicit `impl has Hash` OVERRIDES the structural derive (M20). This impl
+# Feature: an explicit `impl has Hash` OVERRIDES the structural derive. This impl
 # returns a constant regardless of the fields, so `a.hash() == b.hash()` is TRUE even though
 # `a` and `b` differ in `x`. A structural derive would fold `x` and hash them differently —
 # so exit 42 proves the user witness won (the derive never fired; no `Hash$hash$` unit).

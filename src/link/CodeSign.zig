@@ -1,6 +1,6 @@
 //! Ad-hoc Mach-O code signature (SuperBlob + CodeDirectory).
 //!
-//! WHY: macOS refuses to run an unsigned arm64 binary. M1 emits its own ad-hoc
+//! WHY: macOS refuses to run an unsigned arm64 binary. The linker emits its own ad-hoc
 //! signature (no X.509 certificate): a SuperBlob wrapping a single CodeDirectory
 //! whose code-slot hashes are SHA-256 of each page of the file up to the
 //! signature's own offset (`codeLimit`). All SuperBlob/CodeDirectory scalar

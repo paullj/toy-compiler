@@ -1,9 +1,9 @@
-# Feature: M21 conditional conformance — a generic `Box[T]` conforms to `Ord` iff `T`
+# Feature: conditional conformance — a generic `Box[T]` conforms to `Ord` iff `T`
 # does. `max2[T has Ord]` orders two `Box[T]` with `<`; the bound `T has Ord` discharges
 # `Box[T] has Ord` ONCE at the definition (no impl written), and each concrete instance
 # (`Box[int]`, `Box[Point]`) gets its `cmp` witness synthesized at the mono worklist.
 # NOTE: explicit `max2[int]`/`max2[Point]` — App-pattern function-call inference (matching
-# a `Box[T]` param against a `Box[int]` arg to infer T) is out of M21's scope, so the
+# a `Box[T]` param against a `Box[int]` arg to infer T) is out of scope here, so the
 # type args are written explicitly (this deviates from the ROADMAP's literal e2e text).
 struct Box[T] { v: T }
 struct Point { x: int, y: int }

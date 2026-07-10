@@ -268,7 +268,7 @@ fn writeCoherenceKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), pid: u32, 
     for (protocol_args) |a| try appendKeyType(gpa, buf, a);
 }
 
-test "M16: ordEqRefinementReceivers registers exactly one (Eq,T) per Ord recv; explicit Eq wins" {
+test "ordEqRefinementReceivers registers exactly one (Eq,T) per Ord recv; explicit Eq wins" {
     const gpa = testing.allocator;
     const P = Type.structT(0);
     const Q = Type.structT(1);

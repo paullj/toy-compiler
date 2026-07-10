@@ -60,7 +60,7 @@ pub const Kind = enum(u8) {
     /// TO COMPILE until it declares its target-sensitivity here.
     pub fn targetSensitive(kind: Kind) bool {
         return switch (kind) {
-            .codegen => true, // aarch64 blobs must not alias across targets [C10]
+            .codegen => true, // aarch64 blobs must not alias across targets
             .lex, .parse, .signature, .body, .type_of, .layout, .resolve_name, .discover, .collect, .global_tables, .source => false,
         };
     }

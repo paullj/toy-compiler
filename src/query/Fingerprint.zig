@@ -48,10 +48,10 @@ pub const TouchedType = struct {
     kind: Typecheck.Kind,
     /// The integer sign/width descriptor byte (only meaningful when `kind == .int`).
     /// Defaults to platform `int`, so a non-int touched type folds a stable zero and a
-    /// pre-M1 blob's `int` re-hashes identically. Folding it closes the width hole: the
+    /// an older blob's `int` re-hashes identically. Folding it closes the width hole: the
     /// codegen fingerprint does NOT route through `Type.appendKeyBytes`, so without this
-    /// an `int`->`int8` body edit would not re-fingerprint (latent at M1's width-blind
-    /// lowering, a stale-__text miscompile once M2's codegen is width-dependent).
+    /// an `int`->`int8` body edit would not re-fingerprint (latent under width-blind
+    /// lowering, a stale-__text miscompile once codegen is width-dependent).
     int_desc: u8 = @as(u8, @bitCast(Typecheck.IntDesc{})),
     layout: []const u8 = &.{},
 };
@@ -555,7 +555,7 @@ test "adding a nested sub-pattern flips the hash" {
     try testing.expect(fp(&a, 1) != fp(&b, 1));
 }
 
-test "touched int width folds in: int8 and int64 hash differently (M1 codegen-cache soundness)" {
+test "touched int width folds in: int8 and int64 hash differently (codegen-cache soundness)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
     defer b.deinit(gpa);

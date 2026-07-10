@@ -1,4 +1,4 @@
-# Feature: inherent methods on a GENERIC type via `impl Box[T] { fn .. }` (M10).
+# Feature: inherent methods on a GENERIC type via `impl Box[T] { fn .. }`.
 # expect: exit 42
 # `impl Box[T]` puts `T` in scope for the method body; `b.get()` on `b: Box[int]`
 # binds T=int by matching the receiver `Box[int]` against the `Self` pattern `Box[T]`,

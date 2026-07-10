@@ -6,8 +6,8 @@ const Spec = @import("Spec.zig");
 const Attr = std.builtin.Type.StructField.Attributes;
 
 /// One struct field per option and per positional of `cmd`. Subcommands are
-/// deliberately excluded — dispatch to a subcommand's own `Parsed` is M6's
-/// concern, so this type describes exactly the values `cmd` itself binds.
+/// deliberately excluded — dispatch to a subcommand's own `Parsed` is a
+/// separate concern, so this type describes exactly the values `cmd` itself binds.
 ///
 /// The generated struct carries no decls (a reified struct cannot), so every
 /// helper below is a free function.
@@ -356,7 +356,7 @@ test "representative command binds options and positionals together" {
             .{ .name = "input", .value = .string },
             .{ .name = "extra", .value = .string, .arity = .variadic },
         },
-        // A subcommand must NOT contribute a field (M6 handles dispatch).
+        // A subcommand must NOT contribute a field (dispatch is handled separately).
         .subcommands = &.{.{ .name = "build" }},
     };
     comptime Spec.validate(cmd);

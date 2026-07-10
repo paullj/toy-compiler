@@ -1,4 +1,4 @@
-# Feature: structural `Display` derive (M22). `print` accepts ANY value whose type
+# Feature: structural `Display` derive. `print` accepts ANY value whose type
 # conforms to the prelude `Display` protocol; a struct with all-Display fields derives it
 # structurally (no impl, no `derive` keyword). `display()` WRITES directly to stdout via the
 # libSystem `write` path — never a returned `str`, so it touches no allocator: the struct

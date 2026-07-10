@@ -1,4 +1,4 @@
-# Feature: builtin `&`/`|`/`^` on uint8 (M4); width-normalized results.
+# Feature: builtin `&`/`|`/`^` on uint8; width-normalized results.
 # expect: exit 42
 fn main() -> int {
     x: uint8 = 0b1010_1010     # 170

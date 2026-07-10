@@ -1,5 +1,5 @@
-# Feature: a `mut self` method on a GENERIC-type instance keeps the M9 by-address
-# receiver path, threaded through the per-instance dispatch entry (M10).
+# Feature: a `mut self` method on a GENERIC-type instance keeps the by-address
+# receiver path, threaded through the per-instance dispatch entry.
 # expect: exit 42
 # `b: Box[int]` is a local (a mutable place); `b.set(42)` passes `b` by ADDRESS and
 # writes `self.v = 42` into the caller's storage, so `b.get()` then reads 42.

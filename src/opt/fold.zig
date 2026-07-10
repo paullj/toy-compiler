@@ -20,7 +20,7 @@
 //! they are defined by predecessor stores, not by an `iconst` we can see here.
 //! Only `iconst`/`bconst` instruction results seed the table; everything else is
 //! `.none`. Traversal is strict block-id then instruction order (deterministic,
-//! Driver [C11]); no hash-map iteration.
+//! Driver-owned); no hash-map iteration.
 
 const std = @import("std");
 const Ir = @import("../ir/Ir.zig");

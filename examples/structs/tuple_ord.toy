@@ -1,5 +1,5 @@
 # Feature: a tuple struct with all-Ord fields derives lexicographic `<`/`>`/`<=`/`>=`
-# by declaration order (M8 over M19). `.0` ties (1 == 1), so `.1` decides (2 < 3).
+# by declaration order. `.0` ties (1 == 1), so `.1` decides (2 < 3).
 # expect: exit 42
 struct Pair(int, int)
 

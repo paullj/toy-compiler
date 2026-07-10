@@ -343,7 +343,7 @@ pub const Node = extern struct {
         /// operand expression. `rhs` is `none`.
         try_expr,
 
-        /// `type Name = <target>` — a module-local transparent alias (M7). Appended at
+        /// `type Name = <target>` — a module-local transparent alias. Appended at
         /// END (frozen ordinal; `[]Node` is memcpy'd to/from the content cache;
         /// `ParseHeader.version` bumped 12->13). `main_token` is the alias NAME; `lhs`
         /// is the target type-ref node (identifier / field_access / type_app /

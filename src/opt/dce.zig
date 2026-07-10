@@ -13,7 +13,7 @@
 //! PHASE 2 (dead-value pruning — the frame/machine-code win): after phase 1, the
 //! live value set is { every surviving instr's result } ∪ { every block param }.
 //! Rebuild `func.values` to the live values only (alloc-copy-free-old), build an
-//! ascending-old-id remap (preserves [C11] monotonic source-order determinism),
+//! ascending-old-id remap (preserves monotonic source-order determinism),
 //! and rewrite EVERY ValueId site through `walk.remapValues` (shared with liveness
 //! so they cannot drift). `none_value` maps to itself. `entry`/`exit` are BlockIds
 //! — untouched here. Slots are left stable (no dead-slot pass — out of scope).

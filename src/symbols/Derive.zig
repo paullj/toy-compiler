@@ -188,7 +188,7 @@ test "mangle is distinct per (protocol, kind, type)" {
     try testing.expect(!std.mem.eql(u8, a, b));
 }
 
-test "M19: mangle distinguishes Ord `cmp` from Eq `eq` per (kind, type)" {
+test "mangle distinguishes Ord `cmp` from Eq `eq` per (kind, type)" {
     const gpa = testing.allocator;
     const oe = try mangle(gpa, "Ord", .ord, Type.enumT(0));
     defer gpa.free(oe);
@@ -202,7 +202,7 @@ test "M19: mangle distinguishes Ord `cmp` from Eq `eq` per (kind, type)" {
     try testing.expect(!std.mem.eql(u8, os, es));
 }
 
-test "M20: mangle produces a distinct `Hash$hash$` name per (struct/enum, id)" {
+test "mangle produces a distinct `Hash$hash$` name per (struct/enum, id)" {
     const gpa = testing.allocator;
     const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
     defer gpa.free(hs);
@@ -233,7 +233,7 @@ test "lessThan is a total canonical order (protocol, kind, enum-flag, id)" {
     try testing.expect(!lessThan({}, e0, e0));
 }
 
-test "M19: lessThan orders eq-kind before ord-kind for the same protocol/type" {
+test "lessThan orders eq-kind before ord-kind for the same protocol/type" {
     // Same protocol id + same type; the kind ordinal (eq=0 < ord=1) is the tiebreaker.
     const eq0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
     const ord0 = Derive{ .protocol_id = 0, .protocol_name = "Ord", .kind = .ord, .conform_ty = Type.structT(0) };
@@ -241,7 +241,7 @@ test "M19: lessThan orders eq-kind before ord-kind for the same protocol/type" {
     try testing.expect(!lessThan({}, ord0, eq0));
 }
 
-test "M20: lessThan orders eq < ord < hash for the same protocol/type" {
+test "lessThan orders eq < ord < hash for the same protocol/type" {
     // The kind ordinal (eq=0 < ord=1 < hash=2) is the tiebreaker within one (protocol, type);
     // a Hash recipe sorts AFTER Eq and Ord so its synthetic id/name is minted last.
     const eq0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
@@ -254,7 +254,7 @@ test "M20: lessThan orders eq < ord < hash for the same protocol/type" {
     try testing.expect(!lessThan({}, hash0, hash0));
 }
 
-test "M22: mangle produces a distinct `Display$display$` name; kind orders last" {
+test "mangle produces a distinct `Display$display$` name; kind orders last" {
     const gpa = testing.allocator;
     const ds = try mangle(gpa, "Display", .display, Type.structT(0));
     defer gpa.free(ds);
@@ -291,7 +291,7 @@ test "M22: mangle produces a distinct `Display$display$` name; kind orders last"
     try testing.expect(!std.mem.eql(u8, a.items, d.items));
 }
 
-test "C4: mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" {
+test "mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" {
     const gpa = testing.allocator;
     const ic = try mangle(gpa, "TryInto", .conv_int_char, Type.structT(3));
     defer gpa.free(ic);

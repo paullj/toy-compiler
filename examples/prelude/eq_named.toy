@@ -1,4 +1,4 @@
-# Feature: the prelude protocol `Eq` is nameable by BARE name with NO import (M12), so a
+# Feature: the prelude protocol `Eq` is nameable by BARE name with NO import, so a
 # user value type may conform to it directly. `impl S has Eq` references `Eq` with no
 # import; the call dispatches to the user method and runs e2e.
 # expect: exit 42

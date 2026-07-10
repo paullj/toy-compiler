@@ -36,7 +36,7 @@ const Engine = @import("../query/Engine.zig");
 /// Emission options. `identifier` is the code-signing identity (the output
 /// basename) and is byte-load-bearing (it enters both the signature and the
 /// Mach-O layout). The imports list is DERIVED internally from `uses_write`
-/// (M2: just `_write`), not a caller input.
+/// (just `_write`), not a caller input.
 pub const Options = struct {
     identifier: []const u8,
     /// Informational today; the only supported target is aarch64-macos and it is
@@ -50,11 +50,11 @@ pub const Options = struct {
 pub const Linked = struct {
     text: []u8,
     entry_off: u32,
-    /// Interned `__cstring` bytes (M2). Owned; empty for string-free programs.
+    /// Interned `__cstring` bytes. Owned; empty for string-free programs.
     cstrings: []u8 = &.{},
     /// Cross-segment relocs (adrp/add/ldr to __cstring/__got) rebased to absolute
     /// __text offsets, patched by `Link.applyDataRelocs` after MachO assigns
-    /// vmaddrs. Owned; empty for M1/M3 programs.
+    /// vmaddrs. Owned; empty for programs with no data relocations.
     data_relocs: []Link.Reloc = &.{},
     /// Whether the program calls `print` (→ one `_write` import).
     uses_write: bool = false,
@@ -67,7 +67,7 @@ pub const Linked = struct {
 /// `data_relocs` (free `.import` data-reloc names individually).
 pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
     // 1) Scan for the hand-asm builtins any fn references: `print` (the raw write-bytes
-    //    primitive) and `__display_int` (the M22 heap-free decimal renderer). Both call the
+    //    primitive) and `__display_int` (the heap-free decimal renderer). Both call the
     //    libSystem `write` syscall, so referencing EITHER declares the `_write` import
     //    (`uses_write`); each referenced body is appended below.
     var uses_print = false;
@@ -272,14 +272,14 @@ pub fn assembleAndSign(
     data_relocs: []const Link.Reloc,
     uses_write: bool,
 ) ![]u8 {
-    // M2 has exactly one import (`_write`) when `print` is used.
+    // There is exactly one import (`_write`) when `print` is used.
     const write_import = [_]MachO.Import{.{ .name = "_write" }};
     const imports: []const MachO.Import = if (uses_write) &write_import else &.{};
 
     const layout = try MachO.assemble(gpa, identifier, code, entry_off, cstrings, imports);
     errdefer gpa.free(layout.image);
 
-    // The single import `write` lives in GOT slot 0 (M2). `applyDataRelocs` looks
+    // The single import `write` lives in GOT slot 0. `applyDataRelocs` looks
     // up each import target's name in this map.
     var import_slots: std.StringHashMapUnmanaged(u32) = .empty;
     defer import_slots.deinit(gpa);

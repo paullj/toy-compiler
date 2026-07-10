@@ -1,5 +1,5 @@
 # Feature: two instances of one generic impl monomorphize to DISTINCT units, and an
-# uncalled generic method emits ZERO codegen (M10).
+# uncalled generic method emits ZERO codegen.
 # expect: exit 42
 # `Box[int].get()` and `Box[Point].get()` are distinct concrete units (return int vs
 # Point). `sum(self)` is defined but NEVER called on any instance, so it monomorphizes

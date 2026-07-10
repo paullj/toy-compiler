@@ -1,5 +1,5 @@
 # Feature: a non-generic enum whose variant payload is a concrete generic-struct
-# instance `Box[int]` (M4). The payload `App` is reified to the ordinary `Box$int`
+# instance `Box[int]`. The payload `App` is reified to the ordinary `Box$int`
 # struct and rewritten away before the enum layout snapshot, so codegen sees a plain
 # tagged union — no `App` in the enum's variant field_types.
 # Regression guard (check-vs-build differential): before the reify+rewrite covered

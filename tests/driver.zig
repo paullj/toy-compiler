@@ -530,7 +530,7 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
     }
 }
 
-test "M10: print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra bytes)" {
+test "print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra bytes)" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -563,7 +563,7 @@ test "M10: print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no ex
     try testing.expectEqualSlices(u8, "\x41\xC3\xB1\xE2\x82\xAC\xF0\x9F\x98\x80", got);
 }
 
-test "C4: char Display is a shared witness — >6 boundary codepoints compile + byte-exact UTF-8" {
+test "char Display is a shared witness — >6 boundary codepoints compile + byte-exact UTF-8" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -612,7 +612,7 @@ test "C4: char Display is a shared witness — >6 boundary codepoints compile + 
     try testing.expectEqualSlices(u8, "\x7F\xC2\x80\xDF\xBF\xE0\xA0\x80\xEF\xBF\xBF\xF0\x90\x80\x80\xF4\x8F\xBF\xBF", got);
 }
 
-test "C4: int->char try_into is a shared witness — 12 in one fn compile (pre-fix frame overflow)" {
+test "int->char try_into is a shared witness — 12 in one fn compile (pre-fix frame overflow)" {
     // 12 int->char `try_into` in ONE fn — >10, the pre-fix inline (~24 SSA cells/site)
     // overflowed the imm12 frame cap (error.CodegenDiagnostic). Each is now one CALL to
     // the shared `TryInto$int_to_char` witness (O(1)/site), so the fn compiles. Each result
@@ -664,7 +664,7 @@ test "C4: int->char try_into is a shared witness — 12 in one fn compile (pre-f
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term); // pre-fix: CodegenDiagnostic
 }
 
-test "C4: char->byte try_into is a shared witness — 22 in one fn compile (pre-fix frame overflow)" {
+test "char->byte try_into is a shared witness — 22 in one fn compile (pre-fix frame overflow)" {
     // 22 char->byte `try_into` in ONE fn — >20, the pre-fix inline overflowed the frame.
     // Each is now one CALL to the shared `TryInto$char_to_byte` witness. Codepoints 65..86
     // all fit `byte`, so every `unwrap_or(0)` yields the codepoint; the two edge checks
@@ -717,7 +717,7 @@ test "C4: char->byte try_into is a shared witness — 22 in one fn compile (pre-
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "C4: int->char witness — surrogate/range boundaries are byte-exact through the CALL" {
+test "int->char witness — surrogate/range boundaries are byte-exact through the CALL" {
     // The witness's `validScalarValue` predicate must reproduce the inline verdicts exactly:
     // valid scalars Ok (their codepoint), surrogates + >0x10FFFF Err (the '?'=63 sentinel).
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -750,7 +750,7 @@ test "C4: int->char witness — surrogate/range boundaries are byte-exact throug
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "C4: char->byte witness — 0xFF fits, 0x100 does not (byte-exact through the CALL)" {
+test "char->byte witness — 0xFF fits, 0x100 does not (byte-exact through the CALL)" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -773,7 +773,7 @@ test "C4: char->byte witness — 0xFF fits, 0x100 does not (byte-exact through t
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "C4: a uint-source int->char passes the raw value to the witness (no-widen arg path)" {
+test "a uint-source int->char passes the raw value to the witness (no-widen arg path)" {
     // Locks that the call site hands the witness the receiver value RAW (no width coercion):
     // a `uint`-typed source converts to the correct char just like an `int` source.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -801,9 +801,9 @@ test "C4: a uint-source int->char passes the raw value to the witness (no-widen 
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "M23: an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
-    // The prelude `Option[T]` (M23) is nameable with no import; `Option[int]` reifies to a
-    // plain concrete enum through the M6 path, so this compiles + runs on the real backend.
+test "an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
+    // The prelude `Option[T]` is nameable with no import; `Option[int]` reifies to a
+    // plain concrete enum through the reification path, so this compiles + runs on the real backend.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -826,7 +826,7 @@ test "M23: an Option[int] find/match program compiles + runs; exit is the unwrap
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "M23: a Result[int,str] construct+match program compiles + runs; exit is the ok payload" {
+test "a Result[int,str] construct+match program compiles + runs; exit is the ok payload" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -849,7 +849,7 @@ test "M23: a Result[int,str] construct+match program compiles + runs; exit is th
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "M23: a bare `Option.none` with no inferable target reports T0016" {
+test "a bare `Option.none` with no inferable target reports T0016" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -972,7 +972,7 @@ test "match: an out-of-range literal pattern on a narrow-int scrutinee reports T
     try testing.expect(std.mem.indexOf(u8, res.out, "does not match scrutinee") == null);
 }
 
-test "M23: an Option is_some/unwrap_or program compiles + runs; exit is the guarded payload" {
+test "an Option is_some/unwrap_or program compiles + runs; exit is the guarded payload" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -994,7 +994,7 @@ test "M23: an Option is_some/unwrap_or program compiles + runs; exit is the guar
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "M23: a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" {
+test "a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -1016,7 +1016,7 @@ test "M23: a Result is_ok/unwrap_or program compiles + runs; exit is the ok payl
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "M23: unwrap on a non-scalar payload is a clean build diagnostic, not a compiler crash" {
+test "unwrap on a non-scalar payload is a clean build diagnostic, not a compiler crash" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1827,7 +1827,7 @@ test "integration: emitted binary runs with the right exit code" {
         // `int`, exercising the scalar produce-into path's diverging-arm guard.
         .{ .src = "enum Opt { some(int), none }\nfn pick(o: Opt) -> int {\n x := match o { .some(v) -> v, .none -> { return 7 } }\n return x + 1\n}\nfn main() -> int { return pick(Opt.some(41)) }\n", .name = "match_arm_return_mixed", .expect = 42 },
 
-        // Methods (M8) — each RUN proves STATIC method dispatch + self-by-value: a
+        // Methods — each RUN proves STATIC method dispatch + self-by-value: a
         // wrong callee / a dropped or misplaced self arg would fault or mis-total.
         // (me1) `p.sum()` dispatches to the impl method; self passed by value → 42.
         .{ .src = "struct P { x: int, y: int }\nimpl P { fn sum(self) -> int { self.x + self.y } }\nfn main() -> int {\n p := P{ x: 20, y: 22 }\n return p.sum()\n}\n", .name = "method_sum", .expect = 42 },
@@ -1838,87 +1838,87 @@ test "integration: emitted binary runs with the right exit code" {
         // (sret-class) path; the method sums its fields → 6.
         .{ .src = "struct V3 { a: int, b: int, c: int }\nimpl V3 { fn total(self) -> int { self.a + self.b + self.c } }\nfn main() -> int {\n v := V3{ a: 1, b: 2, c: 3 }\n return v.total()\n}\n", .name = "method_bigself", .expect = 6 },
 
-        // Integer literal bases (M1): each decodes to 42 through an independent oracle
+        // Integer literal bases: each decodes to 42 through an independent oracle
         // (hex 0x2A / octal 0o52 / binary 0b0010_1010). Base-0 parse + width lowering.
         .{ .src = "fn main() -> int {\n return 0x2A\n}\n", .name = "hexlit", .expect = 42 },
         .{ .src = "fn main() -> int {\n return 0o52\n}\n", .name = "octlit", .expect = 42 },
         .{ .src = "fn main() -> int {\n return 0b0010_1010\n}\n", .name = "binlit", .expect = 42 },
         // uint8 width + Eq across two bases + `_` grouping: 0b0010_1010 == 0o52 == 42.
         .{ .src = "fn main() -> int {\n x: uint8 = 0b0010_1010\n y: uint8 = 0o52\n return if x == y { 42 } else { 0 }\n}\n", .name = "uint8_bases", .expect = 42 },
-        // Homogeneous-width result type (M1): `c: int8 = a + b` must type as int8 (was
+        // Homogeneous-width result type: `c: int8 = a + b` must type as int8 (was
         // platform int under the old arm) so the annotated bind holds; 100+20=120 > 20.
         .{ .src = "fn main() -> int {\n a: int8 = 100\n b: int8 = 20\n c: int8 = a + b\n return if c > b { 42 } else { 0 }\n}\n", .name = "resultwidth", .expect = 42 },
-        // Bare-literal sibling adoption (M1/E3): `a + 1` adopts a's int8 width; 41+1=42.
+        // Bare-literal sibling adoption (E3): `a + 1` adopts a's int8 width; 41+1=42.
         .{ .src = "fn main() -> int {\n a: int8 = 41\n c: int8 = a + 1\n d: int8 = 42\n return if c == d { 42 } else { 0 }\n}\n", .name = "bare_sibling", .expect = 42 },
-        // Symmetric left-literal sibling adoption (M1): `1 + a` must adopt a's int8 width
+        // Symmetric left-literal sibling adoption: `1 + a` must adopt a's int8 width
         // exactly as `a + 1` does — pins the l_lit branch of the binary arm.
         .{ .src = "fn main() -> int {\n a: int8 = 41\n c: int8 = 1 + a\n d: int8 = 42\n return if c == d { 42 } else { 0 }\n}\n", .name = "bare_sibling_left", .expect = 42 },
-        // Both operands bare literals under a width annotation (M1): `c: int8 = 1 + 2`
+        // Both operands bare literals under a width annotation: `c: int8 = 1 + 2`
         // re-types each literal under the outer int8 expected so the annotated bind holds.
         .{ .src = "fn main() -> int {\n c: int8 = 40 + 2\n d: int8 = 42\n return if c == d { 42 } else { 0 }\n}\n", .name = "both_lit_width", .expect = 42 },
-        // uint64 literal above 2^63 (M1): the checker admits it (u128 range gate) and
+        // uint64 literal above 2^63: the checker admits it (u128 range gate) and
         // lowering now round-trips the full u64 into the iconst via bitcast — a plain i64
         // decode would have rejected it at codegen. 2^64-1 compares equal to itself → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0xFFFFFFFFFFFFFFFF\n return if x == 0xFFFFFFFFFFFFFFFF { 42 } else { 0 }\n}\n", .name = "uint64_full_range", .expect = 42 },
-        // WIDTH-CORRECT WRAPPING (M2): 100+100 on two int8 overflows and wraps to -56
+        // WIDTH-CORRECT WRAPPING: 100+100 on two int8 overflows and wraps to -56
         // (sxtb). Observed via a SIGNED compare (never return the raw int8 — macOS masks
         // main's return to 8 bits). -56 < 100 is true only after the wrap → 42.
         .{ .src = "fn main() -> int {\n a: int8 = 100\n b: int8 = 100\n c: int8 = a + b\n return if c < b { 42 } else { 0 }\n}\n", .name = "wrap_int8", .expect = 42 },
-        // Register-domain normalization (M2): the wrapped sum feeds the icmp DIRECTLY (no
+        // Register-domain normalization: the wrapped sum feeds the icmp DIRECTLY (no
         // memory round-trip), so genArith's post-op sxtb is the only thing that makes
         // 200 wrap to -56. Without it, 200 < 100 is false → 0.
         .{ .src = "fn main() -> int {\n a: int8 = 100\n b: int8 = 100\n return if a + b < b { 42 } else { 0 }\n}\n", .name = "wrap_arith_value", .expect = 42 },
-        // UNSIGNED compare (M2): 2^63 > 1 is true UNSIGNED (ugt→hi) but false signed
+        // UNSIGNED compare: 2^63 > 1 is true UNSIGNED (ugt→hi) but false signed
         // (bit63 reads as negative). x must be uint64 so the operand type drives the
         // unsigned dispatch. → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n return if x > 1 { 42 } else { 0 }\n}\n", .name = "uint64_gt_unsigned", .expect = 42 },
-        // UNSIGNED divide (M2): 2^63 / 2 == 2^62 via udiv; sdiv would give 0xC000... The
+        // UNSIGNED divide: 2^63 / 2 == 2^62 via udiv; sdiv would give 0xC000... The
         // sign-agnostic `==` isolates the divide from the compare. → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n y: uint64 = 2\n z: uint64 = x / y\n return if z == 0x4000000000000000 { 42 } else { 0 }\n}\n", .name = "udiv_unsigned", .expect = 42 },
-        // NARROW STRUCT FIELD round-trip (M2, semantic leg of the GOAL): the wrapped -56
+        // NARROW STRUCT FIELD round-trip (semantic leg of the GOAL): the wrapped -56
         // stores into an int8 field and loads back canonical (8-byte-strided cell + 64-bit
         // str/ldr, sound because the stored value is already canonicalized). -56 < 0 → 42.
         .{ .src = "struct S { v: int8 }\nfn main() -> int {\n a: int8 = 100\n b: int8 = 100\n c: int8 = a + b\n s := S{ v: c }\n return if s.v < 0 { 42 } else { 0 }\n}\n", .name = "struct_narrow_field", .expect = 42 },
-        // NARROW NEG re-wrap (M2, signed leg): a+a=128 wraps to -128, then -(-128)=128
+        // NARROW NEG re-wrap (signed leg): a+a=128 wraps to -128, then -(-128)=128
         // must re-wrap to -128 (sxtb on the neg result) for `d < 0` to hold. Without the
         // neg-leg normalize, d stays +128 → 0. Feeds the icmp directly (no memory hop).
         .{ .src = "fn main() -> int {\n a: int8 = 64\n c: int8 = a + a\n d: int8 = -c\n return if d < 0 { 42 } else { 0 }\n}\n", .name = "neg_int8_rewrap", .expect = 42 },
-        // NARROW NEG re-wrap (M2, unsigned/and-mask leg): -(5) = -5 masks to 251 in uint8.
+        // NARROW NEG re-wrap (unsigned/and-mask leg): -(5) = -5 masks to 251 in uint8.
         // The `and #0xff` on the neg result is the only thing that makes b == 251. → 42.
         .{ .src = "fn main() -> int {\n a: uint8 = 5\n b: uint8 = -a\n return if b == 251 { 42 } else { 0 }\n}\n", .name = "neg_uint8_mask", .expect = 42 },
-        // UNSIGNED `<` (M2, ult→lo): 1 < 2^63 is true unsigned, false signed (bit63<0). → 42.
+        // UNSIGNED `<` (ult→lo): 1 < 2^63 is true unsigned, false signed (bit63<0). → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n return if 1 < x { 42 } else { 0 }\n}\n", .name = "uint64_lt_unsigned", .expect = 42 },
-        // UNSIGNED `<=` (M2, ule→ls): 1 <= 2^63 unsigned true, signed false. → 42.
+        // UNSIGNED `<=` (ule→ls): 1 <= 2^63 unsigned true, signed false. → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n return if 1 <= x { 42 } else { 0 }\n}\n", .name = "uint64_le_unsigned", .expect = 42 },
-        // UNSIGNED `>=` (M2, uge→hs): 2^63 >= 1 unsigned true, signed false. → 42.
+        // UNSIGNED `>=` (uge→hs): 2^63 >= 1 unsigned true, signed false. → 42.
         .{ .src = "fn main() -> int {\n x: uint64 = 0x8000000000000000\n return if x >= 1 { 42 } else { 0 }\n}\n", .name = "uint64_ge_unsigned", .expect = 42 },
 
-        // Into[T] WIDENING (M3): `small.into()` widens uint8→uint losslessly, driven by
+        // Into[T] WIDENING: `small.into()` widens uint8→uint losslessly, driven by
         // the `wide:` annotation. 200 round-trips → 42.
         .{ .src = "fn main() -> int {\n small: uint8 = 200\n wide: uint = small.into()\n return if wide == 200 { 42 } else { 0 }\n}\n", .name = "into_widen", .expect = 42 },
-        // TryInto[T] OK (M3): 200 fits uint8 so `try_into().unwrap()` yields Ok(200) → 42.
+        // TryInto[T] OK: 200 fits uint8 so `try_into().unwrap()` yields Ok(200) → 42.
         .{ .src = "fn main() -> int {\n wide: uint = 200\n back: uint8 = wide.try_into().unwrap()\n return if back == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ok", .expect = 42 },
-        // TryInto[T] ERR (M3, same-sign narrowing): 300 does NOT fit uint8 ⇒ Err ⇒
+        // TryInto[T] ERR (same-sign narrowing): 300 does NOT fit uint8 ⇒ Err ⇒
         // `unwrap_or(0)` gives 0. The negative range gate. → 0.
         .{ .src = "fn main() -> int {\n wide2: uint = 300\n narrow: uint8 = wide2.try_into().unwrap_or(0)\n return if narrow == 0 { 0 } else { 1 }\n}\n", .name = "tryinto_err", .expect = 0 },
-        // TryInto[T] SIGN-FLIP ERR (M3, cross-sign block): -1→uint has `fits` true (same
+        // TryInto[T] SIGN-FLIP ERR (cross-sign block): -1→uint has `fits` true (same
         // 64 bits) but v<0 signed ⇒ Err ⇒ `unwrap_or(9)` = 9. The exact case the
         // sign-check block exists for. → 42.
         .{ .src = "fn main() -> int {\n n: int = -1\n u: uint = n.try_into().unwrap_or(9)\n return if u == 9 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_err", .expect = 42 },
-        // TryInto[T] SIGN-FLIP OK (M3, cross-sign, same width, non-negative): 5→uint is
+        // TryInto[T] SIGN-FLIP OK (cross-sign, same width, non-negative): 5→uint is
         // Ok(5). → 42.
         .{ .src = "fn main() -> int {\n n: int = 5\n u: uint = n.try_into().unwrap()\n return if u == 5 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_ok", .expect = 42 },
-        // Into[T] SIGNED WIDEN of a NEGATIVE value (M3): int16 -5 -> int drives the sxth
+        // Into[T] SIGNED WIDEN of a NEGATIVE value: int16 -5 -> int drives the sxth
         // sign-extend arm of `normalizeWidth` (the unsigned cases only exercise uxt). The
         // widened register must read as -5 in the full 64-bit width. → 42.
         .{ .src = "fn main() -> int {\n a: int16 = -5\n w: int = a.into()\n return if w == -5 { 42 } else { 0 }\n}\n", .name = "into_signed_widen_neg", .expect = 42 },
-        // Into[T] target from a RETURN type (M3): `a.into()` widens uint8->uint with the
+        // Into[T] target from a RETURN type: `a.into()` widens uint8->uint with the
         // conversion target derived from `widen`'s return type, not a let-annotation. → 42.
         .{ .src = "fn widen(a: uint8) -> uint {\n return a.into()\n}\nfn main() -> int {\n return if widen(200) == 200 { 42 } else { 0 }\n}\n", .name = "into_ret_pos", .expect = 42 },
-        // TryInto[T] target from a RETURN type (M3): the `try_into().unwrap()` payload
+        // TryInto[T] target from a RETURN type: the `try_into().unwrap()` payload
         // target flows from `narrow`'s uint8 return type. 200 fits → Ok(200). → 42.
         .{ .src = "fn narrow(w: uint) -> uint8 {\n return w.try_into().unwrap()\n}\nfn main() -> int {\n return if narrow(200) == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ret_pos", .expect = 42 },
-        // Into[T] target from a CALL-ARGUMENT slot (M3): `small.into()` widens uint8->uint
+        // Into[T] target from a CALL-ARGUMENT slot: `small.into()` widens uint8->uint
         // with the target derived from `takes`'s param type. → 42.
         .{ .src = "fn takes(u: uint) -> int {\n return if u == 200 { 42 } else { 0 }\n}\nfn main() -> int {\n small: uint8 = 200\n return takes(small.into())\n}\n", .name = "into_arg_slot", .expect = 42 },
 
@@ -1993,7 +1993,7 @@ test "integration: emitted binary runs with the right exit code" {
     }
 }
 
-test "integration (M2): monomorphized generic instances get distinct symbols, run to exit 42, and cost zero units when uncalled" {
+test "integration: monomorphized generic instances get distinct symbols, run to exit 42, and cost zero units when uncalled" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
     const gpa = testing.allocator;
@@ -2011,7 +2011,7 @@ test "integration (M2): monomorphized generic instances get distinct symbols, ru
     const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
     const cache = try Cache.init(io, dir);
 
-    // Case A: the exact M2 demo — id[int](7) + id[P]({20,15}) → 7 + 20 + 15 = 42.
+    // Case A: the exact demo — id[int](7) + id[P]({20,15}) → 7 + 20 + 15 = 42.
     // The struct-typed instance exercises the reg-pair/indirect struct ABI unchanged.
     {
         const src =
@@ -2087,7 +2087,7 @@ test "integration (M2): monomorphized generic instances get distinct symbols, ru
     }
 }
 
-test "integration (M18): a derived-Eq struct runs to exit 42, mints one source-less unit, and costs zero when uncalled" {
+test "integration: a derived-Eq struct runs to exit 42, mints one source-less unit, and costs zero when uncalled" {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
 
     const gpa = testing.allocator;
@@ -2351,7 +2351,7 @@ test "verify-mode: re-lowering every fn matches the cached blob" {
     try testing.expectEqual(@as(usize, 2), lp2.codegen_cached);
 }
 
-test "cache soundness (M8): a method body edit recompiles only the method; a method return-type edit recompiles its caller" {
+test "cache soundness: a method body edit recompiles only the method; a method return-type edit recompiles its caller" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

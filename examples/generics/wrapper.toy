@@ -1,4 +1,4 @@
-# Feature: a generic struct whose field is ANOTHER generic struct (M4). `Wrapper[T]`
+# Feature: a generic struct whose field is ANOTHER generic struct. `Wrapper[T]`
 # embeds `Box[T]`; reifying `Wrapper[int]` recurses into `Box[int]` for the field.
 # Regression guard: the wrapper is declared BEFORE the inner struct, so the wrapper's
 # reified `struct_id` slot must be claimed before the field recursion runs — otherwise

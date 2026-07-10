@@ -1,5 +1,5 @@
 # Feature: structural `Hash` derive recurses through NESTED aggregates and `str` fields
-# (M20). `Person`'s derived `hash` calls `Name`'s own derived `hash` (a distinct source-less
+# `Person`'s derived `hash` calls `Name`'s own derived `hash` (a distinct source-less
 # unit), which folds its two `str` fields with a heap-free byte polynomial. Two structurally-
 # equal `Person`s hash EQUAL (Eq-consistent); a value differing in a nested str hashes
 # differently. All units are source-less; the field order matches the Eq derive.

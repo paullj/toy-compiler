@@ -1,4 +1,4 @@
-# Feature: overlapping-mutation correctness for `mut self` (M9). Exercises all three
+# Feature: overlapping-mutation correctness for `mut self`. Exercises all three
 # by-address patches — a field write through the pointer, a whole-`self` READ, and a
 # whole-`self` REASSIGN — plus the two aliasing cases the design must get right:
 #   - `p.set(p.x)`: the arg `p.x` is materialized to a value BEFORE the call, so the

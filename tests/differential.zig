@@ -192,7 +192,7 @@ test "differential: check agrees with build in-process (single-file + multi-modu
         try testing.expect(outcome.first_error_scope != 0);
     }
 
-    // (iv) M8 check-vs-build parity: a single-file program calling a MISSING method
+    // (iv) check-vs-build parity: a single-file program calling a MISSING method
     // reports EXACTLY one error (T0018) on the shared `checkGraph` front-end — the
     // same path `build` runs, so `check` and `build` agree it is broken.
     {
@@ -207,7 +207,7 @@ test "differential: check agrees with build in-process (single-file + multi-modu
     }
 }
 
-// M13 regression: the T0024 coherence signature check must anchor its diagnostic in
+// regression: the T0024 coherence signature check must anchor its diagnostic in
 // the CURRENTLY-scanned module's tree, not at the `decl_node` of `findMethod`'s
 // whole-program first match. When the SAME (protocol, receiver) is impl'd in two
 // different modules for a shared imported type (an overlapping impl -> T0020),
@@ -219,7 +219,7 @@ test "differential: check agrees with build in-process (single-file + multi-modu
 // signature is the mismatched one. The check must NOT crash and must attribute
 // EXACTLY one T0024 (to `a`'s genuinely-wrong impl) plus one T0020 (the overlap) —
 // never a spurious T0024 against `b`'s correct sibling impl.
-test "M13 coherence: overlapping cross-module impls with a mismatched sig report T0024+T0020 without crashing" {
+test "coherence: overlapping cross-module impls with a mismatched sig report T0024+T0020 without crashing" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -430,7 +430,7 @@ test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 
     }
 }
 
-test "M5: div/mod by zero aborts (SIGILL) at BOTH -O0 and -O1; nonzero controls exit normally" {
+test "div/mod by zero aborts (SIGILL) at BOTH -O0 and -O1; nonzero controls exit normally" {
     // The panic has no `# expect:` corpus channel, and `toy run` cooks SIGILL into a
     // clean 128+signo, so this builds each fixture and spawns the BUILT BINARY
     // directly. The -O1 abort legs are the SOLE proof that fold's const-0 skip held

@@ -1223,7 +1223,7 @@ pub const BodyChecker = struct {
             return result;
         }
         for (elems, sym.field_types) |a, fty| {
-            const at = try bc.typeOfExpected(a, fty); // expected type drives literal narrowing (C1/C2 widths)
+            const at = try bc.typeOfExpected(a, fty); // expected type drives literal narrowing (integer widths)
             if (!Type.assignable(fty, at))
                 try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "tuple struct '{s}': expected {s}, got {s}", .{ sym.name, bc.typeName(fty), bc.typeName(at) });
         }
@@ -1781,8 +1781,8 @@ pub const BodyChecker = struct {
             },
             .none => {},
         }
-        // Target-directed `.into()` / `.try_into()` on an integer OR `char` receiver (M3,
-        // M9): resolve the destination from `bc.expected`. `into` is lossless (int widen /
+        // Target-directed `.into()` / `.try_into()` on an integer OR `char` receiver:
+        // resolve the destination from `bc.expected`. `into` is lossless (int widen /
         // char↔int·byte); `try_into` is fallible (int narrow / int→char / char→byte),
         // returning a synthesized `Result[T, ConvErr]`. A user `into`/`try_into` method was
         // already selected above; the builtin recognizer only matches int/char, so a

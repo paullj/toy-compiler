@@ -1,4 +1,4 @@
-# Feature: a tuple struct with all-Eq fields derives `==`/`!=` structurally (M8 over M18).
+# Feature: a tuple struct with all-Eq fields derives `==`/`!=` structurally.
 # expect: exit 42
 struct Point(int, int)
 

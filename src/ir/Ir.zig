@@ -1,13 +1,13 @@
-//! Target-independent intermediate representation (M12).
+//! Target-independent intermediate representation.
 //!
 //! A flat, index-based SSA-ish IR sitting between the front-end (Ast + resolved
 //! types) and codegen. This is a PEER DATA MODULE: it depends ONLY on
 //! `types.Type` and `Link.SymName`, never on codegen, lower, or the AST. codegen
 //! depends on `Ir` (Ir→FnCode), and `lower` produces it (Ast→Ir). It carries NO
 //! physical registers, frame offsets, or calling convention — the ABI is decided
-//! entirely in codegen by the `Abi` module (LOCK #3).
+//! entirely in codegen by the `Abi` module.
 //!
-//! VALUE MODEL (LOCK #2): scalars (int/bool temporaries) and control-flow
+//! VALUE MODEL: scalars (int/bool temporaries) and control-flow
 //! merge-values are SSA `Value`s — each defined exactly once. Named locals and
 //! ALL aggregates (struct/enum/str) live in memory `Slot`s, addressed via
 //! `slot_addr`/`field_addr` + `load`/`store`/`copy`. Merge values are carried as
@@ -16,7 +16,7 @@
 //!
 //! DETERMINISM: every `BlockId`/`ValueId`/`SlotId` is handed out monotonically in
 //! a strict source-order walk by `lower`. Blocks render in `BlockId` order. This
-//! is what underpins the VERIFY byte-identity re-lower (Driver [C11]).
+//! is what underpins the VERIFY byte-identity re-lower.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -120,7 +120,7 @@ pub const Op = union(enum) {
     field_addr: struct { base: ValueId, off: u32, ty: Type },
     /// Scalar load from a ptr value → value of `ty`.
     load: struct { addr: ValueId, ty: Type },
-    /// Zero-extended single-byte load from a ptr value → int value (M15). The
+    /// Zero-extended single-byte load from a ptr value → int value. The
     /// heap-free str byte-compare reads one code unit at `ptr + i` this way; distinct
     /// from `load` (which is always a 64-bit `ldr`) so store→load forwarding — which
     /// only matches slot-based `.load` — never rewrites across a `cstr`-ptr byte read.
@@ -171,15 +171,15 @@ pub const Terminator = union(enum) {
     /// Function return. Emitted only by the single EXIT block; `.none` for unit.
     ret: Operand,
     @"unreachable",
-    /// An unconditional hardware trap (M23): codegen emits a single `brk #0`, aborting
+    /// An unconditional hardware trap: codegen emits a single `brk #0`, aborting
     /// the process with SIGILL. Distinct from `.@"unreachable"` (which emits NOTHING, a
     /// fall-through preserving the `never` byte budget) so adding it churns no existing
     /// never-typed FnCode. Terminates its block with no successors (like `ret`); used
     /// only by `Option`/`Result` `unwrap`'s failure arm.
     trap,
     /// A runtime panic with a known cause. Codegens to the same `brk #0` as `.trap`
-    /// in M5 (message + backtrace deferred to M14); the reason rides the terminator
-    /// so M14 maps reason -> message with no lower re-plumbing. No successors.
+    /// for now (message + backtrace deferred); the reason rides the terminator
+    /// so a later pass maps reason -> message with no lower re-plumbing. No successors.
     panic: PanicReason,
 
     pub const PanicReason = enum { div_by_zero, rem_by_zero };
@@ -346,7 +346,7 @@ fn renderType(
             }
         },
         // A check-time generic type-var / composite `App` is substituted/reified to a
-        // concrete kind before any IR is built (M2/M4 monomorphization tail), so it
+        // concrete kind before any IR is built (monomorphization tail), so it
         // never reaches rendering.
         .type_var, .app => unreachable,
     }

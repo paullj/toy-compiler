@@ -1,4 +1,4 @@
-# Feature: inherent methods via `impl Type { fn m(self, ..) -> R { .. } }` (M8).
+# Feature: inherent methods via `impl Type { fn m(self, ..) -> R { .. } }`.
 # expect: exit 42
 # `p.sum()` dispatches STATICALLY to the method desugared from the impl block; the
 # receiver `p` is passed by value as `self`, so `self.x + self.y` is 20 + 22 = 42.

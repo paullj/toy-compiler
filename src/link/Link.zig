@@ -6,10 +6,10 @@
 //! contiguously in __text, assigns each function a text offset, builds the
 //! symbol→offset map, and patches every relocation in place. Keeping the reloc /
 //! symbol types here (rather than in `MachO`) keeps the Mach-O writer a pure
-//! container and makes this file the seam M5 (incremental/parallel codegen +
-//! relink) will reuse: re-lower one changed function, then re-`link` the set.
+//! container and makes this file the seam that incremental/parallel codegen +
+//! relink reuses: re-lower one changed function, then re-`link` the set.
 //!
-//! For M3 the only relocation is `.call26` — an AArch64 `bl`, PC-relative by a
+//! So far the only relocation is `.call26` — an AArch64 `bl`, PC-relative by a
 //! signed word offset. Intra-module `bl` needs NO runtime relocation under PIE/
 //! ASLR: the patched offset is the (target − site) word delta, fixed at link
 //! time. `link()` is itself in Stage B; Stage A only needs the types below so
@@ -38,7 +38,7 @@ pub const SymName = symbols.SymName;
 ///                 literal's CONTENT HASH; the serial relink tail rewrites it to
 ///                 a byte offset into the program-wide `__cstring` blob, after
 ///                 which `applyDataRelocs` reads it as that offset.
-///   * `.import` — an external symbol, named by its stable `SymName` (M2 always
+///   * `.import` — an external symbol, named by its stable `SymName` (always
 ///                 `{.import,"write"}`). Reached through its `__got` slot
 ///                 (adrp+ldr+blr); patched by `applyDataRelocs`.
 pub const SymbolId = union(enum) {
@@ -66,7 +66,7 @@ pub const RelocKind = enum {
 
 /// One patch to apply during linking. `site` is the byte offset of the word to
 /// patch within its owning function's `code`. `addend` is part of the shape for
-/// M5; it is 0 for every M3 reloc.
+/// future relocation kinds; it is 0 for every reloc today.
 pub const Reloc = struct {
     site: u32,
     target: SymbolId,
@@ -90,7 +90,7 @@ pub const Literal = struct {
 /// OWNERSHIP ("always own"): every name (the fn's own `sym.name` and each
 /// `.func`/`.import` reloc target name) is heap-owned by this `FnCode`, whether
 /// it was freshly lowered (Codegen dupes at emit) or unpacked from disk. One
-/// `deinit`, no `owned` flag, no double-free ambiguity. [C9]
+/// `deinit`, no `owned` flag, no double-free ambiguity.
 pub const FnCode = struct {
     sym: SymName,
     code: []u8,
@@ -121,7 +121,7 @@ pub const FnCode = struct {
 /// set by composite key, ties broken by original source index. This makes the
 /// handle (and therefore every offset/concat/patch keyed by it) a pure function
 /// of the fn SET, independent of how/when the keys were derived — the invariant
-/// that lets the M18 parallel tail intern symbols off the worker threads without
+/// that lets the parallel tail intern symbols off the worker threads without
 /// any thread-arrival/pointer/hashmap-iteration order leaking into the output.
 pub const SymInterner = struct {
     map: std.StringHashMapUnmanaged(u32) = .empty,
@@ -279,7 +279,7 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     //    (rank, never arrival/source order), then
     //    walk `fns` in SOURCE ORDER to give each its text offset. Layout STAYS
     //    source order (cursor walks `fns`), so __text bytes are byte-identical to
-    //    the pre-M18 baseline; only the handle VALUES that key the offset map
+    //    the earlier serial baseline; only the handle VALUES that key the offset map
     //    change, and every consumer below keys by `get(f.sym)`, so the bytes the
     //    name resolves to are unchanged.
     try si.internAll(gpa, fns);
@@ -291,7 +291,7 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     // `offsets[h]` is the sum of the
     // code lengths of every fn appearing before fn-h in source order — exactly the
     // value the old `offsets[h]=cursor; cursor+=len` running sum produced, so
-    // __text stays byte-identical to the pre-M18 baseline. The scan is split into
+    // __text stays byte-identical to the earlier serial baseline. The scan is split into
     // an explicit length gather + prefix accumulation (instead of one fused cursor
     // walk) so the address-assignment barrier is a standalone, parallel-scan-ready
     // pass; the math (a left-to-right running sum over source order) is unchanged,
@@ -308,7 +308,7 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     // owning fn's handle; `targets[i]` holds each call26 target's handle in the same
     // flat order the per-fn loop visits relocs (so the job indexes it by a running
     // per-fn cursor). A stale call26 target name surfaces as UnresolvedSymbol here,
-    // exactly where the old serial loop raised it. [C4]
+    // exactly where the old serial loop raised it.
     const site_h = try gpa.alloc(u32, fns.len);
     defer gpa.free(site_h);
     var n_call26: usize = 0;
@@ -553,14 +553,14 @@ fn dataRelocJob(
     std.mem.writeInt(u32, text[rl.site..][0..4], patched, .little);
 }
 
-// A lowered `FnCode` is the M5 cache payload. `Reloc.target` is a tagged union
+// A lowered `FnCode` is the cache payload. `Reloc.target` is a tagged union
 // with an `i64` addend, so it is NOT raw-memcpy-able; serialize each region into
 // `extern` records inside the same `[u64 checksum][payload]` envelope `Cache`
 // uses for the parse Tree. Blob layout:
 //   [FnHeader][sym name][code][RelocRec×n][names pool][LitRec×m][lits pool]
 // Names (reloc `.func`/`.import` targets) are pooled; each RelocRec carries an
 // (offset,len) into that pool. `unpack` reconstructs an "always own" FnCode so a
-// hit and a fresh lower share one `deinit`. [C9]
+// hit and a fresh lower share one `deinit`.
 
 /// "TOFC" — a magic so a foreign/corrupt blob is treated as a cache miss.
 pub const fncode_magic: u32 = 0x544f4643;
@@ -604,7 +604,7 @@ comptime {
 
 /// Serialize `fc` into one flat blob (caller owns it). Deterministic: the same
 /// `FnCode` always produces byte-identical output, so VERIFY mode can compare a
-/// re-lowered blob to the cached one. [C11]
+/// re-lowered blob to the cached one.
 pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
     var names_len: usize = 0;
     for (fc.relocs) |r| switch (r.target) {
@@ -948,7 +948,7 @@ test "entry_off is the entry symbol's offset, not necessarily first" {
 test "reorder does not corrupt a call: same names, different layout order" {
     const gpa = testing.allocator;
     // [f0 calls f1, f1] then [f1, f0 calls f1] — the call resolves by NAME, so the
-    // bl delta differs (layout moved) but always points at f1's body. [C4][vi]
+    // bl delta differs (layout moved) but always points at f1's body. [vi]
     {
         var fns = [_]FnCode{
             try makeFn(gpa, 0, 2, &.{.{ .site = 0, .target = .{ .func = fname(1) }, .kind = .call26 }}),
@@ -980,7 +980,7 @@ test "stable-sort handles: shuffled input order yields the identical handle map"
     // The SAME fn set, interned in three different source orders. A handle is the
     // stable-sort RANK of the composite key (ties broken by source index), so the
     // handle→name mapping is a pure function of the SET — identical across orders,
-    // never arrival/source order. This is the M18 determinism invariant: the
+    // never arrival/source order. This is the determinism invariant: the
     // parallel tail can intern off worker threads without any thread-arrival order
     // leaking into the handles that key every offset/delta.
     const Fn = struct { kind: SymKind, name: []const u8 };

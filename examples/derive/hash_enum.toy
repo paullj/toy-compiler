@@ -1,4 +1,4 @@
-# Feature: structural `Hash` derive on a PAYLOAD enum (M20). An enum value hashes its
+# Feature: structural `Hash` derive on a PAYLOAD enum. An enum value hashes its
 # discriminant (case-declaration order) folded into a fixed seed, then the active variant's
 # payload fields. Two equal values hash EQUAL (Eq-consistent): `A(3)` == `A(3)` hash the
 # same; `A(3)` and `A(4)` differ in payload; `A(3)` and `B` differ in discriminant. The

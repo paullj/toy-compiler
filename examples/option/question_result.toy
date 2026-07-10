@@ -1,9 +1,9 @@
-# Feature: `?` propagates `Result` errors (M24). `total` chains three `?`: two on a
+# Feature: `?` propagates `Result` errors. `total` chains three `?`: two on a
 # `Result[int,str]` and one on a `Result[Point,str]` — a SECOND distinct instance whose
 # `ok` payload is an AGGREGATE (a struct), proving the happy-path extract is a byte copy,
-# not the M23 scalar-only `unwrap`. On `.err`, `?` early-returns the enclosing `err`,
+# not the scalar-only `unwrap`. On `.err`, `?` early-returns the enclosing `err`,
 # copying the `str` error payload UNCHANGED across the (differently-sized) operand and
-# return enum layouts — M24 requires the SAME error type, so it is a plain copy. Any `?`
+# return enum layouts — `?` requires the SAME error type, so it is a plain copy. Any `?`
 # hitting `.err` short-circuits (the tail never runs). Two distinct Result instances plus
 # their discovery order make this a `-j1`==`-jN` determinism case (diff.sh).
 # expect: exit 42

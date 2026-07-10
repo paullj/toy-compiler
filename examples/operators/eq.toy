@@ -1,4 +1,4 @@
-# Feature: `==` / `!=` are operators-as-protocols (M15). They desugar to the prelude
+# Feature: `==` / `!=` are operators-as-protocols. They desugar to the prelude
 # protocol `Eq { fn eq(self, other: Self) -> bool }`; a user struct conforms via
 # `impl P has Eq`, so `p == q` dispatches to `P::eq` and runs e2e.
 # expect: exit 42

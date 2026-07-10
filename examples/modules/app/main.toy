@@ -1,4 +1,4 @@
-# Feature: a multi-module program exercising the whole M14 surface in one entry:
+# Feature: a multi-module program exercising the whole module surface in one entry:
 #   - diamond import: `geometry/vec` reached via both `main` and `geometry/rect`
 #   - alias: `text/banner as msg` binds the namespace to `msg`, not `banner`
 #   - qualified call (`rect.area`), cross-module struct passed BY VALUE

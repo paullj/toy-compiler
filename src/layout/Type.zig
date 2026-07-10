@@ -310,7 +310,7 @@ test "algebra: type_var round-trips its ordinal and eql is per-ordinal" {
     try testing.expect(!t0.isStruct());
 }
 
-test "algebra: app round-trips its composite index and eql is per-index (M4)" {
+test "algebra: app round-trips its composite index and eql is per-index" {
     // The byte-foldable Type never widens: the composite index rides `struct_id`.
     try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
     const a0 = Type.app(0);
@@ -361,7 +361,7 @@ test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
     }
 }
 
-test "algebra: integer widths are distinct byte-foldable types (M1)" {
+test "algebra: integer widths are distinct byte-foldable types" {
     // The width/sign descriptor rides the otherwise-spare pad byte: no widening.
     try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
 

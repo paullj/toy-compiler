@@ -1,4 +1,4 @@
-# Feature: M21 ground conditional conformance — `Box[int]` conforms to `Ord` AND `Eq`
+# Feature: ground conditional conformance — `Box[int]` conforms to `Ord` AND `Eq`
 # directly (no generic fn in sight), because the recursive `conforms` query descends the
 # App's `int` field. A non-generic struct with a `Box[int]` FIELD compares too: its field
 # is an unreified `App` during Pass C, so the same query makes the outer struct conform
