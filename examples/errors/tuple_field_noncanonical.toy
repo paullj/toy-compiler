@@ -1,0 +1,10 @@
+# A non-canonical tuple-field spelling (leading zero / underscore) must be REJECTED:
+# the checker matches the canonical field-name string ("0".."63") exactly as lower does,
+# so `.01` names no field. Previously the checker parsed "01" as index 1 while lower read
+# field 0 — a silent soundness hole.
+# expect: compile-error "has no field .01"
+struct Pair(int, int)
+fn main() -> int {
+    p := Pair(7, 9)
+    return p.01
+}
