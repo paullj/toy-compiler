@@ -1957,7 +1957,7 @@ fn builtinConvCallee(b: *Builder, n: Ast.Node) ?ConvCall {
 /// Whether `ty` is the compiler-provided `char` struct (the id the checker used, threaded
 /// via `Inputs.char_struct`). Null (a prelude-less test caller) means no type is char.
 pub fn isCharTy(b: *const Builder, ty: Typecheck.Type) bool {
-    return ty.kind == .@"struct" and b.in.char_struct != null and ty.struct_id == b.in.char_struct.?;
+    return Typecheck.isCharTy(ty, b.in.char_struct);
 }
 
 /// A native inherent method call on a reified `Option`/`Result` instance: the

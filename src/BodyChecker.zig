@@ -1788,7 +1788,7 @@ pub const BodyChecker = struct {
         // already selected above; the builtin recognizer only matches int/char, so a
         // struct receiver with no such method falls through to T0018 — never a wrong pick.
         const char_id = if (bc.model.prelude) |p| p.char_struct else null;
-        const recv_is_char = recv_ty.kind == .@"struct" and char_id != null and recv_ty.struct_id == char_id.?;
+        const recv_is_char = Typecheck.isCharTy(recv_ty, char_id);
         if ((recv_ty.isInteger() or recv_is_char) and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
             if (bc.expected) |exp| {
                 if (Typecheck.builtinConvMethod(recv_ty, exp, member, char_id)) |cm| {
