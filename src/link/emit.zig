@@ -418,6 +418,87 @@ fn litFn(literals: []const Link.Literal) Link.FnCode {
     return .{ .sym = .{ .kind = .user_fn, .name = "" }, .code = &.{}, .relocs = &.{}, .literals = @constCast(literals) };
 }
 
+// AArch64 placeholder words (the reloc patchers overwrite/preserve as needed):
+// `adrp x0,0` / `add x0,x0,#0` / `bl #0` / `ret`.
+const w_adrp0: u32 = 0x90000000;
+const w_add0: u32 = 0x91000000;
+const w_bl0: u32 = 0x94000000;
+const w_ret: u32 = 0xD65F03C0;
+
+/// Build one owned `FnCode` for the determinism test: `adrp/add` referencing a cstring
+/// literal (a cross-segment data-reloc pair) plus, if `call_panic`, a `bl panic` (a
+/// call26 to the appended builtin, which drags in `write` + the symbol table). Consumed
+/// (freed) by `linkProgram`.
+fn detFn(gpa: std.mem.Allocator, name: []const u8, lit_hash: u64, lit_bytes: []const u8, call_panic: bool) !Link.FnCode {
+    const nwords: usize = if (call_panic) 4 else 3;
+    const code = try gpa.alloc(u8, nwords * 4);
+    std.mem.writeInt(u32, code[0..4], w_adrp0, .little);
+    std.mem.writeInt(u32, code[4..8], w_add0, .little);
+    if (call_panic) {
+        std.mem.writeInt(u32, code[8..12], w_bl0, .little);
+        std.mem.writeInt(u32, code[12..16], w_ret, .little);
+    } else {
+        std.mem.writeInt(u32, code[8..12], w_ret, .little);
+    }
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    try relocs.append(gpa, .{ .site = 0, .target = .{ .cstr = lit_hash }, .kind = .adrp_page });
+    try relocs.append(gpa, .{ .site = 4, .target = .{ .cstr = lit_hash }, .kind = .add_lo12 });
+    if (call_panic) {
+        try relocs.append(gpa, .{ .site = 8, .target = .{ .func = .{ .kind = .builtin, .name = try gpa.dupe(u8, "panic") } }, .kind = .call26 });
+    }
+    const lits = try gpa.alloc(Link.Literal, 1);
+    lits[0] = .{ .hash = lit_hash, .bytes = try gpa.dupe(u8, lit_bytes) };
+    return .{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, name) }, .code = code, .relocs = try relocs.toOwnedSlice(gpa), .literals = lits };
+}
+
+/// Three fns with distinct cstrings; `main` also calls `panic`. Fresh (owned) each call
+/// so both determinism-test runs get their own copy to consume.
+fn detFns(gpa: std.mem.Allocator) ![]Link.FnCode {
+    const fns = try gpa.alloc(Link.FnCode, 3);
+    fns[0] = try detFn(gpa, "aaa", 0x1111, "alpha", false);
+    fns[1] = try detFn(gpa, "bbb", 0x2222, "beta", false);
+    fns[2] = try detFn(gpa, "main", 0x3333, "gamma", true);
+    return fns;
+}
+
+fn freeLinked(gpa: std.mem.Allocator, lk: *Linked) void {
+    gpa.free(lk.text);
+    gpa.free(lk.cstrings);
+    for (lk.data_relocs) |rl| if (rl.target.name()) |nm| gpa.free(nm);
+    gpa.free(lk.data_relocs);
+}
+
+test "backend determinism: linkProgram is byte-identical at -j1 and -jN across every parallel seam" {
+    // The load-bearing -jN invariant was verified only at each component (interning,
+    // prefix-sum, stable-sort, sign); this drives the WHOLE link tail — cstring interning
+    // + `.cstr` rewrite + parallel fnLinkJob + data-reloc stable-concat + panic symbol-table
+    // build/append — serially (.limited(0)) vs on real threads (.limited(8)) and asserts the
+    // emitted __text + __cstring + the deferred reloc list are identical. This is the seam
+    // between the deterministic components, exactly where a regression would hide.
+    const gpa = testing.allocator;
+    const entry = Link.SymName{ .kind = .user_fn, .name = "main" };
+
+    var t_serial = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer t_serial.deinit();
+    var serial = try linkProgram(t_serial.io(), gpa, try detFns(gpa), entry);
+    defer freeLinked(gpa, &serial);
+
+    var t_par = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
+    defer t_par.deinit();
+    var parallel_lk = try linkProgram(t_par.io(), gpa, try detFns(gpa), entry);
+    defer freeLinked(gpa, &parallel_lk);
+
+    try testing.expectEqualSlices(u8, serial.text, parallel_lk.text);
+    try testing.expectEqualSlices(u8, serial.cstrings, parallel_lk.cstrings);
+    try testing.expectEqual(serial.entry_off, parallel_lk.entry_off);
+    // The deferred cross-segment relocs must match in order (the stable-concat seam) and shape.
+    try testing.expectEqual(serial.data_relocs.len, parallel_lk.data_relocs.len);
+    for (serial.data_relocs, parallel_lk.data_relocs) |a, b| {
+        try testing.expectEqual(a.site, b.site);
+        try testing.expectEqual(a.kind, b.kind);
+    }
+}
+
 test "internCstrings: blob+offsets identical under shuffled per-fn collection order" {
     const gpa = testing.allocator;
     // Dedup keeps FIRST occurrence in (fn-source-order, in-fn-order); offsets are a
