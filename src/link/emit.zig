@@ -452,7 +452,8 @@ fn detFn(gpa: std.mem.Allocator, name: []const u8, lit_hash: u64, lit_bytes: []c
 }
 
 /// Three fns with distinct cstrings; `main` also calls `panic`. Fresh (owned) each call
-/// so both determinism-test runs get their own copy to consume.
+/// so both determinism-test runs get their own copy to consume. `linkProgram` deinits
+/// the ELEMENTS but not the slice backing, so the caller frees the returned slice.
 fn detFns(gpa: std.mem.Allocator) ![]Link.FnCode {
     const fns = try gpa.alloc(Link.FnCode, 3);
     fns[0] = try detFn(gpa, "aaa", 0x1111, "alpha", false);
@@ -478,14 +479,18 @@ test "backend determinism: linkProgram is byte-identical at -j1 and -jN across e
     const gpa = testing.allocator;
     const entry = Link.SymName{ .kind = .user_fn, .name = "main" };
 
+    const fns_serial = try detFns(gpa);
+    defer gpa.free(fns_serial); // linkProgram consumes the elements, not the slice
     var t_serial = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
     defer t_serial.deinit();
-    var serial = try linkProgram(t_serial.io(), gpa, try detFns(gpa), entry);
+    var serial = try linkProgram(t_serial.io(), gpa, fns_serial, entry);
     defer freeLinked(gpa, &serial);
 
+    const fns_par = try detFns(gpa);
+    defer gpa.free(fns_par);
     var t_par = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
     defer t_par.deinit();
-    var parallel_lk = try linkProgram(t_par.io(), gpa, try detFns(gpa), entry);
+    var parallel_lk = try linkProgram(t_par.io(), gpa, fns_par, entry);
     defer freeLinked(gpa, &parallel_lk);
 
     try testing.expectEqualSlices(u8, serial.text, parallel_lk.text);
