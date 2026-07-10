@@ -127,6 +127,18 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     errdefer if (cstrings_blob) |b| gpa.free(b);
     const off_by_hash = &interned.off_by_hash;
 
+    // 2b) Reserve the backtrace symbol table's slot at the (8-aligned) END of the
+    //     __cstring blob and bind the sentinel hash `__panic`'s `.cstr` reloc carries
+    //     to that offset, so step 3 rewrites it like any string. The table BYTES are
+    //     appended after `link` (they depend on the layout it computes); only their
+    //     start offset is known now. A real literal hashing to the sentinel would be
+    //     silently mis-pointed — reject it (astronomically unlikely).
+    const symtab_off: u32 = std.mem.alignForward(u32, @intCast(interned.cstrings.len), 8);
+    if (uses_panic) {
+        if (off_by_hash.contains(Link.symtab_base_hash)) return error.CstringHashCollision;
+        try off_by_hash.put(gpa, Link.symtab_base_hash, symtab_off);
+    }
+
     // 3) Rewrite every `.cstr` reloc target from content hash → global offset, in
     //    parallel over fns. Each fn owns its own `relocs` array (disjoint writes);
     //    `off_by_hash` is a read-only map looked up BY KEY (never iterated), so the
@@ -151,9 +163,25 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     // 4) Intern symbols (source order) and link.
     var si: Link.SymInterner = .{};
     defer si.deinit(gpa);
-    const linked = try Link.link(io, gpa, all.items, &si, entry);
+    const linked = try Link.link(io, gpa, all.items, &si, entry, uses_panic);
     errdefer gpa.free(linked.text);
     errdefer gpa.free(linked.data_relocs);
+    defer gpa.free(linked.sym_table);
+
+    // 4b) Append the backtrace symbol table at the reserved `symtab_off` (padding to
+    //     the 8-alignment) so it rides in the signed, read-only __cstring section and
+    //     `__panic`'s reserved `.cstr` reloc resolves to it.
+    if (uses_panic and linked.sym_table.len > 0) {
+        var grown: std.ArrayList(u8) = .empty;
+        errdefer grown.deinit(gpa);
+        const old = cstrings_blob.?;
+        try grown.appendSlice(gpa, old);
+        try grown.appendNTimes(gpa, 0, @as(usize, symtab_off) - old.len); // 8-align pad
+        try grown.appendSlice(gpa, linked.sym_table);
+        const new = try grown.toOwnedSlice(gpa); // old still owned on failure (errdefer frees it)
+        cstrings_blob = new;
+        gpa.free(old);
+    }
 
     // The data-relocs' `.import` target names point into `all`'s FnCodes, which
     // the deferred `all` deinit is about to free. Dupe them so the caller owns
