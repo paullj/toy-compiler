@@ -1,0 +1,10 @@
+# The NSRN-independent-of-NGRN proof: ints ride x0/x1, floats ride v0/v1, the two
+# argument sequences advancing independently.
+# expect: exit 42
+fn pick(i: int, x: float, j: int, y: float) -> float {
+    x *. y                                    # only the floats matter to the result
+}
+fn main() -> int {
+    r := pick(100, 6.0, 200, 7.0)             # i->x0, x->v0, j->x1, y->v1
+    return if r >. 41.0 { 42 } else { 0 }
+}

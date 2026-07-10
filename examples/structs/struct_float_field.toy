@@ -1,0 +1,13 @@
+# A struct-with-float-fields is NOT a bare float: it crosses the boundary on the
+# GPR reg-pair path (P via x0/x1), while a bare-float RESULT still uses v0. Proves
+# classify routes a struct on the aggregate path even when its fields are floats.
+# expect: exit 42
+struct P { x: float, y: float }
+fn getx(p: P) -> float {
+    p.x
+}
+fn main() -> int {
+    p := P { x: 42.5, y: 1.0 }
+    r := getx(p)                              # P in x0/x1 (reg-pair), float back in v0
+    return if r >. 42.0 { 42 } else { 0 }
+}

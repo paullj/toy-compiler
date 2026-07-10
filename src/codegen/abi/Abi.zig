@@ -44,16 +44,22 @@ pub const EnumLayout = Typecheck.EnumLayout;
 /// on the stack.
 pub const num_gpr_args: u32 = 8;
 
-/// AAPCS64 aggregate class (size-driven, never forked by kind):
-///   * `scalar`    — not an aggregate (int/bool): one GPR / 8 stack bytes.
-///   * `reg_pair`  — aggregate <=16B: a 1- or 2-eightbyte register run.
+/// The 8 SIMD&FP argument registers (v0..v7). A bare float scalar rides the NSRN
+/// sequence over these, INDEPENDENT of the GPR (NGRN) sequence; float arg 9+
+/// spills to the shared NSAA stack pool.
+pub const num_fp_args: u32 = 8;
+
+/// AAPCS64 argument class:
+///   * `scalar`    — an integer/bool: one GPR / 8 stack bytes (NGRN).
+///   * `fp`        — a bare float: one V-register / 8 stack bytes (NSRN).
+///   * `reg_pair`  — aggregate <=16B: a 1- or 2-eightbyte GPR run.
 ///   * `indirect`  — aggregate >16B: passed/returned via a pointer (+ x8 sret).
-pub const AbiClass = enum { scalar, reg_pair, indirect };
+pub const AbiClass = enum { scalar, fp, reg_pair, indirect };
 
 /// Byte size of a type (int/bool 8, str 16, struct/enum → its layout size).
 pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
-        .int, .bool => 8,
+        .int, .bool, .float => 8,
         .str => 16,
         .@"struct" => layouts[ty.struct_id].size,
         .@"enum" => enum_layouts[ty.enum_id].size,
@@ -65,7 +71,7 @@ pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLay
 /// alignment).
 pub fn typeAlign(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
-        .int, .bool, .str => 8,
+        .int, .bool, .float, .str => 8,
         .@"struct" => layouts[ty.struct_id].@"align",
         .@"enum" => enum_layouts[ty.enum_id].@"align",
         else => 1,
@@ -87,6 +93,10 @@ pub fn eightbytes(size: u32) u32 {
 /// `reg_pair` (<=16B) or `indirect` (>16B). Single source of truth for the
 /// reg-pair vs indirect split.
 pub fn classify(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) AbiClass {
+    // A bare float rides the NSRN (V-register) sequence. Checked BEFORE the
+    // aggregate test so a struct-with-float-field (kind `.@"struct"`, never
+    // `.float`) correctly stays on the GPR reg-pair/indirect path.
+    if (ty.kind == .float) return .fp;
     if (!isAggregate(ty)) return .scalar;
     return if (typeSize(ty, layouts, enum_layouts) <= 16) .reg_pair else .indirect;
 }
@@ -108,6 +118,10 @@ pub fn classify(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLay
 pub const ParamLoc = union(enum) {
     gpr: struct { first: u8, count: u8 },
     gpr_ptr: u8,
+    /// A bare float scalar in V-register `fpr` (a D-register, the NSRN sequence).
+    /// A float that overflows v7 does NOT use this — it reuses `.stack` (8 raw
+    /// bytes moved by GPR loads/stores, correct for the f64 bit pattern).
+    fpr: u8,
     stack: struct { nsaa_off: u32, bytes: u32 },
     stack_ptr: u32,
 };
@@ -124,6 +138,8 @@ pub const ArgLoc = ParamLoc;
 pub const RetLoc = union(enum) {
     none,
     reg: struct { regs: u8 },
+    /// A bare float result in v0 (D0).
+    fp_reg,
     sret,
 };
 
@@ -133,6 +149,7 @@ pub fn classifyRet(ty: Type, layouts: []const Layout, enum_layouts: []const Enum
     if (ty.kind == .unit) return .none;
     switch (classify(ty, layouts, enum_layouts)) {
         .scalar => return .{ .reg = .{ .regs = 1 } },
+        .fp => return .fp_reg,
         .reg_pair => return .{ .reg = .{ .regs = @intCast(eightbytes(typeSize(ty, layouts, enum_layouts))) } },
         .indirect => return .sret,
     }
@@ -155,9 +172,22 @@ fn walkAbi(
 ) u32 {
     std.debug.assert(out_locs.len == types_.len);
     var ngrn: u32 = 0;
+    // NSRN is the SIMD&FP arg counter — INDEPENDENT of NGRN. A float consumes
+    // only NSRN; an int/bool/aggregate consumes only NGRN. Structural: the `.fp`
+    // arm never touches ngrn, the others never touch nsrn.
+    var nsrn: u32 = 0;
     var nsaa: u32 = 0;
     for (types_, 0..) |ty, i| {
         switch (classify(ty, layouts, enum_layouts)) {
+            .fp => {
+                if (nsrn < num_fp_args) {
+                    out_locs[i] = .{ .fpr = @intCast(nsrn) };
+                    nsrn += 1;
+                } else {
+                    out_locs[i] = .{ .stack = .{ .nsaa_off = nsaa, .bytes = 8 } };
+                    nsaa += 8;
+                }
+            },
             .indirect => {
                 if (ngrn < num_gpr_args) {
                     out_locs[i] = .{ .gpr_ptr = @intCast(ngrn) };
@@ -311,6 +341,69 @@ test "classify: scalar / reg_pair / indirect" {
     try testing.expectEqual(@as(u32, 1), eightbytes(8));
     try testing.expectEqual(@as(u32, 2), eightbytes(16));
     try testing.expectEqual(@as(u32, 2), eightbytes(9));
+}
+
+test "classify: a bare float is fp, a struct-with-float stays an aggregate" {
+    const gpa = testing.allocator;
+    const ls = try mkLayouts(gpa, &.{16}); // a 16B struct (e.g. two floats)
+    defer gpa.free(ls);
+    const el: []const EnumLayout = &.{};
+
+    try testing.expectEqual(AbiClass.fp, classify(Type.float, ls, el));
+    // A struct of floats is `.@"struct"`, never `.float` → the reg-pair GPR path.
+    try testing.expectEqual(AbiClass.reg_pair, classify(structOf(0), ls, el));
+}
+
+test "classifyRet: a bare float returns in v0 (fp_reg)" {
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    try testing.expectEqual(RetLoc.fp_reg, classifyRet(Type.float, ls, el));
+}
+
+test "planParams: (int,float,int,float) — NSRN independent of NGRN" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    // i→x0 (NGRN), x→v0 (NSRN), j→x1 (NGRN), y→v1 (NSRN): the two sequences
+    // advance independently.
+    const params = [_]Type{ Type.int, Type.float, Type.int, Type.float };
+    var plan = try planParams(gpa, &params, Type.float, ls, el);
+    defer plan.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), plan.locs[0].gpr.first);
+    try testing.expectEqual(@as(u8, 0), plan.locs[1].fpr);
+    try testing.expectEqual(@as(u8, 1), plan.locs[2].gpr.first);
+    try testing.expectEqual(@as(u8, 1), plan.locs[3].fpr);
+}
+
+test "planCall: 9 floats — v0..v7 then a stack spill (NSAA)" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    const args = [_]Type{ Type.float, Type.float, Type.float, Type.float, Type.float, Type.float, Type.float, Type.float, Type.float };
+    var plan = try planCall(gpa, &args, Type.float, ls, el);
+    defer plan.deinit(gpa);
+
+    var i: u8 = 0;
+    while (i < 8) : (i += 1) try testing.expectEqual(i, plan.locs[i].fpr);
+    // The 9th float overflows v7 → a shared-NSAA stack slot of 8 bytes.
+    try testing.expectEqual(@as(u32, 0), plan.locs[8].stack.nsaa_off);
+    try testing.expectEqual(@as(u32, 8), plan.locs[8].stack.bytes);
+    try testing.expectEqual(@as(u32, 8), plan.nsaa_bytes);
+}
+
+test "planCall: floats do NOT consume GPR slots — 8 ints + a float still place the float in v0" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    // 8 ints exhaust x0..x7; a trailing float rides v0 (NSRN), NOT the stack —
+    // proof the NSRN pool is untouched by the exhausted NGRN pool.
+    const args = [_]Type{ Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, Type.float };
+    var plan = try planCall(gpa, &args, Type.unit, ls, el);
+    defer plan.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), plan.locs[8].fpr);
+    try testing.expectEqual(@as(u32, 0), plan.nsaa_bytes);
 }
 
 test "classifyRet: unit / scalar / reg_pair / sret" {
