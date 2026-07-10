@@ -530,6 +530,39 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
     }
 }
 
+test "M10: print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra bytes)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+
+    const dir_name = ".toy-test-m10-charutf8";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const out_bin = dir_name ++ "/prog";
+    {
+        const res = try spawnToy(gpa, io, &.{ "build", "examples/io/char_utf8.toy", "-o", out_bin });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, out_bin, gpa);
+    defer gpa.free(bin_abs);
+    var child = try std.process.spawn(io, .{ .argv = &.{bin_abs}, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    // A(41) ñ(C3 B1) €(E2 82 AC) 😀(F0 9F 98 80) = EXACTLY 10 bytes, no trailing newline.
+    try testing.expectEqualSlices(u8, "\x41\xC3\xB1\xE2\x82\xAC\xF0\x9F\x98\x80", got);
+}
+
 test "M23: an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
     // The prelude `Option[T]` (M23) is nameable with no import; `Option[int]` reifies to a
     // plain concrete enum through the M6 path, so this compiles + runs on the real backend.

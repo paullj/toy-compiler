@@ -1,0 +1,8 @@
+# expect: stdout "Añ€😀"
+# expect: exit 0
+fn main() {
+    print('A')
+    print('ñ')
+    print('€')
+    print('😀')
+}

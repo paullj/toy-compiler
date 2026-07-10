@@ -4362,6 +4362,21 @@ test "M22: `print(\"..\")` still types clean and derives nothing (str path uncha
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
+test "M10: `print('A')` derives nothing — char's explicit Display conformance suppresses the structural char(N) unit" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() {
+        \\ print('A')
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // The explicit prelude Display+char conformance wins at findConformance, so no structural
+    // derive fires: BodyChecker records no Display derive request for char.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
 test "M16: Ord refines Eq — `==` on an Ord-only struct types to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(

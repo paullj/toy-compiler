@@ -1415,6 +1415,7 @@ pub fn emitDisplayBoolValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!void 
 /// stays in lockstep with the callee's own derived unit. A miss is unreachable for a
 /// conforming field (the synthesis barrier proved it) — note-and-drop rather than miscompile.
 pub fn displayAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!void {
+    if (isCharTy(b, ty)) return lowerCharDisplay(b, slot);
     switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", b.in.prelude_ids.display, null)) {
         .one => |m| {
             const callee = witnessCallee(b, m);
@@ -1428,6 +1429,121 @@ pub fn displayAtSlot(b: *Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{Out
             b.had_error = true;
         },
     }
+}
+
+fn shr(b: *Builder, v: Ir.ValueId, n: i64) error{OutOfMemory}!Ir.ValueId {
+    const c = try b.emit(.{ .iconst = n }, Typecheck.Type.int);
+    return b.emit(.{ .lshr = .{ .lhs = v, .rhs = c } }, Typecheck.Type.int);
+}
+fn andC(b: *Builder, v: Ir.ValueId, m: i64) error{OutOfMemory}!Ir.ValueId {
+    const c = try b.emit(.{ .iconst = m }, Typecheck.Type.int);
+    return b.emit(.{ .band = .{ .lhs = v, .rhs = c } }, Typecheck.Type.int);
+}
+fn orC(b: *Builder, v: Ir.ValueId, m: i64) error{OutOfMemory}!Ir.ValueId {
+    const c = try b.emit(.{ .iconst = m }, Typecheck.Type.int);
+    return b.emit(.{ .bor = .{ .lhs = v, .rhs = c } }, Typecheck.Type.int);
+}
+/// Fold bytes little-endian into one word: b0 | b1<<8 | b2<<16 | b3<<24.
+fn packLE(b: *Builder, bytes: []const Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    var acc = bytes[0];
+    var shift: i64 = 8;
+    for (bytes[1..]) |y| {
+        const sh = try b.emit(.{ .iconst = shift }, Typecheck.Type.int);
+        const hi = try b.emit(.{ .shl = .{ .lhs = y, .rhs = sh } }, Typecheck.Type.int);
+        acc = try b.emit(.{ .bor = .{ .lhs = acc, .rhs = hi } }, Typecheck.Type.int);
+        shift += 8;
+    }
+    return acc;
+}
+
+/// Display a `char` VALUE (materialized in `slot`) by UTF-8-ENCODING its codepoint and
+/// writing the <=4 bytes to fd 1 — the hand-written witness that overrides char's structural
+/// `char(65)` derive (suppressed by the prelude Display conformance row). A 3-test band ladder
+/// (cp<=0x7F / <=0x7FF / <=0xFFFF else 4-byte) packs the bytes LITTLE-ENDIAN into one word and
+/// does ONE `.store` into an 8-byte scratch slot: `.store` is a 64-bit STR (no store_byte op),
+/// so the high padding is written but never read — the `str` len is the true band width. The
+/// codepoint is a proven-valid scalar (M9's decode/try_into gates: 0..0x10FFFF, no surrogates)
+/// AND the char literal's 64-bit store zeroed the slot's high 4 bytes, so the loaded value has
+/// bit63 clear: unsigned band tests need no validity branch. Pure IR (fixed block/value ids,
+/// reads no map) → -jN- and O0≡O1-stable. Leaves the cursor at the join block.
+fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+
+    const cp_base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const cp = try b.emit(.{ .load = .{ .addr = cp_base, .ty = Typecheck.Type.uint32 } }, int_ty);
+
+    const byte_slot = try b.addSlot(int_ty); // 8-byte scratch for the packed LE word
+    const b0_addr = try b.emit(.{ .slot_addr = byte_slot }, int_ty);
+
+    const band1 = try b.addBlock();
+    const test2 = try b.addBlock();
+    const band2 = try b.addBlock();
+    const test3 = try b.addBlock();
+    const band3 = try b.addBlock();
+    const band4 = try b.addBlock();
+    const join = try b.addBlock();
+    const len = try b.addParam(join, int_ty);
+
+    // Unsigned band tests: a codepoint is an unsigned magnitude. The loaded value has bit63
+    // clear, so .ule == .le here; .ule states the domain honestly and is width-robust.
+    const c7f = try b.emit(.{ .iconst = 0x7F }, int_ty);
+    const is1 = try b.emit(.{ .icmp = .{ .cc = .ule, .lhs = cp, .rhs = c7f } }, bool_ty);
+    b.setTerm(.{ .cond_br = .{ .cond = is1, .t = band1, .f = test2 } });
+
+    // 1 byte: cp
+    b.switchTo(band1);
+    _ = try b.emit(.{ .store = .{ .addr = b0_addr, .val = cp, .ty = int_ty } }, null);
+    try brTo(b, join, .{ .value = try b.emit(.{ .iconst = 1 }, int_ty) });
+
+    b.switchTo(test2);
+    const c7ff = try b.emit(.{ .iconst = 0x7FF }, int_ty);
+    const is2 = try b.emit(.{ .icmp = .{ .cc = .ule, .lhs = cp, .rhs = c7ff } }, bool_ty);
+    b.setTerm(.{ .cond_br = .{ .cond = is2, .t = band2, .f = test3 } });
+
+    // 2 bytes: 0xC0|(cp>>6), 0x80|(cp&0x3F)
+    b.switchTo(band2);
+    {
+        const y0 = try orC(b, try shr(b, cp, 6), 0xC0);
+        const y1 = try orC(b, try andC(b, cp, 0x3F), 0x80);
+        _ = try b.emit(.{ .store = .{ .addr = b0_addr, .val = try packLE(b, &.{ y0, y1 }), .ty = int_ty } }, null);
+        try brTo(b, join, .{ .value = try b.emit(.{ .iconst = 2 }, int_ty) });
+    }
+
+    b.switchTo(test3);
+    const cffff = try b.emit(.{ .iconst = 0xFFFF }, int_ty);
+    const is3 = try b.emit(.{ .icmp = .{ .cc = .ule, .lhs = cp, .rhs = cffff } }, bool_ty);
+    b.setTerm(.{ .cond_br = .{ .cond = is3, .t = band3, .f = band4 } });
+
+    // 3 bytes: 0xE0|(cp>>12), 0x80|((cp>>6)&0x3F), 0x80|(cp&0x3F)
+    b.switchTo(band3);
+    {
+        const y0 = try orC(b, try shr(b, cp, 12), 0xE0);
+        const y1 = try orC(b, try andC(b, try shr(b, cp, 6), 0x3F), 0x80);
+        const y2 = try orC(b, try andC(b, cp, 0x3F), 0x80);
+        _ = try b.emit(.{ .store = .{ .addr = b0_addr, .val = try packLE(b, &.{ y0, y1, y2 }), .ty = int_ty } }, null);
+        try brTo(b, join, .{ .value = try b.emit(.{ .iconst = 3 }, int_ty) });
+    }
+
+    // 4 bytes: 0xF0|(cp>>18), 0x80|((cp>>12)&0x3F), 0x80|((cp>>6)&0x3F), 0x80|(cp&0x3F)
+    b.switchTo(band4);
+    {
+        const y0 = try orC(b, try shr(b, cp, 18), 0xF0);
+        const y1 = try orC(b, try andC(b, try shr(b, cp, 12), 0x3F), 0x80);
+        const y2 = try orC(b, try andC(b, try shr(b, cp, 6), 0x3F), 0x80);
+        const y3 = try orC(b, try andC(b, cp, 0x3F), 0x80);
+        _ = try b.emit(.{ .store = .{ .addr = b0_addr, .val = try packLE(b, &.{ y0, y1, y2, y3 }), .ty = int_ty } }, null);
+        try brTo(b, join, .{ .value = try b.emit(.{ .iconst = 4 }, int_ty) });
+    }
+
+    // join: build a runtime str{ptr=&byte_slot, len} and print exactly `len` bytes.
+    b.switchTo(join);
+    const str_slot = try b.addSlot(Typecheck.Type.str);
+    const sbase = try b.emit(.{ .slot_addr = str_slot }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = sbase, .val = b0_addr, .ty = int_ty } }, null);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = sbase, .off = 8, .ty = int_ty } }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = len, .ty = int_ty } }, null);
+    try emitPrintSlot(b, str_slot);
 }
 
 /// True when `sig` is a generic template (some param is a check-time `type_var`).
