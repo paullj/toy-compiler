@@ -707,8 +707,9 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
 /// are the int↔int cases (M3); the four `char_*`/`*_char` cases are M9's char surface.
 pub const ConvKind = enum { widen, narrow, char_to_int, byte_to_char, int_to_char, char_to_byte };
 
-/// Whether `t` is the compiler-provided `char` struct (`char_id` from the prelude).
-fn isCharTy(t: Type, char_id: ?u32) bool {
+/// Whether `t` is the compiler-provided `char` struct (`char_id` from the prelude). The
+/// single source of the "is this char" predicate; the checker and lower delegate here.
+pub fn isCharTy(t: Type, char_id: ?u32) bool {
     return t.kind == .@"struct" and char_id != null and t.struct_id == char_id.?;
 }
 
