@@ -363,7 +363,105 @@ pub fn lower(
         .ord => lowerDeriveOrd(gpa, in, d, sym, out_diags),
         .hash => lowerDeriveHash(gpa, in, d, sym, out_diags),
         .display => lowerDeriveDisplay(gpa, in, d, sym, out_diags),
+        .conv_int_char => lowerConvIntChar(gpa, in, d, sym, out_diags),
+        .conv_char_byte => lowerConvCharByte(gpa, in, d, sym, out_diags),
     };
+}
+
+/// Lower the SOURCE-LESS `int -> char` fallible-conversion witness:
+/// `int_to_char(int) -> Result[char, ConvErr]`. Reads the source int from its param slot,
+/// stores it verbatim (as `uint32`) into the char payload iff it is a valid Unicode scalar
+/// (`validScalarValue`), else `ConvErr.out_of_range`. The predicate + the Result tail are
+/// the SAME emitters the old inline used, over the SAME interned Result layout (`d.ret`), so
+/// the runtime bytes are byte-identical to the pre-fix inline.
+fn lowerConvIntChar(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const ret = d.ret; // Result[char, ConvErr]
+
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = ret, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_v = try b.addSlot(int_ty);
+    try params.append(gpa, p_v);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, ret);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const e = b.in.enum_layouts[ret.enum_id];
+    const vbase = try b.emit(.{ .slot_addr = p_v }, int_ty);
+    const v = try b.emit(.{ .load = .{ .addr = vbase, .ty = int_ty } }, int_ty);
+    const slot = try b.addSlot(ret);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const valid = try L.validScalarValue(&b, v);
+    const ok_blk = try b.addBlock();
+    const err_blk = try b.addBlock();
+    const join = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = valid, .t = ok_blk, .f = err_blk } });
+    try L.emitConvResultTail(&b, e, base, ok_blk, err_blk, join, v, Typecheck.Type.uint32);
+    b.switchTo(join);
+    try L.brTo(&b, exit, .{ .slot = slot });
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
+/// Lower the SOURCE-LESS `char -> byte` fallible-conversion witness:
+/// `char_to_byte(int) -> Result[byte, ConvErr]`. The receiver's codepoint arrives (raw) in
+/// the param slot; `Ok(masked)` iff `masked` (v truncated + re-extended to `uint8`) equals
+/// v — the same-signedness narrow fits-check (a codepoint is unsigned, so no `sign_blk`).
+fn lowerConvCharByte(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const ret = d.ret; // Result[byte, ConvErr]
+
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = ret, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_v = try b.addSlot(int_ty);
+    try params.append(gpa, p_v);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, ret);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const e = b.in.enum_layouts[ret.enum_id];
+    const vbase = try b.emit(.{ .slot_addr = p_v }, int_ty);
+    const v = try b.emit(.{ .load = .{ .addr = vbase, .ty = int_ty } }, int_ty);
+    const slot = try b.addSlot(ret);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const masked = try L.recanonToWidth(&b, v, Typecheck.Type.uint8);
+    const fits = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = masked, .rhs = v } }, bool_ty);
+    const ok_blk = try b.addBlock();
+    const err_blk = try b.addBlock();
+    const join = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
+    try L.emitConvResultTail(&b, e, base, ok_blk, err_blk, join, masked, Typecheck.Type.uint8);
+    b.switchTo(join);
+    try L.brTo(&b, exit, .{ .slot = slot });
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
 fn lowerDeriveEq(
