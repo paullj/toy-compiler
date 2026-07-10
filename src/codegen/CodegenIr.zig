@@ -934,6 +934,14 @@ fn addLiteral(g: *Gen, hash: u64, bytes: []u8) error{OutOfMemory}!void {
 // program at link time (emit.zig) when any fn references `print`. Shuffles the
 // (ptr,len) str pair into write(fd=1, buf, len) and tail-calls libc `write`.
 
+/// Append one little-endian AArch64 instruction word to a hand-emitted builtin's
+/// code buffer. Shared by the `lowerPrint`/`lowerDisplayInt`/`lowerPanic` bodies.
+fn emitWord(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, word, .little);
+    try c.appendSlice(a, &buf);
+}
+
 /// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
 /// the result.
 pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
@@ -942,13 +950,7 @@ pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     var relocs: std.ArrayList(Link.Reloc) = .empty;
     errdefer relocs.deinit(gpa);
 
-    const emit = struct {
-        fn f(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
-            var buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &buf, word, .little);
-            try c.appendSlice(a, &buf);
-        }
-    }.f;
+    const emit = emitWord;
 
     try emit(&code, gpa, Aarch64.stpFpLrPre); // stp x29, x30, [sp, #-16]!
     try emit(&code, gpa, Aarch64.movFpSp); // mov x29, sp
@@ -1004,13 +1006,7 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     var relocs: std.ArrayList(Link.Reloc) = .empty;
     errdefer relocs.deinit(gpa);
 
-    const emit = struct {
-        fn f(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
-            var buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &buf, word, .little);
-            try c.appendSlice(a, &buf);
-        }
-    }.f;
+    const emit = emitWord;
 
     const A = Aarch64;
     // Prologue + reserve a 32-byte digit buffer at [sp, sp+32); saved fp/lr sit above.
@@ -1092,13 +1088,7 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     var relocs: std.ArrayList(Link.Reloc) = .empty;
     errdefer relocs.deinit(gpa);
 
-    const emit = struct {
-        fn f(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
-            var buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &buf, word, .little);
-            try c.appendSlice(a, &buf);
-        }
-    }.f;
+    const emit = emitWord;
 
     // Prologue + 64-byte scratch buffer for the hex line (`0x` + 16 nibbles + `\n`).
     try emit(&code, gpa, A.stpFpLrPre); // stp x29,x30,[sp,#-16]!
@@ -1219,32 +1209,43 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const cbnz_hex: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbnz(12, 0)); // more nibbles -> HEX
 
-    // ` ` + the symbol name (copied from x28 until its NUL). A missing/empty name
-    // (x28 == 0, or the sentinel's empty string) copies nothing.
+    // Append ' ' then FLUSH the prefix. The buffer only ever holds "0x" + 16 nibbles +
+    // ' ' (19 bytes ≤ 64), so it cannot overflow whatever the (arbitrary-length) name is.
     try emit(&code, gpa, A.movz(9, ' ', 0));
     try emit(&code, gpa, A.strb(9, 11, 0));
     try emit(&code, gpa, A.addImm(11, 11, 1));
-    const name_guard: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(28, 0)); // no entry -> name_done
-    const copy_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.ldrbRegUoff(9, 28, 0)); // w9 = *name
-    const copy_cbz: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(9, 0)); // NUL -> name_done
-    try emit(&code, gpa, A.strb(9, 11, 0));
-    try emit(&code, gpa, A.addImm(11, 11, 1));
-    try emit(&code, gpa, A.addImm(28, 28, 1));
-    const copy_b: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0)); // -> copy_top
-    const name_done: u32 = @intCast(code.items.len);
-
-    try emit(&code, gpa, A.movz(14, '\n', 0));
-    try emit(&code, gpa, A.strb(14, 11, 0));
-    try emit(&code, gpa, A.addImm(11, 11, 1));
-    // write(2, buffer, cursor - base).
-    try emit(&code, gpa, A.subReg(2, 11, 22)); // len
+    try emit(&code, gpa, A.subReg(2, 11, 22)); // len = cursor - base
     try emit(&code, gpa, A.movReg(1, 22)); // buf
     try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
-    try emit(&code, gpa, A.blr(26)); // write the frame line
+    try emit(&code, gpa, A.blr(26)); // write "0x<hex> "
+
+    // The symbol name, written DIRECTLY from its read-only __cstring pointer (x28):
+    // strlen then write — no copy into the fixed buffer, so no length bound on names.
+    // A missing entry (x28 == 0) or the sentinel's empty name writes nothing.
+    const name_guard: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(28, 0)); // no entry -> name_done
+    try emit(&code, gpa, A.movReg(9, 28)); // x9 = scan ptr
+    const strlen_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.ldrbRegUoff(10, 9, 0)); // w10 = *ptr
+    const strlen_cbz: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(10, 0)); // NUL -> strlen_done
+    try emit(&code, gpa, A.addImm(9, 9, 1));
+    const strlen_b: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // -> strlen_top
+    const strlen_done: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.subReg(2, 9, 28)); // len = ptr - name
+    try emit(&code, gpa, A.movReg(1, 28)); // buf = name ptr
+    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(&code, gpa, A.blr(26)); // write the name
+    const name_done: u32 = @intCast(code.items.len);
+
+    // Trailing newline (always, even for an unnamed frame).
+    try emit(&code, gpa, A.movz(9, '\n', 0));
+    try emit(&code, gpa, A.strb(9, 22, 0)); // buffer[0] = '\n'
+    try emit(&code, gpa, A.movz(2, 1, 0)); // len 1
+    try emit(&code, gpa, A.movReg(1, 22)); // buf
+    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(&code, gpa, A.blr(26)); // write '\n'
     try emit(&code, gpa, A.ldrRegUoff(20, 20, 0)); // fp = *fp
     try emit(&code, gpa, A.subImm(21, 21, 1)); // counter--
     const b_loop: u32 = @intCast(code.items.len);
@@ -1267,8 +1268,8 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     patchBCondTo(buf, scan_bhi, scan_done);
     patchBTo(buf, scan_b, scan_top);
     patchCbzTo(buf, name_guard, name_done);
-    patchCbzTo(buf, copy_cbz, name_done);
-    patchBTo(buf, copy_b, copy_top);
+    patchCbzTo(buf, strlen_cbz, strlen_done);
+    patchBTo(buf, strlen_b, strlen_top);
 
     const name = try gpa.dupe(u8, "panic");
     errdefer gpa.free(name);
