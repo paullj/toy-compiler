@@ -40,6 +40,10 @@ pub const Layout = struct {
     offsets: []u32,
     size: u32,
     @"align": u32,
+    /// Positional (tuple-struct) layout: the authoritative bit from `StructSym`,
+    /// carried through so codegen reads it directly rather than re-deriving tuple-ness
+    /// by sniffing whether the first field name leads with a digit.
+    is_tuple: bool = false,
 };
 
 /// A variant's form: a unit (no payload), a tuple (positional payload, no field
@@ -573,6 +577,7 @@ pub fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]La
             .offsets = try gpa.dupe(u32, s.offsets),
             .size = s.size,
             .@"align" = s.@"align",
+            .is_tuple = s.is_tuple,
         };
         built += 1;
     }
