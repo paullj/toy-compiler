@@ -19,19 +19,24 @@ const std = @import("std");
 const Type = @import("../layout/Type.zig").Type;
 
 /// Which derive this recipe carries. Append-only (mirrors `Token.Tag`/`Node.Tag`
-/// discipline): successive kinds are `.ord`, `.hash`, `.display`. The ordinal folds into
-/// the mangled name + the sort key, so it must stay stable.
-pub const Kind = enum(u8) { eq, ord, hash, display };
+/// discipline): successive kinds are `.ord`, `.hash`, `.display`, then the two FALLIBLE
+/// char conversions `.conv_int_char`/`.conv_char_byte` (source-less `TryInto` witnesses,
+/// not real conformance methods — see `derive_synth`). The ordinal folds into the mangled
+/// name + the sort key, so it must stay stable.
+pub const Kind = enum(u8) { eq, ord, hash, display, conv_int_char, conv_char_byte };
 
 /// The method a `Kind` synthesizes (a pure function of the kind). Used for the
 /// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method, `Hash` a
-/// `hash` method, `Display` a `display` method.
+/// `hash` method, `Display` a `display` method. The two conv kinds mint the witness's
+/// `TryInto$<method>$s<charId>` name — they have no dispatch method-table row.
 pub fn methodName(k: Kind) []const u8 {
     return switch (k) {
         .eq => "eq",
         .ord => "cmp",
         .hash => "hash",
         .display => "display",
+        .conv_int_char => "int_to_char",
+        .conv_char_byte => "char_to_byte",
     };
 }
 
@@ -284,6 +289,34 @@ test "M22: mangle produces a distinct `Display$display$` name; kind orders last"
     try writeKey(gpa, &a, 0, .hash, Type.structT(0));
     try writeKey(gpa, &d, 0, .display, Type.structT(0));
     try testing.expect(!std.mem.eql(u8, a.items, d.items));
+}
+
+test "C4: mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" {
+    const gpa = testing.allocator;
+    const ic = try mangle(gpa, "TryInto", .conv_int_char, Type.structT(3));
+    defer gpa.free(ic);
+    try testing.expectEqualStrings("TryInto$int_to_char$s3", ic);
+    const cb = try mangle(gpa, "TryInto", .conv_char_byte, Type.structT(3));
+    defer gpa.free(cb);
+    try testing.expectEqualStrings("TryInto$char_to_byte$s3", cb);
+    // The two conv names are disjoint from each other and from a Display/Eq name for the
+    // same struct id (the `<method>` segment separates them).
+    try testing.expect(!std.mem.eql(u8, ic, cb));
+    const ds = try mangle(gpa, "Display", .display, Type.structT(3));
+    defer gpa.free(ds);
+    const es = try mangle(gpa, "Eq", .eq, Type.structT(3));
+    defer gpa.free(es);
+    try testing.expect(!std.mem.eql(u8, ic, ds));
+    try testing.expect(!std.mem.eql(u8, ic, es));
+    try testing.expect(!std.mem.eql(u8, cb, ds));
+    // writeKey separates the two conv kinds for the same (protocol, type).
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(gpa);
+    try writeKey(gpa, &a, 10, .conv_int_char, Type.structT(3));
+    try writeKey(gpa, &b, 10, .conv_char_byte, Type.structT(3));
+    try testing.expect(!std.mem.eql(u8, a.items, b.items));
 }
 
 test "writeKey is injective across kind/enum-flag/id" {

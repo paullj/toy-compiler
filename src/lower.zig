@@ -2060,7 +2060,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
 /// Re-canonicalize `v` to `ty`'s width via the existing `add v, 0` → `normalizeWidth`
 /// idiom (uxt/sxt), reused by both conversion arms (`into`'s source-width widen and
 /// `try_into`'s destination-width mask). No new IR op, so `--emit ir` goldens are stable.
-fn recanonToWidth(b: *Builder, v: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!Ir.ValueId {
+pub fn recanonToWidth(b: *Builder, v: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!Ir.ValueId {
     const zero = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int);
     return b.emit(.{ .add = .{ .lhs = v, .rhs = zero } }, ty);
 }
@@ -2084,7 +2084,7 @@ fn loadCharCodepoint(b: *Builder, recv: Ast.Index) error{OutOfMemory}!Ir.ValueId
 /// UTF-16 surrogate `0xD800..=0xDFFF`). Composed from `icmp`s via 0/1 int arithmetic (no
 /// bool-AND op), matching the derive emitter's multiply-accumulate idiom, so it stays
 /// branch-free and `--verify`-stable.
-fn validScalarValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+pub fn validScalarValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.@"bool";
     const zero = try b.emit(.{ .iconst = 0 }, int_ty);
@@ -2146,51 +2146,54 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     const dst_T = e.variants[0].field_types[0];
     const to_char = isCharTy(b, dst_T);
 
+    // int→char / char→byte are heavy (~24 / ~12 SSA cells); inlining >10 / >20 per fn
+    // overflowed the imm12 frame cap. Emit each as ONE shared witness and CALL it (O(1)/site).
+    if (to_char) return convCallWitness(b, .conv_int_char, v, call_ty);
+    if (recv_is_char) return convCallWitness(b, .conv_char_byte, v, call_ty);
+
+    // int→int narrow (M3/C1): a per-(width,signedness) family — no single program-global
+    // witness — so it stays inline (see derive_synth: only the 2 char cases become recipes).
     const slot = try b.addSlot(call_ty);
     const base = try b.emit(.{ .slot_addr = slot }, int_ty);
-
-    // The Ok-payload value + its store type + the validity predicate differ per case.
-    var ok_value: Ir.ValueId = undefined;
-    var ok_store_ty = dst_T;
-    var ok_blk: Ir.BlockId = undefined;
-    var err_blk: Ir.BlockId = undefined;
-    var join: Ir.BlockId = undefined;
-
-    if (to_char) {
-        // int -> char: store the codepoint verbatim into `char`'s uint32 field; the value
-        // is a valid char iff it is a Unicode scalar.
-        ok_value = v;
-        ok_store_ty = Typecheck.Type.uint32;
-        const valid = try validScalarValue(b, v);
-        ok_blk = try b.addBlock();
-        err_blk = try b.addBlock();
-        join = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = valid, .t = ok_blk, .f = err_blk } });
+    const masked = try recanonToWidth(b, v, dst_T);
+    const fits = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = masked, .rhs = v } }, bool_ty);
+    const ok_blk = try b.addBlock();
+    const err_blk = try b.addBlock();
+    const join = try b.addBlock();
+    if (recv_ty.isSigned() == dst_T.isSigned()) {
+        b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
     } else {
-        // char -> byte and int -> int narrow: `masked` (v truncated + re-extended to the
-        // destination width) equals v iff it fits. A char codepoint is unsigned (uint32).
-        const src_signed = if (recv_is_char) false else recv_ty.isSigned();
-        const masked = try recanonToWidth(b, v, dst_T);
-        ok_value = masked;
-        const fits = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = masked, .rhs = v } }, bool_ty);
-        ok_blk = try b.addBlock();
-        err_blk = try b.addBlock();
-        join = try b.addBlock();
-        if (src_signed == dst_T.isSigned()) {
-            b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
-        } else {
-            // Cross-signedness: `fits` alone misses the 64-bit int↔uint case (low bits
-            // coincide) and a large unsigned whose low bits sign-extend negative. Also
-            // require v to be non-negative read as signed.
-            const sign_blk = try b.addBlock();
-            b.setTerm(.{ .cond_br = .{ .cond = fits, .t = sign_blk, .f = err_blk } });
-            b.switchTo(sign_blk);
-            const z2 = try b.emit(.{ .iconst = 0 }, int_ty);
-            const nn = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = z2 } }, bool_ty);
-            b.setTerm(.{ .cond_br = .{ .cond = nn, .t = ok_blk, .f = err_blk } });
-        }
+        // Cross-signedness: `fits` alone misses the 64-bit int↔uint case (low bits coincide)
+        // and a large unsigned whose low bits sign-extend negative. Also require v to be
+        // non-negative read as signed.
+        const sign_blk = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = fits, .t = sign_blk, .f = err_blk } });
+        b.switchTo(sign_blk);
+        const z2 = try b.emit(.{ .iconst = 0 }, int_ty);
+        const nn = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = z2 } }, bool_ty);
+        b.setTerm(.{ .cond_br = .{ .cond = nn, .t = ok_blk, .f = err_blk } });
     }
+    try emitConvResultTail(b, e, base, ok_blk, err_blk, join, masked, dst_T);
+    b.switchTo(join);
+    return .{ .slot = slot };
+}
 
+/// Emit the shared `try_into` Result build tail: `ok_blk` stores tag 0 + `ok_value` (typed
+/// `ok_store_ty`) into variant 0's payload; `err_blk` stores tag 1 + `ConvErr.out_of_range`
+/// (tag 0) into variant 1's payload; both branch to `join` (the caller switches to it). The
+/// enum `e` drives every tag/offset — the reified layout of the call's own Result — so the
+/// int→int narrow inline and the two char witnesses build byte-identical Result values.
+pub fn emitConvResultTail(
+    b: *Builder,
+    e: Typecheck.EnumLayout,
+    base: Ir.ValueId,
+    ok_blk: Ir.BlockId,
+    err_blk: Ir.BlockId,
+    join: Ir.BlockId,
+    ok_value: Ir.ValueId,
+    ok_store_ty: Typecheck.Type,
+) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
     b.switchTo(ok_blk);
     const ok_tag = try b.emit(.{ .iconst = 0 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = ok_tag, .ty = int_ty } }, null);
@@ -2208,8 +2211,31 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     const conv_err_tag = try b.emit(.{ .iconst = 0 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = err_addr, .val = conv_err_tag, .ty = int_ty } }, null);
     try brTo(b, join, .none);
+}
 
-    b.switchTo(join);
+/// Resolve the shared fallible-char-conversion witness of `kind` by scanning the derive
+/// table for its recipe (the synthesis barrier appended exactly one per used kind). Null
+/// only on a mis-wired build (the checker gate guarantees a recipe at any real conv site).
+fn convWitnessCallee(b: *Builder, kind: Derive.Kind) ?Link.SymName {
+    for (b.in.derives) |d| if (d.kind == kind) return .{ .kind = .user_fn, .name = d.name.? };
+    return null;
+}
+
+/// Lower a fallible char conversion as a CALL to its shared witness into a fresh Result
+/// slot: `ret_slot` + the raw source scalar arg + the `bl`. O(1) frame per site (vs the
+/// former ~24/~12-cell inline that overflowed the frame). `v` is passed RAW (no widen) —
+/// exactly what the old inline consumed — so the verdicts are byte-identical.
+fn convCallWitness(b: *Builder, kind: Derive.Kind, v: Ir.ValueId, call_ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const slot = try b.addSlot(call_ty);
+    const callee = convWitnessCallee(b, kind) orelse {
+        try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "conv witness missing in lower" });
+        b.had_error = true;
+        return .{ .slot = slot };
+    };
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = v };
+    _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
     return .{ .slot = slot };
 }
 

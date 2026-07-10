@@ -612,6 +612,195 @@ test "C4: char Display is a shared witness — >6 boundary codepoints compile + 
     try testing.expectEqualSlices(u8, "\x7F\xC2\x80\xDF\xBF\xE0\xA0\x80\xEF\xBF\xBF\xF0\x90\x80\x80\xF4\x8F\xBF\xBF", got);
 }
 
+test "C4: int->char try_into is a shared witness — 12 in one fn compile (pre-fix frame overflow)" {
+    // 12 int->char `try_into` in ONE fn — >10, the pre-fix inline (~24 SSA cells/site)
+    // overflowed the imm12 frame cap (error.CodegenDiagnostic). Each is now one CALL to
+    // the shared `TryInto$int_to_char` witness (O(1)/site), so the fn compiles. Each result
+    // is consumed via a char-typed match (pins int->char) then char->int `.into()`; the sum
+    // of codepoints 65..76 is 846, so a correct run exits 42.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c4-icframe";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn f() -> int {
+        \\  c0: char = match (65).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c1: char = match (66).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c2: char = match (67).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c3: char = match (68).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c4: char = match (69).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c5: char = match (70).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c6: char = match (71).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c7: char = match (72).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c8: char = match (73).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c9: char = match (74).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c10: char = match (75).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  c11: char = match (76).try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  n0: int = c0.into()
+        \\  n1: int = c1.into()
+        \\  n2: int = c2.into()
+        \\  n3: int = c3.into()
+        \\  n4: int = c4.into()
+        \\  n5: int = c5.into()
+        \\  n6: int = c6.into()
+        \\  n7: int = c7.into()
+        \\  n8: int = c8.into()
+        \\  n9: int = c9.into()
+        \\  n10: int = c10.into()
+        \\  n11: int = c11.into()
+        \\  return n0 + n1 + n2 + n3 + n4 + n5 + n6 + n7 + n8 + n9 + n10 + n11
+        \\}
+        \\fn main() -> int {
+        \\  if f() == 846 { return 42 }
+        \\  return 1
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term); // pre-fix: CodegenDiagnostic
+}
+
+test "C4: char->byte try_into is a shared witness — 22 in one fn compile (pre-fix frame overflow)" {
+    // 22 char->byte `try_into` in ONE fn — >20, the pre-fix inline overflowed the frame.
+    // Each is now one CALL to the shared `TryInto$char_to_byte` witness. Codepoints 65..86
+    // all fit `byte`, so every `unwrap_or(0)` yields the codepoint; the two edge checks
+    // (b0, b21) exit non-42 on any miscompile, else 42.
+    // 22 is the smallest count that clears the pre-fix ~21-site overflow; the spill-all frame
+    // now overflows at 25, so this test sits ~2 sites under the cap. A per-site frame-cost bump
+    // (wider ret_slot, an extra spill) could regress it — and raising N cannot buy more margin,
+    // since frame overflow at high site counts is inherent to spill-all (plain local-heavy code
+    // overflows at ~90 locals), not to this witness.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c4-cbframe";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn g() -> int {
+        \\  b0: byte = 'A'.try_into().unwrap_or(0)
+        \\  b1: byte = 'B'.try_into().unwrap_or(0)
+        \\  b2: byte = 'C'.try_into().unwrap_or(0)
+        \\  b3: byte = 'D'.try_into().unwrap_or(0)
+        \\  b4: byte = 'E'.try_into().unwrap_or(0)
+        \\  b5: byte = 'F'.try_into().unwrap_or(0)
+        \\  b6: byte = 'G'.try_into().unwrap_or(0)
+        \\  b7: byte = 'H'.try_into().unwrap_or(0)
+        \\  b8: byte = 'I'.try_into().unwrap_or(0)
+        \\  b9: byte = 'J'.try_into().unwrap_or(0)
+        \\  b10: byte = 'K'.try_into().unwrap_or(0)
+        \\  b11: byte = 'L'.try_into().unwrap_or(0)
+        \\  b12: byte = 'M'.try_into().unwrap_or(0)
+        \\  b13: byte = 'N'.try_into().unwrap_or(0)
+        \\  b14: byte = 'O'.try_into().unwrap_or(0)
+        \\  b15: byte = 'P'.try_into().unwrap_or(0)
+        \\  b16: byte = 'Q'.try_into().unwrap_or(0)
+        \\  b17: byte = 'R'.try_into().unwrap_or(0)
+        \\  b18: byte = 'S'.try_into().unwrap_or(0)
+        \\  b19: byte = 'T'.try_into().unwrap_or(0)
+        \\  b20: byte = 'U'.try_into().unwrap_or(0)
+        \\  b21: byte = 'V'.try_into().unwrap_or(0)
+        \\  if b0 != 65 { return 1 }
+        \\  if b21 != 86 { return 2 }
+        \\  return 42
+        \\}
+        \\fn main() -> int { return g() }
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "C4: int->char witness — surrogate/range boundaries are byte-exact through the CALL" {
+    // The witness's `validScalarValue` predicate must reproduce the inline verdicts exactly:
+    // valid scalars Ok (their codepoint), surrogates + >0x10FFFF Err (the '?'=63 sentinel).
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c4-icbounds";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn ci(c: char) -> int { return c.into() }
+        \\fn ic(n: int) -> int {
+        \\  c: char = match n.try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  return ci(c)
+        \\}
+        \\fn main() -> int {
+        \\  if ic(0) != 0 { return 1 }
+        \\  if ic(0xD7FF) != 55295 { return 2 }
+        \\  if ic(0xD800) != 63 { return 3 }
+        \\  if ic(0xDFFF) != 63 { return 4 }
+        \\  if ic(0xE000) != 57344 { return 5 }
+        \\  if ic(0x10FFFF) != 1114111 { return 6 }
+        \\  if ic(0x110000) != 63 { return 7 }
+        \\  return 42
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "C4: char->byte witness — 0xFF fits, 0x100 does not (byte-exact through the CALL)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c4-cbbounds";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn main() -> int {
+        \\  ok255: byte = '\u{FF}'.try_into().unwrap_or(0)
+        \\  if ok255 != 255 { return 1 }
+        \\  err256: byte = '\u{100}'.try_into().unwrap_or(0)
+        \\  if err256 != 0 { return 2 }
+        \\  return 42
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
+test "C4: a uint-source int->char passes the raw value to the witness (no-widen arg path)" {
+    // Locks that the call site hands the witness the receiver value RAW (no width coercion):
+    // a `uint`-typed source converts to the correct char just like an `int` source.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c4-icnonint";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn ci(c: char) -> int { return c.into() }
+        \\fn main() -> int {
+        \\  u: uint = 0x41
+        \\  c: char = match u.try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  if ci(c) != 65 { return 1 }
+        \\  u2: uint = 0x20AC
+        \\  c2: char = match u2.try_into() { .ok(c) -> c, .err(_) -> '?' }
+        \\  if ci(c2) != 8364 { return 2 }
+        \\  return 42
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
 test "M23: an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
     // The prelude `Option[T]` (M23) is nameable with no import; `Option[int]` reifies to a
     // plain concrete enum through the M6 path, so this compiles + runs on the real backend.

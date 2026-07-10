@@ -33,7 +33,10 @@ fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
 /// here on the live method table (after ALL synthetic methods are appended), so the
 /// emitter never re-resolves and the fingerprint can fold the resolved identity.
 pub fn synthesizeDerives(t: *Typecheck) !void {
-    if (t.derive_reqs.items.len == 0) return;
+    // A conv-only program (a fallible char conversion but no `==`/`.hash`/`print` derive)
+    // still needs the barrier to run, so gate on BOTH request sources.
+    if (t.derive_reqs.items.len == 0 and
+        t.conv_int_char_result == null and t.conv_char_byte_result == null) return;
     const pre = t.prelude orelse return;
     const eq_pid = pre.protocols.eq orelse return;
     const eq_name = t.protocols.items[eq_pid].name;
@@ -227,6 +230,32 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         });
     }
 
+    // The two FALLIBLE char conversions become shared source-less witnesses (ONE each,
+    // CALLed per site) so the ~24/~12-cell validate+Result-build never inlines (the
+    // frame-overflow fix). Keyed on the `char` struct + separated by KIND; `try_into` has
+    // no dispatch wiring, so these get NO `t.methods` row. `ret` is the concrete Result the
+    // checker already interned, so the witness reads the byte-identical enum layout. The
+    // `try_into` protocol id (10) is higher than eq/ord/hash/display, so the canonical sort
+    // places these LAST — no existing recipe's sorted position / minted name shifts.
+    if (pre.protocols.try_into) |ti_pid| if (pre.char_struct) |char_id| {
+        const ti_name = t.protocols.items[ti_pid].name;
+        const cty = Type.structT(char_id);
+        if (t.conv_int_char_result) |rty| try t.derives.append(gpa, .{
+            .protocol_id = ti_pid,
+            .protocol_name = ti_name,
+            .kind = .conv_int_char,
+            .conform_ty = cty,
+            .ret = rty,
+        });
+        if (t.conv_char_byte_result) |rty| try t.derives.append(gpa, .{
+            .protocol_id = ti_pid,
+            .protocol_name = ti_name,
+            .kind = .conv_char_byte,
+            .conform_ty = cty,
+            .ret = rty,
+        });
+    };
+
     // Canonical sort — the SOLE ordering driver (never discovery/thread order).
     std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
 
@@ -243,14 +272,23 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         d.params = switch (d.kind) {
             .hash, .display => try gpa.dupe(Type, &[_]Type{d.conform_ty}),
             .eq, .ord => try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty }),
+            // A conv witness takes the source scalar as a plain `int` (the raw value the old
+            // inline consumed): `int_to_char(int) -> Result[char,ConvErr]`,
+            // `char_to_byte(int) -> Result[byte,ConvErr]`.
+            .conv_int_char, .conv_char_byte => try gpa.dupe(Type, &[_]Type{Type.int}),
         };
-        try t.methods.append(gpa, .{
-            .recv = d.conform_ty,
-            .name = Derive.methodName(d.kind),
-            .fn_id = 0,
-            .protocol_id = d.protocol_id,
-            .derive = @intCast(di),
-        });
+        // A conv recipe is NOT a conformance method (`try_into` has no dispatch wiring), so
+        // it gets no `t.methods` row — the call site scans `t.derives` for it by kind.
+        switch (d.kind) {
+            .conv_int_char, .conv_char_byte => {},
+            else => try t.methods.append(gpa, .{
+                .recv = d.conform_ty,
+                .name = Derive.methodName(d.kind),
+                .fn_id = 0,
+                .protocol_id = d.protocol_id,
+                .derive = @intCast(di),
+            }),
+        }
     }
     // Minted names are a pure function of (protocol, kind, type-id); distinct recipes
     // never collide (Debug/ReleaseSafe guard, mirroring the Mono self-collision assert).
@@ -309,6 +347,12 @@ fn collectComponentTypes(t: *Typecheck, ty: Type, out: *std.ArrayList(Type)) !vo
 /// for a no-field recipe (empty struct / empty-payload enum) so teardown's `len > 0` free
 /// guard stays correct. OWNED outer slice (freed by `freeDeriveEntries`).
 fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitness {
+    // A conv witness is hand-emitted (not a per-field structural walk), so it has no field
+    // witnesses — the empty slice keeps teardown's `len > 0` free guard correct.
+    switch (d.kind) {
+        .conv_int_char, .conv_char_byte => return &.{},
+        else => {},
+    }
     var ftys: std.ArrayList(Type) = .empty;
     defer ftys.deinit(t.gpa);
     try collectComponentTypes(t, d.conform_ty, &ftys);
@@ -320,6 +364,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
         .ord => resolveFieldWitness(t, .ord, ft),
         .hash => resolveFieldWitness(t, .hash, ft),
         .display => resolveFieldWitness(t, .display, ft),
+        .conv_int_char, .conv_char_byte => unreachable, // guarded above
     };
     return fw;
 }
@@ -342,6 +387,7 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .ord => .{ "cmp", "cmp_call" },
         .hash => .{ "hash", "hash_call" },
         .display => .{ "display", "display_call" },
+        .conv_int_char, .conv_char_byte => unreachable, // never instantiated (guarded in resolveDeriveFields)
     };
     const pr = Typecheck.gatherPreludeIds(t);
     const pid = switch (kind) {
@@ -349,6 +395,7 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .ord => pr.ord,
         .hash => pr.hash,
         .display => pr.display,
+        .conv_int_char, .conv_char_byte => unreachable,
     };
     switch (resolveConformanceMethod(t.methods.items, ft, method, pid, null)) {
         .one => |m| return @unionInit(Derive.FieldWitness, variant, witnessName(t, m)),

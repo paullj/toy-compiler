@@ -149,6 +149,13 @@ pub const BodyChecker = struct {
     /// so the parallel Pass C never shares mutable derive state.
     derive_reqs: std.ArrayList(Typecheck.DeriveReq) = .empty,
 
+    /// The concrete `Result[char/byte, ConvErr]` a `try_into` in this fn typed — the
+    /// checker-side capture that gates + seeds the shared fallible-char-conversion witness
+    /// (see `types.derive_synth`). `null` until such a conversion is dispatched; moved into
+    /// the `BodyResult` after the walk. POD, so no teardown.
+    conv_int_char_result: ?Type = null,
+    conv_char_byte_result: ?Type = null,
+
     /// The recursive `conforms` query's memo, keyed by `(protocol, kind, type-id)`.
     /// THREAD-LOCAL (one map per BodyChecker) so the query is race-free under the
     /// parallel body fan-out; the answer is stable (layouts/conformances frozen).
@@ -1797,6 +1804,15 @@ pub const BodyChecker = struct {
                             true,
                         )),
                     };
+                    // Capture the concrete Result so the synthesis barrier can reify the
+                    // fallible char conversions as shared witnesses (frame-overflow fix). The
+                    // int→int `.narrow` family has no single program-global witness, so it is
+                    // NOT captured — it stays inlined per site.
+                    switch (cm.kind) {
+                        .int_to_char => bc.conv_int_char_result = ret,
+                        .char_to_byte => bc.conv_char_byte_result = ret,
+                        else => {},
+                    }
                     bc.node_types[(node_idx).int()] = ret;
                     return ret;
                 }

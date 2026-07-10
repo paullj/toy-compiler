@@ -1008,6 +1008,16 @@ mono: std.ArrayList(Mono.Instance) = .empty,
 /// + canonical-sorted into `derives`). PODs, no owned data; freed at teardown.
 derive_reqs: std.ArrayList(DeriveReq) = .empty,
 
+/// The concrete `Result[char, ConvErr]` / `Result[byte, ConvErr]` a `try_into` call
+/// site typed, captured (gate + exact enum layout) so the synthesis barrier can reify
+/// the fallible char conversions as shared source-less witnesses instead of inlining
+/// their ~24/~12-cell validate+Result-build at every site (the frame-overflow fix).
+/// `null` when a program uses no such conversion (then no recipe is appended — the
+/// non-conversion path stays byte-identical). OR-merged from every `BodyResult` /
+/// mono re-check; all values are the same interned enum, so the merge is order-free.
+conv_int_char_result: ?Type = null,
+conv_char_byte_result: ?Type = null,
+
 /// The authorized structural auto-derive recipes, built by the synthesis barrier
 /// at the end of `monomorphize` in canonical order. Transferred whole into
 /// `GraphResult.derives` by `checkGraph`; leftover (error path) freed by the teardown.
@@ -2103,6 +2113,10 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     // first time here (Pass C skips unbounded templates), so drain the structural-Eq
     // requests recorded during this re-check; `synthesizeDerives` dedups+sorts afterward.
     try t.derive_reqs.appendSlice(t.gpa, bc.derive_reqs.items);
+    // A char conversion reached ONLY from an unbounded generic body is first seen here;
+    // OR-merge its captured Result so the synthesis barrier still reifies the witness.
+    if (t.conv_int_char_result == null) t.conv_int_char_result = bc.conv_int_char_result;
+    if (t.conv_char_byte_result == null) t.conv_char_byte_result = bc.conv_char_byte_result;
 
     // Build this instance's resolved bound conformances (all satisfied — enqueue
     // gated them, so a bound's `conform_ty` is a concrete `structT`/`enumT`/scalar the
@@ -2215,6 +2229,10 @@ const BodyResult = struct {
     /// type with no impl. OWNED (moved out of the `BodyChecker`); merged into
     /// `t.derive_reqs` in fn-id order by `checkBodies`, then freed. PODs (no owned data).
     derive_reqs: []DeriveReq = &.{},
+    /// The concrete `Result[char/byte, ConvErr]` this fn's `try_into` sites typed, OR-merged
+    /// into `t.conv_*_result` by `checkBodies` (gate for the shared-witness synthesis).
+    conv_int_char_result: ?Type = null,
+    conv_char_byte_result: ?Type = null,
 };
 
 /// THE per-fn body region (Pass C): run every fn's body check as an independent
@@ -2270,6 +2288,13 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // deterministic collection order the synthesis barrier's dedup+sort depends on —
     // mirrors the poison snapshot above). PODs, so a plain concat.
     for (slots) |s| try t.derive_reqs.appendSlice(gpa, s.derive_reqs);
+
+    // OR-merge the captured conv Result types: every site interned the SAME
+    // `Result[char/byte, ConvErr]`, so first-writer-wins is order-free.
+    for (slots) |s| {
+        if (t.conv_int_char_result == null) t.conv_int_char_result = s.conv_int_char_result;
+        if (t.conv_char_byte_result == null) t.conv_char_byte_result = s.conv_char_byte_result;
+    }
 
     // Merge per-fn sinks in fn-id order, then sort once. `merge` reserves capacity
     // first (infallible appends) and empties each slot, so the trailing `defer`
@@ -2334,6 +2359,8 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
         out.err = e;
         return;
     };
+    out.conv_int_char_result = bc.conv_int_char_result;
+    out.conv_char_byte_result = bc.conv_char_byte_result;
 }
 
 /// A `pub` fn must not expose a non-`pub` type: if any param/return type resolves
