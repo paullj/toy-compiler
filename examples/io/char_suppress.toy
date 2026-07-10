@@ -1,0 +1,5 @@
+# expect: stdout "A"
+# expect: exit 0
+fn main() {
+    print('A')
+}

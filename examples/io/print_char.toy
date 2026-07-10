@@ -1,0 +1,7 @@
+# expect: stdout "A€\n"
+# expect: exit 0
+fn main() {
+    print('A')
+    print('€')
+    print('\n')
+}
