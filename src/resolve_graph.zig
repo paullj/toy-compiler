@@ -593,7 +593,7 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
                     try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'", .{name});
             }
         },
-        .literal_number, .literal_string, .literal_bool => {},
+        .literal_number, .literal_string, .literal_bool, .literal_char => {},
         // A poison leaf is already-diagnosed: no name lookup, no diagnostic.
         .error_node => {},
         .unary => try g.resolveExpr(n.lhs),

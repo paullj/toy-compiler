@@ -1,0 +1,5 @@
+# expect: compile-error "one codepoint"
+fn main() -> int {
+    c := 'ab'
+    return 0
+}

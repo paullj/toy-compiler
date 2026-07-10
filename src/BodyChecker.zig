@@ -489,6 +489,28 @@ pub const BodyChecker = struct {
         return Type.int;
     }
 
+    /// Type a char literal `'x'` to the compiler-provided `char` struct. The content is
+    /// VALIDATED here (a `''`/`'ab'`/bad-escape/bad-`\u` is a clean T0036 at check time,
+    /// never a lower-time crash); lower re-decodes the SAME token for the codepoint value.
+    /// Returns the `char` type even on a content error (no cascade), mirroring the numeric
+    /// range check. `.invalid` only if no prelude `char` exists (a prelude-less caller).
+    pub fn typeCharLiteral(bc: *BodyChecker, main_token: u32) error{OutOfMemory}!Type {
+        const raw = bc.tokens[main_token].text(bc.source);
+        switch (Literal.decodeChar(raw)) {
+            .ok => {},
+            .empty => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "empty char literal"),
+            .too_many => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal must hold exactly one codepoint"),
+            .dangling_backslash => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal ends with a dangling backslash"),
+            .unknown_escape => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "unknown escape in char literal"),
+            .bad_hex_escape => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "malformed '\\x'/'\\u' escape in char literal"),
+            .bad_codepoint => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "'\\u{...}' escape is not a Unicode scalar value"),
+            .bad_utf8 => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal is not valid UTF-8"),
+            .malformed => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "malformed char literal"),
+        }
+        if (bc.model.prelude) |p| if (p.char_struct) |cid| return Type.structT(cid);
+        return .invalid;
+    }
+
     pub fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
         if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
@@ -496,6 +518,7 @@ pub const BodyChecker = struct {
             .literal_number => try bc.typeNumericLiteral(n.main_token, bc.expected),
             .literal_bool => Type.@"bool",
             .literal_string => Type.str,
+            .literal_char => try bc.typeCharLiteral(n.main_token),
             .identifier => switch (bc.resolutions[(node_idx).int()]) {
                 .local => |slot| bc.slotType(slot),
                 .func => blk: {
@@ -1751,21 +1774,24 @@ pub const BodyChecker = struct {
             },
             .none => {},
         }
-        // Target-directed `.into()` / `.try_into()` on an integer receiver (M3): resolve
-        // the destination from `bc.expected`. `into` widens losslessly (returns the value
-        // typed to the target); `try_into` narrows fallibly (returns a synthesized
-        // `Result[T, ConvErr]`). A bare call with no expected, or a rejected pair (e.g.
-        // narrowing via `into`), falls through to T0018 below — never a wrong conversion.
-        if (recv_ty.isInteger() and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
+        // Target-directed `.into()` / `.try_into()` on an integer OR `char` receiver (M3,
+        // M9): resolve the destination from `bc.expected`. `into` is lossless (int widen /
+        // char↔int·byte); `try_into` is fallible (int narrow / int→char / char→byte),
+        // returning a synthesized `Result[T, ConvErr]`. A user `into`/`try_into` method was
+        // already selected above; the builtin recognizer only matches int/char, so a
+        // struct receiver with no such method falls through to T0018 — never a wrong pick.
+        const char_id = if (bc.model.prelude) |p| p.char_struct else null;
+        const recv_is_char = recv_ty.kind == .@"struct" and char_id != null and recv_ty.struct_id == char_id.?;
+        if ((recv_ty.isInteger() or recv_is_char) and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
             if (bc.expected) |exp| {
-                if (Typecheck.builtinConvMethod(recv_ty, exp, member)) |cm| {
+                if (Typecheck.builtinConvMethod(recv_ty, exp, member, char_id)) |cm| {
                     if (args.len != 0) {
                         for (args) |a| _ = try bc.typeOf(a);
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                     }
                     const ret: Type = switch (cm.kind) {
-                        .widen => cm.target,
-                        .narrow => Type.app(try bc.internApp(
+                        .widen, .char_to_int, .byte_to_char => cm.target,
+                        .narrow, .int_to_char, .char_to_byte => Type.app(try bc.internApp(
                             bc.model.prelude.?.result_enum.?,
                             &.{ cm.target, Type.enumT(bc.model.prelude.?.conv_err_enum.?) },
                             true,

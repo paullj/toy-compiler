@@ -102,6 +102,10 @@ pub const Inputs = struct {
     /// checker snapshot) or warm-cache/`-jN` determinism breaks. Defaults to all-null (a
     /// prelude-less test caller): witness sites then fall back to name-only resolution.
     prelude_ids: Typecheck.PreludeProtocolIds = .{},
+    /// The compiler-provided `char` struct id (see `Typecheck.Prelude.char_struct`), so
+    /// the `.into()`/`.try_into()` recognizer + char-literal lowering key the char cases
+    /// off the same id the checker used. Null for a prelude-less test caller (no char).
+    char_struct: ?u32 = null,
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -539,6 +543,8 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             return .none;
         },
         .literal_string => return try lowerStrLiteral(b, node_idx),
+        // A char literal is a `char` struct VALUE: materialize it into a fresh temp slot.
+        .literal_char => return try aggregateValue(b, node_idx, ty),
         .identifier => return try lowerIdentifier(b, node_idx, ty),
         .unary => return try lowerUnary(b, node_idx, n),
         .binary => return try lowerBinary(b, node_idx, n),
@@ -1823,11 +1829,18 @@ const ConvCall = struct { recv: Ast.Index, member: []const u8 };
 fn builtinConvCallee(b: *Builder, n: Ast.Node) ?ConvCall {
     const cn = b.in.tree.nodes[(n.lhs).int()];
     if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    if (!b.in.node_types[(cn.lhs).int()].isInteger()) return null;
+    const recv_ty = b.in.node_types[(cn.lhs).int()];
+    if (!recv_ty.isInteger() and !isCharTy(b, recv_ty)) return null;
     const member = b.in.tokens[cn.main_token].text(b.in.source);
     if (!std.mem.eql(u8, member, "into") and !std.mem.eql(u8, member, "try_into")) return null;
     if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
     return .{ .recv = cn.lhs, .member = member };
+}
+
+/// Whether `ty` is the compiler-provided `char` struct (the id the checker used, threaded
+/// via `Inputs.char_struct`). Null (a prelude-less test caller) means no type is char.
+fn isCharTy(b: *const Builder, ty: Typecheck.Type) bool {
+    return ty.kind == .@"struct" and b.in.char_struct != null and ty.struct_id == b.in.char_struct.?;
 }
 
 /// A native inherent method call on a reified `Option`/`Result` instance: the
@@ -1935,57 +1948,138 @@ fn recanonToWidth(b: *Builder, v: Ir.ValueId, ty: Typecheck.Type) error{OutOfMem
     return b.emit(.{ .add = .{ .lhs = v, .rhs = zero } }, ty);
 }
 
-/// Lower a target-directed int conversion (`.into()` / `.try_into()`). `into` widens
-/// losslessly: `add v, 0` typed to the SOURCE width re-canonicalizes the value (uxt/sxt
-/// via `normalizeWidth`), which is exactly the correct value in the wider destination.
-/// `try_into` builds a `Result[T, ConvErr]` into a fresh slot: `Ok(masked)` iff `masked`
-/// (v truncated+re-extended to T) equals v — and, for a cross-signedness pair, v is also
-/// non-negative read as signed — else `Err(ConvErr.out_of_range)`. The reified layout of
-/// the call's own result enum drives every tag/offset, so no prelude id is read here.
+/// Load a `char` receiver's codepoint — its single `uint32` field at offset 0 — as an int
+/// value. A `char` is a struct, so `lowerExpr` yields it by slot; the load reads the whole
+/// 8-byte field (high bits are 0, the field was stored width-normalized).
+fn loadCharCodepoint(b: *Builder, recv: Ast.Index) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const op = try lowerExpr(b, recv);
+    const s = operandSlot(op);
+    if (s == Ir.none_slot) {
+        try b.note(b.in.tree.nodes[(recv).int()].main_token, "char receiver is not a slot in lower");
+        return try b.emit(.{ .iconst = 0 }, int_ty);
+    }
+    const base = try b.emit(.{ .slot_addr = s }, int_ty);
+    return try b.emit(.{ .load = .{ .addr = base, .ty = Typecheck.Type.uint32 } }, Typecheck.Type.uint32);
+}
+
+/// A bool: whether int value `v` is a valid Unicode scalar (`0 <= v <= 0x10FFFF` and NOT a
+/// UTF-16 surrogate `0xD800..=0xDFFF`). Composed from `icmp`s via 0/1 int arithmetic (no
+/// bool-AND op), matching the derive emitter's multiply-accumulate idiom, so it stays
+/// branch-free and `--verify`-stable.
+fn validScalarValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+    const ge0 = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = zero } }, bool_ty);
+    const maxcp = try b.emit(.{ .iconst = 0x10FFFF }, int_ty);
+    const le_max = try b.emit(.{ .icmp = .{ .cc = .le, .lhs = v, .rhs = maxcp } }, bool_ty);
+    const in_range = try b.emit(.{ .mul = .{ .lhs = ge0, .rhs = le_max } }, int_ty);
+    const sur_lo = try b.emit(.{ .iconst = 0xD800 }, int_ty);
+    const ge_lo = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = sur_lo } }, bool_ty);
+    const sur_hi = try b.emit(.{ .iconst = 0xDFFF }, int_ty);
+    const le_hi = try b.emit(.{ .icmp = .{ .cc = .le, .lhs = v, .rhs = sur_hi } }, bool_ty);
+    const is_sur = try b.emit(.{ .mul = .{ .lhs = ge_lo, .rhs = le_hi } }, int_ty);
+    const one = try b.emit(.{ .iconst = 1 }, int_ty);
+    const not_sur = try b.emit(.{ .sub = .{ .lhs = one, .rhs = is_sur } }, int_ty);
+    const valid_int = try b.emit(.{ .mul = .{ .lhs = in_range, .rhs = not_sur } }, int_ty);
+    const zero2 = try b.emit(.{ .iconst = 0 }, int_ty);
+    return try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = valid_int, .rhs = zero2 } }, bool_ty);
+}
+
+/// Lower a target-directed conversion (`.into()` / `.try_into()`). `into` is lossless: an
+/// int widen (`add v, 0` typed to the SOURCE width re-canonicalizes via uxt/sxt), char→int
+/// (the codepoint field), or byte→char (construct `char{0: byte}`). `try_into` builds a
+/// `Result[T, ConvErr]` into a fresh slot from a per-case validity predicate:
+///   * int→int narrow: `Ok(masked)` iff `masked` (v truncated+re-extended to T) equals v —
+///     and, cross-signedness, v is also non-negative read as signed;
+///   * char→byte: the SAME narrow fits-check on the codepoint (unsigned) to `uint8`;
+///   * int→char: `Ok(char{0: v})` iff v is a valid Unicode scalar (`validScalarValue`).
+/// The reified layout of the call's own result enum drives every tag/offset — no prelude id.
 fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.@"bool";
     const recv_ty = b.in.node_types[(cv.recv).int()];
-    const v = operandValue(try lowerExpr(b, cv.recv));
+    const recv_is_char = isCharTy(b, recv_ty);
 
     if (std.mem.eql(u8, cv.member, "into")) {
+        if (recv_is_char) {
+            // char -> int: the codepoint field, re-canonicalized (uxt) to a clean value.
+            const v = try loadCharCodepoint(b, cv.recv);
+            return .{ .value = try recanonToWidth(b, v, Typecheck.Type.uint32) };
+        }
+        const into_ty = b.in.node_types[(node_idx).int()];
+        if (isCharTy(b, into_ty)) {
+            // byte -> char: construct `char{0: byte}` (a byte is always a valid scalar).
+            const v = operandValue(try lowerExpr(b, cv.recv));
+            const slot = try b.addSlot(into_ty);
+            const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+            _ = try b.emit(.{ .store = .{ .addr = base, .val = v, .ty = Typecheck.Type.uint32 } }, null);
+            return .{ .slot = slot };
+        }
+        // int -> int widen (M3): `add v, 0` typed to the SOURCE width re-canonicalizes.
+        const v = operandValue(try lowerExpr(b, cv.recv));
         return .{ .value = try recanonToWidth(b, v, recv_ty) };
     }
 
+    // try_into: build a `Result[T, ConvErr]` into a fresh slot.
+    const v = if (recv_is_char) try loadCharCodepoint(b, cv.recv) else operandValue(try lowerExpr(b, cv.recv));
     const call_ty = b.in.node_types[(node_idx).int()];
     const e = b.in.enum_layouts[call_ty.enum_id];
     const dst_T = e.variants[0].field_types[0];
+    const to_char = isCharTy(b, dst_T);
 
     const slot = try b.addSlot(call_ty);
     const base = try b.emit(.{ .slot_addr = slot }, int_ty);
 
-    const masked = try recanonToWidth(b, v, dst_T);
-    const fits = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = masked, .rhs = v } }, bool_ty);
+    // The Ok-payload value + its store type + the validity predicate differ per case.
+    var ok_value: Ir.ValueId = undefined;
+    var ok_store_ty = dst_T;
+    var ok_blk: Ir.BlockId = undefined;
+    var err_blk: Ir.BlockId = undefined;
+    var join: Ir.BlockId = undefined;
 
-    const ok_blk = try b.addBlock();
-    const err_blk = try b.addBlock();
-    const join = try b.addBlock();
-
-    if (recv_ty.isSigned() == dst_T.isSigned()) {
-        b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
+    if (to_char) {
+        // int -> char: store the codepoint verbatim into `char`'s uint32 field; the value
+        // is a valid char iff it is a Unicode scalar.
+        ok_value = v;
+        ok_store_ty = Typecheck.Type.uint32;
+        const valid = try validScalarValue(b, v);
+        ok_blk = try b.addBlock();
+        err_blk = try b.addBlock();
+        join = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = valid, .t = ok_blk, .f = err_blk } });
     } else {
-        // Cross-signedness: `fits` alone misses the 64-bit int↔uint case (low bits
-        // coincide) and a large unsigned whose low bits sign-extend negative. Also require
-        // v to be non-negative read as signed.
-        const sign_blk = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = fits, .t = sign_blk, .f = err_blk } });
-        b.switchTo(sign_blk);
-        const z2 = try b.emit(.{ .iconst = 0 }, int_ty);
-        const nn = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = z2 } }, bool_ty);
-        b.setTerm(.{ .cond_br = .{ .cond = nn, .t = ok_blk, .f = err_blk } });
+        // char -> byte and int -> int narrow: `masked` (v truncated + re-extended to the
+        // destination width) equals v iff it fits. A char codepoint is unsigned (uint32).
+        const src_signed = if (recv_is_char) false else recv_ty.isSigned();
+        const masked = try recanonToWidth(b, v, dst_T);
+        ok_value = masked;
+        const fits = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = masked, .rhs = v } }, bool_ty);
+        ok_blk = try b.addBlock();
+        err_blk = try b.addBlock();
+        join = try b.addBlock();
+        if (src_signed == dst_T.isSigned()) {
+            b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
+        } else {
+            // Cross-signedness: `fits` alone misses the 64-bit int↔uint case (low bits
+            // coincide) and a large unsigned whose low bits sign-extend negative. Also
+            // require v to be non-negative read as signed.
+            const sign_blk = try b.addBlock();
+            b.setTerm(.{ .cond_br = .{ .cond = fits, .t = sign_blk, .f = err_blk } });
+            b.switchTo(sign_blk);
+            const z2 = try b.emit(.{ .iconst = 0 }, int_ty);
+            const nn = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = z2 } }, bool_ty);
+            b.setTerm(.{ .cond_br = .{ .cond = nn, .t = ok_blk, .f = err_blk } });
+        }
     }
 
     b.switchTo(ok_blk);
     const ok_tag = try b.emit(.{ .iconst = 0 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = ok_tag, .ty = int_ty } }, null);
     const ok_off = e.payload_off + e.variants[0].offsets[0];
-    const ok_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = ok_off, .ty = dst_T } }, int_ty);
-    _ = try b.emit(.{ .store = .{ .addr = ok_addr, .val = masked, .ty = dst_T } }, null);
+    const ok_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = ok_off, .ty = ok_store_ty } }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = ok_addr, .val = ok_value, .ty = ok_store_ty } }, null);
     try brTo(b, join, .none);
 
     b.switchTo(err_blk);
@@ -2040,6 +2134,7 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
     // Aggregate: dispatch on the producing construct.
     switch (n.tag) {
         .literal_string => try storeStrLiteralInto(b, expr, dst_ptr),
+        .literal_char => try lowerCharLiteralInto(b, expr, dst_ptr),
         .struct_init => try lowerStructInitInto(b, expr, dst_ptr),
         .enum_init_unit, .enum_init_tuple, .enum_init_struct => try lowerEnumInitInto(b, expr, dst_ptr, ty),
         // qualified `N.V` (field_access) / `N.V(args)` (call) that typecheck
@@ -2108,6 +2203,30 @@ fn storeStrLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error{
     const len_addr = try b.emit(.{ .field_addr = .{ .base = dst_ptr, .off = 8, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
     const lenv = try b.emit(.{ .iconst = len }, Typecheck.Type.int);
     _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = lenv, .ty = Typecheck.Type.int } }, null);
+}
+
+/// The decoded codepoint of a char-literal token. The checker already validated the
+/// content (T0036), so a decode error here is an internal invariant break — note-and-0
+/// keeps lower total rather than miscompiling.
+fn charLiteralCodepoint(b: *Builder, tok: u32) error{OutOfMemory}!u32 {
+    return switch (Literal.decodeChar(b.in.tokens[tok].text(b.in.source))) {
+        .ok => |cp| cp,
+        else => blk: {
+            try b.note(tok, "malformed char literal reached lower");
+            break :blk 0;
+        },
+    };
+}
+
+/// Write a char literal `'x'` into `dst_ptr`: a field-width store of the decoded codepoint
+/// into `char`'s single `uint32` field (offset 0). `char` occupies an 8-byte slot, but
+/// every char access reads only this `uint32` field (the codepoint load, derived
+/// Eq/Ord/Hash, the conversions), so the upper 4 bytes are dead and left unwritten.
+fn lowerCharLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
+    const n = b.in.tree.nodes[(expr).int()];
+    const cp = try charLiteralCodepoint(b, n.main_token);
+    const v = try b.emit(.{ .iconst = @intCast(cp) }, Typecheck.Type.uint32);
+    _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = v, .ty = Typecheck.Type.uint32 } }, null);
 }
 
 /// Materialize an aggregate-producing expression into a fresh temp slot and return
@@ -3280,6 +3399,8 @@ fn decodeStringLiteral(b: *Builder, tok: u32) error{OutOfMemory}!?[]u8 {
         .malformed => try b.note(tok, "malformed string literal"),
         .dangling_backslash => try b.note(tok, "string literal ends with a dangling backslash"),
         .unknown_escape => try b.note(tok, "unknown escape in string literal"),
+        .bad_hex_escape => try b.note(tok, "malformed '\\x'/'\\u' escape in string literal"),
+        .bad_codepoint => try b.note(tok, "'\\u{...}' escape is not a Unicode scalar value"),
     }
     return null;
 }

@@ -146,6 +146,9 @@ const Frozen = struct {
     /// reusing the name is excluded). Copied verbatim from the checker; lower and the
     /// fingerprint fold read the SAME bundle. Shared read-only.
     prelude_ids: Typecheck.PreludeProtocolIds = .{},
+    /// The compiler-provided `char` struct id, for the conversion recognizer +
+    /// char-literal lowering. Copied verbatim from the checker. Shared read-only.
+    char_struct: ?u32 = null,
 };
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
@@ -262,6 +265,9 @@ const GraphFrozen = struct {
     /// The prelude protocol ids, copied into every job's `Frozen` by `frozenFor`, so
     /// each operator/derive/`?`-widen witness resolves by its SPECIFIC protocol.
     prelude_ids: Typecheck.PreludeProtocolIds = .{},
+    /// The compiler-provided `char` struct id, copied into every job's `Frozen` by
+    /// `frozenFor` for the conversion recognizer + char-literal lowering.
+    char_struct: ?u32 = null,
     /// The count of BASE fns + Mono instances; `fn_decls`/`fn_modules` entries at
     /// `[derive_base..]` are the source-less derive units (parallel to `derives`).
     derive_base: usize = 0,
@@ -305,6 +311,7 @@ const GraphFrozen = struct {
             .methods = gf.methods,
             .derives = gf.derives,
             .prelude_ids = gf.prelude_ids,
+            .char_struct = gf.char_struct,
         };
     }
 };
@@ -449,6 +456,7 @@ pub fn lowerGraphProgram(
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .char_struct = tc.char_struct,
         .derive_base = derive_base,
         .opt = opt,
         .probe = probe,
@@ -666,6 +674,7 @@ pub fn renderGraphIr(
             .methods = tc.methods,
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
+            .char_struct = tc.char_struct,
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -696,6 +705,7 @@ pub fn renderGraphIr(
             .methods = tc.methods,
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
+            .char_struct = tc.char_struct,
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
@@ -728,6 +738,7 @@ pub fn renderGraphIr(
             .methods = tc.methods,
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
+            .char_struct = tc.char_struct,
         };
         var func = try DeriveEmit.lower(gpa, in, d, sym, &diags);
         defer func.deinit(gpa);

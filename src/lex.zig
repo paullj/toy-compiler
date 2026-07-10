@@ -84,7 +84,7 @@ pub fn next(l: *Lexer) Token {
 /// spam-cap accounting and the parser's future diagnostic handling agree.
 fn isError(tag: Tag) bool {
     return switch (tag) {
-        .invalid, .string_unterminated => true,
+        .invalid, .string_unterminated, .char_unterminated => true,
         else => false,
     };
 }
@@ -105,6 +105,7 @@ fn lexToken(l: *Lexer) Token {
     if (isIdentStart(c)) return l.lexIdentifier(start);
     if (isDigit(c)) return l.lexNumber(start);
     if (c == '"') return l.lexString(start);
+    if (c == '\'') return l.lexChar(start);
     return l.lexSymbol(start);
 }
 
@@ -112,7 +113,7 @@ fn lexToken(l: *Lexer) Token {
 /// insertion when a newline follows it.
 fn canEndStatement(tag: Tag) bool {
     return switch (tag) {
-        .identifier, .number, .string, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .question => true,
+        .identifier, .number, .string, .char_lit, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .question => true,
         else => false,
     };
 }
@@ -193,6 +194,27 @@ fn lexString(l: *Lexer, start: u32) Token {
     return l.make(.string_unterminated, start); // unterminated at EOF
 }
 
+/// Lex a char literal `'…'`. The near-twin of `lexString` (same `\`-skip-2 scan) on the
+/// `'` delimiter, so a `'\''` escaped-quote and a raw multibyte `'€'` both span to their
+/// closing quote. Content is NOT validated here (empty / >1 codepoint / bad escape are
+/// `decodeChar`'s decode-time diagnostic); the lexer stays total, emitting only
+/// `char_unterminated` when no closing quote is found on the line.
+fn lexChar(l: *Lexer, start: u32) Token {
+    l.index += 1; // opening quote
+    while (l.index < l.source.len) {
+        switch (l.source[l.index]) {
+            '\\' => l.index = @min(l.index + 2, @as(u32, @intCast(l.source.len))),
+            '\'' => {
+                l.index += 1; // closing quote
+                return l.make(.char_lit, start);
+            },
+            '\n' => return l.make(.char_unterminated, start),
+            else => l.index += 1,
+        }
+    }
+    return l.make(.char_unterminated, start); // unterminated at EOF
+}
+
 fn lexSymbol(l: *Lexer, start: u32) Token {
     const c = l.source[l.index];
 
@@ -247,6 +269,7 @@ fn beginsToken(c: u8) bool {
     if (isIdentStart(c) or isDigit(c)) return true;
     return switch (c) {
         '"' => true, // string
+        '\'' => true, // char literal
         ' ', '\t', '\r', '\n', '#' => true, // trivia
         '+', '-', '*', '/', '%', '=', '!', '<', '>', '&', '^', '~', '|', '(', ')', '{', '}', '[', ']', ',', ':', '.', '@', '?' => true,
         else => false,
@@ -355,6 +378,48 @@ test "unterminated string at newline stops before the newline" {
     try testing.expectEqualStrings("\"abc", tokens[0].text(src));
     try testing.expectEqual(Tag.identifier, tokens[1].tag);
     try testing.expectEqualStrings("x", tokens[1].text(src));
+}
+
+test "char literals lex to a single char_lit spanning both quotes" {
+    try expectTags("'A'", &.{ .char_lit, .eof });
+    // A `\`-skip-2 scan makes an escaped quote `'\''` and any escape lex correctly.
+    try expectTags("'\\''", &.{ .char_lit, .eof });
+    try expectTags("'\\n'", &.{ .char_lit, .eof });
+    // `char_lit` ends a statement, so a newline after it inserts a terminator.
+    try expectTags("c := 'A'\nd := 'B'\n", &.{
+        .identifier, .colon_eq, .char_lit, .newline,
+        .identifier, .colon_eq, .char_lit, .newline, .eof,
+    });
+}
+
+test "a raw multibyte char literal spans its source bytes as one char_lit" {
+    const src = "'\u{20AC}'"; // '€' — 3 source bytes between the quotes
+    const tokens = try tokenize(testing.allocator, src);
+    defer testing.allocator.free(tokens);
+    try testing.expectEqual(@as(usize, 2), tokens.len);
+    try testing.expectEqual(Tag.char_lit, tokens[0].tag);
+    try testing.expectEqualStrings(src, tokens[0].text(src));
+}
+
+test "unterminated char literal is one char_unterminated token" {
+    // At EOF: spans to EOF.
+    {
+        const src = "'ab";
+        const tokens = try tokenize(testing.allocator, src);
+        defer testing.allocator.free(tokens);
+        try testing.expectEqual(Tag.char_unterminated, tokens[0].tag);
+        try testing.expectEqualStrings("'ab", tokens[0].text(src));
+        try testing.expectEqual(Tag.eof, tokens[tokens.len - 1].tag);
+    }
+    // At a newline: stops before it, leaving the newline as trivia.
+    {
+        const src = "'a\nx";
+        const tokens = try tokenize(testing.allocator, src);
+        defer testing.allocator.free(tokens);
+        try testing.expectEqual(Tag.char_unterminated, tokens[0].tag);
+        try testing.expectEqualStrings("'a", tokens[0].text(src));
+        try testing.expectEqual(Tag.identifier, tokens[1].tag);
+    }
 }
 
 test "a run of unknown bytes coalesces into one invalid token" {

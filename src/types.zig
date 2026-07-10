@@ -331,6 +331,10 @@ pub const GraphResult = struct {
     /// sibling protocol reusing the name is excluded). Threaded into every job's `Frozen`
     /// / lower `Inputs`; lower and the fingerprint fold read the SAME bundle.
     prelude_ids: PreludeProtocolIds = .{},
+    /// The compiler-provided `char` struct id (see `Prelude.char_struct`), threaded into
+    /// lower `Inputs` so the conversion recognizer + char-literal lowering key off it.
+    /// Null only for a prelude-less internal caller.
+    char_struct: ?u32 = null,
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -547,6 +551,13 @@ pub const Prelude = struct {
     /// `try_into`'s synthesized `Result[Dst, ConvErr]`. Never named in source.
     conv_err_enum: ?u32 = null,
 
+    /// The compiler-provided `char` tuple struct id (`struct char(uint32)`), appended to
+    /// the struct table after every user struct so its id is a pure function of source.
+    /// A `char` literal types to `structT(char_struct)`; the `.into()`/`.try_into()`
+    /// conversion recognizer keys the char cases off it. Ord/Eq/Hash derive over its inner
+    /// `uint32` through the ordinary structural path.
+    char_struct: ?u32 = null,
+
     /// The native-enum family of an `App` ctor: `.option`/`.result` when `ctor` is the
     /// prelude Option/Result TEMPLATE id, else `.none`. A user `enum Option` shadow has its
     /// own distinct id (never the prelude template id), so the native path stays silent on it.
@@ -692,8 +703,14 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
     return null;
 }
 
-/// The kind of an int↔int conversion the `Into`/`TryInto` recognizer accepts.
-pub const ConvKind = enum { widen, narrow };
+/// The kind of a conversion the `Into`/`TryInto` recognizer accepts. `widen`/`narrow`
+/// are the int↔int cases (M3); the four `char_*`/`*_char` cases are M9's char surface.
+pub const ConvKind = enum { widen, narrow, char_to_int, byte_to_char, int_to_char, char_to_byte };
+
+/// Whether `t` is the compiler-provided `char` struct (`char_id` from the prelude).
+fn isCharTy(t: Type, char_id: ?u32) bool {
+    return t.kind == .@"struct" and char_id != null and t.struct_id == char_id.?;
+}
 
 /// The pure, table-free recognizer for the target-directed `.into()` (lossless
 /// widening/identity) and `.try_into()` (fallible any-int-to-int) conversion surface.
@@ -707,14 +724,32 @@ pub const ConvKind = enum { widen, narrow };
 ///     targeting `expected`; narrowing/sign-change via `into` is null (→ T0018).
 ///   * `try_into`: any integer `expected` ⇒ `.narrow` targeting `expected` (the desired
 ///     payload `T`). A widening/identity `try_into` is accepted and always yields `Ok`.
-pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8) ?struct { kind: ConvKind, target: Type } {
-    if (!recv.isInteger() or !expected.isInteger()) return null;
+pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8, char_id: ?u32) ?struct { kind: ConvKind, target: Type } {
+    const recv_char = isCharTy(recv, char_id);
+    const exp_char = isCharTy(expected, char_id);
     if (std.mem.eql(u8, member, "into")) {
-        if (recv.isSigned() == expected.isSigned() and expected.intBits() >= recv.intBits())
+        // char -> int: a codepoint (≤ 21 bits) fits any integer ≥ 32 bits, either sign,
+        // losslessly (a char is always non-negative and small).
+        if (recv_char and expected.isInteger() and expected.intBits() >= 32)
+            return .{ .kind = .char_to_int, .target = expected };
+        // byte -> char: a `uint8` (0..=255) is always a valid Unicode scalar.
+        if (Type.eql(recv, Type.uint8) and exp_char)
+            return .{ .kind = .byte_to_char, .target = expected };
+        // int -> int widen (same-sign, non-narrowing).
+        if (recv.isInteger() and expected.isInteger() and
+            recv.isSigned() == expected.isSigned() and expected.intBits() >= recv.intBits())
             return .{ .kind = .widen, .target = expected };
         return null;
     }
-    if (std.mem.eql(u8, member, "try_into")) return .{ .kind = .narrow, .target = expected };
+    if (std.mem.eql(u8, member, "try_into")) {
+        // int -> char: range-check a valid Unicode scalar (surrogate / > 0x10FFFF fail).
+        if (recv.isInteger() and exp_char) return .{ .kind = .int_to_char, .target = expected };
+        // char -> byte: range-check the codepoint fits `uint8` (≤ 0xFF).
+        if (recv_char and Type.eql(expected, Type.uint8)) return .{ .kind = .char_to_byte, .target = expected };
+        // int -> int narrow (fallible).
+        if (recv.isInteger() and expected.isInteger()) return .{ .kind = .narrow, .target = expected };
+        return null;
+    }
     return null;
 }
 
@@ -1529,6 +1564,7 @@ pub fn checkGraph(
         .templates = templates_out,
         .derives = derives,
         .prelude_ids = gatherPreludeIds(t),
+        .char_struct = if (t.prelude) |p| p.char_struct else null,
     };
 }
 
@@ -1583,7 +1619,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // Prelude: native-register `Eq` (+ its builtin scalar conformances) BEFORE the
     // per-module protocol loop, so `Eq` is global id 0 and is bare-nameable everywhere
     // with no import (the `print` precedent — no module-graph/fingerprint surface).
-    t.prelude = try prelude_reg.register(t.gpa, &t.protocols, &t.conformances, &t.enums, t.graph.mods);
+    t.prelude = try prelude_reg.register(t.gpa, &t.protocols, &t.conformances, &t.enums, &t.structs, t.graph.mods);
 
     // Phase 0c: register every module's `protocol` decls into ONE global id
     // space (module-id order, then decl order — same determinism as structs/enums).
@@ -6277,18 +6313,36 @@ test "an enum node carries an @\"enum\" type with the right id" {
 
 test "M3: builtinConvMethod verdict table (widen/narrow/reject)" {
     // into: same-sign widening/identity accepted, narrowing/sign-change rejected.
-    try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.uint8, Type.uint, "into").?.kind);
-    try testing.expectEqual(Type.uint, builtinConvMethod(Type.uint8, Type.uint, "into").?.target);
-    try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.int, Type.int64, "into").?.kind); // plat==w64
-    try testing.expect(builtinConvMethod(Type.uint, Type.uint8, "into") == null); // narrowing
-    try testing.expect(builtinConvMethod(Type.uint8, Type.int, "into") == null); // sign-change
+    try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.uint8, Type.uint, "into", null).?.kind);
+    try testing.expectEqual(Type.uint, builtinConvMethod(Type.uint8, Type.uint, "into", null).?.target);
+    try testing.expectEqual(ConvKind.widen, builtinConvMethod(Type.int, Type.int64, "into", null).?.kind); // plat==w64
+    try testing.expect(builtinConvMethod(Type.uint, Type.uint8, "into", null) == null); // narrowing
+    try testing.expect(builtinConvMethod(Type.uint8, Type.int, "into", null) == null); // sign-change
     // try_into: any int→int accepted (target = expected payload T).
-    try testing.expectEqual(ConvKind.narrow, builtinConvMethod(Type.uint, Type.uint8, "try_into").?.kind);
-    try testing.expectEqual(Type.uint8, builtinConvMethod(Type.uint, Type.uint8, "try_into").?.target);
-    try testing.expectEqual(ConvKind.narrow, builtinConvMethod(Type.int, Type.uint, "try_into").?.kind);
+    try testing.expectEqual(ConvKind.narrow, builtinConvMethod(Type.uint, Type.uint8, "try_into", null).?.kind);
+    try testing.expectEqual(Type.uint8, builtinConvMethod(Type.uint, Type.uint8, "try_into", null).?.target);
+    try testing.expectEqual(ConvKind.narrow, builtinConvMethod(Type.int, Type.uint, "try_into", null).?.kind);
     // Non-integer receiver / expected → null (leaves struct/enum dispatch untouched).
-    try testing.expect(builtinConvMethod(Type.bool, Type.uint8, "try_into") == null);
-    try testing.expect(builtinConvMethod(Type.uint8, Type.bool, "into") == null);
+    try testing.expect(builtinConvMethod(Type.bool, Type.uint8, "try_into", null) == null);
+    try testing.expect(builtinConvMethod(Type.uint8, Type.bool, "into", null) == null);
+}
+
+test "M9: builtinConvMethod char verdicts (char↔int/byte)" {
+    const ch: u32 = 7; // any struct id stands in for `char`
+    const char_ty = Type.structT(ch);
+    // char -> int (into): lossless into any int ≥ 32 bits, either sign.
+    try testing.expectEqual(ConvKind.char_to_int, builtinConvMethod(char_ty, Type.int, "into", ch).?.kind);
+    try testing.expectEqual(ConvKind.char_to_int, builtinConvMethod(char_ty, Type.uint32, "into", ch).?.kind);
+    try testing.expect(builtinConvMethod(char_ty, Type.int16, "into", ch) == null); // too narrow
+    // byte -> char (into): only a `uint8` source is always a valid scalar.
+    try testing.expectEqual(ConvKind.byte_to_char, builtinConvMethod(Type.uint8, char_ty, "into", ch).?.kind);
+    try testing.expectEqual(char_ty, builtinConvMethod(Type.uint8, char_ty, "into", ch).?.target);
+    try testing.expect(builtinConvMethod(Type.uint16, char_ty, "into", ch) == null); // uint16 can be a surrogate
+    // int -> char (try_into) + char -> byte (try_into): the fallible pair.
+    try testing.expectEqual(ConvKind.int_to_char, builtinConvMethod(Type.int, char_ty, "try_into", ch).?.kind);
+    try testing.expectEqual(ConvKind.char_to_byte, builtinConvMethod(char_ty, Type.uint8, "try_into", ch).?.kind);
+    // char is inert when no `char_id` is known (a prelude-less caller).
+    try testing.expect(builtinConvMethod(char_ty, Type.int, "into", null) == null);
 }
 
 test "M3: witnessProtocolId resolves into/try_into to the bundle ids" {

@@ -178,6 +178,20 @@ pub const Tag = enum(u8) {
     // `type` keyword (M7). Appended at END (frozen ordinal; `[]Token` is memcpy'd
     // to/from the content cache). A keyword, so it MUST have a `keywords` row below.
     kw_type, // `type Name = T`
+
+    // Char literals (M9). Appended at the END (frozen ordinals; `[]Token` is memcpy'd
+    // to/from the content cache). A `'`-quoted single Unicode scalar; the span covers
+    // the two quotes and the (possibly multibyte / escaped) content between them —
+    // `lexChar` mirrors `lexString`'s `\`-skip-2 scan but on `'`. NOT keywords.
+
+    /// A well-formed-looking char literal `'x'`: an opening `'`, some content, a
+    /// closing `'`. The CONTENT verdict (empty / >1 codepoint / bad escape) is a
+    /// decode-time diagnostic (`decodeChar`), not a lex error — the token still spans.
+    char_lit,
+    /// A char literal with no closing quote (ran into a newline or EOF). Mirrors
+    /// `string_unterminated`: the span starts at the opening quote and covers what was
+    /// consumed, so a caret can point at it. An error token (`isError`).
+    char_unterminated,
 };
 
 /// Maps identifier text to its keyword tag, if any.

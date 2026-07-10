@@ -486,6 +486,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .methods = frozen.methods,
         .derives = frozen.derives,
         .prelude_ids = frozen.prelude_ids,
+        .char_struct = frozen.char_struct,
     };
     var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
     defer irf.deinit(gpa);
@@ -705,6 +706,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
         .methods = frozen.methods,
         .derives = frozen.derives,
         .prelude_ids = frozen.prelude_ids,
+        .char_struct = frozen.char_struct,
     };
     var irf = try DeriveEmit.lower(gpa, in, d, sym, &diags);
     defer irf.deinit(gpa);
