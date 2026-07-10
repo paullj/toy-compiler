@@ -236,7 +236,21 @@ pub const Linked = struct {
     text: []u8,
     entry_off: u32,
     data_relocs: []Reloc,
+    /// The backtrace symbol side-table (empty unless `link` was asked to emit it):
+    /// `[u64 count][ {u64 text_off, u64 name_off} × count ][name blob]`, entries
+    /// sorted ascending by `text_off` with a final `{text_size, ""}` sentinel (so a
+    /// frame past __text names nothing). `name_off` is a byte offset from the table
+    /// base to a NUL-terminated name. Owned by the caller. A pure function of the fn
+    /// set (offsets are stable-sort-ranked), so it is `-jN` byte-identical.
+    sym_table: []u8 = &.{},
 };
+
+/// The content-hash sentinel a `.cstr` reloc carries to name the backtrace symbol
+/// table's base. The relink tail reserves it in `off_by_hash` (→ the table's byte
+/// offset in the appended `__cstring` blob), so `__panic` reaches the table via the
+/// same adrp+add path a string literal uses. Not a real hash (astronomically
+/// unlikely to collide; the relink tail rejects an actual collision).
+pub const symtab_base_hash: u64 = 0x5717_ab1e_ba5e_0000;
 
 /// Raised when a `.call26` displacement does not fit AArch64's signed imm26
 /// (±128 MiB in words). It cannot occur within one 0x4000 __TEXT page, but we
@@ -284,7 +298,7 @@ fn prefixSumTextOffsets(
 /// backward (and self/mutual) recursion a non-positive one; both encode directly
 /// via `Aarch64.bl`. Because the delta is intra-module it is fixed at link time
 /// and needs NO runtime relocation under PIE/ASLR.
-pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName) LinkError!Linked {
+pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName, emit_symtab: bool) LinkError!Linked {
     // 1) LAYOUT: assign every fn a dense handle by STABLE SORT of the fn set
     //    (rank, never arrival/source order), then
     //    walk `fns` in SOURCE ORDER to give each its text offset. Layout STAYS
@@ -410,13 +424,64 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     errdefer data_relocs.deinit(gpa);
     for (jobs) |j| try data_relocs.appendSlice(gpa, j.relocs.items);
 
-    // 4) ENTRY: the entry function's resolved text offset, resolved by name.
+    // 4) BACKTRACE SYMBOLS: the (offset, name) table `__panic` scans. Built from the
+    //    already-computed layout (`site_h[i]` is fn i's handle → `offsets`), so it is
+    //    a pure function of the fn set.
+    const sym_table: []u8 = if (emit_symtab) try buildSymTable(gpa, fns, site_h, offsets, cursor) else &.{};
+    errdefer gpa.free(sym_table);
+
+    // 5) ENTRY: the entry function's resolved text offset, resolved by name.
     const entry_h = (try si.get(gpa, entry)) orelse return error.NoEntry;
     return .{
         .text = text,
         .entry_off = offsets[entry_h],
         .data_relocs = try data_relocs.toOwnedSlice(gpa),
+        .sym_table = sym_table,
     };
+}
+
+/// One (text offset, function name) row of the backtrace symbol table.
+const SymEnt = struct { off: u64, name: []const u8 };
+
+fn symEntLess(_: void, a: SymEnt, b: SymEnt) bool {
+    if (a.off != b.off) return a.off < b.off;
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+/// Serialize the backtrace symbol table (see `Linked.sym_table`). `site_h[i]` is fn
+/// i's handle (→ `offsets`); `text_size` is the sentinel row's offset. All fields are
+/// u64 so `__panic` reads them with the existing 8-scaled `ldr`. Entries are sorted by
+/// (off, name) — a total order — so the bytes are independent of fn input order
+/// (`-jN` byte-identical). Layout: `[u64 count][{u64 off,u64 name_off}×count][names]`,
+/// `name_off` a byte offset from the table base to a NUL-terminated name.
+fn buildSymTable(gpa: std.mem.Allocator, fns: []const FnCode, site_h: []const u32, offsets: []const u32, text_size: u32) ![]u8 {
+    const ents = try gpa.alloc(SymEnt, fns.len + 1);
+    defer gpa.free(ents);
+    for (fns, 0..) |f, i| ents[i] = .{ .off = offsets[site_h[i]], .name = f.sym.name };
+    ents[fns.len] = .{ .off = text_size, .name = "" }; // sentinel: frames past __text name nothing
+    std.mem.sortUnstable(SymEnt, ents, {}, symEntLess);
+
+    const count = ents.len;
+    const entries_bytes = count * 16;
+    var names_len: usize = 0;
+    for (ents) |e| names_len += e.name.len + 1; // + NUL
+    const buf = try gpa.alloc(u8, 8 + entries_bytes + names_len);
+    errdefer gpa.free(buf);
+
+    std.mem.writeInt(u64, buf[0..8], count, .little);
+    var name_cursor: u64 = 8 + entries_bytes; // name blob starts after the entries
+    var eo: usize = 8;
+    var no: usize = 8 + entries_bytes;
+    for (ents) |e| {
+        std.mem.writeInt(u64, buf[eo..][0..8], e.off, .little);
+        std.mem.writeInt(u64, buf[eo + 8 ..][0..8], name_cursor, .little);
+        eo += 16;
+        @memcpy(buf[no .. no + e.name.len], e.name);
+        buf[no + e.name.len] = 0;
+        no += e.name.len + 1;
+        name_cursor += e.name.len + 1;
+    }
+    return buf;
 }
 
 /// One per-fn link job's output: the cross-segment relocs this fn contributed (in
@@ -866,7 +931,7 @@ fn linkTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) Li
     defer threaded.deinit();
     var si: SymInterner = .{};
     defer si.deinit(gpa);
-    return link(threaded.io(), gpa, fns, &si, fname(entry));
+    return link(threaded.io(), gpa, fns, &si, fname(entry), false);
 }
 
 test "layout offsets follow source order and are contiguous" {

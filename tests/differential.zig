@@ -484,6 +484,9 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
             if (fx.err.len > 0) {
                 try testing.expect(std.mem.indexOf(u8, r.stderr, fx.err) != null);
                 try testing.expect(frames >= 2); // panic dumps >= 2 walked frames
+                // Every fixture panics in `main`, so its symbolized name appears on a
+                // frame line (` main` follows the offset — the symbol-table hit).
+                try testing.expect(std.mem.indexOf(u8, r.stderr, " main\n") != null);
             } else {
                 try testing.expectEqual(@as(usize, 0), frames); // a clean run prints no backtrace
             }

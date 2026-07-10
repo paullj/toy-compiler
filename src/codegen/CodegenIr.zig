@@ -1149,6 +1149,16 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.movk(10, 0, 1)); // x10 |= adr_off (hi)
     try emit(&code, gpa, A.subReg(19, 9, 10)); // x19 = text_base
 
+    // Load the backtrace symbol table base into the callee-saved x27 (survives every
+    // write() call). The relink tail reserved `symtab_base_hash` at the table's
+    // __cstring offset, so this resolves like a string-literal pointer (adrp+add).
+    site = @intCast(code.items.len);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .cstr = Link.symtab_base_hash }, .kind = .adrp_page });
+    try emit(&code, gpa, A.adrp(27, 0)); // adrp x27, symtab@page
+    site = @intCast(code.items.len);
+    try relocs.append(gpa, .{ .site = site, .target = .{ .cstr = Link.symtab_base_hash }, .kind = .add_lo12 });
+    try emit(&code, gpa, A.addImm(27, 27, 0)); // x27 = &symtab
+
     // Walk state: x20 = fp cursor (this frame), x21 = frame cap, x23/x24 = hex shifts.
     try emit(&code, gpa, A.movReg(20, A.FP)); // x20 = x29
     try emit(&code, gpa, A.movz(21, 64, 0)); // x21 = 64 (frame cap)
@@ -1162,7 +1172,32 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.cbz(21, 0)); // counter == 0 -> DONE
     try emit(&code, gpa, A.ldrRegUoff(25, 20, 8)); // x25 = ra = *(fp+8)
     try emit(&code, gpa, A.subReg(25, 25, 19)); // ra - text_base
-    try emit(&code, gpa, A.subImm(25, 25, 4)); // -> call site
+    try emit(&code, gpa, A.subImm(25, 25, 4)); // -> call site (x25 = frame offset)
+
+    // Symbol lookup: linear-scan the sorted table for the greatest entry off <= x25;
+    // x28 = its name ptr (0 = none). Entries ascend by off, so the first off > target
+    // ends the scan; x28 then holds the enclosing fn's name (or the `{text_size,""}`
+    // sentinel for a frame past __text). x4-x10 are scratch (no write() runs here).
+    try emit(&code, gpa, A.ldrRegUoff(4, 27, 0)); // x4 = count
+    try emit(&code, gpa, A.addImm(5, 27, 8)); // x5 = &entry[0]
+    try emit(&code, gpa, A.movz(6, 0, 0)); // x6 = i
+    try emit(&code, gpa, A.movz(28, 0, 0)); // x28 = best name ptr (none)
+    const scan_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cmpReg(6, 4)); // i vs count
+    const scan_bhs: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hs, 0)); // i >= count -> scan_done
+    try emit(&code, gpa, A.ldrRegUoff(9, 5, 0)); // x9 = entry.off
+    try emit(&code, gpa, A.cmpReg(9, 25)); // off vs target
+    const scan_bhi: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hi, 0)); // off > target -> scan_done
+    try emit(&code, gpa, A.ldrRegUoff(10, 5, 8)); // x10 = entry.name_off
+    try emit(&code, gpa, A.addReg(28, 27, 10)); // x28 = base + name_off
+    try emit(&code, gpa, A.addImm(5, 5, 16)); // ++entry
+    try emit(&code, gpa, A.addImm(6, 6, 1)); // ++i
+    const scan_b: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // -> scan_top
+    const scan_done: u32 = @intCast(code.items.len);
+
     // Prefix "0x" into the buffer.
     try emit(&code, gpa, A.movz(9, '0', 0));
     try emit(&code, gpa, A.strb(9, 22, 0));
@@ -1183,6 +1218,25 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.subImm(12, 12, 1));
     const cbnz_hex: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbnz(12, 0)); // more nibbles -> HEX
+
+    // ` ` + the symbol name (copied from x28 until its NUL). A missing/empty name
+    // (x28 == 0, or the sentinel's empty string) copies nothing.
+    try emit(&code, gpa, A.movz(9, ' ', 0));
+    try emit(&code, gpa, A.strb(9, 11, 0));
+    try emit(&code, gpa, A.addImm(11, 11, 1));
+    const name_guard: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(28, 0)); // no entry -> name_done
+    const copy_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.ldrbRegUoff(9, 28, 0)); // w9 = *name
+    const copy_cbz: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(9, 0)); // NUL -> name_done
+    try emit(&code, gpa, A.strb(9, 11, 0));
+    try emit(&code, gpa, A.addImm(11, 11, 1));
+    try emit(&code, gpa, A.addImm(28, 28, 1));
+    const copy_b: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // -> copy_top
+    const name_done: u32 = @intCast(code.items.len);
+
     try emit(&code, gpa, A.movz(14, '\n', 0));
     try emit(&code, gpa, A.strb(14, 11, 0));
     try emit(&code, gpa, A.addImm(11, 11, 1));
@@ -1208,7 +1262,13 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     patchCbzTo(buf, cbz_fp, done_pos);
     patchCbzTo(buf, cbz_cnt, done_pos);
     patchCbzTo(buf, cbnz_hex, hex_top);
-    std.mem.writeInt(u32, buf[b_loop..][0..4], A.b(@intCast(@divExact(@as(i64, loop_top) - @as(i64, b_loop), 4))), .little);
+    patchBTo(buf, b_loop, loop_top);
+    patchBCondTo(buf, scan_bhs, scan_done);
+    patchBCondTo(buf, scan_bhi, scan_done);
+    patchBTo(buf, scan_b, scan_top);
+    patchCbzTo(buf, name_guard, name_done);
+    patchCbzTo(buf, copy_cbz, name_done);
+    patchBTo(buf, copy_b, copy_top);
 
     const name = try gpa.dupe(u8, "panic");
     errdefer gpa.free(name);
@@ -1226,6 +1286,20 @@ fn patchCbzTo(buf: []u8, site: u32, target: u32) void {
     const delta: i19 = @intCast(@divExact(@as(i64, target) - @as(i64, site), 4));
     const word = std.mem.readInt(u32, buf[site..][0..4], .little);
     std.mem.writeInt(u32, buf[site..][0..4], Aarch64.patchCbz(word, delta), .little);
+}
+
+/// Backpatch a `b.cond` placeholder at byte `site` to branch to byte `target`
+/// (preserving opcode + cond).
+fn patchBCondTo(buf: []u8, site: u32, target: u32) void {
+    const delta: i19 = @intCast(@divExact(@as(i64, target) - @as(i64, site), 4));
+    const word = std.mem.readInt(u32, buf[site..][0..4], .little);
+    std.mem.writeInt(u32, buf[site..][0..4], Aarch64.patchBCond(word, delta), .little);
+}
+
+/// Backpatch an unconditional `b` placeholder at byte `site` to branch to `target`.
+fn patchBTo(buf: []u8, site: u32, target: u32) void {
+    const delta: i26 = @intCast(@divExact(@as(i64, target) - @as(i64, site), 4));
+    std.mem.writeInt(u32, buf[site..][0..4], Aarch64.b(delta), .little);
 }
 
 // TESTS — hand-build a tiny Ir.Function and assert the emitted byte shape.
@@ -1294,9 +1368,10 @@ test "lowerPanic: prologue, self-locate movw relocs, hex frame loop, then SYS_ex
     }
     try testing.expect(saw_adr);
     try testing.expect(saw_csel);
-    // Four relocs: two `write` imports (adrp_page + ldr_lo12) reached via the GOT,
-    // then the two self-relative movw relocs that bake the text-base offset.
-    try testing.expectEqual(@as(usize, 4), fc.relocs.len);
+    // Six relocs: two `write` imports (adrp_page + ldr_lo12) reached via the GOT, the
+    // two self-relative movw relocs that bake the text-base offset, then the adrp+add
+    // pair that loads the backtrace symbol table base (a `.cstr` to the reserved hash).
+    try testing.expectEqual(@as(usize, 6), fc.relocs.len);
     try testing.expectEqual(Link.RelocKind.adrp_page, fc.relocs[0].kind);
     try testing.expectEqualStrings("write", fc.relocs[0].target.import.name);
     try testing.expectEqual(Link.RelocKind.ldr_lo12, fc.relocs[1].kind);
@@ -1306,6 +1381,10 @@ test "lowerPanic: prologue, self-locate movw relocs, hex frame loop, then SYS_ex
     // The movw addends name the `adr` site relative to each mov site (−4, −8).
     try testing.expectEqual(@as(i64, -4), fc.relocs[2].addend);
     try testing.expectEqual(@as(i64, -8), fc.relocs[3].addend);
+    try testing.expectEqual(Link.RelocKind.adrp_page, fc.relocs[4].kind);
+    try testing.expectEqual(Link.symtab_base_hash, fc.relocs[4].target.cstr);
+    try testing.expectEqual(Link.RelocKind.add_lo12, fc.relocs[5].kind);
+    try testing.expectEqual(Link.symtab_base_hash, fc.relocs[5].target.cstr);
 }
 
 // A 1-block `fn f() -> int { ret <iconst v> }` exercising prologue/epilogue,
