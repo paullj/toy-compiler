@@ -24,6 +24,7 @@ const Conformance = Typecheck.Conformance;
 const Prelude = Typecheck.Prelude;
 const VariantSym = LayoutEngine.VariantSym;
 const EnumSym = LayoutEngine.EnumSym;
+const StructSym = LayoutEngine.StructSym;
 const ModuleCtx = Typecheck.GraphCtx.ModuleCtx;
 
 /// Which `Prelude.protocols` field a spec records its assigned id into.
@@ -82,12 +83,15 @@ pub fn register(
     protocols: *std.ArrayList(ProtocolSym),
     conformances: *std.ArrayList(Conformance),
     enums: *std.ArrayList(EnumSym),
+    structs: *std.ArrayList(StructSym),
     mods: []ModuleCtx,
 ) !Prelude {
     var prelude: Prelude = .{};
 
     const ordering_id = try registerOrdering(gpa, enums, mods);
     prelude.ordering_enum = ordering_id;
+
+    prelude.char_struct = try registerChar(gpa, structs, mods);
 
     for (specs) |spec| {
         const methods = try gpa.alloc([]const u8, 1);
@@ -190,6 +194,43 @@ fn registerOrdering(gpa: std.mem.Allocator, enums: *std.ArrayList(EnumSym), mods
     return ordering_id;
 }
 
+/// Native `struct char(uint32)`: the compiler-provided tuple/newtype struct a `char`
+/// literal types to. Hand-laid-out (`state == .done`) so Phase-0b `layoutStruct`
+/// early-returns rather than dereferencing the absent decl — its single `uint32` field
+/// occupies a full 8-byte scalar slot (like every int width), so `size == 8`. Appended
+/// AFTER every user struct so its id is a pure function of source, and injected into each
+/// module's `struct_ids` if-absent so a user `struct char` shadow wins (the `Ordering`
+/// enum + `byte` alias precedent). Ord/Eq/Hash derive over the inner `uint32` through the
+/// ordinary structural path — no bespoke conformance rows. Every owned slice is
+/// `gpa`-allocated so the checker's struct teardown frees prelude and user structs
+/// uniformly (the borrowed `"char"` name + `"0"` field name are not freed there).
+fn registerChar(gpa: std.mem.Allocator, structs: *std.ArrayList(StructSym), mods: []ModuleCtx) !u32 {
+    const field_names = try gpa.alloc([]const u8, 1);
+    field_names[0] = LayoutEngine.tuple_field_names[0]; // "0"
+    const field_types = try gpa.alloc(Type, 1);
+    field_types[0] = Type.uint32;
+    const offsets = try gpa.alloc(u32, 1);
+    offsets[0] = 0;
+    const id: u32 = @intCast(structs.items.len);
+    try structs.append(gpa, .{
+        .decl_node = Ast.none,
+        .name = "char",
+        .mod = 0,
+        .pub_export = true,
+        .field_names = field_names,
+        .field_types = field_types,
+        .offsets = offsets,
+        .size = 8,
+        .@"align" = 8,
+        .state = .done,
+        .is_tuple = true,
+    });
+    for (mods) |*m| {
+        if (m.struct_ids.get("char") == null) try m.struct_ids.put(gpa, "char", id);
+    }
+    return id;
+}
+
 /// Prelude generic value enums: `enum Option[T] { some(T), none }` and
 /// `enum Result[T,E] { ok(T), err(E) }`, hand-built as generic TEMPLATES (the shape
 /// `registerEnums` + `decodeTemplateVariants` produce, but AST-less). Appended AFTER every
@@ -267,9 +308,10 @@ test "M3: Into=9/TryInto=10 after From; ConvErr appended after Result" {
     var protocols: std.ArrayList(ProtocolSym) = .empty;
     var conformances: std.ArrayList(Conformance) = .empty;
     var enums: std.ArrayList(EnumSym) = .empty;
+    var structs: std.ArrayList(StructSym) = .empty;
     var mods = [_]ModuleCtx{};
 
-    const prelude = try register(gpa, &protocols, &conformances, &enums, &mods);
+    const prelude = try register(gpa, &protocols, &conformances, &enums, &structs, &mods);
 
     // Appended after From=8, preserving every existing id.
     try testing.expectEqual(@as(?u32, 8), prelude.protocols.from);
@@ -293,4 +335,29 @@ test "M3: Into=9/TryInto=10 after From; ConvErr appended after Result" {
     const ce = enums.items[prelude.conv_err_enum.?];
     try testing.expectEqual(@as(usize, 1), ce.variants.len);
     try testing.expect(std.mem.eql(u8, ce.variants[0].name, "out_of_range"));
+}
+
+test "M9: char is a hand-laid-out tuple struct(uint32), size 8, done" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var protocols: std.ArrayList(ProtocolSym) = .empty;
+    var conformances: std.ArrayList(Conformance) = .empty;
+    var enums: std.ArrayList(EnumSym) = .empty;
+    var structs: std.ArrayList(StructSym) = .empty;
+    var mods = [_]ModuleCtx{};
+
+    const prelude = try register(gpa, &protocols, &conformances, &enums, &structs, &mods);
+
+    try testing.expect(prelude.char_struct != null);
+    const c = structs.items[prelude.char_struct.?];
+    try testing.expectEqualStrings("char", c.name);
+    try testing.expect(c.is_tuple);
+    try testing.expectEqual(LayoutEngine.LayoutState.done, c.state);
+    try testing.expectEqual(@as(u32, 8), c.size);
+    try testing.expectEqual(@as(usize, 1), c.field_types.len);
+    try testing.expect(Type.eql(Type.uint32, c.field_types[0]));
+    try testing.expectEqualStrings("0", c.field_names[0]);
+    try testing.expectEqual(@as(u32, 0), c.offsets[0]);
 }

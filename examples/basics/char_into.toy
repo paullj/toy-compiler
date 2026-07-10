@@ -1,0 +1,6 @@
+# expect: exit 42
+fn main() -> int {
+    c := 'A'                                  # char literal -> char(65)
+    n: int = c.into()                         # char -> int (65), target-directed
+    return n - 23                             # 42
+}

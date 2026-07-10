@@ -82,6 +82,7 @@ pub const Code = enum(u16) {
     T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch — M24)
     T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width — M1)
     T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain — M7)
+    T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x` — M9)
 
     _,
 };
@@ -155,6 +156,7 @@ pub const table = [_]Entry{
     .{ .code = .T0033, .str = "T0033", .slug = "question-constructor-mismatch" },
     .{ .code = .T0034, .str = "T0034", .slug = "literal-out-of-range" },
     .{ .code = .T0035, .str = "T0035", .slug = "alias-cycle" },
+    .{ .code = .T0036, .str = "T0036", .slug = "malformed-char-literal" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -199,7 +201,7 @@ const prefix_bands = "LPRT";
 // Build-time registry safety: coverage (every non-none code has exactly one row),
 // uniqueness, prefix membership, and per-band contiguity (tails run 0001,0002,…).
 comptime {
-    @setEvalBranchQuota(20_000);
+    @setEvalBranchQuota(40_000);
     // Coverage + uniqueness: every enum value except `none` and the `_` sentinel has
     // exactly one table row.
     for (@typeInfo(Code).@"enum".fields) |f| {
@@ -318,6 +320,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0035", str(.T0035).?);
     try testing.expectEqualStrings("alias-cycle", slug(.T0035).?);
     try testing.expectEqual(Code.T0035, fromStr("T0035").?);
+
+    // M9 malformed-char-literal code.
+    try testing.expectEqualStrings("T0036", str(.T0036).?);
+    try testing.expectEqualStrings("malformed-char-literal", slug(.T0036).?);
+    try testing.expectEqual(Code.T0036, fromStr("T0036").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

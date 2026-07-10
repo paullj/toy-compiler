@@ -295,9 +295,10 @@ test "same-named structs in two modules get DISTINCT global ids" {
             _ = g;
             _ = r;
             try testing.expectEqual(@as(usize, 0), tr.diags.len);
-            // Two structs, two distinct global layout ids; b's T has 2 fields.
-            try testing.expectEqual(@as(usize, 2), tr.layouts.len);
-            // The layout sizes differ (1 int vs 2 ints) → distinct nominal types.
+            // Two USER structs at ids 0/1, plus the prelude `char` appended last (id 2).
+            try testing.expectEqual(@as(usize, 3), tr.layouts.len);
+            try testing.expectEqualStrings("char", tr.layouts[2].name);
+            // The user layout sizes differ (1 int vs 2 ints) → distinct nominal types.
             const sizes = [_]u32{ tr.layouts[0].size, tr.layouts[1].size };
             try testing.expect(sizes[0] != sizes[1]);
             try testing.expect(sizes[0] == 8 or sizes[1] == 8); // a.T = 8
@@ -513,8 +514,10 @@ test "single-module graph typechecks like the single-file checker" {
             _ = g;
             _ = r;
             try testing.expectEqual(@as(usize, 0), tr.diags.len);
-            try testing.expectEqual(@as(usize, 1), tr.layouts.len);
+            // The user `struct P` at id 0, plus the prelude `char` appended last (id 1).
+            try testing.expectEqual(@as(usize, 2), tr.layouts.len);
             try testing.expectEqual(@as(u32, 16), tr.layouts[0].size);
+            try testing.expectEqualStrings("char", tr.layouts[1].name);
         }
     };
     try withCheckedGraph(".toy-test-typ-solo", files, "solo.toy", Check.run);

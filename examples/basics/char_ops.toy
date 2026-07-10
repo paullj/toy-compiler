@@ -1,0 +1,39 @@
+# expect: exit 42
+# char literals + escapes, derived Ord/Eq, and the .into()/.try_into() conversions.
+fn cp(c: char) -> int { return c.into() }
+
+# int -> char is fallible: a char-valued match pins the Result[char, ConvErr] target.
+fn to_char(n: int) -> char {
+    return match n.try_into() {
+        .ok(c) -> c
+        .err(_) -> '?'
+    }
+}
+
+fn main() -> int {
+    # Derived Ord/Eq over the inner uint32.
+    if ('A' < 'B') == false { return 1 }
+    if 'z' == 'z' { } else { return 2 }
+
+    # Escapes decode to their codepoints.
+    if cp('\n') != 10 { return 3 }
+    if cp('\u{20AC}') != 8364 { return 4 }   # multibyte scalar via \u
+    if cp('\x41') != 65 { return 5 }
+
+    # byte -> char (lossless) then char -> int.
+    b: byte = 200
+    if cp(b.into()) != 200 { return 6 }
+
+    # char -> byte (fallible): 'A' fits, '€' does not.
+    okb: byte = 'A'.try_into().unwrap_or(0)
+    if okb != 65 { return 7 }
+    errb: byte = '€'.try_into().unwrap_or(255)
+    if errb != 255 { return 8 }
+
+    # int -> char (fallible): valid scalar Ok, surrogate/out-of-range Err.
+    if cp(to_char(65)) != 65 { return 9 }
+    if cp(to_char(0xD800)) != cp('?') { return 10 }     # surrogate -> Err -> '?'
+    if cp(to_char(0x110000)) != cp('?') { return 11 }   # > 0x10FFFF -> Err -> '?'
+
+    return 42
+}

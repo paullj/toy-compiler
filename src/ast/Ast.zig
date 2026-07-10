@@ -364,6 +364,12 @@ pub const Node = extern struct {
         /// `none`. DISTINCT from `field_access` so the checker/lower match by KIND;
         /// the grammar accepts a number after `.` only through this node.
         tuple_field,
+
+        /// A char literal `'x'`. Appended at END (frozen ordinal; `[]Node` is memcpy'd
+        /// to/from the content cache). `main_token` is the `char_lit` token (quotes +
+        /// content); `lhs`/`rhs` are `none`. Decodes to a single Unicode scalar
+        /// (`Literal.decodeChar`) and types to the compiler-provided `char` struct.
+        literal_char,
     };
 };
 
@@ -694,7 +700,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
     const n = nodes[idx.int()];
     const tok_text = tokens[n.main_token].text(source);
     switch (n.tag) {
-        .literal_number, .literal_string, .literal_bool, .identifier => try out.writeAll(tok_text),
+        .literal_number, .literal_string, .literal_bool, .literal_char, .identifier => try out.writeAll(tok_text),
         .literal_unit => try out.writeAll("()"),
         // A poison leaf renders as a fixed `(error)` marker (its `main_token` is
         // the offending token, but the marker deliberately elides its text).

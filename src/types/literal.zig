@@ -68,48 +68,178 @@ pub fn fitsWidth(raw: []const u8, t: Type, negated: bool) bool {
     return v <= max;
 }
 
+/// The hex value of one ASCII hex digit, or null. The single digit table `\xNN` /
+/// `\u{…}` share.
+fn hexDigit(c: u8) ?u4 {
+    return switch (c) {
+        '0'...'9' => @intCast(c - '0'),
+        'a'...'f' => @intCast(c - 'a' + 10),
+        'A'...'F' => @intCast(c - 'A' + 10),
+        else => null,
+    };
+}
+
+/// The result of decoding ONE escape sequence — the single escape table both the string
+/// and char literal decoders route through, so their escape grammar can never drift.
+/// `cp` is the decoded scalar; `unicode` is set ONLY for `\u{…}` (whose value the STRING
+/// path UTF-8-encodes, while every other escape is a single raw byte ≤ 0xFF that it emits
+/// verbatim — `\x80` is byte 0x80, not the two-byte UTF-8 of U+0080). A char literal takes
+/// `cp` directly regardless of `unicode`.
+const Escape = union(enum) {
+    ok: struct { cp: u32, unicode: bool },
+    unknown_escape,
+    /// A `\x`/`\u{…}` with missing/non-hex digits, missing braces, or empty `\u{}`.
+    bad_hex,
+    /// A `\u{…}` naming a UTF-16 surrogate (`0xD800..=0xDFFF`) or a value `> 0x10FFFF`.
+    bad_codepoint,
+};
+
+/// Decode the escape whose backslash was just consumed: `i` points AT the selector char
+/// (guaranteed `< body.len` by the caller's dangling-backslash check); on `.ok` it is
+/// advanced past the whole escape. Recognizes `\n \t \r \0 \\ \" \' \xNN \u{HEX…}`.
+fn decodeEscape(body: []const u8, i: *usize) Escape {
+    const sel = body[i.*];
+    i.* += 1;
+    switch (sel) {
+        'n' => return .{ .ok = .{ .cp = 0x0A, .unicode = false } },
+        't' => return .{ .ok = .{ .cp = 0x09, .unicode = false } },
+        'r' => return .{ .ok = .{ .cp = 0x0D, .unicode = false } },
+        '0' => return .{ .ok = .{ .cp = 0x00, .unicode = false } },
+        '\\' => return .{ .ok = .{ .cp = '\\', .unicode = false } },
+        '"' => return .{ .ok = .{ .cp = '"', .unicode = false } },
+        '\'' => return .{ .ok = .{ .cp = '\'', .unicode = false } },
+        'x' => {
+            if (i.* + 2 > body.len) return .bad_hex;
+            const hi = hexDigit(body[i.*]) orelse return .bad_hex;
+            const lo = hexDigit(body[i.* + 1]) orelse return .bad_hex;
+            i.* += 2;
+            return .{ .ok = .{ .cp = @as(u32, hi) * 16 + lo, .unicode = false } };
+        },
+        'u' => {
+            if (i.* >= body.len or body[i.*] != '{') return .bad_hex;
+            i.* += 1;
+            var cp: u32 = 0;
+            var digits: usize = 0;
+            while (i.* < body.len and body[i.*] != '}') : (i.* += 1) {
+                const d = hexDigit(body[i.*]) orelse return .bad_hex;
+                cp = cp * 16 + d;
+                digits += 1;
+                if (cp > 0x10FFFF) return .bad_codepoint; // caps the running value: no overflow
+            }
+            if (i.* >= body.len or body[i.*] != '}') return .bad_hex;
+            i.* += 1; // consume `}`
+            if (digits == 0) return .bad_hex;
+            if (cp >= 0xD800 and cp <= 0xDFFF) return .bad_codepoint; // lone surrogate
+            return .{ .ok = .{ .cp = cp, .unicode = true } };
+        },
+        else => return .unknown_escape,
+    }
+}
+
 /// The outcome of decoding a string-literal token: the escape-decoded bytes (caller
-/// owns), or one of the three malformed-token kinds the caller renders as a note.
+/// owns), or one of the malformed-token kinds the caller renders as a note.
 pub const StringDecode = union(enum) {
     ok: []u8,
     malformed,
     dangling_backslash,
     unknown_escape,
+    bad_hex_escape,
+    bad_codepoint,
 };
 
-/// Decode a string-literal token (`raw` includes the surrounding quotes) into its
-/// runtime bytes: quotes stripped, escapes `\n \t \\ \"` decoded. A future char-literal
-/// decoder reuses this same escape table — the single source.
+/// Decode a string-literal token (`raw` includes the surrounding quotes) into its runtime
+/// bytes: quotes stripped, escapes decoded through the shared `decodeEscape` table. A
+/// `\u{…}` is UTF-8-encoded (multi-byte); every other escape emits one raw byte. Char
+/// literals reuse `decodeEscape` too (see `decodeChar`) — the single escape source.
 pub fn decodeString(gpa: std.mem.Allocator, raw: []const u8) error{OutOfMemory}!StringDecode {
     if (raw.len < 2 or raw[0] != '"' or raw[raw.len - 1] != '"') return .malformed;
     const body = raw[1 .. raw.len - 1];
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var i: usize = 0;
-    while (i < body.len) : (i += 1) {
+    while (i < body.len) {
         const c = body[i];
         if (c != '\\') {
             try out.append(gpa, c);
+            i += 1;
             continue;
         }
-        i += 1;
+        i += 1; // past the backslash
         if (i >= body.len) {
             out.deinit(gpa);
             return .dangling_backslash;
         }
-        const decoded: u8 = switch (body[i]) {
-            'n' => 0x0A,
-            't' => 0x09,
-            '\\' => '\\',
-            '"' => '"',
-            else => {
+        switch (decodeEscape(body, &i)) {
+            .ok => |e| {
+                if (e.unicode) {
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(e.cp), &buf) catch {
+                        out.deinit(gpa);
+                        return .bad_codepoint;
+                    };
+                    try out.appendSlice(gpa, buf[0..n]);
+                } else {
+                    try out.append(gpa, @intCast(e.cp)); // non-`\u` escapes are ≤ 0xFF
+                }
+            },
+            .unknown_escape => {
                 out.deinit(gpa);
                 return .unknown_escape;
             },
-        };
-        try out.append(gpa, decoded);
+            .bad_hex => {
+                out.deinit(gpa);
+                return .bad_hex_escape;
+            },
+            .bad_codepoint => {
+                out.deinit(gpa);
+                return .bad_codepoint;
+            },
+        }
     }
     return .{ .ok = try out.toOwnedSlice(gpa) };
+}
+
+/// The outcome of decoding a char-literal token into a single Unicode scalar. Every
+/// non-`ok` kind is a T0036 the checker renders; `ok` carries the codepoint the char's
+/// inner `uint32` field holds.
+pub const CharDecode = union(enum) {
+    ok: u32,
+    malformed, // not a `'…'` quoted form (unreachable for a lexed `char_lit`)
+    empty, // `''`
+    too_many, // more than one codepoint, or trailing bytes after an escape
+    dangling_backslash,
+    unknown_escape,
+    bad_hex_escape,
+    bad_codepoint,
+    bad_utf8, // raw content is not a single well-formed UTF-8 scalar
+};
+
+/// Decode a char-literal token (`raw` includes the surrounding quotes) into exactly ONE
+/// Unicode scalar: an escape (`decodeEscape`, must consume the whole body) OR a single raw
+/// UTF-8 codepoint (multibyte SOURCE content — a raw `'€'` decodes here to `0x20AC`, not in
+/// a later milestone). Reuses the shared escape table so `'\n'`/`'\u{20AC}'`/`'\x41'`
+/// decode identically to their string-literal counterparts.
+pub fn decodeChar(raw: []const u8) CharDecode {
+    if (raw.len < 2 or raw[0] != '\'' or raw[raw.len - 1] != '\'') return .malformed;
+    const body = raw[1 .. raw.len - 1];
+    if (body.len == 0) return .empty;
+    if (body[0] == '\\') {
+        var i: usize = 1;
+        if (i >= body.len) return .dangling_backslash; // lone `\` then closing quote
+        const cp = switch (decodeEscape(body, &i)) {
+            .ok => |e| e.cp,
+            .unknown_escape => return .unknown_escape,
+            .bad_hex => return .bad_hex_escape,
+            .bad_codepoint => return .bad_codepoint,
+        };
+        if (i != body.len) return .too_many; // content after the escape
+        return .{ .ok = cp };
+    }
+    // A raw scalar: exactly one UTF-8 codepoint, nothing trailing.
+    const seq_len = std.unicode.utf8ByteSequenceLength(body[0]) catch return .bad_utf8;
+    if (seq_len != body.len) return .too_many;
+    const cp = std.unicode.utf8Decode(body[0..seq_len]) catch return .bad_utf8;
+    return .{ .ok = cp };
 }
 
 const testing = std.testing;
@@ -194,4 +324,49 @@ test "decodeString: escapes, empty, and the three malformed kinds" {
     try testing.expectEqual(StringDecode.dangling_backslash, try decodeString(gpa, "\"x\\\""));
     try testing.expectEqual(StringDecode.unknown_escape, try decodeString(gpa, "\"\\q\""));
     try testing.expectEqual(StringDecode.malformed, try decodeString(gpa, "no-quotes"));
+}
+
+test "decodeString: the new escapes enrich strings (\\r \\0 \\' \\xNN \\u{…})" {
+    const gpa = testing.allocator;
+    {
+        // `\r`, `\0`, `\'`, `\x41` each emit their single byte.
+        const r = try decodeString(gpa, "\"\\r\\0\\'\\x41\"");
+        try testing.expectEqualSlices(u8, &[_]u8{ 0x0D, 0x00, '\'', 0x41 }, r.ok);
+        gpa.free(r.ok);
+    }
+    {
+        // `\u{20AC}` UTF-8-encodes to the 3-byte euro sign; `\x80` stays the RAW byte 0x80
+        // (NOT re-encoded), which is the string-vs-char difference.
+        const r = try decodeString(gpa, "\"\\u{20AC}\\x80\"");
+        try testing.expectEqualSlices(u8, &[_]u8{ 0xE2, 0x82, 0xAC, 0x80 }, r.ok);
+        gpa.free(r.ok);
+    }
+    try testing.expectEqual(StringDecode.bad_hex_escape, try decodeString(gpa, "\"\\xZZ\""));
+    try testing.expectEqual(StringDecode.bad_hex_escape, try decodeString(gpa, "\"\\u{}\""));
+    try testing.expectEqual(StringDecode.bad_codepoint, try decodeString(gpa, "\"\\u{D800}\""));
+    try testing.expectEqual(StringDecode.bad_codepoint, try decodeString(gpa, "\"\\u{110000}\""));
+}
+
+test "decodeChar: raw scalars, escapes, and every malformed kind" {
+    // Simple ASCII + the escapes the spec pins.
+    try testing.expectEqual(@as(u32, 65), decodeChar("'A'").ok);
+    try testing.expectEqual(@as(u32, 10), decodeChar("'\\n'").ok);
+    try testing.expectEqual(@as(u32, 9), decodeChar("'\\t'").ok);
+    try testing.expectEqual(@as(u32, 13), decodeChar("'\\r'").ok);
+    try testing.expectEqual(@as(u32, 0), decodeChar("'\\0'").ok);
+    try testing.expectEqual(@as(u32, 92), decodeChar("'\\\\'").ok);
+    try testing.expectEqual(@as(u32, 39), decodeChar("'\\''").ok);
+    try testing.expectEqual(@as(u32, 0x20AC), decodeChar("'\\u{20AC}'").ok);
+    try testing.expectEqual(@as(u32, 65), decodeChar("'\\x41'").ok);
+    // A raw multibyte source codepoint decodes to one scalar (`'€'`).
+    try testing.expectEqual(@as(u32, 0x20AC), decodeChar("'\u{20AC}'").ok);
+
+    // Malformed kinds.
+    try testing.expectEqual(CharDecode.empty, decodeChar("''"));
+    try testing.expectEqual(CharDecode.too_many, decodeChar("'ab'"));
+    try testing.expectEqual(CharDecode.too_many, decodeChar("'\\n\\n'"));
+    try testing.expectEqual(CharDecode.unknown_escape, decodeChar("'\\q'"));
+    try testing.expectEqual(CharDecode.bad_hex_escape, decodeChar("'\\xZZ'"));
+    try testing.expectEqual(CharDecode.bad_codepoint, decodeChar("'\\u{D800}'")); // surrogate
+    try testing.expectEqual(CharDecode.bad_codepoint, decodeChar("'\\u{110000}'")); // > 0x10FFFF
 }
