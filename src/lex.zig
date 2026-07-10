@@ -176,43 +176,37 @@ fn lexNumber(l: *Lexer, start: u32) Token {
     return l.make(.number, start);
 }
 
-fn lexString(l: *Lexer, start: u32) Token {
+/// The single `\`-skip-2 quoted-literal scan shared by strings and chars (the escape
+/// scan that must never drift between the two): consume to the closing `quote`, emitting
+/// `closed_tag`; on a newline (span up to, NOT past, it — a total span from the opening
+/// quote) or EOF before the close, emit `unterm_tag`. Content is NOT validated here — an
+/// empty/multi-codepoint/bad-escape char is `decodeChar`'s decode-time diagnostic, and the
+/// lexer stays total. `\`-skip-2 lets a `'\''`/`"\""` escaped quote and a raw multibyte
+/// `'€'` span to their real closing quote.
+fn lexQuoted(l: *Lexer, start: u32, quote: u8, closed_tag: Tag, unterm_tag: Tag) Token {
     l.index += 1; // opening quote
     while (l.index < l.source.len) {
-        switch (l.source[l.index]) {
-            '\\' => l.index = @min(l.index + 2, @as(u32, @intCast(l.source.len))),
-            '"' => {
-                l.index += 1; // closing quote
-                return l.make(.string, start);
-            },
-            // Unterminated on this line: consume up to (not past) the newline so
-            // the span is total, and keep the start at the opening quote.
-            '\n' => return l.make(.string_unterminated, start),
-            else => l.index += 1,
+        const c = l.source[l.index];
+        if (c == '\\') {
+            l.index = @min(l.index + 2, @as(u32, @intCast(l.source.len)));
+        } else if (c == quote) {
+            l.index += 1; // closing quote
+            return l.make(closed_tag, start);
+        } else if (c == '\n') {
+            return l.make(unterm_tag, start);
+        } else {
+            l.index += 1;
         }
     }
-    return l.make(.string_unterminated, start); // unterminated at EOF
+    return l.make(unterm_tag, start); // unterminated at EOF
 }
 
-/// Lex a char literal `'…'`. The near-twin of `lexString` (same `\`-skip-2 scan) on the
-/// `'` delimiter, so a `'\''` escaped-quote and a raw multibyte `'€'` both span to their
-/// closing quote. Content is NOT validated here (empty / >1 codepoint / bad escape are
-/// `decodeChar`'s decode-time diagnostic); the lexer stays total, emitting only
-/// `char_unterminated` when no closing quote is found on the line.
+fn lexString(l: *Lexer, start: u32) Token {
+    return lexQuoted(l, start, '"', .string, .string_unterminated);
+}
+
 fn lexChar(l: *Lexer, start: u32) Token {
-    l.index += 1; // opening quote
-    while (l.index < l.source.len) {
-        switch (l.source[l.index]) {
-            '\\' => l.index = @min(l.index + 2, @as(u32, @intCast(l.source.len))),
-            '\'' => {
-                l.index += 1; // closing quote
-                return l.make(.char_lit, start);
-            },
-            '\n' => return l.make(.char_unterminated, start),
-            else => l.index += 1,
-        }
-    }
-    return l.make(.char_unterminated, start); // unterminated at EOF
+    return lexQuoted(l, start, '\'', .char_lit, .char_unterminated);
 }
 
 fn lexSymbol(l: *Lexer, start: u32) Token {
