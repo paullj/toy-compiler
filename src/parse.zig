@@ -100,7 +100,7 @@ const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, 
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
-const expr_first = setOf(&.{ .identifier, .number, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .at, .dot, .minus, .bang });
+const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .at, .dot, .minus, .bang });
 /// FIRST(type): an identifier (dot-chained) or the unit type `()`.
 const type_first = setOf(&.{ .identifier, .l_paren });
 /// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
@@ -1644,6 +1644,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             return p.addNode(.{ .tag = .unary, .main_token = at_tok, .lhs = operand, .rhs = Ast.none });
         },
         .number => return p.leaf(.literal_number, at_tok),
+        .float => return p.leaf(.literal_float, at_tok),
         .string => return p.leaf(.literal_string, at_tok),
         .char_lit => return p.leaf(.literal_char, at_tok),
         .kw_true, .kw_false => return p.leaf(.literal_bool, at_tok),
@@ -1911,6 +1912,15 @@ const infix_bp_table = std.enums.directEnumArrayDefault(token.Tag, i16, -1, 0, .
     .star = 10,
     .slash = 10,
     .percent = 10,
+    // Dotted float operators share the binding power of their integer twins.
+    .lt_dot = 7,
+    .gt_dot = 7,
+    .le_dot = 7,
+    .ge_dot = 7,
+    .plus_dot = 9,
+    .minus_dot = 9,
+    .star_dot = 10,
+    .slash_dot = 10,
 });
 
 /// Infix binding power, or null if the tag is not an infix operator. Higher
@@ -1933,6 +1943,9 @@ fn checkInfixTable() ?[]const u8 {
         .lt_lt,     .gt_gt,
         .plus,      .minus,
         .star,      .slash,     .percent,
+        .lt_dot,    .gt_dot,    .le_dot, .ge_dot,
+        .plus_dot,  .minus_dot,
+        .star_dot,  .slash_dot,
     };
     // Every listed operator has a positive bp.
     for (infix_ops) |op| {
@@ -2568,7 +2581,7 @@ test "root is program and children precede parents" {
             .field_init => try testing.expect(n.lhs.int() < self),
             .field_access => try testing.expect(n.lhs.int() < self),
             // Leaves: `main_token` only; no child node indices to order.
-            .literal_number, .literal_string, .literal_bool, .literal_char, .identifier => {},
+            .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier => {},
             // A poison leaf holds only its offending token; no child nodes.
             .error_node => {},
             .enum_decl => {

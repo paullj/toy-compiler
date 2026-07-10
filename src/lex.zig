@@ -113,7 +113,7 @@ fn lexToken(l: *Lexer) Token {
 /// insertion when a newline follows it.
 fn canEndStatement(tag: Tag) bool {
     return switch (tag) {
-        .identifier, .number, .string, .char_lit, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .question => true,
+        .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .question => true,
         else => false,
     };
 }
@@ -173,7 +173,30 @@ fn lexNumber(l: *Lexer, start: u32) Token {
         if (!isDigit(c) and c != '_') break;
         l.index += 1;
     }
-    return l.make(.number, start);
+    var is_float = false;
+    // `prev == .dot` means this number is an integer tuple index (`x.0`/`x.0.1`/
+    // `x.0e1`), never a float — leading-dot floats like `.5` are unsupported.
+    if (l.prev != .dot) {
+        // A '.' is a decimal point only if a digit immediately follows, so `0..5`
+        // (range), `255.into()` (method), and trailing-dot `1000.` stay int + lone '.'.
+        if (l.index + 1 < l.source.len and l.source[l.index] == '.' and isDigit(l.source[l.index + 1])) {
+            is_float = true;
+            l.index += 1; // '.'
+            while (l.index < l.source.len and (isDigit(l.source[l.index]) or l.source[l.index] == '_')) l.index += 1;
+        }
+        // An exponent needs e/E, an optional sign, then >=1 digit — else it is not an
+        // exponent (`1e` stays `number` + ident `e`).
+        if (l.index < l.source.len and (l.source[l.index] == 'e' or l.source[l.index] == 'E')) {
+            var j = l.index + 1;
+            if (j < l.source.len and (l.source[j] == '+' or l.source[j] == '-')) j += 1;
+            if (j < l.source.len and isDigit(l.source[j])) {
+                is_float = true;
+                l.index = j + 1;
+                while (l.index < l.source.len and (isDigit(l.source[l.index]) or l.source[l.index] == '_')) l.index += 1;
+            }
+        }
+    }
+    return l.make(if (is_float) .float else .number, start);
 }
 
 /// The single `\`-skip-2 quoted-literal scan shared by strings and chars (the escape
@@ -225,15 +248,15 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
 
     l.index += 1;
     const tag: Tag = switch (c) {
-        '+' => .plus,
-        '-' => if (l.eat('>')) .arrow else .minus,
-        '*' => .star,
-        '/' => .slash,
+        '+' => if (l.eat('.')) .plus_dot else .plus,
+        '-' => if (l.eat('>')) .arrow else if (l.eat('.')) .minus_dot else .minus,
+        '*' => if (l.eat('.')) .star_dot else .star,
+        '/' => if (l.eat('.')) .slash_dot else .slash,
         '%' => .percent,
         '=' => if (l.eat('=')) .eq_eq else .eq,
         '!' => if (l.eat('=')) .bang_eq else .bang,
-        '<' => if (l.eat('<')) .lt_lt else if (l.eat('=')) .lt_eq else .lt,
-        '>' => if (l.eat('>')) .gt_gt else if (l.eat('=')) .gt_eq else .gt,
+        '<' => if (l.eat('<')) .lt_lt else if (l.eat('=')) (if (l.eat('.')) .le_dot else .lt_eq) else if (l.eat('.')) .lt_dot else .lt,
+        '>' => if (l.eat('>')) .gt_gt else if (l.eat('=')) (if (l.eat('.')) .ge_dot else .gt_eq) else if (l.eat('.')) .gt_dot else .gt,
         '&' => if (l.eat('&')) .amp_amp else .amp,
         '^' => .caret,
         '~' => .tilde,

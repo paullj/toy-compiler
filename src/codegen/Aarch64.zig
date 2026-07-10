@@ -319,6 +319,8 @@ pub const Cond = enum(u4) {
     ne = 0x1, // not equal (Z==0)
     hs = 0x2, // unsigned >=
     lo = 0x3, // unsigned <
+    mi = 0x4, // N==1 (float <: unordered→false, NOT `lt` which is unordered→true)
+    pl = 0x5, // N==0 (the inverse of `mi`)
     hi = 0x8, // unsigned >
     ls = 0x9, // unsigned <=
     ge = 0xA, // signed >=
@@ -342,6 +344,8 @@ pub fn invert(c: Cond) Cond {
         .hs => .lo,
         .hi => .ls,
         .ls => .hi,
+        .mi => .pl,
+        .pl => .mi,
     };
 }
 
@@ -446,10 +450,74 @@ inline fn writeWord(out: []u8, len: *usize, word: u32) void {
     len.* += 4;
 }
 
+// Scalar double-precision FP. D-registers are the SIMD&FP file (0..31); codegen
+// uses D16/D17 (caller-saved scratch). fadd/fsub/fmul/fdiv/fcmp are the
+// double-precision floating-point data-processing forms (type field = 01). Each
+// word assembler-verified on this host (`as -arch arm64` + `objdump -d`), same
+// protocol as the integer encoders above.
+
+/// fadd dd, dn, dm — double add. fadd d16,d16,d17 → 0x1E712A10.
+pub fn fadd(dd: u32, dn: u32, dm: u32) u32 {
+    return 0x1E602800 | (dm << 16) | (dn << 5) | dd;
+}
+
+/// fsub dd, dn, dm — double subtract. fsub d16,d16,d17 → 0x1E713A10.
+pub fn fsub(dd: u32, dn: u32, dm: u32) u32 {
+    return 0x1E603800 | (dm << 16) | (dn << 5) | dd;
+}
+
+/// fmul dd, dn, dm — double multiply. fmul d16,d16,d17 → 0x1E710A10.
+pub fn fmul(dd: u32, dn: u32, dm: u32) u32 {
+    return 0x1E600800 | (dm << 16) | (dn << 5) | dd;
+}
+
+/// fdiv dd, dn, dm — double divide (IEEE: /0 → ±inf/NaN, no trap). fdiv
+/// d16,d16,d17 → 0x1E711A10.
+pub fn fdiv(dd: u32, dn: u32, dm: u32) u32 {
+    return 0x1E601800 | (dm << 16) | (dn << 5) | dd;
+}
+
+/// fcmp dn, dm — double compare, sets NZCV (unordered → C=1,V=1). fcmp d16,d17 →
+/// 0x1E712200.
+pub fn fcmp(dn: u32, dm: u32) u32 {
+    return 0x1E602000 | (dm << 16) | (dn << 5);
+}
+
+/// ldr dt, [sp, #byteOff] — 64-bit FP load; byteOff a multiple of 8 (scaled
+/// imm12). ldr d16,[sp,#8] → 0xFD4007F0.
+pub fn ldrFpSp(dt: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    return 0xFD400000 | ((byteOff / 8) << 10) | (SP << 5) | dt;
+}
+
+/// str dt, [sp, #byteOff] — 64-bit FP store; byteOff a multiple of 8. str
+/// d16,[sp,#8] → 0xFD0007F0.
+pub fn strFpSp(dt: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0);
+    return 0xFD000000 | ((byteOff / 8) << 10) | (SP << 5) | dt;
+}
+
 // Tests — each expected word is the objdump hex for the matching mnemonic,
 // assembled on this host with `as -arch arm64` (see the file doc comment).
 
 const testing = std.testing;
+
+test "fp encoders" {
+    // Each expected word is the objdump hex for the matching mnemonic assembled on
+    // this host: write to `/tmp/x.s`, `as -arch arm64 -o /tmp/x.o /tmp/x.s`,
+    // `objdump -d /tmp/x.o` — the disassembly's hex column is the ground truth.
+    try testing.expectEqual(@as(u32, 0x1E712A10), fadd(16, 16, 17)); // fadd d16,d16,d17
+    try testing.expectEqual(@as(u32, 0x1E713A10), fsub(16, 16, 17)); // fsub d16,d16,d17
+    try testing.expectEqual(@as(u32, 0x1E710A10), fmul(16, 16, 17)); // fmul d16,d16,d17
+    try testing.expectEqual(@as(u32, 0x1E711A10), fdiv(16, 16, 17)); // fdiv d16,d16,d17
+    try testing.expectEqual(@as(u32, 0x1E712200), fcmp(16, 17)); // fcmp d16,d17
+    try testing.expectEqual(@as(u32, 0xFD4007F0), ldrFpSp(16, 8)); // ldr d16,[sp,#8]
+    try testing.expectEqual(@as(u32, 0xFD0007F0), strFpSp(16, 8)); // str d16,[sp,#8]
+    try testing.expectEqual(@as(u32, 0x9A9F57E0), cset(0, .mi)); // cset x0,mi
+    try testing.expectEqual(@as(u32, 0x9A9F47E0), cset(0, .pl)); // cset x0,pl
+    try testing.expectEqual(Cond.pl, invert(.mi));
+    try testing.expectEqual(Cond.mi, invert(.pl));
+}
 
 test "move-wide immediates" {
     try testing.expectEqual(@as(u32, 0xD2800500), movz(0, 40, 0)); // movz x0,#40

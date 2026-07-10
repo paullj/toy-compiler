@@ -30,7 +30,7 @@ const std = @import("std");
 /// `Layout` registered on the live tables) during the serial monomorphization tail,
 /// BEFORE the layout snapshot, so codegen/fingerprint/cache see only plain `structT`
 /// and an `app` never reaches lower/codegen (Debug-asserted there).
-pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app };
+pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app, float };
 
 /// The width class of an integer type. `plat` is the platform-word `int`/`uint`
 /// (currently 64-bit); the numbered classes are the fixed-width `int8..int64`.
@@ -68,6 +68,7 @@ pub const Type = struct {
     pub const @"bool": Type = .{ .kind = .bool };
     pub const str: Type = .{ .kind = .str };
     pub const never: Type = .{ .kind = .never };
+    pub const float: Type = .{ .kind = .float };
 
     pub const uint: Type = .{ .kind = .int, .int_desc = .{ .signed = false } };
     pub const int8: Type = .{ .kind = .int, .int_desc = .{ .width = .w8 } };
@@ -127,7 +128,7 @@ pub const Type = struct {
         return switch (kind) {
             .@"struct", .type_var, .app => .struct_id,
             .@"enum" => .enum_id,
-            .invalid, .unit, .int, .bool, .str, .never => .none,
+            .invalid, .unit, .int, .bool, .str, .never, .float => .none,
         };
     }
 
@@ -183,6 +184,14 @@ pub const Type = struct {
 
     pub fn isInteger(t: Type) bool {
         return t.kind == .int;
+    }
+
+    pub fn isFloat(t: Type) bool {
+        return t.kind == .float;
+    }
+
+    pub fn isNumeric(t: Type) bool {
+        return t.kind == .int or t.kind == .float;
     }
 
     pub fn isSigned(t: Type) bool {
@@ -346,7 +355,7 @@ test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
         Type.int,       Type.uint,       Type.int8,       Type.int16,      Type.int32,
         Type.int64,     Type.uint8,      Type.uint16,     Type.uint32,     Type.uint64,
         Type.structT(0), Type.structT(1), Type.enumT(0),  Type.enumT(1),   Type.typeVar(0),
-        Type.typeVar(1), Type.app(0),     Type.app(1),
+        Type.typeVar(1), Type.app(0),     Type.app(1),     Type.float,
     };
     for (canon) |a| {
         for (canon) |b| {
@@ -359,6 +368,19 @@ test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
             try testing.expectEqual(Type.eql(a, b), std.mem.eql(u8, ka.items, kb.items));
         }
     }
+}
+
+test "algebra: float is a distinct nominal-id-free type" {
+    try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
+    try testing.expect(Type.float.isFloat());
+    try testing.expect(Type.float.isNumeric());
+    try testing.expect(Type.int.isNumeric());
+    try testing.expect(!Type.float.isInteger());
+    try testing.expect(!Type.bool.isNumeric());
+    // float carries no int descriptor and no nominal id; distinct from int.
+    try testing.expect(!Type.eql(Type.float, Type.int));
+    try testing.expect(Type.eql(Type.float, Type.float));
+    try testing.expectEqual(IdField.none, Type.idField(.float));
 }
 
 test "algebra: integer widths are distinct byte-foldable types" {

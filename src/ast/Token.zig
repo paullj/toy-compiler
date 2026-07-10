@@ -192,6 +192,23 @@ pub const Tag = enum(u8) {
     /// `string_unterminated`: the span starts at the opening quote and covers what was
     /// consumed, so a caret can point at it. An error token (`isError`).
     char_unterminated,
+
+    // Float literals + dotted float operators. Appended at the END (frozen ordinals;
+    // `[]Token` is memcpy'd to/from the content cache). NOT keywords. The dotted
+    // operators (`+.` etc.) keep float arithmetic/comparison lexically distinct from
+    // the integer/protocol operators, so a float op is never a protocol desugar.
+
+    /// A decimal float literal `3.0`/`1e3`/`1.5e-2` (fraction and/or exponent). A
+    /// number followed by an integer tuple index (`x.0`) is NOT a float.
+    float,
+    plus_dot, // +.
+    minus_dot, // -.
+    star_dot, // *.
+    slash_dot, // /.
+    lt_dot, // <.
+    gt_dot, // >.
+    le_dot, // <=.
+    ge_dot, // >=.
 };
 
 /// Maps identifier text to its keyword tag, if any.

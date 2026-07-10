@@ -1,0 +1,9 @@
+# The FP backend: f64 locals, Gleam dotted operators, and a float compare, all in
+# V-registers. Only the int exit code crosses out of the function.
+# expect: exit 42
+fn main() -> int {
+    x := 3.0
+    y := 4.0
+    z := x *. y +. 30.0                       # 12.0 +. 30.0 = 42.0
+    return if z >. 41.0 { 42 } else { 0 }
+}
