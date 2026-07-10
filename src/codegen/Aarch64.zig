@@ -425,6 +425,12 @@ pub const ret: u32 = 0xD65F03C0;
 /// other trap primitive exists on this backend. → 0xD4200000.
 pub const brk0: u32 = 0xD4200000;
 
+/// svc #0x80 — the macOS/XNU supervisor-call gate. XNU takes the syscall number
+/// from x16 (the immediate is ignored) and args from x0..; #0x80 is the BSD
+/// convention. SVC = 0xD4000001 | (imm16<<5); 0x80<<5 = 0x1000 -> 0xD4001001. The
+/// panic exit path issues `movz x0,#1; movz x16,#1 (SYS_exit); svc #0x80`.
+pub const svc0x80: u32 = 0xD4001001;
+
 /// Materialize an arbitrary i64 `value` into register `rd` using the minimal
 /// movz + movk sequence, writing the words (little-endian) into `out` starting
 /// at `*len` and advancing it. At most 4 words. value 0 → a single
@@ -618,6 +624,7 @@ test "branch/system and frame constants" {
     try testing.expectEqual(@as(u32, 0xA8C17BFD), ldpFpLrPost);
     try testing.expectEqual(@as(u32, 0xD65F03C0), ret);
     try testing.expectEqual(@as(u32, 0xD4200000), brk0); // brk #0
+    try testing.expectEqual(@as(u32, 0xD4001001), svc0x80); // svc #0x80
 }
 
 test "pc-relative data addressing + indirect call" {

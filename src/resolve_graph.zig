@@ -304,6 +304,22 @@ fn collectGlobals(g: *GraphResolve) !void {
     for (g.tables) |*t| {
         if (!t.fns.contains("print")) try t.fns.put(g.gpa, "print", print_id);
     }
+    // Seed the shared synthetic `panic` builtin, appended AFTER `print` so every
+    // existing fn id (incl. `print_id`) is unchanged (no fingerprint / incremental
+    // churn). Bodyless, not pub; `kind = .builtin`. Its FnCode is hand-emitted at link
+    // time (CodegenIr.lowerPanic) and referenced by name "panic" from both a user
+    // `panic(<str>)` call and the div/mod/unwrap-trap retrofit.
+    const panic_id: u32 = @intCast(g.fns.items.len);
+    try g.fns.append(g.gpa, .{
+        .name = try g.gpa.dupe(u8, "panic"),
+        .module = entry,
+        .decl_node = Ast.none,
+        .kind = .builtin,
+        .is_pub = false,
+    });
+    for (g.tables) |*t| {
+        if (!t.fns.contains("panic")) try t.fns.put(g.gpa, "panic", panic_id);
+    }
     // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) are nameable
     // in every module with no import (the `print` precedent). Register each into a module's enum
     // table UNLESS the module declares its own (user-first-wins), so their construction/match

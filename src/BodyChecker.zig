@@ -1672,6 +1672,17 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
+            // `panic(msg)`: the message must be a `str` (it lowers to a raw {ptr,len}
+            // write; a non-str arg would be marshalled per its own ABI and misread).
+            // Unlike `print` (any Display), panic is str-only. Discriminate by the callee
+            // token — the Model fn carries no name. Type the call `.unit` regardless so a
+            // bad arg reports exactly once without cascading.
+            if (callee.tag == .identifier and std.mem.eql(u8, bc.nameText(callee.main_token), "panic")) {
+                if (at.kind != .str)
+                    try bc.sink.emitFmt(bc.byteOf(at_tok), "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
+                bc.node_types[(node_idx).int()] = Type.unit;
+                return Type.unit;
+            }
             if (try bc.conformsTo(at, bc.model.preludeProtocols().display, true)) {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;

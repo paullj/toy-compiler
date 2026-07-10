@@ -306,6 +306,21 @@ fn spawnBinaryTerm(gpa: std.mem.Allocator, io: Io, abs_path: []const u8) !std.pr
     return child.wait(io);
 }
 
+const BinTermErr = struct { term: std.process.Child.Term, stderr: []u8 };
+/// Like `spawnBinaryTerm` but ALSO captures the child's STDERR (fd 2). Drains stdout
+/// (discarded) so a program that also prints cannot deadlock on a full pipe; the panic
+/// fixtures print nothing, so their tiny stderr never blocks. Caller frees `.stderr`. A
+/// clean `exit(1)` panic surfaces as `Term.exited{1}` with the message on `.stderr`.
+fn spawnBinaryTermStderr(gpa: std.mem.Allocator, io: Io, abs_path: []const u8) !BinTermErr {
+    var child = try std.process.spawn(io, .{ .argv = &.{abs_path}, .stdout = .pipe, .stderr = .pipe });
+    var out = child.stdout.?.readerStreaming(io, &.{});
+    const out_bytes = try out.interface.allocRemaining(gpa, .limited(1 << 16));
+    gpa.free(out_bytes);
+    var errr = child.stderr.?.readerStreaming(io, &.{});
+    const err_bytes = try errr.interface.allocRemaining(gpa, .limited(1 << 16));
+    return .{ .term = try child.wait(io), .stderr = err_bytes };
+}
+
 test "differential: the real `toy check` and `toy build` exit codes AGREE on the three fixtures" {
     // The literal CLI differential: spawn both subcommands and compare exit codes.
     // `build` runs codegen, so it needs macOS + the built binary; skip cleanly
@@ -430,11 +445,12 @@ test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 
     }
 }
 
-test "div/mod by zero aborts (SIGILL) at BOTH -O0 and -O1; nonzero controls exit normally" {
-    // The panic has no `# expect:` corpus channel, and `toy run` cooks SIGILL into a
-    // clean 128+signo, so this builds each fixture and spawns the BUILT BINARY
-    // directly. The -O1 abort legs are the SOLE proof that fold's const-0 skip held
-    // (that -O1 did not fold `/0`/`%0` to a value and erase the panic).
+test "panic: div/mod/unwrap traps + user panic() write to STDERR and exit nonzero at BOTH -O levels; nonzero controls exit normally" {
+    // `__panic` writes the message to fd 2 then SYS_exit(1) — a clean nonzero exit,
+    // no longer a SIGILL/brk. The -O1 legs are the SOLE proof fold's const-0 skip held
+    // (that -O1 did not fold `/0`/`%0` to a value and erase the panic). The control legs
+    // (nonzero divisor) run to their normal exit — their panic block is now `bl panic`
+    // but never reached (or DCE'd at -O1 for the const divisor).
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -443,10 +459,12 @@ test "div/mod by zero aborts (SIGILL) at BOTH -O0 and -O1; nonzero controls exit
     Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
 
     const fixtures = .{
-        .{ .dir = ".toy-test-m5-div0", .src = "fn main() -> int { return 10 / 0 }\n", .want = @as(?u8, null) },
-        .{ .dir = ".toy-test-m5-mod0", .src = "fn main() -> int { return 10 % 0 }\n", .want = @as(?u8, null) },
-        .{ .dir = ".toy-test-m5-ctldiv", .src = "fn main() -> int { return 10 / 3 }\n", .want = @as(?u8, 3) },
-        .{ .dir = ".toy-test-m5-ctlmod", .src = "fn main() -> int { return 17 % 5 }\n", .want = @as(?u8, 2) },
+        .{ .dir = ".toy-test-panic-div0", .src = "fn main() -> int { return 10 / 0 }\n", .want = @as(?u8, 1), .err = "division by zero" },
+        .{ .dir = ".toy-test-panic-mod0", .src = "fn main() -> int { return 10 % 0 }\n", .want = @as(?u8, 1), .err = "remainder by zero" },
+        .{ .dir = ".toy-test-panic-unwrap", .src = "fn main() -> int {\n  x := Option[int].none\n  return x.unwrap()\n}\n", .want = @as(?u8, 1), .err = "unwrap of empty" },
+        .{ .dir = ".toy-test-panic-user", .src = "fn main() -> int {\n  panic(\"boom\")\n  return 0\n}\n", .want = @as(?u8, 1), .err = "boom" },
+        .{ .dir = ".toy-test-panic-ctldiv", .src = "fn main() -> int { return 10 / 3 }\n", .want = @as(?u8, 3), .err = "" },
+        .{ .dir = ".toy-test-panic-ctlmod", .src = "fn main() -> int { return 17 % 5 }\n", .want = @as(?u8, 2), .err = "" },
     };
     inline for (fixtures) |fx| {
         defer Io.Dir.cwd().deleteTree(io, fx.dir) catch {};
@@ -456,8 +474,10 @@ test "div/mod by zero aborts (SIGILL) at BOTH -O0 and -O1; nonzero controls exit
             try testing.expectEqual(@as(?u8, 0), exitCode(bld)); // compiled cleanly
             const abs = try Io.Dir.cwd().realPathFileAlloc(io, fx.dir ++ "/prog" ++ lvl, gpa);
             defer gpa.free(abs);
-            const term = try spawnBinaryTerm(gpa, io, abs);
-            try testing.expectEqual(fx.want, exitCode(term)); // null == aborted; N == clean exit N
+            const r = try spawnBinaryTermStderr(gpa, io, abs);
+            defer gpa.free(r.stderr);
+            try testing.expectEqual(fx.want, exitCode(r.term)); // clean nonzero exit (1), not a signal
+            if (fx.err.len > 0) try testing.expect(std.mem.indexOf(u8, r.stderr, fx.err) != null);
         }
     }
 }
