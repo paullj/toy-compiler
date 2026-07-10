@@ -102,6 +102,41 @@ fn writeFixture(io: Io, comptime dir_name: []const u8, files: []const [2][]const
     }
 }
 
+test "type-alias privacy: `type S = mod.Private` does not launder a non-pub cross-module type" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Aliasing a NON-pub struct must be rejected exactly as a direct `geom.Secret`
+    // reference is (R0005) — the alias target is resolved through the same
+    // export-visibility check, not laundered past it.
+    {
+        const dir = ".toy-test-alias-privacy";
+        try writeFixture(io, dir, &.{
+            .{ "geom.toy", "struct Secret { x: int }\npub fn ping() -> int { return 1 }\n" },
+            .{ "main.toy", "import geom\ntype S = geom.Secret\nfn describe(s: S) -> int { return s.x }\nfn main() -> int { return geom.ping() }\n" },
+        });
+        defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const outcome = try checkEntry(gpa, io, dir ++ "/main.toy");
+        try testing.expect(!outcome.structural);
+        try testing.expect(outcome.errors >= 1);
+    }
+
+    // Control: aliasing a `pub` struct is clean — the fix must not over-reject.
+    {
+        const dir = ".toy-test-alias-privacy-ok";
+        try writeFixture(io, dir, &.{
+            .{ "geom.toy", "pub struct Rect { w: int, h: int }\npub fn ping() -> int { return 1 }\n" },
+            .{ "main.toy", "import geom\ntype R = geom.Rect\nfn takes(r: R) -> int { return 0 }\nfn main() -> int { return geom.ping() }\n" },
+        });
+        defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+        const outcome = try checkEntry(gpa, io, dir ++ "/main.toy");
+        try testing.expect(!outcome.structural);
+        try testing.expectEqual(@as(usize, 0), outcome.errors);
+    }
+}
+
 test "differential: check agrees with build in-process (single-file + multi-module valid + imported-module error)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
