@@ -1,0 +1,8 @@
+# A float RETURN feeding another float op: id returns via v0, the caller reads v0
+# and adds to it.
+# expect: exit 42
+fn id(x: float) -> float { x }
+fn main() -> int {
+    r := id(2.5) +. 0.5                       # 3.0
+    return if r == 3.0 { 42 } else { 0 }
+}

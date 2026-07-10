@@ -1,0 +1,6 @@
+# expect: exit 42
+fn scale(a: float, b: float) -> float { a *. b }
+fn main() -> int {
+    r := scale(6.0, 7.0)                      # 42.0 via v0/v1 params + v0 return
+    return if r >. 41.0 { 42 } else { 0 }
+}

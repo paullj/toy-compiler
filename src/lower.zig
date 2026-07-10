@@ -1803,7 +1803,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     // Result placement: scalar → an Instr.result value; aggregate → a fresh
     // ret_slot; unit → neither. The ABI (reg vs sret) is decided in codegen.
     switch (result_ty.kind) {
-        .int, .bool => {
+        .int, .bool, .float => {
             const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, result_ty);
             return .{ .value = v };
         },

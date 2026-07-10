@@ -50,6 +50,12 @@ const S2: u32 = 11;
 const D0: u32 = 16;
 const D1: u32 = 17;
 
+// The float ARGUMENT/RESULT V-registers are the low physical D-registers v0..v7
+// (raw indices 0..7), a separate index space from the D16/D17 scratch above.
+// `ldrFpSp`/`strFpSp` encode the raw physical D-number, so arg regs pass 0..7
+// and a float result rides v0 — never colliding with the arith scratch.
+const V0: u32 = 0;
+
 const LabelId = u32;
 const UNPLACED: u32 = std.math.maxInt(u32);
 const BranchWidth = enum { imm19, imm26 };
@@ -300,6 +306,11 @@ fn marshalParams(g: *Gen) error{OutOfMemory}!void {
                 while (k < r.count) : (k += 1) {
                     try g.emit(Aarch64.strSp(r.first + k, off + k * 8));
                 }
+            },
+            .fpr => |v| {
+                // An incoming bare float in v`v` (a D-register): store it into the
+                // slot's 8-byte cell.
+                try g.emit(Aarch64.strFpSp(v, off));
             },
             .gpr_ptr => |r| {
                 // An indirect (>16B) aggregate: r holds a pointer to the caller's
@@ -640,6 +651,17 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
                     .none => {},
                 }
             },
+            .fpr => |v| {
+                // An outgoing bare float → load its frame cell into arg V-reg v`v`.
+                // A separate register file from the GPR targets, so it can't clobber
+                // any x0..x7 arg in this single left-to-right pass.
+                const off: u32 = switch (arg) {
+                    .value => |vv| g.valueOff(vv),
+                    .slot => |s| g.slotOff(s),
+                    .none => continue,
+                };
+                try g.emit(Aarch64.ldrFpSp(v, off));
+            },
             .gpr_ptr => |r| {
                 // Indirect (>16B) aggregate: pass a pointer to its frame cell
                 // (slot, or an in-place value cell for a merge value).
@@ -701,6 +723,7 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     // An sret result was already written through x8 by the callee. Unit: none.
     switch (Abi.classifyRet(ret_ty, g.layouts, g.enum_layouts)) {
         .none => {},
+        .fp_reg => try g.storeFpValue(V0, result), // float result in v0 → its value cell.
         .reg => |r| {
             if (c.ret_slot != Ir.none_slot) {
                 // Aggregate reg-pair result → store x0[,x1] into the slot.
@@ -819,6 +842,15 @@ fn placeReturn(g: *Gen, o: Ir.Operand) error{OutOfMemory}!void {
             while (k < r.regs) : (k += 1) {
                 try g.emit(Aarch64.ldrSp(@intCast(k), off + k * 8));
             }
+        },
+        .fp_reg => {
+            // A bare float result: load the return operand's cell into v0.
+            const off: u32 = switch (o) {
+                .value => |v| g.valueOff(v),
+                .slot => |s| g.slotOff(s),
+                .none => return,
+            };
+            try g.emit(Aarch64.ldrFpSp(V0, off));
         },
         .sret => {
             // Large aggregate: copy the result bytes through the saved x8 buffer.
