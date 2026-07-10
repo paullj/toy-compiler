@@ -32,7 +32,7 @@ fn eachInstrUseOperand(op: *Ir.Op, ctx: anytype, comptime each: anytype) void {
             each(ctx, &bin.lhs);
             each(ctx, &bin.rhs);
         },
-        .neg, .bnot, .get_tag, .load_byte, .bcompl => |*v| each(ctx, v),
+        .neg, .bnot, .get_tag, .load_byte, .bcompl, .scvtf, .fcvtzs => |*v| each(ctx, v),
         .icmp => |*c| {
             each(ctx, &c.lhs);
             each(ctx, &c.rhs);
@@ -164,7 +164,7 @@ const testing = std.testing;
 /// takes a literal `none_value` operand to pin `none_value` routing. `values`/
 /// `slots` are left empty: the walk never dereferences them.
 fn buildUseFixture(a: std.mem.Allocator) !Ir.Function {
-    var instrs = try a.alloc(Ir.Instr, 29);
+    var instrs = try a.alloc(Ir.Instr, 31);
     instrs[0] = .{ .result = 100, .op = .{ .add = .{ .lhs = 1, .rhs = 2 } } };
     instrs[1] = .{ .result = 101, .op = .{ .sub = .{ .lhs = 3, .rhs = 4 } } };
     instrs[2] = .{ .result = 102, .op = .{ .mul = .{ .lhs = 5, .rhs = 6 } } };
@@ -204,6 +204,8 @@ fn buildUseFixture(a: std.mem.Allocator) !Ir.Function {
     instrs[26] = .{ .result = 123, .op = .{ .bcompl = 52 } };
     instrs[27] = .{ .result = 124, .op = .{ .smod = .{ .lhs = 53, .rhs = 54 } } };
     instrs[28] = .{ .result = 125, .op = .{ .umod = .{ .lhs = 55, .rhs = 56 } } };
+    instrs[29] = .{ .result = 126, .op = .{ .scvtf = 57 } };
+    instrs[30] = .{ .result = 127, .op = .{ .fcvtzs = 58 } };
 
     var br_args = try a.alloc(Ir.Operand, 3);
     br_args[0] = .{ .value = 30 };
@@ -246,6 +248,7 @@ const expected_uses = [_]Ir.ValueId{
     46, 47, 48, 49, 50, 51, // shl/lshr/ashr
     52, // bcompl
     53, 54, 55, 56, // smod/umod
+    57, 58, // scvtf, fcvtzs
     30, // br arg (slot + none skipped)
     31, // cond_br cond
     32, // ret value

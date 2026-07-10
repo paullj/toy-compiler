@@ -1,0 +1,8 @@
+# expect: exit 42
+fn main() -> int {
+    n := 7
+    f: float = n.into()                       # int -> float, lossless (scvtf) -> 7.0
+    g := f *. 6.0                             # 42.0
+    m: int = g.try_into().unwrap()            # float -> int, fallible; 42.0 in range -> Ok(42)
+    return if m == 42 { 42 } else { 0 }
+}

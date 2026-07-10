@@ -1,0 +1,8 @@
+# fcvtzs truncates toward zero: 2.9 -> 2, -2.9 -> -2.
+# expect: exit 42
+fn main() -> int {
+    a: int = (2.9).try_into().unwrap()
+    neg := 0.0 -. 2.9
+    b: int = neg.try_into().unwrap()
+    return if a == 2 { if b == (0 - 2) { 42 } else { 1 } } else { 3 }
+}

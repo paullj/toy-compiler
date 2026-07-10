@@ -165,6 +165,11 @@ pub const Op = union(enum) {
     fdiv: Bin,
     /// Float comparison → bool value. NaN-safe cond mapping lives in codegen.
     fcmp: struct { cc: FCond, lhs: ValueId, rhs: ValueId },
+    /// Signed i64 value → f64 value (SCVTF). Lossless in range; rounds |x|>2^53 to nearest. Pure.
+    scvtf: ValueId,
+    /// f64 value → signed i64 value, truncating toward zero (FCVTZS). Pure. Emitted ONLY inside the
+    /// range-guarded float→int witness, so the hardware saturation is never observable.
+    fcvtzs: ValueId,
 };
 
 /// One instruction: an op plus its result value id (`none_value` when the op
@@ -474,6 +479,8 @@ fn renderInstr(
         .fmul => |b| try out.print("fmul %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .fdiv => |b| try out.print("fdiv %{d}, %{d}\n", .{ b.lhs, b.rhs }),
         .fcmp => |c| try out.print("fcmp {s} %{d}, %{d}\n", .{ fcondName(c.cc), c.lhs, c.rhs }),
+        .scvtf => |v| try out.print("scvtf %{d}\n", .{v}),
+        .fcvtzs => |v| try out.print("fcvtzs %{d}\n", .{v}),
     }
 }
 
@@ -649,6 +656,48 @@ test "render: float const/arith/compare render deterministically (hex fconst)" {
         "  %2 = fadd %0, %1\n" ++
         "  %3 = fcmp gt %2, %0\n" ++
         "  ret %3\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(want, w.buffered());
+}
+
+test "render: scvtf/fcvtzs render deterministically" {
+    const gpa = std.testing.allocator;
+
+    var values = try gpa.alloc(ValueDef, 3);
+    values[0] = .{ .type = Type.int };
+    values[1] = .{ .type = Type.float };
+    values[2] = .{ .type = Type.int };
+
+    var instrs = try gpa.alloc(Instr, 2);
+    instrs[0] = .{ .result = 1, .op = .{ .scvtf = 0 } };
+    instrs[1] = .{ .result = 2, .op = .{ .fcvtzs = 1 } };
+
+    var blocks = try gpa.alloc(Block, 1);
+    blocks[0] = .{ .params = try gpa.alloc(ValueId, 0), .instrs = instrs, .term = .{ .ret = .{ .value = 2 } } };
+
+    var func = Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(SlotId, 0),
+        .ret_type = Type.int,
+        .slots = try gpa.alloc(Slot, 0),
+        .values = values,
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+    };
+    defer func.deinit(gpa);
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try render(&w, &func, &.{}, &.{});
+
+    const want =
+        "fn f() -> int {\n" ++
+        "  slots:\n" ++
+        "b0:\n" ++
+        "  %1 = scvtf %0\n" ++
+        "  %2 = fcvtzs %1\n" ++
+        "  ret %2\n" ++
         "}\n";
     try std.testing.expectEqualStrings(want, w.buffered());
 }

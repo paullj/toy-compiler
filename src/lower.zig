@@ -1983,7 +1983,7 @@ fn builtinConvCallee(b: *Builder, n: Ast.Node) ?ConvCall {
     const cn = b.in.tree.nodes[(n.lhs).int()];
     if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
     const recv_ty = b.in.node_types[(cn.lhs).int()];
-    if (!recv_ty.isInteger() and !isCharTy(b, recv_ty)) return null;
+    if (!recv_ty.isInteger() and !isCharTy(b, recv_ty) and recv_ty.kind != .float) return null;
     const member = b.in.tokens[cn.main_token].text(b.in.source);
     if (!std.mem.eql(u8, member, "into") and !std.mem.eql(u8, member, "try_into")) return null;
     if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
@@ -2162,6 +2162,11 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
             return .{ .value = try recanonToWidth(b, v, Typecheck.Type.uint32) };
         }
         const into_ty = b.in.node_types[(node_idx).int()];
+        if (into_ty.kind == .float) {
+            // int -> float: lossless single scvtf. No Result, no witness, no slot.
+            const v = operandValue(try lowerExpr(b, cv.recv));
+            return .{ .value = try b.emit(.{ .scvtf = v }, Typecheck.Type.float) };
+        }
         if (isCharTy(b, into_ty)) {
             // byte -> char: construct `char{0: byte}` (a byte is always a valid scalar).
             const v = operandValue(try lowerExpr(b, cv.recv));
@@ -2186,6 +2191,10 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     // overflowed the imm12 frame cap. Emit each as ONE shared witness and CALL it (O(1)/site).
     if (to_char) return convCallWitness(b, .conv_int_char, v, call_ty);
     if (recv_is_char) return convCallWitness(b, .conv_char_byte, v, call_ty);
+
+    // float -> int: the shared program-global witness (O(1) frame/site — never inlined).
+    // `v` is the raw f64 value cell; convCallWitness passes it as a float arg -> v0.
+    if (recv_ty.kind == .float) return convCallWitness(b, .conv_float_int, v, call_ty);
 
     // int→int narrow: a per-(width,signedness) family — no single program-global
     // witness — so it stays inline (see derive_synth: only the 2 char cases become recipes).

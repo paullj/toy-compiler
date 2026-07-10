@@ -372,6 +372,7 @@ pub fn lower(
         .display => lowerDeriveDisplay(gpa, in, d, sym, out_diags),
         .conv_int_char => lowerConvIntChar(gpa, in, d, sym, out_diags),
         .conv_char_byte => lowerConvCharByte(gpa, in, d, sym, out_diags),
+        .conv_float_int => lowerConvFloatInt(gpa, in, d, sym, out_diags),
     };
 }
 
@@ -466,6 +467,65 @@ fn lowerConvCharByte(
     const join = try b.addBlock();
     b.setTerm(.{ .cond_br = .{ .cond = fits, .t = ok_blk, .f = err_blk } });
     try L.emitConvResultTail(&b, e, base, ok_blk, err_blk, join, masked, Typecheck.Type.uint8);
+    b.switchTo(join);
+    try L.brTo(&b, exit, .{ .slot = slot });
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
+/// Lower the SOURCE-LESS `float -> int` fallible-conversion witness:
+/// `float_to_int(float) -> Result[int, ConvErr]`. Reads the f64 param, then Ok(trunc-toward-zero)
+/// iff `-2^63 <= f < 2^63` else Err. fcvtzs SATURATES on NaN/+-inf/out-of-range, but the ruling
+/// wants Err — so the fcmp range check runs first. `.ge`/`.lt` are NaN-safe (false on unordered),
+/// so NaN and +-inf fall to Err; an explicit `f != f` is redundant and deliberately omitted. The
+/// strict `< 2^63` excludes the exactly-representable 2^63 (whose fcvtzs would saturate to i64_max).
+fn lowerConvFloatInt(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const float_ty = Typecheck.Type.float;
+    const bool_ty = Typecheck.Type.@"bool";
+    const ret = d.ret; // Result[int, ConvErr]
+
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = ret, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_v = try b.addSlot(float_ty); // float param -> v0 via the fp ABI
+    try params.append(gpa, p_v);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, ret);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const e = b.in.enum_layouts[ret.enum_id];
+    const vbase = try b.emit(.{ .slot_addr = p_v }, int_ty);
+    const f = try b.emit(.{ .load = .{ .addr = vbase, .ty = float_ty } }, float_ty);
+    const slot = try b.addSlot(ret);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+
+    const lo = try b.emit(.{ .fconst = -0x1p63 }, float_ty); // -2^63 exactly (0xC3E0000000000000)
+    const hi = try b.emit(.{ .fconst = 0x1p63 }, float_ty); // +2^63 exactly (0x43E0000000000000)
+    const ge_lo = try b.emit(.{ .fcmp = .{ .cc = .ge, .lhs = f, .rhs = lo } }, bool_ty);
+    const lt_hi = try b.emit(.{ .fcmp = .{ .cc = .lt, .lhs = f, .rhs = hi } }, bool_ty);
+    const in_range = try b.emit(.{ .mul = .{ .lhs = ge_lo, .rhs = lt_hi } }, int_ty); // branch-free bool AND
+    const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+    const valid = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = in_range, .rhs = zero } }, bool_ty);
+
+    const iv = try b.emit(.{ .fcvtzs = f }, int_ty); // stored only on the ok path
+    const ok_blk = try b.addBlock();
+    const err_blk = try b.addBlock();
+    const join = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = valid, .t = ok_blk, .f = err_blk } });
+    try L.emitConvResultTail(&b, e, base, ok_blk, err_blk, join, iv, Typecheck.Type.int);
     b.switchTo(join);
     try L.brTo(&b, exit, .{ .slot = slot });
     return try L.finishFn(&b, gpa, sym, &params, entry, exit);

@@ -490,6 +490,16 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
             try g.emit(Aarch64.cset(S0, fcondToAarch64(c.cc))); // bool → GPR cell
             try g.storeValue(S0, ins.result);
         },
+        .scvtf => |v| {
+            try g.loadValue(S0, v); // source int in a GPR (width-canonicalized)
+            try g.emit(Aarch64.scvtf(D0, S0));
+            try g.storeFpValue(D0, ins.result);
+        },
+        .fcvtzs => |v| {
+            try g.loadFpValue(D0, v); // source f64 in a D reg
+            try g.emit(Aarch64.fcvtzs(S0, D0));
+            try g.storeValue(S0, ins.result); // plat-width int result; no normalize needed
+        },
     }
 }
 

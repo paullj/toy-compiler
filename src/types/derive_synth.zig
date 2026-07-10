@@ -36,7 +36,8 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     // A conv-only program (a fallible char conversion but no `==`/`.hash`/`print` derive)
     // still needs the barrier to run, so gate on BOTH request sources.
     if (t.derive_reqs.items.len == 0 and
-        t.conv_int_char_result == null and t.conv_char_byte_result == null) return;
+        t.conv_int_char_result == null and t.conv_char_byte_result == null and
+        t.conv_float_int_result == null) return;
     const pre = t.prelude orelse return;
     const eq_pid = pre.protocols.eq orelse return;
     const eq_name = t.protocols.items[eq_pid].name;
@@ -256,6 +257,19 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         });
     };
 
+    // float -> int rides the same shared-witness path as the char convs, but anchors on
+    // `Type.float` (no char involvement) so a float-only program with no `char` struct still
+    // mints it. `carriesIntDesc(.float)==false`, so mangle/writeKey accept it -> `TryInto$float_to_int$s0`.
+    if (pre.protocols.try_into) |ti_pid| {
+        if (t.conv_float_int_result) |rty| try t.derives.append(gpa, .{
+            .protocol_id = ti_pid,
+            .protocol_name = t.protocols.items[ti_pid].name,
+            .kind = .conv_float_int,
+            .conform_ty = Type.float,
+            .ret = rty,
+        });
+    }
+
     // Canonical sort — the SOLE ordering driver (never discovery/thread order).
     std.mem.sort(DeriveRecipe, t.derives.items, {}, Derive.lessThan);
 
@@ -276,11 +290,12 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             // inline consumed): `int_to_char(int) -> Result[char,ConvErr]`,
             // `char_to_byte(int) -> Result[byte,ConvErr]`.
             .conv_int_char, .conv_char_byte => try gpa.dupe(Type, &[_]Type{Type.int}),
+            .conv_float_int => try gpa.dupe(Type, &[_]Type{Type.float}),
         };
         // A conv recipe is NOT a conformance method (`try_into` has no dispatch wiring), so
         // it gets no `t.methods` row — the call site scans `t.derives` for it by kind.
         switch (d.kind) {
-            .conv_int_char, .conv_char_byte => {},
+            .conv_int_char, .conv_char_byte, .conv_float_int => {},
             else => try t.methods.append(gpa, .{
                 .recv = d.conform_ty,
                 .name = Derive.methodName(d.kind),
@@ -350,7 +365,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
     // A conv witness is hand-emitted (not a per-field structural walk), so it has no field
     // witnesses — the empty slice keeps teardown's `len > 0` free guard correct.
     switch (d.kind) {
-        .conv_int_char, .conv_char_byte => return &.{},
+        .conv_int_char, .conv_char_byte, .conv_float_int => return &.{},
         else => {},
     }
     var ftys: std.ArrayList(Type) = .empty;
@@ -364,7 +379,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
         .ord => resolveFieldWitness(t, .ord, ft),
         .hash => resolveFieldWitness(t, .hash, ft),
         .display => resolveFieldWitness(t, .display, ft),
-        .conv_int_char, .conv_char_byte => unreachable, // guarded above
+        .conv_int_char, .conv_char_byte, .conv_float_int => unreachable, // guarded above
     };
     return fw;
 }
@@ -387,7 +402,7 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .ord => .{ "cmp", "cmp_call" },
         .hash => .{ "hash", "hash_call" },
         .display => .{ "display", "display_call" },
-        .conv_int_char, .conv_char_byte => unreachable, // never instantiated (guarded in resolveDeriveFields)
+        .conv_int_char, .conv_char_byte, .conv_float_int => unreachable, // never instantiated (guarded in resolveDeriveFields)
     };
     const pr = Typecheck.gatherPreludeIds(t);
     const pid = switch (kind) {
@@ -395,7 +410,7 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .ord => pr.ord,
         .hash => pr.hash,
         .display => pr.display,
-        .conv_int_char, .conv_char_byte => unreachable,
+        .conv_int_char, .conv_char_byte, .conv_float_int => unreachable,
     };
     switch (resolveConformanceMethod(t.methods.items, ft, method, pid, null)) {
         .one => |m| return @unionInit(Derive.FieldWitness, variant, witnessName(t, m)),

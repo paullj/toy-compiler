@@ -1,0 +1,7 @@
+# 2^53+1 rounds to 2^53 under scvtf round-to-nearest-even (documented lossy, never fails).
+# expect: exit 42
+fn main() -> int {
+    n := 9007199254740993
+    f: float = n.into()
+    return if f == 9007199254740992.0 { 42 } else { 0 }
+}

@@ -801,6 +801,79 @@ test "a uint-source int->char passes the raw value to the witness (no-widen arg 
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
+test "float->int try_into is a shared witness — 12 in one fn compile (pre-fix frame overflow)" {
+    // 12 float->int `try_into` in ONE fn — >10; the pre-fix inline would overflow the imm12
+    // frame cap. Each is now one CALL to the shared `TryInto$float_to_int` witness (O(1)/site),
+    // so the fn compiles. The 12 floats 0.0..11.0 all convert; the sum is 66, so a correct run exits 42.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c5-fiframe";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn f() -> int {
+        \\  a0: int = (0.0).try_into().unwrap_or(0)
+        \\  a1: int = (1.0).try_into().unwrap_or(0)
+        \\  a2: int = (2.0).try_into().unwrap_or(0)
+        \\  a3: int = (3.0).try_into().unwrap_or(0)
+        \\  a4: int = (4.0).try_into().unwrap_or(0)
+        \\  a5: int = (5.0).try_into().unwrap_or(0)
+        \\  a6: int = (6.0).try_into().unwrap_or(0)
+        \\  a7: int = (7.0).try_into().unwrap_or(0)
+        \\  a8: int = (8.0).try_into().unwrap_or(0)
+        \\  a9: int = (9.0).try_into().unwrap_or(0)
+        \\  a10: int = (10.0).try_into().unwrap_or(0)
+        \\  a11: int = (11.0).try_into().unwrap_or(0)
+        \\  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11
+        \\}
+        \\fn main() -> int {
+        \\  if f() == 66 { return 42 }
+        \\  return 1
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term); // pre-fix: CodegenDiagnostic
+}
+
+test "float->int witness — NaN/+-inf/out-of-range Err, 2^63 boundary is byte-exact through the CALL" {
+    // The fcmp range guard must reproduce the fallible-narrow verdicts: NaN and +-inf and
+    // |f|>=2^63 -> Err (unwrap_or(-1) sentinel); the largest f64 < 2^63 -> Ok. The exactly-
+    // representable 2^63 is the silent-saturation gate: fcvtzs alone would saturate it to
+    // i64_max, but the strict `< 2^63` guard makes it Err.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-c5-fibounds";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\fn main() -> int {
+        \\  nan: int = (0.0 /. 0.0).try_into().unwrap_or(-1)
+        \\  pinf: int = (1.0 /. 0.0).try_into().unwrap_or(-1)
+        \\  huge: int = (1e30).try_into().unwrap_or(-1)
+        \\  nhuge: int = (0.0 -. 1e30).try_into().unwrap_or(-1)
+        \\  at63: int = (9223372036854775808.0).try_into().unwrap_or(-1)
+        \\  below: int = (9223372036854774784.0).try_into().unwrap()
+        \\  if nan != -1 { return 1 }
+        \\  if pinf != -1 { return 2 }
+        \\  if huge != -1 { return 3 }
+        \\  if nhuge != -1 { return 4 }
+        \\  if at63 != -1 { return 5 }
+        \\  if below != 9223372036854774784 { return 6 }
+        \\  return 42
+        \\}
+        \\
+    ;
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
+}
+
 test "an Option[int] find/match program compiles + runs; exit is the unwrapped payload" {
     // The prelude `Option[T]` is nameable with no import; `Option[int]` reifies to a
     // plain concrete enum through the reification path, so this compiles + runs on the real backend.
