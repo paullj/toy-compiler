@@ -59,7 +59,7 @@ pub const AbiClass = enum { scalar, fp, reg_pair, indirect };
 /// Byte size of a type (int/bool 8, str 16, struct/enum → its layout size).
 pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
-        .int, .bool, .float => 8,
+        .int, .bool, .float, .rawptr => 8,
         .str => 16,
         .@"struct" => layouts[ty.struct_id].size,
         .@"enum" => enum_layouts[ty.enum_id].size,
@@ -71,7 +71,7 @@ pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLay
 /// alignment).
 pub fn typeAlign(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
-        .int, .bool, .float, .str => 8,
+        .int, .bool, .float, .str, .rawptr => 8,
         .@"struct" => layouts[ty.struct_id].@"align",
         .@"enum" => enum_layouts[ty.enum_id].@"align",
         else => 1,

@@ -431,6 +431,27 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try walkInner(src, n.lhs, collect, visitor);
             try emit(visitor, .{ .try_operator = .{ .idx = idx } });
         },
+        // A bodyless C-ABI declaration: fold its name + param/return type-refs (an
+        // edit to the extern signature must bust the cache) but never a body or
+        // generics. Mirrors `fn_decl`'s proto walk minus the generic/body arms.
+        .extern_fn_decl => {
+            try emit(visitor, .{ .leaf = leaf });
+            const proto = Ast.protoAt(tree, n.lhs.int());
+            try emit(visitor, .{ .count = @intCast(proto.params.len) });
+            for (proto.params, 0..) |p, i| {
+                const pty_node = tree.nodes[p.int()].lhs;
+                if (pty_node != Ast.none) try emit(visitor, .{ .type_ref = .{ .idx = pty_node, .ordinal = @intCast(i), .is_ret = false } });
+                try walkInner(src, p, collect, visitor);
+            }
+            try emit(visitor, .{ .flag = proto.ret_type != Ast.none });
+            if (proto.ret_type != Ast.none) {
+                try emit(visitor, .{ .type_ref = .{ .idx = proto.ret_type, .ordinal = 0, .is_ret = true } });
+                try walkInner(src, proto.ret_type, collect, visitor);
+            }
+        },
+        // Transparent over its inner block: `unsafe { .. }` folds and walks exactly
+        // as the block does (the `.enter` tag byte keeps it fp-distinct).
+        .unsafe_block => try walkInner(src, n.lhs, collect, visitor),
         .pattern_literal => try emit(visitor, .{ .leaf = leaf }),
         .pattern_or => {
             const alts = Ast.rangeSlice(tree, n.lhs.int());

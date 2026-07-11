@@ -374,6 +374,20 @@ pub const Node = extern struct {
         /// memcpy'd to/from the content cache). `main_token` is the `float` token; it
         /// types to the builtin `float` and lowers to an `fconst`.
         literal_float,
+
+        /// `extern fn name(params) -> R` — a bodyless C-ABI declaration. Appended at
+        /// END (frozen ordinal; `[]Node` is memcpy'd to/from the content cache). Same
+        /// node shape as `fn_decl` (`main_token` = the name identifier, `lhs` = the
+        /// FnProto header, `rhs` = a synthesized empty `block`) so `protoAt`/decode
+        /// sites stay uniform; the distinct tag lets resolve/typecheck register it as
+        /// a dyld import instead of a user fn.
+        extern_fn_decl,
+        /// `unsafe { .. }` — an unsafe-context block. Appended at END (frozen ordinal;
+        /// `[]Node` is memcpy'd to/from the content cache). `main_token` is the
+        /// `unsafe` token; `lhs` is the inner `block` node; `rhs` is `none`. Types and
+        /// lowers transparently as its inner block; the "unsafe context" is scaffolding
+        /// for raw-pointer ops that arrive later.
+        unsafe_block,
     };
 };
 
@@ -833,6 +847,26 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             }
             try out.writeByte(' ');
             try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
+        .extern_fn_decl => {
+            const proto = protoAt(tree, n.lhs.int());
+            try out.print("(extern-fn {s} (", .{tok_text});
+            for (proto.params, 0..) |pidx, i| {
+                if (i != 0) try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, pidx);
+            }
+            try out.writeAll(") ");
+            if (proto.ret_type == none) {
+                try out.writeByte('_');
+            } else {
+                try renderNode(out, tree, tokens, source, proto.ret_type);
+            }
+            try out.writeByte(')');
+        },
+        .unsafe_block => {
+            try out.writeAll("(unsafe ");
+            try renderNode(out, tree, tokens, source, n.lhs);
             try out.writeByte(')');
         },
         .program => {

@@ -713,17 +713,24 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
         try g.emit(Aarch64.addImm(8, Aarch64.SP, @intCast(g.slotOff(c.ret_slot))));
     }
 
-    // bl placeholder + `.call26` reloc.
-    const name_copy = try g.gpa.dupe(u8, c.callee.name);
-    errdefer g.gpa.free(name_copy);
-    const site: u32 = @intCast(g.code.items.len);
-    try g.relocs.append(g.gpa, .{
-        .site = site,
-        .target = .{ .func = .{ .kind = c.callee.kind, .name = name_copy } },
-        .kind = .call26,
-        .addend = 0,
-    });
-    try g.emit(Aarch64.bl(0));
+    // An `extern` callee (`.import`) is a bare dyld symbol reached through its own
+    // `__got` slot: emit the adrp/ldr GOT preamble (x16 = &sym) then `blr x16`. Every
+    // other callee is intra-module: a `bl` + `.call26` reloc, byte-identical to before.
+    if (c.callee.kind == .import) {
+        try emitImportPreamble(&g.code, &g.relocs, g.gpa, c.callee.name, 16);
+        try g.emit(Aarch64.blr(16));
+    } else {
+        const name_copy = try g.gpa.dupe(u8, c.callee.name);
+        errdefer g.gpa.free(name_copy);
+        const site: u32 = @intCast(g.code.items.len);
+        try g.relocs.append(g.gpa, .{
+            .site = site,
+            .target = .{ .func = .{ .kind = c.callee.kind, .name = name_copy } },
+            .kind = .call26,
+            .addend = 0,
+        });
+        try g.emit(Aarch64.bl(0));
+    }
 
     // Place the result. A scalar lands in x0 → store into its value cell. A
     // reg-pair aggregate result lands in x0[,x1] → store into ret_slot's words.
@@ -957,14 +964,24 @@ fn emitFramePrologue(code: *std.ArrayList(u8), gpa: std.mem.Allocator) error{Out
 /// own error path; on success `relocs` owns them (freed via `deinitBuiltinRelocs` or,
 /// once packaged, `FnCode.deinit`).
 fn emitWriteImport(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, rd: u32) error{OutOfMemory}!void {
+    try emitImportPreamble(code, relocs, gpa, "write", rd);
+}
+
+/// Emit the GOT-import preamble for dyld symbol `name` — `adrp x16, name@GOT ; ldr
+/// xRd,[x16]` — and append its two `.import` relocs (patched to the `__got` slot
+/// after layout). The fn pointer lands in xRd; the caller issues `blr xRd`. Each
+/// name is freed on this fn's error path; on success `relocs` owns them (freed via
+/// `deinitBuiltinRelocs` / `FnCode.deinit`). The generalization of `emitWriteImport`
+/// over the symbol name, so an `extern` call reaches its own `__got` slot.
+fn emitImportPreamble(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, name: []const u8, rd: u32) error{OutOfMemory}!void {
     {
-        const nm = try gpa.dupe(u8, "write");
+        const nm = try gpa.dupe(u8, name);
         errdefer gpa.free(nm);
         try relocs.append(gpa, .{ .site = @intCast(code.items.len), .target = .{ .import = .{ .kind = .import, .name = nm } }, .kind = .adrp_page });
     }
     try emitWord(code, gpa, Aarch64.adrp(16, 0));
     {
-        const nm = try gpa.dupe(u8, "write");
+        const nm = try gpa.dupe(u8, name);
         errdefer gpa.free(nm);
         try relocs.append(gpa, .{ .site = @intCast(code.items.len), .target = .{ .import = .{ .kind = .import, .name = nm } }, .kind = .ldr_lo12 });
     }

@@ -23,9 +23,20 @@ const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
 const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
+const BundledStd = @import("bundled_std");
 
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
+
+/// The bundled standard library source for an import path (e.g. `core/ffi`), or
+/// null when the path names no bundled module. The returned bytes are static
+/// (embedded in the compiler at build time) and are NEVER freed. An import that
+/// resolves here is served from the bundle BEFORE any disk lookup, so bundled
+/// `std`/`core` can never be shadowed by a file on disk.
+fn bundledLookup(path: []const u8) ?[]const u8 {
+    for (BundledStd.modules) |m| if (std.mem.eql(u8, m.path, path)) return m.source;
+    return null;
+}
 
 /// One discovered module: its canonical import-path name, on-disk file path, and
 /// the parsed tree (owned). The entry module's `path` is the bare stem of the
@@ -52,6 +63,11 @@ pub const Module = struct {
     /// Indices (into `Graph.modules`) of the modules this one imports, in stable
     /// (sorted-by-import-path) order. Owned.
     imports: []u32 = &.{},
+    /// Whether this module was served from the embedded standard library (`core/`
+    /// or `std/`) rather than a disk file. Bundled modules are the only place an
+    /// `extern`/intrinsic name resolves; a user (non-bundled) module gets the
+    /// standard unresolved diagnostic instead.
+    bundled: bool = false,
 
     pub fn tree(m: *const Module) Ast.Tree {
         return .{ .nodes = m.nodes, .extra = m.extra, .pub_bits = m.pub_bits };
@@ -283,6 +299,10 @@ const Slot = struct {
     imports: std.ArrayList(u32) = .empty,
     color: Color = .white,
     loaded: bool = false,
+    /// Set for a slot served from the embedded standard library. `bundled_src`
+    /// borrows static (build-time-embedded) bytes — never freed.
+    bundled: bool = false,
+    bundled_src: ?[]const u8 = null,
 
     fn deinit(s: *Slot, gpa: std.mem.Allocator) void {
         gpa.free(s.name);
@@ -457,6 +477,54 @@ const Discoverer = struct {
     /// which is byte-identical to a fresh parse because the served source is byte-identical
     /// to the bytes the priming build read) — so the graph + emitted bytes are unchanged.
     fn load(d: *Discoverer, id: u32) DiscoverError!void {
+        // BUNDLED: serve the embedded source directly — no disk read, no stat, no
+        // manifest. The lex/parse content cache still applies (keyed by content_fp),
+        // so a bundled module lexes/parses exactly like a disk one. A program that
+        // imports no bundled path never enters this branch (byte-identical).
+        if (d.slots.items[id].bundled_src) |static_src| {
+            const source = try d.gpa.dupe(u8, static_src);
+            const engine = Engine.initProbe(d.cache, .normal, d.probe);
+            const lexed = engine.lex(d.gpa, d.io, d.target, source, id, true) catch |e| {
+                d.gpa.free(source);
+                return e;
+            };
+            const tokens = lexed.value;
+            const parsed = engine.parse(d.gpa, d.io, d.target, source, tokens, id, true) catch |e| {
+                d.gpa.free(source);
+                d.gpa.free(tokens);
+                return e;
+            };
+            if (parsed.diags.len > 0) {
+                // A bundled module is compiler-authored; a parse error in it is a build
+                // bug, not a user error. Surface the first diagnostic against the
+                // bundled module so it is not silently swallowed.
+                const first = parsed.diags[0];
+                const byte_offset = first.byte_offset;
+                const diags_owned = try d.gpa.dupe(Diagnostic, parsed.diags);
+                const message_owned = d.gpa.dupe(u8, first.message) catch |e| {
+                    d.gpa.free(diags_owned);
+                    return e;
+                };
+                d.gpa.free(@constCast(parsed.diags));
+                d.gpa.free(parsed.tree.nodes);
+                d.gpa.free(parsed.tree.extra);
+                if (parsed.tree.pub_bits.len != 0) d.gpa.free(@constCast(parsed.tree.pub_bits));
+                const s = &d.slots.items[id];
+                s.source = source;
+                s.tokens = tokens;
+                s.loaded = true;
+                return d.fail(.{ .kind = .parse, .message = message_owned, .module = id, .byte_offset = byte_offset, .parse_diags = diags_owned });
+            }
+            const s = &d.slots.items[id];
+            s.source = source;
+            s.tokens = tokens;
+            s.nodes = parsed.tree.nodes;
+            s.extra = parsed.tree.extra;
+            s.pub_bits = parsed.tree.pub_bits;
+            s.loaded = true;
+            return;
+        }
+
         const file = d.slots.items[id].file;
         // Snapshot (mtime, size, ctime) FIRST — one cheap stat, BEFORE any read. This is the
         // warm-discover unchanged-predicate (see `warmServe`): a match against the
@@ -669,6 +737,34 @@ const Discoverer = struct {
             const path = try joinPath(d.gpa, s_tokens, s_source, seg_tokens);
             defer d.gpa.free(path);
 
+            // BUNDLED-FIRST: an import that names an embedded `std`/`core` module is
+            // served from the bundle, so disk cannot shadow it. The synthetic canon
+            // `bundled:<path>` can never collide with an absolute realpath, so it
+            // dedups repeat bundled imports cleanly. Skip the disk resolve + case +
+            // presence guards entirely.
+            if (bundledLookup(path)) |src| {
+                const name = try d.gpa.dupe(u8, path);
+                const file = try std.fmt.allocPrint(d.gpa, "<bundled>/{s}{s}", .{ path, ext });
+                const canon = try std.fmt.allocPrint(d.gpa, "bundled:{s}", .{path});
+                const child = d.intern(name, file, canon) catch |e| {
+                    d.gpa.free(name);
+                    d.gpa.free(file);
+                    d.gpa.free(canon);
+                    return e;
+                };
+                d.slots.items[child].bundled = true;
+                d.slots.items[child].bundled_src = src;
+                var seen = false;
+                for (edges.items) |existing| {
+                    if (existing == child) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) try edges.append(d.gpa, child);
+                continue;
+            }
+
             // Validate + resolve to an on-disk file under the root.
             const file = resolveFile(d.gpa, d.root, path) catch |e| switch (e) {
                 error.PathEscape => return d.fail(.{
@@ -797,6 +893,7 @@ const Discoverer = struct {
                 .extra = s.extra,
                 .pub_bits = s.pub_bits,
                 .imports = try s.imports.toOwnedSlice(d.gpa),
+                .bundled = s.bundled,
             };
             // The canonical dedup key is internal to discovery; it is NOT carried
             // into the Module, so free it here before nulling the slot.

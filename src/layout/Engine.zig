@@ -162,14 +162,14 @@ pub const EnumSym = struct {
 /// Natural size/align of a scalar/str type (struct sizes come from the table).
 fn scalarSize(kind: Kind) u32 {
     return switch (kind) {
-        .int, .bool, .float => 8,
+        .int, .bool, .float, .rawptr => 8,
         .str => 16,
         else => 0,
     };
 }
 fn scalarAlign(kind: Kind) u32 {
     return switch (kind) {
-        .int, .bool, .str, .float => 8,
+        .int, .bool, .str, .float, .rawptr => 8,
         else => 1,
     };
 }

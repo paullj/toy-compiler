@@ -25,6 +25,18 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("build_options", options);
 
+    // The embedded standard library: `core/` and `std/` `.toy` source generated into
+    // a single Zig module (`bundled_std`) at configure time, so `std`/`core` imports
+    // resolve with no files on disk. Bundled source folds into `source_digest` above,
+    // so a stdlib edit busts the compiler-identity cache stamp.
+    const wf = b.addWriteFiles();
+    const gen = wf.add("bundled_std.zig", bundledModulesSource(b));
+    const bundled_mod = b.createModule(.{
+        .root_source_file = gen,
+        .target = target,
+    });
+    mod.addImport("bundled_std", bundled_mod);
+
     const exe = b.addExecutable(.{
         .name = "toy",
         .root_module = b.createModule(.{
@@ -133,23 +145,38 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(fuzz_exe);
 }
 
-/// Hash every `.zig` file under `src/` (by path + contents, sorted for
-/// determinism) into a single 64-bit compiler identity. Done at configure time
-/// with native I/O, so only the digest — not the source bytes — ends up in the
-/// binary, and adding a file never needs a code change. Returns 0 if `src/`
-/// can't be read (degrades to a single shared cache namespace).
+/// Hash the compiler's source into a single 64-bit identity: every `.zig` under
+/// `src/` PLUS every bundled-stdlib `.toy` under `core/` and `std/` (by path +
+/// contents, sorted for determinism). Folding the bundled `.toy` in means a stdlib
+/// edit busts the on-disk cache stamp exactly like a `src/` edit. Done at configure
+/// time with native I/O, so only the digest — not the source bytes — ends up in the
+/// binary. Returns 0 only if src/ can't be read (degrades to one shared cache
+/// namespace); a missing bundled tree is folded as nothing, not a hard degrade.
 fn sourceDigest(b: *std.Build) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    if (!hashDir(b, &hasher, "src", ".zig")) return 0;
+    // Bundled stdlib is best-effort: a source tree that ships without core/std still
+    // gets a meaningful src/-derived identity instead of collapsing to one shared
+    // cache namespace (which would disable cross-version invalidation entirely).
+    _ = hashDir(b, &hasher, "core", ".toy");
+    _ = hashDir(b, &hasher, "std", ".toy");
+    return hasher.final();
+}
+
+/// Fold every file under `sub` with extension `ext` (path + contents, sorted) into
+/// `hasher`. Returns false if the directory can't be read.
+fn hashDir(b: *std.Build, hasher: *std.hash.Wyhash, sub: []const u8, ext: []const u8) bool {
     const io = b.graph.io;
-    var dir = b.build_root.handle.openDir(io, "src", .{ .iterate = true }) catch return 0;
+    var dir = b.build_root.handle.openDir(io, sub, .{ .iterate = true }) catch return false;
     defer dir.close(io);
 
     var paths: std.ArrayList([]const u8) = .empty;
-    var walker = dir.walk(b.allocator) catch return 0;
+    var walker = dir.walk(b.allocator) catch return false;
     defer walker.deinit();
-    while (walker.next(io) catch return 0) |entry| {
+    while (walker.next(io) catch return false) |entry| {
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        paths.append(b.allocator, b.allocator.dupe(u8, entry.path) catch return 0) catch return 0;
+        if (!std.mem.endsWith(u8, entry.basename, ext)) continue;
+        paths.append(b.allocator, b.allocator.dupe(u8, entry.path) catch return false) catch return false;
     }
 
     // Walk order is filesystem-dependent; sort so the digest is stable.
@@ -159,11 +186,78 @@ fn sourceDigest(b: *std.Build) u64 {
         }
     }.lessThan);
 
-    var hasher = std.hash.Wyhash.init(0);
+    // Fold the subdir name too so identical files under different roots can't alias.
+    hasher.update(sub);
     for (paths.items) |p| {
         hasher.update(p);
-        const bytes = dir.readFileAlloc(io, p, b.allocator, .unlimited) catch return 0;
+        const bytes = dir.readFileAlloc(io, p, b.allocator, .unlimited) catch return false;
         hasher.update(bytes);
     }
-    return hasher.final();
+    return true;
+}
+
+/// Generate the `bundled_std.zig` module source: one `Entry{ path, source }` per
+/// `.toy` file under `core/` and `std/`, sorted by import path so the emitted array
+/// (and thus the module's identity) is deterministic regardless of FS walk order.
+/// The import path is `<root>/<rel>` with the trailing `.toy` stripped and OS
+/// separators normalized to `/` (e.g. `core/ffi`).
+fn bundledModulesSource(b: *std.Build) []const u8 {
+    const Entry = struct { path: []const u8, source: []const u8 };
+    var entries: std.ArrayList(Entry) = .empty;
+
+    for ([_][]const u8{ "core", "std" }) |root| {
+        var dir = b.build_root.handle.openDir(b.graph.io, root, .{ .iterate = true }) catch continue;
+        defer dir.close(b.graph.io);
+        var walker = dir.walk(b.allocator) catch continue;
+        defer walker.deinit();
+        while (walker.next(b.graph.io) catch break) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".toy")) continue;
+            const bytes = dir.readFileAlloc(b.graph.io, entry.path, b.allocator, .unlimited) catch continue;
+            // `<root>/<rel-without-.toy>`, separators normalized to `/`.
+            const rel = entry.path[0 .. entry.path.len - ".toy".len];
+            const joined = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ root, rel }) catch continue;
+            const norm = b.allocator.dupe(u8, joined) catch continue;
+            std.mem.replaceScalar(u8, norm, std.fs.path.sep, '/');
+            entries.append(b.allocator, .{ .path = norm, .source = bytes }) catch continue;
+        }
+    }
+
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn lessThan(_: void, a: Entry, c: Entry) bool {
+            return std.mem.lessThan(u8, a.path, c.path);
+        }
+    }.lessThan);
+
+    var out: std.ArrayList(u8) = .empty;
+    const gpa = b.allocator;
+    out.appendSlice(gpa, "pub const Entry = struct { path: []const u8, source: []const u8 };\n") catch {};
+    out.appendSlice(gpa, "pub const modules = [_]Entry{\n") catch {};
+    for (entries.items) |e| {
+        out.appendSlice(gpa, "    .{ .path = \"") catch {};
+        appendZigStringBody(gpa, &out, e.path);
+        out.appendSlice(gpa, "\", .source = \"") catch {};
+        appendZigStringBody(gpa, &out, e.source);
+        out.appendSlice(gpa, "\" },\n") catch {};
+    }
+    out.appendSlice(gpa, "};\n") catch {};
+    return out.items;
+}
+
+/// Escape `s` into the body of a Zig double-quoted string literal (no surrounding
+/// quotes), appending to `out`. A manual escaper (rather than a std helper whose
+/// exact 0.16 API varies) so the generated file is always valid Zig.
+fn appendZigStringBody(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
+    for (s) |c| switch (c) {
+        '"' => out.appendSlice(gpa, "\\\"") catch {},
+        '\\' => out.appendSlice(gpa, "\\\\") catch {},
+        '\n' => out.appendSlice(gpa, "\\n") catch {},
+        '\r' => out.appendSlice(gpa, "\\r") catch {},
+        '\t' => out.appendSlice(gpa, "\\t") catch {},
+        else => if (c < 0x20 or c == 0x7f) {
+            var buf: [4]u8 = undefined;
+            const hex = std.fmt.bufPrint(&buf, "\\x{x:0>2}", .{c}) catch unreachable;
+            out.appendSlice(gpa, hex) catch {};
+        } else out.append(gpa, c) catch {},
+    };
 }

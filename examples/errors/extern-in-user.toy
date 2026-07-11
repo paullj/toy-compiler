@@ -1,0 +1,2 @@
+# expect: compile-error "extern"
+extern fn foo() -> int

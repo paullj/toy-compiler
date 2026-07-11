@@ -96,11 +96,11 @@ fn setOf(comptime tags: []const token.Tag) TagSet {
 }
 
 /// FIRST(top-level decl): the exact arms of `parseDecls`' dispatch.
-const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl, .kw_protocol, .kw_type });
+const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, .kw_impl, .kw_protocol, .kw_type, .kw_extern });
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
-const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .at, .dot, .minus, .bang });
+const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang });
 /// FIRST(type): an identifier (dot-chained) or the unit type `()`.
 const type_first = setOf(&.{ .identifier, .l_paren });
 /// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
@@ -397,6 +397,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
         .kw_fn => try p.parseFnDecl(.top_level),
+        .kw_extern => try p.parseExternFn(),
         .kw_struct => try p.parseStructDecl(),
         .kw_enum => try p.parseEnumDecl(),
         .kw_protocol => try p.parseProtocolDecl(),
@@ -488,13 +489,17 @@ const FnKind = union(enum) {
     protocol_sig: struct { proto_tok: u32 },
     inherent_method: Recv,
     conformance_method: Recv,
+    /// A bodyless `extern fn` C-ABI declaration: no receiver, no generics, no body
+    /// (like `protocol_sig` it synthesizes an empty block). Tagged `extern_fn_decl`
+    /// at `addNode` so resolve/typecheck register it as a dyld import.
+    extern_top_level,
 
     const Recv = struct { recv_tok: u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index };
 };
 
 fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     const self_recv_tok: ?u32 = switch (kind) {
-        .top_level => null,
+        .top_level, .extern_top_level => null,
         .protocol_sig => |ps| ps.proto_tok,
         .inherent_method, .conformance_method => |recv| recv.recv_tok,
     };
@@ -507,7 +512,7 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         else => &.{},
     };
     const bodyless = switch (kind) {
-        .protocol_sig => true,
+        .protocol_sig, .extern_top_level => true,
         else => false,
     };
     const self_optional = switch (kind) {
@@ -525,6 +530,12 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     var generics: std.ArrayList(Ast.Index) = .empty;
     defer generics.deinit(p.gpa);
     if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
+    // An `extern fn` is a bare C-ABI symbol: it cannot be generic. Report and drop
+    // any generic params so the rest of the signature still parses.
+    if (kind == .extern_top_level and generics.items.len > 0) {
+        try p.warn(p.peek(), .P0003, "'extern' functions cannot be generic");
+        generics.clearRetainingCapacity();
+    }
 
     try p.expect(.l_paren, "expected '(' after function name");
 
@@ -625,7 +636,15 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         @intCast(impl_gparams.len + generics.items.len),
     });
 
-    return p.addNode(.{ .tag = .fn_decl, .main_token = name_tok, .lhs = proto_header, .rhs = body });
+    const decl_tag: Ast.Node.Tag = if (kind == .extern_top_level) .extern_fn_decl else .fn_decl;
+    return p.addNode(.{ .tag = decl_tag, .main_token = name_tok, .lhs = proto_header, .rhs = body });
+}
+
+/// `extern fn name(params) -> R` — a bodyless C-ABI declaration. Consumes the
+/// leading `extern`, then reuses `parseFnDecl`'s bodyless path.
+fn parseExternFn(p: *Parser) Error!Ast.Index {
+    try p.expect(.kw_extern, "expected 'extern'");
+    return p.parseFnDecl(.extern_top_level);
 }
 
 /// `impl Type { fn m(self, ..) -> R { .. } }` — an inherent-method block —
@@ -1696,6 +1715,12 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             if (p.no_block) return p.fail(tok, .P0002, "expected an expression");
             return p.parseMatch(); // a match as a value expression
         },
+        .kw_unsafe => {
+            if (p.no_block) return p.fail(tok, .P0002, "expected an expression");
+            p.bump(.kw_unsafe);
+            const blk = try p.parseBlock();
+            return p.addNode(.{ .tag = .unsafe_block, .main_token = at_tok, .lhs = blk, .rhs = Ast.none });
+        },
         // No valid expression start. When the offending token is a structural
         // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
         // of a block/struct-literal), DELETING it (advanceWithError) would break
@@ -2485,6 +2510,27 @@ test "fn with params, return type, binary body" {
     );
 }
 
+test "extern fn parses bodyless to extern_fn_decl" {
+    try expectProgram(
+        "extern fn labs(x: int) -> int\n",
+        "(program (extern-fn labs ((param x int)) int))",
+    );
+}
+
+test "pub extern fn parses and records the export" {
+    try expectProgram(
+        "pub extern fn labs(x: int) -> int\n",
+        "(program (pub (extern-fn labs ((param x int)) int)))",
+    );
+}
+
+test "unsafe block parses as a value expression wrapping its block" {
+    try expectProgram(
+        "fn main() -> int { return unsafe { 1 } }\n",
+        "(program (fn main () int (block (return (unsafe (block 1))))))",
+    );
+}
+
 test "var_decl, call, assign, bare return" {
     try expectProgram(
         "fn main() {\n x := 1\n x = add(x, 2)\n return\n}\n",
@@ -2656,6 +2702,16 @@ test "root is program and children precede parents" {
             },
             // `recv.N`: the receiver is `lhs`, created before this node.
             .tuple_field => try testing.expect(n.lhs.int() < self),
+            // `extern fn ..`: same shape as fn_decl (proto in `lhs`, synthesized empty
+            // block in `rhs`), so its proto/body indices precede this node too.
+            .extern_fn_decl => {
+                const proto = Ast.protoAt(tree, n.lhs.int());
+                if (proto.ret_type != Ast.none) try testing.expect(proto.ret_type.int() < self);
+                for (proto.params) |c| try testing.expect(c.int() < self);
+                try testing.expect(n.rhs.int() < self);
+            },
+            // `unsafe { .. }`: the inner block is `lhs`, created before this node.
+            .unsafe_block => try testing.expect(n.lhs.int() < self),
         }
     }
 }

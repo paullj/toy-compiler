@@ -1,0 +1,3 @@
+# The quarantined C-ABI boundary. `extern` declarations are only legal here (in a
+# `core/` module); everything else reaches C through a safe `std/` wrapper.
+pub extern fn labs(x: int) -> int

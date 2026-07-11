@@ -97,6 +97,9 @@ pub const BodyChecker = struct {
     cur_ret: Type = .unit,
     loop_stack: std.ArrayList(LoopCtx) = .empty,
     expected: ?Type = null,
+    /// Whether the checker is inside an `unsafe { .. }` block. Scaffolding for the
+    /// raw-pointer deref/store ops that arrive next; nothing consumes it yet.
+    in_unsafe: bool = false,
 
     // Local diagnostic sink (merged into the shared result by the Pass-C driver).
     // Its scope is set once in `bodyCheckerFor` to the fn's owning module (graph)
@@ -704,6 +707,12 @@ pub const BodyChecker = struct {
             .try_expr => return bc.typeOfTry(node_idx, n), // sets node_types itself
             .literal_unit => Type.unit,
             .block => try bc.checkBlock(node_idx, true),
+            .unsafe_block => blk: {
+                const save = bc.in_unsafe;
+                bc.in_unsafe = true;
+                defer bc.in_unsafe = save;
+                break :blk try bc.checkBlock(n.lhs, true);
+            },
             .if_stmt => try bc.typeOfIf(node_idx, n),
             .loop_expr => return bc.typeOfLoop(node_idx, n, null), // sets node_types itself
             .labeled => return bc.checkLabeled(node_idx, true), // sets node_types itself
