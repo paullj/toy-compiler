@@ -408,6 +408,14 @@ pub const Node = extern struct {
         /// element with an out-of-bounds runtime panic. Distinguished from a turbofish
         /// `id[T]` by the token following the matching `]` (see `parsePostfix`).
         index,
+
+        /// `for ident in iterable { body }`. Appended at END (frozen ordinal; `[]Node`
+        /// is memcpy'd to/from the content cache; `ParseHeader.version` bumped 16->17).
+        /// `main_token` is the loop-var ident; `lhs` is the body `block`; `rhs` is the
+        /// iterable EXPRESSION (a single child, no header — deliberately unlike
+        /// `for_stmt`'s `{lo,hi}` extra, so the range path stays byte-identical). A `()`
+        /// statement. Desugars to `it := iterable.iter()` then a loop over `it.next()`.
+        for_in_stmt,
     };
 };
 
@@ -632,7 +640,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 16,
+    version: u32 = 17,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -693,7 +701,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 16) return null;
+    if (hdr.magic != parse_magic or hdr.version != 17) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -963,6 +971,13 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try renderNode(out, tree, tokens, source, h.lo);
             try out.writeByte(' ');
             try renderNode(out, tree, tokens, source, h.hi);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .for_in_stmt => {
+            try out.print("(for-in {s} ", .{tok_text});
+            try renderNode(out, tree, tokens, source, n.rhs);
             try out.writeByte(' ');
             try renderNode(out, tree, tokens, source, n.lhs);
             try out.writeByte(')');

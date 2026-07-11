@@ -84,7 +84,7 @@ pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
         // A labeled wrapper is transparent for definite-return: it returns iff its
         // inner construct does (a labeled bare block via its trailing stmt).
         .labeled => stmtReturns(ctx, ctx.tree.nodes[stmt_idx.int()].lhs),
-        .for_stmt, .break_stmt, .continue_stmt => false,
+        .for_stmt, .for_in_stmt, .break_stmt, .continue_stmt => false,
         else => false,
     };
 }
@@ -130,7 +130,7 @@ pub fn stmtHasBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
         // count labeled breaks that name `target`.
         .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
         .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].rhs, target),
-        .for_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
+        .for_stmt, .for_in_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
         else => false,
     };
 }
@@ -160,7 +160,7 @@ pub fn stmtHasLabeledBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) boo
         },
         .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
         .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].rhs, target),
-        .for_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
+        .for_stmt, .for_in_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
         else => false,
     };
 }
@@ -190,7 +190,7 @@ pub fn stmtDiverges(ctx: Ctx, stmt_idx: Ast.Index) bool {
         .while_stmt => false,
         .loop_expr => loopDiverges(ctx, stmt_idx),
         .labeled => labeledDiverges(ctx, stmt_idx),
-        .for_stmt => false,
+        .for_stmt, .for_in_stmt => false,
         // A `match` diverges iff it is exhaustive AND every arm body diverges.
         .match_expr => matchDiverges(ctx, stmt_idx),
         else => false,
@@ -235,7 +235,7 @@ pub fn labeledDiverges(ctx: Ctx, idx: Ast.Index) bool {
     const inner = ctx.tree.nodes[inner_idx.int()];
     return switch (inner.tag) {
         .loop_expr => loopDiverges(ctx, inner_idx),
-        .while_stmt, .for_stmt => false,
+        .while_stmt, .for_stmt, .for_in_stmt => false,
         .block => blockDiverges(ctx, inner_idx) and !blockHasBreak(ctx, inner_idx, inner_idx),
         else => false,
     };

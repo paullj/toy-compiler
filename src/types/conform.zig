@@ -315,6 +315,26 @@ pub fn substPattern(composite: *Composite, gpa: std.mem.Allocator, pat: Type, ar
     return pat;
 }
 
+/// The `Item` type of an iterator type `iter_app` (`VecIter[int]` -> `int`): scan the
+/// GENERIC-conformance table for a row whose receiver ctor matches `iter_app`'s and whose
+/// protocol is named `Iterator`, then substitute the recorded arg PATTERN through
+/// `iter_app`'s concrete args. Null when `iter_app` is not an App or conforms to no
+/// `Iterator`. This is the ONLY reader of `model.template_conformances`, so recording a
+/// generic conformance there perturbs no other verdict. A malformed row (no args) yields
+/// null rather than crash.
+pub fn iteratorItem(model: *const Model, composite: *Composite, gpa: std.mem.Allocator, iter_app: Type) error{OutOfMemory}!?Type {
+    if (!iter_app.isApp()) return null;
+    const e = composite.at(iter_app.appIdx());
+    for (model.template_conformances) |row| {
+        if (row.recv_ctor != e.ctor or row.recv_is_enum != e.ctor_is_enum) continue;
+        if (row.protocol_id >= model.protocols.len) continue;
+        if (!std.mem.eql(u8, model.protocols[row.protocol_id].name, "Iterator")) continue;
+        if (row.protocol_args.len == 0) return null;
+        return try substPattern(composite, gpa, row.protocol_args[0], e.args);
+    }
+    return null;
+}
+
 /// The first struct field (in declaration order) whose type does NOT conform to `pid`
 /// — the field a T0029 use-site diagnostic names when a struct would derive `Eq` but a
 /// field blocks it. Null when `recv` is not a struct or every field conforms.
@@ -450,6 +470,42 @@ test "structural conformance: App types, nested memoization, and the type_var bo
     var memo_s: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo_s.deinit(gpa);
     try testing.expect(try structural(&structs, &enums, &confs, Type.structT(1), ord_pid, &memo_s, gpa, &co, &.{}));
+}
+
+test "iteratorItem: a matching generic-conformance row substitutes Item through the App args" {
+    const gpa = testing.allocator;
+    const iter_pid: u32 = 0;
+    const other_pid: u32 = 1;
+
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+    // VecIter[int] (ctor 0) and a Box[int] (ctor 1) that conforms to no Iterator.
+    const veciter_int = Type.app(try co.intern(gpa, 0, &.{Type.int}, false));
+    const box_int = Type.app(try co.intern(gpa, 1, &.{Type.int}, false));
+
+    const protocols = [_]Typecheck.ProtocolSym{
+        .{ .name = "Iterator", .mod = 0, .pub_export = true, .decl_node = Ast.none, .methods = &.{} },
+        .{ .name = "Other", .mod = 0, .pub_export = true, .decl_node = Ast.none, .methods = &.{} },
+    };
+    // The recorded arg PATTERN is `[type_var(0)]` (Item = the impl's sole type-param).
+    const pat = [_]Type{Type.typeVar(0)};
+    const rows = [_]Typecheck.TemplateConformance{
+        .{ .protocol_id = iter_pid, .recv_ctor = 0, .recv_is_enum = false, .protocol_args = &pat },
+        .{ .protocol_id = other_pid, .recv_ctor = 1, .recv_is_enum = false, .protocol_args = &pat },
+    };
+
+    var model: Model = undefined;
+    model.protocols = &protocols;
+    model.template_conformances = &rows;
+
+    // VecIter[int] -> Item = int (type_var(0) grounded through the App's `[int]`).
+    const item = try iteratorItem(&model, &co, gpa, veciter_int);
+    try testing.expect(item != null);
+    try testing.expect(Type.eql(Type.int, item.?));
+    // Box[int] matches ctor 1 but its protocol is "Other" (not "Iterator") -> null.
+    try testing.expect((try iteratorItem(&model, &co, gpa, box_int)) == null);
+    // A non-App receiver is never iterable here.
+    try testing.expect((try iteratorItem(&model, &co, gpa, Type.int)) == null);
 }
 
 test "axiom + direct: the bound-as-axiom rule, single-sourced" {

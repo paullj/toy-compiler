@@ -1,4 +1,5 @@
 import core/mem
+import std/iter
 
 # A thin, growable `Vec[T]` face over `core/mem`'s `GcArray` primitive. `std` may call
 # `core`'s safe members but never names a heap intrinsic itself, so every raw operation is
@@ -30,5 +31,22 @@ impl Vec[T] {
 
     fn first(self) -> Option[T] {
         return self.get(0)
+    }
+
+    fn iter(self) -> VecIter[T] {
+        return VecIter[T] { v: self, i: -1 }
+    }
+}
+
+# A by-value cursor over a `Vec[T]`. `v` copies the 8-byte handle `h`, so it observes the
+# SAME live backing (reference-semantic); `i` starts at -1 so the first `next` reads index
+# 0 and `get` returns `Option[T].none` once `i >= len`, ending the loop. `mut self` writes
+# `i` back across iterations.
+pub struct VecIter[T] { v: Vec[T], i: int }
+
+impl VecIter[T] has iter.Iterator[T] {
+    fn next(mut self) -> Option[T] {
+        self.i = self.i + 1
+        return self.v.get(self.i)
     }
 }

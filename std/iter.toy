@@ -1,0 +1,6 @@
+# A pull iterator: `next` yields the next element or `None` at exhaustion. `Item` is a
+# protocol TYPE PARAMETER (Self is type_var(0), Item is type_var(1)), modeled on `Into[U]`.
+# `for x in xs` desugars to getting the iterable's iterator then looping over `next()`.
+pub protocol Iterator[Item] {
+    fn next(self) -> Option[Item]
+}

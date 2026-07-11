@@ -354,6 +354,55 @@ test "vec: .first() returns the head element" {
     try std.testing.expectEqual(@as(u8, 11), code);
 }
 
+test "vec: `for x in xs` over a Vec[int] sums each element" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `for x in xs` desugars to `it := xs.iter()` then a loop over `it.next()` until None,
+    // binding `x` to each Some payload. VecIter[int] is a GENERIC conforming receiver of
+    // Iterator[int]. 4 + 5 + 6 + 7 = 22.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-forin-int",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs := [4, 5, 6, 7]
+        \\    total := 0
+        \\    for x in xs {
+        \\        total = total + x
+        \\    }
+        \\    return total
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 22), code);
+}
+
+test "vec: `for p in ps` over a Vec[P] binds the aggregate element (Some payload is a struct)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The Item is an aggregate P, so `next` yields Option[P] and the loop copies the whole
+    // struct payload into the loop var (the aggregate-safe payload copy, not a scalar load).
+    // (10+20) + (30+40) + (1+2) = 103.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-forin-agg",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    ps := [P{ x: 10, y: 20 }, P{ x: 30, y: 40 }, P{ x: 1, y: 2 }]
+        \\    total := 0
+        \\    for p in ps {
+        \\        total = total + p.x + p.y
+        \\    }
+        \\    return total
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 103), code);
+}
+
 test "vec: a Vec program is byte-identical at -j1 and -j8" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

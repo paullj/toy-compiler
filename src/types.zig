@@ -906,6 +906,22 @@ pub const Conformance = struct {
     protocol_args: []const Type = &.{},
 };
 
+/// One recorded GENERIC conformance `impl Ctor[T] has P[..]` — kept in its OWN table
+/// (never `conformances`) precisely because its receiver is a template, not a concrete
+/// type: an `App` row in `conformances` would violate the concrete-only invariant
+/// `existence` relies on and be scanned by every conformance query forever. Keyed on the
+/// receiver type-CONSTRUCTOR (a plain int, never a composite deref), it is invisible to
+/// `existence`/`structural`/`deriveEqFromOrd`, so it perturbs no existing verdict. Read
+/// ONLY by the structural `for x in xs` desugar (`conform.iteratorItem`). `protocol_args`
+/// is the arg PATTERN (`Iterator[T]` -> `[type_var(0)]`), substituted through a concrete
+/// receiver App's args at the use site. OWNED by `t.template_conformances`.
+pub const TemplateConformance = struct {
+    protocol_id: u32,
+    recv_ctor: u32,
+    recv_is_enum: bool,
+    protocol_args: []const Type = &.{},
+};
+
 /// A top-level function's signature, decoded once up front so calls can be
 /// checked against it (and forward references work).
 pub const FnSym = struct {
@@ -1019,6 +1035,12 @@ protocols: std.ArrayList(ProtocolSym) = .empty,
 /// Pre-seeds the builtin scalar conformances (`(Eq,int)`/`(Eq,bool)`) here in
 /// `registerPrelude` BEFORE any user impl, so `checkCoherence` collides a duplicate.
 conformances: std.ArrayList(Conformance) = .empty,
+
+/// Recorded GENERIC conformances `impl Ctor[T] has P[..]`, filled by the serial
+/// `checkCoherence` phase. Kept SEPARATE from `conformances` (see `TemplateConformance`)
+/// so it is invisible to every existing conformance query; read only by the `for x in xs`
+/// desugar. Frozen onto the `Model`; freed at teardown (each entry owns `protocol_args`).
+template_conformances: std.ArrayList(TemplateConformance) = .empty,
 
 /// The prelude protocol/enum ids, populated incrementally by `registerPrelude`
 /// in fixed append order (Eq=0..From=8; `Ordering`/`Option`/`Result` enums after every user
@@ -1200,6 +1222,9 @@ pub const Model = struct {
     /// the parallel body pass. Read-only; no Pass-C consumer (sets up the conformance query).
     protocols: []const ProtocolSym,
     conformances: []const Conformance,
+    /// Recorded GENERIC conformances (`impl Ctor[T] has P[..]`), frozen from
+    /// `checkCoherence`. Read only by the `for x in xs` desugar (`conform.iteratorItem`).
+    template_conformances: []const TemplateConformance,
     /// The prelude protocol/enum ids, frozen from the checker, or `null` if
     /// `registerPrelude` never ran (a narrow internal caller). Every `==`/`<`/arith/
     /// `.hash()`/`print`/`?`/native-method path keys off it; `null` denies conformance
@@ -1230,6 +1255,7 @@ fn buildModel(t: *Typecheck) Model {
         .templates = t.templates.items,
         .protocols = t.protocols.items,
         .conformances = t.conformances.items,
+        .template_conformances = t.template_conformances.items,
         .prelude = t.prelude,
     };
 }
@@ -1500,6 +1526,8 @@ pub fn checkGraph(
         // Each conformance may own a `protocol_args` dupe.
         for (t.conformances.items) |c| if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
         t.conformances.deinit(gpa);
+        for (t.template_conformances.items) |c| if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
+        t.template_conformances.deinit(gpa);
         for (t.enums.items) |e| {
             for (e.variants) |v| {
                 gpa.free(v.field_names);
@@ -2130,13 +2158,24 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         try t.enqueueInstance(model, m.fn_id, out, worklist, seen, mc.tokens[n.main_token].start, mod);
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
-    // over its typed `Vec[V]` receiver: discover BOTH template instances so lower can
-    // call them (the transitive `mem.ga_*` instances follow from re-checking each body).
+    // over its typed `Vec[V]` receiver, and a `for x in xs` desugars to `it := xs.iter()`
+    // then a loop over `it.next()`: discover the template instances lower will call (the
+    // transitive `Vec$T.get`/`mem.ga_*`/`Option$T` follow from re-checking each body).
     for (tree.nodes, 0..) |n, i| {
-        if (n.tag != .list_literal) continue;
-        const recv = node_types[i];
-        try t.discoverRecvMethod(model, recv, "new", worklist, seen, mc.tokens[n.main_token].start, mod);
-        try t.discoverRecvMethod(model, recv, "push", worklist, seen, mc.tokens[n.main_token].start, mod);
+        switch (n.tag) {
+            .list_literal => {
+                const recv = node_types[i];
+                try t.discoverRecvMethod(model, recv, "new", worklist, seen, mc.tokens[n.main_token].start, mod);
+                try t.discoverRecvMethod(model, recv, "push", worklist, seen, mc.tokens[n.main_token].start, mod);
+            },
+            .for_in_stmt => {
+                const recv = node_types[n.rhs.int()];
+                const iter = node_types[i];
+                try t.discoverRecvMethod(model, recv, "iter", worklist, seen, mc.tokens[n.main_token].start, mod);
+                try t.discoverRecvMethod(model, iter, "next", worklist, seen, mc.tokens[n.main_token].start, mod);
+            },
+            else => {},
+        }
     }
 }
 
@@ -2713,6 +2752,28 @@ pub fn groundProtoType(ty: Type, recv: Type, protocol_args: []const Type) Type {
     const ord = ty.typeVarOrd();
     if (ord == 0) return recv;
     return if (ord - 1 < protocol_args.len) protocol_args[ord - 1] else ty;
+}
+
+/// `groundProtoType` extended to recurse into composite `App`s: a protocol return
+/// spelled `Option[Item]` decodes to `App(Option, [type_var(1)])`, whose `type_var(1)`
+/// (Item) must ground THROUGH the App to the conformance's arg pattern before the T0024
+/// signature comparison. Shallow `groundProtoType` leaves it as `App(Option, [tv1])`,
+/// spuriously mismatching a `next(mut self) -> Option[T]` impl. Deep-grounds each App arg
+/// and re-interns (a transient query-only index, never fingerprinted). Deep ≡ shallow for
+/// every EXISTING protocol (all have top-level-only `type_var` sigs), so existing coherence
+/// verdicts are byte-identical. A bad intern degrades to `.invalid` (already an error path).
+pub fn groundProtoTypeDeep(t: *Typecheck, ty: Type, recv: Type, protocol_args: []const Type) Type {
+    if (ty.isTypeVar()) return groundProtoType(ty, recv, protocol_args);
+    if (ty.isApp()) {
+        const e = t.composite.at(ty.appIdx());
+        var buf: [8]Type = undefined;
+        const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (t.gpa.alloc(Type, e.args.len) catch return Type.invalid);
+        defer if (e.args.len > buf.len) t.gpa.free(sub);
+        for (e.args, 0..) |a, i| sub[i] = groundProtoTypeDeep(t, a, recv, protocol_args);
+        const idx = t.composite.intern(t.gpa, e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
+        return Type.app(idx);
+    }
+    return ty;
 }
 
 /// Decode one fn's signature (param + return types) and append a `FnSym` to the
