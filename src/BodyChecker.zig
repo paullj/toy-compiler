@@ -302,7 +302,9 @@ pub const BodyChecker = struct {
                         bc.slotType(bc.resolutions[(stmt.lhs).int()].local)
                     else
                         .invalid,
-                    .field_access, .tuple_field => try bc.typeOf(stmt.lhs),
+                    // A `.`-rooted place or a `*r` deref place types as an expression
+                    // (the `.unary` case types the boxed `T`, poisoning on a non-reference).
+                    .field_access, .tuple_field, .unary => try bc.typeOf(stmt.lhs),
                     else => .invalid,
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
@@ -593,6 +595,17 @@ pub const BodyChecker = struct {
                     .tilde => {
                         if (operand.isInteger()) break :blk operand;
                         try bc.sink.emit(bc.byteOf(n.main_token), "operand of '~' must be int");
+                    },
+                    // `&x` boxes `x` into a fresh managed cell, yielding `Ref[T]`. Reify
+                    // runs later, so `Ref[T]` is an `.app` during body-check.
+                    .amp => break :blk Type.app(bc.composite.intern(bc.gpa, bc.model.prelude.?.ref_struct.?, &.{operand}, false) catch break :blk Type.invalid),
+                    // `*r` place-reads the boxed `T`. The operand must be a `Ref[T]` App.
+                    .star => {
+                        if (operand.isApp()) {
+                            const e = bc.composite.at(operand.appIdx());
+                            if (!e.ctor_is_enum and e.ctor == bc.model.prelude.?.ref_struct.?) break :blk e.args[0];
+                        }
+                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '*' must be a reference");
                     },
                     else => {},
                 }
@@ -2071,7 +2084,9 @@ pub const BodyChecker = struct {
                 // value, and an aggregate join block-arg crashes codegen).
                 const native_ok = switch (op) {
                     .is_tag0, .is_tag1 => true,
-                    .unwrap, .unwrap_or => t_ty.kind == .int or t_ty.kind == .bool,
+                    // A managed-box payload (`Ref[T]`, an `.app` during Pass C) is an
+                    // 8-byte scalar cell pointer, so it rides the scalar unwrap path.
+                    .unwrap, .unwrap_or => t_ty.kind == .int or t_ty.kind == .bool or bc.isRefPayload(t_ty),
                 };
                 if (native_ok) switch (op) {
                     .is_tag0, .is_tag1 => {
@@ -2291,6 +2306,16 @@ pub const BodyChecker = struct {
             return true;
         }
         return true;
+    }
+
+    /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`) — a struct-`App` over a
+    /// prelude box template — during Pass C (before reify). Such a payload is an 8-byte
+    /// scalar cell pointer, so it rides the scalar native-Option/Result unwrap path.
+    fn isRefPayload(bc: *BodyChecker, t: Type) bool {
+        if (!t.isApp()) return false;
+        const e = bc.composite.at(t.appIdx());
+        if (e.ctor_is_enum) return false;
+        return if (bc.model.prelude) |p| p.refFamily(e.ctor) != .none else false;
     }
 
     /// Record a structural derive request once per (protocol, type) in this fn (a fn may

@@ -93,6 +93,9 @@ pub fn register(
 
     prelude.char_struct = try registerChar(gpa, structs, mods);
 
+    prelude.ref_struct = try registerBox(gpa, structs, mods, "Ref", .ref);
+    prelude.gc_array_struct = try registerBox(gpa, structs, mods, "gc_array", .gc_array);
+
     for (specs) |spec| {
         const methods = try gpa.alloc([]const u8, 1);
         methods[0] = spec.method;
@@ -235,6 +238,53 @@ fn registerChar(gpa: std.mem.Allocator, structs: *std.ArrayList(StructSym), mods
     });
     for (mods) |*m| {
         if (m.struct_ids.get("char") == null) try m.struct_ids.put(gpa, "char", id);
+    }
+    return id;
+}
+
+/// A compiler-provided managed-box generic struct TEMPLATE (`Ref[T]`, `gc_array[T]`): a
+/// one-field tuple struct whose single field is `int` (the 8-byte cell pointer). Modeling
+/// the box's field as `int` — rather than `rawptr` — lets a reified `Ref[int]` conform to
+/// Eq/Hash structurally without touching those protocols for the unrelated `rawptr`, and
+/// keeps a Ref FIELD off `deriveFieldEq`'s unsupported `else`. `family` tags the template so
+/// `refFamily` can carry it onto each reified instance. Appended AFTER `char` so its id is a
+/// pure function of source, and injected into each module's `struct_ids` if-absent so a user
+/// shadow wins (the `char`/`Ordering` precedent). Every owned slice is `gpa`-allocated so the
+/// checker's struct teardown frees it uniformly (the borrowed `name` + static `"0"` field name
+/// are not freed there).
+fn registerBox(
+    gpa: std.mem.Allocator,
+    structs: *std.ArrayList(StructSym),
+    mods: []ModuleCtx,
+    name: []const u8,
+    family: LayoutEngine.NativeStructFamily,
+) !u32 {
+    const field_names = try gpa.alloc([]const u8, 1);
+    field_names[0] = LayoutEngine.tuple_field_names[0]; // "0"
+    const field_types = try gpa.alloc(Type, 1);
+    field_types[0] = Type.int;
+    const offsets = try gpa.alloc(u32, 1);
+    offsets[0] = 0;
+    const gparams = try gpa.dupe([]const u8, &.{"T"});
+    const id: u32 = @intCast(structs.items.len);
+    try structs.append(gpa, .{
+        .decl_node = Ast.none,
+        .name = name,
+        .mod = 0,
+        .pub_export = true,
+        .field_names = field_names,
+        .field_types = field_types,
+        .offsets = offsets,
+        .size = 8,
+        .@"align" = 8,
+        .state = .done,
+        .is_tuple = true,
+        .is_generic = true,
+        .generic_params = gparams,
+        .native_family = family,
+    });
+    for (mods) |*m| {
+        if (m.struct_ids.get(name) == null) try m.struct_ids.put(gpa, name, id);
     }
     return id;
 }
@@ -383,4 +433,41 @@ test "char is a hand-laid-out tuple struct(uint32), size 8, done" {
     try testing.expect(Type.eql(Type.uint32, c.field_types[0]));
     try testing.expectEqualStrings("0", c.field_names[0]);
     try testing.expectEqual(@as(u32, 0), c.offsets[0]);
+}
+
+test "Ref/gc_array are generic box templates(int) appended after char, injected into struct_ids" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var protocols: std.ArrayList(ProtocolSym) = .empty;
+    var conformances: std.ArrayList(Conformance) = .empty;
+    var enums: std.ArrayList(EnumSym) = .empty;
+    var structs: std.ArrayList(StructSym) = .empty;
+    // register only touches `struct_ids`/`enum_ids`; the AST/source views are unread here.
+    var one_mod = [_]ModuleCtx{.{ .tree = undefined, .tokens = &.{}, .source = "", .resolutions = &.{} }};
+
+    const prelude = try register(gpa, &protocols, &conformances, &enums, &structs, &one_mod);
+
+    try testing.expect(prelude.ref_struct != null);
+    try testing.expect(prelude.gc_array_struct != null);
+    // Appended AFTER char so their ids are a pure function of source.
+    try testing.expect(prelude.ref_struct.? > prelude.char_struct.?);
+    try testing.expect(prelude.gc_array_struct.? > prelude.ref_struct.?);
+
+    inline for (.{ .{ prelude.ref_struct.?, "Ref", LayoutEngine.NativeStructFamily.ref }, .{ prelude.gc_array_struct.?, "gc_array", LayoutEngine.NativeStructFamily.gc_array } }) |spec| {
+        const s = structs.items[spec[0]];
+        try testing.expectEqualStrings(spec[1], s.name);
+        try testing.expect(s.is_generic);
+        try testing.expect(s.is_tuple);
+        try testing.expectEqual(@as(usize, 1), s.generic_params.len);
+        try testing.expectEqualStrings("T", s.generic_params[0]);
+        // The box field is `int` (the 8-byte cell pointer), not `rawptr`.
+        try testing.expectEqual(@as(usize, 1), s.field_types.len);
+        try testing.expect(Type.eql(Type.int, s.field_types[0]));
+        try testing.expectEqual(@as(u32, 8), s.size);
+        try testing.expectEqual(spec[2], s.native_family);
+        // Injected into the module's bare-name struct table so `Ref[..]` resolves.
+        try testing.expectEqual(spec[0], one_mod[0].struct_ids.get(spec[1]).?);
+    }
 }

@@ -1,0 +1,11 @@
+# expect: exit 1
+# Feature: `&x`/`*r`/`*r = v` over `bool`. Box `true`, flip it through the box, then
+# return an int derived from the (now-false) value.
+fn main() -> int {
+    r := &true
+    *r = !*r        # flip through the box
+    if *r {
+        return 0
+    }
+    return 1
+}

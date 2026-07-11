@@ -226,9 +226,11 @@ pub const Type = struct {
         return t.kind == .rawptr;
     }
 
-    /// An unmanaged `rawptr` carries NO heap-reference semantics (it is a bare C
-    /// `void*`), so it is never a reference. The single predicate a future GC/box
-    /// model routes through; today only `rawptr` exists to say `false` about.
+    /// No bare `Type` is a reference: an unmanaged `rawptr` carries NO heap-reference
+    /// semantics (a bare C `void*`), and a managed box is a marker-tagged struct that only
+    /// the table-aware predicates (lower's `isRefTy` reading `Layout.native_family`, the
+    /// checker's composite-ctor test) can recognize. This leaf-`Type` view has no table, so
+    /// it stays `false`.
     pub fn isReference(t: Type) bool {
         _ = t;
         return false;

@@ -1,0 +1,10 @@
+# expect: compile-error "Ref"
+# Feature (negative): a managed box has no hashable value — its identity is a heap cell,
+# not a stable key. A struct that holds a `Ref` field therefore cannot derive `Hash`; the
+# `.hash()` call is a compile error whose message names 'Ref'.
+struct S { r: Ref[int] }
+
+fn main() -> int {
+    s := S{ r: &41 }
+    return s.hash()
+}

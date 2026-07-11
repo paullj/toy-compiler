@@ -77,6 +77,15 @@ fn structEqAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: I
 /// through `structEqAtSlots`. Unit fields are rejected by T0007, so never occur.
 fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
+    // A managed-box FIELD compares by CELL IDENTITY: an 8-byte pointer `icmp eq`, not a
+    // structural deref (the box's `int` field IS the cell pointer).
+    if (L.isRefTy(b, fty)) {
+        const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = int_ty } }, int_ty);
+        const lv = try b.emit(.{ .load = .{ .addr = la, .ty = int_ty } }, int_ty);
+        const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = int_ty } }, int_ty);
+        const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = int_ty } }, int_ty);
+        return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
+    }
     switch (fty.kind) {
         .int, .bool => {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
@@ -1156,6 +1165,38 @@ test "derive Eq/Ord/Hash walk struct fields in the same layout order" {
     try testing.expectEqualSlices(u32, &expected, eq_offs);
     try testing.expectEqualSlices(u32, &expected, ord_offs);
     try testing.expectEqualSlices(u32, &expected, hash_offs);
+}
+
+test "derive Eq on a Ref field compares by pointer identity (icmp eq, no witness call)" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    // layouts[0] = `struct S { r: Ref[int] }`; layouts[1] = the reified `Ref$int` box,
+    // tagged native_family .ref so `isRefTy` recognizes the field as a managed box.
+    var s_fnames = [_][]const u8{"r"};
+    var s_ftys = [_]Typecheck.Type{Typecheck.Type.structT(1)};
+    var s_offs = [_]u32{0};
+    var ref_fnames = [_][]const u8{"0"};
+    var ref_ftys = [_]Typecheck.Type{Typecheck.Type.int};
+    var ref_offs = [_]u32{0};
+    var layouts = [_]Typecheck.Layout{
+        .{ .name = "S", .field_names = &s_fnames, .field_types = &s_ftys, .offsets = &s_offs, .size = 8, .@"align" = 8 },
+        .{ .name = "Ref$int", .field_names = &ref_fnames, .field_types = &ref_ftys, .offsets = &ref_offs, .size = 8, .@"align" = 8, .native_family = .ref },
+    };
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "D" };
+    var func = try lowerDeriveEq(gpa, intStructInputs(&layouts), .{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Typecheck.Type.structT(0), .ret = Typecheck.Type.@"bool" }, sym, &diags);
+    defer func.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    // Identity compare: an `icmp eq`, and crucially NO witness `.call` (a structural deref).
+    try testing.expect(hasCond(&func, .eq));
+    var calls: usize = 0;
+    for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+        .call => calls += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 0), calls);
 }
 
 test "derive Ord compares an unsigned field unsigned, a signed field signed" {
