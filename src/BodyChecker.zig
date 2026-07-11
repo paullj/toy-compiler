@@ -18,6 +18,7 @@ const Typecheck = @import("types.zig");
 const Conform = Typecheck.conform;
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
+const Intrinsic = @import("symbols/Intrinsic.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const PatternChecker = @import("PatternChecker.zig");
 const Literal = @import("types/literal.zig");
@@ -1615,7 +1616,8 @@ pub const BodyChecker = struct {
             const bres = bc.resolutions[(callee.lhs).int()];
             if (bres == .func and bc.model.fns[bres.func].kind == .builtin) {
                 const bn = bc.nameText(bc.tree.nodes[(callee.lhs).int()].main_token);
-                if (std.mem.eql(u8, bn, "size_of") or std.mem.eql(u8, bn, "align_of")) {
+                const bik = Intrinsic.lookup(bn);
+                if (bik == .size_of or bik == .align_of) {
                     const targ_nodes = Ast.rangeSlice(bc.tree, (callee.rhs).int());
                     for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
                     const val_args = Ast.rangeSlice(bc.tree, (n.rhs).int());
@@ -1696,60 +1698,65 @@ pub const BodyChecker = struct {
             // path since their arities differ (0 for `gc_span_count`, 2 for `store`).
             if (callee.tag == .identifier) {
                 const bn = bc.nameText(callee.main_token);
-                if (std.mem.eql(u8, bn, "gc_alloc")) {
-                    if (args.len != 1) {
+                if (Intrinsic.lookup(bn)) |ik| switch (ik) {
+                    .gc_alloc => {
+                        if (args.len != 1) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                        } else {
+                            const st = try bc.typeOf(args[0]);
+                            if (st.kind != .int and st.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'gc_alloc' size must be an 'int', got '{s}'", .{bc.typeName(st)});
+                        }
+                        bc.node_types[(node_idx).int()] = Type.rawptr;
+                        return Type.rawptr;
+                    },
+                    .gc_span_count => {
+                        if (args.len != 0) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        }
+                        bc.node_types[(node_idx).int()] = Type.int;
+                        return Type.int;
+                    },
+                    .store => {
+                        if (args.len != 2) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                        } else {
+                            const pt = try bc.typeOf(args[0]);
+                            _ = try bc.typeOf(args[1]);
+                            if (!bc.in_unsafe)
+                                try bc.sink.emitFmtCode(.T0038, bc.byteOf(callee.main_token), "raw pointer 'store' requires an 'unsafe' block", .{});
+                            if (pt.kind != .rawptr and pt.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'store' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
+                        }
+                        bc.node_types[(node_idx).int()] = Type.unit;
+                        return Type.unit;
+                    },
+                    .load => {
+                        if (args.len != 1) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                        } else {
+                            const pt = try bc.typeOf(args[0]);
+                            if (!bc.in_unsafe)
+                                try bc.sink.emitFmtCode(.T0038, bc.byteOf(callee.main_token), "raw pointer 'load' requires an 'unsafe' block", .{});
+                            if (pt.kind != .rawptr and pt.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'load' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
+                        }
+                        bc.node_types[(node_idx).int()] = Type.int;
+                        return Type.int;
+                    },
+                    .gc_array => {
                         for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
-                    } else {
-                        const st = try bc.typeOf(args[0]);
-                        if (st.kind != .int and st.kind != .invalid)
-                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'gc_alloc' size must be an 'int', got '{s}'", .{bc.typeName(st)});
-                    }
-                    bc.node_types[(node_idx).int()] = Type.rawptr;
-                    return Type.rawptr;
-                }
-                if (std.mem.eql(u8, bn, "gc_span_count")) {
-                    if (args.len != 0) {
-                        for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
-                    }
-                    bc.node_types[(node_idx).int()] = Type.int;
-                    return Type.int;
-                }
-                if (std.mem.eql(u8, bn, "store")) {
-                    if (args.len != 2) {
-                        for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
-                    } else {
-                        const pt = try bc.typeOf(args[0]);
-                        _ = try bc.typeOf(args[1]);
-                        if (!bc.in_unsafe)
-                            try bc.sink.emitFmtCode(.T0038, bc.byteOf(callee.main_token), "raw pointer 'store' requires an 'unsafe' block", .{});
-                        if (pt.kind != .rawptr and pt.kind != .invalid)
-                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'store' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
-                    }
-                    bc.node_types[(node_idx).int()] = Type.unit;
-                    return Type.unit;
-                }
-                if (std.mem.eql(u8, bn, "load")) {
-                    if (args.len != 1) {
-                        for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
-                    } else {
-                        const pt = try bc.typeOf(args[0]);
-                        if (!bc.in_unsafe)
-                            try bc.sink.emitFmtCode(.T0038, bc.byteOf(callee.main_token), "raw pointer 'load' requires an 'unsafe' block", .{});
-                        if (pt.kind != .rawptr and pt.kind != .invalid)
-                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'load' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
-                    }
-                    bc.node_types[(node_idx).int()] = Type.int;
-                    return Type.int;
-                }
-                if (std.mem.eql(u8, bn, "gc_array")) {
-                    for (args) |arg| _ = try bc.typeOf(arg);
-                    try bc.sink.emit(bc.byteOf(n.main_token), "'gc_array' is not yet available");
-                    return .invalid;
-                }
+                        try bc.sink.emit(bc.byteOf(n.main_token), "'gc_array' is not yet available");
+                        return .invalid;
+                    },
+                    // `size_of[T]()`/`align_of[T]()` are the type_app form handled above;
+                    // a bare-call misuse falls through to the generic path unchanged.
+                    .size_of, .align_of => {},
+                };
             }
             if (args.len != 1) {
                 for (args) |arg| _ = try bc.typeOf(arg);
