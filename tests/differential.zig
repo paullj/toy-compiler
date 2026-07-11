@@ -466,6 +466,7 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
         .{ .dir = ".toy-test-panic-mod0", .src = "fn main() -> int { return 10 % 0 }\n", .want = @as(?u8, 1), .err = "remainder by zero" },
         .{ .dir = ".toy-test-panic-unwrap", .src = "fn main() -> int {\n  x := Option[int].none\n  return x.unwrap()\n}\n", .want = @as(?u8, 1), .err = "unwrap of empty" },
         .{ .dir = ".toy-test-panic-user", .src = "fn main() -> int {\n  panic(\"boom\")\n  return 0\n}\n", .want = @as(?u8, 1), .err = "boom" },
+        .{ .dir = ".toy-test-panic-oob", .src = "import std/vec\nfn main() -> int {\n  xs := [10]\n  return xs[5]\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-ctldiv", .src = "fn main() -> int { return 10 / 3 }\n", .want = @as(?u8, 3), .err = "" },
         .{ .dir = ".toy-test-panic-ctlmod", .src = "fn main() -> int { return 17 % 5 }\n", .want = @as(?u8, 2), .err = "" },
     };

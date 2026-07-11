@@ -27,4 +27,8 @@ impl Vec[T] {
         }
         return Option[T].none
     }
+
+    fn first(self) -> Option[T] {
+        return self.get(0)
+    }
 }

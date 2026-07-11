@@ -184,6 +184,176 @@ test "vec: a Vec[bool] round-trips scalar elements through get" {
     try std.testing.expectEqual(@as(u8, 42), code);
 }
 
+test "vec: a scalar `[1,2,3]` literal is built and read via xs[i]" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The non-empty literal infers V=int from the first element and builds a populated
+    // Vec[int]; bracket indexing reads each element in bounds. 2 + 5 + 7 = 14.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-lit-scalar",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs := [2, 5, 7]
+        \\    return xs[0] + xs[1] + xs[2]
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 14), code);
+}
+
+test "vec: an aggregate `[P{..},..]` literal is read via xs[i] (struct element)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // V=P inferred from the first element; ga_push copies size_of[P] bytes per element and
+    // xs[i] copies the struct out. (10+20) + (30+40) = 100.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-lit-agg",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    ps := [P{ x: 10, y: 20 }, P{ x: 30, y: 40 }]
+        \\    a := ps[0]
+        \\    b := ps[1]
+        \\    return a.x + a.y + b.x + b.y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 100), code);
+}
+
+test "vec: an aggregate element survives a regrow, read via xs[i] below the initial cap" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // Push 6 structs (past the initial cap of 4) so ga_grow copies the live prefix by
+    // size_of[P] bytes; then read index 1 (< the initial cap) — it must survive the copy.
+    // ps[1] = {x:1,y:2} -> 1+2 = 3, plus len 6 -> 9.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-agg-regrow",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    xs := Vec[P].new()
+        \\    i := 0
+        \\    while i < 6 {
+        \\        xs.push(P{ x: i, y: i + 1 })
+        \\        i = i + 1
+        \\    }
+        \\    e := xs[1]
+        \\    return xs.len() + e.x + e.y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 9), code);
+}
+
+test "vec: Option[P] unwrap over an aggregate payload (get) yields the struct" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The SPIKE: get(1) -> Option[P], unwrap of an aggregate payload routes through a
+    // result slot + copy. p.x + p.y = 3 + 4 = 7.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-struct",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    ps := [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }]
+        \\    p := ps.get(1).unwrap()
+        \\    return p.x + p.y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "vec: Option[Vec[int]] unwrap round-trips a Vec payload" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The unwrap payload is a Vec[int] (a struct aggregate — the 8-byte handle rides the
+    // result-slot copy). Build a Vec, wrap it in Option[Vec[int]], unwrap, and read back.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-vec",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs := [10, 20, 30]
+        \\    o := Option[Vec[int]].some(xs)
+        \\    v := o.unwrap()
+        \\    return v.len() * 10 + v[2]   # 3*10 + 30 = 60
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 60), code);
+}
+
+test "vec: Option[Ref[int]] unwrap rides the scalar/ref payload path" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // A managed-box payload is an 8-byte cell pointer, so unwrap keeps the scalar
+    // block-arg join (byte-identical to HEAD). Deref the unwrapped Ref: *r = 42.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-ref",
+        \\fn main() -> int {
+        \\    r := &42
+        \\    o := Option[Ref[int]].some(r)
+        \\    return *o.unwrap()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "vec: unwrap_or with an aggregate default returns the default on none" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // unwrap_or's none-branch writes the aggregate default into the result slot via
+    // lowerExprInto. An empty Vec's get(0) is none -> the default P{x:5,y:6} -> 11.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-unwrap-or",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    xs := Vec[P].new()
+        \\    p := xs.get(0).unwrap_or(P{ x: 5, y: 6 })
+        \\    return p.x + p.y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 11), code);
+}
+
+test "vec: .first() returns the head element" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-first",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs := [8, 1, 2]
+        \\    a := xs.first().unwrap()
+        \\    empty := Vec[int].new()
+        \\    b := empty.first().unwrap_or(3)
+        \\    return a + b   # 8 + 3 = 11
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 11), code);
+}
+
 test "vec: a Vec program is byte-identical at -j1 and -j8" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

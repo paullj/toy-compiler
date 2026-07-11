@@ -2129,6 +2129,42 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         if (!conc) continue;
         try t.enqueueInstance(model, m.fn_id, out, worklist, seen, mc.tokens[n.main_token].start, mod);
     }
+    // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
+    // over its typed `Vec[V]` receiver: discover BOTH template instances so lower can
+    // call them (the transitive `mem.ga_*` instances follow from re-checking each body).
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag != .list_literal) continue;
+        const recv = node_types[i];
+        try t.discoverRecvMethod(model, recv, "new", worklist, seen, mc.tokens[n.main_token].start, mod);
+        try t.discoverRecvMethod(model, recv, "push", worklist, seen, mc.tokens[n.main_token].start, mod);
+    }
+}
+
+/// Discover-and-enqueue the concrete instance of the template method `name` on the
+/// `App` receiver `recv` (binding the impl's params by matching the template's `Self`
+/// pattern against `recv`'s args — the same `Infer.match` Pass C runs). A miss on any
+/// step (not an App, no such template, non-concrete binding) enqueues nothing.
+fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []const u8, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at_byte: u32, mod: u32) !void {
+    if (!recv.isApp()) return;
+    const re = t.composite.at(recv.appIdx());
+    const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, name) orelse return;
+    const mf = model.fns[m.fn_id];
+    if (!mf.self_type.isApp()) return;
+    const pat = t.composite.at(mf.self_type.appIdx()).args;
+    if (pat.len != re.args.len) return;
+    const n_gp: u32 = @intCast(mf.generic_params.len);
+    const out = try t.gpa.alloc(Type, n_gp);
+    defer t.gpa.free(out);
+    const bnd = try t.gpa.alloc(bool, n_gp);
+    defer t.gpa.free(bnd);
+    const fp = try t.gpa.alloc(usize, n_gp);
+    defer t.gpa.free(fp);
+    switch (Infer.match(n_gp, pat, re.args, out, bnd, fp)) {
+        .ok => {},
+        else => return,
+    }
+    for (out) |ta| if (!isConcreteValue(ta)) return;
+    try t.enqueueInstance(model, m.fn_id, out, worklist, seen, at_byte, mod);
 }
 
 /// Enqueue `(gid, args)` for instantiation, deduped on the canonical key. `args` is
@@ -3965,23 +4001,19 @@ test "a native method name on a user `enum Option` shadow is T0018, not the nati
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
-test "unwrap on a str (non-scalar) payload is deferred — exactly one T0018, no crash" {
-    const gpa = testing.allocator;
-    var c = try checkSource(
+test "unwrap on a str (aggregate) payload is accepted — no diagnostic" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[str].some("hi")
         \\ s := x.unwrap()
         \\ return 0
         \\}
         \\
-    );
-    defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+    ));
 }
 
-test "unwrap_or on a str (non-scalar) payload is deferred — exactly one T0018" {
-    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+test "unwrap_or on a str (aggregate) payload is accepted — no diagnostic" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[str].some("hi")
         \\ s := x.unwrap_or("d")
@@ -3991,9 +4023,8 @@ test "unwrap_or on a str (non-scalar) payload is deferred — exactly one T0018"
     ));
 }
 
-test "unwrap on a struct payload is deferred — exactly one T0018, no crash" {
-    const gpa = testing.allocator;
-    var c = try checkSource(
+test "unwrap on a struct (aggregate) payload is accepted — no diagnostic" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\struct P { x: int }
         \\fn main() -> int {
         \\ x := Option[P].some(P { x: 40 })
@@ -4001,15 +4032,11 @@ test "unwrap on a struct payload is deferred — exactly one T0018, no crash" {
         \\ return 0
         \\}
         \\
-    );
-    defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+    ));
 }
 
-test "unwrap_or on a struct payload is deferred — exactly one T0018, no crash" {
-    const gpa = testing.allocator;
-    var c = try checkSource(
+test "unwrap_or on a struct (aggregate) payload is accepted — no diagnostic" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\struct P { x: int }
         \\fn main() -> int {
         \\ d := P { x: 2 }
@@ -4017,10 +4044,7 @@ test "unwrap_or on a struct payload is deferred — exactly one T0018, no crash"
         \\ return 0
         \\}
         \\
-    );
-    defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
+    ));
 }
 
 test "predicates stay native for a non-scalar payload (tag-only, safe)" {

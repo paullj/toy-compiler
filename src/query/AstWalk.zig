@@ -458,6 +458,19 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .count = @intCast(alts.len) });
             for (alts) |a| try walkInner(src, a, collect, visitor);
         },
+        // A non-empty list literal: fold the element arity (so `[1]` != `[1,2]`) then
+        // walk each element (mirroring `.call`'s args tail, minus the callee).
+        .list_literal => {
+            const elems = Ast.rangeSlice(tree, n.rhs.int());
+            try emit(visitor, .{ .count = @intCast(elems.len) });
+            for (elems) |el| try walkInner(src, el, collect, visitor);
+        },
+        // A value index: the `.enter` tag byte keeps it fp-distinct; walk receiver
+        // then index (lhs before rhs, like `.binary` minus the operator event).
+        .index => {
+            try walkInner(src, n.lhs, collect, visitor);
+            try walkInner(src, n.rhs, collect, visitor);
+        },
     }
 }
 

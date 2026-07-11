@@ -64,7 +64,8 @@ pub fn ga_grow[T](a: gc_array[T], c: int) {
     e := unsafe { load(offset(a, 16)) }
     i := 0
     while i < c {
-        unsafe { store(offset(ne, i * size_of[T]()), load(offset(e, i * size_of[T]()))) }
+        v: T = unsafe { load(offset(e, i * size_of[T]())) }
+        unsafe { store(offset(ne, i * size_of[T]()), v) }
         i = i + 1
     }
     unsafe {

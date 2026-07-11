@@ -201,7 +201,7 @@ pub const Terminator = union(enum) {
     /// so a later pass maps reason -> message with no lower re-plumbing. No successors.
     panic: PanicReason,
 
-    pub const PanicReason = enum { div_by_zero, rem_by_zero };
+    pub const PanicReason = enum { div_by_zero, rem_by_zero, index_oob };
 };
 
 /// A basic block: a list of block params (the merge slots), straight-line

@@ -597,6 +597,9 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
         },
         // An empty list literal `[]` is sugar for the type's associated `new()`.
         .empty_list => return .{ .slot = try lowerEmptyListSlot(b, node_idx, ty) },
+        // A non-empty `[e0, ..]` builds a `Vec[V]` via `new()` + one `push` per element.
+        .list_literal => return .{ .slot = try lowerListLiteralSlot(b, node_idx, ty) },
+        .index => return try lowerIndex(b, node_idx, ty),
         // A poison leaf must never reach lower: a tainted tree is gated out before
         // codegen, and it is not produced anywhere yet.
         .error_node => unreachable,
@@ -1488,6 +1491,13 @@ pub fn isRefTy(b: *Builder, t: Typecheck.Type) bool {
         b.in.layouts[t.struct_id].native_family != .none;
 }
 
+/// Whether `t` is a by-slot aggregate for lowering (str/struct/enum), EXCLUDING a
+/// managed-box handle (`Ref`/`gc_array`), which is a scalar 8-byte cell pointer.
+fn isAggTy(b: *Builder, t: Typecheck.Type) bool {
+    if (isRefTy(b, t)) return false;
+    return t.kind == .str or t.kind == .@"struct" or t.kind == .@"enum";
+}
+
 /// Call the `print` builtin over the `str` slot `slot` — write its `{ptr,len}` bytes to
 /// fd 1. The single shared raw write path (literals + `str` fields both route here).
 pub fn emitPrintSlot(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
@@ -1839,7 +1849,13 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| switch (ik) {
                 .store => {
                     const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const vty = b.in.node_types[(sargs[1]).int()];
                     const addr = operandValue(try lowerExpr(b, sargs[0]));
+                    if (isAggTy(b, vty)) {
+                        const src = try operandPtr(b, try lowerExpr(b, sargs[1]));
+                        if (src != Ir.none_value) _ = try b.emit(.{ .copy = .{ .dst = addr, .src = src, .ty = vty } }, null);
+                        return .none;
+                    }
                     const val = operandValue(try lowerExpr(b, sargs[1]));
                     _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = Typecheck.Type.int } }, null);
                     return .none;
@@ -1848,6 +1864,12 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                     const addr = operandValue(try lowerExpr(b, largs[0]));
                     const lty = b.in.node_types[(node_idx).int()];
+                    if (isAggTy(b, lty)) {
+                        const slot = try b.addSlot(lty);
+                        const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+                        _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = lty } }, null);
+                        return .{ .slot = slot };
+                    }
                     return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = lty } }, lty) };
                 },
                 .offset => {
@@ -2192,19 +2214,6 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
     // truncate a str/aggregate to one 8-byte load, and an aggregate join block-arg
     // crashes codegen (unassigned value offset). The checker already rejects this with
     // T0018, so this is a defensive clean-fail should an aggregate reach `lower`.
-    switch (om.op) {
-        .unwrap, .unwrap_or => {
-            const pty = e.variants[0].field_types[0];
-            // A managed-box payload is an 8-byte scalar cell pointer, so it rides the
-            // scalar unwrap path (an int-typed load + int block-arg) like int/bool.
-            if (pty.kind != .int and pty.kind != .bool and !isRefTy(b, pty)) {
-                try b.note(n.main_token, "unwrap on a non-scalar Option/Result payload is not yet supported");
-                return .none;
-            }
-        },
-        else => {},
-    }
-
     const slot = try b.addSlot(recv_ty);
     const base = try b.emit(.{ .slot_addr = slot }, int_ty);
     try lowerExprInto(b, om.recv, base, recv_ty);
@@ -2218,14 +2227,29 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
         },
         .unwrap => {
             const payload_ty = e.variants[0].field_types[0];
-            // A managed-box payload joins as an 8-byte scalar (int block-arg); a struct
-            // block-arg would crash codegen (unassigned value offset).
-            const merge_ty = if (isRefTy(b, payload_ty)) int_ty else payload_ty;
             const zero = try b.emit(.{ .iconst = 0 }, int_ty);
             const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
             const ok_blk = try b.addBlock();
             const trap_blk = try b.addBlock();
             const join = try b.addBlock();
+            // An AGGREGATE payload (str/struct/enum) cannot ride a join block-arg (a
+            // struct phi crashes codegen); route it through a result slot the some-arm
+            // copies into, an argless join, then yield the slot — mirroring lowerTryInto.
+            // A scalar/ref payload keeps the block-arg join, so its IR is byte-identical.
+            if (isAggTy(b, payload_ty)) {
+                const res = try b.addSlot(payload_ty);
+                const res_addr = try b.emit(.{ .slot_addr = res }, int_ty);
+                b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
+                b.switchTo(ok_blk);
+                const src = try addrAtOff(b, base, e.payload_off + e.variants[0].offsets[0], payload_ty);
+                try copyValueByType(b, res_addr, src, payload_ty);
+                try brTo(b, join, .none);
+                b.switchTo(trap_blk);
+                b.setTerm(.trap);
+                b.switchTo(join);
+                return .{ .slot = res };
+            }
+            const merge_ty = if (isRefTy(b, payload_ty)) int_ty else payload_ty;
             const merge = try b.addParam(join, merge_ty);
             b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
             b.switchTo(ok_blk);
@@ -2237,13 +2261,27 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
         },
         .unwrap_or => {
             const payload_ty = e.variants[0].field_types[0];
-            const merge_ty = if (isRefTy(b, payload_ty)) int_ty else payload_ty;
             const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             const zero = try b.emit(.{ .iconst = 0 }, int_ty);
             const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
             const some_blk = try b.addBlock();
             const none_blk = try b.addBlock();
             const join = try b.addBlock();
+            if (isAggTy(b, payload_ty)) {
+                const res = try b.addSlot(payload_ty);
+                const res_addr = try b.emit(.{ .slot_addr = res }, int_ty);
+                b.setTerm(.{ .cond_br = .{ .cond = present, .t = some_blk, .f = none_blk } });
+                b.switchTo(some_blk);
+                const src = try addrAtOff(b, base, e.payload_off + e.variants[0].offsets[0], payload_ty);
+                try copyValueByType(b, res_addr, src, payload_ty);
+                try brTo(b, join, .none);
+                b.switchTo(none_blk);
+                try lowerExprInto(b, args[0], res_addr, payload_ty);
+                try brTo(b, join, .none);
+                b.switchTo(join);
+                return .{ .slot = res };
+            }
+            const merge_ty = if (isRefTy(b, payload_ty)) int_ty else payload_ty;
             const merge = try b.addParam(join, merge_ty);
             b.setTerm(.{ .cond_br = .{ .cond = present, .t = some_blk, .f = none_blk } });
             b.switchTo(some_blk);
@@ -2532,6 +2570,15 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
             const src = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             _ = try b.emit(.{ .copy = .{ .dst = dst_ptr, .src = src, .ty = ty } }, null);
         },
+        // A non-empty list literal: build into a temp then copy the handle out (mirrors
+        // the `.empty_list` into-dest arm).
+        .list_literal => {
+            const slot = try lowerListLiteralSlot(b, expr, ty);
+            const src = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            _ = try b.emit(.{ .copy = .{ .dst = dst_ptr, .src = src, .ty = ty } }, null);
+        },
+        // An aggregate `Vec[V]` element read: lowerIndex yields its `.slot`, copy out.
+        .index => try copyAggInto(b, expr, dst_ptr, ty),
         // An arithmetic operator on struct/enum operands desugars to an
         // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
         // `.slot`, so copy those bytes into the destination like any other agg result.
@@ -2617,6 +2664,78 @@ fn lowerEmptyListSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) erro
     errdefer b.gpa.free(args);
     _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
     return slot;
+}
+
+/// Lower a non-empty list literal `[e0, ..]` (type `ty`, a `Vec[V]`) into a fresh temp
+/// slot: call the type's associated `new()`, then one `push(self, ei)` per element.
+/// `push` takes `self` by value (the 8-byte handle), so the same slot is passed as the
+/// receiver each time — the header never moves, so every push targets the shared
+/// backing. An aggregate element rides `push`'s arg by slot (its `store` copies
+/// `size_of[V]` bytes), a scalar by value.
+fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const slot = try b.addSlot(ty);
+    const nm = Typecheck.findMethod(b.in.methods, ty, "new") orelse {
+        try b.note(n.main_token, "list-literal 'new' constructor unresolved in lower");
+        return slot;
+    };
+    {
+        const new_args = try b.gpa.alloc(Ir.Operand, 0);
+        errdefer b.gpa.free(new_args);
+        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, nm), .args = new_args, .ret_slot = slot } }, null);
+    }
+    const pm = Typecheck.findMethod(b.in.methods, ty, "push") orelse {
+        try b.note(n.main_token, "list-literal 'push' unresolved in lower");
+        return slot;
+    };
+    const push_callee = witnessCallee(b, pm);
+    for (Ast.rangeSlice(b.in.tree, (n.rhs).int())) |ei| {
+        const args = try b.gpa.alloc(Ir.Operand, 2);
+        errdefer b.gpa.free(args);
+        args[0] = .{ .slot = slot };
+        args[1] = try lowerExpr(b, ei);
+        _ = try b.emit(.{ .call = .{ .callee = push_callee, .args = args, .ret_slot = Ir.none_slot } }, null);
+    }
+    return slot;
+}
+
+/// Lower a value index `recv[i]` reading a `Vec[V]` element. The receiver's single field
+/// `h` (offset 0) is the 8-byte handle at a `{len@0, cap@8, elems@16}` header (see
+/// `core/mem`). One UNSIGNED compare `i >= len` catches both `i < 0` and `i >= len`;
+/// out of bounds panics, otherwise the element at `elems + i*size_of[V]()` is read (an
+/// aggregate copied into a fresh slot, a scalar/ref loaded as a value) — mirroring the
+/// unchecked `mem.ga_get`.
+fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const recv_op = try lowerExpr(b, n.lhs);
+    const base = try operandPtr(b, recv_op);
+    if (base == Ir.none_value) return .none;
+    const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+    const idx = operandValue(try lowerExpr(b, n.rhs));
+    const len = try b.emit(.{ .load = .{ .addr = handle, .ty = int_ty } }, int_ty);
+    const oob = try b.emit(.{ .icmp = .{ .cc = .uge, .lhs = idx, .rhs = len } }, Typecheck.Type.@"bool");
+    const cont = try b.addBlock();
+    const panic_blk = try b.addBlock();
+    b.setTerm(.{ .cond_br = .{ .cond = oob, .t = panic_blk, .f = cont } });
+    b.switchTo(panic_blk);
+    b.setTerm(.{ .panic = .index_oob });
+    b.switchTo(cont);
+    const elems_addr = try b.emit(.{ .field_addr = .{ .base = handle, .off = 16, .ty = int_ty } }, int_ty);
+    const elems = try b.emit(.{ .load = .{ .addr = elems_addr, .ty = int_ty } }, int_ty);
+    const sz: i64 = @intCast(Abi.typeSize(ty, b.in.layouts, b.in.enum_layouts));
+    const szv = try b.emit(.{ .iconst = sz }, int_ty);
+    const off = try b.emit(.{ .mul = .{ .lhs = idx, .rhs = szv } }, int_ty);
+    const ea = try b.emit(.{ .add = .{ .lhs = elems, .rhs = off } }, int_ty);
+    if (isAggTy(b, ty)) {
+        const res = try b.addSlot(ty);
+        const res_addr = try b.emit(.{ .slot_addr = res }, int_ty);
+        _ = try b.emit(.{ .copy = .{ .dst = res_addr, .src = ea, .ty = ty } }, null);
+        return .{ .slot = res };
+    }
+    // A managed-box (`Ref`/`gc_array`) element is an 8-byte scalar cell pointer.
+    if (isRefTy(b, ty)) return .{ .value = try b.emit(.{ .load = .{ .addr = ea, .ty = int_ty } }, int_ty) };
+    return .{ .value = try b.emit(.{ .load = .{ .addr = ea, .ty = ty } }, ty) };
 }
 
 /// Materialize an aggregate-producing expression into a fresh temp slot and return

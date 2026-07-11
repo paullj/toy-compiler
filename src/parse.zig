@@ -1303,6 +1303,46 @@ fn parseTypeApp(p: *Parser, base: Ast.Index) Error!Ast.Index {
     return p.addNode(.{ .tag = .type_app, .main_token = lbracket, .lhs = base, .rhs = header });
 }
 
+/// Peek past a bracketed run `[ .. ]` (from the `[` at the cursor to its depth-matched
+/// `]`) and report whether the token AFTER it opens a call `(`, struct literal `{`, or
+/// member access `.` — the three positions a `type_app` is validly consumed in. Every
+/// other follower marks the `[ .. ]` as a value INDEX. An unbalanced run reads as an
+/// index (its `parseIndex` reports the missing `]`). In a `no_block` header (if/while/
+/// match/for scrutinee) a following `{` is the body brace, not a struct literal, so it
+/// must not pull the index into a `type_app`.
+fn turbofishFollows(p: *const Parser) bool {
+    var depth: usize = 0;
+    var i: u32 = p.index;
+    while (i < p.tokens.len) : (i += 1) {
+        switch (p.tokens[i].tag) {
+            .l_bracket => depth += 1,
+            .r_bracket => {
+                depth -= 1;
+                if (depth == 0) {
+                    const next: token.Tag = if (i + 1 < p.tokens.len) p.tokens[i + 1].tag else .eof;
+                    return next == .l_paren or (next == .l_brace and !p.no_block) or next == .dot;
+                }
+            },
+            .eof => return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Parse a value index `recv[idx]`. The receiver and index nodes are created before
+/// the `index` node, so children precede the parent.
+fn parseIndex(p: *Parser, recv: Ast.Index) Error!Ast.Index {
+    const lbracket = p.index;
+    p.bump(.l_bracket);
+    // The `[ ]` open a fresh expression context (re-allow blocks/literals in the index).
+    var nb = NoBlockScope.enter(p, false);
+    defer nb.end();
+    const idx = try p.parseExpr(0);
+    try p.expect(.r_bracket, "expected ']' to close an index");
+    return p.addNode(.{ .tag = .index, .main_token = lbracket, .lhs = recv, .rhs = idx });
+}
+
 /// Parse a bare or dot-qualified name (`A` / `mod.A` / `a.b.C`) into an `identifier`
 /// leaf (bare) or a left-nested `field_access` chain (qualified) — the shared shape a
 /// qualified type / protocol / impl-receiver name uses. `first_err`/`chain_err` are the
@@ -1742,9 +1782,9 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             const blk = try p.parseBlock();
             return p.addNode(.{ .tag = .unsafe_block, .main_token = at_tok, .lhs = blk, .rhs = Ast.none });
         },
-        // A list literal in expression-START position. Only the EMPTY `[]` form is
-        // supported this milestone (annotation-typed to a `Vec[T]`); a non-empty
-        // `[1, 2, 3]` is a deferred feature. (A postfix `id[..]` type-app is reached
+        // A list literal in expression-START position. The empty `[]` form is typed
+        // bidirectionally by a `Vec[T]` annotation; a non-empty `[e0, ..]` infers its
+        // element type from `e0`. (A postfix `id[..]` type-app / value index is reached
         // through parsePostfix after an operand, never here.)
         .l_bracket => {
             p.bump(.l_bracket);
@@ -1752,7 +1792,29 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
                 p.bump(.r_bracket);
                 return p.addNode(.{ .tag = .empty_list, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
             }
-            return p.fail(p.peek(), .P0001, "non-empty list literals are not yet supported");
+            var elems: std.ArrayList(Ast.Index) = .empty;
+            defer elems.deinit(p.gpa);
+            // The `[ ]` open a fresh expression context, so re-allow blocks/literals in
+            // elements even inside an if/while condition (mirrors `parseCall`).
+            var nb = NoBlockScope.enter(p, false);
+            defer nb.end();
+            while (!p.at(.r_bracket) and !p.at(.eof)) {
+                const entry = p.index;
+                if (expr_first.contains(p.peek().tag)) {
+                    try elems.append(p.gpa, try p.parseExpr(0));
+                    if (!p.eat(.comma)) {
+                        if (p.at(.r_bracket)) break;
+                    }
+                } else if (tuple_recovery.contains(p.peek().tag)) {
+                    break;
+                } else {
+                    _ = try p.advanceWithError(.P0002, "expected a list element");
+                }
+                std.debug.assert(p.index > entry or p.at(.r_bracket) or p.at(.eof));
+            }
+            try p.expect(.r_bracket, "expected ']' to close a list literal");
+            const header = try p.addRange(elems.items);
+            return p.addNode(.{ .tag = .list_literal, .main_token = at_tok, .lhs = Ast.none, .rhs = header });
         },
         // No valid expression start. When the offending token is a structural
         // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
@@ -1810,9 +1872,18 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             // `v[i]` free to adopt a distinct form.
             .l_bracket => {
                 const ltag = p.nodes.items[lhs.int()].tag;
-                if (ltag == .identifier or ltag == .field_access) {
+                if (ltag != .identifier and ltag != .field_access) break;
+                // Disambiguate a turbofish head (`id[T](..)` / `Box[T]{..}` /
+                // `Vec[T].new()`) from a value index `v[i]` by the token AFTER the
+                // matching `]`: a call / struct-literal / member access keeps the
+                // type-app; anything else is a subscript. (A value index whose result is
+                // itself indexed / member-accessed — `xs[i].f`, `xs[i][j]` — stays a
+                // type-app; bind first, then access.)
+                if (p.turbofishFollows()) {
                     lhs = try p.parseTypeApp(lhs);
-                } else break;
+                } else {
+                    lhs = try p.parseIndex(lhs);
+                }
             },
             // `Name { ... }` literal / variant construction — only when blocks are
             // allowed and `lhs` is a bare name (struct), an inferred `.V`
@@ -2606,6 +2677,55 @@ test "nested call precedence" {
     );
 }
 
+test "non-empty list literal parses to a list_literal of its elements" {
+    try expectProgram(
+        "fn main() -> int { xs := [1, 2, 3]\n return 0 }\n",
+        "(program (fn main () int (block (:= xs (list 1 2 3)) (return 0))))",
+    );
+}
+
+test "empty list literal still parses to empty_list" {
+    try expectProgram(
+        "fn main() -> int { xs: Vec[int] = []\n return 0 }\n",
+        "(program (fn main () int (block (:= xs []) (return 0))))",
+    );
+}
+
+test "value index parses to an index node" {
+    try expectProgram(
+        "fn main() -> int { return xs[0] }\n",
+        "(program (fn main () int (block (return (index xs 0)))))",
+    );
+}
+
+test "index on a field access parses to an index over the field" {
+    try expectProgram(
+        "fn main() -> int { return p.items[1] }\n",
+        "(program (fn main () int (block (return (index (. p items) 1)))))",
+    );
+}
+
+test "turbofish call `id[int](x)` still parses as a type_app callee (not an index)" {
+    try expectProgram(
+        "fn main() -> int { return f[int](3) }\n",
+        "(program (fn main () int (block (return (call (tyapp f int) 3)))))",
+    );
+}
+
+test "associated-fn `Vec[int].new()` still parses as a type_app receiver (not an index)" {
+    try expectProgram(
+        "fn main() -> int { return Vec[int].new() }\n",
+        "(program (fn main () int (block (return (call (. (tyapp Vec int) new))))))",
+    );
+}
+
+test "generic struct literal `Box[int]{..}` still parses as a type_app head (not an index)" {
+    try expectProgram(
+        "fn main() -> int { b := Box[int] { v: 1 }\n return 0 }\n",
+        "(program (fn main () int (block (:= b (new (tyapp Box int) (field v 1))) (return 0))))",
+    );
+}
+
 test "root is program and children precede parents" {
     const gpa = testing.allocator;
     const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
@@ -2678,6 +2798,11 @@ test "root is program and children precede parents" {
             .field_access => try testing.expect(n.lhs.int() < self),
             // Leaves: `main_token` only; no child node indices to order.
             .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier, .empty_list => {},
+            .list_literal => for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self),
+            .index => {
+                try testing.expect(n.lhs.int() < self);
+                try testing.expect(n.rhs.int() < self);
+            },
             // A poison leaf holds only its offending token; no child nodes.
             .error_node => {},
             .enum_decl => {
