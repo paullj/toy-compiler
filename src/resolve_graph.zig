@@ -45,6 +45,7 @@ const codes = @import("diagnostics/codes.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const SymKind = @import("symbols/Sym.zig").SymKind;
+const Intrinsic = @import("symbols/Intrinsic.zig");
 
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
@@ -353,7 +354,8 @@ fn collectGlobals(g: *GraphResolve) !void {
     // are registered ONLY into a bundled `core/` module's fn table — naming them from
     // a user or `std/` module leaves the name unresolved (R0001). `gc_array` is
     // reserved (no lowering yet) so the name is claimed for the container tier.
-    for ([_][]const u8{ "size_of", "align_of", "gc_alloc", "gc_span_count", "store", "load", "gc_array" }) |nm| {
+    for (std.enums.values(Intrinsic.Kind)) |k| {
+        const nm = Intrinsic.name(k);
         const id: u32 = @intCast(g.fns.items.len);
         try g.fns.append(g.gpa, .{
             .name = try g.gpa.dupe(u8, nm),

@@ -38,6 +38,7 @@ const Sig = @import("symbols/Sig.zig").Sig;
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
 const Infer = @import("symbols/Infer.zig");
+const Intrinsic = @import("symbols/Intrinsic.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const Literal = @import("types/literal.zig");
 
@@ -1643,11 +1644,11 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             const bres = b.in.resolutions[(callee_node.lhs).int()];
             if (bres == .func and bres.func < b.in.names.len and b.in.names[bres.func].kind == .builtin) {
                 const bn = b.in.names[bres.func].name;
-                const is_size = std.mem.eql(u8, bn, "size_of");
-                if (is_size or std.mem.eql(u8, bn, "align_of")) {
+                const bik = Intrinsic.lookup(bn);
+                if (bik == .size_of or bik == .align_of) {
                     const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
                     const t = b.in.node_types[(tnodes[0]).int()];
-                    const c: u32 = if (is_size)
+                    const c: u32 = if (bik == .size_of)
                         Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
                     else
                         Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
@@ -1736,18 +1737,21 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
             // no reloc). The checker fenced them in `unsafe { }` and typed the rawptr
             // operand; this milestone reads/writes a 64-bit int through the pointer.
-            if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "store")) {
-                const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                const addr = operandValue(try lowerExpr(b, sargs[0]));
-                const val = operandValue(try lowerExpr(b, sargs[1]));
-                _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = Typecheck.Type.int } }, null);
-                return .none;
-            }
-            if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "load")) {
-                const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                const addr = operandValue(try lowerExpr(b, largs[0]));
-                return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) };
-            }
+            if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| switch (ik) {
+                .store => {
+                    const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const addr = operandValue(try lowerExpr(b, sargs[0]));
+                    const val = operandValue(try lowerExpr(b, sargs[1]));
+                    _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = Typecheck.Type.int } }, null);
+                    return .none;
+                },
+                .load => {
+                    const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const addr = operandValue(try lowerExpr(b, largs[0]));
+                    return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) };
+                },
+                else => {},
+            };
             if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print")) {
                 const parg = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                 if (parg.len == 1) {
