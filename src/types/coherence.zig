@@ -80,12 +80,23 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     try t.sink.emitFmtCode(.T0021, t.byteOf(decl.main_token), "impl of protocol '{s}' for '{s}' is missing method '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token), req });
             }
 
+            const prot = t.protocols.items[pid];
+
+            // A GENERIC conforming receiver `impl Ctor[T] has P[..]`: its methods
+            // register as generic-impl TEMPLATEs (never `t.methods`), so record the
+            // conformance in the separate template table keyed by the receiver ctor and
+            // monomorphize the T0024 signature check per the receiver's own type-params.
+            // `receiverTypeFromNode` returns null for a `type_app`, so the concrete path
+            // below never handles this shape.
+            if (t.tree.nodes[decl.lhs.int()].tag == .type_app) {
+                try recordGenericConformance(t, &seen, &keybuf, mod, decl, proto_ref, pid, prot, provided);
+                continue;
+            }
+
             // Coherence: reject a duplicate (protocol, receiver-ctor). The receiver was
             // already resolved (and any error emitted) in Phase A, so re-resolve
             // silently; an unresolved receiver simply forms no coherence key.
             const recv = t.receiverTypeFromNode(decl.lhs) orelse continue;
-
-            const prot = t.protocols.items[pid];
 
             // decode + validate this impl's protocol type-args `impl P has Into[int]`.
             // Arity must match the protocol's generic-param count; each arg must be a
@@ -157,12 +168,12 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                 var mismatch = impl_fn.params.len != want_params.len;
                 if (!mismatch) {
                     for (want_params, impl_fn.params) |wp, ip| {
-                        if (!Type.eql(Typecheck.groundProtoType(wp, recv, pargs), ip)) {
+                        if (!Type.eql(Typecheck.groundProtoTypeDeep(t, wp, recv, pargs), ip)) {
                             mismatch = true;
                             break;
                         }
                     }
-                    if (!mismatch and !Type.eql(Typecheck.groundProtoType(want_ret, recv, pargs), impl_fn.ret)) mismatch = true;
+                    if (!mismatch and !Type.eql(Typecheck.groundProtoTypeDeep(t, want_ret, recv, pargs), impl_fn.ret)) mismatch = true;
                 }
                 if (mismatch) {
                     const at_tok = t.tree.nodes[method_node.int()].main_token;
@@ -192,6 +203,121 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             }
         }
     }
+}
+
+/// Record a GENERIC conformance `impl Ctor[T] has P[..]` into `t.template_conformances`
+/// (invisible to every existing conformance query) and validate its method signatures
+/// (T0024) monomorphized per the receiver's own type-params. The impl's methods live in
+/// `t.templates`, so there is no `t.methods` witness to stamp (the `for x in xs` desugar
+/// dispatches structurally on the reified receiver). Duplicate detection keys on the
+/// receiver CTOR int (the App index is interning-order dependent — would break `-jN`).
+fn recordGenericConformance(
+    t: *Typecheck,
+    seen: *std.StringHashMapUnmanaged(void),
+    keybuf: *std.ArrayList(u8),
+    mod: u32,
+    decl: Ast.Node,
+    proto_ref: Ast.Index,
+    pid: u32,
+    prot: Typecheck.ProtocolSym,
+    provided: []const Ast.Index,
+) !void {
+    // A representative impl-method FnSym carries the impl's generic-param NAMES and the
+    // receiver App (the `Self` pattern) — shared by every method, so the first that
+    // resolved in Phase A suffices; none means every method errored (nothing to record).
+    var rep: ?FnSym = null;
+    outer: for (provided) |pn| {
+        for (t.fns.items) |f| {
+            if (f.mod == mod and f.decl_node == pn) {
+                rep = f;
+                break :outer;
+            }
+        }
+    }
+    const impl_fn0 = rep orelse return;
+    if (!impl_fn0.self_type.isApp()) return;
+    const recv_app = impl_fn0.self_type;
+    const e = t.composite.at(recv_app.appIdx());
+    const gnames = impl_fn0.generic_params;
+
+    const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
+    if (arg_nodes.len != prot.generic_params.len) {
+        try t.sink.emitFmt(t.byteOf(decl.main_token), "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
+        return;
+    }
+    // The protocol-arg PATTERN: an arg naming an impl type-param becomes `type_var(ord)`
+    // (grounded through the receiver App at the use site); any other arg is a concrete
+    // type via `typeFromNode`. A gname arg is NEVER routed through `typeFromNode` — the
+    // impl's params are not in scope here, so it would spuriously T0001.
+    var pargs_buf: std.ArrayList(Type) = .empty;
+    defer pargs_buf.deinit(t.gpa);
+    for (arg_nodes) |an| {
+        const anode = t.tree.nodes[an.int()];
+        var mapped: ?Type = null;
+        if (anode.tag == .identifier) {
+            const nm = t.nameText(anode.main_token);
+            for (gnames, 0..) |gn, k| if (std.mem.eql(u8, gn, nm)) {
+                mapped = Type.typeVar(@intCast(k));
+                break;
+            };
+        }
+        try pargs_buf.append(t.gpa, mapped orelse t.typeFromNode(an));
+    }
+    const pargs = pargs_buf.items;
+
+    // T0024: each protocol method's signature — `Self` grounded to the receiver App and
+    // each protocol type-param grounded to the pattern, DEEPLY (so `Option[Item]`'s inner
+    // `type_var` grounds inside the App) — must match the impl method's decoded sig.
+    for (prot.methods, 0..) |req, j| {
+        var method_node: Ast.Index = Ast.none;
+        for (provided) |pn| {
+            if (std.mem.eql(u8, t.nameText(t.tree.nodes[pn.int()].main_token), req)) {
+                method_node = pn;
+                break;
+            }
+        }
+        if (method_node == Ast.none) continue; // missing method: already T0021
+        var maybe_fn: ?FnSym = null;
+        for (t.fns.items) |f| {
+            if (f.mod == mod and f.decl_node == method_node) {
+                maybe_fn = f;
+                break;
+            }
+        }
+        const impl_fn = maybe_fn orelse continue;
+        const want_params = prot.method_params[j];
+        const want_ret = prot.method_rets[j];
+        var mismatch = impl_fn.params.len != want_params.len;
+        if (!mismatch) {
+            for (want_params, impl_fn.params) |wp, ip| {
+                if (!Type.eql(Typecheck.groundProtoTypeDeep(t, wp, recv_app, pargs), ip)) {
+                    mismatch = true;
+                    break;
+                }
+            }
+            if (!mismatch and !Type.eql(Typecheck.groundProtoTypeDeep(t, want_ret, recv_app, pargs), impl_fn.ret)) mismatch = true;
+        }
+        if (mismatch) {
+            const at_tok = t.tree.nodes[method_node.int()].main_token;
+            try t.sink.emitFmtCode(.T0024, t.byteOf(at_tok), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
+        }
+    }
+
+    // Duplicate detection: a 'G'-tagged key so it never aliases a concrete
+    // `writeCoherenceKey`; keyed on the receiver CTOR (deterministic at any `-jN`).
+    keybuf.clearRetainingCapacity();
+    try keybuf.append(t.gpa, 'G');
+    try appendKeyU32(t.gpa, keybuf, pid);
+    try appendKeyU32(t.gpa, keybuf, e.ctor);
+    try keybuf.append(t.gpa, @intFromBool(e.ctor_is_enum));
+    for (pargs) |a| try appendKeyType(t.gpa, keybuf, a);
+    const gop = try seen.getOrPut(t.gpa, keybuf.items);
+    if (gop.found_existing) {
+        try t.sink.emitFmtCode(.T0020, t.byteOf(decl.main_token), "overlapping impl of protocol '{s}' for type '{s}'", .{ prot.name, t.nameText(decl.main_token) });
+        return;
+    }
+    gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+    try t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = try t.gpa.dupe(Type, pargs) });
 }
 
 /// Whether `conf` already records a `(pid, recv)` conformance (any protocol_args).

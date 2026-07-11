@@ -19,6 +19,7 @@ const Conform = Typecheck.conform;
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const Intrinsic = @import("symbols/Intrinsic.zig");
+const conform = @import("types/conform.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const PatternChecker = @import("PatternChecker.zig");
 const Literal = @import("types/literal.zig");
@@ -342,6 +343,7 @@ pub const BodyChecker = struct {
             },
             .while_stmt => try bc.checkWhile(stmt_idx, null),
             .for_stmt => try bc.checkFor(stmt_idx, null),
+            .for_in_stmt => try bc.checkForIn(stmt_idx, null),
             .labeled => _ = try bc.checkLabeled(stmt_idx, false),
             .break_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
@@ -426,6 +428,62 @@ pub const BodyChecker = struct {
         _ = bc.loop_stack.pop();
     }
 
+    /// `for x in xs { body }` over a reference-semantic container. The receiver must have
+    /// an inherent `iter()` returning a type that conforms to `Iterator[Item]`; the loop
+    /// var binds to `Item` (mirroring `checkFor`'s `setSlot(.., int)`). A receiver with no
+    /// `iter()` / no Iterator conformance is a compile error naming `Iterator`. `node_types
+    /// [stmt]` is set to the iterator type — load-bearing: `scanCalls`/reify/`lowerForIn`
+    /// read it, exactly as `dispatchAppMethod` writes the receiver App onto the call node.
+    fn checkForIn(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
+        const stmt = bc.tree.nodes[(stmt_idx).int()];
+        const recv = try bc.typeOf(stmt.rhs);
+        const iter_ty = bc.resolveIterType(recv) orelse blk: {
+            // A non-iterable receiver: name the protocol so the error is greppable.
+            if (recv.kind != .invalid)
+                try bc.sink.emitFmtCode(.T0023, bc.byteOf(bc.tree.nodes[(stmt.rhs).int()].main_token), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+            break :blk Type.invalid;
+        };
+        const item: Type = if (iter_ty.kind == .invalid)
+            .invalid
+        else
+            try conform.iteratorItem(bc.model, bc.composite, bc.gpa, iter_ty) orelse blk: {
+                try bc.sink.emitFmtCode(.T0023, bc.byteOf(bc.tree.nodes[(stmt.rhs).int()].main_token), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+                break :blk Type.invalid;
+            };
+        bc.node_types[(stmt_idx).int()] = iter_ty;
+        if (bc.resolutions[(stmt_idx).int()] == .local) try bc.setSlot(bc.resolutions[(stmt_idx).int()].local, item);
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
+        _ = try bc.checkBlock(stmt.lhs, false);
+        _ = bc.loop_stack.pop();
+    }
+
+    /// The return type of the inherent `iter()` method on `recv`, or null when `recv`
+    /// has no such method. Only a generic-type (`App`) receiver is supported this
+    /// milestone (Vec); the impl's type-params bind by matching the template's `Self`
+    /// pattern against the receiver's args — the SAME `Infer.match` `dispatchAppMethod`
+    /// runs. `.invalid` when `iter()` exists but is malformed (self-less / arity).
+    fn resolveIterType(bc: *BodyChecker, recv: Type) ?Type {
+        if (!recv.isApp()) return null;
+        const e = bc.composite.at(recv.appIdx());
+        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, "iter") orelse return null;
+        const mf = bc.model.fns[m.fn_id];
+        if (!m.has_self or mf.params.len != 1) return Type.invalid; // iter(self), no extra args
+        const n_gp: u32 = @intCast(mf.generic_params.len);
+        const targs = bc.gpa.alloc(Type, n_gp) catch return Type.invalid;
+        defer bc.gpa.free(targs);
+        const bnd = bc.gpa.alloc(bool, n_gp) catch return Type.invalid;
+        defer bc.gpa.free(bnd);
+        const fp = bc.gpa.alloc(usize, n_gp) catch return Type.invalid;
+        defer bc.gpa.free(fp);
+        const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
+        if (pat.len != e.args.len) return Type.invalid;
+        switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
+            .ok => {},
+            else => return Type.invalid,
+        }
+        return substTy(bc, mf.ret, targs);
+    }
+
     fn checkLabeled(bc: *BodyChecker, idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {
         const n = bc.tree.nodes[(idx).int()];
         const label = bc.nameText(n.main_token);
@@ -439,6 +497,10 @@ pub const BodyChecker = struct {
             },
             .for_stmt => blk: {
                 try bc.checkFor(n.lhs, label);
+                break :blk Type.unit;
+            },
+            .for_in_stmt => blk: {
+                try bc.checkForIn(n.lhs, label);
                 break :blk Type.unit;
             },
             else => Type.invalid,

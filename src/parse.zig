@@ -684,23 +684,21 @@ fn parseImplDecl(p: *Parser) Error!Ast.Index {
     var impl_gparams: std.ArrayList(Ast.Index) = .empty;
     defer impl_gparams.deinit(p.gpa);
     var recv_node: Ast.Index = recv_ref;
-    var is_generic = false;
     if (p.at(.l_bracket)) {
         const lbracket = p.index;
         try p.parseGenericParams(&impl_gparams);
         const args_range = try p.addRange(impl_gparams.items);
         recv_node = try p.addNode(.{ .tag = .type_app, .main_token = lbracket, .lhs = recv_ref, .rhs = args_range });
-        is_generic = true;
     }
 
     var methods: std.ArrayList(Ast.Index) = .empty;
     defer methods.deinit(p.gpa);
 
-    // A conformance impl `impl T has P { .. }`.
+    // A conformance impl `impl T has P { .. }`. A generic (`Box[T]`) receiver
+    // conforms per element type: its methods register as generic-impl TEMPLATEs (the
+    // same mechanism inherent `impl Box[T]` uses) and coherence monomorphizes the
+    // conformance per element type.
     if (p.eat(.kw_has)) {
-        // A generic (`Box[T]`) receiver is a BOUND (`impl Box[T] has P`); reject it
-        // cleanly rather than mint an unsupported shape.
-        if (is_generic) return p.fail(p.peek(), .P0001, "a generic 'impl ... has' receiver is not yet supported");
         const proto_ref = try p.parseProtocolRef();
         // A conformance impl permits self-less methods; coherence (T0024) then
         // governs signature correctness against the protocol's declared sig.
@@ -1645,26 +1643,30 @@ fn parseLoop(p: *Parser) Error!Ast.Index {
     return p.addNode(.{ .tag = .loop_expr, .main_token = loop_tok, .lhs = body, .rhs = Ast.none });
 }
 
-/// `for ident in lo..hi { body }`. Iterates the half-open integer range
-/// `[lo, hi)` with `ident: int` bound per-iteration. A `()` statement.
+/// `for ident in lo..hi { body }` (range) OR `for ident in iterable { body }`
+/// (iterator). Parse the loop var + `in`, then ONE expression inside a no-block scope;
+/// a trailing `..` means the range form (half-open `[lo, hi)`, `ident: int`), any other
+/// token means the iterator form. Both are `()` statements. The range branch preserves
+/// HEAD's `first -> hi -> body -> header -> node` allocation order verbatim, so a range
+/// `for` is byte-identical; the iterator branch builds a distinct `for_in_stmt` node.
 fn parseFor(p: *Parser) Error!Ast.Index {
     p.bump(.kw_for);
     const ident_tok = p.index;
     try p.expect(.identifier, "expected a loop variable name");
     try p.expect(.kw_in, "expected 'in' after the loop variable");
-    const range = range: {
-        var nb = NoBlockScope.enter(p, true);
-        defer nb.end();
-        const lo = try p.parseExpr(0); // halts at `..` (no infix bp)
-        try p.expect(.dotdot, "expected '..' in the for range");
+    var nb = NoBlockScope.enter(p, true);
+    const first = try p.parseExpr(0); // halts at `..` (no infix bp)
+    if (p.at(.dotdot)) {
+        p.bump(.dotdot);
         const hi = try p.parseExpr(0);
-        break :range .{ lo, hi };
-    };
-    const lo = range[0];
-    const hi = range[1];
-    const body = try p.parseBlock(); // re-arms no_block internally
-    const header = try p.addExtra(&.{ lo.int(), hi.int() }); // children before parent
-    return p.addNode(.{ .tag = .for_stmt, .main_token = ident_tok, .lhs = body, .rhs = header });
+        nb.end();
+        const body = try p.parseBlock(); // re-arms no_block internally
+        const header = try p.addExtra(&.{ first.int(), hi.int() }); // children before parent
+        return p.addNode(.{ .tag = .for_stmt, .main_token = ident_tok, .lhs = body, .rhs = header });
+    }
+    nb.end();
+    const body = try p.parseBlock();
+    return p.addNode(.{ .tag = .for_in_stmt, .main_token = ident_tok, .lhs = body, .rhs = first });
 }
 
 fn parseExprStmt(p: *Parser) Error!Ast.Index {
@@ -2780,6 +2782,10 @@ test "root is program and children precede parents" {
                 try testing.expect(h.lo.int() < self);
                 try testing.expect(h.hi.int() < self);
             },
+            .for_in_stmt => {
+                try testing.expect(n.lhs.int() < self);
+                try testing.expect(n.rhs.int() < self);
+            },
             // break/continue overload `rhs` as a *token* index (the label), so
             // only `lhs` (the value expr) is a child node to check.
             .break_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
@@ -3137,7 +3143,7 @@ test "a qualified impl-has parses (qualified receiver AND protocol)" {
     );
 }
 
-test "a generic `impl Box[T] has P` receiver is rejected (P0001)" {
+test "a generic `impl Box[T] has P` conforming receiver parses (a GENERIC conforming receiver)" {
     const gpa = testing.allocator;
     const source = "impl Box[T] has P { fn m(self) -> int { 0 } }\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -3145,7 +3151,7 @@ test "a generic `impl Box[T] has P` receiver is rejected (P0001)" {
     const res = try parse(gpa, tokens, source);
     defer gpa.free(@constCast(res.diags));
     defer freeTree(gpa, res.tree);
-    try testing.expect(res.diags.len >= 1);
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
 }
 
 test "`pub protocol` records the pub export" {
@@ -3375,6 +3381,13 @@ test "for range parses to a for_stmt" {
     try expectProgram(
         "fn f() {\n for i in 0..5 { x = i }\n return\n}\n",
         "(program (fn f () _ (block (for i 0 5 (block (= x i))) (return))))",
+    );
+}
+
+test "for-in over a non-range expr parses to a for_in_stmt" {
+    try expectProgram(
+        "fn f() {\n for x in xs { y = x }\n return\n}\n",
+        "(program (fn f () _ (block (for-in x xs (block (= y x))) (return))))",
     );
 }
 

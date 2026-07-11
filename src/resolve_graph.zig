@@ -652,6 +652,14 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             try g.resolveBlock(stmt.lhs);
             g.popScope();
         },
+        .for_in_stmt => {
+            try g.resolveExpr(stmt.rhs);
+            try g.pushScope();
+            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'");
+            if (slot) |s| g.res(stmt_idx, .{ .local = s });
+            try g.resolveBlock(stmt.lhs);
+            g.popScope();
+        },
         .break_stmt => {
             if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "break");
             if (stmt.lhs != Ast.none) try g.resolveExpr(stmt.lhs);
@@ -825,7 +833,7 @@ fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
     const inner = g.nodes()[n.lhs.int()];
     switch (inner.tag) {
         .block => try g.resolveBlock(n.lhs),
-        .loop_expr, .while_stmt, .for_stmt => try g.resolveStmt(n.lhs),
+        .loop_expr, .while_stmt, .for_stmt, .for_in_stmt => try g.resolveStmt(n.lhs),
         else => {},
     }
     _ = g.label_stack.pop();

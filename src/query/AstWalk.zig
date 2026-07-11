@@ -279,6 +279,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try walkInner(src, head.hi, collect, visitor);
             try walkInner(src, n.lhs, collect, visitor);
         },
+        .for_in_stmt => {
+            try emit(visitor, .{ .leaf = leaf });
+            try walkInner(src, n.rhs, collect, visitor);
+            try walkInner(src, n.lhs, collect, visitor);
+        },
         .break_stmt => {
             // The label target identity is load-bearing; fold its TEXT (not a
             // token index — index-free). `rhs` names a TOKEN, not a node.

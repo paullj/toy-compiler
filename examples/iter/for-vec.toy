@@ -1,0 +1,15 @@
+# Feature: `for x in xs` over a reference-semantic `Vec[int]`. Desugars to
+# `it := xs.iter()` then a loop over `it.next()` until `None`, binding `x` to each
+# `Some` payload. `VecIter[T]` conforms to the parameterized protocol `Iterator[T]`
+# (a GENERIC conforming receiver) and `Vec[T].iter()` returns it.
+# expect: exit 15
+import std/vec
+
+fn main() -> int {
+    xs := [4, 5, 6]
+    total := 0
+    for x in xs {
+        total = total + x
+    }
+    return total
+}
