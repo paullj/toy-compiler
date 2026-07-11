@@ -595,6 +595,8 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             // into a fresh temp slot and yield Operand.slot.
             return try aggregateValue(b, node_idx, ty);
         },
+        // An empty list literal `[]` is sugar for the type's associated `new()`.
+        .empty_list => return .{ .slot = try lowerEmptyListSlot(b, node_idx, ty) },
         // A poison leaf must never reach lower: a tainted tree is gated out before
         // codegen, and it is not produced anywhere yet.
         .error_node => unreachable,
@@ -1723,7 +1725,9 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         // shared `witnessCallee` (derive-first) rather than `names[m.fn_id]` (would be
         // `names[0]` — a wrong-symbol miscompile).
         callee = witnessCallee(b, m);
-        self_recv = if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
+        // An ASSOCIATED function (`Vec[int].new()`) takes no `self` arg — the receiver is
+        // a type, not a value — so leave `self_recv` unset.
+        self_recv = if (m.is_static) Ast.none else if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
         self_mut = m.mut_self;
     } else if (callee_node.tag == .type_app) {
         // `size_of[T]()` / `align_of[T]()`: the base resolves to a core-only builtin.
@@ -1742,6 +1746,12 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     else
                         Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
                     return .{ .value = try b.emit(.{ .iconst = @intCast(c) }, Typecheck.Type.int) };
+                }
+                // `gc_array[T](p)` wraps a raw cell pointer into an 8-byte handle: a
+                // checker-only type change, so lower yields the pointer operand directly.
+                if (bik == .gc_array) {
+                    const vargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    return .{ .value = operandValue(try lowerExpr(b, vargs[0])) };
                 }
             }
         }
@@ -1837,7 +1847,16 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 .load => {
                     const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                     const addr = operandValue(try lowerExpr(b, largs[0]));
-                    return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) };
+                    const lty = b.in.node_types[(node_idx).int()];
+                    return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = lty } }, lty) };
+                },
+                .offset => {
+                    // `offset(base, i)` is a plain 64-bit pointer add: the base's isRefTy
+                    // value already lowers to its 8-byte cell pointer, so no unwrap needed.
+                    const oargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const base = operandValue(try lowerExpr(b, oargs[0]));
+                    const idx = operandValue(try lowerExpr(b, oargs[1]));
+                    return .{ .value = try b.emit(.{ .add = .{ .lhs = base, .rhs = idx } }, Typecheck.Type.rawptr) };
                 },
                 else => {},
             };
@@ -2506,6 +2525,13 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         .match_expr => try lowerMatchInto(b, expr, dst_ptr, ty),
         .try_expr => try lowerTryInto(b, expr, dst_ptr, ty),
         .identifier => try copyAggInto(b, expr, dst_ptr, ty),
+        // An empty list literal `[]`: construct via `new()` into a temp, then copy the
+        // handle into the destination (mirrors a `.new()` call routed through copyAggInto).
+        .empty_list => {
+            const slot = try lowerEmptyListSlot(b, expr, ty);
+            const src = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            _ = try b.emit(.{ .copy = .{ .dst = dst_ptr, .src = src, .ty = ty } }, null);
+        },
         // An arithmetic operator on struct/enum operands desugars to an
         // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
         // `.slot`, so copy those bytes into the destination like any other agg result.
@@ -2575,6 +2601,22 @@ fn lowerCharLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error
     const cp = try charLiteralCodepoint(b, n.main_token);
     const v = try b.emit(.{ .iconst = @intCast(cp) }, Typecheck.Type.uint32);
     _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = v, .ty = Typecheck.Type.uint32 } }, null);
+}
+
+/// Lower an annotated empty-list literal `[]` (type `ty`, a `Vec[T]`) into a fresh temp
+/// slot by calling the type's associated `new()` constructor. This is the SAME mangled
+/// symbol `Vec[T].new()` dispatches to, so `[]` is pure sugar for `.new()`.
+fn lowerEmptyListSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
+    const slot = try b.addSlot(ty);
+    const m = Typecheck.findMethod(b.in.methods, ty, "new") orelse {
+        try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "empty-list '[]' constructor unresolved in lower");
+        return slot;
+    };
+    const callee = witnessCallee(b, m);
+    const args = try b.gpa.alloc(Ir.Operand, 0);
+    errdefer b.gpa.free(args);
+    _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
+    return slot;
 }
 
 /// Materialize an aggregate-producing expression into a fresh temp slot and return

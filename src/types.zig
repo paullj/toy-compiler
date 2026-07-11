@@ -418,6 +418,10 @@ pub const Method = struct {
     /// pass its address instead of a by-value copy. Type-checking is unaffected —
     /// the receiver type in the `Sig` stays the struct/enum (by-value-logical).
     mut_self: bool = false,
+    /// An ASSOCIATED (self-less) function `Vec[T].new()`: dispatched via a `Type[args]`
+    /// receiver, with NO `self` arg prepended at the call site. `false` for an ordinary
+    /// instance method (the common case), so every existing method entry is byte-identical.
+    is_static: bool = false,
     /// A REIFIED-DISPATCH entry: appended in the mono tail for each reachable
     /// `(instance, method)` of a generic-type `impl`. `recv` is the reified concrete
     /// `structT`/`enumT` and `instance` indexes `GraphResult.instances`, so post-typecheck
@@ -463,6 +467,11 @@ pub const TemplateMethod = struct {
     name: []const u8,
     fn_id: u32,
     mut_self: bool = false,
+    /// Whether the method takes a leading `self` receiver. `false` for an ASSOCIATED
+    /// (self-less) function `fn new() -> Vec[T]` in an inherent `impl`; the mono tail
+    /// reifies its dispatch entry off the impl receiver rather than `inst.params[0]`,
+    /// and the call site prepends no `self` arg. `true` for every ordinary method.
+    has_self: bool = true,
 };
 
 /// Structural equality of two `Type` vectors: same length and pairwise `Type.eql`.
@@ -1660,6 +1669,29 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // with no import (the `print` precedent — no module-graph/fingerprint surface).
     t.prelude = try prelude_reg.register(t.gpa, &t.protocols, &t.conformances, &t.enums, &t.structs, t.graph.mods);
 
+    // Bare imported-type visibility: a `pub` struct/enum in an imported module is
+    // nameable UNQUALIFIED in the importer (the `std/vec` `Vec` surface), mirroring the
+    // prelude enum/struct injection. Injected AFTER every module's own decls + the
+    // prelude, if-absent + pub-only, so a local or prelude name always shadows an import;
+    // structs/enums are scanned in global-id order so a two-import name clash resolves to
+    // the lowest id deterministically (a clashing bare name is only reachable when a
+    // program actually writes it — the corpus references imports qualified, so this is
+    // additive). Only the importer's OWN direct imports contribute (no transitive
+    // re-export): the owning module must be one this importer imports.
+    for (mods, 0..) |_, mi| {
+        const importer = &t.graph.mods[mi];
+        for (t.structs.items, 0..) |s, sid| {
+            if (!s.pub_export or !importerImports(importer, s.mod)) continue;
+            if (importer.struct_ids.get(s.name) == null)
+                try importer.struct_ids.put(t.gpa, s.name, @intCast(sid));
+        }
+        for (t.enums.items, 0..) |e, eid| {
+            if (!e.pub_export or !importerImports(importer, e.mod)) continue;
+            if (importer.enum_ids.get(e.name) == null)
+                try importer.enum_ids.put(t.gpa, e.name, @intCast(eid));
+        }
+    }
+
     // Phase 0c: register every module's `protocol` decls into ONE global id
     // space (module-id order, then decl order — same determinism as structs/enums).
     // Each module's `protocol_ids` (bare name -> global id) is filled so a bare or
@@ -1892,14 +1924,22 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // which is what `findMethod` keys off in lower / `CallVisitor`.
     if (t.templates.items.len > 0) {
         for (t.mono.items, 0..) |inst, i| {
-            if (inst.params.len == 0) continue;
             for (t.templates.items) |tmpl| {
                 if (tmpl.fn_id != inst.template_gid) continue;
+                // An instance method's receiver is its (reified) `self` param; an
+                // ASSOCIATED function has no `self` param, so its dispatch receiver is
+                // the impl's own reified type (`Vec[int]` for `Vec[T].new()`), computed
+                // from the template's `self_type` substituted through the instance args.
+                const recv: Type = if (tmpl.has_self)
+                    inst.params[0]
+                else
+                    (t.reifiedStaticRecv(model.fns[tmpl.fn_id].self_type, inst.args) orelse continue);
                 try t.methods.append(t.gpa, .{
-                    .recv = inst.params[0],
+                    .recv = recv,
                     .name = tmpl.name,
                     .fn_id = tmpl.fn_id,
                     .mut_self = tmpl.mut_self,
+                    .is_static = !tmpl.has_self,
                     .instance = @intCast(i),
                 });
                 break;
@@ -1915,6 +1955,37 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // The mono tail may have emitted instance-body diagnostics (and T0014); re-sort
     // the shared stream so the final (scope, byte_offset) order is deterministic.
     t.sink.sort();
+}
+
+/// Whether module `importer` directly imports the module with id `target` (any namespace
+/// binding resolves to it). Used to gate bare imported-type visibility to a module's own
+/// direct imports.
+fn importerImports(importer: *const GraphCtx.ModuleCtx, target: u32) bool {
+    var it = importer.namespaces.valueIterator();
+    while (it.next()) |v| if (v.* == target) return true;
+    return false;
+}
+
+/// The reified concrete receiver an ASSOCIATED function dispatches off: the template's
+/// `self_type` App (`Vec[T]`) substituted through the instance's type-args (`[int]`) to a
+/// ground `Vec[int]` App, then mapped to the `structT`/`enumT` it reified to. Returns null
+/// when `self_type` is not an App or the ground App was never reified (defensive — an
+/// instance's own signature keeps its receiver reachable, so the memo normally hits).
+fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type) ?Type {
+    if (!self_type.isApp()) return null;
+    const e = t.composite.at(self_type.appIdx());
+    var abuf: [8]Type = undefined;
+    if (e.args.len > abuf.len) return null;
+    const sub = abuf[0..e.args.len];
+    for (e.args, 0..) |a, i| {
+        if (a.isTypeVar()) {
+            const ord = a.typeVarOrd();
+            if (ord >= args.len) return null;
+            sub[i] = args[ord];
+        } else sub[i] = a;
+    }
+    const idx = t.composite.intern(t.gpa, e.ctor, sub, e.ctor_is_enum) catch return null;
+    return t.reify_map.get(idx);
 }
 
 /// Scan module `mod`'s nodes for call-position generic calls, reading `node_types`
@@ -2025,6 +2096,38 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             if (!conc) continue;
             try t.enqueueInstance(model, m.fn_id, out, worklist, seen, mc.tokens[n.main_token].start, mod);
         }
+    }
+    // An annotated empty-list literal `xs: Vec[int] = []` desugars to the type's
+    // associated `new()`: discover that instance from the literal's typed `Vec[int]`
+    // receiver, mirroring the `Type[int].new()` field_access branch above.
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag != .empty_list) continue;
+        const recv = node_types[i];
+        if (!recv.isApp()) continue;
+        const re = t.composite.at(recv.appIdx());
+        const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, "new") orelse continue;
+        const mf = model.fns[m.fn_id];
+        if (!mf.self_type.isApp()) continue;
+        const pat = t.composite.at(mf.self_type.appIdx()).args;
+        if (pat.len != re.args.len) continue;
+        const n_gp: u32 = @intCast(mf.generic_params.len);
+        const out = try t.gpa.alloc(Type, n_gp);
+        defer t.gpa.free(out);
+        const bnd = try t.gpa.alloc(bool, n_gp);
+        defer t.gpa.free(bnd);
+        const fp = try t.gpa.alloc(usize, n_gp);
+        defer t.gpa.free(fp);
+        switch (Infer.match(n_gp, pat, re.args, out, bnd, fp)) {
+            .ok => {},
+            else => continue,
+        }
+        var conc = true;
+        for (out) |ta| if (!isConcreteValue(ta)) {
+            conc = false;
+            break;
+        };
+        if (!conc) continue;
+        try t.enqueueInstance(model, m.fn_id, out, worklist, seen, mc.tokens[n.main_token].start, mod);
     }
 }
 
@@ -2672,6 +2775,13 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     if (recv_type != Ast.none) {
         const name = t.nameText(decl.main_token);
         const mut_self = proto.params.len > 0 and Ast.isMutParam(t.tree, t.tokens, proto.params[0]);
+        // An impl method with no leading `self` param is an ASSOCIATED function
+        // (`fn new() -> Vec[T]`): it carries the impl receiver as `self_type` (so `Self`
+        // and the receiver's generics resolve) but takes no `self` value. Classify off the
+        // syntactic receiver marker (the leading param the parser named `self`), not off a
+        // params[0]-equals-receiver type test — an associated fn whose first parameter
+        // happens to be the receiver type (`fn combine(other: Box[T])`) is still self-less.
+        const has_self = proto.params.len > 0 and std.mem.eql(u8, t.nameText(t.tree.nodes[proto.params[0].int()].main_token), "self");
         if (self_ty.isApp()) {
             // A generic receiver `impl Box[T]`: `self_ty` is a check-time `App`.
             // Record its ctor into the TEMPLATE table so `findGenericMethod` dispatches
@@ -2695,6 +2805,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 .name = name,
                 .fn_id = gid,
                 .mut_self = mut_self,
+                .has_self = has_self,
             });
         } else {
             try t.methods.append(t.gpa, .{
@@ -2702,6 +2813,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 .name = name,
                 .fn_id = gid,
                 .mut_self = mut_self,
+                .is_static = !has_self,
             });
         }
     }
@@ -3677,6 +3789,59 @@ test "Ref[int] and Ref[bool] reify to DISTINCT structs, each tagged native_famil
     try testing.expectEqual(LayoutEngine.NativeStructFamily.ref, c.result.layouts[ref_bool.?].native_family);
     // Each box is an 8-byte cell pointer.
     try testing.expectEqual(@as(u32, 8), c.result.layouts[ref_int.?].size);
+}
+
+test "an associated fn `Vec[int].new()` mints one instance + a static reified-dispatch Method; an instance method's recv stays its self param" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Vec[T] { n: int }
+        \\impl Vec[T] {
+        \\ fn new() -> Vec[T] { Vec[T] { n: 0 } }
+        \\ fn bump(self) -> int { self.n }
+        \\}
+        \\fn main() -> int {
+        \\ a := Vec[int].new()
+        \\ return a.bump()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+
+    // The reified `Vec[int]` struct (the `new` receiver + the `bump` self type).
+    var vec_int: ?u32 = null;
+    for (c.result.layouts, 0..) |l, i| {
+        if (std.mem.eql(u8, l.name, "Vec$int")) vec_int = @intCast(i);
+    }
+    try testing.expect(vec_int != null);
+    const vec_int_ty = Type.structT(vec_int.?);
+
+    // Exactly one reified-dispatch entry for `new`: static, receiver = reified `Vec[int]`.
+    var new_entries: usize = 0;
+    var saw_static_new = false;
+    var saw_instance_bump = false;
+    for (c.result.methods) |m| {
+        if (m.instance == null) continue;
+        if (std.mem.eql(u8, m.name, "new")) {
+            new_entries += 1;
+            try testing.expect(m.is_static);
+            try testing.expect(Type.eql(m.recv, vec_int_ty));
+            // The associated `new` instance has NO params — its receiver is reified from
+            // the impl's self_type, not read off a (non-existent) self param.
+            try testing.expectEqual(@as(usize, 0), c.result.instances[m.instance.?].params.len);
+            saw_static_new = true;
+        }
+        if (std.mem.eql(u8, m.name, "bump")) {
+            // An instance method keeps `is_static == false` and its recv is the self param.
+            try testing.expect(!m.is_static);
+            try testing.expect(Type.eql(m.recv, c.result.instances[m.instance.?].params[0]));
+            try testing.expect(Type.eql(m.recv, vec_int_ty));
+            saw_instance_bump = true;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), new_entries);
+    try testing.expect(saw_static_new);
+    try testing.expect(saw_instance_bump);
 }
 
 test "a user `enum Option` shadows the prelude (user-first-wins)" {

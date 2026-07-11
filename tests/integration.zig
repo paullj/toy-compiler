@@ -21,4 +21,5 @@ test {
     _ = @import("ui.zig");
     _ = @import("heap.zig");
     _ = @import("ref.zig");
+    _ = @import("vec.zig");
 }

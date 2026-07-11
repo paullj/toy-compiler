@@ -1,0 +1,14 @@
+# Feature: an annotated empty-list literal `xs: Vec[int] = []` builds an identical empty
+# Vec to `Vec[int].new()` — `[]` desugars to the SAME associated constructor. Same program
+# as push-share.toy, so it must produce the same exit 33 (sharing + a post-share read).
+# expect: exit 33
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = []
+    xs.push(3)
+    xs.push(0)
+    ys := xs
+    ys.push(0)
+    return xs.len() * 10 + xs.get(0).unwrap()
+}
