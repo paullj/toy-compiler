@@ -73,6 +73,13 @@ pub const Module = struct {
         return .{ .nodes = m.nodes, .extra = m.extra, .pub_bits = m.pub_bits };
     }
 
+    /// The bundled `core/` layer — the sole place `extern` decls and heap
+    /// intrinsics may be declared/named. `std/` is bundled but NOT core, so it
+    /// calls core's safe members without itself naming an intrinsic.
+    pub fn isCore(m: Module) bool {
+        return m.bundled and std.mem.startsWith(u8, m.path, "core/");
+    }
+
     fn deinit(m: *Module, gpa: std.mem.Allocator) void {
         gpa.free(m.path);
         gpa.free(m.file);
