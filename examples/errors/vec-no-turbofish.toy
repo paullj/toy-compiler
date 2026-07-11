@@ -1,0 +1,9 @@
+# Feature: an associated-function call needs the element type. A bare `Vec.new()` (no
+# turbofish) cannot infer `T`, so it is a compile error demanding explicit type arguments.
+# expect: compile-error "type argument"
+import std/vec
+
+fn main() -> int {
+    xs := Vec.new()
+    return xs.len()
+}

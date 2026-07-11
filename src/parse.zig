@@ -100,7 +100,7 @@ const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, 
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
-const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .amp, .star });
+const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .l_bracket, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .amp, .star });
 /// FIRST(type): an identifier (dot-chained) or the unit type `()`.
 const type_first = setOf(&.{ .identifier, .l_paren });
 /// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
@@ -515,8 +515,13 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         .protocol_sig, .extern_top_level => true,
         else => false,
     };
+    // Both impl-method forms may declare a SELF-LESS method: a `conformance_method`
+    // (`fn from(s: Src) -> Self`, governed by the T0024 coherence check) and an
+    // `inherent_method` (an ASSOCIATED function `fn new() -> Vec[T]`, dispatched via
+    // `Type[args].new()`). The receiver token is still recorded, so a leading `self`
+    // is consumed when present; only the "must take 'self'" P0006 is lifted.
     const self_optional = switch (kind) {
-        .conformance_method => true,
+        .conformance_method, .inherent_method => true,
         else => false,
     };
 
@@ -1737,6 +1742,18 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             const blk = try p.parseBlock();
             return p.addNode(.{ .tag = .unsafe_block, .main_token = at_tok, .lhs = blk, .rhs = Ast.none });
         },
+        // A list literal in expression-START position. Only the EMPTY `[]` form is
+        // supported this milestone (annotation-typed to a `Vec[T]`); a non-empty
+        // `[1, 2, 3]` is a deferred feature. (A postfix `id[..]` type-app is reached
+        // through parsePostfix after an operand, never here.)
+        .l_bracket => {
+            p.bump(.l_bracket);
+            if (p.at(.r_bracket)) {
+                p.bump(.r_bracket);
+                return p.addNode(.{ .tag = .empty_list, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
+            }
+            return p.fail(p.peek(), .P0001, "non-empty list literals are not yet supported");
+        },
         // No valid expression start. When the offending token is a structural
         // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
         // of a block/struct-literal), DELETING it (advanceWithError) would break
@@ -2660,7 +2677,7 @@ test "root is program and children precede parents" {
             .field_init => try testing.expect(n.lhs.int() < self),
             .field_access => try testing.expect(n.lhs.int() < self),
             // Leaves: `main_token` only; no child node indices to order.
-            .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier => {},
+            .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier, .empty_list => {},
             // A poison leaf holds only its offending token; no child nodes.
             .error_node => {},
             .enum_decl => {
@@ -3073,7 +3090,7 @@ test "a mut on a non-self first param is rejected (P0006), mut self is not" {
     }
 }
 
-test "a method missing self is a tainted parse (static fns out of scope)" {
+test "a self-less inherent method is an associated function: a clean parse, no P0006" {
     const gpa = testing.allocator;
     const source = "struct P { x: int }\nimpl P { fn make() -> int { 0 } }\n";
     const tokens = try Lexer.tokenize(gpa, source);
@@ -3081,7 +3098,7 @@ test "a method missing self is a tainted parse (static fns out of scope)" {
     const res = try parse(gpa, tokens, source);
     defer gpa.free(@constCast(res.diags));
     defer freeTree(gpa, res.tree);
-    try testing.expect(res.diags.len >= 1);
+    for (res.diags) |d| try testing.expect(d.code != .P0006);
 }
 
 test "generic nodes precede their parents (children-before-parents on generics)" {
@@ -4025,7 +4042,7 @@ test "parse diagnostics carry P-codes by syntactic category" {
     }
 }
 
-test "a self-less method in a conformance impl parses with no P0006; an inherent one still P0006" {
+test "a self-less method parses with no P0006 in BOTH a conformance and an inherent impl" {
     const gpa = testing.allocator;
 
     // A CONFORMANCE impl (`impl T has P`) permits a self-less method (`From`): no
@@ -4059,23 +4076,32 @@ test "a self-less method in a conformance impl parses with no P0006; an inherent
         try testing.expect(saw_from);
     }
 
-    // An INHERENT impl (`impl T`) still REQUIRES self — a self-less method is P0006, so a
-    // forgotten `self` on a real method is caught (static/associated methods stay out of scope).
+    // An INHERENT impl (`impl T`) now permits a self-less ASSOCIATED function
+    // (`fn new() -> Vec[T]`): no P0006, and its declared params carry no synthesized self.
     {
         const res = try parseResult(gpa,
-            \\struct P { x: int }
-            \\impl P {
-            \\ fn make(x: int) -> int { x }
+            \\struct Vec[T] { n: int }
+            \\impl Vec[T] {
+            \\ fn new() -> Vec[T] { Vec[T] { n: 0 } }
             \\}
             \\
         );
         defer gpa.free(@constCast(res.diags));
         defer freeTree(gpa, res.tree);
-        var saw_p0006 = false;
-        for (res.diags) |d| if (d.code == .P0006) {
-            saw_p0006 = true;
-        };
-        try testing.expect(saw_p0006);
+        for (res.diags) |d| try testing.expect(d.code != .P0006);
+        const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+        var saw_new = false;
+        for (Ast.rangeSlice(res.tree, prog.lhs.int())) |decl_idx| {
+            const decl = res.tree.nodes[decl_idx.int()];
+            if (decl.tag != .impl_decl) continue;
+            for (Ast.implMethods(res.tree, decl)) |mnode| {
+                const m = res.tree.nodes[mnode.int()];
+                const proto = Ast.protoAt(res.tree, m.lhs.int());
+                try testing.expectEqual(@as(usize, 0), proto.params.len); // no synthesized self
+                saw_new = true;
+            }
+        }
+        try testing.expect(saw_new);
     }
 }
 

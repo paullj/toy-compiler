@@ -434,6 +434,34 @@ fn collectNamespaces(g: *GraphResolve) !void {
     }
 }
 
+/// Make a `pub` struct/enum in a DIRECTLY imported module nameable UNQUALIFIED in the
+/// importer (the `std/vec` `Vec` surface), mirroring the prelude Option/Result injection
+/// above. Copies each import target's OWN pub type names into the importer's bare
+/// struct/enum tables if-absent, marked NON-pub so the injected name is not transitively
+/// re-exported to a module importing this one. Runs after namespaces are bound and every
+/// module's own decls are registered, before body resolution. A local/prelude name always
+/// wins (if-absent), so the corpus — which references imports qualified — is unperturbed.
+fn injectImportedTypes(g: *GraphResolve) !void {
+    for (g.tables) |*t| {
+        var nit = t.namespaces.valueIterator();
+        while (nit.next()) |target_ptr| {
+            const target = target_ptr.*;
+            var sit = g.tables[target].structs.iterator();
+            while (sit.next()) |se| {
+                if (!se.value_ptr.*) continue; // pub only (own decls)
+                if (!t.structs.contains(se.key_ptr.*))
+                    try t.structs.put(g.gpa, se.key_ptr.*, false);
+            }
+            var eit = g.tables[target].enums.iterator();
+            while (eit.next()) |ee| {
+                if (!ee.value_ptr.*) continue;
+                if (!t.enums.contains(ee.key_ptr.*))
+                    try t.enums.put(g.gpa, ee.key_ptr.*, false);
+            }
+        }
+    }
+}
+
 /// Find the graph module id an `import_decl` in module `mod` refers to, by
 /// rebuilding its `/`-joined path and matching a module's canonical name.
 fn importTarget(g: *GraphResolve, mod: u32, decl: Ast.Node) ?u32 {
@@ -1043,6 +1071,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
 
     try g.collectGlobals();
     try g.collectNamespaces();
+    try g.injectImportedTypes();
     for (0..n) |i| try g.resolveModule(@intCast(i));
 
     g.sink.sort();

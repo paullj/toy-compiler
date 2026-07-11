@@ -712,6 +712,26 @@ pub const BodyChecker = struct {
                 }
                 break :blk Type.invalid;
             },
+            .empty_list => blk: {
+                // An empty list literal `[]` is typed bidirectionally by its expected
+                // type: a `Vec[T]` annotation makes it the type's associated `new()`
+                // constructor. With no expected type (a bare `xs := []`) the element type
+                // is uninferable — require an annotation.
+                const exp = bc.expected orelse {
+                    try bc.sink.emit(bc.byteOf(n.main_token), "an empty list literal '[]' requires a type annotation, e.g. 'xs: Vec[int] = []'");
+                    break :blk Type.invalid;
+                };
+                if (!exp.isApp()) {
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
+                    break :blk Type.invalid;
+                }
+                const e = bc.composite.at(exp.appIdx());
+                if (e.ctor_is_enum or Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, "new") == null) {
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
+                    break :blk Type.invalid;
+                }
+                break :blk exp;
+            },
             .call => try bc.typeOfCall(node_idx, n),
             .struct_init => try bc.typeOfStructInit(node_idx, n),
             .field_access => try bc.typeOfFieldAccess(node_idx, n),
@@ -1597,10 +1617,90 @@ pub const BodyChecker = struct {
         return null;
     }
 
+    /// An ASSOCIATED-function call `Vec[int].new(args)`: a `field_access` callee whose
+    /// receiver is a generic-STRUCT `type_app`, dispatching to a self-less method in the
+    /// type's inherent `impl` (no `self` arg). Returns the (substituted) return type, or
+    /// null when this is not an associated call (an instance-method receiver, an enum, a
+    /// module — all handled by their own paths). Two error gates:
+    ///   * a `type_app` receiver whose member IS an instance method -> T0018;
+    ///   * a bare `Vec.new()` (no turbofish) naming a generic struct's associated fn ->
+    ///     the turbofish-required T0016 (the element type cannot be inferred).
+    fn tryAssociatedCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
+        const recv = bc.tree.nodes[(callee.lhs).int()];
+        const member = bc.nameText(callee.main_token);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        if (recv.tag == .type_app) {
+            const app_ty = bc.typeFromNode(callee.lhs);
+            if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
+            const e = bc.composite.at(app_ty.appIdx());
+            if (e.ctor_is_enum) return null; // an enum type_app is variant construction
+            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member) orelse return null;
+            if (m.has_self) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an instance method, not an associated function; call it on a value", .{member});
+                return .invalid;
+            }
+            // Load-bearing: the reified receiver flows to scanCalls / reify / lower off
+            // `node_types[type_app]`.
+            bc.node_types[(callee.lhs).int()] = app_ty;
+            const mf = bc.model.fns[m.fn_id];
+            const n_gp: u32 = @intCast(mf.generic_params.len);
+            const targs = try bc.gpa.alloc(Type, n_gp);
+            defer bc.gpa.free(targs);
+            const bnd = try bc.gpa.alloc(bool, n_gp);
+            defer bc.gpa.free(bnd);
+            const fp = try bc.gpa.alloc(usize, n_gp);
+            defer bc.gpa.free(fp);
+            const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
+            var bound_ok = pat.len == e.args.len;
+            if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
+                .ok => {},
+                else => bound_ok = false,
+            };
+            if (args.len != mf.params.len) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ mf.params.len, args.len });
+                if (!bound_ok) return .invalid;
+                const ret = substTy(bc, mf.ret, targs);
+                bc.node_types[(node_idx).int()] = ret;
+                return ret;
+            }
+            if (!bound_ok) {
+                for (args) |a| _ = try bc.typeOfExpected(a, null);
+                return .invalid;
+            }
+            for (args, mf.params, 0..) |a, pty, i| {
+                const want_ty = substTy(bc, pty, targs);
+                const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
+                if (!Type.assignable(want_ty, at))
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
+            }
+            const ret = substTy(bc, mf.ret, targs);
+            bc.node_types[(node_idx).int()] = ret;
+            return ret;
+        }
+        // A bare `Vec.new()` (no turbofish) naming a generic struct with an associated
+        // `new`: the element type is uninferable, so require explicit type arguments.
+        if (recv.tag == .identifier and bc.resolutions[(callee.lhs).int()] != .module) {
+            const name = bc.nameText(recv.main_token);
+            if (bc.activeStructMap().get(name)) |sid| {
+                if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic and
+                    Typecheck.findGenericMethod(bc.model.templates, sid, false, member) != null)
+                {
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmtCode(.T0016, bc.byteOf(recv.main_token), "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
+                    return .invalid;
+                }
+            }
+        }
+        return null;
+    }
+
     fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         const callee = bc.tree.nodes[(n.lhs).int()];
         if (callee.tag == .field_access) {
             if (try bc.tryEnumConstruction(node_idx, n, callee)) |t| return t;
+            if (try bc.tryAssociatedCall(node_idx, n, callee)) |t| return t;
             // A method call `recv.m(args)` on a VALUE receiver. The enum-variant /
             // qualified-call cases above fire only for an enum type-name / type_app /
             // qualified-namespace receiver; a field_access callee whose receiver is a
@@ -1641,6 +1741,26 @@ pub const BodyChecker = struct {
                         try bc.sink.emitFmt(bc.byteOf(n.main_token), "'{s}' takes no value arguments", .{bn});
                     bc.node_types[(node_idx).int()] = Type.int;
                     return Type.int;
+                }
+                // `gc_array[T](p)`: wrap a raw cell pointer into a `gc_array[T]` handle (an
+                // 8-byte reference over the prelude box template). The value change is
+                // checker-only — lower passes the pointer operand straight through.
+                if (bik == .gc_array) {
+                    const targ_nodes = Ast.rangeSlice(bc.tree, (callee.rhs).int());
+                    for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
+                    const val_args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                    for (val_args) |arg| _ = try bc.typeOf(arg);
+                    if (targ_nodes.len != 1) {
+                        try bc.sink.emitFmt(bc.byteOf(callee.main_token), "'{s}' expects exactly one type argument", .{bn});
+                        return .invalid;
+                    }
+                    if (val_args.len != 1)
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "'{s}' expects exactly one value argument", .{bn});
+                    const elem = bc.node_types[(targ_nodes[0]).int()];
+                    const box = bc.model.prelude.?.gc_array_struct.?;
+                    const app = Type.app(bc.composite.intern(bc.gpa, box, &.{elem}, false) catch return .invalid);
+                    bc.node_types[(node_idx).int()] = app;
+                    return app;
                 }
             }
         }
@@ -1758,12 +1878,43 @@ pub const BodyChecker = struct {
                             if (pt.kind != .rawptr and pt.kind != .invalid)
                                 try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'load' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
                         }
-                        bc.node_types[(node_idx).int()] = Type.int;
-                        return Type.int;
+                        // A `load` used where a scalar value type is expected (a generic
+                        // `ga_get[T]` returning `load(..)`) yields that element type, so a
+                        // `bool` element round-trips as `bool`; every other context reads a
+                        // 64-bit `int` (mem_selftest is unaffected — its loads are int-typed).
+                        const lt: Type = if (bc.expected) |e|
+                            (if (e.isScalar() or e.kind == .float) e else Type.int)
+                        else
+                            Type.int;
+                        bc.node_types[(node_idx).int()] = lt;
+                        return lt;
+                    },
+                    .offset => {
+                        // Raw pointer arithmetic `offset(base, i)` -> `base + i` as a
+                        // `rawptr`. `base` is a `rawptr`, an `int`, or a reference-family
+                        // handle (a `gc_array[T]`, an 8-byte cell pointer); `i` is an int.
+                        // NOT `unsafe`-gated (pure arithmetic) — the `store`/`load` it feeds
+                        // stay gated.
+                        if (args.len != 2) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                        } else {
+                            const bt = try bc.typeOf(args[0]);
+                            const it = try bc.typeOf(args[1]);
+                            const base_ok = bt.kind == .rawptr or bt.kind == .int or bt.kind == .invalid or bc.isRefPayload(bt);
+                            if (!base_ok)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'offset' base must be a 'rawptr' or 'int', got '{s}'", .{bc.typeName(bt)});
+                            if (it.kind != .int and it.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[1]).int()].main_token), "'offset' index must be an 'int', got '{s}'", .{bc.typeName(it)});
+                        }
+                        bc.node_types[(node_idx).int()] = Type.rawptr;
+                        return Type.rawptr;
                     },
                     .gc_array => {
+                        // The bare-call form `gc_array(p)` is rejected; the wrapping form
+                        // is `gc_array[T](p)`, intercepted in `typeOfCall` as a `type_app`.
                         for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emit(bc.byteOf(n.main_token), "'gc_array' is not yet available");
+                        try bc.sink.emit(bc.byteOf(n.main_token), "'gc_array' requires a type argument, e.g. gc_array[int](p)");
                         return .invalid;
                     },
                     // `size_of[T]()`/`align_of[T]()` are the type_app form handled above;
@@ -1908,7 +2059,16 @@ pub const BodyChecker = struct {
         // conformance / prelude); `.ambiguous` (a doubly-conforming generic
         // protocol used with no type-args) is T0025 — never an arbitrary pick.
         switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
-            .one => |m| return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m),
+            .one => |m| {
+                // An associated (self-less) function must be reached via `Type[..].fn()`,
+                // never on a value receiver.
+                if (m.is_static) {
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an associated function; call it as '{s}.{s}(..)'", .{ member, bc.typeName(recv_ty), member });
+                    return .invalid;
+                }
+                return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m);
+            },
             .ambiguous => {
                 for (args) |a| _ = try bc.typeOf(a);
                 try bc.emitAmbiguousConformance(callee.main_token, recv_ty, member);
@@ -2018,6 +2178,13 @@ pub const BodyChecker = struct {
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const e = bc.composite.at(recv_ty.appIdx());
         if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member)) |m| {
+            // An associated (self-less) function is not callable on a value receiver —
+            // it must be reached via `Type[args].fn()`.
+            if (!m.has_self) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an associated function; call it as '{s}[..].{s}(..)'", .{ member, bc.typeName(recv_ty), member });
+                return .invalid;
+            }
             const mf = bc.model.fns[m.fn_id];
             const n_gp: u32 = @intCast(mf.generic_params.len);
             const targs = try bc.gpa.alloc(Type, n_gp);

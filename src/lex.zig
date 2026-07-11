@@ -110,10 +110,12 @@ fn lexToken(l: *Lexer) Token {
 }
 
 /// Whether a token of this tag can end a statement, and so triggers terminator
-/// insertion when a newline follows it.
+/// insertion when a newline follows it. `r_bracket` is here so a line-final `]`
+/// terminates on a newline (e.g. an annotated empty-list literal `xs: Vec[int] = []`);
+/// a future line-continued expression whose first line ends in `]` would need a wrap.
 fn canEndStatement(tag: Tag) bool {
     return switch (tag) {
-        .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .question => true,
+        .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .r_bracket, .question => true,
         else => false,
     };
 }

@@ -1,0 +1,30 @@
+import core/mem
+
+# A thin, growable `Vec[T]` face over `core/mem`'s `GcArray` primitive. `std` may call
+# `core`'s safe members but never names a heap intrinsic itself, so every raw operation is
+# delegated to `mem`. The sole field `h` is the 8-byte reference handle, so `ys := xs`
+# copies the handle and shares the SAME growable (a push through one is visible through the
+# other). `new` is an ASSOCIATED function (no `self`), called as `Vec[int].new()`; `[]`
+# desugars to the same constructor.
+pub struct Vec[T] { h: gc_array[T] }
+
+impl Vec[T] {
+    fn new() -> Vec[T] {
+        return Vec[T] { h: mem.ga_new[T]() }
+    }
+
+    fn push(self, x: T) {
+        mem.ga_push[T](self.h, x)
+    }
+
+    fn len(self) -> int {
+        return mem.ga_len[T](self.h)
+    }
+
+    fn get(self, i: int) -> Option[T] {
+        if 0 <= i && i < mem.ga_len[T](self.h) {
+            return Option.some(mem.ga_get[T](self.h, i))
+        }
+        return Option[T].none
+    }
+}

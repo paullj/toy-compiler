@@ -17,3 +17,58 @@ pub fn size_class_of(n: int) -> int {
     if n <= 8192 { return 8192 }
     return n
 }
+
+# A growable, traced array primitive: the ONE growable container. The handle is an
+# 8-byte reference (`gc_array[T]`, a reused native box) pointing at a heap header
+# `{len@0, cap@8, elems@16}` — a raw 24-byte cell addressed by literal offsets. The
+# element backing lives at `elems`, each element at `elems + i*size_of[T]()`. `:=` copies
+# the handle, so two bindings share the same growable (mutation through one is seen
+# through the other). There is no collector: `ga_grow` leaks the old backing.
+
+# Construct an empty array with a small initial backing. `len` is born 0 (cells are
+# zeroed on alloc); `cap` starts at 4.
+pub fn ga_new[T]() -> gc_array[T] {
+    hdr := gc_alloc(24)
+    unsafe {
+        store(offset(hdr, 8), 4)
+        store(offset(hdr, 16), gc_alloc(4 * size_of[T]()))
+    }
+    return gc_array[T](hdr)
+}
+
+pub fn ga_len[T](a: gc_array[T]) -> int {
+    return unsafe { load(offset(a, 0)) }
+}
+
+pub fn ga_get[T](a: gc_array[T], i: int) -> T {
+    e := unsafe { load(offset(a, 16)) }
+    return unsafe { load(offset(e, i * size_of[T]())) }
+}
+
+pub fn ga_push[T](a: gc_array[T], x: T) {
+    l := unsafe { load(offset(a, 0)) }
+    c := unsafe { load(offset(a, 8)) }
+    if l == c { ga_grow[T](a, c) }
+    e := unsafe { load(offset(a, 16)) }
+    unsafe {
+        store(offset(e, l * size_of[T]()), x)
+        store(offset(a, 0), l + 1)
+    }
+}
+
+# Double the backing and copy the live prefix over. The OLD backing just leaks (no
+# collector). The header never moves, so every alias sees the new backing.
+pub fn ga_grow[T](a: gc_array[T], c: int) {
+    nc := c * 2
+    ne := gc_alloc(nc * size_of[T]())
+    e := unsafe { load(offset(a, 16)) }
+    i := 0
+    while i < c {
+        unsafe { store(offset(ne, i * size_of[T]()), load(offset(e, i * size_of[T]()))) }
+        i = i + 1
+    }
+    unsafe {
+        store(offset(a, 16), ne)
+        store(offset(a, 8), nc)
+    }
+}

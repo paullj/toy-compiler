@@ -388,6 +388,13 @@ pub const Node = extern struct {
         /// lowers transparently as its inner block; the unsafe context gates the raw
         /// `store`/`load` ops.
         unsafe_block,
+
+        /// An empty list literal `[]`. Appended at END (frozen ordinal; `[]Node` is
+        /// memcpy'd to/from the content cache; `ParseHeader.version` bumped 14->15).
+        /// `main_token` is the `[`; `lhs`/`rhs` are `none` (a value leaf, no children).
+        /// Typed bidirectionally by its `Vec[T]` annotation and desugared to the type's
+        /// associated `new()` constructor; an un-annotated `[]` is a type error.
+        empty_list,
     };
 };
 
@@ -612,7 +619,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 14,
+    version: u32 = 15,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -673,7 +680,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 14) return null;
+    if (hdr.magic != parse_magic or hdr.version != 15) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -720,6 +727,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
     switch (n.tag) {
         .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier => try out.writeAll(tok_text),
         .literal_unit => try out.writeAll("()"),
+        .empty_list => try out.writeAll("[]"),
         // A poison leaf renders as a fixed `(error)` marker (its `main_token` is
         // the offending token, but the marker deliberately elides its text).
         .error_node => try out.writeAll("(error)"),

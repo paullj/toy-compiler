@@ -1,0 +1,15 @@
+# Feature: a growable `Vec[T]` over a traced `GcArray`, constructed with the ASSOCIATED
+# constructor `Vec[int].new()`. The handle is an 8-byte reference, so `ys := xs` shares
+# the SAME growable (Model R): a push through `ys` is visible through `xs`. The `*10`
+# makes sharing observable — a value-copy `ys` would leave `xs.len() == 2` -> exit 23.
+# expect: exit 33
+import std/vec
+
+fn main() -> int {
+    xs := Vec[int].new()
+    xs.push(3)
+    xs.push(0)
+    ys := xs               # shares the same GcArray (Model R)
+    ys.push(0)             # visible through xs
+    return xs.len() * 10 + xs.get(0).unwrap()   # 3*10 + 3 = 33
+}

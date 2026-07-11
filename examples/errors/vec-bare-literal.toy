@@ -1,0 +1,10 @@
+# Feature: an empty-list literal is typed by its annotation. A bare `xs := []` with no
+# target type cannot infer the element type, so it is a compile error demanding an
+# annotation.
+# expect: compile-error "annotation"
+import std/vec
+
+fn main() -> int {
+    xs := []
+    return 0
+}
