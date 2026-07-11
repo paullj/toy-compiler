@@ -385,8 +385,8 @@ pub const Node = extern struct {
         /// `unsafe { .. }` — an unsafe-context block. Appended at END (frozen ordinal;
         /// `[]Node` is memcpy'd to/from the content cache). `main_token` is the
         /// `unsafe` token; `lhs` is the inner `block` node; `rhs` is `none`. Types and
-        /// lowers transparently as its inner block; the "unsafe context" is scaffolding
-        /// for raw-pointer ops that arrive later.
+        /// lowers transparently as its inner block; the unsafe context gates the raw
+        /// `store`/`load` ops.
         unsafe_block,
     };
 };
