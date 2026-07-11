@@ -1,0 +1,48 @@
+import core/mem
+
+# A `core/` module, so it is allowlisted to name the heap intrinsics. It exposes the
+# self-checks the integration harness drives (the harness can only observe the child's
+# exit code, so every invariant is proven here and surfaced as a return value).
+
+pub fn selftest() -> int {
+    c := gc_alloc(mem.size_class_of(16))
+    return unsafe {
+        store(c, 42)
+        load(c)
+    }
+}
+
+# Two cells must be distinct, non-overlapping, and both born zeroed. Writing 111/222
+# and reading each back proves they do not alias; the pre-write reads prove zero-on-
+# alloc. A no-op readback could not pass this.
+pub fn check_distinct_zeroed() -> int {
+    c1 := gc_alloc(16)
+    c2 := gc_alloc(16)
+    return unsafe {
+        z1 := load(c1)
+        z2 := load(c2)
+        store(c1, 111)
+        store(c2, 222)
+        a := load(c1)
+        b := load(c2)
+        if z1 == 0 && z2 == 0 && a == 111 && b == 222 { 1 } else { 0 }
+    }
+}
+
+# Allocate well past two 16 KiB spans so at least two refills happen, then report how
+# many spans exist. Every cell is written to prove it is real, mapped storage — a cell
+# handed out past a span's true limit would fault here rather than pass.
+pub fn check_span_growth() -> int {
+    i := 0
+    loop {
+        if i >= 700 { break }
+        p := gc_alloc(64)
+        unsafe { store(p, i) }
+        i = i + 1
+    }
+    return gc_span_count()
+}
+
+pub fn gc_arena_count() -> int {
+    return gc_span_count()
+}

@@ -34,6 +34,13 @@ pub fn movk(rd: u32, imm16: u16, hw: u2) u32 {
     return 0xF2800000 | (@as(u32, hw) << 21) | (@as(u32, imm16) << 5) | rd;
 }
 
+/// movn rd, #imm16, lsl #(hw*16) — load the bitwise-NOT of a shifted 16-bit
+/// immediate. `movn rd,#0` yields all-ones (−1), the `mmap`/`mincore` `fd = -1`
+/// an anonymous mapping requires. movn x4,#0 → 0x92800004.
+pub fn movn(rd: u32, imm16: u16, hw: u2) u32 {
+    return 0x92800000 | (@as(u32, hw) << 21) | (@as(u32, imm16) << 5) | rd;
+}
+
 /// add rd, rn, #imm12. With rd/rn = SP this is the sp adjust. add sp,sp,#16 →
 /// 0x910043FF.
 pub fn addImm(rd: u32, rn: u32, imm12: u12) u32 {
@@ -565,6 +572,8 @@ test "move-wide immediates" {
     try testing.expectEqual(@as(u32, 0xF2BFFFE0), movk(0, 0xFFFF, 1));
     try testing.expectEqual(@as(u32, 0xF2DFFFE0), movk(0, 0xFFFF, 2));
     try testing.expectEqual(@as(u32, 0xF2FFFFE0), movk(0, 0xFFFF, 3));
+    try testing.expectEqual(@as(u32, 0x92800004), movn(4, 0, 0)); // movn x4,#0 (→ -1)
+    try testing.expectEqual(@as(u32, 0x92800000), movn(0, 0, 0)); // movn x0,#0
 }
 
 test "add/sub immediate" {

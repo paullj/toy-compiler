@@ -1314,6 +1314,188 @@ fn patchBTo(buf: []u8, site: u32, target: u32) void {
     std.mem.writeInt(u32, buf[site..][0..4], Aarch64.patchB(word, delta), .little);
 }
 
+// The leaking span bump allocator, hand-emitted like `print`/`panic`. Appended once at
+// link time (emit.zig) when any fn references `gc_alloc`/`gc_span_count`. There is no
+// writable image segment (LC_MAIN gives no init hook, __DATA_CONST is read-only after
+// dyld binds, and no __bss exists), so the allocator's control block lives at a fixed
+// high VM address, `mmap`ped MAP_FIXED on the first call. `msync(CB_ADDR, 1, MS_ASYNC)`
+// is the fault-free is-it-initialized probe: it returns 0 when the page is mapped and −1
+// (ENOMEM) when it is not. (macOS `mincore` cannot serve here — it returns 0 for an
+// unmapped page too.) The CB page doubles as the first 16 KiB span: init seeds
+// cursor = CB+HDR, end = CB+SPAN, span_count = 1. Both bodies are PURE fixed AArch64
+// (only the constant CB address / mmap flags / lengths are baked), so the emitted bytes
+// are byte-identical at any -jN; the runtime-nondeterministic span addresses the kernel
+// picks never touch the image.
+//
+// Every cell handed out is ZEROED: fresh mmap pages (CB, refill spans, large objects)
+// are kernel-zeroed and no cell is ever reused — there is no free/collector — so the
+// zero-on-alloc invariant holds by construction with no freelist-pop clear path.
+
+const cb_addr_hw: u16 = 0x3000; // CB_ADDR = 0x3000 << 32 (48 TiB, image-far, empty mid-VA)
+const cb_addr_lsl: u2 = 2; // lsl #32
+const cur_off: u32 = 0;
+const end_off: u32 = 8;
+const cnt_off: u32 = 16;
+const hdr: u12 = 256; // control-block header size; the first span's cells begin here
+const span: u16 = 0x4000; // 16 KiB span
+const prot_rw: u16 = 3; // PROT_READ | PROT_WRITE
+const map_anon_priv: u16 = 0x1002; // MAP_ANON | MAP_PRIVATE
+const map_anon_priv_fixed: u16 = 0x1012; // MAP_ANON | MAP_PRIVATE | MAP_FIXED
+const large_threshold: u16 = 0x2000; // 8 KiB: requests above this bypass the span arena
+const ms_async: u16 = 1; // MS_ASYNC
+
+/// Ensure the control-block page exists and is initialized, leaving CB_ADDR in x9 on
+/// exit. Clobbers x0-x5, x9-x12, x16; emits `.import` relocs for `msync` and `mmap`
+/// (auto-joining the dedup+sorted GOT set).
+fn emitLocateCb(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+
+    // msync(CB_ADDR, 1, MS_ASYNC): 0 → page mapped (already initialized) → skip init.
+    try emit(code, gpa, A.movz(0, cb_addr_hw, cb_addr_lsl));
+    try emit(code, gpa, A.movz(1, 1, 0));
+    try emit(code, gpa, A.movz(2, ms_async, 0));
+    try emitImportPreamble(code, relocs, gpa, "msync", 16);
+    try emit(code, gpa, A.blr(16));
+    const cbz_site: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(0, 0)); // mapped → skip init (backpatched below)
+
+    // mmap(CB_ADDR, SPAN, RW, ANON|PRIVATE|FIXED, -1, 0): lands a zeroed page at CB_ADDR.
+    try emit(code, gpa, A.movz(0, cb_addr_hw, cb_addr_lsl));
+    try emit(code, gpa, A.movz(1, span, 0));
+    try emit(code, gpa, A.movz(2, prot_rw, 0));
+    try emit(code, gpa, A.movz(3, map_anon_priv_fixed, 0));
+    try emit(code, gpa, A.movn(4, 0, 0)); // fd = -1
+    try emit(code, gpa, A.movz(5, 0, 0));
+    try emitImportPreamble(code, relocs, gpa, "mmap", 16);
+    try emit(code, gpa, A.blr(16));
+
+    // Seed the header (the page is zeroed, so freelist heads etc. start null).
+    try emit(code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl)); // x9 = CB_ADDR
+    try emit(code, gpa, A.addImm(10, 9, hdr)); // cursor = CB + HDR
+    try emit(code, gpa, A.strRegUoff(10, 9, cur_off));
+    try emit(code, gpa, A.movz(11, span, 0));
+    try emit(code, gpa, A.addReg(11, 9, 11)); // end = CB + SPAN
+    try emit(code, gpa, A.strRegUoff(11, 9, end_off));
+    try emit(code, gpa, A.movz(12, 1, 0));
+    try emit(code, gpa, A.strRegUoff(12, 9, cnt_off)); // span_count = 1
+
+    const mapped: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_site, mapped);
+    try emit(code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl)); // x9 = CB_ADDR (both paths)
+}
+
+/// Build the `gc_alloc(size)` builtin: returns a fresh zeroed cell pointer for the
+/// (already size-class-rounded) request. Small requests bump a single per-span cursor,
+/// mmapping a new span on exhaustion; requests above 8 KiB get a direct span-aligned
+/// mmap. Caller owns the result.
+pub fn lowerGcAlloc(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
+    const emit = emitWord;
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    // Frame + 16-byte scratch: [sp,#0] = saved size across the msync/mmap calls.
+    try emitFramePrologue(&code, gpa);
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.strSp(0, 0)); // save size (msync/mmap clobber x0-x18)
+
+    try emitLocateCb(&code, &relocs, gpa);
+
+    try emit(&code, gpa, A.ldrSp(0, 0)); // x0 = size; x9 = CB_ADDR (from emitLocateCb)
+
+    // Large object (> 8 KiB): a direct span-aligned mmap, bypassing the arena.
+    try emit(&code, gpa, A.movz(13, large_threshold, 0));
+    try emit(&code, gpa, A.cmpReg(0, 13));
+    const to_small: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.ls, 0)); // size <= 8192 → small path
+
+    try emit(&code, gpa, A.movz(14, 0x3FFF, 0));
+    try emit(&code, gpa, A.addReg(1, 0, 14)); // size + (SPAN-1)
+    try emit(&code, gpa, A.movz(15, 14, 0)); // shift = 14
+    try emit(&code, gpa, A.lsrv(1, 1, 15));
+    try emit(&code, gpa, A.lslv(1, 1, 15)); // len = round_up(size, SPAN)
+    try emit(&code, gpa, A.movz(0, 0, 0)); // addr = 0 (kernel-chosen)
+    try emit(&code, gpa, A.movz(2, prot_rw, 0));
+    try emit(&code, gpa, A.movz(3, map_anon_priv, 0));
+    try emit(&code, gpa, A.movn(4, 0, 0)); // fd = -1
+    try emit(&code, gpa, A.movz(5, 0, 0));
+    try emitImportPreamble(&code, &relocs, gpa, "mmap", 16);
+    try emit(&code, gpa, A.blr(16)); // x0 = ptr
+    try emit(&code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl));
+    try emit(&code, gpa, A.ldrRegUoff(12, 9, cnt_off));
+    try emit(&code, gpa, A.addImm(12, 12, 1));
+    try emit(&code, gpa, A.strRegUoff(12, 9, cnt_off)); // span_count++
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    const small: u32 = @intCast(code.items.len);
+    patchBCondTo(code.items, to_small, small);
+
+    // Small path (x9 = CB_ADDR, x0 = size — no call since the reload above).
+    try emit(&code, gpa, A.ldrRegUoff(10, 9, cur_off)); // cursor
+    try emit(&code, gpa, A.ldrRegUoff(11, 9, end_off)); // end
+    try emit(&code, gpa, A.addReg(14, 10, 0)); // new_cursor = cursor + size
+    try emit(&code, gpa, A.cmpReg(14, 11));
+    const to_fit: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.ls, 0)); // new_cursor <= end → fits
+
+    // Refill: mmap a fresh zeroed span and make it the current one.
+    try emit(&code, gpa, A.movz(0, 0, 0));
+    try emit(&code, gpa, A.movz(1, span, 0));
+    try emit(&code, gpa, A.movz(2, prot_rw, 0));
+    try emit(&code, gpa, A.movz(3, map_anon_priv, 0));
+    try emit(&code, gpa, A.movn(4, 0, 0));
+    try emit(&code, gpa, A.movz(5, 0, 0));
+    try emitImportPreamble(&code, &relocs, gpa, "mmap", 16);
+    try emit(&code, gpa, A.blr(16)); // x0 = span base
+    try emit(&code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl));
+    try emit(&code, gpa, A.ldrRegUoff(12, 9, cnt_off));
+    try emit(&code, gpa, A.addImm(12, 12, 1));
+    try emit(&code, gpa, A.strRegUoff(12, 9, cnt_off)); // span_count++
+    try emit(&code, gpa, A.movReg(10, 0)); // cursor = base
+    try emit(&code, gpa, A.movz(11, span, 0));
+    try emit(&code, gpa, A.addReg(11, 0, 11)); // end = base + SPAN
+    try emit(&code, gpa, A.ldrSp(15, 0)); // reload size
+    try emit(&code, gpa, A.addReg(14, 10, 15)); // new_cursor
+
+    const fit: u32 = @intCast(code.items.len);
+    patchBCondTo(code.items, to_fit, fit);
+
+    try emit(&code, gpa, A.movReg(0, 10)); // return the current cursor as the cell
+    try emit(&code, gpa, A.strRegUoff(14, 9, cur_off)); // advance cursor
+    try emit(&code, gpa, A.strRegUoff(11, 9, end_off)); // persist end (a no-op in the fit path; the fresh span's limit after a refill)
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    return finishBuiltin(&code, &relocs, gpa, "gc_alloc");
+}
+
+/// Build the `gc_span_count()` builtin: the number of spans mmapped so far (>= 1 once
+/// the heap is initialized). Forces lazy init if called before any `gc_alloc`, so it
+/// always returns a truthful count. Caller owns the result.
+pub fn lowerGcSpanCount(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
+    const emit = emitWord;
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    try emitFramePrologue(&code, gpa);
+    try emitLocateCb(&code, &relocs, gpa);
+    try emit(&code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl));
+    try emit(&code, gpa, A.ldrRegUoff(0, 9, cnt_off));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    return finishBuiltin(&code, &relocs, gpa, "gc_span_count");
+}
+
 test "panic backpatch wrappers resolve signed word deltas, preserving opcode/rt/cond" {
     var buf: [16]u8 = undefined;
     // cbz x20 @ site 0 → target 8: +2 words, opcode + rt preserved.

@@ -33,6 +33,7 @@ const Resolve = @import("resolve.zig");
 const Typecheck = @import("types.zig");
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
+const Abi = @import("codegen/abi/Abi.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
@@ -500,7 +501,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 /// never value-then-copy).
 fn storeInto(b: *Builder, slot: Ir.SlotId, expr: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
     switch (ty.kind) {
-        .int, .bool, .float => {
+        .int, .bool, .float, .rawptr => {
             const v = try lowerExpr(b, expr);
             const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = operandValue(v), .ty = ty } }, null);
@@ -610,7 +611,7 @@ fn lowerStrLiteral(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Opera
 fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const slot = try localSlot(b, node_idx, ty);
     switch (ty.kind) {
-        .int, .bool, .float => {
+        .int, .bool, .float, .rawptr => {
             const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
             const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
             return .{ .value = v };
@@ -1635,6 +1636,25 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         self_recv = if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
         self_mut = m.mut_self;
     } else if (callee_node.tag == .type_app) {
+        // `size_of[T]()` / `align_of[T]()`: the base resolves to a core-only builtin.
+        // Fold to a compile-time ABI constant (no call, no reloc). Checked BEFORE the
+        // generic-instance resolution below.
+        {
+            const bres = b.in.resolutions[(callee_node.lhs).int()];
+            if (bres == .func and bres.func < b.in.names.len and b.in.names[bres.func].kind == .builtin) {
+                const bn = b.in.names[bres.func].name;
+                const is_size = std.mem.eql(u8, bn, "size_of");
+                if (is_size or std.mem.eql(u8, bn, "align_of")) {
+                    const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+                    const t = b.in.node_types[(tnodes[0]).int()];
+                    const c: u32 = if (is_size)
+                        Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
+                    else
+                        Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
+                    return .{ .value = try b.emit(.{ .iconst = @intCast(c) }, Typecheck.Type.int) };
+                }
+            }
+        }
         // A generic call `id[int](..)`: the callee is a `type_app` whose base
         // identifier carries the template gid. Resolve to the reified instance's
         // mangled SymName by matching (gid + the concrete type-args the checker
@@ -1713,6 +1733,21 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         // struct/enum witness always resolves. Intercept BEFORE the plain-name resolution.
         if (callee_res.func < b.in.names.len) {
             const nm = b.in.names[callee_res.func];
+            // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
+            // no reloc). The checker fenced them in `unsafe { }` and typed the rawptr
+            // operand; this milestone reads/writes a 64-bit int through the pointer.
+            if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "store")) {
+                const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                const addr = operandValue(try lowerExpr(b, sargs[0]));
+                const val = operandValue(try lowerExpr(b, sargs[1]));
+                _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = Typecheck.Type.int } }, null);
+                return .none;
+            }
+            if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "load")) {
+                const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                const addr = operandValue(try lowerExpr(b, largs[0]));
+                return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) };
+            }
             if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print")) {
                 const parg = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                 if (parg.len == 1) {
@@ -1807,7 +1842,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     // Result placement: scalar → an Instr.result value; aggregate → a fresh
     // ret_slot; unit → neither. The ABI (reg vs sret) is decided in codegen.
     switch (result_ty.kind) {
-        .int, .bool, .float => {
+        .int, .bool, .float, .rawptr => {
             const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, result_ty);
             return .{ .value = v };
         },

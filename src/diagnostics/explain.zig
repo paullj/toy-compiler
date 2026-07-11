@@ -70,6 +70,7 @@ pub const docs = [_]Doc{
     .{ .code = .T0035, .text = @embedFile("errors/T0035.md") },
     .{ .code = .T0036, .text = @embedFile("errors/T0036.md") },
     .{ .code = .T0037, .text = @embedFile("errors/T0037.md") },
+    .{ .code = .T0038, .text = @embedFile("errors/T0038.md") },
 };
 
 /// The embedded doc for a code, or null if the code has no doc (only `.none`).
