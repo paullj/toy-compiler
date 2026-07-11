@@ -66,32 +66,28 @@ pub const Linked = struct {
 /// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
 /// `data_relocs` (free `.import` data-reloc names individually).
 pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
-    // 1) Scan for the hand-asm builtins any fn references: `print` (the raw write-bytes
-    //    primitive) and `__display_int` (the heap-free decimal renderer). Each referenced
-    //    body is appended below; those bodies emit the `write` `.import` reloc themselves,
-    //    so the `write` dyld import is DERIVED from `data_relocs` like any other import.
-    var uses_print = false;
-    var uses_display_int = false;
-    var uses_panic = false;
-    var uses_gc_alloc = false;
-    var uses_gc_span_count = false;
+    // 1) Scan which hand-emitted builtins (`CodegenIr.hand_builtins`) any fn references;
+    //    each referenced body is appended below. Those bodies emit their own `.import`
+    //    relocs (e.g. `print`/`panic` -> `write`), so the dyld import set is DERIVED from
+    //    `data_relocs` like any other import.
+    var used = [_]bool{false} ** CodegenIr.hand_builtins.len;
     for (fns) |f| {
         for (f.relocs) |rl| switch (rl.target) {
             .func => |s| if (s.kind == .builtin) {
-                if (std.mem.eql(u8, s.name, "print")) uses_print = true;
-                if (std.mem.eql(u8, s.name, "__display_int")) uses_display_int = true;
-                if (std.mem.eql(u8, s.name, "panic")) uses_panic = true;
-                if (std.mem.eql(u8, s.name, "gc_alloc")) uses_gc_alloc = true;
-                if (std.mem.eql(u8, s.name, "gc_span_count")) uses_gc_span_count = true;
+                for (CodegenIr.hand_builtins, 0..) |hb, i| {
+                    if (std.mem.eql(u8, s.name, hb.name)) used[i] = true;
+                }
             },
             else => {},
         };
     }
-    // Build the full fn set: the user fns + (if referenced) the print / __display_int
-    // bodies, in a FIXED append order (print then __display_int) so the linked image is a
-    // pure function of the fn set (never thread order). We OWN `fns`' elements now (the
-    // caller relinquished them); on any failure free the ones not yet moved into `all` plus
-    // everything in `all`.
+    // `panic` alone is consumed past the append: it drags in the `write` import and
+    // reserves the backtrace symbol table's slot.
+    const uses_panic = used[comptime CodegenIr.handBuiltinIndex("panic")];
+    // Build the full fn set: the user fns + (if referenced) the hand-emitted builtin
+    // bodies, appended in `hand_builtins` order so the linked image is a pure function of
+    // the fn set (never thread order). We OWN `fns`' elements now (the caller relinquished
+    // them); on any failure free the ones not yet moved into `all` plus everything in `all`.
     var all: std.ArrayList(Link.FnCode) = .empty;
     var moved: usize = 0;
     errdefer {
@@ -105,25 +101,8 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
         try all.append(gpa, f);
         moved += 1;
     }
-    if (uses_print) {
-        const pf = try CodegenIr.lowerPrint(gpa);
-        try all.append(gpa, pf);
-    }
-    if (uses_display_int) {
-        const df = try CodegenIr.lowerDisplayInt(gpa);
-        try all.append(gpa, df);
-    }
-    if (uses_panic) {
-        const pf = try CodegenIr.lowerPanic(gpa);
-        try all.append(gpa, pf);
-    }
-    if (uses_gc_alloc) {
-        const gf = try CodegenIr.lowerGcAlloc(gpa);
-        try all.append(gpa, gf);
-    }
-    if (uses_gc_span_count) {
-        const gf = try CodegenIr.lowerGcSpanCount(gpa);
-        try all.append(gpa, gf);
+    for (CodegenIr.hand_builtins, 0..) |hb, i| {
+        if (used[i]) try all.append(gpa, try hb.lower(gpa));
     }
 
     // 2) Intern strings program-wide via `internCstrings` (stable collect +

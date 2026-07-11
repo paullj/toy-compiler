@@ -1009,6 +1009,35 @@ fn finishBuiltin(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), g
     };
 }
 
+/// A hand-emitted AArch64 builtin body and its stable name. The link tail both
+/// scans for referenced builtins and appends their bodies off this one list, so
+/// the image stays a pure function of the fn set.
+pub const HandBuiltin = struct {
+    name: []const u8,
+    lower: *const fn (std.mem.Allocator) error{OutOfMemory}!Link.FnCode,
+};
+
+/// The FIXED append order of the hand-emitted builtins. Load-bearing: it makes the
+/// linked image order-independent of the fn set's discovery/thread order. Append,
+/// never reorder.
+pub const hand_builtins = [_]HandBuiltin{
+    .{ .name = "print", .lower = lowerPrint },
+    .{ .name = "__display_int", .lower = lowerDisplayInt },
+    .{ .name = "panic", .lower = lowerPanic },
+    .{ .name = "gc_alloc", .lower = lowerGcAlloc },
+    .{ .name = "gc_span_count", .lower = lowerGcSpanCount },
+};
+
+/// The `hand_builtins` index of `name`, resolved at comptime — lets a caller name
+/// a specific builtin (e.g. `panic`, which drives the backtrace symbol table)
+/// without hardcoding a numeric slot.
+pub fn handBuiltinIndex(comptime name: []const u8) usize {
+    for (hand_builtins, 0..) |hb, i| {
+        if (std.mem.eql(u8, hb.name, name)) return i;
+    }
+    @compileError("unknown hand builtin: " ++ name);
+}
+
 /// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
 /// the result.
 pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
