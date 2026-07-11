@@ -45,6 +45,7 @@ pub const Code = enum(u16) {
     R0007, // invalid-assignment-target
     R0008, // duplicate-label
     R0009, // undefined-label
+    R0010, // extern-not-in-core (an `extern fn` declared outside a `core/` module)
 
     // Type band (T####).
     T0001, // unknown-type
@@ -83,6 +84,7 @@ pub const Code = enum(u16) {
     T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width)
     T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain)
     T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x`)
+    T0037, // extern-invalid-type (an `extern fn` param/return type is not int, rawptr, or bool)
 
     _,
 };
@@ -121,6 +123,7 @@ pub const table = [_]Entry{
     .{ .code = .R0007, .str = "R0007", .slug = "invalid-assignment-target" },
     .{ .code = .R0008, .str = "R0008", .slug = "duplicate-label" },
     .{ .code = .R0009, .str = "R0009", .slug = "undefined-label" },
+    .{ .code = .R0010, .str = "R0010", .slug = "extern-not-in-core" },
     .{ .code = .T0001, .str = "T0001", .slug = "unknown-type" },
     .{ .code = .T0002, .str = "T0002", .slug = "unknown-module" },
     .{ .code = .T0003, .str = "T0003", .slug = "module-has-no-type" },
@@ -157,6 +160,7 @@ pub const table = [_]Entry{
     .{ .code = .T0034, .str = "T0034", .slug = "literal-out-of-range" },
     .{ .code = .T0035, .str = "T0035", .slug = "alias-cycle" },
     .{ .code = .T0036, .str = "T0036", .slug = "malformed-char-literal" },
+    .{ .code = .T0037, .str = "T0037", .slug = "extern-invalid-type" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -325,6 +329,14 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0036", str(.T0036).?);
     try testing.expectEqualStrings("malformed-char-literal", slug(.T0036).?);
     try testing.expectEqual(Code.T0036, fromStr("T0036").?);
+
+    // Extern-not-in-core (resolve) + extern-invalid-type (type) codes.
+    try testing.expectEqualStrings("R0010", str(.R0010).?);
+    try testing.expectEqualStrings("extern-not-in-core", slug(.R0010).?);
+    try testing.expectEqual(Code.R0010, fromStr("R0010").?);
+    try testing.expectEqualStrings("T0037", str(.T0037).?);
+    try testing.expectEqualStrings("extern-invalid-type", slug(.T0037).?);
+    try testing.expectEqual(Code.T0037, fromStr("T0037").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

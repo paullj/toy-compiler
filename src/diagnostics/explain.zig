@@ -32,6 +32,7 @@ pub const docs = [_]Doc{
     .{ .code = .R0007, .text = @embedFile("errors/R0007.md") },
     .{ .code = .R0008, .text = @embedFile("errors/R0008.md") },
     .{ .code = .R0009, .text = @embedFile("errors/R0009.md") },
+    .{ .code = .R0010, .text = @embedFile("errors/R0010.md") },
     .{ .code = .T0001, .text = @embedFile("errors/T0001.md") },
     .{ .code = .T0002, .text = @embedFile("errors/T0002.md") },
     .{ .code = .T0003, .text = @embedFile("errors/T0003.md") },
@@ -68,6 +69,7 @@ pub const docs = [_]Doc{
     .{ .code = .T0034, .text = @embedFile("errors/T0034.md") },
     .{ .code = .T0035, .text = @embedFile("errors/T0035.md") },
     .{ .code = .T0036, .text = @embedFile("errors/T0036.md") },
+    .{ .code = .T0037, .text = @embedFile("errors/T0037.md") },
 };
 
 /// The embedded doc for a code, or null if the code has no doc (only `.none`).

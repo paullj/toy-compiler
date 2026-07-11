@@ -839,7 +839,6 @@ fn emitExecutable(
         lp.entry_off,
         lp.cstrings,
         lp.data_relocs,
-        lp.uses_write,
     );
     defer gpa.free(image);
 

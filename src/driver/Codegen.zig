@@ -51,10 +51,9 @@ pub const LinkedProgram = struct {
     cstrings: []u8 = &.{},
     /// Cross-segment relocs (adrp/add/ldr to __cstring/__got) rebased to absolute
     /// __text offsets, patched by `Link.applyDataRelocs` after MachO assigns
-    /// vmaddrs. Owned; empty for reloc-free programs.
+    /// vmaddrs. Owned; empty for reloc-free programs. The dyld import set is DERIVED
+    /// from these (`.import` targets) in `assembleAndSign`.
     data_relocs: []Link.Reloc = &.{},
-    /// Whether the program calls `print` (→ one `_write` import).
-    uses_write: bool = false,
     /// Incremental counters: how many functions were freshly lowered vs served
     /// from the codegen cache this build. Surfaced via `--codegen-stats`.
     codegen_compiled: usize = 0,
@@ -210,7 +209,6 @@ fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []cons
         .owned_msgs = &.{},
         .cstrings = lk.cstrings,
         .data_relocs = lk.data_relocs,
-        .uses_write = lk.uses_write,
     };
 }
 
@@ -375,6 +373,7 @@ pub fn lowerGraphProgram(
     var entry_id: ?u32 = null;
     for (res.fns, 0..) |gf, gid| {
         if (gf.decl_node == Ast.none) continue; // synthetic print: no body to lower
+        if (gf.kind == .import) continue; // an `extern`: bodyless, referenced only via `names[gid]`
         // Skip generic TEMPLATES: their params/ret are `type_var`s with no ABI,
         // so they are never lowered directly — only their concrete instances are
         // (appended below). An uncalled generic fn thus emits ZERO codegen units.
@@ -620,8 +619,10 @@ fn buildGraphNames(gpa: std.mem.Allocator, fns: []const ResolveGraph.GlobalFn, s
         gpa.free(names);
     }
     for (fns, 0..) |gf, i| {
-        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
-        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, sigs[i].name) };
+        // The resolver's kind carries straight through: `.builtin` (print/panic),
+        // `.import` (an `extern` — a bare dyld symbol reached via `__got`), or
+        // `.user_fn`. An extern's name is the bare C symbol (`labs`), matching its reloc.
+        names[i] = .{ .kind = gf.kind, .name = try gpa.dupe(u8, sigs[i].name) };
         built += 1;
     }
     return names;
@@ -651,6 +652,7 @@ pub fn renderGraphIr(
     var first = true;
     for (res.fns, 0..) |gf, gid| {
         if (gf.decl_node == Ast.none) continue; // skip bodyless print
+        if (gf.kind == .import) continue; // an `extern` emits no IR
         const m = &graph.modules[gf.module];
         // Skip generic templates: rendered only as concrete instances below.
         const gdecl = m.nodes[gf.decl_node.int()];
@@ -763,7 +765,6 @@ pub fn buildImage(
     entry_off: u32,
     cstrings: []const u8,
     data_relocs: []const Link.Reloc,
-    uses_write: bool,
 ) ![]u8 {
-    return link.assembleAndSign(io, gpa, identifier, code, entry_off, cstrings, data_relocs, uses_write);
+    return link.assembleAndSign(io, gpa, identifier, code, entry_off, cstrings, data_relocs);
 }

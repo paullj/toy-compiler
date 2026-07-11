@@ -2085,7 +2085,7 @@ test "integration: emitted binary runs with the right exit code" {
         defer lp.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), lp.diags.len);
 
-        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs);
         defer gpa.free(image);
 
         const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
@@ -2168,7 +2168,7 @@ test "integration: monomorphized generic instances get distinct symbols, run to 
         try testing.expectEqual(@as(usize, 0), lp.diags.len);
         try testing.expectEqual(@as(usize, 3), lp.codegen_compiled);
 
-        const image = try buildImage(io, gpa, "idexp", lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        const image = try buildImage(io, gpa, "idexp", lp.text, lp.entry_off, lp.cstrings, lp.data_relocs);
         defer gpa.free(image);
         const out_path = std.fmt.allocPrint(gpa, "{s}/idexp", .{dir_name}) catch unreachable;
         defer gpa.free(out_path);
@@ -2258,7 +2258,7 @@ test "integration: a derived-Eq struct runs to exit 42, mints one source-less un
         try testing.expectEqual(@as(usize, 0), lp.diags.len);
         try testing.expectEqual(@as(usize, 2), lp.codegen_compiled); // main + Eq$eq$s0
 
-        const image = try buildImage(io, gpa, "deq", lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        const image = try buildImage(io, gpa, "deq", lp.text, lp.entry_off, lp.cstrings, lp.data_relocs);
         defer gpa.free(image);
         const out_path = std.fmt.allocPrint(gpa, "{s}/deq", .{dir_name}) catch unreachable;
         defer gpa.free(out_path);
@@ -2343,7 +2343,7 @@ test "integration: print writes the expected bytes to stdout" {
         defer lp.deinit(gpa);
         try testing.expectEqual(@as(usize, 0), lp.diags.len);
 
-        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, lp.uses_write);
+        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs);
         defer gpa.free(image);
 
         const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
@@ -3144,7 +3144,7 @@ test "byte-identical: a warm build equals a from-scratch (.force) build" {
     var warm = try checkAndLower(gpa, io, cache, path, src, .normal, &rw);
     defer rw.deinit(gpa);
     defer warm.deinit(gpa);
-    const warm_img = try buildImage(io, gpa, "p", warm.text, warm.entry_off, warm.cstrings, warm.data_relocs, warm.uses_write);
+    const warm_img = try buildImage(io, gpa, "p", warm.text, warm.entry_off, warm.cstrings, warm.data_relocs);
     defer gpa.free(warm_img);
 
     // From scratch (ignore the cache).
@@ -3152,7 +3152,7 @@ test "byte-identical: a warm build equals a from-scratch (.force) build" {
     var fresh = try checkAndLower(gpa, io, cache, path, src, .force, &rf);
     defer rf.deinit(gpa);
     defer fresh.deinit(gpa);
-    const fresh_img = try buildImage(io, gpa, "p", fresh.text, fresh.entry_off, fresh.cstrings, fresh.data_relocs, fresh.uses_write);
+    const fresh_img = try buildImage(io, gpa, "p", fresh.text, fresh.entry_off, fresh.cstrings, fresh.data_relocs);
     defer gpa.free(fresh_img);
 
     try testing.expectEqualSlices(u8, fresh_img, warm_img);
@@ -3196,7 +3196,7 @@ test "reorder: swapping fn order is all cache hits and keeps correct linkage" {
     // The reordered binary still links correctly (call resolves by name): build
     // it and run it — must exit 7. (macOS/aarch64 only.)
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return;
-    const image = try buildImage(io, gpa, "p", lpb.text, lpb.entry_off, lpb.cstrings, lpb.data_relocs, lpb.uses_write);
+    const image = try buildImage(io, gpa, "p", lpb.text, lpb.entry_off, lpb.cstrings, lpb.data_relocs);
     defer gpa.free(image);
     const out_path = std.fmt.allocPrint(gpa, "{s}/p", .{src_dir}) catch unreachable;
     defer gpa.free(out_path);

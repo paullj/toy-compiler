@@ -222,6 +222,33 @@ fn collectGlobals(g: *GraphResolve) !void {
                     });
                     if (is_pub) try g.tables[mod].pub_fns.put(g.gpa, name, id);
                 },
+                .extern_fn_decl => {
+                    const name = g.nameOf(mod, decl.main_token);
+                    // The DECL gate is core-only: an `extern fn` is legal solely in a
+                    // bundled `core/` module. Anywhere else it is never registered, so
+                    // any use of the name is undeclared (R0001).
+                    if (!m.bundled or !std.mem.startsWith(u8, m.path, "core/")) {
+                        try g.emit(.R0010, mod, m.tokens[decl.main_token].start, "'extern' functions are only allowed in 'core/' modules", .{});
+                        continue;
+                    }
+                    const gop = try g.tables[mod].fns.getOrPut(g.gpa, name);
+                    if (gop.found_existing) {
+                        try g.emit(.R0002, mod, m.tokens[decl.main_token].start, "duplicate function '{s}'", .{name});
+                        continue;
+                    }
+                    const id: u32 = @intCast(g.fns.items.len);
+                    gop.value_ptr.* = id;
+                    // The symbol name is the BARE C symbol (never module-qualified):
+                    // it is what dyld binds through the `__got`, so `labs` stays `labs`.
+                    try g.fns.append(g.gpa, .{
+                        .name = try g.gpa.dupe(u8, name),
+                        .module = mod,
+                        .decl_node = decl_idx,
+                        .kind = .import,
+                        .is_pub = is_pub,
+                    });
+                    if (is_pub) try g.tables[mod].pub_fns.put(g.gpa, name, id);
+                },
                 .impl_decl, .impl_has_decl => {
                     // Each method is an ordinary global fn with a MANGLED name
                     // `<module.path>.<Receiver>.<method>` (so it gets a global id +
@@ -639,6 +666,9 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         .match_expr => try g.resolveMatch(node_idx),
         .literal_unit => {},
         .block => try g.resolveBlock(node_idx),
+        // `unsafe { .. }`: resolve the names in its inner block (the silent `else`
+        // would otherwise skip them). The unsafe context itself binds nothing here.
+        .unsafe_block => try g.resolveBlock(n.lhs),
         .labeled => try g.resolveLabeled(node_idx),
         .loop_expr => try g.resolveBlock(n.lhs),
         .if_stmt => {
@@ -691,8 +721,14 @@ fn resolveModuleMember(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, targe
     const member = g.nameText(n.main_token);
     const tt = &g.tables[target];
     if (tt.pub_fns.get(member)) |gid| {
-        g.res(node_idx, .{ .func = gid });
-        return;
+        // Quarantine: a bundled module's pub `.import` (extern) member is served only
+        // to another bundled module (so `std/math` may call `core/ffi.labs`). A user
+        // module doing `import core/ffi; ffi.labs(..)` falls through to the R0006
+        // no-member branch, closing the bypass.
+        if (!(g.fns.items[gid].kind == .import and !g.refBundled())) {
+            g.res(node_idx, .{ .func = gid });
+            return;
+        }
     }
     // A pub type member is quiet (the qualified type / enum-variant tail is bound
     // by Typecheck). For a 3-level `mod.Enum.Variant`, this node is the inner
@@ -853,8 +889,22 @@ fn lookupLocalOrFn(g: *GraphResolve, name_tok: u32) ?Resolution {
             return .{ .local = g.locals.items[local_idx].slot };
         }
     }
-    if (g.tables[g.cur_mod].fns.get(name)) |gid| return .{ .func = gid };
+    if (g.tables[g.cur_mod].fns.get(name)) |gid| {
+        // An `.import` (extern) symbol resolves only in a bundled module; a
+        // non-bundled module falls through to the undeclared diagnostic. In practice
+        // a user module never holds an import symbol in its own `fns`, but this keeps
+        // the quarantine invariant explicit at the bare-name site too.
+        if (g.fns.items[gid].kind == .import and !g.refBundled()) return null;
+        return .{ .func = gid };
+    }
     return null;
+}
+
+/// Whether the CURRENTLY-RESOLVING module is bundled (`core/` or `std/`). An
+/// `.import` (extern) symbol is served only to a bundled module; every other
+/// reference gets the standard unresolved/no-member diagnostic.
+fn refBundled(g: *GraphResolve) bool {
+    return g.graph.modules[g.cur_mod].bundled;
 }
 
 /// An iterator over exactly the names `lookupName` searches, for near-miss

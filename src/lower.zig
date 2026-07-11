@@ -480,6 +480,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             _ = try lowerExpr(b, stmt.lhs); // evaluate for effect, discard
         },
         .block => try lowerBlockStmts(b, stmt_idx),
+        .unsafe_block => try lowerBlockStmts(b, stmt.lhs),
         .if_stmt => try lowerIfStmt(b, stmt_idx),
         .while_stmt => try lowerWhile(b, stmt_idx, null),
         .for_stmt => try lowerFor(b, stmt_idx, null),
@@ -562,6 +563,9 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             return try lowerCall(b, node_idx, n);
         },
         .block => return try lowerBlockValue(b, node_idx, ty),
+        // `unsafe { .. }` lowers transparently as its inner block (the unsafe context
+        // is a check-time concern; there are no raw-pointer ops yet).
+        .unsafe_block => return try lowerBlockValue(b, n.lhs, ty),
         .if_stmt => return try lowerIfValue(b, node_idx, ty),
         .loop_expr => return try lowerLoopValue(b, node_idx, ty, null),
         .labeled => return try lowerLabeledValue(b, node_idx, ty),
@@ -2347,6 +2351,7 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         },
         .if_stmt => try lowerIfValueInto(b, expr, dst_ptr, ty),
         .block => try lowerBlockValueInto(b, expr, dst_ptr, ty),
+        .unsafe_block => try lowerBlockValueInto(b, n.lhs, dst_ptr, ty),
         .loop_expr => try lowerLoopValueInto(b, expr, dst_ptr, ty, null),
         .labeled => try lowerLabeledValueInto(b, expr, dst_ptr, ty),
         .match_expr => try lowerMatchInto(b, expr, dst_ptr, ty),

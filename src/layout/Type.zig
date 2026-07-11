@@ -30,7 +30,12 @@ const std = @import("std");
 /// `Layout` registered on the live tables) during the serial monomorphization tail,
 /// BEFORE the layout snapshot, so codegen/fingerprint/cache see only plain `structT`
 /// and an `app` never reaches lower/codegen (Debug-asserted there).
-pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app, float };
+/// `rawptr` (APPENDED — ordinals frozen) is an opaque, UNMANAGED C `void*`: a
+/// plain scalar (size=align=8) with no laid-out referent and no nominal id, so
+/// `idField(.rawptr) == .none` and all rawptrs are equal by kind. It carries no
+/// heap-reference semantics (`isReference()` is false); its only functional client
+/// this milestone is as an `extern` param/return type.
+pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app, float, rawptr };
 
 /// The width class of an integer type. `plat` is the platform-word `int`/`uint`
 /// (currently 64-bit); the numbered classes are the fixed-width `int8..int64`.
@@ -69,6 +74,7 @@ pub const Type = struct {
     pub const str: Type = .{ .kind = .str };
     pub const never: Type = .{ .kind = .never };
     pub const float: Type = .{ .kind = .float };
+    pub const rawptr: Type = .{ .kind = .rawptr };
 
     pub const uint: Type = .{ .kind = .int, .int_desc = .{ .signed = false } };
     pub const int8: Type = .{ .kind = .int, .int_desc = .{ .width = .w8 } };
@@ -128,7 +134,7 @@ pub const Type = struct {
         return switch (kind) {
             .@"struct", .type_var, .app => .struct_id,
             .@"enum" => .enum_id,
-            .invalid, .unit, .int, .bool, .str, .never, .float => .none,
+            .invalid, .unit, .int, .bool, .str, .never, .float, .rawptr => .none,
         };
     }
 
@@ -216,9 +222,21 @@ pub const Type = struct {
         };
     }
 
+    pub fn isRawPtr(t: Type) bool {
+        return t.kind == .rawptr;
+    }
+
+    /// An unmanaged `rawptr` carries NO heap-reference semantics (it is a bare C
+    /// `void*`), so it is never a reference. The single predicate a future GC/box
+    /// model routes through; today only `rawptr` exists to say `false` about.
+    pub fn isReference(t: Type) bool {
+        _ = t;
+        return false;
+    }
+
     /// A builtin scalar type — one with no laid-out referent (`int`/`bool`/`str`/`unit`).
     pub fn isScalar(t: Type) bool {
-        return t.kind == .int or t.kind == .bool or t.kind == .str or t.kind == .unit;
+        return t.kind == .int or t.kind == .bool or t.kind == .str or t.kind == .unit or t.kind == .rawptr;
     }
 
     /// The source spelling of an integer type (`int`/`uint`/`int8`.../`uint64`).
@@ -355,7 +373,7 @@ test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
         Type.int,       Type.uint,       Type.int8,       Type.int16,      Type.int32,
         Type.int64,     Type.uint8,      Type.uint16,     Type.uint32,     Type.uint64,
         Type.structT(0), Type.structT(1), Type.enumT(0),  Type.enumT(1),   Type.typeVar(0),
-        Type.typeVar(1), Type.app(0),     Type.app(1),     Type.float,
+        Type.typeVar(1), Type.app(0),     Type.app(1),     Type.float,      Type.rawptr,
     };
     for (canon) |a| {
         for (canon) |b| {
@@ -381,6 +399,18 @@ test "algebra: float is a distinct nominal-id-free type" {
     try testing.expect(!Type.eql(Type.float, Type.int));
     try testing.expect(Type.eql(Type.float, Type.float));
     try testing.expectEqual(IdField.none, Type.idField(.float));
+}
+
+test "algebra: rawptr is a distinct nominal-id-free 8-byte scalar" {
+    try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
+    try testing.expect(Type.rawptr.isRawPtr());
+    try testing.expect(Type.rawptr.isScalar());
+    try testing.expect(!Type.rawptr.isReference());
+    // A distinct type: not int, not str, no nominal id; equal only to itself.
+    try testing.expect(Type.eql(Type.rawptr, Type.rawptr));
+    try testing.expect(!Type.eql(Type.rawptr, Type.int));
+    try testing.expect(!Type.eql(Type.rawptr, Type.str));
+    try testing.expectEqual(IdField.none, Type.idField(.rawptr));
 }
 
 test "algebra: integer widths are distinct byte-foldable types" {

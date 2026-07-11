@@ -85,6 +85,7 @@ pub const type_names = std.StaticStringMap(Type).initComptime(.{
     .{ "bool", Type.bool },
     .{ "str", Type.str },
     .{ "float", Type.float },
+    .{ "rawptr", Type.rawptr },
 });
 
 /// Shared type-reference resolution + token/diagnostic helpers, generic over the
@@ -1685,6 +1686,9 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     for (fns) |gf| {
         if (gf.kind == .builtin) {
             try t.appendPrint();
+        } else if (gf.kind == .import) {
+            _ = t.gphSelect(gf.module);
+            try t.decodeExternSig(gf.decl_node, gf.module);
         } else {
             _ = t.gphSelect(gf.module);
             try t.decodeFnSig(gf.decl_node, gf.module, gf.recv_type);
@@ -1812,7 +1816,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // generic calls, reading the Pass-C-populated per-module node_types.
     const nts = t.gph_node_types orelse return; // graph mode always sets it
     for (model.fns) |f| {
-        if (f.kind == .builtin or f.isGeneric()) continue;
+        if (f.kind != .user_fn or f.isGeneric()) continue; // bodyless builtins/externs have no calls
         try t.scanCalls(model, f.mod, nts[f.mod], &worklist, &seen);
     }
 
@@ -2325,7 +2329,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
 /// order-free (safe under `Engine.fanOut` and identical inline).
 fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult) void {
     const f = model.fns[fid];
-    if (f.kind == .builtin) return; // the bodyless `print` has no body to walk
+    if (f.kind == .builtin or f.kind == .import) return; // bodyless (`print` / an `extern`)
     // A generic TEMPLATE is normally checked only through its concrete instances (the
     // mono tail re-checks each instance body with a substitution) — its `type_var`-typed
     // params/locals have no ABI, so its node_types stay `.invalid`, never lowered. A
@@ -2384,7 +2388,9 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
 /// name the type. Diagnose against the owning module + the offending type-ref.
 fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
     for (fns, 0..) |gf, i| {
-        if (gf.kind == .builtin or !gf.is_pub) continue;
+        // An `extern` (`.import`) only names C-ABI scalars (never a non-pub type), and
+        // has no proto to re-walk for pub-exposure — skip it like the bodyless builtin.
+        if (gf.kind != .user_fn or !gf.is_pub) continue;
         _ = t.gphSelect(gf.module);
         const f = t.fns.items[i];
         const decl = t.tree.nodes[f.decl_node.int()];
@@ -2683,6 +2689,42 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
             });
         }
     }
+}
+
+/// Decode a bodyless `extern fn` signature into the global fn table (kind `.import`).
+/// Every param type and the return type are gated to the C-ABI scalars the backend
+/// can marshal — `int` (any width), `rawptr`, or `bool` (a `void` return, spelled by
+/// omitting `-> R`, is also fine). A type outside that set is T0037 and poisoned to
+/// `.invalid`. No generics, no self, no method registration.
+fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
+    const decl = t.tree.nodes[fn_idx.int()];
+    const proto = Ast.protoAt(t.tree, decl.lhs.int());
+
+    const params = try t.gpa.alloc(Type, proto.params.len);
+    for (proto.params, 0..) |param_idx, i| {
+        const param = t.tree.nodes[param_idx.int()];
+        const pty = t.typeFromNode(param.lhs);
+        if (externTypeOk(pty)) {
+            params[i] = pty;
+        } else {
+            try t.sink.emitFmtCode(.T0037, t.byteOf(param.main_token), "extern function parameter/return type must be int, rawptr, or bool", .{});
+            params[i] = .invalid;
+        }
+    }
+    var ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
+    // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI scalar.
+    if (proto.ret_type != Ast.none and !externTypeOk(ret)) {
+        try t.sink.emitFmtCode(.T0037, t.byteOf(t.tree.nodes[proto.ret_type.int()].main_token), "extern function parameter/return type must be int, rawptr, or bool", .{});
+        ret = .invalid;
+    }
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .import, .params = params, .ret = ret, .mod = mod });
+}
+
+/// The C-ABI scalar set an `extern` param/return may use: any integer width, `bool`,
+/// or an opaque `rawptr`. Poison (`.invalid`) is accepted so a prior error does not
+/// cascade into a second T0037.
+fn externTypeOk(ty: Type) bool {
+    return ty.isInteger() or ty.kind == .bool or ty.isRawPtr() or ty.kind == .invalid;
 }
 
 /// Append the synthetic bodyless `print(str) -> ()` builtin to the fn table.

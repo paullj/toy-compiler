@@ -35,8 +35,8 @@ const Engine = @import("../query/Engine.zig");
 
 /// Emission options. `identifier` is the code-signing identity (the output
 /// basename) and is byte-load-bearing (it enters both the signature and the
-/// Mach-O layout). The imports list is DERIVED internally from `uses_write`
-/// (just `_write`), not a caller input.
+/// Mach-O layout). The dyld imports list is DERIVED internally from the `.import`
+/// reloc targets (dedup + stable-sort by name), not a caller input.
 pub const Options = struct {
     identifier: []const u8,
     /// Informational today; the only supported target is aarch64-macos and it is
@@ -54,10 +54,10 @@ pub const Linked = struct {
     cstrings: []u8 = &.{},
     /// Cross-segment relocs (adrp/add/ldr to __cstring/__got) rebased to absolute
     /// __text offsets, patched by `Link.applyDataRelocs` after MachO assigns
-    /// vmaddrs. Owned; empty for programs with no data relocations.
+    /// vmaddrs. Owned; empty for programs with no data relocations. The dyld import
+    /// set is DERIVED from these (`.import` targets) in `assembleAndSign` — never a
+    /// separate flag — so it is a pure function of the fn set at any `-jN`.
     data_relocs: []Link.Reloc = &.{},
-    /// Whether the program calls `print` (→ one `_write` import).
-    uses_write: bool = false,
 };
 
 /// Append the print body if referenced, intern strings deterministically,
@@ -67,9 +67,9 @@ pub const Linked = struct {
 /// `data_relocs` (free `.import` data-reloc names individually).
 pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
     // 1) Scan for the hand-asm builtins any fn references: `print` (the raw write-bytes
-    //    primitive) and `__display_int` (the heap-free decimal renderer). Both call the
-    //    libSystem `write` syscall, so referencing EITHER declares the `_write` import
-    //    (`uses_write`); each referenced body is appended below.
+    //    primitive) and `__display_int` (the heap-free decimal renderer). Each referenced
+    //    body is appended below; those bodies emit the `write` `.import` reloc themselves,
+    //    so the `write` dyld import is DERIVED from `data_relocs` like any other import.
     var uses_print = false;
     var uses_display_int = false;
     var uses_panic = false;
@@ -83,10 +83,6 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
             else => {},
         };
     }
-    // `panic` itself calls `write`, so referencing it declares the `_write` import
-    // even in a program that never prints.
-    const uses_write = uses_print or uses_display_int or uses_panic;
-
     // Build the full fn set: the user fns + (if referenced) the print / __display_int
     // bodies, in a FIXED append order (print then __display_int) so the linked image is a
     // pure function of the fn set (never thread order). We OWN `fns`' elements now (the
@@ -209,7 +205,6 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
         .entry_off = linked.entry_off,
         .cstrings = cstr_bytes,
         .data_relocs = linked.data_relocs,
-        .uses_write = uses_write,
     };
 }
 
@@ -288,11 +283,40 @@ fn internCstrings(gpa: std.mem.Allocator, fns: []const Link.FnCode) !InternedCst
     return .{ .cstrings = try cstrings.toOwnedSlice(gpa), .off_by_hash = off_by_hash };
 }
 
+/// The DISTINCT `.import` reloc target names, sorted by name bytes — the canonical
+/// GOT slot order. Dedup first (via `seen`) means the sort ranges over unique keys, so
+/// sort stability is moot: the total order is a pure function of the name SET,
+/// independent of `data_relocs` arrival order / thread count. Caller owns the slice
+/// and each duped name.
+fn importNames(gpa: std.mem.Allocator, data_relocs: []const Link.Reloc) ![]const []const u8 {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    var names: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (names.items) |nm| gpa.free(nm);
+        names.deinit(gpa);
+    }
+    for (data_relocs) |rl| switch (rl.target) {
+        .import => |s| {
+            const gop = try seen.getOrPut(gpa, s.name);
+            if (!gop.found_existing) try names.append(gpa, try gpa.dupe(u8, s.name));
+        },
+        else => {},
+    };
+    const out = try names.toOwnedSlice(gpa);
+    std.mem.sort([]const u8, out, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    return out;
+}
+
 /// Build the fully signed, runnable Mach-O image for `code`. `identifier` is the
 /// code-signing identity (the output basename); `entry_off` is `main`'s byte
 /// offset within `code`. `cstrings` are the interned `__cstring` bytes, and
 /// `data_relocs` the cross-segment adrp/add/ldr patches `Link.link` rebased to
-/// absolute __text offsets; `uses_write` is whether the program imports `_write`.
+/// absolute __text offsets; the dyld import set is derived from their `.import` targets.
 ///
 /// ORDER MATTERS: MachO assigns segment vmaddrs, THEN `Link.applyDataRelocs`
 /// patches the cross-segment relocs in __text, and ONLY THEN does `CodeSign.sign`
@@ -306,20 +330,35 @@ pub fn assembleAndSign(
     entry_off: u32,
     cstrings: []const u8,
     data_relocs: []const Link.Reloc,
-    uses_write: bool,
 ) ![]u8 {
-    // There is exactly one import (`_write`) when `print` is used.
-    const write_import = [_]MachO.Import{.{ .name = "_write" }};
-    const imports: []const MachO.Import = if (uses_write) &write_import else &.{};
+    // Derive the ordered dyld import set from the `.import` reloc targets: collect the
+    // DISTINCT names, stable-sort by name → canonical GOT slot order. This is a pure
+    // function of the name SET (arrival order / thread count irrelevant), so it is the
+    // sole authority for the GOT layout, the imports/symbols tables, `import_slots`,
+    // and each slot's chained-fixups ordinal — byte-identical at any `-jN`.
+    const names = try importNames(gpa, data_relocs);
+    defer {
+        for (names) |nm| gpa.free(nm);
+        gpa.free(names);
+    }
+
+    // The dyld-facing linkage name is the C symbol with a leading `_` (`labs`→`_labs`),
+    // in the same sorted slot order. Heap-owned; freed after `assemble` copies them.
+    const imports = try gpa.alloc(MachO.Import, names.len);
+    defer {
+        for (imports) |im| gpa.free(@constCast(im.name));
+        gpa.free(imports);
+    }
+    for (names, 0..) |nm, i| imports[i] = .{ .name = try std.fmt.allocPrint(gpa, "_{s}", .{nm}) };
 
     const layout = try MachO.assemble(gpa, identifier, code, entry_off, cstrings, imports);
     errdefer gpa.free(layout.image);
 
-    // The single import `write` lives in GOT slot 0. `applyDataRelocs` looks
-    // up each import target's name in this map.
+    // Slot i binds the i-th sorted import; `applyDataRelocs` looks each `.import`
+    // target's (bare) name up here to patch its adrp/ldr to the right __got slot.
     var import_slots: std.StringHashMapUnmanaged(u32) = .empty;
     defer import_slots.deinit(gpa);
-    if (uses_write) try import_slots.put(gpa, "write", 0);
+    for (names, 0..) |nm, i| try import_slots.put(gpa, nm, @intCast(i));
 
     // Patch the cross-segment relocs now that vmaddrs are known. The reloc sites
     // are absolute within __text, so slice the image at __text and pass them
@@ -357,7 +396,7 @@ pub fn emitExecutable(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry:
         };
         gpa.free(lk.data_relocs);
     }
-    return assembleAndSign(io, gpa, opts.identifier, lk.text, lk.entry_off, lk.cstrings, lk.data_relocs, lk.uses_write);
+    return assembleAndSign(io, gpa, opts.identifier, lk.text, lk.entry_off, lk.cstrings, lk.data_relocs);
 }
 
 test "link.emitExecutable: hand-built main returns 42 (no front-end)" {
@@ -449,6 +488,60 @@ fn detFn(gpa: std.mem.Allocator, name: []const u8, lit_hash: u64, lit_bytes: []c
     const lits = try gpa.alloc(Link.Literal, 1);
     lits[0] = .{ .hash = lit_hash, .bytes = try gpa.dupe(u8, lit_bytes) };
     return .{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, name) }, .code = code, .relocs = try relocs.toOwnedSlice(gpa), .literals = lits };
+}
+
+/// Build one owned `FnCode` that calls an `extern` import `sym` via its GOT slot:
+/// `adrp x16,0 ; ldr x16,[x16] ; blr x16 ; ret`, with the two `.import` relocs the
+/// cross-segment pass rebases to the `__got` slot. Consumed (freed) by `linkProgram`.
+fn importFn(gpa: std.mem.Allocator, name: []const u8, sym_name: []const u8) !Link.FnCode {
+    const code = try gpa.alloc(u8, 16);
+    std.mem.writeInt(u32, code[0..4], w_adrp0, .little);
+    std.mem.writeInt(u32, code[4..8], 0xF9400210, .little); // ldr x16,[x16]
+    std.mem.writeInt(u32, code[8..12], 0xD63F0200, .little); // blr x16
+    std.mem.writeInt(u32, code[12..16], w_ret, .little);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    try relocs.append(gpa, .{ .site = 0, .target = .{ .import = .{ .kind = .import, .name = try gpa.dupe(u8, sym_name) } }, .kind = .adrp_page });
+    try relocs.append(gpa, .{ .site = 4, .target = .{ .import = .{ .kind = .import, .name = try gpa.dupe(u8, sym_name) } }, .kind = .ldr_lo12 });
+    return .{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, name) }, .code = code, .relocs = try relocs.toOwnedSlice(gpa), .literals = &.{} };
+}
+
+/// Two fns importing distinct dyld symbols (`write`, `labs`) → a 2-slot `__got`.
+/// Fresh (owned) each call so both determinism-test runs get their own to consume.
+fn twoImportFns(gpa: std.mem.Allocator) ![]Link.FnCode {
+    const fns = try gpa.alloc(Link.FnCode, 2);
+    fns[0] = try importFn(gpa, "aaa", "write");
+    fns[1] = try importFn(gpa, "main", "labs");
+    return fns;
+}
+
+test "backend spike: a 2-import (labs+write) image is byte-identical at -j1 and -jN" {
+    // The [C11] gate: the generalized N-import chained-fixups blob + GOT layout + the
+    // whole emitted image must be byte-identical regardless of thread count, because the
+    // import set is DERIVED (dedup + stable-sort by name), never thread-arrival ordered.
+    const gpa = testing.allocator;
+    const entry = Link.SymName{ .kind = .user_fn, .name = "main" };
+
+    const fns_serial = try twoImportFns(gpa);
+    defer gpa.free(fns_serial);
+    var t_serial = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer t_serial.deinit();
+    const img_serial = try emitExecutable(t_serial.io(), gpa, fns_serial, entry, .{ .identifier = "spike" });
+    defer gpa.free(img_serial);
+
+    const fns_par = try twoImportFns(gpa);
+    defer gpa.free(fns_par);
+    var t_par = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
+    defer t_par.deinit();
+    const img_par = try emitExecutable(t_par.io(), gpa, fns_par, entry, .{ .identifier = "spike" });
+    defer gpa.free(img_par);
+
+    try testing.expectEqualSlices(u8, img_serial, img_par);
+
+    // The __got sits at the third segment's __got section; its two slots carry the
+    // name-sorted chained binds: labs (slot 0) then write (slot 1).
+    const got_off: usize = @intCast(MachO.PAGE); // __DATA_CONST is the page after single-page __TEXT
+    try testing.expectEqual(@as(u64, 0x8010000000000000), std.mem.readInt(u64, img_serial[got_off..][0..8], .little));
+    try testing.expectEqual(@as(u64, 0x8000000000000001), std.mem.readInt(u64, img_serial[got_off + 8 ..][0..8], .little));
 }
 
 /// Three fns with distinct cstrings; `main` also calls `panic`. Fresh (owned) each call

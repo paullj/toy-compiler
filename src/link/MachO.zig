@@ -74,17 +74,34 @@ const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 // __DATA_CONST is read-only after dyld binds it.
 const SG_READ_ONLY: u32 = 0x10;
 
-/// One dyld-imported external symbol. There is always exactly one: `_write` from
-/// libSystem (the only LC_LOAD_DYLIB, so its dylib ordinal is 1).
+/// One dyld-imported external symbol, named by its dyld-facing linkage name (with
+/// the leading `_`, e.g. `_write`/`_labs`). All imports come from libSystem (the only
+/// LC_LOAD_DYLIB, so every dylib ordinal is 1). The imports slice is stable-sorted by
+/// name, so its index is the symbol's `__got` slot.
 pub const Import = struct {
     name: []const u8,
 };
 
-/// The chained-fixups bind sentinel written into each `__got` slot on disk: a
-/// `dyld_chained_ptr_64_bind` with bind=1 (bit 63) and ordinal 0 → imports[0].
-/// dyld overwrites it in memory with the bound address at load; the on-disk byte
-/// is what we hash, so it stays stable.
+/// The chained-fixups bind sentinel written into a SINGLE-import `__got` slot on
+/// disk: a `dyld_chained_ptr_64_bind` with bind=1 (bit 63), ordinal 0 (→ imports[0]),
+/// and next=0 (chain ends). dyld overwrites it in memory with the bound address at
+/// load; the on-disk byte is what we hash, so it stays stable. It equals
+/// `gotBindValue(0, 1)` — the N=1 case is bit-identical, so a single-import corpus
+/// stays byte-identical after the N-import generalization.
 const GOT_BIND_SENTINEL: u64 = 0x8000000000000000;
+
+/// The on-disk `dyld_chained_ptr_64_bind` value for `__got` slot `i` of `count`
+/// (pointer_format 6, `DYLD_CHAINED_PTR_64_OFFSET`). Bit layout LSB→MSB:
+/// `ordinal:24 | addend:8 | reserved:19 | next:12 | bind:1`. Each slot binds to
+/// `imports[i]` (ordinal = the import index; addend = reserved = 0, bind = 1) and
+/// chains to the next slot: slots are 8 bytes apart and the stride unit is 4 bytes,
+/// so `next` = 2, except the LAST slot which ends the chain with `next` = 0.
+/// Validated byte-for-byte against a clang 2-import reference (`_write`/`_getpid`):
+/// slot0 = 0x8010000000000000, slot1 = 0x8000000000000001.
+fn gotBindValue(i: usize, count: usize) u64 {
+    const next: u64 = if (i + 1 == count) 0 else 2;
+    return (@as(u64, 1) << 63) | (next << 51) | @as(u64, @intCast(i));
+}
 
 /// Segment file alignment / vm page size for this target (16 KB).
 pub const PAGE: u64 = 0x4000;
@@ -554,10 +571,11 @@ fn assembleMulti(
     @memcpy(image[code_file_off..][0..code.len], code);
     @memcpy(image[cstring_file_off..][0..cstrings.len], cstrings);
 
-    // __DATA_CONST: seed each __got slot with the bind sentinel.
+    // __DATA_CONST: seed each __got slot with its chained-fixups bind value (ordinal
+    // = import index, chained to the next slot). N=1 reproduces GOT_BIND_SENTINEL.
     var i: usize = 0;
     while (i < imports.len) : (i += 1) {
-        std.mem.writeInt(u64, image[datac_file_off + i * 8 ..][0..8], GOT_BIND_SENTINEL, .little);
+        std.mem.writeInt(u64, image[datac_file_off + i * 8 ..][0..8], gotBindValue(i, imports.len), .little);
     }
 
     // __LINKEDIT: the chained-fixups blob (sig region stays zeroed).
@@ -1043,6 +1061,46 @@ test "multi-seg: __DATA_CONST geometry, __got, and the seeded slot" {
     const got_off = rd32(img, got + 48);
     try testing.expectEqual(@as(u32, @intCast(PAGE)), got_off);
     try testing.expectEqual(GOT_BIND_SENTINEL, rd64(img, got_off));
+}
+
+test "gotBindValue: chained-fixups bind encoding matches the clang 2-import reference" {
+    // N=1 is bit-identical to the historical single-import sentinel (byte-identity of
+    // the whole print/panic corpus rests on this).
+    try testing.expectEqual(GOT_BIND_SENTINEL, gotBindValue(0, 1));
+    // N=2 golden values captured from a clang `_write`/`_getpid` reference:
+    //   slot0 = bind(1<<63) | next(2<<51) | ordinal 0
+    //   slot1 = bind(1<<63) | next(0)     | ordinal 1
+    try testing.expectEqual(@as(u64, 0x8010000000000000), gotBindValue(0, 2));
+    try testing.expectEqual(@as(u64, 0x8000000000000001), gotBindValue(1, 2));
+    // A 3-import chain: only the last slot ends (next 0).
+    try testing.expectEqual(@as(u64, 0x8010000000000000), gotBindValue(0, 3));
+    try testing.expectEqual(@as(u64, 0x8010000000000001), gotBindValue(1, 3));
+    try testing.expectEqual(@as(u64, 0x8000000000000002), gotBindValue(2, 3));
+}
+
+test "multi-seg: two imports seed two chained __got slots + ordered import/symbol tables" {
+    // Imports arrive in canonical (name-sorted) slot order: labs (0) before write (1).
+    const two = [_]Import{ .{ .name = "_labs" }, .{ .name = "_write" } };
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &two);
+    defer testing.allocator.free(layout.image);
+    const img = layout.image;
+
+    // __got holds two 8-byte slots, each carrying its chained bind value.
+    const dc = HEADER_SIZE + SEG_CMD_SIZE + (SEG_CMD_SIZE + 2 * SECT_SIZE);
+    const got = dc + SEG_CMD_SIZE;
+    try testing.expectEqual(@as(u64, 16), rd64(img, got + 40)); // size (two imports)
+    const got_off = rd32(img, got + 48);
+    try testing.expectEqual(@as(u64, 0x8010000000000000), rd64(img, got_off)); // slot 0 -> labs
+    try testing.expectEqual(@as(u64, 0x8000000000000001), rd64(img, got_off + 8)); // slot 1 -> write
+
+    // The fixups blob (at __LINKEDIT start) carries the two imports + the ordered
+    // symbol table `\0_labs\0_write\0` — import[i]/symbol[i] follow the GOT slot order.
+    const blob = img[2 * PAGE ..];
+    const symbols_off = rd32(blob, 12);
+    const imports_count = rd32(blob, 16);
+    try testing.expectEqual(@as(u32, 2), imports_count);
+    try testing.expectEqualStrings("_labs", std.mem.sliceTo(blob[symbols_off + 1 ..], 0));
+    try testing.expectEqualStrings("_write", std.mem.sliceTo(blob[symbols_off + 1 + "_labs".len + 1 ..], 0));
 }
 
 test "multi-seg: fixups blob + sig placement, sig last" {

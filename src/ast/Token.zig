@@ -209,6 +209,12 @@ pub const Tag = enum(u8) {
     gt_dot, // >.
     le_dot, // <=.
     ge_dot, // >=.
+
+    // FFI keywords. Appended at the END (frozen ordinals; `[]Token` is memcpy'd
+    // to/from the content cache). Both are keywords, so each MUST have a `keywords`
+    // row below. `rawptr` stays a PLAIN identifier (like `int`/`bool`) — no keyword.
+    kw_extern, // `extern fn name(..) -> R`
+    kw_unsafe, // `unsafe { .. }`
 };
 
 /// Maps identifier text to its keyword tag, if any.
@@ -236,6 +242,8 @@ pub const keywords = std.StaticStringMap(Tag).initComptime(.{
     .{ "protocol", .kw_protocol },
     .{ "has", .kw_has },
     .{ "type", .kw_type },
+    .{ "extern", .kw_extern },
+    .{ "unsafe", .kw_unsafe },
 });
 
 comptime {

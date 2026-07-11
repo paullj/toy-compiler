@@ -1,0 +1,7 @@
+import core/ffi
+
+# A safe wrapper over the C `labs`. `std` may call `core`'s safe members but never
+# re-exports an extern/intrinsic name directly.
+pub fn abs(x: int) -> int {
+    return ffi.labs(x)
+}
