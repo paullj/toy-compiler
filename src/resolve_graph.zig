@@ -347,6 +347,27 @@ fn collectGlobals(g: *GraphResolve) !void {
     for (g.tables) |*t| {
         if (!t.fns.contains("panic")) try t.fns.put(g.gpa, "panic", panic_id);
     }
+    // Seed the core-only intrinsic names, appended AFTER `print`/`panic` so no
+    // existing fn id shifts. Each is a homeless `.builtin` (bodyless; the ones that
+    // need machine code are hand-emitted at link time). Unlike `print`/`panic` these
+    // are registered ONLY into a bundled `core/` module's fn table — naming them from
+    // a user or `std/` module leaves the name unresolved (R0001). `gc_array` is
+    // reserved (no lowering yet) so the name is claimed for the container tier.
+    for ([_][]const u8{ "size_of", "align_of", "gc_alloc", "gc_span_count", "store", "load", "gc_array" }) |nm| {
+        const id: u32 = @intCast(g.fns.items.len);
+        try g.fns.append(g.gpa, .{
+            .name = try g.gpa.dupe(u8, nm),
+            .module = entry,
+            .decl_node = Ast.none,
+            .kind = .builtin,
+            .is_pub = false,
+        });
+        for (g.tables, 0..) |*t, i| {
+            const m = g.graph.modules[i];
+            if (m.bundled and std.mem.startsWith(u8, m.path, "core/") and !t.fns.contains(nm))
+                try t.fns.put(g.gpa, nm, id);
+        }
+    }
     // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) are nameable
     // in every module with no import (the `print` precedent). Register each into a module's enum
     // table UNLESS the module declares its own (user-first-wins), so their construction/match

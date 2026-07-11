@@ -73,12 +73,16 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     var uses_print = false;
     var uses_display_int = false;
     var uses_panic = false;
+    var uses_gc_alloc = false;
+    var uses_gc_span_count = false;
     for (fns) |f| {
         for (f.relocs) |rl| switch (rl.target) {
             .func => |s| if (s.kind == .builtin) {
                 if (std.mem.eql(u8, s.name, "print")) uses_print = true;
                 if (std.mem.eql(u8, s.name, "__display_int")) uses_display_int = true;
                 if (std.mem.eql(u8, s.name, "panic")) uses_panic = true;
+                if (std.mem.eql(u8, s.name, "gc_alloc")) uses_gc_alloc = true;
+                if (std.mem.eql(u8, s.name, "gc_span_count")) uses_gc_span_count = true;
             },
             else => {},
         };
@@ -112,6 +116,14 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     if (uses_panic) {
         const pf = try CodegenIr.lowerPanic(gpa);
         try all.append(gpa, pf);
+    }
+    if (uses_gc_alloc) {
+        const gf = try CodegenIr.lowerGcAlloc(gpa);
+        try all.append(gpa, gf);
+    }
+    if (uses_gc_span_count) {
+        const gf = try CodegenIr.lowerGcSpanCount(gpa);
+        try all.append(gpa, gf);
     }
 
     // 2) Intern strings program-wide via `internCstrings` (stable collect +
@@ -542,6 +554,45 @@ test "backend spike: a 2-import (labs+write) image is byte-identical at -j1 and 
     const got_off: usize = @intCast(MachO.PAGE); // __DATA_CONST is the page after single-page __TEXT
     try testing.expectEqual(@as(u64, 0x8010000000000000), std.mem.readInt(u64, img_serial[got_off..][0..8], .little));
     try testing.expectEqual(@as(u64, 0x8000000000000001), std.mem.readInt(u64, img_serial[got_off + 8 ..][0..8], .little));
+}
+
+/// One owned `FnCode` `main` whose body is `bl gc_alloc ; ret` — a `.call26` to the
+/// hand-emitted `gc_alloc` builtin, which drags in its body plus the `msync`/`mmap`
+/// imports. Fresh each call so both determinism-test runs get their own to consume.
+fn gcFns(gpa: std.mem.Allocator) ![]Link.FnCode {
+    const fns = try gpa.alloc(Link.FnCode, 1);
+    const code = try gpa.alloc(u8, 8);
+    std.mem.writeInt(u32, code[0..4], w_bl0, .little); // bl gc_alloc (patched at link)
+    std.mem.writeInt(u32, code[4..8], w_ret, .little);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    try relocs.append(gpa, .{ .site = 0, .target = .{ .func = .{ .kind = .builtin, .name = try gpa.dupe(u8, "gc_alloc") } }, .kind = .call26 });
+    fns[0] = .{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, "main") }, .code = code, .relocs = try relocs.toOwnedSlice(gpa), .literals = &.{} };
+    return fns;
+}
+
+test "backend determinism: a gc_alloc-using image is byte-identical at -j1 and -jN" {
+    // The appended allocator body + its derived `msync`/`mmap` GOT imports must be a
+    // pure function of the fn set (the body is fixed AArch64; the imports are dedup+
+    // sorted by name), so the whole image is identical regardless of thread count.
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const entry = Link.SymName{ .kind = .user_fn, .name = "main" };
+
+    const fns_serial = try gcFns(gpa);
+    defer gpa.free(fns_serial);
+    var t_serial = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer t_serial.deinit();
+    const img_serial = try emitExecutable(t_serial.io(), gpa, fns_serial, entry, .{ .identifier = "gc" });
+    defer gpa.free(img_serial);
+
+    const fns_par = try gcFns(gpa);
+    defer gpa.free(fns_par);
+    var t_par = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
+    defer t_par.deinit();
+    const img_par = try emitExecutable(t_par.io(), gpa, fns_par, entry, .{ .identifier = "gc" });
+    defer gpa.free(img_par);
+
+    try testing.expectEqualSlices(u8, img_serial, img_par);
 }
 
 /// Three fns with distinct cstrings; `main` also calls `panic`. Fresh (owned) each call

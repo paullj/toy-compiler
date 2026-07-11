@@ -19,4 +19,5 @@ test {
     _ = @import("check.zig");
     _ = @import("differential.zig");
     _ = @import("ui.zig");
+    _ = @import("heap.zig");
 }

@@ -85,6 +85,7 @@ pub const Code = enum(u16) {
     T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain)
     T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x`)
     T0037, // extern-invalid-type (an `extern fn` param/return type is not int, rawptr, or bool)
+    T0038, // unsafe-required (a raw-pointer `store`/`load` used outside an `unsafe { }` block)
 
     _,
 };
@@ -161,6 +162,7 @@ pub const table = [_]Entry{
     .{ .code = .T0035, .str = "T0035", .slug = "alias-cycle" },
     .{ .code = .T0036, .str = "T0036", .slug = "malformed-char-literal" },
     .{ .code = .T0037, .str = "T0037", .slug = "extern-invalid-type" },
+    .{ .code = .T0038, .str = "T0038", .slug = "unsafe-required" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -337,6 +339,9 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0037", str(.T0037).?);
     try testing.expectEqualStrings("extern-invalid-type", slug(.T0037).?);
     try testing.expectEqual(Code.T0037, fromStr("T0037").?);
+    try testing.expectEqualStrings("T0038", str(.T0038).?);
+    try testing.expectEqualStrings("unsafe-required", slug(.T0038).?);
+    try testing.expectEqual(Code.T0038, fromStr("T0038").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
