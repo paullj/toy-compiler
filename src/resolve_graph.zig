@@ -712,6 +712,13 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         .type_app => try g.resolveExpr(n.lhs),
         // Postfix `?`: resolve the operand's names; the `?` itself binds nothing.
         .try_expr => try g.resolveExpr(n.lhs),
+        // A list literal's elements and a value index's receiver + index are ordinary
+        // expressions whose names must resolve (the silent `else` would skip them).
+        .list_literal => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |el| try g.resolveExpr(el),
+        .index => {
+            try g.resolveExpr(n.lhs);
+            try g.resolveExpr(n.rhs);
+        },
         .enum_init_unit => {},
         .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a),
         .enum_init_struct => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs),

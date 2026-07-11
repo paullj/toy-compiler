@@ -1,0 +1,9 @@
+# expect: exit 1
+# Feature: an out-of-bounds `xs[i]` panics with "index out of bounds" and exits 1. The
+# stderr message + backtrace are asserted by the integration test's panic suite.
+import std/vec
+
+fn main() -> int {
+    xs := [10]
+    return xs[5]
+}

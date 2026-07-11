@@ -732,6 +732,56 @@ pub const BodyChecker = struct {
                 }
                 break :blk exp;
             },
+            .list_literal => blk: {
+                // A non-empty `[e0, ..]` builds a populated `Vec[V]`: V is inferred from
+                // the first element (seeded by a `Vec[W]` annotation when present); every
+                // remaining element must be assignable to V.
+                const elems = Ast.rangeSlice(bc.tree, n.rhs.int());
+                const vec_ctor = bc.activeStructMap().get("Vec") orelse {
+                    for (elems) |ei| _ = try bc.typeOf(ei);
+                    try bc.sink.emit(bc.byteOf(n.main_token), "a list literal requires 'Vec' in scope (try 'import std/vec')");
+                    break :blk Type.invalid;
+                };
+                var seed: ?Type = null;
+                if (bc.expected) |exp| if (exp.isApp()) {
+                    const ce = bc.composite.at(exp.appIdx());
+                    if (ce.ctor == vec_ctor and ce.args.len == 1) seed = ce.args[0];
+                };
+                const v_ty = try bc.typeOfExpected(elems[0], seed);
+                const result = Type.app(bc.internApp(vec_ctor, &.{v_ty}, false) catch break :blk Type.invalid);
+                for (elems[1..], 1..) |ei, k| {
+                    const at = try bc.typeOfExpected(ei, v_ty);
+                    if (!Type.assignable(v_ty, at))
+                        try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(ei).int()].main_token), "list element {d}: expected '{s}', got '{s}'", .{ k, bc.typeName(v_ty), bc.typeName(at) });
+                }
+                if (bc.expected) |exp| if (!Type.eql(result, exp)) {
+                    if (seed) |s|
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "list element type '{s}' does not match the annotation's '{s}'", .{ bc.typeName(v_ty), bc.typeName(s) })
+                    else
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "a list literal of type '{s}' cannot produce '{s}'", .{ bc.typeName(result), bc.typeName(exp) });
+                    break :blk Type.invalid;
+                };
+                break :blk result;
+            },
+            .index => blk: {
+                // `recv[i]` reads a `Vec[V]` element; the result type is V.
+                const rt = try bc.typeOf(n.lhs);
+                const it = try bc.typeOfExpected(n.rhs, Type.int);
+                const vec_ctor = bc.activeStructMap().get("Vec");
+                if (!rt.isApp()) {
+                    if (rt.kind != .invalid)
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+                    break :blk Type.invalid;
+                }
+                const e = bc.composite.at(rt.appIdx());
+                if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1) {
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+                    break :blk Type.invalid;
+                }
+                if (it.kind != .int and it.kind != .invalid)
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(n.rhs).int()].main_token), "an index must be 'int', got '{s}'", .{bc.typeName(it)});
+                break :blk e.args[0];
+            },
             .call => try bc.typeOfCall(node_idx, n),
             .struct_init => try bc.typeOfStructInit(node_idx, n),
             .field_access => try bc.typeOfFieldAccess(node_idx, n),
@@ -1883,7 +1933,7 @@ pub const BodyChecker = struct {
                         // `bool` element round-trips as `bool`; every other context reads a
                         // 64-bit `int` (mem_selftest is unaffected — its loads are int-typed).
                         const lt: Type = if (bc.expected) |e|
-                            (if (e.isScalar() or e.kind == .float) e else Type.int)
+                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str) e else Type.int)
                         else
                             Type.int;
                         bc.node_types[(node_idx).int()] = lt;
@@ -2253,7 +2303,7 @@ pub const BodyChecker = struct {
                     .is_tag0, .is_tag1 => true,
                     // A managed-box payload (`Ref[T]`, an `.app` during Pass C) is an
                     // 8-byte scalar cell pointer, so it rides the scalar unwrap path.
-                    .unwrap, .unwrap_or => t_ty.kind == .int or t_ty.kind == .bool or bc.isRefPayload(t_ty),
+                    .unwrap, .unwrap_or => t_ty.kind != .invalid,
                 };
                 if (native_ok) switch (op) {
                     .is_tag0, .is_tag1 => {

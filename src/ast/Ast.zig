@@ -395,6 +395,19 @@ pub const Node = extern struct {
         /// Typed bidirectionally by its `Vec[T]` annotation and desugared to the type's
         /// associated `new()` constructor; an un-annotated `[]` is a type error.
         empty_list,
+
+        /// A non-empty list literal `[e0, e1, ..]`. Appended at END (frozen ordinal;
+        /// `[]Node` is memcpy'd to/from the content cache; `ParseHeader.version` bumped
+        /// 15->16). `main_token` is the `[`; `lhs` is `none`; `rhs` is a Range of the
+        /// element exprs. The element type is inferred from `e0`; typed to a populated
+        /// `Vec[V]` and lowered to `new()` + one `push` per element.
+        list_literal,
+
+        /// A value index `recv[i]`. Appended at END (frozen ordinal). `main_token` is
+        /// the `[`; `lhs` is the receiver, `rhs` the index expr. Reads a `Vec[V]`
+        /// element with an out-of-bounds runtime panic. Distinguished from a turbofish
+        /// `id[T]` by the token following the matching `]` (see `parsePostfix`).
+        index,
     };
 };
 
@@ -619,7 +632,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 15,
+    version: u32 = 16,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -680,7 +693,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 15) return null;
+    if (hdr.magic != parse_magic or hdr.version != 16) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -728,6 +741,21 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .literal_number, .literal_float, .literal_string, .literal_bool, .literal_char, .identifier => try out.writeAll(tok_text),
         .literal_unit => try out.writeAll("()"),
         .empty_list => try out.writeAll("[]"),
+        .list_literal => {
+            try out.writeAll("(list");
+            for (rangeSlice(tree, n.rhs.int())) |el| {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, el);
+            }
+            try out.writeByte(')');
+        },
+        .index => {
+            try out.writeAll("(index ");
+            try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
         // A poison leaf renders as a fixed `(error)` marker (its `main_token` is
         // the offending token, but the marker deliberately elides its text).
         .error_node => try out.writeAll("(error)"),

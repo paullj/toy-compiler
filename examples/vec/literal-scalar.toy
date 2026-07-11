@@ -1,0 +1,10 @@
+# expect: exit 14
+# Feature: a non-empty list literal `[1, 2, 3]` infers its element type from the first
+# element and builds a populated Vec[int]; `xs[i]` reads an element (panicking on an
+# out-of-bounds index). Here 2 + 5 + 7 = 14.
+import std/vec
+
+fn main() -> int {
+    xs := [2, 5, 7]
+    return xs[0] + xs[1] + xs[2]
+}

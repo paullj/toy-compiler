@@ -808,6 +808,7 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
         .panic => |reason| try emitPanicCall(g, switch (reason) {
             .div_by_zero => "division by zero",
             .rem_by_zero => "remainder by zero",
+            .index_oob => "index out of bounds",
         }),
     }
 }

@@ -1140,15 +1140,17 @@ test "a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" 
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "unwrap on a non-scalar payload is a clean build diagnostic, not a compiler crash" {
+test "unwrap on an aggregate payload compiles and runs (result-slot copy, not a crash)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const dir_name = ".toy-test-m23-agg-unwrap";
+    const dir_name = ".toy-test-agg-unwrap";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
-    // Aggregate-payload `unwrap_or` used to PANIC codegen (unassigned join block-arg
-    // offset); it must now be rejected at check with T0018 (exit 1), never a crash.
+    // Aggregate-payload `unwrap_or` once PANICKED codegen (unassigned join block-arg
+    // offset) then was deferred with a T0018 reject; it now routes the struct payload
+    // through a result slot + copy, so it compiles and runs — `.none.unwrap_or(P{x:2})`
+    // takes the default, returning 2.
     const src =
         \\struct P { x: int }
         \\fn main() -> int {
@@ -1158,10 +1160,9 @@ test "unwrap on a non-scalar payload is a clean build diagnostic, not a compiler
         \\}
         \\
     ;
-    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"build"});
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
     defer gpa.free(res.out);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
-    try testing.expect(std.mem.indexOf(u8, res.out, "T0018") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
 }
 
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
