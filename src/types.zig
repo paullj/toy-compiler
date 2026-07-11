@@ -560,12 +560,28 @@ pub const Prelude = struct {
     /// `uint32` through the ordinary structural path.
     char_struct: ?u32 = null,
 
+    /// The compiler-provided managed-box generic struct templates: `ref[T]` (an 8-byte
+    /// cell pointer) and the reserved `gc_array[T]`. Appended after `char` so their ids
+    /// stay a pure function of source; `refFamily` keys a reified instance's family
+    /// marker off them.
+    ref_struct: ?u32 = null,
+    gc_array_struct: ?u32 = null,
+
     /// The native-enum family of an `App` ctor: `.option`/`.result` when `ctor` is the
     /// prelude Option/Result TEMPLATE id, else `.none`. A user `enum Option` shadow has its
     /// own distinct id (never the prelude template id), so the native path stays silent on it.
     pub fn optResultFamily(p: Prelude, ctor: u32) LayoutEngine.NativeEnumFamily {
         if (p.option_enum) |oid| if (oid == ctor) return .option;
         if (p.result_enum) |rid| if (rid == ctor) return .result;
+        return .none;
+    }
+
+    /// The managed-box family of a struct-`App` ctor: `.ref`/`.gc_array` when `ctor` is
+    /// the prelude Ref/gc_array TEMPLATE id, else `.none`. A user `struct Ref` shadow has
+    /// its own distinct id, so the native path stays silent on it. Mirrors `optResultFamily`.
+    pub fn refFamily(p: Prelude, ctor: u32) LayoutEngine.NativeStructFamily {
+        if (p.ref_struct) |id| if (id == ctor) return .ref;
+        if (p.gc_array_struct) |id| if (id == ctor) return .gc_array;
         return .none;
     }
 
@@ -3633,6 +3649,34 @@ test "Option[int] and Result[int,str] construct + match with no import; reify to
     }
     try testing.expect(opt_int);
     try testing.expect(res_int_str);
+}
+
+test "Ref[int] and Ref[bool] reify to DISTINCT structs, each tagged native_family .ref" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ a := &41
+        \\ b := &true
+        \\ if *b { return *a }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var ref_int: ?usize = null;
+    var ref_bool: ?usize = null;
+    for (c.result.layouts, 0..) |l, i| {
+        if (std.mem.eql(u8, l.name, "Ref$int")) ref_int = i;
+        if (std.mem.eql(u8, l.name, "Ref$bool")) ref_bool = i;
+    }
+    try testing.expect(ref_int != null);
+    try testing.expect(ref_bool != null);
+    try testing.expect(ref_int.? != ref_bool.?); // distinct reified struct ids
+    try testing.expectEqual(LayoutEngine.NativeStructFamily.ref, c.result.layouts[ref_int.?].native_family);
+    try testing.expectEqual(LayoutEngine.NativeStructFamily.ref, c.result.layouts[ref_bool.?].native_family);
+    // Each box is an 8-byte cell pointer.
+    try testing.expectEqual(@as(u32, 8), c.result.layouts[ref_int.?].size);
 }
 
 test "a user `enum Option` shadows the prelude (user-first-wins)" {

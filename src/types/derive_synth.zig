@@ -13,6 +13,14 @@ const Derive = @import("../symbols/Derive.zig");
 const conforms = Typecheck.conform.structural;
 const resolveConformanceMethod = Typecheck.resolveConformanceMethod;
 
+/// Whether `ty` is a managed box (`Ref[T]`/`gc_array[T]`): a reified struct carrying the
+/// reference-family marker. Such a type is never given a structural Eq/Ord witness (its
+/// `==` is compared inline by cell identity) and blocks a `Hash` derive.
+fn isRefType(t: *const Typecheck, ty: Type) bool {
+    return ty.isStruct() and ty.struct_id < t.structs.items.len and
+        t.structs.items[ty.struct_id].native_family != .none;
+}
+
 /// True when `recv` has an EXPLICIT/prelude/Ord-refinement `(pid, recv)` conformance in
 /// the live table (the double-fire guard: such a type is never structurally derived).
 fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
@@ -99,6 +107,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
 
     for (t.derive_reqs.items) |req| {
         if (req.protocol_id != eq_pid) continue;
+        if (isRefType(t, req.conform_ty)) continue; // a Ref is compared inline (cell identity), no witness
         if (try ordFills(t, &ord_seen, ord_pid_opt, req.conform_ty)) continue; // Ord fills Eq
         try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, req.conform_ty);
     }
@@ -111,6 +120,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 .@"struct", .@"enum" => {},
                 else => continue,
             }
+            if (isRefType(t, ft)) continue; // a Ref field is compared inline (cell identity), no witness
             if (hasConformanceLive(t, eq_pid, ft)) continue; // explicit Eq field: reuse its witness
             if (try ordFills(t, &ord_seen, ord_pid_opt, ft)) continue; // Ord fills Eq: the field's cmp witness serves `==`
             if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa, t.composite, &.{}))
@@ -146,6 +156,12 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 switch (ft.kind) {
                     .@"struct", .@"enum" => {},
                     else => continue,
+                }
+                // A managed box has no hashable value — its identity is a heap cell, not a
+                // stable key — so a Hash derive over a field that holds one is a compile error.
+                if (isRefType(t, ft)) {
+                    try t.sink.emitFmtCode(.T0030, 0, "cannot derive 'Hash' for '{s}': it holds a Ref (reference identity is not hashable)", .{t.structs.items[ft.struct_id].name});
+                    continue;
                 }
                 if (hasConformanceLive(t, hash_pid, ft)) continue; // explicit Hash field: reuse its witness
                 if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa, t.composite, &.{}))

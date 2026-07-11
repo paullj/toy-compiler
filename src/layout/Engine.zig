@@ -44,7 +44,20 @@ pub const Layout = struct {
     /// carried through so codegen reads it directly rather than re-deriving tuple-ness
     /// by sniffing whether the first field name leads with a digit.
     is_tuple: bool = false,
+    /// See `NativeStructFamily`: `.ref`/`.gc_array` on a reified managed-box instance,
+    /// else `.none`. Copied from `StructSym` in `snapshotLayouts`; lets the table-aware
+    /// reference predicate recognize a managed box per-instance (not by live App index).
+    native_family: NativeStructFamily = .none,
 };
+
+/// The prelude managed-box family a reified concrete instance belongs to, or `.none`
+/// for any user/ordinary struct. Set on a reified `Ref[T]`/`gc_array[T]` instance
+/// (keyed off the prelude template id in `reifyAppToStruct`, NOT the name — a user
+/// `struct Ref` mangles to the same `Ref$int` yet is a distinct template) and copied
+/// through to its `Layout`, so the reference predicate can recognize a managed box
+/// per-instance. Never serialized (layouts are recomputed each typecheck), so adding it
+/// needs no content-cache version bump. Mirrors `NativeEnumFamily`.
+pub const NativeStructFamily = enum(u8) { none, ref, gc_array };
 
 /// A variant's form: a unit (no payload), a tuple (positional payload, no field
 /// names), or a struct (named payload fields).
@@ -115,6 +128,10 @@ pub const StructSym = struct {
     /// (`N(args)` is positional, not `N{..}`) and `.N` access in the checker. Layout /
     /// derive / Display reuse the record machinery over the numeric field names.
     is_tuple: bool = false,
+    /// See `NativeStructFamily`: `.ref`/`.gc_array` on a reified managed-box instance,
+    /// else `.none`. Set in `reifyAppToStruct` (keyed off the prelude template id);
+    /// copied into the snapshot `Layout`.
+    native_family: NativeStructFamily = .none,
 };
 
 /// One variant in the scratch enum table (during layout). `field_names`/`name`
@@ -308,7 +325,11 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
     defer _ = env.gphSelect(env.ctx, prev);
 
     const types = env.structs.items[id].field_types;
-    const at = env.byteOf(env.ctx, env.tree(env.ctx).nodes[env.structs.items[id].decl_node.int()].main_token);
+    // A reified managed-box instance (`Ref$int`) inherits decl_node == Ast.none from its
+    // AST-less template; anchor the (poison-only) diagnostic at byte 0 rather than
+    // OOB-derefing the tree on maxInt(u32). A concrete instance never poisons.
+    const decl_node = env.structs.items[id].decl_node;
+    const at: u32 = if (decl_node == Ast.none) 0 else env.byteOf(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
     const name = env.structs.items[id].name;
 
     const offsets = try env.gpa.alloc(u32, types.len);
@@ -578,6 +599,7 @@ pub fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]La
             .size = s.size,
             .@"align" = s.@"align",
             .is_tuple = s.is_tuple,
+            .native_family = s.native_family,
         };
         built += 1;
     }
@@ -1133,6 +1155,26 @@ test "engine: snapshot owns its strings and omits poison; poisoned struct snapsh
     const ls = try snapshotLayouts(testing.allocator, h2.structs.items);
     defer freeLayouts(testing.allocator, ls);
     try testing.expectEqual(@as(u32, 0), ls[0].size);
+}
+
+test "engine: snapshotLayouts carries native_family onto the Layout" {
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    const f = try h.field("0", Type.int);
+    const id = try h.struct_("Ref$int", &.{f});
+    h.structs.items[id].native_family = .ref;
+    try layoutStruct(h.env(), id);
+
+    const layouts = try snapshotLayouts(testing.allocator, h.structs.items);
+    defer freeLayouts(testing.allocator, layouts);
+    try testing.expectEqual(NativeStructFamily.ref, layouts[id].native_family);
+    // An ordinary struct's Layout stays `.none`.
+    const g = try h.field("x", Type.int);
+    const uid = try h.struct_("Plain", &.{g});
+    try layoutStruct(h.env(), uid);
+    const l2 = try snapshotLayouts(testing.allocator, h.structs.items);
+    defer freeLayouts(testing.allocator, l2);
+    try testing.expectEqual(NativeStructFamily.none, l2[uid].native_family);
 }
 
 test "engine: memoization — a second layoutStruct is a no-op (state stays done)" {

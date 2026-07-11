@@ -100,7 +100,7 @@ const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, 
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
-const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang });
+const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .amp, .star });
 /// FIRST(type): an identifier (dot-chained) or the unit type `()`.
 const type_first = setOf(&.{ .identifier, .l_paren });
 /// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
@@ -1509,6 +1509,19 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             },
             else => return p.parseExprStmt(),
         },
+        // A `*`-rooted place: `*r = v`. Parse the deref place; if `=` follows it is a
+        // store-through-box, otherwise it is an expression statement (continue the infix
+        // climb). Mirrors the `.`-rooted place path above.
+        .star => {
+            const first = p.index;
+            const place = try p.parsePostfix(try p.parsePrefix());
+            if (p.eat(.eq)) {
+                const value = try p.parseExpr(0);
+                return p.addNode(.{ .tag = .assign, .main_token = first, .lhs = place, .rhs = value });
+            }
+            const expr = try p.continueInfix(place, 0);
+            return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
+        },
         else => return p.parseExprStmt(),
     }
 }
@@ -1657,7 +1670,10 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
     const tok = p.peek();
     const at_tok = p.index;
     switch (tok.tag) {
-        .minus, .bang, .tilde => {
+        // `&x` boxes; `*r` derefs. Both bind as prefix unaries (tighter than any infix),
+        // so `*r + 1` is `(*r) + 1`. Infix `a & b`/`a * b` are unaffected — they are
+        // reached only via `continueInfix`, never here.
+        .minus, .bang, .tilde, .amp, .star => {
             p.advance();
             const operand = try p.parseExpr(prefix_bp);
             return p.addNode(.{ .tag = .unary, .main_token = at_tok, .lhs = operand, .rhs = Ast.none });
@@ -2345,6 +2361,22 @@ test "grouping overrides precedence" {
     try expectSexpr("(1 + 2) * 3", "(* (+ 1 2) 3)");
 }
 
+test "&x/*r parse as prefix unaries binding tighter than infix" {
+    try expectSexpr("&x", "(& x)");
+    try expectSexpr("*r", "(* r)");
+    // Prefix binds tighter than infix: `*r + 1` is `(*r) + 1`, not `*(r + 1)`.
+    try expectSexpr("*r + 1", "(+ (* r) 1)");
+    // Infix `a * b` is UNAFFECTED (reached via the infix climb, never parsePrefix).
+    try expectSexpr("a * b", "(* a b)");
+}
+
+test "*r = v parses as an assign whose target is a deref-unary place" {
+    try expectProgram(
+        "fn f() {\n *r = 1\n}\n",
+        "(program (fn f () _ (block (= (* r) 1))))",
+    );
+}
+
 test "comparison and equality precedence" {
     try expectSexpr("1 + 2 == 3 < 4", "(== (+ 1 2) (< 3 4))");
 }
@@ -2453,16 +2485,17 @@ test "the offending region is an error_node" {
 
 test "a syntax error is reported (>=1 diagnostic) and the parse is tainted" {
     const gpa = testing.allocator;
-    const source = "fn f() -> int {\n return *\n}\n";
+    // `+` is binary-only (not a prefix operator), so it is invalid at expression start.
+    const source = "fn f() -> int {\n return +\n}\n";
     const res = try parseResult(gpa, source);
     defer gpa.free(@constCast(res.diags));
     defer freeTree(gpa, res.tree);
 
     try testing.expect(res.diags.len >= 1);
     try testing.expectEqualStrings("expected an expression", res.diags[0].message);
-    // The diagnostic points at the offending `*` token.
-    const star_off = std.mem.indexOfScalar(u8, source, '*').?;
-    try testing.expectEqual(@as(u32, @intCast(star_off)), res.diags[0].byte_offset);
+    // The diagnostic points at the offending `+` token.
+    const bad_off = std.mem.indexOfScalar(u8, source, '+').?;
+    try testing.expectEqual(@as(u32, @intCast(bad_off)), res.diags[0].byte_offset);
 }
 
 test "single-token INSERTION — a missing expected token reports and recovers" {
@@ -3738,18 +3771,19 @@ test "a broken decl recovers to the next decl" {
 }
 
 test "one root error yields exactly one diagnostic (no cascade)" {
-    // A single bad operand (`*` after `return`) must produce exactly ONE
-    // diagnostic — the ASI/newline anti-cascade guards against duplicates.
+    // A single bad operand (`+` after `return`; `+` is binary-only, invalid at
+    // expression start) must produce exactly ONE diagnostic — the ASI/newline
+    // anti-cascade guards against duplicates.
     const gpa = testing.allocator;
-    const source = "fn f() -> int {\n  return *\n}\n";
+    const source = "fn f() -> int {\n  return +\n}\n";
     const res = try parseResult(gpa, source);
     defer gpa.free(@constCast(res.diags));
     defer freeTree(gpa, res.tree);
 
     try testing.expectEqual(@as(usize, 1), res.diags.len);
     try testing.expectEqualStrings("expected an expression", res.diags[0].message);
-    const star_off: u32 = @intCast(std.mem.indexOfScalar(u8, source, '*').?);
-    try testing.expectEqual(star_off, res.diags[0].byte_offset);
+    const bad_off: u32 = @intCast(std.mem.indexOfScalar(u8, source, '+').?);
+    try testing.expectEqual(bad_off, res.diags[0].byte_offset);
 }
 
 test "a missing call operand before ')' yields exactly one diagnostic (no closer-delete cascade)" {

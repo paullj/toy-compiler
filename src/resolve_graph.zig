@@ -580,7 +580,9 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         },
         .assign => {
             const target = g.nodes()[stmt.lhs.int()];
-            if (target.tag == .field_access or target.tag == .tuple_field) {
+            // A `.`-rooted place (`p.x`), or a `*r` deref place, resolves as an
+            // expression (its root name is checked there), not as a bare assignable name.
+            if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .unary) {
                 try g.resolveExpr(stmt.lhs);
             } else {
                 const resn = g.lookupName(target.main_token);

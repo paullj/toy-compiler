@@ -72,6 +72,9 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
 pub fn decodeTemplateFields(t: *Typecheck) !void {
     for (0..t.structs.items.len) |id| {
         if (!t.structs.items[id].is_generic) continue;
+        // The native prelude generic structs (Ref/gc_array) are AST-less and already
+        // field-decoded in `registerPrelude`; skip the AST deref (else OOB on Ast.none).
+        if (t.structs.items[id].decl_node == Ast.none) continue;
         _ = t.gphSelect(t.structs.items[id].mod);
         t.cur_generic_params = t.structs.items[id].generic_params;
         defer t.cur_generic_params = &.{};

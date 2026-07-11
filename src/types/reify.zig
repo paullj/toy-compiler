@@ -112,6 +112,10 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
         .name = name,
         .mod = tmpl.mod,
         .is_generic = false,
+        // Tag the reified instance by the PRELUDE template id (not the mangled name — a
+        // user `struct Ref` would mangle to the same `Ref$int`), so the reference
+        // predicate recognizes a managed box per-instance. Mirrors `reifyAppToEnum`.
+        .native_family = if (t.prelude) |p| p.refFamily(e.ctor) else .none,
     });
     const fnames = try t.gpa.dupe([]const u8, tmpl.field_names);
     errdefer t.gpa.free(fnames);

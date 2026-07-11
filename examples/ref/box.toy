@@ -1,0 +1,11 @@
+# expect: exit 42
+# Feature: a managed heap box `Ref[T]`. `&x` boxes `x` into a fresh cell (an 8-byte
+# handle); `*r` place-reads it; `*r = v` place-stores it. `:=` shares the handle (same
+# cell), so a write through one handle is observed through the other.
+fn main() -> int {
+    r := &41            # box: gc_alloc(size_of(int)), copy 41 in, yield Ref[int]
+    *r = *r + 1         # place-read + place-store through the box
+    s := r              # := shares the handle (same cell)
+    *s = *s + 0
+    return *r           # 42, observed through the aliased handle
+}
