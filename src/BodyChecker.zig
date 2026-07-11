@@ -97,8 +97,8 @@ pub const BodyChecker = struct {
     cur_ret: Type = .unit,
     loop_stack: std.ArrayList(LoopCtx) = .empty,
     expected: ?Type = null,
-    /// Whether the checker is inside an `unsafe { .. }` block. Scaffolding for the
-    /// raw-pointer deref/store ops that arrive next; nothing consumes it yet.
+    /// Whether the checker is inside an `unsafe { .. }` block. Gates the raw-pointer
+    /// `store`/`load` ops — a use outside `unsafe` is a T0038 error.
     in_unsafe: bool = false,
 
     // Local diagnostic sink (merged into the shared result by the Pass-C driver).

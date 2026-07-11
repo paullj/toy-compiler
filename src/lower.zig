@@ -564,8 +564,8 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             return try lowerCall(b, node_idx, n);
         },
         .block => return try lowerBlockValue(b, node_idx, ty),
-        // `unsafe { .. }` lowers transparently as its inner block (the unsafe context
-        // is a check-time concern; there are no raw-pointer ops yet).
+        // `unsafe { .. }` lowers transparently as its inner block — the unsafe context
+        // is a check-time concern (BodyChecker gates `store`/`load`), invisible here.
         .unsafe_block => return try lowerBlockValue(b, n.lhs, ty),
         .if_stmt => return try lowerIfValue(b, node_idx, ty),
         .loop_expr => return try lowerLoopValue(b, node_idx, ty, null),

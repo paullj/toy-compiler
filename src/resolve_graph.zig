@@ -744,8 +744,8 @@ fn resolveModuleMember(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, targe
     if (tt.pub_fns.get(member)) |gid| {
         // Quarantine: a bundled module's pub `.import` (extern) member is served only
         // to another bundled module (so `std/math` may call `core/ffi.labs`). A user
-        // module doing `import core/ffi; ffi.labs(..)` falls through to the R0006
-        // no-member branch, closing the bypass.
+        // module doing `import core/ffi; ffi.labs(..)` falls through to the R0005
+        // not-exported branch below, closing the bypass.
         if (!(g.fns.items[gid].kind == .import and !g.refBundled())) {
             g.res(node_idx, .{ .func = gid });
             return;

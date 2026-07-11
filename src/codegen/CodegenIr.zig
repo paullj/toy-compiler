@@ -1370,7 +1370,7 @@ fn emitLocateCb(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gp
     try emitImportPreamble(code, relocs, gpa, "mmap", 16);
     try emit(code, gpa, A.blr(16));
 
-    // Seed the header (the page is zeroed, so freelist heads etc. start null).
+    // Seed cursor/end/span-count. The rest of the header stays 0 (fresh mmap pages are zeroed).
     try emit(code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl)); // x9 = CB_ADDR
     try emit(code, gpa, A.addImm(10, 9, hdr)); // cursor = CB + HDR
     try emit(code, gpa, A.strRegUoff(10, 9, cur_off));
