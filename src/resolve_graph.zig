@@ -227,7 +227,7 @@ fn collectGlobals(g: *GraphResolve) !void {
                     // The DECL gate is core-only: an `extern fn` is legal solely in a
                     // bundled `core/` module. Anywhere else it is never registered, so
                     // any use of the name is undeclared (R0001).
-                    if (!m.bundled or !std.mem.startsWith(u8, m.path, "core/")) {
+                    if (!m.isCore()) {
                         try g.emit(.R0010, mod, m.tokens[decl.main_token].start, "'extern' functions are only allowed in 'core/' modules", .{});
                         continue;
                     }
@@ -363,8 +363,7 @@ fn collectGlobals(g: *GraphResolve) !void {
             .is_pub = false,
         });
         for (g.tables, 0..) |*t, i| {
-            const m = g.graph.modules[i];
-            if (m.bundled and std.mem.startsWith(u8, m.path, "core/") and !t.fns.contains(nm))
+            if (g.graph.modules[i].isCore() and !t.fns.contains(nm))
                 try t.fns.put(g.gpa, nm, id);
         }
     }
