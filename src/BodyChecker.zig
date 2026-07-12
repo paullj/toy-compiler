@@ -20,6 +20,7 @@ const Conform = Typecheck.conform;
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const Intrinsic = @import("symbols/Intrinsic.zig");
+const StdNames = @import("symbols/StdNames.zig");
 const conform = @import("types/conform.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const PatternChecker = @import("PatternChecker.zig");
@@ -469,7 +470,7 @@ pub const BodyChecker = struct {
     fn resolveIterType(bc: *BodyChecker, recv: Type) ?Type {
         if (!recv.isApp()) return null;
         const e = bc.composite.at(recv.appIdx());
-        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, "iter") orelse return null;
+        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter) orelse return null;
         const mf = bc.model.fns[m.fn_id];
         if (!m.has_self or mf.params.len != 1) return Type.invalid; // iter(self), no extra args
         const targs = (Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args) catch return Type.invalid) orelse return Type.invalid;
@@ -596,7 +597,7 @@ pub const BodyChecker = struct {
     fn typeOfIndexParts(bc: *BodyChecker, recv: Ast.Index, idx: Ast.Index, main_token: u32) error{OutOfMemory}!Type {
         const rt = try bc.typeOf(recv);
         const it = try bc.typeOfExpected(idx, Type.int);
-        const vec_ctor = bc.activeStructMap().get("Vec");
+        const vec_ctor = bc.activeStructMap().get(StdNames.vec_struct);
         if (!rt.isApp()) {
             if (rt.kind != .invalid)
                 try bc.sink.emitFmt(bc.byteOf(main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
@@ -813,7 +814,7 @@ pub const BodyChecker = struct {
                     break :blk Type.invalid;
                 }
                 const e = bc.composite.at(exp.appIdx());
-                if (e.ctor_is_enum or Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, "new") == null) {
+                if (e.ctor_is_enum or Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, StdNames.method_new) == null) {
                     try bc.sink.emitFmt(bc.byteOf(n.main_token), "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
                     break :blk Type.invalid;
                 }
@@ -824,7 +825,7 @@ pub const BodyChecker = struct {
                 // the first element (seeded by a `Vec[W]` annotation when present); every
                 // remaining element must be assignable to V.
                 const elems = Ast.rangeSlice(bc.tree, n.rhs.int());
-                const vec_ctor = bc.activeStructMap().get("Vec") orelse {
+                const vec_ctor = bc.activeStructMap().get(StdNames.vec_struct) orelse {
                     for (elems) |ei| _ = try bc.typeOf(ei);
                     try bc.sink.emit(bc.byteOf(n.main_token), "a list literal requires 'Vec' in scope (try 'import std/vec')");
                     break :blk Type.invalid;

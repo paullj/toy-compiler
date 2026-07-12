@@ -40,6 +40,7 @@ const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
 const Infer = @import("symbols/Infer.zig");
 const Intrinsic = @import("symbols/Intrinsic.zig");
+const StdNames = @import("symbols/StdNames.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const Literal = @import("types/literal.zig");
 
@@ -2710,7 +2711,7 @@ fn lowerCharLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error
 /// symbol `Vec[T].new()` dispatches to, so `[]` is pure sugar for `.new()`.
 fn lowerEmptyListSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
     const slot = try b.addSlot(ty);
-    const m = Typecheck.findMethod(b.in.methods, ty, "new") orelse {
+    const m = Typecheck.findMethod(b.in.methods, ty, StdNames.method_new) orelse {
         try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "empty-list '[]' constructor unresolved in lower");
         return slot;
     };
@@ -2730,7 +2731,7 @@ fn lowerEmptyListSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) erro
 fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
     const n = b.in.tree.nodes[(node_idx).int()];
     const slot = try b.addSlot(ty);
-    const nm = Typecheck.findMethod(b.in.methods, ty, "new") orelse {
+    const nm = Typecheck.findMethod(b.in.methods, ty, StdNames.method_new) orelse {
         try b.note(n.main_token, "list-literal 'new' constructor unresolved in lower");
         return slot;
     };
@@ -2739,7 +2740,7 @@ fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
         errdefer b.gpa.free(new_args);
         _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, nm), .args = new_args, .ret_slot = slot } }, null);
     }
-    const pm = Typecheck.findMethod(b.in.methods, ty, "push") orelse {
+    const pm = Typecheck.findMethod(b.in.methods, ty, StdNames.method_push) orelse {
         try b.note(n.main_token, "list-literal 'push' unresolved in lower");
         return slot;
     };
@@ -2760,7 +2761,7 @@ fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
 fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
     var gid: ?u32 = null;
     for (b.in.names, 0..) |sn, i| {
-        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, "core/mem.ga_at")) {
+        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, StdNames.ga_at)) {
             gid = @intCast(i);
             break;
         }
@@ -3625,7 +3626,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     const int_ty = Typecheck.Type.int;
 
     const recv_ty = b.in.node_types[(stmt.rhs).int()];
-    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, "iter") orelse {
+    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, StdNames.method_iter) orelse {
         try b.note(stmt.main_token, "for-in: no reified 'iter' method in lower");
         return;
     };
@@ -3643,7 +3644,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
         _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
     }
 
-    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, "next") orelse {
+    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, StdNames.method_next) orelse {
         try b.note(stmt.main_token, "for-in: no reified 'next' method in lower");
         return;
     };
