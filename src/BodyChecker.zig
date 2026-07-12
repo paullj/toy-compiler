@@ -59,7 +59,7 @@ pub fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
 /// `Typecheck.isConcreteValue`.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .str, .@"struct", .@"enum", .app => true,
+        .int, .bool, .float, .str, .@"struct", .@"enum", .app => true,
         else => false,
     };
 }

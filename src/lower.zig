@@ -1902,7 +1902,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                         return .none;
                     }
                     const val = operandValue(try lowerExpr(b, sargs[1]));
-                    _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = Typecheck.Type.int } }, null);
+                    _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = vty } }, null);
                     return .none;
                 },
                 .load => {

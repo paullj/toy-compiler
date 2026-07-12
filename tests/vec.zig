@@ -529,3 +529,24 @@ test "vec: indexing a non-indexable value is a clean compile error" {
         \\
     , &.{}));
 }
+
+test "vec: a float element round-trips through push/get (float as a monomorphization type-arg)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `float` must be admitted as a generic type-argument (so Vec[float]/GcArray[float]
+    // monomorphize), and the element store must carry the value's type.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-float",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs: Vec[float] = []
+        \\    xs.push(1.5)
+        \\    xs.push(2.5)
+        \\    return if xs.get(0).unwrap() +. xs.get(1).unwrap() == 4.0 { 42 } else { 0 }
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
