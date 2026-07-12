@@ -28,6 +28,7 @@ const Token = @import("ast/Token.zig").Token;
 const Ast = @import("ast/Ast.zig");
 const Resolve = @import("resolve.zig");
 const Resolution = @import("symbols/Resolution.zig").Resolution;
+const symbols_res = @import("symbols/Resolution.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
@@ -2183,10 +2184,10 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 };
             },
             // A value-headed `type_app` is a value index the parser could not tell from a
-            // turbofish (`xs[i].f`); it lowers through the same `mem.ga_at[V]` primitive as
-            // `.index`, so discover that instance too. A real type-app's head is not
-            // `.local`, so this never fires for one.
-            .type_app => if (resolutions[n.lhs.int()] == .local) {
+            // turbofish (`b.items[i].f`); it lowers through the same `mem.ga_at[V]`
+            // primitive as `.index`, so discover that instance too. A real type-app's
+            // leftmost identifier is not `.local`, so this never fires for one.
+            .type_app => if (symbols_res.leftmostHeadIsValue(tree, resolutions, n.lhs)) {
                 const elem = node_types[i];
                 if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
                     const args = [_]Type{elem};

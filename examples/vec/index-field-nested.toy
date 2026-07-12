@@ -1,0 +1,15 @@
+# expect: exit 7
+# Feature: `b.items[i].field` — indexing a Vec-typed struct FIELD and reading a field
+# off the element. The index is a VARIABLE: a literal `b.items[1]` already parses as an
+# `.index`, but `b.items[i].x` parses as a field_access-headed `type_app` that formerly
+# misparsed as a qualified type ("unknown module 'b'").
+import std/vec
+
+struct P { x: int, y: int }
+struct Bag { items: Vec[P] }
+
+fn main() -> int {
+    b := Bag { items: [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }] }
+    i := 1
+    return b.items[i].x + b.items[i].y   # 3 + 4 = 7
+}

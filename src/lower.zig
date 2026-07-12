@@ -30,6 +30,7 @@ const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
 const TokenTag = @import("ast/Token.zig").Tag;
 const Resolve = @import("resolve.zig");
+const symbols_res = @import("symbols/Resolution.zig");
 const Typecheck = @import("types.zig");
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
@@ -2780,12 +2781,13 @@ fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfM
     return try lowerIndexCore(b, n.lhs, n.rhs, n.main_token, ty);
 }
 
-/// A bracketed-postfix `type_app` whose head resolves to a `.local` is a value index the
-/// parser could not tell from a turbofish; mirrors `BodyChecker.appHeadIsValue` so lower
-/// reinterprets exactly the nodes the checker typed as an index.
+/// A bracketed-postfix `type_app` whose head chain's LEFTMOST identifier resolves to a
+/// value is a value index the parser could not tell from a turbofish; mirrors
+/// `BodyChecker.appHeadIsValue` via the shared authority so lower reinterprets exactly
+/// the nodes the checker typed as an index.
 fn appHeadIsValue(b: *Builder, node_idx: Ast.Index) bool {
     const n = b.in.tree.nodes[(node_idx).int()];
-    return n.tag == .type_app and b.in.resolutions[(n.lhs).int()] == .local;
+    return n.tag == .type_app and symbols_res.leftmostHeadIsValue(b.in.tree, b.in.resolutions, n.lhs);
 }
 
 fn lowerIndexCore(b: *Builder, recv: Ast.Index, idx: Ast.Index, main_token: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
@@ -2926,11 +2928,12 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
             }
             return base_addr; // unreachable on a well-typed program
         },
-        // A `.field` off an index element (`ps[i].x`): the element is an rvalue with no
-        // named place, so materialize it into a temp and return that temp's ptr — the
-        // `.field_access` recursion above then computes `field_addr` off it. A store
-        // through this ptr would write the copy, not the vector; the checker's mutable-
-        // place gate rejects `ps[i].x = v`, so this is only ever a read base.
+        // A `.field` off an index element (`ps[i].x`, `b.items[i].x`): the element is
+        // an rvalue with no named place, so materialize it into a temp and return that
+        // temp's ptr — the `.field_access` recursion above then computes `field_addr`
+        // off it. A store through this ptr would write the copy, not the vector, so the
+        // checker's `targetRootsAtIndexElement` gate rejects assigning through it; only
+        // the read base (`= b.items[i].x`, `b.items[i].m()`) reaches here.
         .index => {
             const op = try lowerExpr(b, node_idx);
             return try operandPtr(b, op);

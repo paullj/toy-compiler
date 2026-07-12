@@ -44,6 +44,7 @@ const nearmiss = @import("diagnostics/nearmiss.zig");
 const codes = @import("diagnostics/codes.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
+const symbols_res = @import("symbols/Resolution.zig");
 const SymKind = @import("symbols/Sym.zig").SymKind;
 const Intrinsic = @import("symbols/Intrinsic.zig");
 
@@ -705,7 +706,20 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
             try g.resolveExpr(n.rhs);
         },
         .call => {
-            try g.resolveExpr(n.lhs); // callee (may be a field_access mod.fn)
+            // A type_app DIRECTLY in callee position is a turbofish call — `id[int](..)`
+            // or a method turbofish `v.into[int](..)` — whose bracket holds TYPE args, not
+            // a value subscript. Resolve only the base callee; never descend the type-args
+            // (resolving `int` would fire R0001). Going through the generic `.type_app` arm
+            // would misread `v.into[int]` as a value index (leftmost `v` is `.local`) and
+            // descend `int`. The language has no first-class function values, so a value
+            // index in callee position (`xs[i]()`) is never a valid call anyway — leaving
+            // its subscript's names unbound here is harmless (a later stage rejects the
+            // call), so this base-only resolution is safe for both readings.
+            const callee = g.nodes()[n.lhs.int()];
+            if (callee.tag == .type_app)
+                try g.resolveExpr(callee.lhs)
+            else
+                try g.resolveExpr(n.lhs);
             for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |arg| try g.resolveExpr(arg);
         },
         .struct_init => {
@@ -718,15 +732,17 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         // like `int` would fire R0001 and stop the pipeline at resolve, pre-empting
         // the T0013 generics gate at typecheck. Forward-safety.
         //
-        // EXCEPT when the head resolves to a `.local`: then this is a value index
-        // `xs[i]` the parser could not tell from a turbofish, and its bracket
-        // contents are an ordinary expression (`i`) whose names must bind. A real
-        // type-app's head is a struct/enum name (.unresolved), a generic fn (.func),
-        // or a module (.module) — never `.local` — so its type-arg range stays
-        // undescended and R0001 on `int` never fires.
+        // EXCEPT when the head chain's LEFTMOST identifier resolves to a `.local`:
+        // then this is a value index `b.items[i]` the parser could not tell from a
+        // turbofish, and its bracket contents are an ordinary expression (`i`) whose
+        // names must bind. A real type-app's leftmost is a struct/enum name
+        // (.unresolved), a generic fn (.func), or a module (.module) — never `.local`
+        // — so its type-arg range stays undescended and R0001 on `int` never fires.
+        // `resolveExpr(n.lhs)` runs FIRST so the leftmost ident is bound before the
+        // predicate reads it.
         .type_app => {
             try g.resolveExpr(n.lhs);
-            if (g.resolutions[g.cur_mod][n.lhs.int()] == .local)
+            if (symbols_res.leftmostHeadIsValue(g.tree(g.cur_mod), g.resolutions[g.cur_mod], n.lhs))
                 for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a);
         },
         // Postfix `?`: resolve the operand's names; the `?` itself binds nothing.
