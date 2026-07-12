@@ -3518,6 +3518,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     {
         const self0 = try lowerExpr(b, stmt.rhs);
         const args = try b.gpa.alloc(Ir.Operand, 1);
+        errdefer b.gpa.free(args);
         args[0] = self0;
         _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
     }
@@ -3549,6 +3550,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     {
         const it_addr = try b.emit(.{ .slot_addr = it_slot }, int_ty);
         const args = try b.gpa.alloc(Ir.Operand, 1);
+        errdefer b.gpa.free(args);
         args[0] = .{ .value = it_addr }; // mut self: by address
         _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, next_m), .args = args, .ret_slot = opt_slot } }, null);
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
