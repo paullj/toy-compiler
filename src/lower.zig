@@ -2272,7 +2272,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = kv } }, bool_ty) };
         },
         .unwrap => {
-            const payload_ty = e.variants[0].field_types[0];
+            const payload_ty = Typecheck.somePayload(e);
             const zero = try b.emit(.{ .iconst = 0 }, int_ty);
             const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
             const ok_blk = try b.addBlock();
@@ -2286,7 +2286,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
                 const res = try aggSlot(b, payload_ty);
                 b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
                 b.switchTo(ok_blk);
-                const src = try addrAtOff(b, base, e.payload_off + e.variants[0].offsets[0], payload_ty);
+                const src = try addrAtOff(b, base, Typecheck.payloadAddr(e, 0), payload_ty);
                 try copyValueByType(b, res.addr, src, payload_ty);
                 try brTo(b, join, .none);
                 b.switchTo(trap_blk);
@@ -2308,7 +2308,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             return .{ .value = merge };
         },
         .unwrap_or => {
-            const payload_ty = e.variants[0].field_types[0];
+            const payload_ty = Typecheck.somePayload(e);
             const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             const zero = try b.emit(.{ .iconst = 0 }, int_ty);
             const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
@@ -2319,7 +2319,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
                 const res = try aggSlot(b, payload_ty);
                 b.setTerm(.{ .cond_br = .{ .cond = present, .t = some_blk, .f = none_blk } });
                 b.switchTo(some_blk);
-                const src = try addrAtOff(b, base, e.payload_off + e.variants[0].offsets[0], payload_ty);
+                const src = try addrAtOff(b, base, Typecheck.payloadAddr(e, 0), payload_ty);
                 try copyValueByType(b, res.addr, src, payload_ty);
                 try brTo(b, join, .none);
                 b.switchTo(none_blk);
@@ -2435,7 +2435,7 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     const v = if (recv_is_char) try loadCharCodepoint(b, cv.recv) else operandValue(try lowerExpr(b, cv.recv));
     const call_ty = b.in.node_types[(node_idx).int()];
     const e = b.in.enum_layouts[call_ty.enum_id];
-    const dst_T = e.variants[0].field_types[0];
+    const dst_T = Typecheck.somePayload(e);
     const to_char = isCharTy(b, dst_T);
 
     // int→char / char→byte are heavy (~24 / ~12 SSA cells); inlining >10 / >20 per fn
@@ -2493,7 +2493,7 @@ pub fn emitConvResultTail(
     b.switchTo(ok_blk);
     const ok_tag = try b.emit(.{ .iconst = 0 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = ok_tag, .ty = int_ty } }, null);
-    const ok_off = e.payload_off + e.variants[0].offsets[0];
+    const ok_off = Typecheck.payloadAddr(e, 0);
     const ok_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = ok_off, .ty = ok_store_ty } }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = ok_addr, .val = ok_value, .ty = ok_store_ty } }, null);
     try brTo(b, join, .none);
@@ -2501,8 +2501,8 @@ pub fn emitConvResultTail(
     b.switchTo(err_blk);
     const err_tag = try b.emit(.{ .iconst = 1 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = err_tag, .ty = int_ty } }, null);
-    const err_off = e.payload_off + e.variants[1].offsets[0];
-    const err_fty = e.variants[1].field_types[0];
+    const err_off = Typecheck.payloadAddr(e, 1);
+    const err_fty = Typecheck.errPayload(e);
     const err_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = err_off, .ty = err_fty } }, int_ty);
     const conv_err_tag = try b.emit(.{ .iconst = 0 }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = err_addr, .val = conv_err_tag, .ty = int_ty } }, null);
@@ -2540,8 +2540,8 @@ fn convCallWitness(b: *Builder, kind: Derive.Kind, v: Ir.ValueId, call_ty: Typec
 /// Scalar payload only; the accept set is int/bool.
 fn loadNativePayload(b: *Builder, e: Typecheck.EnumLayout, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const payload_ty = e.variants[0].field_types[0];
-    const off = e.payload_off + e.variants[0].offsets[0];
+    const payload_ty = Typecheck.somePayload(e);
+    const off = Typecheck.payloadAddr(e, 0);
     const pa = try b.emit(.{ .field_addr = .{ .base = base, .off = off, .ty = payload_ty } }, int_ty);
     // A managed-box payload is an 8-byte scalar cell pointer: load it as `int` (a
     // struct-typed `.load` misfires in codegen).
@@ -3177,7 +3177,7 @@ fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typec
 
     // Happy: extract variant-0's payload into the destination; control continues here.
     b.switchTo(happy_bb);
-    const src = try addrAtOff(b, op_base, ol.payload_off + ol.variants[0].offsets[0], ty);
+    const src = try addrAtOff(b, op_base, Typecheck.payloadAddr(ol, 0), ty);
     try copyValueByType(b, dst_ptr, src, ty);
 }
 
@@ -3213,10 +3213,10 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
     //     From[OpErr]` before this runs; a `.none`/`.ambiguous` resolution is an internal
     //     invariant break -> note-and-drop rather than miscompile.
     if (rl.native_family == .result) {
-        const op_err = ol.variants[1].field_types[0];
-        const ret_err = rl.variants[1].field_types[0];
-        const src_off = ol.payload_off + ol.variants[1].offsets[0];
-        const dst_off = rl.payload_off + rl.variants[1].offsets[0];
+        const op_err = Typecheck.errPayload(ol);
+        const ret_err = Typecheck.errPayload(rl);
+        const src_off = Typecheck.payloadAddr(ol, 1);
+        const dst_off = Typecheck.payloadAddr(rl, 1);
         if (Typecheck.Type.eql(op_err, ret_err)) {
             const src = try addrAtOff(b, op_base, src_off, op_err);
             const dst = try addrAtOff(b, ret_base, dst_off, ret_err);
@@ -3657,7 +3657,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
         return;
     }
     const ol = b.in.enum_layouts[opt_ty.enum_id];
-    const item_ty = ol.variants[0].field_types[0];
+    const item_ty = Typecheck.somePayload(ol);
     const opt_slot = try b.addSlot(opt_ty);
     const xslot = try localSlot(b, stmt_idx, item_ty);
 
@@ -3683,7 +3683,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     b.switchTo(body);
     {
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
-        const src = try addrAtOff(b, base, ol.payload_off + ol.variants[0].offsets[0], item_ty);
+        const src = try addrAtOff(b, base, Typecheck.payloadAddr(ol, 0), item_ty);
         const dst = try b.emit(.{ .slot_addr = xslot }, int_ty);
         try copyValueByType(b, dst, src, item_ty); // AGGREGATE-safe payload copy
     }

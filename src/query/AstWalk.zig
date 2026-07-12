@@ -683,8 +683,8 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     if (ol.native_family != .result or rl.native_family != .result) return;
                     if (ol.variants.len < 2 or rl.variants.len < 2) return;
                     if (ol.variants[1].field_types.len < 1 or rl.variants[1].field_types.len < 1) return;
-                    const op_err = ol.variants[1].field_types[0];
-                    const ret_err = rl.variants[1].field_types[0];
+                    const op_err = Typecheck.errPayload(ol);
+                    const ret_err = Typecheck.errPayload(rl);
                     if (Typecheck.Type.eql(op_err, ret_err)) return;
                     switch (Typecheck.resolveConformanceMethod(self.frozen.methods, ret_err, "from", self.frozen.prelude_ids.from, &.{op_err})) {
                         .one => |m| try self.foldWitness(m),
@@ -1937,8 +1937,8 @@ test "a WIDENING `?` folds the resolved `From` witness; the identity `?` folds n
     // (variants[1]) of each fn's reified return-Result enum — exactly what the fold reads.
     const rl = tc.enum_layouts[outer_sig.?.ret.enum_id];
     const ol = tc.enum_layouts[inner_sig.?.ret.enum_id];
-    const ret_err = rl.variants[1].field_types[0];
-    const op_err = ol.variants[1].field_types[0];
+    const ret_err = Typecheck.errPayload(rl);
+    const op_err = Typecheck.errPayload(ol);
     const pick = Typecheck.resolveConformanceMethod(tc.methods, ret_err, "from", tc.prelude_ids.from, &.{op_err});
     try testing.expect(pick == .one);
     const want_name = if (pick.one.instance) |ii| tc.instances[ii].name.? else names[pick.one.fn_id].name;
