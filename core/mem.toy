@@ -45,6 +45,16 @@ pub fn ga_get[T](a: gc_array[T], i: int) -> T {
     return unsafe { load(offset(e, i * size_of[T]())) }
 }
 
+# Bounds-checked read: the sole element-access contract `xs[i]` desugars to, so the
+# header offsets and element stride live only here. A signed `i < 0 || i >= len` catches
+# both a negative index and an over-length one before the unchecked `ga_get` read.
+pub fn ga_at[T](a: gc_array[T], i: int) -> T {
+    if i < 0 || i >= ga_len[T](a) {
+        panic("index out of bounds")
+    }
+    return ga_get[T](a, i)
+}
+
 pub fn ga_push[T](a: gc_array[T], x: T) {
     l := unsafe { load(offset(a, 0)) }
     c := unsafe { load(offset(a, 8)) }

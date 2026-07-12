@@ -2739,12 +2739,28 @@ fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
     return slot;
 }
 
+/// The mangled symbol of the `mem.ga_at[V]` instance a `Vec[V]` index desugars to, or
+/// null when the primitive or its instance is absent (an internal invariant break —
+/// scanCalls enqueues the instance whenever an index node types concrete).
+fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
+    var gid: ?u32 = null;
+    for (b.in.names, 0..) |sn, i| {
+        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, "core/mem.ga_at")) {
+            gid = @intCast(i);
+            break;
+        }
+    }
+    const g = gid orelse return null;
+    const targs = [_]Typecheck.Type{elem_ty};
+    const ii = Mono.find(b.in.instances, g, &targs) orelse return null;
+    return .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
+}
+
 /// Lower a value index `recv[i]` reading a `Vec[V]` element. The receiver's single field
-/// `h` (offset 0) is the 8-byte handle at a `{len@0, cap@8, elems@16}` header (see
-/// `core/mem`). One UNSIGNED compare `i >= len` catches both `i < 0` and `i >= len`;
-/// out of bounds panics, otherwise the element at `elems + i*size_of[V]()` is read (an
-/// aggregate copied into a fresh slot, a scalar/ref loaded as a value) — mirroring the
-/// unchecked `mem.ga_get`.
+/// `h` (offset 0) is the 8-byte `gc_array[V]` handle, passed to `mem.ga_at[V]` along with
+/// the index — one call to the bounds-checked element-read primitive that owns the header
+/// offsets and stride (see `core/mem`). The result is placed by how V travels: an
+/// aggregate into a fresh slot, a scalar/box in a register.
 fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
     const n = b.in.tree.nodes[(node_idx).int()];
@@ -2753,25 +2769,28 @@ fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfM
     if (base == Ir.none_value) return .none;
     const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
     const idx = operandValue(try lowerExpr(b, n.rhs));
-    const len = try b.emit(.{ .load = .{ .addr = handle, .ty = int_ty } }, int_ty);
-    const oob = try b.emit(.{ .icmp = .{ .cc = .uge, .lhs = idx, .rhs = len } }, Typecheck.Type.@"bool");
-    const cont = try b.addBlock();
-    const panic_blk = try b.addBlock();
-    b.setTerm(.{ .cond_br = .{ .cond = oob, .t = panic_blk, .f = cont } });
-    b.switchTo(panic_blk);
-    b.setTerm(.{ .panic = .index_oob });
-    b.switchTo(cont);
-    const elems_addr = try b.emit(.{ .field_addr = .{ .base = handle, .off = 16, .ty = int_ty } }, int_ty);
-    const elems = try b.emit(.{ .load = .{ .addr = elems_addr, .ty = int_ty } }, int_ty);
-    const sz: i64 = @intCast(Abi.typeSize(ty, b.in.layouts, b.in.enum_layouts));
-    const szv = try b.emit(.{ .iconst = sz }, int_ty);
-    const off = try b.emit(.{ .mul = .{ .lhs = idx, .rhs = szv } }, int_ty);
-    const ea = try b.emit(.{ .add = .{ .lhs = elems, .rhs = off } }, int_ty);
-    // A managed-box (`Ref`/`gc_array`) element is an 8-byte scalar cell pointer.
+    const callee = gaAtCallee(b, ty) orelse {
+        try b.note(n.main_token, "unresolved 'ga_at' index primitive in lower");
+        return .none;
+    };
+    const args = try b.gpa.alloc(Ir.Operand, 2);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = handle };
+    args[1] = .{ .value = idx };
     switch (passKind(b, ty)) {
-        .str, .@"struct", .@"enum" => return .{ .slot = try materializeAgg(b, ty, ea) },
-        .box => return .{ .value = try b.emit(.{ .load = .{ .addr = ea, .ty = int_ty } }, int_ty) },
-        else => return .{ .value = try b.emit(.{ .load = .{ .addr = ea, .ty = ty } }, ty) },
+        .box => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty) },
+        .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, ty) },
+        .str, .@"struct", .@"enum" => {
+            const slot = try b.addSlot(ty);
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
+            return .{ .slot = slot };
+        },
+        .unit, .never, .invalid => {
+            const slot = try b.addSlot(ty);
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
+            try b.note(n.main_token, "index result type unsupported in lower");
+            return .{ .slot = slot };
+        },
     }
 }
 
