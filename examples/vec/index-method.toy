@@ -1,0 +1,17 @@
+# expect: exit 42
+# Feature: `xs[i].method()` — calling an inherent method on a Vec element read in place,
+# with a VARIABLE index so the value-headed bracketed-postfix path (not just the literal
+# one) is exercised. `ps[i].sum()` = 20 + 22 = 42.
+import std/vec
+
+struct P { x: int, y: int }
+
+impl P {
+    fn sum(self) -> int { self.x + self.y }
+}
+
+fn main() -> int {
+    ps := [P{ x: 20, y: 22 }, P{ x: 1, y: 1 }]
+    i := 0
+    return ps[i].sum()
+}

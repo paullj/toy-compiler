@@ -1328,6 +1328,34 @@ fn turbofishFollows(p: *const Parser) bool {
     return false;
 }
 
+/// Peek across the bracketed run `[ .. ]` at the cursor and report whether every token
+/// in it (at any nesting depth) is drawn from the type-syntax alphabet. Type arguments
+/// this tier are only bare/qualified names (`int`, `mod.T`), nested applications
+/// (`Box[Vec[int]]`), or the unit type `()` — never a literal or an operator. So a run
+/// containing a number (`xs[0]`) or an operator (`xs[i+1]`) cannot be a real type-app and
+/// is a value index, even when a `.`/`(` follower would otherwise look like a turbofish.
+/// Parens are admitted for the unit type `()`, which leaves a value index whose content is
+/// a call or a parenthesized expr (`xs[f()]`, `xs[(i)]`) still read as type-shaped; that
+/// case is later rejected cleanly by the checker rather than miscompiled. Unbalanced/eof
+/// reads as not type-shaped so `parseIndex` reports the missing `]`.
+fn bracketIsTypeShaped(p: *const Parser) bool {
+    var depth: usize = 0;
+    var i: u32 = p.index;
+    while (i < p.tokens.len) : (i += 1) {
+        switch (p.tokens[i].tag) {
+            .l_bracket => depth += 1,
+            .r_bracket => {
+                depth -= 1;
+                if (depth == 0) return true;
+            },
+            .identifier, .dot, .comma, .l_paren, .r_paren => {},
+            .eof => return false,
+            else => return false,
+        }
+    }
+    return false;
+}
+
 /// Parse a value index `recv[idx]`. The receiver and index nodes are created before
 /// the `index` node, so children precede the parent.
 fn parseIndex(p: *Parser, recv: Ast.Index) Error!Ast.Index {
@@ -1866,26 +1894,28 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
                 p.bump(.question);
                 lhs = try p.addNode(.{ .tag = .try_expr, .main_token = q, .lhs = lhs, .rhs = Ast.none });
             },
-            // Explicit call type-args `id[int](..)`: wrap ONLY a name / qualified
-            // `mod.fn` callee into a `type_app`; the loop then sees the following
-            // `(` and builds a normal `call` whose callee is the `type_app`. This
-            // is the RESERVED postfix-call position; any other `lhs` (e.g. a call
-            // result) breaks WITHOUT consuming `[`, keeping a future value-index
-            // `v[i]` free to adopt a distinct form.
+            // A trailing `[..]` on a name / qualified `mod.fn` is a turbofish type-app
+            // (`id[int](..)`, `Box[int]{..}`, `Vec[int].new()`) ONLY when a call /
+            // struct-literal / member-access follower makes it one AND the bracket
+            // content is type-shaped (names, not literals/operators). Otherwise it is a
+            // value index `v[i]`: `xs[0].x` (literal content), `xs[i+1]` etc. A value
+            // index result may itself be indexed (`xs[i][j]`), so an `index` lhs also
+            // takes a subscript. The parser cannot tell `xs[i].f` (value index of a var)
+            // from `Vec[int].new()` (type-app) — both are name-headed, type-shaped, and
+            // `.`-followed — so that stays a `type_app` here and the checker reinterprets
+            // a value-resolved head as an index. Any other `lhs` breaks WITHOUT consuming
+            // `[`.
             .l_bracket => {
                 const ltag = p.nodes.items[lhs.int()].tag;
-                if (ltag != .identifier and ltag != .field_access) break;
-                // Disambiguate a turbofish head (`id[T](..)` / `Box[T]{..}` /
-                // `Vec[T].new()`) from a value index `v[i]` by the token AFTER the
-                // matching `]`: a call / struct-literal / member access keeps the
-                // type-app; anything else is a subscript. (A value index whose result is
-                // itself indexed / member-accessed — `xs[i].f`, `xs[i][j]` — stays a
-                // type-app; bind first, then access.)
-                if (p.turbofishFollows()) {
-                    lhs = try p.parseTypeApp(lhs);
-                } else {
+                if (ltag == .identifier or ltag == .field_access) {
+                    if (p.turbofishFollows() and p.bracketIsTypeShaped()) {
+                        lhs = try p.parseTypeApp(lhs);
+                    } else {
+                        lhs = try p.parseIndex(lhs);
+                    }
+                } else if (ltag == .index) {
                     lhs = try p.parseIndex(lhs);
-                }
+                } else break;
             },
             // `Name { ... }` literal / variant construction — only when blocks are
             // allowed and `lhs` is a bare name (struct), an inferred `.V`
@@ -2502,6 +2532,55 @@ test "p.0 parses to tuple_field, p.x to field_access, p.0.1 chains" {
     const outer = tree.nodes[Ast.root(tree.nodes).int()];
     try testing.expectEqual(Ast.Node.Tag.tuple_field, outer.tag);
     try testing.expectEqual(Ast.Node.Tag.tuple_field, tree.nodes[outer.lhs.int()].tag);
+}
+
+test "bracketed postfix: a value index disambiguates from a turbofish type-app" {
+    const gpa = testing.allocator;
+    // A value index whose result is member-accessed / re-indexed must NOT misparse as a
+    // turbofish type_app. The head resolves to a value in the checker; here we assert the
+    // parser's structural routing (literal / `[`-follower stay indices; a name-shaped `.`-
+    // followed bracket stays a `type_app` the checker later reinterprets).
+    const Tag = Ast.Node.Tag;
+    const cases = [_]struct {
+        src: []const u8,
+        root: Tag,
+        lhs: Tag, // the root's lhs (for a call: its callee)
+    }{
+        // `ps[1].x`: literal content -> index; the `.x` wraps it in a field_access.
+        .{ .src = "ps[1].x", .root = .field_access, .lhs = .index },
+        // `xs[i].f`: name-shaped, `.`-followed -> a `type_app` (value-reinterpreted later).
+        .{ .src = "xs[i].f", .root = .field_access, .lhs = .type_app },
+        // `xss[0][0]`: `[`-follower -> nested value index (the 2nd `[0]` no longer dropped).
+        .{ .src = "xss[0][0]", .root = .index, .lhs = .index },
+        // Regression: real turbofish type-apps keep their `type_app`-rooted shape.
+        .{ .src = "Vec[int].new()", .root = .call, .lhs = .field_access },
+        .{ .src = "id[int](7)", .root = .call, .lhs = .type_app },
+        .{ .src = "Box[int]{x: 1}", .root = .struct_init, .lhs = .type_app },
+    };
+    for (cases) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, c.src, &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        try testing.expect(diag == null);
+        const root = tree.nodes[Ast.root(tree.nodes).int()];
+        try testing.expectEqual(c.root, root.tag);
+        try testing.expectEqual(c.lhs, tree.nodes[root.lhs.int()].tag);
+    }
+    // `xs[i].f`'s type_app head is the bare `xs` identifier (what the checker keys the
+    // value-vs-type reinterpretation off of).
+    {
+        const tokens = try Lexer.tokenize(gpa, "xs[i].f");
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, "xs[i].f", &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        const fa = tree.nodes[Ast.root(tree.nodes).int()];
+        const app = tree.nodes[fa.lhs.int()];
+        try testing.expectEqual(Ast.Node.Tag.type_app, app.tag);
+        try testing.expectEqual(Ast.Node.Tag.identifier, tree.nodes[app.lhs.int()].tag);
+    }
 }
 
 test "parse error reports an offset and leaves a diagnostic" {
