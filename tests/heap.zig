@@ -74,6 +74,129 @@ test "heap: two cells are distinct, non-overlapping, and zeroed" {
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
+test "gc: an explicit collection bumps the collection count to 1" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-forced",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.forced_collect_count() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+}
+
+test "gc: churning unreachable arrays forces at least one collection (falsifies never-collect)" {
+    // The decisive proof that a collection ACTUALLY runs — a bump-only allocator would
+    // leave gc_stats().collections at 0 here even though collect.toy still exits 15.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-churn",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.churn_collects() }
+        \\
+    );
+    try std.testing.expect(code >= 1);
+}
+
+test "gc: a struct-embedded growable survives a forced collection (conservative whole-frame scan)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-aggregate",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.aggregate_survivor() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "gc: a self-referential cycle is traced without looping and swept without crashing" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-cycle",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.ref_cycle_reclaimed() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+}
+
+test "gc: a rooted Vec survives churning ~20000 unreachable Vecs (collect.toy spike gate)" {
+    // The spike gate: exit 15 (= keep.get(0)==7 + 8) proves the collector does NOT
+    // over-collect the survivor rooted in main's frame while reclaiming the churn.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-collect",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    keep: Vec[int] = []
+        \\    keep.push(7)
+        \\    i := 0
+        \\    loop {
+        \\        if i >= 20000 { break }
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    return keep.get(0).unwrap_or(0) + 8
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 15), code);
+}
+
+test "gc: a >4096-wide object forces the mark stack to realloc-grow; all children survive" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-markstack-grow",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.mark_stack_grow() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "gc: a large object (> 8 KiB direct mmap) survives a forced collection" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-large-survive",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.large_object_survivor() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 9), code);
+}
+
+test "gc: churning dropped large objects is bounded — dead spans munmapped, rooted one kept" {
+    // Guards the large-object sweep: each dropped > 8 KiB object is a direct mmap the
+    // collector must munmap. Without watermark-triggered collection on the large path plus
+    // the unlink+munmap sweep, this churn leaks unbounded; the sweep must also never free
+    // the rooted large object, so the survivor still reads back (exit 9).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-large-churn",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.large_churn_survivor() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 9), code);
+}
+
 test "heap: repeated span exhaustion keeps mmapping fresh spans (arena count >= 3)" {
     // Allocating past two full spans forces two refills. This catches a refill that
     // fails to persist the new span's limit: such a bug bumps unbounded off the second

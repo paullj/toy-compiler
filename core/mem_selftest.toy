@@ -46,3 +46,126 @@ pub fn check_span_growth() -> int {
 pub fn gc_arena_count() -> int {
     return gc_span_count()
 }
+
+# One explicit collection must bump the collection count from 0 to exactly 1. This is
+# the decisive falsifier of the bump-only/never-collect fallback: a non-collecting
+# allocator leaves `gc_stats()` at 0 here.
+pub fn forced_collect_count() -> int {
+    c := gc_alloc(16)
+    unsafe { store(c, 5) }
+    gc_collect()
+    return gc_stats()
+}
+
+# Churn unreachable cells past the growth watermark. A real collector fires at least one
+# synchronous collection along the way (each iteration's cell is dead the moment the local
+# is overwritten), so `gc_stats()` returns >= 1; a bump-only allocator returns 0.
+pub fn churn_collects() -> int {
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        p := gc_alloc(64)
+        unsafe { store(p, i) }
+        i = i + 1
+    }
+    return gc_stats()
+}
+
+# A reference embedded BY VALUE inside an aggregate frame cell must be found by the
+# conservative whole-frame scan. `h` holds a `Ref[int]` boxing 7; churning forces a
+# collection while `h` is live in the frame, and the boxed 7 must survive it. Reads 7.
+struct Holder { r: Ref[int] }
+
+pub fn aggregate_survivor() -> int {
+    h := Holder { r: &7 }
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk := gc_alloc(64)
+        unsafe { store(junk, i) }
+        i = i + 1
+    }
+    box := h.r
+    return *box
+}
+
+# A self-referential cycle must be traced without the marker looping (the mark bit stops
+# re-push) and later swept without crashing. `cyc` builds two mutually-pointing cells and
+# collects while they are rooted (exercising the cycle trace); back here they are dead, and
+# the churn-driven collection reclaims them. Reaching the return (no hang, no fault) is 1.
+fn cyc() {
+    a := gc_alloc(16)
+    b := gc_alloc(16)
+    unsafe {
+        store(a, b)
+        store(b, a)
+    }
+    gc_collect()
+}
+
+pub fn ref_cycle_reclaimed() -> int {
+    cyc()
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk := gc_alloc(64)
+        unsafe { store(junk, i) }
+        i = i + 1
+    }
+    return 1
+}
+
+# A large object (> 8 KiB, so it takes the direct-mmap path, not the size-class arena)
+# must be traced, marked, and survive a forced collection while rooted. `big` holds 9 at
+# its head; churning smaller cells forces a collection, after which the large span's value
+# must still read back. Reads 9.
+pub fn large_object_survivor() -> int {
+    big := gc_alloc(16384)
+    unsafe { store(big, 9) }
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk := gc_alloc(64)
+        unsafe { store(junk, i) }
+        i = i + 1
+    }
+    return unsafe { load(big) }
+}
+
+# Force the malloc-backed mark stack to realloc-grow past its initial 4096-entry capacity:
+# a single wide object holding > 4096 child pointers pushes them all in one trace step, so
+# the mark stack must double mid-collection. Every child stays rooted through the wide
+# object, so all survive; reading `arr[0]`'s payload back proves the grow kept the stack
+# coherent. Reads 42.
+pub fn mark_stack_grow() -> int {
+    n := 4200
+    arr := gc_alloc(n * 8)
+    i := 0
+    loop {
+        if i >= n { break }
+        c := gc_alloc(16)
+        unsafe { store(offset(c, 8), 42) }
+        unsafe { store(offset(arr, i * 8), c) }
+        i = i + 1
+    }
+    gc_collect()
+    c0 := unsafe { load(offset(arr, 0)) }
+    return unsafe { load(offset(c0, 8)) }
+}
+
+# Churn dropped large objects (each > 8 KiB, so each is a direct mmap swept by munmap)
+# across many collections while ONE large object stays rooted. The sweep must munmap every
+# dead large span (no leak, no crash) yet never free the rooted one — the rooted value must
+# still read back. Reads 9.
+pub fn large_churn_survivor() -> int {
+    keep := gc_alloc(16384)
+    unsafe { store(keep, 9) }
+    i := 0
+    loop {
+        if i >= 3000 { break }
+        junk := gc_alloc(16384)
+        unsafe { store(junk, i) }
+        i = i + 1
+    }
+    return unsafe { load(keep) }
+}

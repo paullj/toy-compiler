@@ -66,20 +66,23 @@ pub fn ga_push[T](a: gc_array[T], x: T) {
     }
 }
 
-# Double the backing and copy the live prefix over. The OLD backing just leaks (no
-# collector). The header never moves, so every alias sees the new backing.
+# Double the backing and copy the live prefix over. Store-before-alloc/copy: a collection
+# can fire inside `gc_alloc`, so the header still holds the OLD backing there (keeping it
+# reachable); once `ne` is allocated, publish it into the rooted header BEFORE the copy so
+# a later collection keeps BOTH arrays live (old via the spilled `e`, new via the header).
+# The header never moves, so every alias sees the new backing.
 pub fn ga_grow[T](a: gc_array[T], c: int) {
     nc := c * 2
     ne := gc_alloc(nc * size_of[T]())
     e := unsafe { load(offset(a, 16)) }
+    unsafe {
+        store(offset(a, 16), ne)
+        store(offset(a, 8), nc)
+    }
     i := 0
     while i < c {
         v: T = unsafe { load(offset(e, i * size_of[T]())) }
         unsafe { store(offset(ne, i * size_of[T]()), v) }
         i = i + 1
-    }
-    unsafe {
-        store(offset(a, 16), ne)
-        store(offset(a, 8), nc)
     }
 }
