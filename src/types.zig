@@ -41,6 +41,7 @@ pub const coherence = @import("types/coherence.zig");
 const reify = @import("types/reify.zig");
 const register = @import("symbols/register.zig");
 const prelude_reg = @import("symbols/Prelude.zig");
+const StdNames = @import("symbols/StdNames.zig");
 const Engine = @import("query/Engine.zig");
 const Io = std.Io;
 
@@ -2126,7 +2127,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         const recv = node_types[i];
         if (!recv.isApp()) continue;
         const re = t.composite.at(recv.appIdx());
-        const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, "new") orelse continue;
+        const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, StdNames.method_new) orelse continue;
         const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse continue;
         defer t.gpa.free(out);
         var conc = true;
@@ -2145,14 +2146,14 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         switch (n.tag) {
             .list_literal => {
                 const recv = node_types[i];
-                try t.discoverRecvMethod(model, recv, "new", worklist, seen, mc.tokens[n.main_token].start, mod);
-                try t.discoverRecvMethod(model, recv, "push", worklist, seen, mc.tokens[n.main_token].start, mod);
+                try t.discoverRecvMethod(model, recv, StdNames.method_new, worklist, seen, mc.tokens[n.main_token].start, mod);
+                try t.discoverRecvMethod(model, recv, StdNames.method_push, worklist, seen, mc.tokens[n.main_token].start, mod);
             },
             .for_in_stmt => {
                 const recv = node_types[n.rhs.int()];
                 const iter = node_types[i];
-                try t.discoverRecvMethod(model, recv, "iter", worklist, seen, mc.tokens[n.main_token].start, mod);
-                try t.discoverRecvMethod(model, iter, "next", worklist, seen, mc.tokens[n.main_token].start, mod);
+                try t.discoverRecvMethod(model, recv, StdNames.method_iter, worklist, seen, mc.tokens[n.main_token].start, mod);
+                try t.discoverRecvMethod(model, iter, StdNames.method_next, worklist, seen, mc.tokens[n.main_token].start, mod);
             },
             .index => {
                 // `xs[i]` desugars to `mem.ga_at[V]`; discover that instance keyed on the
@@ -2186,7 +2187,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
 fn gaAtGid(model: *const Model) ?u32 {
     const names = model.gph_fn_names orelse return null;
     for (names, 0..) |nm, i| {
-        if (std.mem.eql(u8, nm, "core/mem.ga_at")) return @intCast(i);
+        if (std.mem.eql(u8, nm, StdNames.ga_at)) return @intCast(i);
     }
     return null;
 }
@@ -3918,7 +3919,7 @@ test "an associated fn `Vec[int].new()` mints one instance + a static reified-di
     var saw_instance_bump = false;
     for (c.result.methods) |m| {
         if (m.instance == null) continue;
-        if (std.mem.eql(u8, m.name, "new")) {
+        if (std.mem.eql(u8, m.name, StdNames.method_new)) {
             new_entries += 1;
             try testing.expect(m.is_static);
             try testing.expect(Type.eql(m.recv, vec_int_ty));

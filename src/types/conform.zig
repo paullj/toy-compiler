@@ -14,6 +14,7 @@ const std = @import("std");
 const Typecheck = @import("../types.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Composite = @import("../symbols/Composite.zig");
+const StdNames = @import("../symbols/StdNames.zig");
 
 const Type = Typecheck.Type;
 const Model = Typecheck.Model;
@@ -328,7 +329,7 @@ pub fn iteratorItem(model: *const Model, composite: *Composite, gpa: std.mem.All
     for (model.template_conformances) |row| {
         if (row.recv_ctor != e.ctor or row.recv_is_enum != e.ctor_is_enum) continue;
         if (row.protocol_id >= model.protocols.len) continue;
-        if (!std.mem.eql(u8, model.protocols[row.protocol_id].name, "Iterator")) continue;
+        if (!std.mem.eql(u8, model.protocols[row.protocol_id].name, StdNames.iter_protocol)) continue;
         if (row.protocol_args.len == 0) return null;
         return try substPattern(composite, gpa, row.protocol_args[0], e.args);
     }
