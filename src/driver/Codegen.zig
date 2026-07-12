@@ -145,6 +145,16 @@ const Frozen = struct {
     /// The compiler-provided `char` struct id, for the conversion recognizer +
     /// char-literal lowering. Copied verbatim from the checker. Shared read-only.
     char_struct: ?u32 = null,
+
+    /// The template facts `Mono.callInstanceRef` needs for this job's read-only view:
+    /// derived from the callee's `Sig` (the fingerprint side of the shared discovery/
+    /// fold arg-extraction). `null` for a non-generic callee.
+    pub fn genericTemplate(self: *const Frozen, gid: u32) ?Mono.TemplateRef {
+        if (gid >= self.sigs.len) return null;
+        const sig = self.sigs[gid];
+        if (!sig.hasTypeVar()) return null;
+        return .{ .params = sig.params, .count = sig.genericParamCount() };
+    }
 };
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
