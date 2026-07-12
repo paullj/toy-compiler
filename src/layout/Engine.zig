@@ -95,6 +95,26 @@ pub const EnumLayout = struct {
     native_family: NativeEnumFamily = .none,
 };
 
+/// The variant-ordinal convention of a native `Option`/`Result` layout — some/ok = 0,
+/// none/err = 1 — is fixed by `registerOptionResult` (`? ` resolves by ordinal). These
+/// three helpers are the ONE place the frontend spells that convention when reading a
+/// native enum's payload, so a change to the ordinal or payload shape lands in a single
+/// authority rather than a dozen `variants[0]`/`variants[1]` hand-indexings across
+/// `lower`/`AstWalk`. `somePayload`/`errPayload` return the sole payload FIELD TYPE of
+/// variant 0/1; `payloadAddr` the ABSOLUTE byte offset of variant `vi`'s payload field
+/// (aggregate `payload_off` + the variant's payload-local offset). Callers guard the
+/// short-variant case where it can occur (a malformed/foreign enum); the leaf index is
+/// unchecked, matching the code it replaces.
+pub fn somePayload(e: EnumLayout) Type {
+    return e.variants[0].field_types[0];
+}
+pub fn errPayload(e: EnumLayout) Type {
+    return e.variants[1].field_types[0];
+}
+pub fn payloadAddr(e: EnumLayout, vi: usize) u32 {
+    return e.payload_off + e.variants[vi].offsets[0];
+}
+
 /// A struct's resolved symbol: its decl node, name, and (after layout) per-field
 /// names/types/offsets plus aggregate size/align. `state` guards the layout
 /// recursion so a directly- or indirectly-recursive struct is caught once.
@@ -1203,4 +1223,22 @@ test "engine: memoization — a second layoutStruct is a no-op (state stays done
     try layoutStruct(h.env(), id); // must early-return, not re-alloc
     try testing.expectEqual(size_before, h.structs.items[0].size);
     try testing.expectEqual(fields_ptr, h.structs.items[0].field_types.ptr);
+}
+
+test "engine: native payload helpers read the fixed some=0/err=1 ordinal" {
+    // A minimal Result$int$bool-shaped layout: variant 0 (ok) carries int, variant 1
+    // (err) carries bool, both at payload-local offset 0, aggregate payload at 8.
+    var ok_ft = [_]Type{Type.int};
+    var ok_off = [_]u32{0};
+    var err_ft = [_]Type{Type.@"bool"};
+    var err_off = [_]u32{0};
+    var vars = [_]VariantLayout{
+        .{ .name = "ok", .form = .tuple, .field_names = &.{}, .field_types = &ok_ft, .offsets = &ok_off },
+        .{ .name = "err", .form = .tuple, .field_names = &.{}, .field_types = &err_ft, .offsets = &err_off },
+    };
+    const e = EnumLayout{ .name = "Result$int$bool", .variants = &vars, .tag_size = 8, .payload_off = 8, .size = 16, .@"align" = 8, .native_family = .result };
+    try testing.expectEqual(Kind.int, somePayload(e).kind);
+    try testing.expectEqual(Kind.bool, errPayload(e).kind);
+    try testing.expectEqual(@as(u32, 8), payloadAddr(e, 0));
+    try testing.expectEqual(@as(u32, 8), payloadAddr(e, 1));
 }
