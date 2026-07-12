@@ -1,0 +1,20 @@
+# expect: exit 15
+# Feature: the mark-sweep collector runs UNDER Vec — churning unreachable vectors past the
+# growth watermark forces at least one collection, yet a Vec kept rooted in main's frame
+# survives it. `keep` holds 7; after ~20000 dead `Vec[int]` are churned (and reclaimed),
+# `keep.get(0)` still reads 7, so the exit is 7 + 8 = 15. A collector that mis-swept the
+# rooted survivor would change this exit; a never-collect allocator would OOM long before.
+import std/vec
+
+fn main() -> int {
+    keep: Vec[int] = []
+    keep.push(7)
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk: Vec[int] = []
+        junk.push(i)
+        i = i + 1
+    }
+    return keep.get(0).unwrap_or(0) + 8
+}

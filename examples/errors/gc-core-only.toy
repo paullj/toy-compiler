@@ -1,0 +1,8 @@
+# expect: compile-error "undeclared"
+# The collector intrinsics resolve only inside a bundled `core/` module; naming `gc_stats`
+# or `gc_collect` from a user file is the ordinary undeclared-identifier error (R0001),
+# inherited from the same core-only allowlist that gates `gc_alloc`.
+fn main() -> int {
+    gc_collect()
+    return gc_stats()
+}

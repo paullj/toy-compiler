@@ -81,6 +81,10 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
             else => {},
         };
     }
+    // `gc_alloc` calls `gc_collect` internally (an alloc-triggered collection). That
+    // builtin→builtin edge lives in an APPENDED body, invisible to the fn-only used-scan
+    // above, so couple it by hand: any program that allocs must carry the collector.
+    if (used[comptime CodegenIr.handBuiltinIndex("gc_alloc")]) used[comptime CodegenIr.handBuiltinIndex("gc_collect")] = true;
     // `panic` alone is consumed past the append: it drags in the `write` import and
     // reserves the backtrace symbol table's slot.
     const uses_panic = used[comptime CodegenIr.handBuiltinIndex("panic")];

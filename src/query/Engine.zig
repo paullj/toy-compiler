@@ -467,7 +467,7 @@ pub const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
 ///
 /// `frozen` is the single-fn read-only view (`Driver.Frozen` / a graph `frozenFor`
 /// slice); taken `anytype` so the `Frozen` type can stay in the driver this stage.
-fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, sig: ?Fingerprint.Sig, opt_out: ?*OptOut) !Link.FnCode {
+fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, sig: ?Fingerprint.Sig, verify: bool, opt_out: ?*OptOut) !Link.FnCode {
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
 
@@ -509,6 +509,16 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         var tmp = fc;
         tmp.deinit(gpa);
         return error.CodegenDiagnostic;
+    }
+    // The UAF tripwire runs only in `--verify` (a real runtime check, like the
+    // determinism/cache audits): every reference must be spill-backed for the collector's
+    // conservative frame scan to see it.
+    if (verify) {
+        CodegenIr.verifyRefsSpilled(gpa, &irf, frozen.layouts, frozen.enum_layouts) catch |e| {
+            var tmp = fc;
+            tmp.deinit(gpa);
+            return e;
+        };
     }
     return fc;
 }
@@ -591,17 +601,19 @@ pub fn codegen(
         sym: Link.SymName,
         is_entry: bool,
         my_sig: ?Fingerprint.Sig,
+        verify: bool,
     };
     return self.serve(gpa, io, key, tmp_tag, slot, Ctx{
         .gpa = gpa,
         .frozen = frozen,
         .fn_decl = fn_decl,
         .sym = sym,
+        .verify = self.mode == .verify,
         .is_entry = is_entry,
         .my_sig = my_sig,
     }, struct {
         fn f(c: Ctx, opt_out: ?*OptOut) !Link.FnCode {
-            return lowerOne(c.gpa, c.frozen, c.fn_decl, c.sym, c.is_entry, c.my_sig, opt_out);
+            return lowerOne(c.gpa, c.frozen, c.fn_decl, c.sym, c.is_entry, c.my_sig, c.verify, opt_out);
         }
     }.f);
 }

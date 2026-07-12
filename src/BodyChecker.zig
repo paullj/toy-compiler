@@ -1975,6 +1975,22 @@ pub const BodyChecker = struct {
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
                     },
+                    .gc_collect => {
+                        if (args.len != 0) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        }
+                        bc.node_types[(node_idx).int()] = Type.unit;
+                        return Type.unit;
+                    },
+                    .gc_stats => {
+                        if (args.len != 0) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        }
+                        bc.node_types[(node_idx).int()] = Type.int;
+                        return Type.int;
+                    },
                     .store => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
