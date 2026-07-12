@@ -2173,9 +2173,30 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 try t.discoverRecvMethod(model, recv, "iter", worklist, seen, mc.tokens[n.main_token].start, mod);
                 try t.discoverRecvMethod(model, iter, "next", worklist, seen, mc.tokens[n.main_token].start, mod);
             },
+            .index => {
+                // `xs[i]` desugars to `mem.ga_at[V]`; discover that instance keyed on the
+                // index node's element type V so lower can resolve its mangled symbol.
+                const elem = node_types[i];
+                if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
+                    const args = [_]Type{elem};
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, mc.tokens[n.main_token].start, mod);
+                };
+            },
             else => {},
         }
     }
+}
+
+/// The global fn id of `core/mem`'s `ga_at`, the element-read primitive `xs[i]` desugars
+/// to. Found by its qualified name (bundled `core/mem` is always in the graph when a
+/// program indexes a `Vec`); `null` when the name table is absent or the module was not
+/// pulled in.
+fn gaAtGid(model: *const Model) ?u32 {
+    const names = model.gph_fn_names orelse return null;
+    for (names, 0..) |nm, i| {
+        if (std.mem.eql(u8, nm, "core/mem.ga_at")) return @intCast(i);
+    }
+    return null;
 }
 
 /// Discover-and-enqueue the concrete instance of the template method `name` on the
