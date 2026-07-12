@@ -81,10 +81,23 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
             else => {},
         };
     }
-    // `gc_alloc` calls `gc_collect` internally (an alloc-triggered collection). That
-    // builtin→builtin edge lives in an APPENDED body, invisible to the fn-only used-scan
-    // above, so couple it by hand: any program that allocs must carry the collector.
-    if (used[comptime CodegenIr.handBuiltinIndex("gc_alloc")]) used[comptime CodegenIr.handBuiltinIndex("gc_collect")] = true;
+    // A builtin body can statically call other builtins from within its APPENDED code
+    // (e.g. `gc_alloc` triggers `gc_collect`), an edge invisible to the fn-only used-scan
+    // above. Close the used set over each row's declared `static_call_deps` to a fixpoint,
+    // so any program that carries a builtin also carries its transitive callees.
+    var closure_changed = true;
+    while (closure_changed) {
+        closure_changed = false;
+        inline for (CodegenIr.hand_builtins, 0..) |hb, i| {
+            if (used[i]) inline for (hb.static_call_deps) |dep| {
+                const j = comptime CodegenIr.handBuiltinIndex(dep);
+                if (!used[j]) {
+                    used[j] = true;
+                    closure_changed = true;
+                }
+            };
+        }
+    }
     // `panic` alone is consumed past the append: it drags in the `write` import and
     // reserves the backtrace symbol table's slot.
     const uses_panic = used[comptime CodegenIr.handBuiltinIndex("panic")];

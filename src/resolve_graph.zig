@@ -160,9 +160,58 @@ const GraphResolve = struct {
         return g.nameOf(g.cur_mod, tok);
     }
 
+/// A synthetic builtin the resolver seeds after the user fns. `core_only` gates
+/// registration into per-module fn tables: `false` = global prelude (every module),
+/// `true` = only bundled `core/` modules.
+const SeededBuiltin = struct { name: []const u8, core_only: bool };
+
+/// The single ordered authority for the seeded builtins. Order is load-bearing: it
+/// fixes each builtin's global fn id, which feeds the content fingerprint / -jN
+/// identity — `print`/`panic` lead so later appends never shift an existing id.
+/// Append, never reorder. The intrinsic names are pulled from `Intrinsic.Kind` (their
+/// own id-order authority) so the two lists stay in one derivation, not two spellings.
+const seeded_builtins = blk: {
+    const kinds = std.enums.values(Intrinsic.Kind);
+    var list: [2 + kinds.len]SeededBuiltin = undefined;
+    list[0] = .{ .name = "print", .core_only = false };
+    list[1] = .{ .name = "panic", .core_only = false };
+    for (kinds, 0..) |k, i| list[2 + i] = .{ .name = Intrinsic.name(k), .core_only = true };
+    break :blk list;
+};
+
+/// Append one homeless `.builtin` fn for `b` and register its name into the in-scope
+/// modules' fn tables (never over a module's own same-name decl — user-first-wins).
+fn seedBuiltin(g: *GraphResolve, entry: u32, b: SeededBuiltin) !void {
+    const id: u32 = @intCast(g.fns.items.len);
+    try g.fns.append(g.gpa, .{
+        .name = try g.gpa.dupe(u8, b.name),
+        .module = entry,
+        .decl_node = Ast.none,
+        .kind = .builtin,
+        .is_pub = false,
+    });
+    for (g.tables, 0..) |*t, i| {
+        const in_scope = if (b.core_only) g.graph.modules[i].isCore() else true;
+        if (in_scope and !t.fns.contains(b.name)) try t.fns.put(g.gpa, b.name, id);
+    }
+}
+
+test "seeded_builtins: print/panic lead as global prelude, then the intrinsics core-only" {
+    try std.testing.expectEqualStrings("print", seeded_builtins[0].name);
+    try std.testing.expect(!seeded_builtins[0].core_only);
+    try std.testing.expectEqualStrings("panic", seeded_builtins[1].name);
+    try std.testing.expect(!seeded_builtins[1].core_only);
+    const kinds = std.enums.values(Intrinsic.Kind);
+    try std.testing.expectEqual(2 + kinds.len, seeded_builtins.len);
+    for (kinds, 0..) |k, i| {
+        try std.testing.expectEqualStrings(Intrinsic.name(k), seeded_builtins[2 + i].name);
+        try std.testing.expect(seeded_builtins[2 + i].core_only);
+    }
+}
+
 /// Assign every user fn a global id + qualified name, and register each module's
 /// struct/enum type names. Deterministic: modules in id order, decls in source
-/// order. `print` is seeded last (one shared synthetic builtin).
+/// order. The synthetic builtins are seeded last (see `seeded_builtins`).
 fn collectGlobals(g: *GraphResolve) !void {
     const entry = g.graph.entry_index;
     // Scratch set of minted method symbol names, to reject a duplicate `(Receiver,
@@ -317,59 +366,14 @@ fn collectGlobals(g: *GraphResolve) !void {
         }
     }
 
-    // Seed the shared synthetic `print` builtin once, at the end of the table.
-    // Every module's bare `print` resolves to this id (global prelude). It is
-    // bodyless and not pub; `kind = .builtin` is the homeless entry's marker.
-    const print_id: u32 = @intCast(g.fns.items.len);
-    try g.fns.append(g.gpa, .{
-        .name = try g.gpa.dupe(u8, "print"),
-        .module = entry,
-        .decl_node = Ast.none,
-        .kind = .builtin,
-        .is_pub = false,
-    });
-    // Register `print` into every module's local fn table UNLESS that module
-    // declares its own `print` (the user fn keeps its own id, as in single-file).
-    for (g.tables) |*t| {
-        if (!t.fns.contains("print")) try t.fns.put(g.gpa, "print", print_id);
-    }
-    // Seed the shared synthetic `panic` builtin, appended AFTER `print` so every
-    // existing fn id (incl. `print_id`) is unchanged (no fingerprint / incremental
-    // churn). Bodyless, not pub; `kind = .builtin`. Its FnCode is hand-emitted at link
-    // time (CodegenIr.lowerPanic) and referenced by name "panic" from both a user
-    // `panic(<str>)` call and the div/mod/unwrap-trap retrofit.
-    const panic_id: u32 = @intCast(g.fns.items.len);
-    try g.fns.append(g.gpa, .{
-        .name = try g.gpa.dupe(u8, "panic"),
-        .module = entry,
-        .decl_node = Ast.none,
-        .kind = .builtin,
-        .is_pub = false,
-    });
-    for (g.tables) |*t| {
-        if (!t.fns.contains("panic")) try t.fns.put(g.gpa, "panic", panic_id);
-    }
-    // Seed the core-only intrinsic names, appended AFTER `print`/`panic` so no
-    // existing fn id shifts. Each is a homeless `.builtin` (bodyless; the ones that
-    // need machine code are hand-emitted at link time). Unlike `print`/`panic` these
-    // are registered ONLY into a bundled `core/` module's fn table — naming them from
-    // a user or `std/` module leaves the name unresolved (R0001). `gc_array` is
-    // reserved (no lowering yet) so the name is claimed for the container tier.
-    for (std.enums.values(Intrinsic.Kind)) |k| {
-        const nm = Intrinsic.name(k);
-        const id: u32 = @intCast(g.fns.items.len);
-        try g.fns.append(g.gpa, .{
-            .name = try g.gpa.dupe(u8, nm),
-            .module = entry,
-            .decl_node = Ast.none,
-            .kind = .builtin,
-            .is_pub = false,
-        });
-        for (g.tables, 0..) |*t, i| {
-            if (g.graph.modules[i].isCore() and !t.fns.contains(nm))
-                try t.fns.put(g.gpa, nm, id);
-        }
-    }
+    // Seed every synthetic builtin off one ordered list (`seeded_builtins`). Each is a
+    // homeless `.builtin` (bodyless; the ones that need machine code are hand-emitted at
+    // link time). `print`/`panic` are global prelude (registered into every module's fn
+    // table unless shadowed); the `Intrinsic` names are core-only (registered only into a
+    // bundled `core/` module — naming them elsewhere leaves the name unresolved, R0001).
+    // The list's order fixes each id, so `print` and `panic` lead and no later append
+    // shifts an existing id.
+    for (seeded_builtins) |b| try seedBuiltin(g, entry, b);
     // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) are nameable
     // in every module with no import (the `print` precedent). Register each into a module's enum
     // table UNLESS the module declares its own (user-first-wins), so their construction/match
