@@ -23,7 +23,7 @@ const Type = @import("../layout/Type.zig").Type;
 /// char conversions `.conv_int_char`/`.conv_char_byte` (source-less `TryInto` witnesses,
 /// not real conformance methods — see `derive_synth`). The ordinal folds into the mangled
 /// name + the sort key, so it must stay stable.
-pub const Kind = enum(u8) { eq, ord, hash, display, conv_int_char, conv_char_byte, conv_float_int };
+pub const Kind = enum(u8) { eq, ord, hash, display, conv_int_char, conv_char_byte, conv_float_int, trace };
 
 /// The method a `Kind` synthesizes (a pure function of the kind). Used for the
 /// mangled name segment; `Eq` derives an `eq` method, `Ord` a `cmp` method, `Hash` a
@@ -38,6 +38,7 @@ pub fn methodName(k: Kind) []const u8 {
         .conv_int_char => "int_to_char",
         .conv_char_byte => "char_to_byte",
         .conv_float_int => "float_to_int",
+        .trace => "trace",
     };
 }
 
@@ -68,6 +69,14 @@ pub const FieldWitness = union(enum) {
     /// call `display(field_self) -> ()`, which writes the field's rendering directly
     /// to the output fd. Append-only (ordinal 5).
     display_call: []const u8,
+    /// A MANAGED (reference) field of a `Trace` derive: the trace boundary. The emitter
+    /// loads the 8-byte cell pointer and `bl gc_mark`s it — it does NOT recurse into the
+    /// pointee's descriptor. Append-only (ordinal 6).
+    trace_mark,
+    /// A by-value aggregate (struct / enum) field of a `Trace` derive that itself holds a
+    /// managed field: call the sibling `trace(field_self) -> ()` witness. Append-only
+    /// (ordinal 7).
+    trace_call: []const u8,
 };
 
 /// One authorized structural-derive recipe. `field_witnesses`, `params`, and `name`
@@ -325,6 +334,23 @@ test "mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" 
     try writeKey(gpa, &a, 10, .conv_int_char, Type.structT(3));
     try writeKey(gpa, &b, 10, .conv_char_byte, Type.structT(3));
     try testing.expect(!std.mem.eql(u8, a.items, b.items));
+}
+
+test "mangle produces a distinct `Trace$trace$` name per (struct/enum, id)" {
+    const gpa = testing.allocator;
+    const ts = try mangle(gpa, "Trace", .trace, Type.structT(0));
+    defer gpa.free(ts);
+    try testing.expectEqualStrings("Trace$trace$s0", ts);
+    const te = try mangle(gpa, "Trace", .trace, Type.enumT(1));
+    defer gpa.free(te);
+    try testing.expectEqualStrings("Trace$trace$e1", te);
+    // The Trace `trace` name is disjoint from the Eq/Hash names for the same struct id.
+    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
+    defer gpa.free(es);
+    const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
+    defer gpa.free(hs);
+    try testing.expect(!std.mem.eql(u8, ts, es));
+    try testing.expect(!std.mem.eql(u8, ts, hs));
 }
 
 test "writeKey is injective across kind/enum-flag/id" {

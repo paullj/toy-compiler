@@ -1,7 +1,8 @@
-# expect: compile-error "Ref"
+# expect: compile-error "Ref-containing type has no auto Hash"
 # Feature (negative): a managed box has no hashable value — its identity is a heap cell,
 # not a stable key. A struct that holds a `Ref` field therefore cannot derive `Hash`; the
-# `.hash()` call is a compile error whose message names 'Ref'.
+# `.hash()` call is a compile error. The Ref guardrail lives in the single descriptor
+# producer (derive synthesis): a Ref field forces identity Eq and is EXCLUDED from auto Hash.
 struct S { r: Ref[int] }
 
 fn main() -> int {

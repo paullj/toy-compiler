@@ -217,6 +217,8 @@ pub fn deriveFingerprint(
             .cmp_call => |n| AstWalk.updateLeaf(&h, n),
             .hash_call => |n| AstWalk.updateLeaf(&h, n),
             .display_call => |n| AstWalk.updateLeaf(&h, n),
+            .trace_mark => {},
+            .trace_call => |n| AstWalk.updateLeaf(&h, n),
         }
     }
     return h.final();

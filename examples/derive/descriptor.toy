@@ -1,0 +1,13 @@
+# expect: exit 42
+# Feature: `==` and `.hash()` route through the ONE descriptor producer. A plain scalar
+# struct (no Ref) derives Eq + Hash as before; this passes identically under the pre- and
+# post-producer compiler, proving the producer did not regress the eq/hash path. The
+# co-emitted trace/descriptor products are not observable from source (no runtime consumer
+# yet), so this stays a pure eq/hash regression guard.
+struct Pair { a: int, b: int }
+
+fn main() -> int {
+    p := Pair{ a: 20, b: 22 }
+    q := Pair{ a: 20, b: 22 }
+    return if p == q && p.hash() == q.hash() { p.a + p.b } else { 0 }
+}

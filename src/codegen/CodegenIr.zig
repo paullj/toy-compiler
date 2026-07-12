@@ -1060,6 +1060,7 @@ pub const hand_builtins = [_]HandBuiltin{
     .{ .name = "gc_span_count", .lower = lowerGcSpanCount },
     .{ .name = "gc_collect", .lower = lowerGcCollect },
     .{ .name = "gc_stats", .lower = lowerGcStats },
+    .{ .name = "gc_mark", .lower = lowerGcMark },
 };
 
 /// The `hand_builtins` index of `name`, resolved at comptime — lets a caller name
@@ -1549,7 +1550,8 @@ const ms_async: u16 = 1; // MS_ASYNC
 const ms_init: u16 = 4096; // initial mark-stack capacity (entries; 16 B each)
 
 // Size classes (index 0..12). 48/96/192 are non-pow2 → normalize via real udiv/mul.
-const size_classes = [_]u16{ 16, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192 };
+// The taxonomy lives in `Abi` (the descriptor + the allocator share one authority).
+const size_classes = Abi.size_classes;
 
 /// Ensure the control-block page exists, leaving CB_ADDR in x9 on exit. The page is
 /// metadata-only now (it no longer doubles as span 0); a fresh MAP_FIXED page is zeroed,
@@ -1935,6 +1937,41 @@ fn emitPush(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: s
     try emit(code, gpa, A.strRegUoff(11, 19, off_ms_len)); // ms_len++
 }
 
+/// Build the `gc_mark(candidate)` builtin: mark ONE candidate pointer (x0), reusing the
+/// collector's own `emitConservativeMark`/`emitPush`. It is the callable wrapper a derived
+/// `trace(obj)` unit `bl`s per managed field — the mark-stack pair's descriptor slot is
+/// already reserved (`emitPush`) for the descriptor-driven-tracing swap that will make this
+/// the collector's precise object scanner. Emitted now so a `trace` unit links; it has no
+/// runtime caller in the collector yet (the object scan stays conservative). Caller owns
+/// the result.
+pub fn lowerGcMark(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
+    const emit = emitWord;
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    // x19 is callee-saved (emitConservativeMark reads CB from it) and x0 is clobbered by
+    // emitLocateCb, so both are stashed in a 16-byte scratch frame across the setup.
+    try emitFramePrologue(&code, gpa);
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.strSp(19, 0)); // preserve caller's x19
+    try emit(&code, gpa, A.strSp(0, 8)); // save candidate (emitLocateCb clobbers x0)
+
+    try emitLocateCb(&code, &relocs, gpa); // x9 = CB
+    try emit(&code, gpa, A.movReg(19, 9)); // x19 = CB (the reg emitConservativeMark reads)
+    try emit(&code, gpa, A.ldrSp(10, 8)); // x10 = candidate (the reg it marks)
+    try emitConservativeMark(&code, &relocs, gpa);
+
+    try emit(&code, gpa, A.ldrSp(19, 0)); // restore caller's x19
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    return finishBuiltin(&code, &relocs, gpa, "gc_mark");
+}
+
 /// Build the `gc_collect()` builtin: a synchronous stop-the-world conservative
 /// mark-sweep. Reuses `panic`'s FP-chain mechanics (minus all symbolization): finds the
 /// live frame region [x_lo, outermost_fp+16), conservatively marks every 8-byte word in
@@ -2247,6 +2284,29 @@ pub fn lowerGcStats(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ret);
 
     return finishBuiltin(&code, &relocs, gpa, "gc_stats");
+}
+
+test "gc_mark: names the builtin, opens a frame, ends in ret, byte-identical across relowers" {
+    const gpa = testing.allocator;
+    var a = try lowerGcMark(gpa);
+    defer a.deinit(gpa);
+    var b = try lowerGcMark(gpa);
+    defer b.deinit(gpa);
+
+    try testing.expectEqualStrings("gc_mark", a.sym.name);
+    try testing.expectEqual(Link.SymKind.builtin, a.sym.kind);
+    try testing.expect(a.code.len % 4 == 0);
+    try testing.expectEqual(Aarch64.stpFpLrPre, std.mem.readInt(u32, a.code[0..4], .little));
+    try testing.expectEqual(Aarch64.ret, std.mem.readInt(u32, a.code[a.code.len - 4 ..][0..4], .little));
+    // The mark step reuses the collector's `emitPush`, whose grow path pulls `realloc`; it
+    // calls no other builtin, so there is no `.call26` edge.
+    var saw_realloc = false;
+    for (a.relocs) |r| {
+        try testing.expect(r.kind != .call26);
+        if (r.target == .import and std.mem.eql(u8, r.target.import.name, "realloc")) saw_realloc = true;
+    }
+    try testing.expect(saw_realloc);
+    try testing.expectEqualSlices(u8, a.code, b.code); // pure fixed bytes (-jN identity)
 }
 
 test "panic backpatch wrappers resolve signed word deltas, preserving opcode/rt/cond" {

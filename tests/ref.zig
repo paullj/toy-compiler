@@ -142,3 +142,47 @@ test "ref: a program building Ref[int] AND Ref[bool] is byte-identical at -j1 an
     }
     try std.testing.expect(differing <= 1);
 }
+
+test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-j1 == -j8)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    // `Node` derives `Eq` (used via `==`) AND holds a `Ref` field, so the one descriptor
+    // producer co-emits a `trace` unit that `bl`s `gc_mark`. Both the trace unit's synthetic
+    // name (minted off the reified struct id, which rides the (depth, structural-key) order)
+    // and `gc_mark`'s appended body are a pure function of source — so the two images are
+    // byte-identical bar the one-byte code-sign nonce, the spike's determinism guarantee.
+    const src =
+        \\struct Node { v: int, next: Ref[int] }
+        \\fn main() -> int {
+        \\    r := &1
+        \\    a := Node{ v: 42, next: r }
+        \\    b := Node{ v: 42, next: r }
+        \\    return if a == b { a.v } else { 0 }
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-ref-trace-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqual(b1.len, b8.len);
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+}

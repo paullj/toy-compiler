@@ -9,8 +9,17 @@ const Type = Typecheck.Type;
 const Method = Typecheck.Method;
 const DeriveRecipe = Typecheck.DeriveRecipe;
 const Derive = @import("../symbols/Derive.zig");
+const Abi = @import("../codegen/abi/Abi.zig");
 
 const conforms = Typecheck.conform.structural;
+
+/// The sentinel `protocol_id` for a `Trace` recipe. `Trace` is not a source protocol (no
+/// row in `t.protocols`), so it borrows a value above every real protocol id — the
+/// canonical sort then places every trace recipe LAST, after eq/ord/hash/display/try_into,
+/// so no existing recipe's sorted position (and thus its minted name / synthetic id) shifts.
+/// No derive path indexes `t.protocols.items[protocol_id]` for a trace recipe (mangle keys
+/// off the name string; writeKey/lessThan use the id as an opaque u32).
+const trace_pid: u32 = std.math.maxInt(u32);
 const resolveConformanceMethod = Typecheck.resolveConformanceMethod;
 
 /// Whether `ty` is a managed box (`Ref[T]`/`gc_array[T]`): a reified struct carrying the
@@ -20,6 +29,58 @@ const resolveConformanceMethod = Typecheck.resolveConformanceMethod;
 /// (`Typecheck.isRefStruct`) over the layout snapshot.
 fn isRefType(t: *const Typecheck, ty: Type) bool {
     return Typecheck.isRefStruct(ty, t.structs.items);
+}
+
+/// Whether `ty` transitively holds a MANAGED (reference) field — i.e. tracing it is not a
+/// no-op. A managed component is an immediate `true`; a by-value struct/enum component
+/// recurses (a `Ref` is a leaf boundary, NEVER recursed through). Terminates: by-value
+/// cycles are already a compile error (`Engine.layoutReferent`), and a `Ref`'s single field
+/// is `int`, so the by-value graph is a finite acyclic DAG. `memo` (keyed on the nominal id
+/// + the enum flag) collapses the DAG's shared subtrees.
+fn needsTrace(t: *Typecheck, ty: Type, memo: *std.AutoHashMapUnmanaged(u64, bool)) error{OutOfMemory}!bool {
+    switch (ty.kind) {
+        .@"struct", .@"enum" => {},
+        else => return false,
+    }
+    const key = (@as(u64, ty.nominalId()) << 1) | @intFromBool(ty.kind == .@"enum");
+    if (memo.get(key)) |v| return v;
+    // Pre-seed `false` so a self-referential probe (should not occur for by-value types, but
+    // cheap insurance) terminates rather than recursing forever.
+    try memo.put(t.gpa, key, false);
+
+    var comps: std.ArrayList(Type) = .empty;
+    defer comps.deinit(t.gpa);
+    try collectComponentTypes(t, ty, &comps);
+    var result = false;
+    for (comps.items) |ft| {
+        switch (ft.kind) {
+            .@"struct", .@"enum" => {},
+            else => continue,
+        }
+        if (isRefType(t, ft) or try needsTrace(t, ft, memo)) {
+            result = true;
+            break;
+        }
+    }
+    try memo.put(t.gpa, key, result);
+    return result;
+}
+
+/// Resolve one component field of a `Trace` recipe to its `FieldWitness`: a managed field
+/// is the `.trace_mark` boundary; a by-value aggregate that itself holds managed fields has
+/// a sibling `.trace` recipe (its presence IS the `needsTrace` signal — no recompute), so
+/// call it; everything else is `.inline_kind` (not managed → the emitter no-ops it). Read
+/// AFTER all trace names are minted, so the sibling's `name` is live.
+fn resolveTraceFieldWitness(t: *const Typecheck, ft: Type) Derive.FieldWitness {
+    switch (ft.kind) {
+        .@"struct", .@"enum" => {},
+        else => return .inline_kind,
+    }
+    if (isRefType(t, ft)) return .trace_mark;
+    for (t.derives.items) |d| {
+        if (d.kind == .trace and Type.eql(d.conform_ty, ft)) return .{ .trace_call = d.name.? };
+    }
+    return .inline_kind;
 }
 
 /// True when `recv` has an EXPLICIT/prelude/Ord-refinement `(pid, recv)` conformance in
@@ -161,7 +222,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 // A managed box has no hashable value — its identity is a heap cell, not a
                 // stable key — so a Hash derive over a field that holds one is a compile error.
                 if (isRefType(t, ft)) {
-                    try t.sink.emitFmtCode(.T0030, 0, "cannot derive 'Hash' for '{s}': it holds a Ref (reference identity is not hashable)", .{t.structs.items[ft.struct_id].name});
+                    try t.sink.emitFmtCode(.T0030, 0, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.structs.items[ft.struct_id].name});
                     continue;
                 }
                 if (hasConformanceLive(t, hash_pid, ft)) continue; // explicit Hash field: reuse its witness
@@ -208,6 +269,49 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
+    // Trace fixpoint, the FOURTH co-product of the one walk. Seeded from the UNION of the
+    // four derive worklists intersected with `needsTrace` (a type earns a trace unit as a
+    // co-product of being derived), it chases every by-value aggregate component that itself
+    // holds a managed field — a `Ref` field is the trace BOUNDARY and is never enqueued
+    // (its cell is marked, its pointee never recursed). The SAME `collectComponentTypes`
+    // order the other fixpoints walk, so trace's field projection agrees with eq/hash.
+    var trace_seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer {
+        var it = trace_seen.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        trace_seen.deinit(gpa);
+    }
+    var trace_work: std.ArrayList(Type) = .empty;
+    defer trace_work.deinit(gpa);
+    {
+        var tmemo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+        defer tmemo.deinit(gpa);
+        for ([_][]const Type{ ord_work.items, eq_work.items, hash_work.items, disp_work.items }) |lst| {
+            for (lst) |ty| {
+                switch (ty.kind) {
+                    .@"struct", .@"enum" => {},
+                    else => continue,
+                }
+                if (try needsTrace(t, ty, &tmemo))
+                    try enqueueDerive(gpa, &trace_seen, &trace_work, trace_pid, .trace, ty);
+            }
+        }
+        var ti: usize = 0;
+        while (ti < trace_work.items.len) : (ti += 1) {
+            comps.clearRetainingCapacity();
+            try collectComponentTypes(t, trace_work.items[ti], &comps);
+            for (comps.items) |ft| {
+                switch (ft.kind) {
+                    .@"struct", .@"enum" => {},
+                    else => continue,
+                }
+                if (isRefType(t, ft)) continue; // the trace boundary — mark the cell, never recurse
+                if (try needsTrace(t, ft, &tmemo))
+                    try enqueueDerive(gpa, &trace_seen, &trace_work, trace_pid, .trace, ft);
+            }
+        }
+    }
+
     // Materialize recipes (names/params/field_witnesses filled after the sort).
     const ordering_ty: Type = if (pre.ordering_enum) |oid| Type.enumT(oid) else .{ .kind = .invalid };
     if (ord_pid_opt) |ord_pid| {
@@ -245,6 +349,32 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             .kind = .display,
             .conform_ty = ty,
             .ret = Type.unit,
+        });
+    }
+
+    // Trace recipes + the co-produced `{size, align, size_class}` descriptor records. The
+    // sentinel `trace_pid` sorts these LAST, so no eq/ord/hash/display recipe's position or
+    // minted name shifts. Descriptors read the already-computed layout off the live
+    // struct/enum tables (`layoutStruct`/`layoutEnum` ran before this barrier); the table is
+    // in-memory only (its consumer is a later milestone) and never affects the image bytes.
+    for (trace_work.items) |ty| {
+        try t.derives.append(gpa, .{
+            .protocol_id = trace_pid,
+            .protocol_name = "Trace",
+            .kind = .trace,
+            .conform_ty = ty,
+            .ret = Type.unit,
+        });
+        const is_enum = ty.kind == .@"enum";
+        const id = ty.nominalId();
+        const size = if (is_enum) t.enums.items[id].size else t.structs.items[id].size;
+        const algn = if (is_enum) t.enums.items[id].@"align" else t.structs.items[id].@"align";
+        try t.descriptors.append(gpa, .{
+            .reified_id = id,
+            .is_enum = is_enum,
+            .size = size,
+            .@"align" = algn,
+            .size_class = Abi.sizeClassFor(size),
         });
     }
 
@@ -301,7 +431,8 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         // homogeneous 2-ary (`m(self, other) -> _`). The param count feeds the ABI + the
         // fingerprint Sig fold, so it MUST match the emitter's declared param count.
         d.params = switch (d.kind) {
-            .hash, .display => try gpa.dupe(Type, &[_]Type{d.conform_ty}),
+            // `trace` is a 1-ary unit like `hash`: `trace(self) -> ()`.
+            .hash, .display, .trace => try gpa.dupe(Type, &[_]Type{d.conform_ty}),
             .eq, .ord => try gpa.dupe(Type, &[_]Type{ d.conform_ty, d.conform_ty }),
             // A conv witness takes the source scalar as a plain `int` (the raw value the old
             // inline consumed): `int_to_char(int) -> Result[char,ConvErr]`,
@@ -312,7 +443,10 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         // A conv recipe is NOT a conformance method (`try_into` has no dispatch wiring), so
         // it gets no `t.methods` row — the call site scans `t.derives` for it by kind.
         switch (d.kind) {
-            .conv_int_char, .conv_char_byte, .conv_float_int => {},
+            // `trace` has no dispatch wiring (it is not a source protocol method), so — like
+            // the conv witnesses — it gets no `t.methods` row; the emitter reads the sibling
+            // trace unit off the recipe's resolved `field_witnesses`, not the method table.
+            .conv_int_char, .conv_char_byte, .conv_float_int, .trace => {},
             else => try t.methods.append(gpa, .{
                 .recv = d.conform_ty,
                 .name = Derive.methodName(d.kind),
@@ -396,6 +530,7 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
         .ord => resolveFieldWitness(t, .ord, ft),
         .hash => resolveFieldWitness(t, .hash, ft),
         .display => resolveFieldWitness(t, .display, ft),
+        .trace => resolveTraceFieldWitness(t, ft),
         .conv_int_char, .conv_char_byte, .conv_float_int => unreachable, // guarded above
     };
     return fw;
@@ -419,7 +554,8 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .ord => .{ "cmp", "cmp_call" },
         .hash => .{ "hash", "hash_call" },
         .display => .{ "display", "display_call" },
-        .conv_int_char, .conv_char_byte, .conv_float_int => unreachable, // never instantiated (guarded in resolveDeriveFields)
+        // `trace` is resolved by `resolveTraceFieldWitness`, never this generic path.
+        .trace, .conv_int_char, .conv_char_byte, .conv_float_int => unreachable, // never instantiated (guarded in resolveDeriveFields)
     };
     const pr = Typecheck.gatherPreludeIds(t);
     const pid = switch (kind) {
@@ -427,7 +563,7 @@ fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type
         .ord => pr.ord,
         .hash => pr.hash,
         .display => pr.display,
-        .conv_int_char, .conv_char_byte, .conv_float_int => unreachable,
+        .trace, .conv_int_char, .conv_char_byte, .conv_float_int => unreachable,
     };
     switch (resolveConformanceMethod(t.methods.items, ft, method, pid, null)) {
         .one => |m| return @unionInit(Derive.FieldWitness, variant, witnessName(t, m)),
