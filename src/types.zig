@@ -2124,36 +2124,24 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     // receiver, mirroring the `Type[int].new()` field_access branch above.
     for (tree.nodes, 0..) |n, i| {
         if (n.tag != .empty_list) continue;
-        const recv = node_types[i];
-        if (!recv.isApp()) continue;
-        const re = t.composite.at(recv.appIdx());
-        const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, StdNames.method_new) orelse continue;
-        const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse continue;
-        defer t.gpa.free(out);
-        var conc = true;
-        for (out) |ta| if (!isConcreteValue(ta)) {
-            conc = false;
-            break;
-        };
-        if (!conc) continue;
-        try t.enqueueInstance(model, m.fn_id, out, worklist, seen, mc.tokens[n.main_token].start, mod);
+        for (StdNames.desugarMethods(.empty_list)) |dm| {
+            const recv = desugarRecvType(node_types, n, i, dm.recv);
+            try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, mc.tokens[n.main_token].start, mod);
+        }
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
     // over its typed `Vec[V]` receiver, and a `for x in xs` desugars to `it := xs.iter()`
     // then a loop over `it.next()`: discover the template instances lower will call (the
     // transitive `Vec$T.get`/`mem.ga_*`/`Option$T` follow from re-checking each body).
+    // The method set + receiver source come from the shared `desugarMethods` table so
+    // discovery enqueues exactly what lower emits.
     for (tree.nodes, 0..) |n, i| {
         switch (n.tag) {
-            .list_literal => {
-                const recv = node_types[i];
-                try t.discoverRecvMethod(model, recv, StdNames.method_new, worklist, seen, mc.tokens[n.main_token].start, mod);
-                try t.discoverRecvMethod(model, recv, StdNames.method_push, worklist, seen, mc.tokens[n.main_token].start, mod);
-            },
-            .for_in_stmt => {
-                const recv = node_types[n.rhs.int()];
-                const iter = node_types[i];
-                try t.discoverRecvMethod(model, recv, StdNames.method_iter, worklist, seen, mc.tokens[n.main_token].start, mod);
-                try t.discoverRecvMethod(model, iter, StdNames.method_next, worklist, seen, mc.tokens[n.main_token].start, mod);
+            .list_literal, .for_in_stmt => {
+                for (StdNames.desugarMethods(n.tag)) |dm| {
+                    const recv = desugarRecvType(node_types, n, i, dm.recv);
+                    try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, mc.tokens[n.main_token].start, mod);
+                }
             },
             .index => {
                 // `xs[i]` desugars to `mem.ga_at[V]`; discover that instance keyed on the
@@ -2190,6 +2178,15 @@ fn gaAtGid(model: *const Model) ?u32 {
         if (std.mem.eql(u8, nm, StdNames.ga_at)) return @intCast(i);
     }
     return null;
+}
+
+/// Resolve the receiver type a `desugarMethods` entry selects its method on, from the
+/// sugar node `n` (at index `i`) and the pass's `node_types`.
+fn desugarRecvType(node_types: []const Type, n: Ast.Node, i: usize, src: StdNames.RecvSource) Type {
+    return switch (src) {
+        .node => node_types[i],
+        .rhs => node_types[n.rhs.int()],
+    };
 }
 
 /// Discover-and-enqueue the concrete instance of the template method `name` on the
