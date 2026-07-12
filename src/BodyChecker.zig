@@ -3,6 +3,7 @@ const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
 const TokenTag = @import("ast/Token.zig").Tag;
 const Resolution = @import("symbols/Resolution.zig").Resolution;
+const symbols_res = @import("symbols/Resolution.zig");
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const LayoutEngine = @import("layout/Engine.zig");
 const Type = @import("layout/Type.zig").Type;
@@ -313,6 +314,9 @@ pub const BodyChecker = struct {
                 if (!Type.assignable(lhs, rhs)) {
                     try bc.sink.emitFmt(bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
                 }
+                if (bc.targetRootsAtIndexElement(stmt.lhs)) {
+                    try bc.sink.emitFmt(bc.byteOf(target.main_token), "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{});
+                }
             },
             .return_stmt => {
                 const ty: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, if (bc.cur_ret.kind == .invalid) null else bc.cur_ret);
@@ -576,13 +580,15 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
-    /// A bracketed-postfix `type_app` whose head resolves to a `.local` is a value
-    /// index the parser could not distinguish from a turbofish (`xs[i].f` looks exactly
-    /// like `Vec[int].new()`). A real type-app's head is a struct/enum name, generic fn,
-    /// or module — never `.local` — so this reinterpretation never touches one.
+    /// A bracketed-postfix `type_app` whose head chain's LEFTMOST identifier resolves
+    /// to a value is a value index the parser could not distinguish from a turbofish
+    /// (`b.items[i].f` looks exactly like `mod.Box[int].new()`). A real type-app's
+    /// leftmost is a struct/enum name, generic fn, or module — never `.local` — so
+    /// this reinterpretation never touches one. `b.items[i]` (leftmost `b` -> .local)
+    /// is an index; `mod.Box[int]` (leftmost `mod` -> .module) stays a turbofish.
     fn appHeadIsValue(bc: *BodyChecker, node_idx: Ast.Index) bool {
         const n = bc.tree.nodes[(node_idx).int()];
-        return n.tag == .type_app and bc.resolutions[(n.lhs).int()] == .local;
+        return n.tag == .type_app and symbols_res.leftmostHeadIsValue(bc.tree, bc.resolutions, n.lhs);
     }
 
     /// `recv[idx]` reads a `Vec[V]` element; the result type is V. Shared by the `.index`
@@ -2759,6 +2765,25 @@ pub const BodyChecker = struct {
             .field_access, .tuple_field => bc.isMutablePlace(n.lhs),
             else => false,
         };
+    }
+
+    /// A `.field`/`.tuple_field` chain that bottoms out at an index element
+    /// (`ps[i]` — an `.index` node, or a value-headed `type_app` the parser could
+    /// not tell from a turbofish) has no named, addressable place: `lower`'s
+    /// place-addr materializes the element into a temp, so a store through it would
+    /// write the copy and silently drop the write. Reject the assignment instead.
+    fn targetRootsAtIndexElement(bc: *BodyChecker, node_idx: Ast.Index) bool {
+        var cur = node_idx;
+        while (cur != Ast.none) {
+            const n = bc.tree.nodes[cur.int()];
+            switch (n.tag) {
+                .field_access, .tuple_field => cur = n.lhs,
+                .index => return true,
+                .type_app => return bc.appHeadIsValue(cur),
+                else => return false,
+            }
+        }
+        return false;
     }
 
     fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {

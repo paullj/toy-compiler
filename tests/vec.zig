@@ -510,6 +510,120 @@ test "vec: xs[i].method() dispatches an inherent method on the element" {
     try std.testing.expectEqual(@as(u8, 42), code);
 }
 
+test "vec: b.items[i].field indexes a Vec-typed struct FIELD and reads the element field" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The field-headed value index: `b.items` is a `Vec[P]` struct FIELD, not a local. The
+    // bracket head is a field_access, so the value-index predicate must walk to the LEFTMOST
+    // identifier (`b` -> .local). Formerly misparsed as a qualified type ("unknown module
+    // 'b'"). 3 + 4 = 7.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-field-index",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\struct Bag { items: Vec[P] }
+        \\fn main() -> int {
+        \\    b := Bag { items: [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }] }
+        \\    i := 1
+        \\    return b.items[i].x + b.items[i].y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "vec: b.items[i].method() dispatches an inherent method off a Vec-typed field element" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-field-method",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\impl P { fn sum(self) -> int { self.x + self.y } }
+        \\struct Bag { items: Vec[P] }
+        \\fn main() -> int {
+        \\    b := Bag { items: [P{ x: 20, y: 22 }, P{ x: 1, y: 1 }] }
+        \\    i := 0
+        \\    return b.items[i].sum()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "vec: v := b.items[i]; v.x workaround still reads a Vec-typed field element" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The pre-fix workaround for the field-headed case must keep working.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-field-bind",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\struct Bag { items: Vec[P] }
+        \\fn main() -> int {
+        \\    b := Bag { items: [P{ x: 5, y: 2 }, P{ x: 3, y: 4 }] }
+        \\    v := b.items[1]
+        \\    return v.x + v.y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "vec: indexing a non-indexable struct FIELD is a clean type error (not 'unknown module')" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `b.n[i]` where `n: int`: the leftmost `b` is .local so this is treated as an index,
+    // and indexing an int is rejected as a type error — NOT misrouted to a qualified-type
+    // "unknown module 'b'" path, and NO crash. The compile fails cleanly.
+    const dir = ".toy-test-vec-field-badtype";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.testing.expectError(error.CompileFailed, compile(gpa, io, dir,
+        \\struct Bag { n: int }
+        \\fn main() -> int {
+        \\    b := Bag { n: 3 }
+        \\    i := 0
+        \\    return b.n[i]
+        \\}
+        \\
+    , &.{}));
+}
+
+test "vec: assigning to a field of an index element is rejected (never a silent write-drop)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `b.items[i].x = 99` reads its element into a temp copy, so a store would write the
+    // copy and be lost. The checker must reject it rather than accept-and-drop.
+    const dir = ".toy-test-vec-index-assign";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.testing.expectError(error.CompileFailed, compile(gpa, io, dir,
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\struct Bag { items: Vec[P] }
+        \\fn main() -> int {
+        \\    b := Bag { items: [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }] }
+        \\    i := 1
+        \\    b.items[i].x = 99
+        \\    return b.items[i].x
+        \\}
+        \\
+    , &.{}));
+}
+
 test "vec: indexing a non-indexable value is a clean compile error" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
