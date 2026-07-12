@@ -15,10 +15,11 @@ const resolveConformanceMethod = Typecheck.resolveConformanceMethod;
 
 /// Whether `ty` is a managed box (`Ref[T]`/`gc_array[T]`): a reified struct carrying the
 /// reference-family marker. Such a type is never given a structural Eq/Ord witness (its
-/// `==` is compared inline by cell identity) and blocks a `Hash` derive.
+/// `==` is compared inline by cell identity) and blocks a `Hash` derive. The post-reify
+/// predicate over the live struct table; `lower.isRefTy` runs the same authority
+/// (`Typecheck.isRefStruct`) over the layout snapshot.
 fn isRefType(t: *const Typecheck, ty: Type) bool {
-    return ty.isStruct() and ty.struct_id < t.structs.items.len and
-        t.structs.items[ty.struct_id].native_family != .none;
+    return Typecheck.isRefStruct(ty, t.structs.items);
 }
 
 /// True when `recv` has an EXPLICIT/prelude/Ord-refinement `(pid, recv)` conformance in

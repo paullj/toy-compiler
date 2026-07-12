@@ -134,6 +134,21 @@ pub const StructSym = struct {
     native_family: NativeStructFamily = .none,
 };
 
+/// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`): a reified struct whose entry
+/// in `table` carries a non-`.none` reference-family marker. A box is an 8-byte cell
+/// pointer — lowered as a scalar `int`, NOT by its struct field layout — so every scalar
+/// path that must treat it as a pointer guards on this.
+///
+/// POST-reify only: it indexes a reified struct table by `struct_id`. `table` is any
+/// slice whose element exposes `.native_family` — both the layout snapshot (`[]Layout`,
+/// read by `lower`) and the live checker table (`[]StructSym`, read by derive synthesis)
+/// qualify, so both stages share ONE authority. The PRE-reify analogue tests a live
+/// composite `App` against the prelude and lives in `BodyChecker` (`isRefPayload`).
+pub fn isRefStruct(t: Type, table: anytype) bool {
+    return t.isStruct() and t.struct_id < table.len and
+        table[t.struct_id].native_family != .none;
+}
+
 /// One variant in the scratch enum table (during layout). `field_names`/`name`
 /// are BORROWED source slices; `field_types`/`offsets` are owned arrays.
 pub const VariantSym = struct {
