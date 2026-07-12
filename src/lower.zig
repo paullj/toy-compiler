@@ -2270,17 +2270,16 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             // copies into, an argless join, then yield the slot — mirroring lowerTryInto.
             // A scalar/ref payload keeps the block-arg join, so its IR is byte-identical.
             if (isAggTy(b, payload_ty)) {
-                const res = try b.addSlot(payload_ty);
-                const res_addr = try b.emit(.{ .slot_addr = res }, int_ty);
+                const res = try aggSlot(b, payload_ty);
                 b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
                 b.switchTo(ok_blk);
                 const src = try addrAtOff(b, base, e.payload_off + e.variants[0].offsets[0], payload_ty);
-                try copyValueByType(b, res_addr, src, payload_ty);
+                try copyValueByType(b, res.addr, src, payload_ty);
                 try brTo(b, join, .none);
                 b.switchTo(trap_blk);
                 b.setTerm(.trap);
                 b.switchTo(join);
-                return .{ .slot = res };
+                return .{ .slot = res.slot };
             }
             const merge_ty: Typecheck.Type = switch (passKind(b, payload_ty)) {
                 .box => int_ty,
@@ -2304,18 +2303,17 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             const none_blk = try b.addBlock();
             const join = try b.addBlock();
             if (isAggTy(b, payload_ty)) {
-                const res = try b.addSlot(payload_ty);
-                const res_addr = try b.emit(.{ .slot_addr = res }, int_ty);
+                const res = try aggSlot(b, payload_ty);
                 b.setTerm(.{ .cond_br = .{ .cond = present, .t = some_blk, .f = none_blk } });
                 b.switchTo(some_blk);
                 const src = try addrAtOff(b, base, e.payload_off + e.variants[0].offsets[0], payload_ty);
-                try copyValueByType(b, res_addr, src, payload_ty);
+                try copyValueByType(b, res.addr, src, payload_ty);
                 try brTo(b, join, .none);
                 b.switchTo(none_blk);
-                try lowerExprInto(b, args[0], res_addr, payload_ty);
+                try lowerExprInto(b, args[0], res.addr, payload_ty);
                 try brTo(b, join, .none);
                 b.switchTo(join);
-                return .{ .slot = res };
+                return .{ .slot = res.slot };
             }
             const merge_ty: Typecheck.Type = switch (passKind(b, payload_ty)) {
                 .box => int_ty,
@@ -2771,12 +2769,7 @@ fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfM
     const ea = try b.emit(.{ .add = .{ .lhs = elems, .rhs = off } }, int_ty);
     // A managed-box (`Ref`/`gc_array`) element is an 8-byte scalar cell pointer.
     switch (passKind(b, ty)) {
-        .str, .@"struct", .@"enum" => {
-            const res = try b.addSlot(ty);
-            const res_addr = try b.emit(.{ .slot_addr = res }, int_ty);
-            _ = try b.emit(.{ .copy = .{ .dst = res_addr, .src = ea, .ty = ty } }, null);
-            return .{ .slot = res };
-        },
+        .str, .@"struct", .@"enum" => return .{ .slot = try materializeAgg(b, ty, ea) },
         .box => return .{ .value = try b.emit(.{ .load = .{ .addr = ea, .ty = int_ty } }, int_ty) },
         else => return .{ .value = try b.emit(.{ .load = .{ .addr = ea, .ty = ty } }, ty) },
     }
@@ -3208,6 +3201,28 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
         }
     }
     try brTo(b, b.exit, .{ .slot = ret_slot });
+}
+
+/// A fresh temp slot for an aggregate result, paired with its base address. The
+/// `Option`/`Result` aggregate-payload arms take the slot BEFORE the branch (its addr
+/// must dominate both arms — `unwrap_or` writes the default into it from the none arm),
+/// then copy the payload in the happy arm, so they hold the pieces apart rather than
+/// calling `materializeAgg`.
+const AggSlot = struct { slot: Ir.SlotId, addr: Ir.ValueId };
+
+fn aggSlot(b: *Builder, ty: Typecheck.Type) error{OutOfMemory}!AggSlot {
+    const slot = try b.addSlot(ty);
+    return .{ .slot = slot, .addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int) };
+}
+
+/// Copy an aggregate value at `src` into a fresh temp slot, returning it. The single
+/// "result slot + copy" primitive for when the source address is already in hand: a value
+/// that cannot ride a join block-arg (a struct phi crashes codegen) travels through a slot
+/// instead — an index read yields its element this way.
+fn materializeAgg(b: *Builder, ty: Typecheck.Type, src: Ir.ValueId) error{OutOfMemory}!Ir.SlotId {
+    const res = try aggSlot(b, ty);
+    try copyValueByType(b, res.addr, src, ty);
+    return res.slot;
 }
 
 /// Copy the value of `ty` at `src` into `dst`: a scalar load/store (int/bool), an
