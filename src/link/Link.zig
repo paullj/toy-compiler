@@ -392,12 +392,44 @@ fn symEntLess(_: void, a: SymEnt, b: SymEnt) bool {
     return std.mem.order(u8, a.name, b.name) == .lt;
 }
 
-/// Serialize the backtrace symbol table (see `Linked.sym_table`). `site_h[i]` is fn
-/// i's handle (→ `offsets`); `text_size` is the sentinel row's offset. All fields are
-/// u64 so `__panic` reads them with the existing 8-scaled `ldr`. Entries are sorted by
-/// (off, name) — a total order — so the bytes are independent of fn input order
-/// (`-jN` byte-identical). Layout: `[u64 count][{u64 off,u64 name_off}×count][names]`,
-/// `name_off` a byte offset from the table base to a NUL-terminated name.
+/// One row of a `buildSideTable` side table: an offset key plus the byte offset of
+/// this row's payload WITHIN the trailing blob (the builder rebases it past the
+/// header + rows into a table-base-relative offset). Rows must already be in the
+/// total order the runtime consumer scans in.
+const SideRow = struct { off: u64, blob_off: u64 };
+
+/// Sole authority for the framing every side table `link` reserves in the signed,
+/// read-only __cstring blob and a hand-emitted builtin locates at runtime via a
+/// reserved base hash (today the backtrace symbols; a GC stack map would be a
+/// different `blob`/`rows` payload through this same builder, not a fork). Layout:
+/// `[u64 count][{u64 off, u64 payload_off}×count][blob]`. Each `blob_off` is
+/// relative to `blob`'s start and is rewritten to a table-base-relative
+/// `payload_off`. All fields are u64 so the consumer reads them with an 8-scaled
+/// `ldr`; `rows` must be pre-sorted so the bytes are independent of input order
+/// (`-jN` byte-identical).
+fn buildSideTable(gpa: std.mem.Allocator, rows: []const SideRow, blob: []const u8) ![]u8 {
+    const count = rows.len;
+    const entries_bytes = count * 16;
+    const buf = try gpa.alloc(u8, 8 + entries_bytes + blob.len);
+    errdefer gpa.free(buf);
+
+    std.mem.writeInt(u64, buf[0..8], count, .little);
+    const blob_base: u64 = 8 + entries_bytes;
+    var eo: usize = 8;
+    for (rows) |r| {
+        std.mem.writeInt(u64, buf[eo..][0..8], r.off, .little);
+        std.mem.writeInt(u64, buf[eo + 8 ..][0..8], blob_base + r.blob_off, .little);
+        eo += 16;
+    }
+    @memcpy(buf[blob_base..], blob);
+    return buf;
+}
+
+/// Build the backtrace symbol table (see `Linked.sym_table`) as a `buildSideTable`
+/// payload: one row per fn `{text offset, name}` plus a final `{text_size, ""}`
+/// sentinel (frames past __text name nothing), sorted by (off, name) — a total
+/// order — with the blob a NUL-terminated name per row. `site_h[i]` is fn i's
+/// handle (→ `offsets`).
 fn buildSymTable(gpa: std.mem.Allocator, fns: []const FnCode, site_h: []const u32, offsets: []const u32, text_size: u32) ![]u8 {
     const ents = try gpa.alloc(SymEnt, fns.len + 1);
     defer gpa.free(ents);
@@ -405,27 +437,21 @@ fn buildSymTable(gpa: std.mem.Allocator, fns: []const FnCode, site_h: []const u3
     ents[fns.len] = .{ .off = text_size, .name = "" }; // sentinel: frames past __text name nothing
     std.mem.sortUnstable(SymEnt, ents, {}, symEntLess);
 
-    const count = ents.len;
-    const entries_bytes = count * 16;
     var names_len: usize = 0;
     for (ents) |e| names_len += e.name.len + 1; // + NUL
-    const buf = try gpa.alloc(u8, 8 + entries_bytes + names_len);
-    errdefer gpa.free(buf);
+    const blob = try gpa.alloc(u8, names_len);
+    defer gpa.free(blob);
+    const rows = try gpa.alloc(SideRow, ents.len);
+    defer gpa.free(rows);
 
-    std.mem.writeInt(u64, buf[0..8], count, .little);
-    var name_cursor: u64 = 8 + entries_bytes; // name blob starts after the entries
-    var eo: usize = 8;
-    var no: usize = 8 + entries_bytes;
-    for (ents) |e| {
-        std.mem.writeInt(u64, buf[eo..][0..8], e.off, .little);
-        std.mem.writeInt(u64, buf[eo + 8 ..][0..8], name_cursor, .little);
-        eo += 16;
-        @memcpy(buf[no .. no + e.name.len], e.name);
-        buf[no + e.name.len] = 0;
-        no += e.name.len + 1;
-        name_cursor += e.name.len + 1;
+    var cursor: u64 = 0;
+    for (ents, rows) |e, *row| {
+        row.* = .{ .off = e.off, .blob_off = cursor };
+        @memcpy(blob[cursor .. cursor + e.name.len], e.name);
+        blob[cursor + e.name.len] = 0;
+        cursor += e.name.len + 1;
     }
-    return buf;
+    return buildSideTable(gpa, rows, blob);
 }
 
 /// One per-fn link job's output: the cross-segment relocs this fn contributed (in
@@ -860,6 +886,29 @@ fn linkSymTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32)
     var si: SymInterner = .{};
     defer si.deinit(gpa);
     return link(threaded.io(), gpa, fns, &si, fname(entry), true);
+}
+
+test "buildSideTable: count header, off rows, payload_off rebased past header into blob" {
+    const gpa = testing.allocator;
+    const blob = "ab\x00cd\x00"; // two NUL-terminated payloads at blob offsets 0 and 3
+    const rows = [_]SideRow{
+        .{ .off = 10, .blob_off = 0 },
+        .{ .off = 20, .blob_off = 3 },
+    };
+    const tab = try buildSideTable(gpa, &rows, blob);
+    defer gpa.free(tab);
+
+    const count = std.mem.readInt(u64, tab[0..8], .little);
+    try testing.expectEqual(@as(u64, 2), count);
+    const blob_base: u64 = 8 + count * 16;
+    inline for (rows, 0..) |r, i| {
+        const off = std.mem.readInt(u64, tab[8 + i * 16 ..][0..8], .little);
+        const poff = std.mem.readInt(u64, tab[8 + i * 16 + 8 ..][0..8], .little);
+        try testing.expectEqual(r.off, off);
+        try testing.expectEqual(blob_base + r.blob_off, poff); // rebased past header + rows
+        try testing.expectEqualStrings(if (i == 0) "ab" else "cd", std.mem.sliceTo(tab[poff..], 0));
+    }
+    try testing.expectEqualSlices(u8, blob, tab[blob_base..]);
 }
 
 test "buildSymTable: header + (off,name) rows sorted, trailing text-size sentinel, names round-trip" {
