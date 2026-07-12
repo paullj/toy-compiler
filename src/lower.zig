@@ -2711,7 +2711,9 @@ fn lowerCharLiteralInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId) error
 /// symbol `Vec[T].new()` dispatches to, so `[]` is pure sugar for `.new()`.
 fn lowerEmptyListSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
     const slot = try b.addSlot(ty);
-    const m = Typecheck.findMethod(b.in.methods, ty, StdNames.method_new) orelse {
+    const dm = comptime StdNames.desugarMethods(.empty_list);
+    comptime std.debug.assert(dm.len == 1); // dm[0]: new
+    const m = Typecheck.findMethod(b.in.methods, ty, dm[0].name) orelse {
         try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "empty-list '[]' constructor unresolved in lower");
         return slot;
     };
@@ -2731,7 +2733,9 @@ fn lowerEmptyListSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) erro
 fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
     const n = b.in.tree.nodes[(node_idx).int()];
     const slot = try b.addSlot(ty);
-    const nm = Typecheck.findMethod(b.in.methods, ty, StdNames.method_new) orelse {
+    const dm = comptime StdNames.desugarMethods(.list_literal);
+    comptime std.debug.assert(dm.len == 2); // dm[0]: new, dm[1]: push
+    const nm = Typecheck.findMethod(b.in.methods, ty, dm[0].name) orelse {
         try b.note(n.main_token, "list-literal 'new' constructor unresolved in lower");
         return slot;
     };
@@ -2740,7 +2744,7 @@ fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
         errdefer b.gpa.free(new_args);
         _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, nm), .args = new_args, .ret_slot = slot } }, null);
     }
-    const pm = Typecheck.findMethod(b.in.methods, ty, StdNames.method_push) orelse {
+    const pm = Typecheck.findMethod(b.in.methods, ty, dm[1].name) orelse {
         try b.note(n.main_token, "list-literal 'push' unresolved in lower");
         return slot;
     };
@@ -3625,8 +3629,10 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
     const int_ty = Typecheck.Type.int;
 
+    const dm = comptime StdNames.desugarMethods(.for_in_stmt);
+    comptime std.debug.assert(dm.len == 2); // dm[0]: iter, dm[1]: next
     const recv_ty = b.in.node_types[(stmt.rhs).int()];
-    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, StdNames.method_iter) orelse {
+    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, dm[0].name) orelse {
         try b.note(stmt.main_token, "for-in: no reified 'iter' method in lower");
         return;
     };
@@ -3644,7 +3650,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
         _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
     }
 
-    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, StdNames.method_next) orelse {
+    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, dm[1].name) orelse {
         try b.note(stmt.main_token, "for-in: no reified 'next' method in lower");
         return;
     };
