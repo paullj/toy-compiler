@@ -1168,6 +1168,112 @@ pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 // `.movw_g0`/`.movw_g1` relocs), so `text_base = adr_addr - baked_offset` holds under
 // PIE/ASLR. Loop invariants (text_base, fp cursor, counter, buffer base, shift consts)
 // live in x19-x24/x26 — callee-saved, so they survive each `write` call.
+/// Emit `panic`'s per-frame backtrace work for the frame whose fp is in x20:
+/// read the return address, resolve it to a `0x<call-site-offset> <name>` line
+/// against the symbol table in x27, and write that line to STDERR. Reads the
+/// callee-saved state `lowerPanic` seeds (x19 text_base, x22 buffer, x23/x24 hex
+/// shifts, x26 &write, x27 &symtab); x4-x15/x25/x28 are scratch. Runs inside
+/// `emitFpWalk`'s per-frame slot, so it does its own intra-body backpatching only.
+fn emitPanicFrame(code: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+
+    try emit(code, gpa, A.ldrRegUoff(25, 20, 8)); // x25 = ra = *(fp+8)
+    try emit(code, gpa, A.subReg(25, 25, 19)); // ra - text_base
+    try emit(code, gpa, A.subImm(25, 25, 4)); // -> call site (x25 = frame offset)
+
+    // Symbol lookup: linear-scan the sorted table for the greatest entry off <= x25;
+    // x28 = its name ptr (0 = none). Entries ascend by off, so the first off > target
+    // ends the scan; x28 then holds the enclosing fn's name (or the `{text_size,""}`
+    // sentinel for a frame past __text). x4-x10 are scratch (no write() runs here).
+    try emit(code, gpa, A.ldrRegUoff(4, 27, 0)); // x4 = count
+    try emit(code, gpa, A.addImm(5, 27, 8)); // x5 = &entry[0]
+    try emit(code, gpa, A.movz(6, 0, 0)); // x6 = i
+    try emit(code, gpa, A.movz(28, 0, 0)); // x28 = best name ptr (none)
+    const scan_top: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cmpReg(6, 4)); // i vs count
+    const scan_bhs: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.bCond(.hs, 0)); // i >= count -> scan_done
+    try emit(code, gpa, A.ldrRegUoff(9, 5, 0)); // x9 = entry.off
+    try emit(code, gpa, A.cmpReg(9, 25)); // off vs target
+    const scan_bhi: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.bCond(.hi, 0)); // off > target -> scan_done
+    try emit(code, gpa, A.ldrRegUoff(10, 5, 8)); // x10 = entry.name_off
+    try emit(code, gpa, A.addReg(28, 27, 10)); // x28 = base + name_off
+    try emit(code, gpa, A.addImm(5, 5, 16)); // ++entry
+    try emit(code, gpa, A.addImm(6, 6, 1)); // ++i
+    const scan_b: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0)); // -> scan_top
+    const scan_done: u32 = @intCast(code.items.len);
+
+    // Prefix "0x" into the buffer.
+    try emit(code, gpa, A.movz(9, '0', 0));
+    try emit(code, gpa, A.strb(9, 22, 0));
+    try emit(code, gpa, A.movz(9, 'x', 0));
+    try emit(code, gpa, A.strb(9, 22, 1));
+    try emit(code, gpa, A.addImm(11, 22, 2)); // x11 = write cursor
+    try emit(code, gpa, A.movz(12, 16, 0)); // x12 = 16 nibbles
+    const hex_top: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.lsrv(13, 25, 24)); // top nibble = val >> 60
+    try emit(code, gpa, A.lslv(25, 25, 23)); // val <<= 4
+    try emit(code, gpa, A.andLowBits(13, 13, 3)); // & 0xF
+    try emit(code, gpa, A.cmpImm(13, 10));
+    try emit(code, gpa, A.addImm(14, 13, '0')); // '0' + n
+    try emit(code, gpa, A.addImm(15, 13, 'a' - 10)); // 'a'-10 + n
+    try emit(code, gpa, A.csel(14, 14, 15, .lo)); // n < 10 ? digit : letter
+    try emit(code, gpa, A.strb(14, 11, 0));
+    try emit(code, gpa, A.addImm(11, 11, 1));
+    try emit(code, gpa, A.subImm(12, 12, 1));
+    const cbnz_hex: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbnz(12, 0)); // more nibbles -> HEX
+
+    // Append ' ' then FLUSH the prefix. The buffer only ever holds "0x" + 16 nibbles +
+    // ' ' (19 bytes ≤ 64), so it cannot overflow whatever the (arbitrary-length) name is.
+    try emit(code, gpa, A.movz(9, ' ', 0));
+    try emit(code, gpa, A.strb(9, 11, 0));
+    try emit(code, gpa, A.addImm(11, 11, 1));
+    try emit(code, gpa, A.subReg(2, 11, 22)); // len = cursor - base
+    try emit(code, gpa, A.movReg(1, 22)); // buf
+    try emit(code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(code, gpa, A.blr(26)); // write "0x<hex> "
+
+    // The symbol name, written DIRECTLY from its read-only __cstring pointer (x28):
+    // strlen then write — no copy into the fixed buffer, so no length bound on names.
+    // A missing entry (x28 == 0) or the sentinel's empty name writes nothing.
+    const name_guard: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(28, 0)); // no entry -> name_done
+    try emit(code, gpa, A.movReg(9, 28)); // x9 = scan ptr
+    const strlen_top: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.ldrbRegUoff(10, 9, 0)); // w10 = *ptr
+    const strlen_cbz: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(10, 0)); // NUL -> strlen_done
+    try emit(code, gpa, A.addImm(9, 9, 1));
+    const strlen_b: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0)); // -> strlen_top
+    const strlen_done: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.subReg(2, 9, 28)); // len = ptr - name
+    try emit(code, gpa, A.movReg(1, 28)); // buf = name ptr
+    try emit(code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(code, gpa, A.blr(26)); // write the name
+    const name_done: u32 = @intCast(code.items.len);
+
+    // Trailing newline (always, even for an unnamed frame).
+    try emit(code, gpa, A.movz(9, '\n', 0));
+    try emit(code, gpa, A.strb(9, 22, 0)); // buffer[0] = '\n'
+    try emit(code, gpa, A.movz(2, 1, 0)); // len 1
+    try emit(code, gpa, A.movReg(1, 22)); // buf
+    try emit(code, gpa, A.movz(0, 2, 0)); // fd 2
+    try emit(code, gpa, A.blr(26)); // write '\n'
+
+    patchCbzTo(code.items, cbnz_hex, hex_top);
+    patchBCondTo(code.items, scan_bhs, scan_done);
+    patchBCondTo(code.items, scan_bhi, scan_done);
+    patchBTo(code.items, scan_b, scan_top);
+    patchCbzTo(code.items, name_guard, name_done);
+    patchCbzTo(code.items, strlen_cbz, strlen_done);
+    patchBTo(code.items, strlen_b, strlen_top);
+}
+
 pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
     var code: std.ArrayList(u8) = .empty;
@@ -1229,121 +1335,15 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.movz(23, 4, 0)); // x23 = 4
     try emit(&code, gpa, A.movz(24, 60, 0)); // x24 = 60
 
-    const loop_top: u32 = @intCast(code.items.len);
-    const cbz_fp: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(20, 0)); // fp == 0 -> DONE
-    const cbz_cnt: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(21, 0)); // counter == 0 -> DONE
-    try emit(&code, gpa, A.ldrRegUoff(25, 20, 8)); // x25 = ra = *(fp+8)
-    try emit(&code, gpa, A.subReg(25, 25, 19)); // ra - text_base
-    try emit(&code, gpa, A.subImm(25, 25, 4)); // -> call site (x25 = frame offset)
+    // Walk the x29 chain, symbolizing each live frame; the loop falls through
+    // when fp hits 0 (or the 64-frame cap trips), leaving x20 == 0.
+    try emitFpWalk(&code, gpa, .each_frame, 20, 21, undefined, emitPanicFrame);
 
-    // Symbol lookup: linear-scan the sorted table for the greatest entry off <= x25;
-    // x28 = its name ptr (0 = none). Entries ascend by off, so the first off > target
-    // ends the scan; x28 then holds the enclosing fn's name (or the `{text_size,""}`
-    // sentinel for a frame past __text). x4-x10 are scratch (no write() runs here).
-    try emit(&code, gpa, A.ldrRegUoff(4, 27, 0)); // x4 = count
-    try emit(&code, gpa, A.addImm(5, 27, 8)); // x5 = &entry[0]
-    try emit(&code, gpa, A.movz(6, 0, 0)); // x6 = i
-    try emit(&code, gpa, A.movz(28, 0, 0)); // x28 = best name ptr (none)
-    const scan_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cmpReg(6, 4)); // i vs count
-    const scan_bhs: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.bCond(.hs, 0)); // i >= count -> scan_done
-    try emit(&code, gpa, A.ldrRegUoff(9, 5, 0)); // x9 = entry.off
-    try emit(&code, gpa, A.cmpReg(9, 25)); // off vs target
-    const scan_bhi: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.bCond(.hi, 0)); // off > target -> scan_done
-    try emit(&code, gpa, A.ldrRegUoff(10, 5, 8)); // x10 = entry.name_off
-    try emit(&code, gpa, A.addReg(28, 27, 10)); // x28 = base + name_off
-    try emit(&code, gpa, A.addImm(5, 5, 16)); // ++entry
-    try emit(&code, gpa, A.addImm(6, 6, 1)); // ++i
-    const scan_b: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0)); // -> scan_top
-    const scan_done: u32 = @intCast(code.items.len);
-
-    // Prefix "0x" into the buffer.
-    try emit(&code, gpa, A.movz(9, '0', 0));
-    try emit(&code, gpa, A.strb(9, 22, 0));
-    try emit(&code, gpa, A.movz(9, 'x', 0));
-    try emit(&code, gpa, A.strb(9, 22, 1));
-    try emit(&code, gpa, A.addImm(11, 22, 2)); // x11 = write cursor
-    try emit(&code, gpa, A.movz(12, 16, 0)); // x12 = 16 nibbles
-    const hex_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.lsrv(13, 25, 24)); // top nibble = val >> 60
-    try emit(&code, gpa, A.lslv(25, 25, 23)); // val <<= 4
-    try emit(&code, gpa, A.andLowBits(13, 13, 3)); // & 0xF
-    try emit(&code, gpa, A.cmpImm(13, 10));
-    try emit(&code, gpa, A.addImm(14, 13, '0')); // '0' + n
-    try emit(&code, gpa, A.addImm(15, 13, 'a' - 10)); // 'a'-10 + n
-    try emit(&code, gpa, A.csel(14, 14, 15, .lo)); // n < 10 ? digit : letter
-    try emit(&code, gpa, A.strb(14, 11, 0));
-    try emit(&code, gpa, A.addImm(11, 11, 1));
-    try emit(&code, gpa, A.subImm(12, 12, 1));
-    const cbnz_hex: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbnz(12, 0)); // more nibbles -> HEX
-
-    // Append ' ' then FLUSH the prefix. The buffer only ever holds "0x" + 16 nibbles +
-    // ' ' (19 bytes ≤ 64), so it cannot overflow whatever the (arbitrary-length) name is.
-    try emit(&code, gpa, A.movz(9, ' ', 0));
-    try emit(&code, gpa, A.strb(9, 11, 0));
-    try emit(&code, gpa, A.addImm(11, 11, 1));
-    try emit(&code, gpa, A.subReg(2, 11, 22)); // len = cursor - base
-    try emit(&code, gpa, A.movReg(1, 22)); // buf
-    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
-    try emit(&code, gpa, A.blr(26)); // write "0x<hex> "
-
-    // The symbol name, written DIRECTLY from its read-only __cstring pointer (x28):
-    // strlen then write — no copy into the fixed buffer, so no length bound on names.
-    // A missing entry (x28 == 0) or the sentinel's empty name writes nothing.
-    const name_guard: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(28, 0)); // no entry -> name_done
-    try emit(&code, gpa, A.movReg(9, 28)); // x9 = scan ptr
-    const strlen_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.ldrbRegUoff(10, 9, 0)); // w10 = *ptr
-    const strlen_cbz: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(10, 0)); // NUL -> strlen_done
-    try emit(&code, gpa, A.addImm(9, 9, 1));
-    const strlen_b: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0)); // -> strlen_top
-    const strlen_done: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.subReg(2, 9, 28)); // len = ptr - name
-    try emit(&code, gpa, A.movReg(1, 28)); // buf = name ptr
-    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
-    try emit(&code, gpa, A.blr(26)); // write the name
-    const name_done: u32 = @intCast(code.items.len);
-
-    // Trailing newline (always, even for an unnamed frame).
-    try emit(&code, gpa, A.movz(9, '\n', 0));
-    try emit(&code, gpa, A.strb(9, 22, 0)); // buffer[0] = '\n'
-    try emit(&code, gpa, A.movz(2, 1, 0)); // len 1
-    try emit(&code, gpa, A.movReg(1, 22)); // buf
-    try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
-    try emit(&code, gpa, A.blr(26)); // write '\n'
-    try emit(&code, gpa, A.ldrRegUoff(20, 20, 0)); // fp = *fp
-    try emit(&code, gpa, A.subImm(21, 21, 1)); // counter--
-    const b_loop: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0)); // -> LOOP
-
-    const done_pos: u32 = @intCast(code.items.len);
     // SYS_exit(1): x0 = status, x16 = SYS_exit, svc #0x80. Never returns.
     try emit(&code, gpa, A.movz(0, 1, 0));
     try emit(&code, gpa, A.movz(16, 1, 0));
     try emit(&code, gpa, A.svc0x80);
     try emit(&code, gpa, A.brk0); // unreachable backstop
-
-    // Backpatch the intra-fn branches (signed word deltas).
-    const buf = code.items;
-    patchCbzTo(buf, cbz_fp, done_pos);
-    patchCbzTo(buf, cbz_cnt, done_pos);
-    patchCbzTo(buf, cbnz_hex, hex_top);
-    patchBTo(buf, b_loop, loop_top);
-    patchBCondTo(buf, scan_bhs, scan_done);
-    patchBCondTo(buf, scan_bhi, scan_done);
-    patchBTo(buf, scan_b, scan_top);
-    patchCbzTo(buf, name_guard, name_done);
-    patchCbzTo(buf, strlen_cbz, strlen_done);
-    patchBTo(buf, strlen_b, strlen_top);
 
     return finishBuiltin(&code, &relocs, gpa, "panic");
 }
@@ -1369,6 +1369,94 @@ fn patchBTo(buf: []u8, site: u32, target: u32) void {
     const delta: i26 = @intCast(@divExact(@as(i64, target) - @as(i64, site), 4));
     const word = std.mem.readInt(u32, buf[site..][0..4], .little);
     std.mem.writeInt(u32, buf[site..][0..4], Aarch64.patchB(word, delta), .little);
+}
+
+/// The two x29-chain walk shapes. They differ behaviorally, not cosmetically:
+/// `each_frame` guards the current fp, runs per-frame work on it, then advances —
+/// falling through with the cursor at 0; `to_outermost` advances to the last
+/// non-null fp and keeps it in the cursor, doing no per-frame work.
+const FpWalkMode = enum { each_frame, to_outermost };
+
+/// Emit an x29 frame-chain walk shared by `panic` (symbolize every live frame)
+/// and the collector root scan (locate the outermost frame). Emits a null-fp +
+/// cap-backstop loop that advances `cursor = *cursor` and backpatches its two
+/// `cbz`s to the fall-through exit and its `b` to the loop top. The caller seeds
+/// `cursor` (from x29) and `cap_reg` before the call and consumes the terminal
+/// state after it. `.each_frame` emits `per_frame` (if non-null) once per live
+/// frame with the frame's fp in `cursor` and ignores `scratch`; `.to_outermost`
+/// uses `scratch` as the parent register and ignores `per_frame`.
+fn emitFpWalk(
+    code: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    comptime mode: FpWalkMode,
+    cursor: u32,
+    cap_reg: u32,
+    scratch: u32,
+    per_frame: ?*const fn (*std.ArrayList(u8), std.mem.Allocator) error{OutOfMemory}!void,
+) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const loop_top: u32 = @intCast(code.items.len);
+    var cbz_null: u32 = undefined;
+    var cbz_cap: u32 = undefined;
+    switch (mode) {
+        .each_frame => {
+            cbz_null = @intCast(code.items.len);
+            try emitWord(code, gpa, A.cbz(cursor, 0)); // fp == 0 -> done
+            cbz_cap = @intCast(code.items.len);
+            try emitWord(code, gpa, A.cbz(cap_reg, 0)); // cap exhausted -> done
+            if (per_frame) |cb| try cb(code, gpa);
+            try emitWord(code, gpa, A.ldrRegUoff(cursor, cursor, 0)); // fp = *fp
+            try emitWord(code, gpa, A.subImm(cap_reg, cap_reg, 1));
+        },
+        .to_outermost => {
+            try emitWord(code, gpa, A.ldrRegUoff(scratch, cursor, 0)); // parent = *fp
+            cbz_null = @intCast(code.items.len);
+            try emitWord(code, gpa, A.cbz(scratch, 0)); // parent == 0 -> keep cursor
+            try emitWord(code, gpa, A.subImm(cap_reg, cap_reg, 1));
+            cbz_cap = @intCast(code.items.len);
+            try emitWord(code, gpa, A.cbz(cap_reg, 0)); // cap exhausted -> done
+            try emitWord(code, gpa, A.movReg(cursor, scratch));
+        },
+    }
+    const b_site: u32 = @intCast(code.items.len);
+    try emitWord(code, gpa, A.b(0));
+    const done: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_null, done);
+    patchCbzTo(code.items, cbz_cap, done);
+    patchBTo(code.items, b_site, loop_top);
+}
+
+test "emitFpWalk each_frame: top-guarded loop advancing in place, cbz/b patched" {
+    const gpa = std.testing.allocator;
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(gpa);
+    try emitFpWalk(&code, gpa, .each_frame, 20, 21, undefined, null);
+
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    try emitWord(&want, gpa, Aarch64.cbz(20, 5)); // @0  -> done @20
+    try emitWord(&want, gpa, Aarch64.cbz(21, 4)); // @4  -> done @20
+    try emitWord(&want, gpa, Aarch64.ldrRegUoff(20, 20, 0)); // fp = *fp
+    try emitWord(&want, gpa, Aarch64.subImm(21, 21, 1));
+    try emitWord(&want, gpa, Aarch64.b(-4)); // @16 -> loop top @0
+    try std.testing.expectEqualSlices(u8, want.items, code.items);
+}
+
+test "emitFpWalk to_outermost: parent-load loop keeping the last non-null fp" {
+    const gpa = std.testing.allocator;
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(gpa);
+    try emitFpWalk(&code, gpa, .to_outermost, 0, 1, 2, null);
+
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    try emitWord(&want, gpa, Aarch64.ldrRegUoff(2, 0, 0)); // parent = *fp
+    try emitWord(&want, gpa, Aarch64.cbz(2, 5)); // @4  -> done @24
+    try emitWord(&want, gpa, Aarch64.subImm(1, 1, 1));
+    try emitWord(&want, gpa, Aarch64.cbz(1, 3)); // @12 -> done @24
+    try emitWord(&want, gpa, Aarch64.movReg(0, 2));
+    try emitWord(&want, gpa, Aarch64.b(-5)); // @20 -> loop top @0
+    try std.testing.expectEqualSlices(u8, want.items, code.items);
 }
 
 // A conservative, non-moving MARK-SWEEP collector, hand-emitted like `print`/`panic`.
@@ -1883,23 +1971,11 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.cbnz(1, 0));
     patchCbzTo(code.items, cbnz_reset, reset_top);
 
-    // Walk the FP chain to the outermost frame; x_hi = outermost_fp + 16.
+    // Walk the FP chain to the outermost frame (x0 = last non-null fp, x2 = the
+    // null parent that stops it); x_hi = outermost_fp + 16.
     try emit(&code, gpa, A.movReg(0, A.FP));
     try emit(&code, gpa, A.movz(1, 4096, 0)); // corruption backstop
-    const fpwalk_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.ldrRegUoff(2, 0, 0)); // parent = *fp
-    const cbz_fpdone: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(2, 0)); // parent == 0 → outermost
-    try emit(&code, gpa, A.subImm(1, 1, 1));
-    const cbz_fpdone2: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(1, 0)); // cap hit → stop
-    try emit(&code, gpa, A.movReg(0, 2));
-    const b_fpwalk: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0));
-    const fpwalk_done: u32 = @intCast(code.items.len);
-    patchCbzTo(code.items, cbz_fpdone, fpwalk_done);
-    patchCbzTo(code.items, cbz_fpdone2, fpwalk_done);
-    patchBTo(code.items, b_fpwalk, fpwalk_top);
+    try emitFpWalk(&code, gpa, .to_outermost, 0, 1, 2, null);
     try emit(&code, gpa, A.addImm(21, 0, 16)); // x_hi
 
     // Root scan: conservatively mark every nonzero word of [x_lo, x_hi).
