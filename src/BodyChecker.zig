@@ -576,6 +576,36 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
+    /// A bracketed-postfix `type_app` whose head resolves to a `.local` is a value
+    /// index the parser could not distinguish from a turbofish (`xs[i].f` looks exactly
+    /// like `Vec[int].new()`). A real type-app's head is a struct/enum name, generic fn,
+    /// or module — never `.local` — so this reinterpretation never touches one.
+    fn appHeadIsValue(bc: *BodyChecker, node_idx: Ast.Index) bool {
+        const n = bc.tree.nodes[(node_idx).int()];
+        return n.tag == .type_app and bc.resolutions[(n.lhs).int()] == .local;
+    }
+
+    /// `recv[idx]` reads a `Vec[V]` element; the result type is V. Shared by the `.index`
+    /// arm and the value-headed `.type_app` reinterpretation.
+    fn typeOfIndexParts(bc: *BodyChecker, recv: Ast.Index, idx: Ast.Index, main_token: u32) error{OutOfMemory}!Type {
+        const rt = try bc.typeOf(recv);
+        const it = try bc.typeOfExpected(idx, Type.int);
+        const vec_ctor = bc.activeStructMap().get("Vec");
+        if (!rt.isApp()) {
+            if (rt.kind != .invalid)
+                try bc.sink.emitFmt(bc.byteOf(main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+            return Type.invalid;
+        }
+        const e = bc.composite.at(rt.appIdx());
+        if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1) {
+            try bc.sink.emitFmt(bc.byteOf(main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+            return Type.invalid;
+        }
+        if (it.kind != .int and it.kind != .invalid)
+            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(idx).int()].main_token), "an index must be 'int', got '{s}'", .{bc.typeName(it)});
+        return e.args[0];
+    }
+
     pub fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
         if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
@@ -814,24 +844,19 @@ pub const BodyChecker = struct {
                 };
                 break :blk result;
             },
-            .index => blk: {
-                // `recv[i]` reads a `Vec[V]` element; the result type is V.
-                const rt = try bc.typeOf(n.lhs);
-                const it = try bc.typeOfExpected(n.rhs, Type.int);
-                const vec_ctor = bc.activeStructMap().get("Vec");
-                if (!rt.isApp()) {
-                    if (rt.kind != .invalid)
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+            .index => try bc.typeOfIndexParts(n.lhs, n.rhs, n.main_token),
+            // A `type_app` reaches `typeOf` as a standalone expr only when the parser
+            // could not tell a value index `xs[i]` from a turbofish and the head turned
+            // out to resolve to a value; reinterpret it as an index. A real type-app is
+            // consumed by call/struct_init/field_access and never lands here.
+            .type_app => blk: {
+                if (!bc.appHeadIsValue(node_idx)) break :blk Type.invalid;
+                const targs = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                if (targs.len != 1) {
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot index a value with {d} subscripts", .{targs.len});
                     break :blk Type.invalid;
                 }
-                const e = bc.composite.at(rt.appIdx());
-                if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1) {
-                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
-                    break :blk Type.invalid;
-                }
-                if (it.kind != .int and it.kind != .invalid)
-                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(n.rhs).int()].main_token), "an index must be 'int', got '{s}'", .{bc.typeName(it)});
-                break :blk e.args[0];
+                break :blk try bc.typeOfIndexParts(n.lhs, targs[0], n.main_token);
             },
             .call => try bc.typeOfCall(node_idx, n),
             .struct_init => try bc.typeOfStructInit(node_idx, n),
@@ -871,7 +896,7 @@ pub const BodyChecker = struct {
         var targs: []const Type = &.{};
         var result: Type = undefined;
         var disp_name: []const u8 = undefined;
-        if (lhs.tag == .type_app) {
+        if (lhs.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
             const app_ty = bc.typeFromNode(n.lhs); // App or invalid (already diagnosed)
             if (!app_ty.isApp()) {
                 for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
@@ -1054,7 +1079,7 @@ pub const BodyChecker = struct {
         // App's args and type the node as the `App` (reified to `enumT` in the mono tail).
         // Placed BEFORE the value `typeOf(n.lhs)` so a `type_app` receiver never mis-routes
         // into the struct-field-access path.
-        if (recv.tag == .type_app) {
+        if (recv.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
             const app_ty = bc.typeFromNode(n.lhs);
             if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
                 const e = bc.composite.at(app_ty.appIdx());
@@ -1692,7 +1717,7 @@ pub const BodyChecker = struct {
         //: the callee field_access's receiver is a `type_app` resolving to an
         // enum-`App`. Substitute the variant payload patterns through the App's args
         // and type the node as the `App` (reified to `enumT` in the mono tail).
-        if (recv.tag == .type_app) {
+        if (recv.tag == .type_app and !bc.appHeadIsValue(callee.lhs)) {
             const app_ty = bc.typeFromNode(callee.lhs);
             if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
                 const e = bc.composite.at(app_ty.appIdx());
@@ -1730,7 +1755,7 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[(callee.lhs).int()];
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        if (recv.tag == .type_app) {
+        if (recv.tag == .type_app and !bc.appHeadIsValue(callee.lhs)) {
             const app_ty = bc.typeFromNode(callee.lhs);
             if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
             const e = bc.composite.at(app_ty.appIdx());

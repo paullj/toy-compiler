@@ -717,7 +717,18 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         // (`n.lhs`). The type-arg Range is NOT descended — resolving a type name
         // like `int` would fire R0001 and stop the pipeline at resolve, pre-empting
         // the T0013 generics gate at typecheck. Forward-safety.
-        .type_app => try g.resolveExpr(n.lhs),
+        //
+        // EXCEPT when the head resolves to a `.local`: then this is a value index
+        // `xs[i]` the parser could not tell from a turbofish, and its bracket
+        // contents are an ordinary expression (`i`) whose names must bind. A real
+        // type-app's head is a struct/enum name (.unresolved), a generic fn (.func),
+        // or a module (.module) — never `.local` — so its type-arg range stays
+        // undescended and R0001 on `int` never fires.
+        .type_app => {
+            try g.resolveExpr(n.lhs);
+            if (g.resolutions[g.cur_mod][n.lhs.int()] == .local)
+                for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a);
+        },
         // Postfix `?`: resolve the operand's names; the `?` itself binds nothing.
         .try_expr => try g.resolveExpr(n.lhs),
         // A list literal's elements and a value index's receiver + index are ordinary

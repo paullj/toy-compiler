@@ -603,6 +603,18 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
         // A non-empty `[e0, ..]` builds a `Vec[V]` via `new()` + one `push` per element.
         .list_literal => return .{ .slot = try lowerListLiteralSlot(b, node_idx, ty) },
         .index => return try lowerIndex(b, node_idx, ty),
+        // A value-headed `type_app` is a value index the parser could not tell from a
+        // turbofish (`xs[i].f`); the checker typed it as an index, so lower it as one. A
+        // real type-app is consumed by call/struct_init/field_access and never reaches
+        // lowerExpr standalone.
+        .type_app => {
+            if (!appHeadIsValue(b, node_idx)) {
+                try b.note(n.main_token, "expression unsupported in lower");
+                return .none;
+            }
+            const targs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            return try lowerIndexCore(b, n.lhs, targs[0], n.main_token, ty);
+        },
         // A poison leaf must never reach lower: a tainted tree is gated out before
         // codegen, and it is not produced anywhere yet.
         .error_node => unreachable,
@@ -2618,7 +2630,9 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
             _ = try b.emit(.{ .copy = .{ .dst = dst_ptr, .src = src, .ty = ty } }, null);
         },
         // An aggregate `Vec[V]` element read: lowerIndex yields its `.slot`, copy out.
-        .index => try copyAggInto(b, expr, dst_ptr, ty),
+        // A value-headed `type_app` is the same element read the parser could not tell
+        // from a turbofish.
+        .index, .type_app => try copyAggInto(b, expr, dst_ptr, ty),
         // An arithmetic operator on struct/enum operands desugars to an
         // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
         // `.slot`, so copy those bytes into the destination like any other agg result.
@@ -2762,21 +2776,33 @@ fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
 /// offsets and stride (see `core/mem`). The result is placed by how V travels: an
 /// aggregate into a fresh slot, a scalar/box in a register.
 fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
-    const int_ty = Typecheck.Type.int;
     const n = b.in.tree.nodes[(node_idx).int()];
-    const recv_op = try lowerExpr(b, n.lhs);
+    return try lowerIndexCore(b, n.lhs, n.rhs, n.main_token, ty);
+}
+
+/// A bracketed-postfix `type_app` whose head resolves to a `.local` is a value index the
+/// parser could not tell from a turbofish; mirrors `BodyChecker.appHeadIsValue` so lower
+/// reinterprets exactly the nodes the checker typed as an index.
+fn appHeadIsValue(b: *Builder, node_idx: Ast.Index) bool {
+    const n = b.in.tree.nodes[(node_idx).int()];
+    return n.tag == .type_app and b.in.resolutions[(n.lhs).int()] == .local;
+}
+
+fn lowerIndexCore(b: *Builder, recv: Ast.Index, idx: Ast.Index, main_token: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const recv_op = try lowerExpr(b, recv);
     const base = try operandPtr(b, recv_op);
     if (base == Ir.none_value) return .none;
     const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
-    const idx = operandValue(try lowerExpr(b, n.rhs));
+    const idx_val = operandValue(try lowerExpr(b, idx));
     const callee = gaAtCallee(b, ty) orelse {
-        try b.note(n.main_token, "unresolved 'ga_at' index primitive in lower");
+        try b.note(main_token, "unresolved 'ga_at' index primitive in lower");
         return .none;
     };
     const args = try b.gpa.alloc(Ir.Operand, 2);
     errdefer b.gpa.free(args);
     args[0] = .{ .value = handle };
-    args[1] = .{ .value = idx };
+    args[1] = .{ .value = idx_val };
     switch (passKind(b, ty)) {
         .box => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty) },
         .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, ty) },
@@ -2788,7 +2814,7 @@ fn lowerIndex(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfM
         .unit, .never, .invalid => {
             const slot = try b.addSlot(ty);
             _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
-            try b.note(n.main_token, "index result type unsupported in lower");
+            try b.note(main_token, "index result type unsupported in lower");
             return .{ .slot = slot };
         },
     }
@@ -2899,6 +2925,20 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
                 }
             }
             return base_addr; // unreachable on a well-typed program
+        },
+        // A `.field` off an index element (`ps[i].x`): the element is an rvalue with no
+        // named place, so materialize it into a temp and return that temp's ptr — the
+        // `.field_access` recursion above then computes `field_addr` off it. A store
+        // through this ptr would write the copy, not the vector; the checker's mutable-
+        // place gate rejects `ps[i].x = v`, so this is only ever a read base.
+        .index => {
+            const op = try lowerExpr(b, node_idx);
+            return try operandPtr(b, op);
+        },
+        .type_app => {
+            if (!appHeadIsValue(b, node_idx)) return Ir.none_value;
+            const op = try lowerExpr(b, node_idx);
+            return try operandPtr(b, op);
         },
         else => return Ir.none_value,
     }

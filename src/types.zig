@@ -2182,6 +2182,17 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                     try t.enqueueInstance(model, gid, &args, worklist, seen, mc.tokens[n.main_token].start, mod);
                 };
             },
+            // A value-headed `type_app` is a value index the parser could not tell from a
+            // turbofish (`xs[i].f`); it lowers through the same `mem.ga_at[V]` primitive as
+            // `.index`, so discover that instance too. A real type-app's head is not
+            // `.local`, so this never fires for one.
+            .type_app => if (resolutions[n.lhs.int()] == .local) {
+                const elem = node_types[i];
+                if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
+                    const args = [_]Type{elem};
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, mc.tokens[n.main_token].start, mod);
+                };
+            },
             else => {},
         }
     }

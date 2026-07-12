@@ -445,3 +445,87 @@ test "vec: a Vec program is byte-identical at -j1 and -j8" {
     }
     try std.testing.expect(differing <= 1);
 }
+
+test "vec: xs[i].field reads a struct element's field in place (variable index)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `ps[i].x + ps[i].y` with a VARIABLE index exercises the value-headed bracketed-
+    // postfix path (the parser cannot tell `ps[i].x` from a `Vec[int].new()` turbofish;
+    // the checker reinterprets a value-resolved head as an index). 3 + 4 = 7.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-index-field",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    ps := [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }]
+        \\    i := 1
+        \\    return ps[i].x + ps[i].y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "vec: a := ps[0]; a.x workaround still reads the element field" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The pre-fix workaround (bind the element to a local, then access) must keep working.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-index-bind",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    ps := [P{ x: 5, y: 2 }, P{ x: 3, y: 4 }]
+        \\    a := ps[0]
+        \\    return a.x + a.y
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "vec: xs[i].method() dispatches an inherent method on the element" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `ps[i].sum()` with a variable index: the element read composes with instance-method
+    // dispatch. 20 + 22 = 42.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-index-method",
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\impl P { fn sum(self) -> int { self.x + self.y } }
+        \\fn main() -> int {
+        \\    ps := [P{ x: 20, y: 22 }, P{ x: 1, y: 1 }]
+        \\    i := 0
+        \\    return ps[i].sum()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "vec: indexing a non-indexable value is a clean compile error" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `n[0]` on an int must be rejected (not a spurious "unknown type 'n'"); the compile
+    // fails cleanly.
+    const dir = ".toy-test-vec-index-badtype";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.testing.expectError(error.CompileFailed, compile(gpa, io, dir,
+        \\fn main() -> int {
+        \\    n := 3
+        \\    return n[0]
+        \\}
+        \\
+    , &.{}));
+}
