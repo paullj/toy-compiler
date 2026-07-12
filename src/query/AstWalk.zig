@@ -28,7 +28,6 @@ const TokenTag = @import("../ast/Token.zig").Tag;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const Mono = @import("../symbols/Mono.zig");
-const Infer = @import("../symbols/Infer.zig");
 
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 const Fingerprint = @import("Fingerprint.zig");
@@ -567,7 +566,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         {
                             try self.foldMethodCalleeExplicit(cn);
                         } else {
-                            try self.foldGenericCallee(cn);
+                            try self.foldViaInstanceRef(c.call);
                         }
                         return;
                     }
@@ -584,8 +583,8 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         // so the caller folds the SAME identity the reloc targets (mirroring
                         // the type_app path). The plain-identifier gate matches the other
                         // three sites; a bare qualified generic call is rejected at Pass C.
-                        if (self.frozen.tree.nodes[c.idx.int()].tag == .identifier and sigHasTypeVar(sig)) {
-                            try self.foldInferredGenericCallee(c.call, res.func, sig);
+                        if (self.frozen.tree.nodes[c.idx.int()].tag == .identifier and sig.hasTypeVar()) {
+                            try self.foldViaInstanceRef(c.call);
                             return;
                         }
                         const nm = self.frozen.names[res.func];
@@ -784,59 +783,20 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
         }
 
-        fn foldGenericCallee(self: *Self, cn: Ast.Node) error{OutOfMemory}!void {
-            const bres = self.frozen.resolutions[cn.lhs.int()];
-            if (bres != .func) return;
-            const targ_nodes = Ast.rangeSlice(self.frozen.tree, cn.rhs.int());
-            const args = try self.gpa.alloc(Typecheck.Type, targ_nodes.len);
-            defer self.gpa.free(args);
-            for (targ_nodes, 0..) |tn, i| {
-                if (tn.int() >= self.frozen.node_types.len) return; // pre-typecheck view
-                args[i] = self.frozen.node_types[tn.int()];
-            }
-            const ii = Mono.find(self.frozen.instances, bres.func, args) orelse return;
-            const inst = self.frozen.instances[ii];
-            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
-        }
-
-        /// Bare inferred generic callee: infer the type-args from the enclosing
-        /// call's value-arg node_types (the SAME matcher Pass C / scanCalls ran), find
-        /// the reified instance, and fold its INSTANCE sig. A miss (pre-typecheck view,
-        /// arity/conflict/unbound, or an unminted instance) folds nothing — identical to
-        /// `foldGenericCallee`, so exactly one-or-zero Sig per call is preserved.
-        fn foldInferredGenericCallee(self: *Self, call_idx: Ast.Index, gid: u32, sig: Sig) error{OutOfMemory}!void {
+        /// Recover the generic call's `(gid, type-args)` via the SHARED `callInstanceRef`
+        /// (explicit turbofish or bare inference), find the reified instance, and fold its
+        /// INSTANCE sig. A miss (pre-typecheck view, arity/conflict/unbound, or an unminted
+        /// instance) folds nothing, so exactly one-or-zero Sig per call is preserved and the
+        /// fold tracks the SAME `Instance` mono discovery enqueued.
+        fn foldViaInstanceRef(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
             const call_node = self.frozen.tree.nodes[call_idx.int()];
-            const value_args = Ast.rangeSlice(self.frozen.tree, call_node.rhs.int());
-            const arg_types = try self.gpa.alloc(Typecheck.Type, value_args.len);
-            defer self.gpa.free(arg_types);
-            for (value_args, 0..) |va, i| {
-                if (va.int() >= self.frozen.node_types.len) return; // pre-typecheck view
-                arg_types[i] = self.frozen.node_types[va.int()];
-            }
-            const targs = (try Infer.infer(self.gpa, genericParamCount(sig), sig.params, arg_types)) orelse return;
-            defer self.gpa.free(targs);
-            const ii = Mono.find(self.frozen.instances, gid, targs) orelse return;
+            const ref = (try Mono.callInstanceRef(self.gpa, self.frozen, call_node)) orelse return;
+            defer self.gpa.free(ref.args);
+            const ii = Mono.find(self.frozen.instances, ref.gid, ref.args) orelse return;
             const inst = self.frozen.instances[ii];
             try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
         }
     };
-}
-
-/// True when `sig` is a generic template (some param is a check-time `type_var`).
-fn sigHasTypeVar(sig: Sig) bool {
-    for (sig.params) |p| if (p.isTypeVar()) return true;
-    return false;
-}
-
-/// `1 + max type_var ordinal` over `sig.params` — the generic-param count `Infer.infer`
-/// needs. Equals `generic_params.len` for any bare call folded here (it survived Pass C,
-/// so every type-var was bound, hence appears in a value param).
-fn genericParamCount(sig: Sig) u32 {
-    var m: u32 = 0;
-    for (sig.params) |p| if (p.isTypeVar() and p.typeVarOrd() > m) {
-        m = p.typeVarOrd();
-    };
-    return m + 1;
 }
 
 /// Records each touched type's layout in body-walk order: at a `.touch` event the
@@ -1150,6 +1110,13 @@ const FakeFrozen = struct {
     methods: []const Typecheck.Method = &.{},
     derives: []const Typecheck.DeriveRecipe = &.{},
     prelude_ids: Typecheck.PreludeProtocolIds = .{},
+
+    pub fn genericTemplate(self: *const FakeFrozen, gid: u32) ?Mono.TemplateRef {
+        if (gid >= self.sigs.len) return null;
+        const sig = self.sigs[gid];
+        if (!sig.hasTypeVar()) return null;
+        return .{ .params = sig.params, .count = sig.genericParamCount() };
+    }
 };
 
 test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch positions" {

@@ -2045,6 +2045,23 @@ pub fn bindImplParams(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, 
     }
 }
 
+/// The read-only view mono discovery hands `Mono.callInstanceRef`: the module's
+/// tree/resolutions + the pass's `node_types`, plus `genericTemplate` derived from
+/// the `FnSym` (`generic_params.len` is the inference count — the fingerprint side
+/// derives the same count from the `Sig`).
+const DiscoveryView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolution,
+    node_types: []const Type,
+    model: *const Model,
+    pub fn genericTemplate(self: DiscoveryView, gid: u32) ?Mono.TemplateRef {
+        if (gid >= self.model.fns.len) return null;
+        const f = self.model.fns[gid];
+        if (!f.isGeneric()) return null;
+        return .{ .params = f.params, .count = @intCast(f.generic_params.len) };
+    }
+};
+
 /// Scan module `mod`'s nodes for call-position generic calls, reading `node_types`
 /// for the concrete type-args, and enqueue each new `(gid, args)`. Uniform for the
 /// base seed (module node_types) and an instance re-check (the instance's own
@@ -2054,68 +2071,28 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     const mc = &t.graph.mods[mod];
     const tree = mc.tree;
     const resolutions = mc.resolutions;
+    const view = DiscoveryView{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .model = model };
     for (tree.nodes) |n| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
-        const callee = tree.nodes[n.lhs.int()];
-        if (callee.tag == .type_app) {
-            // Explicit-args `id[int](..)`: the type-args are the type-app's
-            // arg nodes, read straight from node_types.
-            const bres = resolutions[callee.lhs.int()];
-            if (bres != .func) continue;
-            const gid = bres.func;
-            const f = model.fns[gid];
-            if (!f.isGeneric()) continue;
-            const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
-            if (targ_nodes.len != f.generic_params.len) continue;
-            const args = try t.gpa.alloc(Type, targ_nodes.len);
-            defer t.gpa.free(args);
-            var ok = true;
-            for (targ_nodes, 0..) |tn, k| {
-                const ty = node_types[tn.int()];
-                if (!isConcreteValue(ty)) {
-                    ok = false;
-                    break;
-                }
-                args[k] = ty;
-            }
-            if (!ok) continue;
-            try t.enqueueInstance(model, gid, args, worklist, seen, mc.tokens[n.main_token].start, mod);
-        } else if (callee.tag == .identifier) {
-            // Bare inferred `id(7)`: re-run the SHARED matcher over the value-arg
-            // node_types so discovery selects the exact same instance Pass C created.
-            // The never/invalid skip + the `isConcreteValue` gate are identical to Pass
-            // C's, so the `(gid, args)` tuple — hence the `Mono.Instance` — agrees.
-            const bres = resolutions[n.lhs.int()];
-            if (bres != .func) continue;
-            const gid = bres.func;
-            const f = model.fns[gid];
-            if (!f.isGeneric()) continue;
-            const value_args = Ast.rangeSlice(tree, n.rhs.int());
-            if (value_args.len != f.params.len) continue; // Pass C already erred arity
-            const arg_types = try t.gpa.alloc(Type, value_args.len);
-            defer t.gpa.free(arg_types);
-            for (value_args, 0..) |va, k| arg_types[k] = node_types[va.int()];
-            const n_gp: u32 = @intCast(f.generic_params.len);
-            const out = try t.gpa.alloc(Type, n_gp);
-            defer t.gpa.free(out);
-            const bnd = try t.gpa.alloc(bool, n_gp);
-            defer t.gpa.free(bnd);
-            const fp = try t.gpa.alloc(usize, n_gp);
-            defer t.gpa.free(fp);
-            switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp)) {
-                .ok => {},
-                else => continue, // conflict/unbound: Pass C reported it; mint nothing
-            }
+        // The explicit-turbofish `id[int](..)` and bare-inferred `id(7)` shapes route
+        // through the SAME arg-extraction the fingerprint fold uses (`callInstanceRef`),
+        // so discovery selects the exact instance the caller's fingerprint targets.
+        if (try Mono.callInstanceRef(t.gpa, view, n)) |ref| {
+            defer t.gpa.free(ref.args);
+            // Turbofish arity (a no-op for the inferred shape + any valid turbofish):
+            // guards a wrong-arity `id[int,bool]()` on an already-erroring program.
+            if (ref.args.len != model.fns[ref.gid].generic_params.len) continue;
             var conc = true;
-            for (out) |ta| {
-                if (!isConcreteValue(ta)) {
-                    conc = false;
-                    break;
-                }
-            }
+            for (ref.args) |ta| if (!isConcreteValue(ta)) {
+                conc = false;
+                break;
+            };
             if (!conc) continue;
-            try t.enqueueInstance(model, gid, out, worklist, seen, mc.tokens[n.main_token].start, mod);
-        } else if (callee.tag == .field_access) {
+            try t.enqueueInstance(model, ref.gid, ref.args, worklist, seen, mc.tokens[n.main_token].start, mod);
+            continue;
+        }
+        const callee = tree.nodes[n.lhs.int()];
+        if (callee.tag == .field_access) {
             // A method call on a generic-type instance `b.get()`: the receiver
             // types to an `App` (reify runs later in this tail), whose ctor selects the
             // `impl Box[T]` method TEMPLATE. Bind the impl's type-params by matching the

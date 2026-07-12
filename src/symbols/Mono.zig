@@ -16,6 +16,7 @@
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Type = @import("../layout/Type.zig").Type;
+const Infer = @import("Infer.zig");
 
 /// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
 /// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
@@ -74,6 +75,73 @@ pub const Instance = struct {
     /// slice are OWNED by the owning `GraphResult`; see `ResolvedConformance`.
     conformances: []const ResolvedConformance = &.{},
 };
+
+/// A generic template's inference facts, supplied by the caller's read-only view
+/// (`params` is the template's value params; `count` is the generic-param count fed
+/// to `Infer.infer` and used as the explicit-turbofish arity). Discovery derives it
+/// from the `FnSym` (`generic_params.len`); the fingerprint fold from the `Sig`
+/// (`Sig.genericParamCount`) — they agree for any call that survives Pass C.
+pub const TemplateRef = struct { params: []const Type, count: u32 };
+
+/// A recovered generic call site: the template `gid` and its concrete type-args
+/// (OWNED — the caller frees `args`).
+pub const CallRef = struct { gid: u32, args: []Type };
+
+/// Recover `(template gid, concrete type-args)` from a `.call` node's callee — the
+/// single arg-extraction both mono discovery (`types.scanCalls`) and the content
+/// fingerprint (`AstWalk.CallVisitor`) walk, so they cannot drift on which
+/// `Instance` a call selects. Two call-shapes:
+///   * explicit turbofish `id[int](..)` — the callee is a `type_app`; the type-args
+///     are read straight from `node_types`.
+///   * bare inferred `id(7)` — the callee is a plain `identifier`; the type-args are
+///     inferred from the value-arg `node_types` via `Infer.infer`.
+/// A field-access method callee is NOT handled here (discovery binds impl params;
+/// the fingerprint resolves the conformance witness — genuinely different leaves).
+///
+/// `view` supplies `.tree`, `.resolutions`, `.node_types`, and
+/// `genericTemplate(gid) -> ?TemplateRef` (returns null for a non-generic callee,
+/// which filters both shapes). Returns null for any non-generic / non-`.func` /
+/// out-of-range / uninferable call; on `.ok` the caller owns `.args`.
+pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Node) error{OutOfMemory}!?CallRef {
+    if (call_node.tag != .call or call_node.lhs == Ast.none) return null;
+    const tree = view.tree;
+    const callee = tree.nodes[call_node.lhs.int()];
+    switch (callee.tag) {
+        .type_app => {
+            const bres = view.resolutions[callee.lhs.int()];
+            if (bres != .func) return null;
+            const gid = bres.func;
+            if (view.genericTemplate(gid) == null) return null;
+            const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
+            const args = try gpa.alloc(Type, targ_nodes.len);
+            errdefer gpa.free(args);
+            for (targ_nodes, 0..) |tn, k| {
+                if (tn.int() >= view.node_types.len) {
+                    gpa.free(args);
+                    return null; // pre-typecheck view
+                }
+                args[k] = view.node_types[tn.int()];
+            }
+            return .{ .gid = gid, .args = args };
+        },
+        .identifier => {
+            const bres = view.resolutions[call_node.lhs.int()];
+            if (bres != .func) return null;
+            const gid = bres.func;
+            const tmpl = view.genericTemplate(gid) orelse return null;
+            const value_args = Ast.rangeSlice(tree, call_node.rhs.int());
+            const arg_types = try gpa.alloc(Type, value_args.len);
+            defer gpa.free(arg_types);
+            for (value_args, 0..) |va, k| {
+                if (va.int() >= view.node_types.len) return null; // pre-typecheck view
+                arg_types[k] = view.node_types[va.int()];
+            }
+            const targs = (try Infer.infer(gpa, tmpl.count, tmpl.params, arg_types)) orelse return null;
+            return .{ .gid = gid, .args = targs };
+        },
+        else => return null,
+    }
+}
 
 /// The index of the instance for `(gid, args)`, or null. A deterministic linear
 /// scan comparing the template gid + each arg by `Type.eql`.
@@ -148,6 +216,88 @@ pub fn mangle(gpa: std.mem.Allocator, template_name: []const u8, args: []const T
 }
 
 const testing = std.testing;
+
+const Resolution = @import("Resolution.zig").Resolution;
+
+/// A hand-built read-only view over a tiny tree, matching the `anytype` interface
+/// `callInstanceRef` reads. `genericTemplate` answers for exactly one gid.
+const FakeView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolution,
+    node_types: []const Type,
+    gen_gid: u32,
+    gen_params: []const Type,
+    gen_count: u32,
+    fn genericTemplate(self: FakeView, gid: u32) ?TemplateRef {
+        if (gid != self.gen_gid) return null;
+        return .{ .params = self.gen_params, .count = self.gen_count };
+    }
+};
+
+test "callInstanceRef recovers (gid, args) from an explicit turbofish callee" {
+    const gpa = testing.allocator;
+    // Tree for `id[int](x)`: n0=id, n1=int(type-arg), n2=type_app(lhs=0,rhs=hdr@0),
+    // n3=x(value-arg), n4=call(lhs=2,rhs=hdr@3).
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .type_app, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.Index.from(0) },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 0, .lhs = Ast.Index.from(2), .rhs = Ast.Index.from(3) },
+    };
+    var extra = [_]u32{ 2, 1, 1, 4, 1, 3 };
+    const tree = Ast.Tree{ .nodes = &nodes, .extra = &extra };
+    var resolutions = [_]Resolution{.unresolved} ** 5;
+    resolutions[0] = .{ .func = 7 };
+    const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid, Type.invalid, Type.invalid };
+    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 7, .gen_params = &.{}, .gen_count = 1 };
+
+    const ref = (try callInstanceRef(gpa, view, nodes[4])).?;
+    defer gpa.free(ref.args);
+    try testing.expectEqual(@as(u32, 7), ref.gid);
+    try testing.expectEqual(@as(usize, 1), ref.args.len);
+    try testing.expect(Type.eql(ref.args[0], Type.int));
+}
+
+test "callInstanceRef infers (gid, args) from a bare generic callee" {
+    const gpa = testing.allocator;
+    // Tree for `id(x)`: n0=id, n1=x(value-arg), n2=call(lhs=0,rhs=hdr@0).
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.Index.from(0) },
+    };
+    var extra = [_]u32{ 2, 1, 1 };
+    const tree = Ast.Tree{ .nodes = &nodes, .extra = &extra };
+    var resolutions = [_]Resolution{.unresolved} ** 3;
+    resolutions[0] = .{ .func = 5 };
+    const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid };
+    const params = [_]Type{Type.typeVar(0)};
+    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1 };
+
+    const ref = (try callInstanceRef(gpa, view, nodes[2])).?;
+    defer gpa.free(ref.args);
+    try testing.expectEqual(@as(u32, 5), ref.gid);
+    try testing.expectEqual(@as(usize, 1), ref.args.len);
+    try testing.expect(Type.eql(ref.args[0], Type.int));
+}
+
+test "callInstanceRef returns null for a non-generic or non-func callee" {
+    const gpa = testing.allocator;
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.Index.from(0) },
+    };
+    var extra = [_]u32{ 2, 1, 1 };
+    const tree = Ast.Tree{ .nodes = &nodes, .extra = &extra };
+    var resolutions = [_]Resolution{.unresolved} ** 3;
+    resolutions[0] = .{ .func = 5 };
+    const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid };
+    // gen_gid 9 != the callee's gid 5 -> genericTemplate is null -> not a template.
+    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 9, .gen_params = &.{}, .gen_count = 1 };
+    try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[2]));
+}
 
 test "mangle is index-free-ish and distinct per arg tuple" {
     const gpa = testing.allocator;
