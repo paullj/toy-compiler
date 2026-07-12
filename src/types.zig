@@ -2017,6 +2017,30 @@ fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type) ?Type {
     return t.reify_map.get(idx);
 }
 
+/// Bind an impl's type-params by matching the template method `mf`'s `Self` pattern
+/// (`Vec[T]`) against a receiver App's concrete `recv_args`, via the same `Infer.match`
+/// Pass C runs. Returns a freshly-allocated slice of the bound params (length
+/// `mf.generic_params.len`, the CALLER owns and frees it) on a successful match, or null
+/// when the pattern arity disagrees or the match conflicts / leaves a param unbound.
+/// Concreteness of the bound args is the caller's to check.
+pub fn bindImplParams(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, recv_args: []const Type) error{OutOfMemory}!?[]Type {
+    const pat: []const Type = if (mf.self_type.isApp()) composite.at(mf.self_type.appIdx()).args else &.{};
+    if (pat.len != recv_args.len) return null;
+    const n_gp: u32 = @intCast(mf.generic_params.len);
+    const out = try gpa.alloc(Type, n_gp);
+    const bnd = try gpa.alloc(bool, n_gp);
+    defer gpa.free(bnd);
+    const fp = try gpa.alloc(usize, n_gp);
+    defer gpa.free(fp);
+    switch (Infer.match(n_gp, pat, recv_args, out, bnd, fp)) {
+        .ok => return out,
+        else => {
+            gpa.free(out);
+            return null;
+        },
+    }
+}
+
 /// Scan module `mod`'s nodes for call-position generic calls, reading `node_types`
 /// for the concrete type-args, and enqueue each new `(gid, args)`. Uniform for the
 /// base seed (module node_types) and an instance re-check (the instance's own
@@ -2100,21 +2124,8 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             const re = t.composite.at(recv.appIdx());
             const member = mc.tokens[callee.main_token].text(mc.source);
             const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member) orelse continue;
-            const mf = model.fns[m.fn_id];
-            if (!mf.self_type.isApp()) continue;
-            const pat = t.composite.at(mf.self_type.appIdx()).args;
-            if (pat.len != re.args.len) continue; // ctor fixes the arity; defensive
-            const n_gp: u32 = @intCast(mf.generic_params.len);
-            const out = try t.gpa.alloc(Type, n_gp);
+            const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse continue;
             defer t.gpa.free(out);
-            const bnd = try t.gpa.alloc(bool, n_gp);
-            defer t.gpa.free(bnd);
-            const fp = try t.gpa.alloc(usize, n_gp);
-            defer t.gpa.free(fp);
-            switch (Infer.match(n_gp, pat, re.args, out, bnd, fp)) {
-                .ok => {},
-                else => continue, // unbound/conflict: Pass C reported it; mint nothing
-            }
             var conc = true;
             for (out) |ta| {
                 if (!isConcreteValue(ta)) {
@@ -2135,21 +2146,8 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         if (!recv.isApp()) continue;
         const re = t.composite.at(recv.appIdx());
         const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, "new") orelse continue;
-        const mf = model.fns[m.fn_id];
-        if (!mf.self_type.isApp()) continue;
-        const pat = t.composite.at(mf.self_type.appIdx()).args;
-        if (pat.len != re.args.len) continue;
-        const n_gp: u32 = @intCast(mf.generic_params.len);
-        const out = try t.gpa.alloc(Type, n_gp);
+        const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse continue;
         defer t.gpa.free(out);
-        const bnd = try t.gpa.alloc(bool, n_gp);
-        defer t.gpa.free(bnd);
-        const fp = try t.gpa.alloc(usize, n_gp);
-        defer t.gpa.free(fp);
-        switch (Infer.match(n_gp, pat, re.args, out, bnd, fp)) {
-            .ok => {},
-            else => continue,
-        }
         var conc = true;
         for (out) |ta| if (!isConcreteValue(ta)) {
             conc = false;
@@ -2188,21 +2186,8 @@ fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []co
     if (!recv.isApp()) return;
     const re = t.composite.at(recv.appIdx());
     const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, name) orelse return;
-    const mf = model.fns[m.fn_id];
-    if (!mf.self_type.isApp()) return;
-    const pat = t.composite.at(mf.self_type.appIdx()).args;
-    if (pat.len != re.args.len) return;
-    const n_gp: u32 = @intCast(mf.generic_params.len);
-    const out = try t.gpa.alloc(Type, n_gp);
+    const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse return;
     defer t.gpa.free(out);
-    const bnd = try t.gpa.alloc(bool, n_gp);
-    defer t.gpa.free(bnd);
-    const fp = try t.gpa.alloc(usize, n_gp);
-    defer t.gpa.free(fp);
-    switch (Infer.match(n_gp, pat, re.args, out, bnd, fp)) {
-        .ok => {},
-        else => return,
-    }
     for (out) |ta| if (!isConcreteValue(ta)) return;
     try t.enqueueInstance(model, m.fn_id, out, worklist, seen, at_byte, mod);
 }

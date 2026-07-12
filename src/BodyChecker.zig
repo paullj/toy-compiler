@@ -468,19 +468,8 @@ pub const BodyChecker = struct {
         const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, "iter") orelse return null;
         const mf = bc.model.fns[m.fn_id];
         if (!m.has_self or mf.params.len != 1) return Type.invalid; // iter(self), no extra args
-        const n_gp: u32 = @intCast(mf.generic_params.len);
-        const targs = bc.gpa.alloc(Type, n_gp) catch return Type.invalid;
+        const targs = (Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args) catch return Type.invalid) orelse return Type.invalid;
         defer bc.gpa.free(targs);
-        const bnd = bc.gpa.alloc(bool, n_gp) catch return Type.invalid;
-        defer bc.gpa.free(bnd);
-        const fp = bc.gpa.alloc(usize, n_gp) catch return Type.invalid;
-        defer bc.gpa.free(fp);
-        const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
-        if (pat.len != e.args.len) return Type.invalid;
-        switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
-            .ok => {},
-            else => return Type.invalid,
-        }
         return substTy(bc, mf.ret, targs);
     }
 
@@ -1756,24 +1745,14 @@ pub const BodyChecker = struct {
             // `node_types[type_app]`.
             bc.node_types[(callee.lhs).int()] = app_ty;
             const mf = bc.model.fns[m.fn_id];
-            const n_gp: u32 = @intCast(mf.generic_params.len);
-            const targs = try bc.gpa.alloc(Type, n_gp);
-            defer bc.gpa.free(targs);
-            const bnd = try bc.gpa.alloc(bool, n_gp);
-            defer bc.gpa.free(bnd);
-            const fp = try bc.gpa.alloc(usize, n_gp);
-            defer bc.gpa.free(fp);
-            const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
-            var bound_ok = pat.len == e.args.len;
-            if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
-                .ok => {},
-                else => bound_ok = false,
-            };
+            const targs_opt = try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args);
+            defer if (targs_opt) |ta| bc.gpa.free(ta);
+            const bound_ok = targs_opt != null;
             if (args.len != mf.params.len) {
                 for (args) |a| _ = try bc.typeOf(a);
                 try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ mf.params.len, args.len });
                 if (!bound_ok) return .invalid;
-                const ret = substTy(bc, mf.ret, targs);
+                const ret = substTy(bc, mf.ret, targs_opt.?);
                 bc.node_types[(node_idx).int()] = ret;
                 return ret;
             }
@@ -1781,6 +1760,7 @@ pub const BodyChecker = struct {
                 for (args) |a| _ = try bc.typeOfExpected(a, null);
                 return .invalid;
             }
+            const targs = targs_opt.?;
             for (args, mf.params, 0..) |a, pty, i| {
                 const want_ty = substTy(bc, pty, targs);
                 const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
