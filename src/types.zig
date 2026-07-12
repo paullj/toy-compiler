@@ -57,6 +57,7 @@ pub const Kind = @import("layout/Type.zig").Kind;
 pub const Type = @import("layout/Type.zig").Type;
 pub const IntDesc = @import("layout/Type.zig").IntDesc;
 pub const Layout = LayoutEngine.Layout;
+pub const isRefStruct = LayoutEngine.isRefStruct;
 pub const VariantForm = LayoutEngine.VariantForm;
 pub const VariantLayout = LayoutEngine.VariantLayout;
 pub const EnumLayout = LayoutEngine.EnumLayout;

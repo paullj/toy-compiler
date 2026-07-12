@@ -226,11 +226,13 @@ pub const Type = struct {
         return t.kind == .rawptr;
     }
 
-    /// No bare `Type` is a reference: an unmanaged `rawptr` carries NO heap-reference
-    /// semantics (a bare C `void*`), and a managed box is a marker-tagged struct that only
-    /// the table-aware predicates (lower's `isRefTy` reading `Layout.native_family`, the
-    /// checker's composite-ctor test) can recognize. This leaf-`Type` view has no table, so
-    /// it stays `false`.
+    /// Leaf-`Type` view: ALWAYS false — do not use it to detect a managed box. A bare
+    /// `Type` has no table, and reference-ness lives in a side table: an unmanaged `rawptr`
+    /// carries NO heap-reference semantics (a bare C `void*`), and a managed box is a
+    /// marker-tagged struct only the table-aware authority can recognize. To ask whether a
+    /// reified type is a box, call `Engine.isRefStruct(t, table)` (the layout snapshot or
+    /// the live struct table); pre-reify, use `BodyChecker.isRefPayload`. This stub exists
+    /// only so the `rawptr`-is-not-a-reference invariant reads at the leaf.
     pub fn isReference(t: Type) bool {
         _ = t;
         return false;

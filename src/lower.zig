@@ -1487,9 +1487,10 @@ const gc_alloc_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_alloc" };
 /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`): a struct carrying the reified
 /// reference-family marker. A box is an 8-byte cell pointer — lowered as a scalar `int`,
 /// NOT by its 8-byte struct field layout — so every scalar-value path guards on this.
+/// The post-reify predicate over the layout SNAPSHOT; derive synthesis runs the same
+/// authority over the live struct table (`Typecheck.isRefStruct`).
 pub fn isRefTy(b: *Builder, t: Typecheck.Type) bool {
-    return t.kind == .@"struct" and t.struct_id < b.in.layouts.len and
-        b.in.layouts[t.struct_id].native_family != .none;
+    return Typecheck.isRefStruct(t, b.in.layouts);
 }
 
 /// Whether `t` is a by-slot aggregate for lowering (str/struct/enum), EXCLUDING a
