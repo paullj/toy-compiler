@@ -1041,6 +1041,12 @@ fn finishBuiltin(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), g
 pub const HandBuiltin = struct {
     name: []const u8,
     lower: *const fn (std.mem.Allocator) error{OutOfMemory}!Link.FnCode,
+    /// Other hand-emitted builtins this body statically calls from WITHIN its appended
+    /// machine code (e.g. `gc_alloc` triggers `gc_collect`). Such an edge is invisible to
+    /// the link tail's fn-only used-scan, so the linker closes the used set over it — a
+    /// program that carries this builtin also carries its callees. Each name must be a
+    /// `hand_builtins` row.
+    static_call_deps: []const []const u8 = &.{},
 };
 
 /// The FIXED append order of the hand-emitted builtins. Load-bearing: it makes the
@@ -1050,7 +1056,7 @@ pub const hand_builtins = [_]HandBuiltin{
     .{ .name = "print", .lower = lowerPrint },
     .{ .name = "__display_int", .lower = lowerDisplayInt },
     .{ .name = "panic", .lower = lowerPanic },
-    .{ .name = "gc_alloc", .lower = lowerGcAlloc },
+    .{ .name = "gc_alloc", .lower = lowerGcAlloc, .static_call_deps = &.{"gc_collect"} },
     .{ .name = "gc_span_count", .lower = lowerGcSpanCount },
     .{ .name = "gc_collect", .lower = lowerGcCollect },
     .{ .name = "gc_stats", .lower = lowerGcStats },
@@ -1064,6 +1070,21 @@ pub fn handBuiltinIndex(comptime name: []const u8) usize {
         if (std.mem.eql(u8, hb.name, name)) return i;
     }
     @compileError("unknown hand builtin: " ++ name);
+}
+
+test "hand_builtins static_call_deps name real rows; gc_alloc pulls gc_collect" {
+    for (hand_builtins) |hb| {
+        for (hb.static_call_deps) |dep| {
+            var found = false;
+            for (hand_builtins) |other| {
+                if (std.mem.eql(u8, other.name, dep)) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
+    const deps = hand_builtins[comptime handBuiltinIndex("gc_alloc")].static_call_deps;
+    try std.testing.expectEqual(@as(usize, 1), deps.len);
+    try std.testing.expectEqualStrings("gc_collect", deps[0]);
 }
 
 /// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
