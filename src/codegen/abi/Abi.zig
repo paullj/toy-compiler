@@ -56,6 +56,32 @@ pub const num_fp_args: u32 = 8;
 ///   * `indirect`  — aggregate >16B: passed/returned via a pointer (+ x8 sret).
 pub const AbiClass = enum { scalar, fp, reg_pair, indirect };
 
+/// The allocator's size-class ladder (bytes). `gc_alloc` rounds a small request up to
+/// the first class `>= size`; a request past the last class is a large object. The one
+/// authority for the taxonomy — `CodegenIr` reads it at its emit sites and `sizeClassFor`
+/// derives a type's static class from it, so the descriptor and the allocator agree.
+pub const size_classes = [_]u16{ 16, 32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192 };
+
+/// The static allocation size class for `size`: the first ladder class `>= size`, or `0`
+/// (the large-object marker — a direct span-aligned mmap, no class arena) when `size`
+/// exceeds the largest class.
+pub fn sizeClassFor(size: u32) u16 {
+    for (size_classes) |cls| if (size <= cls) return cls;
+    return 0;
+}
+
+/// The static per-type descriptor the allocator / a later precise-tracing milestone reads:
+/// the type's byte size, its natural alignment, and its allocation size class. A pure
+/// function of the layout snapshot; provisioned minimally (its runtime consumer is a later
+/// milestone).
+pub const Descriptor = struct { size: u32, @"align": u32, size_class: u16 };
+
+/// The `Descriptor` for a reified type over the layout snapshot.
+pub fn descriptorFor(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) Descriptor {
+    const size = typeSize(ty, layouts, enum_layouts);
+    return .{ .size = size, .@"align" = typeAlign(ty, layouts, enum_layouts), .size_class = sizeClassFor(size) };
+}
+
 /// Byte size of a type (int/bool 8, str 16, struct/enum → its layout size).
 pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
@@ -552,6 +578,30 @@ test "planCall: aggregate return sets sret_in_x8" {
     // the result does not consume a GPR; the int arg is still x0.
     try testing.expectEqual(@as(u8, 0), plan.locs[0].gpr.first);
     try testing.expectEqual(@as(u32, 0), plan.nsaa_bytes);
+}
+
+test "sizeClassFor: rounds up to the first class, large past the ladder marks 0" {
+    try testing.expectEqual(@as(u16, 16), sizeClassFor(8)); // scalar → smallest class
+    try testing.expectEqual(@as(u16, 16), sizeClassFor(16)); // exact boundary
+    try testing.expectEqual(@as(u16, 32), sizeClassFor(17)); // just over → next class
+    try testing.expectEqual(@as(u16, 48), sizeClassFor(48)); // a non-pow2 class, exact
+    try testing.expectEqual(@as(u16, 8192), sizeClassFor(8192)); // the last class, exact
+    try testing.expectEqual(@as(u16, 0), sizeClassFor(8193)); // past the ladder → large marker
+}
+
+test "descriptorFor: reads size/align off the layout, classes by size" {
+    const gpa = testing.allocator;
+    const ls = try mkLayouts(gpa, &.{24}); // struct#0 is 24 bytes, align 8
+    defer gpa.free(ls);
+    const el: []const EnumLayout = &.{};
+    const d = descriptorFor(structOf(0), ls, el);
+    try testing.expectEqual(@as(u32, 24), d.size);
+    try testing.expectEqual(@as(u32, 8), d.@"align");
+    try testing.expectEqual(@as(u16, 32), d.size_class);
+    // A bare int: 8 bytes, align 8, smallest class.
+    const di = descriptorFor(Type.int, &.{}, el);
+    try testing.expectEqual(@as(u32, 8), di.size);
+    try testing.expectEqual(@as(u16, 16), di.size_class);
 }
 
 test "planCall: no args -> empty locs, zero nsaa" {

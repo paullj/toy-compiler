@@ -1502,6 +1502,10 @@ const display_int_sym: Link.SymName = .{ .kind = .builtin, .name = "__display_in
 /// bypasses the core-only allowlist by construction.
 const gc_alloc_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_alloc" };
 
+/// The `gc_mark` builtin's stable symbol identity — marks one managed cell. A derived
+/// `trace(obj)` unit `bl`s this per managed field; user source never names it.
+pub const gc_mark_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_mark" };
+
 /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`): a struct carrying the reified
 /// reference-family marker. A box is an 8-byte cell pointer — lowered as a scalar `int`,
 /// NOT by its 8-byte struct field layout — so every scalar-value path guards on this.

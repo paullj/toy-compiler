@@ -1,0 +1,15 @@
+# expect: exit 42
+# Feature: a derivable type that ALSO holds a managed `Ref` field. Deriving `Eq` on it
+# (compared with `==`, where the Ref field compares by cell identity) makes the one
+# descriptor producer co-emit a `trace` unit for the type — which `bl`s the `gc_mark`
+# builtin per managed field. Nothing calls `trace` at runtime yet (the collector's scan
+# stays conservative), but the unit + `gc_mark` are LINKED, so this is the real spike
+# surface the -jN determinism gate re-lowers.
+struct Node { v: int, next: Ref[int] }
+
+fn main() -> int {
+    r := &1
+    a := Node{ v: 42, next: r }
+    b := Node{ v: 42, next: r }   # same cell: `next` compares equal by identity
+    return if a == b { a.v } else { 0 }
+}

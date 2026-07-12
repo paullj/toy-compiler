@@ -34,6 +34,19 @@ const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
 pub const DeriveRecipe = Derive.Derive;
+
+/// A reified aggregate's static `{size, align, size_class}` record, co-produced by the
+/// auto-derive synthesis barrier alongside its `trace`/`eq`/`hash` units. Keyed on the
+/// reified nominal id (index-independent). An in-memory table only — never serialized into
+/// the image; its consumer (the allocator / a later precise-tracing milestone) reads it in
+/// process. Plain PODs, so teardown frees only the backing array.
+pub const TypeDescriptor = struct {
+    reified_id: u32,
+    is_enum: bool,
+    size: u32,
+    @"align": u32,
+    size_class: u16,
+};
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const derive_synth = @import("types/derive_synth.zig");
@@ -1089,6 +1102,11 @@ conv_float_int_result: ?Type = null,
 /// `GraphResult.derives` by `checkGraph`; leftover (error path) freed by the teardown.
 derives: std.ArrayList(DeriveRecipe) = .empty,
 
+/// The static per-reified-type descriptors, co-produced with the derive recipes by the
+/// synthesis barrier (one per aggregate the trace walk visits). In-memory only (PODs);
+/// its consumer is a later milestone, so it is provisioned but not yet read or emitted.
+descriptors: std.ArrayList(TypeDescriptor) = .empty,
+
 /// The composite (`App`) intern table. Heap-allocated in `checkGraph` (stable
 /// address across the run, so every `BodyChecker` can borrow it), freed at teardown.
 /// `App` types are interned here during checking and REIFIED away before the layout
@@ -1506,6 +1524,8 @@ pub fn checkGraph(
         t.derive_reqs.deinit(gpa);
         freeDeriveEntries(gpa, t.derives.items);
         t.derives.deinit(gpa);
+        // The descriptor table holds PODs (no per-entry owned data); free the backing array.
+        t.descriptors.deinit(gpa);
         // The per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
         // The method table's backing array (entries' names are borrowed source

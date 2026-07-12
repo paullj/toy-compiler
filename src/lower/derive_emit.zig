@@ -382,6 +382,7 @@ pub fn lower(
         .conv_int_char => lowerConvIntChar(gpa, in, d, sym, out_diags),
         .conv_char_byte => lowerConvCharByte(gpa, in, d, sym, out_diags),
         .conv_float_int => lowerConvFloatInt(gpa, in, d, sym, out_diags),
+        .trace => lowerDeriveTrace(gpa, in, d, sym, out_diags),
     };
 }
 
@@ -992,6 +993,117 @@ fn lowerDeriveDisplay(
     return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
+/// Trace one component field per its RESOLVED `FieldWitness` (the recipe carries the
+/// managed-vs-by-value decision, so the emitter reads no method table — the same purity the
+/// other derive emitters hold). A `.trace_mark` (managed) field loads the 8-byte cell
+/// pointer and `bl gc_mark`s it — the trace BOUNDARY, never recursing into the pointee. A
+/// `.trace_call` by-value aggregate is copied into a fresh slot then routed to its sibling
+/// `trace` witness (mirrors `deriveFieldHash`'s aggregate path). Everything else
+/// (`.inline_kind`: scalar/str/unmanaged aggregate) is a no-op — not managed.
+fn deriveFieldTrace(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId, fw: Derive.FieldWitness) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    switch (fw) {
+        .trace_mark => {
+            const fa = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = int_ty } }, int_ty);
+            const cell = try b.emit(.{ .load = .{ .addr = fa, .ty = int_ty } }, int_ty);
+            const args = try b.gpa.alloc(Ir.Operand, 1);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .value = cell };
+            _ = try b.emit(.{ .call = .{ .callee = L.gc_mark_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
+        },
+        .trace_call => |name| {
+            const slot = try b.addSlot(fty);
+            const d = try b.emit(.{ .slot_addr = slot }, int_ty);
+            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
+            const args = try b.gpa.alloc(Ir.Operand, 1);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = slot };
+            _ = try b.emit(.{ .call = .{ .callee = .{ .kind = .user_fn, .name = name }, .args = args, .ret_slot = Ir.none_slot } }, null);
+        },
+        else => {},
+    }
+}
+
+/// Trace variant `vi`'s active payload (its slice of the flattened `field_witnesses`) and
+/// branch to `join`. Mirrors `emitVariantPayloadEq`/`emitVariantDisplay`'s ladder-arm shape,
+/// writing for effect (unit). The per-variant base into the flat witness list is the sum of
+/// the prior variants' field counts — the SAME variant-decl-then-field order
+/// `collectComponentTypes` (and thus `resolveDeriveFields`) walked.
+fn emitVariantTrace(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, field_witnesses: []const Derive.FieldWitness, join: Ir.BlockId) error{OutOfMemory}!void {
+    const v = e.variants[vi];
+    var base: usize = 0;
+    for (e.variants[0..vi]) |pv| base += pv.field_types.len;
+    for (v.field_types, v.offsets, 0..) |fty, poff, j| {
+        try deriveFieldTrace(b, fty, e.payload_off + poff, self_base, field_witnesses[base + j]);
+    }
+    if (!b.termSet()) try L.brTo(b, join, .none);
+}
+
+/// Lower a SOURCE-LESS auto-derive `Trace` unit: a unit-returning, layout-walking emitter
+/// that marks each MANAGED field of the receiver. ONE param (the receiver, by slot). A
+/// struct walks its fields in layout order; a payload enum does a `get_tag` dispatch ladder
+/// over each variant's payload. Every managed field emits a `bl gc_mark` (the trace
+/// boundary); by-value aggregates that hold managed fields call their sibling trace witness;
+/// scalar/str/unmanaged fields are no-ops. EMITTED but not yet CALLED at runtime — the
+/// collector's object scan stays conservative until a later milestone swaps it to this.
+fn lowerDeriveTrace(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    d: Derive.Derive,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const unit_ty = Typecheck.Type.unit;
+    const cty = d.conform_ty;
+
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = unit_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_self = try b.addSlot(cty);
+    try params.append(gpa, p_self);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.blocks.items[exit].term = .{ .ret = .none };
+    b.blocks.items[exit].term_set = true;
+
+    const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
+
+    switch (cty.kind) {
+        .@"struct" => {
+            const layout = b.in.layouts[cty.struct_id];
+            for (layout.field_types, layout.offsets, d.field_witnesses) |fty, off, fw| {
+                try deriveFieldTrace(&b, fty, off, self_base, fw);
+            }
+        },
+        .@"enum" => {
+            const e = b.in.enum_layouts[cty.enum_id];
+            const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
+            const join = try b.addBlock();
+            try emitVariantLadder(&b, e, tag, .{ .e = e, .self_base = self_base, .fw = d.field_witnesses, .join = join }, struct {
+                fn f(bb: *L.Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
+                    try emitVariantTrace(bb, c.e, vi, c.self_base, c.fw, c.join);
+                }
+            }.f);
+            b.switchTo(join);
+        },
+        else => {
+            // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Trace: unsupported conform type in lower" });
+            b.had_error = true;
+        },
+    }
+
+    if (!b.termSet()) try L.brTo(&b, exit, .none);
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
 // ===========================================================================
 // Boundary tests — the seam these emitters finally make reachable. Each builds a
 // bare `L.Inputs` (all-int-field aggregate → the field walkers never touch the
@@ -1197,6 +1309,170 @@ test "derive Eq on a Ref field compares by pointer identity (icmp eq, no witness
         else => {},
     };
     try testing.expectEqual(@as(usize, 0), calls);
+}
+
+/// Count the `bl gc_mark` sites in an emitted trace body: every `.call` whose callee is
+/// the `gc_mark` builtin.
+fn gcMarkCallSites(func: *const Ir.Function) usize {
+    var n: usize = 0;
+    for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+        .call => |c| if (c.callee.kind == .builtin and std.mem.eql(u8, c.callee.name, "gc_mark")) {
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+/// Count the sibling-`trace` recursion sites in an emitted trace body: every `.call` to a
+/// named `user_fn` (the by-value-aggregate `.trace_call` witness), excluding the `gc_mark`
+/// builtin boundary.
+fn userFnCallSites(func: *const Ir.Function) usize {
+    var n: usize = 0;
+    for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+        .call => |c| if (c.callee.kind == .user_fn) {
+            n += 1;
+        },
+        else => {},
+    };
+    return n;
+}
+
+test "derive Trace marks exactly the managed fields; a scalar struct traces to a no-op" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "T" };
+
+    // struct S { r: Ref[int], n: int, r2: Ref[int] } — two managed fields flanking a scalar.
+    // layouts[1] is the reified Ref box (native_family .ref). The recipe's field witnesses
+    // are the resolver's output: mark / no-op / mark, in layout order.
+    {
+        var s_fnames = [_][]const u8{ "r", "n", "r2" };
+        var s_ftys = [_]Typecheck.Type{ Typecheck.Type.structT(1), Typecheck.Type.int, Typecheck.Type.structT(1) };
+        var s_offs = [_]u32{ 0, 8, 16 };
+        var ref_fnames = [_][]const u8{"0"};
+        var ref_ftys = [_]Typecheck.Type{Typecheck.Type.int};
+        var ref_offs = [_]u32{0};
+        var layouts = [_]Typecheck.Layout{
+            .{ .name = "S", .field_names = &s_fnames, .field_types = &s_ftys, .offsets = &s_offs, .size = 24, .@"align" = 8 },
+            .{ .name = "Ref$int", .field_names = &ref_fnames, .field_types = &ref_ftys, .offsets = &ref_offs, .size = 8, .@"align" = 8, .native_family = .ref },
+        };
+        var fws = [_]Derive.FieldWitness{ .trace_mark, .inline_kind, .trace_mark };
+        const d: Derive.Derive = .{ .protocol_id = 0, .protocol_name = "Trace", .kind = .trace, .conform_ty = Typecheck.Type.structT(0), .ret = Typecheck.Type.unit, .field_witnesses = &fws };
+        var func = try lowerDeriveTrace(gpa, intStructInputs(&layouts), d, sym, &diags);
+        defer func.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+        // One `bl gc_mark` per managed field (2), and the scalar field is NOT marked.
+        try testing.expectEqual(@as(usize, 2), gcMarkCallSites(&func));
+        // The two marked offsets are the managed fields' offsets (0 and 16), in layout order.
+        const offs = try selfFieldOffsets(gpa, &func);
+        defer gpa.free(offs);
+        try testing.expectEqualSlices(u32, &[_]u32{ 0, 16 }, offs);
+    }
+
+    // A plain scalar struct { a: int, b: int } traces to an EMPTY body — no mark sites.
+    {
+        var fnames = [_][]const u8{ "a", "b" };
+        var ftys = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int };
+        var offs = [_]u32{ 0, 8 };
+        var layouts = [_]Typecheck.Layout{.{ .name = "P", .field_names = &fnames, .field_types = &ftys, .offsets = &offs, .size = 16, .@"align" = 8 }};
+        var fws = [_]Derive.FieldWitness{ .inline_kind, .inline_kind };
+        const d: Derive.Derive = .{ .protocol_id = 0, .protocol_name = "Trace", .kind = .trace, .conform_ty = Typecheck.Type.structT(0), .ret = Typecheck.Type.unit, .field_witnesses = &fws };
+        var func = try lowerDeriveTrace(gpa, intStructInputs(&layouts), d, sym, &diags);
+        defer func.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), diags.items.len);
+        try testing.expectEqual(@as(usize, 0), gcMarkCallSites(&func));
+    }
+}
+
+test "derive Trace recurses into a by-value aggregate field, marks nothing itself (the boundary is the callee)" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "T" };
+
+    // struct Outer { i: Inner, n: int } where Inner { r: Ref[int] } holds the managed field.
+    // Outer's own trace does NOT mark: field `i` is a by-value aggregate that itself derives
+    // Trace, so Outer routes it to Inner's sibling witness (`.trace_call`); `n` is a no-op.
+    // The `gc_mark` boundary lives one level down, in Inner's body — this is the spike-core
+    // by-value recursion path.
+    var outer_fnames = [_][]const u8{ "i", "n" };
+    var outer_ftys = [_]Typecheck.Type{ Typecheck.Type.structT(1), Typecheck.Type.int };
+    var outer_offs = [_]u32{ 0, 8 };
+    var inner_fnames = [_][]const u8{"r"};
+    var inner_ftys = [_]Typecheck.Type{Typecheck.Type.structT(2)};
+    var inner_offs = [_]u32{0};
+    var ref_fnames = [_][]const u8{"0"};
+    var ref_ftys = [_]Typecheck.Type{Typecheck.Type.int};
+    var ref_offs = [_]u32{0};
+    var layouts = [_]Typecheck.Layout{
+        .{ .name = "Outer", .field_names = &outer_fnames, .field_types = &outer_ftys, .offsets = &outer_offs, .size = 16, .@"align" = 8 },
+        .{ .name = "Inner", .field_names = &inner_fnames, .field_types = &inner_ftys, .offsets = &inner_offs, .size = 8, .@"align" = 8 },
+        .{ .name = "Ref$int", .field_names = &ref_fnames, .field_types = &ref_ftys, .offsets = &ref_offs, .size = 8, .@"align" = 8, .native_family = .ref },
+    };
+
+    // Outer: `.trace_call` for the Inner field, no-op for the scalar.
+    var outer_fws = [_]Derive.FieldWitness{ .{ .trace_call = "trace$Inner" }, .inline_kind };
+    const outer_d: Derive.Derive = .{ .protocol_id = 0, .protocol_name = "Trace", .kind = .trace, .conform_ty = Typecheck.Type.structT(0), .ret = Typecheck.Type.unit, .field_witnesses = &outer_fws };
+    var outer_f = try lowerDeriveTrace(gpa, intStructInputs(&layouts), outer_d, sym, &diags);
+    defer outer_f.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    // Outer routes one recursion to Inner's witness and marks NOTHING itself.
+    try testing.expectEqual(@as(usize, 1), userFnCallSites(&outer_f));
+    try testing.expectEqual(@as(usize, 0), gcMarkCallSites(&outer_f));
+
+    // Inner: the managed `Ref` field marks — the boundary the recursion terminates at.
+    var inner_fws = [_]Derive.FieldWitness{.trace_mark};
+    const inner_d: Derive.Derive = .{ .protocol_id = 0, .protocol_name = "Trace", .kind = .trace, .conform_ty = Typecheck.Type.structT(1), .ret = Typecheck.Type.unit, .field_witnesses = &inner_fws };
+    var inner_f = try lowerDeriveTrace(gpa, intStructInputs(&layouts), inner_d, sym, &diags);
+    defer inner_f.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    try testing.expectEqual(@as(usize, 1), gcMarkCallSites(&inner_f));
+    try testing.expectEqual(@as(usize, 0), userFnCallSites(&inner_f));
+}
+
+test "derive Trace on a payload enum marks the managed field of the active variant only" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "T" };
+
+    // enum E { Empty, Boxed(Ref[int]) } — the flattened field-witness list is the variants'
+    // payloads concatenated in decl order: Empty contributes none, Boxed contributes one
+    // `.trace_mark`. The get_tag dispatch ladder emits ONE `gc_mark` (on the Boxed arm); the
+    // base-offset arithmetic must land it on the right slice of the flat witness list.
+    var ref_fnames = [_][]const u8{"0"};
+    var ref_ftys = [_]Typecheck.Type{Typecheck.Type.int};
+    var ref_offs = [_]u32{0};
+    var layouts = [_]Typecheck.Layout{
+        .{ .name = "Ref$int", .field_names = &ref_fnames, .field_types = &ref_ftys, .offsets = &ref_offs, .size = 8, .@"align" = 8, .native_family = .ref },
+    };
+
+    var empty_offs = [_]u32{};
+    var empty_fnames = [_][]const u8{};
+    var empty_ftys = [_]Typecheck.Type{};
+    var boxed_fnames = [_][]const u8{"0"};
+    var boxed_ftys = [_]Typecheck.Type{Typecheck.Type.structT(0)};
+    var boxed_offs = [_]u32{0};
+    var variants = [_]Typecheck.VariantLayout{
+        .{ .name = "Empty", .form = .unit, .field_names = &empty_fnames, .field_types = &empty_ftys, .offsets = &empty_offs },
+        .{ .name = "Boxed", .form = .tuple, .field_names = &boxed_fnames, .field_types = &boxed_ftys, .offsets = &boxed_offs },
+    };
+    var enum_layouts = [_]Typecheck.EnumLayout{
+        .{ .name = "E", .variants = &variants, .tag_size = 8, .payload_off = 8, .size = 16, .@"align" = 8 },
+    };
+
+    var in = intStructInputs(&layouts);
+    in.enum_layouts = &enum_layouts;
+
+    var fws = [_]Derive.FieldWitness{.trace_mark}; // flattened: [] ++ [Ref]
+    const d: Derive.Derive = .{ .protocol_id = 0, .protocol_name = "Trace", .kind = .trace, .conform_ty = Typecheck.Type.enumT(0), .ret = Typecheck.Type.unit, .field_witnesses = &fws };
+    var func = try lowerDeriveTrace(gpa, in, d, sym, &diags);
+    defer func.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    try testing.expectEqual(@as(usize, 1), gcMarkCallSites(&func));
 }
 
 test "derive Ord compares an unsigned field unsigned, a signed field signed" {
