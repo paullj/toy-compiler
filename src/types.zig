@@ -1844,7 +1844,7 @@ pub const max_instantiation_depth: u32 = 64;
 /// excludes `type_var`, `unit`, and poison.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .str, .@"struct", .@"enum", .app => true,
+        .int, .bool, .float, .str, .@"struct", .@"enum", .app => true,
         else => false,
     };
 }

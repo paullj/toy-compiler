@@ -1,0 +1,13 @@
+# A generic fn and a generic struct instantiated at `float`: the element type must be
+# accepted as a monomorphization type-argument, then travel through FP registers.
+# expect: exit 42
+struct Box[T] { v: T }
+impl Box[T] { fn get(self) -> T { return self.v } }
+
+fn id[T](x: T) -> T { return x }
+
+fn main() -> int {
+    f := id[float](1.5)
+    b := Box[float] { v: 2.5 }
+    return if f +. b.get() == 4.0 { 42 } else { 0 }
+}
