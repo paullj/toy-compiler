@@ -1,11 +1,9 @@
-import core/mem
-
 # A `core/` module, so it is allowlisted to name the heap intrinsics. It exposes the
 # self-checks the integration harness drives (the harness can only observe the child's
 # exit code, so every invariant is proven here and surfaced as a return value).
 
 pub fn selftest() -> int {
-    c := gc_alloc(mem.size_class_of(16))
+    c := gc_alloc(16)
     return unsafe {
         store(c, 42)
         load(c)

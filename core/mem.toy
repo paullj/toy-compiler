@@ -1,23 +1,3 @@
-# Size-class policy for the span arena. Pure and heap-free: it names no allocator
-# intrinsic, it only rounds a byte request up to the nearest size class. Requests
-# above the largest class fall through to `gc_alloc`'s direct large-object mmap.
-pub fn size_class_of(n: int) -> int {
-    if n <= 16 { return 16 }
-    if n <= 32 { return 32 }
-    if n <= 48 { return 48 }
-    if n <= 64 { return 64 }
-    if n <= 96 { return 96 }
-    if n <= 128 { return 128 }
-    if n <= 192 { return 192 }
-    if n <= 256 { return 256 }
-    if n <= 512 { return 512 }
-    if n <= 1024 { return 1024 }
-    if n <= 2048 { return 2048 }
-    if n <= 4096 { return 4096 }
-    if n <= 8192 { return 8192 }
-    return n
-}
-
 # A growable, traced array primitive: the ONE growable container. The handle is an
 # 8-byte reference (`gc_array[T]`, a reused native box) pointing at a heap header
 # `{len@0, cap@8, elems@16}` — a raw 24-byte cell addressed by literal offsets. The
