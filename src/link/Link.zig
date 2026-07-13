@@ -27,6 +27,7 @@ const Engine = @import("../query/Engine.zig");
 const symbols = @import("../symbols/Sym.zig");
 pub const SymKind = symbols.SymKind;
 pub const SymName = symbols.SymName;
+const Type = @import("../layout/Type.zig").Type;
 
 // The relocation vocabulary + the kind→bytes machinery live in the `reloc` peer module
 // (so understanding one relocation is one file, not the whole backend). Re-exported here
@@ -37,6 +38,33 @@ pub const SymbolId = reloc.SymbolId;
 pub const RelocKind = reloc.RelocKind;
 pub const Reloc = reloc.Reloc;
 pub const symtab_base_hash = reloc.symtab_base_hash;
+pub const desc_table_base_hash = reloc.desc_table_base_hash;
+
+/// The per-type descriptor sentinel a `descriptor_of[T]()` `cstr_ptr` reloc carries: the
+/// reserved `0xDE5C` prefix OR'd with a 48-bit Wyhash of `T`'s structural key bytes, so
+/// it is source-pure and index-independent (`-jN`-stable) and disjoint from real string
+/// literals. The relink tail reserves it → the type's descriptor-entry byte offset.
+pub fn descHash(gpa: std.mem.Allocator, ty: Type) !u64 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try ty.appendKeyBytes(gpa, &buf);
+    const h = std.hash.Wyhash.hash(0, buf.items);
+    return desc_table_base_hash | (h & 0x0000_FFFF_FFFF_FFFF);
+}
+
+/// One descriptor-table entry: 6×u64 (48 bytes). `{size, align, size_class, hash_off,
+/// eq_off, trace_off}` where the `*_off`s are `__text` byte OFFSETS of the named erased
+/// units (0 when absent — the runtime resolves offset→address by adding `text_base()`).
+/// The name slices are BORROWED (the caller's `erased_units`), never freed here.
+pub const DescEntry = struct {
+    desc_hash: u64,
+    size: u32,
+    @"align": u32,
+    size_class: u16,
+    hash_name: ?[]const u8 = null,
+    eq_name: ?[]const u8 = null,
+    trace_name: ?[]const u8 = null,
+};
 
 /// One decoded string literal a function references, keyed by its content hash
 /// (the same hash a `.cstr` reloc target carries). `bytes` are the decoded
@@ -194,6 +222,12 @@ pub const Linked = struct {
     /// base to a NUL-terminated name. Owned by the caller. A pure function of the fn
     /// set (offsets are stable-sort-ranked), so it is `-jN` byte-identical.
     sym_table: []u8 = &.{},
+    /// The per-type descriptor table (empty unless `link` was given descriptors):
+    /// `{size, align, size_class, hash_off, eq_off, trace_off}` × N, 48 bytes each, in
+    /// the caller's canonical order. The `*_off`s are `__text` byte offsets (0 when
+    /// absent). A pure function of the fn set (built from the stable `si`/`offsets`), so
+    /// it is `-jN` byte-identical. Owned by the caller.
+    desc_table: []u8 = &.{},
 };
 
 /// Raised when a `.call26` displacement does not fit AArch64's signed imm26
@@ -242,7 +276,7 @@ fn prefixSumTextOffsets(
 /// backward (and self/mutual) recursion a non-positive one; both encode directly
 /// via `Aarch64.bl`. Because the delta is intra-module it is fixed at link time
 /// and needs NO runtime relocation under PIE/ASLR.
-pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName, emit_symtab: bool) LinkError!Linked {
+pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName, emit_symtab: bool, descriptors: []const DescEntry) LinkError!Linked {
     // 1) LAYOUT: assign every fn a dense handle by STABLE SORT of the fn set
     //    (rank, never arrival/source order), then
     //    walk `fns` in SOURCE ORDER to give each its text offset. Layout STAYS
@@ -374,6 +408,11 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     const sym_table: []u8 = if (emit_symtab) try buildSymTable(gpa, fns, site_h, offsets, cursor) else &.{};
     errdefer gpa.free(sym_table);
 
+    // 4b) DESCRIPTORS: the per-type table the erased `descriptor_of` path reads. Built
+    //     from the same `si`/`offsets`, so it is a pure function of the fn set.
+    const desc_table: []u8 = if (descriptors.len > 0) try buildDescTable(gpa, descriptors, si, offsets) else &.{};
+    errdefer gpa.free(desc_table);
+
     // 5) ENTRY: the entry function's resolved text offset, resolved by name.
     const entry_h = (try si.get(gpa, entry)) orelse return error.NoEntry;
     return .{
@@ -381,7 +420,34 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
         .entry_off = offsets[entry_h],
         .data_relocs = try data_relocs.toOwnedSlice(gpa),
         .sym_table = sym_table,
+        .desc_table = desc_table,
     };
+}
+
+/// Build the per-type descriptor table (see `Linked.desc_table`): 48 bytes per entry in
+/// the caller's canonical order, each `{size, align, size_class, hash_off, eq_off,
+/// trace_off}`. A name's `*_off` is the erased unit's `__text` byte offset (resolved from
+/// the interned handle → `offsets`), or 0 when the name is absent.
+fn buildDescTable(gpa: std.mem.Allocator, entries: []const DescEntry, si: *SymInterner, offsets: []const u32) ![]u8 {
+    const buf = try gpa.alloc(u8, entries.len * 48);
+    errdefer gpa.free(buf);
+    var pos: usize = 0;
+    for (entries) |e| {
+        std.mem.writeInt(u64, buf[pos..][0..8], e.size, .little);
+        std.mem.writeInt(u64, buf[pos + 8 ..][0..8], e.@"align", .little);
+        std.mem.writeInt(u64, buf[pos + 16 ..][0..8], e.size_class, .little);
+        std.mem.writeInt(u64, buf[pos + 24 ..][0..8], try descOffOf(gpa, si, offsets, e.hash_name), .little);
+        std.mem.writeInt(u64, buf[pos + 32 ..][0..8], try descOffOf(gpa, si, offsets, e.eq_name), .little);
+        std.mem.writeInt(u64, buf[pos + 40 ..][0..8], try descOffOf(gpa, si, offsets, e.trace_name), .little);
+        pos += 48;
+    }
+    return buf;
+}
+
+fn descOffOf(gpa: std.mem.Allocator, si: *SymInterner, offsets: []const u32, name: ?[]const u8) !u64 {
+    const nm = name orelse return 0;
+    const h = (try si.get(gpa, .{ .kind = .user_fn, .name = nm })) orelse return error.UnresolvedSymbol;
+    return offsets[h];
 }
 
 /// One (text offset, function name) row of the backtrace symbol table.
@@ -876,7 +942,7 @@ fn linkTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) Li
     defer threaded.deinit();
     var si: SymInterner = .{};
     defer si.deinit(gpa);
-    return link(threaded.io(), gpa, fns, &si, fname(entry), false);
+    return link(threaded.io(), gpa, fns, &si, fname(entry), false, &.{});
 }
 
 /// Like `linkTest` but requests the backtrace symbol table (`emit_symtab = true`).
@@ -885,7 +951,7 @@ fn linkSymTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32)
     defer threaded.deinit();
     var si: SymInterner = .{};
     defer si.deinit(gpa);
-    return link(threaded.io(), gpa, fns, &si, fname(entry), true);
+    return link(threaded.io(), gpa, fns, &si, fname(entry), true, &.{});
 }
 
 test "buildSideTable: count header, off rows, payload_off rebased past header into blob" {

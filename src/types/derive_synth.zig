@@ -471,6 +471,82 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     for (t.derives.items) |*d| d.field_witnesses = try resolveDeriveFields(t, d.*);
 }
 
+/// The descriptor ordering class: scalar (0), struct (1), enum (2). Within a class,
+/// scalars sort by a fixed kind rank and aggregates by nominal id — a source-pure,
+/// index-independent, `-jN`-stable total order.
+fn descClass(ty: Type) u8 {
+    return switch (ty.kind) {
+        .@"struct" => 1,
+        .@"enum" => 2,
+        else => 0,
+    };
+}
+
+fn scalarRank(ty: Type) u8 {
+    return switch (ty.kind) {
+        .int => 0,
+        .bool => 1,
+        .str => 2,
+        .unit => 3,
+        .float => 4,
+        .rawptr => 5,
+        else => 6,
+    };
+}
+
+fn descLess(_: void, a: Type, b: Type) bool {
+    const ca = descClass(a);
+    const cb = descClass(b);
+    if (ca != cb) return ca < cb;
+    return switch (ca) {
+        // A tie on scalar rank means both are `.int` (every other scalar has a unique
+        // rank); break it on the sign/width byte so distinct int widths get a stable
+        // order — else the unstable sort could reorder them across `-jN`.
+        0 => if (scalarRank(a) != scalarRank(b))
+            scalarRank(a) < scalarRank(b)
+        else
+            @as(u8, @bitCast(a.int_desc)) < @as(u8, @bitCast(b.int_desc)),
+        else => a.nominalId() < b.nominalId(),
+    };
+}
+
+/// Resolve the `descriptor_of[T]` requests into the descriptor plan + erased hash/eq
+/// witnesses. Runs AFTER `synthesizeDerives` so the natural Hash/Eq recipes + methods the
+/// erased struct/enum walk delegates to already exist. Determinism is anchored by the
+/// canonical sort + names minted after the sort — never discovery/thread order.
+pub fn synthesizeDescriptors(t: *Typecheck) !void {
+    if (t.descriptor_reqs.items.len == 0) return;
+    const pre = t.prelude orelse return;
+    const hash_pid_opt = pre.protocols.hash;
+    const gpa = t.gpa;
+
+    // 1) dedup (reified concrete types → structural equality suffices).
+    var uniq: std.ArrayList(Type) = .empty;
+    defer uniq.deinit(gpa);
+    outer: for (t.descriptor_reqs.items) |r| {
+        for (uniq.items) |u| if (Type.eql(u, r)) continue :outer;
+        try uniq.append(gpa, r);
+    }
+
+    // 2) canonical sort (the SOLE ordering driver).
+    std.mem.sort(Type, uniq.items, {}, descLess);
+
+    // 3) resolve each: a descriptor entry, plus erased hash+eq units when `Hashable`.
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    for (uniq.items) |ty| {
+        const hashable = if (hash_pid_opt) |hp|
+            try conforms(t.structs.items, t.enums.items, t.conformances.items, ty, hp, &memo, gpa, t.composite, &.{})
+        else
+            false;
+        try t.descriptor_types.append(gpa, .{ .ty = ty, .hashable = hashable });
+        if (hashable) {
+            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .hash, .name = try Derive.erasedMangle(gpa, .hash, ty) });
+            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .eq, .name = try Derive.erasedMangle(gpa, .eq, ty) });
+        }
+    }
+}
+
 /// Enqueue `ty` for derive `(pid, kind)` once, deduped on the canonical recipe key so a
 /// repeated request / nested field is synthesized a single time. `seen` OWNS the key bytes.
 fn enqueueDerive(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), work: *std.ArrayList(Type), pid: u32, kind: Derive.Kind, ty: Type) !void {

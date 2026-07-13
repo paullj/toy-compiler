@@ -787,6 +787,64 @@ pub fn codegenSynthetic(
     }.f);
 }
 
+/// Lower one ERASED hash/eq unit (type+kind→Ir→OPT→FnCode), UNCACHED. The unit is pure
+/// over `(ty, kind, layout)` and enumerated in canonical order, so it is `-jN`-deterministic
+/// without a cache key — no fingerprint, no probe. Fills the same `FnSlot` shape as
+/// `lowerSynthetic`.
+pub fn codegenErased(
+    self: Engine,
+    gpa: std.mem.Allocator,
+    io: Io,
+    target: []const u8,
+    frozen: anytype,
+    ei: usize,
+    tmp_tag: usize,
+    slot: anytype,
+) !void {
+    _ = self;
+    _ = io;
+    _ = target;
+    _ = tmp_tag;
+    const u = frozen.erased_units[ei];
+    const sym = Link.SymName{ .kind = .user_fn, .name = u.name.? };
+
+    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    const in: lower.Inputs = .{
+        .tree = frozen.tree,
+        .tokens = frozen.tokens,
+        .source = frozen.source,
+        .resolutions = frozen.resolutions,
+        .node_types = frozen.node_types, // &.{} for an erased unit — the emitter reads none
+        .layouts = frozen.layouts,
+        .enum_layouts = frozen.enum_layouts,
+        .names = frozen.names,
+        .sig = null,
+        .instances = frozen.instances,
+        .sigs = frozen.sigs,
+        .methods = frozen.methods,
+        .derives = frozen.derives,
+        .prelude_ids = frozen.prelude_ids,
+        .char_struct = frozen.char_struct,
+    };
+    var irf = try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, sym, &diags);
+    defer irf.deinit(gpa);
+    if (diags.items.len > 0) return error.CodegenDiagnostic;
+
+    var opt_st: Opt.Stats = .{};
+    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
+    const ir_instrs = Ir.instrCount(&irf);
+
+    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);
+    if (diags.items.len > 0) {
+        var tmp = fc;
+        tmp.deinit(gpa);
+        return error.CodegenDiagnostic;
+    }
+    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
+}
+
 const testing = std.testing;
 
 test "aggKey is order-independent and does not cancel duplicates" {

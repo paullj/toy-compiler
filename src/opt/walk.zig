@@ -55,6 +55,13 @@ fn eachInstrUseOperand(op: *Ir.Op, ctx: anytype, comptime each: anytype) void {
             .value => |*v| each(ctx, v),
             .slot, .none => {},
         },
+        .call_indirect => |*c| {
+            each(ctx, &c.target);
+            for (c.args) |*a| switch (a.*) {
+                .value => |*v| each(ctx, v),
+                .slot, .none => {},
+            };
+        },
     }
 }
 

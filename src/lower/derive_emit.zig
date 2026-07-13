@@ -846,6 +846,174 @@ fn lowerDeriveHash(
     return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
+/// Re-export so callers name the erased kind through this emitter.
+pub const ErasedKind = Derive.ErasedKind;
+
+/// Lower an ERASED key witness: the same structural walk as the natural `hash`/`eq`
+/// derive, but the receiver base(s) arrive as `rawptr` params (the key's byte address)
+/// instead of by-value self slots. The loaded pointer IS the key base, so the shared
+/// `deriveFieldHash`/`deriveFieldEq`/`hashStrAtPtr`/`strEqAtPtrs` walks apply unchanged —
+/// `field_addr(base, off)` reads through the passed pointer identically to a frame-slot
+/// base. Uncached and pure of `(ty, kind, layout)`, so a double-lower is byte-identical.
+/// Replicates the 3-line struct/enum folds rather than editing `lowerDeriveHash`/
+/// `lowerDeriveEq`, deliberately keeping the natural-derive corpus untouched.
+pub fn lowerErased(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    ty: Typecheck.Type,
+    kind: Derive.ErasedKind,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const rawptr_ty = Typecheck.Type.rawptr;
+    return switch (kind) {
+        .hash => lowerErasedHash(gpa, in, ty, sym, out_diags, int_ty, rawptr_ty),
+        .eq => lowerErasedEq(gpa, in, ty, sym, out_diags, int_ty, bool_ty, rawptr_ty),
+    };
+}
+
+fn lowerErasedHash(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    ty: Typecheck.Type,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+    int_ty: Typecheck.Type,
+    rawptr_ty: Typecheck.Type,
+) error{OutOfMemory}!Ir.Function {
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = int_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_ptr = try b.addSlot(rawptr_ty);
+    try params.append(gpa, p_ptr);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, int_ty);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const p_addr = try b.emit(.{ .slot_addr = p_ptr }, int_ty);
+    const self_base = try b.emit(.{ .load = .{ .addr = p_addr, .ty = rawptr_ty } }, rawptr_ty);
+
+    const result: Ir.ValueId = switch (ty.kind) {
+        .int, .bool => try b.emit(.{ .load = .{ .addr = self_base, .ty = ty } }, ty),
+        .str => try L.hashStrAtPtr(&b, self_base),
+        .@"struct" => blk: {
+            const layout = b.in.layouts[ty.struct_id];
+            var h = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
+            for (layout.field_types, layout.offsets) |fty, off| {
+                const fh = try deriveFieldHash(&b, fty, off, self_base);
+                h = try L.hashMix(&b, h, fh);
+            }
+            break :blk h;
+        },
+        .@"enum" => blk: {
+            const e = b.in.enum_layouts[ty.enum_id];
+            var any_payload = false;
+            for (e.variants) |v| if (v.field_types.len != 0) {
+                any_payload = true;
+                break;
+            };
+            if (!any_payload) {
+                const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
+                const seed = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
+                break :blk try L.hashMix(&b, seed, tag);
+            }
+            break :blk try deriveEnumHash(&b, ty, self_base);
+        },
+        else => blk: {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "erased hash: unsupported key type in lower" });
+            b.had_error = true;
+            break :blk try b.emit(.{ .iconst = 0 }, int_ty);
+        },
+    };
+
+    if (!b.termSet()) try L.brTo(&b, exit, .{ .value = result });
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
+fn lowerErasedEq(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    ty: Typecheck.Type,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+    int_ty: Typecheck.Type,
+    bool_ty: Typecheck.Type,
+    rawptr_ty: Typecheck.Type,
+) error{OutOfMemory}!Ir.Function {
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = bool_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_a = try b.addSlot(rawptr_ty);
+    try params.append(gpa, p_a);
+    const p_b = try b.addSlot(rawptr_ty);
+    try params.append(gpa, p_b);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.ret_param = try b.addParam(exit, bool_ty);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
+    b.blocks.items[exit].term_set = true;
+
+    const pa_addr = try b.emit(.{ .slot_addr = p_a }, int_ty);
+    const self_base = try b.emit(.{ .load = .{ .addr = pa_addr, .ty = rawptr_ty } }, rawptr_ty);
+    const pb_addr = try b.emit(.{ .slot_addr = p_b }, int_ty);
+    const other_base = try b.emit(.{ .load = .{ .addr = pb_addr, .ty = rawptr_ty } }, rawptr_ty);
+
+    const result: Ir.ValueId = switch (ty.kind) {
+        .int, .bool => blk: {
+            const lv = try b.emit(.{ .load = .{ .addr = self_base, .ty = ty } }, ty);
+            const rv = try b.emit(.{ .load = .{ .addr = other_base, .ty = ty } }, ty);
+            break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, bool_ty);
+        },
+        .str => try L.strEqAtPtrs(&b, self_base, other_base),
+        .@"struct" => blk: {
+            const layout = b.in.layouts[ty.struct_id];
+            var acc = try b.emit(.{ .iconst = 1 }, int_ty);
+            for (layout.field_types, layout.offsets) |fty, off| {
+                const feq = try deriveFieldEq(&b, fty, off, self_base, other_base);
+                acc = try b.emit(.{ .mul = .{ .lhs = acc, .rhs = feq } }, int_ty);
+            }
+            const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+            break :blk try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = acc, .rhs = zero } }, bool_ty);
+        },
+        .@"enum" => blk: {
+            const e = b.in.enum_layouts[ty.enum_id];
+            var any_payload = false;
+            for (e.variants) |v| if (v.field_types.len != 0) {
+                any_payload = true;
+                break;
+            };
+            if (!any_payload) {
+                const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
+                const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
+                break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
+            }
+            break :blk try deriveEnumEq(&b, ty, self_base, other_base);
+        },
+        else => blk: {
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "erased eq: unsupported key type in lower" });
+            b.had_error = true;
+            break :blk try b.emit(.{ .bconst = false }, bool_ty);
+        },
+    };
+
+    if (!b.termSet()) try L.brTo(&b, exit, .{ .value = result });
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+}
+
 /// Display field `i` (at byte `off`, type `fty`) of receiver base `self_base`:
 /// int/bool render inline (via `__display_int` / the bool cond); a `str` field writes its
 /// raw bytes (the SAME `str {ptr,len}` write path a top-level `str` uses — no quotes); a
@@ -1174,6 +1342,100 @@ fn intStructInputs(layouts: []const Typecheck.Layout) L.Inputs {
         .methods = &.{},
         .derives = &.{},
     };
+}
+
+/// Render a Function to owned text — used to pin `-jN` byte-identity of the erased units.
+fn renderFn(gpa: std.mem.Allocator, func: *const Ir.Function, in: L.Inputs) ![]u8 {
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ir.render(&w, func, in.layouts, in.enum_layouts);
+    return gpa.dupe(u8, w.buffered());
+}
+
+/// The field-walk offsets of an erased unit: the `field_addr`s whose base is the loaded
+/// key pointer (`load` of `slot_addr(0)` — the `rawptr` param slot).
+fn erasedFieldOffsets(gpa: std.mem.Allocator, func: *const Ir.Function) error{OutOfMemory}![]u32 {
+    var slot0_addr: ?Ir.ValueId = null;
+    var self_base: ?Ir.ValueId = null;
+    for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+        .slot_addr => |s| if (s == 0 and slot0_addr == null) {
+            slot0_addr = ins.result;
+        },
+        .load => |l| if (slot0_addr != null and l.addr == slot0_addr.? and self_base == null) {
+            self_base = ins.result;
+        },
+        else => {},
+    };
+    var list: std.ArrayList(u32) = .empty;
+    errdefer list.deinit(gpa);
+    if (self_base) |sb| for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+        .field_addr => |fa| if (fa.base == sb) try list.append(gpa, fa.off),
+        else => {},
+    };
+    return list.toOwnedSlice(gpa);
+}
+
+test "erased hash on an int key returns the loaded value; byte-identical across relowers" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const in = intStructInputs(&.{});
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "descriptor$hash$int" };
+
+    var f1 = try lowerErased(gpa, in, Typecheck.Type.int, .hash, sym, &diags);
+    defer f1.deinit(gpa);
+    var f2 = try lowerErased(gpa, in, Typecheck.Type.int, .hash, sym, &diags);
+    defer f2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    const t1 = try renderFn(gpa, &f1, in);
+    defer gpa.free(t1);
+    const t2 = try renderFn(gpa, &f2, in);
+    defer gpa.free(t2);
+    try testing.expectEqualStrings(t1, t2);
+}
+
+test "erased struct hash walks fields in layout order; byte-identical across relowers" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    var fnames = [_][]const u8{ "a", "b", "c" };
+    var ftys = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int, Typecheck.Type.int };
+    var offs = [_]u32{ 0, 8, 16 };
+    var layouts = [_]Typecheck.Layout{.{ .name = "S", .field_names = &fnames, .field_types = &ftys, .offsets = &offs, .size = 24, .@"align" = 8 }};
+    const in = intStructInputs(&layouts);
+    const ct = Typecheck.Type.structT(0);
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "descriptor$hash$s0" };
+
+    var f1 = try lowerErased(gpa, in, ct, .hash, sym, &diags);
+    defer f1.deinit(gpa);
+    var f2 = try lowerErased(gpa, in, ct, .hash, sym, &diags);
+    defer f2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    const walk_offs = try erasedFieldOffsets(gpa, &f1);
+    defer gpa.free(walk_offs);
+    try testing.expectEqualSlices(u32, &[_]u32{ 0, 8, 16 }, walk_offs);
+
+    const t1 = try renderFn(gpa, &f1, in);
+    defer gpa.free(t1);
+    const t2 = try renderFn(gpa, &f2, in);
+    defer gpa.free(t2);
+    try testing.expectEqualStrings(t1, t2);
+}
+
+test "erased eq on an int key emits an icmp eq over two loaded pointers" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const in = intStructInputs(&.{});
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "descriptor$eq$int" };
+
+    var f = try lowerErased(gpa, in, Typecheck.Type.int, .eq, sym, &diags);
+    defer f.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    try testing.expect(hasCond(&f, .eq));
 }
 
 test "derive Hash: mixer is fxhash (rotl(h,5)^word)*%K — constants/shifts/lshr + operand order pinned" {

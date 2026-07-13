@@ -147,6 +147,12 @@ pub fn patchCross(word: u32, kind: RelocKind, site_vmaddr: u64, target_vmaddr: u
 /// collide; the relink tail rejects an actual collision).
 pub const symtab_base_hash: u64 = 0x5717_ab1e_ba5e_0000;
 
+/// The content-hash sentinel naming the descriptor table's base. A distinct high prefix
+/// from `symtab_base_hash` so the two reserved sentinels never alias; the per-type
+/// `descHash(T)` sentinels share this prefix (see `Link.descHash`). Reserved in the
+/// cstring offset map by the relink tail exactly like `symtab_base_hash`.
+pub const desc_table_base_hash: u64 = 0xDE5C_0000_0000_0000;
+
 const testing = std.testing;
 
 test "SymbolId.name is the single source of truth for name ownership" {

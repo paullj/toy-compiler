@@ -47,6 +47,16 @@ pub const TypeDescriptor = struct {
     @"align": u32,
     size_class: u16,
 };
+
+/// One type demanded by a `descriptor_of[T]()` site, resolved after synthesis. `hashable`
+/// records whether `T` conforms to `Hash`+`Eq` (so its descriptor carries erased
+/// hash/eq references, else those slots are null/absent). PODs — the ty is a reified value.
+pub const DescType = struct { ty: Type, hashable: bool };
+
+/// An erased key witness to synthesize for a descriptor'd `Hashable` type: the key type,
+/// which witness (`hash`/`eq`), the owning module sentinel, and the minted mangled name
+/// (`descriptor$hash$…`/`descriptor$eq$…`, owned — freed at teardown / by `GraphResult`).
+pub const ErasedUnit = struct { ty: Type, kind: Derive.ErasedKind, mod: u32 = 0, name: ?[]u8 = null };
 const Composite = @import("symbols/Composite.zig");
 const Infer = @import("symbols/Infer.zig");
 const derive_synth = @import("types/derive_synth.zig");
@@ -347,6 +357,12 @@ pub const GraphResult = struct {
     /// `protocol_name` are BORROWED (sibling derive/instance/fn names + prelude/source
     /// protocol names — all outlive codegen).
     derives: []DeriveRecipe = &.{},
+    /// The per-type descriptor plan demanded by `descriptor_of[T]()` sites, in canonical
+    /// order. Empty for a program with no `descriptor_of` use. PODs (owned backing array).
+    descriptor_types: []DescType = &.{},
+    /// The erased hash/eq witnesses for the descriptor'd Hashable types, in canonical
+    /// order. Each entry's `name` is OWNED (freed in `deinit`); the backing array is owned.
+    erased_units: []ErasedUnit = &.{},
     /// The prelude protocol ids, snapshotted off the checker so codegen resolves
     /// each `==`/`<`/`+`/`.hash()`/`print`/`?`-widen witness by its SPECIFIC protocol (a
     /// sibling protocol reusing the name is excluded). Threaded into every job's `Frozen`
@@ -409,6 +425,9 @@ pub const GraphResult = struct {
         // backing array.
         freeDeriveEntries(gpa, self.derives);
         gpa.free(self.derives);
+        gpa.free(self.descriptor_types);
+        for (self.erased_units) |u| if (u.name) |nm| gpa.free(nm);
+        gpa.free(self.erased_units);
         self.* = undefined;
     }
 };
@@ -1107,6 +1126,21 @@ derives: std.ArrayList(DeriveRecipe) = .empty,
 /// its consumer is a later milestone, so it is provisioned but not yet read or emitted.
 descriptors: std.ArrayList(TypeDescriptor) = .empty,
 
+/// The types demanded by `descriptor_of[T]()` sites, merged in fn-id order by
+/// `checkBodies` (mirroring `derive_reqs`), then reified and consumed by the synthesis
+/// barrier (deduped + canonically sorted into `descriptor_types`/`erased_units`). Empty
+/// for a program with no `descriptor_of` use → no synthesis → corpus byte-identical.
+descriptor_reqs: std.ArrayList(Type) = .empty,
+
+/// The resolved per-type descriptor plan, produced by the synthesis barrier in canonical
+/// order. Transferred whole into `GraphResult.descriptor_types` by `checkGraph`. PODs.
+descriptor_types: std.ArrayList(DescType) = .empty,
+
+/// The erased hash/eq witnesses to codegen, produced by the synthesis barrier in canonical
+/// order (names minted AFTER the sort). Transferred into `GraphResult.erased_units`; each
+/// `name` is owned (freed there / at teardown).
+erased_units: std.ArrayList(ErasedUnit) = .empty,
+
 /// The composite (`App`) intern table. Heap-allocated in `checkGraph` (stable
 /// address across the run, so every `BodyChecker` can borrow it), freed at teardown.
 /// `App` types are interned here during checking and REIFIED away before the layout
@@ -1526,6 +1560,12 @@ pub fn checkGraph(
         t.derives.deinit(gpa);
         // The descriptor table holds PODs (no per-entry owned data); free the backing array.
         t.descriptors.deinit(gpa);
+        // Descriptor requests + resolved plan (PODs). Any un-transferred erased units
+        // (error path) own their minted `name`; the success path empties the list first.
+        t.descriptor_reqs.deinit(gpa);
+        t.descriptor_types.deinit(gpa);
+        for (t.erased_units.items) |u| if (u.name) |nm| gpa.free(nm);
+        t.erased_units.deinit(gpa);
         // The per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
         // The method table's backing array (entries' names are borrowed source
@@ -1645,6 +1685,16 @@ pub fn checkGraph(
         gpa.free(derives);
     }
 
+    // Transfer the descriptor plan + erased units (mirrors derives). `descriptor_types`
+    // holds PODs; each erased unit owns its minted `name`, freed on the error path here.
+    const descriptor_types = try t.descriptor_types.toOwnedSlice(gpa);
+    errdefer gpa.free(descriptor_types);
+    const erased_units = try t.erased_units.toOwnedSlice(gpa);
+    errdefer {
+        for (erased_units) |u| if (u.name) |nm| gpa.free(nm);
+        gpa.free(erased_units);
+    }
+
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
@@ -1665,6 +1715,8 @@ pub fn checkGraph(
         .methods = methods,
         .templates = templates_out,
         .derives = derives,
+        .descriptor_types = descriptor_types,
+        .erased_units = erased_units,
         .prelude_ids = gatherPreludeIds(t),
         .char_struct = if (t.prelude) |p| p.char_struct else null,
     };
@@ -2006,6 +2058,10 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // canonical source-less recipes + their synthetic method-table entries.
     try derive_synth.synthesizeDerives(t);
 
+    // Descriptor synthesis runs AFTER derive synthesis so the natural Hash/Eq recipes +
+    // methods the erased walk delegates to already exist.
+    try derive_synth.synthesizeDescriptors(t);
+
     // The mono tail may have emitted instance-body diagnostics (and T0014); re-sort
     // the shared stream so the final (scope, byte_offset) order is deterministic.
     t.sink.sort();
@@ -2340,6 +2396,9 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     // first time here (Pass C skips unbounded templates), so drain the structural-Eq
     // requests recorded during this re-check; `synthesizeDerives` dedups+sorts afterward.
     try t.derive_reqs.appendSlice(t.gpa, bc.derive_reqs.items);
+    // A `descriptor_of[T]` reached ONLY from an unbounded generic body is first seen here;
+    // drain its requests so the synthesis barrier still plans the descriptor + erased units.
+    try t.descriptor_reqs.appendSlice(t.gpa, bc.descriptor_reqs.items);
     // A char conversion reached ONLY from an unbounded generic body is first seen here;
     // OR-merge its captured Result so the synthesis barrier still reifies the witness.
     if (t.conv_int_char_result == null) t.conv_int_char_result = bc.conv_int_char_result;
@@ -2457,6 +2516,9 @@ const BodyResult = struct {
     /// type with no impl. OWNED (moved out of the `BodyChecker`); merged into
     /// `t.derive_reqs` in fn-id order by `checkBodies`, then freed. PODs (no owned data).
     derive_reqs: []DeriveReq = &.{},
+    /// The types this fn's `descriptor_of[T]()` sites demanded. OWNED (moved out of the
+    /// `BodyChecker`); merged into `t.descriptor_reqs` in fn-id order by `checkBodies`.
+    descriptor_reqs: []Type = &.{},
     /// The concrete `Result[char/byte, ConvErr]` this fn's `try_into` sites typed, OR-merged
     /// into `t.conv_*_result` by `checkBodies` (gate for the shared-witness synthesis).
     conv_int_char_result: ?Type = null,
@@ -2490,6 +2552,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // default, and freeing a zero-length slice is a no-op). The merge below copies the
     // PODs into `t.derive_reqs`, so freeing the source afterward is correct.
     defer for (slots) |*s| gpa.free(s.derive_reqs);
+    defer for (slots) |*s| gpa.free(s.descriptor_reqs);
 
     if (t.io) |io| {
         const Ctx = struct {
@@ -2517,6 +2580,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // deterministic collection order the synthesis barrier's dedup+sort depends on —
     // mirrors the poison snapshot above). PODs, so a plain concat.
     for (slots) |s| try t.derive_reqs.appendSlice(gpa, s.derive_reqs);
+    for (slots) |s| try t.descriptor_reqs.appendSlice(gpa, s.descriptor_reqs);
 
     // OR-merge the captured conv Result types: every site interned the SAME
     // `Result[char/byte, ConvErr]`, so first-writer-wins is order-free.
@@ -2586,6 +2650,10 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // checkBodies). `toOwnedSlice` empties bc's list so the deferred `bc.deinit` frees
     // nothing it no longer owns.
     out.derive_reqs = bc.derive_reqs.toOwnedSlice(bc.gpa) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.descriptor_reqs = bc.descriptor_reqs.toOwnedSlice(bc.gpa) catch |e| {
         out.err = e;
         return;
     };

@@ -42,6 +42,9 @@ pub const Options = struct {
     /// Informational today; the only supported target is aarch64-macos and it is
     /// not threaded into the emitted bytes.
     target: []const u8 = "aarch64-macos",
+    /// The per-type descriptor table to embed, in canonical order. Empty (the default)
+    /// leaves the image byte-identical to a descriptor-free build.
+    descriptors: []const Link.DescEntry = &.{},
 };
 
 /// The linked-program tail: the joined __text blob, the entry offset, and the
@@ -65,7 +68,7 @@ pub const Linked = struct {
 /// and any appended print body). `entry` is the entry function's stable symbol
 /// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
 /// `data_relocs` (free `.import` data-reloc names individually).
-pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName) !Linked {
+pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, descriptors: []const Link.DescEntry) !Linked {
     // 1) Scan which hand-emitted builtins (`CodegenIr.hand_builtins`) any fn references;
     //    each referenced body is appended below. Those bodies emit their own `.import`
     //    relocs (e.g. `print`/`panic` -> `write`), so the dyld import set is DERIVED from
@@ -137,7 +140,21 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     //     appended after `link` (they depend on the layout it computes); only their
     //     start offset is known now. A real literal hashing to the sentinel would be
     //     silently mis-pointed — reject it (astronomically unlikely).
-    const symtab_off: u32 = std.mem.alignForward(u32, @intCast(interned.cstrings.len), 8);
+    // The descriptor table is reserved FIRST (before the symtab), so when there are no
+    // descriptors `desc_table_off == symtab_off == align8(cstrings.len)` — the panic corpus
+    // reservation is byte-identical. Each per-type sentinel maps to its 48-byte entry.
+    const desc_table_off: u32 = std.mem.alignForward(u32, @intCast(interned.cstrings.len), 8);
+    const n_desc = descriptors.len;
+    if (n_desc > 0) {
+        for (descriptors, 0..) |e, i| {
+            if (off_by_hash.contains(e.desc_hash)) return error.CstringHashCollision;
+            try off_by_hash.put(gpa, e.desc_hash, @intCast(@as(usize, desc_table_off) + i * 48));
+        }
+    }
+    const symtab_off: u32 = if (n_desc > 0)
+        std.mem.alignForward(u32, desc_table_off + @as(u32, @intCast(n_desc * 48)), 8)
+    else
+        desc_table_off;
     if (uses_panic) {
         if (off_by_hash.contains(Link.symtab_base_hash)) return error.CstringHashCollision;
         try off_by_hash.put(gpa, Link.symtab_base_hash, symtab_off);
@@ -167,21 +184,30 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     // 4) Intern symbols (source order) and link.
     var si: Link.SymInterner = .{};
     defer si.deinit(gpa);
-    const linked = try Link.link(io, gpa, all.items, &si, entry, uses_panic);
+    const linked = try Link.link(io, gpa, all.items, &si, entry, uses_panic, descriptors);
     errdefer gpa.free(linked.text);
     errdefer gpa.free(linked.data_relocs);
     defer gpa.free(linked.sym_table);
+    defer gpa.free(linked.desc_table);
 
-    // 4b) Append the backtrace symbol table at the reserved `symtab_off` (padding to
-    //     the 8-alignment) so it rides in the signed, read-only __cstring section and
-    //     `__panic`'s reserved `.cstr` reloc resolves to it.
-    if (uses_panic and linked.sym_table.len > 0) {
+    // 4b) Append the reserved __cstring tail — the descriptor table (at `desc_table_off`)
+    //     then the backtrace symbol table (at `symtab_off`), each padded to its 8-aligned
+    //     start so it rides in the signed, read-only section and the reserved `.cstr` relocs
+    //     resolve to it. With no descriptors the desc branch is skipped and the symtab pads
+    //     to the SAME offset as before → byte-identical.
+    if (linked.desc_table.len > 0 or (uses_panic and linked.sym_table.len > 0)) {
         var grown: std.ArrayList(u8) = .empty;
         errdefer grown.deinit(gpa);
         const old = cstrings_blob.?;
         try grown.appendSlice(gpa, old);
-        try grown.appendNTimes(gpa, 0, @as(usize, symtab_off) - old.len); // 8-align pad
-        try grown.appendSlice(gpa, linked.sym_table);
+        if (linked.desc_table.len > 0) {
+            try grown.appendNTimes(gpa, 0, @as(usize, desc_table_off) - grown.items.len);
+            try grown.appendSlice(gpa, linked.desc_table);
+        }
+        if (uses_panic and linked.sym_table.len > 0) {
+            try grown.appendNTimes(gpa, 0, @as(usize, symtab_off) - grown.items.len);
+            try grown.appendSlice(gpa, linked.sym_table);
+        }
         const new = try grown.toOwnedSlice(gpa); // old still owned on failure (errdefer frees it)
         cstrings_blob = new;
         gpa.free(old);
@@ -394,7 +420,7 @@ pub fn assembleAndSign(
 /// is byte-load-bearing (sign LAST). `entry` is the entry function's stable
 /// symbol identity (e.g. `{.user_fn, "main"}`). Caller owns the returned bytes.
 pub fn emitExecutable(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, opts: Options) ![]u8 {
-    const lk = try linkProgram(io, gpa, fns, entry);
+    const lk = try linkProgram(io, gpa, fns, entry, opts.descriptors);
     defer {
         gpa.free(lk.text);
         gpa.free(lk.cstrings);
@@ -623,14 +649,14 @@ test "backend determinism: linkProgram is byte-identical at -j1 and -jN across e
     defer gpa.free(fns_serial); // linkProgram consumes the elements, not the slice
     var t_serial = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
     defer t_serial.deinit();
-    var serial = try linkProgram(t_serial.io(), gpa, fns_serial, entry);
+    var serial = try linkProgram(t_serial.io(), gpa, fns_serial, entry, &.{});
     defer freeLinked(gpa, &serial);
 
     const fns_par = try detFns(gpa);
     defer gpa.free(fns_par);
     var t_par = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
     defer t_par.deinit();
-    var parallel_lk = try linkProgram(t_par.io(), gpa, fns_par, entry);
+    var parallel_lk = try linkProgram(t_par.io(), gpa, fns_par, entry, &.{});
     defer freeLinked(gpa, &parallel_lk);
 
     try testing.expectEqualSlices(u8, serial.text, parallel_lk.text);

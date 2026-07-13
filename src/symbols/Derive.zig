@@ -179,7 +179,79 @@ pub fn mangle(gpa: std.mem.Allocator, protocol_name: []const u8, kind: Kind, con
     return buf.toOwnedSlice(gpa);
 }
 
+/// Which erased key witness a descriptor entry carries. The erased units adapt a
+/// natural `hash`/`eq` recipe to a key-by-pointer ABI; unlike `Kind`/`mangle`, they
+/// must also name SCALAR key types (a `Map[int, V]` key is an `int`), so they get
+/// their own scalar-capable mangle rather than reusing `mangle` (which asserts a
+/// nominal struct/enum via `carriesIntDesc`).
+pub const ErasedKind = enum { hash, eq };
+
+/// The mangled erased-unit symbol: `descriptor$hash$<tag>` / `descriptor$eq$<tag>`,
+/// where `<tag>` is `s<id>`/`e<id>` for a struct/enum, or the kind spelling for a
+/// scalar. `$` bars source collision; the `descriptor$` prefix bars collision with a
+/// `Hash$hash$…`/`Eq$eq$…` derive name and a Mono `<template>$<args>` name.
+pub fn erasedMangle(gpa: std.mem.Allocator, kind: ErasedKind, ty: Type) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "descriptor$");
+    try buf.appendSlice(gpa, switch (kind) {
+        .hash => "hash",
+        .eq => "eq",
+    });
+    try buf.append(gpa, '$');
+    switch (ty.kind) {
+        .@"struct", .@"enum" => {
+            try buf.append(gpa, if (isEnum(ty)) 'e' else 's');
+            var nb: [16]u8 = undefined;
+            try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d}", .{typeId(ty)}) catch unreachable);
+        },
+        // Per-width spelling (`int`/`uint`/`int8`…/`uint64`), so each int width mints a
+        // distinct erased symbol — mirroring `appendKeyBytes`/`descHash` folding the
+        // sign/width byte into the type key. A bare "int" would alias every width onto ONE
+        // hash/eq implementation (a silent wrong-width read).
+        .int => try buf.appendSlice(gpa, ty.intName()),
+        .bool => try buf.appendSlice(gpa, "bool"),
+        .str => try buf.appendSlice(gpa, "str"),
+        .unit => try buf.appendSlice(gpa, "unit"),
+        .float => try buf.appendSlice(gpa, "float"),
+        .rawptr => try buf.appendSlice(gpa, "rawptr"),
+        else => try buf.appendSlice(gpa, "other"),
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
 const testing = std.testing;
+
+test "erasedMangle distinct per (kind, type), disjoint from mangle" {
+    const gpa = testing.allocator;
+    const hs = try erasedMangle(gpa, .hash, Type.structT(0));
+    defer gpa.free(hs);
+    try testing.expectEqualStrings("descriptor$hash$s0", hs);
+    const es = try erasedMangle(gpa, .eq, Type.structT(0));
+    defer gpa.free(es);
+    try testing.expectEqualStrings("descriptor$eq$s0", es);
+    const hi = try erasedMangle(gpa, .hash, Type.int);
+    defer gpa.free(hi);
+    try testing.expectEqualStrings("descriptor$hash$int", hi);
+    const hstr = try erasedMangle(gpa, .hash, Type.str);
+    defer gpa.free(hstr);
+    try testing.expectEqualStrings("descriptor$hash$str", hstr);
+    try testing.expect(!std.mem.eql(u8, hs, es));
+    // Each int width mints its own erased symbol — a bare "int" would alias every width
+    // onto one hash/eq body (a silent wrong-width read for a `byte`/`int8` key).
+    const hi8 = try erasedMangle(gpa, .hash, Type.int8);
+    defer gpa.free(hi8);
+    try testing.expectEqualStrings("descriptor$hash$int8", hi8);
+    const hu8 = try erasedMangle(gpa, .hash, Type.uint8);
+    defer gpa.free(hu8);
+    try testing.expectEqualStrings("descriptor$hash$uint8", hu8);
+    try testing.expect(!std.mem.eql(u8, hi, hi8));
+    try testing.expect(!std.mem.eql(u8, hi8, hu8));
+    // Disjoint from a natural derive name for the same type.
+    const dhs = try mangle(gpa, "Hash", .hash, Type.structT(0));
+    defer gpa.free(dhs);
+    try testing.expect(!std.mem.eql(u8, hs, dhs));
+}
 
 test "mangle is distinct per (protocol, kind, type)" {
     const gpa = testing.allocator;
