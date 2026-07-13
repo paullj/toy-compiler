@@ -173,6 +173,7 @@ pub const Builder = struct {
             bb.params.deinit(b.gpa);
             for (bb.instrs.items) |*ins| switch (ins.op) {
                 .call => |c| b.gpa.free(c.args),
+                .call_indirect => |c| b.gpa.free(c.args),
                 else => {},
             };
             bb.instrs.deinit(b.gpa);
@@ -1814,6 +1815,14 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     const vargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                     return .{ .value = operandValue(try lowerExpr(b, vargs[0])) };
                 }
+                // `descriptor_of[T]()`: materialize the address of T's descriptor entry via
+                // the reserved-sentinel `cstr_ptr` path (NOT folded to a constant — the
+                // address is a link-time-resolved reloc, exactly like a string literal ptr).
+                if (bik == .descriptor_of) {
+                    const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+                    const t = b.in.node_types[(tnodes[0]).int()];
+                    return .{ .value = try b.emit(.{ .cstr_ptr = try Link.descHash(b.gpa, t) }, Typecheck.Type.rawptr) };
+                }
             }
         }
         // A generic call `id[int](..)`: the callee is a `type_app` whose base
@@ -1930,6 +1939,24 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     const base = operandValue(try lowerExpr(b, oargs[0]));
                     const idx = operandValue(try lowerExpr(b, oargs[1]));
                     return .{ .value = try b.emit(.{ .add = .{ .lhs = base, .rhs = idx } }, Typecheck.Type.rawptr) };
+                },
+                .call_hash => {
+                    const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const fp = operandValue(try lowerExpr(b, a[0]));
+                    const kp = operandValue(try lowerExpr(b, a[1]));
+                    const args = try b.gpa.alloc(Ir.Operand, 1);
+                    args[0] = .{ .value = kp };
+                    return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int) };
+                },
+                .call_eq => {
+                    const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const fp = operandValue(try lowerExpr(b, a[0]));
+                    const ap = operandValue(try lowerExpr(b, a[1]));
+                    const bp = operandValue(try lowerExpr(b, a[2]));
+                    const args = try b.gpa.alloc(Ir.Operand, 2);
+                    args[0] = .{ .value = ap };
+                    args[1] = .{ .value = bp };
+                    return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool") };
                 },
                 else => {},
             };

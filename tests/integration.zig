@@ -22,4 +22,5 @@ test {
     _ = @import("heap.zig");
     _ = @import("ref.zig");
     _ = @import("vec.zig");
+    _ = @import("desc.zig");
 }

@@ -25,6 +25,18 @@ const DeriveEmit = @import("../lower/derive_emit.zig");
 const Fingerprint = @import("../query/Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
+const Abi = @import("../codegen/abi/Abi.zig");
+const Derive = @import("../symbols/Derive.zig");
+
+/// The mangled name of the erased `(ty, kind)` witness in `tc.erased_units` — a linear
+/// scan matching `(Type.eql, kind)`. Borrowed (the plan holds it by reference); `null`
+/// only if the unit was not synthesized (a non-Hashable type never asks for one).
+fn erasedNameFor(tc: *const Typecheck.GraphResult, ty: Typecheck.Type, kind: Derive.ErasedKind) ?[]const u8 {
+    for (tc.erased_units) |u| {
+        if (u.kind == kind and Typecheck.Type.eql(u.ty, ty)) return u.name.?;
+    }
+    return null;
+}
 
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
@@ -137,6 +149,9 @@ const Frozen = struct {
     /// resolve a derived witness to its synthetic unit, and `CallVisitor.foldWitness`
     /// folds the derived-Eq witness identity. Shared read-only.
     derives: []const Typecheck.DeriveRecipe = &.{},
+    /// The erased hash/eq witnesses, so `Engine.codegenErased` reads its unit's type/kind/
+    /// name off this job's view. Shared read-only.
+    erased_units: []const Typecheck.ErasedUnit = &.{},
     /// The prelude protocol ids: so `lowerStructEq`/`CallVisitor` resolve each
     /// operator/derive/`?`-widen witness by its SPECIFIC protocol (a sibling protocol
     /// reusing the name is excluded). Copied verbatim from the checker; lower and the
@@ -178,6 +193,7 @@ fn relink(
     cached_n: usize,
     opt_stats: Opt.Stats,
     ir_instrs: usize,
+    desc_plan: []const Link.DescEntry,
 ) !LowerProgramResult {
     // Gather the lowered fns into a contiguous slice in source order. `linkAndTail`
     // CONSUMES the elements (frees each FnCode on every path), so we only free the
@@ -189,7 +205,7 @@ fn relink(
         s.fc = null; // ownership moved into `fns`, then into linkAndTail
     }
 
-    var lp = linkAndTail(io, gpa, fns.items, names, entry_fn) catch |e| switch (e) {
+    var lp = linkAndTail(io, gpa, fns.items, names, entry_fn, desc_plan) catch |e| switch (e) {
         error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range", .byte_offset = null } },
         error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .byte_offset = null } },
         else => |err| return err,
@@ -210,8 +226,8 @@ fn relink(
 /// strings deterministically, rewrite `.cstr` targets, then `Link.link`. CONSUMES
 /// `fns` (frees each FnCode and any appended print body). Returns a LinkedProgram
 /// with `diags`/`owned_msgs` left empty for the caller to fill.
-fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32) !LinkedProgram {
-    const lk = try link.linkProgram(io, gpa, fns, names[entry_fn]);
+fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32, desc_plan: []const Link.DescEntry) !LinkedProgram {
+    const lk = try link.linkProgram(io, gpa, fns, names[entry_fn], desc_plan);
     return LinkedProgram{
         .text = lk.text,
         .entry_off = lk.entry_off,
@@ -274,8 +290,14 @@ const GraphFrozen = struct {
     /// `frozenFor` for the conversion recognizer + char-literal lowering.
     char_struct: ?u32 = null,
     /// The count of BASE fns + Mono instances; `fn_decls`/`fn_modules` entries at
-    /// `[derive_base..]` are the source-less derive units (parallel to `derives`).
+    /// `[derive_base, erased_base)` are the source-less derive units (parallel to `derives`).
     derive_base: usize = 0,
+    /// The erased hash/eq witnesses, appended after the derive units as a FOURTH class of
+    /// lowerable units. Routed to `Engine.codegenErased` (uncached).
+    erased_units: []const Typecheck.ErasedUnit = &.{},
+    /// The count of BASE fns + Mono instances + derive units; `fn_decls`/`fn_modules`
+    /// entries at `[erased_base..]` are the erased units (parallel to `erased_units`).
+    erased_base: usize = 0,
     opt: Opt.Config,
 
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
@@ -315,6 +337,7 @@ const GraphFrozen = struct {
             .conformances = confs,
             .methods = gf.methods,
             .derives = gf.derives,
+            .erased_units = gf.erased_units,
             .prelude_ids = gf.prelude_ids,
             .char_struct = gf.char_struct,
         };
@@ -414,6 +437,14 @@ pub fn lowerGraphProgram(
         try fn_decls.append(gpa, Ast.none);
         try fn_modules.append(gpa, d.mod);
     }
+    // The ERASED hash/eq units follow the derive units, in canonical order. Sentinel
+    // `decl_node` (layout-driven emitter) + the unit's `mod`. Routed to
+    // `Engine.codegenErased` (uncached) in `graphFnJobInner`.
+    const erased_base = fn_decls.items.len;
+    for (tc.erased_units) |u| {
+        try fn_decls.append(gpa, Ast.none);
+        try fn_modules.append(gpa, u.mod);
+    }
 
     const eid = entry_id orelse return .{ .err = .{
         .message = "-o requires a function named 'main' in the entry module",
@@ -464,6 +495,8 @@ pub fn lowerGraphProgram(
         .prelude_ids = tc.prelude_ids,
         .char_struct = tc.char_struct,
         .derive_base = derive_base,
+        .erased_units = tc.erased_units,
+        .erased_base = erased_base,
         .opt = opt,
         .probe = probe,
     };
@@ -533,9 +566,30 @@ pub fn lowerGraphProgram(
     for (tc.instances, 0..) |inst, k| lowered_names[base_count + k] = .{ .kind = .user_fn, .name = inst.name.? };
     // Derive units carry their synthetic mangled SymName (borrowed from `tc.derives`).
     for (tc.derives, 0..) |d, k| lowered_names[derive_base + k] = .{ .kind = .user_fn, .name = d.name.? };
+    // Erased units carry their synthetic mangled SymName (borrowed from `tc.erased_units`).
+    for (tc.erased_units, 0..) |u, k| lowered_names[erased_base + k] = .{ .kind = .user_fn, .name = u.name.? };
+
+    // Build the descriptor plan (canonical order = `tc.descriptor_types`), each entry's
+    // `{size, align, size_class}` from the layout snapshot + the erased hash/eq unit names
+    // (borrowed from `tc.erased_units`); `trace_name` is a reserved slot filled by a later
+    // consumer. Threaded through relink → linkAndTail → linkProgram → Link.link.
+    var desc_plan: std.ArrayList(Link.DescEntry) = .empty;
+    defer desc_plan.deinit(gpa);
+    for (tc.descriptor_types) |dt| {
+        const d = Abi.descriptorFor(dt.ty, tc.layouts, tc.enum_layouts);
+        try desc_plan.append(gpa, .{
+            .desc_hash = try Link.descHash(gpa, dt.ty),
+            .size = d.size,
+            .@"align" = d.@"align",
+            .size_class = d.size_class,
+            .hash_name = if (dt.hashable) erasedNameFor(tc, dt.ty, .hash) else null,
+            .eq_name = if (dt.hashable) erasedNameFor(tc, dt.ty, .eq) else null,
+            .trace_name = null,
+        });
+    }
 
     const link_t0: i128 = if (link_ns != null) nowNs(io) else 0;
-    const out = relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs);
+    const out = relink(io, gpa, slots, lowered_names, entry_pos, compiled, cached_n, opt_stats, ir_instrs, desc_plan.items);
     if (link_ns) |lp| {
         const dt = nowNs(io) - link_t0;
         lp.* = if (dt > 0) @intCast(dt) else 0;
@@ -588,7 +642,14 @@ fn graphFnJobInner(
     // the first same-named type in the merged layout table, missing a pub-type
     // layout edit at the importer (cross-module hole).
     var my_sig: ?Fingerprint.Sig = null;
-    if (lower_i >= gf.derive_base) {
+    if (lower_i >= gf.erased_base) {
+        // An ERASED hash/eq unit: layout-driven, uncached (pure over `(ty, kind, layout)` +
+        // enumerated in canonical order, so `-jN`-deterministic without a cache key).
+        const ei = lower_i - gf.erased_base;
+        const engine = Engine.initProbe(cache, mode, gf.probe);
+        try engine.codegenErased(gpa, io, target, &frozen, ei, lower_i, slot);
+        return;
+    } else if (lower_i >= gf.derive_base) {
         // A SOURCE-LESS auto-derive unit: no fn_decl / no AST fingerprint. Its
         // identity is the recipe's synthetic mangled name; route to the synthetic engine
         // entry which builds a NON-AST fingerprint from the recipe.
@@ -750,6 +811,38 @@ pub fn renderGraphIr(
             .char_struct = tc.char_struct,
         };
         var func = try DeriveEmit.lower(gpa, in, d, sym, &diags);
+        defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
+        if (!first) try aw.writer.writeAll("\n");
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        first = false;
+    }
+
+    // Render each ERASED hash/eq unit via the key-by-pointer emitter, in canonical order —
+    // the same units codegen lowers, so `--emit ir` shows one `descriptor$hash$…`/
+    // `descriptor$eq$…` per hashable descriptor type.
+    for (tc.erased_units) |u| {
+        const m = &graph.modules[u.mod];
+        const sym = Link.SymName{ .kind = .user_fn, .name = u.name.? };
+        const in = lower.Inputs{
+            .tree = m.tree(),
+            .tokens = m.tokens,
+            .source = m.source,
+            .resolutions = res.resolutions[u.mod],
+            .node_types = &.{},
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = names,
+            .sig = null,
+            .instances = tc.instances,
+            .sigs = tc.sigs,
+            .methods = tc.methods,
+            .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
+            .char_struct = tc.char_struct,
+        };
+        var func = try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, sym, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);

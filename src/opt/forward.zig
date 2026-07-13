@@ -145,7 +145,7 @@ pub fn run(gpa: std.mem.Allocator, func: *Ir.Function, stats: *Opt.Stats) error{
                         .unknown => {}, // unknown load addr: nothing to forward.
                     }
                 },
-                .call => clearAll(&avail), // may write through an escaped addr / effects.
+                .call, .call_indirect => clearAll(&avail), // may write through an escaped addr / effects.
                 .copy => |c| {
                     switch (resolve(def, c.dst)) {
                         .slot => |sl| clearSlot(&avail, sl.s), // whole-aggregate write.
@@ -213,6 +213,16 @@ fn markEscapes(func: *const Ir.Function, def: []const ?Ir.Op, escaped: []bool) v
                         escaped[sid] = true; // slot passed directly by reference.
                     },
                     .none => {},
+                },
+                .call_indirect => |c| {
+                    escapeOf(def, escaped, c.target);
+                    for (c.args) |a| switch (a) {
+                        .value => |v| escapeOf(def, escaped, v),
+                        .slot => |sid| if (sid < escaped.len) {
+                            escaped[sid] = true;
+                        },
+                        .none => {},
+                    };
                 },
                 else => {},
             }

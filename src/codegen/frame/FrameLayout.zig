@@ -152,6 +152,20 @@ pub fn compute(
                         defer plan.deinit(gpa);
                         if (plan.nsaa_bytes > max_nsaa) max_nsaa = plan.nsaa_bytes;
                     },
+                    .call_indirect => |c| {
+                        arg_types.clearRetainingCapacity();
+                        try arg_types.ensureTotalCapacity(gpa, c.args.len);
+                        for (c.args) |arg| {
+                            arg_types.appendAssumeCapacity(func.operandType(arg));
+                        }
+                        const ret_ty: Type = if (c.ret_slot != Ir.none_slot)
+                            func.slots[c.ret_slot].type
+                        else
+                            Type.unit;
+                        var plan = try Abi.planCall(gpa, arg_types.items, ret_ty, layouts, enum_layouts);
+                        defer plan.deinit(gpa);
+                        if (plan.nsaa_bytes > max_nsaa) max_nsaa = plan.nsaa_bytes;
+                    },
                     else => {},
                 }
             }

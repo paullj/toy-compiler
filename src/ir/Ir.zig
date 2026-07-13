@@ -94,6 +94,14 @@ pub const Call = struct {
     ret_slot: SlotId,
 };
 
+/// An indirect call. `target` is a computed value holding the callee's runtime
+/// code address (via `blr`). `args`/`ret_slot` follow `Call`'s conventions.
+pub const CallIndirect = struct {
+    target: ValueId,
+    args: []Operand,
+    ret_slot: SlotId,
+};
+
 /// An operation producing (at most) one value. Aggregate construction never
 /// produces a value — it writes into a slot via store/copy/field_addr.
 pub const Op = union(enum) {
@@ -170,6 +178,8 @@ pub const Op = union(enum) {
     /// f64 value → signed i64 value, truncating toward zero (FCVTZS). Pure. Emitted ONLY inside the
     /// range-guarded float→int witness, so the hardware saturation is never observable.
     fcvtzs: ValueId,
+
+    call_indirect: CallIndirect,
 };
 
 /// One instruction: an op plus its result value id (`none_value` when the op
@@ -219,6 +229,7 @@ pub const Block = struct {
     pub fn freeOwned(b: Block, gpa: std.mem.Allocator) void {
         for (b.instrs) |ins| switch (ins.op) {
             .call => |c| gpa.free(c.args),
+            .call_indirect => |c| gpa.free(c.args),
             else => {},
         };
         gpa.free(b.instrs);
@@ -482,6 +493,17 @@ fn renderInstr(
         .fcmp => |c| try out.print("fcmp {s} %{d}, %{d}\n", .{ fcondName(c.cc), c.lhs, c.rhs }),
         .scvtf => |v| try out.print("scvtf %{d}\n", .{v}),
         .fcvtzs => |v| try out.print("fcvtzs %{d}\n", .{v}),
+        .call_indirect => |c| {
+            try out.print("call_indirect %{d}(", .{c.target});
+            for (c.args, 0..) |a, i| {
+                if (i != 0) try out.writeAll(", ");
+                try renderOperand(out, a);
+            }
+            if (c.ret_slot != none_slot) {
+                try out.print(" -> s{d}", .{c.ret_slot});
+            }
+            try out.writeAll(")\n");
+        },
     }
 }
 
@@ -605,6 +627,59 @@ test "render: arithmetic + slots + call" {
         "  %1 = iconst 3\n" ++
         "  %2 = add %0, %1\n" ++
         "  ret %2\n" ++
+        "}\n";
+    try std.testing.expectEqualStrings(want, w.buffered());
+}
+
+test "render + freeOwned: call_indirect golden line and args freed" {
+    const gpa = std.testing.allocator;
+
+    var values = try gpa.alloc(ValueDef, 4);
+    values[0] = .{ .type = Type.rawptr }; // target
+    values[1] = .{ .type = Type.int }; // arg a
+    values[2] = .{ .type = Type.int }; // arg b
+    values[3] = .{ .type = Type.int }; // result
+
+    const args = try gpa.alloc(Operand, 2);
+    args[0] = .{ .value = 1 };
+    args[1] = .{ .value = 2 };
+
+    var instrs = try gpa.alloc(Instr, 3);
+    instrs[0] = .{ .result = 1, .op = .{ .iconst = 5 } };
+    instrs[1] = .{ .result = 2, .op = .{ .iconst = 9 } };
+    instrs[2] = .{ .result = 3, .op = .{ .call_indirect = .{ .target = 0, .args = args, .ret_slot = none_slot } } };
+
+    var blocks = try gpa.alloc(Block, 1);
+    blocks[0] = .{
+        .params = try gpa.alloc(ValueId, 0),
+        .instrs = instrs,
+        .term = .{ .ret = .{ .value = 3 } },
+    };
+
+    var func = Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(SlotId, 0),
+        .ret_type = Type.int,
+        .slots = try gpa.alloc(Slot, 0),
+        .values = values,
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+    };
+    defer func.deinit(gpa); // frees args via freeOwned's .call_indirect arm (leak-checked)
+
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try render(&w, &func, &.{}, &.{});
+
+    const want =
+        "fn f() -> int {\n" ++
+        "  slots:\n" ++
+        "b0:\n" ++
+        "  %1 = iconst 5\n" ++
+        "  %2 = iconst 9\n" ++
+        "  %3 = call_indirect %0(%1, %2)\n" ++
+        "  ret %3\n" ++
         "}\n";
     try std.testing.expectEqualStrings(want, w.buffered());
 }

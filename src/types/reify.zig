@@ -260,6 +260,10 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // its concrete `struct_id`, and step (3) rewrites the request to that `structT` — else
     // `synthesizeDerives` (post-reify) would key `Derive.writeKey` off a stale App index.
     for (t.derive_reqs.items) |r| try collectApp(t, r.conform_ty, &to_reify);
+    // A `descriptor_of[T]` request may carry a ground `App` (`Map[str,int]` key etc.);
+    // collect it so its concrete id is minted here and step (3) rewrites the request —
+    // else `synthesizeDescriptors` (post-reify) would key `descHash` off a stale App.
+    for (t.descriptor_reqs.items) |*r| try collectApp(t, r.*, &to_reify);
     // The captured fallible-char-conversion Results are ground `App`s (`Result[char,ConvErr]`)
     // the synthesis barrier reads AFTER this pass; collect them so their concrete enum id is
     // minted here and step (3) rewrites the capture to that `enumT` (else `synthesizeDerives`
@@ -314,6 +318,9 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
     // rewrite each conditional-conformance derive request's `App` conform_ty to its
     // reified `structT`/`enumT`, so `synthesizeDerives` sees the concrete type.
     for (t.derive_reqs.items) |*r| rewriteApp(t, &r.conform_ty);
+    // rewrite each descriptor request's `App` to its reified `structT`/`enumT` so
+    // `synthesizeDescriptors` sees the concrete type.
+    for (t.descriptor_reqs.items) |*r| rewriteApp(t, r);
     // rewrite the captured conv Results to the concrete `enumT` the synthesis barrier's
     // witness recipes carry (their emitter reads `d.ret.enum_id`).
     if (t.conv_int_char_result) |*r| rewriteApp(t, r);

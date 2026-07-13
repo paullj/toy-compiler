@@ -486,6 +486,7 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         },
         .cstr_ptr => |h| try genCstrPtr(g, ins.result, h),
         .call => |c| try genCall(g, ins.result, c),
+        .call_indirect => |c| try genCallIndirect(g, ins.result, c),
         .band => |b| try genArith(g, ins.result, b, .band),
         .bor => |b| try genArith(g, ins.result, b, .bor),
         .bxor => |b| try genArith(g, ins.result, b, .bxor),
@@ -637,26 +638,32 @@ fn genCstrPtr(g: *Gen, result: Ir.ValueId, h: u64) error{OutOfMemory}!void {
 /// in a single left-to-right pass; this is safe because every source is a FRAME
 /// cell (no inter-register dependencies) and each target GPR is written exactly
 /// once. Stack args/ptrs use scratch S0 transiently.
-fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
-    // Recover arg + ret types for the ABI plan.
+/// The ABI plan for a call plus the recovered return type. Shared by direct
+/// (`genCall`) and indirect (`genCallIndirect`) dispatch so the two paths cannot
+/// drift on AAPCS64 marshalling — the single-authority the Abi header warns about.
+const PlanResult = struct { plan: Abi.CallPlan, ret_ty: Type };
+
+fn planFor(g: *Gen, args: []const Ir.Operand, ret_slot: Ir.SlotId, result: Ir.ValueId) error{OutOfMemory}!PlanResult {
     var arg_types: std.ArrayList(Type) = .empty;
     defer arg_types.deinit(g.gpa);
-    try arg_types.ensureTotalCapacity(g.gpa, c.args.len);
-    for (c.args) |a| arg_types.appendAssumeCapacity(g.func.operandType(a));
+    try arg_types.ensureTotalCapacity(g.gpa, args.len);
+    for (args) |a| arg_types.appendAssumeCapacity(g.func.operandType(a));
     // Recover the RETURN type: an aggregate result lands in `ret_slot` (its type);
     // a scalar result is the call instr's own value type; a unit call has neither.
-    const ret_ty: Type = if (c.ret_slot != Ir.none_slot)
-        g.func.slots[c.ret_slot].type
+    const ret_ty: Type = if (ret_slot != Ir.none_slot)
+        g.func.slots[ret_slot].type
     else if (result != Ir.none_value)
         g.func.values[result].type
     else
         Type.unit;
 
-    var plan = try Abi.planCall(g.gpa, arg_types.items, ret_ty, g.layouts, g.enum_layouts);
-    defer plan.deinit(g.gpa);
+    const plan = try Abi.planCall(g.gpa, arg_types.items, ret_ty, g.layouts, g.enum_layouts);
+    return .{ .plan = plan, .ret_ty = ret_ty };
+}
 
+fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutOfMemory}!void {
     for (plan.locs, 0..) |loc, i| {
-        const arg = c.args[i];
+        const arg = args[i];
         switch (loc) {
             .gpr => |r| {
                 // A scalar value → one GPR; a reg-pair aggregate → `count`
@@ -730,10 +737,41 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
             },
         }
     }
+}
+
+fn placeResult(g: *Gen, result: Ir.ValueId, ret_slot: Ir.SlotId, ret_ty: Type) error{OutOfMemory}!void {
+    // Place the result. A scalar lands in x0 → store into its value cell. A
+    // reg-pair aggregate result lands in x0[,x1] → store into ret_slot's words.
+    // An sret result was already written through x8 by the callee. Unit: none.
+    switch (Abi.classifyRet(ret_ty, g.layouts, g.enum_layouts)) {
+        .none => {},
+        .fp_reg => try g.storeFpValue(V0, result), // float result in v0 → its value cell.
+        .reg => |r| {
+            if (ret_slot != Ir.none_slot) {
+                // Aggregate reg-pair result → store x0[,x1] into the slot.
+                const off = g.slotOff(ret_slot);
+                var k: u32 = 0;
+                while (k < r.regs) : (k += 1) {
+                    try g.emit(Aarch64.strSp(@intCast(k), off + k * 8));
+                }
+            } else {
+                // Scalar result in x0 → its value cell.
+                try g.storeValue(0, result);
+            }
+        },
+        .sret => {}, // written through x8.
+    }
+}
+
+fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
+    var pr = try planFor(g, c.args, c.ret_slot, result);
+    defer pr.plan.deinit(g.gpa);
+
+    try marshalArgs(g, c.args, pr.plan);
 
     // sret: point x8 at the result slot AFTER args (so an `add x8,sp` is not
     // disturbed by arg marshalling reading sp).
-    if (plan.sret_in_x8) {
+    if (pr.plan.sret_in_x8) {
         std.debug.assert(c.ret_slot != Ir.none_slot);
         try g.emit(Aarch64.addImm(8, Aarch64.SP, @intCast(g.slotOff(c.ret_slot))));
     }
@@ -757,27 +795,26 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
         try g.emit(Aarch64.bl(0));
     }
 
-    // Place the result. A scalar lands in x0 → store into its value cell. A
-    // reg-pair aggregate result lands in x0[,x1] → store into ret_slot's words.
-    // An sret result was already written through x8 by the callee. Unit: none.
-    switch (Abi.classifyRet(ret_ty, g.layouts, g.enum_layouts)) {
-        .none => {},
-        .fp_reg => try g.storeFpValue(V0, result), // float result in v0 → its value cell.
-        .reg => |r| {
-            if (c.ret_slot != Ir.none_slot) {
-                // Aggregate reg-pair result → store x0[,x1] into the slot.
-                const off = g.slotOff(c.ret_slot);
-                var k: u32 = 0;
-                while (k < r.regs) : (k += 1) {
-                    try g.emit(Aarch64.strSp(@intCast(k), off + k * 8));
-                }
-            } else {
-                // Scalar result in x0 → its value cell.
-                try g.storeValue(0, result);
-            }
-        },
-        .sret => {}, // written through x8.
+    try placeResult(g, result, c.ret_slot, pr.ret_ty);
+}
+
+fn genCallIndirect(g: *Gen, result: Ir.ValueId, c: Ir.CallIndirect) error{OutOfMemory}!void {
+    var pr = try planFor(g, c.args, c.ret_slot, result);
+    defer pr.plan.deinit(g.gpa);
+
+    try marshalArgs(g, c.args, pr.plan);
+
+    if (pr.plan.sret_in_x8) {
+        std.debug.assert(c.ret_slot != Ir.none_slot);
+        try g.emit(Aarch64.addImm(8, Aarch64.SP, @intCast(g.slotOff(c.ret_slot))));
     }
+
+    // Load the target AFTER args + sret so x16 (never an arg reg, never the marshal
+    // scratch S0=x9) is not clobbered by the marshalling pass.
+    try g.loadValue(16, c.target);
+    try g.emit(Aarch64.blr(16));
+
+    try placeResult(g, result, c.ret_slot, pr.ret_ty);
 }
 
 /// Same seed as lower.zig's `lit_seed`, so a panic message that ALSO appears as a
@@ -1061,6 +1098,7 @@ pub const hand_builtins = [_]HandBuiltin{
     .{ .name = "gc_collect", .lower = lowerGcCollect },
     .{ .name = "gc_stats", .lower = lowerGcStats },
     .{ .name = "gc_mark", .lower = lowerGcMark },
+    .{ .name = "text_base", .lower = lowerTextBase },
 };
 
 /// The `hand_builtins` index of `name`, resolved at comptime — lets a caller name
@@ -1296,6 +1334,40 @@ fn emitPanicFrame(code: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfM
     patchBTo(code.items, strlen_b, strlen_top);
 }
 
+/// Self-locate the runtime base of `__text` into `dst_reg` (the PIE code address of
+/// the first byte of the emitted text section). The two movw relocs bake the `adr`'s
+/// own absolute __text offset (addend = adr_site - mov_site); they carry `.none` (the
+/// baked value is site-relative). Intermediate scratch x9/x10 are consumed here and
+/// left dead; `dst_reg` receives the result last. The one PIE way to a code address —
+/// shared by `lowerPanic` (dst x19) and the `text_base()` builtin (dst x0).
+fn emitTextBase(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, dst_reg: u32) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+    const adr_pos: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.adr(9, 0)); // x9 = text_base + adr_off
+    var site: u32 = @intCast(code.items.len);
+    try relocs.append(gpa, .{ .site = site, .target = .none, .kind = .movw_g0, .addend = @as(i64, adr_pos) - @as(i64, site) });
+    try emit(code, gpa, A.movz(10, 0, 0)); // x10 = adr_off (lo)
+    site = @intCast(code.items.len);
+    try relocs.append(gpa, .{ .site = site, .target = .none, .kind = .movw_g1, .addend = @as(i64, adr_pos) - @as(i64, site) });
+    try emit(code, gpa, A.movk(10, 0, 1)); // x10 |= adr_off (hi)
+    try emit(code, gpa, A.subReg(dst_reg, 9, 10)); // dst = text_base
+}
+
+/// The `text_base()` builtin: return the runtime base of `__text` in x0. No frame is
+/// opened — the body makes no calls and the movw addends are site-relative, so it is
+/// position-independent without a saved link register.
+pub fn lowerTextBase(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    try emitTextBase(&code, &relocs, gpa, 0);
+    try emitWord(&code, gpa, Aarch64.ret);
+    return finishBuiltin(&code, &relocs, gpa, "text_base");
+}
+
 pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
     var code: std.ArrayList(u8) = .empty;
@@ -1328,18 +1400,9 @@ pub fn lowerPanic(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.movz(0, 2, 0)); // fd 2
     try emit(&code, gpa, A.blr(26)); // write '\n'
 
-    // Self-locate text_base into x19 (see the doc comment). The two movw relocs bake
-    // the `adr`'s own absolute __text offset (addend = adr_site - mov_site); they need
-    // no target (the baked value is site-relative), so they carry `.none`.
-    const adr_pos: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.adr(9, 0)); // x9 = text_base + adr_off
-    var site: u32 = @intCast(code.items.len);
-    try relocs.append(gpa, .{ .site = site, .target = .none, .kind = .movw_g0, .addend = @as(i64, adr_pos) - @as(i64, site) });
-    try emit(&code, gpa, A.movz(10, 0, 0)); // x10 = adr_off (lo)
-    site = @intCast(code.items.len);
-    try relocs.append(gpa, .{ .site = site, .target = .none, .kind = .movw_g1, .addend = @as(i64, adr_pos) - @as(i64, site) });
-    try emit(&code, gpa, A.movk(10, 0, 1)); // x10 |= adr_off (hi)
-    try emit(&code, gpa, A.subReg(19, 9, 10)); // x19 = text_base
+    // Self-locate text_base into x19 (see the doc comment).
+    try emitTextBase(&code, &relocs, gpa, 19);
+    var site: u32 = undefined;
 
     // Load the backtrace symbol table base into the callee-saved x27 (survives every
     // write() call). The relink tail reserved `symtab_base_hash` at the table's

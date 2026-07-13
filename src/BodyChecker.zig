@@ -156,6 +156,11 @@ pub const BodyChecker = struct {
     /// so the parallel Pass C never shares mutable derive state.
     derive_reqs: std.ArrayList(Typecheck.DeriveReq) = .empty,
 
+    /// The types this fn's body demanded a descriptor for (`descriptor_of[T]()`). Moved
+    /// into the `BodyResult` after the walk; merged fn-id-ordered by `checkBodies`.
+    /// THREAD-LOCAL, mirroring `derive_reqs` (no shared mutable state under parallel Pass C).
+    descriptor_reqs: std.ArrayList(Type) = .empty,
+
     /// The concrete `Result[char/byte, ConvErr]` a `try_into` in this fn typed — the
     /// checker-side capture that gates + seeds the shared fallible-char-conversion witness
     /// (see `types.derive_synth`). `null` until such a conversion is dispatched; moved into
@@ -178,6 +183,7 @@ pub const BodyChecker = struct {
         bc.loop_stack.deinit(bc.gpa);
         bc.sink.deinit();
         bc.derive_reqs.deinit(bc.gpa);
+        bc.descriptor_reqs.deinit(bc.gpa);
         bc.conforms_memo.deinit(bc.gpa);
     }
 
@@ -1866,6 +1872,36 @@ pub const BodyChecker = struct {
                     bc.node_types[(node_idx).int()] = Type.int;
                     return Type.int;
                 }
+                // `descriptor_of[T]()`: yields a `rawptr` to `T`'s descriptor entry (the
+                // constant is materialized in lower). Records the demand so the synthesis
+                // barrier plans the descriptor + erased units; an aggregate/ground key also
+                // forces the natural Hash+Eq witnesses the erased struct/enum walk delegates
+                // to (and their transitive per-field witnesses).
+                if (bik == .descriptor_of) {
+                    const targ_nodes = Ast.rangeSlice(bc.tree, (callee.rhs).int());
+                    for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
+                    const val_args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+                    for (val_args) |arg| _ = try bc.typeOf(arg);
+                    if (targ_nodes.len != 1)
+                        try bc.sink.emitFmt(bc.byteOf(callee.main_token), "'descriptor_of' expects exactly one type argument", .{});
+                    if (val_args.len != 0)
+                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "'descriptor_of' takes no value arguments", .{});
+                    if (targ_nodes.len == 1) {
+                        const t = bc.node_types[(targ_nodes[0]).int()];
+                        // Only a ground type is recorded here: a `type_var` from a generic
+                        // template body would reify to a phantom entry (and, being scalar-ranked,
+                        // sort-tie with other type-vars → `-jN` table divergence). Concrete
+                        // instances are recorded when `recheck` re-runs the body with the arg
+                        // substituted, exactly as `recordDeriveReq` below is gated.
+                        if (bc.isGround(t)) try bc.recordDescriptorReq(t);
+                        if ((t.kind == .@"struct" or t.kind == .@"enum" or t.isApp()) and bc.isGround(t)) {
+                            if (bc.model.preludeProtocols().hash) |hp| try bc.recordDeriveReq(hp, t);
+                            if (bc.model.preludeProtocols().eq) |ep| try bc.recordDeriveReq(ep, t);
+                        }
+                    }
+                    bc.node_types[(node_idx).int()] = Type.rawptr;
+                    return Type.rawptr;
+                }
                 // `gc_array[T](p)`: wrap a raw cell pointer into a `gc_array[T]` handle (an
                 // 8-byte reference over the prelude box template). The value change is
                 // checker-only — lower passes the pointer operand straight through.
@@ -1992,6 +2028,51 @@ pub const BodyChecker = struct {
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
                     },
+                    .text_base => {
+                        if (args.len != 0) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        }
+                        bc.node_types[(node_idx).int()] = Type.rawptr;
+                        return Type.rawptr;
+                    },
+                    .call_hash => {
+                        if (args.len != 2) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                        } else {
+                            const p0 = try bc.typeOf(args[0]);
+                            const p1 = try bc.typeOf(args[1]);
+                            if (!bc.in_unsafe)
+                                try bc.sink.emitFmtCode(.T0038, bc.byteOf(callee.main_token), "raw pointer 'call_hash' requires an 'unsafe' block", .{});
+                            if (p0.kind != .rawptr and p0.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'call_hash' expects a 'rawptr', got '{s}'", .{bc.typeName(p0)});
+                            if (p1.kind != .rawptr and p1.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[1]).int()].main_token), "'call_hash' expects a 'rawptr', got '{s}'", .{bc.typeName(p1)});
+                        }
+                        bc.node_types[(node_idx).int()] = Type.int;
+                        return Type.int;
+                    },
+                    .call_eq => {
+                        if (args.len != 3) {
+                            for (args) |arg| _ = try bc.typeOf(arg);
+                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 3), args.len });
+                        } else {
+                            const p0 = try bc.typeOf(args[0]);
+                            const p1 = try bc.typeOf(args[1]);
+                            const p2 = try bc.typeOf(args[2]);
+                            if (!bc.in_unsafe)
+                                try bc.sink.emitFmtCode(.T0038, bc.byteOf(callee.main_token), "raw pointer 'call_eq' requires an 'unsafe' block", .{});
+                            if (p0.kind != .rawptr and p0.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[0]).int()].main_token), "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p0)});
+                            if (p1.kind != .rawptr and p1.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[1]).int()].main_token), "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p1)});
+                            if (p2.kind != .rawptr and p2.kind != .invalid)
+                                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(args[2]).int()].main_token), "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p2)});
+                        }
+                        bc.node_types[(node_idx).int()] = Type.@"bool";
+                        return Type.@"bool";
+                    },
                     .store => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
@@ -2057,9 +2138,9 @@ pub const BodyChecker = struct {
                         try bc.sink.emit(bc.byteOf(n.main_token), "'gc_array' requires a type argument, e.g. gc_array[int](p)");
                         return .invalid;
                     },
-                    // `size_of[T]()`/`align_of[T]()` are the type_app form handled above;
-                    // a bare-call misuse falls through to the generic path unchanged.
-                    .size_of, .align_of => {},
+                    // `size_of[T]()`/`align_of[T]()`/`descriptor_of[T]()` are the type_app
+                    // form handled above; a bare-call misuse falls through to the generic path.
+                    .size_of, .align_of, .descriptor_of => {},
                 };
             }
             if (args.len != 1) {
@@ -2630,6 +2711,13 @@ pub const BodyChecker = struct {
     fn recordDeriveReq(bc: *BodyChecker, pid: u32, t: Type) error{OutOfMemory}!void {
         for (bc.derive_reqs.items) |r| if (r.protocol_id == pid and Type.eql(r.conform_ty, t)) return;
         try bc.derive_reqs.append(bc.gpa, .{ .protocol_id = pid, .conform_ty = t });
+    }
+
+    /// Record a descriptor request once per type in this fn (a fn may `descriptor_of[T]`
+    /// repeatedly; the synthesis barrier dedups across fns too).
+    fn recordDescriptorReq(bc: *BodyChecker, t: Type) error{OutOfMemory}!void {
+        for (bc.descriptor_reqs.items) |r| if (Type.eql(r, t)) return;
+        try bc.descriptor_reqs.append(bc.gpa, t);
     }
 
     /// The first struct field that blocks a structural derive of `pid_opt` (Eq T0029,

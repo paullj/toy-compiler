@@ -1,0 +1,80 @@
+# A `core/` module, so it is allowlisted to name the descriptor / indirect-call
+# intrinsics. It exercises the whole subsystem end-to-end: obtain a type's descriptor,
+# read its hash/eq function offsets, resolve those to runtime addresses via text_base,
+# and call them on raw key bytes — then compare against the inline `.hash()` / `==`.
+# The harness can only observe the child's exit code, so every check returns a code.
+
+struct Point { x: int, y: int }
+
+pub fn selftest() -> int {
+    ps := check_key_struct()
+    if ps != 0 { return ps }
+    si := check_key_int()
+    if si != 0 { return si }
+    return check_key_str()
+}
+
+pub fn check_key_int() -> int {
+    dp := descriptor_of[int]()
+    return unsafe {
+        ho := load(offset(dp, 24))
+        fp := offset(text_base(), ho)
+        buf := gc_alloc(size_of[int]())
+        store(buf, 5)
+        h := call_hash(fp, buf)
+        if h != 5 { return 1 }
+        eo := load(offset(dp, 32))
+        feq := offset(text_base(), eo)
+        b2 := gc_alloc(size_of[int]())
+        store(b2, 5)
+        b3 := gc_alloc(size_of[int]())
+        store(b3, 9)
+        if !call_eq(feq, buf, b2) { return 2 }
+        if call_eq(feq, buf, b3) { return 3 }
+        0
+    }
+}
+
+pub fn check_key_str() -> int {
+    dp := descriptor_of[str]()
+    k := "hello"
+    return unsafe {
+        ho := load(offset(dp, 24))
+        fp := offset(text_base(), ho)
+        buf := gc_alloc(size_of[str]())
+        store(buf, k)
+        h := call_hash(fp, buf)
+        if h != k.hash() { return 4 }
+        eo := load(offset(dp, 32))
+        feq := offset(text_base(), eo)
+        b2 := gc_alloc(size_of[str]())
+        store(b2, "hello")
+        b3 := gc_alloc(size_of[str]())
+        store(b3, "world")
+        if !call_eq(feq, buf, b2) { return 5 }
+        if call_eq(feq, buf, b3) { return 6 }
+        0
+    }
+}
+
+pub fn check_key_struct() -> int {
+    dp := descriptor_of[Point]()
+    k := Point { x: 1, y: 2 }
+    return unsafe {
+        ho := load(offset(dp, 24))
+        fp := offset(text_base(), ho)
+        buf := gc_alloc(size_of[Point]())
+        store(buf, k)
+        h := call_hash(fp, buf)
+        if h != k.hash() { return 7 }
+        eo := load(offset(dp, 32))
+        feq := offset(text_base(), eo)
+        b2 := gc_alloc(size_of[Point]())
+        store(b2, Point { x: 1, y: 2 })
+        b3 := gc_alloc(size_of[Point]())
+        store(b3, Point { x: 9, y: 9 })
+        if !call_eq(feq, buf, b2) { return 8 }
+        if call_eq(feq, buf, b3) { return 9 }
+        0
+    }
+}
