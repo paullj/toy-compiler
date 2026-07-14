@@ -5010,7 +5010,7 @@ test "`+` on a struct with no `Add` impl is exactly one T0028 at the operator" {
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Add' impl") != null);
 }
 
-test "`str + str` is T0028 (no builtin Add for str — never a silent allocation)" {
+test "`str + str` with no String in scope requires the std/string import" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int { s := "a" + "b"
@@ -5019,12 +5019,33 @@ test "`str + str` is T0028 (no builtin Add for str — never a silent allocation
         \\
     );
     defer c.deinit(gpa);
-    var n28: usize = 0;
-    for (c.result.diags) |d| if (d.code == codes.Code.T0028) {
-        n28 += 1;
-        try testing.expect(std.mem.indexOf(u8, d.message, "requires an 'Add' impl for type 'str'") != null);
+    // Without `import std/string` there is no `String` result type, so concatenation is
+    // rejected with a plain diagnostic naming the required import (not the old T0028).
+    var n: usize = 0;
+    for (c.result.diags) |d| if (std.mem.indexOf(u8, d.message, "requires 'String' in scope") != null) {
+        n += 1;
     };
-    try testing.expectEqual(@as(usize, 1), n28);
+    try testing.expectEqual(@as(usize, 1), n);
+}
+
+test "`str + str` with a user struct merely NAMED String (no import) still requires the import" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct String { x: int }
+        \\fn main() -> int { s := "a" + "b"
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // The concat primitive `str_concat` is unreachable without `import std/string`, so a
+    // bare struct that only shares the name must NOT be typed as the concat result (else
+    // the checker accepts what lower cannot resolve). Falls to the requires-import diag.
+    var n: usize = 0;
+    for (c.result.diags) |d| if (std.mem.indexOf(u8, d.message, "requires 'String' in scope") != null) {
+        n += 1;
+    };
+    try testing.expectEqual(@as(usize, 1), n);
 }
 
 test "`bool + bool` is T0028 (no builtin Add for bool)" {

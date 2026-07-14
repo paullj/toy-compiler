@@ -1,0 +1,81 @@
+# core/string: the packed, byte-addressed String primitive. The handle is a
+# gc_array[int] 8-byte reference (a reused native box) pointing at a heap header
+# {len@0, cap@8, buf@16}; `buf` is a gc_alloc'd PACKED byte buffer (1 byte per element,
+# byte-strided via store_byte/load_byte), NOT a gc_array whose 8-byte cells cannot feed a
+# byte `write`. `:=` copies the handle, so two bindings share the one buffer. No
+# collector: str_grow leaks the old buffer. Logical `cap` (not gc_alloc's size class)
+# governs growth.
+
+pub fn str_new(cap0: int) -> gc_array[int] {
+    c := if cap0 < 1 { 1 } else { cap0 }
+    hdr := gc_alloc(24)
+    unsafe {
+        store(offset(hdr, 8), c)
+        store(offset(hdr, 16), gc_alloc(c))
+    }
+    return gc_array[int](hdr)
+}
+
+pub fn str_len(s: gc_array[int]) -> int {
+    return unsafe { load(offset(s, 0)) }
+}
+
+pub fn str_byte_at(s: gc_array[int], i: int) -> int {
+    if i < 0 || i >= str_len(s) {
+        panic("index out of bounds")
+    }
+    buf := unsafe { load(offset(s, 16)) }
+    return unsafe { load_byte(offset(buf, i)) }
+}
+
+# Store-before-alloc (the ga_grow rule, core/mem): the header holds the OLD buf across
+# gc_alloc (keeping it reachable); publish the new buf into the rooted header BEFORE the
+# byte-copy so a collection keeps BOTH live. The header never moves; no alloc in the copy.
+fn str_grow(s: gc_array[int]) {
+    c := unsafe { load(offset(s, 8)) }
+    nc := c * 2
+    nb := gc_alloc(nc)
+    ob := unsafe { load(offset(s, 16)) }
+    l := unsafe { load(offset(s, 0)) }
+    unsafe {
+        store(offset(s, 16), nb)
+        store(offset(s, 8), nc)
+    }
+    i := 0
+    while i < l {
+        unsafe { store_byte(offset(nb, i), load_byte(offset(ob, i))) }
+        i = i + 1
+    }
+}
+
+pub fn str_push_byte(s: gc_array[int], byte: int) {
+    l := unsafe { load(offset(s, 0)) }
+    c := unsafe { load(offset(s, 8)) }
+    if l >= c { str_grow(s) }
+    buf := unsafe { load(offset(s, 16)) }
+    unsafe {
+        store_byte(offset(buf, l), byte)
+        store(offset(s, 0), l + 1)
+    }
+}
+
+# The arm `str + str` / `String + str` lowers to: build a String holding lp[0..ll) ++
+# rp[0..rl). Pre-sized to ll+rl so no grow fires — buf is stable across the copy (no alloc
+# between), so no store-before-alloc concern here. Length-driven copy: an embedded NUL is a
+# byte like any other (never NUL-terminated).
+pub fn str_concat(lp: int, ll: int, rp: int, rl: int) -> gc_array[int] {
+    s := str_new(ll + rl)
+    buf := unsafe { load(offset(s, 16)) }
+    i := 0
+    while i < ll {
+        unsafe { store_byte(offset(buf, i), load_byte(offset(lp, i))) }
+        i = i + 1
+    }
+    j := 0
+    while j < rl {
+        unsafe { store_byte(offset(buf, ll + j), load_byte(offset(rp, j))) }
+        j = j + 1
+    }
+    unsafe { store(offset(s, 0), ll + rl) }
+    return s
+}

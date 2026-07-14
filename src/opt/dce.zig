@@ -85,7 +85,7 @@ fn instrLive(ins: Ir.Instr, used: []const bool) bool {
 
 fn hasSideEffect(op: Ir.Op) bool {
     return switch (op) {
-        .call, .call_indirect, .store, .copy => true,
+        .call, .call_indirect, .store, .store_byte, .copy => true,
         else => false,
     };
 }

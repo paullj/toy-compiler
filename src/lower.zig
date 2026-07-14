@@ -774,10 +774,12 @@ fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Te
 }
 
 fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
-    _ = node_idx;
     const op = b.in.tokens[n.main_token].tag;
     switch (op) {
         .plus, .minus, .star, .slash => {
+            if (op == .plus and isStringTy(b, b.in.node_types[(node_idx).int()])) {
+                return try lowerConcat(b, node_idx, n);
+            }
             // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
             // operand desugars to the resolved Add/Sub/Mul/Div witness via `lowerArithValue`
             //. The checker (T0028) has already proven a same-type conforming operand.
@@ -817,6 +819,13 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             return try lowerOrdValue(b, lt, n.lhs, n.rhs, op);
         },
         .eq_eq, .bang_eq => {
+            {
+                const lt2 = b.in.node_types[(n.lhs).int()];
+                const rt2 = b.in.node_types[(n.rhs).int()];
+                if (isMixedStringEq(b, lt2, rt2)) {
+                    return try lowerStringEq(b, n.lhs, n.rhs, op == .bang_eq);
+                }
+            }
             // int/bool stay an inline `icmp` (bytes unchanged); str/unit/struct/enum
             // desugar to `Eq::eq` via `lowerEqValue`.
             const lt = b.in.node_types[(n.lhs).int()];
@@ -1400,6 +1409,114 @@ pub fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutO
     return merge;
 }
 
+/// Whether the reified type `t` is the std `String` struct, keyed by the bare layout
+/// name (a non-generic struct's model id == its layout id; `Layout.name` is the declared
+/// name). Mirrors the checker's `activeStructMap`-by-name recognition.
+fn isStringTy(b: *Builder, t: Typecheck.Type) bool {
+    return t.kind == .@"struct" and t.struct_id < b.in.layouts.len and
+        std.mem.eql(u8, b.in.layouts[t.struct_id].name, StdNames.string_struct);
+}
+
+fn isStrLike2(b: *Builder, t: Typecheck.Type) bool {
+    return t.kind == .str or isStringTy(b, t);
+}
+
+/// A mixed str/String `==`/`!=` (at least one String operand): both str-like but NOT the
+/// plain str/str pair (which keeps its own `lowerEqValue` path). The predicate `==`
+/// desugars to a content byte-compare via `lowerStringEq`; shared by the value and
+/// `genCond` arms so they cannot drift.
+fn isMixedStringEq(b: *Builder, lt: Typecheck.Type, rt: Typecheck.Type) bool {
+    return isStrLike2(b, lt) and isStrLike2(b, rt) and !(lt.kind == .str and rt.kind == .str);
+}
+
+const StrView = struct { ptr: Ir.ValueId, len: Ir.ValueId };
+
+/// Lower `node` (a str OR a String) and extract its (ptr,len). str: {ptr@0,len@8} slot.
+/// String: handle@0 -> header, len@0, buf@16. The one uniform reader for concat/print/==.
+fn strOrStringView(b: *Builder, node: Ast.Index) error{OutOfMemory}!StrView {
+    const int_ty = Typecheck.Type.int;
+    const ty = b.in.node_types[(node).int()];
+    const op = try lowerExpr(b, node);
+    const slot = operandSlot(op);
+    if (slot == Ir.none_slot) {
+        try b.note(b.in.tree.nodes[(node).int()].main_token, "str/String operand is not a slot in lower");
+        const z = try b.emit(.{ .iconst = 0 }, int_ty);
+        return .{ .ptr = z, .len = z };
+    }
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    if (isStringTy(b, ty)) {
+        const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+        const len = try b.emit(.{ .load = .{ .addr = handle, .ty = int_ty } }, int_ty);
+        const buf_addr = try b.emit(.{ .field_addr = .{ .base = handle, .off = 16, .ty = int_ty } }, int_ty);
+        const buf = try b.emit(.{ .load = .{ .addr = buf_addr, .ty = int_ty } }, int_ty);
+        return .{ .ptr = buf, .len = len };
+    }
+    const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+    const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
+    return .{ .ptr = ptr, .len = len };
+}
+
+/// Materialize a transient `str {ptr@0,len@8}` slot from a (ptr,len) view; returns its
+/// SlotId. Reused by print(String) and String `==` (whose `strEqAtPtrs` wants an address).
+fn emitStrViewSlot(b: *Builder, v: StrView) error{OutOfMemory}!Ir.SlotId {
+    const int_ty = Typecheck.Type.int;
+    const slot = try b.addSlot(Typecheck.Type.str);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = base, .val = v.ptr, .ty = int_ty } }, null);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = v.len, .ty = int_ty } }, null);
+    return slot;
+}
+
+/// The core/string.str_concat symbol (non-generic → no Mono.find, unlike gaAtCallee).
+fn strConcatCallee(b: *Builder) ?Link.SymName {
+    for (b.in.names) |sn| {
+        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, StdNames.str_concat)) return sn;
+    }
+    return null;
+}
+
+/// Build a String from `lhs ++ rhs`: extract each operand's (ptr,len), call str_concat
+/// (returns the gc_array[int] handle in x0), store the handle into a fresh String slot@0.
+fn lowerConcat(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const res_ty = b.in.node_types[(node_idx).int()];
+    const lv = try strOrStringView(b, n.lhs);
+    const rv = try strOrStringView(b, n.rhs);
+    const callee = strConcatCallee(b) orelse {
+        try b.note(n.main_token, "unresolved 'str_concat' primitive in lower");
+        return .none;
+    };
+    const args = try b.gpa.alloc(Ir.Operand, 4);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = lv.ptr };
+    args[1] = .{ .value = lv.len };
+    args[2] = .{ .value = rv.ptr };
+    args[3] = .{ .value = rv.len };
+    const handle = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty);
+    const slot = try b.addSlot(res_ty);
+    const sbase = try b.emit(.{ .slot_addr = slot }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = sbase, .val = handle, .ty = int_ty } }, null);
+    return .{ .slot = slot };
+}
+
+/// Content `==` for mixed str/String: build a transient {ptr,len} view of each operand
+/// and feed the existing address-based byte-compare. A String header ({len@0,cap@8,buf@16})
+/// is NOT a contiguous {ptr,len}, so a view MUST be materialized first.
+fn lowerStringEq(b: *Builder, lhs: Ast.Index, rhs: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const lv = try strOrStringView(b, lhs);
+    const rv = try strOrStringView(b, rhs);
+    const ls = try emitStrViewSlot(b, lv);
+    const rs = try emitStrViewSlot(b, rv);
+    const lbase = try b.emit(.{ .slot_addr = ls }, int_ty);
+    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
+    const eqv = try strEqAtPtrs(b, lbase, rbase);
+    if (negate) return .{ .value = try b.emit(.{ .bnot = eqv }, Typecheck.Type.@"bool") };
+    return .{ .value = eqv };
+}
+
 /// The emitted callee for a resolved conformance-witness `Method`: a derived unit's
 /// synthetic name, a Mono instance's mangled name, else the fn's global
 /// SymName. `derive` is checked FIRST (a derive Method has `fn_id == 0`, which would
@@ -1959,12 +2076,30 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     args[1] = .{ .value = bp };
                     return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool") };
                 },
+                .store_byte => {
+                    const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const addr = operandValue(try lowerExpr(b, sargs[0]));
+                    const val = operandValue(try lowerExpr(b, sargs[1]));
+                    _ = try b.emit(.{ .store_byte = .{ .addr = addr, .val = val } }, null);
+                    return .none;
+                },
+                .load_byte => {
+                    const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                    const addr = operandValue(try lowerExpr(b, largs[0]));
+                    return .{ .value = try b.emit(.{ .load_byte = addr }, Typecheck.Type.int) };
+                },
                 else => {},
             };
             if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print")) {
                 const parg = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                 if (parg.len == 1) {
                     const at = b.in.node_types[(parg[0]).int()];
+                    if (isStringTy(b, at)) {
+                        const v = try strOrStringView(b, parg[0]);
+                        const slot = try emitStrViewSlot(b, v);
+                        try emitPrintSlot(b, slot);
+                        return .none;
+                    }
                     switch (at.kind) {
                         .int => {
                             try emitDisplayIntValue(b, operandValue(try lowerExpr(b, parg[0])));
@@ -4069,6 +4204,13 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                     // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
                     // str/unit/struct/enum desugar via `lowerEqValue`, then cond_br on
                     // the produced bool (its current block is the eq computation's tail).
+                    const lt2 = b.in.node_types[(n.lhs).int()];
+                    const rt2 = b.in.node_types[(n.rhs).int()];
+                    if (isMixedStringEq(b, lt2, rt2)) {
+                        const v = operandValue(try lowerStringEq(b, n.lhs, n.rhs, op == .bang_eq));
+                        b.setTerm(.{ .cond_br = .{ .cond = v, .t = true_bb, .f = false_bb } });
+                        return;
+                    }
                     const lt = b.in.node_types[(n.lhs).int()];
                     if (isInlineEq(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
