@@ -1681,6 +1681,21 @@ fn parseFor(p: *Parser) Error!Ast.Index {
     p.bump(.kw_for);
     const ident_tok = p.index;
     try p.expect(.identifier, "expected a loop variable name");
+    // `for key, val in m { .. }`: a comma after the first binding diverts to the
+    // two-binding iterator form (`for_in2_stmt`). The single-binding path below is
+    // node-allocation-order-identical, so a range/single `for` stays byte-identical.
+    if (p.eat(.comma)) {
+        const val_tok = p.index;
+        try p.expect(.identifier, "expected a second loop variable name after ','");
+        const val_leaf = try p.addNode(.{ .tag = .identifier, .main_token = val_tok, .lhs = Ast.none, .rhs = Ast.none });
+        try p.expect(.kw_in, "expected 'in' after the loop variables");
+        var nb2 = NoBlockScope.enter(p, true);
+        const iter = try p.parseExpr(0);
+        nb2.end();
+        const body = try p.parseBlock();
+        const header = try p.addExtra(&.{ body.int(), val_leaf.int() });
+        return p.addNode(.{ .tag = .for_in2_stmt, .main_token = ident_tok, .lhs = header, .rhs = iter });
+    }
     try p.expect(.kw_in, "expected 'in' after the loop variable");
     var nb = NoBlockScope.enter(p, true);
     const first = try p.parseExpr(0); // halts at `..` (no infix bp)
@@ -2864,6 +2879,12 @@ test "root is program and children precede parents" {
             .for_in_stmt => {
                 try testing.expect(n.lhs.int() < self);
                 try testing.expect(n.rhs.int() < self);
+            },
+            .for_in2_stmt => {
+                try testing.expect(n.rhs.int() < self);
+                const h = Ast.forIn2HeaderAt(tree, n.lhs.int());
+                try testing.expect(h.body.int() < self);
+                try testing.expect(h.val_leaf.int() < self);
             },
             // break/continue overload `rhs` as a *token* index (the label), so
             // only `lhs` (the value expr) is a child node to check.

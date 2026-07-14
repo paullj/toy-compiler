@@ -551,6 +551,7 @@ pub const PreludeProtocolIds = struct {
     from: ?u32 = null,
     into: ?u32 = null,
     try_into: ?u32 = null,
+    hashable: ?u32 = null,
 };
 
 /// Snapshot the prelude protocol ids off a `Typecheck`/`Model` into a `PreludeProtocolIds`
@@ -2213,7 +2214,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     // discovery enqueues exactly what lower emits.
     for (tree.nodes, 0..) |n, i| {
         switch (n.tag) {
-            .list_literal, .for_in_stmt => {
+            .list_literal, .for_in_stmt, .for_in2_stmt => {
                 for (StdNames.desugarMethods(n.tag)) |dm| {
                     const recv = desugarRecvType(node_types, n, i, dm.recv);
                     try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, mc.tokens[n.main_token].start, mod);
@@ -2337,6 +2338,16 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             for (bargs, 0..) |ba, k| subst_buf[k] = t.substType(ba, args);
         }
         if (conform.existence(model, pid, args[ord], subst_buf)) continue;
+        // A `[K has Hashable]` bound is satisfied structurally by an aggregate whose fields are
+        // all Hashable AND which holds no managed box (a `Ref` has no stable hashable value) —
+        // the SAME `conform.hashable` authority the descriptor's erased key dispatch gates on,
+        // so a key that passes here always has resolvable hash/eq witnesses. A Ref-tainted /
+        // non-hashable key falls through to the clean T0023 below (never the mislocated
+        // internal T0030 the descriptor synth would otherwise emit).
+        if (subst_buf.len == 0) if (model.prelude) |pre| if (pre.protocols.hashable) |hpid| if (hpid == pid) {
+            if (pre.protocols.hash) |hp|
+                if (try conform.hashable(model.structs, model.enums, model.conformances, t.composite, args[ord], hpid, hp, pre.ref_struct, pre.gc_array_struct, &cmemo, t.gpa)) continue;
+        };
         // The frozen table holds only EXPLICIT/prelude conformances. A struct/enum that
         // merely DERIVES Eq/Ord/Hash structurally (no `impl`) satisfies a `[T has Ord]`
         // bound too — the same relation the `<`/`==`/`.hash()` operator predicates
@@ -2625,6 +2636,7 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // before; the scratch is discarded (a template is never a codegen unit — only its
     // reified instances are, and each instance re-check writes its OWN node_types).
     var scratch: []Type = &.{};
+    var tvars: []Type = &.{};
     if (f.isGeneric()) {
         scratch = t.gpa.alloc(Type, t.graph.mods[f.mod].tree.nodes.len) catch {
             out.err = error.OutOfMemory;
@@ -2632,8 +2644,22 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
         };
         @memset(scratch, .invalid);
         bc.node_types = scratch;
+        // Resolve the template's OWN generic-param type-refs (a body annotation /
+        // turbofish spelling a param, e.g. `return Map[K, V] { .. }` or `mp_find[K, V]`)
+        // to their ordinal `type_var`s — the SAME mapping `decodeFnSig` used for the
+        // signature. Without this the bound-as-axiom check has no substitution, so a
+        // bounded template that constructs/calls with its own params fails "unknown type
+        // K"; an unbounded template is skipped above and never reaches here.
+        tvars = t.gpa.alloc(Type, f.generic_params.len) catch {
+            out.err = error.OutOfMemory;
+            return;
+        };
+        for (tvars, 0..) |*tv, i| tv.* = Type.typeVar(@intCast(i));
+        bc.subst = .{ .names = f.generic_params, .types = tvars };
+        bc.abstract_template = true;
     }
     defer if (scratch.len > 0) t.gpa.free(scratch);
+    defer if (tvars.len > 0) t.gpa.free(tvars);
     bc.checkBody(fid, f) catch |e| {
         out.err = e;
         return;
@@ -2779,6 +2805,7 @@ pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
             if (pr.from) |id| if (std.mem.eql(u8, name, "From")) return id;
             if (pr.into) |id| if (std.mem.eql(u8, name, "Into")) return id;
             if (pr.try_into) |id| if (std.mem.eql(u8, name, "TryInto")) return id;
+            if (pr.hashable) |id| if (std.mem.eql(u8, name, "Hashable")) return id;
         }
         return null;
     }

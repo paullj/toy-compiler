@@ -11,6 +11,11 @@ const Ast = @import("../ast/Ast.zig");
 /// The list/vector struct (`std/vec.toy`) list-literal and index sugar target.
 pub const vec_struct = "Vec";
 
+/// The hashed-container struct (`std/map.toy`): the index gate rejects `m[k]` by this
+/// name, and the `for k, v` desugar reads `Entry`'s two fields to bind key/val.
+pub const map_struct = "Map";
+pub const entry_struct = "Entry";
+
 /// The protocol a `for-in` receiver's `iter()` must yield (`std/iter.toy`), matched by
 /// name against `model.protocols`.
 pub const iter_protocol = "Iterator";
@@ -52,6 +57,14 @@ pub fn desugarMethods(tag: Ast.Node.Tag) []const DesugarMethod {
             .{ .recv = .rhs, .name = method_iter },
             .{ .recv = .node, .name = method_next },
         },
+        // `for k, v in m` desugars identically to `for x in m`: `iter()` on the iterable
+        // (`.rhs`), `next()` on the resulting iterator type (`.node` = node_types[stmt],
+        // set by checkForIn2). The two bindings are a lower-only concern (the Entry field
+        // split), so the discovered method set is the same as the single-binding form.
+        .for_in2_stmt => &.{
+            .{ .recv = .rhs, .name = method_iter },
+            .{ .recv = .node, .name = method_next },
+        },
         else => &.{},
     };
 }
@@ -79,6 +92,13 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
     try std.testing.expectEqual(@as(usize, 2), fin.len);
     try std.testing.expect(std.mem.eql(u8, fin[0].name, method_iter) and fin[0].recv == .rhs);
     try std.testing.expect(std.mem.eql(u8, fin[1].name, method_next) and fin[1].recv == .node);
+
+    const fin2 = desugarMethods(.for_in2_stmt);
+    try std.testing.expectEqual(@as(usize, 2), fin2.len);
+    try std.testing.expect(std.mem.eql(u8, fin2[0].name, method_iter) and fin2[0].recv == .rhs);
+    try std.testing.expect(std.mem.eql(u8, fin2[1].name, method_next) and fin2[1].recv == .node);
+
+    try std.testing.expect(map_struct.len != 0 and entry_struct.len != 0);
 
     // A sugar with no receiver-method desugar (indexing goes through `ga_at`).
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);

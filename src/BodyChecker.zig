@@ -124,6 +124,15 @@ pub const BodyChecker = struct {
     /// byte-identical. Borrowed for the duration of one re-check.
     subst: ?Subst = null,
 
+    /// True ONLY for a bounded generic template's one-shot bound-as-axiom body check
+    /// (`bodyUnit`), where `subst` maps each param name to its own ordinal `type_var`
+    /// rather than a concrete type. In that mode a nested generic call spelled with the
+    /// template's params (`mp_find[K, V]`) legitimately passes `type_var` type-args that
+    /// ground at the OUTER template's instantiation, so the "concrete value type-arg"
+    /// gate must admit a `type_var`. Never set on a per-instance re-check (subst is
+    /// concrete there) or a non-generic body, so those paths stay byte-identical.
+    abstract_template: bool = false,
+
     /// The receiver type when checking an inherent method's body, set by
     /// `bodyCheckerFor` from the method's `FnSym.self_type`; null for a non-method.
     /// Consumed by the `Self` type-ref hook (`selfType`).
@@ -355,6 +364,7 @@ pub const BodyChecker = struct {
             .while_stmt => try bc.checkWhile(stmt_idx, null),
             .for_stmt => try bc.checkFor(stmt_idx, null),
             .for_in_stmt => try bc.checkForIn(stmt_idx, null),
+            .for_in2_stmt => try bc.checkForIn2(stmt_idx, null),
             .labeled => _ = try bc.checkLabeled(stmt_idx, false),
             .break_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
@@ -468,6 +478,45 @@ pub const BodyChecker = struct {
         _ = bc.loop_stack.pop();
     }
 
+    /// `for k, v in m { body }`: the receiver's `iter()` must yield `Iterator[Entry[K,V]]`.
+    /// `k` binds to the Entry's first field type, `v` to its second (the field-order coupling
+    /// on `struct Entry[K,V] { key, val }`). `node_types[stmt]` = the iterator type (read by
+    /// scanCalls/reify/lower), exactly as `checkForIn`.
+    fn checkForIn2(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
+        const stmt = bc.tree.nodes[stmt_idx.int()];
+        const h = Ast.forIn2HeaderAt(bc.tree, stmt.lhs.int());
+        const recv = try bc.typeOf(stmt.rhs);
+        const iter_ty = bc.resolveIterType(recv) orelse blk: {
+            if (recv.kind != .invalid)
+                try bc.sink.emitFmtCode(.T0023, bc.byteOf(bc.tree.nodes[stmt.rhs.int()].main_token), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+            break :blk Type.invalid;
+        };
+        const item: Type = if (iter_ty.kind == .invalid) .invalid else try conform.iteratorItem(bc.model, bc.composite, bc.gpa, iter_ty) orelse blk: {
+            try bc.sink.emitFmtCode(.T0023, bc.byteOf(bc.tree.nodes[stmt.rhs.int()].main_token), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+            break :blk Type.invalid;
+        };
+        var kty: Type = .invalid;
+        var vty: Type = .invalid;
+        if (item.isApp()) {
+            const e = bc.composite.at(item.appIdx());
+            const entry_ctor = bc.activeStructMap().get(StdNames.entry_struct);
+            if (!e.ctor_is_enum and entry_ctor != null and e.ctor == entry_ctor.? and e.args.len == 2) {
+                kty = e.args[0];
+                vty = e.args[1];
+            } else {
+                try bc.sink.emitFmtCode(.T0023, bc.byteOf(stmt.main_token), "'for k, v' requires an iterator over 'Entry' pairs", .{});
+            }
+        } else if (item.kind != .invalid) {
+            try bc.sink.emitFmtCode(.T0023, bc.byteOf(stmt.main_token), "'for k, v' requires an iterator over 'Entry' pairs", .{});
+        }
+        bc.node_types[stmt_idx.int()] = iter_ty;
+        if (bc.resolutions[stmt_idx.int()] == .local) try bc.setSlot(bc.resolutions[stmt_idx.int()].local, kty);
+        if (bc.resolutions[h.val_leaf.int()] == .local) try bc.setSlot(bc.resolutions[h.val_leaf.int()].local, vty);
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
+        _ = try bc.checkBlock(h.body, false);
+        _ = bc.loop_stack.pop();
+    }
+
     /// The return type of the inherent `iter()` method on `recv`, or null when `recv`
     /// has no such method. Only a generic-type (`App`) receiver is supported this
     /// milestone (Vec); the impl's type-params bind by matching the template's `Self`
@@ -501,6 +550,10 @@ pub const BodyChecker = struct {
             },
             .for_in_stmt => blk: {
                 try bc.checkForIn(n.lhs, label);
+                break :blk Type.unit;
+            },
+            .for_in2_stmt => blk: {
+                try bc.checkForIn2(n.lhs, label);
                 break :blk Type.unit;
             },
             else => Type.invalid,
@@ -610,6 +663,15 @@ pub const BodyChecker = struct {
             return Type.invalid;
         }
         const e = bc.composite.at(rt.appIdx());
+        // A miss is a normal outcome for a hashed lookup, so `Map` deliberately has no
+        // index operator (a lookup returns `Option`); reject `m[k]` by name before the
+        // generic reject, exactly as `Vec` is recognized by name.
+        if (bc.activeStructMap().get(StdNames.map_struct)) |map_ctor| {
+            if (!e.ctor_is_enum and e.ctor == map_ctor) {
+                try bc.sink.emitFmt(bc.byteOf(main_token), "Map has no index operator; use .get", .{});
+                return Type.invalid;
+            }
+        }
         if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1) {
             try bc.sink.emitFmt(bc.byteOf(main_token), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
             return Type.invalid;
@@ -1479,6 +1541,9 @@ pub const BodyChecker = struct {
             .unbound => |u| return .{ .unbound = u.ord },
             .ok => {
                 for (out) |ta| {
+                    // A bounded template's own param inferred here grounds at the outer
+                    // instantiation; admit it (the instance re-check re-gates concretely).
+                    if (bc.abstract_template and ta.isTypeVar()) continue;
                     if (!isConcreteValue(ta)) {
                         try bc.sink.emitCode(.T0013, bc.byteOf(span_tok), "inferred type argument must be a concrete value type; add explicit type arguments");
                         return .err;
@@ -1892,12 +1957,15 @@ pub const BodyChecker = struct {
                         // template body would reify to a phantom entry (and, being scalar-ranked,
                         // sort-tie with other type-vars → `-jN` table divergence). Concrete
                         // instances are recorded when `recheck` re-runs the body with the arg
-                        // substituted, exactly as `recordDeriveReq` below is gated.
+                        // substituted.
+                        //
+                        // The descriptor's erased hash/eq witnesses are seeded from
+                        // `descriptor_reqs` in the synthesis barrier, gated on the SAME
+                        // `conform.hashable` verdict the erased-unit gate uses — so an
+                        // explicit-impl key supplies its own witnesses (no derived recipe) and a
+                        // Ref-tainted / non-hashable key records nothing (no phantom recipe, no
+                        // mislocated T0030).
                         if (bc.isGround(t)) try bc.recordDescriptorReq(t);
-                        if ((t.kind == .@"struct" or t.kind == .@"enum" or t.isApp()) and bc.isGround(t)) {
-                            if (bc.model.preludeProtocols().hash) |hp| try bc.recordDeriveReq(hp, t);
-                            if (bc.model.preludeProtocols().eq) |ep| try bc.recordDeriveReq(ep, t);
-                        }
                     }
                     bc.node_types[(node_idx).int()] = Type.rawptr;
                     return Type.rawptr;
@@ -2232,6 +2300,9 @@ pub const BodyChecker = struct {
                     // bare calls become instances (a `unit`-inferred var, say, is rejected
                     // here rather than silently dropped by discovery → lower miss).
                     for (out) |ta| {
+                        // A bounded template's own param inferred here grounds at the outer
+                        // instantiation; admit it (the instance re-check re-gates concretely).
+                        if (bc.abstract_template and ta.isTypeVar()) continue;
                         if (!isConcreteValue(ta)) {
                             try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "inferred type argument must be a concrete value type; add explicit type arguments");
                             return .invalid;
@@ -2605,6 +2676,12 @@ pub const BodyChecker = struct {
             targs[i] = ty;
             if (ty.kind == .invalid) {
                 all_concrete = false; // an unknown type already reported by typeFromNode
+            } else if (bc.abstract_template and ty.isTypeVar()) {
+                // A bounded template's own param passed to a nested generic call: it
+                // grounds at the outer template's instantiation, so it is admitted here
+                // (the reified instance re-check substitutes a concrete type and re-gates).
+                // Left `all_concrete` so the call types to its substituted (type_var)
+                // return — matching the enclosing template's own type_var signature.
             } else if (!isConcreteValue(ty)) {
                 // `type_var`/`unit` are not monomorphizable type-args. A ground `App`
                 // (`Box[int]`) now IS — it reifies to a concrete struct in the mono

@@ -416,6 +416,16 @@ pub const Node = extern struct {
         /// `for_stmt`'s `{lo,hi}` extra, so the range path stays byte-identical). A `()`
         /// statement. Desugars to `it := iterable.iter()` then a loop over `it.next()`.
         for_in_stmt,
+
+        /// `for key, val in iterable { body }` — the two-binding iterator form.
+        /// Appended at END (frozen ordinal; `[]Node` is memcpy'd to/from the content
+        /// cache; `ParseHeader.version` bumped 17->18). `main_token` is the FIRST
+        /// binding ident; `rhs` is the iterable EXPRESSION (so the frozen desugar/
+        /// discovery `RecvSource.rhs` contract is unchanged); `lhs` is a 2-cell header
+        /// `{body, val_leaf}` (`forIn2HeaderAt`), where `val_leaf` is a synthesized
+        /// `.identifier` leaf owning the SECOND binding's token + resolution. The
+        /// iterator must yield `Entry[K, V]`; `key` binds field 0, `val` field 1.
+        for_in2_stmt,
     };
 };
 
@@ -496,6 +506,13 @@ pub fn ifHeaderAt(tree: Tree, header: u32) struct { then_block: Index, else_node
 /// Decode the 2-cell `for_stmt` range header at `header`: `{lo, hi}`.
 pub fn forHeaderAt(tree: Tree, header: u32) struct { lo: Index, hi: Index } {
     return .{ .lo = Index.from(tree.extra[header]), .hi = Index.from(tree.extra[header + 1]) };
+}
+
+/// Decode the 2-cell `for_in2_stmt` header: `{body, val_leaf}` (the loop BODY block + the
+/// synthesized second-binding identifier leaf). The FIRST binding rides the stmt node's own
+/// `main_token`/resolution; `rhs` is the iterable expression.
+pub fn forIn2HeaderAt(tree: Tree, header: u32) struct { body: Index, val_leaf: Index } {
+    return .{ .body = Index.from(tree.extra[header]), .val_leaf = Index.from(tree.extra[header + 1]) };
 }
 
 /// Decode the 2-cell `match_arm` header at `header`: `{guard, body}`.
@@ -640,7 +657,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 17,
+    version: u32 = 18,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -701,7 +718,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 17) return null;
+    if (hdr.magic != parse_magic or hdr.version != 18) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -980,6 +997,14 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try renderNode(out, tree, tokens, source, n.rhs);
             try out.writeByte(' ');
             try renderNode(out, tree, tokens, source, n.lhs);
+            try out.writeByte(')');
+        },
+        .for_in2_stmt => {
+            const h = forIn2HeaderAt(tree, n.lhs.int());
+            try out.print("(for-in2 {s} {s} ", .{ tok_text, tokens[tree.nodes[h.val_leaf.int()].main_token].text(source) });
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, h.body);
             try out.writeByte(')');
         },
         .break_stmt => {

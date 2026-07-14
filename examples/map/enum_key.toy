@@ -1,0 +1,14 @@
+# An empty-payload enum is structurally Hashable and works as a Map key.
+# expect: exit 0
+import std/map
+enum Color { red, green, blue }
+fn main() -> int {
+    m := Map[Color, int].new()
+    m.set(Color.red, 1)
+    m.set(Color.blue, 3)
+    if m.len() != 2 { return 1 }
+    if m.get(Color.red).unwrap_or(0) != 1 { return 2 }
+    if m.get(Color.blue).unwrap_or(0) != 3 { return 3 }
+    if m.get(Color.green).unwrap_or(-1) != -1 { return 4 }
+    return 0
+}

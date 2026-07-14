@@ -360,6 +360,89 @@ pub fn firstNonConformingField(
     return null;
 }
 
+/// Whether `recv` IS a managed box (`Ref`/`gc_array`): a reified structT carrying the
+/// reference marker (post-reify), OR a struct-`App` over the prelude box template (pre-reify,
+/// as the bound check may see). Single leaf test for both stages.
+fn isManagedBox(structs: []const StructSym, composite: *Composite, recv: Type, ref_ctor: ?u32, gc_array_ctor: ?u32) bool {
+    if (LayoutEngine.isRefStruct(recv, structs)) return true;
+    if (recv.isApp()) {
+        const e = composite.at(recv.appIdx());
+        if (e.ctor_is_enum) return false;
+        if (ref_ctor) |rc| if (e.ctor == rc) return true;
+        if (gc_array_ctor) |gc| if (e.ctor == gc) return true;
+    }
+    return false;
+}
+
+/// Whether `recv` is, or transitively (by-value) HOLDS, a managed box. A box has no stable
+/// hashable value (its identity is a heap cell), so a Hashable KEY must exclude it — the Ref
+/// guard the structural Hash relation itself lacks (a box's reified field is `int`, which
+/// `structural(hash)` would wrongly accept). Mirrors `derive_synth.needsTrace`'s by-value
+/// walk but pure over the tables so both callers share it; a box is a LEAF (never recursed).
+/// Terminates: by-value cycles are already a compile error and a box's field is `int`, so the
+/// by-value graph is a finite DAG. `memo` keyed on (nominal id + enum flag) collapses shared
+/// subtrees; the transient `App` arm is unmemoized (bounded by the finite by-value DAG).
+fn containsManaged(structs: []const StructSym, enums: []const EnumSym, composite: *Composite, recv: Type, ref_ctor: ?u32, gc_array_ctor: ?u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!bool {
+    if (isManagedBox(structs, composite, recv, ref_ctor, gc_array_ctor)) return true;
+    switch (recv.kind) {
+        .@"struct", .@"enum" => {
+            const is_enum = recv.kind == .@"enum";
+            const id = recv.nominalId();
+            const key = (@as(u64, id) << 1) | @intFromBool(is_enum);
+            if (memo.get(key)) |v| return v;
+            try memo.put(gpa, key, false); // cheap insurance against a (should-not-occur) by-value cycle
+            var result = false;
+            if (is_enum) {
+                if (id < enums.len) outer: for (enums[id].variants) |v| for (v.field_types) |ft| {
+                    if (try containsManaged(structs, enums, composite, ft, ref_ctor, gc_array_ctor, memo, gpa)) {
+                        result = true;
+                        break :outer;
+                    }
+                };
+            } else if (id < structs.len) for (structs[id].field_types) |ft| {
+                if (try containsManaged(structs, enums, composite, ft, ref_ctor, gc_array_ctor, memo, gpa)) {
+                    result = true;
+                    break;
+                }
+            };
+            try memo.put(gpa, key, result);
+            return result;
+        },
+        .app => {
+            const e = composite.at(recv.appIdx());
+            if (e.ctor_is_enum) {
+                if (e.ctor < enums.len) for (enums[e.ctor].variants) |v| for (v.field_types) |ft| {
+                    if (try containsManaged(structs, enums, composite, try substPattern(composite, gpa, ft, e.args), ref_ctor, gc_array_ctor, memo, gpa)) return true;
+                };
+            } else if (e.ctor < structs.len) for (structs[e.ctor].field_types) |ft| {
+                if (try containsManaged(structs, enums, composite, try substPattern(composite, gpa, ft, e.args), ref_ctor, gc_array_ctor, memo, gpa)) return true;
+            };
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// The SINGLE Hashable-key authority, shared by the `[K has Hashable]` bound and the
+/// descriptor's erased hash/eq gate so "passes the gate" ≡ "the erased hash/eq units can be
+/// built AND call a resolvable witness". `existence`-FIRST (a builtin scalar row OR a
+/// top-level explicit `impl` — honored, and short-circuiting the Ref guard so an explicit box
+/// impl is respected), then the STRUCTURAL leg keyed on `hash_pid` (the pid the Hash/Eq
+/// emitters resolve each field through), minus managed-box keys (`containsManaged`).
+pub fn hashable(structs: []const StructSym, enums: []const EnumSym, conformances: []const Conformance, composite: *Composite, recv: Type, hashable_pid: u32, hash_pid: u32, ref_ctor: ?u32, gc_array_ctor: ?u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!bool {
+    for (conformances) |c| {
+        if (c.protocol == hashable_pid and c.protocol_args.len == 0 and (Type.eql(c.recv, recv) or intMatchesPlatformRow(recv, c.recv))) return true;
+    }
+    switch (recv.kind) {
+        .@"struct", .@"enum", .app => {},
+        else => return false,
+    }
+    var mm: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer mm.deinit(gpa);
+    if (try containsManaged(structs, enums, composite, recv, ref_ctor, gc_array_ctor, &mm, gpa)) return false;
+    return structural(structs, enums, conformances, recv, hash_pid, memo, gpa, composite, &.{});
+}
+
 const testing = std.testing;
 const Ast = @import("../ast/Ast.zig");
 const VariantSym = LayoutEngine.VariantSym;
@@ -600,4 +683,69 @@ test "keystone: the checker verdict and the shared witness leaf agree across the
     // discharges structurally at the instance re-check, not here).
     const bounds = [_]?u32{ord_pid};
     try testing.expect(direct(&model, Type.typeVar(0), ord_pid, &bounds));
+}
+
+test "hashable: scalar/struct/nested/Ref/float/enum/explicit truth table" {
+    const gpa = testing.allocator;
+    const hash_pid: u32 = 0;
+    const hashable_pid: u32 = 1;
+
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+
+    // struct#0 {x:int, y:int} — all Hashable scalars; struct#1 Box (native_family=.ref) —
+    // a reified managed box; struct#2 {r: Box} — holds a box (excluded); struct#3 {f:float}
+    // — a non-Hashable field; struct#4 {b: Box} but carries an EXPLICIT (hashable, S4) row.
+    const s0_ft = [_]Type{ Type.int, Type.int };
+    const s0_fn = [_][]const u8{ "x", "y" };
+    const box_ft = [_]Type{Type.int};
+    const box_fn = [_][]const u8{"0"};
+    const s2_ft = [_]Type{Type.structT(1)};
+    const s2_fn = [_][]const u8{"r"};
+    const s3_ft = [_]Type{Type.float};
+    const s3_fn = [_][]const u8{"f"};
+    const s4_ft = [_]Type{Type.structT(1)};
+    const s4_fn = [_][]const u8{"b"};
+    const structs = [_]StructSym{
+        .{ .decl_node = Ast.none, .name = "S0", .field_types = @constCast(&s0_ft), .field_names = @constCast(&s0_fn) },
+        .{ .decl_node = Ast.none, .name = "Box", .field_types = @constCast(&box_ft), .field_names = @constCast(&box_fn), .native_family = .ref },
+        .{ .decl_node = Ast.none, .name = "S2", .field_types = @constCast(&s2_ft), .field_names = @constCast(&s2_fn) },
+        .{ .decl_node = Ast.none, .name = "S3", .field_types = @constCast(&s3_ft), .field_names = @constCast(&s3_fn) },
+        .{ .decl_node = Ast.none, .name = "S4", .field_types = @constCast(&s4_ft), .field_names = @constCast(&s4_fn) },
+    };
+    var e0_vars = [_]VariantSym{ .{ .name = "A", .form = .unit }, .{ .name = "B", .form = .unit } };
+    var e1_pl = [_]Type{Type.int};
+    var e1_vars = [_]VariantSym{ .{ .name = "R", .form = .tuple, .field_types = &e1_pl }, .{ .name = "G", .form = .unit } };
+    var e2_pl = [_]Type{Type.float};
+    var e2_vars = [_]VariantSym{ .{ .name = "X", .form = .tuple, .field_types = &e2_pl }, .{ .name = "Y", .form = .unit } };
+    const enums = [_]EnumSym{
+        .{ .decl_node = Ast.none, .name = "E0", .variants = &e0_vars },
+        .{ .decl_node = Ast.none, .name = "E1", .variants = &e1_vars },
+        .{ .decl_node = Ast.none, .name = "E2", .variants = &e2_vars },
+    };
+    const confs = [_]Conformance{
+        .{ .protocol = hash_pid, .recv = Type.int },
+        .{ .protocol = hashable_pid, .recv = Type.int },
+        .{ .protocol = hashable_pid, .recv = Type.structT(4) },
+    };
+    // The Box ctor id in the composite is struct#1; a bare `Ref`-ctor App is that ctor.
+    const box_app = Type.app(try co.intern(gpa, 1, &.{Type.int}, false));
+    const ref_ctor: ?u32 = 1;
+
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    const H = struct {
+        fn q(st: []const StructSym, en: []const EnumSym, cf: []const Conformance, cp: *Composite, ty: Type, rc: ?u32, m: *std.AutoHashMapUnmanaged(u64, bool), g: std.mem.Allocator) !bool {
+            return hashable(st, en, cf, cp, ty, 1, 0, rc, null, m, g);
+        }
+    };
+    try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.int, ref_ctor, &memo, gpa)); // scalar (Hashable row)
+    try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.structT(0), ref_ctor, &memo, gpa)); // {x,y:int}
+    try testing.expect(!try H.q(&structs, &enums, &confs, &co, Type.structT(2), ref_ctor, &memo, gpa)); // {r:Box}
+    try testing.expect(!try H.q(&structs, &enums, &confs, &co, box_app, ref_ctor, &memo, gpa)); // bare Ref-ctor App
+    try testing.expect(!try H.q(&structs, &enums, &confs, &co, Type.structT(3), ref_ctor, &memo, gpa)); // {f:float}
+    try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.enumT(0), ref_ctor, &memo, gpa)); // empty enum
+    try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.enumT(1), ref_ctor, &memo, gpa)); // payload enum {int}
+    try testing.expect(!try H.q(&structs, &enums, &confs, &co, Type.enumT(2), ref_ctor, &memo, gpa)); // payload enum {float}
+    try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.structT(4), ref_ctor, &memo, gpa)); // explicit impl over a box
 }
