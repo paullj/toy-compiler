@@ -1,0 +1,4 @@
+# expect: compile-error "same type"
+fn main() -> int {
+    return 1 + "x"
+}

@@ -473,6 +473,11 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
             try g.loadValue(S1, s.val); // S1 = value
             try g.emit(Aarch64.strRegUoff(S1, S0, 0));
         },
+        .store_byte => |s| {
+            try g.loadValue(S0, s.addr); // S0 = byte address
+            try g.loadValue(S1, s.val); // S1 = value (low byte written)
+            try g.emit(Aarch64.strb(S1, S0, 0));
+        },
         .copy => |c| {
             // dst/src are ptr VALUES. Load them into base regs, then byte-copy.
             try g.loadValue(S0, c.dst);
@@ -2597,6 +2602,55 @@ test "ir-codegen: constant-return function lowers to a valid prologue/epilogue" 
     // Last word is `ret`.
     const last = std.mem.readInt(u32, fc.code[fc.code.len - 4 ..][0..4], .little);
     try testing.expectEqual(Aarch64.ret, last);
+}
+
+test "ir-codegen: store_byte emits a strb into the address register" {
+    const gpa = testing.allocator;
+
+    // %0 = slot_addr s0 ; %1 = iconst 65 ; store_byte %0, %1 ; %2 = load_byte %0 ; ret %2.
+    var values = try gpa.alloc(Ir.ValueDef, 3);
+    values[0] = .{ .type = Type.int };
+    values[1] = .{ .type = Type.int };
+    values[2] = .{ .type = Type.int };
+
+    var instrs = try gpa.alloc(Ir.Instr, 4);
+    instrs[0] = .{ .result = 0, .op = .{ .slot_addr = 0 } };
+    instrs[1] = .{ .result = 1, .op = .{ .iconst = 65 } };
+    instrs[2] = .{ .result = Ir.none_value, .op = .{ .store_byte = .{ .addr = 0, .val = 1 } } };
+    instrs[3] = .{ .result = 2, .op = .{ .load_byte = 0 } };
+
+    var slots = try gpa.alloc(Ir.Slot, 1);
+    slots[0] = .{ .type = Type.int };
+
+    var blocks = try gpa.alloc(Ir.Block, 1);
+    blocks[0] = .{
+        .params = try gpa.alloc(Ir.ValueId, 0),
+        .instrs = instrs,
+        .term = .{ .ret = .{ .value = 2 } },
+    };
+
+    var func = Ir.Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(Ir.SlotId, 0),
+        .ret_type = Type.int,
+        .slots = slots,
+        .values = values,
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+        .literals = try gpa.alloc(Ir.Literal, 0),
+    };
+    defer func.deinit(gpa);
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var fc = try lowerIr(gpa, &func, &.{}, &.{}, false, &diags);
+    defer fc.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    // val loaded into S1, address into S0, then strb w(S1),[x(S0)].
+    try testing.expect(codeHasWord(fc, Aarch64.strb(S1, S0, 0)));
+    try testing.expect(codeHasWord(fc, Aarch64.ldrbRegUoff(S0, S0, 0)));
 }
 
 // A unit-returning ENTRY function must force x0=0 in the return path.

@@ -29,6 +29,13 @@ pub const method_next = "next";
 /// The `core/mem` element-read primitive `xs[i]` desugars to, by qualified name.
 pub const ga_at = "core/mem.ga_at";
 
+/// The std String struct (`std/string.toy`) — the str/String concatenation result type
+/// and the print/`==` recognizer target, matched by name via `activeStructMap`.
+pub const string_struct = "String";
+/// The `core/string` concatenation primitive `str + str` / `String + str` desugars to,
+/// by qualified name.
+pub const str_concat = "core/string.str_concat";
+
 /// Where a receiver-method desugar reads the receiver type it selects the method on.
 pub const RecvSource = enum {
     /// The sugar node's own type (`node_types[i]`).
@@ -76,6 +83,8 @@ test "method names are distinct, non-empty, and ga_at is qualified" {
         try std.testing.expect(!std.mem.eql(u8, a, b));
     try std.testing.expect(std.mem.indexOfScalar(u8, ga_at, '.') != null);
     try std.testing.expect(vec_struct.len != 0 and iter_protocol.len != 0);
+    try std.testing.expect(string_struct.len != 0);
+    try std.testing.expect(std.mem.indexOfScalar(u8, str_concat, '.') != null);
 }
 
 test "desugarMethods enumerates each sugar's receiver methods in expansion order" {

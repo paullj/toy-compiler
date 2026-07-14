@@ -1,7 +1,7 @@
-# Feature: `str` has NO builtin `Add`. String concatenation allocates on the heap,
-# which is deferred to the heap/stdlib roadmap, so `str + str` is a compile error (T0028)
-# here rather than a silent allocation. `int` is the only builtin arithmetic type.
-# expect: compile-error "requires an 'Add' impl for type 'str'"
+# Feature: `str + str` concatenates into a `String`, but only when `String` is in scope
+# (via `import std/string`). Without the import there is no `String` type to produce, so
+# concatenation is a compile error naming the required import.
+# expect: compile-error "requires 'String' in scope"
 fn main() -> int {
     s := "a" + "b"
     return 0
