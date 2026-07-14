@@ -104,8 +104,10 @@ fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
 /// emitter never re-resolves and the fingerprint can fold the resolved identity.
 pub fn synthesizeDerives(t: *Typecheck) !void {
     // A conv-only program (a fallible char conversion but no `==`/`.hash`/`print` derive)
-    // still needs the barrier to run, so gate on BOTH request sources.
-    if (t.derive_reqs.items.len == 0 and
+    // still needs the barrier to run, so gate on BOTH request sources. A descriptor'd
+    // Hashable key with no explicit derive also seeds Eq/Hash below (the erased dispatch's
+    // witnesses), so an otherwise-derive-free Map program must run the barrier too.
+    if (t.derive_reqs.items.len == 0 and t.descriptor_reqs.items.len == 0 and
         t.conv_int_char_result == null and t.conv_char_byte_result == null and
         t.conv_float_int_result == null) return;
     const pre = t.prelude orelse return;
@@ -157,6 +159,33 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         }
     }
 
+    // Descriptor'd Hashable keys with NO explicit `impl` need the DERIVED Hash + Eq witnesses so
+    // the erased key dispatch (which resolves the KEY's Hashable hash/eq) has something to call.
+    // Seed them into the Eq + Hash worklists below — BEFORE those fixpoints run — so each key's
+    // fields are chased identically to an `==`/`.hash()`-driven request. Gated on the SAME
+    // `conform.hashable` verdict (over the SAME `t.descriptor_reqs`) that `synthesizeDescriptors`
+    // gates the erased unit on, so the recipe set and the erased-unit set are in lockstep: no key
+    // gets an erased unit without a resolvable witness. The Ref guard excludes managed-box keys
+    // (no phantom recipe / T0030); an explicit-impl key is skipped (it supplies its own witnesses).
+    var desc_keys: std.ArrayList(Type) = .empty;
+    defer desc_keys.deinit(gpa);
+    if (pre.protocols.hashable) |hashable_pid| if (hash_pid_opt) |hash_pid| {
+        for (t.descriptor_reqs.items) |k| {
+            switch (k.kind) {
+                .@"struct", .@"enum" => {},
+                else => continue,
+            }
+            var dup = false;
+            for (desc_keys.items) |e| if (Type.eql(e, k)) {
+                dup = true;
+                break;
+            };
+            if (dup or hasConformanceLive(t, hashable_pid, k)) continue;
+            if (try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, t.composite, k, hashable_pid, hash_pid, pre.ref_struct, pre.gc_array_struct, &memo, gpa))
+                try desc_keys.append(gpa, k);
+        }
+    };
+
     // Eq fixpoint, SKIPPING any Ord type.
     var eq_seen: std.StringHashMapUnmanaged(void) = .empty;
     defer {
@@ -172,6 +201,18 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         if (isRefType(t, req.conform_ty)) continue; // a Ref is compared inline (cell identity), no witness
         if (try ordFills(t, &ord_seen, ord_pid_opt, req.conform_ty)) continue; // Ord fills Eq
         try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, req.conform_ty);
+    }
+    for (desc_keys.items) |k| {
+        // A descriptor'd key carrying an EXPLICIT `impl has Eq`/`Ord` supplies its own `==`
+        // witness (the erased eq dispatch resolves it via `structEqAtSlots`); minting a
+        // derived Eq alongside it would either collide into an `.ambiguous` resolve (an
+        // internal codegen diagnostic) or, for an Ord-refined key with no explicit eq, register
+        // a spurious structural `eq` that silently rebinds the program's `==`. Reuse the live
+        // witness — the SAME guard the aggregate-field Eq walk below applies.
+        if (hasConformanceLive(t, eq_pid, k)) continue; // explicit Eq: reuse its witness
+        if (ord_pid_opt) |op| if (hasConformanceLive(t, op, k)) continue; // explicit Ord: its cmp fills eq
+        if (try ordFills(t, &ord_seen, ord_pid_opt, k)) continue; // a derived Ord fills the (Eq,K) slot
+        try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, k);
     }
     var ei: usize = 0;
     while (ei < eq_work.items.len) : (ei += 1) {
@@ -209,6 +250,14 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != hash_pid) continue;
             try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, req.conform_ty);
+        }
+        for (desc_keys.items) |k| {
+            // A key with an EXPLICIT `impl has Hash` supplies its own hash witness (which the
+            // erased hash dispatch resolves via `hashAtSlot`); a derived Hash alongside it would
+            // collide into an `.ambiguous` resolve. Reuse the live witness — any deterministic
+            // hash is consistent with the derived structural eq the map pairs it with.
+            if (hasConformanceLive(t, hash_pid, k)) continue; // explicit Hash: reuse its witness
+            try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, k);
         }
         var hi: usize = 0;
         while (hi < hash_work.items.len) : (hi += 1) {
@@ -535,10 +584,10 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
     for (uniq.items) |ty| {
-        const hashable = if (hash_pid_opt) |hp|
-            try conforms(t.structs.items, t.enums.items, t.conformances.items, ty, hp, &memo, gpa, t.composite, &.{})
+        const hashable = if (pre.protocols.hashable) |hpid| (if (hash_pid_opt) |hp|
+            try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, t.composite, ty, hpid, hp, pre.ref_struct, pre.gc_array_struct, &memo, gpa)
         else
-            false;
+            false) else false;
         try t.descriptor_types.append(gpa, .{ .ty = ty, .hashable = hashable });
         if (hashable) {
             try t.erased_units.append(gpa, .{ .ty = ty, .kind = .hash, .name = try Derive.erasedMangle(gpa, .hash, ty) });

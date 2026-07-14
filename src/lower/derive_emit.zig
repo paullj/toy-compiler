@@ -70,6 +70,24 @@ fn structEqAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: I
     }
 }
 
+/// Eq of two aggregate KEYs already MATERIALIZED into slots: dispatch to the HASHABLE (pid 11)
+/// `eq` witness first (explicit `impl` — honored), else delegate to `structEqAtSlots` (pid 0
+/// `eq`, then the Ord-fills-Eq `cmp` fallback). The one authority the Map's key eq is.
+fn eqKeyAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    if (b.in.prelude_ids.hashable) |hp| switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "eq", hp, null)) {
+        .one => |m| {
+            const callee = L.witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 2);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = lslot };
+            args[1] = .{ .slot = rslot };
+            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
+        },
+        .none, .ambiguous => {},
+    };
+    return structEqAtSlots(b, ty, lslot, rslot);
+}
+
 /// The bool eq of struct field `i` (at byte `off`, type `fty`) between the two receiver
 /// bases: int/bool inline `icmp eq`; `str` via the `{ptr,len}` byte-loop
 /// (`strEqAtPtrs`); a struct/enum field is copied into fresh temp slots (a `field_addr`
@@ -706,6 +724,23 @@ fn hashAtSlot(b: *L.Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMem
     }
 }
 
+/// Hash of an aggregate KEY already MATERIALIZED into `slot`: dispatch to the key's HASHABLE
+/// (pid 11) `hash` witness first (an explicit `impl has Hashable` — honored), else delegate to
+/// the structural Hash witness (`hashAtSlot`, pid 6). The one authority the Map's key hash is.
+fn hashKeyAtSlot(b: *L.Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    if (b.in.prelude_ids.hashable) |hp| switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "hash", hp, null)) {
+        .one => |m| {
+            const callee = L.witnessCallee(b, m);
+            const args = try b.gpa.alloc(Ir.Operand, 1);
+            errdefer b.gpa.free(args);
+            args[0] = .{ .slot = slot };
+            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int);
+        },
+        .none, .ambiguous => {},
+    };
+    return hashAtSlot(b, ty, slot);
+}
+
 /// The int hash of struct field `i` (at byte `off`, type `fty`) of receiver base `self_base`
 ///: int/bool hash to their own loaded VALUE (identity — an int is its own hash, a bool
 /// is 0/1); `str` via the `{ptr,len}` byte polynomial (`hashStrAtPtr`); a struct/enum field is
@@ -905,28 +940,14 @@ fn lowerErasedHash(
     const result: Ir.ValueId = switch (ty.kind) {
         .int, .bool => try b.emit(.{ .load = .{ .addr = self_base, .ty = ty } }, ty),
         .str => try L.hashStrAtPtr(&b, self_base),
-        .@"struct" => blk: {
-            const layout = b.in.layouts[ty.struct_id];
-            var h = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
-            for (layout.field_types, layout.offsets) |fty, off| {
-                const fh = try deriveFieldHash(&b, fty, off, self_base);
-                h = try L.hashMix(&b, h, fh);
-            }
-            break :blk h;
-        },
-        .@"enum" => blk: {
-            const e = b.in.enum_layouts[ty.enum_id];
-            var any_payload = false;
-            for (e.variants) |v| if (v.field_types.len != 0) {
-                any_payload = true;
-                break;
-            };
-            if (!any_payload) {
-                const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
-                const seed = try b.emit(.{ .iconst = L.hash_seed }, int_ty);
-                break :blk try L.hashMix(&b, seed, tag);
-            }
-            break :blk try deriveEnumHash(&b, ty, self_base);
+        .@"struct", .@"enum" => blk: {
+            // Materialize the key into a fresh by-value slot off the loaded pointer, then
+            // dispatch to the key's Hashable `hash` witness (an explicit `impl` OR the derived
+            // structural unit) — the SAME authority the `[K has Hashable]` bound gates on.
+            const slot = try b.addSlot(ty);
+            const d = try b.emit(.{ .slot_addr = slot }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = d, .src = self_base, .ty = ty } }, null);
+            break :blk try hashKeyAtSlot(&b, ty, slot);
         },
         else => blk: {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "erased hash: unsupported key type in lower" });
@@ -979,29 +1000,17 @@ fn lowerErasedEq(
             break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, bool_ty);
         },
         .str => try L.strEqAtPtrs(&b, self_base, other_base),
-        .@"struct" => blk: {
-            const layout = b.in.layouts[ty.struct_id];
-            var acc = try b.emit(.{ .iconst = 1 }, int_ty);
-            for (layout.field_types, layout.offsets) |fty, off| {
-                const feq = try deriveFieldEq(&b, fty, off, self_base, other_base);
-                acc = try b.emit(.{ .mul = .{ .lhs = acc, .rhs = feq } }, int_ty);
-            }
-            const zero = try b.emit(.{ .iconst = 0 }, int_ty);
-            break :blk try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = acc, .rhs = zero } }, bool_ty);
-        },
-        .@"enum" => blk: {
-            const e = b.in.enum_layouts[ty.enum_id];
-            var any_payload = false;
-            for (e.variants) |v| if (v.field_types.len != 0) {
-                any_payload = true;
-                break;
-            };
-            if (!any_payload) {
-                const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
-                const rt = try b.emit(.{ .get_tag = other_base }, int_ty);
-                break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lt, .rhs = rt } }, bool_ty);
-            }
-            break :blk try deriveEnumEq(&b, ty, self_base, other_base);
+        .@"struct", .@"enum" => blk: {
+            // Materialize both keys into fresh by-value slots off their loaded pointers, then
+            // dispatch to the key's Hashable `eq` witness (an explicit `impl` OR the derived
+            // structural unit) — the SAME authority the `[K has Hashable]` bound gates on.
+            const lslot = try b.addSlot(ty);
+            const ld = try b.emit(.{ .slot_addr = lslot }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = ld, .src = self_base, .ty = ty } }, null);
+            const rslot = try b.addSlot(ty);
+            const rd = try b.emit(.{ .slot_addr = rslot }, int_ty);
+            _ = try b.emit(.{ .copy = .{ .dst = rd, .src = other_base, .ty = ty } }, null);
+            break :blk try eqKeyAtSlots(&b, ty, lslot, rslot);
         },
         else => blk: {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "erased eq: unsupported key type in lower" });
@@ -1352,27 +1361,21 @@ fn renderFn(gpa: std.mem.Allocator, func: *const Ir.Function, in: L.Inputs) ![]u
     return gpa.dupe(u8, w.buffered());
 }
 
-/// The field-walk offsets of an erased unit: the `field_addr`s whose base is the loaded
-/// key pointer (`load` of `slot_addr(0)` — the `rawptr` param slot).
-fn erasedFieldOffsets(gpa: std.mem.Allocator, func: *const Ir.Function) error{OutOfMemory}![]u32 {
-    var slot0_addr: ?Ir.ValueId = null;
-    var self_base: ?Ir.ValueId = null;
+/// Whether any block emits an op whose active tag matches `tag`.
+fn hasOp(func: *const Ir.Function, comptime tag: std.meta.Tag(Ir.Op)) bool {
+    for (func.blocks) |blk| for (blk.instrs) |ins| {
+        if (std.meta.activeTag(ins.op) == tag) return true;
+    };
+    return false;
+}
+
+/// The name of the first `call` whose callee is a `user_fn`, or null.
+fn firstCallName(func: *const Ir.Function) ?[]const u8 {
     for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
-        .slot_addr => |s| if (s == 0 and slot0_addr == null) {
-            slot0_addr = ins.result;
-        },
-        .load => |l| if (slot0_addr != null and l.addr == slot0_addr.? and self_base == null) {
-            self_base = ins.result;
-        },
+        .call => |c| if (c.callee.kind == .user_fn) return c.callee.name,
         else => {},
     };
-    var list: std.ArrayList(u32) = .empty;
-    errdefer list.deinit(gpa);
-    if (self_base) |sb| for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
-        .field_addr => |fa| if (fa.base == sb) try list.append(gpa, fa.off),
-        else => {},
-    };
-    return list.toOwnedSlice(gpa);
+    return null;
 }
 
 test "erased hash on an int key returns the loaded value; byte-identical across relowers" {
@@ -1395,7 +1398,7 @@ test "erased hash on an int key returns the loaded value; byte-identical across 
     try testing.expectEqualStrings(t1, t2);
 }
 
-test "erased struct hash walks fields in layout order; byte-identical across relowers" {
+test "erased struct hash copies the key into a slot and calls its Hash witness; byte-identical across relowers" {
     const gpa = testing.allocator;
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -1404,8 +1407,19 @@ test "erased struct hash walks fields in layout order; byte-identical across rel
     var ftys = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int, Typecheck.Type.int };
     var offs = [_]u32{ 0, 8, 16 };
     var layouts = [_]Typecheck.Layout{.{ .name = "S", .field_names = &fnames, .field_types = &ftys, .offsets = &offs, .size = 24, .@"align" = 8 }};
-    const in = intStructInputs(&layouts);
     const ct = Typecheck.Type.structT(0);
+    const hash_pid: u32 = 6;
+
+    // The erased unit no longer walks the key's fields inline; it materializes the key and
+    // calls the key's resolved structural `Hash` witness. Wire a one-entry derive + method
+    // table so that witness resolves to `Hash$hash$s0`.
+    var derives = [_]Derive.Derive{.{ .protocol_id = hash_pid, .protocol_name = "Hash", .kind = .hash, .conform_ty = ct, .ret = Typecheck.Type.int, .name = "Hash$hash$s0" }};
+    var methods = [_]Typecheck.Method{.{ .recv = ct, .name = "hash", .fn_id = 0, .derive = 0, .protocol_id = hash_pid }};
+    var in = intStructInputs(&layouts);
+    in.methods = &methods;
+    in.derives = &derives;
+    in.prelude_ids = .{ .hash = hash_pid };
+
     const sym: Link.SymName = .{ .kind = .user_fn, .name = "descriptor$hash$s0" };
 
     var f1 = try lowerErased(gpa, in, ct, .hash, sym, &diags);
@@ -1414,9 +1428,11 @@ test "erased struct hash walks fields in layout order; byte-identical across rel
     defer f2.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), diags.items.len);
 
-    const walk_offs = try erasedFieldOffsets(gpa, &f1);
-    defer gpa.free(walk_offs);
-    try testing.expectEqualSlices(u32, &[_]u32{ 0, 8, 16 }, walk_offs);
+    // (a) the key is copied into a by-value slot; (b) the witness is CALLed (no `field_addr`
+    // walk off the key base).
+    try testing.expect(hasOp(&f1, .copy));
+    try testing.expect(!hasOp(&f1, .field_addr));
+    try testing.expectEqualStrings("Hash$hash$s0", firstCallName(&f1).?);
 
     const t1 = try renderFn(gpa, &f1, in);
     defer gpa.free(t1);

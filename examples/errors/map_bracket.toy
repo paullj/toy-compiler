@@ -1,0 +1,7 @@
+# expect: compile-error "Map has no index operator; use .get"
+import std/map
+
+fn main() -> int {
+    counts := Map[str, int].new()
+    return counts["the"]
+}

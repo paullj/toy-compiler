@@ -665,6 +665,18 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             try g.resolveBlock(stmt.lhs);
             g.popScope();
         },
+        .for_in2_stmt => {
+            const h = Ast.forIn2HeaderAt(g.tree(g.cur_mod), stmt.lhs.int());
+            try g.resolveExpr(stmt.rhs);
+            try g.pushScope();
+            const ks = try g.declare(stmt.main_token, "redeclaration of '{s}'");
+            if (ks) |s| g.res(stmt_idx, .{ .local = s });
+            const vtok = g.nodes()[h.val_leaf.int()].main_token;
+            const vs = try g.declare(vtok, "redeclaration of '{s}'");
+            if (vs) |s| g.res(h.val_leaf, .{ .local = s });
+            try g.resolveBlock(h.body);
+            g.popScope();
+        },
         .break_stmt => {
             if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "break");
             if (stmt.lhs != Ast.none) try g.resolveExpr(stmt.lhs);
@@ -864,7 +876,7 @@ fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
     const inner = g.nodes()[n.lhs.int()];
     switch (inner.tag) {
         .block => try g.resolveBlock(n.lhs),
-        .loop_expr, .while_stmt, .for_stmt, .for_in_stmt => try g.resolveStmt(n.lhs),
+        .loop_expr, .while_stmt, .for_stmt, .for_in_stmt, .for_in2_stmt => try g.resolveStmt(n.lhs),
         else => {},
     }
     _ = g.label_stack.pop();

@@ -247,8 +247,13 @@ fn recordGenericConformance(
     }
     // The protocol-arg PATTERN: an arg naming an impl type-param becomes `type_var(ord)`
     // (grounded through the receiver App at the use site); any other arg is a concrete
-    // type via `typeFromNode`. A gname arg is NEVER routed through `typeFromNode` — the
-    // impl's params are not in scope here, so it would spuriously T0001.
+    // type via `typeFromNode`. Put the impl's params in scope for the decode so a NESTED
+    // type-app arg spelling them (`Iterator[Entry[K, V]]`) resolves K/V to their type_vars
+    // rather than T0001; a bare-identifier gname arg is mapped directly (same type_var),
+    // and a concrete arg still decodes concretely.
+    const prev_gp = t.cur_generic_params;
+    t.cur_generic_params = gnames;
+    defer t.cur_generic_params = prev_gp;
     var pargs_buf: std.ArrayList(Type) = .empty;
     defer pargs_buf.deinit(t.gpa);
     for (arg_nodes) |an| {

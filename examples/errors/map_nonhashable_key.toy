@@ -1,0 +1,10 @@
+# A Ref-containing struct is not Hashable, so it is rejected as a key at Map instantiation
+# rather than reaching a descriptor.
+# expect: compile-error "does not conform to protocol 'Hashable'"
+import std/map
+
+struct Bad { r: Ref[int] }
+
+fn main() {
+    m := Map[Bad, int].new()
+}

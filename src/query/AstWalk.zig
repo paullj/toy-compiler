@@ -283,6 +283,13 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try walkInner(src, n.rhs, collect, visitor);
             try walkInner(src, n.lhs, collect, visitor);
         },
+        .for_in2_stmt => {
+            try emit(visitor, .{ .leaf = leaf }); // first binding token
+            const hh = Ast.forIn2HeaderAt(tree, n.lhs.int());
+            try emit(visitor, .{ .raw_leaf = src.tokenText(tree.nodes[hh.val_leaf.int()].main_token) }); // second binding token
+            try walkInner(src, n.rhs, collect, visitor); // iterable
+            try walkInner(src, hh.body, collect, visitor); // body
+        },
         .break_stmt => {
             // The label target identity is load-bearing; fold its TEXT (not a
             // token index — index-free). `rhs` names a TOKEN, not a node.

@@ -28,7 +28,7 @@ const StructSym = LayoutEngine.StructSym;
 const ModuleCtx = Typecheck.GraphCtx.ModuleCtx;
 
 /// Which `Prelude.protocols` field a spec records its assigned id into.
-const Slot = enum { eq, ord, add, sub, mul, div, hash, display, from, into, try_into };
+const Slot = enum { eq, ord, add, sub, mul, div, hash, display, from, into, try_into, hashable };
 
 /// A prelude protocol's return-type shape. `ordering` is resolved to `Type.enumT(id)`
 /// against the runtime `Ordering` id; the rest are concrete or `Self` (`type_var(0)`).
@@ -138,6 +138,8 @@ pub fn register(
     // `Display$display$s<id>` unit that every site CALLs — instead of inlining the ~70-value
     // encoder at each site (frame overflow past ~6 char displays in one function).
 
+    try registerHashable(gpa, protocols, conformances, &prelude);
+
     try registerOptionResult(gpa, enums, mods, &prelude);
     prelude.conv_err_enum = try registerConvErr(gpa, enums);
     return prelude;
@@ -156,7 +158,43 @@ fn setSlot(p: *Prelude, slot: Slot, id: u32) void {
         .from => p.protocols.from = id,
         .into => p.protocols.into = id,
         .try_into => p.protocols.try_into = id,
+        .hashable => p.protocols.hashable = id,
     }
+}
+
+/// Bundled `Hashable { hash(self) -> int; eq(self, self) -> bool }`. Bespoke because
+/// `ProtoSpec` models one method; Hashable carries two (and its OWN eq slot + OWN conf
+/// rows — there is no implies-Eq mechanism, so it never reuses Eq's pid 0). Appended AFTER
+/// the `specs` loop so its id is 11 (Eq=0..TryInto=10 unshifted) and BEFORE the
+/// Option/Result enums, so no protocol/derive id shifts. N-method protocols are already
+/// modeled everywhere downstream (only the registration convenience loop is one-method).
+/// Its conformance rows MUST equal Hash's `{int, bool, str, unit}` so a key that satisfies
+/// `has Hashable` also conforms to Hash and thus has synthesized descriptor hash/eq units.
+fn registerHashable(
+    gpa: std.mem.Allocator,
+    protocols: *std.ArrayList(ProtocolSym),
+    conformances: *std.ArrayList(Conformance),
+    prelude: *Prelude,
+) !void {
+    const methods = try gpa.dupe([]const u8, &.{ "hash", "eq" });
+    const params = try gpa.alloc([]const Type, 2);
+    params[0] = try gpa.dupe(Type, &.{Type.typeVar(0)});
+    params[1] = try gpa.dupe(Type, &.{ Type.typeVar(0), Type.typeVar(0) });
+    const rets = try gpa.dupe(Type, &.{ Type.int, Type.@"bool" });
+    const pid: u32 = @intCast(protocols.items.len);
+    prelude.protocols.hashable = pid;
+    try protocols.append(gpa, .{
+        .name = "Hashable",
+        .mod = 0,
+        .pub_export = true,
+        .decl_node = Ast.none,
+        .methods = methods,
+        .method_params = params,
+        .method_rets = rets,
+        .generic_params = &.{},
+    });
+    for ([_]Type{ Type.int, Type.@"bool", Type.str, Type.unit }) |recv|
+        try conformances.append(gpa, .{ .protocol = pid, .recv = recv });
 }
 
 /// Native `enum ConvErr { out_of_range }`: the checker-internal error payload of a
@@ -390,6 +428,25 @@ test "Into=9/TryInto=10 after From; ConvErr appended after Result" {
     try testing.expectEqual(@as(?u32, 8), prelude.protocols.from);
     try testing.expectEqual(@as(?u32, 9), prelude.protocols.into);
     try testing.expectEqual(@as(?u32, 10), prelude.protocols.try_into);
+
+    // Hashable is appended after TryInto=10, so it is pid 11 and shifts no existing id. It
+    // is a bespoke two-method protocol (hash/eq) whose conformance rows equal Hash's set,
+    // so a `has Hashable` key also conforms to Hash (its descriptor hash/eq are synthesized).
+    try testing.expectEqual(@as(?u32, 11), prelude.protocols.hashable);
+    const hp = protocols.items[prelude.protocols.hashable.?];
+    try testing.expectEqualStrings("Hashable", hp.name);
+    try testing.expectEqual(@as(usize, 2), hp.methods.len);
+    try testing.expectEqualStrings("hash", hp.methods[0]);
+    try testing.expectEqualStrings("eq", hp.methods[1]);
+    var hashable_rows: usize = 0;
+    for (conformances.items) |c| {
+        if (c.protocol != prelude.protocols.hashable.?) continue;
+        hashable_rows += 1;
+        // Every Hashable row is one of Hash's scalar receivers.
+        try testing.expect(Type.eql(c.recv, Type.int) or Type.eql(c.recv, Type.@"bool") or
+            Type.eql(c.recv, Type.str) or Type.eql(c.recv, Type.unit));
+    }
+    try testing.expectEqual(@as(usize, 4), hashable_rows);
 
     // Each carries generic_params={"Dst"} and registers NO builtin conformance rows.
     inline for (.{ prelude.protocols.into.?, prelude.protocols.try_into.? }) |pid| {

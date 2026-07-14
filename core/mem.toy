@@ -66,3 +66,163 @@ pub fn ga_grow[T](a: gc_array[T], c: int) {
         i = i + 1
     }
 }
+
+# A container-precise trace (mark buckets + entries, trace only entries[0..len)) is
+# intentionally NOT wired here: there is no toy-callable mark primitive (gc_mark is a
+# codegen builtin, not an intrinsic) and the descriptor's trace slot is unread, so any
+# hand-written trace would mark nothing. Live entries survive a collection through the
+# conservative object scan of the rooted header -> buckets/entries. Precise tracing lands
+# when the collector begins consuming descriptor trace offsets.
+
+# An erased open-addressing hash table: the ONE hashed container. The 8-byte handle
+# (`gc_array[int]`, a reused native box) points at a 32-byte header {buckets@0, entries@8,
+# cap@16, len@24}. `buckets` is a `cap`-slot int array mapping a hash bucket to
+# `entry_index+1` (0 == EMPTY, free because cells are zeroed on alloc); `entries` is a
+# `cap`-cell DENSE array in INSERTION ORDER, each cell {key@0, val@size_of[K]}. Iteration
+# walks entries[0..len) directly, so hash order can never reach program output. `cap` is a
+# power of two so `hash & (cap-1)` masks the (possibly negative) hash into range without a
+# sign fix. `:=` copies the handle, so two bindings share the one header. Cells are packed
+# with no alignment padding (stride = size_of[K] + size_of[V]), so a sub-8-byte scalar key
+# like bool leaves later cells unaligned; that is safe because a cell only ever holds a
+# non-traced scalar or a static pointer, never a heap-managed pointer the object scan (which
+# reads 8-aligned words) would need to find at a cell offset.
+pub fn mp_new[K, V]() -> gc_array[int] {
+    hdr := gc_alloc(32)
+    unsafe {
+        store(offset(hdr, 0), gc_alloc(8 * 8))
+        store(offset(hdr, 8), gc_alloc(8 * (size_of[K]() + size_of[V]())))
+        store(offset(hdr, 16), 8)
+    }
+    return gc_array[int](hdr)
+}
+
+pub fn mp_len[K, V](m: gc_array[int]) -> int {
+    return unsafe { load(offset(m, 24)) }
+}
+
+pub fn mp_key_at[K, V](m: gc_array[int], i: int) -> K {
+    stride := size_of[K]() + size_of[V]()
+    entries := unsafe { load(offset(m, 8)) }
+    return unsafe { load(offset(entries, i * stride)) }
+}
+
+pub fn mp_val_at[K, V](m: gc_array[int], i: int) -> V {
+    stride := size_of[K]() + size_of[V]()
+    entries := unsafe { load(offset(m, 8)) }
+    return unsafe { load(offset(entries, i * stride + size_of[K]())) }
+}
+
+# The erased probe: the ONE place the key's hash/eq are consumed, via the key descriptor's
+# function offsets resolved off text_base and call_indirect'd on raw key bytes (the exact
+# desc_selftest pattern). Returns the entry index of `k`, or -1 when absent. The face's `has
+# Hashable` bound rejects a non-Hashable key at compile time, but a raw `import core/mem`
+# reaches these unbounded functions directly; a key with no hash/eq (offset 24/32 zero) would
+# `call_indirect` into text_base and jump wild, so the guard turns that into a clean panic.
+# The bound cannot move here: the raw `load`-into-`K` idiom needs a monomorphized (concrete)
+# K, which a bound's abstract-template checking forbids. Guarding inside these generic bodies
+# (not a shared non-generic helper) keeps the emit demand-driven, so no non-Map program shifts.
+pub fn mp_find[K, V](m: gc_array[int], k: K) -> int {
+    dp := descriptor_of[K]()
+    return unsafe {
+        ho := load(offset(dp, 24))
+        eo := load(offset(dp, 32))
+        if ho == 0 || eo == 0 { panic("key type is not Hashable") }
+        fh := offset(text_base(), ho)
+        fe := offset(text_base(), eo)
+        stride := size_of[K]() + size_of[V]()
+        qk := gc_alloc(size_of[K]())
+        store(qk, k)
+        cap := load(offset(m, 16))
+        buckets := load(offset(m, 0))
+        entries := load(offset(m, 8))
+        mask := cap - 1
+        i := call_hash(fh, qk) & mask
+        loop {
+            slot := load(offset(buckets, i * 8))
+            if slot == 0 { return -1 }
+            ei := slot - 1
+            if call_eq(fe, offset(entries, ei * stride), qk) { return ei }
+            i = (i + 1) & mask
+        }
+    }
+}
+
+# Insert or update. A miss appends a new entry (extending insertion order); a hit rewrites
+# the value in place and leaves the index untouched, so a repeated key is iterated once at
+# its ORIGINAL position. Grows at load factor 0.75, AFTER the append, so a probe always
+# finds an EMPTY slot (the loop terminates).
+pub fn mp_set[K, V](m: gc_array[int], k: K, v: V) {
+    dp := descriptor_of[K]()
+    unsafe {
+        ho := load(offset(dp, 24))
+        eo := load(offset(dp, 32))
+        if ho == 0 || eo == 0 { panic("key type is not Hashable") }
+        fh := offset(text_base(), ho)
+        fe := offset(text_base(), eo)
+        stride := size_of[K]() + size_of[V]()
+        qk := gc_alloc(size_of[K]())
+        store(qk, k)
+        cap := load(offset(m, 16))
+        buckets := load(offset(m, 0))
+        entries := load(offset(m, 8))
+        mask := cap - 1
+        i := call_hash(fh, qk) & mask
+        loop {
+            slot := load(offset(buckets, i * 8))
+            if slot == 0 {
+                ei := load(offset(m, 24))
+                cell := offset(entries, ei * stride)
+                store(cell, k)
+                store(offset(cell, size_of[K]()), v)
+                store(offset(buckets, i * 8), ei + 1)
+                store(offset(m, 24), ei + 1)
+                if (ei + 1) * 4 >= cap * 3 { mp_grow[K, V](m) }
+                return
+            }
+            ei := slot - 1
+            cell := offset(entries, ei * stride)
+            if call_eq(fe, cell, qk) {
+                store(offset(cell, size_of[K]()), v)
+                return
+            }
+            i = (i + 1) & mask
+        }
+    }
+}
+
+# Double the capacity, copy the entries array IN INSERTION ORDER (so iteration order
+# survives a grow — the LOCK), and rebuild `buckets` by rehashing each entry's key.
+# Store-before-alloc/copy (the ga_grow rule): the two arrays are allocated then published
+# into the rooted header BEFORE the copy, so a collection mid-rehash keeps the NEW arrays
+# live via the header and the OLD arrays live via the spilled `oe` local; the header never
+# moves, so every alias sees the new backing. (No alloc occurs during the copy loop.)
+fn mp_grow[K, V](m: gc_array[int]) {
+    dp := descriptor_of[K]()
+    unsafe {
+        fh := offset(text_base(), load(offset(dp, 24)))
+        stride := size_of[K]() + size_of[V]()
+        cap := load(offset(m, 16))
+        len := load(offset(m, 24))
+        oe := load(offset(m, 8))
+        nc := cap * 2
+        nb := gc_alloc(nc * 8)
+        ne := gc_alloc(nc * stride)
+        store(offset(m, 0), nb)
+        store(offset(m, 8), ne)
+        store(offset(m, 16), nc)
+        mask := nc - 1
+        j := 0
+        while j < len {
+            src := offset(oe, j * stride)
+            dst := offset(ne, j * stride)
+            kk: K = load(src)
+            store(dst, kk)
+            vv: V = load(offset(src, size_of[K]()))
+            store(offset(dst, size_of[K]()), vv)
+            b := call_hash(fh, dst) & mask
+            while load(offset(nb, b * 8)) != 0 { b = (b + 1) & mask }
+            store(offset(nb, b * 8), j + 1)
+            j = j + 1
+        }
+    }
+}

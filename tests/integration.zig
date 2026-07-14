@@ -23,4 +23,5 @@ test {
     _ = @import("ref.zig");
     _ = @import("vec.zig");
     _ = @import("desc.zig");
+    _ = @import("map.zig");
 }

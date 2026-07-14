@@ -1,0 +1,20 @@
+# Insertion-order iteration over an erased Map: "the" is set before "cat", so it iterates
+# first regardless of hash order (the load-bearing order gate). "the" is set twice but
+# updates in place, so it appears once, at its original position.
+# expect: stdout "the\ncat"
+# expect: exit 0
+import std/map
+import std/vec
+
+fn main() {
+    counts := Map[str, int].new()
+    words := ["the", "cat", "the"]
+    for w in words {
+        n := counts.get(w).unwrap_or(0)
+        counts.set(w, n + 1)
+    }
+    for k, v in counts {
+        print(k)
+        print("\n")
+    }
+}

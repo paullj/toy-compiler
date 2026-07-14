@@ -1,0 +1,15 @@
+# A plain struct with hashable fields is structurally Hashable, so it works as a Map key
+# with no explicit impl.
+# expect: exit 0
+import std/map
+struct Point { x: int, y: int }
+fn main() -> int {
+    m := Map[Point, int].new()
+    m.set(Point{ x: 1, y: 2 }, 10)
+    m.set(Point{ x: 3, y: 4 }, 20)
+    if m.len() != 2 { return 1 }
+    if m.get(Point{ x: 1, y: 2 }).unwrap_or(0) != 10 { return 2 }
+    if m.get(Point{ x: 3, y: 4 }).unwrap_or(0) != 20 { return 3 }
+    if m.get(Point{ x: 9, y: 9 }).unwrap_or(-1) != -1 { return 4 }
+    return 0
+}

@@ -501,6 +501,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .while_stmt => try lowerWhile(b, stmt_idx, null),
         .for_stmt => try lowerFor(b, stmt_idx, null),
         .for_in_stmt => try lowerForIn(b, stmt_idx, null),
+        .for_in2_stmt => try lowerForIn2(b, stmt_idx, null),
         .labeled => try lowerLabeledStmt(b, stmt_idx),
         .break_stmt => try lowerBreak(b, stmt_idx),
         .continue_stmt => try lowerContinue(b, stmt_idx),
@@ -3733,6 +3734,93 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     b.switchTo(done);
 }
 
+/// `for k, v in m { body }`: the two-binding iterator desugar. Identical machinery to
+/// `lowerForIn` (iter into a slot, header `opt := it.next()`, tag branch) except the
+/// Some-payload — a reified `Entry[K, V]` struct — is split into TWO slots: field 0 into
+/// the first binding, field 1 into the second. Reading `entries[0..len)` in the iterator
+/// yields INSERTION order, so the loop observes it directly.
+fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
+    const stmt = b.in.tree.nodes[(stmt_idx).int()];
+    const h = Ast.forIn2HeaderAt(b.in.tree, stmt.lhs.int());
+    const int_ty = Typecheck.Type.int;
+
+    const dm = comptime StdNames.desugarMethods(.for_in2_stmt);
+    comptime std.debug.assert(dm.len == 2); // dm[0]: iter, dm[1]: next
+    const recv_ty = b.in.node_types[(stmt.rhs).int()];
+    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, dm[0].name) orelse {
+        try b.note(stmt.main_token, "for-in2: no reified 'iter' method in lower");
+        return;
+    };
+    const ii = iter_m.instance orelse {
+        try b.note(stmt.main_token, "for-in2: 'iter' is not a reified instance in lower");
+        return;
+    };
+    const iter_ty = b.in.instances[ii].ret;
+    const it_slot = try b.addSlot(iter_ty);
+    {
+        const self0 = try lowerExpr(b, stmt.rhs);
+        const args = try b.gpa.alloc(Ir.Operand, 1);
+        errdefer b.gpa.free(args);
+        args[0] = self0;
+        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
+    }
+
+    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, dm[1].name) orelse {
+        try b.note(stmt.main_token, "for-in2: no reified 'next' method in lower");
+        return;
+    };
+    const ni = next_m.instance orelse {
+        try b.note(stmt.main_token, "for-in2: 'next' is not a reified instance in lower");
+        return;
+    };
+    const opt_ty = b.in.instances[ni].ret;
+    if (opt_ty.kind != .@"enum" or opt_ty.enum_id >= b.in.enum_layouts.len) {
+        try b.note(stmt.main_token, "for-in2: 'next' did not reify to an Option enum in lower");
+        return;
+    }
+    const ol = b.in.enum_layouts[opt_ty.enum_id];
+    const item_ty = Typecheck.somePayload(ol); // the reified Entry[K,V] struct
+    const opt_slot = try b.addSlot(opt_ty);
+    const elayout = b.in.layouts[item_ty.struct_id];
+    const kslot = try localSlot(b, stmt_idx, elayout.field_types[0]); // first binding
+    const vslot = try localSlot(b, h.val_leaf, elayout.field_types[1]); // second binding
+
+    const header = try b.addBlock();
+    const body = try b.addBlock();
+    const done = try b.addBlock();
+
+    try brTo(b, header, .none);
+    b.switchTo(header);
+    {
+        const it_addr = try b.emit(.{ .slot_addr = it_slot }, int_ty);
+        const args = try b.gpa.alloc(Ir.Operand, 1);
+        errdefer b.gpa.free(args);
+        args[0] = .{ .value = it_addr }; // mut self: by address
+        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, next_m), .args = args, .ret_slot = opt_slot } }, null);
+        const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
+        const tag = try b.emit(.{ .get_tag = base }, int_ty);
+        const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+        const is_some = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, Typecheck.Type.@"bool");
+        b.setTerm(.{ .cond_br = .{ .cond = is_some, .t = body, .f = done } }); // variant 0 = some
+    }
+
+    b.switchTo(body);
+    {
+        const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
+        const payload = try addrAtOff(b, base, Typecheck.payloadAddr(ol, 0), item_ty);
+        const kaddr = try addrAtOff(b, payload, elayout.offsets[0], elayout.field_types[0]);
+        try copyValueByType(b, try b.emit(.{ .slot_addr = kslot }, int_ty), kaddr, elayout.field_types[0]);
+        const vaddr = try addrAtOff(b, payload, elayout.offsets[1], elayout.field_types[1]);
+        try copyValueByType(b, try b.emit(.{ .slot_addr = vslot }, int_ty), vaddr, elayout.field_types[1]);
+    }
+    try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = header, .merge = .none });
+    try lowerBlockStmts(b, h.body);
+    _ = b.loops.pop();
+    if (!b.termSet()) try brTo(b, header, .none);
+
+    b.switchTo(done);
+}
+
 /// VALUE `loop { body }`: infinite loop yielding via `break <expr>`. `top` is the
 /// back-edge target; `exit` carries the merge param. A break-less (`never`) loop
 /// never reaches `exit` → its body just back-edges; the exit stays unreachable.
@@ -3764,6 +3852,7 @@ fn lowerLabeledStmt(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!void {
         .while_stmt => try lowerWhile(b, n.lhs, label),
         .for_stmt => try lowerFor(b, n.lhs, label),
         .for_in_stmt => try lowerForIn(b, n.lhs, label),
+        .for_in2_stmt => try lowerForIn2(b, n.lhs, label),
         .loop_expr => _ = try lowerLoopValue(b, n.lhs, b.in.node_types[(n.lhs).int()], label),
         .block => _ = try lowerLabeledBlock(b, n.lhs, b.in.node_types[(node_idx).int()], label),
         else => try b.note(n.main_token, "labeled construct unsupported in lower"),
@@ -3788,6 +3877,10 @@ fn lowerLabeledValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error
         },
         .for_in_stmt => {
             try lowerForIn(b, n.lhs, label);
+            return .none;
+        },
+        .for_in2_stmt => {
+            try lowerForIn2(b, n.lhs, label);
             return .none;
         },
         else => {

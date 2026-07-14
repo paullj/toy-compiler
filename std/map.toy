@@ -1,0 +1,61 @@
+import core/mem
+import std/iter
+
+# A thin `Map[K,V]` face over `core/mem`'s erased table. The sole field `h` is the 8-byte
+# reference handle, so `n := m` copies the handle and shares the SAME table (a set through
+# one is visible through the other). `has Hashable` on the impl prepends into every method's
+# generic run, so each is instantiated only for a key that conforms to Hashable (else
+# T0023) — the gate that keeps a non-Hashable key from reaching a descriptor. `new` is an
+# ASSOCIATED function, called as `Map[str, int].new()`. `[k]` is a compile error (a miss is
+# normal, so lookups return `Option`); use `.get`.
+pub struct Map[K, V] { h: gc_array[int] }
+
+impl Map[K has Hashable, V] {
+    fn new() -> Map[K, V] {
+        return Map[K, V] { h: mem.mp_new[K, V]() }
+    }
+
+    fn get(self, k: K) -> Option[V] {
+        i := mem.mp_find[K, V](self.h, k)
+        if i < 0 {
+            return Option[V].none
+        }
+        return Option.some(mem.mp_val_at[K, V](self.h, i))
+    }
+
+    fn set(self, k: K, v: V) {
+        mem.mp_set[K, V](self.h, k, v)
+    }
+
+    fn len(self) -> int {
+        return mem.mp_len[K, V](self.h)
+    }
+
+    fn iter(self) -> MapIter[K, V] {
+        return MapIter[K, V] { m: self, i: -1 }
+    }
+}
+
+# The (key, value) pair a `for k, v in m` loop binds. Field order (key first, val second)
+# is load-bearing: the two-binding loop lowers field 0 -> the first name, field 1 -> the
+# second.
+pub struct Entry[K, V] { key: K, val: V }
+
+# A by-value cursor. `m` copies the 8-byte handle, so it observes the SAME live table; `i`
+# starts at -1 so the first `next` reads entry 0 and the loop ends once `i >= len`. `mut
+# self` writes `i` back across iterations. Reading entries in [0,len) order yields INSERTION
+# order. No Hashable bound: `next` calls only the unbounded length/positional readers.
+pub struct MapIter[K, V] { m: Map[K, V], i: int }
+
+impl MapIter[K, V] has iter.Iterator[Entry[K, V]] {
+    fn next(mut self) -> Option[Entry[K, V]] {
+        self.i = self.i + 1
+        if self.i >= mem.mp_len[K, V](self.m.h) {
+            return Option[Entry[K, V]].none
+        }
+        return Option.some(Entry[K, V] {
+            key: mem.mp_key_at[K, V](self.m.h, self.i),
+            val: mem.mp_val_at[K, V](self.m.h, self.i),
+        })
+    }
+}
