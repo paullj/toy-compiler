@@ -1,0 +1,18 @@
+# Feature: `Set[T]` over the erased `Map[T, bool]` — `.add` dedup, `.contains`, and
+# insertion-order key iteration. `1` is added twice but collapses to one entry, so the loop
+# counts 2 distinct keys (1, 2). The count is returned only when a present key hits and an
+# absent key misses, so a broken `contains` or a broken dedup changes the exit.
+# expect: exit 2
+import std/set
+
+fn main() -> int {
+    seen := Set[int].new()
+    seen.add(1)
+    seen.add(1)
+    seen.add(2)
+    n := 0
+    for x in seen {
+        n = n + 1
+    }
+    return if seen.contains(1) && !seen.contains(9) { n } else { 0 }
+}

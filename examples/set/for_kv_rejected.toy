@@ -1,0 +1,13 @@
+# A `Set` iterates KEYS (`Iterator[T]`), not `Entry` pairs, so a two-binding `for k, v` over
+# a `Set` is rejected: the two-binding loop requires an `Entry`-yielding iterator (a `Map`).
+# expect: compile-error "'for k, v' requires an iterator over 'Entry' pairs"
+import std/set
+
+fn main() -> int {
+    s := Set[int].new()
+    s.add(1)
+    for k, v in s {
+        return k
+    }
+    return 0
+}
