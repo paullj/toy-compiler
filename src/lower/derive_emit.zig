@@ -92,7 +92,7 @@ fn eqKeyAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.S
 /// bases: int/bool inline `icmp eq`; `str` via the `{ptr,len}` byte-loop
 /// (`strEqAtPtrs`); a struct/enum field is copied into fresh temp slots (a `field_addr`
 /// is a ptr VALUE, not a slot operand — the ABI needs the field's own slot) then routed
-/// through `structEqAtSlots`. Unit fields are rejected by T0007, so never occur.
+/// through `structEqAtSlots`. A `()` field is zero-sized: eq true (all `()` are equal).
 fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
     // A managed-box FIELD compares by CELL IDENTITY: an 8-byte pointer `icmp eq`, not a
@@ -135,6 +135,9 @@ fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
             _ = try b.emit(.{ .copy = .{ .dst = rd, .src = ra, .ty = fty } }, null);
             return try structEqAtSlots(b, fty, lslot, rslot);
         },
+        // A `()` field is zero-sized: two `()` are always equal (the identity in the
+        // AND-fold), so no field_addr/load — emit the constant `true`.
+        .unit => return try b.emit(.{ .bconst = true }, Typecheck.Type.@"bool"),
         else => {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: unsupported field type in lower" });
             b.had_error = true;
@@ -247,8 +250,8 @@ fn threeWayInt(b: *L.Builder, lv: Ir.ValueId, rv: Ir.ValueId, unsigned: bool) er
 /// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of field `i` (at byte `off`, type
 /// `fty`) between the two receiver bases: int/bool via the branch-free `threeWayInt`;
 /// `str` via the `{ptr,len}` lexicographic byte-loop (`strCmpAtPtrs`); a struct/enum field is
-/// copied into fresh temp slots then routed through `cmpAtSlots`. Unit fields are rejected by
-/// T0007, so never occur. Mirrors `deriveFieldEq`.
+/// copied into fresh temp slots then routed through `cmpAtSlots`. A `()` field is zero-sized:
+/// cmp Equal (all `()` are equal). Mirrors `deriveFieldEq`.
 fn deriveFieldCmp(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
     switch (fty.kind) {
@@ -275,6 +278,9 @@ fn deriveFieldCmp(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Va
             _ = try b.emit(.{ .copy = .{ .dst = rd, .src = ra, .ty = fty } }, null);
             return try cmpAtSlots(b, fty, lslot, rslot);
         },
+        // A `()` field is zero-sized: two `()` compare Equal (the identity in the
+        // lexicographic fold), so no field_addr/load — emit the `Equal` discriminant.
+        .unit => return try b.emit(.{ .iconst = L.ord_eq }, int_ty),
         else => {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: unsupported field type in lower" });
             b.had_error = true;
@@ -744,8 +750,8 @@ fn hashKeyAtSlot(b: *L.Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOf
 /// The int hash of struct field `i` (at byte `off`, type `fty`) of receiver base `self_base`
 ///: int/bool hash to their own loaded VALUE (identity — an int is its own hash, a bool
 /// is 0/1); `str` via the `{ptr,len}` byte polynomial (`hashStrAtPtr`); a struct/enum field is
-/// copied into a fresh temp slot then routed through `hashAtSlot`. Unit fields are rejected by
-/// T0007, so never occur. Mirrors `deriveFieldEq`/`deriveFieldCmp` (single receiver — hash is
+/// copied into a fresh temp slot then routed through `hashAtSlot`. A `()` field is zero-sized:
+/// hash `hash_seed` (Eq-consistent). Mirrors `deriveFieldEq`/`deriveFieldCmp` (single receiver — hash is
 /// 1-ary).
 fn deriveFieldHash(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
@@ -765,6 +771,9 @@ fn deriveFieldHash(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.V
             _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
             return try hashAtSlot(b, fty, slot);
         },
+        // A `()` field is zero-sized: fold a fixed constant (Eq-consistent, since all
+        // `()` are equal; matches the bare-unit `.hash()` seed in lower).
+        .unit => return try b.emit(.{ .iconst = L.hash_seed }, int_ty),
         else => {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: unsupported field type in lower" });
             b.had_error = true;
@@ -940,6 +949,10 @@ fn lowerErasedHash(
     const result: Ir.ValueId = switch (ty.kind) {
         .int, .bool => try b.emit(.{ .load = .{ .addr = self_base, .ty = ty } }, ty),
         .str => try L.hashStrAtPtr(&b, self_base),
+        // A bare `()` key is zero-sized: nothing to load off the passed pointer, so fold
+        // the fixed seed (Eq-consistent, since all `()` are equal). Mirrors the `.unit`
+        // field arm in `deriveFieldHash`.
+        .unit => try b.emit(.{ .iconst = L.hash_seed }, int_ty),
         .@"struct", .@"enum" => blk: {
             // Materialize the key into a fresh by-value slot off the loaded pointer, then
             // dispatch to the key's Hashable `hash` witness (an explicit `impl` OR the derived
@@ -1000,6 +1013,9 @@ fn lowerErasedEq(
             break :blk try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, bool_ty);
         },
         .str => try L.strEqAtPtrs(&b, self_base, other_base),
+        // A bare `()` key is zero-sized: no bytes to compare off either pointer, so two
+        // `()` are always equal. Mirrors the `.unit` field arm in `deriveFieldEq`.
+        .unit => try b.emit(.{ .bconst = true }, bool_ty),
         .@"struct", .@"enum" => blk: {
             // Materialize both keys into fresh by-value slots off their loaded pointers, then
             // dispatch to the key's Hashable `eq` witness (an explicit `impl` OR the derived
@@ -1027,7 +1043,7 @@ fn lowerErasedEq(
 /// int/bool render inline (via `__display_int` / the bool cond); a `str` field writes its
 /// raw bytes (the SAME `str {ptr,len}` write path a top-level `str` uses — no quotes); a
 /// struct/enum field is copied into a fresh temp slot then routed through `displayAtSlot`.
-/// Unit fields are rejected by T0007, so never occur. Mirrors `deriveFieldHash`.
+/// A `()` field is zero-sized: display the literal `()`. Mirrors `deriveFieldHash`.
 fn deriveFieldDisplay(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
     switch (fty.kind) {
@@ -1058,6 +1074,8 @@ fn deriveFieldDisplay(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: I
             _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
             try L.displayAtSlot(b, fty, slot);
         },
+        // A `()` field is zero-sized: render the literal `()` (matches print(())).
+        .unit => try L.emitWriteLiteral(b, "()"),
         else => {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported field type in lower" });
             b.had_error = true;

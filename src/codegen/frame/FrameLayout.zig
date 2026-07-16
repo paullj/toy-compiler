@@ -110,6 +110,9 @@ fn slotSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout)
     return switch (ty.kind) {
         .str => 16,
         .@"struct", .@"enum" => roundUp8(Abi.typeSize(ty, layouts, enum_layouts)),
+        // A `()` slot occupies no bytes; its address is never taken (a unit read
+        // yields `.none`), so the next slot simply shares this offset.
+        .unit => 0,
         else => 8,
     };
 }
@@ -355,6 +358,23 @@ test "frame: scalar slots + scalar values lay out sequentially, 8-aligned, 16-al
     try testing.expectEqual(@as(u32, 32), fl.value_off[2]);
     try testing.expectEqual(@as(u32, 48), fl.frame);
     try testing.expectEqual(NO_SRET, fl.sret_save_off);
+}
+
+test "frame: a unit slot is 0 bytes and shares the next slot's offset" {
+    const gpa = testing.allocator;
+    // int, unit, int slots: the unit contributes 0 bytes, so slot 2 shares slot 1's
+    // offset — the frame matches an [int, int] layout with a degenerate middle slot.
+    var func = try buildSimple(gpa, &.{ Type.int, Type.unit, Type.int }, &.{}, 0, Type.int);
+    defer func.deinit(gpa);
+
+    var fl = try compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+
+    try testing.expectEqual(@as(u32, 0), fl.slot_off[0]);
+    try testing.expectEqual(@as(u32, 8), fl.slot_off[1]);
+    try testing.expectEqual(@as(u32, 8), fl.slot_off[2]);
+    // slots run 0,8,8..16 (running=16); frame roundUp16(16)=16.
+    try testing.expectEqual(@as(u32, 16), fl.frame);
 }
 
 test "frame: str slot occupies 16 bytes and keeps following slots 8-aligned" {

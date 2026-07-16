@@ -49,7 +49,8 @@ pub fn methodName(k: Kind) []const u8 {
 /// name, or a resolve-result fn name) — all outlive codegen, none owned here.
 pub const FieldWitness = union(enum) {
     /// A scalar (int/bool/str) field the emitter compares inline by layout kind —
-    /// no witness symbol. (Unit fields are rejected by T0007, so never occur.)
+    /// no witness symbol. (A `()` field is also inline: eq true / cmp Equal / hash
+    /// `hash_seed` / display `()`.)
     inline_kind,
     /// An aggregate (struct / empty-payload enum) field with an `eq` witness: call it
     /// `witness(field_self, field_other) -> bool`.

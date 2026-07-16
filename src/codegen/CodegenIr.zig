@@ -353,6 +353,8 @@ fn marshalParams(g: *Gen) error{OutOfMemory}!void {
                 try g.emit(Aarch64.ldrFp(S0, 16 + nsaa_off));
                 try copyBytes(g, Aarch64.SP, off, S0, 0, size);
             },
+            // A zero-sized param (`()`): 0 bytes arrived, its slot is 0 bytes — store nothing.
+            .zero => {},
         }
     }
 }
@@ -740,6 +742,8 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                 try g.emit(Aarch64.addImm(S0, Aarch64.SP, @intCast(base)));
                 try g.emit(Aarch64.strSp(S0, nsaa_off));
             },
+            // A zero-sized arg (`()`): no register/stack move; its operand is `.none`.
+            .zero => {},
         }
     }
 }

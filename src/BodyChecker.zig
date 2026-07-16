@@ -57,11 +57,12 @@ pub fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
 }
 
 /// True when `ty` is a concrete value type usable as a monomorphization type-arg. This
-/// predicate admits a ground `App` (a generic-struct instance used as a type-arg). Mirrors
+/// predicate admits a ground `App` (a generic-struct instance used as a type-arg) and
+/// `unit` (a concrete zero-sized type-arg, as in `Map[T, ()]`). Mirrors
 /// `Typecheck.isConcreteValue`.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .float, .str, .@"struct", .@"enum", .app => true,
+        .int, .bool, .float, .str, .@"struct", .@"enum", .app, .unit => true,
         else => false,
     };
 }
@@ -306,9 +307,6 @@ pub const BodyChecker = struct {
                 if (bc.resolutions[(stmt_idx).int()] == .local) {
                     const slot = bc.resolutions[(stmt_idx).int()].local;
                     try bc.setSlot(slot, ty);
-                }
-                if (ty.kind == .unit) {
-                    try bc.sink.emitFmt(bc.byteOf(stmt.main_token), "cannot bind () to '{s}'", .{bc.nameText(stmt.main_token)});
                 }
             },
             .assign => {
@@ -2726,9 +2724,9 @@ pub const BodyChecker = struct {
                 // Left `all_concrete` so the call types to its substituted (type_var)
                 // return — matching the enclosing template's own type_var signature.
             } else if (!isConcreteValue(ty)) {
-                // `type_var`/`unit` are not monomorphizable type-args. A ground `App`
-                // (`Box[int]`) now IS — it reifies to a concrete struct in the mono
-                // tail — so `isConcreteValue` admits it and it is stored + reified later.
+                // A `type_var` is not a monomorphizable type-arg. A ground `App`
+                // (`Box[int]`) IS — it reifies to a concrete struct in the mono tail — and
+                // `unit` IS (a zero-sized `()` type-arg); `isConcreteValue` admits both.
                 try bc.sink.emitCode(.T0013, bc.byteOf(bc.tree.nodes[(tn).int()].main_token), "type argument must be a concrete value type");
                 all_concrete = false;
             }

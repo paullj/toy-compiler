@@ -276,3 +276,75 @@ test "map: the Map program is byte-identical at -j1 and -j8" {
     }
     try std.testing.expect(differing <= 1);
 }
+
+// A zero-sized value column (`V = ()`, the Set backing): the cell stride is `size_of[K] + 0`
+// and every value store/load is a no-op. Exercises `mp_set`/`mp_val_at`/`mp_grow` with a unit
+// value across a forced grow (this whole path was a lower crash before `()` became a value).
+const unit_val_int_src =
+    \\import std/map
+    \\import std/vec
+    \\fn main() -> int {
+    \\    m := Map[int, ()].new()
+    \\    order := [5, 13, 21, 3, 11, 19, 7, 2]
+    \\    for k in order { m.set(k, ()) }
+    \\    m.set(5, ())
+    \\    if m.len() != 8 { return 1 }
+    \\    if !m.get(21).is_some() { return 2 }
+    \\    if m.get(99).is_some() { return 3 }
+    \\    j := 0
+    \\    for k, v in m {
+    \\        if k != order.get(j).unwrap() { return 4 }
+    \\        j = j + 1
+    \\    }
+    \\    if j != 8 { return 5 }
+    \\    return 0
+    \\}
+    \\
+;
+
+test "map: Map[int, ()] set/get/for-k,v with a zero-sized value column across a grow" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const dir = ".toy-test-map-unit-int";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const prog = try compile(gpa, io, dir, unit_val_int_src, &.{});
+    defer gpa.free(prog);
+    try std.testing.expectEqual(@as(u8, 0), try runExit(gpa, io, prog));
+}
+
+const unit_val_str_src =
+    \\import std/map
+    \\fn main() -> int {
+    \\    m := Map[str, ()].new()
+    \\    m.set("aaa", ())
+    \\    m.set("bbb", ())
+    \\    m.set("aaa", ())
+    \\    if m.len() != 2 { return 1 }
+    \\    if !m.get("bbb").is_some() { return 2 }
+    \\    if m.get("zzz").is_some() { return 3 }
+    \\    return 0
+    \\}
+    \\
+;
+
+test "map: Map[str, ()] dedups an owned key with a zero-sized value" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const dir = ".toy-test-map-unit-str";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const prog = try compile(gpa, io, dir, unit_val_str_src, &.{});
+    defer gpa.free(prog);
+    try std.testing.expectEqual(@as(u8, 0), try runExit(gpa, io, prog));
+}

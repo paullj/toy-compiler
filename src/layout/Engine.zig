@@ -257,10 +257,6 @@ pub const Env = struct {
     emitEmptyStruct: *const fn (ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void,
     /// "empty enum '{s}' is not allowed" at `byte`.
     emitEmptyEnum: *const fn (ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void,
-    /// "field '{s}' cannot have type ()" at `byte`.
-    emitUnitField: *const fn (ctx: *anyopaque, byte: u32, field: []const u8) error{OutOfMemory}!void,
-    /// "variant '{s}' payload cannot have type ()" at `byte`.
-    emitUnitPayload: *const fn (ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void,
     /// The active tree (after `gphSelect`). Resolved lazily inside the engine so
     /// the read happens AFTER the active-module swap (mirroring the checker).
     tree: *const fn (ctx: *anyopaque) Ast.Tree,
@@ -309,7 +305,6 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     defer env.gpa.free(sizing);
 
     const is_tuple = decl.tag == .tuple_struct_decl;
-    var unit_poison = false;
     for (field_nodes, 0..) |field_idx, i| {
         const field = tree.nodes[field_idx.int()];
         // A tuple struct's field NODE is the type-ref directly (no `.param`); its name
@@ -324,15 +319,24 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         // — the mono-tail rewrite turns both into the reified `structT`/`enumT` before
         // the snapshot. `reifyApp` returns the concrete type directly.
         const size_ty: Type = if (fty.isApp()) try env.reifyApp(env.ctx, fty.appIdx()) else fty;
-        if (size_ty.kind == .unit) {
-            try env.emitUnitField(env.ctx, env.byteOf(env.ctx, field.main_token), names[i]);
-            unit_poison = true;
-        }
         sizing[i] = size_ty;
     }
 
     const acc = try accumulateOffsets(env, sizing, offsets, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name);
-    const poisoned = acc.poisoned or unit_poison or empty_poison;
+    // A `()` field is a zero-sized member (offset well-defined, contributes 0 bytes).
+    // But a struct whose fields are ALL `()` lays out to size 0 — the same
+    // zero-sized-aggregate ABI hazard the empty-struct guard exists to prevent — so
+    // reject it identically. A `()` field alongside a sized field is fine. The test
+    // is `every field is unit`, NOT `size == 0`: a poisoned (recursive/empty)
+    // aggregate field also sizes to 0 but already carries its own diagnostic, and
+    // must not be double-reported here.
+    var all_unit = n > 0;
+    for (sizing) |sty| if (sty.kind != .unit) {
+        all_unit = false;
+        break;
+    };
+    if (all_unit) try env.emitEmptyStruct(env.ctx, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name);
+    const poisoned = acc.poisoned or empty_poison or all_unit;
 
     env.structs.items[id].field_names = names;
     env.structs.items[id].field_types = types;
@@ -351,8 +355,8 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
 /// the reg-pair↔indirect ABI boundary is byte-identical to a hand-written struct.
 /// The field types are concrete by construction (type-args are checked to be concrete
 /// value types; nested `App` fields were reified to `structT` by `substReify`), so the
-/// empty/unit/`App` diagnostic paths cannot fire here; any residual `unit`/`invalid`
-/// is sized to 0 defensively (offsets stay well-defined).
+/// empty/`App` diagnostic paths cannot fire here; a residual `unit`/`invalid` sizes to 0
+/// (offsets stay well-defined).
 pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
     if (env.structs.items[id].state == .done) return;
     env.structs.items[id].state = .laying;
@@ -372,10 +376,22 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
 
     const acc = try accumulateOffsets(env, types, offsets, at, name);
 
+    // Mirror `layoutStruct`'s all-`()` guard: a reified instance whose fields are ALL
+    // zero-sized (`Box[()]`) lays out to size 0 — the same zero-sized-aggregate hazard —
+    // so reject it rather than let a 0-byte struct value reach codegen. A `()` field
+    // beside a sized field is fine (the reified `Entry[int,()]` stays 8B).
+    var all_unit = types.len > 0;
+    for (types) |ft| if (ft.kind != .unit) {
+        all_unit = false;
+        break;
+    };
+    if (all_unit and !acc.poisoned) try env.emitEmptyStruct(env.ctx, at, name);
+    const poisoned = acc.poisoned or all_unit;
+
     env.structs.items[id].offsets = offsets;
     env.structs.items[id].@"align" = acc.@"align";
-    env.structs.items[id].size = if (acc.poisoned) 0 else acc.size;
-    env.structs.items[id].poisoned = acc.poisoned;
+    env.structs.items[id].size = if (poisoned) 0 else acc.size;
+    env.structs.items[id].poisoned = poisoned;
     env.structs.items[id].state = .done;
 }
 
@@ -387,8 +403,8 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
 /// tag at 0; payload sized to the largest variant at `payload_off`), so the ABI is
 /// byte-identical to a hand-written enum. The payload field types are concrete by
 /// construction (nested `App`s were reified to `structT`/`enumT` by `substReify`), so
-/// the empty/unit/`App` diagnostic paths cannot fire here; any residual `unit`/`invalid`
-/// sizes to 0 defensively (offsets stay well-defined). Mirrors `layoutReified`.
+/// the empty/`App` diagnostic paths cannot fire here; a residual `unit`/`invalid`
+/// sizes to 0 (offsets stay well-defined). Mirrors `layoutReified`.
 pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
     if (env.enums.items[id].state == .done) return;
     env.enums.items[id].state = .laying;
@@ -574,10 +590,6 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             // rewrite turns it into the reified `structT`/`enumT` before the snapshot, so
             // no `App` survives into the enum layout/fingerprint.
             const size_ty: Type = if (pty.isApp()) try env.reifyApp(env.ctx, pty.appIdx()) else pty;
-            if (size_ty.kind == .unit) {
-                try env.emitUnitPayload(env.ctx, env.byteOf(env.ctx, vnode.main_token), vname);
-                poisoned = true;
-            }
             sizing[pi] = size_ty;
         }
         const acc = try accumulatePayload(env, sizing, foffs, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name);
@@ -885,8 +897,6 @@ const Harness = struct {
             .emitRecursive = stubEmitRecursive,
             .emitEmptyStruct = stubEmitEmptyStruct,
             .emitEmptyEnum = stubEmitEmptyEnum,
-            .emitUnitField = stubEmitUnitField,
-            .emitUnitPayload = stubEmitUnitPayload,
             .tree = stubTree,
             .reifyApp = stubReifyApp,
         };
@@ -925,12 +935,6 @@ fn stubEmitEmptyStruct(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOf
 }
 fn stubEmitEmptyEnum(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
     return pushDiag(ctx, byte, "empty enum '{s}' is not allowed", .{name});
-}
-fn stubEmitUnitField(ctx: *anyopaque, byte: u32, fld: []const u8) error{OutOfMemory}!void {
-    return pushDiag(ctx, byte, "field '{s}' cannot have type ()", .{fld});
-}
-fn stubEmitUnitPayload(ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void {
-    return pushDiag(ctx, byte, "variant '{s}' payload cannot have type ()", .{variant});
 }
 fn stubReifyApp(_: *anyopaque, _: u32) error{OutOfMemory}!Type {
     // The layout unit tests never build a struct with a concrete `App` field, so this
@@ -1148,20 +1152,41 @@ test "engine: empty struct and empty enum are poisoned with the right text" {
     try testing.expectEqual(@as(usize, 1), countDiag(&h, "empty enum 'Y' is not allowed"));
 }
 
-test "engine: unit-typed field/payload is rejected" {
+test "engine: () field/payload lays out as a 0-byte member; all-() struct is rejected" {
     var h = Harness.init(testing.allocator);
     defer h.deinit();
-    const f = try h.field("u", Type.unit);
-    const s = try h.struct_("S", &.{f});
+    // A `()` field alongside sized fields is a 0-byte member: it shares the next
+    // field's offset and contributes nothing to the size.
+    const fa = try h.field("a", Type.int);
+    const fu = try h.field("u", Type.unit);
+    const fb = try h.field("b", Type.int);
+    const s = try h.struct_("M", &.{ fa, fu, fb });
     try layoutStruct(h.env(), s);
-    try testing.expect(h.structs.items[0].poisoned);
-    try testing.expectEqual(@as(usize, 1), countDiag(&h, "field 'u' cannot have type ()"));
+    try testing.expect(!h.structs.items[0].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.structs.items[0].offsets[0]);
+    try testing.expectEqual(@as(u32, 8), h.structs.items[0].offsets[1]);
+    try testing.expectEqual(@as(u32, 8), h.structs.items[0].offsets[2]);
+    try testing.expectEqual(@as(u32, 16), h.structs.items[0].size);
+    try testing.expectEqual(@as(u32, 8), h.structs.items[0].@"align");
 
+    // A `()` variant payload lays out to a 0-byte payload; the enum is still 8B (the tag).
     const vp = try h.vTuple("P", &.{Type.unit});
     const e = try h.enum_("E", &.{vp});
     try layoutEnum(h.env(), e);
-    try testing.expect(h.enums.items[0].poisoned);
-    try testing.expectEqual(@as(usize, 1), countDiag(&h, "variant 'P' payload cannot have type ()"));
+    try testing.expect(!h.enums.items[0].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.enums.items[0].variants[0].payload_size);
+    try testing.expectEqual(@as(u32, 8), h.enums.items[0].size);
+}
+
+test "engine: an all-() struct is rejected as zero-sized" {
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    const fu = try h.field("u", Type.unit);
+    const s = try h.struct_("S", &.{fu});
+    try layoutStruct(h.env(), s);
+    try testing.expect(h.structs.items[0].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.structs.items[0].size);
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "empty struct 'S' is not allowed"));
 }
 
 test "engine: snapshot owns its strings and omits poison; poisoned struct snapshots size 0" {

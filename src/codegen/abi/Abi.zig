@@ -54,7 +54,10 @@ pub const num_fp_args: u32 = 8;
 ///   * `fp`        — a bare float: one V-register / 8 stack bytes (NSRN).
 ///   * `reg_pair`  — aggregate <=16B: a 1- or 2-eightbyte GPR run.
 ///   * `indirect`  — aggregate >16B: passed/returned via a pointer (+ x8 sret).
-pub const AbiClass = enum { scalar, fp, reg_pair, indirect };
+///   * `zero`      — a zero-sized value (`()`): consumes no register and no stack
+///                  byte. Gated on `.unit` (never `typeSize==0`, which also matches
+///                  `never`/`invalid`), so only a genuine unit value is placed here.
+pub const AbiClass = enum { scalar, fp, reg_pair, indirect, zero };
 
 /// The allocator's size-class ladder (bytes). `gc_alloc` rounds a small request up to
 /// the first class `>= size`; a request past the last class is a large object. The one
@@ -119,6 +122,10 @@ pub fn eightbytes(size: u32) u32 {
 /// `reg_pair` (<=16B) or `indirect` (>16B). Single source of truth for the
 /// reg-pair vs indirect split.
 pub fn classify(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) AbiClass {
+    // A `()` value occupies no register and no stack byte. Gated on `.unit` (not
+    // `typeSize==0`) so `never`/`invalid` (also size 0) keep their historic
+    // `.scalar` placement — the additive-vs-baseline invariant.
+    if (ty.kind == .unit) return .zero;
     // A bare float rides the NSRN (V-register) sequence. Checked BEFORE the
     // aggregate test so a struct-with-float-field (kind `.@"struct"`, never
     // `.float`) correctly stays on the GPR reg-pair/indirect path.
@@ -150,6 +157,11 @@ pub const ParamLoc = union(enum) {
     fpr: u8,
     stack: struct { nsaa_off: u32, bytes: u32 },
     stack_ptr: u32,
+    /// A zero-sized value (`()`): consumes no register and no stack byte; the
+    /// emitter stores/loads nothing. Its presence in the union forces every
+    /// `ParamLoc`/`ArgLoc` switch (marshalParams/marshalArgs) to handle it, so a
+    /// unit param/arg can never silently mis-place an adjacent argument.
+    zero,
 };
 
 /// Outbound call arguments use the exact same location encoding as parameters.
@@ -178,6 +190,9 @@ pub fn classifyRet(ty: Type, layouts: []const Layout, enum_layouts: []const Enum
         .fp => return .fp_reg,
         .reg_pair => return .{ .reg = .{ .regs = @intCast(eightbytes(typeSize(ty, layouts, enum_layouts))) } },
         .indirect => return .sret,
+        // Unreachable in practice (the `.unit` early-out above), but the switch
+        // must stay exhaustive over `AbiClass`.
+        .zero => return .none,
     }
 }
 
@@ -205,6 +220,10 @@ fn walkAbi(
     var nsaa: u32 = 0;
     for (types_, 0..) |ty, i| {
         switch (classify(ty, layouts, enum_layouts)) {
+            // A zero-sized value consumes no register and no stack byte, so it does
+            // NOT touch ngrn/nsrn/nsaa — this is what keeps a later real arg at its
+            // correct register/offset (a unit param never shifts its neighbours).
+            .zero => out_locs[i] = .zero,
             .fp => {
                 if (nsrn < num_fp_args) {
                     out_locs[i] = .{ .fpr = @intCast(nsrn) };
@@ -602,6 +621,68 @@ test "descriptorFor: reads size/align off the layout, classes by size" {
     const di = descriptorFor(Type.int, &.{}, el);
     try testing.expectEqual(@as(u32, 8), di.size);
     try testing.expectEqual(@as(u16, 16), di.size_class);
+}
+
+test "classify: unit is zero" {
+    try testing.expectEqual(AbiClass.zero, classify(Type.unit, &.{}, &.{}));
+}
+
+test "walkAbi: a unit param does not shift adjacent ints" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    const params = [_]Type{ Type.int, Type.unit, Type.int };
+    var plan = try planParams(gpa, &params, Type.int, ls, el);
+    defer plan.deinit(gpa);
+
+    try testing.expectEqual(@as(u8, 0), plan.locs[0].gpr.first);
+    try testing.expectEqual(ParamLoc.zero, plan.locs[1]);
+    // The trailing int backfills x1 — the unit consumed no GPR.
+    try testing.expectEqual(@as(u8, 1), plan.locs[2].gpr.first);
+}
+
+test "planCall: a unit arg consumes 0 GPR / 0 NSAA" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    {
+        const args = [_]Type{Type.unit};
+        var plan = try planCall(gpa, &args, Type.int, ls, el);
+        defer plan.deinit(gpa);
+        try testing.expectEqual(ArgLoc.zero, plan.locs[0]);
+        try testing.expectEqual(@as(u32, 0), plan.nsaa_bytes);
+    }
+    {
+        // A leading unit does not push the int off x0.
+        const args = [_]Type{ Type.unit, Type.int };
+        var plan = try planCall(gpa, &args, Type.int, ls, el);
+        defer plan.deinit(gpa);
+        try testing.expectEqual(ArgLoc.zero, plan.locs[0]);
+        try testing.expectEqual(@as(u8, 0), plan.locs[1].gpr.first);
+    }
+    {
+        // A trailing unit does not add a stack byte.
+        const args = [_]Type{ Type.int, Type.unit };
+        var plan = try planCall(gpa, &args, Type.int, ls, el);
+        defer plan.deinit(gpa);
+        try testing.expectEqual(@as(u8, 0), plan.locs[0].gpr.first);
+        try testing.expectEqual(ArgLoc.zero, plan.locs[1]);
+        try testing.expectEqual(@as(u32, 0), plan.nsaa_bytes);
+    }
+}
+
+test "planCall: unit does not disturb NSRN" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    const args = [_]Type{ Type.unit, Type.float, Type.unit };
+    var plan = try planCall(gpa, &args, Type.unit, ls, el);
+    defer plan.deinit(gpa);
+
+    try testing.expectEqual(ArgLoc.zero, plan.locs[0]);
+    try testing.expectEqual(@as(u8, 0), plan.locs[1].fpr);
+    try testing.expectEqual(ArgLoc.zero, plan.locs[2]);
+    try testing.expectEqual(@as(u32, 0), plan.nsaa_bytes);
 }
 
 test "planCall: no args -> empty locs, zero nsaa" {
