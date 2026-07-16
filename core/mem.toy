@@ -83,9 +83,9 @@ pub fn ga_grow[T](a: gc_array[T], c: int) {
 # power of two so `hash & (cap-1)` masks the (possibly negative) hash into range without a
 # sign fix. `:=` copies the handle, so two bindings share the one header. Cells are packed
 # with no alignment padding (stride = size_of[K] + size_of[V]), so a sub-8-byte scalar key
-# like bool leaves later cells unaligned; that is safe because a cell only ever holds a
-# non-traced scalar or a static pointer, never a heap-managed pointer the object scan (which
-# reads 8-aligned words) would need to find at a cell offset.
+# like bool leaves later cells unaligned. An owned (heap-backed) `str` key stores its `ptr`
+# at the cell's 8-aligned key offset, which the object scan (reading 8-aligned words) does
+# find, so the key's buffer stays marked; a scalar/static-pointer key needs no such reach.
 pub fn mp_new[K, V]() -> gc_array[int] {
     hdr := gc_alloc(32)
     unsafe {

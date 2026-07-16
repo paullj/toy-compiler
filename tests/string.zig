@@ -1,8 +1,7 @@
-//! End-to-end coverage for the packed String: str/String concatenation + read-back,
-//! content `==` across mixed str/String operands (including independent backing),
-//! a push-forced grow (store-before-alloc + byte copy), single-handle reference
-//! sharing, and -jN determinism. Each check surfaces as the child's EXIT CODE (0 on
-//! success), the only thing this harness observes.
+//! End-to-end coverage for the unified `str`: concat + read-back, method-based and
+//! `==` content equality (including independent backing), int/bool `to_string`, an
+//! owned (concat'd) str key surviving a forced collection in a Map, and -jN
+//! determinism. Each check surfaces as the child's EXIT CODE (0 == success).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -67,90 +66,95 @@ fn expectPass(dir: []const u8, src: []const u8) !void {
 }
 
 const concat_src =
-    \\import std/string
     \\fn main() -> int {
-    \\    s := "ab" + "cd"
+    \\    s := "ab".concat("cd")
     \\    return if s.len() == 4 && s.byte_at(0) == 97 && s.byte_at(3) == 100 { 0 } else { 1 }
     \\}
     \\
 ;
 
-test "string: str + str concatenates and reads back (numeric ASCII)" {
+test "string: concat allocates a heap buffer and reads back (numeric ASCII)" {
     try expectPass(".toy-test-string-concat", concat_src);
 }
 
 const eq_src =
-    \\import std/string
     \\fn main() -> int {
-    \\    if !(("th" + "e") == "the") { return 1 }
-    \\    if ("th" + "e") == "no" { return 2 }
+    \\    if !("th".concat("e").eq("the")) { return 1 }
+    \\    if "th".concat("e").eq("no") { return 2 }
+    \\    if !(("th".concat("e")) == "the") { return 3 }
     \\    return 0
     \\}
     \\
 ;
 
-test "string: (\"th\"+\"e\") content-equals \"the\" and differs from \"no\"" {
+test "string: concat result content-equals a literal via .eq() and ==, differs from another" {
     try expectPass(".toy-test-string-eq", eq_src);
 }
 
-const eq_str_str_src =
-    \\import std/string
+const eq_backing_src =
     \\fn main() -> int {
-    \\    a := "xy" + "z"
-    \\    c := "x" + "yz"
-    \\    return if a == c { 0 } else { 1 }
+    \\    a := "xy".concat("z")
+    \\    c := "x".concat("yz")
+    \\    return if a.eq(c) { 0 } else { 1 }
     \\}
     \\
 ;
 
-test "string: String == String compares content across independent backing" {
-    try expectPass(".toy-test-string-eq-ss", eq_str_str_src);
+test "string: two independently-backed concat results compare equal by content" {
+    try expectPass(".toy-test-string-eq-backing", eq_backing_src);
 }
 
-const grow_src =
-    \\import std/string
+const long_src =
     \\fn main() -> int {
-    \\    s := String.new()
+    \\    s := ""
     \\    i := 0
-    \\    while i < 100 {
-    \\        s.push_byte(65 + (i % 26))
+    \\    while i < 50 {
+    \\        s = s.concat("ab")
     \\        i = i + 1
     \\    }
-    \\    return if s.len() == 100 && s.byte_at(50) == 65 + (50 % 26) { 0 } else { 1 }
+    \\    return if s.len() == 100 && s.byte_at(0) == 97 && s.byte_at(99) == 98 { 0 } else { 1 }
     \\}
     \\
 ;
 
-test "string: a push-forced grow copies bytes correctly and survives" {
-    try expectPass(".toy-test-string-grow", grow_src);
+test "string: a long repeated concat (heap buffer) reads back correct" {
+    try expectPass(".toy-test-string-long", long_src);
 }
 
-const share_src =
-    \\import std/string
+const to_string_src =
     \\fn main() -> int {
-    \\    s := String.new()
-    \\    s.push_byte(65)
-    \\    s2 := s
-    \\    s2.push_byte(66)
-    \\    return if s.len() == 2 { 0 } else { 1 }
-    \\}
-    \\
-;
-
-test "string: `s2 := s` shares the one buffer (single handle)" {
-    try expectPass(".toy-test-string-share", share_src);
-}
-
-const det_src =
-    \\import std/string
-    \\fn main() -> int {
-    \\    print("hello" + " " + "world")
+    \\    if !(42.to_string().eq("42")) { return 1 }
+    \\    if !((0 - 7).to_string().eq("-7")) { return 2 }
+    \\    if !(0.to_string().eq("0")) { return 3 }
+    \\    if !(true.to_string().eq("true")) { return 4 }
     \\    return 0
     \\}
     \\
 ;
 
-test "string: a String program is byte-identical at -j1 and -j8" {
+test "string: int/bool to_string render into a str comparable by content" {
+    try expectPass(".toy-test-string-to-string", to_string_src);
+}
+
+const map_owned_key_src =
+    \\import core/map_selftest
+    \\fn main() -> int { return map_selftest.concat_str_key_survives() }
+    \\
+;
+
+test "string: Map with owned (concat'd) str keys survives a forced collection and dedups by content" {
+    try expectPass(".toy-test-string-map-owned", map_owned_key_src);
+}
+
+const det_src =
+    \\fn main() -> int {
+    \\    print("hello".concat(" ").concat("world"))
+    \\    return 0
+    \\}
+    \\
+;
+
+test "string: a concat program is byte-identical at -j1 and -j8" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

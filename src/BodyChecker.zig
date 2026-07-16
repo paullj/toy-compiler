@@ -803,15 +803,6 @@ pub const BodyChecker = struct {
                         // conforms to the operator's protocol — a user struct/enum `impl T has
                         // Add`, or a `[T has Add]` bound in a generic body. str/bool have NO
                         // arithmetic impl (str concat allocates, deferred), so they fall to T0028.
-                        if (op == .plus and bc.isStrLike(lt) and bc.isStrLike(rt)) {
-                            if (bc.strConcatReachable()) {
-                                if (bc.activeStructMap().get(StdNames.string_struct)) |sid| {
-                                    break :blk Type.structT(sid);
-                                }
-                            }
-                            try bc.sink.emit(bc.byteOf(n.main_token), "string concatenation requires 'String' in scope (import std/string)");
-                            break :blk Type.invalid;
-                        }
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
                         const ap = bc.arithProtocol(op);
                         if (!Type.eql(lt, rt)) {
@@ -842,9 +833,6 @@ pub const BodyChecker = struct {
                         // sides individually conform), then type to bool iff the operand
                         // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
-                        if (bc.isStrLike(lt) and bc.isStrLike(rt) and !(lt.kind == .str and rt.kind == .str)) {
-                            break :blk Type.@"bool";
-                        }
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, true)) {
@@ -1886,42 +1874,6 @@ pub const BodyChecker = struct {
             bc.node_types[(node_idx).int()] = ret;
             return ret;
         }
-        // A bare `String.new()` naming a NON-GENERIC struct's associated function: the
-        // receiver identifier is a struct type-name (not a value), so resolve the self-less
-        // method directly — no type args to bind. A generic struct falls to the turbofish
-        // branch below (its element type is uninferable without an explicit `[T]`).
-        if (recv.tag == .identifier and bc.resolutions[(callee.lhs).int()] != .module) {
-            const name = bc.nameText(recv.main_token);
-            if (bc.activeStructMap().get(name)) |sid| {
-                if (sid < bc.structSyms().len and !bc.structSyms()[sid].is_generic) {
-                    const recv_ty = Type.structT(sid);
-                    switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
-                        .one => |m| {
-                            if (!m.is_static) {
-                                for (args) |a| _ = try bc.typeOf(a);
-                                try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an instance method, not an associated function; call it on a value", .{member});
-                                return .invalid;
-                            }
-                            // The receiver type-name flows to lower's `methodGidOf`, which
-                            // reads the concrete static method off `node_types[recv]`.
-                            bc.node_types[(callee.lhs).int()] = recv_ty;
-                            const mf = bc.model.fns[m.fn_id];
-                            if (args.len != mf.params.len) {
-                                for (args) |a| _ = try bc.typeOf(a);
-                                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ mf.params.len, args.len });
-                            } else for (args, mf.params, 0..) |a, pty, i| {
-                                const at = try bc.typeOfExpected(a, if (pty.kind == .invalid) null else pty);
-                                if (!Type.assignable(pty, at))
-                                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
-                            }
-                            bc.node_types[(node_idx).int()] = mf.ret;
-                            return mf.ret;
-                        },
-                        else => {},
-                    }
-                }
-            }
-        }
         // A bare `Vec.new()` (no turbofish) naming a generic struct with an associated
         // `new`: the element type is uninferable, so require explicit type arguments.
         if (recv.tag == .identifier and bc.resolutions[(callee.lhs).int()] != .module) {
@@ -2312,10 +2264,6 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
-            if (bc.isStringTy(at)) {
-                bc.node_types[(node_idx).int()] = Type.unit;
-                return Type.unit;
-            }
             if (try bc.conformsTo(at, bc.model.preludeProtocols().display, true)) {
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
@@ -2529,6 +2477,20 @@ pub const BodyChecker = struct {
                 const at = try bc.typeOfExpected(a, recv_ty);
                 if (!Type.assignable(recv_ty, at))
                     try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
+            }
+            bc.node_types[(node_idx).int()] = bm.ret;
+            return bm.ret;
+        }
+        // The string builtin methods (`concat`/`len`/`byte_at`/`to_string`) — kept out of
+        // `builtinScalarMethod` so lower's `eq`-keyed classifier cannot misroute them.
+        if (Typecheck.builtinStrMethod(recv_ty, member)) |bm| {
+            if (args.len != bm.params.len) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ bm.params.len, args.len });
+            } else for (args, bm.params, 0..) |a, pty, i| {
+                const at = try bc.typeOfExpected(a, pty);
+                if (!Type.assignable(pty, at))
+                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
             }
             bc.node_types[(node_idx).int()] = bm.ret;
             return bm.ret;
@@ -3085,27 +3047,6 @@ pub const BodyChecker = struct {
 
     pub fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {
         return &bc.model.graph.mods[bc.graph_mod].struct_ids;
-    }
-
-    fn isStringTy(bc: *const BodyChecker, t: Type) bool {
-        if (t.kind != .@"struct") return false;
-        const sid = bc.activeStructMap().get(StdNames.string_struct) orelse return false;
-        return t.struct_id == sid;
-    }
-
-    fn isStrLike(bc: *const BodyChecker, t: Type) bool {
-        return t.kind == .str or bc.isStringTy(t);
-    }
-
-    /// Whether the concat primitive `str_concat` is reachable (its owning `core/string`
-    /// module is in the graph). Matches the exact reachability lower requires: a bare
-    /// struct merely NAMED `String` (a user shadow, no `import std/string`) is in
-    /// `activeStructMap` but has no `str_concat`, so typing concat to it would let the
-    /// checker accept what lower cannot resolve.
-    fn strConcatReachable(bc: *const BodyChecker) bool {
-        const names = bc.gph_fn_names orelse return false;
-        for (names) |nm| if (std.mem.eql(u8, nm, StdNames.str_concat)) return true;
-        return false;
     }
 
     pub fn activeEnumMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {

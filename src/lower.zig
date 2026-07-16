@@ -774,12 +774,10 @@ fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Te
 }
 
 fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    _ = node_idx;
     const op = b.in.tokens[n.main_token].tag;
     switch (op) {
         .plus, .minus, .star, .slash => {
-            if (op == .plus and isStringTy(b, b.in.node_types[(node_idx).int()])) {
-                return try lowerConcat(b, node_idx, n);
-            }
             // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
             // operand desugars to the resolved Add/Sub/Mul/Div witness via `lowerArithValue`
             //. The checker (T0028) has already proven a same-type conforming operand.
@@ -819,13 +817,6 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             return try lowerOrdValue(b, lt, n.lhs, n.rhs, op);
         },
         .eq_eq, .bang_eq => {
-            {
-                const lt2 = b.in.node_types[(n.lhs).int()];
-                const rt2 = b.in.node_types[(n.rhs).int()];
-                if (isMixedStringEq(b, lt2, rt2)) {
-                    return try lowerStringEq(b, n.lhs, n.rhs, op == .bang_eq);
-                }
-            }
             // int/bool stay an inline `icmp` (bytes unchanged); str/unit/struct/enum
             // desugar to `Eq::eq` via `lowerEqValue`.
             const lt = b.in.node_types[(n.lhs).int()];
@@ -1409,114 +1400,6 @@ pub fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutO
     return merge;
 }
 
-/// Whether the reified type `t` is the std `String` struct, keyed by the bare layout
-/// name (a non-generic struct's model id == its layout id; `Layout.name` is the declared
-/// name). Mirrors the checker's `activeStructMap`-by-name recognition.
-fn isStringTy(b: *Builder, t: Typecheck.Type) bool {
-    return t.kind == .@"struct" and t.struct_id < b.in.layouts.len and
-        std.mem.eql(u8, b.in.layouts[t.struct_id].name, StdNames.string_struct);
-}
-
-fn isStrLike2(b: *Builder, t: Typecheck.Type) bool {
-    return t.kind == .str or isStringTy(b, t);
-}
-
-/// A mixed str/String `==`/`!=` (at least one String operand): both str-like but NOT the
-/// plain str/str pair (which keeps its own `lowerEqValue` path). The predicate `==`
-/// desugars to a content byte-compare via `lowerStringEq`; shared by the value and
-/// `genCond` arms so they cannot drift.
-fn isMixedStringEq(b: *Builder, lt: Typecheck.Type, rt: Typecheck.Type) bool {
-    return isStrLike2(b, lt) and isStrLike2(b, rt) and !(lt.kind == .str and rt.kind == .str);
-}
-
-const StrView = struct { ptr: Ir.ValueId, len: Ir.ValueId };
-
-/// Lower `node` (a str OR a String) and extract its (ptr,len). str: {ptr@0,len@8} slot.
-/// String: handle@0 -> header, len@0, buf@16. The one uniform reader for concat/print/==.
-fn strOrStringView(b: *Builder, node: Ast.Index) error{OutOfMemory}!StrView {
-    const int_ty = Typecheck.Type.int;
-    const ty = b.in.node_types[(node).int()];
-    const op = try lowerExpr(b, node);
-    const slot = operandSlot(op);
-    if (slot == Ir.none_slot) {
-        try b.note(b.in.tree.nodes[(node).int()].main_token, "str/String operand is not a slot in lower");
-        const z = try b.emit(.{ .iconst = 0 }, int_ty);
-        return .{ .ptr = z, .len = z };
-    }
-    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
-    if (isStringTy(b, ty)) {
-        const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
-        const len = try b.emit(.{ .load = .{ .addr = handle, .ty = int_ty } }, int_ty);
-        const buf_addr = try b.emit(.{ .field_addr = .{ .base = handle, .off = 16, .ty = int_ty } }, int_ty);
-        const buf = try b.emit(.{ .load = .{ .addr = buf_addr, .ty = int_ty } }, int_ty);
-        return .{ .ptr = buf, .len = len };
-    }
-    const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
-    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
-    const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
-    return .{ .ptr = ptr, .len = len };
-}
-
-/// Materialize a transient `str {ptr@0,len@8}` slot from a (ptr,len) view; returns its
-/// SlotId. Reused by print(String) and String `==` (whose `strEqAtPtrs` wants an address).
-fn emitStrViewSlot(b: *Builder, v: StrView) error{OutOfMemory}!Ir.SlotId {
-    const int_ty = Typecheck.Type.int;
-    const slot = try b.addSlot(Typecheck.Type.str);
-    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
-    _ = try b.emit(.{ .store = .{ .addr = base, .val = v.ptr, .ty = int_ty } }, null);
-    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
-    _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = v.len, .ty = int_ty } }, null);
-    return slot;
-}
-
-/// The core/string.str_concat symbol (non-generic → no Mono.find, unlike gaAtCallee).
-fn strConcatCallee(b: *Builder) ?Link.SymName {
-    for (b.in.names) |sn| {
-        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, StdNames.str_concat)) return sn;
-    }
-    return null;
-}
-
-/// Build a String from `lhs ++ rhs`: extract each operand's (ptr,len), call str_concat
-/// (returns the gc_array[int] handle in x0), store the handle into a fresh String slot@0.
-fn lowerConcat(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
-    const int_ty = Typecheck.Type.int;
-    const res_ty = b.in.node_types[(node_idx).int()];
-    const lv = try strOrStringView(b, n.lhs);
-    const rv = try strOrStringView(b, n.rhs);
-    const callee = strConcatCallee(b) orelse {
-        try b.note(n.main_token, "unresolved 'str_concat' primitive in lower");
-        return .none;
-    };
-    const args = try b.gpa.alloc(Ir.Operand, 4);
-    errdefer b.gpa.free(args);
-    args[0] = .{ .value = lv.ptr };
-    args[1] = .{ .value = lv.len };
-    args[2] = .{ .value = rv.ptr };
-    args[3] = .{ .value = rv.len };
-    const handle = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty);
-    const slot = try b.addSlot(res_ty);
-    const sbase = try b.emit(.{ .slot_addr = slot }, int_ty);
-    _ = try b.emit(.{ .store = .{ .addr = sbase, .val = handle, .ty = int_ty } }, null);
-    return .{ .slot = slot };
-}
-
-/// Content `==` for mixed str/String: build a transient {ptr,len} view of each operand
-/// and feed the existing address-based byte-compare. A String header ({len@0,cap@8,buf@16})
-/// is NOT a contiguous {ptr,len}, so a view MUST be materialized first.
-fn lowerStringEq(b: *Builder, lhs: Ast.Index, rhs: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
-    const int_ty = Typecheck.Type.int;
-    const lv = try strOrStringView(b, lhs);
-    const rv = try strOrStringView(b, rhs);
-    const ls = try emitStrViewSlot(b, lv);
-    const rs = try emitStrViewSlot(b, rv);
-    const lbase = try b.emit(.{ .slot_addr = ls }, int_ty);
-    const rbase = try b.emit(.{ .slot_addr = rs }, int_ty);
-    const eqv = try strEqAtPtrs(b, lbase, rbase);
-    if (negate) return .{ .value = try b.emit(.{ .bnot = eqv }, Typecheck.Type.@"bool") };
-    return .{ .value = eqv };
-}
-
 /// The emitted callee for a resolved conformance-witness `Method`: a derived unit's
 /// synthetic name, a Mono instance's mangled name, else the fn's global
 /// SymName. `derive` is checked FIRST (a derive Method has `fn_id == 0`, which would
@@ -1601,6 +1484,155 @@ pub fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId
     b.switchTo(done);
     const ha_f = try b.emit(.{ .slot_addr = hslot }, int_ty);
     return try b.emit(.{ .load = .{ .addr = ha_f, .ty = int_ty } }, int_ty);
+}
+
+/// The `__int_to_str` builtin's stable symbol identity — renders an i64 into a fresh
+/// `gc_alloc`'d packed byte buffer and returns the str reg-pair {ptr,len} (x0:x1).
+const int_to_str_sym: Link.SymName = .{ .kind = .builtin, .name = "__int_to_str" };
+
+/// The `__str_concat` builtin's stable symbol identity — joins two str values into a fresh
+/// `gc_alloc`'d packed byte buffer and returns the str reg-pair {ptr,len} (x0:x1).
+const str_concat_sym: Link.SymName = .{ .kind = .builtin, .name = "__str_concat" };
+
+/// The slot ADDRESS of a str operand's `{ptr@0,len@8}`. The note-and-zero fallback keeps a
+/// mis-lowered operand from becoming a wild pointer (a well-typed program never hits it).
+fn strBase(b: *Builder, node: Ast.Index) error{OutOfMemory}!Ir.ValueId {
+    const op = try lowerExpr(b, node);
+    const slot = operandSlot(op);
+    if (slot == Ir.none_slot) {
+        try b.note(b.in.tree.nodes[(node).int()].main_token, "str method receiver is not a slot in lower");
+        return try b.emit(.{ .iconst = 0 }, Typecheck.Type.int);
+    }
+    return try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+}
+
+/// `lhs.concat(rhs)`: hand the two operands' `{ptr,len}` to the out-of-line `__str_concat`
+/// builtin, which `gc_alloc`s exactly `len_lhs+len_rhs` packed bytes and copies both in.
+/// The four scalar args are read from the operands' frame slots BEFORE the call — a raw
+/// heap pointer is never held across the call (its sole safepoint), while the operand str
+/// VALUES stay slot-rooted so the conservative frame scan keeps their buffers marked across
+/// any collection the alloc triggers. The builtin returns the str reg-pair, which
+/// `placeResult` stores x0->slot@0, x1->slot@8. Out-of-lining (vs an inline byte-copy loop)
+/// keeps a concat's cost off the caller's spill-all frame, so concats do not stack up toward
+/// `FrameTooLarge`.
+fn lowerStrConcat(b: *Builder, node_idx: Ast.Index, lhs: Ast.Index, rhs: Ast.Index) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const res_ty = b.in.node_types[(node_idx).int()];
+
+    const lb = try strBase(b, lhs);
+    const rb = try strBase(b, rhs);
+    const lp = try b.emit(.{ .load = .{ .addr = lb, .ty = int_ty } }, int_ty);
+    const ll_addr = try b.emit(.{ .field_addr = .{ .base = lb, .off = 8, .ty = int_ty } }, int_ty);
+    const ll = try b.emit(.{ .load = .{ .addr = ll_addr, .ty = int_ty } }, int_ty);
+    const rp = try b.emit(.{ .load = .{ .addr = rb, .ty = int_ty } }, int_ty);
+    const rl_addr = try b.emit(.{ .field_addr = .{ .base = rb, .off = 8, .ty = int_ty } }, int_ty);
+    const rl = try b.emit(.{ .load = .{ .addr = rl_addr, .ty = int_ty } }, int_ty);
+
+    const slot = try b.addSlot(res_ty);
+    const args = try b.gpa.alloc(Ir.Operand, 4);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = lp };
+    args[1] = .{ .value = ll };
+    args[2] = .{ .value = rp };
+    args[3] = .{ .value = rl };
+    _ = try b.emit(.{ .call = .{ .callee = str_concat_sym, .args = args, .ret_slot = slot } }, null);
+    return .{ .slot = slot };
+}
+
+/// Materialize a transient `str {ptr@0,len@8}` slot over a COMPILE-TIME byte string,
+/// WITHOUT emitting a `print`. A new sibling of `emitWriteLiteral` — that fn is on every
+/// print path, so it must not be refactored; this duplicates only its slot-building half.
+fn emitStrLiteralSlot(b: *Builder, bytes: []const u8) error{OutOfMemory}!Ir.SlotId {
+    const int_ty = Typecheck.Type.int;
+    const owned = try b.gpa.dupe(u8, bytes);
+    const h = std.hash.Wyhash.hash(lit_seed, owned);
+    try b.addLiteral(h, owned);
+    const slot = try b.addSlot(Typecheck.Type.str);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const p = try b.emit(.{ .cstr_ptr = h }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = base, .val = p, .ty = int_ty } }, null);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+    const lenv = try b.emit(.{ .iconst = @intCast(bytes.len) }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = len_addr, .val = lenv, .ty = int_ty } }, null);
+    return slot;
+}
+
+/// Lower a builtin string method (`concat`/`len`/`byte_at`/`to_string`) inline. All are
+/// immutable/functional: `concat`/int&bool `to_string` produce a fresh `str`; `str
+/// .to_string` shares the receiver (immutable ⇒ safe); `len`/`byte_at` read the value.
+fn lowerStrMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, recv_node: Ast.Index, member: []const u8) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.@"bool";
+    const recv_ty = b.in.node_types[(recv_node).int()];
+
+    if (std.mem.eql(u8, member, "concat")) {
+        const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+        return try lowerStrConcat(b, node_idx, recv_node, args[0]);
+    }
+    if (std.mem.eql(u8, member, "len")) {
+        const base = try strBase(b, recv_node);
+        const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+        return .{ .value = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty) };
+    }
+    if (std.mem.eql(u8, member, "byte_at")) {
+        const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+        const base = try strBase(b, recv_node);
+        const i = operandValue(try lowerExpr(b, args[0]));
+        const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+        const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
+        // Two guards to a shared panic block (emitZeroGuard-style): i < 0, then i >= len.
+        const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+        const neg = try b.emit(.{ .icmp = .{ .cc = .lt, .lhs = i, .rhs = zero } }, bool_ty);
+        const chk2 = try b.addBlock();
+        const panic_blk = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = neg, .t = panic_blk, .f = chk2 } });
+        b.switchTo(chk2);
+        const over = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = i, .rhs = len } }, bool_ty);
+        const cont = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = over, .t = panic_blk, .f = cont } });
+        b.switchTo(panic_blk);
+        b.setTerm(.{ .panic = .index_oob });
+        b.switchTo(cont);
+        const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+        const bx = try b.emit(.{ .add = .{ .lhs = ptr, .rhs = i } }, int_ty);
+        return .{ .value = try b.emit(.{ .load_byte = bx }, int_ty) };
+    }
+    // `to_string`.
+    if (recv_ty.kind == .str) return try lowerExpr(b, recv_node);
+    if (recv_ty.kind == .bool) {
+        const v = operandValue(try lowerExpr(b, recv_node));
+        const res = try b.addSlot(Typecheck.Type.str);
+        const t_blk = try b.addBlock();
+        const f_blk = try b.addBlock();
+        const join = try b.addBlock();
+        b.setTerm(.{ .cond_br = .{ .cond = v, .t = t_blk, .f = f_blk } });
+        b.switchTo(t_blk);
+        try copyStrSlot(b, res, try emitStrLiteralSlot(b, "true"));
+        try brTo(b, join, .none);
+        b.switchTo(f_blk);
+        try copyStrSlot(b, res, try emitStrLiteralSlot(b, "false"));
+        try brTo(b, join, .none);
+        b.switchTo(join);
+        return .{ .slot = res };
+    }
+    // int `to_string`: the hand-asm builtin renders into a fresh gc_alloc'd cell and
+    // returns the str reg-pair, which `placeResult` stores x0->slot@0, x1->slot@8.
+    const nv = operandValue(try lowerExpr(b, recv_node));
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = nv };
+    const slot = try b.addSlot(Typecheck.Type.str);
+    _ = try b.emit(.{ .call = .{ .callee = int_to_str_sym, .args = args, .ret_slot = slot } }, null);
+    return .{ .slot = slot };
+}
+
+/// Copy a source str slot's two words into `dst`. Used by `bool.to_string` to funnel both
+/// literal arms into one result slot.
+fn copyStrSlot(b: *Builder, dst: Ir.SlotId, src: Ir.SlotId) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    const dbase = try b.emit(.{ .slot_addr = dst }, int_ty);
+    const sbase = try b.emit(.{ .slot_addr = src }, int_ty);
+    _ = try b.emit(.{ .copy = .{ .dst = dbase, .src = sbase, .ty = Typecheck.Type.str } }, null);
 }
 
 // The Display emitter and the `print(x)` dispatch share ONE raw write path: every
@@ -1998,6 +2030,8 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 return .{ .value = try b.emit(.{ .iconst = hash_seed }, Typecheck.Type.int) };
             },
         }
+    } else if (builtinStrMethodCallee(b, n)) |sm| {
+        return try lowerStrMethod(b, node_idx, n, sm.recv, sm.member);
     } else if (optionResultMethodCallee(b, n)) |om| {
         // A native inherent method on a reified `Option`/`Result` instance: no
         // `.call`/symbol — inline the tag test / payload load per the reified layout.
@@ -2094,12 +2128,6 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 const parg = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                 if (parg.len == 1) {
                     const at = b.in.node_types[(parg[0]).int()];
-                    if (isStringTy(b, at)) {
-                        const v = try strOrStringView(b, parg[0]);
-                        const slot = try emitStrViewSlot(b, v);
-                        try emitPrintSlot(b, slot);
-                        return .none;
-                    }
                     switch (at.kind) {
                         .int => {
                             try emitDisplayIntValue(b, operandValue(try lowerExpr(b, parg[0])));
@@ -2360,6 +2388,18 @@ fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index }
     if (bm.arity != 0) return null;
     if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
     return .{ .recv = cn.lhs };
+}
+
+/// A builtin string method call `recv.concat(o)`/`.len()`/`.byte_at(i)`/`.to_string()`:
+/// the callee is a `field_access` NOT bound to a `.func` whose receiver the recognizer
+/// accepts. A separate classifier from `builtinScalarEqCallee` (which keys on any arity-1
+/// scalar method WITHOUT checking the name) so `concat`/`byte_at` cannot misroute to `eq`.
+fn builtinStrMethodCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index, member: []const u8 } {
+    const cn = b.in.tree.nodes[(n.lhs).int()];
+    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
+    const member = b.in.tokens[cn.main_token].text(b.in.source);
+    if (Typecheck.builtinStrMethod(b.in.node_types[(cn.lhs).int()], member) == null) return null;
+    return .{ .recv = cn.lhs, .member = member };
 }
 
 /// A target-directed `.into()` / `.try_into()` conversion call on an integer receiver:
@@ -4204,13 +4244,6 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                     // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
                     // str/unit/struct/enum desugar via `lowerEqValue`, then cond_br on
                     // the produced bool (its current block is the eq computation's tail).
-                    const lt2 = b.in.node_types[(n.lhs).int()];
-                    const rt2 = b.in.node_types[(n.rhs).int()];
-                    if (isMixedStringEq(b, lt2, rt2)) {
-                        const v = operandValue(try lowerStringEq(b, n.lhs, n.rhs, op == .bang_eq));
-                        b.setTerm(.{ .cond_br = .{ .cond = v, .t = true_bb, .f = false_bb } });
-                        return;
-                    }
                     const lt = b.in.node_types[(n.lhs).int()];
                     if (isInlineEq(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));

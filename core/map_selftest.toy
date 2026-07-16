@@ -27,3 +27,26 @@ pub fn collision_survives() -> int {
     if mem.mp_len[int, int](m) != 8 { return 3 }
     return 0
 }
+
+# An owned (concat'd) str key is a heap buffer, not a literal cstring. Insert several,
+# force a collection: the conservative object scan of the entries array must keep each
+# key's buffer marked (the key ptr sits at the cell's 8-aligned offset). Re-inserting a
+# content-equal owned key must UPDATE, not grow (content hash/eq, buffer identity aside),
+# and a lookup by a LITERAL of the same bytes must still hit. 0 == every invariant held.
+pub fn concat_str_key_survives() -> int {
+    m := mem.mp_new[str, int]()
+    mem.mp_set[str, int](m, "a".concat("aa"), 1)
+    mem.mp_set[str, int](m, "b".concat("bb"), 2)
+    mem.mp_set[str, int](m, "c".concat("cc"), 3)
+    gc_collect()
+    mem.mp_set[str, int](m, "a".concat("aa"), 10)
+    gc_collect()
+    if mem.mp_len[str, int](m) != 3 { return 1 }
+    i1 := mem.mp_find[str, int](m, "aaa")
+    if i1 < 0 { return 2 }
+    if mem.mp_val_at[str, int](m, i1) != 10 { return 3 }
+    i2 := mem.mp_find[str, int](m, "bbb")
+    if i2 < 0 { return 4 }
+    if mem.mp_val_at[str, int](m, i2) != 2 { return 5 }
+    return 0
+}

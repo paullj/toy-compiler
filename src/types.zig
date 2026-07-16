@@ -769,6 +769,23 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
     return null;
 }
 
+/// The string builtin methods, kept OUT of `builtinScalarMethod`: `concat`/`byte_at`
+/// take a non-`Self` arg, and `builtinScalarEqCallee` keys on any arity-1 scalar method
+/// WITHOUT checking the name — folding `concat` in there would misroute it to `eq`. A
+/// pure, table-free recognizer (no `t.methods`/`t.fns` row) shared by the checker and
+/// lower so the two consumers cannot drift. `to_string` on int/bool/str produces a str.
+pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, params: []const Type } {
+    if (recv.kind == .str) {
+        if (std.mem.eql(u8, name, "concat")) return .{ .ret = Type.str, .params = &.{Type.str} };
+        if (std.mem.eql(u8, name, "len")) return .{ .ret = Type.int, .params = &.{} };
+        if (std.mem.eql(u8, name, "byte_at")) return .{ .ret = Type.int, .params = &.{Type.int} };
+        if (std.mem.eql(u8, name, "to_string")) return .{ .ret = Type.str, .params = &.{} };
+    }
+    if ((recv.isInteger() or recv.kind == .bool) and std.mem.eql(u8, name, "to_string"))
+        return .{ .ret = Type.str, .params = &.{} };
+    return null;
+}
+
 /// The kind of a conversion the `Into`/`TryInto` recognizer accepts. `widen`/`narrow`
 /// are the int↔int cases; the four `char_*`/`*_char` cases are the char surface.
 pub const ConvKind = enum { widen, narrow, char_to_int, byte_to_char, int_to_char, char_to_byte, int_to_float, float_to_int };
@@ -3649,6 +3666,25 @@ test "builtinScalarMethod recognizes `eq` on all four scalars (pure, table-free)
     try testing.expectEqual(@as(usize, 1), builtinScalarMethod(Type.int, "eq").?.arity);
 }
 
+test "builtinStrMethod recognizes str concat/len/byte_at + int/bool to_string, rejects the rest" {
+    const cc = builtinStrMethod(Type.str, "concat").?;
+    try testing.expectEqual(@as(usize, 1), cc.params.len);
+    try testing.expectEqual(Kind.str, cc.params[0].kind);
+    try testing.expectEqual(Kind.str, cc.ret.kind);
+    const ln = builtinStrMethod(Type.str, "len").?;
+    try testing.expectEqual(@as(usize, 0), ln.params.len);
+    try testing.expectEqual(Kind.int, ln.ret.kind);
+    const ba = builtinStrMethod(Type.str, "byte_at").?;
+    try testing.expectEqual(@as(usize, 1), ba.params.len);
+    try testing.expectEqual(Kind.int, ba.params[0].kind);
+    try testing.expectEqual(Kind.int, ba.ret.kind);
+    try testing.expectEqual(Kind.str, builtinStrMethod(Type.int, "to_string").?.ret.kind);
+    try testing.expectEqual(Kind.str, builtinStrMethod(Type.bool, "to_string").?.ret.kind);
+    try testing.expectEqual(Kind.str, builtinStrMethod(Type.str, "to_string").?.ret.kind);
+    try testing.expect(builtinStrMethod(Type.int, "concat") == null);
+    try testing.expect(builtinStrMethod(Type.structT(0), "to_string") == null);
+}
+
 test "resolveConformanceMethod: an operator witness binds only its own protocol; a sibling makes general dispatch ambiguous" {
     // Both the `impl P { fn eq(self, n: int) }` inherent-shadow bug AND the sibling-protocol
     // bug: an inherent `eq` (protocol_id == null) and a `Weird` protocol's `eq` (a DIFFERENT
@@ -5010,7 +5046,7 @@ test "`+` on a struct with no `Add` impl is exactly one T0028 at the operator" {
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "requires an 'Add' impl") != null);
 }
 
-test "`str + str` with no String in scope requires the std/string import" {
+test "`str + str` is T0028 (no builtin Add for str — never a silent allocation)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int { s := "a" + "b"
@@ -5019,33 +5055,12 @@ test "`str + str` with no String in scope requires the std/string import" {
         \\
     );
     defer c.deinit(gpa);
-    // Without `import std/string` there is no `String` result type, so concatenation is
-    // rejected with a plain diagnostic naming the required import (not the old T0028).
-    var n: usize = 0;
-    for (c.result.diags) |d| if (std.mem.indexOf(u8, d.message, "requires 'String' in scope") != null) {
-        n += 1;
+    var n28: usize = 0;
+    for (c.result.diags) |d| if (d.code == codes.Code.T0028) {
+        n28 += 1;
+        try testing.expect(std.mem.indexOf(u8, d.message, "requires an 'Add' impl for type 'str'") != null);
     };
-    try testing.expectEqual(@as(usize, 1), n);
-}
-
-test "`str + str` with a user struct merely NAMED String (no import) still requires the import" {
-    const gpa = testing.allocator;
-    var c = try checkSource(
-        \\struct String { x: int }
-        \\fn main() -> int { s := "a" + "b"
-        \\ return 0
-        \\}
-        \\
-    );
-    defer c.deinit(gpa);
-    // The concat primitive `str_concat` is unreachable without `import std/string`, so a
-    // bare struct that only shares the name must NOT be typed as the concat result (else
-    // the checker accepts what lower cannot resolve). Falls to the requires-import diag.
-    var n: usize = 0;
-    for (c.result.diags) |d| if (std.mem.indexOf(u8, d.message, "requires 'String' in scope") != null) {
-        n += 1;
-    };
-    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqual(@as(usize, 1), n28);
 }
 
 test "`bool + bool` is T0028 (no builtin Add for bool)" {

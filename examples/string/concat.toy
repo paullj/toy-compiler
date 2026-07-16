@@ -1,7 +1,6 @@
-import std/string
 # expect: stdout "hello world"
 # expect: exit 0
 fn main() -> int {
-    print("hello" + " " + "world")
+    print("hello".concat(" ").concat("world"))
     return 0
 }
