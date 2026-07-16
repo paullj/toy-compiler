@@ -54,8 +54,8 @@ pub const Code = enum(u16) {
     T0004, // recursive-type
     T0005, // empty-struct
     T0006, // empty-enum
-    T0007, // unit-field
-    T0008, // unit-payload
+    T0007, // unit-field (removed: () is now a permitted zero-sized field type)
+    T0008, // unit-payload (removed: () is now a permitted zero-sized variant payload type)
     T0009, // pub-exposes-non-pub
     T0010, // main-return-type
     T0011, // shadows-builtin
@@ -131,8 +131,8 @@ pub const table = [_]Entry{
     .{ .code = .T0004, .str = "T0004", .slug = "recursive-type" },
     .{ .code = .T0005, .str = "T0005", .slug = "empty-struct" },
     .{ .code = .T0006, .str = "T0006", .slug = "empty-enum" },
-    .{ .code = .T0007, .str = "T0007", .slug = "unit-field" },
-    .{ .code = .T0008, .str = "T0008", .slug = "unit-payload" },
+    .{ .code = .T0007, .str = "T0007", .slug = "unit-field", .status = .removed },
+    .{ .code = .T0008, .str = "T0008", .slug = "unit-payload", .status = .removed },
     .{ .code = .T0009, .str = "T0009", .slug = "pub-exposes-non-pub" },
     .{ .code = .T0010, .str = "T0010", .slug = "main-return-type" },
     .{ .code = .T0011, .str = "T0011", .slug = "shadows-builtin" },

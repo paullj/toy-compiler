@@ -2063,6 +2063,14 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                     const vty = b.in.node_types[(sargs[1]).int()];
                     const addr = operandValue(try lowerExpr(b, sargs[0]));
+                    // A zero-sized value (`()`) occupies no bytes: evaluate the value
+                    // expr for its effects, emit no store (the erased Map's value column
+                    // when V = ()). Also prevents an OOB write — the cell stride is
+                    // size_of[K]+0, so offset(cell, size_of[K]) points past the cell.
+                    if (vty.kind == .unit) {
+                        _ = try lowerExpr(b, sargs[1]);
+                        return .none;
+                    }
                     if (isAggTy(b, vty)) {
                         const src = try operandPtr(b, try lowerExpr(b, sargs[1]));
                         if (src != Ir.none_value) _ = try b.emit(.{ .copy = .{ .dst = addr, .src = src, .ty = vty } }, null);
@@ -2076,6 +2084,10 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                     const addr = operandValue(try lowerExpr(b, largs[0]));
                     const lty = b.in.node_types[(node_idx).int()];
+                    // A load typed `()` yields the zero-sized unit value (`.none`): the
+                    // address was already evaluated for effect; read nothing (mp_val_at /
+                    // mp_grow when V = ()).
+                    if (lty.kind == .unit) return .none;
                     if (isAggTy(b, lty)) {
                         const slot = try b.addSlot(lty);
                         const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
@@ -3095,6 +3107,8 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = v, .ty = ty } }, null);
         },
         .str, .@"struct", .@"enum" => try lowerExprInto(b, value, addr, ty),
+        // A zero-sized place (`()`): evaluate the RHS for effect, store nothing.
+        .unit => _ = try lowerExpr(b, value),
         else => try b.note(b.in.tree.nodes[(place).int()].main_token, "field store type unsupported in lower"),
     }
 }

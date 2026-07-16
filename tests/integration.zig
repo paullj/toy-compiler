@@ -26,4 +26,5 @@ test {
     _ = @import("map.zig");
     _ = @import("set.zig");
     _ = @import("string.zig");
+    _ = @import("unit.zig");
 }

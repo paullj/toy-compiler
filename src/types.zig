@@ -1453,14 +1453,6 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
             try tc.sink.emitFmtCode(.T0006, byte, "empty enum '{s}' is not allowed", .{name});
         }
-        fn emitUnitField(ctx: *anyopaque, byte: u32, field: []const u8) error{OutOfMemory}!void {
-            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmtCode(.T0007, byte, "field '{s}' cannot have type ()", .{field});
-        }
-        fn emitUnitPayload(ctx: *anyopaque, byte: u32, variant: []const u8) error{OutOfMemory}!void {
-            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmtCode(.T0008, byte, "variant '{s}' payload cannot have type ()", .{variant});
-        }
         fn reifyApp(ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
             return reify.reifyAppTo(tc, app_idx);
@@ -1478,8 +1470,6 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
         .emitRecursive = T.emitRecursive,
         .emitEmptyStruct = T.emitEmptyStruct,
         .emitEmptyEnum = T.emitEmptyEnum,
-        .emitUnitField = T.emitUnitField,
-        .emitUnitPayload = T.emitUnitPayload,
         .tree = T.castTree,
         .reifyApp = T.reifyApp,
     };
@@ -1935,11 +1925,12 @@ pub const max_instantiation_depth: u32 = 64;
 /// Admits a ground `App` (a generic-struct instance like `Box[int]` used as a
 /// type-arg): it is reified to a concrete `struct_id` in the mono tail. An `App`
 /// reaching a type-arg slot in a CHECKED body is always ground (templates are never
-/// body-checked; an instance re-check grounds its `type_var`s via `bc.subst`). Still
-/// excludes `type_var`, `unit`, and poison.
+/// body-checked; an instance re-check grounds its `type_var`s via `bc.subst`). Admits
+/// `unit`: `()` is a concrete zero-sized value type-arg (as in `Map[T, ()]`), reified
+/// to a 0-byte field/payload. Still excludes `type_var` and poison.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .float, .str, .@"struct", .@"enum", .app => true,
+        .int, .bool, .float, .str, .@"struct", .@"enum", .app, .unit => true,
         else => false,
     };
 }
@@ -2986,13 +2977,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     const params = try t.gpa.alloc(Type, proto.params.len);
     for (proto.params, 0..) |param_idx, i| {
         const param = t.tree.nodes[param_idx.int()];
-        const pty = t.typeFromNode(param.lhs);
-        if (pty.kind == .unit) {
-            try t.sink.emitFmt(t.byteOf(param.main_token), "parameter '{s}' cannot have type ()", .{t.nameText(param.main_token)});
-            params[i] = .invalid; // poison so call-arg checks don't cascade
-        } else {
-            params[i] = pty;
-        }
+        params[i] = t.typeFromNode(param.lhs);
     }
     const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
     try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .generic_bounds = gbounds, .generic_bound_args = gbound_args, .self_type = self_ty });
@@ -5658,15 +5643,18 @@ test "missing-field-with-inference still infers T then reports the missing field
     try testing.expect(saw_missing);
 }
 
-test "a unit-typed inferred field value is gated with T0013 before internApp" {
+test "an all-() reified struct instance (Box[()]) is rejected as empty" {
+    // `()` is now a permitted zero-sized type-arg, so `Box{ v: nop() }` infers `Box[()]`
+    // and reifies to a struct whose only field is `()` — an all-zero-sized aggregate, the
+    // same hazard the empty-struct guard exists for, so it is rejected as empty (T0005).
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn nop() {}\nfn main() -> int {\n c := Box{ v: nop() }\n return 0\n}\n");
     defer c.deinit(gpa);
-    var saw13 = false;
+    var saw_empty = false;
     for (c.result.diags) |d| {
-        if (d.code == codes.Code.T0013) saw13 = true;
+        if (d.code == codes.Code.T0005) saw_empty = true;
     }
-    try testing.expect(saw13);
+    try testing.expect(saw_empty);
 }
 
 test "the Either e2e typechecks clean and reifies exactly one concrete enum" {
@@ -6004,8 +5992,8 @@ test "bare return in a non-unit function" {
     ));
 }
 
-test ":= from a () call is an error" {
-    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+test ":= from a () call binds (zero-sized)" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         "fn g() { return }\nfn f() {\n x := g()\n return\n}\n",
     ));
 }
@@ -6034,8 +6022,8 @@ test "typed local rejects a mismatched initializer" {
     try testing.expectEqualStrings("cannot bind bool to 'x' of type int", c.result.diags[0].message);
 }
 
-test "typed local with () annotation is still rejected (cannot bind ())" {
-    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+test "() local binds (zero-sized)" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         "fn g() { return }\nfn f() {\n x: () = g()\n return\n}\n",
     ));
 }
@@ -6194,8 +6182,8 @@ test "unknown parameter type does not cascade to call arguments" {
     ));
 }
 
-test "() parameter type is rejected" {
-    try testing.expectEqual(@as(usize, 1), try checkDiagCount(
+test "() parameter type is allowed (zero-sized)" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         "fn k(a: ()) -> int {\n return 0\n}\n",
     ));
 }

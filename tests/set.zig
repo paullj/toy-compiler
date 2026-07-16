@@ -1,4 +1,4 @@
-//! End-to-end coverage for `Set[T]` over the erased `Map[T, bool]`: `.add` dedup, `.contains`
+//! End-to-end coverage for `Set[T]` over the erased `Map[T, ()]`: `.add` dedup, `.contains`
 //! hit/miss, insertion-order key iteration across a grow, single-handle sharing, survival of
 //! a forced collection (conservative scan of the Set -> Map -> entries -> str-key buffers),
 //! and -jN determinism. Each check surfaces as the child's EXIT CODE (0 on success), the only
