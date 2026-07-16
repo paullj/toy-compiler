@@ -1,0 +1,11 @@
+# A `Ref`-containing struct is not Hashable, so a `Set` of it is rejected at the `Set`
+# instantiation by the `[T has Hashable]` bound — naming the type and the protocol at the
+# user's call, the same contract a non-Hashable `Map` key already reports.
+# expect: compile-error "does not conform to protocol 'Hashable'"
+import std/set
+
+struct Bad { r: Ref[int] }
+
+fn main() {
+    s := Set[Bad].new()
+}

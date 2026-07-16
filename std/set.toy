@@ -1,0 +1,54 @@
+import core/mem
+import std/map
+import std/iter
+
+# A thin `Set[T]` face over an M-erased `Map[T, bool]`. The sole field `m` is itself a
+# single 8-byte handle, so `n := s` shares the SAME table (an add through one is seen through
+# the other). The value column is `bool`, always `true`: the key's PRESENCE is the payload,
+# and a `bool` value is a normal 8-byte cell needing no language change (a zero-sized `unit`
+# value is intentionally not carryable). The `[T has Hashable]` bound mirrors `Map`'s: it
+# makes a non-Hashable element a clean T0023 at the user's `Set[..]` call, naming the type
+# and `Hashable`, instead of pointing inside this file. `new` is an ASSOCIATED function,
+# called `Set[int].new()`.
+pub struct Set[T] { m: Map[T, bool] }
+
+impl Set[T has Hashable] {
+    fn new() -> Set[T] {
+        return Set[T] { m: Map[T, bool].new() }
+    }
+
+    fn add(self, x: T) {
+        self.m.set(x, true)
+    }
+
+    fn contains(self, x: T) -> bool {
+        return self.m.get(x).is_some()
+    }
+
+    fn len(self) -> int {
+        return self.m.len()
+    }
+
+    fn iter(self) -> SetIter[T] {
+        return SetIter[T] { m: self.m, i: -1 }
+    }
+}
+
+# A by-value key cursor over the backing table, mirroring `MapIter` but yielding the KEY via
+# `Iterator[T]` (so single-binding `for x in s` binds the key, and a two-binding `for k, v`
+# is correctly rejected — a Set has no `Entry`). `m` copies the 8-byte handle so it observes
+# the SAME live table; `i` starts at -1 so the first `next` reads entry 0 and the loop ends
+# once `i >= len`. Reading entries in [0,len) order yields INSERTION order. No Hashable bound:
+# `next` calls only the unbounded length/positional readers, and a `SetIter` is only reachable
+# via `Set.iter`, where `T` is already Hashable.
+pub struct SetIter[T] { m: Map[T, bool], i: int }
+
+impl SetIter[T] has iter.Iterator[T] {
+    fn next(mut self) -> Option[T] {
+        self.i = self.i + 1
+        if self.i >= mem.mp_len[T, bool](self.m.h) {
+            return Option[T].none
+        }
+        return Option.some(mem.mp_key_at[T, bool](self.m.h, self.i))
+    }
+}
