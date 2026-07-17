@@ -1,17 +1,23 @@
 # A growable, traced array primitive: the ONE growable container. The handle is an
 # 8-byte reference (`gc_array[T]`, a reused native box) pointing at a heap header
-# `{len@0, cap@8, elems@16}` — a raw 24-byte cell addressed by literal offsets. The
-# element backing lives at `elems`, each element at `elems + i*size_of[T]()`. `:=` copies
-# the handle, so two bindings share the same growable (mutation through one is seen
-# through the other). There is no collector: `ga_grow` leaks the old backing.
+# `{len@0, cap@8, elems@16}` addressed by literal offsets, followed by a self-describing
+# trace stash `{shape@32, elem_desc@40, elem_size@48}`. The element backing lives at
+# `elems`, each element at `elems + i*size_of[T]()`. `:=` copies the handle, so two
+# bindings share the same growable (mutation through one is seen through the other).
+# `ga_grow` leaks the old backing to the collector.
 
 # Construct an empty array with a small initial backing. `len` is born 0 (cells are
-# zeroed on alloc); `cap` starts at 4.
+# zeroed on alloc); `cap` starts at 4. The stash records `shape=0` (this is a Vec, not a
+# Map) plus the element type's descriptor + size, so the erased collector — which sees
+# only a structurally-identical `gc_array` handle — can trace the live elements precisely.
 pub fn ga_new[T]() -> gc_array[T] {
-    hdr := gc_alloc(24)
+    hdr := gc_alloc(56)
     unsafe {
         store(offset(hdr, 8), 4)
         store(offset(hdr, 16), gc_alloc(4 * size_of[T]()))
+        store(offset(hdr, 32), 0)
+        store(offset(hdr, 40), descriptor_of[T]())
+        store(offset(hdr, 48), size_of[T]())
     }
     return gc_array[T](hdr)
 }
@@ -67,16 +73,17 @@ pub fn ga_grow[T](a: gc_array[T], c: int) {
     }
 }
 
-# A container-precise trace (mark buckets + entries, trace only entries[0..len)) is
-# intentionally NOT wired here: there is no toy-callable mark primitive (gc_mark is a
-# codegen builtin, not an intrinsic) and the descriptor's trace slot is unread, so any
-# hand-written trace would mark nothing. Live entries survive a collection through the
-# conservative object scan of the rooted header -> buckets/entries. Precise tracing lands
-# when the collector begins consuming descriptor trace offsets.
+# The container-precise trace lives in the collector, not here: the collector is erased and
+# a `Vec[int]` handle and a `Map[str,int]` handle reify to structurally-identical
+# `gc_array` boxes, so nothing at a call site could tell it which walk to run. Instead the
+# header carries its own `shape` byte + per-type element/K/V descriptors (below), which the
+# collector reads to trace buckets/entries + each live entry through the K/V descriptors.
 
 # An erased open-addressing hash table: the ONE hashed container. The 8-byte handle
-# (`gc_array[int]`, a reused native box) points at a 32-byte header {buckets@0, entries@8,
-# cap@16, len@24}. `buckets` is a `cap`-slot int array mapping a hash bucket to
+# (`gc_array[int]`, a reused native box) points at a header {buckets@0, entries@8,
+# cap@16, len@24}, followed by the trace stash {shape@32=1, key_desc@40, val_desc@48,
+# key_size@56, stride@64} the erased collector reads to trace live entries precisely.
+# `buckets` is a `cap`-slot int array mapping a hash bucket to
 # `entry_index+1` (0 == EMPTY, free because cells are zeroed on alloc); `entries` is a
 # `cap`-cell DENSE array in INSERTION ORDER, each cell {key@0, val@size_of[K]}. Iteration
 # walks entries[0..len) directly, so hash order can never reach program output. `cap` is a
@@ -84,15 +91,21 @@ pub fn ga_grow[T](a: gc_array[T], c: int) {
 # sign fix. `:=` copies the handle, so two bindings share the one header. Cells are packed
 # with no alignment padding (stride = size_of[K] + size_of[V]), so a sub-8-byte scalar key
 # like bool leaves later cells unaligned. `V` may be zero-sized (`()`, as in `Set`): the
-# stride is then `size_of[K] + 0` and the value store/load are no-ops. An owned (heap-backed) `str` key stores its `ptr`
-# at the cell's 8-aligned key offset, which the object scan (reading 8-aligned words) does
-# find, so the key's buffer stays marked; a scalar/static-pointer key needs no such reach.
+# stride is then `size_of[K] + 0` and the value store/load are no-ops. An owned (heap-backed)
+# `str` key stores its `ptr` at the cell's key offset; the collector reaches it by walking
+# entries[0..len) and marking each key through the K descriptor's trace unit (the entries
+# backing is leaf-marked, not word-scanned), so a scalar/static-pointer key needs no reach.
 pub fn mp_new[K, V]() -> gc_array[int] {
-    hdr := gc_alloc(32)
+    hdr := gc_alloc(72)
     unsafe {
         store(offset(hdr, 0), gc_alloc(8 * 8))
         store(offset(hdr, 8), gc_alloc(8 * (size_of[K]() + size_of[V]())))
         store(offset(hdr, 16), 8)
+        store(offset(hdr, 32), 1)
+        store(offset(hdr, 40), descriptor_of[K]())
+        store(offset(hdr, 48), descriptor_of[V]())
+        store(offset(hdr, 56), size_of[K]())
+        store(offset(hdr, 64), size_of[K]() + size_of[V]())
     }
     return gc_array[int](hdr)
 }

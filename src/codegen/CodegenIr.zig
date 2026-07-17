@@ -1118,9 +1118,12 @@ pub const hand_builtins = [_]HandBuiltin{
     .{ .name = "panic", .lower = lowerPanic },
     .{ .name = "gc_alloc", .lower = lowerGcAlloc, .static_call_deps = &.{"gc_collect"} },
     .{ .name = "gc_span_count", .lower = lowerGcSpanCount },
-    .{ .name = "gc_collect", .lower = lowerGcCollect },
+    .{ .name = "gc_collect", .lower = lowerGcCollect, .static_call_deps = &.{ "ga_trace", "mp_trace" } },
     .{ .name = "gc_stats", .lower = lowerGcStats },
     .{ .name = "gc_mark", .lower = lowerGcMark },
+    .{ .name = "gc_mark_leaf", .lower = lowerGcMarkLeaf },
+    .{ .name = "ga_trace", .lower = lowerGaTrace, .static_call_deps = &.{"gc_mark_leaf"} },
+    .{ .name = "mp_trace", .lower = lowerMpTrace, .static_call_deps = &.{"gc_mark_leaf"} },
     .{ .name = "text_base", .lower = lowerTextBase },
     .{ .name = "__int_to_str", .lower = lowerIntToStr, .static_call_deps = &.{"gc_alloc"} },
     .{ .name = "__str_concat", .lower = lowerStrConcat, .static_call_deps = &.{"gc_alloc"} },
@@ -1157,6 +1160,45 @@ test "hand_builtins static_call_deps name real rows; gc_alloc pulls gc_collect" 
     const sc = hand_builtins[comptime handBuiltinIndex("__str_concat")].static_call_deps;
     try std.testing.expectEqual(@as(usize, 1), sc.len);
     try std.testing.expectEqualStrings("gc_alloc", sc[0]);
+
+    // The collector's precise container traces: gc_collect may dispatch to ga_trace/mp_trace
+    // on a container pop, and each leaf-marks its backings via gc_mark_leaf. These edges are
+    // asm-level `bl`s invisible to the fn-only used-scan, so the linker closes over them.
+    const gc = hand_builtins[comptime handBuiltinIndex("gc_collect")].static_call_deps;
+    try std.testing.expectEqual(@as(usize, 2), gc.len);
+    try std.testing.expectEqualStrings("ga_trace", gc[0]);
+    try std.testing.expectEqualStrings("mp_trace", gc[1]);
+    const gat = hand_builtins[comptime handBuiltinIndex("ga_trace")].static_call_deps;
+    try std.testing.expectEqual(@as(usize, 1), gat.len);
+    try std.testing.expectEqualStrings("gc_mark_leaf", gat[0]);
+    const mpt = hand_builtins[comptime handBuiltinIndex("mp_trace")].static_call_deps;
+    try std.testing.expectEqual(@as(usize, 1), mpt.len);
+    try std.testing.expectEqualStrings("gc_mark_leaf", mpt[0]);
+}
+
+test "gc_mark_leaf marks without pushing (no mark-stack realloc), unlike gc_mark" {
+    const gpa = std.testing.allocator;
+    // The push path (emitPush) is the ONLY thing that reallocs the mark stack, so a body
+    // that never pushes carries no `realloc` import — the observable difference between a
+    // leaf mark (bit only) and a full mark (bit + push).
+    const hasRealloc = struct {
+        fn f(fc: Link.FnCode) bool {
+            for (fc.relocs) |r| if (r.target.name()) |nm| {
+                if (std.mem.eql(u8, nm, "realloc")) return true;
+            };
+            return false;
+        }
+    }.f;
+
+    var mark = try lowerGcMark(gpa);
+    defer mark.deinit(gpa);
+    var leaf = try lowerGcMarkLeaf(gpa);
+    defer leaf.deinit(gpa);
+
+    try std.testing.expect(hasRealloc(mark)); // gc_mark pushes → reallocs when full
+    try std.testing.expect(!hasRealloc(leaf)); // gc_mark_leaf only sets the bit
+    // The leaf body is therefore strictly smaller (it omits the whole push sequence).
+    try std.testing.expect(leaf.code.len < mark.code.len);
 }
 
 /// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
@@ -2055,9 +2097,12 @@ pub fn lowerGcAlloc(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 /// Emit, inline, the conservative "mark one candidate word" step: given the candidate
 /// pointer in x10 and CB in x19, round it down to a 16 KiB span base and look that base
 /// up in the class-span list (then the large-object list). On a hit, normalize to the
-/// enclosing cell/payload, set its mark bit, and — if newly set — push it. Clobbers
-/// x0-x16; preserves x17-x28. Every branch is a local backpatched jump.
-fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+/// enclosing cell/payload, set its mark bit, and — if newly set AND `push` — push it
+/// (carrying x24 as its descriptor). A leaf mark (`push == false`) sets only the mark
+/// bit: the cell survives the sweep but is never traced, so a backing array's scattered
+/// interior pointers are reached only through an explicit container walk, not a rescan.
+/// Clobbers x0-x16; preserves x17-x28. Every branch is a local backpatched jump.
+fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, push: bool) error{OutOfMemory}!void {
     const A = Aarch64;
     const emit = emitWord;
 
@@ -2104,8 +2149,10 @@ fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Re
     try emit(code, gpa, A.cbnz(0, 0)); // already marked → done
     try emit(code, gpa, A.orrReg(9, 9, 1));
     try emit(code, gpa, A.strb(9, 8, 0)); // set bit
-    try emit(code, gpa, A.movReg(10, 5)); // push cell
-    try emitPush(code, relocs, gpa);
+    if (push) {
+        try emit(code, gpa, A.movReg(10, 5)); // push cell
+        try emitPush(code, relocs, gpa);
+    }
     const b_done_a: u32 = @intCast(code.items.len);
     try emit(code, gpa, A.b(0)); // → done
 
@@ -2129,8 +2176,10 @@ fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Re
     try emit(code, gpa, A.cbnz(3, 0)); // already marked → done
     try emit(code, gpa, A.movz(4, 1, 0));
     try emit(code, gpa, A.strRegUoff(4, 14, lg_mark));
-    try emit(code, gpa, A.movReg(10, 0)); // push objbase
-    try emitPush(code, relocs, gpa);
+    if (push) {
+        try emit(code, gpa, A.movReg(10, 0)); // push objbase
+        try emitPush(code, relocs, gpa);
+    }
     const b_done_c: u32 = @intCast(code.items.len);
     try emit(code, gpa, A.b(0)); // → done
     const large_next: u32 = @intCast(code.items.len);
@@ -2153,10 +2202,11 @@ fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Re
 }
 
 /// Emit, inline, a push of the pointer in x10 onto the malloc-backed mark stack (16-byte
-/// (ptr, descriptor=0) pairs; the descriptor slot is provisioned for a later
-/// descriptor-driven-tracing swap). Doubles the backing via `realloc` when full,
-/// preserving the pushed ptr + new capacity in CB scratch across the call. Clobbers
-/// x0-x2, x11-x14, x16; preserves x17-x28 (and x10 across the realloc).
+/// (ptr, descriptor) pairs; the descriptor half takes x24 — the pending tag/descriptor the
+/// caller set for this candidate, 0 for a conservative word-scan on pop). Doubles the
+/// backing via `realloc` when full, preserving the pushed ptr + new capacity in CB scratch
+/// across the call. Clobbers x0-x2, x11-x14, x16; preserves x17-x28 (and x10 across the
+/// realloc).
 fn emitPush(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator) error{OutOfMemory}!void {
     const A = Aarch64;
     const emit = emitWord;
@@ -2189,18 +2239,17 @@ fn emitPush(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: s
     try emit(code, gpa, A.lslv(1, 11, 1)); // len*16
     try emit(code, gpa, A.addReg(2, 0, 1));
     try emit(code, gpa, A.strRegUoff(10, 2, 0)); // slot.ptr
-    try emit(code, gpa, A.strRegUoff(A.XZR, 2, 8)); // slot.descriptor = 0
+    try emit(code, gpa, A.strRegUoff(24, 2, 8)); // slot.descriptor = x24
     try emit(code, gpa, A.addImm(11, 11, 1));
     try emit(code, gpa, A.strRegUoff(11, 19, off_ms_len)); // ms_len++
 }
 
-/// Build the `gc_mark(candidate)` builtin: mark ONE candidate pointer (x0), reusing the
-/// collector's own `emitConservativeMark`/`emitPush`. It is the callable wrapper a derived
-/// `trace(obj)` unit `bl`s per managed field — the mark-stack pair's descriptor slot is
-/// already reserved (`emitPush`) for the descriptor-driven-tracing swap that will make this
-/// the collector's precise object scanner. Emitted now so a `trace` unit links; it has no
-/// runtime caller in the collector yet (the object scan stays conservative). Caller owns
-/// the result.
+/// Build the `gc_mark(candidate)` builtin: mark ONE candidate pointer (x0) and push it for a
+/// conservative body scan, reusing the collector's own `emitConservativeMark`/`emitPush`
+/// with descriptor 0. It is the callable wrapper a trace unit `bl`s per managed reference:
+/// an erased `Ref`/`gc_array` element trace marks its pointee/header through it, so the
+/// pointee is scanned in turn (a sound superset — a leaf pointee scans to a no-op). Caller
+/// owns the result.
 pub fn lowerGcMark(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
     const emit = emitWord;
@@ -2219,7 +2268,8 @@ pub fn lowerGcMark(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emitLocateCb(&code, &relocs, gpa); // x9 = CB
     try emit(&code, gpa, A.movReg(19, 9)); // x19 = CB (the reg emitConservativeMark reads)
     try emit(&code, gpa, A.ldrSp(10, 8)); // x10 = candidate (the reg it marks)
-    try emitConservativeMark(&code, &relocs, gpa);
+    try emit(&code, gpa, A.movz(24, 0, 0)); // descriptor = 0 → the pop word-scans conservatively
+    try emitConservativeMark(&code, &relocs, gpa, true);
 
     try emit(&code, gpa, A.ldrSp(19, 0)); // restore caller's x19
     try emit(&code, gpa, A.addImm(A.SP, A.SP, 16));
@@ -2227,6 +2277,237 @@ pub fn lowerGcMark(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ret);
 
     return finishBuiltin(&code, &relocs, gpa, "gc_mark");
+}
+
+/// Build the `gc_mark_leaf(candidate)` builtin: set ONLY the mark bit of the candidate's
+/// cell (x0) — no push, so the sweep spares it but the collector never scans its body. The
+/// container traces leaf-mark their backing arrays with this: a backing whose interior
+/// holds scattered element/key pointers is kept alive, yet those pointers are reached only
+/// through the container's explicit dense-element walk (never a whole-backing rescan), which
+/// is what makes that walk load-bearing. Same frame/locate-CB shape as `gc_mark`. Caller
+/// owns the result.
+pub fn lowerGcMarkLeaf(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
+    const emit = emitWord;
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    try emitFramePrologue(&code, gpa);
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.strSp(19, 0)); // preserve caller's x19
+    try emit(&code, gpa, A.strSp(0, 8)); // save candidate (emitLocateCb clobbers x0)
+
+    try emitLocateCb(&code, &relocs, gpa); // x9 = CB
+    try emit(&code, gpa, A.movReg(19, 9)); // x19 = CB
+    try emit(&code, gpa, A.ldrSp(10, 8)); // x10 = candidate
+    try emitConservativeMark(&code, &relocs, gpa, false); // mark bit only, no push
+
+    try emit(&code, gpa, A.ldrSp(19, 0)); // restore caller's x19
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 16));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    return finishBuiltin(&code, &relocs, gpa, "gc_mark_leaf");
+}
+
+/// Build the `ga_trace(header)` builtin: the precise trace of a `gc_array`-backed Vec. x0 =
+/// the header. Reads the self-describing stash `{len@0, elems@16, elem_desc@40,
+/// elem_size@48}`: leaf-marks the `elems` backing (kept, never scanned), then — when the
+/// element descriptor names a trace unit (`trace_off@40 != 0`) — walks the DENSE
+/// `elems[0..len)` and dispatches each live element through `(text_base + trace_off)`. An
+/// unmanaged element (int/scalar → `trace_off == 0`) skips the walk: the leaf-marked backing
+/// already keeps it. Erased/non-generic (everything read from the header), so one body traces
+/// every Vec. Loop state lives in callee-saved regs saved in the prologue; a `Vec[Ref[int]]`'s
+/// per-element trace `bl`s `gc_mark`, which honours the callee-saved ABI, so the state
+/// survives. Caller owns the result.
+pub fn lowerGaTrace(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
+    const emit = emitWord;
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    try emitFramePrologue(&code, gpa);
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 48));
+    try emit(&code, gpa, A.strSp(19, 0)); // elems
+    try emit(&code, gpa, A.strSp(20, 8)); // len
+    try emit(&code, gpa, A.strSp(21, 16)); // elem_size
+    try emit(&code, gpa, A.strSp(22, 24)); // i
+    try emit(&code, gpa, A.strSp(23, 32)); // element trace fn addr
+
+    // x0 = header. Load the loop constants + compute the element trace fn address FIRST, so
+    // nothing below reads scratch clobbered by the gc_mark_leaf call.
+    try emit(&code, gpa, A.ldrRegUoff(20, 0, 0)); // len
+    try emit(&code, gpa, A.ldrRegUoff(21, 0, 48)); // elem_size
+    try emit(&code, gpa, A.ldrRegUoff(2, 0, 40)); // elem_desc
+    try emit(&code, gpa, A.ldrRegUoff(19, 0, 16)); // elems
+    try emit(&code, gpa, A.movz(23, 0, 0)); // fn addr = 0 (no element trace)
+    const cbz_skip_a: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(2, 0)); // elem_desc == 0 → no trace
+    try emit(&code, gpa, A.ldrRegUoff(3, 2, 40)); // trace_off
+    const cbz_skip_b: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(3, 0)); // trace_off == 0 → unmanaged element
+    try emitTextBase(&code, &relocs, gpa, 4); // x4 = text_base
+    try emit(&code, gpa, A.addReg(23, 4, 3)); // fn addr = text_base + trace_off
+    const skip: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_skip_a, skip);
+    patchCbzTo(code.items, cbz_skip_b, skip);
+
+    // leaf-mark the backing (survives the sweep; its interior is reached only via the walk).
+    try emit(&code, gpa, A.movReg(0, 19));
+    try emitBuiltinCall(&code, &relocs, gpa, "gc_mark_leaf");
+
+    const cbz_done: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(23, 0)); // no element trace → done
+    try emit(&code, gpa, A.movz(22, 0, 0)); // i = 0
+    const loop_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cmpReg(22, 20));
+    const bhs_done: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hs, 0)); // i >= len → done
+    try emit(&code, gpa, A.mul(5, 22, 21));
+    try emit(&code, gpa, A.addReg(0, 19, 5)); // x0 = elems + i*elem_size
+    try emit(&code, gpa, A.blr(23));
+    try emit(&code, gpa, A.addImm(22, 22, 1));
+    const b_loop: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0));
+    patchBTo(code.items, b_loop, loop_top);
+
+    const done: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_done, done);
+    patchBCondTo(code.items, bhs_done, done);
+    try emit(&code, gpa, A.ldrSp(19, 0));
+    try emit(&code, gpa, A.ldrSp(20, 8));
+    try emit(&code, gpa, A.ldrSp(21, 16));
+    try emit(&code, gpa, A.ldrSp(22, 24));
+    try emit(&code, gpa, A.ldrSp(23, 32));
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 48));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    return finishBuiltin(&code, &relocs, gpa, "ga_trace");
+}
+
+/// Build the `mp_trace(header)` builtin: the precise trace of a `gc_array`-backed Map (and
+/// Set = `Map[T,()]`). x0 = the header. Reads the stash `{buckets@0, entries@8, len@24,
+/// key_desc@40, val_desc@48, key_size@56, stride@64}`: leaf-marks BOTH backings, then walks
+/// the DENSE `entries[0..len)` (insertion order — open-addressing scatter is invisible to
+/// it, so every live entry is visited regardless of which physical bucket it probed into)
+/// and dispatches each entry's key (at cell+0) and value (at cell+key_size) through their
+/// descriptors' trace units when present. A `()` value (Set) has `val_desc.trace_off == 0`,
+/// so the value dispatch is a no-op. Because the backings are leaf-marked (not scanned), a
+/// scattered collision key's buffer is reached ONLY through this dense walk — a physical or
+/// truncated walk would sweep it. Erased/non-generic. Caller owns the result.
+pub fn lowerMpTrace(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    const A = Aarch64;
+    const emit = emitWord;
+    var code: std.ArrayList(u8) = .empty;
+    errdefer code.deinit(gpa);
+    var relocs: std.ArrayList(Link.Reloc) = .empty;
+    errdefer deinitBuiltinRelocs(&relocs, gpa);
+
+    try emitFramePrologue(&code, gpa);
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 80));
+    try emit(&code, gpa, A.strSp(19, 0)); // entries
+    try emit(&code, gpa, A.strSp(20, 8)); // len
+    try emit(&code, gpa, A.strSp(21, 16)); // stride
+    try emit(&code, gpa, A.strSp(22, 24)); // i
+    try emit(&code, gpa, A.strSp(23, 32)); // key trace fn addr
+    try emit(&code, gpa, A.strSp(24, 40)); // preserve caller x24 (reloaded per-entry, not held)
+    try emit(&code, gpa, A.strSp(25, 48)); // val trace fn addr
+    try emit(&code, gpa, A.strSp(26, 56)); // header
+    try emit(&code, gpa, A.strSp(27, 64)); // text_base
+
+    try emit(&code, gpa, A.movReg(26, 0)); // header
+
+    // leaf-mark buckets and entries (both backings survive; interiors reached via the walk).
+    try emit(&code, gpa, A.ldrRegUoff(0, 26, 0)); // buckets
+    try emitBuiltinCall(&code, &relocs, gpa, "gc_mark_leaf");
+    try emit(&code, gpa, A.ldrRegUoff(0, 26, 8)); // entries
+    try emitBuiltinCall(&code, &relocs, gpa, "gc_mark_leaf");
+
+    try emit(&code, gpa, A.ldrRegUoff(19, 26, 8)); // entries
+    try emit(&code, gpa, A.ldrRegUoff(20, 26, 24)); // len
+    try emit(&code, gpa, A.ldrRegUoff(21, 26, 64)); // stride
+    try emitTextBase(&code, &relocs, gpa, 27); // x27 = text_base
+
+    // key trace fn addr → x23 (0 when the key type is unmanaged).
+    try emit(&code, gpa, A.movz(23, 0, 0));
+    try emit(&code, gpa, A.ldrRegUoff(4, 26, 40)); // key_desc
+    const cbz_nok: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(4, 0));
+    try emit(&code, gpa, A.ldrRegUoff(5, 4, 40)); // key trace_off
+    const cbz_nok2: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(5, 0));
+    try emit(&code, gpa, A.addReg(23, 27, 5));
+    const nok: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_nok, nok);
+    patchCbzTo(code.items, cbz_nok2, nok);
+
+    // val trace fn addr → x25 (0 for a `()` value / unmanaged value).
+    try emit(&code, gpa, A.movz(25, 0, 0));
+    try emit(&code, gpa, A.ldrRegUoff(4, 26, 48)); // val_desc
+    const cbz_nov: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(4, 0));
+    try emit(&code, gpa, A.ldrRegUoff(5, 4, 40)); // val trace_off
+    const cbz_nov2: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(5, 0));
+    try emit(&code, gpa, A.addReg(25, 27, 5));
+    const nov: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_nov, nov);
+    patchCbzTo(code.items, cbz_nov2, nov);
+
+    try emit(&code, gpa, A.movz(22, 0, 0)); // i = 0
+    const loop_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cmpReg(22, 20));
+    const bhs_done: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hs, 0)); // i >= len → done
+
+    // key dispatch: x0 = entries + i*stride.
+    const cbz_dov: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(23, 0)); // no key trace → skip to value
+    try emit(&code, gpa, A.mul(6, 22, 21));
+    try emit(&code, gpa, A.addReg(0, 19, 6));
+    try emit(&code, gpa, A.blr(23));
+    const dov: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_dov, dov);
+
+    // value dispatch: x0 = entries + i*stride + key_size (recomputed; the key blr clobbers scratch).
+    const cbz_next: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(25, 0)); // no value trace → skip
+    try emit(&code, gpa, A.mul(6, 22, 21));
+    try emit(&code, gpa, A.addReg(0, 19, 6));
+    // Reload key_size from the header: a key/value trace that routes through gc_mark resets
+    // x24 (the collector's pending-push descriptor) to 0, so it cannot be kept across the loop.
+    try emit(&code, gpa, A.ldrRegUoff(24, 26, 56));
+    try emit(&code, gpa, A.addReg(0, 0, 24)); // + key_size
+    try emit(&code, gpa, A.blr(25));
+    const next: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_next, next);
+
+    try emit(&code, gpa, A.addImm(22, 22, 1));
+    const b_loop: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0));
+    patchBTo(code.items, b_loop, loop_top);
+
+    const done: u32 = @intCast(code.items.len);
+    patchBCondTo(code.items, bhs_done, done);
+    try emit(&code, gpa, A.ldrSp(19, 0));
+    try emit(&code, gpa, A.ldrSp(20, 8));
+    try emit(&code, gpa, A.ldrSp(21, 16));
+    try emit(&code, gpa, A.ldrSp(22, 24));
+    try emit(&code, gpa, A.ldrSp(23, 32));
+    try emit(&code, gpa, A.ldrSp(24, 40));
+    try emit(&code, gpa, A.ldrSp(25, 48));
+    try emit(&code, gpa, A.ldrSp(26, 56));
+    try emit(&code, gpa, A.ldrSp(27, 64));
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 80));
+    try emit(&code, gpa, A.ldpFpLrPost);
+    try emit(&code, gpa, A.ret);
+
+    return finishBuiltin(&code, &relocs, gpa, "mp_trace");
 }
 
 /// Build the `gc_collect()` builtin: a synchronous stop-the-world mark-sweep with a HYBRID
@@ -2237,16 +2518,18 @@ pub fn lowerGcMark(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 /// a failed lower, or a foreign C-runtime frame — all carrying the `0xFFFFFFFF` conservative
 /// marker) falls back to a whole-frame word scan. Precise roots are always a subset of that
 /// whole-frame set, and the marker validates each candidate before any dereference, so a
-/// misidentified frame over-retains at worst — never a use-after-free. OBJECT TRACING stays
-/// conservative (a marked object's body is still scanned word-by-word); only ROOT
-/// enumeration is precise. Marked objects are traced to a fixpoint over the mark stack, then
-/// every class span is linear-swept (dead cells → per-class freelists, mark bits cleared).
-/// Large objects leak (their mark is just reset). Caller owns the result.
+/// misidentified frame over-retains at worst — never a use-after-free. OBJECT TRACING is
+/// descriptor-driven where a descriptor rode the push: on pop, a container (descriptor 1)
+/// dispatches to `ga_trace`/`mp_trace` (leaf-mark the backings, trace the live elements
+/// through their stashed element/K/V descriptors); everything else (descriptor 0) is
+/// word-scanned conservatively. Marked objects are traced to a fixpoint over the mark stack,
+/// then every class span is linear-swept (dead cells → per-class freelists, mark bits
+/// cleared). Large objects leak (their mark is just reset). Caller owns the result.
 ///
-/// Register contract: x19=CB, x25=text_base, x26=&stackmap, x27=cur fp, x28=parent fp,
-/// x20/x21/x22=scan/enumeration cursors, x23=corruption cap — all callee-saved,
-/// saved/restored so the collector honors the ABI toward the allocating caller (x24 is
-/// saved too though now unused).
+/// Register contract: x19=CB, x24=pending descriptor for the next push, x25=text_base,
+/// x26=&stackmap, x27=cur fp, x28=parent fp, x20/x21/x22=scan/enumeration cursors,
+/// x23=corruption cap — all callee-saved, saved/restored so the collector honors the ABI
+/// toward the allocating caller.
 pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
     const emit = emitWord;
@@ -2262,7 +2545,7 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.strSp(21, 16));
     try emit(&code, gpa, A.strSp(22, 24));
     try emit(&code, gpa, A.strSp(23, 32));
-    try emit(&code, gpa, A.strSp(24, 40)); // x24 unused now (old x_lo) but saved for the ABI
+    try emit(&code, gpa, A.strSp(24, 40)); // x24 = pending push descriptor (root tag / 0)
     try emit(&code, gpa, A.strSp(25, 48));
     try emit(&code, gpa, A.strSp(26, 56));
     try emit(&code, gpa, A.strSp(27, 64));
@@ -2366,22 +2649,25 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const beq_cons: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.bCond(.eq, 0)); // conservative marker → whole-frame scan
 
-    // PRECISE: enumerate n cells at parent_sp + sp_off (region_lo = cur+16 = parent's sp).
+    // PRECISE: enumerate n roots at parent_sp + sp_off (region_lo = cur+16 = parent's sp).
+    // Each root is an 8-byte `{u32 sp_off, u32 tag}` pair; the tag rides the push in x24 as
+    // the popped candidate's descriptor (1 = gc_array container header, 0 = word-scan).
     try emit(&code, gpa, A.addImm(22, 27, 16)); // region_lo
-    try emit(&code, gpa, A.addImm(20, 9, 4)); // &sp_off[0]
+    try emit(&code, gpa, A.addImm(20, 9, 4)); // &root[0]
     try emit(&code, gpa, A.movReg(21, 10)); // remaining = n
     const p_top: u32 = @intCast(code.items.len);
     const cbz_p_advance: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(21, 0)); // remaining == 0 → advance
     try emit(&code, gpa, A.ldrwRegUoff(12, 20, 0)); // sp_off
+    try emit(&code, gpa, A.ldrwRegUoff(24, 20, 4)); // tag → x24 (descriptor for this root)
     try emit(&code, gpa, A.addReg(10, 22, 12)); // cell = region_lo + sp_off
     try emit(&code, gpa, A.ldrRegUoff(10, 10, 0)); // word
     const cbz_p_next: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(10, 0)); // null → skip
-    try emitConservativeMark(&code, &relocs, gpa);
+    try emitConservativeMark(&code, &relocs, gpa, true);
     const p_next: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbz_p_next, p_next);
-    try emit(&code, gpa, A.addImm(20, 20, 4));
+    try emit(&code, gpa, A.addImm(20, 20, 8)); // next {sp_off,tag} pair
     try emit(&code, gpa, A.subImm(21, 21, 1));
     const b_p_top: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.b(0)); // → p_top
@@ -2400,7 +2686,8 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ldrRegUoff(10, 20, 0));
     const cbz_c_next: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(10, 0));
-    try emitConservativeMark(&code, &relocs, gpa);
+    try emit(&code, gpa, A.movz(24, 0, 0)); // conservative root → word-scan on pop
+    try emitConservativeMark(&code, &relocs, gpa, true);
     const c_next: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbz_c_next, c_next);
     try emit(&code, gpa, A.addImm(20, 20, 8));
@@ -2434,6 +2721,30 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.lslv(2, 11, 1));
     try emit(&code, gpa, A.addReg(3, 0, 2));
     try emit(&code, gpa, A.ldrRegUoff(22, 3, 0)); // popped ptr
+    // The entry's descriptor half selects the trace strategy. desc == 1 → a gc_array
+    // container header: read its self-describing `shape@32` (0 = Vec → ga_trace, else
+    // Map/Set → mp_trace) and run the precise walk, then loop. Any other desc (0 today)
+    // falls through to the conservative word-scan below.
+    try emit(&code, gpa, A.ldrRegUoff(4, 3, 8)); // desc
+    try emit(&code, gpa, A.subImm(4, 4, 1));
+    const cbnz_not_container: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbnz(4, 0)); // desc != 1 → conservative
+    try emit(&code, gpa, A.ldrRegUoff(5, 22, 32)); // shape
+    try emit(&code, gpa, A.movReg(0, 22)); // x0 = header
+    const cbnz_map: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbnz(5, 0)); // shape != 0 → mp_trace
+    try emitBuiltinCall(&code, &relocs, gpa, "ga_trace");
+    const b_after_ga: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → trace_pop
+    const map_call: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbnz_map, map_call);
+    try emitBuiltinCall(&code, &relocs, gpa, "mp_trace");
+    const b_after_mp: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → trace_pop
+    patchBTo(code.items, b_after_ga, trace_pop);
+    patchBTo(code.items, b_after_mp, trace_pop);
+    const cons_scan: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbnz_not_container, cons_scan);
     try emit(&code, gpa, A.movz(4, 0x3FFF, 0));
     try emit(&code, gpa, A.mvn(5, 4));
     try emit(&code, gpa, A.andReg(6, 22, 5)); // cand_base
@@ -2479,7 +2790,8 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ldrRegUoff(10, 22, 0));
     const cbz_tp_next: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(10, 0));
-    try emitConservativeMark(&code, &relocs, gpa);
+    try emit(&code, gpa, A.movz(24, 0, 0)); // sub-object word found conservatively → word-scan on pop
+    try emitConservativeMark(&code, &relocs, gpa, true);
     const tp_scan_next: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbz_tp_next, tp_scan_next);
     try emit(&code, gpa, A.addImm(22, 22, 8));
@@ -2781,9 +3093,12 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
     try testing.expectEqual(Aarch64.ret, std.mem.readInt(u32, fc.code[fc.code.len - 4 ..][0..4], .little));
 
     // The mark stack lives on the malloc heap (off-image), so realloc-grown: both imports
-    // must be minted. No `.call26` (the collector calls no other builtin).
+    // must be minted. The pop dispatch `bl`s the container traces (`ga_trace`/`mp_trace`),
+    // the only `.call26` edges out of the collector.
     var saw_malloc = false;
     var saw_realloc = false;
+    var saw_ga_trace = false;
+    var saw_mp_trace = false;
     // The hybrid root scan self-locates text_base (a movw_g0/movw_g1 self-relative pair)
     // and loads the stack-map table base via the reserved `.cstr` hash (an adrp_page +
     // add_lo12 pair, exactly like the panic symtab).
@@ -2792,7 +3107,8 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
     var saw_sm_adrp = false;
     var saw_sm_add = false;
     for (fc.relocs) |r| {
-        try testing.expect(r.kind != .call26);
+        if (r.target == .func and r.kind == .call26 and std.mem.eql(u8, r.target.func.name, "ga_trace")) saw_ga_trace = true;
+        if (r.target == .func and r.kind == .call26 and std.mem.eql(u8, r.target.func.name, "mp_trace")) saw_mp_trace = true;
         if (r.target == .import and std.mem.eql(u8, r.target.import.name, "malloc")) saw_malloc = true;
         if (r.target == .import and std.mem.eql(u8, r.target.import.name, "realloc")) saw_realloc = true;
         if (r.kind == .movw_g0) saw_movw_g0 = true;
@@ -2802,6 +3118,7 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
     }
     try testing.expect(saw_malloc);
     try testing.expect(saw_realloc);
+    try testing.expect(saw_ga_trace and saw_mp_trace);
     try testing.expect(saw_movw_g0 and saw_movw_g1);
     try testing.expect(saw_sm_adrp and saw_sm_add);
 

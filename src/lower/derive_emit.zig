@@ -18,6 +18,7 @@ const L = @import("../lower.zig");
 const Ir = @import("../ir/Ir.zig");
 const Typecheck = @import("../types.zig");
 const Link = @import("../link/Link.zig");
+const Abi = @import("../codegen/abi/Abi.zig");
 const Derive = @import("../symbols/Derive.zig");
 const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
 const arith = @import("../opt/arith.zig");
@@ -915,7 +916,80 @@ pub fn lowerErased(
     return switch (kind) {
         .hash => lowerErasedHash(gpa, in, ty, sym, out_diags, int_ty, rawptr_ty),
         .eq => lowerErasedEq(gpa, in, ty, sym, out_diags, int_ty, bool_ty, rawptr_ty),
+        .trace => lowerErasedTrace(gpa, in, ty, sym, out_diags, int_ty, rawptr_ty),
     };
+}
+
+/// Emit `gc_mark(cell)` / `gc_mark_leaf(cell)` for a value already in `cell`.
+fn emitMarkCall(b: *L.Builder, callee: Link.SymName, cell: Ir.ValueId) error{OutOfMemory}!void {
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = cell };
+    _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, null);
+}
+
+/// Lower an ERASED trace unit `descriptor$trace$<ty>(self: rawptr) -> ()`: called by the
+/// collector (and by a container walk) with `self` = the byte address of a `ty`-typed cell,
+/// it marks the managed heap object(s) that cell references. Three shapes:
+///  * `str` — the cell holds a heap buffer pointer at offset 0 → `gc_mark_leaf` it (a leaf:
+///    the buffer holds no further managed pointers, so the bit alone keeps it, no scan).
+///  * a managed box (`Ref`/`gc_array`) — the cell holds a pointee/header pointer at offset 0
+///    → `gc_mark` it (conservative: the pointee may itself hold managed pointers, so it is
+///    pushed and scanned; a leaf pointee like `Ref[int]`'s int cell scans to a no-op).
+///  * a managed by-value aggregate (a struct/enum transitively holding a box) — conservatively
+///    `gc_mark` each 8-byte word of the in-place cell; every genuine managed pointer within
+///    (in any field / any enum variant) is thereby pushed + scanned, a sound superset that
+///    needs no per-field layout walk. Uncached and pure of `(ty, kind, layout)`, so a
+///    double-lower is byte-identical.
+fn lowerErasedTrace(
+    gpa: std.mem.Allocator,
+    in: L.Inputs,
+    ty: Typecheck.Type,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+    int_ty: Typecheck.Type,
+    rawptr_ty: Typecheck.Type,
+) error{OutOfMemory}!Ir.Function {
+    const unit_ty = Typecheck.Type.unit;
+
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = unit_ty, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    const p_ptr = try b.addSlot(rawptr_ty);
+    try params.append(gpa, p_ptr);
+
+    const entry = try b.addBlock();
+    b.switchTo(entry);
+    const exit = try b.addBlock();
+    b.exit = exit;
+    b.blocks.items[exit].term = .{ .ret = .none };
+    b.blocks.items[exit].term_set = true;
+
+    const p_addr = try b.emit(.{ .slot_addr = p_ptr }, int_ty);
+    const self_base = try b.emit(.{ .load = .{ .addr = p_addr, .ty = rawptr_ty } }, rawptr_ty);
+
+    if (ty.kind == .str) {
+        const buf = try b.emit(.{ .load = .{ .addr = self_base, .ty = int_ty } }, int_ty);
+        try emitMarkCall(&b, L.gc_mark_leaf_sym, buf);
+    } else if (L.isRefTy(&b, ty)) {
+        const pointee = try b.emit(.{ .load = .{ .addr = self_base, .ty = int_ty } }, int_ty);
+        try emitMarkCall(&b, L.gc_mark_sym, pointee);
+    } else {
+        // A by-value aggregate: conservatively mark every 8-byte word of the in-place cell.
+        const size = Abi.typeSize(ty, in.layouts, in.enum_layouts);
+        const words = (size + 7) / 8;
+        var k: u32 = 0;
+        while (k < words) : (k += 1) {
+            const wa = try b.emit(.{ .field_addr = .{ .base = self_base, .off = k * 8, .ty = int_ty } }, int_ty);
+            const w = try b.emit(.{ .load = .{ .addr = wa, .ty = int_ty } }, int_ty);
+            try emitMarkCall(&b, L.gc_mark_sym, w);
+        }
+    }
+
+    if (!b.termSet()) try L.brTo(&b, exit, .none);
+    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
 fn lowerErasedHash(
@@ -1408,6 +1482,52 @@ test "erased hash on an int key returns the loaded value; byte-identical across 
     var f2 = try lowerErased(gpa, in, Typecheck.Type.int, .hash, sym, &diags);
     defer f2.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    const t1 = try renderFn(gpa, &f1, in);
+    defer gpa.free(t1);
+    const t2 = try renderFn(gpa, &f2, in);
+    defer gpa.free(t2);
+    try testing.expectEqualStrings(t1, t2);
+}
+
+test "erased str trace leaf-marks the buffer once (gc_mark_leaf over load[self,0]); byte-identical" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const in = intStructInputs(&.{});
+    const sym: Link.SymName = .{ .kind = .user_fn, .name = "descriptor$trace$str" };
+
+    var f1 = try lowerErased(gpa, in, Typecheck.Type.str, .trace, sym, &diags);
+    defer f1.deinit(gpa);
+    var f2 = try lowerErased(gpa, in, Typecheck.Type.str, .trace, sym, &diags);
+    defer f2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    // Exactly one leaf-mark of the heap buffer (the str's ptr half), and NOT a full gc_mark
+    // (the buffer holds no further managed pointers). The single `.call` arg is the value
+    // loaded from the passed pointer at offset 0.
+    var leaf_calls: usize = 0;
+    var full_calls: usize = 0;
+    var loaded_cell: ?Ir.ValueId = null;
+    for (f1.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+        .call => |c| {
+            if (c.callee.kind == .builtin and std.mem.eql(u8, c.callee.name, "gc_mark_leaf")) {
+                leaf_calls += 1;
+                try testing.expectEqual(@as(usize, 1), c.args.len);
+                loaded_cell = c.args[0].value;
+            }
+            if (c.callee.kind == .builtin and std.mem.eql(u8, c.callee.name, "gc_mark")) full_calls += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), leaf_calls);
+    try testing.expectEqual(@as(usize, 0), full_calls);
+    // The marked cell is a `.load` (the buffer pointer read off self).
+    try testing.expect(loaded_cell != null);
+    switch (defOf(&f1, loaded_cell.?).?) {
+        .load => {},
+        else => try testing.expect(false),
+    }
 
     const t1 = try renderFn(gpa, &f1, in);
     defer gpa.free(t1);

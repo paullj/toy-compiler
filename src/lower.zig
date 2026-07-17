@@ -1665,6 +1665,11 @@ const box_repr_ty: Typecheck.Type = Typecheck.Type.rawptr;
 /// `trace(obj)` unit `bl`s this per managed field; user source never names it.
 pub const gc_mark_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_mark" };
 
+/// The `gc_mark_leaf` builtin's stable symbol identity — sets one cell's mark bit without
+/// pushing it (the cell survives but is never scanned). An erased `str` trace unit `bl`s it
+/// on the heap buffer; container traces `bl` it on their leaf-marked backings.
+pub const gc_mark_leaf_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_mark_leaf" };
+
 /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`): a struct carrying the reified
 /// reference-family marker. A box is an 8-byte cell pointer — lowered as a scalar `int`,
 /// NOT by its 8-byte struct field layout — so every scalar-value path guards on this.

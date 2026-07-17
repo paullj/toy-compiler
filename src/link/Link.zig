@@ -89,10 +89,12 @@ pub const FnCode = struct {
     code: []u8,
     relocs: []Reloc,
     literals: []Literal,
-    /// The per-fn precise GC root map (`FrameLayout.projectRoots`): `[u32 n][u32 sp_off ×
-    /// n]`. Empty for a hand-emitted builtin or a fn that failed to lower — the collector
-    /// reads an empty map as "scan this frame conservatively". A pure function of the IR +
-    /// layouts, so it rides the content-fp cache. Owned like the other regions ("always own").
+    /// The per-fn precise GC root map (`FrameLayout.projectRoots`): `[u32 n][{u32 sp_off,
+    /// u32 tag} × n]`, where `tag` is 1 for a `gc_array` container header (precise
+    /// container walk) and 0 for everything else (conservative word-scan). Empty for a
+    /// hand-emitted builtin or a fn that failed to lower — the collector reads an empty map
+    /// as "scan this frame conservatively". A pure function of the IR + layouts, so it rides
+    /// the content-fp cache. Owned like the other regions ("always own").
     root_bitmap: []u8 = &.{},
 
     pub fn deinit(fc: *FnCode, gpa: std.mem.Allocator) void {
@@ -1112,8 +1114,9 @@ test "buildStackMapTable: rows ascend by off, payloads round-trip, row-less fn +
         try makeFn(gpa, 2, 2, &.{}),
     };
     defer freeFns(gpa, &fns);
-    // fn0: one root at sp-off 8. fn1: empty ⇒ conservative marker. fn2: mapped but root-less.
-    const rb0 = [_]u8{ 1, 0, 0, 0, 8, 0, 0, 0 };
+    // fn0: one root at sp-off 8, container tag 1. fn1: empty ⇒ conservative marker.
+    // fn2: mapped but root-less. Roots are `{u32 sp_off, u32 tag}` pairs.
+    const rb0 = [_]u8{ 1, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0 };
     const rb2 = [_]u8{ 0, 0, 0, 0 };
     fns[0].root_bitmap = @constCast(&rb0);
     fns[1].root_bitmap = &.{};
@@ -1140,7 +1143,8 @@ test "buildStackMapTable: rows ascend by off, payloads round-trip, row-less fn +
         const n = std.mem.readInt(u32, tab[poff..][0..4], .little);
         if (off == 0) {
             try testing.expectEqual(@as(u32, 1), n); // fn0's one root
-            try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, tab[poff + 4 ..][0..4], .little));
+            try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, tab[poff + 4 ..][0..4], .little)); // sp_off
+            try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, tab[poff + 8 ..][0..4], .little)); // tag
         } else if (off == 12) {
             try testing.expectEqual(@as(u32, 0xFFFFFFFF), n); // fn1 conservative
         } else if (off == 16) {

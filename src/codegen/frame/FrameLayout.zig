@@ -250,30 +250,39 @@ pub fn compute(
     };
 }
 
-/// Append the managed-field sp-offsets of a cell of type `ty` based at sp-offset
-/// `base` to `out`, RECURSIVELY. The precise-root authority: a managed box
-/// (`Ref`/`gc_array`) is a LEAF — its cell holds a heap pointer, projected once, never
-/// recursed into; a raw handle (`.rawptr`, which post-retype also covers every box
-/// SSA value) and a heap `str`'s pointer half (base+0 only; the len@8 is not a root)
-/// are leaves too; a by-value `struct`/`enum` recurses into its laid-out fields; a
-/// scalar contributes nothing. Box-before-struct ordering mirrors `lower.passKind`
-/// (a box IS a struct kind, so the box test must precede the struct arm). An enum
-/// unions its variants' payload offsets (a sound superset — the collector's marker is
-/// deref-safe, so listing a currently-inactive variant's field over-retains at worst).
+/// One projected root: its sp-relative byte offset plus a TAG the collector reads to pick
+/// a trace strategy on the first pop. `tag == 1` marks a `gc_array` container header (the
+/// collector reads its self-describing shape + element/K/V descriptors and runs the precise
+/// container walk); `tag == 0` marks everything else (`Ref`/`rawptr`/`str` — conservatively
+/// word-scanned, always a sound superset). Only the container earns a non-zero tag; a `Ref`
+/// referent is reached by the conservative scan without demanding its descriptor here.
+pub const Root = struct { off: u32, tag: u32 };
+
+/// Append the managed roots of a cell of type `ty` based at sp-offset `base` to `out`,
+/// RECURSIVELY. The precise-root authority: a managed box (`Ref`/`gc_array`) is a LEAF —
+/// its cell holds a heap pointer, projected once, never recursed into (a `gc_array` box
+/// tags 1, a `Ref` box tags 0); a raw handle (`.rawptr`, which post-retype also covers
+/// every box SSA value) and a heap `str`'s pointer half (base+0 only; the len@8 is not a
+/// root) are tag-0 leaves too; a by-value `struct`/`enum` recurses into its laid-out
+/// fields; a scalar contributes nothing. Box-before-struct ordering mirrors
+/// `lower.passKind` (a box IS a struct kind, so the box test must precede the struct arm).
+/// An enum unions its variants' payload offsets (a sound superset — the collector's marker
+/// is deref-safe, so listing a currently-inactive variant's field over-retains at worst).
 fn projectCell(
     ty: Type,
     base: u32,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
-    out: *std.ArrayList(u32),
+    out: *std.ArrayList(Root),
     gpa: std.mem.Allocator,
 ) error{OutOfMemory}!void {
     if (types.isRefStruct(ty, layouts)) {
-        try out.append(gpa, base);
+        const fam = layouts[ty.struct_id].native_family;
+        try out.append(gpa, .{ .off = base, .tag = if (fam == .gc_array) 1 else 0 });
         return;
     }
     switch (ty.kind) {
-        .rawptr, .str => try out.append(gpa, base),
+        .rawptr, .str => try out.append(gpa, .{ .off = base, .tag = 0 }),
         .@"struct" => {
             if (ty.struct_id >= layouts.len) return;
             const l = layouts[ty.struct_id];
@@ -298,12 +307,13 @@ fn projectCell(
 /// frame word holding a managed pointer, so the collector enumerates roots by lookup
 /// rather than a conservative whole-frame scan. Walks `func.slots` (each based at
 /// `fl.slot_off[i]`) then `func.values` (`fl.value_off[i]`) in index order, projecting
-/// each cell's managed-field offsets, and serializes them as a count-prefixed packed
-/// list of sp-offsets: `[u32 n][u32 sp_off × n]`, little-endian. A successfully-lowered
-/// fn always yields ≥4 bytes (`[u32 0]` when root-less); an empty payload is the
-/// collector's "treat this frame conservatively" signal, reserved for unmapped frames
-/// (builtins / failed lowers) that never run this. Pure over the IR + read-only layouts,
-/// so it is content-fingerprint cacheable and `-jN` byte-identical. Caller owns the result.
+/// each cell's managed roots, and serializes them as a count-prefixed packed list of
+/// `(sp_off, tag)` pairs: `[u32 n][{u32 sp_off, u32 tag} × n]`, little-endian. A
+/// successfully-lowered fn always yields ≥4 bytes (`[u32 0]` when root-less); an empty
+/// payload is the collector's "treat this frame conservatively" signal, reserved for
+/// unmapped frames (builtins / failed lowers) that never run this. Pure over the IR +
+/// read-only layouts, so it is content-fingerprint cacheable and `-jN` byte-identical.
+/// Caller owns the result.
 pub fn projectRoots(
     gpa: std.mem.Allocator,
     func: *const Ir.Function,
@@ -311,21 +321,22 @@ pub fn projectRoots(
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) error{OutOfMemory}![]u8 {
-    var offs: std.ArrayList(u32) = .empty;
-    defer offs.deinit(gpa);
+    var roots: std.ArrayList(Root) = .empty;
+    defer roots.deinit(gpa);
 
     for (func.slots, 0..) |slot, i| {
-        try projectCell(slot.type, fl.slot_off[i], layouts, enum_layouts, &offs, gpa);
+        try projectCell(slot.type, fl.slot_off[i], layouts, enum_layouts, &roots, gpa);
     }
     for (func.values, 0..) |vdef, i| {
-        try projectCell(vdef.type, fl.value_off[i], layouts, enum_layouts, &offs, gpa);
+        try projectCell(vdef.type, fl.value_off[i], layouts, enum_layouts, &roots, gpa);
     }
 
-    const buf = try gpa.alloc(u8, 4 + offs.items.len * 4);
+    const buf = try gpa.alloc(u8, 4 + roots.items.len * 8);
     errdefer gpa.free(buf);
-    std.mem.writeInt(u32, buf[0..4], @intCast(offs.items.len), .little);
-    for (offs.items, 0..) |off, i| {
-        std.mem.writeInt(u32, buf[4 + i * 4 ..][0..4], off, .little);
+    std.mem.writeInt(u32, buf[0..4], @intCast(roots.items.len), .little);
+    for (roots.items, 0..) |r, i| {
+        std.mem.writeInt(u32, buf[4 + i * 8 ..][0..4], r.off, .little);
+        std.mem.writeInt(u32, buf[4 + i * 8 + 4 ..][0..4], r.tag, .little);
     }
     return buf;
 }
@@ -341,10 +352,10 @@ pub fn cellHasManaged(
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) error{OutOfMemory}!bool {
-    var offs: std.ArrayList(u32) = .empty;
-    defer offs.deinit(gpa);
-    try projectCell(ty, 0, layouts, enum_layouts, &offs, gpa);
-    return offs.items.len != 0;
+    var roots: std.ArrayList(Root) = .empty;
+    defer roots.deinit(gpa);
+    try projectCell(ty, 0, layouts, enum_layouts, &roots, gpa);
+    return roots.items.len != 0;
 }
 
 const testing = std.testing;
@@ -647,12 +658,15 @@ test "frame: ParamOffsetTooLarge when an incoming stack-arg offset exceeds imm12
     try testing.expect(res == error.FrameTooLarge or res == error.ParamOffsetTooLarge);
 }
 
-// Decode a `[u32 n][u32 off × n]` root bitmap into (count, offsets-slice-view).
+// Decode a `[u32 n][{u32 off, u32 tag} × n]` root bitmap.
 fn rootCount(bm: []const u8) u32 {
     return std.mem.readInt(u32, bm[0..4], .little);
 }
 fn rootAt(bm: []const u8, i: usize) u32 {
-    return std.mem.readInt(u32, bm[4 + i * 4 ..][0..4], .little);
+    return std.mem.readInt(u32, bm[4 + i * 8 ..][0..4], .little);
+}
+fn tagAt(bm: []const u8, i: usize) u32 {
+    return std.mem.readInt(u32, bm[4 + i * 8 + 4 ..][0..4], .little);
 }
 
 // A `Layout` with the given fields (owned arrays freed by the caller).
@@ -693,6 +707,8 @@ test "roots: a lone rawptr VALUE is projected at its value cell" {
     defer gpa.free(bm);
     try testing.expectEqual(@as(u32, 1), rootCount(bm));
     try testing.expectEqual(fl.value_off[0], rootAt(bm, 0));
+    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // rawptr → conservative tag 0
+    try testing.expectEqual(@as(usize, 12), bm.len); // [u32 n][{off,tag}]
 }
 
 test "roots: a str slot projects the ptr half only (base+0), not the len at +8" {
@@ -705,14 +721,15 @@ test "roots: a str slot projects the ptr half only (base+0), not the len at +8" 
     defer gpa.free(bm);
     try testing.expectEqual(@as(u32, 1), rootCount(bm));
     try testing.expectEqual(fl.slot_off[1], rootAt(bm, 0)); // the str slot's ptr half
+    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // str → conservative tag 0
 }
 
 test "roots: a by-value aggregate recurses to its contained box (Bag{Vec[int], int})" {
     const gpa = testing.allocator;
-    // struct 0 = the inner box (Ref/gc_array), tagged .ref, size 8, no sub-fields.
+    // struct 0 = the inner gc_array box, size 8, no sub-fields.
     // struct 1 = Vec-like {box @0}, size 8. struct 2 = Bag {Vec @0, int @8}, size 16.
     var ls: [3]Layout = undefined;
-    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .ref);
+    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .gc_array);
     ls[1] = try mkLayoutFields(gpa, &.{Type.structT(0)}, &.{0}, 8, .none);
     ls[2] = try mkLayoutFields(gpa, &.{ Type.structT(1), Type.int }, &.{ 0, 8 }, 16, .none);
     defer for (&ls) |*l| {
@@ -726,9 +743,11 @@ test "roots: a by-value aggregate recurses to its contained box (Bag{Vec[int], i
     defer fl.deinit(gpa);
     const bm = try projectRoots(gpa, &func, &fl, &ls, &.{});
     defer gpa.free(bm);
-    // Bag → Vec@0 → box@0: one recursed root at the Bag slot's base (offset 0 within).
+    // Bag → Vec@0 → box@0: one recursed root at the Bag slot's base (offset 0 within),
+    // carrying the gc_array container tag (1) recovered from the inner box's family.
     try testing.expectEqual(@as(u32, 1), rootCount(bm));
     try testing.expectEqual(fl.slot_off[0], rootAt(bm, 0));
+    try testing.expectEqual(@as(u32, 1), tagAt(bm, 0)); // gc_array container → tag 1
 }
 
 test "roots: an enum unions its variants' box payload offsets; a () field contributes nothing" {
@@ -761,6 +780,7 @@ test "roots: an enum unions its variants' box payload offsets; a () field contri
     defer gpa.free(bm);
     try testing.expectEqual(@as(u32, 1), rootCount(bm));
     try testing.expectEqual(fl.slot_off[0] + 8, rootAt(bm, 0)); // payload_off within the enum slot
+    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // a Ref box → conservative tag 0
 }
 
 test "roots: projection is deterministic (two calls byte-identical)" {

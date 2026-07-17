@@ -46,6 +46,115 @@ fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: 
     };
 }
 
+/// Compile `entry_src` with extra `args` (e.g. `--force -j8`) into `dir_name/prog` and return
+/// the produced image bytes (caller frees). Same `-o prog` basename across calls, so the
+/// ad-hoc code-sign IDENTIFIER matches and only the one-byte code-sign nonce may differ —
+/// the seam a `-jN` determinism check compares. Skips off the aarch64-macos backend.
+fn compileBytes(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8, args: []const []const u8) ![]u8 {
+    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
+    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
+    defer gpa.free(bin_abs);
+
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const main_path = try std.fmt.allocPrint(gpa, "{s}/main.toy", .{dir_name});
+    defer gpa.free(main_path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = entry_src });
+
+    const out_bin = try std.fmt.allocPrint(gpa, "{s}/prog", .{dir_name});
+    defer gpa.free(out_bin);
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ bin_abs, "build", main_path, "-o", out_bin });
+    try argv.appendSlice(gpa, args);
+
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe, .stderr = .pipe });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.CompileFailed;
+
+    return Io.Dir.cwd().readFileAlloc(io, out_bin, gpa, .unlimited);
+}
+
+/// The load-bearing precise-trace entry: 64 OWNED (heap `concat`-built) string keys inserted
+/// into a `Map[str,int]` (which grows `cap` to 128, scattering the 64 dense entries into
+/// physical buckets ≥ len), then a forced collection while ~20000 dead heap strings churn the
+/// same size classes so a swept key buffer is reused and overwritten. It exits 42 iff every
+/// key still maps to its value. The precise `mp_trace` keeps them by walking the DENSE
+/// `entries[0..len)` and marking each key buffer — the backings are leaf-marked, so a
+/// physical-bucket or truncated walk misses the scattered keys and this flips to a low count.
+const map_high_bucket_src =
+    \\import std/vec
+    \\import std/map
+    \\fn main() -> int {
+    \\    m := Map[str, int].new()
+    \\    n := 0
+    \\    loop {
+    \\        if n >= 64 { break }
+    \\        m.set("k".concat(n.to_string()), n)
+    \\        n = n + 1
+    \\    }
+    \\    i := 0
+    \\    loop {
+    \\        if i >= 20000 { break }
+    \\        dead := "x".concat(i.to_string())
+    \\        junk: Vec[int] = []
+    \\        junk.push(i)
+    \\        i = i + 1
+    \\    }
+    \\    ok := 0
+    \\    j := 0
+    \\    loop {
+    \\        if j >= 64 { break }
+    \\        v := m.get("k".concat(j.to_string())).unwrap_or(-1)
+    \\        if v == j { ok = ok + 1 }
+    \\        j = j + 1
+    \\    }
+    \\    if ok == 64 {
+    \\        if m.len() == 64 { return 42 }
+    \\    }
+    \\    return ok
+    \\}
+    \\
+;
+
+test "gc: high-bucket-collision Map[str,int] keys survive a forced collection (precise mp_trace)" {
+    // THE load-bearing proof of descriptor-driven container tracing: with the entries backing
+    // leaf-marked, the scattered collision keys are reached ONLY through the dense
+    // entries[0..len) walk that dispatches each key through the str descriptor's trace unit.
+    // A "walk physical buckets[0..len)" mutation sweeps the scattered keys → a low exit code;
+    // exit 42 confirms the precise walk is live (output-identity alone cannot show this).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-map-highbucket", map_high_bucket_src);
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "gc: a descriptor-traced Map program is byte-identical at -j1 and -j8" {
+    // The widened stack-map (off,tag) payload + the descriptor/trace-unit bytes are pure
+    // functions of source, so the container-tracing collector image is `-jN` byte-identical
+    // (only the one-byte code-sign nonce may differ).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const b1 = compileBytes(gpa, io, ".toy-test-gc-jN-1", map_high_bucket_src, &.{ "--force", "-j1" }) catch |e| return if (e == error.SkipZigTest) e else e;
+    defer gpa.free(b1);
+    const b8 = try compileBytes(gpa, io, ".toy-test-gc-jN-8", map_high_bucket_src, &.{ "--force", "-j8" });
+    defer gpa.free(b8);
+    try std.testing.expectEqual(b1.len, b8.len);
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+}
+
 test "heap: store + read-back through a rawptr cell returns 42" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -322,4 +431,87 @@ test "gc: forced collection count is deterministic across identical runs (waterm
         \\
     );
     try std.testing.expectEqual(a, b);
+}
+
+test "gc: a str-only aggregate as a Vec element survives churn (trace unit reaches the buffer)" {
+    // A struct whose only managed content is a `str` is still trace-requiring: as a container
+    // element its buffer is reached ONLY through the descriptor's trace unit dispatched by the
+    // dense element walk. If the aggregate earned no trace unit (trace_off == 0) the leaf-marked
+    // backing keeps the struct but the str buffers are swept → the read-back fails (exit != 7).
+    // Built in a separate frame so a stale stack pointer cannot conservatively over-retain them.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-vec-strwrap",
+        \\import std/vec
+        \\struct Wrap { s: str }
+        \\fn build() -> Vec[Wrap] {
+        \\    v: Vec[Wrap] = []
+        \\    v.push(Wrap{ s: 700.to_string() })
+        \\    v.push(Wrap{ s: 800.to_string() })
+        \\    return v
+        \\}
+        \\fn main() -> int {
+        \\    keep := build()
+        \\    i := 0
+        \\    loop {
+        \\        if i >= 20000 { break }
+        \\        dead := "x".concat(i.to_string())
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    ok := 0
+        \\    for w in keep {
+        \\        if w.s == "700" { ok = ok + 3 }
+        \\        if w.s == "800" { ok = ok + 4 }
+        \\    }
+        \\    return ok
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "gc: a multi-entry Map[str,Ref] keeps EVERY value's pointee across a collection (not just entry 0)" {
+    // The dense entries walk dispatches the key trace then the value trace at cell+key_size. A
+    // value trace routing through gc_mark must not leave a stale key_size for the NEXT entry's
+    // value dispatch, else every entry after the first marks the key slot instead of the value
+    // → the later values' boxed cells are swept. Sum of all three pointees (10+20+40) proves
+    // every entry's value survived, not just insertion-order entry 0.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-map-refval",
+        \\import std/vec
+        \\import std/map
+        \\fn build() -> Map[str, Ref[int]] {
+        \\    m := Map[str, Ref[int]].new()
+        \\    m.set("a", &10)
+        \\    m.set("b", &20)
+        \\    m.set("c", &40)
+        \\    return m
+        \\}
+        \\fn main() -> int {
+        \\    m := build()
+        \\    i := 0
+        \\    loop {
+        \\        if i >= 20000 { break }
+        \\        dead := "x".concat(i.to_string())
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    sum := 0
+        \\    for k, v in m {
+        \\        sum = sum + *v
+        \\    }
+        \\    if sum == 70 { return 7 }
+        \\    return 0
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
 }

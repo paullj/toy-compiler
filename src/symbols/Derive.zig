@@ -185,12 +185,13 @@ pub fn mangle(gpa: std.mem.Allocator, protocol_name: []const u8, kind: Kind, con
 /// must also name SCALAR key types (a `Map[int, V]` key is an `int`), so they get
 /// their own scalar-capable mangle rather than reusing `mangle` (which asserts a
 /// nominal struct/enum via `carriesIntDesc`).
-pub const ErasedKind = enum { hash, eq };
+pub const ErasedKind = enum { hash, eq, trace };
 
-/// The mangled erased-unit symbol: `descriptor$hash$<tag>` / `descriptor$eq$<tag>`,
-/// where `<tag>` is `s<id>`/`e<id>` for a struct/enum, or the kind spelling for a
-/// scalar. `$` bars source collision; the `descriptor$` prefix bars collision with a
-/// `Hash$hash$…`/`Eq$eq$…` derive name and a Mono `<template>$<args>` name.
+/// The mangled erased-unit symbol: `descriptor$hash$<tag>` / `descriptor$eq$<tag>` /
+/// `descriptor$trace$<tag>`, where `<tag>` is `s<id>`/`e<id>` for a struct/enum, or the
+/// kind spelling for a scalar. `$` bars source collision; the `descriptor$` prefix bars
+/// collision with a `Hash$hash$…`/`Eq$eq$…`/`Trace$trace$…` derive name and a Mono
+/// `<template>$<args>` name.
 pub fn erasedMangle(gpa: std.mem.Allocator, kind: ErasedKind, ty: Type) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
@@ -198,6 +199,7 @@ pub fn erasedMangle(gpa: std.mem.Allocator, kind: ErasedKind, ty: Type) ![]u8 {
     try buf.appendSlice(gpa, switch (kind) {
         .hash => "hash",
         .eq => "eq",
+        .trace => "trace",
     });
     try buf.append(gpa, '$');
     switch (ty.kind) {
@@ -252,6 +254,15 @@ test "erasedMangle distinct per (kind, type), disjoint from mangle" {
     const dhs = try mangle(gpa, "Hash", .hash, Type.structT(0));
     defer gpa.free(dhs);
     try testing.expect(!std.mem.eql(u8, hs, dhs));
+    // The erased `.trace` kind mangles per (type) too: `descriptor$trace$str` for a heap
+    // string buffer, `descriptor$trace$s<id>` for a reified Ref/gc_array box.
+    const tstr = try erasedMangle(gpa, .trace, Type.str);
+    defer gpa.free(tstr);
+    try testing.expectEqualStrings("descriptor$trace$str", tstr);
+    const ts0 = try erasedMangle(gpa, .trace, Type.structT(0));
+    defer gpa.free(ts0);
+    try testing.expectEqualStrings("descriptor$trace$s0", ts0);
+    try testing.expect(!std.mem.eql(u8, tstr, hstr)); // trace vs hash disjoint
 }
 
 test "mangle is distinct per (protocol, kind, type)" {
