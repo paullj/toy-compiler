@@ -664,3 +664,109 @@ test "vec: a float element round-trips through push/get (float as a monomorphiza
     );
     try std.testing.expectEqual(@as(u8, 42), code);
 }
+
+test "vec: Vec[Vec[int]].new() nested container round-trips" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The outer element type is itself a generic instance (`Vec[int]`), so the outer
+    // `new()` receiver `Vec[Vec[int]]` must resolve through the reified-arg -> App-form
+    // inverse. A local for the unwrap avoids method-chaining on the inner handle.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-nested-vec",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    outer := Vec[Vec[int]].new()
+        \\    inner := Vec[int].new()
+        \\    inner.push(5)
+        \\    outer.push(inner)
+        \\    got: Vec[int] = outer.get(0).unwrap()
+        \\    return got.get(0).unwrap()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 5), code);
+}
+
+test "vec: Vec[Ref[int]].new() round-trips managed-box elements" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The element is a managed box (`Ref[int]`, an `isRefPayload` type). Both `&x` and
+    // `ref.new[int](x)` construct one; `*get(i).unwrap()` reads the boxed cell back.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-ref",
+        \\import std/vec
+        \\import std/ref
+        \\fn main() -> int {
+        \\    xs := Vec[Ref[int]].new()
+        \\    xs.push(ref.new[int](3))
+        \\    xs.push(&4)
+        \\    return *xs.get(0).unwrap() + *xs.get(1).unwrap()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "vec: Vec[Option[int]].new() constructs + round-trips an enum element" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The element is a generic enum instance (`Option[int]`), reaching the same
+    // reified-arg -> App-form inverse via the `enumT` id-space.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-elem",
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs := Vec[Option[int]].new()
+        \\    xs.push(Option.some(9))
+        \\    return xs.get(0).unwrap().unwrap()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 9), code);
+}
+
+test "vec: a nested-generic-container program is byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const src =
+        \\import std/vec
+        \\import std/ref
+        \\fn main() -> int {
+        \\    xs := Vec[Ref[int]].new()
+        \\    xs.push(&3)
+        \\    xs.push(&4)
+        \\    return *xs.get(0).unwrap() + *xs.get(1).unwrap()
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-vec-nested-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqual(b1.len, b8.len);
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+}
