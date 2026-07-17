@@ -1642,10 +1642,12 @@ fn copyStrSlot(b: *Builder, dst: Ir.SlotId, src: Ir.SlotId) error{OutOfMemory}!v
 // `bool` inlines a `cond_br` over two literal writes. No allocator is ever referenced —
 // only stack slots, cstring literals, and the `write` syscall.
 
-/// The `print` builtin's stable symbol identity — a raw write-bytes primitive over a
-/// `str {ptr,len}`. A comptime literal name is safe (codegen dupes callee names into
-/// relocs; the Ir.Function only borrows it), matching `CodegenIr.lowerPrint`'s own sym.
-const print_sym: Link.SymName = .{ .kind = .builtin, .name = "print" };
+/// The libSystem `write` symbol identity. The raw-`str` output leaf mints a direct
+/// `.import` call to it (mirroring `gc_alloc_sym`), reaching libSystem through the
+/// ordinary extern-call path — so no hand-emitted write body is linked for a bare
+/// `print`. A comptime literal name is safe (codegen dupes callee names into relocs;
+/// the Ir.Function only borrows it).
+const write_sym: Link.SymName = .{ .kind = .import, .name = "write" };
 /// The `__display_int` builtin's stable symbol identity (the heap-free decimal renderer).
 const display_int_sym: Link.SymName = .{ .kind = .builtin, .name = "__display_int" };
 /// The `gc_alloc` builtin's stable symbol identity — returns a fresh zeroed cell pointer.
@@ -1713,13 +1715,24 @@ fn isAggTy(b: *Builder, t: Typecheck.Type) bool {
     };
 }
 
-/// Call the `print` builtin over the `str` slot `slot` — write its `{ptr,len}` bytes to
-/// fd 1. The single shared raw write path (literals + `str` fields both route here).
+/// Write the `str` slot `slot`'s `{ptr,len}` bytes to fd 1 via libSystem `write`. Decomposes
+/// the slot into its ptr (offset 0) and len (offset 8) halves and mints a direct `write(1,
+/// ptr, len)` extern call — the general C-ABI path (`[int,int,int]` → x0=fd, x1=ptr, x2=len;
+/// the unit ret discards x0). The single shared raw write path (literals + `str` fields both
+/// route here).
 pub fn emitPrintSlot(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
-    const args = try b.gpa.alloc(Ir.Operand, 1);
+    const int_ty = Typecheck.Type.int;
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+    const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
+    const fd = try b.emit(.{ .iconst = 1 }, int_ty);
+    const args = try b.gpa.alloc(Ir.Operand, 3);
     errdefer b.gpa.free(args);
-    args[0] = .{ .slot = slot };
-    _ = try b.emit(.{ .call = .{ .callee = print_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
+    args[0] = .{ .value = fd };
+    args[1] = .{ .value = ptr };
+    args[2] = .{ .value = len };
+    _ = try b.emit(.{ .call = .{ .callee = write_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
 }
 
 /// Write a COMPILE-TIME byte string directly to fd 1: register it as a fn literal
@@ -2180,7 +2193,28 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                             try emitWriteLiteral(b, "()");
                             return .none;
                         },
-                        else => {}, // str: the raw write-bytes builtin — fall through.
+                        else => {
+                            // str is the only kind reaching here (int/bool/struct/enum/unit
+                            // are handled above). Write its {ptr,len} bytes via libSystem
+                            // `write`, NEVER falling through to a generic `.builtin "print"`
+                            // call — that symbol no longer exists. A str SLOT decomposes
+                            // through the shared leaf; a str reg-pair VALUE (a labeled-block /
+                            // call result whose {ptr,len} live in a value cell) spreads
+                            // straight into `write`'s (buf,len) arg pair.
+                            const op = try lowerExpr(b, parg[0]);
+                            const slot = operandSlot(op);
+                            if (slot != Ir.none_slot) {
+                                try emitPrintSlot(b, slot);
+                            } else {
+                                const fd = try b.emit(.{ .iconst = 1 }, Typecheck.Type.int);
+                                const wargs = try b.gpa.alloc(Ir.Operand, 2);
+                                errdefer b.gpa.free(wargs);
+                                wargs[0] = .{ .value = fd };
+                                wargs[1] = op;
+                                _ = try b.emit(.{ .call = .{ .callee = write_sym, .args = wargs, .ret_slot = Ir.none_slot } }, null);
+                            }
+                            return .none;
+                        },
                     }
                 }
             }

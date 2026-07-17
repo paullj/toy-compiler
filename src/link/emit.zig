@@ -63,15 +63,15 @@ pub const Linked = struct {
     data_relocs: []Link.Reloc = &.{},
 };
 
-/// Append the print body if referenced, intern strings deterministically,
+/// Append referenced hand-emitted builtin bodies, intern strings deterministically,
 /// rewrite `.cstr` targets, then `Link.link`. CONSUMES `fns` (frees each FnCode
-/// and any appended print body). `entry` is the entry function's stable symbol
+/// and any appended builtin body). `entry` is the entry function's stable symbol
 /// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
 /// `data_relocs` (free `.import` data-reloc names individually).
 pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, descriptors: []const Link.DescEntry) !Linked {
     // 1) Scan which hand-emitted builtins (`CodegenIr.hand_builtins`) any fn references;
     //    each referenced body is appended below. Those bodies emit their own `.import`
-    //    relocs (e.g. `print`/`panic` -> `write`), so the dyld import set is DERIVED from
+    //    relocs (e.g. `panic` -> `write`), so the dyld import set is DERIVED from
     //    `data_relocs` like any other import.
     var used = [_]bool{false} ** CodegenIr.hand_builtins.len;
     for (fns) |f| {

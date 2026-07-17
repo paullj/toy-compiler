@@ -1020,15 +1020,11 @@ fn addLiteral(g: *Gen, hash: u64, bytes: []u8) error{OutOfMemory}!void {
     };
 }
 
-// print(str) builtin body — hand-written, AST/IR-independent. Appended to the
-// program at link time (emit.zig) when any fn references `print`. Shuffles the
-// (ptr,len) str pair into write(fd=1, buf, len) and tail-calls libc `write`.
-
 // A tiny shared harness for the hand-emitted `write`-calling builtins
-// (`lowerPrint`/`lowerDisplayInt`/`lowerPanic`). Each still writes its own body; these
-// own only the boilerplate every one repeats verbatim — opening a frame, the `write`
-// GOT-import preamble (byte-identical bar the destination register), the error-path
-// reloc-name cleanup, and packaging the finished FnCode.
+// (`lowerDisplayInt`/`lowerPanic`). Each still writes its own body; these own only the
+// boilerplate every one repeats verbatim — opening a frame, the `write` GOT-import
+// preamble (byte-identical bar the destination register), the error-path reloc-name
+// cleanup, and packaging the finished FnCode.
 
 /// Append one little-endian AArch64 instruction word to a builtin's code buffer.
 fn emitWord(c: *std.ArrayList(u8), a: std.mem.Allocator, word: u32) error{OutOfMemory}!void {
@@ -1113,7 +1109,6 @@ pub const HandBuiltin = struct {
 /// linked image order-independent of the fn set's discovery/thread order. Append,
 /// never reorder.
 pub const hand_builtins = [_]HandBuiltin{
-    .{ .name = "print", .lower = lowerPrint },
     .{ .name = "__display_int", .lower = lowerDisplayInt },
     .{ .name = "panic", .lower = lowerPanic },
     .{ .name = "gc_alloc", .lower = lowerGcAlloc, .static_call_deps = &.{"gc_collect"} },
@@ -1199,30 +1194,6 @@ test "gc_mark_leaf marks without pushing (no mark-stack realloc), unlike gc_mark
     try std.testing.expect(!hasRealloc(leaf)); // gc_mark_leaf only sets the bit
     // The leaf body is therefore strictly smaller (it omits the whole push sequence).
     try std.testing.expect(leaf.code.len < mark.code.len);
-}
-
-/// Build the `print` builtin's FnCode directly (no IR, no frame). Caller owns
-/// the result.
-pub fn lowerPrint(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
-    var code: std.ArrayList(u8) = .empty;
-    errdefer code.deinit(gpa);
-    var relocs: std.ArrayList(Link.Reloc) = .empty;
-    errdefer deinitBuiltinRelocs(&relocs, gpa);
-
-    const emit = emitWord;
-
-    try emitFramePrologue(&code, gpa);
-    // Shuffle (ptr,len) into write's (buf,len) = (x1,x2), then fd=1 in w0. Order
-    // matters: move len (x1→x2) BEFORE overwriting x1 with ptr (x0→x1).
-    try emit(&code, gpa, Aarch64.movReg(2, 1)); // len → x2
-    try emit(&code, gpa, Aarch64.movReg(1, 0)); // ptr → x1
-    try emit(&code, gpa, Aarch64.movz(0, 1, 0)); // fd = 1
-    try emitWriteImport(&code, &relocs, gpa, 16); // x16 = &write
-    try emit(&code, gpa, Aarch64.blr(16)); // blr x16
-    try emit(&code, gpa, Aarch64.ldpFpLrPost); // ldp x29, x30, [sp], #16
-    try emit(&code, gpa, Aarch64.ret); // ret
-
-    return finishBuiltin(&code, &relocs, gpa, "print");
 }
 
 // __display_int(n) builtin body — hand-written, AST/IR-independent. The

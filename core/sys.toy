@@ -1,0 +1,9 @@
+# The quarantined libSystem write client. `extern` is legal only in `core/*`, so the
+# raw syscall lives here; std reaches stdout through the safe `print` wrapper, never
+# naming the extern. A `str` arg spreads to (buf,len) in the next two arg registers,
+# matching C write(fd, buf, count).
+pub extern fn write(fd: int, s: str) -> int
+
+pub fn print(s: str) {
+    write(1, s)
+}

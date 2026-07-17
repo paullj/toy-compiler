@@ -1,7 +1,7 @@
 import core/ffi
 
-# A safe wrapper over the C `labs`. `std` may call `core`'s safe members but never
-# re-exports an extern/intrinsic name directly.
+# Absolute value via `core/ffi`'s safe `abs`. `std` may call `core`'s safe members
+# but never names an extern itself (the resolver forbids that outside `core/`).
 pub fn abs(x: int) -> int {
-    return ffi.labs(x)
+    return ffi.abs(x)
 }
