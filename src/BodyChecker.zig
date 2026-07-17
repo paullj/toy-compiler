@@ -2169,8 +2169,13 @@ pub const BodyChecker = struct {
                         // `ga_get[T]` returning `load(..)`) yields that element type, so a
                         // `bool` element round-trips as `bool`; every other context reads a
                         // 64-bit `int` (mem_selftest is unaffected — its loads are int-typed).
+                        // A generic-instance element type (`Vec[int]`, `Option[int]`) is still
+                        // an `App` during the pre-reify instance recheck, so accept `.app` too —
+                        // reify later rewrites the load's node type to the concrete
+                        // `structT`/`enumT`. (A ref-family element already rides `isRefPayload`; a
+                        // scalar/`str`/float/struct/enum element rides its own kind.)
                         const lt: Type = if (bc.expected) |e|
-                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str or bc.isRefPayload(e)) e else Type.int)
+                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str or e.kind == .app or bc.isRefPayload(e)) e else Type.int)
                         else
                             Type.int;
                         bc.node_types[(node_idx).int()] = lt;
