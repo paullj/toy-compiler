@@ -1,0 +1,6 @@
+# expect: stdout "prelude ok\n"
+# expect: exit 0
+import std/prelude
+fn main() {
+    print("prelude ok\n")
+}

@@ -1,0 +1,7 @@
+import core/sys
+
+# Write `s` to stdout via the core write client. `std` calls a core pub member; it
+# never names the `write` extern (the resolver forbids that outside `core/`).
+pub fn print(s: str) {
+    sys.print(s)
+}

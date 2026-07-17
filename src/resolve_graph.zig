@@ -831,11 +831,12 @@ fn resolveModuleMember(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, targe
     const member = g.nameText(n.main_token);
     const tt = &g.tables[target];
     if (tt.pub_fns.get(member)) |gid| {
-        // Quarantine: a bundled module's pub `.import` (extern) member is served only
-        // to another bundled module (so `std/math` may call `core/ffi.labs`). A user
-        // module doing `import core/ffi; ffi.labs(..)` falls through to the R0005
-        // not-exported branch below, closing the bypass.
-        if (!(g.fns.items[gid].kind == .import and !g.refBundled())) {
+        // Quarantine: a pub `.import` (extern) member is served only to a `core/*`
+        // module (so `core/sys.print` reaches `write`, but `std/math` never names an
+        // extern — it calls a safe `core/ffi.abs` wrapper). A std/user module doing
+        // `import core/ffi; ffi.labs(..)` falls through to the R0005 not-exported branch
+        // below, closing the bypass.
+        if (!(g.fns.items[gid].kind == .import and !g.refCore())) {
             g.res(node_idx, .{ .func = gid });
             return;
         }
@@ -1000,21 +1001,23 @@ fn lookupLocalOrFn(g: *GraphResolve, name_tok: u32) ?Resolution {
         }
     }
     if (g.tables[g.cur_mod].fns.get(name)) |gid| {
-        // An `.import` (extern) symbol resolves only in a bundled module; a
-        // non-bundled module falls through to the undeclared diagnostic. In practice
-        // a user module never holds an import symbol in its own `fns`, but this keeps
-        // the quarantine invariant explicit at the bare-name site too.
-        if (g.fns.items[gid].kind == .import and !g.refBundled()) return null;
+        // An `.import` (extern) symbol resolves only in a `core/*` module; anywhere
+        // else it falls through to the undeclared diagnostic. In practice only a
+        // `core/` module holds an import symbol in its own `fns` (the DECL gate is
+        // core-only), but this keeps the quarantine invariant explicit at the bare-name
+        // site too.
+        if (g.fns.items[gid].kind == .import and !g.refCore()) return null;
         return .{ .func = gid };
     }
     return null;
 }
 
-/// Whether the CURRENTLY-RESOLVING module is bundled (`core/` or `std/`). An
-/// `.import` (extern) symbol is served only to a bundled module; every other
-/// reference gets the standard unresolved/no-member diagnostic.
-fn refBundled(g: *GraphResolve) bool {
-    return g.graph.modules[g.cur_mod].bundled;
+/// Whether the CURRENTLY-RESOLVING module is under `core/`. An `.import` (extern)
+/// name resolves only when the referring module is `core/`; `std` reaches C only
+/// through a safe core wrapper, so a `std`/user module naming an extern gets the
+/// standard not-exported/unresolved diagnostic.
+fn refCore(g: *GraphResolve) bool {
+    return g.graph.modules[g.cur_mod].isCore();
 }
 
 /// An iterator over exactly the names `lookupName` searches, for near-miss
@@ -1533,6 +1536,30 @@ test "print is available unqualified in every module with one shared id" {
         }
     };
     try withResolvedGraph(".toy-test-res-print", files, "main.toy", Check.run);
+}
+
+test "a non-core module naming a pub extern is a visibility error (extern name served only to core)" {
+    // The entry `main.toy` is a disk (non-`core/`) module importing the REAL bundled
+    // `core/ffi` and naming its pub extern `labs`. Discovery serves `core/ffi` from the
+    // embedded bundle, so `ffi.labs` finds the pub `.import` member but the referring
+    // module is not `core/*` → the quarantine falls through to R0005 (not exported),
+    // pinning "an extern name resolves only inside `core/`".
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import core/ffi
+        \\fn main() -> int { return ffi.labs(-15) }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), r.diags.len);
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "not exported") != null);
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "labs") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-res-extern-gate", files, "main.toy", Check.run);
 }
 
 test "two non-generic conformances sharing a method name register distinctly (no R0002)" {
