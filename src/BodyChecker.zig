@@ -2170,7 +2170,7 @@ pub const BodyChecker = struct {
                         // `bool` element round-trips as `bool`; every other context reads a
                         // 64-bit `int` (mem_selftest is unaffected — its loads are int-typed).
                         const lt: Type = if (bc.expected) |e|
-                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str) e else Type.int)
+                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str or bc.isRefPayload(e)) e else Type.int)
                         else
                             Type.int;
                         bc.node_types[(node_idx).int()] = lt;

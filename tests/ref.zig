@@ -143,6 +143,69 @@ test "ref: a program building Ref[int] AND Ref[bool] is byte-identical at -j1 an
     try std.testing.expect(differing <= 1);
 }
 
+test "ref: a growable holding Ref[int] elements pushes then reads-back the boxed values" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // A box element is an 8-byte handle: `ga_push` stores it and `ga_get` reads it back as a
+    // `Ref[int]` (not a truncated int). Both value-creation spellings — the `&` operator and
+    // the `ref.new` constructor — round-trip through the same element slot. 3 + 4 == 7.
+    const code = try buildAndRun(gpa, io, ".toy-test-ref-box-element",
+        \\import core/mem
+        \\import std/ref
+        \\fn main() -> int {
+        \\    a := mem.ga_new[Ref[int]]()
+        \\    mem.ga_push[Ref[int]](a, &3)
+        \\    mem.ga_push[Ref[int]](a, ref.new[int](4))
+        \\    return *mem.ga_get[Ref[int]](a, 0) + *mem.ga_get[Ref[int]](a, 1)
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const src =
+        \\import core/mem
+        \\import std/ref
+        \\fn main() -> int {
+        \\    a := mem.ga_new[Ref[int]]()
+        \\    mem.ga_push[Ref[int]](a, &3)
+        \\    mem.ga_push[Ref[int]](a, ref.new[int](4))
+        \\    return *mem.ga_get[Ref[int]](a, 0) + *mem.ga_get[Ref[int]](a, 1)
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-ref-box-element-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqual(b1.len, b8.len);
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+}
+
 test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-j1 == -j8)" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
