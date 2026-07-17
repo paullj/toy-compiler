@@ -153,7 +153,26 @@ pub const symtab_base_hash: u64 = 0x5717_ab1e_ba5e_0000;
 /// cstring offset map by the relink tail exactly like `symtab_base_hash`.
 pub const desc_table_base_hash: u64 = 0xDE5C_0000_0000_0000;
 
+/// The content-hash sentinel naming the GC stack-map table's base. A distinct high prefix
+/// from the other two reserved sentinels so none alias; reserved in the cstring offset map
+/// by the relink tail exactly like `symtab_base_hash`, and reached via the same adrp+add
+/// `.cstr` path (no new `RelocKind`/`SymbolId`). The collector loads the table base through
+/// it to look up a frame's precise root map.
+pub const gc_stackmap_base_hash: u64 = 0x57AC_C0DE_BA5E_0000;
+
+comptime {
+    std.debug.assert(gc_stackmap_base_hash != symtab_base_hash and
+        gc_stackmap_base_hash != desc_table_base_hash and gc_stackmap_base_hash != 0);
+}
+
 const testing = std.testing;
+
+test "reserved side-table base hashes are pairwise distinct and nonzero" {
+    try testing.expect(symtab_base_hash != desc_table_base_hash);
+    try testing.expect(symtab_base_hash != gc_stackmap_base_hash);
+    try testing.expect(desc_table_base_hash != gc_stackmap_base_hash);
+    try testing.expect(gc_stackmap_base_hash != 0);
+}
 
 test "SymbolId.name is the single source of truth for name ownership" {
     try testing.expectEqualStrings("f", (SymbolId{ .func = .{ .kind = .user_fn, .name = "f" } }).name().?);

@@ -212,3 +212,114 @@ test "heap: repeated span exhaustion keeps mmapping fresh spans (arena count >= 
     );
     try std.testing.expect(code >= 3);
 }
+
+test "gc: a by-value aggregate SLOT survivor is kept by recursing the precise root map" {
+    // The precise map must project a by-value struct's CONTAINED reference, not just bare
+    // Ref locals: after make() returns, the backing gc_array's only root is `keep`'s Bag
+    // slot, reached only via Bag -> Vec -> gc_array recursion. Exit 8 proves the recursion;
+    // an isReference()-only map would skip the slot and sweep the survivor (exit 0).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-roots",
+        \\import std/vec
+        \\struct Bag { items: Vec[int], n: int }
+        \\fn make() -> Bag {
+        \\    v: Vec[int] = []
+        \\    v.push(8)
+        \\    return Bag{ items: v, n: 1 }
+        \\}
+        \\fn main() -> int {
+        \\    keep: Bag = make()
+        \\    i := 0
+        \\    loop {
+        \\        if i >= 20000 { break }
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    it := keep.items
+        \\    return it.get(0).unwrap_or(0)
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 8), code);
+}
+
+test "gc: a box VALUE held across an alloc-triggered collection is a root (retyped-box gate)" {
+    // The box handle from `&8` lives ONLY as an SSA value in main's frame while the second
+    // argument (`churn_ref()`) forces a collection. It survives only because a box VALUE is
+    // recorded as a managed cell (`.rawptr`) the precise map projects — the retype whose
+    // absence UAFs the boxed 8. Exit 17 (= 8 + 9); a swept 8 would read reused memory.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-boxval",
+        \\import std/vec
+        \\fn use2(x: Ref[int], y: Ref[int]) -> int { return *x + *y }
+        \\fn churn_ref() -> Ref[int] {
+        \\    i := 0
+        \\    loop {
+        \\        if i >= 20000 { break }
+        \\        j: Vec[int] = []
+        \\        j.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    return &9
+        \\}
+        \\fn main() -> int { return use2(&8, churn_ref()) }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 17), code);
+}
+
+test "gc: a struct-embedded heap str survives churn (str leaf projected at its ptr half)" {
+    // A `str` field holds a pointer into a heap buffer; the precise map must project that
+    // pointer (base+0). Box{s: to_string(700)} survives 20000 churned vectors and still
+    // compares equal to "700" (exit 7); without the str leaf the buffer is swept (exit 0).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-strbox",
+        \\import std/vec
+        \\struct Box { s: str, n: int }
+        \\fn main() -> int {
+        \\    b := Box{ s: 700.to_string(), n: 0 }
+        \\    i := 0
+        \\    loop {
+        \\        if i >= 20000 { break }
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    if b.s == "700" { return 7 }
+        \\    return 0
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 7), code);
+}
+
+test "gc: forced collection count is deterministic across identical runs (watermark-driven)" {
+    // Collection count is driven by the allocation watermark, not by liveness/reclamation,
+    // so two identical programs must report the SAME count regardless of what the precise
+    // map retains. Assert count-equality only (never live-bytes / span count).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const a = try buildAndRun(gpa, io, ".toy-test-gc-detcount-a",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.forced_collect_count() }
+        \\
+    );
+    const b = try buildAndRun(gpa, io, ".toy-test-gc-detcount-b",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.forced_collect_count() }
+        \\
+    );
+    try std.testing.expectEqual(a, b);
+}

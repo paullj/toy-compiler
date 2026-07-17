@@ -53,6 +53,7 @@ const types = @import("../../types.zig");
 pub const Type = types.Type;
 pub const Layout = types.Layout;
 pub const EnumLayout = types.EnumLayout;
+pub const VariantLayout = types.VariantLayout;
 
 const FrameLayout = @This();
 
@@ -106,7 +107,7 @@ fn roundUp16(n: u32) u32 {
 /// Per-slot frame size: a slot must hold the WHOLE value. str is 16 (ptr,len);
 /// struct/enum take their layout size rounded to 8 (so the next slot stays
 /// 8-aligned; struct align is <=8 today). Everything else is one 8-byte word.
-fn slotSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
+pub fn slotSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {
         .str => 16,
         .@"struct", .@"enum" => roundUp8(Abi.typeSize(ty, layouts, enum_layouts)),
@@ -247,6 +248,103 @@ pub fn compute(
         .slot_off = slot_off,
         .value_off = value_off,
     };
+}
+
+/// Append the managed-field sp-offsets of a cell of type `ty` based at sp-offset
+/// `base` to `out`, RECURSIVELY. The precise-root authority: a managed box
+/// (`Ref`/`gc_array`) is a LEAF — its cell holds a heap pointer, projected once, never
+/// recursed into; a raw handle (`.rawptr`, which post-retype also covers every box
+/// SSA value) and a heap `str`'s pointer half (base+0 only; the len@8 is not a root)
+/// are leaves too; a by-value `struct`/`enum` recurses into its laid-out fields; a
+/// scalar contributes nothing. Box-before-struct ordering mirrors `lower.passKind`
+/// (a box IS a struct kind, so the box test must precede the struct arm). An enum
+/// unions its variants' payload offsets (a sound superset — the collector's marker is
+/// deref-safe, so listing a currently-inactive variant's field over-retains at worst).
+fn projectCell(
+    ty: Type,
+    base: u32,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+    out: *std.ArrayList(u32),
+    gpa: std.mem.Allocator,
+) error{OutOfMemory}!void {
+    if (types.isRefStruct(ty, layouts)) {
+        try out.append(gpa, base);
+        return;
+    }
+    switch (ty.kind) {
+        .rawptr, .str => try out.append(gpa, base),
+        .@"struct" => {
+            if (ty.struct_id >= layouts.len) return;
+            const l = layouts[ty.struct_id];
+            for (l.field_types, l.offsets) |ft, fo| {
+                try projectCell(ft, base + fo, layouts, enum_layouts, out, gpa);
+            }
+        },
+        .@"enum" => {
+            if (ty.enum_id >= enum_layouts.len) return;
+            const e = enum_layouts[ty.enum_id];
+            for (e.variants) |v| {
+                for (v.field_types, v.offsets) |ft, fo| {
+                    try projectCell(ft, base + e.payload_off + fo, layouts, enum_layouts, out, gpa);
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+/// The per-fn ROOT BITMAP: a byproduct of the (pure) frame layout that names every
+/// frame word holding a managed pointer, so the collector enumerates roots by lookup
+/// rather than a conservative whole-frame scan. Walks `func.slots` (each based at
+/// `fl.slot_off[i]`) then `func.values` (`fl.value_off[i]`) in index order, projecting
+/// each cell's managed-field offsets, and serializes them as a count-prefixed packed
+/// list of sp-offsets: `[u32 n][u32 sp_off × n]`, little-endian. A successfully-lowered
+/// fn always yields ≥4 bytes (`[u32 0]` when root-less); an empty payload is the
+/// collector's "treat this frame conservatively" signal, reserved for unmapped frames
+/// (builtins / failed lowers) that never run this. Pure over the IR + read-only layouts,
+/// so it is content-fingerprint cacheable and `-jN` byte-identical. Caller owns the result.
+pub fn projectRoots(
+    gpa: std.mem.Allocator,
+    func: *const Ir.Function,
+    fl: *const FrameLayout,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+) error{OutOfMemory}![]u8 {
+    var offs: std.ArrayList(u32) = .empty;
+    defer offs.deinit(gpa);
+
+    for (func.slots, 0..) |slot, i| {
+        try projectCell(slot.type, fl.slot_off[i], layouts, enum_layouts, &offs, gpa);
+    }
+    for (func.values, 0..) |vdef, i| {
+        try projectCell(vdef.type, fl.value_off[i], layouts, enum_layouts, &offs, gpa);
+    }
+
+    const buf = try gpa.alloc(u8, 4 + offs.items.len * 4);
+    errdefer gpa.free(buf);
+    std.mem.writeInt(u32, buf[0..4], @intCast(offs.items.len), .little);
+    for (offs.items, 0..) |off, i| {
+        std.mem.writeInt(u32, buf[4 + i * 4 ..][0..4], off, .little);
+    }
+    return buf;
+}
+
+/// Whether a cell of type `ty` holds ANY managed pointer the collector must see —
+/// asked through the SAME `projectCell` authority the root map uses, so the spill
+/// verifier and the projector can never diverge on what counts as managed. A flat
+/// kind check would miss a by-value aggregate that carries a box in one of its
+/// fields (the projector recurses into it; a `.rawptr`/`.str`/box test would not).
+pub fn cellHasManaged(
+    gpa: std.mem.Allocator,
+    ty: Type,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+) error{OutOfMemory}!bool {
+    var offs: std.ArrayList(u32) = .empty;
+    defer offs.deinit(gpa);
+    try projectCell(ty, 0, layouts, enum_layouts, &offs, gpa);
+    return offs.items.len != 0;
 }
 
 const testing = std.testing;
@@ -547,4 +645,154 @@ test "frame: ParamOffsetTooLarge when an incoming stack-arg offset exceeds imm12
     // test instead confirms an over-budget configuration errors (either guard).
     const res = compute(gpa, &func, &.{}, &.{});
     try testing.expect(res == error.FrameTooLarge or res == error.ParamOffsetTooLarge);
+}
+
+// Decode a `[u32 n][u32 off × n]` root bitmap into (count, offsets-slice-view).
+fn rootCount(bm: []const u8) u32 {
+    return std.mem.readInt(u32, bm[0..4], .little);
+}
+fn rootAt(bm: []const u8, i: usize) u32 {
+    return std.mem.readInt(u32, bm[4 + i * 4 ..][0..4], .little);
+}
+
+// A `Layout` with the given fields (owned arrays freed by the caller).
+fn mkLayoutFields(gpa: std.mem.Allocator, fts: []const Type, offs: []const u32, size: u32, fam: NativeFam) !Layout {
+    return .{
+        .name = "T",
+        .field_names = &.{},
+        .field_types = try gpa.dupe(Type, fts),
+        .offsets = try gpa.dupe(u32, offs),
+        .size = size,
+        .@"align" = 8,
+        .native_family = fam,
+    };
+}
+
+const NativeFam = @import("../../layout/Engine.zig").NativeStructFamily;
+
+test "roots: scalar-only fn yields [u32 0]" {
+    const gpa = testing.allocator;
+    var func = try buildSimple(gpa, &.{ Type.int, Type.bool }, &.{Type.int}, 0, Type.int);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(bm);
+    try testing.expectEqual(@as(u32, 0), rootCount(bm));
+    try testing.expectEqual(@as(usize, 4), bm.len);
+}
+
+test "roots: a lone rawptr VALUE is projected at its value cell" {
+    const gpa = testing.allocator;
+    // one int slot (off 0), one rawptr value (off 8) — the retyped box handle.
+    var func = try buildSimple(gpa, &.{Type.int}, &.{Type.rawptr}, 0, Type.int);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(bm);
+    try testing.expectEqual(@as(u32, 1), rootCount(bm));
+    try testing.expectEqual(fl.value_off[0], rootAt(bm, 0));
+}
+
+test "roots: a str slot projects the ptr half only (base+0), not the len at +8" {
+    const gpa = testing.allocator;
+    var func = try buildSimple(gpa, &.{ Type.int, Type.str }, &.{}, 0, Type.unit);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(bm);
+    try testing.expectEqual(@as(u32, 1), rootCount(bm));
+    try testing.expectEqual(fl.slot_off[1], rootAt(bm, 0)); // the str slot's ptr half
+}
+
+test "roots: a by-value aggregate recurses to its contained box (Bag{Vec[int], int})" {
+    const gpa = testing.allocator;
+    // struct 0 = the inner box (Ref/gc_array), tagged .ref, size 8, no sub-fields.
+    // struct 1 = Vec-like {box @0}, size 8. struct 2 = Bag {Vec @0, int @8}, size 16.
+    var ls: [3]Layout = undefined;
+    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .ref);
+    ls[1] = try mkLayoutFields(gpa, &.{Type.structT(0)}, &.{0}, 8, .none);
+    ls[2] = try mkLayoutFields(gpa, &.{ Type.structT(1), Type.int }, &.{ 0, 8 }, 16, .none);
+    defer for (&ls) |*l| {
+        gpa.free(l.field_types);
+        gpa.free(l.offsets);
+    };
+
+    var func = try buildSimple(gpa, &.{Type.structT(2)}, &.{}, 0, Type.unit);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &ls, &.{});
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &ls, &.{});
+    defer gpa.free(bm);
+    // Bag → Vec@0 → box@0: one recursed root at the Bag slot's base (offset 0 within).
+    try testing.expectEqual(@as(u32, 1), rootCount(bm));
+    try testing.expectEqual(fl.slot_off[0], rootAt(bm, 0));
+}
+
+test "roots: an enum unions its variants' box payload offsets; a () field contributes nothing" {
+    const gpa = testing.allocator;
+    // box struct 0 (.ref, 8B). enum 0: payload_off 8; variant A carries a box @ local 0,
+    // variant B carries a () (no field). Union → one root at slot_base + payload_off.
+    var ls: [1]Layout = undefined;
+    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .ref);
+    defer {
+        gpa.free(ls[0].field_types);
+        gpa.free(ls[0].offsets);
+    }
+
+    const va = VariantLayout{ .name = "A", .form = .tuple, .field_names = &.{}, .field_types = try gpa.dupe(Type, &.{Type.structT(0)}), .offsets = try gpa.dupe(u32, &.{0}) };
+    const vb = VariantLayout{ .name = "B", .form = .unit, .field_names = &.{}, .field_types = try gpa.dupe(Type, &.{}), .offsets = try gpa.dupe(u32, &.{}) };
+    defer {
+        gpa.free(va.field_types);
+        gpa.free(va.offsets);
+        gpa.free(vb.field_types);
+        gpa.free(vb.offsets);
+    }
+    var vars = [_]VariantLayout{ va, vb };
+    const el = [_]EnumLayout{.{ .name = "E", .variants = &vars, .tag_size = 8, .payload_off = 8, .size = 16, .@"align" = 8 }};
+
+    var func = try buildSimple(gpa, &.{Type.enumT(0)}, &.{}, 0, Type.unit);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &ls, &el);
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &ls, &el);
+    defer gpa.free(bm);
+    try testing.expectEqual(@as(u32, 1), rootCount(bm));
+    try testing.expectEqual(fl.slot_off[0] + 8, rootAt(bm, 0)); // payload_off within the enum slot
+}
+
+test "roots: projection is deterministic (two calls byte-identical)" {
+    const gpa = testing.allocator;
+    var func = try buildSimple(gpa, &.{ Type.int, Type.str }, &.{ Type.rawptr, Type.int }, 0, Type.int);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    const a = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(a);
+    const b = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(b);
+    try testing.expectEqualSlices(u8, a, b);
+}
+
+test "cellHasManaged: matches the projector on leaves, aggregates, and scalars" {
+    const gpa = testing.allocator;
+    // A by-value aggregate carrying a box in a field is managed — a flat kind check
+    // (rawptr/str/box) would miss it, leaving the spill verifier blind to it.
+    var ls: [3]Layout = undefined;
+    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .ref);
+    ls[1] = try mkLayoutFields(gpa, &.{Type.structT(0)}, &.{0}, 8, .none);
+    ls[2] = try mkLayoutFields(gpa, &.{ Type.structT(1), Type.int }, &.{ 0, 8 }, 16, .none);
+    defer for (&ls) |*l| {
+        gpa.free(l.field_types);
+        gpa.free(l.offsets);
+    };
+
+    try testing.expect(try cellHasManaged(gpa, Type.rawptr, &.{}, &.{}));
+    try testing.expect(try cellHasManaged(gpa, Type.str, &.{}, &.{}));
+    try testing.expect(try cellHasManaged(gpa, Type.structT(0), &ls, &.{})); // box leaf
+    try testing.expect(try cellHasManaged(gpa, Type.structT(2), &ls, &.{})); // aggregate -> box
+    try testing.expect(!try cellHasManaged(gpa, Type.int, &.{}, &.{}));
+    try testing.expect(!try cellHasManaged(gpa, Type.unit, &.{}, &.{}));
 }

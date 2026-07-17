@@ -356,7 +356,7 @@ pub fn lowerFn(
         // in as a scalar (every Ref producer yields `.value`), and the call site reads it
         // as a scalar too.
         const ret_param_ty: Typecheck.Type = switch (passKind(&b, ret_type)) {
-            .box => Typecheck.Type.int,
+            .box => box_repr_ty,
             else => ret_type,
         };
         b.ret_param = try b.addParam(exit, ret_param_ty);
@@ -655,7 +655,7 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
     switch (passKind(b, ty)) {
         .box => {
             const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
-            return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) };
+            return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) };
         },
         .int, .bool, .float, .rawptr => {
             const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
@@ -711,7 +711,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
                 const args = try b.gpa.alloc(Ir.Operand, 1);
                 errdefer b.gpa.free(args);
                 args[0] = .{ .value = size_v };
-                break :cell try b.emit(.{ .call = .{ .callee = gc_alloc_sym, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int);
+                break :cell try b.emit(.{ .call = .{ .callee = gc_alloc_sym, .args = args, .ret_slot = Ir.none_slot } }, box_repr_ty);
             };
             switch (passKind(b, t)) {
                 .box => {
@@ -734,7 +734,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
             if (addr == Ir.none_value) return .none;
             const t = b.in.node_types[(node_idx).int()];
             switch (passKind(b, t)) {
-                .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) },
+                .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) },
                 .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = t } }, t) },
                 .str, .@"struct", .@"enum" => {
                     const tmp = try b.addSlot(t);
@@ -1653,6 +1653,14 @@ const display_int_sym: Link.SymName = .{ .kind = .builtin, .name = "__display_in
 /// bypasses the core-only allowlist by construction.
 const gc_alloc_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_alloc" };
 
+/// The IR value type a managed-box PRODUCER records. A box is erased to a scalar
+/// cell pointer, but typing it `.int` hides it from the precise root map (an integer
+/// word and a live heap handle look identical). `.rawptr` is ABI-identical to `.int`
+/// (scalar, 8 bytes, integer class — byte-neutral through codegen) yet marks the value
+/// cell as managed, so the root projector emits it and `verifyRefsSpilled` covers it.
+/// Box STORES keep their `.int` store-width (never read by the projector).
+const box_repr_ty: Typecheck.Type = Typecheck.Type.rawptr;
+
 /// The `gc_mark` builtin's stable symbol identity — marks one managed cell. A derived
 /// `trace(obj)` unit `bl`s this per managed field; user source never names it.
 pub const gc_mark_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_mark" };
@@ -2233,7 +2241,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     // ret_slot; unit → neither. The ABI (reg vs sret) is decided in codegen.
     switch (passKind(b, result_ty)) {
         .box => {
-            const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int);
+            const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, box_repr_ty);
             return .{ .value = v };
         },
         .int, .bool, .float, .rawptr => {
@@ -2515,7 +2523,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
                 return .{ .slot = res.slot };
             }
             const merge_ty: Typecheck.Type = switch (passKind(b, payload_ty)) {
-                .box => int_ty,
+                .box => box_repr_ty,
                 else => payload_ty,
             };
             const merge = try b.addParam(join, merge_ty);
@@ -2549,7 +2557,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
                 return .{ .slot = res.slot };
             }
             const merge_ty: Typecheck.Type = switch (passKind(b, payload_ty)) {
-                .box => int_ty,
+                .box => box_repr_ty,
                 else => payload_ty,
             };
             const merge = try b.addParam(join, merge_ty);
@@ -2763,13 +2771,14 @@ fn loadNativePayload(b: *Builder, e: Typecheck.EnumLayout, base: Ir.ValueId) err
     const payload_ty = Typecheck.somePayload(e);
     const off = Typecheck.payloadAddr(e, 0);
     const pa = try b.emit(.{ .field_addr = .{ .base = base, .off = off, .ty = payload_ty } }, int_ty);
-    // A managed-box payload is an 8-byte scalar cell pointer: load it as `int` (a
-    // struct-typed `.load` misfires in codegen).
-    const load_ty: Typecheck.Type = switch (passKind(b, payload_ty)) {
-        .box => int_ty,
-        else => payload_ty,
-    };
-    return try b.emit(.{ .load = .{ .addr = pa, .ty = load_ty } }, load_ty);
+    // A managed-box payload is an 8-byte scalar cell pointer: load it at `int` WIDTH (a
+    // struct-typed `.load` misfires in codegen) but record the produced VALUE as a managed
+    // box (`box_repr_ty`), so the precise root map projects it. The width choice is
+    // byte-neutral; only the value's cell type changes.
+    const is_box = passKind(b, payload_ty) == .box;
+    const load_width: Typecheck.Type = if (is_box) int_ty else payload_ty;
+    const result_ty: Typecheck.Type = if (is_box) box_repr_ty else payload_ty;
+    return try b.emit(.{ .load = .{ .addr = pa, .ty = load_width } }, result_ty);
 }
 
 fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
@@ -3030,7 +3039,7 @@ fn lowerIndexCore(b: *Builder, recv: Ast.Index, idx: Ast.Index, main_token: u32,
     args[0] = .{ .value = handle };
     args[1] = .{ .value = idx_val };
     switch (passKind(b, ty)) {
-        .box => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty) },
+        .box => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, box_repr_ty) },
         .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, ty) },
         .str, .@"struct", .@"enum" => {
             const slot = try b.addSlot(ty);
@@ -3071,7 +3080,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
     if (addr == Ir.none_value) return .none;
     // A managed-box field reads as an 8-byte scalar cell pointer, not by aggregate copy.
     switch (passKind(b, ty)) {
-        .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, Typecheck.Type.int) },
+        .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) },
         .int, .bool, .float => {
             const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
             return .{ .value = v };

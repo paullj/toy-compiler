@@ -1,0 +1,29 @@
+# expect: exit 8
+# Feature: the precise root map projects BY-VALUE AGGREGATES, not just bare references.
+# `make()` returns a Bag holding a Vec by value; after it returns, the backing gc_array's
+# only root is `keep`'s Bag slot, reached ONLY by recursing Bag -> Vec -> gc_array. Churning
+# 20000 dead vectors forces a collection; if the map projected the aggregate, `keep` survives
+# and `get(0)` reads 8 (exit 8). An isReference()-only map would skip the Bag slot -> the
+# survivor is swept -> exit 0.
+import std/vec
+
+struct Bag { items: Vec[int], n: int }
+
+fn make() -> Bag {
+    v: Vec[int] = []
+    v.push(8)
+    return Bag{ items: v, n: 1 }
+}
+
+fn main() -> int {
+    keep: Bag = make()
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk: Vec[int] = []
+        junk.push(i)
+        i = i + 1
+    }
+    it := keep.items
+    return it.get(0).unwrap_or(0)
+}

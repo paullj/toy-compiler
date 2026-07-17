@@ -39,6 +39,7 @@ pub const RelocKind = reloc.RelocKind;
 pub const Reloc = reloc.Reloc;
 pub const symtab_base_hash = reloc.symtab_base_hash;
 pub const desc_table_base_hash = reloc.desc_table_base_hash;
+pub const gc_stackmap_base_hash = reloc.gc_stackmap_base_hash;
 
 /// The per-type descriptor sentinel a `descriptor_of[T]()` `cstr_ptr` reloc carries: the
 /// reserved `0xDE5C` prefix OR'd with a 48-bit Wyhash of `T`'s structural key bytes, so
@@ -88,6 +89,11 @@ pub const FnCode = struct {
     code: []u8,
     relocs: []Reloc,
     literals: []Literal,
+    /// The per-fn precise GC root map (`FrameLayout.projectRoots`): `[u32 n][u32 sp_off ×
+    /// n]`. Empty for a hand-emitted builtin or a fn that failed to lower — the collector
+    /// reads an empty map as "scan this frame conservatively". A pure function of the IR +
+    /// layouts, so it rides the content-fp cache. Owned like the other regions ("always own").
+    root_bitmap: []u8 = &.{},
 
     pub fn deinit(fc: *FnCode, gpa: std.mem.Allocator) void {
         gpa.free(fc.sym.name);
@@ -96,6 +102,7 @@ pub const FnCode = struct {
         gpa.free(fc.relocs);
         for (fc.literals) |l| gpa.free(l.bytes);
         gpa.free(fc.literals);
+        gpa.free(fc.root_bitmap);
         fc.* = undefined;
     }
 };
@@ -228,6 +235,14 @@ pub const Linked = struct {
     /// absent). A pure function of the fn set (built from the stable `si`/`offsets`), so
     /// it is `-jN` byte-identical. Owned by the caller.
     desc_table: []u8 = &.{},
+    /// The GC stack-map table (empty unless `link` was asked to emit it): a `buildSideTable`
+    /// payload keyed by each fn's START text offset → its precise root bitmap (or the 4-byte
+    /// `0xFFFFFFFF` conservative marker for a row-less fn), rows ascending by off with a final
+    /// `{text_size, conservative}` sentinel. The collector scans it for the greatest row off ≤
+    /// an identifying frame offset. A pure function of the fn set (offsets are stable-sort-
+    /// ranked; consumes only order-independent inputs), so it is `-jN` byte-identical. Owned
+    /// by the caller.
+    stack_map: []u8 = &.{},
 };
 
 /// Raised when a `.call26` displacement does not fit AArch64's signed imm26
@@ -276,7 +291,7 @@ fn prefixSumTextOffsets(
 /// backward (and self/mutual) recursion a non-positive one; both encode directly
 /// via `Aarch64.bl`. Because the delta is intra-module it is fixed at link time
 /// and needs NO runtime relocation under PIE/ASLR.
-pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName, emit_symtab: bool, descriptors: []const DescEntry) LinkError!Linked {
+pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterner, entry: SymName, emit_symtab: bool, emit_stackmap: bool, descriptors: []const DescEntry) LinkError!Linked {
     // 1) LAYOUT: assign every fn a dense handle by STABLE SORT of the fn set
     //    (rank, never arrival/source order), then
     //    walk `fns` in SOURCE ORDER to give each its text offset. Layout STAYS
@@ -413,6 +428,11 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     const desc_table: []u8 = if (descriptors.len > 0) try buildDescTable(gpa, descriptors, si, offsets) else &.{};
     errdefer gpa.free(desc_table);
 
+    // 4c) GC STACK MAP: the (fn-start offset → root bitmap) table the collector scans.
+    //     Built from the same layout, so it is a pure function of the fn set.
+    const stack_map: []u8 = if (emit_stackmap) try buildStackMapTable(gpa, fns, site_h, offsets, cursor) else &.{};
+    errdefer gpa.free(stack_map);
+
     // 5) ENTRY: the entry function's resolved text offset, resolved by name.
     const entry_h = (try si.get(gpa, entry)) orelse return error.NoEntry;
     return .{
@@ -421,7 +441,49 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
         .data_relocs = try data_relocs.toOwnedSlice(gpa),
         .sym_table = sym_table,
         .desc_table = desc_table,
+        .stack_map = stack_map,
     };
+}
+
+/// The 4-byte conservative marker `0xFFFFFFFF`: a row-less fn's payload, telling the
+/// collector to fall back to a whole-frame scan for frames it maps (builtins, failed
+/// lowers, and the sentinel past __text).
+const conservative_marker = [4]u8{ 0xFF, 0xFF, 0xFF, 0xFF };
+
+/// Build the GC stack-map table (see `Linked.stack_map`) as a `buildSideTable` payload:
+/// one row per fn `{fn-start offset, root_bitmap}` plus a final `{text_size, conservative}`
+/// sentinel, rows sorted ascending by off (fn starts are distinct; sentinel last). A fn
+/// with an empty `root_bitmap` (a builtin / failed lower) contributes the 4-byte
+/// conservative marker instead. `site_h[i]` is fn i's handle (→ `offsets`).
+fn buildStackMapTable(gpa: std.mem.Allocator, fns: []const FnCode, site_h: []const u32, offsets: []const u32, text_size: u32) ![]u8 {
+    const SmEnt = struct { off: u64, payload: []const u8 };
+    const ents = try gpa.alloc(SmEnt, fns.len + 1);
+    defer gpa.free(ents);
+    for (fns, 0..) |f, i| ents[i] = .{
+        .off = offsets[site_h[i]],
+        .payload = if (f.root_bitmap.len == 0) &conservative_marker else f.root_bitmap,
+    };
+    ents[fns.len] = .{ .off = text_size, .payload = &conservative_marker };
+    std.mem.sortUnstable(SmEnt, ents, {}, struct {
+        fn less(_: void, a: SmEnt, b: SmEnt) bool {
+            return a.off < b.off;
+        }
+    }.less);
+
+    var blob_len: usize = 0;
+    for (ents) |e| blob_len += e.payload.len;
+    const blob = try gpa.alloc(u8, blob_len);
+    defer gpa.free(blob);
+    const rows = try gpa.alloc(SideRow, ents.len);
+    defer gpa.free(rows);
+
+    var cursor: u64 = 0;
+    for (ents, rows) |e, *row| {
+        row.* = .{ .off = e.off, .blob_off = cursor };
+        @memcpy(blob[cursor .. cursor + e.payload.len], e.payload);
+        cursor += e.payload.len;
+    }
+    return buildSideTable(gpa, rows, blob);
 }
 
 /// Build the per-type descriptor table (see `Linked.desc_table`): 48 bytes per entry in
@@ -657,7 +719,7 @@ fn dataRelocJob(
 // with an `i64` addend, so it is NOT raw-memcpy-able; serialize each region into
 // `extern` records inside the same `[u64 checksum][payload]` envelope `Cache`
 // uses for the parse Tree. Blob layout:
-//   [FnHeader][sym name][code][RelocRec×n][names pool][LitRec×m][lits pool]
+//   [FnHeader][sym name][code][RelocRec×n][names pool][LitRec×m][lits pool][root bitmap]
 // Names (reloc `.func`/`.import` targets) are pooled; each RelocRec carries an
 // (offset,len) into that pool. `unpack` reconstructs an "always own" FnCode so a
 // hit and a fresh lower share one `deinit`.
@@ -667,7 +729,7 @@ pub const fncode_magic: u32 = 0x544f4643;
 
 const FnHeader = extern struct {
     magic: u32,
-    version: u32 = 1,
+    version: u32 = 2,
     sym_kind: u8,
     _pad: [3]u8 = .{ 0, 0, 0 },
     sym_name_len: u32,
@@ -676,6 +738,7 @@ const FnHeader = extern struct {
     lit_count: u32,
     names_len: u32,
     lits_len: u32,
+    root_bitmap_len: u32,
 };
 
 const RelocRec = extern struct {
@@ -715,7 +778,7 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
 
     const total = @sizeOf(FnHeader) + fc.sym.name.len + fc.code.len +
         fc.relocs.len * @sizeOf(RelocRec) + names_len +
-        fc.literals.len * @sizeOf(LitRec) + lits_len;
+        fc.literals.len * @sizeOf(LitRec) + lits_len + fc.root_bitmap.len;
     const buf = try gpa.alloc(u8, total);
     errdefer gpa.free(buf);
 
@@ -728,6 +791,7 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
         .lit_count = @intCast(fc.literals.len),
         .names_len = @intCast(names_len),
         .lits_len = @intCast(lits_len),
+        .root_bitmap_len = @intCast(fc.root_bitmap.len),
     };
     @memcpy(buf[0..@sizeOf(FnHeader)], std.mem.asBytes(&hdr));
     var off: usize = @sizeOf(FnHeader);
@@ -794,6 +858,10 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
         off += l.bytes.len;
     }
 
+    // Root bitmap trails the lits pool (a raw byte blob, no records).
+    @memcpy(buf[off .. off + fc.root_bitmap.len], fc.root_bitmap);
+    off += fc.root_bitmap.len;
+
     std.debug.assert(off == total);
     return buf;
 }
@@ -806,12 +874,13 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
     if (bytes.len < @sizeOf(FnHeader)) return null;
     var hdr: FnHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(FnHeader)]);
-    if (hdr.magic != fncode_magic or hdr.version != 1) return null;
+    if (hdr.magic != fncode_magic or hdr.version != 2) return null;
     if (hdr.sym_kind > @intFromEnum(SymKind.import)) return null;
 
     const need = @sizeOf(FnHeader) + @as(usize, hdr.sym_name_len) + @as(usize, hdr.code_len) +
         @as(usize, hdr.reloc_count) * @sizeOf(RelocRec) + @as(usize, hdr.names_len) +
-        @as(usize, hdr.lit_count) * @sizeOf(LitRec) + @as(usize, hdr.lits_len);
+        @as(usize, hdr.lit_count) * @sizeOf(LitRec) + @as(usize, hdr.lits_len) +
+        @as(usize, hdr.root_bitmap_len);
     if (bytes.len != need) return null;
 
     var off: usize = @sizeOf(FnHeader);
@@ -884,11 +953,17 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?FnCode {
         lits_built += 1;
     }
 
+    // Root bitmap: the trailing raw byte blob.
+    const root_bitmap = try gpa.dupe(u8, bytes[off .. off + hdr.root_bitmap_len]);
+    errdefer gpa.free(root_bitmap);
+    off += hdr.root_bitmap_len;
+
     return FnCode{
         .sym = .{ .kind = @enumFromInt(hdr.sym_kind), .name = sym_name },
         .code = code,
         .relocs = relocs,
         .literals = literals,
+        .root_bitmap = root_bitmap,
     };
 }
 
@@ -942,7 +1017,7 @@ fn linkTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) Li
     defer threaded.deinit();
     var si: SymInterner = .{};
     defer si.deinit(gpa);
-    return link(threaded.io(), gpa, fns, &si, fname(entry), false, &.{});
+    return link(threaded.io(), gpa, fns, &si, fname(entry), false, false, &.{});
 }
 
 /// Like `linkTest` but requests the backtrace symbol table (`emit_symtab = true`).
@@ -951,7 +1026,16 @@ fn linkSymTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32)
     defer threaded.deinit();
     var si: SymInterner = .{};
     defer si.deinit(gpa);
-    return link(threaded.io(), gpa, fns, &si, fname(entry), true, &.{});
+    return link(threaded.io(), gpa, fns, &si, fname(entry), true, false, &.{});
+}
+
+/// Like `linkTest` but requests the GC stack-map table (`emit_stackmap = true`).
+fn linkStackMapTest(gpa: std.mem.Allocator, fns: []const FnCode, comptime entry: u32) LinkError!Linked {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    var si: SymInterner = .{};
+    defer si.deinit(gpa);
+    return link(threaded.io(), gpa, fns, &si, fname(entry), false, true, &.{});
 }
 
 test "buildSideTable: count header, off rows, payload_off rebased past header into blob" {
@@ -1017,6 +1101,57 @@ test "buildSymTable: header + (off,name) rows sorted, trailing text-size sentine
     const last_noff = std.mem.readInt(u64, tab[8 + (count - 1) * 16 + 8 ..][0..8], .little);
     try testing.expectEqual(@as(u64, linked.text.len), last_off);
     try testing.expectEqual(@as(u8, 0), tab[last_noff]); // empty string → immediate NUL
+}
+
+test "buildStackMapTable: rows ascend by off, payloads round-trip, row-less fn + sentinel are conservative" {
+    const gpa = testing.allocator;
+    // Sizes 3,1,2 words → offsets 0, 12, 16; total __text 24.
+    var fns = [_]FnCode{
+        try makeFn(gpa, 0, 3, &.{}),
+        try makeFn(gpa, 1, 1, &.{}),
+        try makeFn(gpa, 2, 2, &.{}),
+    };
+    defer freeFns(gpa, &fns);
+    // fn0: one root at sp-off 8. fn1: empty ⇒ conservative marker. fn2: mapped but root-less.
+    const rb0 = [_]u8{ 1, 0, 0, 0, 8, 0, 0, 0 };
+    const rb2 = [_]u8{ 0, 0, 0, 0 };
+    fns[0].root_bitmap = @constCast(&rb0);
+    fns[1].root_bitmap = &.{};
+    fns[2].root_bitmap = @constCast(&rb2);
+
+    const linked = try linkStackMapTest(gpa, &fns, 0);
+    defer gpa.free(linked.text);
+    defer gpa.free(linked.data_relocs);
+    defer gpa.free(linked.stack_map);
+    // The static root_bitmaps must not be freed by FnCode.deinit — this test path uses
+    // freeFns (code/relocs only), so no double-free.
+
+    const tab = linked.stack_map;
+    const count = std.mem.readInt(u64, tab[0..8], .little);
+    try testing.expectEqual(@as(u64, 4), count); // 3 fns + sentinel
+
+    var prev_off: u64 = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const off = std.mem.readInt(u64, tab[8 + i * 16 ..][0..8], .little);
+        const poff = std.mem.readInt(u64, tab[8 + i * 16 + 8 ..][0..8], .little);
+        try testing.expect(off >= prev_off);
+        prev_off = off;
+        const n = std.mem.readInt(u32, tab[poff..][0..4], .little);
+        if (off == 0) {
+            try testing.expectEqual(@as(u32, 1), n); // fn0's one root
+            try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, tab[poff + 4 ..][0..4], .little));
+        } else if (off == 12) {
+            try testing.expectEqual(@as(u32, 0xFFFFFFFF), n); // fn1 conservative
+        } else if (off == 16) {
+            try testing.expectEqual(@as(u32, 0), n); // fn2 mapped, root-less
+        }
+    }
+    // Sentinel: last row at text_size, conservative marker.
+    const last_off = std.mem.readInt(u64, tab[8 + (count - 1) * 16 ..][0..8], .little);
+    const last_poff = std.mem.readInt(u64, tab[8 + (count - 1) * 16 + 8 ..][0..8], .little);
+    try testing.expectEqual(@as(u64, linked.text.len), last_off);
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), std.mem.readInt(u32, tab[last_poff..][0..4], .little));
 }
 
 test "layout offsets follow source order and are contiguous" {
@@ -1408,7 +1543,9 @@ test "FnCode pack/unpack round-trips relocs, names, and literals" {
     });
     const lit_bytes = try gpa.dupe(u8, "hi");
     const literals = try gpa.dupe(Literal, &.{.{ .hash = 0x1234, .bytes = lit_bytes }});
-    const fc = FnCode{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, "main") }, .code = code, .relocs = relocs, .literals = literals };
+    // A non-empty root bitmap `[u32 2][8][24]` exercises the trailing-blob round-trip.
+    const rb = try gpa.dupe(u8, &[_]u8{ 2, 0, 0, 0, 8, 0, 0, 0, 24, 0, 0, 0 });
+    const fc = FnCode{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, "main") }, .code = code, .relocs = relocs, .literals = literals, .root_bitmap = rb };
     defer {
         // free the original's owned bits (names here are static literals except
         // sym.name and the duped slices) — use a manual free, not deinit, since
@@ -1418,6 +1555,7 @@ test "FnCode pack/unpack round-trips relocs, names, and literals" {
         gpa.free(fc.relocs);
         for (fc.literals) |l| gpa.free(l.bytes);
         gpa.free(fc.literals);
+        gpa.free(fc.root_bitmap);
     }
 
     const blob = try pack(gpa, fc);
@@ -1427,6 +1565,7 @@ test "FnCode pack/unpack round-trips relocs, names, and literals" {
 
     try testing.expect(got.sym.eql(fc.sym));
     try testing.expectEqualSlices(u8, fc.code, got.code);
+    try testing.expectEqualSlices(u8, fc.root_bitmap, got.root_bitmap);
     try testing.expectEqual(@as(usize, 3), got.relocs.len);
     try testing.expect(got.relocs[0].target.func.eql(.{ .kind = .user_fn, .name = "add" }));
     try testing.expectEqual(@as(u64, 0xDEADBEEF), got.relocs[1].target.cstr);

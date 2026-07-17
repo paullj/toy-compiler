@@ -192,8 +192,16 @@ pub fn verifyRefsSpilled(
     };
     defer fl.deinit(gpa);
     for (func.values, 0..) |vd, i| {
-        if (vd.type.kind != .rawptr) continue; // the raw 8-byte cell pointer a reference is
-        if (fl.valueAddr(@intCast(i)) + 8 > fl.frame) return error.VerifyRefInRegister;
+        // The managed set is whatever the root projector treats as a root: a raw/handle
+        // pointer, a heap-`str` pointer half, a box, OR a by-value aggregate carrying any
+        // of those in a field. Asking `cellHasManaged` (the projector's own authority)
+        // rather than a flat kind check keeps this tripwire in lockstep with projection —
+        // each such value must own a frame cell so a live managed pointer is visible to the
+        // collector's root scan and never sits only in a register across a `gc_alloc`-capable
+        // call.
+        if (!try FrameLayout.cellHasManaged(gpa, vd.type, layouts, enum_layouts)) continue;
+        if (fl.valueAddr(@intCast(i)) + FrameLayout.slotSize(vd.type, layouts, enum_layouts) > fl.frame)
+            return error.VerifyRefInRegister;
     }
 }
 
@@ -257,6 +265,11 @@ pub fn lowerIr(
 
     try genBody(&g);
 
+    // The precise GC root map, a byproduct of the (still-live) frame layout. `g.fl` is
+    // deinited by the `defer` above only AFTER this return value is built.
+    const rb = try FrameLayout.projectRoots(gpa, func, &g.fl, layouts, enum_layouts);
+    errdefer gpa.free(rb);
+
     const name_copy = try gpa.dupe(u8, func.name.name);
     errdefer gpa.free(name_copy);
     return .{
@@ -264,6 +277,7 @@ pub fn lowerIr(
         .code = try g.code.toOwnedSlice(gpa),
         .relocs = try g.relocs.toOwnedSlice(gpa),
         .literals = try g.literals.toOwnedSlice(gpa),
+        .root_bitmap = rb,
     };
 }
 
@@ -1740,9 +1754,10 @@ test "emitFpWalk to_outermost: parent-load loop keeping the last non-null fp" {
 // prologue shape. `gc_alloc` pops a per-class freelist (clearing the reused cell's
 // next-pointer to keep the zero-on-alloc invariant), refills by mmapping+carving a fresh
 // span when the freelist is empty, and runs a synchronous stop-the-world collection once
-// an allocation watermark is crossed. The collector walks the FP chain conservatively
-// (every 8-byte word of the live frame region is a candidate root — sound because the
-// spill-everything frame puts every live reference in a frame cell), traces marked
+// an allocation watermark is crossed. The collector walks the FP chain enumerating each
+// frame's roots by PRECISE stack-map lookup (a per-fn table names the managed cells;
+// frames with no entry fall back to a conservative whole-frame word scan — sound because
+// the spill-everything frame puts every live reference in a frame cell), traces marked
 // objects to a fixpoint over a malloc-backed mark stack, and linear-sweeps every span
 // (dead cells → freelists, mark bits cleared). All emitted bodies are PURE fixed AArch64
 // (only the constant CB address / mmap+malloc flags / lengths are baked), so the bytes
@@ -2214,17 +2229,24 @@ pub fn lowerGcMark(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     return finishBuiltin(&code, &relocs, gpa, "gc_mark");
 }
 
-/// Build the `gc_collect()` builtin: a synchronous stop-the-world conservative
-/// mark-sweep. Reuses `panic`'s FP-chain mechanics (minus all symbolization): finds the
-/// live frame region [x_lo, outermost_fp+16), conservatively marks every 8-byte word in
-/// it (roots come ONLY from the frame — never registers, which are not a pure function of
-/// source), traces marked objects to a fixpoint over the mark stack, then linear-sweeps
-/// every class span (dead cells → per-class freelists, mark bits cleared). Large objects
-/// leak (their mark is just reset); the spike creates none. Caller owns the result.
+/// Build the `gc_collect()` builtin: a synchronous stop-the-world mark-sweep with a HYBRID
+/// root scan. Walks the x29 chain from its own frame outward; for each parent frame it
+/// identifies the enclosing fn by the child-saved return address and looks that fn's precise
+/// root map up in the address-keyed stack-map table (`text_off -> root bitmap`), enumerating
+/// only the managed cells the map names. A frame with no map entry (a hand-emitted builtin,
+/// a failed lower, or a foreign C-runtime frame — all carrying the `0xFFFFFFFF` conservative
+/// marker) falls back to a whole-frame word scan. Precise roots are always a subset of that
+/// whole-frame set, and the marker validates each candidate before any dereference, so a
+/// misidentified frame over-retains at worst — never a use-after-free. OBJECT TRACING stays
+/// conservative (a marked object's body is still scanned word-by-word); only ROOT
+/// enumeration is precise. Marked objects are traced to a fixpoint over the mark stack, then
+/// every class span is linear-swept (dead cells → per-class freelists, mark bits cleared).
+/// Large objects leak (their mark is just reset). Caller owns the result.
 ///
-/// Register contract: x19=CB, x20=root cursor, x21=x_hi, x22=trace cursor, x23=trace end,
-/// x24=x_lo — all callee-saved, saved/restored so the collector honors the ABI toward the
-/// allocating caller.
+/// Register contract: x19=CB, x25=text_base, x26=&stackmap, x27=cur fp, x28=parent fp,
+/// x20/x21/x22=scan/enumeration cursors, x23=corruption cap — all callee-saved,
+/// saved/restored so the collector honors the ABI toward the allocating caller (x24 is
+/// saved too though now unused).
 pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
     const emit = emitWord;
@@ -2234,17 +2256,33 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     errdefer deinitBuiltinRelocs(&relocs, gpa);
 
     try emitFramePrologue(&code, gpa);
-    try emit(&code, gpa, A.subImm(A.SP, A.SP, 48)); // save area for x19-x24
+    try emit(&code, gpa, A.subImm(A.SP, A.SP, 80)); // save area for x19-x28
     try emit(&code, gpa, A.strSp(19, 0));
     try emit(&code, gpa, A.strSp(20, 8));
     try emit(&code, gpa, A.strSp(21, 16));
     try emit(&code, gpa, A.strSp(22, 24));
     try emit(&code, gpa, A.strSp(23, 32));
-    try emit(&code, gpa, A.strSp(24, 40));
-    try emit(&code, gpa, A.addImm(24, A.SP, 0)); // x_lo = sp (reg 31 is SP here, not XZR)
+    try emit(&code, gpa, A.strSp(24, 40)); // x24 unused now (old x_lo) but saved for the ABI
+    try emit(&code, gpa, A.strSp(25, 48));
+    try emit(&code, gpa, A.strSp(26, 56));
+    try emit(&code, gpa, A.strSp(27, 64));
+    try emit(&code, gpa, A.strSp(28, 72));
 
     try emitLocateCb(&code, &relocs, gpa); // x9 = CB
     try emit(&code, gpa, A.movReg(19, 9)); // x19 = CB
+
+    // Self-locate text_base into x25, and load the GC stack-map table base into x26 via the
+    // reserved `.cstr` hash (the exact adrp+add path `lowerPanic` uses for the symtab). Both
+    // are callee-saved, surviving every malloc/realloc/munmap the collector calls.
+    try emitTextBase(&code, &relocs, gpa, 25);
+    {
+        const site_a: u32 = @intCast(code.items.len);
+        try relocs.append(gpa, .{ .site = site_a, .target = .{ .cstr = Link.gc_stackmap_base_hash }, .kind = .adrp_page });
+        try emit(&code, gpa, A.adrp(26, 0)); // adrp x26, stackmap@page
+        const site_b: u32 = @intCast(code.items.len);
+        try relocs.append(gpa, .{ .site = site_b, .target = .{ .cstr = Link.gc_stackmap_base_hash }, .kind = .add_lo12 });
+        try emit(&code, gpa, A.addImm(26, 26, 0)); // x26 = &stackmap
+    }
 
     // Ensure the mark stack is allocated (ms_cap == 0 on the first collection).
     try emit(&code, gpa, A.ldrRegUoff(0, 19, off_ms_cap));
@@ -2271,33 +2309,121 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.cbnz(1, 0));
     patchCbzTo(code.items, cbnz_reset, reset_top);
 
-    // Walk the FP chain to the outermost frame (x0 = last non-null fp, x2 = the
-    // null parent that stops it); x_hi = outermost_fp + 16.
-    try emit(&code, gpa, A.movReg(0, A.FP));
-    try emit(&code, gpa, A.movz(1, 4096, 0)); // corruption backstop
-    try emitFpWalk(&code, gpa, .to_outermost, 0, 1, 2, null);
-    try emit(&code, gpa, A.addImm(21, 0, 16)); // x_hi
+    // Hybrid root scan: walk the x29 chain from gc_collect's own frame outward. For each
+    // parent frame, identify its fn by the return address the child saved (`*(cur+8)`, less
+    // text_base, less 4 to land on the `bl`), scan the address-keyed stack map for the
+    // greatest row off <= that fn offset, and enumerate ITS precise root cells at
+    // `parent_sp + sp_off`. A row-less/sentinel/foreign frame carries the `0xFFFFFFFF`
+    // marker → fall back to the whole-frame conservative scan (matching the old behavior for
+    // builtin/C-runtime frames). The marker validates every candidate before dereferencing,
+    // so a misidentified frame over-retains at worst.
+    // Loop-carried state (all callee-saved, surviving emitConservativeMark/emitPush):
+    //   x19=CB, x25=text_base, x26=&stackmap, x27=cur fp, x28=parent fp,
+    //   x20/x21/x22=scan+enumeration cursors, x23=corruption cap.
+    try emit(&code, gpa, A.movReg(27, A.FP)); // cur = gc_collect.fp (its own frame holds no roots)
+    try emit(&code, gpa, A.movz(23, 4096, 0)); // corruption cap
+    const walk_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.ldrRegUoff(28, 27, 0)); // parent_fp = *cur
+    const cbz_walk_done_a: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(28, 0)); // fp == 0 → done
+    const cbz_walk_done_b: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(23, 0)); // cap exhausted → done
+    try emit(&code, gpa, A.ldrRegUoff(20, 27, 8)); // ra into the PARENT's fn
+    try emit(&code, gpa, A.subReg(20, 20, 25)); // - text_base
+    try emit(&code, gpa, A.subImm(20, 20, 4)); // -> parent fn body offset
 
-    // Root scan: conservatively mark every nonzero word of [x_lo, x_hi).
-    try emit(&code, gpa, A.movReg(20, 24)); // p = x_lo
-    const root_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cmpReg(20, 21));
-    const bhs_trace: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.bCond(.hs, 0)); // p >= x_hi → trace
+    // Scan the sorted table for the greatest entry off <= x20; x21 = its payload_off.
+    // The first fn starts at off 0, so a match always exists.
+    try emit(&code, gpa, A.ldrRegUoff(4, 26, 0)); // count
+    try emit(&code, gpa, A.addImm(5, 26, 8)); // &entry[0]
+    try emit(&code, gpa, A.movz(6, 0, 0)); // i
+    try emit(&code, gpa, A.movz(21, 0, 0)); // best payload_off
+    const scan_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cmpReg(6, 4));
+    const scan_bhs: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hs, 0)); // i >= count → scan_done
+    try emit(&code, gpa, A.ldrRegUoff(9, 5, 0)); // entry.off
+    try emit(&code, gpa, A.cmpReg(9, 20));
+    const scan_bhi: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hi, 0)); // off > target → scan_done
+    try emit(&code, gpa, A.ldrRegUoff(21, 5, 8)); // best = entry.payload_off
+    try emit(&code, gpa, A.addImm(5, 5, 16));
+    try emit(&code, gpa, A.addImm(6, 6, 1));
+    const scan_b: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → scan_top
+    const scan_done: u32 = @intCast(code.items.len);
+    patchBCondTo(code.items, scan_bhs, scan_done);
+    patchBCondTo(code.items, scan_bhi, scan_done);
+    patchBTo(code.items, scan_b, scan_top);
+
+    try emit(&code, gpa, A.addReg(9, 26, 21)); // payload ptr = table_base + payload_off
+    try emit(&code, gpa, A.ldrwRegUoff(10, 9, 0)); // n (or 0xFFFFFFFF marker), zero-extended
+    // Build 0x0000_0000_FFFF_FFFF (NOT the 64-bit movn all-ones) so it matches the
+    // zero-extended marker word.
+    try emit(&code, gpa, A.movz(11, 0xFFFF, 0));
+    try emit(&code, gpa, A.movk(11, 0xFFFF, 1));
+    try emit(&code, gpa, A.cmpReg(10, 11));
+    const beq_cons: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.eq, 0)); // conservative marker → whole-frame scan
+
+    // PRECISE: enumerate n cells at parent_sp + sp_off (region_lo = cur+16 = parent's sp).
+    try emit(&code, gpa, A.addImm(22, 27, 16)); // region_lo
+    try emit(&code, gpa, A.addImm(20, 9, 4)); // &sp_off[0]
+    try emit(&code, gpa, A.movReg(21, 10)); // remaining = n
+    const p_top: u32 = @intCast(code.items.len);
+    const cbz_p_advance: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(21, 0)); // remaining == 0 → advance
+    try emit(&code, gpa, A.ldrwRegUoff(12, 20, 0)); // sp_off
+    try emit(&code, gpa, A.addReg(10, 22, 12)); // cell = region_lo + sp_off
+    try emit(&code, gpa, A.ldrRegUoff(10, 10, 0)); // word
+    const cbz_p_next: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbz(10, 0)); // null → skip
+    try emitConservativeMark(&code, &relocs, gpa);
+    const p_next: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_p_next, p_next);
+    try emit(&code, gpa, A.addImm(20, 20, 4));
+    try emit(&code, gpa, A.subImm(21, 21, 1));
+    const b_p_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → p_top
+    const b_precise_advance: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → advance
+    patchBTo(code.items, b_p_top, p_top);
+
+    // CONSERVATIVE: whole-frame scan [cur+16, parent_fp).
+    const cons: u32 = @intCast(code.items.len);
+    patchBCondTo(code.items, beq_cons, cons);
+    try emit(&code, gpa, A.addImm(20, 27, 16)); // p = cur+16
+    const c_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cmpReg(20, 28));
+    const bhs_c_advance: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.bCond(.hs, 0)); // p >= parent_fp → advance
     try emit(&code, gpa, A.ldrRegUoff(10, 20, 0));
-    const cbz_root_next: u32 = @intCast(code.items.len);
+    const cbz_c_next: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(10, 0));
     try emitConservativeMark(&code, &relocs, gpa);
-    const root_next: u32 = @intCast(code.items.len);
-    patchCbzTo(code.items, cbz_root_next, root_next);
+    const c_next: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_c_next, c_next);
     try emit(&code, gpa, A.addImm(20, 20, 8));
-    const b_root_top: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0));
-    patchBTo(code.items, b_root_top, root_top);
+    const b_c_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → c_top
+    patchBTo(code.items, b_c_top, c_top);
+
+    // ADVANCE: cur = parent_fp; --cap; loop.
+    const advance: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_p_advance, advance);
+    patchBTo(code.items, b_precise_advance, advance);
+    patchBCondTo(code.items, bhs_c_advance, advance);
+    try emit(&code, gpa, A.movReg(27, 28)); // cur = parent_fp
+    try emit(&code, gpa, A.subImm(23, 23, 1)); // --cap
+    const b_walk_top: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.b(0)); // → walk_top
+    patchBTo(code.items, b_walk_top, walk_top);
+    const walk_done: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_walk_done_a, walk_done);
+    patchCbzTo(code.items, cbz_walk_done_b, walk_done);
 
     // Trace to fixpoint: pop a ptr, find its size, mark every nonzero word it holds.
     const trace_pop: u32 = @intCast(code.items.len);
-    patchBCondTo(code.items, bhs_trace, trace_pop);
     try emit(&code, gpa, A.ldrRegUoff(11, 19, off_ms_len));
     const cbz_trace_done: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(11, 0));
@@ -2483,7 +2609,11 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ldrSp(22, 24));
     try emit(&code, gpa, A.ldrSp(23, 32));
     try emit(&code, gpa, A.ldrSp(24, 40));
-    try emit(&code, gpa, A.addImm(A.SP, A.SP, 48));
+    try emit(&code, gpa, A.ldrSp(25, 48));
+    try emit(&code, gpa, A.ldrSp(26, 56));
+    try emit(&code, gpa, A.ldrSp(27, 64));
+    try emit(&code, gpa, A.ldrSp(28, 72));
+    try emit(&code, gpa, A.addImm(A.SP, A.SP, 80));
     try emit(&code, gpa, A.ldpFpLrPost);
     try emit(&code, gpa, A.ret);
 
@@ -2654,13 +2784,31 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
     // must be minted. No `.call26` (the collector calls no other builtin).
     var saw_malloc = false;
     var saw_realloc = false;
+    // The hybrid root scan self-locates text_base (a movw_g0/movw_g1 self-relative pair)
+    // and loads the stack-map table base via the reserved `.cstr` hash (an adrp_page +
+    // add_lo12 pair, exactly like the panic symtab).
+    var saw_movw_g0 = false;
+    var saw_movw_g1 = false;
+    var saw_sm_adrp = false;
+    var saw_sm_add = false;
     for (fc.relocs) |r| {
         try testing.expect(r.kind != .call26);
         if (r.target == .import and std.mem.eql(u8, r.target.import.name, "malloc")) saw_malloc = true;
         if (r.target == .import and std.mem.eql(u8, r.target.import.name, "realloc")) saw_realloc = true;
+        if (r.kind == .movw_g0) saw_movw_g0 = true;
+        if (r.kind == .movw_g1) saw_movw_g1 = true;
+        if (r.target == .cstr and r.target.cstr == Link.gc_stackmap_base_hash and r.kind == .adrp_page) saw_sm_adrp = true;
+        if (r.target == .cstr and r.target.cstr == Link.gc_stackmap_base_hash and r.kind == .add_lo12) saw_sm_add = true;
     }
     try testing.expect(saw_malloc);
     try testing.expect(saw_realloc);
+    try testing.expect(saw_movw_g0 and saw_movw_g1);
+    try testing.expect(saw_sm_adrp and saw_sm_add);
+
+    // Pure fixed bytes ⇒ byte-identical across relowers (-jN determinism).
+    var fc2 = try lowerGcCollect(gpa);
+    defer fc2.deinit(gpa);
+    try testing.expectEqualSlices(u8, fc.code, fc2.code);
 }
 
 test "gc_stats/gc_span_count: read the CB counters and are byte-identical across relowers" {

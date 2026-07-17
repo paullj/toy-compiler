@@ -1,0 +1,20 @@
+# expect: exit 7
+# Feature: the precise root map lists a ref cell that is UNINITIALIZED during an earlier
+# collection. The churn forces collections before `r` is ever assigned, so `r`'s cell holds
+# stack garbage while the map already names it as a root. The collector's marker validates
+# every candidate against the live span set before dereferencing, so a garbage cell is a safe
+# no-op (over-retain at worst) — no crash, no prologue zero-init needed. After the churn `r`
+# boxes 7, and `*r` reads it back: exit 7.
+import std/vec
+
+fn main() -> int {
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk: Vec[int] = []
+        junk.push(i)
+        i = i + 1
+    }
+    r := &7
+    return *r
+}
