@@ -32,12 +32,20 @@ fn isRefType(t: *const Typecheck, ty: Type) bool {
 }
 
 /// Whether `ty` transitively holds a MANAGED (reference) field — i.e. tracing it is not a
-/// no-op. A managed component is an immediate `true`; a by-value struct/enum component
-/// recurses (a `Ref` is a leaf boundary, NEVER recursed through). Terminates: by-value
-/// cycles are already a compile error (`Engine.layoutReferent`), and a `Ref`'s single field
-/// is `int`, so the by-value graph is a finite acyclic DAG. `memo` (keyed on the nominal id
-/// + the enum flag) collapses the DAG's shared subtrees.
-fn needsTrace(t: *Typecheck, ty: Type, memo: *std.AutoHashMapUnmanaged(u64, bool)) error{OutOfMemory}!bool {
+/// no-op. A `Ref`/`gc_array` box component is an immediate `true`; a by-value struct/enum
+/// component recurses (a `Ref` is a leaf boundary, NEVER recursed through). Terminates:
+/// by-value cycles are already a compile error (`Engine.layoutReferent`), and a `Ref`'s
+/// single field is `int`, so the by-value graph is a finite acyclic DAG. `memo` (keyed on the
+/// nominal id + the enum flag) collapses the DAG's shared subtrees.
+///
+/// `count_str` decides whether a `str` component (a managed leaf whose heap buffer is reached
+/// only by tracing the enclosing cell) makes the aggregate trace-requiring. The descriptor's
+/// erased trace unit — the one the collector actually dispatches through a container element
+/// walk — must see `str` as managed (it word-scans the cell, so the buffer pointer is
+/// marked). The vestigial natural-derive `Trace` fixpoint (emitted but never called under
+/// descriptor-driven tracing) passes `false`, so it synthesizes no dead unit for a str-only
+/// aggregate — which would otherwise enlarge a heap-free program's image.
+fn needsTrace(t: *Typecheck, ty: Type, count_str: bool, memo: *std.AutoHashMapUnmanaged(u64, bool)) error{OutOfMemory}!bool {
     switch (ty.kind) {
         .@"struct", .@"enum" => {},
         else => return false,
@@ -53,11 +61,15 @@ fn needsTrace(t: *Typecheck, ty: Type, memo: *std.AutoHashMapUnmanaged(u64, bool
     try collectComponentTypes(t, ty, &comps);
     var result = false;
     for (comps.items) |ft| {
+        if (count_str and ft.kind == .str) {
+            result = true;
+            break;
+        }
         switch (ft.kind) {
             .@"struct", .@"enum" => {},
             else => continue,
         }
-        if (isRefType(t, ft) or try needsTrace(t, ft, memo)) {
+        if (isRefType(t, ft) or try needsTrace(t, ft, count_str, memo)) {
             result = true;
             break;
         }
@@ -341,7 +353,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                     .@"struct", .@"enum" => {},
                     else => continue,
                 }
-                if (try needsTrace(t, ty, &tmemo))
+                if (try needsTrace(t, ty, false, &tmemo))
                     try enqueueDerive(gpa, &trace_seen, &trace_work, trace_pid, .trace, ty);
             }
         }
@@ -355,7 +367,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                     else => continue,
                 }
                 if (isRefType(t, ft)) continue; // the trace boundary — mark the cell, never recurse
-                if (try needsTrace(t, ft, &tmemo))
+                if (try needsTrace(t, ft, false, &tmemo))
                     try enqueueDerive(gpa, &trace_seen, &trace_work, trace_pid, .trace, ft);
             }
         }
@@ -583,6 +595,10 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
     // 3) resolve each: a descriptor entry, plus erased hash+eq units when `Hashable`.
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
+    // A SEPARATE memo for the trace-ability probe (distinct semantics from `hashable`, though
+    // keyed the same way, so it must not share `memo`).
+    var tmemo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer tmemo.deinit(gpa);
     for (uniq.items) |ty| {
         const hashable = if (pre.protocols.hashable) |hpid| (if (hash_pid_opt) |hp|
             try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, t.composite, ty, hpid, hp, pre.ref_struct, pre.gc_array_struct, &memo, gpa)
@@ -592,6 +608,15 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
         if (hashable) {
             try t.erased_units.append(gpa, .{ .ty = ty, .kind = .hash, .name = try Derive.erasedMangle(gpa, .hash, ty) });
             try t.erased_units.append(gpa, .{ .ty = ty, .kind = .eq, .name = try Derive.erasedMangle(gpa, .eq, ty) });
+        }
+        // A container stashes `descriptor_of[Elem]`/[K]/[V] in its header; the collector reads
+        // that descriptor's `trace_off` to mark the managed object each live cell references.
+        // Every MANAGED cell type gets an erased trace unit here (the ONE place its descriptor
+        // is minted): a heap `str` buffer, a `Ref`/`gc_array` box pointer, or a by-value
+        // aggregate transitively holding one (`needsTrace`). A scalar / managed-free aggregate
+        // needs none — its cells are leaves the leaf-marked backing already keeps.
+        if (ty.kind == .str or isRefType(t, ty) or try needsTrace(t, ty, true, &tmemo)) {
+            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .trace, .name = try Derive.erasedMangle(gpa, .trace, ty) });
         }
     }
 }

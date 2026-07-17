@@ -38,6 +38,16 @@ fn erasedNameFor(tc: *const Typecheck.GraphResult, ty: Typecheck.Type, kind: Der
     return null;
 }
 
+/// The mangled trace unit a descriptor's `trace_off` points at, or `null` when `ty` needs
+/// no tracing (a scalar / managed-free aggregate). The collector calls it as
+/// `(text_base + trace_off)(cell_addr)` to mark the managed heap object a `ty`-typed cell
+/// references. Only `str`/`Ref`/`gc_array` primitives carry one today (their erased trace
+/// unit); a managed-free type resolves to `null` → `trace_off` 0 → the container walk
+/// treats its cells as leaves.
+fn traceNameFor(tc: *const Typecheck.GraphResult, ty: Typecheck.Type) ?[]const u8 {
+    return erasedNameFor(tc, ty, .trace);
+}
+
 /// A user-facing failure while emitting code: a message plus the source byte
 /// offset to render as `line:col` (or `null` for whole-file errors). The driver
 /// returns these to `main`, which renders them and exits non-zero.
@@ -571,8 +581,10 @@ pub fn lowerGraphProgram(
 
     // Build the descriptor plan (canonical order = `tc.descriptor_types`), each entry's
     // `{size, align, size_class}` from the layout snapshot + the erased hash/eq unit names
-    // (borrowed from `tc.erased_units`); `trace_name` is a reserved slot filled by a later
-    // consumer. Threaded through relink → linkAndTail → linkProgram → Link.link.
+    // (borrowed from `tc.erased_units`); `trace_name` points at the type's trace unit (its
+    // erased str/Ref/gc_array trace, else null), so the collector resolves `trace_off` and
+    // dispatches container-element tracing. Threaded through relink → linkAndTail →
+    // linkProgram → Link.link.
     var desc_plan: std.ArrayList(Link.DescEntry) = .empty;
     defer desc_plan.deinit(gpa);
     for (tc.descriptor_types) |dt| {
@@ -584,7 +596,7 @@ pub fn lowerGraphProgram(
             .size_class = d.size_class,
             .hash_name = if (dt.hashable) erasedNameFor(tc, dt.ty, .hash) else null,
             .eq_name = if (dt.hashable) erasedNameFor(tc, dt.ty, .eq) else null,
-            .trace_name = null,
+            .trace_name = traceNameFor(tc, dt.ty),
         });
     }
 

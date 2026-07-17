@@ -4702,7 +4702,9 @@ test "`.hash()` recurses through a NESTED aggregate + str field (two recipes)" {
     );
     defer c.deinit(gpa);
     // Person's Hash fixpoint chases its `name: Name` field, deriving Hash for both — two
-    // recipes, both `.hash` kind. (Name = struct id 0, Person = struct id 1.)
+    // recipes, both `.hash` kind. No container/descriptor is in play, so no trace unit is
+    // synthesized (the vestigial natural-derive Trace fixpoint ignores str-only aggregates).
+    // (Name = struct id 0, Person = struct id 1.)
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 2), c.result.derives.len);
     for (c.result.derives) |d| try testing.expectEqual(Derive.Kind.hash, d.kind);
