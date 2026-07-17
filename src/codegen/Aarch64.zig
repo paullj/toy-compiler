@@ -249,6 +249,15 @@ pub fn ldrbRegUoff(rt: u32, rn: u32, byteOff: u12) u32 {
     return 0x39400000 | (@as(u32, byteOff) << 10) | (rn << 5) | rt;
 }
 
+/// ldr wt, [rn, #byteOff] — 32-bit zero-extended word load, unsigned scaled offset
+/// (byteOff a multiple of 4). ldr w0,[x0] → 0xB9400000; ldr w0,[x0,#4] → 0xB9400400.
+/// The GC root scan reads the packed `[u32 n][u32 sp_off …]` stack-map payload with it.
+pub fn ldrwRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 4 == 0);
+    const scaled: u32 = byteOff / 4;
+    return 0xB9400000 | (scaled << 10) | (rn << 5) | rt;
+}
+
 /// str rt, [rn, #byteOff] — 64-bit store, unsigned scaled offset, arbitrary base
 /// register `rn`. byteOff must be a multiple of 8. str x0,[x8] → 0xF9000100;
 /// str x1,[x8,#8] → 0xF9000501. Symmetric to `ldrRegUoff`; used for the

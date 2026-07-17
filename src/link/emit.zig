@@ -104,6 +104,11 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     // `panic` alone is consumed past the append: it drags in the `write` import and
     // reserves the backtrace symbol table's slot.
     const uses_panic = used[comptime CodegenIr.handBuiltinIndex("panic")];
+    // `gc_collect` present ⇒ the collector runs ⇒ reserve + emit the GC stack map. The
+    // static-call closure above already pulls `gc_collect` in via `gc_alloc`, so this is
+    // true for any allocating program and false for a heap-free one (keeping it
+    // byte-identical). Local to `linkProgram`: no new param threads through `Codegen`.
+    const uses_gc = used[comptime CodegenIr.handBuiltinIndex("gc_collect")];
     // Build the full fn set: the user fns + (if referenced) the hand-emitted builtin
     // bodies, appended in `hand_builtins` order so the linked image is a pure function of
     // the fn set (never thread order). We OWN `fns`' elements now (the caller relinquished
@@ -151,10 +156,24 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
             try off_by_hash.put(gpa, e.desc_hash, @intCast(@as(usize, desc_table_off) + i * 48));
         }
     }
-    const symtab_off: u32 = if (n_desc > 0)
+    // The GC stack map is reserved BETWEEN the descriptor table and the symtab, only when
+    // the collector runs. When no gc, `stackmap_off`/`stackmap_len` collapse and
+    // `symtab_off == after_desc` — the panic-but-not-gc corpus stays byte-identical.
+    const after_desc: u32 = if (n_desc > 0)
         std.mem.alignForward(u32, desc_table_off + @as(u32, @intCast(n_desc * 48)), 8)
     else
         desc_table_off;
+    const stackmap_off: u32 = after_desc;
+    var stackmap_len: u32 = 0;
+    if (uses_gc) {
+        if (off_by_hash.contains(Link.gc_stackmap_base_hash)) return error.CstringHashCollision;
+        try off_by_hash.put(gpa, Link.gc_stackmap_base_hash, stackmap_off);
+        stackmap_len = stackMapLen(all.items);
+    }
+    const symtab_off: u32 = if (uses_gc)
+        std.mem.alignForward(u32, stackmap_off + stackmap_len, 8)
+    else
+        after_desc;
     if (uses_panic) {
         if (off_by_hash.contains(Link.symtab_base_hash)) return error.CstringHashCollision;
         try off_by_hash.put(gpa, Link.symtab_base_hash, symtab_off);
@@ -184,18 +203,21 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     // 4) Intern symbols (source order) and link.
     var si: Link.SymInterner = .{};
     defer si.deinit(gpa);
-    const linked = try Link.link(io, gpa, all.items, &si, entry, uses_panic, descriptors);
+    const linked = try Link.link(io, gpa, all.items, &si, entry, uses_panic, uses_gc, descriptors);
     errdefer gpa.free(linked.text);
     errdefer gpa.free(linked.data_relocs);
     defer gpa.free(linked.sym_table);
     defer gpa.free(linked.desc_table);
+    defer gpa.free(linked.stack_map);
+    // The pre-link length reservation must equal the linked table's actual size.
+    std.debug.assert(!uses_gc or linked.stack_map.len == stackmap_len);
 
     // 4b) Append the reserved __cstring tail — the descriptor table (at `desc_table_off`)
     //     then the backtrace symbol table (at `symtab_off`), each padded to its 8-aligned
     //     start so it rides in the signed, read-only section and the reserved `.cstr` relocs
     //     resolve to it. With no descriptors the desc branch is skipped and the symtab pads
     //     to the SAME offset as before → byte-identical.
-    if (linked.desc_table.len > 0 or (uses_panic and linked.sym_table.len > 0)) {
+    if (linked.desc_table.len > 0 or (uses_gc and linked.stack_map.len > 0) or (uses_panic and linked.sym_table.len > 0)) {
         var grown: std.ArrayList(u8) = .empty;
         errdefer grown.deinit(gpa);
         const old = cstrings_blob.?;
@@ -203,6 +225,11 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
         if (linked.desc_table.len > 0) {
             try grown.appendNTimes(gpa, 0, @as(usize, desc_table_off) - grown.items.len);
             try grown.appendSlice(gpa, linked.desc_table);
+        }
+        // Stack map sits between the descriptor table and the symtab.
+        if (uses_gc and linked.stack_map.len > 0) {
+            try grown.appendNTimes(gpa, 0, @as(usize, stackmap_off) - grown.items.len);
+            try grown.appendSlice(gpa, linked.stack_map);
         }
         if (uses_panic and linked.sym_table.len > 0) {
             try grown.appendNTimes(gpa, 0, @as(usize, symtab_off) - grown.items.len);
@@ -240,6 +267,19 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
         .cstrings = cstr_bytes,
         .data_relocs = linked.data_relocs,
     };
+}
+
+/// The pre-link byte length of the GC stack-map table `Link.buildStackMapTable` will
+/// produce for `fns` — computed from each `FnCode.root_bitmap` (present pre-link), so the
+/// symtab's reserved offset is known before layout. Two spellings of one size; the
+/// `std.debug.assert` at the link callsite guards them against drift. Layout mirrors
+/// `buildSideTable`: `[u64 count][{off,payload_off}×count][blob]`, count = fns+1 (sentinel),
+/// blob = Σ per-fn payload (`root_bitmap` or the 4-byte conservative marker) + the
+/// sentinel's 4-byte marker.
+fn stackMapLen(fns: []const Link.FnCode) u32 {
+    var blob: usize = 4; // sentinel's conservative marker
+    for (fns) |f| blob += if (f.root_bitmap.len == 0) 4 else f.root_bitmap.len;
+    return @intCast(8 + (fns.len + 1) * 16 + blob);
 }
 
 /// Rewrite one fn's `.cstr` reloc targets from content hash → global `__cstring`
@@ -615,6 +655,36 @@ test "backend determinism: a gc_alloc-using image is byte-identical at -j1 and -
     defer gpa.free(img_par);
 
     try testing.expectEqualSlices(u8, img_serial, img_par);
+}
+
+test "backend determinism: the gc stack-map table (riding __cstring) is byte-identical at -j1 and -jN" {
+    // A gc_alloc-using program reserves + appends the GC stack map into the signed,
+    // read-only __cstring blob. It is built from the layout (stable-sort-ranked offsets +
+    // each fn's root bitmap), a pure function of the fn set, so the whole __cstring blob —
+    // stack map included — is byte-identical regardless of thread count. Assert the blob is
+    // non-empty (the table rides it) and matches across `-j`.
+    const gpa = testing.allocator;
+    const entry = Link.SymName{ .kind = .user_fn, .name = "main" };
+
+    const fns_serial = try gcFns(gpa);
+    defer gpa.free(fns_serial);
+    var t_serial = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer t_serial.deinit();
+    var serial = try linkProgram(t_serial.io(), gpa, fns_serial, entry, &.{});
+    defer freeLinked(gpa, &serial);
+
+    const fns_par = try gcFns(gpa);
+    defer gpa.free(fns_par);
+    var t_par = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(8) });
+    defer t_par.deinit();
+    var parallel_lk = try linkProgram(t_par.io(), gpa, fns_par, entry, &.{});
+    defer freeLinked(gpa, &parallel_lk);
+
+    try testing.expectEqualSlices(u8, serial.text, parallel_lk.text);
+    try testing.expectEqualSlices(u8, serial.cstrings, parallel_lk.cstrings);
+    // The stack map lives in __cstring: a gc program's blob is non-empty even with no string
+    // literals (the reserved table bytes are appended past the literal region).
+    try testing.expect(serial.cstrings.len > 0);
 }
 
 /// Three fns with distinct cstrings; `main` also calls `panic`. Fresh (owned) each call
