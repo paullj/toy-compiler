@@ -35,19 +35,6 @@ const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
 pub const DeriveRecipe = Derive.Derive;
 
-/// A reified aggregate's static `{size, align, size_class}` record, co-produced by the
-/// auto-derive synthesis barrier alongside its `trace`/`eq`/`hash` units. Keyed on the
-/// reified nominal id (index-independent). An in-memory table only — never serialized into
-/// the image; its consumer (the allocator / a later precise-tracing milestone) reads it in
-/// process. Plain PODs, so teardown frees only the backing array.
-pub const TypeDescriptor = struct {
-    reified_id: u32,
-    is_enum: bool,
-    size: u32,
-    @"align": u32,
-    size_class: u16,
-};
-
 /// One type demanded by a `descriptor_of[T]()` site, resolved after synthesis. `hashable`
 /// records whether `T` conforms to `Hash`+`Eq` (so its descriptor carries erased
 /// hash/eq references, else those slots are null/absent). PODs — the ty is a reified value.
@@ -1141,11 +1128,6 @@ conv_float_int_result: ?Type = null,
 /// `GraphResult.derives` by `checkGraph`; leftover (error path) freed by the teardown.
 derives: std.ArrayList(DeriveRecipe) = .empty,
 
-/// The static per-reified-type descriptors, co-produced with the derive recipes by the
-/// synthesis barrier (one per aggregate the trace walk visits). In-memory only (PODs);
-/// its consumer is a later milestone, so it is provisioned but not yet read or emitted.
-descriptors: std.ArrayList(TypeDescriptor) = .empty,
-
 /// The types demanded by `descriptor_of[T]()` sites, merged in fn-id order by
 /// `checkBodies` (mirroring `derive_reqs`), then reified and consumed by the synthesis
 /// barrier (deduped + canonically sorted into `descriptor_types`/`erased_units`). Empty
@@ -1568,8 +1550,6 @@ pub fn checkGraph(
         t.derive_reqs.deinit(gpa);
         freeDeriveEntries(gpa, t.derives.items);
         t.derives.deinit(gpa);
-        // The descriptor table holds PODs (no per-entry owned data); free the backing array.
-        t.descriptors.deinit(gpa);
         // Descriptor requests + resolved plan (PODs). Any un-transferred erased units
         // (error path) own their minted `name`; the success path empties the list first.
         t.descriptor_reqs.deinit(gpa);

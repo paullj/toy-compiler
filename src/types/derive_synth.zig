@@ -413,11 +413,8 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         });
     }
 
-    // Trace recipes + the co-produced `{size, align, size_class}` descriptor records. The
-    // sentinel `trace_pid` sorts these LAST, so no eq/ord/hash/display recipe's position or
-    // minted name shifts. Descriptors read the already-computed layout off the live
-    // struct/enum tables (`layoutStruct`/`layoutEnum` ran before this barrier); the table is
-    // in-memory only (its consumer is a later milestone) and never affects the image bytes.
+    // Trace recipes. The sentinel `trace_pid` sorts these LAST, so no eq/ord/hash/display
+    // recipe's position or minted name shifts.
     for (trace_work.items) |ty| {
         try t.derives.append(gpa, .{
             .protocol_id = trace_pid,
@@ -425,17 +422,6 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             .kind = .trace,
             .conform_ty = ty,
             .ret = Type.unit,
-        });
-        const is_enum = ty.kind == .@"enum";
-        const id = ty.nominalId();
-        const size = if (is_enum) t.enums.items[id].size else t.structs.items[id].size;
-        const algn = if (is_enum) t.enums.items[id].@"align" else t.structs.items[id].@"align";
-        try t.descriptors.append(gpa, .{
-            .reified_id = id,
-            .is_enum = is_enum,
-            .size = size,
-            .@"align" = algn,
-            .size_class = Abi.sizeClassFor(size),
         });
     }
 
