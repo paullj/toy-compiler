@@ -1320,8 +1320,10 @@ fn emitVariantTrace(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_base
 /// struct walks its fields in layout order; a payload enum does a `get_tag` dispatch ladder
 /// over each variant's payload. Every managed field emits a `bl gc_mark` (the trace
 /// boundary); by-value aggregates that hold managed fields call their sibling trace witness;
-/// scalar/str/unmanaged fields are no-ops. EMITTED but not yet CALLED at runtime — the
-/// collector's object scan stays conservative until a later milestone swaps it to this.
+/// scalar/str/unmanaged fields are no-ops. VESTIGIAL: this typed unit is emitted but never
+/// called. Descriptor-driven tracing dispatches per object through the ERASED per-type trace
+/// units named in the descriptor table (`traceNameFor` -> `lowerErasedTrace`), not this one,
+/// so it has no runtime caller and is dead-stripped (removing the dead emission is a follow-up).
 fn lowerDeriveTrace(
     gpa: std.mem.Allocator,
     in: L.Inputs,
