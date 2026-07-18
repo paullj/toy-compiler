@@ -2256,7 +2256,7 @@ pub fn lowerGaTrace(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.movz(23, 0, 0)); // fn addr = 0 (no element trace)
     const cbz_skip_a: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(2, 0)); // elem_desc == 0 → no trace
-    try emit(&code, gpa, A.ldrRegUoff(3, 2, 40)); // trace_off
+    try emit(&code, gpa, A.ldrRegUoff(3, 2, Abi.desc.trace_off)); // descriptor trace_off
     const cbz_skip_b: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(3, 0)); // trace_off == 0 → unmanaged element
     try emitTextBase(&code, &relocs, gpa, 4); // x4 = text_base
@@ -2347,7 +2347,7 @@ pub fn lowerMpTrace(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ldrRegUoff(4, 26, 40)); // key_desc
     const cbz_nok: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(4, 0));
-    try emit(&code, gpa, A.ldrRegUoff(5, 4, 40)); // key trace_off
+    try emit(&code, gpa, A.ldrRegUoff(5, 4, Abi.desc.trace_off)); // key descriptor trace_off
     const cbz_nok2: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(5, 0));
     try emit(&code, gpa, A.addReg(23, 27, 5));
@@ -2360,7 +2360,7 @@ pub fn lowerMpTrace(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ldrRegUoff(4, 26, 48)); // val_desc
     const cbz_nov: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(4, 0));
-    try emit(&code, gpa, A.ldrRegUoff(5, 4, 40)); // val trace_off
+    try emit(&code, gpa, A.ldrRegUoff(5, 4, Abi.desc.trace_off)); // val descriptor trace_off
     const cbz_nov2: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbz(5, 0));
     try emit(&code, gpa, A.addReg(25, 27, 5));
