@@ -409,7 +409,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             .protocol_name = disp_name,
             .kind = .display,
             .conform_ty = ty,
-            .ret = Type.unit,
+            .ret = Type.str,
         });
     }
 

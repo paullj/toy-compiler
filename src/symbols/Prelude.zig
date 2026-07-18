@@ -33,7 +33,7 @@ const Slot = enum { eq, ord, add, sub, mul, div, hash, display, from, into, try_
 /// A prelude protocol's return-type shape. `ordering` is resolved to `Type.enumT(id)`
 /// against the runtime `Ordering` id; the rest are concrete or `Self` (`type_var(0)`).
 /// `dst_t` is the protocol's first generic arg (`Dst`, `type_var(1)`).
-const Ret = enum { self_t, bool_t, int_t, unit_t, ordering_t, dst_t };
+const Ret = enum { self_t, bool_t, int_t, unit_t, str_t, ordering_t, dst_t };
 
 const ProtoSpec = struct {
     slot: Slot,
@@ -56,6 +56,9 @@ const from_params: []const Type = &.{Type.typeVar(1)};
 // str/unit join int/bool for Eq/Hash/Display so the operator's uniform conformance check
 // covers every scalar; arithmetic is int-ONLY (str concat allocates, deferred). Ord omits
 // unit (no ordering). From registers NO builtin conformance (always needs an explicit impl).
+// Display's method returns `str` (a value's rendering, built once): `print` writes it and
+// `to_string` returns it, so a custom `impl .. has Display` MUST provide `fn display(self)
+// -> str` (a unit-returning body is a T0024 via the coherence ret-eql check).
 const specs = [_]ProtoSpec{
     .{ .slot = .eq, .name = "Eq", .method = "eq", .params = homogeneous, .ret = .bool_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit, Type.float } },
     .{ .slot = .ord, .name = "Ord", .method = "cmp", .params = homogeneous, .ret = .ordering_t, .conf = &.{ Type.int, Type.str, Type.bool } },
@@ -64,7 +67,7 @@ const specs = [_]ProtoSpec{
     .{ .slot = .mul, .name = "Mul", .method = "mul", .params = homogeneous, .ret = .self_t, .conf = &.{Type.int} },
     .{ .slot = .div, .name = "Div", .method = "div", .params = homogeneous, .ret = .self_t, .conf = &.{Type.int} },
     .{ .slot = .hash, .name = "Hash", .method = "hash", .params = self_only, .ret = .int_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit } },
-    .{ .slot = .display, .name = "Display", .method = "display", .params = self_only, .ret = .unit_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit } },
+    .{ .slot = .display, .name = "Display", .method = "display", .params = self_only, .ret = .str_t, .conf = &.{ Type.int, Type.bool, Type.str, Type.unit } },
     .{ .slot = .from, .name = "From", .method = "from", .params = from_params, .ret = .self_t, .generic_params = &.{"Src"} },
     .{ .slot = .into, .name = "Into", .method = "into", .params = self_only, .ret = .dst_t, .generic_params = &.{"Dst"} },
     // `TryInto.try_into`'s declared ret `dst_t` (=`Dst`) is a deliberate PLACEHOLDER: the
@@ -107,6 +110,7 @@ pub fn register(
             .bool_t => Type.bool,
             .int_t => Type.int,
             .unit_t => Type.unit,
+            .str_t => Type.str,
             .ordering_t => Type.enumT(ordering_id),
             .dst_t => Type.typeVar(1),
         };
@@ -465,6 +469,25 @@ test "Into=9/TryInto=10 after From; ConvErr appended after Result" {
     const ce = enums.items[prelude.conv_err_enum.?];
     try testing.expectEqual(@as(usize, 1), ce.variants.len);
     try testing.expect(std.mem.eql(u8, ce.variants[0].name, "out_of_range"));
+}
+
+test "Display's method returns str (print writes it / to_string returns it)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+
+    var protocols: std.ArrayList(ProtocolSym) = .empty;
+    var conformances: std.ArrayList(Conformance) = .empty;
+    var enums: std.ArrayList(EnumSym) = .empty;
+    var structs: std.ArrayList(StructSym) = .empty;
+    var mods = [_]ModuleCtx{};
+
+    const prelude = try register(gpa, &protocols, &conformances, &enums, &structs, &mods);
+    const d = protocols.items[prelude.protocols.display.?];
+    try testing.expectEqualStrings("Display", d.name);
+    try testing.expectEqualStrings("display", d.methods[0]);
+    try testing.expectEqual(@as(usize, 1), d.method_params[0].len); // self-only
+    try testing.expect(Type.eql(Type.str, d.method_rets[0]));
 }
 
 test "char is a hand-laid-out tuple struct(uint32), size 8, done" {

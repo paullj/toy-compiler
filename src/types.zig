@@ -773,7 +773,9 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
 /// take a non-`Self` arg, and `builtinScalarEqCallee` keys on any arity-1 scalar method
 /// WITHOUT checking the name — folding `concat` in there would misroute it to `eq`. A
 /// pure, table-free recognizer (no `t.methods`/`t.fns` row) shared by the checker and
-/// lower so the two consumers cannot drift. `to_string` on int/bool/str produces a str.
+/// lower so the two consumers cannot drift. `to_string` on int/bool/str/unit produces a str
+/// (it is `self.display()` for every Display-conforming scalar); struct/enum `to_string` is
+/// gated separately (it may record a structural Display derive), so it is NOT recognized here.
 pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, params: []const Type } {
     if (recv.kind == .str) {
         if (std.mem.eql(u8, name, "concat")) return .{ .ret = Type.str, .params = &.{Type.str} };
@@ -781,7 +783,7 @@ pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, param
         if (std.mem.eql(u8, name, "byte_at")) return .{ .ret = Type.int, .params = &.{Type.int} };
         if (std.mem.eql(u8, name, "to_string")) return .{ .ret = Type.str, .params = &.{} };
     }
-    if ((recv.isInteger() or recv.kind == .bool) and std.mem.eql(u8, name, "to_string"))
+    if ((recv.isInteger() or recv.kind == .bool or recv.kind == .unit) and std.mem.eql(u8, name, "to_string"))
         return .{ .ret = Type.str, .params = &.{} };
     return null;
 }
@@ -3697,7 +3699,10 @@ test "builtinStrMethod recognizes str concat/len/byte_at + int/bool to_string, r
     try testing.expectEqual(Kind.str, builtinStrMethod(Type.int, "to_string").?.ret.kind);
     try testing.expectEqual(Kind.str, builtinStrMethod(Type.bool, "to_string").?.ret.kind);
     try testing.expectEqual(Kind.str, builtinStrMethod(Type.str, "to_string").?.ret.kind);
+    // `()` gained `to_string` (it is `self.display()` -> the const-data `"()"`).
+    try testing.expectEqual(Kind.str, builtinStrMethod(Type.unit, "to_string").?.ret.kind);
     try testing.expect(builtinStrMethod(Type.int, "concat") == null);
+    // struct/enum `to_string` is gated in the checker (may derive Display), not here.
     try testing.expect(builtinStrMethod(Type.structT(0), "to_string") == null);
 }
 
@@ -4815,12 +4820,13 @@ test "`print(P{..})` on an all-Display-fields struct DERIVES exactly one recipe"
     );
     defer c.deinit(gpa);
     // The reworked `print` accepts a Display arg: it records ONE structural Display derive
-    // (struct id 0 -> `Display$display$s0`), no diagnostic, ret unit, `self`-only (1 param).
+    // (struct id 0 -> `Display$display$s0`), no diagnostic, ret str (the built rendering),
+    // `self`-only (1 param).
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
     try testing.expectEqualStrings("Display$display$s0", c.result.derives[0].name.?);
     try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
-    try testing.expectEqual(Kind.unit, c.result.derives[0].ret.kind);
+    try testing.expectEqual(Kind.str, c.result.derives[0].ret.kind);
     try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
 }
 
@@ -4880,7 +4886,7 @@ test "explicit `impl P has Display` OVERRIDES the derive (zero synthetic units)"
     var c = try checkSource(
         \\struct P { x: int }
         \\impl P has Display {
-        \\ fn display(self) { print("x") }
+        \\ fn display(self) -> str { return "x" }
         \\}
         \\fn main() {
         \\ print(P{ x: 1 })
@@ -4892,6 +4898,58 @@ test "explicit `impl P has Display` OVERRIDES the derive (zero synthetic units)"
     // derive fires.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+}
+
+test "`x.to_string()` on a struct records one Display derive (to_string == display)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\fn main() {
+        \\ s := P{ x: 4, y: 2 }.to_string()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    // to_string reuses the SAME `conformsTo(display)` gate print uses: it records ONE
+    // structural Display derive and types the call `str`.
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
+    try testing.expectEqual(Kind.str, c.result.derives[0].ret.kind);
+}
+
+test "`to_string` on a struct with a non-Display (float) field is T0031 (shared gate)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Bad { f: float }
+        \\fn main() {
+        \\ s := Bad{ f: 1.5 }.to_string()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len >= 1);
+    try testing.expectEqual(codes.Code.T0031, c.result.diags[0].code);
+    // The message uses the `to_string` verb (print's would mislead).
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "to_string") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "float") != null);
+}
+
+test "a unit-returning custom `impl Display` is a clean T0024 (ret must be str)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Display {
+        \\ fn display(self) { }
+        \\}
+        \\fn main() {
+        \\ print(P{ x: 1 })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len >= 1);
+    try testing.expectEqual(codes.Code.T0024, c.result.diags[0].code);
 }
 
 test "`print(\"..\")` still types clean and derives nothing (str path unchanged)" {

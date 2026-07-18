@@ -1021,7 +1021,7 @@ fn addLiteral(g: *Gen, hash: u64, bytes: []u8) error{OutOfMemory}!void {
 }
 
 // A tiny shared harness for the hand-emitted `write`-calling builtins
-// (`lowerDisplayInt`/`lowerPanic`). Each still writes its own body; these own only the
+// (`lowerPanic` and friends). Each still writes its own body; these own only the
 // boilerplate every one repeats verbatim — opening a frame, the `write` GOT-import
 // preamble (byte-identical bar the destination register), the error-path reloc-name
 // cleanup, and packaging the finished FnCode.
@@ -1109,7 +1109,6 @@ pub const HandBuiltin = struct {
 /// linked image order-independent of the fn set's discovery/thread order. Append,
 /// never reorder.
 pub const hand_builtins = [_]HandBuiltin{
-    .{ .name = "__display_int", .lower = lowerDisplayInt },
     .{ .name = "panic", .lower = lowerPanic },
     .{ .name = "gc_alloc", .lower = lowerGcAlloc, .static_call_deps = &.{"gc_collect"} },
     .{ .name = "gc_span_count", .lower = lowerGcSpanCount },
@@ -1196,79 +1195,18 @@ test "gc_mark_leaf marks without pushing (no mark-stack realloc), unlike gc_mark
     try std.testing.expect(leaf.code.len < mark.code.len);
 }
 
-// __display_int(n) builtin body — hand-written, AST/IR-independent. The
-// heap-free `int`->decimal renderer: format the digits of the i64 in x0 into a
-// fixed 32-byte STACK buffer (backward, so no reversal), then tail into
-// write(fd=1, buf, len). Appended at link time (emit.zig) when any fn references
-// `__display_int`; like `print` it uses only the stack + the `write` syscall, so
-// a generated program that displays an int touches NO allocator.
-//
-// Digit extraction avoids i64::MIN overflow by NEVER negating the running value:
-// each step computes q = n/10 (sdiv, truncates toward zero) and the single-digit
-// remainder r = n - q*10 (range -9..9), takes |r| (safe — |r| <= 9), and stores
-// '0'+|r|. The original sign (saved in x9) prepends a '-'. n==0 emits one '0' via
-// the do-while shape. All branch offsets are compile-time-known local words.
-
-/// Build the `__display_int` builtin's FnCode directly (no IR, no frame beyond the
-/// 32-byte digit buffer). Caller owns the result.
-pub fn lowerDisplayInt(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
-    var code: std.ArrayList(u8) = .empty;
-    errdefer code.deinit(gpa);
-    var relocs: std.ArrayList(Link.Reloc) = .empty;
-    errdefer deinitBuiltinRelocs(&relocs, gpa);
-
-    const emit = emitWord;
-
-    const A = Aarch64;
-    // Prologue + reserve a 32-byte digit buffer at [sp, sp+32); saved fp/lr sit above.
-    try emitFramePrologue(&code, gpa);
-    try emit(&code, gpa, A.subImm(A.SP, A.SP, 32)); // sub sp, sp, #32
-    try emit(&code, gpa, A.movReg(9, 0)); // x9 = n (saved for the sign test)
-    try emit(&code, gpa, A.movz(11, 10, 0)); // x11 = 10 (divisor)
-    try emit(&code, gpa, A.movz(14, 0x30, 0)); // x14 = '0'
-    try emit(&code, gpa, A.addImm(10, A.SP, 24)); // x10 = &buf_end (write cursor, grows down)
-    // do-while digit loop (LOOP = this sdiv):
-    try emit(&code, gpa, A.sdiv(12, 0, 11)); // x12 = n / 10
-    try emit(&code, gpa, A.mul(13, 12, 11)); // x13 = q * 10
-    try emit(&code, gpa, A.subReg(13, 0, 13)); // x13 = n - q*10  (signed remainder)
-    try emit(&code, gpa, A.cmpImm(13, 0)); // cmp r, #0
-    try emit(&code, gpa, A.bCond(.ge, 2)); // b.ge +2  (skip the neg if r >= 0)
-    try emit(&code, gpa, A.neg(13, 13)); // x13 = -r   (|r|, safe: |r| <= 9)
-    try emit(&code, gpa, A.addReg(13, 13, 14)); // x13 = '0' + digit
-    try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
-    try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = digit char
-    try emit(&code, gpa, A.movReg(0, 12)); // n = q
-    try emit(&code, gpa, A.cbnz(0, -10)); // cbnz n, LOOP  (back 10 words to the sdiv)
-    // Sign: if the original value was negative, prepend '-'.
-    try emit(&code, gpa, A.cmpImm(9, 0)); // cmp orig, #0
-    try emit(&code, gpa, A.bCond(.ge, 4)); // b.ge +4  (skip the 3 sign instrs if >= 0)
-    try emit(&code, gpa, A.movz(13, 0x2D, 0)); // x13 = '-'
-    try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
-    try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = '-'
-    // write(fd=1, buf=cursor, len=buf_end-cursor).
-    try emit(&code, gpa, A.addImm(1, A.SP, 24)); // x1 = &buf_end
-    try emit(&code, gpa, A.subReg(2, 1, 10)); // x2 = len = end - cursor
-    try emit(&code, gpa, A.movReg(1, 10)); // x1 = buf = cursor
-    try emit(&code, gpa, A.movz(0, 1, 0)); // x0 = fd = 1
-    try emitWriteImport(&code, &relocs, gpa, 16); // x16 = &write
-    try emit(&code, gpa, A.blr(16));
-    // Epilogue.
-    try emit(&code, gpa, A.addImm(A.SP, A.SP, 32)); // sub-buffer teardown
-    try emit(&code, gpa, A.ldpFpLrPost); // ldp x29,x30,[sp],#16
-    try emit(&code, gpa, A.ret);
-
-    return finishBuiltin(&code, &relocs, gpa, "__display_int");
-}
-
 // __int_to_str(n) builtin body — hand-written, AST/IR-independent. Renders the i64 in x0
 // into a fresh `gc_alloc`'d packed byte buffer and returns the str reg-pair
 // (x0 = ptr@buffer-base, x1 = len). Appended at link time (emit.zig) when any fn
-// references `__int_to_str`; unlike `__display_int` (which write()s to fd 1) it allocates,
-// so its used-scan pulls in `gc_alloc` (and `gc_collect` by closure).
+// references `__int_to_str`; it allocates, so its used-scan pulls in `gc_alloc` (and
+// `gc_collect` by closure).
 //
-// The digit render reuses `__display_int`'s verbatim never-negate loop + sign prepend (so
-// i64::MIN is correct): format backward into a 32-byte STACK buffer, giving the digit
-// start (cursor) and length. Two extra reserved stack words hold cursor/len across the
+// Digit extraction avoids i64::MIN overflow by NEVER negating the running value: each step
+// computes q = n/10 (sdiv, truncates toward zero) and the single-digit remainder
+// r = n - q*10 (range -9..9), takes |r| (safe — |r| <= 9), and stores '0'+|r|. The original
+// sign (saved in x9) prepends a '-'. n==0 emits one '0' via the do-while shape. Format
+// backward into a 32-byte STACK buffer, giving the digit start (cursor) and length. Two
+// extra reserved stack words hold cursor/len across the
 // `gc_alloc` call (which clobbers x0-x18); the buffer is sp-addressed and survives. Then
 // copy exactly `len` bytes forward into the cell (ptr@0, no header), matching the uniform
 // owned-str model, and return.
@@ -1291,7 +1229,7 @@ pub fn lowerIntToStr(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.movz(11, 10, 0)); // x11 = 10 (divisor)
     try emit(&code, gpa, A.movz(14, 0x30, 0)); // x14 = '0'
     try emit(&code, gpa, A.addImm(10, A.SP, 48)); // x10 = &buf_end (write cursor, grows down)
-    // do-while digit loop (LOOP = this sdiv) — verbatim from __display_int.
+    // do-while digit loop (LOOP = this sdiv) — the never-negate render (i64::MIN-correct).
     try emit(&code, gpa, A.sdiv(12, 0, 11)); // x12 = n / 10
     try emit(&code, gpa, A.mul(13, 12, 11)); // x13 = q * 10
     try emit(&code, gpa, A.subReg(13, 0, 13)); // x13 = n - q*10 (signed remainder)
@@ -2984,26 +2922,23 @@ test "panic backpatch wrappers resolve signed word deltas, preserving opcode/rt/
 
 const testing = std.testing;
 
-test "ir-codegen: __display_int builtin byte shape (prologue, buffer, digit loop, write, ret)" {
+test "ir-codegen: __int_to_str builtin byte shape (prologue, buffer, digit loop, gc_alloc, ret)" {
     const gpa = testing.allocator;
-    var fc = try lowerDisplayInt(gpa);
+    var fc = try lowerIntToStr(gpa);
     defer fc.deinit(gpa);
 
-    // A hand-asm builtin named `__display_int`.
-    try testing.expectEqualStrings("__display_int", fc.sym.name);
+    // A hand-asm builtin named `__int_to_str`.
+    try testing.expectEqualStrings("__int_to_str", fc.sym.name);
     try testing.expectEqual(Link.SymKind.builtin, fc.sym.kind);
     // 4-byte aligned instruction stream; opens with the frame prologue.
     try testing.expect(fc.code.len % 4 == 0);
     try testing.expectEqual(Aarch64.stpFpLrPre, std.mem.readInt(u32, fc.code[0..4], .little));
-    // Reserves the 32-byte digit buffer right after `mov x29,sp`.
-    try testing.expectEqual(Aarch64.subImm(Aarch64.SP, Aarch64.SP, 32), std.mem.readInt(u32, fc.code[8..12], .little));
     // Ends with `ret`; the two instructions before it are the frame teardown.
     const n = fc.code.len;
     try testing.expectEqual(Aarch64.ret, std.mem.readInt(u32, fc.code[n - 4 ..][0..4], .little));
     try testing.expectEqual(Aarch64.ldpFpLrPost, std.mem.readInt(u32, fc.code[n - 8 ..][0..4], .little));
-    try testing.expectEqual(Aarch64.addImm(Aarch64.SP, Aarch64.SP, 32), std.mem.readInt(u32, fc.code[n - 12 ..][0..4], .little));
-    // The body contains the backward loop back-edge (`cbnz x0, -10`) and at least one
-    // byte store (`strb w13,[x10]`) — the digit-emitting core.
+    // The body contains the backward digit-loop back-edge (`cbnz x0, -10`) and at least one
+    // byte store (`strb w13,[x10]`) — the shared never-negate digit core.
     var saw_cbnz = false;
     var saw_strb = false;
     var i: usize = 0;
@@ -3014,12 +2949,12 @@ test "ir-codegen: __display_int builtin byte shape (prologue, buffer, digit loop
     }
     try testing.expect(saw_cbnz);
     try testing.expect(saw_strb);
-    // Two relocs to the `write` import (adrp_page + ldr_lo12), like `print`.
-    try testing.expectEqual(@as(usize, 2), fc.relocs.len);
+    // It allocates (unlike a bare fd write): a `.call26` reloc to the `gc_alloc` builtin.
+    var saw_gc_alloc = false;
     for (fc.relocs) |r| {
-        try testing.expect(r.target == .import);
-        try testing.expectEqualStrings("write", r.target.import.name);
+        if (r.kind == .call26 and r.target == .func and std.mem.eql(u8, r.target.func.name, "gc_alloc")) saw_gc_alloc = true;
     }
+    try testing.expect(saw_gc_alloc);
 }
 
 test "gc_alloc: names the builtin, opens a frame, and carries a bl gc_collect call reloc" {

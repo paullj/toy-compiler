@@ -50,6 +50,107 @@ fn runExit(gpa: std.mem.Allocator, io: Io, prog: []const u8) !u8 {
     };
 }
 
+fn runStdout(gpa: std.mem.Allocator, io: Io, prog: []const u8) ![]u8 {
+    var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const out = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    errdefer gpa.free(out);
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.ChildFailed;
+    return out;
+}
+
+/// A kind's rendering under `print(x)` and `print(x.to_string())` must be the identical
+/// bytes — the invariant `print(x) ≡ print(x.to_string())`, proven per kind against the
+/// running program's stdout (not a compiler internal).
+const PrintCase = struct { name: []const u8, defs: []const u8, expr: []const u8 };
+
+const print_ts_cases = [_]PrintCase{
+    .{ .name = "str", .defs = "", .expr = "\"hi there\"" },
+    .{ .name = "int", .defs = "", .expr = "42" },
+    .{ .name = "int-neg", .defs = "", .expr = "(0 - 7)" },
+    .{ .name = "int-min", .defs = "", .expr = "(-9223372036854775807 - 1)" },
+    .{ .name = "bool", .defs = "", .expr = "true" },
+    .{ .name = "unit", .defs = "", .expr = "()" },
+    .{ .name = "record", .defs = "struct Point { x: int, y: int }\n", .expr = "Point{ x: 4, y: 2 }" },
+    .{ .name = "tuple", .defs = "struct Tup(int, bool)\n", .expr = "Tup(9, true)" },
+    .{ .name = "enum-payload", .defs = "enum Color { R(int), G, B }\n", .expr = "Color.R(7)" },
+    .{ .name = "enum-bare", .defs = "enum Color { R(int), G, B }\n", .expr = "Color.G" },
+    .{ .name = "char-multibyte", .defs = "", .expr = "'\\u{20AC}'" },
+    .{ .name = "nested", .defs = "struct Inner { u: int, v: int }\nstruct Outer { lo: Inner, hi: Inner }\n", .expr = "Outer{ lo: Inner{ u: 1, v: 2 }, hi: Inner{ u: 3, v: 4 } }" },
+};
+
+test "string: print(x) and print(x.to_string()) are byte-identical stdout for every kind" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    for (print_ts_cases) |c| {
+        const src_print = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{ x := {s}\n print(x)\n return 0 }}\n", .{ c.defs, c.expr });
+        defer gpa.free(src_print);
+        const src_ts = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{ x := {s}\n print(x.to_string())\n return 0 }}\n", .{ c.defs, c.expr });
+        defer gpa.free(src_ts);
+
+        const dir_p = try std.fmt.allocPrint(gpa, ".toy-test-pts-{s}-p", .{c.name});
+        defer gpa.free(dir_p);
+        const dir_t = try std.fmt.allocPrint(gpa, ".toy-test-pts-{s}-t", .{c.name});
+        defer gpa.free(dir_t);
+        Io.Dir.cwd().deleteTree(io, dir_p) catch {};
+        Io.Dir.cwd().deleteTree(io, dir_t) catch {};
+        defer Io.Dir.cwd().deleteTree(io, dir_p) catch {};
+        defer Io.Dir.cwd().deleteTree(io, dir_t) catch {};
+
+        const prog_p = try compile(gpa, io, dir_p, src_print, &.{});
+        defer gpa.free(prog_p);
+        const prog_t = try compile(gpa, io, dir_t, src_ts, &.{});
+        defer gpa.free(prog_t);
+
+        const out_p = try runStdout(gpa, io, prog_p);
+        defer gpa.free(out_p);
+        const out_t = try runStdout(gpa, io, prog_t);
+        defer gpa.free(out_t);
+
+        std.testing.expectEqualStrings(out_p, out_t) catch |e| {
+            std.debug.print("print==to_string mismatch for kind '{s}'\n", .{c.name});
+            return e;
+        };
+    }
+}
+
+const custom_display_src =
+    \\struct Money { cents: int }
+    \\impl Money has Display {
+    \\    fn display(self) -> str { return "$".concat(self.cents.to_string()) }
+    \\}
+    \\fn main() -> int {
+    \\    m := Money{ cents: 42 }
+    \\    if !(m.to_string() == "$42") { return 1 }
+    \\    if !(m.to_string().concat("!") == "$42!") { return 2 }
+    \\    return 0
+    \\}
+    \\
+;
+
+test "string: to_string on a custom-Display type returns the impl's str (universal, round-trips)" {
+    try expectPass(".toy-test-string-custom-display", custom_display_src);
+}
+
+const wide_ts_src =
+    \\struct Wide { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int, j: int, k: int, l: int, m: int }
+    \\fn main() -> int {
+    \\    w := Wide{ a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13 }
+    \\    if !(w.to_string() == "Wide{a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13}") { return 1 }
+    \\    return 0
+    \\}
+    \\
+;
+
+test "string: a 13-field struct renders under to_string (no field-count cliff)" {
+    try expectPass(".toy-test-string-wide-ts", wide_ts_src);
+}
+
 fn expectPass(dir: []const u8, src: []const u8) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -172,6 +273,42 @@ test "string: a concat program is byte-identical at -j1 and -j8" {
     const p1 = try compile(gpa, io, dir ++ "/j1", det_src, &.{ "--force", "-j1" });
     defer gpa.free(p1);
     const p8 = try compile(gpa, io, dir ++ "/j8", det_src, &.{ "--force", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqualSlices(u8, b1, b8);
+}
+
+const ts_det_src =
+    \\struct Point { x: int, y: int }
+    \\fn main() -> int {
+    \\    p := Point{ x: 4, y: 2 }
+    \\    print(p)
+    \\    print(p.to_string())
+    \\    print(42.to_string())
+    \\    return 0
+    \\}
+    \\
+;
+
+test "string: a print/to_string program is byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const dir = ".toy-test-string-ts-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", ts_det_src, &.{ "--force", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", ts_det_src, &.{ "--force", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
