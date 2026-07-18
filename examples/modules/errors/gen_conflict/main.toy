@@ -1,0 +1,8 @@
+# Feature (negative): a qualified bare generic call binding one type param to two
+# incompatible arg types (int vs bool) is a conflict; the qualified path reaches the
+# same T0015 gate the plain-identifier path does.
+# expect: compile-error "T0015"
+import lib
+fn main() -> int {
+    return lib.same(1, true)
+}

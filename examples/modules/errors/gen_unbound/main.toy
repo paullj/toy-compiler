@@ -1,0 +1,8 @@
+# Feature (negative): a qualified bare generic call whose type param appears in NO
+# value arg cannot be inferred; the qualified path reaches the same T0016 gate the
+# plain-identifier path does. No turbofish, no arg to infer from -> unbound.
+# expect: compile-error "T0016"
+import lib
+fn main() -> int {
+    return lib.ro()
+}

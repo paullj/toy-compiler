@@ -2219,8 +2219,11 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 }
             }
         }
-        if (callee_node.tag == .identifier and callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func])) {
-            // A bare inferred generic call `id(7)`: the plain-identifier callee
+        if ((callee_node.tag == .identifier or callee_node.tag == .field_access) and
+            callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func]))
+        {
+            // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`: the callee
+            // (plain identifier, or a field_access `resolveModuleMember` bound to `.func`)
             // resolves to a generic template (its sig params carry `type_var`s). Re-run
             // the SHARED matcher over the value-arg node_types to pick the SAME instance
             // Pass C / scanCalls selected, then use its mangled name (mirroring the

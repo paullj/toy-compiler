@@ -584,13 +584,16 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // the caller's hash.
                     if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
                         const sig = self.frozen.sigs[res.func];
-                        // A bare inferred generic call `id(7)`: a PLAIN-IDENTIFIER
-                        // callee resolving to a generic template (its sig params carry
-                        // type_vars). Fold the resolved INSTANCE sig — not the template —
+                        // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`:
+                        // the callee (plain identifier, or a field_access `resolveModuleMember`
+                        // bound to this `.func`) resolves to a generic template (its sig params
+                        // carry type_vars). Fold the resolved INSTANCE sig — not the template —
                         // so the caller folds the SAME identity the reloc targets (mirroring
-                        // the type_app path). The plain-identifier gate matches the other
-                        // three sites; a bare qualified generic call is rejected at Pass C.
-                        if (self.frozen.tree.nodes[c.idx.int()].tag == .identifier and sig.hasTypeVar()) {
+                        // the type_app path). Both shapes route through the shared
+                        // `callInstanceRef`, keeping every consumer's instance selection in
+                        // agreement.
+                        const ctag = self.frozen.tree.nodes[c.idx.int()].tag;
+                        if ((ctag == .identifier or ctag == .field_access) and sig.hasTypeVar()) {
                             try self.foldViaInstanceRef(c.call);
                             return;
                         }

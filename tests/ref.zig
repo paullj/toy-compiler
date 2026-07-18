@@ -249,3 +249,63 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
     }
     try std.testing.expect(differing <= 1);
 }
+
+test "ref: ref.new(41) with NO turbofish infers Ref[int] and derefs to 41" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // A qualified bare generic call across a module boundary: `ref.new` is std/ref's
+    // `new[T]`, and T=int is inferred from the value arg with no turbofish. The deref
+    // reads back 41 — the ergonomic proof that a std generic free fn needs no turbofish.
+    const code = try buildAndRun(gpa, io, ".toy-test-ref-bare-infer",
+        \\import std/ref
+        \\fn main() -> int {
+        \\    r := ref.new(41)
+        \\    return *r
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 41), code);
+}
+
+test "ref: bare ref.new(41) is byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    // The qualified bare-inferred instance keys on (gid, args) exactly like the plain
+    // path — no run-order-dependent key material — so the two images differ ONLY in the
+    // one-byte code-sign nonce.
+    const src =
+        \\import std/ref
+        \\fn main() -> int {
+        \\    r := ref.new(41)
+        \\    return *r
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-ref-bare-infer-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqual(b1.len, b8.len);
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+}
