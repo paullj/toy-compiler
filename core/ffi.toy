@@ -2,8 +2,35 @@
 # `core/` module); everything else reaches C through a safe wrapper.
 pub extern fn labs(x: int) -> int
 
+# The libm double-precision math entry points (toy `float` is an f64, matching C `double`).
+# The C symbol name IS the extern name, so these bind libSystem's `sqrt`/`floor`/... directly.
+pub extern fn sqrt(x: float) -> float
+pub extern fn floor(x: float) -> float
+pub extern fn ceil(x: float) -> float
+pub extern fn sin(x: float) -> float
+pub extern fn cos(x: float) -> float
+
 # `std` reaches C `labs` through this safe `abs`: the extern name resolves only inside
 # `core/`, so a std/user module calls this wrapper, never the raw extern.
 pub fn abs(x: int) -> int {
     return labs(x)
+}
+
+# Safe wrappers for the libm entry points. `std/math` calls these (never the raw externs,
+# which resolve only here). The `m` prefix keeps each wrapper distinct from the C-named
+# extern it forwards to.
+pub fn msqrt(x: float) -> float {
+    return sqrt(x)
+}
+pub fn mfloor(x: float) -> float {
+    return floor(x)
+}
+pub fn mceil(x: float) -> float {
+    return ceil(x)
+}
+pub fn msin(x: float) -> float {
+    return sin(x)
+}
+pub fn mcos(x: float) -> float {
+    return cos(x)
 }

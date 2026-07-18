@@ -84,7 +84,7 @@ pub const Code = enum(u16) {
     T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width)
     T0035, // alias-cycle (a `type X = Y` chain resolves back to itself, directly or through a chain)
     T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x`)
-    T0037, // extern-invalid-type (an `extern fn` param/return type is not int, rawptr, or bool)
+    T0037, // extern-invalid-type (an `extern fn` param/return type is not int, float, str, rawptr, or bool)
     T0038, // unsafe-required (a raw-pointer `store`/`load` used outside an `unsafe { }` block)
 
     _,
