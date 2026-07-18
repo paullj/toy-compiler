@@ -695,14 +695,13 @@ test "vec: Vec[Ref[int]].new() round-trips managed-box elements" {
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // The element is a managed box (`Ref[int]`, an `isRefPayload` type). Both `&x` and
-    // `ref.new[int](x)` construct one; `*get(i).unwrap()` reads the boxed cell back.
+    // The element is a managed box (`Ref[int]`, an `isRefPayload` type). `&x` boxes the
+    // value; `*get(i).unwrap()` reads the boxed cell back.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-ref",
         \\import std/vec
-        \\import std/ref
         \\fn main() -> int {
         \\    xs := Vec[Ref[int]].new()
-        \\    xs.push(ref.new[int](3))
+        \\    xs.push(&3)
         \\    xs.push(&4)
         \\    return *xs.get(0).unwrap() + *xs.get(1).unwrap()
         \\}
@@ -740,7 +739,6 @@ test "vec: a nested-generic-container program is byte-identical at -j1 and -j8" 
 
     const src =
         \\import std/vec
-        \\import std/ref
         \\fn main() -> int {
         \\    xs := Vec[Ref[int]].new()
         \\    xs.push(&3)

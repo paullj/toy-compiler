@@ -1,5 +1,0 @@
-# A managed heap box: `Ref.new(x)` allocates a fresh cell holding `x` and yields a
-# `Ref[T]` handle to it. A thin alias over the `&` operator, so it names no intrinsic.
-pub fn new[T](x: T) -> Ref[T] {
-    return &x
-}

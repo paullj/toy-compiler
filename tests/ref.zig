@@ -84,9 +84,8 @@ test "ref: Option[Ref[int]] unwrap-some yields the boxed value; absence takes th
     const io = threaded.io();
     try skipUnlessBackend(io);
     const code = try buildAndRun(gpa, io, ".toy-test-ref-option",
-        \\import std/ref
         \\fn pick(present: bool) -> Option[Ref[int]] {
-        \\    if present { return Option.some(ref.new[int](40)) }
+        \\    if present { return Option.some(&40) }
         \\    return Option[Ref[int]].none
         \\}
         \\fn main() -> int {
@@ -150,15 +149,14 @@ test "ref: a growable holding Ref[int] elements pushes then reads-back the boxed
     const io = threaded.io();
     try skipUnlessBackend(io);
     // A box element is an 8-byte handle: `ga_push` stores it and `ga_get` reads it back as a
-    // `Ref[int]` (not a truncated int). Both value-creation spellings — the `&` operator and
-    // the `ref.new` constructor — round-trip through the same element slot. 3 + 4 == 7.
+    // `Ref[int]` (not a truncated int). `&x` boxes the value; the push round-trips through the
+    // same element slot. 3 + 4 == 7.
     const code = try buildAndRun(gpa, io, ".toy-test-ref-box-element",
         \\import core/mem
-        \\import std/ref
         \\fn main() -> int {
         \\    a := mem.ga_new[Ref[int]]()
         \\    mem.ga_push[Ref[int]](a, &3)
-        \\    mem.ga_push[Ref[int]](a, ref.new[int](4))
+        \\    mem.ga_push[Ref[int]](a, &4)
         \\    return *mem.ga_get[Ref[int]](a, 0) + *mem.ga_get[Ref[int]](a, 1)
         \\}
         \\
@@ -175,11 +173,10 @@ test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
 
     const src =
         \\import core/mem
-        \\import std/ref
         \\fn main() -> int {
         \\    a := mem.ga_new[Ref[int]]()
         \\    mem.ga_push[Ref[int]](a, &3)
-        \\    mem.ga_push[Ref[int]](a, ref.new[int](4))
+        \\    mem.ga_push[Ref[int]](a, &4)
         \\    return *mem.ga_get[Ref[int]](a, 0) + *mem.ga_get[Ref[int]](a, 1)
         \\}
         \\
@@ -229,66 +226,6 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
         \\
     ;
     const dir = ".toy-test-ref-trace-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
-}
-
-test "ref: ref.new(41) with NO turbofish infers Ref[int] and derefs to 41" {
-    const gpa = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    try skipUnlessBackend(io);
-    // A qualified bare generic call across a module boundary: `ref.new` is std/ref's
-    // `new[T]`, and T=int is inferred from the value arg with no turbofish. The deref
-    // reads back 41 — the ergonomic proof that a std generic free fn needs no turbofish.
-    const code = try buildAndRun(gpa, io, ".toy-test-ref-bare-infer",
-        \\import std/ref
-        \\fn main() -> int {
-        \\    r := ref.new(41)
-        \\    return *r
-        \\}
-        \\
-    );
-    try std.testing.expectEqual(@as(u8, 41), code);
-}
-
-test "ref: bare ref.new(41) is byte-identical at -j1 and -j8" {
-    const gpa = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    try skipUnlessBackend(io);
-
-    // The qualified bare-inferred instance keys on (gid, args) exactly like the plain
-    // path — no run-order-dependent key material — so the two images differ ONLY in the
-    // one-byte code-sign nonce.
-    const src =
-        \\import std/ref
-        \\fn main() -> int {
-        \\    r := ref.new(41)
-        \\    return *r
-        \\}
-        \\
-    ;
-    const dir = ".toy-test-ref-bare-infer-determinism";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
