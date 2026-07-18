@@ -2044,16 +2044,12 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        // The `print` builtin: a compiler-magic polymorphic builtin accepting ANY
-        // `Display`-conforming argument (Q8 — NOT a monomorphized generic). Intercept BEFORE
-        // the generic/arg-assignability check below (which previously rejected `print(42)` with
-        // "expected str, got int"). Require exactly one arg, require it conform to `Display`
-        // (recording a ground struct/enum derive req so the serial barrier synthesizes the
-        // `display` unit), and type the call `.unit`. `print("..")` still works (str conforms);
-        // a non-conforming arg is T0031, naming the blocking struct field where applicable.
+        // The bodyless builtins: the core-only raw-memory/pointer intrinsics, then the
+        // global `panic(str)`. Intercept BEFORE the generic/arg-assignability check below
+        // (a builtin carries only a placeholder sig — its arg-checking is token-based here).
         if (f.kind == .builtin) {
             // The core-only heap/raw-pointer intrinsics. Discriminated by the callee
-            // token (a `FnSym` carries no name), typed BEFORE the print/panic 1-arg
+            // token (a `FnSym` carries no name), typed BEFORE the panic 1-arg
             // path since their arities differ (0 for `gc_span_count`, 2 for `store`).
             if (callee.tag == .identifier) {
                 const bn = bc.nameText(callee.main_token);
@@ -2239,8 +2235,14 @@ pub const BodyChecker = struct {
                         return Type.int;
                     },
                     // `size_of[T]()`/`align_of[T]()`/`descriptor_of[T]()` are the type_app
-                    // form handled above; a bare-call misuse falls through to the generic path.
-                    .size_of, .align_of, .descriptor_of => {},
+                    // form handled above; a bare-call misuse names no type, so it can never
+                    // produce a size/align/descriptor — reject with the type-arg hint
+                    // (mirroring `.gc_array`), never fall through to the generic path.
+                    .size_of, .align_of, .descriptor_of => {
+                        for (args) |arg| _ = try bc.typeOf(arg);
+                        try bc.sink.emitFmt(bc.byteOf(callee.main_token), "'{s}' requires a type argument, e.g. {s}[int]()", .{ bn, bn });
+                        return .invalid;
+                    },
                 };
             }
             if (args.len != 1) {
@@ -2258,27 +2260,17 @@ pub const BodyChecker = struct {
             }
             // `panic(msg)`: the message must be a `str` (it lowers to a raw {ptr,len}
             // write; a non-str arg would be marshalled per its own ABI and misread).
-            // Unlike `print` (any Display), panic is str-only. Discriminate by the callee
-            // token — the Model fn carries no name. Type the call `.unit` regardless so a
-            // bad arg reports exactly once without cascading.
+            // Discriminate by the callee token — the Model fn carries no name. Type the
+            // call `.unit` regardless so a bad arg reports exactly once without cascading.
             if (callee.tag == .identifier and std.mem.eql(u8, bc.nameText(callee.main_token), "panic")) {
                 if (at.kind != .str)
                     try bc.sink.emitFmt(bc.byteOf(at_tok), "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
-            if (try bc.conformsTo(at, bc.model.preludeProtocols().display, true)) {
-                bc.node_types[(node_idx).int()] = Type.unit;
-                return Type.unit;
-            }
-            if (try bc.deriveBlocker(at, bc.model.preludeProtocols().display)) |blocker| {
-                try bc.sink.emitFmtCode(.T0031, bc.byteOf(at_tok), "cannot 'print' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(at), blocker.name, bc.typeName(blocker.ty) });
-            } else {
-                // A `type_var` (a generic param without a `Display` bound) renders as its
-                // source name (`T`), mirroring `nonConformingName`, not the opaque `type_var`.
-                const nm = if (at.isTypeVar() and at.typeVarOrd() < bc.gph_generic_params.len) bc.gph_generic_params[at.typeVarOrd()] else bc.typeName(at);
-                try bc.sink.emitFmtCode(.T0031, bc.byteOf(at_tok), "cannot 'print' a value of type '{s}': it does not conform to 'Display'", .{nm});
-            }
+            // No other 1-arg builtin exists post the intrinsic switch above; a `.func` here
+            // is not a builtin call the checker recognizes. Reject rather than fall into the
+            // generic path against a placeholder sig.
             return .invalid;
         }
         // A bare (no-explicit-args) generic call `id(7)`: infer each type-arg by
@@ -2469,11 +2461,10 @@ pub const BodyChecker = struct {
         }
         // A direct `.to_string()` on a struct/enum with NO explicit `to_string` fn: the
         // structural `Display` derive trigger (`to_string(x) == x.display()`). Mirrors the
-        // `hash` trigger and reuses the SAME `conformsTo(display)` gate `print` uses, so a
-        // custom `impl Display` (a `.direct` conformance) reuses its witness with no
-        // structural derive. A conforming aggregate records the display derive + types the
-        // call `str`; a struct with a non-Display field names it (T0031, with a to_string
-        // verb since print's message would mislead); a payload enum with a non-conforming
+        // `hash` trigger, reusing the shared `conformsTo(display)` gate, so a custom `impl
+        // Display` (a `.direct` conformance) reuses its witness with no structural derive.
+        // A conforming aggregate records the display derive + types the call `str`; a struct
+        // with a non-Display field names it (T0031); a payload enum with a non-conforming
         // payload has no nameable field and falls through to T0018.
         if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null and
             (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
@@ -2654,6 +2645,27 @@ pub const BodyChecker = struct {
                 };
             }
         }
+        // The universal `to_string` on a reified generic instance (e.g. `Option[int]`):
+        // it reifies to a concrete struct/enum whose structural `Display` derive fires
+        // through the SAME `conformsTo(display)` gate a plain struct/enum uses. Mirrors the
+        // struct/enum `to_string` arm so `io.print(Option[int])` — whose body is
+        // `x.to_string()` at `x: Option[int]` — types `str` and records the derive.
+        if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null) {
+            if (args.len != 0) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                bc.node_types[(node_idx).int()] = Type.str;
+                return Type.str;
+            }
+            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, true)) {
+                bc.node_types[(node_idx).int()] = Type.str;
+                return Type.str;
+            }
+            if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().display)) |blocker| {
+                try bc.sink.emitFmtCode(.T0031, bc.byteOf(callee.main_token), "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                return .invalid;
+            }
+        }
         // A generic-type value with no such method.
         for (args) |a| _ = try bc.typeOf(a);
         try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
@@ -2674,6 +2686,22 @@ pub const BodyChecker = struct {
         const pid_opt: ?u32 = if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null;
         if (pid_opt) |pid| {
             const p = bc.model.protocols[pid];
+            // `to_string` is the universal Display renderer, callable on ANY Display-conforming
+            // receiver — including a `type_var` bounded by Display (as-axiom in the template
+            // body). It is not a Display protocol *method*, so the bound-method search below
+            // would miss it; recognize it here so `x.to_string()` in a `[T has Display]` body
+            // types `str`. The per-instance re-check grounds the receiver, so the concrete
+            // struct/enum/scalar `to_string` path (with its derive/witness) handles lowering.
+            if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null and
+                pid == bc.model.preludeProtocols().display.?)
+            {
+                if (args.len != 0) {
+                    for (args) |a| _ = try bc.typeOf(a);
+                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                }
+                bc.node_types[(node_idx).int()] = Type.str;
+                return Type.str;
+            }
             // The bound's protocol type-args (`[T has Into[int]]` -> `[int]`)
             // ground the protocol's OWN generic params (`tv(1..)`); `Self`
             // (`tv(0)`) grounds to the bounded `type_var` receiver itself.
@@ -2807,7 +2835,7 @@ pub const BodyChecker = struct {
 
     /// Whether `t` conforms to the derivable prelude protocol `pid_opt` — the shared
     /// predicate behind the `==`/`!=` (`Eq`), `<`/`>`/`<=`/`>=` (`Ord`),
-    /// `.hash()` (`Hash`), and `print(x)` (`Display`) operator/trigger typings.
+    /// `.hash()` (`Hash`), and `to_string`/`x.to_string()` (`Display`) operator/trigger typings.
     /// A concrete type resolves via the frozen conformance table (`Conform.existence` covers
     /// the int/bool/str/unit prelude conformances AND every user `impl T has P`); a
     /// `type_var` in a bounded generic body conforms as-axiom when its declared bound IS

@@ -3,6 +3,7 @@
 # updates in place, so it appears once, at its original position.
 # expect: stdout "the\ncat"
 # expect: exit 0
+import std/io
 import std/map
 import std/vec
 
@@ -14,7 +15,7 @@ fn main() {
         counts.set(w, n + 1)
     }
     for k, v in counts {
-        print(k)
-        print("\n")
+        io.print(k)
+        io.print("\n")
     }
 }

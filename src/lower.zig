@@ -12,7 +12,7 @@
 //! load/store), scalar calls, if/else (merge via a block param), while/for (the
 //! induction var is a slot)/loop (break value via a block param), labels +
 //! break/continue/return resolving to the right block. `str` is also lowered
-//! (literal/identifier/var_decl/assign/arg/result + the `print` builtin) since it
+//! (literal/identifier/var_decl/assign/arg/result) since it
 //! is a 16-byte aggregate carried by slot — cheap and needed for I/O. Aggregate
 //! struct/enum construction, field access, and `match` are LATER stages: they
 //! surface a clean diagnostic here so the IR stays well-formed.
@@ -1608,9 +1608,8 @@ pub fn appendPiece(b: *Builder, acc: Ir.SlotId, piece: Ir.SlotId) error{OutOfMem
     try appendRaw(b, acc, pp, pl);
 }
 
-/// The SOLE producer of a value's `str` rendering — the authority both `print` and
-/// `to_string` consume, so `print(x)` and `print(x.to_string())` reduce to the identical
-/// IR by construction. `op` is `ty`'s already-lowered operand. Returns a `str` slot:
+/// The SOLE producer of a value's `str` rendering — the authority `to_string` (and the
+/// derive `display` emitters) consume. `op` is `ty`'s already-lowered operand. Returns a `str` slot:
 ///   * str    -> the operand's own slot (identity, no alloc).
 ///   * int    -> `__int_to_str` into a fresh cell (i64::MIN-correct never-negate render).
 ///   * bool   -> `cond_br` selecting the const-data `"true"`/`"false"` literal.
@@ -1626,9 +1625,9 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
         .str => {
             const s = operandSlot(op);
             if (s != Ir.none_slot) return s;
-            // A str VALUE operand never reaches here: `print` keeps its verbatim str arm and
-            // `to_string(str)` returns the receiver operand directly. Note-and-empty rather
-            // than miscompile keeps lower total for the unreachable-for-well-typed case.
+            // A str VALUE operand never reaches here: `to_string(str)` returns the receiver
+            // operand directly. Note-and-empty rather than miscompile keeps lower total for
+            // the unreachable-for-well-typed case.
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "display: str operand is not a slot in lower" });
             b.had_error = true;
             return try emitStrLiteralSlot(b, "");
@@ -1723,10 +1722,9 @@ fn lowerStrMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, recv_node: Ast.
         const bx = try b.emit(.{ .add = .{ .lhs = ptr, .rhs = i } }, int_ty);
         return .{ .value = try b.emit(.{ .load_byte = bx }, int_ty) };
     }
-    // `to_string`: the SAME `displayToSlot` renderer `print` consumes, so `print(x)` and
-    // `print(x.to_string())` reduce to the identical IR. `str` is identity (share the
-    // immutable receiver, no alloc); int/bool/unit build a fresh str (via `__int_to_str` /
-    // the literal cond / the const-data `"()"`).
+    // `to_string`: the `displayToSlot` renderer. `str` is identity (share the immutable
+    // receiver, no alloc); int/bool/unit build a fresh str (via `__int_to_str` / the
+    // literal cond / the const-data `"()"`).
     if (recv_ty.kind == .str) return try lowerExpr(b, recv_node);
     const op = try lowerExpr(b, recv_node);
     return .{ .slot = try displayToSlot(b, recv_ty, op) };
@@ -1741,19 +1739,6 @@ fn copyStrSlot(b: *Builder, dst: Ir.SlotId, src: Ir.SlotId) error{OutOfMemory}!v
     _ = try b.emit(.{ .copy = .{ .dst = dbase, .src = sbase, .ty = Typecheck.Type.str } }, null);
 }
 
-// `print(x)` is `write(x.display())`: `displayToSlot` builds the value's rendering into a
-// `str` accumulator (const-data literals for names/separators, `__int_to_str` for ints, a
-// `cond_br` over `"true"`/`"false"` for bools, a recursive witness call for aggregate
-// fields — all joined by the reused-slot `__str_concat` accumulator), then `emitPrintSlot`
-// writes those bytes to fd 1. `print(str)` skips the builder (the receiver already IS the
-// bytes) and writes verbatim — the sole alloc-free print arm.
-
-/// The libSystem `write` symbol identity. The raw-`str` output leaf mints a direct
-/// `.import` call to it (mirroring `gc_alloc_sym`), reaching libSystem through the
-/// ordinary extern-call path — so no hand-emitted write body is linked for a bare
-/// `print`. A comptime literal name is safe (codegen dupes callee names into relocs;
-/// the Ir.Function only borrows it).
-const write_sym: Link.SymName = .{ .kind = .import, .name = "write" };
 /// The `gc_alloc` builtin's stable symbol identity — returns a fresh zeroed cell pointer.
 /// A `&x` box MINTS this call directly in lower; user source never names it, so this
 /// bypasses the core-only allowlist by construction.
@@ -1819,27 +1804,6 @@ fn isAggTy(b: *Builder, t: Typecheck.Type) bool {
     };
 }
 
-/// Write the `str` slot `slot`'s `{ptr,len}` bytes to fd 1 via libSystem `write`. Decomposes
-/// the slot into its ptr (offset 0) and len (offset 8) halves and mints a direct `write(1,
-/// ptr, len)` extern call — the general C-ABI path (`[int,int,int]` → x0=fd, x1=ptr, x2=len;
-/// the unit ret discards x0). The single shared raw write path (literals + `str` fields both
-/// route here).
-pub fn emitPrintSlot(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!void {
-    const int_ty = Typecheck.Type.int;
-    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
-    const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
-    const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
-    const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
-    const fd = try b.emit(.{ .iconst = 1 }, int_ty);
-    const args = try b.gpa.alloc(Ir.Operand, 3);
-    errdefer b.gpa.free(args);
-    args[0] = .{ .value = fd };
-    args[1] = .{ .value = ptr };
-    args[2] = .{ .value = len };
-    _ = try b.emit(.{ .call = .{ .callee = write_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
-}
-
-
 fn shr(b: *Builder, v: Ir.ValueId, n: i64) error{OutOfMemory}!Ir.ValueId {
     const c = try b.emit(.{ .iconst = n }, Typecheck.Type.int);
     return b.emit(.{ .lshr = .{ .lhs = v, .rhs = c } }, Typecheck.Type.int);
@@ -1877,7 +1841,7 @@ fn packLE(b: *Builder, bytes: []const Ir.ValueId) error{OutOfMemory}!Ir.ValueId 
 /// AND the char literal's 64-bit store zeroed the slot's high 4 bytes, so the loaded value has
 /// bit63 clear: unsigned band tests need no validity branch. Pure IR (fixed block/value ids,
 /// reads no map) → -jN- and O0≡O1-stable. The packed bytes are copied into a fresh gc cell
-/// (the stack scratch dies on return; the caller — `print`/`to_string` — keeps the value):
+/// (the stack scratch dies on return; the caller — `to_string` — keeps the value):
 /// the smallest size class is 16 bytes, so the 8-byte packed store is in-bounds while only
 /// `len` bytes are ever read. Returns the built `str` slot in the join block.
 pub fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.SlotId {
@@ -2108,10 +2072,9 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     } else if (builtinStrMethodCallee(b, n)) |sm| {
         return try lowerStrMethod(b, node_idx, n, sm.recv, sm.member);
     } else if (displayToStringCallee(b, n)) |ds| {
-        // A struct/enum (incl `char`) `.to_string()`: render through the SAME
-        // `displayToSlot` authority `print` uses, so `print(x)` and `print(x.to_string())`
-        // are the identical IR. A custom `impl Display` and a structural derive land in the
-        // same witness call, which is what makes `to_string` universal.
+        // A struct/enum (incl `char`) `.to_string()`: render through the `displayToSlot`
+        // authority. A custom `impl Display` and a structural derive land in the same
+        // witness call, which is what makes `to_string` universal.
         const recv_ty = b.in.node_types[(ds.recv).int()];
         const op = try lowerExpr(b, ds.recv);
         return .{ .slot = try displayToSlot(b, recv_ty, op) };
@@ -2124,18 +2087,15 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         // inline the mask/extend or the range-checked `Result` build.
         return try lowerConvMethod(b, node_idx, cv);
     } else {
-        // The callee identifier resolves to a `.func` index into `names` (this also
-        // covers the `print` builtin, whose name index points at the synthetic entry).
+        // The callee identifier resolves to a `.func` index into `names`.
         const callee_res = b.in.resolutions[(n.lhs).int()];
         if (callee_res != .func) {
             try b.note(n.main_token, "call target unsupported in lower");
             return .none;
         }
-        // The `print` builtin is a compiler-magic polymorphic dispatch by the single
-        // arg's type: `str` keeps the raw write-bytes path (falls through below); `int`/
-        // `bool` render inline (heap-free) and a struct/enum routes to its resolved `Display`
-        // witness. The checker already required the arg to conform to `Display`, so a
-        // struct/enum witness always resolves. Intercept BEFORE the plain-name resolution.
+        // The core-only raw-memory/pointer intrinsics (`store`/`load`/`offset`/... and the
+        // `call_hash`/`call_eq` indirect-dispatch helpers) lower directly to IR memory ops
+        // with no call/reloc — intercept them BEFORE the plain-name resolution below.
         if (callee_res.func < b.in.names.len) {
             const nm = b.in.names[callee_res.func];
             // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
@@ -2219,41 +2179,6 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 },
                 else => {},
             };
-            if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print")) {
-                const parg = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                if (parg.len == 1) {
-                    const at = b.in.node_types[(parg[0]).int()];
-                    if (at.kind == .str) {
-                        // `print(str)` is the sole alloc-free arm: the receiver already IS the
-                        // bytes, so write them VERBATIM (byte-identical to before this change).
-                        // A str SLOT decomposes through the shared leaf; a str reg-pair VALUE (a
-                        // labeled-block / call result whose {ptr,len} live in a value cell)
-                        // spreads straight into `write`'s (buf,len) arg pair.
-                        const op = try lowerExpr(b, parg[0]);
-                        const slot = operandSlot(op);
-                        if (slot != Ir.none_slot) {
-                            try emitPrintSlot(b, slot);
-                        } else {
-                            const fd = try b.emit(.{ .iconst = 1 }, Typecheck.Type.int);
-                            const wargs = try b.gpa.alloc(Ir.Operand, 2);
-                            errdefer b.gpa.free(wargs);
-                            wargs[0] = .{ .value = fd };
-                            wargs[1] = op;
-                            _ = try b.emit(.{ .call = .{ .callee = write_sym, .args = wargs, .ret_slot = Ir.none_slot } }, null);
-                        }
-                        return .none;
-                    }
-                    // Every other kind: `print(x) = write(x.display())`. Build the rendering
-                    // through the SOLE `displayToSlot` authority (so `print(x)` and
-                    // `print(x.to_string())` are the identical IR), then write it. int/struct/
-                    // enum/char now allocate a transient str — the accepted cost of the
-                    // unification; only `str` stays alloc-free.
-                    const op = try lowerExpr(b, parg[0]);
-                    const s = try displayToSlot(b, at, op);
-                    try emitPrintSlot(b, s);
-                    return .none;
-                }
-            }
         }
         if ((callee_node.tag == .identifier or callee_node.tag == .field_access) and
             callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func]))
@@ -4613,7 +4538,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         if (tree.nodes[(idx).int()].tag == .fn_decl) try fn_nodes.append(gpa, idx);
     }
 
-    const names = try gpa.alloc(Link.SymName, fn_nodes.items.len + 1);
+    const names = try gpa.alloc(Link.SymName, fn_nodes.items.len);
     defer {
         for (names) |nm| gpa.free(nm.name);
         gpa.free(names);
@@ -4622,7 +4547,6 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         const nm = tokens[tree.nodes[(idx).int()].main_token].text(src);
         names[i] = .{ .kind = .user_fn, .name = try gpa.dupe(u8, nm) };
     }
-    names[fn_nodes.items.len] = .{ .kind = .builtin, .name = try gpa.dupe(u8, "print") };
 
     const in = Inputs{
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },

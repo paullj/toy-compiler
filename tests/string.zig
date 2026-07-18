@@ -60,8 +60,8 @@ fn runStdout(gpa: std.mem.Allocator, io: Io, prog: []const u8) ![]u8 {
     return out;
 }
 
-/// A kind's rendering under `print(x)` and `print(x.to_string())` must be the identical
-/// bytes — the invariant `print(x) ≡ print(x.to_string())`, proven per kind against the
+/// A kind's rendering under `io.print(x)` and `io.print(x.to_string())` must be the identical
+/// bytes — the invariant `io.print(x) ≡ io.print(x.to_string())`, proven per kind against the
 /// running program's stdout (not a compiler internal).
 const PrintCase = struct { name: []const u8, defs: []const u8, expr: []const u8 };
 
@@ -80,7 +80,7 @@ const print_ts_cases = [_]PrintCase{
     .{ .name = "nested", .defs = "struct Inner { u: int, v: int }\nstruct Outer { lo: Inner, hi: Inner }\n", .expr = "Outer{ lo: Inner{ u: 1, v: 2 }, hi: Inner{ u: 3, v: 4 } }" },
 };
 
-test "string: print(x) and print(x.to_string()) are byte-identical stdout for every kind" {
+test "string: io.print(x) and io.print(x.to_string()) are byte-identical stdout for every kind" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -88,9 +88,9 @@ test "string: print(x) and print(x.to_string()) are byte-identical stdout for ev
     try skipUnlessBackend(io);
 
     for (print_ts_cases) |c| {
-        const src_print = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{ x := {s}\n print(x)\n return 0 }}\n", .{ c.defs, c.expr });
+        const src_print = try std.fmt.allocPrint(gpa, "import std/io\n{s}fn main() -> int {{ x := {s}\n io.print(x)\n return 0 }}\n", .{ c.defs, c.expr });
         defer gpa.free(src_print);
-        const src_ts = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{ x := {s}\n print(x.to_string())\n return 0 }}\n", .{ c.defs, c.expr });
+        const src_ts = try std.fmt.allocPrint(gpa, "import std/io\n{s}fn main() -> int {{ x := {s}\n io.print(x.to_string())\n return 0 }}\n", .{ c.defs, c.expr });
         defer gpa.free(src_ts);
 
         const dir_p = try std.fmt.allocPrint(gpa, ".toy-test-pts-{s}-p", .{c.name});
@@ -248,8 +248,9 @@ test "string: Map with owned (concat'd) str keys survives a forced collection an
 }
 
 const det_src =
+    \\import std/io
     \\fn main() -> int {
-    \\    print("hello".concat(" ").concat("world"))
+    \\    io.print("hello".concat(" ").concat("world"))
     \\    return 0
     \\}
     \\
@@ -284,12 +285,13 @@ test "string: a concat program is byte-identical at -j1 and -j8" {
 }
 
 const ts_det_src =
+    \\import std/io
     \\struct Point { x: int, y: int }
     \\fn main() -> int {
     \\    p := Point{ x: 4, y: 2 }
-    \\    print(p)
-    \\    print(p.to_string())
-    \\    print(42.to_string())
+    \\    io.print(p)
+    \\    io.print(p.to_string())
+    \\    io.print(42.to_string())
     \\    return 0
     \\}
     \\

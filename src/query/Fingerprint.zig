@@ -128,7 +128,7 @@ pub fn fingerprint(
     // (b) callee identities + signatures, in walk order. The callee's resolved
     // SymName{kind,name} is folded BEFORE its sig: it is what the `.func` reloc
     // target carries, so a shadow/unshadow that changes the bound symbol (e.g.
-    // builtin `print` vs a user `fn print` of the same sig) flips the caller's
+    // builtin `panic` vs a user `fn panic` of the same sig) flips the caller's
     // hash even though the sig is identical.
     AstWalk.updateU32(&h, @intCast(callee_sigs.len));
     for (callee_sigs) |s| {
@@ -314,14 +314,14 @@ test "callee signature folds in: a sig change flips the caller's hash" {
 
 test "callee kind folds in: builtin vs user_fn of an identical sig flips the hash" {
     const gpa = testing.allocator;
-    var b = try build(gpa, "fn main() {\n print(\"hi\")\n return\n}\n");
+    var b = try build(gpa, "fn main() {\n panic(\"hi\")\n return\n}\n");
     defer b.deinit(gpa);
     const decl = b.fnDecl(0);
-    // Same name, same sig — only the resolved KIND differs (builtin print vs a
-    // user `fn print`). The caller's fingerprint MUST differ, else a
+    // Same name, same sig — only the resolved KIND differs (builtin panic vs a
+    // user `fn panic`). The caller's fingerprint MUST differ, else a
     // shadow/unshadow edit is a stale-cache miscompile.
-    const builtin_callee = [_]Sig{.{ .kind = .builtin, .name = "print", .params = &.{.str}, .ret = .unit }};
-    const user_callee = [_]Sig{.{ .kind = .user_fn, .name = "print", .params = &.{.str}, .ret = .unit }};
+    const builtin_callee = [_]Sig{.{ .kind = .builtin, .name = "panic", .params = &.{.str}, .ret = .unit }};
+    const user_callee = [_]Sig{.{ .kind = .user_fn, .name = "panic", .params = &.{.str}, .ret = .unit }};
     const hb = fingerprint(b.tree, b.tokens, b.source, decl, &builtin_callee, &.{}, &.{}, &.{});
     const hu = fingerprint(b.tree, b.tokens, b.source, decl, &user_callee, &.{}, &.{}, &.{});
     try testing.expect(hb != hu);

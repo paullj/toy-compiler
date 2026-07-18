@@ -6,8 +6,9 @@
 //!   * GLOBAL COLLECT — walk every module's top-level decls once. Assign each
 //!     user fn a GRAPH-GLOBAL id (deterministic: module order, then decl order)
 //!     and a MODULE-QUALIFIED symbol name (`<module-path>.<fn>`), except the entry
-//!     module's `main` (stays bare `main`) and the synthetic `print` (one shared
-//!     `print` at the end of the table). Each module records its own fns (pub +
+//!     module's `main` (stays bare `main`). The seeded builtins (`panic` plus the
+//!     core-only intrinsics) are appended after all user fns. Each module records
+//!     its own fns (pub +
 //!     private, visible only inside the module) plus its `pub` fns/structs/enums
 //!     (visible to importers under the import namespace). Each module's `import`
 //!     decls bind a namespace name → imported module id, rejecting a same-last-
@@ -15,7 +16,7 @@
 //!
 //!   * PER-MODULE BODY RESOLVE — resolve each fn body in its own lexical state,
 //!     exactly like the single-file resolver, with two cross-module additions:
-//!       - `lookupName`: locals → this module's fns → the global `print` →
+//!       - `lookupName`: locals → this module's fns (incl. seeded builtins) →
 //!         import namespaces (innermost lexical binding still shadows a namespace).
 //!       - `mod.member` (field_access whose receiver resolves to `.module`): the
 //!         receiver gets `.module`, and the member is resolved against the owning
@@ -51,18 +52,18 @@ const Intrinsic = @import("symbols/Intrinsic.zig");
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
     /// Module-qualified symbol name (`geometry/rect.area`), or bare for the
-    /// entry `main` / the synthetic `print`. Owned by `GraphResult`.
+    /// entry `main` / a seeded builtin (`panic`, intrinsics). Owned by `GraphResult`.
     name: []const u8,
-    /// Owning module id (index into `Graph.modules`). For `print` this is the
-    /// entry module (it has no real home; only the bare name matters).
+    /// Owning module id (index into `Graph.modules`). For a seeded builtin this is
+    /// the entry module (it has no real home; only the bare name matters).
     module: u32,
-    /// The `fn_decl` node in that module's tree (`Ast.none` for the bodyless
-    /// builtin `print`, identified by `kind` — never test `decl_node` for builtin-ness).
+    /// The `fn_decl` node in that module's tree (`Ast.none` for a bodyless seeded
+    /// builtin, identified by `kind` — never test `decl_node` for builtin-ness).
     decl_node: Ast.Index,
-    /// `.user_fn` for a real decl, `.builtin` for the synthetic `print`. The
-    /// single source of "is this a builtin", carried across the resolve→types boundary.
+    /// `.user_fn` for a real decl, `.builtin` for a seeded builtin (`panic`/intrinsics).
+    /// The single source of "is this a builtin", carried across the resolve→types boundary.
     kind: SymKind,
-    /// Whether the decl is `pub` (exported). `main`/`print` are not pub.
+    /// Whether the decl is `pub` (exported). `main` and the seeded builtins are not pub.
     is_pub: bool,
     /// For an inherent method: the receiver type-ref node (an `identifier`) in
     /// this module's tree — Typecheck resolves it to the receiver `Type` and keys the
@@ -167,15 +168,14 @@ const SeededBuiltin = struct { name: []const u8, core_only: bool };
 
 /// The single ordered authority for the seeded builtins. Order is load-bearing: it
 /// fixes each builtin's global fn id, which feeds the content fingerprint / -jN
-/// identity — `print`/`panic` lead so later appends never shift an existing id.
+/// identity — `panic` leads so later appends never shift an existing id.
 /// Append, never reorder. The intrinsic names are pulled from `Intrinsic.Kind` (their
 /// own id-order authority) so the two lists stay in one derivation, not two spellings.
 const seeded_builtins = blk: {
     const kinds = std.enums.values(Intrinsic.Kind);
-    var list: [2 + kinds.len]SeededBuiltin = undefined;
-    list[0] = .{ .name = "print", .core_only = false };
-    list[1] = .{ .name = "panic", .core_only = false };
-    for (kinds, 0..) |k, i| list[2 + i] = .{ .name = Intrinsic.name(k), .core_only = true };
+    var list: [1 + kinds.len]SeededBuiltin = undefined;
+    list[0] = .{ .name = "panic", .core_only = false };
+    for (kinds, 0..) |k, i| list[1 + i] = .{ .name = Intrinsic.name(k), .core_only = true };
     break :blk list;
 };
 
@@ -196,16 +196,14 @@ fn seedBuiltin(g: *GraphResolve, entry: u32, b: SeededBuiltin) !void {
     }
 }
 
-test "seeded_builtins: print/panic lead as global prelude, then the intrinsics core-only" {
-    try std.testing.expectEqualStrings("print", seeded_builtins[0].name);
+test "seeded_builtins: panic leads as global prelude, then the intrinsics core-only" {
+    try std.testing.expectEqualStrings("panic", seeded_builtins[0].name);
     try std.testing.expect(!seeded_builtins[0].core_only);
-    try std.testing.expectEqualStrings("panic", seeded_builtins[1].name);
-    try std.testing.expect(!seeded_builtins[1].core_only);
     const kinds = std.enums.values(Intrinsic.Kind);
-    try std.testing.expectEqual(2 + kinds.len, seeded_builtins.len);
+    try std.testing.expectEqual(1 + kinds.len, seeded_builtins.len);
     for (kinds, 0..) |k, i| {
-        try std.testing.expectEqualStrings(Intrinsic.name(k), seeded_builtins[2 + i].name);
-        try std.testing.expect(seeded_builtins[2 + i].core_only);
+        try std.testing.expectEqualStrings(Intrinsic.name(k), seeded_builtins[1 + i].name);
+        try std.testing.expect(seeded_builtins[1 + i].core_only);
     }
 }
 
@@ -368,14 +366,14 @@ fn collectGlobals(g: *GraphResolve) !void {
 
     // Seed every synthetic builtin off one ordered list (`seeded_builtins`). Each is a
     // homeless `.builtin` (bodyless; the ones that need machine code are hand-emitted at
-    // link time). `print`/`panic` are global prelude (registered into every module's fn
-    // table unless shadowed); the `Intrinsic` names are core-only (registered only into a
+    // link time). `panic` is global prelude (registered into every module's fn table
+    // unless shadowed); the `Intrinsic` names are core-only (registered only into a
     // bundled `core/` module — naming them elsewhere leaves the name unresolved, R0001).
-    // The list's order fixes each id, so `print` and `panic` lead and no later append
-    // shifts an existing id.
+    // The list's order fixes each id, so `panic` leads and no later append shifts an
+    // existing id.
     for (seeded_builtins) |b| try seedBuiltin(g, entry, b);
     // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) are nameable
-    // in every module with no import (the `print` precedent). Register each into a module's enum
+    // in every module with no import (the `panic` precedent). Register each into a module's enum
     // table UNLESS the module declares its own (user-first-wins), so their construction/match
     // resolve quietly (left for Typecheck, which native-registers the enums). The typecheck-time
     // `enum_ids` injection in `registerPrelude` mirrors this on its own tables.
@@ -1022,7 +1020,7 @@ fn refCore(g: *GraphResolve) bool {
 
 /// An iterator over exactly the names `lookupName` searches, for near-miss
 /// suggestions: every lexical scope's local names (innermost scope first), then this
-/// module's fn names (incl. the shared `print`), then this module's import namespace
+/// module's fn names (incl. seeded builtins), then this module's import namespace
 /// names. Fixed traversal order; the suggester's strict-unique-winner rule makes the
 /// emitted string independent of the per-map hash iteration order.
 const CandidateIter = struct {
@@ -1062,8 +1060,8 @@ fn candidateIter(g: *GraphResolve) CandidateIter {
     return .{ .g = g, .scope_i = g.scopes.items.len };
 }
 
-/// Look a name up: locals (innermost first) → this module's fns (incl. the
-/// shared `print`) → import namespaces. A lexical binding shadows a namespace.
+/// Look a name up: locals (innermost first) → this module's fns (incl. seeded
+/// builtins) → import namespaces. A lexical binding shadows a namespace.
 fn lookupName(g: *GraphResolve, name_tok: u32) Resolution {
     if (g.lookupLocalOrFn(name_tok)) |r| return r;
     const name = g.nameText(name_tok);
@@ -1502,7 +1500,10 @@ test "single-module graph resolves bodies like the single-file resolver" {
     try withResolvedGraph(".toy-test-res-solo", files, "solo.toy", Check.run);
 }
 
-test "print is available unqualified in every module with one shared id" {
+test "a bare `print` with no import is R0001 undeclared" {
+    // `print` is ordinary library code in `std/io` now, not a global builtin. A bare
+    // `print(..)` with no `import std/io` binds nothing in any module's fn table, so the
+    // call callee is `.unresolved` and R0001 fires — in EVERY module, since none seed it.
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
         "import util\nfn main() -> int { print(\"hi\")\n return util.go() }\n" },
@@ -1511,14 +1512,12 @@ test "print is available unqualified in every module with one shared id" {
     };
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
-            try testing.expectEqual(@as(usize, 0), r.diags.len);
-            // Find the print global fn id (bodyless, name "print").
-            var print_id: ?u32 = null;
-            for (r.fns, 0..) |f, i| if (std.mem.eql(u8, f.name, "print")) {
-                print_id = @intCast(i);
+            var r0001: usize = 0;
+            for (r.diags) |d| if (d.code == .R0001) {
+                r0001 += 1;
             };
-            try testing.expect(print_id != null);
-            // Both modules' print(...) call callees resolve to that same id.
+            try testing.expect(r0001 >= 1);
+            // No module registers `print`, so every `print(...)` callee is `.unresolved`.
             for (g.modules, 0..) |m, mi| {
                 for (m.nodes) |n| {
                     if (n.tag == .call) {
@@ -1526,9 +1525,7 @@ test "print is available unqualified in every module with one shared id" {
                         if (callee.tag == .identifier and
                             std.mem.eql(u8, m.tokens[callee.main_token].text(m.source), "print"))
                         {
-                            const cr = r.resolutions[mi][n.lhs.int()];
-                            try testing.expect(cr == .func);
-                            try testing.expectEqual(print_id.?, cr.func);
+                            try testing.expect(r.resolutions[mi][n.lhs.int()] == .unresolved);
                         }
                     }
                 }

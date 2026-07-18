@@ -1,8 +1,9 @@
 # Feature: an explicit `impl has Display` OVERRIDES the structural derive. This impl
 # returns a custom rendering instead of the structural `P{x: ..}` form, so the output is
 # `<custom>` — proving the user witness won (the derive never fired; no `Display$display$s*`
-# unit is synthesized). `resolveConformanceMethod` finds the explicit impl first. `print`
-# writes the returned str: print(P{..}) == write(P{..}.display()).
+# unit is synthesized). `resolveConformanceMethod` finds the explicit impl first. `io.print`
+# writes the str the witness returns: io.print(P{..}) renders P{..}.to_string().
+import std/io
 struct P { x: int, y: int }
 
 impl P has Display {
@@ -12,7 +13,7 @@ impl P has Display {
 }
 
 fn main() {
-    print(P{ x: 4, y: 2 })
+    io.print(P{ x: 4, y: 2 })
 }
 # expect: stdout "<custom>"
 # expect: exit 0

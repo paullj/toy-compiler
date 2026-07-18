@@ -1,20 +1,21 @@
-# Feature: `to_string(x)` == `x.display()` renders a struct/enum to the SAME bytes `print(x)`
-# writes (print(x) == write(x.display())). A record struct, a payload/bare enum, and a
+# Feature: `to_string(x)` == `x.display()` renders a struct/enum to the SAME bytes `io.print(x)`
+# writes (io.print(x) renders x.to_string() and writes it). A record struct, a payload/bare enum, and a
 # 20-field struct all render structurally with no field-count cliff (the accumulator builds
 # one growable str, not one live temp per field).
+import std/io
 struct Point { x: int, y: int }
 enum Color { R(int), G, B }
 struct Wide { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int, j: int, k: int, l: int, m: int, n: int, o: int, p: int, q: int, r: int, s: int, t: int }
 
 fn main() -> int {
-    print(Point{ x: 4, y: 2 }.to_string())
-    print("\n")
-    print(Color.R(7).to_string())
-    print("\n")
-    print(Color.G.to_string())
-    print("\n")
+    io.print(Point{ x: 4, y: 2 }.to_string())
+    io.print("\n")
+    io.print(Color.R(7).to_string())
+    io.print("\n")
+    io.print(Color.G.to_string())
+    io.print("\n")
     w := Wide{ a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20 }
-    print(w.to_string())
+    io.print(w.to_string())
     return 0
 }
 # expect: stdout "Point{x: 4, y: 2}\nR(7)\nG\nWide{a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10, k: 11, l: 12, m: 13, n: 14, o: 15, p: 16, q: 17, r: 18, s: 19, t: 20}"

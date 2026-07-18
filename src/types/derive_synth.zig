@@ -294,8 +294,8 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     }
 
     // Display fixpoint, INDEPENDENT of Eq/Ord/Hash (Display is not a
-    // refinement of any, so there is no `ordFills`-style skip). Seeded from the `print(x)`
-    // requests, it chases every aggregate field the same way the other fixpoints do —
+    // refinement of any, so there is no `ordFills`-style skip). Seeded from the `to_string`
+    // / display-derive requests, it chases every aggregate field the same way the other fixpoints do —
     // struct fields AND every enum variant's payload — skipping any field with a live
     // explicit `Display` conformance (it uses its own witness). The SAME
     // `collectComponentTypes` order the emitter walks, so a nested field's `display` witness

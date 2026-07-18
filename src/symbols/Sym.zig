@@ -17,7 +17,7 @@ pub const SymKind = enum(u8) { user_fn, builtin, import };
 /// Stable, source-position-INDEPENDENT identity of a definition. This is what a
 /// cached reloc names — never a source index (indices shift under reorder/insert,
 /// so an index in a cache hit would call the wrong code). PERSISTED on disk; the
-/// `name` is the sigil-free internal key ("main"/"print"/"write"). dyld-facing
+/// `name` is the sigil-free internal key ("main"/"panic"/"write"). dyld-facing
 /// linkage names (_main, _write) are DERIVED from this at emit. In-session the
 /// linker assigns a dense u32 handle via `SymInterner` for the hot path.
 ///

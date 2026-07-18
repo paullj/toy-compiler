@@ -189,8 +189,8 @@ pub const IrResult = union(enum) {
     err: EmitError,
 };
 
-/// The SERIAL relink tail (every build, uncached): derive `uses_write`, append
-/// the print body, intern strings program-wide (deterministic: fn source order
+/// The SERIAL relink tail (every build, uncached): append referenced hand-emitted
+/// builtin bodies, intern strings program-wide (deterministic: fn source order
 /// then in-fn literal order), rewrite `.cstr` hashes to offsets, then link and
 /// rebase cross-segment relocs. `slots` is consumed (each FnCode freed).
 fn relink(
@@ -232,9 +232,9 @@ fn relink(
     return .{ .ok = lp };
 }
 
-/// Shared back half of both paths: append the print body if referenced, intern
-/// strings deterministically, rewrite `.cstr` targets, then `Link.link`. CONSUMES
-/// `fns` (frees each FnCode and any appended print body). Returns a LinkedProgram
+/// Shared back half of both paths: append any referenced hand-emitted builtin bodies,
+/// intern strings deterministically, rewrite `.cstr` targets, then `Link.link`. CONSUMES
+/// `fns` (frees each FnCode and any appended builtin body). Returns a LinkedProgram
 /// with `diags`/`owned_msgs` left empty for the caller to fill.
 fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []const Link.SymName, entry_fn: u32, desc_plan: []const Link.DescEntry) !LinkedProgram {
     const lk = try link.linkProgram(io, gpa, fns, names[entry_fn], desc_plan);
@@ -252,7 +252,7 @@ fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []cons
 /// Per-module arrays (trees/tokens/sources/resolutions/node_types) are indexed by
 /// module id; `layouts`/`enum_layouts`/`names`/`sigs` are PROGRAM-WIDE (one global
 /// id space). `fn_decls`/`fn_modules` are parallel to the global fn id space (one
-/// entry per global fn; `print` excluded — only real fn bodies are lowered). A
+/// entry per global fn; bodyless builtins excluded — only real fn bodies are lowered). A
 /// codegen job selects its fn's owning module to build a single-fn `Frozen` view,
 /// so `walkCalls`/`walkTouchedSig`/`typeRefToType`/`fingerprint`/`lowerOne` run
 /// UNCHANGED — the only difference from single-file is which module's tree/resolutions
@@ -267,7 +267,7 @@ const GraphFrozen = struct {
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
     /// Program-wide: one SymName per global fn id (qualified user fns, bare `main`,
-    /// `{builtin,"print"}` at the print id). Parallel to `sigs`.
+    /// `{builtin,"panic"}` at the panic id). Parallel to `sigs`.
     names: []const Link.SymName,
     sigs: []const Fingerprint.Sig,
     /// The `fn_decl` node for each LOWERABLE global fn (parallel to `lower_ids`).
@@ -275,8 +275,8 @@ const GraphFrozen = struct {
     /// The owning module id for each lowerable fn (parallel to `fn_decls`).
     fn_modules: []const u32,
     /// Global fn id of each lowerable BASE fn (parallel to the first `base_count`
-    /// entries of `fn_decls`/`fn_modules`); indexes `names`/`sigs`. Excludes `print`
-    /// (bodyless) and generic templates (lowered only as instances).
+    /// entries of `fn_decls`/`fn_modules`); indexes `names`/`sigs`. Excludes bodyless
+    /// builtins and generic templates (lowered only as instances).
     lower_ids: []const u32,
     /// Number of base fn units; `fn_decls`/`fn_modules` entries at `[base_count..]`
     /// are monomorphized instances (parallel to `instances`).
@@ -398,8 +398,8 @@ pub fn lowerGraphProgram(
     }
 
     // Mirrors the resolver's global fn order exactly: a user fn -> {user_fn, its
-    // qualified/bare name from the typecheck sig}; the synthetic bodyless `print`
-    // -> {builtin,"print"}. The qualified name MUST equal the typecheck sig name
+    // qualified/bare name from the typecheck sig}; a synthetic bodyless builtin (`panic`)
+    // -> {builtin,"panic"}. The qualified name MUST equal the typecheck sig name
     // so the fingerprint callee fold lines up with the reloc target.
     const names = try buildGraphNames(gpa, res.fns, tc.sigs);
     defer {
@@ -415,7 +415,7 @@ pub fn lowerGraphProgram(
     defer lower_ids.deinit(gpa);
     var entry_id: ?u32 = null;
     for (res.fns, 0..) |gf, gid| {
-        if (gf.decl_node == Ast.none) continue; // synthetic print: no body to lower
+        if (gf.decl_node == Ast.none) continue; // synthetic builtin: no body to lower
         if (gf.kind == .import) continue; // an `extern`: bodyless, referenced only via `names[gid]`
         // Skip generic TEMPLATES: their params/ret are `type_var`s with no ABI,
         // so they are never lowered directly — only their concrete instances are
@@ -691,8 +691,8 @@ fn graphFnJobInner(
 
 /// Build the program-wide index→SymName table for a graph build: one entry per
 /// global fn id, parallel to `tc.sigs`. A user fn -> {user_fn, sig name} (the
-/// qualified spelling, or bare `main`); the synthetic bodyless `print` ->
-/// {builtin,"print"}. The name MUST equal the sig name so the fingerprint callee
+/// qualified spelling, or bare `main`); a synthetic bodyless builtin (`panic`) ->
+/// {builtin,"panic"}. The name MUST equal the sig name so the fingerprint callee
 /// fold matches the reloc target. Caller owns the names.
 fn buildGraphNames(gpa: std.mem.Allocator, fns: []const ResolveGraph.GlobalFn, sigs: []const Fingerprint.Sig) ![]Link.SymName {
     const names = try gpa.alloc(Link.SymName, fns.len);
@@ -702,7 +702,7 @@ fn buildGraphNames(gpa: std.mem.Allocator, fns: []const ResolveGraph.GlobalFn, s
         gpa.free(names);
     }
     for (fns, 0..) |gf, i| {
-        // The resolver's kind carries straight through: `.builtin` (print/panic),
+        // The resolver's kind carries straight through: `.builtin` (`panic`/intrinsics),
         // `.import` (an `extern` — a bare dyld symbol reached via `__got`), or
         // `.user_fn`. An extern's name is the bare C symbol (`labs`), matching its reloc.
         names[i] = .{ .kind = gf.kind, .name = try gpa.dupe(u8, sigs[i].name) };
@@ -734,7 +734,7 @@ pub fn renderGraphIr(
 
     var first = true;
     for (res.fns, 0..) |gf, gid| {
-        if (gf.decl_node == Ast.none) continue; // skip bodyless print
+        if (gf.decl_node == Ast.none) continue; // skip bodyless builtin
         if (gf.kind == .import) continue; // an `extern` emits no IR
         const m = &graph.modules[gf.module];
         // Skip generic templates: rendered only as concrete instances below.

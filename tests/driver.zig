@@ -530,7 +530,7 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
     }
 }
 
-test "print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra bytes)" {
+test "io.print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra bytes)" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -563,10 +563,10 @@ test "print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extra b
     try testing.expectEqualSlices(u8, "\x41\xC3\xB1\xE2\x82\xAC\xF0\x9F\x98\x80", got);
 }
 
-test "print(int) renders decimal for 0 / negative / i64 max / i64 MIN (never-negate loop); print(str) separates" {
+test "io.print(int) renders decimal for 0 / negative / i64 max / i64 MIN (never-negate loop); io.print(str) separates" {
     // BEHAVIORAL coverage for the two hand-asm builtins whose unit tests only assert
-    // instruction SHAPE: __display_int's i64::MIN-safe digit loop (it must NOT negate the
-    // running value) and print's str write. i64::MIN is the critical case — negating it
+    // instruction SHAPE: __int_to_str's i64::MIN-safe digit loop (it must NOT negate the
+    // running value) and the str write. i64::MIN is the critical case — negating it
     // overflows. Asserts exact stdout bytes.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -583,15 +583,16 @@ test "print(int) renders decimal for 0 / negative / i64 max / i64 MIN (never-neg
 
     const main_path = dir_name ++ "/main.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data =
+        \\import std/io
         \\fn main() {
-        \\    print(0)
-        \\    print("\n")
-        \\    print(-1)
-        \\    print("\n")
-        \\    print(9223372036854775807)
-        \\    print("\n")
-        \\    print(-9223372036854775808)
-        \\    print("\n")
+        \\    io.print(0)
+        \\    io.print("\n")
+        \\    io.print(-1)
+        \\    io.print("\n")
+        \\    io.print(9223372036854775807)
+        \\    io.print("\n")
+        \\    io.print(-9223372036854775808)
+        \\    io.print("\n")
         \\}
         \\
     });
@@ -632,14 +633,15 @@ test "char Display is a shared witness — >6 boundary codepoints compile + byte
     // length band and BOTH edges of each: U+7F|U+80, U+7FF|U+800, U+FFFF|U+10000, U+10FFFF.
     const main_path = dir_name ++ "/main.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data =
+        \\import std/io
         \\fn main() {
-        \\    print('\u{7F}')
-        \\    print('\u{80}')
-        \\    print('\u{7FF}')
-        \\    print('\u{800}')
-        \\    print('\u{FFFF}')
-        \\    print('\u{10000}')
-        \\    print('\u{10FFFF}')
+        \\    io.print('\u{7F}')
+        \\    io.print('\u{80}')
+        \\    io.print('\u{7FF}')
+        \\    io.print('\u{800}')
+        \\    io.print('\u{FFFF}')
+        \\    io.print('\u{10000}')
+        \\    io.print('\u{10FFFF}')
         \\}
         \\
     });
@@ -1718,8 +1720,10 @@ test "integration: emitted binary runs with the right exit code" {
         // Same regression via a BARE-BLOCK expr as the deep 3rd arg.
         .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute(k: int) -> int {\n return add3(10, 20, { 1 + (2 + (3 + (4 + (5 + 6)))) })\n}\nfn main() -> int {\n return compute(1)\n}\n", .name = "blockval_deeparg", .expect = 51 },
         // a str-returning fn whose body is a value-if, consumed through a CALL → its
-        // (ptr,len) must reach the caller in (x0,x1) and feed `print`. Exits 0.
-        .{ .src = "fn pick(b: int) -> str {\n if b > 0 { \"yes\" } else { \"no\" }\n}\nfn main() -> int {\n print(pick(1))\n return 0\n}\n", .name = "strret_call", .expect = 0 },
+        // (ptr,len) must reach the caller in (x0,x1) and bind cleanly. Exits 0. (No
+        // print: this single-file pipeline cannot import `std/io`; binding the str
+        // still forces the reg-pair return to materialize in the caller.)
+        .{ .src = "fn pick(b: int) -> str {\n if b > 0 { \"yes\" } else { \"no\" }\n}\nfn main() -> int {\n s := pick(1)\n return 0\n}\n", .name = "strret_call", .expect = 0 },
         // ENTRY-EPILOGUE REGRESSION: a non-unit `main` whose body is a TRAILING value
         // expression (no explicit return) lands its value in x0 at the fall-through
         // epilogue — the entry's `movz x0,#0` must NOT clobber it (only a UNIT entry
@@ -1786,9 +1790,10 @@ test "integration: emitted binary runs with the right exit code" {
         // (5b) deep break @outer value as the SIGBUS canary on a labeled loop too.
         .{ .src = "fn add3(a: int, b: int, c: int) -> int {\n return a + b + c\n}\nfn compute() -> int {\n return add3(10, 20, @lp loop { break @lp 1 + (2 + (3 + (4 + (5 + 6)))) })\n}\nfn main() -> int {\n return compute()\n}\n", .name = "break_outer_deeparg", .expect = 51 },
         // (6) str-typed result canary: a labeled bare block yielding a str (16-byte
-        // result slot + x0/x1) consumed by `print`. Exits 0; proves the fat-value
-        // store/load through the labeled-block result slot.
-        .{ .src = "fn greet(s: str) -> str {\n s\n}\nfn main() -> int {\n print(@blk { break @blk greet(\"hi\") })\n return 0\n}\n", .name = "labeledblock_str", .expect = 0 },
+        // result slot + x0/x1) bound to a local. Exits 0; proves the fat-value
+        // store/load through the labeled-block result slot. (No print: single-file
+        // pipeline can't import `std/io`; binding the str still exercises the slot.)
+        .{ .src = "fn greet(s: str) -> str {\n s\n}\nfn main() -> int {\n s := @blk { break @blk greet(\"hi\") }\n return 0\n}\n", .name = "labeledblock_str", .expect = 0 },
 
         // Structs — each RUN proves a back-end capability (layout/ABI/copy) that
         // a byte assert can't: a wrong field offset, ABI class, or missed copy
@@ -2321,40 +2326,27 @@ test "integration: print writes the expected bytes to stdout" {
 
     const Case = struct { src: []const u8, name: []const u8, want: []const u8 };
     const cases = [_]Case{
-        .{ .src = "fn main() {\n print(\"hello world\\n\")\n}\n", .name = "hw", .want = "hello world\n" },
+        .{ .src = "import std/io\nfn main() {\n io.print(\"hello world\\n\")\n}\n", .name = "hw", .want = "hello world\n" },
         // A str local + a second literal: two distinct cstrings + a 16-byte slot.
-        .{ .src = "fn main() {\n print(\"AB\")\n s := \"CD\\n\"\n print(s)\n}\n", .name = "two", .want = "ABCD\n" },
+        .{ .src = "import std/io\nfn main() {\n io.print(\"AB\")\n s := \"CD\\n\"\n io.print(s)\n}\n", .name = "two", .want = "ABCD\n" },
     };
 
+    _ = cache;
     for (cases, 0..) |c, i| {
+        _ = i;
         const src_path = std.fmt.allocPrint(gpa, "{s}/{s}.toy", .{ dir_name, c.name }) catch unreachable;
         defer gpa.free(src_path);
         try Io.Dir.cwd().writeFile(io, .{ .sub_path = src_path, .data = c.src });
 
-        var r: FileResult = .{ .path = src_path };
-        try pipeline(gpa, io, cache, .check, "aarch64-macos", &r, i);
-        defer r.deinit(gpa);
-        try testing.expect(r.err == null);
-
-        var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
-        const lp = switch (lowered) {
-            .ok => |*ok| ok,
-            .err => return error.TestUnexpectedResult,
-        };
-        defer lp.deinit(gpa);
-        try testing.expectEqual(@as(usize, 0), lp.diags.len);
-
-        const image = try buildImage(io, gpa, c.name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs);
-        defer gpa.free(image);
-
+        // `io.print` is ordinary library code in `std/io`, so these programs import a
+        // module — the WHOLE-BINARY build (with graph discovery) is the only path that
+        // follows imports; the single-file `pipeline` cannot. Build via the real `toy`.
         const out_path = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, c.name }) catch unreachable;
         defer gpa.free(out_path);
         {
-            const perms: Io.File.Permissions = .fromMode(0o755);
-            var f = try Io.Dir.cwd().createFile(io, out_path, .{ .permissions = perms });
-            defer f.close(io);
-            try f.writeStreamingAll(io, image);
-            try f.setPermissions(io, perms);
+            const res = try spawnToy(gpa, io, &.{ "build", src_path, "-o", out_path });
+            defer gpa.free(res.out);
+            try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
         }
 
         const abs = try Io.Dir.cwd().realPathFileAlloc(io, out_path, gpa);

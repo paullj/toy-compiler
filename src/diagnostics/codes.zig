@@ -78,7 +78,7 @@ pub const Code = enum(u16) {
     T0028, // missing-arith-impl (`+`/`-`/`*`/`/` used on a value type with no matching `Add`/`Sub`/`Mul`/`Div` conformance — operator desugar)
     T0029, // non-derivable-field (structural `Eq` derive blocked by a struct field whose type does not conform to `Eq` — use-site)
     T0030, // non-hashable-field (structural `Hash` derive blocked by a field whose type does not conform to `Hash` — use-site)
-    T0031, // non-displayable-arg (`print(x)`/structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site)
+    T0031, // non-displayable-arg (structural `Display` derive blocked by an arg/field whose type does not conform to `Display` — use-site, via `to_string`)
     T0032, // question-non-optionresult (`?` operand is not an Option/Result, or the enclosing return type cannot absorb the residual)
     T0033, // question-constructor-mismatch (`?` operand family differs from the enclosing return, or a Result error-type mismatch)
     T0034, // literal-out-of-range (an integer literal exceeds the range of its annotated width)
@@ -303,7 +303,7 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("non-hashable-field", slug(.T0030).?);
     try testing.expectEqual(Code.T0030, fromStr("T0030").?);
 
-    // `print`/structural `Display` derive blocker code.
+    // Structural `Display` derive blocker code (via `to_string`).
     try testing.expectEqualStrings("T0031", str(.T0031).?);
     try testing.expectEqualStrings("non-displayable-arg", slug(.T0031).?);
     try testing.expectEqual(Code.T0031, fromStr("T0031").?);

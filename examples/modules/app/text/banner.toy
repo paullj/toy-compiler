@@ -1,5 +1,6 @@
-# Feature: `print` is a GLOBAL PRELUDE — usable UNQUALIFIED in every module with
-# no import, with the same {builtin,"print"} identity as in the entry module.
+# Feature: a printing submodule imports `std/io` for itself — `io.print` is ordinary
+# library code, so each module that prints names the import it needs (no global prelude).
+import std/io
 pub fn hello() {
-    print("modules ok\n")
+    io.print("modules ok\n")
 }

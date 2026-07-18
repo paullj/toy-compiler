@@ -1,6 +1,7 @@
 # expect: stdout "42"
 # expect: exit 0
+import std/io
 fn main() -> int {
-    print(42.to_string())
+    io.print(42.to_string())
     return 0
 }

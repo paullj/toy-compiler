@@ -1,7 +1,8 @@
 # expect: stdout "A€\n"
 # expect: exit 0
+import std/io
 fn main() {
-    print('A')
-    print('€')
-    print('\n')
+    io.print('A')
+    io.print('€')
+    io.print('\n')
 }

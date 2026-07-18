@@ -590,15 +590,6 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             return;
                         }
                         const nm = self.frozen.names[res.func];
-                        // The `print` builtin: for a struct/enum arg its reloc target is the
-                        // resolved `Display` witness (not the fixed `print` Sig), so fold that
-                        // witness — a caller recompiles when it changes (e.g. the arg struct
-                        // gains an explicit `impl Display`), the same incremental-soundness
-                        // discipline as the `.operator` witness fold. A scalar arg relocs to a
-                        // fixed builtin/inline sequence, so `foldPrintCallee` returns false and
-                        // the plain `print` Sig is folded (fingerprints byte-identical).
-                        if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print") and
-                            try self.foldPrintCallee(c.call)) return;
                         try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
                         return;
                     }
@@ -735,32 +726,6 @@ pub fn CallVisitor(comptime Frozen: type) type {
                 const nm = self.frozen.names[m.fn_id];
                 const sig = self.frozen.sigs[m.fn_id];
                 try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
-            }
-        }
-
-        /// Fold the `print` builtin callee by its single arg's type, returning TRUE when it
-        /// folded an arg-kind-specific identity so the caller skips the plain `print` fold.
-        /// The ONLY source-invisible reloc is a struct/enum's resolved `Display` witness ->
-        /// `foldWitness` it (so gaining an explicit `impl Display`, which flips the resolved
-        /// witness, recompiles the caller); `dv.ret` is now `str`, self-updating. Every scalar
-        /// (int/bool/str/unit) relocs to a FIXED builtin (`__int_to_str`/`write`) or an inline
-        /// sequence that is program-invariant — a change in the arg's KIND is already visible
-        /// in the caller's own content-fp — so they return FALSE and fold the plain `print`
-        /// Sig, leaving those fingerprints byte-identical (warm cache preserved).
-        fn foldPrintCallee(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!bool {
-            const call_node = self.frozen.tree.nodes[call_idx.int()];
-            const pargs = Ast.rangeSlice(self.frozen.tree, call_node.rhs.int());
-            if (pargs.len != 1 or pargs[0].int() >= self.frozen.node_types.len) return false;
-            const at = self.frozen.node_types[pargs[0].int()];
-            switch (at.kind) {
-                .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, at, "display", self.frozen.prelude_ids.display, null)) {
-                    .one => |m| {
-                        try self.foldWitness(m);
-                        return true;
-                    },
-                    .none, .ambiguous => return false, // plain `print` fold
-                },
-                else => return false, // scalars: fixed builtin/inline reloc — plain `print` fold
             }
         }
 

@@ -1,7 +1,8 @@
 import core/sys
 
-# Write `s` to stdout via the core write client. `std` calls a core pub member; it
-# never names the `write` extern (the resolver forbids that outside `core/`).
-pub fn print(s: str) {
-    sys.print(s)
+# `print` renders any Display value to a str then writes it. `to_string(str)` is identity
+# (no alloc), so a str arg keeps the alloc-free path; every other kind renders through the
+# universal `to_string`/`display` authority.
+pub fn print[T has Display](x: T) {
+    sys.print(x.to_string())
 }

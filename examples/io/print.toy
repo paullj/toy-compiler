@@ -1,9 +1,11 @@
-# Feature: runtime output via libSystem `write`.
+# Feature: runtime output. `io.print` renders its arg to a `str` and hands it to
+# `sys.print`, which writes the {ptr,len} to fd 1 via libSystem `write`.
 # expect: stdout "hello world\n"
 # expect: exit 0
-# `print` takes a `str` ({ptr,len}); string literals live in __cstring and are
-# addressed PIE-safely with adrp/add. `write` is bound from libSystem via a
-# chained-fixup into __got. (exit is still dyld's, on main's return.)
+# String literals live in __cstring and are addressed PIE-safely with adrp/add; `write`
+# is bound from libSystem via a chained-fixup into __got. (exit is still dyld's, on
+# main's return.)
+import std/io
 fn main() {
-    print("hello world\n")
+    io.print("hello world\n")
 }

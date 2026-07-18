@@ -2,7 +2,8 @@
 //! runnable Mach-O image.
 //!
 //! WHY this is one entry point: the backend tail is a fixed, order-sensitive
-//! pipeline — (1) detect `_write` use, append the `print` body, (2) intern the
+//! pipeline — (1) detect referenced hand-emitted builtin bodies (e.g. `panic`, which
+//! pulls in `write`) and append them, (2) intern the
 //! per-fn content-hashed cstring literals program-wide IN A DETERMINISTIC ORDER
 //! (fn source order, then in-fn literal order), (3) rewrite each `.cstr` reloc's
 //! hash target to its global `__cstring` offset, (4) `Link.link` (layout +
