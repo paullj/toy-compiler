@@ -3063,8 +3063,9 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
 
 /// Decode a bodyless `extern fn` signature into the global fn table (kind `.import`).
 /// Every param type and the return type are gated to the C-ABI types the backend
-/// can marshal — `int` (any width), `rawptr`, `bool`, or `str` (a `{ptr,len}` reg-pair
-/// spreading to two C args); a `void` return, spelled by omitting `-> R`, is also fine.
+/// can marshal — `int` (any width), `rawptr`, `bool`, `float` (f64/C `double`), or `str`
+/// (a `{ptr,len}` reg-pair spreading to two C args); a `void` return, spelled by omitting
+/// `-> R`, is also fine.
 /// A type outside that set is T0037 and poisoned to `.invalid`. No generics, no self,
 /// no method registration.
 fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
@@ -3078,28 +3079,29 @@ fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         if (externTypeOk(pty)) {
             params[i] = pty;
         } else {
-            try t.sink.emitFmtCode(.T0037, t.byteOf(param.main_token), "extern function parameter/return type must be int, str, rawptr, or bool", .{});
+            try t.sink.emitFmtCode(.T0037, t.byteOf(param.main_token), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
             params[i] = .invalid;
         }
     }
     var ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
     // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI scalar.
     if (proto.ret_type != Ast.none and !externTypeOk(ret)) {
-        try t.sink.emitFmtCode(.T0037, t.byteOf(t.tree.nodes[proto.ret_type.int()].main_token), "extern function parameter/return type must be int, str, rawptr, or bool", .{});
+        try t.sink.emitFmtCode(.T0037, t.byteOf(t.tree.nodes[proto.ret_type.int()].main_token), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
         ret = .invalid;
     }
     try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .import, .params = params, .ret = ret, .mod = mod });
 }
 
 /// The C-ABI type set an `extern` param/return may use: any integer width, `bool`,
-/// an opaque `rawptr`, or a `str`. A `str` is a `{ptr,len}` reg-pair the backend
-/// already marshals to two consecutive integer registers, so an extern `str` param
-/// spreads to a C `(const char* buf, size_t len)` pair — the only way to hand a toy
-/// string to a raw C call in plain toy source (no address-of-local exists to
-/// decompose it into a `rawptr`). Poison (`.invalid`) is accepted so a prior error
+/// an opaque `rawptr`, a `float`, or a `str`. A `str` is a `{ptr,len}` reg-pair the
+/// backend already marshals to two consecutive integer registers, so an extern `str`
+/// param spreads to a C `(const char* buf, size_t len)` pair — the only way to hand a
+/// toy string to a raw C call in plain toy source (no address-of-local exists to
+/// decompose it into a `rawptr`). A `float` is an f64 riding the V-register (NSRN)
+/// sequence, matching C `double`. Poison (`.invalid`) is accepted so a prior error
 /// does not cascade into a second T0037.
 fn externTypeOk(ty: Type) bool {
-    return ty.isInteger() or ty.kind == .bool or ty.isRawPtr() or ty.kind == .str or ty.kind == .invalid;
+    return ty.isInteger() or ty.kind == .bool or ty.isRawPtr() or ty.kind == .str or ty.kind == .float or ty.kind == .invalid;
 }
 
 /// Append a placeholder `(str) -> ()` sig for a bodyless builtin (`panic`/the intrinsics).
