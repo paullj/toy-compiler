@@ -45,14 +45,6 @@ const eq_params_bool = [_]Typecheck.Type{ Typecheck.Type.bool, Typecheck.Type.bo
 // receiver-typed element — distinct from the 2-ary `eq` sentinel above by both count + name.
 const hash_params_int = [_]Typecheck.Type{Typecheck.Type.int};
 const hash_params_bool = [_]Typecheck.Type{Typecheck.Type.bool};
-// The `print` builtin scalar-dispatch sentinel params: `print(x)` on an `int` folds a
-// fixed `__display_int` sentinel; on a `bool`, a fixed `display_bool` sentinel — so a
-// `print(x)` site's fingerprint distinguishes the arg KIND (int vs bool vs str vs a
-// struct/enum's resolved Display witness) for incremental soundness, mirroring the builtin
-// scalar `eq`/`hash` sentinels. A struct/enum print folds its resolved witness (see `.callee`).
-const display_params_int = [_]Typecheck.Type{Typecheck.Type.int};
-const display_params_bool = [_]Typecheck.Type{Typecheck.Type.bool};
-
 /// The read-only inputs a walk needs to spell a leaf. `tree`/`tokens`/`source`
 /// are the same trio every consumer already threads; `leaf`/`tokenText` fold the
 /// inline `tokens[n.main_token].text(source)` idiom the old walks repeated.
@@ -598,14 +590,13 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             return;
                         }
                         const nm = self.frozen.names[res.func];
-                        // The `print` builtin: its reloc target depends on the single
-                        // arg's TYPE (int->__display_int, bool->inline, struct/enum->the
-                        // resolved Display witness), not on the fixed `print` Sig. Fold by the
-                        // arg kind so a caller recompiles when the resolved witness changes
-                        // (e.g. the arg struct gains an explicit `impl Display`) — the same
-                        // incremental-soundness discipline as the `.operator` witness fold.
-                        // `str`/`unit` keep the raw `print` write path, so folding the `print`
-                        // Sig for them leaves those fingerprints byte-identical (warm cache).
+                        // The `print` builtin: for a struct/enum arg its reloc target is the
+                        // resolved `Display` witness (not the fixed `print` Sig), so fold that
+                        // witness — a caller recompiles when it changes (e.g. the arg struct
+                        // gains an explicit `impl Display`), the same incremental-soundness
+                        // discipline as the `.operator` witness fold. A scalar arg relocs to a
+                        // fixed builtin/inline sequence, so `foldPrintCallee` returns false and
+                        // the plain `print` Sig is folded (fingerprints byte-identical).
                         if (nm.kind == .builtin and std.mem.eql(u8, nm.name, "print") and
                             try self.foldPrintCallee(c.call)) return;
                         try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
@@ -621,6 +612,17 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         if (recv.kind == .@"struct" or recv.kind == .@"enum" or recv.isScalar())
                         {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
+                            // A struct/enum `x.to_string()` relocs to x's DISPLAY witness
+                            // (there is no `to_string` symbol — lower routes it through
+                            // `displayToSlot`). Fold that witness so a struct gaining an `impl
+                            // Display` in another module recompiles its `to_string` callers.
+                            // Scalar `to_string` is a fixed builtin, needing no fold.
+                            if (std.mem.eql(u8, member, "to_string") and (recv.kind == .@"struct" or recv.kind == .@"enum")) {
+                                switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "display", self.frozen.prelude_ids.display, null)) {
+                                    .one => |m| return self.foldWitness(m),
+                                    .none, .ambiguous => return,
+                                }
+                            }
                             // The SAME multi-conformance resolver the checker + lower use, so
                             // the folded witness matches the reloc target. `.one` is
                             // byte-identical to the earlier single-conformance `findMethod` for
@@ -736,27 +738,21 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
         }
 
-        /// Fold the `print` builtin callee by its single arg's type, returning TRUE when
-        /// it folded an arg-kind-specific identity so the caller skips the plain `print` fold.
-        /// `int` -> a fixed `__display_int` sentinel; `bool` -> a fixed `display_bool` sentinel;
-        /// a struct/enum -> its resolved `Display` witness (via `foldWitness`, so gaining an
-        /// explicit `impl Display` flips the caller). Returns FALSE for `str`/`unit` (or a
-        /// pre-typecheck / non-conforming view) so the caller folds the plain `print` Sig,
-        /// leaving `print("..")` fingerprints byte-identical (warm cache preserved).
+        /// Fold the `print` builtin callee by its single arg's type, returning TRUE when it
+        /// folded an arg-kind-specific identity so the caller skips the plain `print` fold.
+        /// The ONLY source-invisible reloc is a struct/enum's resolved `Display` witness ->
+        /// `foldWitness` it (so gaining an explicit `impl Display`, which flips the resolved
+        /// witness, recompiles the caller); `dv.ret` is now `str`, self-updating. Every scalar
+        /// (int/bool/str/unit) relocs to a FIXED builtin (`__int_to_str`/`write`) or an inline
+        /// sequence that is program-invariant — a change in the arg's KIND is already visible
+        /// in the caller's own content-fp — so they return FALSE and fold the plain `print`
+        /// Sig, leaving those fingerprints byte-identical (warm cache preserved).
         fn foldPrintCallee(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!bool {
             const call_node = self.frozen.tree.nodes[call_idx.int()];
             const pargs = Ast.rangeSlice(self.frozen.tree, call_node.rhs.int());
             if (pargs.len != 1 or pargs[0].int() >= self.frozen.node_types.len) return false;
             const at = self.frozen.node_types[pargs[0].int()];
             switch (at.kind) {
-                .int => {
-                    try self.out.append(self.gpa, .{ .kind = .builtin, .name = "__display_int", .params = &display_params_int, .ret = Typecheck.Type.unit });
-                    return true;
-                },
-                .bool => {
-                    try self.out.append(self.gpa, .{ .kind = .builtin, .name = "display_bool", .params = &display_params_bool, .ret = Typecheck.Type.unit });
-                    return true;
-                },
                 .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(self.frozen.methods, at, "display", self.frozen.prelude_ids.display, null)) {
                     .one => |m| {
                         try self.foldWitness(m);
@@ -764,7 +760,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     },
                     .none, .ambiguous => return false, // plain `print` fold
                 },
-                else => return false, // str/unit: the raw write path — plain `print` fold
+                else => return false, // scalars: fixed builtin/inline reloc — plain `print` fold
             }
         }
 

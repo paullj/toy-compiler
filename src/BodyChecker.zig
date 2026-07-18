@@ -2467,6 +2467,33 @@ pub const BodyChecker = struct {
             }
             // No structural derive and no nameable blocker: fall through to T0018.
         }
+        // A direct `.to_string()` on a struct/enum with NO explicit `to_string` fn: the
+        // structural `Display` derive trigger (`to_string(x) == x.display()`). Mirrors the
+        // `hash` trigger and reuses the SAME `conformsTo(display)` gate `print` uses, so a
+        // custom `impl Display` (a `.direct` conformance) reuses its witness with no
+        // structural derive. A conforming aggregate records the display derive + types the
+        // call `str`; a struct with a non-Display field names it (T0031, with a to_string
+        // verb since print's message would mislead); a payload enum with a non-conforming
+        // payload has no nameable field and falls through to T0018.
+        if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null and
+            (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
+        {
+            if (args.len != 0) {
+                for (args) |a| _ = try bc.typeOf(a);
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                bc.node_types[(node_idx).int()] = Type.str;
+                return Type.str;
+            }
+            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, true)) {
+                bc.node_types[(node_idx).int()] = Type.str;
+                return Type.str;
+            }
+            if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().display)) |blocker| {
+                try bc.sink.emitFmtCode(.T0031, bc.byteOf(callee.main_token), "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                return .invalid;
+            }
+            // No structural derive and no nameable blocker: fall through to T0018.
+        }
         // A builtin scalar protocol method: `n.eq(m)` on int/bool, or
         // `n.hash()` on any scalar. Not a `t.methods` entry (the recognizer is
         // pure), so `findMethod` misses; recognize it here, check arity (`eq` = 1

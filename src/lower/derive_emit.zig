@@ -1113,74 +1113,69 @@ fn lowerErasedEq(
     return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
-/// Display field `i` (at byte `off`, type `fty`) of receiver base `self_base`:
-/// int/bool render inline (via `__display_int` / the bool cond); a `str` field writes its
-/// raw bytes (the SAME `str {ptr,len}` write path a top-level `str` uses — no quotes); a
-/// struct/enum field is copied into a fresh temp slot then routed through `displayAtSlot`.
-/// A `()` field is zero-sized: display the literal `()`. Mirrors `deriveFieldHash`.
-fn deriveFieldDisplay(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!void {
+/// Render field `i` (at byte `off`, type `fty`) of receiver base `self_base` to a fresh
+/// `str` slot through the SHARED `displayToSlot` authority — the SAME renderer `print` /
+/// `to_string` / a top-level value use, so a field never drifts from a standalone value.
+/// int/bool load the field value; str/struct/enum copy the 16-/N-byte field into a temp
+/// slot (self by slot); a `()` field is zero-sized (a `.none` operand → the const-data
+/// `"()"`). The caller `appendPiece`s the returned slot. Mirrors `deriveFieldHash`.
+fn deriveFieldDisplay(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!Ir.SlotId {
     const int_ty = Typecheck.Type.int;
-    switch (fty.kind) {
-        .int => {
+    const op: Ir.Operand = switch (fty.kind) {
+        .int, .bool => blk: {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
-            const v = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
-            try L.emitDisplayIntValue(b, v);
+            break :blk .{ .value = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty) };
         },
-        .bool => {
-            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
-            const v = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
-            try L.emitDisplayBoolValue(b, v);
-        },
-        .str => {
-            // Copy the 16-byte {ptr,len} header into a fresh str slot then `print` it —
-            // ONE shared raw-bytes path, so a nested `str` field renders identically to a
-            // top-level `str` (raw bytes, no surrounding quotes).
+        .str, .@"struct", .@"enum" => blk: {
             const slot = try b.addSlot(fty);
             const d = try b.emit(.{ .slot_addr = slot }, int_ty);
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
             _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
-            try L.emitPrintSlot(b, slot);
+            break :blk .{ .slot = slot };
         },
-        .@"struct", .@"enum" => {
-            const slot = try b.addSlot(fty);
-            const d = try b.emit(.{ .slot_addr = slot }, int_ty);
-            const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
-            _ = try b.emit(.{ .copy = .{ .dst = d, .src = la, .ty = fty } }, null);
-            try L.displayAtSlot(b, fty, slot);
-        },
-        // A `()` field is zero-sized: render the literal `()` (matches print(())).
-        .unit => try L.emitWriteLiteral(b, "()"),
+        .unit => .none,
         else => {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported field type in lower" });
             b.had_error = true;
+            return try L.emitStrLiteralSlot(b, "");
         },
-    }
+    };
+    return try L.displayToSlot(b, fty, op);
 }
 
-/// Render variant `vi`'s active payload to fd 1 and branch to `join`: write the
-/// bare `variant` name, and for a payload variant `variant(<v0>, <v1>)` (fields in
-/// declaration order, `, `-separated), using ABSOLUTE payload offsets. Mirrors
-/// `emitVariantPayloadEq`'s ladder-arm shape but writes for effect (unit).
-fn emitVariantDisplay(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
+/// Render variant `vi`'s active payload into the shared `acc` and branch to `join`: append
+/// the bare `variant` name, and for a payload variant `variant(<v0>, <v1>)` (fields in
+/// declaration order, `, `-separated), using ABSOLUTE payload offsets. The variant name +
+/// `"("` are fused into one interned literal. Mirrors `emitVariantPayloadEq`'s ladder-arm
+/// shape but builds a str instead of comparing.
+fn emitVariantDisplay(b: *L.Builder, acc: Ir.SlotId, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
     const v = e.variants[vi];
-    try L.emitWriteLiteral(b, v.name);
-    if (v.field_types.len != 0) {
-        try L.emitWriteLiteral(b, "(");
+    if (v.field_types.len == 0) {
+        try L.appendLiteral(b, acc, v.name);
+    } else {
+        const open = try std.fmt.allocPrint(b.gpa, "{s}(", .{v.name});
+        defer b.gpa.free(open);
+        try L.appendLiteral(b, acc, open);
         for (v.field_types, v.offsets, 0..) |fty, poff, j| {
-            try deriveFieldDisplay(b, fty, e.payload_off + poff, self_base);
-            if (j + 1 != v.field_types.len) try L.emitWriteLiteral(b, ", ");
+            const piece = try deriveFieldDisplay(b, fty, e.payload_off + poff, self_base);
+            try L.appendPiece(b, acc, piece);
+            if (j + 1 != v.field_types.len) try L.appendLiteral(b, acc, ", ");
         }
-        try L.emitWriteLiteral(b, ")");
+        try L.appendLiteral(b, acc, ")");
     }
     if (!b.termSet()) try L.brTo(b, join, .none);
 }
 
-/// Lower a SOURCE-LESS auto-derive `Display` unit: a unit-returning, layout-walking
-/// emitter that WRITES the value's structural rendering directly to the output fd — never a
-/// returned `str`. ONE param (the receiver, by slot). A struct writes `Name{field: <v>, ...}`
-/// (fields in layout order); a payload enum does a `get_tag` dispatch ladder writing a bare
-/// `variant` or `variant(<v0>, <v1>)`; scalar fields render inline (int->__display_int, bool
-/// inline, str->raw bytes), aggregate fields call the sibling `display` witness.
+/// Lower a SOURCE-LESS auto-derive `Display` unit: a `str`-RETURNING, layout-walking emitter
+/// that BUILDS the value's structural rendering into a fresh gc `str` (the exact bytes it
+/// used to write to fd 1) and returns it. `print` writes the result; `to_string` returns it.
+/// ONE param (the receiver, by slot). A struct builds `Name{field: <v>, ...}` (fields in
+/// layout order); a payload enum does a `get_tag` dispatch ladder producing a bare `variant`
+/// or `variant(<v0>, <v1>)`. Every fixed run (name + separators) is one interned literal;
+/// each dynamic field is rendered by the shared `displayToSlot` and appended into the reused
+/// `acc` str slot (one slot for the whole render — the frame-capacity fix). A scalar field
+/// renders through `displayToSlot`'s scalar arms; an aggregate field calls its sibling
+/// `display` witness — one authority, no drift.
 fn lowerDeriveDisplay(
     gpa: std.mem.Allocator,
     in: L.Inputs,
@@ -1189,10 +1184,10 @@ fn lowerDeriveDisplay(
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
     const int_ty = Typecheck.Type.int;
-    const unit_ty = Typecheck.Type.unit;
+    const str_ty = Typecheck.Type.str;
     const cty = d.conform_ty;
 
-    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = unit_ty, .diags = out_diags };
+    var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = str_ty, .diags = out_diags };
     errdefer b.deinit();
 
     var params: std.ArrayList(Ir.SlotId) = .empty;
@@ -1204,61 +1199,72 @@ fn lowerDeriveDisplay(
     b.switchTo(entry);
     const exit = try b.addBlock();
     b.exit = exit;
-    b.blocks.items[exit].term = .{ .ret = .none };
+    b.ret_param = try b.addParam(exit, str_ty);
+    b.blocks.items[exit].term = .{ .ret = .{ .value = b.ret_param } };
     b.blocks.items[exit].term_set = true;
 
     if (L.isCharTy(&b, cty)) {
         // char's Display OVERRIDES the structural tuple walk with the hand-written UTF-8
         // encoder — the same override the per-site inline shunt used to provide, now emitted
         // ONCE here and CALLed from every char-display site (the frame-overflow fix).
-        try L.lowerCharDisplay(&b, p_self);
-        if (!b.termSet()) try L.brTo(&b, exit, .none);
+        const s = try L.lowerCharDisplay(&b, p_self);
+        if (!b.termSet()) try L.brTo(&b, exit, .{ .slot = s });
         return try L.finishFn(&b, gpa, sym, &params, entry, exit);
     }
 
     const self_base = try b.emit(.{ .slot_addr = p_self }, int_ty);
+    const acc = try L.emitStrLiteralSlot(&b, "");
 
     switch (cty.kind) {
         .@"struct" => {
             const layout = b.in.layouts[cty.struct_id];
-            try L.emitWriteLiteral(&b, layout.name);
             if (layout.is_tuple) {
-                try L.emitWriteLiteral(&b, "(");
+                const open = try std.fmt.allocPrint(gpa, "{s}(", .{layout.name});
+                defer gpa.free(open);
+                try L.appendLiteral(&b, acc, open);
                 for (layout.field_types, layout.offsets, 0..) |fty, off, i| {
-                    try deriveFieldDisplay(&b, fty, off, self_base);
-                    if (i + 1 != layout.field_types.len) try L.emitWriteLiteral(&b, ", ");
+                    try L.appendPiece(&b, acc, try deriveFieldDisplay(&b, fty, off, self_base));
+                    if (i + 1 != layout.field_types.len) try L.appendLiteral(&b, acc, ", ");
                 }
-                try L.emitWriteLiteral(&b, ")");
+                try L.appendLiteral(&b, acc, ")");
             } else {
-                try L.emitWriteLiteral(&b, "{");
                 for (layout.field_names, layout.field_types, layout.offsets, 0..) |fname, fty, off, i| {
-                    try L.emitWriteLiteral(&b, fname);
-                    try L.emitWriteLiteral(&b, ": ");
-                    try deriveFieldDisplay(&b, fty, off, self_base);
-                    if (i + 1 != layout.field_types.len) try L.emitWriteLiteral(&b, ", ");
+                    // Fuse the (separator + field name + `: `) run into ONE interned literal:
+                    // `Name{f0: ` for the first field, `, f1: ` for the rest.
+                    const lit = if (i == 0)
+                        try std.fmt.allocPrint(gpa, "{s}{{{s}: ", .{ layout.name, fname })
+                    else
+                        try std.fmt.allocPrint(gpa, ", {s}: ", .{fname});
+                    defer gpa.free(lit);
+                    try L.appendLiteral(&b, acc, lit);
+                    try L.appendPiece(&b, acc, try deriveFieldDisplay(&b, fty, off, self_base));
                 }
-                try L.emitWriteLiteral(&b, "}");
+                // A record struct always has >= 1 field (T0005 rejects an empty struct), so
+                // the loop emitted the fused `Name{f0: ` open; close the brace.
+                try L.appendLiteral(&b, acc, "}");
             }
+            if (!b.termSet()) try L.brTo(&b, exit, .{ .slot = acc });
         },
         .@"enum" => {
             const e = b.in.enum_layouts[cty.enum_id];
             const tag = try b.emit(.{ .get_tag = self_base }, int_ty);
             const join = try b.addBlock();
-            try emitVariantLadder(&b, e, tag, .{ .e = e, .self_base = self_base, .join = join }, struct {
+            try emitVariantLadder(&b, e, tag, .{ .e = e, .acc = acc, .self_base = self_base, .join = join }, struct {
                 fn f(bb: *L.Builder, c: anytype, vi: usize) error{OutOfMemory}!void {
-                    try emitVariantDisplay(bb, c.e, vi, c.self_base, c.join);
+                    try emitVariantDisplay(bb, c.acc, c.e, vi, c.self_base, c.join);
                 }
             }.f);
             b.switchTo(join);
+            if (!b.termSet()) try L.brTo(&b, exit, .{ .slot = acc });
         },
         else => {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported conform type in lower" });
             b.had_error = true;
+            if (!b.termSet()) try L.brTo(&b, exit, .{ .slot = acc });
         },
     }
 
-    if (!b.termSet()) try L.brTo(&b, exit, .none);
     return try L.finishFn(&b, gpa, sym, &params, entry, exit);
 }
 
