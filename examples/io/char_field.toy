@@ -1,6 +1,7 @@
 # expect: stdout "Tagged(€, 7)"
 # expect: exit 0
+import std/io
 struct Tagged(char, int)
 fn main() {
-    print(Tagged('€', 7))
+    io.print(Tagged('€', 7))
 }

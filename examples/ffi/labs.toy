@@ -1,7 +1,8 @@
 # expect: exit 15
 # expect: stdout "ffi ok\n"
+import std/io
 import std/math
 fn main() -> int {
-    print("ffi ok\n")
+    io.print("ffi ok\n")
     return math.abs(-15)
 }

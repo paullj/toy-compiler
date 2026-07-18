@@ -2,8 +2,9 @@
 # (positional, `, `-separated), the tuple twin of the record `Name{f: v}` form.
 # expect: stdout "Meters(42)"
 # expect: exit 0
+import std/io
 struct Meters(int)
 
 fn main() {
-    print(Meters(42))
+    io.print(Meters(42))
 }

@@ -122,13 +122,13 @@ test "a close typo of an in-scope local yields a did-you-mean hint" {
 
 test "a close typo of a fn name yields a did-you-mean hint" {
     const gpa = testing.allocator;
-    // `print` is always in the fn table; `prnt` is a transposition/deletion away.
-    var parsed = try parseSource(gpa, "fn f() {\n prnt(\"hi\")\n return\n}\n");
+    // `panic` is always in the fn table; `pnic` is a transposition/deletion away.
+    var parsed = try parseSource(gpa, "fn f() {\n pnic(\"hi\")\n return\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), res.diags.len);
-    try testing.expectEqualStrings("undeclared identifier 'prnt'; did you mean 'print'?", res.diags[0].message);
+    try testing.expectEqualStrings("undeclared identifier 'pnic'; did you mean 'panic'?", res.diags[0].message);
 }
 
 test "a close typo of a SHADOWED local still yields a did-you-mean hint" {
@@ -146,15 +146,15 @@ test "a close typo of a SHADOWED local still yields a did-you-mean hint" {
 
 test "a close typo of a fn name shadowed by a local still yields a hint" {
     const gpa = testing.allocator;
-    // A local named `print` shadows the built-in fn `print`: the string `print` is
+    // A local named `panic` shadows the built-in fn `panic`: the string `panic` is
     // yielded by both the local scope and the fn table. The duplicate must not
     // suppress the hint for a typo of it.
-    var parsed = try parseSource(gpa, "fn f() -> int {\n print := 1\n return prin\n}\n");
+    var parsed = try parseSource(gpa, "fn f() -> int {\n panic := 1\n return pani\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), res.diags.len);
-    try testing.expectEqualStrings("undeclared identifier 'prin'; did you mean 'print'?", res.diags[0].message);
+    try testing.expectEqualStrings("undeclared identifier 'pani'; did you mean 'panic'?", res.diags[0].message);
 }
 
 test "a distant undeclared name yields NO hint" {

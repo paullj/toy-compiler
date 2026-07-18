@@ -1,13 +1,13 @@
-# Feature: structural `Display` derive. `print` accepts ANY value whose type
+# Feature: structural `Display` derive. `io.print` accepts ANY value whose type
 # conforms to the prelude `Display` protocol; a struct with all-Display fields derives it
-# structurally (no impl, no `derive` keyword). `display()` WRITES directly to stdout via the
-# libSystem `write` path — never a returned `str`, so it touches no allocator: the struct
-# name + `{`, each `field: <value>` (`, `-separated), then `}`. The int fields render via a
-# heap-free stack-buffer decimal renderer (`__display_int`).
+# structurally (no impl, no `derive` keyword). `display()` renders to a `str`: the struct
+# name + `{`, each `field: <value>` (`, `-separated), then `}`. The int fields render via the
+# never-negate `__int_to_str`.
+import std/io
 struct P { x: int, y: int }
 
 fn main() {
-    print(P{ x: 4, y: 2 })
+    io.print(P{ x: 4, y: 2 })
 }
 # expect: stdout "P{x: 4, y: 2}"
 # expect: exit 0

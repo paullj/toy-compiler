@@ -1,14 +1,15 @@
 # expect: stdout "AAAAAAAAAA"
 # expect: exit 0
+import std/io
 fn main() {
-    print('A')
-    print('A')
-    print('A')
-    print('A')
-    print('A')
-    print('A')
-    print('A')
-    print('A')
-    print('A')
-    print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
+    io.print('A')
 }

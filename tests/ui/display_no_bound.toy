@@ -1,7 +1,11 @@
-protocol Doubler { fn dbl(self) -> int }
+# `io.print` is `fn print[T has Display](x)`. Its bound is checked at INSTANTIATION, not on
+# the abstract body, so calling such a fn with a concrete non-Display type is a use-site
+# T0023 (the ui harness front-end runs single-file, so this stands in for `io.print` with a
+# local `[T has Display]` proxy rather than an `import std/io`).
+struct Bad { f: float }
 
-fn show[T has Doubler](x: T) { print(x) }  #~ ERROR [T0031] does not conform to 'Display'
+fn needs_display[T has Display](x: T) -> str { x.to_string() }
 
 fn main() {
-    return
+    s := needs_display(Bad{ f: 1.5 })  #~ ERROR [T0023] does not conform to protocol 'Display'
 }

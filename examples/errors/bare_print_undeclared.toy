@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — `print` is ordinary library code in std/io now, not a global
+# builtin; calling it with no `import std/io` is an undeclared identifier.
+# expect: compile-error "undeclared identifier 'print'"
+fn main() {
+    print("hi\n")
+}

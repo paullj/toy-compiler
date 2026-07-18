@@ -4,7 +4,7 @@ import std/set
 import std/iter
 
 # A single facade that pulls the standard collection modules into the build graph.
-# Option/Result/Ordering/print/panic/Ref/String/char are already in scope everywhere
+# Option/Result/Ordering/panic/Ref/String/char are already in scope everywhere
 # (globally seeded builtins + native prelude types), so `import std/prelude` puts the
 # whole global vocabulary at hand in one line. The collection types (Vec/Map/Set) and
 # the `iter.Iterator` protocol remain reachable through their own qualified imports.

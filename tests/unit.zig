@@ -168,9 +168,10 @@ test "unit: structural Display renders a () field as ()" {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     const src =
+        \\import std/io
         \\struct S { a: int, u: () }
         \\fn main() {
-        \\    print(S { a: 7, u: () })
+        \\    io.print(S { a: 7, u: () })
         \\}
         \\
     ;

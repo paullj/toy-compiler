@@ -15,7 +15,8 @@
 //!   LC_MAIN, LC_LOAD_DYLIB libSystem, LC_CODE_SIGNATURE (always LAST).
 //!
 //! A SECOND layout serves programs that emit output. When the lowered
-//! program carries interned `__cstring` bytes and/or imports (it called `print`),
+//! program carries interned `__cstring` bytes and/or imports (it wrote output via
+//! `io.print`/`panic`, which import libSystem `write`),
 //! `assemble` takes the MULTI-SEGMENT path:
 //!   __PAGEZERO, __TEXT(+__text +__cstring), __DATA_CONST(+__got), __LINKEDIT,
 //!   LC_DYLD_CHAINED_FIXUPS (a real one-import blob), LC_LOAD_DYLINKER,
@@ -622,7 +623,7 @@ fn buildChainedFixups(
 ) ![]u8 {
     std.debug.assert(datac_seg_index < seg_count);
     // A program may have __cstring data but NO imports (a `str` materialized but
-    // never `print`ed). Then there is no __got slot and no fixup chain — emit a
+    // never written out). Then there is no __got slot and no fixup chain — emit a
     // valid blob with imports_count 0 and no segment chain (so dyld binds nothing).
     const has_fixups = imports.len > 0;
 
@@ -950,7 +951,7 @@ test "code spanning multiple pages grows __TEXT instead of being rejected" {
     try testing.expect(layout.sig_file_off >= text_seg_size);
 }
 
-// Multi-segment (output) path — exercised by any program that calls `print`.
+// Multi-segment (output) path — exercised by any program that writes output.
 // Ground truth is the clang `write` reference dumped on this host
 // (`otool -hlv`, `xxd`, `dyld_info -fixups`).
 

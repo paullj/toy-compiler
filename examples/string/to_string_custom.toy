@@ -1,6 +1,7 @@
 # Feature: `to_string` is UNIVERSAL — a type with an explicit `impl Display` has it too,
 # returning that impl's str (no derive, no T0031). The result round-trips through `==` and
 # `.concat`, proving it is an ordinary str value, not a write side effect.
+import std/io
 struct Money { cents: int }
 
 impl Money has Display {
@@ -13,9 +14,9 @@ fn main() -> int {
     m := Money{ cents: 42 }
     s := m.to_string()
     if s == "$42" {
-        print(s.concat("!"))
+        io.print(s.concat("!"))
     } else {
-        print("MISMATCH")
+        io.print("MISMATCH")
     }
     return 0
 }

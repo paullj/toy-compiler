@@ -306,12 +306,12 @@ pub const GraphModuleInput = struct {
 
 /// A global function descriptor (parallel to the resolver's global fn table).
 pub const GraphFnInput = struct {
-    /// The fn's decl node (`Ast.none` for the bodyless builtin `print`; identify
+    /// The fn's decl node (`Ast.none` for a bodyless seeded builtin; identify
     /// builtin-ness by `kind`, never by this sentinel).
     decl_node: Ast.Index,
-    /// `.builtin` for the synthetic `print`, else `.user_fn` (from the resolver).
+    /// `.builtin` for a seeded builtin (`panic`/intrinsics), else `.user_fn` (from the resolver).
     kind: symbols.SymKind,
-    /// Owning module id; meaningless for the homeless `print` builtin.
+    /// Owning module id; meaningless for a homeless seeded builtin.
     module: u32,
     /// Whether this fn is `pub` (drives the pub-signature-coherence check).
     is_pub: bool,
@@ -983,10 +983,10 @@ pub const TemplateConformance = struct {
 /// A top-level function's signature, decoded once up front so calls can be
 /// checked against it (and forward references work).
 pub const FnSym = struct {
-    /// The fn's decl node (`Ast.none` for the bodyless builtin `print`; identify
+    /// The fn's decl node (`Ast.none` for a bodyless seeded builtin; identify
     /// builtin-ness by `kind`, never by this sentinel).
     decl_node: Ast.Index,
-    /// `.builtin` for the synthetic `print`, else `.user_fn`.
+    /// `.builtin` for a seeded builtin (`panic`/intrinsics), else `.user_fn`.
     kind: symbols.SymKind,
     params: []Type,
     ret: Type,
@@ -1483,7 +1483,7 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
 /// owning module's id, checks every fn body cross-module against the resolver's
 /// GLOBAL fn table, and enforces pub-signature coherence (a pub fn may not name a
 /// non-pub type in its param/return). `mods` is parallel to the module graph;
-/// `fns` is parallel to the resolver's global fn table (`print` last, bodyless).
+/// `fns` is parallel to the resolver's global fn table (seeded builtins last, bodyless).
 /// Caller owns the returned `GraphResult`.
 pub fn checkGraph(
     gpa: std.mem.Allocator,
@@ -1649,9 +1649,12 @@ pub fn checkGraph(
     errdefer gpa.free(sigs);
     var sigs_built: usize = 0;
     errdefer for (sigs[0..sigs_built]) |s| gpa.free(@constCast(s.params));
+    // Phase A appends exactly one sig per global fn (a bodyless builtin gets a placeholder
+    // sig, not a monomorph instance — those live in `t.mono`), so `t.fns` stays parallel to
+    // `fns`; the sig name is the resolver's qualified/bare name for that id.
+    std.debug.assert(t.fns.items.len == fns.len);
     for (t.fns.items, 0..) |f, i| {
-        const name = if (i < fns.len) fns[i].name else "print";
-        sigs[i] = .{ .kind = f.kind, .name = name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
+        sigs[i] = .{ .kind = f.kind, .name = fns[i].name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
         sigs_built += 1;
     }
 
@@ -1846,10 +1849,10 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
 
     // Phase A: decode every fn signature into the GLOBAL fn table, in the exact
     // order of `fns` (parallel to the resolver's global fn ids), so `.func` ids
-    // index this table directly. The synthetic bodyless `print` is one of them.
+    // index this table directly. The synthetic bodyless `panic` is one of them.
     for (fns) |gf| {
         if (gf.kind == .builtin) {
-            try t.appendPrint();
+            try t.appendBuiltinSig();
         } else if (gf.kind == .import) {
             _ = t.gphSelect(gf.module);
             try t.decodeExternSig(gf.decl_node, gf.module);
@@ -3099,8 +3102,9 @@ fn externTypeOk(ty: Type) bool {
     return ty.isInteger() or ty.kind == .bool or ty.isRawPtr() or ty.kind == .str or ty.kind == .invalid;
 }
 
-/// Append the synthetic bodyless `print(str) -> ()` builtin to the fn table.
-fn appendPrint(t: *Typecheck) !void {
+/// Append a placeholder `(str) -> ()` sig for a bodyless builtin (`panic`/the intrinsics).
+/// The real arg-checking is token-based in `BodyChecker`; this sig only holds the id slot.
+fn appendBuiltinSig(t: *Typecheck) !void {
     const params = try t.gpa.dupe(Type, &.{.str});
     try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .kind = .builtin, .params = params, .ret = .unit });
 }
@@ -4809,17 +4813,17 @@ test "firstNonConformingField names the field blocking a `Hash` derive (T0030 su
     try testing.expect(Type.eql(Type.str, off.?.ty));
 }
 
-test "`print(P{..})` on an all-Display-fields struct DERIVES exactly one recipe" {
+test "`P{..}.to_string()` on an all-Display-fields struct DERIVES exactly one recipe" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct P { x: int, y: int }
         \\fn main() {
-        \\ print(P{ x: 4, y: 2 })
+        \\ s := P{ x: 4, y: 2 }.to_string()
         \\}
         \\
     );
     defer c.deinit(gpa);
-    // The reworked `print` accepts a Display arg: it records ONE structural Display derive
+    // `to_string` on a Display arg records ONE structural Display derive
     // (struct id 0 -> `Display$display$s0`), no diagnostic, ret str (the built rendering),
     // `self`-only (1 param).
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
@@ -4830,12 +4834,12 @@ test "`print(P{..})` on an all-Display-fields struct DERIVES exactly one recipe"
     try testing.expectEqual(@as(usize, 1), c.result.derives[0].params.len);
 }
 
-test "`print(enum value)` derives one Display recipe (Display$display$e0)" {
+test "`(enum value).to_string()` derives one Display recipe (Display$display$e0)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\enum E { A(int), B }
         \\fn main() {
-        \\ print(E.A(3))
+        \\ s := E.A(3).to_string()
         \\}
         \\
     );
@@ -4846,13 +4850,13 @@ test "`print(enum value)` derives one Display recipe (Display$display$e0)" {
     try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
 }
 
-test "`print` recurses through a NESTED aggregate (two Display recipes)" {
+test "`to_string` recurses through a NESTED aggregate (two Display recipes)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\struct Point { x: int, y: int }
         \\struct Line { from: Point, to: Point }
         \\fn main() {
-        \\ print(Line{ from: Point{ x: 0, y: 0 }, to: Point{ x: 4, y: 2 } })
+        \\ s := Line{ from: Point{ x: 0, y: 0 }, to: Point{ x: 4, y: 2 } }.to_string()
         \\}
         \\
     );
@@ -4870,13 +4874,13 @@ test "an UNUSED Display-eligible struct records zero recipes (lazy)" {
         \\struct Q { v: int }
         \\fn main() {
         \\ q := Q{ v: 42 }
-        \\ print(q.v)
+        \\ s := q.v.to_string()
         \\}
         \\
     );
     defer c.deinit(gpa);
-    // `print(q.v)` displays an int (a prelude conformance, no derive); `Q` itself is never
-    // printed, so no `Display$display$s*` unit is synthesized.
+    // `q.v.to_string()` renders an int (a prelude conformance, no derive); `Q` itself is
+    // never rendered, so no `Display$display$s*` unit is synthesized.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
@@ -4889,7 +4893,7 @@ test "explicit `impl P has Display` OVERRIDES the derive (zero synthetic units)"
         \\ fn display(self) -> str { return "x" }
         \\}
         \\fn main() {
-        \\ print(P{ x: 1 })
+        \\ s := P{ x: 1 }.to_string()
         \\}
         \\
     );
@@ -4943,7 +4947,7 @@ test "a unit-returning custom `impl Display` is a clean T0024 (ret must be str)"
         \\ fn display(self) { }
         \\}
         \\fn main() {
-        \\ print(P{ x: 1 })
+        \\ s := P{ x: 1 }.to_string()
         \\}
         \\
     );
@@ -4952,11 +4956,11 @@ test "a unit-returning custom `impl Display` is a clean T0024 (ret must be str)"
     try testing.expectEqual(codes.Code.T0024, c.result.diags[0].code);
 }
 
-test "`print(\"..\")` still types clean and derives nothing (str path unchanged)" {
+test "`\"..\".to_string()` types clean and derives nothing (str path unchanged)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() {
-        \\ print("hi")
+        \\ s := "hi".to_string()
         \\}
         \\
     );
@@ -4965,11 +4969,11 @@ test "`print(\"..\")` still types clean and derives nothing (str path unchanged)
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "`print('A')` derives ONE shared char Display witness (UTF-8 encoder, not inlined)" {
+test "`'A'.to_string()` derives ONE shared char Display witness (UTF-8 encoder, not inlined)" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() {
-        \\ print('A')
+        \\ s := 'A'.to_string()
         \\}
         \\
     );
@@ -6376,27 +6380,20 @@ test "string literal types as str" {
     }
 }
 
-test "print of a string literal typechecks clean" {
-    try testing.expectEqual(@as(usize, 0), try checkDiagCount(
-        "fn main() {\n print(\"hi\")\n return\n}\n",
-    ));
-}
-
-test "print of an int typechecks clean (Display, no longer an arg-type error)" {
-    // `print` formerly only took `str`, so `print(42)` was `argument 1: expected str, got int`.
-    // `print` is now a polymorphic Display-accepting builtin: `int` conforms to the
-    // prelude `Display`, so `print(42)` is clean (no diagnostic) and derives nothing (int has
-    // a prelude Display conformance, so `findConformance` wins over the structural path).
+test "to_string of an int typechecks clean (Display, no arg-type error)" {
+    // `int` conforms to the prelude `Display`, so `42.to_string()` is clean (no diagnostic)
+    // and derives nothing (int has a prelude Display conformance, so `findConformance` wins
+    // over the structural path).
     const gpa = testing.allocator;
-    var c = try checkSource("fn main() {\n print(42)\n return\n}\n");
+    var c = try checkSource("fn main() {\n s := 42.to_string()\n return\n}\n");
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
-test "print with no arguments is an arity error" {
+test "panic with no arguments is an arity error" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
-        "fn main() {\n print()\n return\n}\n",
+        "fn main() {\n panic()\n return\n}\n",
     ));
 }
 
@@ -6526,28 +6523,6 @@ test "for body using its int loop variable typechecks clean" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         "fn f() -> int {\n s := 0\n for i in 0..5 { s = s + i }\n return s\n}\n",
     ));
-}
-
-test "print resolves and typechecks at index user_fn_count" {
-    // The synthetic `print` must occupy the index right after the user fns in
-    // BOTH Resolve and Typecheck so its global id is stable across the boundary and
-    // lower dispatches print(...) by arg type onto the raw output leaf.
-    const gpa = testing.allocator;
-    var c = try checkSource("fn main() {\n print(\"hi\")\n return\n}\n");
-    defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
-    // Find the call's callee identifier; it must resolve to func == 1 (main is
-    // the only user fn, index 0; print is seeded next at index 1).
-    var found = false;
-    for (c.tree.nodes) |n| {
-        if (n.tag == .call) {
-            const callee_res = c.resolve.resolutions[0][n.lhs.int()];
-            try testing.expect(callee_res == .func);
-            try testing.expectEqual(@as(u32, 1), callee_res.func);
-            found = true;
-        }
-    }
-    try testing.expect(found);
 }
 
 test "labeled bare block value typechecks: trailing + breaks must agree" {

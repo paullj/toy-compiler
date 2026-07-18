@@ -1,5 +1,6 @@
 # expect: stdout "A"
 # expect: exit 0
+import std/io
 fn main() {
-    print('A')
+    io.print('A')
 }
