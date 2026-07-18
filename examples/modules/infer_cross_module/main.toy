@@ -1,0 +1,8 @@
+# expect: exit 42
+# Qualified bare generic calls into a user sibling module: `lib.id` (unbounded) and
+# `lib.tag` ([T has Display], bound checked at instantiation) both infer T=int from
+# the value arg with no turbofish. 40 + 2 == 42.
+import lib
+fn main() -> int {
+    return lib.id(40) + lib.tag(2)
+}

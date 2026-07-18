@@ -1,0 +1,8 @@
+# expect: exit 41
+# A qualified bare (no-turbofish) generic call across a module boundary: `ref.new`
+# is std/ref's `new[T]`; T=int is inferred from the value arg. Deref yields 41.
+import std/ref
+fn main() -> int {
+    r := ref.new(41)
+    return *r
+}

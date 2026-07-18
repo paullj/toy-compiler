@@ -93,10 +93,14 @@ pub const CallRef = struct { gid: u32, args: []Type };
 /// `Instance` a call selects. Two call-shapes:
 ///   * explicit turbofish `id[int](..)` — the callee is a `type_app`; the type-args
 ///     are read straight from `node_types`.
-///   * bare inferred `id(7)` — the callee is a plain `identifier`; the type-args are
-///     inferred from the value-arg `node_types` via `Infer.infer`.
-/// A field-access method callee is NOT handled here (discovery binds impl params;
-/// the fingerprint resolves the conformance witness — genuinely different leaves).
+///   * bare inferred `id(7)` — the callee is a plain `identifier`, OR a qualified
+///     module generic fn `mod.id(7)` whose `.field_access` callee `resolveModuleMember`
+///     bound to `.func`; both carry the SAME gid on `call.lhs`, so the type-args are
+///     inferred from the value-arg `node_types` via `Infer.infer` identically.
+/// The leading `if (bres != .func)` is the discriminator: a value-method field_access
+/// stays `.unresolved` (discovery binds impl params; the fingerprint resolves the
+/// conformance witness — genuinely different leaves) and a same-module `N.V` variant
+/// access is `.unresolved` too, so both still return null here.
 ///
 /// `view` supplies `.tree`, `.resolutions`, `.node_types`, and
 /// `genericTemplate(gid) -> ?TemplateRef` (returns null for a non-generic callee,
@@ -124,7 +128,7 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Nod
             }
             return .{ .gid = gid, .args = args };
         },
-        .identifier => {
+        .identifier, .field_access => {
             const bres = view.resolutions[call_node.lhs.int()];
             if (bres != .func) return null;
             const gid = bres.func;
@@ -297,6 +301,52 @@ test "callInstanceRef returns null for a non-generic or non-func callee" {
     // gen_gid 9 != the callee's gid 5 -> genericTemplate is null -> not a template.
     const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 9, .gen_params = &.{}, .gen_count = 1 };
     try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[2]));
+}
+
+test "callInstanceRef infers (gid, args) from a qualified bare generic callee" {
+    const gpa = testing.allocator;
+    // Tree for `mod.id(x)`: n0=mod(receiver, unused by the arm), n1=field_access
+    // (call.lhs, bound to .func by resolveModuleMember), n2=x(value-arg),
+    // n3=call(lhs=1,rhs=hdr@0). The arm reads resolutions[call.lhs] + call.rhs only.
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 0, .lhs = Ast.Index.from(1), .rhs = Ast.Index.from(0) },
+    };
+    var extra = [_]u32{ 2, 1, 2 };
+    const tree = Ast.Tree{ .nodes = &nodes, .extra = &extra };
+    var resolutions = [_]Resolution{.unresolved} ** 4;
+    resolutions[1] = .{ .func = 5 };
+    const node_types = [_]Type{ Type.invalid, Type.invalid, Type.int, Type.invalid };
+    const params = [_]Type{Type.typeVar(0)};
+    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1 };
+
+    const ref = (try callInstanceRef(gpa, view, nodes[3])).?;
+    defer gpa.free(ref.args);
+    try testing.expectEqual(@as(u32, 5), ref.gid);
+    try testing.expectEqual(@as(usize, 1), ref.args.len);
+    try testing.expect(Type.eql(ref.args[0], Type.int));
+}
+
+test "callInstanceRef returns null for a value-method field_access callee" {
+    const gpa = testing.allocator;
+    // A `recv.m(x)` value method: the field_access callee stays .unresolved (no .func),
+    // so the `bres != .func` discriminator excludes it — a method is not a bare-inferred
+    // free fn.
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 0, .lhs = Ast.Index.from(1), .rhs = Ast.Index.from(0) },
+    };
+    var extra = [_]u32{ 2, 1, 2 };
+    const tree = Ast.Tree{ .nodes = &nodes, .extra = &extra };
+    const resolutions = [_]Resolution{.unresolved} ** 4;
+    const node_types = [_]Type{ Type.invalid, Type.invalid, Type.int, Type.invalid };
+    const params = [_]Type{Type.typeVar(0)};
+    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1 };
+    try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[3]));
 }
 
 test "mangle is index-free-ish and distinct per arg tuple" {

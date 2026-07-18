@@ -2287,13 +2287,15 @@ pub const BodyChecker = struct {
         // node. The matcher runs and is discarded here — no `type_var` is ever stored.
         // Explicit `id[int](7)` is handled above (typeOfGenericCall) and still overrides.
         if (f.isGeneric()) {
-            // Type-args are inferred only for a PLAIN-IDENTIFIER callee `id(7)`. A bare
-            // qualified generic call `mod.id(7)` (field_access callee) is NOT inferred:
-            // the three post-typecheck consumers (scanCalls/lower/CallVisitor) key the
-            // bare path on a plain identifier too, so accepting it here would type the
-            // node concretely but mint NO instance (a `Mono.find` miss in lower). Require
-            // explicit type args instead — the same clean reject as before.
-            if (callee.tag != .identifier) {
+            // Type-args are inferred for a PLAIN-IDENTIFIER callee `id(7)` OR a qualified
+            // module-member callee `mod.id(7)`. A qualified pub fn binds `.func(gid)` onto
+            // its field_access (resolveModuleMember), so this arm was reached with the SAME
+            // gid a plain callee carries (the `!= .func` guard in typeOfDirectCall already
+            // passed), hence a qualified module generic fn. The post-typecheck consumers key
+            // both shapes off `resolutions[call.lhs]`, so the inferred instance is found at
+            // lower. Any other callee (e.g. a value-index `xs[i]()`) cannot infer — require
+            // explicit type args.
+            if (callee.tag != .identifier and callee.tag != .field_access) {
                 for (args) |arg| _ = try bc.typeOf(arg);
                 try bc.sink.emitCode(.T0013, bc.byteOf(n.main_token), "generic call requires explicit type arguments, e.g. f[int](..)");
                 return .invalid;

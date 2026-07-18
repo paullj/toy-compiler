@@ -1,0 +1,2 @@
+pub fn id[T](x: T) -> T { return x }
+pub fn tag[T has Display](x: T) -> T { return x }
