@@ -2,11 +2,9 @@
 # Feature: absence over a managed box is `Option[Ref[T]]` (there is no nil). A `Ref[int]`
 # is an 8-byte scalar cell pointer, so it rides the scalar Option path (some/none/is_some/
 # unwrap). Present: unwrap the handle and deref it (40). Absent: default to 2. 40+2 == 42.
-import std/ref
-
 fn pick(present: bool) -> Option[Ref[int]] {
     if present {
-        return Option.some(ref.new[int](40))
+        return Option.some(&40)
     }
     return Option[Ref[int]].none
 }
