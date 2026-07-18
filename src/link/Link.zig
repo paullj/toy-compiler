@@ -18,6 +18,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Aarch64 = @import("../codegen/Aarch64.zig");
+const Abi = @import("../codegen/abi/Abi.zig");
 const Engine = @import("../query/Engine.zig");
 
 // The stable symbol identity types now live in the `symbols/` peer data module
@@ -493,17 +494,18 @@ fn buildStackMapTable(gpa: std.mem.Allocator, fns: []const FnCode, site_h: []con
 /// trace_off}`. A name's `*_off` is the erased unit's `__text` byte offset (resolved from
 /// the interned handle → `offsets`), or 0 when the name is absent.
 fn buildDescTable(gpa: std.mem.Allocator, entries: []const DescEntry, si: *SymInterner, offsets: []const u32) ![]u8 {
-    const buf = try gpa.alloc(u8, entries.len * 48);
+    const d = Abi.desc;
+    const buf = try gpa.alloc(u8, entries.len * d.stride);
     errdefer gpa.free(buf);
     var pos: usize = 0;
     for (entries) |e| {
-        std.mem.writeInt(u64, buf[pos..][0..8], e.size, .little);
-        std.mem.writeInt(u64, buf[pos + 8 ..][0..8], e.@"align", .little);
-        std.mem.writeInt(u64, buf[pos + 16 ..][0..8], e.size_class, .little);
-        std.mem.writeInt(u64, buf[pos + 24 ..][0..8], try descOffOf(gpa, si, offsets, e.hash_name), .little);
-        std.mem.writeInt(u64, buf[pos + 32 ..][0..8], try descOffOf(gpa, si, offsets, e.eq_name), .little);
-        std.mem.writeInt(u64, buf[pos + 40 ..][0..8], try descOffOf(gpa, si, offsets, e.trace_name), .little);
-        pos += 48;
+        std.mem.writeInt(u64, buf[pos + d.size_off ..][0..8], e.size, .little);
+        std.mem.writeInt(u64, buf[pos + d.align_off ..][0..8], e.@"align", .little);
+        std.mem.writeInt(u64, buf[pos + d.size_class_off ..][0..8], e.size_class, .little);
+        std.mem.writeInt(u64, buf[pos + d.hash_off ..][0..8], try descOffOf(gpa, si, offsets, e.hash_name), .little);
+        std.mem.writeInt(u64, buf[pos + d.eq_off ..][0..8], try descOffOf(gpa, si, offsets, e.eq_name), .little);
+        std.mem.writeInt(u64, buf[pos + d.trace_off ..][0..8], try descOffOf(gpa, si, offsets, e.trace_name), .little);
+        pos += d.stride;
     }
     return buf;
 }

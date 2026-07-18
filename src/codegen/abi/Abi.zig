@@ -85,6 +85,45 @@ pub fn descriptorFor(ty: Type, layouts: []const Layout, enum_layouts: []const En
     return .{ .size = size, .@"align" = typeAlign(ty, layouts, enum_layouts), .size_class = sizeClassFor(size) };
 }
 
+/// Byte layout of the emitted per-type descriptor RECORD: a fixed `stride`-byte, all-8-byte
+/// little-endian record `{size, align, size_class, hash_off, eq_off, trace_off}`, where each
+/// `*_off` is an erased unit's `__text` byte offset (0 = absent). This is the SINGLE authority
+/// for those offsets: `link.buildDescTable` writes them, `link.emit` reserves table entries by
+/// `stride`, and the collector's descriptor reads (`CodegenIr` ga/mp trace) index by them.
+/// The `.toy` runtime hard-codes the same numbers and cannot import this authority (no Zig
+/// consts in `.toy`) — the `descriptor record layout` test below pins the mirror.
+/// CAUTION: `trace_off == 40` here is the DESCRIPTOR's field; a *container header* also has a
+/// field at byte 40 (an element/key descriptor pointer) — an unrelated offset that must NOT be
+/// spelled `desc.trace_off`. The two ABIs share the number by coincidence, not meaning.
+pub const desc = struct {
+    pub const size_off: u32 = 0;
+    pub const align_off: u32 = 8;
+    pub const size_class_off: u32 = 16;
+    pub const hash_off: u32 = 24;
+    pub const eq_off: u32 = 32;
+    pub const trace_off: u32 = 40;
+    pub const stride: u32 = 48;
+};
+
+test "descriptor record layout is six contiguous 8-byte fields the .toy runtime mirrors" {
+    // Each field is 8 bytes, so every offset is the previous + 8 and `stride` closes the record.
+    try std.testing.expectEqual(@as(u32, 0), desc.size_off);
+    try std.testing.expectEqual(desc.size_off + 8, desc.align_off);
+    try std.testing.expectEqual(desc.align_off + 8, desc.size_class_off);
+    try std.testing.expectEqual(desc.size_class_off + 8, desc.hash_off);
+    try std.testing.expectEqual(desc.hash_off + 8, desc.eq_off);
+    try std.testing.expectEqual(desc.eq_off + 8, desc.trace_off);
+    try std.testing.expectEqual(desc.trace_off + 8, desc.stride);
+    // The `.toy` runtime hard-codes these exact byte offsets. If a change here trips this
+    // assertion, update the mirrors before shipping:
+    //   core/mem.toy  (mp_find/mp_set/mp_grow): `load(offset(dp, 24))` = hash, `(dp, 32)` = eq
+    //   core/desc_selftest.toy: the same hash@24 / eq@32 descriptor reads
+    // (`trace_off` is consumed only from Zig, so it has no `.toy` mirror.)
+    try std.testing.expectEqual(@as(u32, 24), desc.hash_off);
+    try std.testing.expectEqual(@as(u32, 32), desc.eq_off);
+    try std.testing.expectEqual(@as(u32, 48), desc.stride);
+}
+
 /// Byte size of a type (int/bool 8, str 16, struct/enum → its layout size).
 pub fn typeSize(ty: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     return switch (ty.kind) {

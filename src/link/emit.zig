@@ -28,6 +28,7 @@ const testing = std.testing;
 const Io = std.Io;
 
 const Link = @import("Link.zig");
+const Abi = @import("../codegen/abi/Abi.zig");
 const MachO = @import("MachO.zig");
 const CodeSign = @import("CodeSign.zig");
 const CodegenIr = @import("../codegen/CodegenIr.zig");
@@ -154,14 +155,14 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     if (n_desc > 0) {
         for (descriptors, 0..) |e, i| {
             if (off_by_hash.contains(e.desc_hash)) return error.CstringHashCollision;
-            try off_by_hash.put(gpa, e.desc_hash, @intCast(@as(usize, desc_table_off) + i * 48));
+            try off_by_hash.put(gpa, e.desc_hash, @intCast(@as(usize, desc_table_off) + i * Abi.desc.stride));
         }
     }
     // The GC stack map is reserved BETWEEN the descriptor table and the symtab, only when
     // the collector runs. When no gc, `stackmap_off`/`stackmap_len` collapse and
     // `symtab_off == after_desc` — the panic-but-not-gc corpus stays byte-identical.
     const after_desc: u32 = if (n_desc > 0)
-        std.mem.alignForward(u32, desc_table_off + @as(u32, @intCast(n_desc * 48)), 8)
+        std.mem.alignForward(u32, desc_table_off + @as(u32, @intCast(n_desc * Abi.desc.stride)), 8)
     else
         desc_table_off;
     const stackmap_off: u32 = after_desc;
