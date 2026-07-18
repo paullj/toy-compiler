@@ -1,0 +1,55 @@
+# Feature: the usable-language terminus — Vec + Map + for-in + for-k,v + Ref + str, all
+# GC-managed and reached through `std` only. `count` tallies a word list into a Map; a
+# ~20k dead-Vec `churn` then forces at least one collection while `counts`/`words`/`total`
+# stay rooted in main's frame. The survivors are RE-READ after the churn (the winner is
+# printed and the boxed counter is dereferenced), so a collector that mis-swept a reachable
+# object would change the output. "the" wins with 3, over 5 words: 3 * 5 == 15.
+# expect: stdout "the seen 3 times\n"
+# expect: exit 15
+import std/io
+import std/vec
+import std/map
+
+fn churn() {
+    i := 0
+    while i < 20000 {
+        g := Vec[int].new()
+        g.push(i)
+        i = i + 1
+    }
+}
+
+fn count(words: Vec[str]) -> Map[str, int] {
+    counts := Map[str, int].new()
+    for w in words {
+        n := counts.get(w).unwrap_or(0)
+        counts.set(w, n + 1)
+    }
+    return counts
+}
+
+fn main() -> int {
+    words := ["the", "cat", "the", "dog", "the"]
+    counts := count(words)
+    churn()
+
+    top := ""
+    best := 0
+    for k, v in counts {
+        if v > best {
+            best = v
+            top = k
+        }
+    }
+
+    total := &0
+    for w in words {
+        *total = *total + 1
+    }
+
+    io.print(top)
+    io.print(" seen ")
+    io.print(best.to_string())
+    io.print(" times\n")
+    return if top == "th".concat("e") { best * *total } else { 0 }
+}
