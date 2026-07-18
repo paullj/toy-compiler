@@ -768,3 +768,32 @@ test "vec: a nested-generic-container program is byte-identical at -j1 and -j8" 
     }
     try std.testing.expect(differing <= 1);
 }
+
+test "vec: a .field off a call/method result materializes the aggregate rvalue" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // A `.field` off an expression with no named place — `get(i).unwrap().field`, a
+    // nested `.unwrap().i.x`, a direct `mk().x` — must materialize the aggregate rvalue
+    // into a temp once and read the field from the copy. Regression: the lowerer had no
+    // arm for a call base, so it read a stale register (garbage) or crashed codegen when
+    // the field fed arithmetic. 3 + 5 + 3 + 5 == 16.
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-field-thru-call",
+        \\import std/vec
+        \\struct I { x: int }
+        \\struct P { x: int, i: I }
+        \\fn mk() -> P { return P{ x: 3, i: I{ x: 5 } } }
+        \\fn main() -> int {
+        \\    ps := Vec[P].new()
+        \\    ps.push(mk())
+        \\    a := ps.get(0).unwrap().x
+        \\    b := ps.get(0).unwrap().i.x
+        \\    c := mk().x
+        \\    return a + b + c + mk().i.x
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 16), code);
+}

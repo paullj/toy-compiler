@@ -3197,7 +3197,20 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
             const op = try lowerExpr(b, node_idx);
             return try operandPtr(b, op);
         },
-        else => return Ir.none_value,
+        // Any other base that produces an aggregate RVALUE with no named place — a
+        // call/method result, a `match`/`if` expression — is materialized into a temp
+        // once so the field_addr chain reads from the copy. Without this, `f().field`
+        // (e.g. the idiomatic `v.get(i).unwrap().field`) resolves to no address and
+        // silently reads a stale register, or crashes when used in arithmetic. A store
+        // through such a base is a parse error, so this read-only materialization can
+        // never alias a real place.
+        else => switch (passKind(b, b.in.node_types[(node_idx).int()])) {
+            .str, .@"struct", .@"enum" => {
+                const op = try lowerExpr(b, node_idx);
+                return try operandPtr(b, op);
+            },
+            else => return Ir.none_value,
+        },
     }
 }
 
