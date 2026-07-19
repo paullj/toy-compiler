@@ -1,0 +1,4 @@
+fn head(xs: Vec[int]) -> int {  #~ ERROR [T0001] add 'import std/vec'
+  return 0
+}
+fn main() -> int { return 0 }

@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — using the stdlib `Set` type in an expression without its import.
+# expect: compile-error "import std/set"
+fn main() -> int {
+    seen := Set[int].new()
+    return 0
+}

@@ -1,0 +1,4 @@
+fn main() -> int {
+  m := Map[int, int].new()  #~ ERROR [R0001] add 'import std/map'
+  return 0
+}

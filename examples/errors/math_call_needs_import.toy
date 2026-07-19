@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — calling `math.sqrt` without importing std/math.
+# expect: compile-error "import std/math"
+fn main() -> int {
+    x := math.sqrt(4.0)
+    return 0
+}
