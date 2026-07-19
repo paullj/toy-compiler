@@ -4,10 +4,10 @@
 # For each EDIT SCENARIO (body / signature / type-layout / comment-only /
 # cross-module) it:
 #   (1) cold-builds a base program (primes the content-fp cache),
-#   (2) records the FULL codegen count via `--codegen-stats --force`,
+#   (2) records the FULL codegen count via `--codegen-stats --no-cache`,
 #   (3) applies the edit,
 #   (4) INCREMENTAL rebuild with `--codegen-stats` (cache serves unchanged fns),
-#   (5) `--force` FULL rebuild of the SAME final source,
+#   (5) `--no-cache` FULL rebuild of the SAME final source,
 #   (6) SOUNDNESS: cmp the __text of (4) vs (5) -> must be IDENTICAL. A divergence
 #       is a stale-cache miscompile (the critical anti-regression gate).
 #   (7) CUTOFF (localized edits): the incremental codegen count is a STRICT SUBSET
@@ -48,12 +48,12 @@ run_scenario() {
   ( cd "$d" && "$toyc" -o base.bin prog.toy >/dev/null 2>&1 ) \
     || { fail_one "$name: cold build failed"; return; }
   local full_compiled
-  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force prog.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
+  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --no-cache prog.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
 
   printf '%s' "$edited" > "$src"
   local inc_out
   inc_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats prog.toy 2>&1 )"
-  ( cd "$d" && "$toyc" -o force.bin --force prog.toy >/dev/null 2>&1 ) \
+  ( cd "$d" && "$toyc" -o force.bin --no-cache prog.toy >/dev/null 2>&1 ) \
     || { fail_one "$name: force build failed"; return; }
 
   local ih fh
@@ -210,7 +210,7 @@ TOY
   ( cd "$d" && "$toyc" -o base.bin main.toy >/dev/null 2>&1 ) \
     || { fail_one "cross-module: cold build failed"; return; }
   local full_compiled
-  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force main.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
+  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --no-cache main.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
 
   cat > "$d/lib/util.toy" <<'TOY'
 pub fn compute(n: int) -> int { return helper(n) + 2 }
@@ -218,7 +218,7 @@ fn helper(n: int) -> int { return n + 0 }
 TOY
   local inc_out
   inc_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats main.toy 2>&1 )"
-  ( cd "$d" && "$toyc" -o force.bin --force main.toy >/dev/null 2>&1 ) \
+  ( cd "$d" && "$toyc" -o force.bin --no-cache main.toy >/dev/null 2>&1 ) \
     || { fail_one "cross-module: force build failed"; return; }
 
   local ih fh
@@ -241,7 +241,7 @@ run_cross_module
 # 6) `?`-FROM CONFORMANCE TOGGLE — `outer`'s `?` WIDENS `inner()`'s error via
 #    `impl BigErr has From[SmallErr]`. Base builds; REMOVING the impl makes a warm rebuild a
 #    T0033 compile-error (the widen is NOT stale-served from the cached green `outer`);
-#    RE-ADDING it rebuilds green with __text byte-identical to a --force full build (soundness),
+#    RE-ADDING it rebuilds green with __text byte-identical to a --no-cache full build (soundness),
 #    and every fn — incl. the `unrelated` cutoff witness — is served from cache.
 #
 #    HONEST TEETH: typecheck runs FRESH every build (Orchestrator -> checkGraph, uncached), so
@@ -281,7 +281,7 @@ fn main() -> int { return match outer() { .ok(_) -> unrelated(0), .err(_) -> 42 
   ( cd "$d" && "$toyc" -o base.bin prog.toy >/dev/null 2>&1 ) \
     || { fail_one "from_widen: cold build (impl present) failed"; return; }
   local full_compiled
-  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --force prog.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
+  full_compiled="$( cd "$d" && "$toyc" -o /dev/null --codegen-stats --no-cache prog.toy 2>&1 )"; full_compiled="$(compiled_of "$full_compiled")"
 
   # (2) REMOVE the impl -> warm rebuild MUST fail with T0033 (the widen is not stale-served).
   printf '%s' "$without_impl" > "$src"
@@ -296,7 +296,7 @@ fn main() -> int { return match outer() { .ok(_) -> unrelated(0), .err(_) -> 42 
     return
   fi
 
-  # (3) RESTORE the impl -> warm rebuild green; its __text must equal a --force full build.
+  # (3) RESTORE the impl -> warm rebuild green; its __text must equal a --no-cache full build.
   printf '%s' "$with_impl" > "$src"
   local inc_out inc_rc
   inc_out="$( cd "$d" && "$toyc" -o inc.bin --codegen-stats prog.toy 2>&1 )"; inc_rc=$?
@@ -304,7 +304,7 @@ fn main() -> int { return match outer() { .ok(_) -> unrelated(0), .err(_) -> 42 
     fail_one "from_widen: restore-impl warm rebuild failed (expected green) [$inc_out]"
     return
   fi
-  ( cd "$d" && "$toyc" -o force.bin --force prog.toy >/dev/null 2>&1 ) \
+  ( cd "$d" && "$toyc" -o force.bin --no-cache prog.toy >/dev/null 2>&1 ) \
     || { fail_one "from_widen: force build failed"; return; }
 
   local ih fh

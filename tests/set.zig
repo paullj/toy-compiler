@@ -235,9 +235,9 @@ test "set: a Set program is byte-identical at -j1 and -j8" {
     // Same `-o` basename in both dirs, so the ad-hoc code-sign IDENTIFIER is identical —
     // only the one-byte code-sign nonce may differ. Set's mono instances + the shared
     // descriptor table are pure functions of source, so codegen is -jN byte-identical.
-    const p1 = try compile(gpa, io, dir ++ "/j1", share_src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", share_src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", share_src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", share_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);

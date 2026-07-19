@@ -1,0 +1,6 @@
+fn main() -> int {
+    return match 0 {
+        0 => 1     #~ ERROR [P0009] match arms use '->', not '=>'
+        _ -> 2
+    }
+}

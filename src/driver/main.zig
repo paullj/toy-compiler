@@ -333,10 +333,10 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     st.codegen_stats = p.codegen_stats;
     st.opt_stats = p.opt_stats;
     st.timings = p.timings;
-    // --force DOMINATES --verify when both are given: the flat model loses argv
+    // --no-cache DOMINATES --verify when both are given: the flat model loses argv
     // order, so apply .verify first then let .force win (no script passes both).
     if (p.verify) st.mode = .verify;
-    if (p.force) st.mode = .force;
+    if (p.no_cache) st.mode = .force;
     st.target = p.target orelse "native";
     st.out_path = p.output;
     st.color_choice = switch (p.color orelse .auto) {
@@ -388,7 +388,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     // all --error, then all --warn, then all --ignore. With `resolve`'s last-match-wins
     // this makes ignore dominate warn dominate error for a code named by multiple flags,
     // deterministically and independent of cross-flag argv position (the flat model
-    // loses cross-flag order — the same documented deviation as --verify/--force). Each
+    // loses cross-flag order — the same documented deviation as --verify/--no-cache). Each
     // spec must be a known code (R0001) or a band letter (L/P/R/T); garbage arg-errors
     // (exit 1), mirroring --opt validation. RENDER-ONLY: never flips the exit status.
     // Field `error` is a Zig keyword => access it as `p.@"error"`.
@@ -815,7 +815,7 @@ fn emitExecutable(
     }
 
     // dual-metric counters, fixed field order, deterministic. Cached fns
-    // contribute 0 to the opt counters; use --force for honest numbers.
+    // contribute 0 to the opt counters; use --no-cache for honest numbers.
     if (opt_stats) {
         const s = lp.opt_stats;
         try out.print("opt: rounds={d} ir_instrs={d}->{d} emitted_instrs={d}\n", .{
@@ -882,7 +882,7 @@ fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel,
         error.StageDiagnostics => {
             const g = &orch.graph.*.?;
             switch (orch.failed_stage.*.?) {
-                .discover => try DiagRender.renderGraphError(gpa, out, level, g, g.err.?),
+                .discover => try DiagRender.renderGraphError(gpa, out, level, g, g.err.?, cfg),
                 .resolve => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.res.*.?.diags, cfg),
                 .typecheck => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.tc.*.?.diags, cfg),
                 .codegen => switch (orch.tail) {
@@ -1112,7 +1112,7 @@ fn runCheck(
         // OTHER structural error (a real missing/mis-cased IMPORT, a path escape, an import
         // cycle, a tainted parse in a discovered import) is a compile-level error `build`
         // reports too -> render it against its owning module and exit 1.
-        try DiagRender.renderGraphError(gpa, out, level, &graph, ge);
+        try DiagRender.renderGraphError(gpa, out, level, &graph, ge, sev);
         try out.flush();
         if (exit_zero) return 0;
         return if (ge.kind == .missing and ge.module == null) 2 else 1;

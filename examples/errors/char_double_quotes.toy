@@ -1,0 +1,5 @@
+# expect: compile-error "use double quotes"
+fn main() -> int {
+    c := 'ab'
+    return 0
+}

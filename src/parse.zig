@@ -603,7 +603,12 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     try p.expect(.r_paren, "expected ')' to close parameter list");
 
     var ret_type: Ast.Index = Ast.none;
-    if (p.eat(.arrow)) {
+    if (p.at(.colon)) {
+        // A return type is `-> T`, not `: T` (Python/TypeScript muscle memory).
+        try p.warn(p.peek(), .P0012, "a function's return type is written '-> T', not ': T'");
+        p.advance();
+        ret_type = try p.parseType();
+    } else if (p.eat(.arrow)) {
         ret_type = try p.parseType();
     }
 
@@ -1050,7 +1055,14 @@ fn parseMatchArm(p: *Parser) Error!Ast.Index {
         guard = try p.parseExpr(0);
     }
     const arrow = p.index;
-    try p.expect(.arrow, "expected '->' after a match pattern");
+    if (p.at(.eq)) {
+        // `=>` lexes as `.eq` then `.gt`; consume both so the arm body still parses.
+        try p.warn(p.peek(), .P0009, "match arms use '->', not '=>'");
+        p.advance();
+        _ = p.eat(.gt);
+    } else {
+        try p.expect(.arrow, "expected '->' after a match pattern");
+    }
     const body = try p.parseExpr(0);
     const arm_hdr = try p.addExtra(&.{ guard.int(), body.int() });
     return p.addNode(.{ .tag = .match_arm, .main_token = arrow, .lhs = pat, .rhs = arm_hdr });
@@ -1424,8 +1436,37 @@ fn parseType(p: *Parser) Error!Ast.Index {
     var ty = (try p.parseQualifiedName("expected a type name", "expected a type name after '.'")).node;
     // A trailing `[..]` applies type arguments in TYPE position (`Box[int]`,
     // `mod.Box[int]`). Parses to a `type_app`; Typecheck rejects it (T0013).
-    if (p.at(.l_bracket)) ty = try p.parseTypeApp(ty);
+    if (p.at(.l_bracket)) {
+        ty = try p.parseTypeApp(ty);
+    } else if (p.at(.lt)) {
+        // `parseType` is reached ONLY in type position (annotation/return/param/field/
+        // nested type-arg/alias/protocol-ref); no expression parses here, so a `<` can
+        // never be a comparison — it is unambiguously the C++/Rust generic spelling.
+        try p.warn(p.peek(), .P0010, "type arguments use '[]', not '<>': write 'Vec[int]'");
+        p.skipAngleTypeArgs();
+    }
     return ty;
+}
+
+/// Skip a mistaken `<...>` angle-bracket type-argument run at the cursor so the
+/// surrounding TYPE keeps parsing. Depth-tracked; `>>` (lexed as one `.gt_gt`) closes
+/// two levels, so a nested `Vec<Vec<int>>` is consumed whole. Consumes ONLY the
+/// type-arg alphabet (names, `.`, `,`, angles) and stops at anything else, so it can
+/// never run past a statement boundary or swallow an unrelated `(`/`[`/`{`.
+fn skipAngleTypeArgs(p: *Parser) void {
+    std.debug.assert(p.at(.lt));
+    var depth: i32 = 0;
+    while (!p.at(.eof)) {
+        switch (p.peek().tag) {
+            .lt => depth += 1,
+            .gt => depth -= 1,
+            .gt_gt => depth -= 2,
+            .identifier, .dot, .comma => {},
+            else => return,
+        }
+        p.advance();
+        if (depth <= 0) return;
+    }
 }
 
 fn parseBlock(p: *Parser) Error!Ast.Index {
@@ -1497,7 +1538,29 @@ fn expectTerminator(p: *Parser) Error!void {
             p.skipNewlines();
         },
         .r_brace, .eof => p.in_error = false,
-        else => return p.fail(p.peek(), .P0004, "expected a newline or '}' after statement"),
+        else => {
+            const tok = p.peek();
+            // A run of stray bytes coalesces into ONE `.invalid` token, so a doubled
+            // `;;` (or `;`-then-garbage) carries text like ";;" — a `;`-led `.invalid`
+            // is the stray-semicolon case regardless of the trailing bytes.
+            if (tok.tag == .invalid and std.mem.startsWith(u8, tok.text(p.src), ";")) {
+                // A `;` never terminates a toy statement; name the fix and, ONLY when
+                // this is the region's first error, treat it like a crossed boundary
+                // (clear the latch, as the `.newline` arm does) so the next statement
+                // reports its own first error. Mid-cascade the `warn` is suppressed, and
+                // clearing the latch here would revive it into fresh downstream noise, so
+                // fall through to the unwinding P0004 (also suppressed) instead.
+                const latched = p.in_error;
+                try p.warn(tok, .P0013, "statements are separated by newlines; remove the ';'");
+                if (!latched) {
+                    p.in_error = false;
+                    p.advance();
+                    p.skipNewlines();
+                    return;
+                }
+            }
+            return p.fail(tok, .P0004, "expected a newline or '}' after statement");
+        },
     }
 }
 
@@ -1678,7 +1741,9 @@ fn parseLoop(p: *Parser) Error!Ast.Index {
 /// HEAD's `first -> hi -> body -> header -> node` allocation order verbatim, so a range
 /// `for` is byte-identical; the iterator branch builds a distinct `for_in_stmt` node.
 fn parseFor(p: *Parser) Error!Ast.Index {
+    const for_tok = p.index;
     p.bump(.kw_for);
+    if (p.at(.l_paren)) return p.recoverCStyleFor(for_tok);
     const ident_tok = p.index;
     try p.expect(.identifier, "expected a loop variable name");
     // `for key, val in m { .. }`: a comma after the first binding diverts to the
@@ -1710,6 +1775,38 @@ fn parseFor(p: *Parser) Error!Ast.Index {
     nb.end();
     const body = try p.parseBlock();
     return p.addNode(.{ .tag = .for_in_stmt, .main_token = ident_tok, .lhs = body, .rhs = first });
+}
+
+/// A C-style `for (init; cond; step)` header is never toy syntax. Name the fix,
+/// then consume the balanced `(...)` in place rather than unwinding: an unwind
+/// leaves the header tokens to be re-scanned as statements, where each `;` un-
+/// latches cascade suppression and spawns further diagnostics. Bounded by a block
+/// open / newline / eof so a header with no matching `)` still terminates. The
+/// body block, when present, is parsed and discarded; the whole construct
+/// collapses to one `error_node` so exactly one diagnostic fires.
+fn recoverCStyleFor(p: *Parser, for_tok: u32) Error!Ast.Index {
+    try p.warn(p.peek(), .P0011, "toy has no C-style 'for (init; cond; step)'; write 'for x in xs { }'");
+    var depth: u32 = 0;
+    while (!p.at(.eof)) {
+        const tag = p.peek().tag;
+        switch (tag) {
+            .l_brace, .newline => break,
+            .l_paren => depth += 1,
+            .r_paren => if (depth > 0) {
+                depth -= 1;
+            },
+            else => {},
+        }
+        p.advance();
+        if (tag == .r_paren and depth == 0) break;
+    }
+    if (p.at(.l_brace)) {
+        _ = p.parseBlock() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ParseError => {},
+        };
+    }
+    return p.addNode(.{ .tag = .error_node, .main_token = for_tok, .lhs = Ast.none, .rhs = Ast.none });
 }
 
 fn parseExprStmt(p: *Parser) Error!Ast.Index {
@@ -4440,4 +4537,59 @@ test "the adversarial `fn f( ) ) ) {` recovers with imbalance TOLERATED" {
     try testing.expect(parens != 0 or braces != 0);
     // And the pairing check tolerates it because the parse recovered.
     checkBracketPairing(res.tree, tokens, res.diags);
+}
+
+test "fix-suggesting parse codes: category, count, and hint text" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, code: codes.Code, hint: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "fn a() -> int {\n  x := match 0 {\n    0 => 0\n    _ -> 1\n  }\n  return x\n}\n", .code = .P0009, .hint = "'->'" },
+        .{ .src = "fn id(x: Vec<int>) -> int {\n  return 0\n}\n", .code = .P0010, .hint = "'[]'" },
+        .{ .src = "fn a() -> int {\n  for (i := 0; i < 3; i = i + 1) {\n  }\n  return 0\n}\n", .code = .P0011, .hint = "for x in xs" },
+        .{ .src = "fn f(): int {\n  return 0\n}\n", .code = .P0012, .hint = "'-> T'" },
+        .{ .src = "fn a() -> int {\n  x := 1;\n  return x\n}\n", .code = .P0013, .hint = "remove the ';'" },
+    };
+    for (cases) |c| {
+        const res = try parseResult(gpa, c.src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(c.code, res.diags[0].code);
+        try testing.expect(std.mem.indexOf(u8, res.diags[0].message, c.hint) != null);
+    }
+}
+
+test "P0010 nested `<Vec<int>>` closes on `>>` and reports exactly one diagnostic" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "fn f(x: Map<Vec<int>>) -> int {\n  return 0\n}\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqual(codes.Code.P0010, res.diags[0].code);
+}
+
+test "fix-suggesting parse codes do not fire on valid programs" {
+    const gpa = testing.allocator;
+    const oks = [_][]const u8{
+        "fn a() -> int {\n  x := match 0 { 0 -> 1\n    _ -> 2 }\n  return x\n}\n",
+        "fn id(xs: Vec[int]) -> int {\n  return 0\n}\n",
+        "fn a() -> int {\n  for i in 0..3 {\n  }\n  return 0\n}\n",
+        "fn f() -> int {\n  return 0\n}\n",
+        "fn a() -> bool {\n  return 1 < 2\n}\n",
+    };
+    for (oks) |src| {
+        const res = try parseResult(gpa, src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 0), res.diags.len);
+    }
+}
+
+test "P0004 preserved: a non-`;` unexpected terminator token still reports P0004" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "fn f() -> int {\n  return 0 )\n}\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expect(res.diags.len >= 1);
+    try testing.expectEqual(codes.Code.P0004, res.diags[0].code);
 }

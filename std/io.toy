@@ -6,3 +6,9 @@ import core/sys
 pub fn print[T has Display](x: T) {
     sys.print(x.to_string())
 }
+
+# The newline is a second `sys.print` (not string concat) so the alloc-free str path holds.
+pub fn println[T has Display](x: T) {
+    sys.print(x.to_string())
+    sys.print("\n")
+}

@@ -34,6 +34,11 @@ pub const Code = enum(u16) {
     P0006, // expected-name        (identifier: field/param/type/variant/label/loop-var/alias/path-seg)
     P0007, // invalid-label-target ("a label must prefix a loop, while, for, or block")
     P0008, // expected-pattern     (match sub-pattern / variant pattern)
+    P0009, // match-arm-arrow      (`=>` used where a match arm needs `->`)
+    P0010, // angle-type-args      (`<...>` type args in TYPE position; toy uses `[]`)
+    P0011, // c-style-for          (C-style `for (init; cond; step)` header)
+    P0012, // colon-return-type    (`fn f(): T` return type written `:` not `->`)
+    P0013, // stray-semicolon      (a `;` statement terminator)
 
     // Resolve band (R####).
     R0001, // undeclared-identifier
@@ -115,6 +120,11 @@ pub const table = [_]Entry{
     .{ .code = .P0006, .str = "P0006", .slug = "expected-name" },
     .{ .code = .P0007, .str = "P0007", .slug = "invalid-label-target" },
     .{ .code = .P0008, .str = "P0008", .slug = "expected-pattern" },
+    .{ .code = .P0009, .str = "P0009", .slug = "match-arm-arrow" },
+    .{ .code = .P0010, .str = "P0010", .slug = "angle-type-args" },
+    .{ .code = .P0011, .str = "P0011", .slug = "c-style-for" },
+    .{ .code = .P0012, .str = "P0012", .slug = "colon-return-type" },
+    .{ .code = .P0013, .str = "P0013", .slug = "stray-semicolon" },
     .{ .code = .R0001, .str = "R0001", .slug = "undeclared-identifier" },
     .{ .code = .R0002, .str = "R0002", .slug = "duplicate-function" },
     .{ .code = .R0003, .str = "R0003", .slug = "unknown-imported-module" },
@@ -264,6 +274,16 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("expected-token", slug(.P0001).?);
     try testing.expectEqual(Severity.err, defaultSeverity(.P0001));
     try testing.expectEqual(Code.P0005, fromStr("P0005").?);
+    try testing.expectEqualStrings("match-arm-arrow", slug(.P0009).?);
+    try testing.expectEqual(Code.P0009, fromStr("P0009").?);
+    try testing.expectEqualStrings("angle-type-args", slug(.P0010).?);
+    try testing.expectEqual(Code.P0010, fromStr("P0010").?);
+    try testing.expectEqualStrings("c-style-for", slug(.P0011).?);
+    try testing.expectEqual(Code.P0011, fromStr("P0011").?);
+    try testing.expectEqualStrings("colon-return-type", slug(.P0012).?);
+    try testing.expectEqual(Code.P0012, fromStr("P0012").?);
+    try testing.expectEqualStrings("stray-semicolon", slug(.P0013).?);
+    try testing.expectEqual(Code.P0013, fromStr("P0013").?);
 
     // Type band (T####) — the bound + conformance codes.
     try testing.expectEqualStrings("T0023", str(.T0023).?);

@@ -1,0 +1,3 @@
+fn main(): int {   #~ ERROR [P0012] a function's return type is written '-> T'
+    return 0
+}

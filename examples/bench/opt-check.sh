@@ -3,7 +3,7 @@
 # AND are worthwhile (not merely "implemented + tests pass"). Three checks:
 #
 #   (b) DIFFERENTIAL CORRECTNESS over the FULL corpus: every .toy compiled twice
-#       (-O0 and -O1, both --force), run, and asserted exit_off == exit_on AND
+#       (-O0 and -O1, both --no-cache), run, and asserted exit_off == exit_on AND
 #       stdout_off == stdout_on. The file's `# expect: exit N`/`stdout "..."` is
 #       the oracle (the -O0 path == the pre-opt path), and #expect is
 #       checked under -O0 FIRST so a wrong expected value cannot mask a bug.
@@ -19,7 +19,7 @@
 #       -O1 --no-opt=<pass> and assert emitted_instrs is WORSE than full -O1
 #       (proves the pass is the sole load-bearing one for that win AND toggleable).
 #
-# ALWAYS --force: cached fns contribute 0 to --opt-stats and a stale .codegen blob
+# ALWAYS --no-cache: cached fns contribute 0 to --opt-stats and a stale .codegen blob
 # could otherwise serve cross-opt-level garbage.
 #
 # Run from anywhere: resolves the repo root and prefers the prebuilt
@@ -63,8 +63,8 @@ while IFS= read -r src; do
 
   b0="$work/$(basename "$src" .toy).o0"
   b1="$work/$(basename "$src" .toy).o1"
-  timeout 30 "$toyc" --force -O0 -o "$b0" "$src" >/dev/null 2>&1; c0=$?
-  timeout 30 "$toyc" --force -O1 -o "$b1" "$src" >/dev/null 2>&1; c1=$?
+  timeout 30 "$toyc" --no-cache -O0 -o "$b0" "$src" >/dev/null 2>&1; c0=$?
+  timeout 30 "$toyc" --no-cache -O1 -o "$b1" "$src" >/dev/null 2>&1; c1=$?
 
   if [ "$want_cerr" -eq 1 ]; then
     if [ "$c0" -eq 0 ] || [ "$c1" -eq 0 ]; then
@@ -119,8 +119,8 @@ printf "  %-20s %-12s %-16s %s\n" "bench" "ir B->A" "emitted O0->O1" "result"
 any_ir_drop=0; any_emit_drop=0
 for b in "${benches[@]}"; do
   src="$root/examples/bench/$b.toy"
-  s0="$(timeout 30 "$toyc" --force --opt-stats -O0 -o "$work/$b.s0" "$src" 2>&1)"
-  s1="$(timeout 30 "$toyc" --force --opt-stats -O1 -o "$work/$b.s1" "$src" 2>&1)"
+  s0="$(timeout 30 "$toyc" --no-cache --opt-stats -O0 -o "$work/$b.s0" "$src" 2>&1)"
+  s1="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.s1" "$src" 2>&1)"
   ir_before="$(sed -nE 's/.*ir_instrs=([0-9]+)->([0-9]+).*/\1/p' <<<"$s1" | head -1)"
   ir_after="$(sed -nE 's/.*ir_instrs=([0-9]+)->([0-9]+).*/\2/p' <<<"$s1" | head -1)"
   e0="$(stat_field "$s0" emitted_instrs)"
@@ -143,13 +143,13 @@ for b in "${benches[@]}"; do
   p="$(target_pass "$b")"
   cname="$(pass_counter "$p")"
   # only the target pass on
-  sonly="$(timeout 30 "$toyc" --force --opt-stats "--opt=$p" -o "$work/$b.only" "$src" 2>&1)"
+  sonly="$(timeout 30 "$toyc" --no-cache --opt-stats "--opt=$p" -o "$work/$b.only" "$src" 2>&1)"
   cval="$(stat_field "$sonly" "$cname")"
   # full O1 emitted
-  sfull="$(timeout 30 "$toyc" --force --opt-stats -O1 -o "$work/$b.full" "$src" 2>&1)"
+  sfull="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.full" "$src" 2>&1)"
   efull="$(stat_field "$sfull" emitted_instrs)"
   # O1 with target pass removed
-  snoopt="$(timeout 30 "$toyc" --force --opt-stats -O1 "--no-opt=$p" -o "$work/$b.noopt" "$src" 2>&1)"
+  snoopt="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 "--no-opt=$p" -o "$work/$b.noopt" "$src" 2>&1)"
   enoopt="$(stat_field "$snoopt" emitted_instrs)"
   res="ok"
   if [ -z "$cval" ] || [ "$cval" -le 0 ]; then res="FAIL(counter=$cval)"; fi
@@ -163,11 +163,11 @@ done
 # nonzero once a producer pass (fold) has created dead values. Attribute it on
 # const_arith with `--opt=fold,dce`: dced>0, and `-O1 --no-opt=dce` regresses the
 # emitted win (the folded const feeders survive as load/op/store words without it).
-sdce="$(timeout 30 "$toyc" --force --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/examples/bench/const_arith.toy" 2>&1)"
+sdce="$(timeout 30 "$toyc" --no-cache --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/examples/bench/const_arith.toy" 2>&1)"
 dval="$(stat_field "$sdce" dced)"
-sdcefull="$(timeout 30 "$toyc" --force --opt-stats -O1 -o "$work/dce.full" "$root/examples/bench/const_arith.toy" 2>&1)"
+sdcefull="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/dce.full" "$root/examples/bench/const_arith.toy" 2>&1)"
 edcefull="$(stat_field "$sdcefull" emitted_instrs)"
-sdcenoopt="$(timeout 30 "$toyc" --force --opt-stats -O1 --no-opt=dce -o "$work/dce.noopt" "$root/examples/bench/const_arith.toy" 2>&1)"
+sdcenoopt="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 --no-opt=dce -o "$work/dce.noopt" "$root/examples/bench/const_arith.toy" 2>&1)"
 edcenoopt="$(stat_field "$sdcenoopt" emitted_instrs)"
 dres="ok"
 if [ -z "$dval" ] || [ "$dval" -le 0 ]; then dres="FAIL(counter=$dval)"; fi

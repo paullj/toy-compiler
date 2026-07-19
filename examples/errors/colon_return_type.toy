@@ -1,0 +1,4 @@
+# expect: compile-error "[P0012]: a function's return type is written '-> T'"
+fn main(): int {
+    return 0
+}

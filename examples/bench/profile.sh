@@ -17,7 +17,7 @@ dir="$(cd "$(dirname "$entry")" && pwd)"; base="$(basename "$entry")"
 
 echo "== per-stage breakdown (-j 1, best of 3) =="
 b=99999; out=""
-for r in 1 2 3; do ( cd "$dir" && rm -rf .toy ); o="$( cd "$dir" && "$toyc" -j 1 --timings --force -o /tmp/prof.bin "$base" 2>&1 )"; t="$(awk '/total/{print $2}' <<<"$o")"
+for r in 1 2 3; do ( cd "$dir" && rm -rf .toy ); o="$( cd "$dir" && "$toyc" -j 1 --timings --no-cache -o /tmp/prof.bin "$base" 2>&1 )"; t="$(awk '/total/{print $2}' <<<"$o")"
   awk -v a="$t" -v c="$b" 'BEGIN{exit !(a<c)}' && { b="$t"; out="$o"; }
 done
 echo "$out" | sed 's/^/  /'
@@ -25,7 +25,7 @@ echo "$out" | sed 's/^/  /'
 echo "== -j scaling (best total ms of 3) =="
 for j in "${jobs[@]}"; do
   b=99999
-  for r in 1 2 3; do ( cd "$dir" && rm -rf .toy ); t="$( cd "$dir" && "$toyc" -j "$j" --timings --force -o /tmp/prof.bin "$base" 2>&1 | awk '/total/{print $2}' )"
+  for r in 1 2 3; do ( cd "$dir" && rm -rf .toy ); t="$( cd "$dir" && "$toyc" -j "$j" --timings --no-cache -o /tmp/prof.bin "$base" 2>&1 | awk '/total/{print $2}' )"
     b="$(awk -v a="$t" -v c="$b" 'BEGIN{print (a<c)?a:c}')"
   done
   printf "  -j %-3s %s ms\n" "$j" "$b"

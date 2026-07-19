@@ -1,0 +1,2 @@
+# expect: compile-error "[P0010]: type arguments use '[]'"
+fn id(x: Vec<int>) -> int { return 0 }

@@ -59,7 +59,7 @@ while IFS= read -r src; do
   bin="$work/${base}.bin"
   bin2="$work/${base}.verify"
 
-  out="$("$toyc" --force -o "$bin" "$src" 2>&1)"; rc=$?
+  out="$("$toyc" --no-cache -o "$bin" "$src" 2>&1)"; rc=$?
 
   if [ "$want_cerr" -eq 1 ]; then
     if [ "$rc" -eq 0 ]; then
@@ -89,7 +89,7 @@ while IFS= read -r src; do
   # Determinism: --verify re-lowers every fn TWICE and asserts per-fn FnCode
   # byte-identity ([C11]). It is self-contained (does not depend on a primed
   # cache), so a Debug-build assertion failure here aborts non-zero and fails
-  # the gate. (--force is intentionally omitted: it is redundant under the new
+  # the gate. (--no-cache is intentionally omitted: it is redundant under the new
   # verify semantics, and pairing it previously masked the assertion entirely.)
   if ! "$toyc" --verify -o "$bin2" "$src" >/dev/null 2>&1; then
     fail_one "$rel: codegen NON-deterministic (--verify re-lower mismatch)"; ok=0

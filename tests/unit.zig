@@ -245,9 +245,9 @@ test "unit: a ()-value program (a () param + Map[int,()]) is byte-identical at -
     ;
     // Same `-o` basename in both dirs so the ad-hoc code-sign identifier is identical; the
     // () monomorphized instances are pure functions of source, so codegen is -jN identical.
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);

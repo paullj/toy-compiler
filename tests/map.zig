@@ -187,9 +187,9 @@ test "map: an explicit-impl-Hashable key program is byte-identical at -j1 and -j
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", custom_eq_src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", custom_eq_src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", custom_eq_src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", custom_eq_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
@@ -259,9 +259,9 @@ test "map: the Map program is byte-identical at -j1 and -j8" {
     // identical — only the one-byte code-sign nonce may differ. The descriptor table +
     // erased units + the Map's mono instances are pure functions of source, so codegen
     // is `-jN` byte-identical.
-    const p1 = try compile(gpa, io, dir ++ "/j1", share_src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", share_src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", share_src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", share_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
