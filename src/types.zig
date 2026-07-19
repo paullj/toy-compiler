@@ -195,6 +195,15 @@ pub const refs = struct {
         // concrete type (per-instance re-check via the checker's substitution). Empty
         // context => null => the normal unknown-type path, byte-identical otherwise.
         if (self.genericParamType(name)) |ty| return ty;
+        // An exact stdlib type/namespace named here means the import is missing —
+        // name the module. The print family (spelling != null) is never a type, so
+        // it falls through to the bare message unchanged.
+        if (StdNames.importHintFor(name)) |hint| {
+            if (hint.spelling == null) {
+                self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type ++ "; add 'import std/{s}'", .{ name, hint.module }) catch {};
+                return .invalid;
+            }
+        }
         self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
         return .invalid;
     }
@@ -239,6 +248,12 @@ pub const refs = struct {
                 ctor_id = id;
                 is_enum = true;
             } else {
+                if (StdNames.importHintFor(bname)) |hint| {
+                    if (hint.spelling == null) {
+                        self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type ++ "; add 'import std/{s}'", .{ bname, hint.module }) catch {};
+                        return .invalid;
+                    }
+                }
                 self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type, .{bname}) catch {};
                 return .invalid;
             }
@@ -6242,6 +6257,22 @@ test "unknown type name in a parameter" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         "fn f(a: nope) {\n return\n}\n",
     ));
+}
+
+test "an unimported std type in a type-app base position hints the module to import" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn f(v: Vec[int]) -> int {\n return 0\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqualStrings("unknown type 'Vec'; add 'import std/vec'", c.result.diags[0].message);
+}
+
+test "an unimported std type as a bare type name hints the module to import" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn f(s: Set) -> int {\n return 0\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqualStrings("unknown type 'Set'; add 'import std/set'", c.result.diags[0].message);
 }
 
 test "unknown return type does not cascade (poison)" {

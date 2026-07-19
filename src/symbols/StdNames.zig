@@ -69,6 +69,42 @@ pub fn desugarMethods(tag: Ast.Node.Tag) []const DesugarMethod {
     };
 }
 
+/// A missing-import hint for a stdlib symbol named without its `import`: the
+/// `std/<module>` path that brings it into scope, and — when the typed name is not
+/// itself the export — the spelling to use instead. The print family is ordinary
+/// library code under `io` now, not a global, so `print` must become `io.print`.
+pub const ImportHint = struct {
+    module: []const u8,
+    spelling: ?[]const u8 = null,
+};
+
+/// Stdlib names a program is likely to reach for WITHOUT the import that binds them,
+/// keyed by EXACT spelling: a typo (`Vecc`) is not a key, so the resolver's fuzzy
+/// "did you mean" keeps ownership of typos and only a genuine stdlib name yields the
+/// deterministic import hint. `Option`/`Result` are prelude generics (no import) and
+/// are absent; there is no `std/string` yet, so `string`/`String` are too.
+const import_hints = std.StaticStringMap(ImportHint).initComptime(.{
+    .{ "Vec", ImportHint{ .module = "vec" } },
+    .{ "Map", ImportHint{ .module = "map" } },
+    .{ "Set", ImportHint{ .module = "set" } },
+    .{ "io", ImportHint{ .module = "io" } },
+    .{ "math", ImportHint{ .module = "math" } },
+    .{ "iter", ImportHint{ .module = "iter" } },
+    .{ "vec", ImportHint{ .module = "vec" } },
+    .{ "map", ImportHint{ .module = "map" } },
+    .{ "set", ImportHint{ .module = "set" } },
+    .{ "print", ImportHint{ .module = "io", .spelling = "io.print" } },
+    .{ "println", ImportHint{ .module = "io", .spelling = "io.println" } },
+    .{ "console", ImportHint{ .module = "io", .spelling = "io.print" } },
+});
+
+/// The `std/` import (and, when the typed name is wrong, the correct spelling) for an
+/// unimported stdlib symbol, or null when `name` is not a known stdlib name — leaving
+/// typo/near-miss handling to the caller.
+pub fn importHintFor(name: []const u8) ?ImportHint {
+    return import_hints.get(name);
+}
+
 test "method names are distinct, non-empty, and ga_at is qualified" {
     const methods = [_][]const u8{ method_new, method_push, method_iter, method_next };
     for (methods) |m| try std.testing.expect(m.len != 0);
@@ -102,4 +138,32 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
 
     // A sugar with no receiver-method desugar (indexing goes through `ga_at`).
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);
+}
+
+test "importHintFor: exact stdlib names hint; typos, prelude generics, and unknowns do not" {
+    const vec = importHintFor("Vec").?;
+    try std.testing.expectEqualStrings("vec", vec.module);
+    try std.testing.expect(vec.spelling == null);
+
+    try std.testing.expectEqualStrings("io", importHintFor("io").?.module);
+    try std.testing.expect(importHintFor("io").?.spelling == null);
+
+    const print = importHintFor("print").?;
+    try std.testing.expectEqualStrings("io", print.module);
+    try std.testing.expectEqualStrings("io.print", print.spelling.?);
+    try std.testing.expectEqualStrings("io.println", importHintFor("println").?.spelling.?);
+    try std.testing.expectEqualStrings("io.print", importHintFor("console").?.spelling.?);
+
+    inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter" }) |n|
+        try std.testing.expect(importHintFor(n) != null);
+
+    // A typo is NOT a key: near-miss keeps ownership of typos.
+    try std.testing.expect(importHintFor("Vecc") == null);
+    try std.testing.expect(importHintFor("prnt") == null);
+    // Prelude generics never hint (no import needed); there is no std/string yet.
+    try std.testing.expect(importHintFor("Option") == null);
+    try std.testing.expect(importHintFor("Result") == null);
+    try std.testing.expect(importHintFor("String") == null);
+    try std.testing.expect(importHintFor("string") == null);
+    try std.testing.expect(importHintFor("") == null);
 }

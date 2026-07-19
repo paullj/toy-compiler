@@ -1,0 +1,6 @@
+# Feature: SHOULD FAIL — calling `io.print` without importing std/io. The `io` namespace
+# is unbound; the hint names the module to import.
+# expect: compile-error "import std/io"
+fn main() {
+    io.print("hi\n")
+}

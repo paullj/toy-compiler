@@ -48,6 +48,7 @@ pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
 const SymKind = @import("symbols/Sym.zig").SymKind;
 const Intrinsic = @import("symbols/Intrinsic.zig");
+const StdNames = @import("symbols/StdNames.zig");
 
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
@@ -701,11 +702,22 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
                 if (g.tables[g.cur_mod].enums.contains(g.nameText(n.main_token))) return;
                 const name = g.nameText(n.main_token);
                 const off = g.tokens()[n.main_token].start;
+                // An EXACT stdlib name (checked before the fuzzy suggester) means the
+                // import is missing, not that the name is a typo — name the module to
+                // import. Only an exact match hints, so a genuine typo still falls
+                // through to near-miss below; a user struct/enum of the same name has
+                // already returned above, so it is never overridden here.
+                if (StdNames.importHintFor(name)) |hint| {
+                    if (hint.spelling) |sp|
+                        try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'; use '{s}' and add 'import std/{s}'", .{ name, sp, hint.module })
+                    else
+                        try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'; add 'import std/{s}'", .{ name, hint.module });
+                }
                 // If an in-scope name is a close typo of the undeclared one, append a
                 // "did you mean" hint (message-embedded — no note channel yet). The
                 // suggester is conservative (short names / distant names / ties → no
                 // hint), so this stays byte-identical for the existing no-hint cases.
-                if (nearmiss.suggest(name, g.candidateIter())) |cand|
+                else if (nearmiss.suggest(name, g.candidateIter())) |cand|
                     try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'; did you mean '{s}'?", .{ name, cand })
                 else
                     try g.emit(.R0001, g.cur_mod, off, "undeclared identifier '{s}'", .{name});

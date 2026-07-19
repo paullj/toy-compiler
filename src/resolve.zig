@@ -178,6 +178,40 @@ test "an ambiguous near-miss (tie) yields NO hint" {
     try testing.expectEqualStrings("undeclared identifier 'bat'", res.diags[0].message);
 }
 
+test "an unimported std type in expression position hints its import" {
+    const gpa = testing.allocator;
+    // `Map` binds nothing without the import; the type-args are not descended, so
+    // there is exactly one diagnostic — the import hint on `Map`.
+    var parsed = try parseSource(gpa, "fn main() -> int {\n m := Map[int, int].new()\n return 0\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'Map'; add 'import std/map'", res.diags[0].message);
+}
+
+test "an unimported print uses the corrected spelling and names its import" {
+    const gpa = testing.allocator;
+    var parsed = try parseSource(gpa, "fn main() -> int {\n print(\"hi\")\n return 0\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'print'; use 'io.print' and add 'import std/io'", res.diags[0].message);
+}
+
+test "a typo of a std name gets NO import hint (near-miss owns typos)" {
+    const gpa = testing.allocator;
+    // `Mapp` is one edit from stdlib `Map` but is NOT an exact key, and nothing named
+    // `Map` is in scope, so neither an import hint nor a near-miss fires → bare message.
+    var parsed = try parseSource(gpa, "fn main() -> int {\n x := Mapp\n return 0\n}\n");
+    defer parsed.deinit(gpa);
+    var res = try resolveParsed(gpa, parsed);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("undeclared identifier 'Mapp'", res.diags[0].message);
+}
+
 test "duplicate parameter is reported" {
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
         "fn f(a: int, a: int) {\n return\n}\n",
