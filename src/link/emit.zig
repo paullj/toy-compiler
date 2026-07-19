@@ -31,7 +31,7 @@ const Link = @import("Link.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
 const MachO = @import("MachO.zig");
 const CodeSign = @import("CodeSign.zig");
-const CodegenIr = @import("../codegen/CodegenIr.zig");
+const runtime = @import("../codegen/runtime/runtime.zig");
 const sym = @import("../symbols/Sym.zig");
 const Engine = @import("../query/Engine.zig");
 
@@ -71,15 +71,15 @@ pub const Linked = struct {
 /// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
 /// `data_relocs` (free `.import` data-reloc names individually).
 pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, descriptors: []const Link.DescEntry) !Linked {
-    // 1) Scan which hand-emitted builtins (`CodegenIr.hand_builtins`) any fn references;
+    // 1) Scan which hand-emitted builtins (`runtime.hand_builtins`) any fn references;
     //    each referenced body is appended below. Those bodies emit their own `.import`
     //    relocs (e.g. `panic` -> `write`), so the dyld import set is DERIVED from
     //    `data_relocs` like any other import.
-    var used = [_]bool{false} ** CodegenIr.hand_builtins.len;
+    var used = [_]bool{false} ** runtime.hand_builtins.len;
     for (fns) |f| {
         for (f.relocs) |rl| switch (rl.target) {
             .func => |s| if (s.kind == .builtin) {
-                for (CodegenIr.hand_builtins, 0..) |hb, i| {
+                for (runtime.hand_builtins, 0..) |hb, i| {
                     if (std.mem.eql(u8, s.name, hb.name)) used[i] = true;
                 }
             },
@@ -93,9 +93,9 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     var closure_changed = true;
     while (closure_changed) {
         closure_changed = false;
-        inline for (CodegenIr.hand_builtins, 0..) |hb, i| {
+        inline for (runtime.hand_builtins, 0..) |hb, i| {
             if (used[i]) inline for (hb.static_call_deps) |dep| {
-                const j = comptime CodegenIr.handBuiltinIndex(dep);
+                const j = comptime runtime.handBuiltinIndex(dep);
                 if (!used[j]) {
                     used[j] = true;
                     closure_changed = true;
@@ -105,12 +105,12 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     }
     // `panic` alone is consumed past the append: it drags in the `write` import and
     // reserves the backtrace symbol table's slot.
-    const uses_panic = used[comptime CodegenIr.handBuiltinIndex("panic")];
+    const uses_panic = used[comptime runtime.handBuiltinIndex("panic")];
     // `gc_collect` present ⇒ the collector runs ⇒ reserve + emit the GC stack map. The
     // static-call closure above already pulls `gc_collect` in via `gc_alloc`, so this is
     // true for any allocating program and false for a heap-free one (keeping it
     // byte-identical). Local to `linkProgram`: no new param threads through `Codegen`.
-    const uses_gc = used[comptime CodegenIr.handBuiltinIndex("gc_collect")];
+    const uses_gc = used[comptime runtime.handBuiltinIndex("gc_collect")];
     // Build the full fn set: the user fns + (if referenced) the hand-emitted builtin
     // bodies, appended in `hand_builtins` order so the linked image is a pure function of
     // the fn set (never thread order). We OWN `fns`' elements now (the caller relinquished
@@ -128,7 +128,7 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
         try all.append(gpa, f);
         moved += 1;
     }
-    for (CodegenIr.hand_builtins, 0..) |hb, i| {
+    for (runtime.hand_builtins, 0..) |hb, i| {
         if (used[i]) try all.append(gpa, try hb.lower(gpa));
     }
 
