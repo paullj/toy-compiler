@@ -88,9 +88,9 @@ test "desc: the descriptor-table program is byte-identical at -j1 and -j8" {
     // from the basename) is identical — only the one-byte code-sign nonce may differ. The
     // descriptor table + erased units are pure functions of source (canonical order), so
     // codegen is `-jN` byte-identical.
-    const p1 = try compile(gpa, io, dir ++ "/j1", selftest_src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", selftest_src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", selftest_src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", selftest_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);

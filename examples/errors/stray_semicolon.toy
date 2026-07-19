@@ -1,0 +1,5 @@
+# expect: compile-error "[P0013]: statements are separated by newlines"
+fn main() -> int {
+    x := 1;
+    return x
+}

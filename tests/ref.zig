@@ -121,9 +121,9 @@ test "ref: a program building Ref[int] AND Ref[bool] is byte-identical at -j1 an
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
@@ -185,9 +185,9 @@ test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
@@ -229,9 +229,9 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);

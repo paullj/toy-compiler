@@ -1,0 +1,5 @@
+# expect: compile-error "declare it first with ':='"
+fn main() -> int {
+    x = 1
+    return 0
+}

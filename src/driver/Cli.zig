@@ -45,8 +45,8 @@ const post_emit: []const Spec.Option = &.{
     .{ .long = "dump", .action = .set_true, .help = "Print the emit phase's artifact (tokens, or the AST)" },
     .{ .long = "codegen-stats", .action = .set_true, .help = "Print compiled-vs-cached function counts (with -o)" },
     .{ .long = "verify", .action = .set_true, .help = "Re-lower cached functions and assert they match (with -o)" },
-    .{ .long = "force", .action = .set_true, .help = "Ignore the codegen cache; lower every function (with -o)" },
-    .{ .long = "opt-stats", .action = .set_true, .help = "Print per-pass opt counters + dual metric (with -o; use --force)" },
+    .{ .long = "no-cache", .action = .set_true, .help = "Ignore the codegen cache; lower every function (with -o)" },
+    .{ .long = "opt-stats", .action = .set_true, .help = "Print per-pass opt counters + dual metric (with -o; use --no-cache)" },
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
     // Render-time severity overrides. Repeatable; take a code (R0001) or a band
@@ -153,7 +153,7 @@ comptime {
     if (hasLong(check_opts, "emit"))
         @compileError("`check` must never register `--emit`");
     // check_opts must carry ONLY the restricted, non-codegen knobs.
-    for ([_][]const u8{ "output", "j", "O", "opt", "no-opt", "dump", "codegen-stats", "verify", "force", "opt-stats", "timings", "emit" }) |banned| {
+    for ([_][]const u8{ "output", "j", "O", "opt", "no-opt", "dump", "codegen-stats", "verify", "no-cache", "opt-stats", "timings", "emit" }) |banned| {
         if (hasLong(check_opts, banned))
             @compileError("`check` option set must not contain build/codegen/opt flags");
     }

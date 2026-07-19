@@ -1,0 +1,4 @@
+fn main() -> int {
+    x := 1;   #~ ERROR [P0013] remove the ';'
+    return x
+}

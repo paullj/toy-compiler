@@ -619,7 +619,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 const resn = g.lookupName(target.main_token);
                 g.res(stmt.lhs, resn);
                 switch (resn) {
-                    .unresolved => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "assignment to undeclared name '{s}'", .{g.nameText(target.main_token)}),
+                    .unresolved => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "assignment to undeclared name '{s}'; declare it first with ':='", .{g.nameText(target.main_token)}),
                     .func => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "cannot assign to function '{s}'", .{g.nameText(target.main_token)}),
                     .module => try g.emit(.R0007, g.cur_mod, g.tokens()[target.main_token].start, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
                     .local, .label => {},

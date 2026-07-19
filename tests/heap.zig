@@ -46,7 +46,7 @@ fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: 
     };
 }
 
-/// Compile `entry_src` with extra `args` (e.g. `--force -j8`) into `dir_name/prog` and return
+/// Compile `entry_src` with extra `args` (e.g. `--no-cache -j8`) into `dir_name/prog` and return
 /// the produced image bytes (caller frees). Same `-o prog` basename across calls, so the
 /// ad-hoc code-sign IDENTIFIER matches and only the one-byte code-sign nonce may differ —
 /// the seam a `-jN` determinism check compares. Skips off the aarch64-macos backend.
@@ -143,9 +143,9 @@ test "gc: a descriptor-traced Map program is byte-identical at -j1 and -j8" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const b1 = compileBytes(gpa, io, ".toy-test-gc-jN-1", map_high_bucket_src, &.{ "--force", "-j1" }) catch |e| return if (e == error.SkipZigTest) e else e;
+    const b1 = compileBytes(gpa, io, ".toy-test-gc-jN-1", map_high_bucket_src, &.{ "--no-cache", "-j1" }) catch |e| return if (e == error.SkipZigTest) e else e;
     defer gpa.free(b1);
-    const b8 = try compileBytes(gpa, io, ".toy-test-gc-jN-8", map_high_bucket_src, &.{ "--force", "-j8" });
+    const b8 = try compileBytes(gpa, io, ".toy-test-gc-jN-8", map_high_bucket_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(b8);
     try std.testing.expectEqual(b1.len, b8.len);
     var differing: usize = 0;

@@ -626,7 +626,7 @@ pub const BodyChecker = struct {
         switch (Literal.decodeChar(raw)) {
             .ok => {},
             .empty => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "empty char literal"),
-            .too_many => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal must hold exactly one codepoint"),
+            .too_many => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal must hold exactly one codepoint; use double quotes for a string"),
             .dangling_backslash => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal ends with a dangling backslash"),
             .unknown_escape => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "unknown escape in char literal"),
             .bad_hex_escape => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "malformed '\\x'/'\\u' escape in char literal"),

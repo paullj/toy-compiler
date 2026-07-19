@@ -1,0 +1,4 @@
+fn main() -> int {
+    for (i := 0) { }   #~ ERROR [P0011] toy has no C-style
+    return 0
+}

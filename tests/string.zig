@@ -271,9 +271,9 @@ test "string: a concat program is byte-identical at -j1 and -j8" {
     // IDENTIFIER, and the packed String codegen is a pure function of source, so the two
     // binaries are byte-for-byte identical (assert EXACT equality so a genuine 1-byte
     // non-determinism cannot hide behind a slack tolerance).
-    const p1 = try compile(gpa, io, dir ++ "/j1", det_src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", det_src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", det_src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", det_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
@@ -308,9 +308,9 @@ test "string: a print/to_string program is byte-identical at -j1 and -j8" {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", ts_det_src, &.{ "--force", "-j1" });
+    const p1 = try compile(gpa, io, dir ++ "/j1", ts_det_src, &.{ "--no-cache", "-j1" });
     defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", ts_det_src, &.{ "--force", "-j8" });
+    const p8 = try compile(gpa, io, dir ++ "/j8", ts_det_src, &.{ "--no-cache", "-j8" });
     defer gpa.free(p8);
 
     const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);

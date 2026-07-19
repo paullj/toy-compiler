@@ -1,0 +1,3 @@
+fn id(x: Vec<int>) -> int {   #~ ERROR [P0010] type arguments use '[]'
+    return 0
+}

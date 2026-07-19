@@ -194,7 +194,17 @@ pub fn renderFileDiags(
 /// Render a graph-discovery structural error against the owning module's source (or
 /// the entry path when no module loaded). With a location, snippet + `= note: detail`;
 /// otherwise the plain `path: error: msg (detail)` fallback.
-pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Graph.Error) !void {
+pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Graph.Error, cfg: SevCfg.SeverityConfig) !void {
+    // A tainted parse carries the module's FULL coded diagnostic list; render those
+    // (codes + carets) so `-o` matches `check`'s per-file output. Other kinds
+    // (missing/escape/cycle) carry no parse_diags and fall through unchanged.
+    if (e.kind == .parse and e.parse_diags.len > 0) {
+        const m = moduleAt(g, e.module orelse g.entry_index);
+        var sm = try Rr.SourceMap.init(gpa, m.path, m.source);
+        defer sm.deinit(gpa);
+        for (e.parse_diags) |d| _ = try renderSinkDiag(out, level, &sm, d, cfg);
+        return;
+    }
     const name = if (e.module) |m| moduleAt(g, m).path else if (g.modules.len > 0) g.entry().path else "<entry>";
     const has_src = e.module != null or g.modules.len > 0;
     if (e.byte_offset != null and has_src) {

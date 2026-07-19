@@ -84,7 +84,7 @@ pub const LinkedProgram = struct {
     /// IR instruction count after opt, and the emitted aarch64 instruction count
     /// (text.len/4). No owned slices → deinit unchanged. Cached fns contribute 0
     /// to opt_stats/ir_instrs (their opt ran on a prior build), so honest
-    /// `--opt-stats` numbers require `--force`.
+    /// `--opt-stats` numbers require `--no-cache`.
     opt_stats: Opt.Stats = .{},
     ir_instrs: usize = 0,
     emitted_instrs: usize = 0,
