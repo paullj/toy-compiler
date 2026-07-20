@@ -284,7 +284,50 @@ pub const BodyChecker = struct {
             try bc.checkStmt(last); // statement context (incl. trailing else-less if)
         }
         bc.node_types[(block_idx).int()] = bt;
+        try bc.warnUnreachable(stmts);
         return bt;
+    }
+
+    /// Emit W0005 on the first statement made unreachable by a preceding always-
+    /// diverging statement in the same block. Runs after the block is typed so the
+    /// divergence walk can read a match scrutinee's memoized type. Read-only: it only
+    /// emits a diagnostic, so it never perturbs the definite-return / fall-off logic
+    /// nor the emitted machine code. At most one W0005 per block (no cascade).
+    fn warnUnreachable(bc: *BodyChecker, stmts: []const Ast.Index) error{OutOfMemory}!void {
+        if (stmts.len < 2) return;
+        for (stmts[0 .. stmts.len - 1], 1..) |s, next| {
+            if (!bc.divergesForReach(s)) continue;
+            const dead_tok = bc.tree.nodes[(stmts[next]).int()].main_token;
+            try bc.sink.emitFmtCode(.W0005, bc.byteOf(dead_tok), "unreachable code; the previous statement always diverges", .{});
+            return;
+        }
+    }
+
+    /// Whether `stmt_idx` always transfers control away, so a following statement in the
+    /// same block cannot run. `stmtDiverges` is the shared control-flow authority
+    /// (return/break/continue/if-both/loop-no-break/exhaustive-match); it is NOT modified
+    /// here. The `never` clause additionally catches a `var_decl` bound to a diverging
+    /// value (`x := loop {}`), which `stmtDiverges` leaves as `false`. `panic(..)` is a
+    /// `unit`-typed builtin call that no type-based test can see, so it is detected
+    /// structurally.
+    fn divergesForReach(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
+        if (bc.stmtDiverges(stmt_idx)) return true;
+        if (bc.node_types[(stmt_idx).int()].kind == .never) return true;
+        return bc.stmtIsPanic(stmt_idx);
+    }
+
+    /// Whether `stmt_idx` is a bare `panic(..)` call statement. Gated on both the seeded
+    /// builtin kind and the name so a user-declared `fn panic` (a `.user_fn`) never fires.
+    fn stmtIsPanic(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
+        const s = bc.tree.nodes[(stmt_idx).int()];
+        if (s.tag != .expr_stmt) return false;
+        const inner = bc.tree.nodes[(s.lhs).int()];
+        if (inner.tag != .call) return false;
+        const callee = bc.tree.nodes[(inner.lhs).int()];
+        if (callee.tag != .identifier) return false;
+        if (bc.resolutions[(inner.lhs).int()] != .func) return false;
+        const f = bc.model.fns[bc.resolutions[(inner.lhs).int()].func];
+        return f.kind == .builtin and std.mem.eql(u8, bc.nameText(callee.main_token), "panic");
     }
 
     fn checkStmt(bc: *BodyChecker, stmt_idx: Ast.Index) error{OutOfMemory}!void {

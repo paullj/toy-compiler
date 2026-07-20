@@ -1803,6 +1803,191 @@ test "`--allow W0003` silences the unused-function warning (exit 0)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
+// The unreachable-code warning: a statement that can never run because a preceding
+// statement in the same block always diverges. `return 0\n return 1` is the cleanest
+// case — a single W0005 with no co-emitted unused-variable or fall-off noise. It must
+// warn W0005 and NOT fail the check (exit 0), be promoted by `--deny-warnings`, and be
+// silenced by `--allow W0005`.
+const unreachable_after_return_fixture = "fn main() -> int {\n  return 0\n  return 1\n}\n";
+
+test "`toy check` renders W0005 for code after a return and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unreachable_after_return_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0005]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unreachable code") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check --deny-warnings` promotes W0005 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unreachable_after_return_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0005]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0005` silences the unreachable-code warning (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unreachable_after_return_fixture, &.{ "check", "--allow", "W0005" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0005") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` flags code after a panic (the unit-typed diverging builtin)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-panic";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn main() -> int {\n  panic(\"x\")\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0005]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` flags code after an if/else whose arms both diverge" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-ifelse";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f(c: bool) -> int {\n  if c {\n    return 1\n  } else {\n    return 2\n  }\n  return 3\n}\nfn main() -> int { return f(true) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0005]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` flags code after a break inside a loop" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-break";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn main() -> int {\n  loop {\n    break\n    _x := 1\n  }\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0005]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` flags dead code nested inside a reachable block" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-nested";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f() {\n  {\n    return\n    _x := 1\n  }\n}\nfn main() -> int {\n  f()\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0005]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// Only the FIRST unreachable statement warns: two dead statements after a `return`
+// produce exactly one W0005 (no cascade). The tail is a unit function so the fall-off
+// error does not co-emit and muddy the count.
+test "`toy check` reports only the first unreachable statement (no cascade)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0005-once";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f() {\n  return\n  _x := 1\n  _y := 2\n}\nfn main() -> int {\n  f()\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, res.out, i, "W0005")) |at| {
+        count += 1;
+        i = at + 5;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+// A construct control can fall through — an else-less `if`, a `while`, a bare `for` —
+// does NOT make what follows unreachable. None of these fixtures may emit W0005.
+test "`toy check` does not flag code after an else-less if or a while" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const cases = [_][]const u8{
+        // else-less if: the then-arm diverges but the if may be skipped.
+        "fn f(c: bool) -> int {\n  if c {\n    return 1\n  }\n  return 3\n}\nfn main() -> int { return f(true) }\n",
+        // while: the body may run zero times, so control falls through.
+        "fn main() -> int {\n  i := 0\n  while i < 3 {\n    i = i + 1\n  }\n  return 0\n}\n",
+    };
+    for (cases, 0..) |src, n| {
+        var buf: [64]u8 = undefined;
+        const dir_name = try std.fmt.bufPrint(&buf, ".toy-test-driver-w0005-neg-{d}", .{n});
+        defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+        const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "W0005") == null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
