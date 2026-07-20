@@ -6406,7 +6406,7 @@ test "to_string of an int typechecks clean (Display, no arg-type error)" {
 
 test "panic with no arguments is an arity error" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
-        "fn main() {\n panic()\n return\n}\n",
+        "fn main() {\n panic()\n}\n",
     ));
 }
 
@@ -6480,7 +6480,7 @@ test "loop value-break agreement is accepted" {
 
 test "loop value-break disagreement is rejected" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
-        "fn f() -> int {\n i := 0\n loop {\n if i >= 5 { break i } else { break i > 0 }\n i = i + 1\n }\n}\n",
+        "fn f() -> int {\n i := 0\n loop {\n if i >= 5 { break i } else { break i > 0 }\n }\n}\n",
     ));
 }
 
@@ -6516,13 +6516,13 @@ test "bare break in a while loop is accepted" {
 
 test "break outside a loop is rejected" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
-        "fn f() {\n break\n return\n}\n",
+        "fn f() {\n break\n}\n",
     ));
 }
 
 test "continue outside a loop is rejected" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
-        "fn f() {\n continue\n return\n}\n",
+        "fn f() {\n continue\n}\n",
     ));
 }
 
@@ -6580,7 +6580,6 @@ test "continue on a labeled bare block is rejected (not a loop)" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         \\fn f() {
         \\ @blk { continue @blk }
-        \\ return
         \\}
         \\
     ));
