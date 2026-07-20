@@ -2,6 +2,6 @@
 # The heap intrinsics resolve only inside a bundled `core/` module; naming one from a
 # user file is the ordinary undeclared-identifier error (R0001), not a special case.
 fn main() -> int {
-    p := gc_alloc(16)
+    _p := gc_alloc(16)
     return 0
 }

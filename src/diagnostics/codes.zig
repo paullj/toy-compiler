@@ -92,6 +92,9 @@ pub const Code = enum(u16) {
     T0037, // extern-invalid-type (an `extern fn` param/return type is not int, float, str, rawptr, or bool)
     T0038, // unsafe-required (a raw-pointer `store`/`load` used outside an `unsafe { }` block)
 
+    // Warning band (W####).
+    W0001, // unused-variable
+
     _,
 };
 
@@ -173,6 +176,7 @@ pub const table = [_]Entry{
     .{ .code = .T0036, .str = "T0036", .slug = "malformed-char-literal" },
     .{ .code = .T0037, .str = "T0037", .slug = "extern-invalid-type" },
     .{ .code = .T0038, .str = "T0038", .slug = "unsafe-required" },
+    .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -212,7 +216,7 @@ pub fn hasPrefix(s: []const u8, band: u8) bool {
     return s.len > 0 and s[0] == band;
 }
 
-const prefix_bands = "LPRT";
+const prefix_bands = "LPRTW";
 
 // Build-time registry safety: coverage (every non-none code has exactly one row),
 // uniqueness, prefix membership, and per-band contiguity (tails run 0001,0002,…).
@@ -362,6 +366,13 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0038", str(.T0038).?);
     try testing.expectEqualStrings("unsafe-required", slug(.T0038).?);
     try testing.expectEqual(Code.T0038, fromStr("T0038").?);
+
+    // Unused-variable warning code — the ONLY .warning default, so this proves the
+    // warning-by-default wiring end to end.
+    try testing.expectEqualStrings("W0001", str(.W0001).?);
+    try testing.expectEqualStrings("unused-variable", slug(.W0001).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0001));
+    try testing.expectEqual(Code.W0001, fromStr("W0001").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
@@ -376,14 +387,14 @@ test "fromStr round-trips every table code and rejects garbage" {
 test "registry runtime invariants: unique, in-band prefix, contiguous tails" {
     // Uniqueness (code + str) and prefix membership.
     for (table, 0..) |e, i| {
-        try testing.expect(e.str[0] == 'L' or e.str[0] == 'P' or e.str[0] == 'R' or e.str[0] == 'T');
+        try testing.expect(e.str[0] == 'L' or e.str[0] == 'P' or e.str[0] == 'R' or e.str[0] == 'T' or e.str[0] == 'W');
         for (table[i + 1 ..]) |o| {
             try testing.expect(e.code != o.code);
             try testing.expect(!std.mem.eql(u8, e.str, o.str));
         }
     }
     // Per-band contiguity from 0001.
-    inline for ("LPRT") |band| {
+    inline for ("LPRTW") |band| {
         var next: u32 = 1;
         for (table) |e| {
             if (e.str[0] != band) continue;

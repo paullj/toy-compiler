@@ -1,6 +1,6 @@
 # float is Eq-only: a non-dotted `+` (which desugars to Add) is rejected — use `+.`.
 # expect: compile-error "requires an 'Add' impl for type 'float'"
 fn main() -> int {
-    z := 3.0 + 4.0
+    _z := 3.0 + 4.0
     return 0
 }

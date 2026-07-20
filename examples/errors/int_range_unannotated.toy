@@ -2,7 +2,7 @@
 # still fit a 64-bit word. 2^64 is past `uint64`'s max, so no `iconst` can hold it — it is
 # rejected at the checker (T0034) rather than escaping to a codegen-time note.
 fn main() -> int {
-    x := 18446744073709551616
+    _x := 18446744073709551616
     return 0
 }
 # expect: compile-error "out of range"

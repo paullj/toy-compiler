@@ -3,7 +3,7 @@
 # has neither, so the loop is a compile error naming the `Iterator` protocol.
 # expect: compile-error "Iterator"
 fn main() -> int {
-    for x in 5 {
+    for _ in 5 {
     }
     return 0
 }

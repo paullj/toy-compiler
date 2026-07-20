@@ -2,6 +2,6 @@
 # (mirrors `&&`/`||`).
 # expect: compile-error "operands of '&' must be int"
 fn main() -> int {
-    b := true & false
+    _b := true & false
     return 0
 }

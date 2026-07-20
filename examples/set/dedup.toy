@@ -11,7 +11,7 @@ fn main() -> int {
     seen.add(1)
     seen.add(2)
     n := 0
-    for x in seen {
+    for _ in seen {
         n = n + 1
     }
     return if seen.contains(1) && !seen.contains(9) { n } else { 0 }

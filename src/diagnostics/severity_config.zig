@@ -18,7 +18,7 @@ pub const Rule = struct { match: []const u8, action: Action };
 
 /// A borrowed, ordered list of override rules. Empty (the default) is the identity
 /// policy: `resolve` returns the POD default verbatim for every code.
-pub const SeverityConfig = struct { rules: []const Rule = &.{} };
+pub const SeverityConfig = struct { rules: []const Rule = &.{}, deny_warnings: bool = false };
 
 /// True when `rule` names `code`: a 1-char match is a band letter (matches every code
 /// in that band); otherwise an exact code string. `.none` has no string so never
@@ -38,6 +38,11 @@ pub fn resolve(code: codes.Code, default: model.Severity, cfg: SeverityConfig) ?
     for (cfg.rules) |r| {
         if (!matches(r, code)) continue;
         eff = switch (r.action) { .err => .err, .warning => .warning, .ignore => null };
+    }
+    // -Werror: a surviving warning becomes an error. An `.ignore`d code is already
+    // null here and stays null — deny never resurrects a dropped diagnostic.
+    if (eff) |e| {
+        if (cfg.deny_warnings and e == .warning) eff = .err;
     }
     return eff;
 }
@@ -67,6 +72,15 @@ test "ignore returns null (drop); last-match-wins" {
     const chain = [_]Rule{ .{ .match = "R", .action = .warning }, .{ .match = "R0001", .action = .err } };
     try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .rules = &chain }).?);
     try testing.expectEqual(model.Severity.warning, resolve(.R0002, .err, .{ .rules = &chain }).?);
+}
+
+test "deny_warnings promotes a surviving warning but never resurrects an ignored one" {
+    try testing.expectEqual(model.Severity.err, resolve(.W0001, .warning, .{ .deny_warnings = true }).?);
+    try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .deny_warnings = true }).?);
+    const ig = [_]Rule{.{ .match = "W0001", .action = .ignore }};
+    try testing.expectEqual(@as(?model.Severity, null), resolve(.W0001, .warning, .{ .rules = &ig, .deny_warnings = true }));
+    const w = [_]Rule{.{ .match = "R0001", .action = .warning }};
+    try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .rules = &w, .deny_warnings = true }).?);
 }
 
 test ".none never matches a band/exact rule" {

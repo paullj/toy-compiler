@@ -3,8 +3,8 @@
 # one past the positive max, so it is range-checked against `max+1` when negated into a
 # signed width rather than rejected as out of range.
 fn main() -> int {
-    a: int8 = -128
-    b: int = -9223372036854775808
+    _a: int8 = -128
+    _b: int = -9223372036854775808
     return 0
 }
 # expect: exit 0

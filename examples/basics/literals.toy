@@ -8,11 +8,11 @@ fn add(a: int, b: int) -> int {
 
 fn main() {
     x := 1_000
-    ok := true
+    _ok := true
 
     if x >= 10 {
         x = add(x, 2)
     }
     # a trailing comment
-    msg := "hello world"
+    _msg := "hello world"
 }

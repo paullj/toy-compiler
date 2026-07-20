@@ -43,7 +43,7 @@ fn main() -> int {
     }
 
     total := &0
-    for w in words {
+    for _ in words {
         *total = *total + 1
     }
 

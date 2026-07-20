@@ -5,6 +5,6 @@
 import std/vec
 
 fn main() -> int {
-    xs := []
+    _xs := []
     return 0
 }

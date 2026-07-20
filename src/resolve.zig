@@ -78,7 +78,7 @@ test "forward function reference resolves" {
     try testing.expectEqual(@as(usize, 0), try resolveDiagCount(
         \\fn main() {
         \\ x := add(1, 2)
-        \\ y := neg(x)
+        \\ _y := neg(x)
         \\ return
         \\}
         \\fn add(a: int, b: int) -> int { return a + b }
@@ -89,7 +89,7 @@ test "forward function reference resolves" {
 
 test "undeclared identifier yields exactly one diagnostic" {
     const gpa = testing.allocator;
-    var parsed = try parseSource(gpa, "fn f() {\n y := x\n return\n}\n");
+    var parsed = try parseSource(gpa, "fn f() {\n _y := x\n return\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -111,8 +111,8 @@ test "a single root undeclared name yields exactly one diagnostic (report-once)"
 
 test "a close typo of an in-scope local yields a did-you-mean hint" {
     const gpa = testing.allocator;
-    // `count` is bound; `cont` is undeclared and one deletion away → hint.
-    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n return cont\n}\n");
+    // `count` is bound (and used); `cont` is undeclared and one deletion away → hint.
+    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n return count + cont\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -136,7 +136,7 @@ test "a close typo of a SHADOWED local still yields a did-you-mean hint" {
     // `count` is declared in an outer scope and re-declared (shadowed) in an inner
     // block, so candidateIter yields the string `count` twice. That duplicate must
     // NOT be treated as an ambiguous tie — the hint must still fire.
-    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n {\n count := 2\n return cont\n }\n}\n");
+    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n count = count + 1\n {\n count := 2\n return count + cont\n }\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -149,7 +149,7 @@ test "a close typo of a fn name shadowed by a local still yields a hint" {
     // A local named `panic` shadows the built-in fn `panic`: the string `panic` is
     // yielded by both the local scope and the fn table. The duplicate must not
     // suppress the hint for a typo of it.
-    var parsed = try parseSource(gpa, "fn f() -> int {\n panic := 1\n return pani\n}\n");
+    var parsed = try parseSource(gpa, "fn f() -> int {\n panic := 1\n return pani + panic\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -159,7 +159,7 @@ test "a close typo of a fn name shadowed by a local still yields a hint" {
 
 test "a distant undeclared name yields NO hint" {
     const gpa = testing.allocator;
-    var parsed = try parseSource(gpa, "fn f() -> int {\n count := 1\n return zzzzzz\n}\n");
+    var parsed = try parseSource(gpa, "fn f() -> int {\n _count := 1\n return zzzzzz\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -170,7 +170,7 @@ test "a distant undeclared name yields NO hint" {
 test "an ambiguous near-miss (tie) yields NO hint" {
     const gpa = testing.allocator;
     // `cat` and `bar` are each distance 1 from `bat` → strict-unique-winner fails → no hint.
-    var parsed = try parseSource(gpa, "fn f() -> int {\n cat := 1\n bar := 2\n return bat\n}\n");
+    var parsed = try parseSource(gpa, "fn f() -> int {\n cat := 1\n bar := 2\n return bat + cat + bar\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -182,7 +182,7 @@ test "an unimported std type in expression position hints its import" {
     const gpa = testing.allocator;
     // `Map` binds nothing without the import; the type-args are not descended, so
     // there is exactly one diagnostic — the import hint on `Map`.
-    var parsed = try parseSource(gpa, "fn main() -> int {\n m := Map[int, int].new()\n return 0\n}\n");
+    var parsed = try parseSource(gpa, "fn main() -> int {\n _m := Map[int, int].new()\n return 0\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -204,7 +204,7 @@ test "a typo of a std name gets NO import hint (near-miss owns typos)" {
     const gpa = testing.allocator;
     // `Mapp` is one edit from stdlib `Map` but is NOT an exact key, and nothing named
     // `Map` is in scope, so neither an import hint nor a near-miss fires → bare message.
-    var parsed = try parseSource(gpa, "fn main() -> int {\n x := Mapp\n return 0\n}\n");
+    var parsed = try parseSource(gpa, "fn main() -> int {\n _x := Mapp\n return 0\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -220,20 +220,20 @@ test "duplicate parameter is reported" {
 
 test "same-scope := redeclaration is reported" {
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
-        "fn f() {\n x := 1\n x := 2\n return\n}\n",
+        "fn f() {\n x := 1\n x := 2\n return x\n}\n",
     ));
 }
 
 test "x := x with no outer is undeclared" {
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
-        "fn f() {\n x := x\n return\n}\n",
+        "fn f() {\n x := x\n return x\n}\n",
     ));
 }
 
 test "x := x with an outer in scope resolves to the outer" {
     // Inner var_decl initializer must see the parameter `x`, not itself.
     const gpa = testing.allocator;
-    var parsed = try parseSource(gpa, "fn f(x: int) {\n x := x\n return\n}\n");
+    var parsed = try parseSource(gpa, "fn f(x: int) {\n x := x\n return x\n}\n");
     defer parsed.deinit(gpa);
     var res = try resolveParsed(gpa, parsed);
     defer res.deinit(gpa);
@@ -305,7 +305,7 @@ test "for loop variable is in scope only inside the body" {
     // `i` referenced after the loop is undeclared.
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
         \\fn f() -> int {
-        \\ for i in 0..5 { x := i }
+        \\ for i in 0..5 { _x := i }
         \\ return i
         \\}
         \\
@@ -315,7 +315,7 @@ test "for loop variable is in scope only inside the body" {
 test "undeclared range bound is reported" {
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
         \\fn f() {
-        \\ for i in 0..n { x := i }
+        \\ for i in 0..n { _x := i }
         \\ return
         \\}
         \\

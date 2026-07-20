@@ -7,5 +7,5 @@ import std/set
 struct Bad { r: Ref[int] }
 
 fn main() {
-    s := Set[Bad].new()
+    _s := Set[Bad].new()
 }

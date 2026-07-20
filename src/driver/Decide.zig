@@ -14,21 +14,22 @@ const Diagnostic = @import("../diagnostics/Sink.zig").Diagnostic;
 const Opt = @import("../opt/Opt.zig");
 
 /// Map a `check` tally to the process exit code: 0 clean (or `--exit-zero`), 1 when at
-/// least one diagnostic resolved to an error — or, under `--error-on-warning`, when at
-/// least one warning survives. `--exit-zero` DOMINATES (editors that read the stream, not
-/// the status). IO/CLI failures (exit 2) are handled by the caller before reaching here.
-pub fn checkExit(counts: Check.Counts, exit_zero: bool, error_on_warning: bool) u8 {
+/// least one diagnostic resolved to an error. `--deny-warnings` (-Werror) is applied
+/// UPSTREAM in `SevCfg.resolve`, so a promoted warning already counts as an error in the
+/// tally here — there is no per-warning branch. `--exit-zero` DOMINATES (editors that
+/// read the stream, not the status). IO/CLI failures (exit 2) are handled by the caller
+/// before reaching here.
+pub fn checkExit(counts: Check.Counts, exit_zero: bool) u8 {
     if (exit_zero) return 0;
     if (counts.hasErrors()) return 1;
-    if (error_on_warning and counts.warnings > 0) return 1;
     return 0;
 }
 
 /// True when any diagnostic in `diags` carries an error-severity REGISTRY DEFAULT — the
 /// gate that decides whether the graph is resolved enough to typecheck. Deliberately
 /// reads the POD default (NOT the render-time config): the ability to typecheck
-/// depends on whether resolution actually succeeded, which `--warn`/`--ignore` (a
-/// presentation choice) must never change. So a `--ignore`d resolve error still blocks
+/// depends on whether resolution actually succeeded, which `--warn`/`--allow` (a
+/// presentation choice) must never change. So an `--allow`d resolve error still blocks
 /// typecheck, exactly as it does in a `build`.
 pub fn resolveHasError(diags: []const Diagnostic) bool {
     for (diags) |d| if (d.severity == .err) return true;
@@ -45,9 +46,9 @@ pub fn passByName(name: []const u8) ?Opt.Pass {
 }
 
 /// True when `m` names a diagnostic override target: a known code string ("R0001")
-/// or a single band letter (L/P/R/T). Used to validate --error/--warn/--ignore specs.
+/// or a single band letter (L/P/R/T/W). Used to validate --deny/--warn/--allow specs.
 pub fn validSpec(m: []const u8) bool {
-    return codes.fromStr(m) != null or (m.len == 1 and (m[0] == 'L' or m[0] == 'P' or m[0] == 'R' or m[0] == 'T'));
+    return codes.fromStr(m) != null or (m.len == 1 and (m[0] == 'L' or m[0] == 'P' or m[0] == 'R' or m[0] == 'T' or m[0] == 'W'));
 }
 
 /// True if `target` names the aarch64-macos triple we can emit for (or `native`,
@@ -78,23 +79,18 @@ pub fn stemOf(name: []const u8) []const u8 {
 }
 
 test "checkExit: clean tally exits 0" {
-    try std.testing.expectEqual(@as(u8, 0), checkExit(.{}, false, false));
-    try std.testing.expectEqual(@as(u8, 0), checkExit(.{ .warnings = 3 }, false, false));
+    try std.testing.expectEqual(@as(u8, 0), checkExit(.{}, false));
+    try std.testing.expectEqual(@as(u8, 0), checkExit(.{ .warnings = 3 }, false));
 }
 
 test "checkExit: any error exits 1" {
-    try std.testing.expectEqual(@as(u8, 1), checkExit(.{ .errors = 1 }, false, false));
-    try std.testing.expectEqual(@as(u8, 1), checkExit(.{ .errors = 2, .warnings = 5 }, false, false));
+    try std.testing.expectEqual(@as(u8, 1), checkExit(.{ .errors = 1 }, false));
+    try std.testing.expectEqual(@as(u8, 1), checkExit(.{ .errors = 2, .warnings = 5 }, false));
 }
 
 test "checkExit: --exit-zero dominates errors and warnings" {
-    try std.testing.expectEqual(@as(u8, 0), checkExit(.{ .errors = 9 }, true, false));
-    try std.testing.expectEqual(@as(u8, 0), checkExit(.{ .warnings = 9 }, true, true));
-}
-
-test "checkExit: --error-on-warning promotes a surviving warning" {
-    try std.testing.expectEqual(@as(u8, 1), checkExit(.{ .warnings = 1 }, false, true));
-    try std.testing.expectEqual(@as(u8, 0), checkExit(.{}, false, true));
+    try std.testing.expectEqual(@as(u8, 0), checkExit(.{ .errors = 9 }, true));
+    try std.testing.expectEqual(@as(u8, 0), checkExit(.{ .warnings = 9 }, true));
 }
 
 test "resolveHasError: only error severity blocks typecheck" {
@@ -119,6 +115,7 @@ test "validSpec: codes, band letters, and rejects" {
     try std.testing.expect(validSpec("P"));
     try std.testing.expect(validSpec("R"));
     try std.testing.expect(validSpec("T"));
+    try std.testing.expect(validSpec("W"));
     try std.testing.expect(!validSpec("X"));
     try std.testing.expect(!validSpec(""));
     try std.testing.expect(!validSpec("ZZ999"));

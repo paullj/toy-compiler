@@ -14,7 +14,7 @@ fn main() {
         n := counts.get(w).unwrap_or(0)
         counts.set(w, n + 1)
     }
-    for k, v in counts {
+    for k, _v in counts {
         io.print(k)
         io.print("\n")
     }

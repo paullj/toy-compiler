@@ -1,6 +1,6 @@
 # Feature: SHOULD FAIL — using the stdlib `Map` type in an expression without its import.
 # expect: compile-error "import std/map"
 fn main() -> int {
-    counts := Map[str, int].new()
+    _counts := Map[str, int].new()
     return 0
 }

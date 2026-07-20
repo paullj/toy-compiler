@@ -118,7 +118,7 @@ const ModuleTables = struct {
     }
 };
 
-const Local = struct { name_tok: u32, slot: u32 };
+const Local = struct { name_tok: u32, slot: u32, used: bool = false, warnable: bool = false };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
 
@@ -552,13 +552,24 @@ fn resolveFn(g: *GraphResolve, fn_idx: Ast.Index) error{OutOfMemory}!void {
     try g.pushScope();
     for (proto.params) |param_idx| {
         const param = g.nodes()[param_idx.int()];
-        _ = try g.declare(param.main_token, "duplicate parameter '{s}'");
+        _ = try g.declare(param.main_token, "duplicate parameter '{s}'", false);
         // Resolve the param's type-ref for a qualified cross-module type.
         try g.resolveTypeRef(param.lhs);
     }
     try g.resolveTypeRef(proto.ret_type);
     try g.resolveBlock(decl.rhs);
     g.popScope();
+
+    // `g.locals` is per-fn (cleared at entry) and appended once at each `declare`, so it
+    // is in source-declaration order here — deterministic without touching the
+    // nondeterministic scope name maps. Only var_decl + the for-loop binders are
+    // `warnable`; a leading `_` opts out (and silences a `_`-named binding).
+    for (g.locals.items) |loc| {
+        if (!loc.warnable or loc.used) continue;
+        const nm = g.nameText(loc.name_tok);
+        if (nm.len != 0 and nm[0] == '_') continue;
+        try g.emit(.W0001, g.cur_mod, g.tokens()[loc.name_tok].start, "unused variable '{s}'; prefix with '_' (as '_{s}') to silence", .{ nm, nm });
+    }
 }
 
 /// Resolve a TYPE-REF node (a param/return/field type annotation). A bare
@@ -607,7 +618,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
     switch (stmt.tag) {
         .var_decl => {
             try g.resolveExpr(stmt.lhs);
-            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'");
+            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'", true);
             if (slot) |s| g.res(stmt_idx, .{ .local = s });
         },
         .assign => {
@@ -651,7 +662,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             try g.resolveExpr(h.lo);
             try g.resolveExpr(h.hi);
             try g.pushScope();
-            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'");
+            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'", true);
             if (slot) |s| g.res(stmt_idx, .{ .local = s });
             try g.resolveBlock(stmt.lhs);
             g.popScope();
@@ -659,7 +670,7 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .for_in_stmt => {
             try g.resolveExpr(stmt.rhs);
             try g.pushScope();
-            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'");
+            const slot = try g.declare(stmt.main_token, "redeclaration of '{s}'", true);
             if (slot) |s| g.res(stmt_idx, .{ .local = s });
             try g.resolveBlock(stmt.lhs);
             g.popScope();
@@ -668,10 +679,10 @@ fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
             const h = Ast.forIn2HeaderAt(g.tree(g.cur_mod), stmt.lhs.int());
             try g.resolveExpr(stmt.rhs);
             try g.pushScope();
-            const ks = try g.declare(stmt.main_token, "redeclaration of '{s}'");
+            const ks = try g.declare(stmt.main_token, "redeclaration of '{s}'", true);
             if (ks) |s| g.res(stmt_idx, .{ .local = s });
             const vtok = g.nodes()[h.val_leaf.int()].main_token;
-            const vs = try g.declare(vtok, "redeclaration of '{s}'");
+            const vs = try g.declare(vtok, "redeclaration of '{s}'", true);
             if (vs) |s| g.res(h.val_leaf, .{ .local = s });
             try g.resolveBlock(h.body);
             g.popScope();
@@ -913,7 +924,7 @@ fn declarePattern(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!void 
     switch (pat.tag) {
         .pattern_wildcard, .pattern_literal => {},
         .pattern_binding => {
-            const slot = try g.declare(pat.main_token, "redeclaration of '{s}'");
+            const slot = try g.declare(pat.main_token, "redeclaration of '{s}'", false);
             if (slot) |s| g.res(pat_idx, .{ .local = s });
             if (pat.rhs != Ast.none) try g.declarePattern(pat.rhs);
         },
@@ -941,7 +952,7 @@ fn bindOrAltToFirst(g: *GraphResolve, pat_idx: Ast.Index) error{OutOfMemory}!voi
             if (existing == .local) {
                 g.res(pat_idx, existing);
             } else {
-                const slot = try g.declare(pat.main_token, "redeclaration of '{s}'");
+                const slot = try g.declare(pat.main_token, "redeclaration of '{s}'", false);
                 if (slot) |s| g.res(pat_idx, .{ .local = s });
             }
             if (pat.rhs != Ast.none) try g.bindOrAltToFirst(pat.rhs);
@@ -983,7 +994,7 @@ fn popScope(g: *GraphResolve) void {
     s.names.deinit(g.gpa);
 }
 
-fn declare(g: *GraphResolve, name_tok: u32, comptime dup_fmt: []const u8) !?u32 {
+fn declare(g: *GraphResolve, name_tok: u32, comptime dup_fmt: []const u8, comptime warnable: bool) !?u32 {
     const name = g.nameText(name_tok);
     const scope = &g.scopes.items[g.scopes.items.len - 1];
     const gop = try scope.names.getOrPut(g.gpa, name);
@@ -994,7 +1005,7 @@ fn declare(g: *GraphResolve, name_tok: u32, comptime dup_fmt: []const u8) !?u32 
     const slot = g.slot_next;
     g.slot_next += 1;
     const local_idx: u32 = @intCast(g.locals.items.len);
-    try g.locals.append(g.gpa, .{ .name_tok = name_tok, .slot = slot });
+    try g.locals.append(g.gpa, .{ .name_tok = name_tok, .slot = slot, .warnable = warnable });
     gop.value_ptr.* = local_idx;
     return slot;
 }
@@ -1007,6 +1018,7 @@ fn lookupLocalOrFn(g: *GraphResolve, name_tok: u32) ?Resolution {
     while (i > 0) {
         i -= 1;
         if (g.scopes.items[i].names.get(name)) |local_idx| {
+            g.locals.items[local_idx].used = true;
             return .{ .local = g.locals.items[local_idx].slot };
         }
     }
@@ -1214,6 +1226,197 @@ fn modId(g: *const Graph.Graph, path: []const u8) u32 {
 fn nodeOfTag(g: *const Graph.Graph, mod: u32, tag: Ast.Node.Tag) Ast.Index {
     for (g.modules[mod].nodes, 0..) |n, i| if (n.tag == tag) return Ast.Index.from(@intCast(i));
     unreachable;
+}
+
+/// Count the diagnostics in a resolved result carrying code `c` (for the unused-variable
+/// tests, which assert exactly N W0001s).
+fn countCode(r: *GraphResult, c: codes.Code) usize {
+    var n: usize = 0;
+    for (r.diags) |d| if (d.code == c) {
+        n += 1;
+    };
+    return n;
+}
+
+test "unused `:=` local warns W0001" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 5
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0001));
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "unused variable 'x'") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-let", files, "main.toy", Check.run);
+}
+
+test "unused `for` range loop var warns W0001" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ for i in 0..3 {}
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-for", files, "main.toy", Check.run);
+}
+
+test "unused `for-in` iterator var warns W0001" {
+    // Resolve does no type-checking, so the iterable's type is irrelevant here; only the
+    // NAME binding of the loop var matters. `xs` is referenced (the iterable) so never warns.
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(xs: int) -> int {
+    \\ for x in xs {}
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-forin", files, "main.toy", Check.run);
+}
+
+test "`_`-prefixed and bare `_` bindings do not warn" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ _x := 5
+    \\ for _ in 0..3 {}
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-underscore", files, "main.toy", Check.run);
+}
+
+test "used local does not warn" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 5
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-used-local", files, "main.toy", Check.run);
+}
+
+test "a local used only as an assignment target does not warn" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 5
+    \\ x = 6
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-used-assign", files, "main.toy", Check.run);
+}
+
+test "an unused parameter does not warn (out of scope)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(p: int) -> int { return 0 }
+    \\fn main() -> int { return f(1) }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-param", files, "main.toy", Check.run);
+}
+
+test "an unused match binding does not warn (out of scope)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\enum E { A(int) }
+    \\fn main() -> int {
+    \\ e := E.A(1)
+    \\ return match e {
+    \\  E.A(v) -> 0
+    \\ }
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-match", files, "main.toy", Check.run);
+}
+
+test "two unused locals in one scope warn in source order" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ a := 1
+    \\ b := 2
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 2), countCode(r, .W0001));
+            // `a` is declared before `b`, so it must render first (ascending offset).
+            try testing.expect(r.diags[0].byte_offset < r.diags[1].byte_offset);
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "'a'") != null);
+            try testing.expect(std.mem.indexOf(u8, r.diags[1].message, "'b'") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-order", files, "main.toy", Check.run);
+}
+
+test "`for k,v in m` both unused warn twice" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(m: int) -> int {
+    \\ for k, v in m {}
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 2), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-kv", files, "main.toy", Check.run);
 }
 
 test "cross-module call resolves to a global fn with a qualified name" {
@@ -1454,7 +1657,7 @@ test "3-level cross-module mod.Enum.Variant binds the inner receiver to .module,
         .{ .path = "main.toy", .source =
         \\import palette as p
         \\fn main() -> int {
-        \\ c := p.Color.Red
+        \\ _c := p.Color.Red
         \\ return 0
         \\}
         \\
