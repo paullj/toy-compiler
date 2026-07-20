@@ -570,10 +570,10 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
         // positions so a thread-arrival ordering would scramble the stream.
         .{ .path = "main.toy", .source =
         \\import lib
-        \\fn a() -> int { return true }
-        \\fn b() -> int { return 1 + true }
-        \\fn c() -> int { return lib.f(true) }
-        \\fn d() -> int { _x: bool = 3
+        \\fn _a() -> int { return true }
+        \\fn _b() -> int { return 1 + true }
+        \\fn _c() -> int { return lib.f(true) }
+        \\fn _d() -> int { _x: bool = 3
         \\ return 0 }
         \\fn main() -> int { return 0 }
         \\
@@ -617,7 +617,7 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
     }
 
     // The four body errors surface (g's `1`-to-bool is in an UNUSED lib fn but still
-    // checked): a/b/c/d in main + g in lib. Same count, same order, same bytes.
+    // checked): _a/_b/_c/_d in main + g in lib. Same count, same order, same bytes.
     try testing.expect(serial.len >= 4);
     try testing.expectEqual(serial.len, parallel.len);
     for (serial, parallel) |s, p| {

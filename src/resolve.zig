@@ -25,6 +25,7 @@ const Lexer = @import("lex.zig");
 const Parser = @import("parse.zig");
 const Graph = @import("driver/Graph.zig");
 const ResolveGraph = @import("resolve_graph.zig");
+const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
 const Parsed = struct {
     tokens: []Token,
@@ -54,7 +55,18 @@ fn parseSource(gpa: std.mem.Allocator, source: []const u8) !Parsed {
 fn resolveParsed(gpa: std.mem.Allocator, parsed: Parsed) !ResolveGraph.GraphResult {
     var g = try Graph.single(gpa, "main", "", parsed.source, parsed.tokens, parsed.tree.nodes, parsed.tree.extra, parsed.tree.pub_bits);
     defer g.deinit(gpa);
-    return ResolveGraph.resolveGraph(gpa, &g);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    // These tests assert resolution ERRORS; the W-band lint warnings (e.g. the
+    // unused-function sweep) are exercised in resolve_graph.zig. Drop warnings here
+    // so the error-count and first-diagnostic assertions stay independent of lints.
+    var kept: std.ArrayList(Diagnostic) = .empty;
+    errdefer kept.deinit(gpa);
+    for (res.diags) |d| {
+        if (d.severity != .warning) try kept.append(gpa, d);
+    }
+    gpa.free(res.diags);
+    res.diags = try kept.toOwnedSlice(gpa);
+    return res;
 }
 
 /// Resolve a source and return the diagnostic count (and free everything).

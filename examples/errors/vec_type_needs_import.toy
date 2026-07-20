@@ -1,7 +1,7 @@
 # Feature: SHOULD FAIL — naming the stdlib `Vec` type in a signature without its import.
 # The type is unknown here; the hint names the module to import.
 # expect: compile-error "import std/vec"
-fn head(_xs: Vec[int]) -> int {
+fn _head(_xs: Vec[int]) -> int {
     return 0
 }
 fn main() -> int { return 0 }

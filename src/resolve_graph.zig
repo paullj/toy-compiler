@@ -1101,6 +1101,36 @@ fn lookupName(g: *GraphResolve, name_tok: u32) Resolution {
     return .unresolved;
 }
 
+/// Warn (W0003) on every non-`pub` top-level user fn that no `.func` resolution
+/// anywhere in the graph names. The sweep is write-path-agnostic: it reads every
+/// module's resolution slots, so a bare call, a qualified `mod.fn`, and a turbofish
+/// callee all mark their target used. Over-marking (marking a fn called when it isn't)
+/// only ever MISSES a warning, never produces a false positive.
+///
+/// Methods (`recv_type` set) are dispatched through the program-wide method table,
+/// never via a `.func` resolution, so they are excluded structurally — otherwise every
+/// uncalled method would false-positive. A recursive-only fn writes a `.func` at its
+/// self-call, so it is (correctly) not flagged. Emission walks `fns` in id order for a
+/// deterministic sink (resolveGraph is sequential; `-j1` == `-jN`).
+fn warnUnusedFns(g: *GraphResolve) !void {
+    const called = try g.gpa.alloc(bool, g.fns.items.len);
+    defer g.gpa.free(called);
+    @memset(called, false);
+    for (g.resolutions) |modres| for (modres) |r| switch (r) {
+        .func => |gid| called[gid] = true,
+        else => {},
+    };
+    for (g.fns.items, 0..) |f, gid| {
+        if (f.kind != .user_fn or f.is_pub or f.recv_type != Ast.none or called[gid]) continue;
+        const m = &g.graph.modules[f.module];
+        const name_tok = m.nodes[f.decl_node.int()].main_token;
+        const name = g.nameOf(f.module, name_tok);
+        if (name.len != 0 and name[0] == '_') continue;
+        if (f.module == g.graph.entry_index and std.mem.eql(u8, name, "main")) continue;
+        try g.emit(.W0003, f.module, m.tokens[name_tok].start, "unused function '{s}'; remove it, make it 'pub', or prefix with '_' to silence", .{name});
+    }
+}
+
 /// Stamp the owning module onto the diagnostic (this resolver emits with an
 /// explicit `mod` per call rather than a single per-walk scope), attach the stable
 /// `code`, and record it. Message text is unchanged from the old `emitFmt`.
@@ -1164,6 +1194,8 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
     try g.collectNamespaces();
     try g.injectImportedTypes();
     for (0..n) |i| try g.resolveModule(@intCast(i));
+
+    try g.warnUnusedFns();
 
     g.sink.sort();
     const owned = try g.sink.toOwned();
@@ -1244,6 +1276,22 @@ fn countCode(r: *GraphResult, c: codes.Code) usize {
         n += 1;
     };
     return n;
+}
+
+/// Count only ERROR-severity diagnostics — the visibility/undeclared tests assert on
+/// resolution errors and must stay independent of the W-band lint warnings.
+fn errorCount(r: *GraphResult) usize {
+    var n: usize = 0;
+    for (r.diags) |d| if (d.severity != .warning) {
+        n += 1;
+    };
+    return n;
+}
+
+/// The first ERROR-severity diagnostic (mirrors `errorCount`; callers assert its message).
+fn firstError(r: *GraphResult) Diagnostic {
+    for (r.diags) |d| if (d.severity != .warning) return d;
+    unreachable;
 }
 
 test "unused `:=` local warns W0001" {
@@ -1509,6 +1557,160 @@ test "`for k,v in m` both unused warn twice" {
     try withResolvedGraph(".toy-test-unused-kv", files, "main.toy", Check.run);
 }
 
+test "an uncalled private fn warns W0003 with its bare source name" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn helper() -> int { return 7 }
+    \\fn main() -> int { return 0 }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0003));
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "unused function 'helper'") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-unused-fn", files, "main.toy", Check.run);
+}
+
+test "a called private fn does not warn W0003" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn helper() -> int { return 7 }
+    \\fn main() -> int { return helper() }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-called-fn", files, "main.toy", Check.run);
+}
+
+test "a pub uncalled fn does not warn W0003" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\pub fn api() -> int { return 7 }
+    \\fn main() -> int { return 0 }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-pub-fn", files, "main.toy", Check.run);
+}
+
+test "the entry main never warns W0003 even though nothing calls it" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int { return 0 }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-main-fn", files, "main.toy", Check.run);
+}
+
+test "an uncalled impl method never warns W0003 (dispatched via the method table)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\struct P { x: int }
+    \\impl P { fn get(self) -> int { return self.x } }
+    \\fn main() -> int { return 0 }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-method-fn", files, "main.toy", Check.run);
+}
+
+test "an `_`-prefixed uncalled fn does not warn W0003" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn _stub() -> int { return 7 }
+    \\fn main() -> int { return 0 }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-underscore-fn", files, "main.toy", Check.run);
+}
+
+test "a recursive-only private fn does not warn W0003 (the self-call is a call site)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn recur(n: int) -> int { return recur(n) }
+    \\fn main() -> int { return 0 }
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-recursive-fn", files, "main.toy", Check.run);
+}
+
+test "a pub fn used only from another module does not warn W0003" {
+    // Proves the sweep reads EVERY module's resolution array (util.used is named
+    // only from main) and that the `!is_pub` exclusion holds cross-module.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int { return util.used() }
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub fn used() -> int { return 7 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-xmod-pub-fn", files, "main.toy", Check.run);
+}
+
+test "a private fn named cross-module is R0005 and W0003 in its own module" {
+    // A non-pub fn cannot be referenced across modules: the importer gets R0005 (no
+    // `.func` is ever written), so the fn is genuinely uncalled and correctly W0003
+    // warned in its home module.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int { return util.hidden() }
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\fn hidden() -> int { return 7 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0005));
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0003));
+        }
+    };
+    try withResolvedGraph(".toy-test-xmod-private-fn", files, "main.toy", Check.run);
+}
+
 test "cross-module call resolves to a global fn with a qualified name" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
@@ -1598,9 +1800,9 @@ test "referencing a non-pub fn cross-module is a visibility error" {
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
             _ = g;
-            try testing.expectEqual(@as(usize, 1), r.diags.len);
-            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "not exported") != null);
-            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "secret") != null);
+            try testing.expectEqual(@as(usize, 1), errorCount(r));
+            try testing.expect(std.mem.indexOf(u8, firstError(r).message, "not exported") != null);
+            try testing.expect(std.mem.indexOf(u8, firstError(r).message, "secret") != null);
         }
     };
     try withResolvedGraph(".toy-test-res-priv", files, "main.toy", Check.run);
@@ -1713,7 +1915,7 @@ test "qualified pub type in a signature resolves quietly (no error)" {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
             _ = g;
             // No undeclared/visibility error: `r.Rect` is a pub type reference.
-            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            try testing.expectEqual(@as(usize, 0), errorCount(r));
         }
     };
     try withResolvedGraph(".toy-test-res-qtype", files, "main.toy", Check.run);
@@ -1735,8 +1937,8 @@ test "referencing a non-pub type cross-module is a visibility error" {
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
             _ = g;
-            try testing.expectEqual(@as(usize, 1), r.diags.len);
-            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "not exported") != null);
+            try testing.expectEqual(@as(usize, 1), errorCount(r));
+            try testing.expect(std.mem.indexOf(u8, firstError(r).message, "not exported") != null);
         }
     };
     try withResolvedGraph(".toy-test-res-qtype-priv", files, "main.toy", Check.run);
