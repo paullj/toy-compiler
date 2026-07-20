@@ -118,6 +118,13 @@ const ModuleTables = struct {
     }
 };
 
+/// The prelude enums nameable in every module with no import (see `collectGlobals`).
+/// A bare reference to one of these credits NO import, so `warnUnusedImports` must
+/// exclude them when crediting an import via a bare pub-enum name — otherwise a bare
+/// `Option` would spuriously mark EVERY import used (they are injected pub into every
+/// module's enum table).
+const prelude_enum_names = [_][]const u8{ "Ordering", "Option", "Result" };
+
 const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
@@ -379,7 +386,7 @@ fn collectGlobals(g: *GraphResolve) !void {
     // resolve quietly (left for Typecheck, which native-registers the enums). The typecheck-time
     // `enum_ids` injection in `registerPrelude` mirrors this on its own tables.
     for (g.tables) |*t| {
-        for ([_][]const u8{ "Ordering", "Option", "Result" }) |name| {
+        for (prelude_enum_names) |name| {
             if (!t.enums.contains(name)) try t.enums.put(g.gpa, name, true);
         }
     }
@@ -1131,6 +1138,161 @@ fn warnUnusedFns(g: *GraphResolve) !void {
     }
 }
 
+/// Warn (W0004) on every `import a/b` whose bound namespace is never used in the
+/// importing module — neither QUALIFIED (`b.member`, whose receiver is a bare
+/// `identifier` node spelling the namespace) nor via a BARE imported type (`Vec` from
+/// `import std/vec`, a bare `identifier` node spelling a pub struct/enum the import
+/// provides). An imported fn is always called qualified, so only the namespace name and
+/// the imported pub TYPES can carry a bare use.
+///
+/// The bare-type crediting is complete only because rules 3 and 4 enumerate the ONLY
+/// two library-type needs the language expresses with no textual type token: a
+/// `[..]`/`[]` list literal constructs a `Vec`, and a `for k, v` binds an `Entry`.
+/// Every other construct either spells its type (caught by the identifier scan) or needs
+/// no import (single-var `for-in`, range-for, `&`/`*`, `?`, str methods, tuples). If a
+/// future desugar introduces a new implicit library-type need, a rule MUST be added
+/// here or that import silently becomes a false positive.
+///
+/// A module that declares any `impl` is credited wholesale: its conformances and
+/// inherent methods join whole-program coherence, and an importer can depend on one via
+/// method-call or operator dispatch that resolves only in typecheck (no textual token
+/// this resolver-side pass can key on). Over-approximating an impl-bearing import as used
+/// is the safe direction — it only ever misses a warning, never a false positive.
+///
+/// Diagnostics-only: reads nodes/tokens/`tables`, writes only `g.sink`. Emission walks
+/// each module's import decls in SOURCE order; the membership sets are order-independent
+/// and `resolveGraph` is sequential, so `-j1` == `-jN`. Over-crediting only ever MISSES
+/// a warning; it can never fabricate a false positive.
+fn warnUnusedImports(g: *GraphResolve) !void {
+    var ref_idents: std.StringHashMapUnmanaged(void) = .empty;
+    var own_types: std.StringHashMapUnmanaged(void) = .empty;
+    var seen_ns: std.StringHashMapUnmanaged(void) = .empty;
+    defer ref_idents.deinit(g.gpa);
+    defer own_types.deinit(g.gpa);
+    defer seen_ns.deinit(g.gpa);
+
+    // A target's impl decls credit any importer of it (see `importIsUsed`), so the bit
+    // is needed for every module as a potential target before the emit loop runs.
+    const has_impl = try g.gpa.alloc(bool, g.graph.modules.len);
+    defer g.gpa.free(has_impl);
+    @memset(has_impl, false);
+    for (g.graph.modules, 0..) |m, mi| {
+        if (m.nodes.len == 0) continue;
+        const t = g.tree(@intCast(mi));
+        const prog = m.nodes[Ast.root(m.nodes).int()];
+        if (prog.tag != .program) continue;
+        for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| switch (m.nodes[decl_idx.int()].tag) {
+            .impl_decl, .impl_has_decl => {
+                has_impl[mi] = true;
+                break;
+            },
+            else => {},
+        };
+    }
+
+    for (g.graph.modules, 0..) |m, mi| {
+        const mod: u32 = @intCast(mi);
+        if (m.nodes.len == 0) continue;
+        const t = g.tree(mod);
+        const prog = m.nodes[Ast.root(m.nodes).int()];
+        if (prog.tag != .program) continue;
+
+        ref_idents.clearRetainingCapacity();
+        own_types.clearRetainingCapacity();
+        seen_ns.clearRetainingCapacity();
+
+        // This module's OWN struct/enum/alias names. A bare reference to one binds the
+        // module's own type (own wins the if-absent bare injection), so it must NOT credit
+        // an import that happens to provide a same-named pub type.
+        for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
+            const decl = m.nodes[decl_idx.int()];
+            switch (decl.tag) {
+                .struct_decl, .tuple_struct_decl, .enum_decl, .type_alias_decl => try own_types.put(g.gpa, g.nameOf(mod, decl.main_token), {}),
+                else => {},
+            }
+        }
+
+        // One flat, order-independent pass: every referenced bare identifier name, plus
+        // whether a list-literal / `for k,v` desugar is present (their implicit
+        // `Vec`/`Entry` needs). Import path/alias are TOKENS, not nodes, so an import
+        // never self-credits its own namespace name here.
+        var has_list = false;
+        var has_forkv = false;
+        for (m.nodes) |node| switch (node.tag) {
+            .identifier => try ref_idents.put(g.gpa, g.nameOf(mod, node.main_token), {}),
+            .list_literal, .empty_list => has_list = true,
+            .for_in2_stmt => has_forkv = true,
+            else => {},
+        };
+
+        // Emit in source order. `seen_ns` gives the first import binding a name the win
+        // (matching `collectNamespaces`, which binds the first and rejects later
+        // collisions); a loser was never bound to this target and already carries R0003/R0004.
+        for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
+            const decl = m.nodes[decl_idx.int()];
+            if (decl.tag != .import_decl) continue;
+            const target = g.importTarget(mod, decl) orelse continue;
+            const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |a| a.int() else decl.main_token;
+            const ns_name = g.nameOf(mod, ns_tok);
+            const gop = try seen_ns.getOrPut(g.gpa, ns_name);
+            if (gop.found_existing) continue;
+            const bound = g.tables[mod].namespaces.get(ns_name) orelse continue;
+            if (bound != target) continue;
+            if (ns_name.len != 0 and ns_name[0] == '_') continue; // deliberate side-effect-only import
+            if (g.importIsUsed(target, ns_name, &ref_idents, &own_types, has_list, has_forkv, has_impl[target])) continue;
+            try g.emit(.W0004, mod, m.tokens[decl.main_token].start, "unused import '{s}'; remove it", .{g.graph.modules[target].path});
+        }
+    }
+}
+
+/// Whether import `target` (bound as `ns_name`) is referenced in the current module.
+/// True iff any of: (1) the namespace name appears bare (every qualified `ns.member`
+/// — call, type-ref, turbofish, or an `impl .. has ns.P` protocol ref — has `ns` as a
+/// bare `identifier` node); (2) a pub struct/enum NAME the target OWNS appears bare,
+/// excluding a name the module declares itself (own wins) and the prelude enums
+/// (injected pub into every table, so not specific to any import); (3) a list literal
+/// is present and the target owns pub `Vec`; (4) a `for k,v` is present and the target
+/// owns pub `Entry`; (5) the target declares any `impl` (`target_has_impl`), whose
+/// conformances / inherent methods an importer can reach through method-call or operator
+/// dispatch resolved only in typecheck. Every branch only ever CREDITS use, so it can
+/// never false-positive.
+fn importIsUsed(
+    g: *GraphResolve,
+    target: u32,
+    ns_name: []const u8,
+    ref_idents: *const std.StringHashMapUnmanaged(void),
+    own_types: *const std.StringHashMapUnmanaged(void),
+    has_list: bool,
+    has_forkv: bool,
+    target_has_impl: bool,
+) bool {
+    if (ref_idents.contains(ns_name)) return true;
+    if (target_has_impl) return true;
+    const tt = &g.tables[target];
+    var sit = tt.structs.iterator();
+    while (sit.next()) |se| {
+        if (!se.value_ptr.*) continue; // pub only: the target's OWN exported types
+        const name = se.key_ptr.*;
+        if (own_types.contains(name)) continue;
+        if (ref_idents.contains(name)) return true;
+    }
+    var eit = tt.enums.iterator();
+    while (eit.next()) |ee| {
+        if (!ee.value_ptr.*) continue;
+        const name = ee.key_ptr.*;
+        if (own_types.contains(name)) continue;
+        var is_prelude = false;
+        for (prelude_enum_names) |p| if (std.mem.eql(u8, name, p)) {
+            is_prelude = true;
+        };
+        if (is_prelude) continue;
+        if (ref_idents.contains(name)) return true;
+    }
+    if (has_list and (tt.structs.get(StdNames.vec_struct) orelse false)) return true;
+    if (has_forkv and (tt.structs.get(StdNames.entry_struct) orelse false)) return true;
+    return false;
+}
+
 /// Stamp the owning module onto the diagnostic (this resolver emits with an
 /// explicit `mod` per call rather than a single per-walk scope), attach the stable
 /// `code`, and record it. Message text is unchanged from the old `emitFmt`.
@@ -1196,6 +1358,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
     for (0..n) |i| try g.resolveModule(@intCast(i));
 
     try g.warnUnusedFns();
+    try g.warnUnusedImports();
 
     g.sink.sort();
     const owned = try g.sink.toOwned();
@@ -1844,8 +2007,11 @@ test "namespace collision without `as` is an error; `as` disambiguates" {
     const Collide = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
             _ = g;
-            try testing.expectEqual(@as(usize, 1), r.diags.len);
-            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "collides") != null);
+            // The subject is the collision error. The winning import `a/util` (bound
+            // first) is genuinely unused and warns W0004; the losing `b/util` gets R0004.
+            // Assert on the ERROR channel only so the collision is what's under test.
+            try testing.expectEqual(@as(usize, 1), errorCount(r));
+            try testing.expect(std.mem.indexOf(u8, firstError(r).message, "collides") != null);
         }
     };
     try withResolvedGraph(".toy-test-res-collide", collide, "main.toy", Collide.run);
@@ -2097,4 +2263,304 @@ test "two non-generic conformances sharing a method name register distinctly (no
         }
     };
     try withResolvedGraph(".toy-test-res-multiconf", files, "solo.toy", Check.run);
+}
+
+/// The first W0004 diagnostic's message (callers assert its text).
+fn firstW0004(r: *GraphResult) []const u8 {
+    for (r.diags) |d| if (d.code == .W0004) return d.message;
+    unreachable;
+}
+
+test "an import used only qualified does not warn W0004" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn main() -> int { return lib.f() }
+        \\
+        },
+        .{ .path = "lib.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-qualified", files, "main.toy", Check.run);
+}
+
+test "an import used ONLY via a bare imported type does not warn W0004" {
+    // THE critical case: `Point` is nameable unqualified because `shapes` exports it;
+    // the resolver never observes a bare type reference, so W0004 must credit it via the
+    // provider's pub-struct table, not via a `.module` resolution.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import shapes
+        \\fn f(_p: Point) -> int { return 0 }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "shapes.toy", .source = "pub struct Point { x: int, y: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-bare-type", files, "main.toy", Check.run);
+}
+
+test "a list literal credits its provider's `Vec` (no W0004)" {
+    // A `[..]` list literal constructs a `Vec` with no textual `Vec` anywhere — the
+    // hidden implicit-need rule 3. Without it this import false-positives.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import buf
+        \\fn main() -> int {
+        \\ _xs := [1, 2, 3]
+        \\ return 0
+        \\}
+        \\
+        },
+        .{ .path = "buf.toy", .source =
+        \\pub struct Vec { n: int }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-list", files, "main.toy", Check.run);
+}
+
+test "a `for k, v` credits its provider's `Entry` (no W0004)" {
+    // `for k, v in m` binds an `Entry` with no textual `Entry` — implicit-need rule 4.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import mapmod
+        \\fn f(m: int) -> int {
+        \\ for k, v in m { return k + v }
+        \\ return 0
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "mapmod.toy", .source =
+        \\pub struct Entry { key: int, val: int }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-forkv", files, "main.toy", Check.run);
+}
+
+test "a qualified protocol ref `impl .. has lib.Show` credits the import (no W0004)" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\struct W { x: int }
+        \\impl W has lib.Show { fn render(self) -> int { return self.x } }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "lib.toy", .source = "pub protocol Show { fn render(self) -> int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-proto", files, "main.toy", Check.run);
+}
+
+test "an import providing only a cross-module conformance is credited (no W0004)" {
+    // `import show` binds a namespace never named and no bare type; its sole contribution
+    // is the `impl shape.Sq has Show` that lets `q.show()` resolve in typecheck. Removing
+    // it breaks the build, so the impl-crediting branch must keep it out of W0004.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import shape
+        \\import show
+        \\fn main() -> int {
+        \\ q := Sq { s: 42 }
+        \\ return q.show()
+        \\}
+        \\
+        },
+        .{ .path = "shape.toy", .source = "pub struct Sq { s: int }\n" },
+        .{ .path = "show.toy", .source =
+        \\import shape
+        \\pub protocol Show { fn show(self) -> int }
+        \\impl shape.Sq has Show { fn show(self) -> int { self.s } }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-conf", files, "main.toy", Check.run);
+}
+
+test "an import providing only a cross-module inherent method is credited (no W0004)" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import shape
+        \\import ext
+        \\fn main() -> int {
+        \\ q := Sq { s: 25 }
+        \\ return q.area()
+        \\}
+        \\
+        },
+        .{ .path = "shape.toy", .source = "pub struct Sq { s: int }\n" },
+        .{ .path = "ext.toy", .source =
+        \\import shape
+        \\impl Sq { fn area(self) -> int { self.s } }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-inherent", files, "main.toy", Check.run);
+}
+
+test "a truly-unused import warns W0004 with a remove hint" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "lib.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0004));
+            try testing.expect(std.mem.indexOf(u8, firstW0004(r), "unused import 'lib'; remove it") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-unused", files, "main.toy", Check.run);
+}
+
+test "a multi-import file warns only the unused import" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import a
+        \\import b
+        \\fn main() -> int { return a.f() }
+        \\
+        },
+        .{ .path = "a.toy", .source = "pub fn f() -> int { return 1 }\n" },
+        .{ .path = "b.toy", .source = "pub fn g() -> int { return 2 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0004));
+            try testing.expect(std.mem.indexOf(u8, firstW0004(r), "unused import 'b'") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-multi", files, "main.toy", Check.run);
+}
+
+test "a bare imported type in a struct field credits the import (no W0004)" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import shapes
+        \\struct Wrap { p: Point }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "shapes.toy", .source = "pub struct Point { x: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-field", files, "main.toy", Check.run);
+}
+
+test "a module's OWN same-named type does not credit an otherwise-unused import" {
+    // `Point` is referenced, but it is the module's OWN type (own wins the bare name);
+    // the import's same-named pub type is unnameable, so the import still warns.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import shapes
+        \\struct Point { x: int }
+        \\fn main() -> int {
+        \\ _p := Point { x: 0 }
+        \\ return 0
+        \\}
+        \\
+        },
+        .{ .path = "shapes.toy", .source = "pub struct Point { x: int, y: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-own-shadow", files, "main.toy", Check.run);
+}
+
+test "a bare prelude `Option` does not credit an unused import" {
+    // The prelude enums are injected pub into EVERY module's table; referencing one must
+    // not mark an import used, or every import would be spuriously credited.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn main() -> int {
+        \\ _o := Option[int].none
+        \\ return 0
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-prelude", files, "main.toy", Check.run);
+}
+
+test "an `as _`-aliased unused import is a deliberate silence (no W0004)" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib as _lib
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "lib.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-silence", files, "main.toy", Check.run);
 }

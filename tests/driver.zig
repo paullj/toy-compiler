@@ -1727,6 +1727,65 @@ test "`toy check --deny-warnings` promotes W0003 to an error (exit 1)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
 }
 
+// The unused-import warning: an `import a/b` referenced neither qualified nor via a
+// bare imported type. The bundled `std/io` is an unused import here (nothing names `io`,
+// and io declares no `impl` and no bare-nameable type, so no branch credits it). It must
+// warn W0004 and NOT fail the check (exit 0), be promoted by `--deny-warnings`, and be
+// silenced by `--allow W0004`.
+const unused_import_fixture = "import std/io\nfn main() -> int {\n  return 0\n}\n";
+
+test "`toy check` renders W0004 for an unused import and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0004";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_import_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0004]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused import 'std/io'") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check --deny-warnings` promotes W0004 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0004-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_import_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0004]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0004` silences the unused-import warning (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0004-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_import_fixture, &.{ "check", "--allow", "W0004" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0004") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
 test "`--allow W0003` silences the unused-function warning (exit 0)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
