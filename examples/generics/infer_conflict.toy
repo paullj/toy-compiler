@@ -3,5 +3,5 @@
 # int (arg 1) then bool (arg 2) — inference cannot pick one, so the call is rejected
 # with T0015 naming both argument spans. Explicit `same[int](1, 1)` would override.
 # expect: compile-error "T0015"
-fn same[T](a: T, b: T) -> T { a }
+fn same[T](a: T, _b: T) -> T { a }
 fn main() -> int { return same(1, true) }

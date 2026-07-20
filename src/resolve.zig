@@ -213,8 +213,10 @@ test "a typo of a std name gets NO import hint (near-miss owns typos)" {
 }
 
 test "duplicate parameter is reported" {
+    // `return a` references the param so the only diagnostic is the duplicate itself,
+    // not an unused-parameter warning.
     try testing.expectEqual(@as(usize, 1), try resolveDiagCount(
-        "fn f(a: int, a: int) {\n return\n}\n",
+        "fn f(a: int, a: int) {\n return a\n}\n",
     ));
 }
 

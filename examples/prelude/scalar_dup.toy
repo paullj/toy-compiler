@@ -4,7 +4,7 @@
 # collide (T0020).
 # expect: compile-error "overlapping impl"
 impl int has Eq {
-    fn eq(self, o: int) -> bool { true }
+    fn eq(self, _o: int) -> bool { true }
 }
 
 fn main() -> int {
