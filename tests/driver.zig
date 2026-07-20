@@ -1988,6 +1988,165 @@ test "`toy check` does not flag code after an else-less if or a while" {
     }
 }
 
+// The unreachable-match-arm warning: a match arm that can never match because the
+// preceding UNGUARDED arms already cover every value the scrutinee can take. An arm
+// after an unguarded `_` is the cleanest case; it must warn W0006 and NOT fail the
+// check (exit 0), be promoted by `--deny-warnings`, and be silenced by `--allow W0006`.
+const unreachable_arm_after_wildcard_fixture = "fn f(n: int) -> int {\n  match n {\n    _ -> 1,\n    0 -> 2\n  }\n}\nfn main() -> int { return f(0) }\n";
+
+test "`toy check` renders W0006 for an arm after an unguarded wildcard and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unreachable_arm_after_wildcard_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0006]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unreachable match arm") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` flags an arm after full enum coverage" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-enum";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "enum E { A, B }\nfn f(e: E) -> int {\n  match e {\n    .A -> 1,\n    .B -> 2,\n    _ -> 3\n  }\n}\nfn main() -> int { return f(E.A) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0006]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` flags an arm after both bools" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-bool";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f(b: bool) -> int {\n  match b {\n    true -> 1,\n    false -> 0,\n    _ -> 2\n  }\n}\nfn main() -> int { return f(true) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0006]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// A required, reachable int `_` (the exhaustiveness provider for an infinite domain)
+// COMPLETES coverage and must not warn — it is tested before its own contribution.
+test "`toy check` does not flag a required int wildcard catch-all" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-int-req";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f(n: int) -> int {\n  match n {\n    0 -> 1,\n    _ -> 2\n  }\n}\nfn main() -> int { return f(0) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0006") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// A guarded arm may fall through, so it never saturates the match: the normal arm that
+// follows a guarded-only prefix is reachable and must not warn.
+test "`toy check` does not flag a normal arm after a guarded arm" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-guard";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f(n: int) -> int {\n  match n {\n    _ if n > 0 -> 1,\n    _ -> 2\n  }\n}\nfn main() -> int { return f(1) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0006") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// Only the FIRST arm reached after saturation warns: two arms after an unguarded `_`
+// produce exactly one W0006 (no cascade).
+test "`toy check` reports only the first unreachable arm (no cascade)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-once";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f(n: int) -> int {\n  match n {\n    _ -> 1,\n    0 -> 2,\n    1 -> 3\n  }\n}\nfn main() -> int { return f(0) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, res.out, i, "W0006")) |at| {
+        count += 1;
+        i = at + 5;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "`toy check --deny-warnings` promotes W0006 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unreachable_arm_after_wildcard_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0006]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0006` silences the unreachable-match-arm warning (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0006-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unreachable_arm_after_wildcard_fixture, &.{ "check", "--allow", "W0006" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0006") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

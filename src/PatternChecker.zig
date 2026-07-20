@@ -22,6 +22,20 @@ const Cov = union(enum) {
 };
 const BoolCov = struct { t: bool = false, f: bool = false };
 
+/// Whether the prior UNGUARDED arms already cover every value the scrutinee can take.
+/// Enum: every variant seen. Bool: both cases seen. Int: only a wildcard (its domain
+/// is infinite). An arm reached while this holds can never match.
+fn matchSaturated(cov: Cov, has_wildcard: bool) bool {
+    if (has_wildcard) return true;
+    return switch (cov) {
+        .@"enum" => |sv| for (sv) |s| {
+            if (!s) break false;
+        } else true,
+        .@"bool" => |b| b.t and b.f,
+        .int => false,
+    };
+}
+
 pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
     const st = try bc.typeOf(n.lhs);
     const arms = Ast.rangeSlice(bc.tree, (n.rhs).int());
@@ -55,11 +69,20 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
     defer if (enum_id != null) bc.gpa.free(seen);
 
     var has_wildcard = false;
+    var warned = false;
     var result: Type = Type.never;
     for (arms) |arm_idx| {
         const arm = bc.tree.nodes[(arm_idx).int()];
         const h = Ast.armHeaderAt(bc.tree, (arm.rhs).int());
         const guarded = h.guard != Ast.none;
+        // Tested BEFORE this arm contributes, so the arm that COMPLETES coverage
+        // (and the required int `_`) is reachable; only an arm reached while already
+        // saturated by prior unguarded arms warns. Argument-free so per-generic-instance
+        // rechecks dedupe. First one only — no cascade.
+        if (!warned and matchSaturated(cov, has_wildcard)) {
+            try bc.sink.emitFmtCode(.W0006, bc.byteOf(bc.tree.nodes[(arm.lhs).int()].main_token), "unreachable match arm; every value is already matched by an earlier arm", .{});
+            warned = true;
+        }
         try checkPattern(bc, arm.lhs, st, &cov, &has_wildcard, !guarded);
         if (guarded) {
             const gt = try bc.typeOf(h.guard);
