@@ -20,6 +20,7 @@ const Typecheck = @import("../types.zig");
 const Graph = @import("Graph.zig");
 const ResolveGraph = @import("../resolve_graph.zig");
 const TypecheckGraph = @import("../types_graph.zig");
+const Decide = @import("Decide.zig");
 const version = @import("../version.zig");
 
 pub const cache_root = ".toy";
@@ -222,8 +223,10 @@ pub fn pipeline(gpa: std.mem.Allocator, io: Io, cache: Cache, emit: Emit, target
     result.resolve = gr;
     gr = undefined;
 
-    if (result.resolve.?.diags.len > 0) {
-        // A name error would poison every dependent type; don't typecheck. The
+    if (Decide.resolveHasError(result.resolve.?.diags)) {
+        // A name ERROR would poison every dependent type; don't typecheck. Gate on
+        // error-severity only (POD default): a resolve WARNING (e.g. an unused-variable
+        // W0001) must not block typecheck, exactly as it does not in `runCheck`. The
         // diag-bearing resolve result is already on the FileResult; stop here.
         result.err = error.ResolveError;
         return;

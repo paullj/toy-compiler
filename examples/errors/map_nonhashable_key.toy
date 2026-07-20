@@ -6,5 +6,5 @@ import std/map
 struct Bad { r: Ref[int] }
 
 fn main() {
-    m := Map[Bad, int].new()
+    _m := Map[Bad, int].new()
 }

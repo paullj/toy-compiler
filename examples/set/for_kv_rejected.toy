@@ -6,7 +6,7 @@ import std/set
 fn main() -> int {
     s := Set[int].new()
     s.add(1)
-    for k, v in s {
+    for k, _v in s {
         return k
     }
     return 0

@@ -1,5 +1,5 @@
 # expect: compile-error "gc_array"
 fn main() -> int {
-    x := gc_array[int](0)
+    _x := gc_array[int](0)
     return 0
 }

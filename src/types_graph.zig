@@ -573,7 +573,7 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
         \\fn a() -> int { return true }
         \\fn b() -> int { return 1 + true }
         \\fn c() -> int { return lib.f(true) }
-        \\fn d() -> int { x: bool = 3
+        \\fn d() -> int { _x: bool = 3
         \\ return 0 }
         \\fn main() -> int { return 0 }
         \\

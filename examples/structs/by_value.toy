@@ -11,6 +11,6 @@ fn bump(q: P) -> int {
 
 fn main() -> int {
     p := P { x: 7, y: 0 }
-    z := bump(p)
+    _z := bump(p)
     return p.x
 }

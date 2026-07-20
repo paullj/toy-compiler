@@ -13,7 +13,7 @@ fn neg(x: int) -> int {
 fn main() {
     x := add(1, 2)
     y := neg(x)
-    ok := x == 3
-    z := x > y
+    _ok := x == 3
+    _z := x > y
     return
 }

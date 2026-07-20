@@ -195,7 +195,7 @@ test "a many-error file collects the FULL uncapped diagnostic set (render cap is
     try src.appendSlice(gpa, "fn f() {\n");
     for (0..n_errs) |i| {
         var line: [32]u8 = undefined;
-        try src.appendSlice(gpa, std.fmt.bufPrint(&line, " x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
+        try src.appendSlice(gpa, std.fmt.bufPrint(&line, " _x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
     }
     try src.appendSlice(gpa, " return\n}\n");
 
@@ -243,7 +243,7 @@ test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a sum
     try src.appendSlice(gpa, "fn f() {\n");
     for (0..n_errs) |i| {
         var line: [32]u8 = undefined;
-        try src.appendSlice(gpa, std.fmt.bufPrint(&line, " x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
+        try src.appendSlice(gpa, std.fmt.bufPrint(&line, " _x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
     }
     try src.appendSlice(gpa, " return\n}\n");
     const path = dir_name ++ "/many.toy";
@@ -1240,7 +1240,7 @@ test "`toy check` --ignore suppresses a code entirely (zero diagnostic bytes; no
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
     // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--ignore", "R0001" }) catch |e| {
+    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--allow", "R0001" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
@@ -1395,7 +1395,7 @@ test "the summary line counts respect severity config (--warn, --ignore)" {
     }
     // --ignore R0001: excluded from the summary entirely (no diagnostic-count line).
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--ignore", "R0001" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--allow", "R0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
@@ -1484,7 +1484,7 @@ test "`toy check --format ndjson` enriches each line with file, rendered, labels
     try testing.expect(saw_r0002);
 }
 
-test "`toy check --error-on-warning` promotes a surviving warning to a nonzero exit" {
+test "`toy check --deny-warnings` promotes a surviving warning to a nonzero exit" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1492,7 +1492,7 @@ test "`toy check --error-on-warning` promotes a surviving warning to a nonzero e
     const dir_name = ".toy-test-driver-d2-eow";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // --warn R0001 downgrades the only error to a warning. Without --error-on-warning the
+    // --warn R0001 downgrades the only error to a warning. Without --deny-warnings the
     // exit is 0 (no errors survive); WITH it, the surviving warning forces exit 1.
     {
         const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001" }) catch |e| {
@@ -1503,12 +1503,130 @@ test "`toy check --error-on-warning` promotes a surviving warning to a nonzero e
         try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
     }
     {
-        const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001", "--error-on-warning" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001", "--deny-warnings" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
         defer gpa.free(res.out);
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    }
+}
+
+// The unused-variable warning fixtures: a `:=` local and a `for` loop var that are
+// never referenced. Both must warn W0001 and NOT fail the build/check (exit 0), be
+// promoted to an error by `--deny-warnings`, and be silenced by `--allow`.
+const unused_local_fixture = "fn main() -> int {\n  i := 41\n  return 1\n}\n";
+const unused_loopvar_fixture = "fn main() -> int {\n  for i in 0..3 {}\n  return 1\n}\n";
+
+test "`toy check` renders W0001 for an unused local and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0001-check";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0001]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused variable 'i'") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "1 warning(s)") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` warns W0001 for an unused `for` loop variable (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0001-loop";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_loopvar_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0001]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "a warning-only build renders W0001, still produces a binary, and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0001-build";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var out_buf: [256]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&out_buf, "{s}/out", .{dir_name});
+    const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "-o", out_path }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0001") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    // The binary was actually produced despite the warning.
+    try Io.Dir.cwd().access(io, out_path, .{});
+}
+
+test "`toy check --deny-warnings` promotes W0001 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0001-deny-check";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0001]") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "1 error(s)") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "a build with --deny-warnings fails on a surviving W0001 (nonzero exit)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0001-deny-build";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    var out_buf: [256]u8 = undefined;
+    const out_path = try std.fmt.bufPrint(&out_buf, "{s}/out", .{dir_name});
+    const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "-o", out_path, "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0001` and `--allow W` silence the warning (no bytes, exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{ "W0001", "W" }) |spec| {
+        const dir_name = ".toy-test-driver-w0001-allow-" ++ spec;
+        defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+        const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "check", "--allow", spec }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "W0001") == null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
     }
 }
 

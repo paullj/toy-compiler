@@ -7,6 +7,6 @@
 # expect: compile-error "cannot infer"
 enum Opt[T] { some(T), none }
 fn main() -> int {
-  x := Opt.none
+  _x := Opt.none
   return 0
 }

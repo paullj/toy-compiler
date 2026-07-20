@@ -143,6 +143,23 @@ test "check: --warn demotes a code so the error tally drops to a warning (exit g
     }.body);
 }
 
+test "check: --deny-warnings re-promotes a demoted code so it counts as an error" {
+    const src = "fn main() -> int {\n  return nope_zzq\n}\n";
+    try withCheck(".toy-test-check-deny-warnings", src, struct {
+        fn body(results: []Driver.FileResult) anyerror!void {
+            // --warn R0001 demotes the only error to a warning; --deny-warnings promotes
+            // any surviving warning back to an error via `resolve`, so the tally counts it
+            // as an error (errors==1, warnings==0) and the exit gate trips.
+            var rules = [_]SevCfg.Rule{.{ .match = "R0001", .action = .warning }};
+            const cfg = SevCfg.SeverityConfig{ .rules = &rules, .deny_warnings = true };
+            const counts = Check.tallyAll(results, cfg);
+            try testing.expectEqual(@as(usize, 1), counts.errors);
+            try testing.expectEqual(@as(usize, 0), counts.warnings);
+            try testing.expect(counts.hasErrors());
+        }
+    }.body);
+}
+
 test "check: --ignore suppresses a code from both the tally and the NDJSON stream" {
     const src = "fn main() -> int {\n  return nope_zzq\n}\n";
     try withCheck(".toy-test-check-ignore", src, struct {

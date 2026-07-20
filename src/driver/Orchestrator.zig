@@ -14,6 +14,24 @@ const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const Codegen = toyc.DriverCodegen;
 const Opt = toyc.Opt;
+const SevCfg = toyc.diagnostics.severity_config;
+const Diagnostic = toyc.DiagnosticSink.Diagnostic;
+
+/// True when a diagnostic must block the next stage. A registry-default error
+/// (`d.severity == .err`) ALWAYS bails, independent of `cfg`: `--allow` demotes it
+/// for DISPLAY, but the downstream stage assumes resolution/typing actually succeeded,
+/// so proceeding on an --allow'd resolve/type error would crash in lowering. On top of
+/// that, `deny_warnings` promotes a surviving warning here so -Werror bails the stage
+/// exactly as it gates the check exit; a normal or `--allow`/ignore'd warning does not.
+fn hasError(diags: []const Diagnostic, cfg: SevCfg.SeverityConfig) bool {
+    for (diags) |d| {
+        if (d.severity == .err) return true;
+        if (SevCfg.resolve(d.code, d.severity, cfg)) |eff| {
+            if (eff == .err) return true;
+        }
+    }
+    return false;
+}
 
 /// The SINGLE stage adapter for `StageGraph.interpret`, shared by every
 /// program-producing build (`-o`, `--emit ir`). It supplies each stage's compute
@@ -88,6 +106,10 @@ pub const Orchestrator = struct {
     /// per-fn fan-outs the orchestrator drives — the GLOBAL_TABLES body checks
     /// (`checkGraph`) and the codegen region (`lowerGraphProgram`).
     ncpu: usize,
+    /// The render-time severity config. Threaded here so a stage's error-bail predicate
+    /// gates on EFFECTIVE severity (`hasError`) — a warning-only stage does not bail, and
+    /// `--deny-warnings` promotes a surviving warning to a stage-failing error.
+    sev: SevCfg.SeverityConfig,
 
     // `--timings` per-stage laps (each stage closure charges its own bucket). Null
     // pointers on paths that don't profile (`--emit ir`) => no lap.
@@ -182,7 +204,7 @@ pub const Orchestrator = struct {
                 self.lap(self.ns_lower);
                 const bad = switch (self.lowered.*.?) {
                     .err => true,
-                    .ok => |lp| lp.diags.len > 0,
+                    .ok => |lp| hasError(lp.diags, self.sev),
                 };
                 if (bad) {
                     self.failed_stage.* = .codegen;
@@ -238,7 +260,7 @@ const ResolveCompute = struct {
     o: Orchestrator,
     pub fn run(c: ResolveCompute) !void {
         c.o.res.* = try ResolveGraph.resolveGraph(c.o.gpa, &c.o.graph.*.?);
-        if (c.o.res.*.?.diags.len > 0) {
+        if (hasError(c.o.res.*.?.diags, c.o.sev)) {
             c.o.failed_stage.* = .resolve;
             return error.StageDiagnostics;
         }
@@ -254,7 +276,7 @@ const TypecheckCompute = struct {
     o: Orchestrator,
     pub fn run(c: TypecheckCompute) !void {
         c.o.tc.* = try TypecheckGraph.checkGraph(c.o.gpa, &c.o.graph.*.?, &c.o.res.*.?, c.o.io, c.o.ncpu);
-        if (c.o.tc.*.?.diags.len > 0) {
+        if (hasError(c.o.tc.*.?.diags, c.o.sev)) {
             c.o.failed_stage.* = .typecheck;
             return error.StageDiagnostics;
         }

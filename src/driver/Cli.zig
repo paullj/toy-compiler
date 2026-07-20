@@ -49,12 +49,12 @@ const post_emit: []const Spec.Option = &.{
     .{ .long = "opt-stats", .action = .set_true, .help = "Print per-pass opt counters + dual metric (with -o; use --no-cache)" },
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
-    // Render-time severity overrides. Repeatable; take a code (R0001) or a band
-    // letter (L/P/R/T). Fixed precedence ignore > warn > error; last match wins.
-    // Render-only: they NEVER change the exit status.
-    .{ .long = "error", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --error R0001 or --error T; render-only)" },
-    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable; render-only)" },
-    .{ .long = "ignore", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable; render-only)" },
+    // Per-code severity overrides. Repeatable; take a code (R0001) or a band
+    // letter (L/P/R/T/W). Fixed precedence allow > warn > deny; last match wins.
+    .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable)" },
+    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable)" },
+    .{ .long = "deny-warnings", .action = .set_true, .help = "Treat any surviving warning as an error (non-zero exit)" },
 };
 
 /// The option set shared verbatim by root, `build`, and `run` (defined once so
@@ -72,17 +72,17 @@ const files_pos: []const Spec.Positional = &.{
 /// `check`'s OWN option set — deliberately NOT the shared build/inspect options. `check`
 /// reports diagnostics without building, so nothing codegen/emit/opt related belongs
 /// here: only the diagnostic-shaping + input knobs. `--format` picks the wire form
-/// (pretty snippets vs stable NDJSON); `--error/--warn/--ignore` are the repeatable
-/// severity overrides; `--error-on-warning` promotes any surviving warning to an error
+/// (pretty snippets vs stable NDJSON); `--deny/--warn/--allow` are the repeatable
+/// severity overrides; `--deny-warnings` promotes any surviving warning to an error
 /// for the exit gate; `--exit-zero` forces a 0 exit even with errors (editors that read
 /// the stream, not the status); `--watch` is a forward-compatible no-op stub; `--color`
 /// and `--target` mirror the shared spellings.
 const check_opts: []const Spec.Option = &.{
     .{ .long = "format", .value = .{ .@"enum" = &.{ "human", "ndjson" } }, .value_name = "FORM", .help = "Diagnostic output form (human snippets or line-delimited JSON; default human)" },
-    .{ .long = "error", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --error R0001 or --error T; render-only)" },
-    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable; render-only)" },
-    .{ .long = "ignore", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable; render-only)" },
-    .{ .long = "error-on-warning", .action = .set_true, .help = "Exit non-zero if any warning survives the severity config" },
+    .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable)" },
+    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable)" },
+    .{ .long = "deny-warnings", .action = .set_true, .help = "Treat any surviving warning as an error (non-zero exit)" },
     .{ .long = "exit-zero", .action = .set_true, .help = "Always exit 0, even when diagnostics contain errors" },
     .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
@@ -123,7 +123,7 @@ pub const spec: Spec.Cli = .{
 };
 
 // A malformed spec is a build error: `Spec.validate` fires `@compileError`. The
-// larger option set (the --error/--warn/--ignore flags added here) pushes the
+// larger option set (the --deny/--warn/--allow flags added here) pushes the
 // comptime cross-check over the default 1000-branch budget, so raise the quota at this
 // caller-side comptime site (not in the framework).
 comptime {

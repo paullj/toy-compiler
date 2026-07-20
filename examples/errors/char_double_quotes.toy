@@ -1,5 +1,5 @@
 # expect: compile-error "use double quotes"
 fn main() -> int {
-    c := 'ab'
+    _c := 'ab'
     return 0
 }

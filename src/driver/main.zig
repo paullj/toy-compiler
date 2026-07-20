@@ -238,7 +238,7 @@ pub fn main(init: std.process.Init) !void {
     // the severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
     // the config, 2 on a hard CLI/IO error. `--exit-zero` forces 0 regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.check_error_on_warning, st.sev));
+        std.process.exit(try runCheck(gpa, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.sev));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -297,8 +297,6 @@ const State = struct {
     check_ndjson: bool = false,
     // `check --exit-zero`: always exit 0 even with errors (editor/LSP streaming).
     check_exit_zero: bool = false,
-    // `check --error-on-warning`: any surviving warning forces a non-zero (error) exit.
-    check_error_on_warning: bool = false,
     target: []const u8 = "native",
     out_path: ?[]const u8 = null,
     codegen_stats: bool = false,
@@ -315,9 +313,9 @@ const State = struct {
     job_count: usize = 0,
     // The resolved `--color` choice, fed once into `resolveLevel` after the parse.
     color_choice: Terminal.ColorChoice = .auto,
-    // Render-time severity overrides (--error/--warn/--ignore). Empty by default ==
-    // identity, so no-flag runs render byte-identical. `rules` BORROWS argv bytes via a
-    // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
+    // Render-time severity overrides (--deny/--warn/--allow) + `--deny-warnings`. Empty
+    // by default == identity, so no-flag runs render byte-identical. `rules` BORROWS argv
+    // bytes via a fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
     sev: SevCfg.SeverityConfig = .{},
     paths: std.ArrayList([]const u8),
 };
@@ -385,26 +383,26 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         st.opt.set(pass, false);
     }
     // Severity overrides. Build the borrowed rule slice in FIXED severity order:
-    // all --error, then all --warn, then all --ignore. With `resolve`'s last-match-wins
-    // this makes ignore dominate warn dominate error for a code named by multiple flags,
+    // all --deny, then all --warn, then all --allow. With `resolve`'s last-match-wins
+    // this makes allow dominate warn dominate deny for a code named by multiple flags,
     // deterministically and independent of cross-flag argv position (the flat model
     // loses cross-flag order — the same documented deviation as --verify/--no-cache). Each
-    // spec must be a known code (R0001) or a band letter (L/P/R/T); garbage arg-errors
-    // (exit 1), mirroring --opt validation. RENDER-ONLY: never flips the exit status.
-    // Field `error` is a Zig keyword => access it as `p.@"error"`.
-    for (p.@"error") |m| {
-        if (!Decide.validSpec(m)) return argErrCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
+    // spec must be a known code (R0001) or a band letter (L/P/R/T/W); garbage arg-errors
+    // (exit 1), mirroring --opt validation. `--deny-warnings` promotes any surviving
+    // warning to an error uniformly (build stage-bail AND check exit) via `resolve`.
+    for (p.deny) |m| {
+        if (!Decide.validSpec(m)) return argErrCode(out, level, "--deny: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .err });
     }
     for (p.warn) |m| {
         if (!Decide.validSpec(m)) return argErrCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .warning });
     }
-    for (p.ignore) |m| {
-        if (!Decide.validSpec(m)) return argErrCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
+    for (p.allow) |m| {
+        if (!Decide.validSpec(m)) return argErrCode(out, level, "--allow: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
     }
-    st.sev = .{ .rules = sev_rules.items };
+    st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
     for (p.file) |f| try st.paths.append(gpa, f);
@@ -427,23 +425,22 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: 
     };
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
-    st.check_error_on_warning = p.error_on_warning;
-    // Severity overrides, FIXED order (error, warn, ignore) so ignore>warn>error under
+    // Severity overrides, FIXED order (deny, warn, allow) so allow>warn>deny under
     // last-match-wins. An unknown code OR band letter is a USAGE error -> exit 2 (not the
     // build path's 1): `usageCode` prints the styled `error:` line and returns 2.
-    for (p.@"error") |m| {
-        if (!Decide.validSpec(m)) return usageCode(out, level, "--error: unknown code or band (e.g. R0001 or R)");
+    for (p.deny) |m| {
+        if (!Decide.validSpec(m)) return usageCode(out, level, "--deny: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .err });
     }
     for (p.warn) |m| {
         if (!Decide.validSpec(m)) return usageCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .warning });
     }
-    for (p.ignore) |m| {
-        if (!Decide.validSpec(m)) return usageCode(out, level, "--ignore: unknown code or band (e.g. R0001 or R)");
+    for (p.allow) |m| {
+        if (!Decide.validSpec(m)) return usageCode(out, level, "--allow: unknown code or band (e.g. R0001 or R)");
         try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
     }
-    st.sev = .{ .rules = sev_rules.items };
+    st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
 }
@@ -789,6 +786,7 @@ fn emitExecutable(
         // `-j` chunk-count basis for the body-check + codegen fan-outs. `threads` is the
         // resolved jobs count (the `-j N` value, else the host cpu count).
         .ncpu = threads,
+        .sev = sev,
         .timings = timings,
         .last_ns = &last_ns,
         .ns_discover = &ns_discover,
@@ -806,8 +804,30 @@ fn emitExecutable(
     const engine = Engine.initProbe(cache, mode, probe_ptr);
     if (!try runPipeline(out, gpa, level, engine, &orch, sev)) return 1;
 
-    // The interpreter ran every stage clean: `lowered` is `.ok` with no diagnostics.
+    // The interpreter ran every stage clean: `lowered` is `.ok` with no EFFECTIVE error.
     const lp = &lowered.?.ok;
+
+    // Render any surviving warnings + a summary, then build the binary. No warning
+    // survives to here under `deny_warnings` (it would have promoted to an error and
+    // bailed a stage), so the surviving warnings render as warnings and the build still
+    // exits 0. A truly clean build renders nothing (`renderDiagSummary` no-ops at 0/0),
+    // so its stdout stays byte-identical.
+    {
+        const g = &graph.?;
+        var counts: Check.Counts = .{};
+        const stages = [_][]const toyc.DiagnosticSink.Diagnostic{
+            res.?.diags,
+            if (tc) |t| t.diags else &.{},
+            lp.diags,
+        };
+        for (stages) |s| {
+            try DiagRender.renderScopedDiags(gpa, out, level, g, s, sev);
+            const c = Check.tallyGraph(s, sev);
+            counts.errors += c.errors;
+            counts.warnings += c.warnings;
+        }
+        try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
+    }
 
     if (codegen_stats) {
         try out.print("codegen: compiled={d} cached={d}\n", .{ lp.codegen_compiled, lp.codegen_cached });
@@ -983,6 +1003,7 @@ fn emitIr(
         // `-j` chunk basis from the pool limit: `.limited(N)`->N, `.unlimited`->host
         // cpus, `-j1` (`.limited(0)`)->1 (one chunk = the serial inline path).
         .ncpu = @max(@as(usize, 1), jlimit.toInt() orelse Engine.hostCpus()),
+        .sev = sev,
         .timings = false,
         .last_ns = null,
         .ns_discover = null,
@@ -1065,7 +1086,6 @@ fn runCheck(
     paths: []const []const u8,
     ndjson: bool,
     exit_zero: bool,
-    error_on_warning: bool,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
     // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
@@ -1106,7 +1126,7 @@ fn runCheck(
         // error in an IMPORTED module instead falls through to `renderGraphError` (matching
         // `build` — discovery never enters an import past a broken one).
         const parse_in_entry = ge.kind == .parse and (ge.module == null or ge.module == graph.entry_index);
-        if (parse_in_entry) return reportEntryFile(gpa, out, level, &graph, ndjson, ge.parse_diags, &.{}, &.{}, sev, exit_zero, error_on_warning);
+        if (parse_in_entry) return reportEntryFile(gpa, out, level, &graph, ndjson, ge.parse_diags, &.{}, &.{}, sev, exit_zero);
         // A missing/unreadable ENTRY file (kind=.missing, module=null) is a hard CLI/IO
         // failure -> exit 2, matching `check`'s single-file missing-input contract. Every
         // OTHER structural error (a real missing/mis-cased IMPORT, a path escape, an import
@@ -1127,52 +1147,51 @@ fn runCheck(
     };
     defer res.deinit(gpa);
 
-    // The diagnostic slice to report: resolve diagnostics when resolve produced ANY
-    // error-severity one (typecheck can't run on unresolved code); otherwise the
-    // typecheck diagnostics. `tc` is kept alive (fn-scope optional) so its borrowed
-    // messages outlive every render below.
+    // Typecheck only when resolve is error-free (you cannot type unresolved code). BOTH
+    // stages' diagnostics are reported — resolve carries the unused-variable warnings
+    // (W0001), which the old code dropped by collapsing to `tc.?.diags` on a clean
+    // resolve. `tc` is kept alive (fn-scope optional) so its borrowed messages outlive
+    // every render below.
     var tc: ?TypecheckGraph.GraphResult = null;
     defer if (tc) |*t| t.deinit(gpa);
-    const diags: []const toyc.DiagnosticSink.Diagnostic = if (Decide.resolveHasError(res.diags))
-        res.diags
-    else blk: {
+    if (!Decide.resolveHasError(res.diags)) {
         tc = TypecheckGraph.checkGraph(gpa, &graph, &res, cio, 0) catch |e| {
             try argLine(out, level, @errorName(e));
             return 2;
         };
-        // Resolve was clean but may still carry warnings/notes; if it has any VISIBLE
-        // diagnostic that typecheck did not (it won't, given resolve had no errors),
-        // report typecheck's — resolve's non-error diagnostics are rare and already
-        // covered by the graph front-end's own reporting elsewhere. Report typecheck.
-        break :blk tc.?.diags;
-    };
+    }
+    const type_diags: []const toyc.DiagnosticSink.Diagnostic = if (tc) |t| t.diags else &.{};
 
     // SINGLE-MODULE (no imports discovered): render against the entry's ON-DISK `file`,
     // not its module `path` (a bare stem like `fix_bad` vs `/tmp/fix_bad.toy`), so the
     // human `-->` header matches the per-file build output. All entry parse errors already
-    // routed above, so a single-module graph carries only resolve OR type diagnostics.
-    // Both wire forms share `reportEntryFile` with the tainted-entry path.
-    if (graph.modules.len == 1) {
-        const resolve_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) diags else &.{};
-        const type_batch: []const toyc.DiagnosticSink.Diagnostic = if (tc == null) &.{} else diags;
-        return reportEntryFile(gpa, out, level, &graph, ndjson, &.{}, resolve_batch, type_batch, sev, exit_zero, error_on_warning);
-    }
+    // routed above, so a single-module graph carries resolve (incl. warnings) + type
+    // diagnostics. Both wire forms share `reportEntryFile` with the tainted-entry path.
+    if (graph.modules.len == 1)
+        return reportEntryFile(gpa, out, level, &graph, ndjson, &.{}, res.diags, type_diags, sev, exit_zero);
 
+    // Multi-module: combine resolve + type diagnostics into ONE slice (single cap + single
+    // tally). `ScopeCache.get` rebuilds on scope change, so a resolve-then-type
+    // concatenation renders correctly and deterministically.
+    const combined = try gpa.alloc(toyc.DiagnosticSink.Diagnostic, res.diags.len + type_diags.len);
+    defer gpa.free(combined);
+    @memcpy(combined[0..res.diags.len], res.diags);
+    @memcpy(combined[res.diags.len..], type_diags);
     if (ndjson) {
         // NDJSON over the graph's flat slice: each diagnostic's `file` is its OWNING
         // module path (not always the entry), so an imported module's error is attributed
         // correctly. Schema byte-identical to the single-file form.
-        const counts = try Check.emitNdjsonGraph(out, gpa, &graph, diags, sev);
+        const counts = try Check.emitNdjsonGraph(out, gpa, &graph, combined, sev);
         try out.flush();
-        return Decide.checkExit(counts, exit_zero, error_on_warning);
+        return Decide.checkExit(counts, exit_zero);
     }
     // Human form: pretty per-module snippets (reusing the multi-module renderer, which
     // builds ONE SourceMap per scope) + a program-wide `N error(s), M warning(s)` summary.
-    try DiagRender.renderScopedDiags(gpa, out, level, &graph, diags, sev);
-    const counts = Check.tallyGraph(diags, sev);
+    try DiagRender.renderScopedDiags(gpa, out, level, &graph, combined, sev);
+    const counts = Check.tallyGraph(combined, sev);
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
-    return Decide.checkExit(counts, exit_zero, error_on_warning);
+    return Decide.checkExit(counts, exit_zero);
 }
 
 /// Report the diagnostics belonging to the ENTRY file — a tainted entry parse, or a
@@ -1191,7 +1210,6 @@ fn reportEntryFile(
     type_diags: []const toyc.DiagnosticSink.Diagnostic,
     sev: SevCfg.SeverityConfig,
     exit_zero: bool,
-    error_on_warning: bool,
 ) !u8 {
     const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
     var counts: Check.Counts = .{};
@@ -1204,7 +1222,7 @@ fn reportEntryFile(
             counts.warnings += c.warnings;
         }
         try out.flush();
-        return Decide.checkExit(counts, exit_zero, error_on_warning);
+        return Decide.checkExit(counts, exit_zero);
     }
     const e = g.entry();
     try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, parse_diags, resolve_diags, type_diags, sev);
@@ -1215,7 +1233,7 @@ fn reportEntryFile(
     }
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
-    return Decide.checkExit(counts, exit_zero, error_on_warning);
+    return Decide.checkExit(counts, exit_zero);
 }
 
 /// `toy explain <CODE>`: print the code's embedded documentation. A known code prints
@@ -1253,6 +1271,7 @@ fn bandTitle(prefix: u8) []const u8 {
         'P' => "Parser (P)",
         'R' => "Name resolution (R)",
         'T' => "Type checking (T)",
+        'W' => "Warnings (W)",
         else => "Other",
     };
 }

@@ -3,6 +3,6 @@
 # allocation behind an operator. `int` is the only builtin arithmetic type.
 # expect: compile-error "requires an 'Add' impl for type 'str'"
 fn main() -> int {
-    s := "a" + "b"
+    _s := "a" + "b"
     return 0
 }
