@@ -6,7 +6,7 @@
 # in scope, so `a == b` cannot desugar. The fix: bound `T` by `Eq`.
 protocol Doubler { fn dbl(self) -> int }
 
-fn bad[T has Doubler](a: T, b: T) -> bool { a == b }
+fn _bad[T has Doubler](a: T, b: T) -> bool { a == b }
 
 fn main() -> int {
     return 0

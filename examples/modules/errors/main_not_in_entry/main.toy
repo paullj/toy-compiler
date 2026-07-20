@@ -3,6 +3,6 @@
 # expect: compile-error "main"
 import lib
 
-fn helper() -> int {
+fn _helper() -> int {
     lib.main()
 }

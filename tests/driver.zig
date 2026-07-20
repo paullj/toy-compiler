@@ -124,7 +124,7 @@ test "emit=check on a clean program resolves with no diagnostics" {
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    const src = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
+    const src = "pub fn add(a: int, b: int) -> int {\n return a + b\n}\n";
     const path = dir_name ++ "/p.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
@@ -192,7 +192,7 @@ test "a many-error file collects the FULL uncapped diagnostic set (render cap is
     const n_errs = 120;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(gpa);
-    try src.appendSlice(gpa, "fn f() {\n");
+    try src.appendSlice(gpa, "fn _f() {\n");
     for (0..n_errs) |i| {
         var line: [32]u8 = undefined;
         try src.appendSlice(gpa, std.fmt.bufPrint(&line, " _x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
@@ -240,7 +240,7 @@ test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a sum
     const n_errs = 120;
     var src: std.ArrayList(u8) = .empty;
     defer src.deinit(gpa);
-    try src.appendSlice(gpa, "fn f() {\n");
+    try src.appendSlice(gpa, "fn _f() {\n");
     for (0..n_errs) |i| {
         var line: [32]u8 = undefined;
         try src.appendSlice(gpa, std.fmt.bufPrint(&line, " _x{d} := undecl{d}\n", .{ i, i }) catch unreachable);
@@ -1684,6 +1684,63 @@ test "`--allow W0002` silences the unused-parameter warning (exit 0)" {
     };
     defer gpa.free(res.out);
     try testing.expect(std.mem.indexOf(u8, res.out, "W0002") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// The unused-function warning: a non-`pub` top-level fn that nothing in the module
+// graph calls. It must warn W0003 and NOT fail the check (exit 0), be promoted by
+// `--deny-warnings`, and be silenced by `--allow W0003`.
+const unused_fn_fixture = "fn helper() -> int {\n  return 7\n}\nfn main() -> int {\n  return 0\n}\n";
+
+test "`toy check` renders W0003 for an unused function and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0003";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_fn_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0003]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused function 'helper'") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check --deny-warnings` promotes W0003 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0003-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_fn_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0003]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0003` silences the unused-function warning (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0003-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, unused_fn_fixture, &.{ "check", "--allow", "W0003" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0003") == null);
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 

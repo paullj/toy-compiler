@@ -4,5 +4,5 @@
 import secret
 
 fn main() -> int {
-    secret.hidden()
+    secret._hidden()
 }

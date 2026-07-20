@@ -4,7 +4,7 @@
 # `Result`. (Cross-constructor bridging and `From`-style error widening are deferred to
 # a later phase.) This proves the mismatch path is a diagnostic, not a miscompile.
 # expect: compile-error "in a function returning Result"
-fn get(o: Option[int]) -> Result[int, str] {
+fn _get(o: Option[int]) -> Result[int, str] {
   v := o?
   return Result.ok(v)
 }
