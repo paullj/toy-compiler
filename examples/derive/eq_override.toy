@@ -5,7 +5,7 @@
 struct P { x: int }
 
 impl P has Eq {
-    fn eq(self, o: P) -> bool { true }
+    fn eq(self, _o: P) -> bool { true }
 }
 
 fn main() -> int {

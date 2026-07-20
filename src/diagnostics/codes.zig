@@ -94,6 +94,7 @@ pub const Code = enum(u16) {
 
     // Warning band (W####).
     W0001, // unused-variable
+    W0002, // unused-parameter
 
     _,
 };
@@ -177,6 +178,7 @@ pub const table = [_]Entry{
     .{ .code = .T0037, .str = "T0037", .slug = "extern-invalid-type" },
     .{ .code = .T0038, .str = "T0038", .slug = "unsafe-required" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
+    .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -367,12 +369,18 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("unsafe-required", slug(.T0038).?);
     try testing.expectEqual(Code.T0038, fromStr("T0038").?);
 
-    // Unused-variable warning code — the ONLY .warning default, so this proves the
+    // Unused-variable/parameter warning codes — the `.warning` defaults, proving the
     // warning-by-default wiring end to end.
     try testing.expectEqualStrings("W0001", str(.W0001).?);
     try testing.expectEqualStrings("unused-variable", slug(.W0001).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0001));
     try testing.expectEqual(Code.W0001, fromStr("W0001").?);
+
+    // Unused-parameter warning code — sibling of W0001, also .warning by default.
+    try testing.expectEqualStrings("W0002", str(.W0002).?);
+    try testing.expectEqualStrings("unused-parameter", slug(.W0002).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0002));
+    try testing.expectEqual(Code.W0002, fromStr("W0002").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

@@ -6,6 +6,6 @@
 # (snd$bool$int, id$int); the matcher runs at the call site and is discarded — no
 # type variable is ever stored in a Type/AST/IR node.
 # expect: exit 42
-fn snd[T, U](a: T, b: U) -> U { b }
+fn snd[T, U](_a: T, b: U) -> U { b }
 fn id[T](x: T) -> T { x }
 fn main() -> int { return snd(true, id(42)) }

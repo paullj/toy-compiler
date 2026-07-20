@@ -1,7 +1,7 @@
 # A float arg SPILL past v7: the first 8 floats ride v0..v7, the 9th spills to the
 # incoming stack (NSAA). The callee reads the 9th correctly.
 # expect: exit 42
-fn ninth(a: float, b: float, c: float, d: float, e: float, f: float, g: float, h: float, i: float) -> float {
+fn ninth(_a: float, _b: float, _c: float, _d: float, _e: float, _f: float, _g: float, _h: float, i: float) -> float {
     i                                         # the stack-passed arg
 }
 fn main() -> int {

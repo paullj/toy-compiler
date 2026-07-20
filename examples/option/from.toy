@@ -14,7 +14,7 @@ enum SmallErr { bad }
 enum BigErr { small, other }
 
 impl BigErr has From[SmallErr] {
-  fn from(s: SmallErr) -> BigErr { BigErr.small }
+  fn from(_s: SmallErr) -> BigErr { BigErr.small }
 }
 
 fn inner() -> Result[int, SmallErr] {
