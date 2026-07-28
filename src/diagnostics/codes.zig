@@ -101,6 +101,7 @@ pub const Code = enum(u16) {
     W0006, // unreachable-match-arm
     W0007, // constant-condition
     W0008, // unused-must-use
+    W0009, // shadowed-binding
 
     _,
 };
@@ -191,6 +192,7 @@ pub const table = [_]Entry{
     .{ .code = .W0006, .str = "W0006", .slug = "unreachable-match-arm", .default_severity = .warning },
     .{ .code = .W0007, .str = "W0007", .slug = "constant-condition", .default_severity = .warning },
     .{ .code = .W0008, .str = "W0008", .slug = "unused-must-use", .default_severity = .warning },
+    .{ .code = .W0009, .str = "W0009", .slug = "shadowed-binding", .default_severity = .warning },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -429,6 +431,12 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("unused-must-use", slug(.W0008).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0008));
     try testing.expectEqual(Code.W0008, fromStr("W0008").?);
+
+    // Shadowed-binding warning code — sibling of W0001..W0008, also .warning by default.
+    try testing.expectEqualStrings("W0009", str(.W0009).?);
+    try testing.expectEqualStrings("shadowed-binding", slug(.W0009).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0009));
+    try testing.expectEqual(Code.W0009, fromStr("W0009").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
