@@ -83,6 +83,7 @@ pub const docs = [_]Doc{
     .{ .code = .W0005, .text = @embedFile("errors/W0005.md") },
     .{ .code = .W0006, .text = @embedFile("errors/W0006.md") },
     .{ .code = .W0007, .text = @embedFile("errors/W0007.md") },
+    .{ .code = .W0008, .text = @embedFile("errors/W0008.md") },
 };
 
 /// The embedded doc for a code, or null if the code has no doc (only `.none`).
@@ -149,4 +150,7 @@ test "docForStr resolves a known code and rejects garbage" {
 
     const w7 = docForStr("W0007") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, w7, "constant condition") != null);
+
+    const w8 = docForStr("W0008") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w8, "unused") != null);
 }
