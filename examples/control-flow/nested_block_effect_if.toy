@@ -1,0 +1,12 @@
+# Feature: an else-less `if` as the trailing statement of a nested block is an effect statement.
+# expect: exit 5
+# The inner block's last statement is a value-less `if`; it runs for effect (an early
+# return), so the block yields nothing and control reaches the final `return 0` only
+# when the condition is false. Here x > 0 holds, so `return 5` fires.
+fn main() -> int {
+    x := 5
+    {
+        if x > 0 { return 5 }
+    }
+    return 0
+}

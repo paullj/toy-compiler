@@ -337,10 +337,17 @@ pub const BodyChecker = struct {
             bt = try bc.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
             bc.node_types[(last).int()] = bt; // the expr_stmt carries the value type
             if (!want_value) try bc.warnDroppedMustUse(last, bt);
-        } else if (want_value and (last_n.tag == .if_stmt or last_n.tag == .block)) {
+        } else if (want_value and last_n.tag == .block) {
+            bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
+        } else if (want_value and last_n.tag == .if_stmt and
+            Ast.ifHeaderAt(bc.tree, (last_n.rhs).int()).else_node != Ast.none)
+        {
+            // A value-if needs both arms to yield a value; an else-less trailing
+            // `if` produces nothing, so it is an effect statement, not this
+            // block's value.
             bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
         } else {
-            try bc.checkStmt(last); // statement context (incl. trailing else-less if)
+            try bc.checkStmt(last); // statement context (else-less trailing if / want_value=false)
         }
         bc.node_types[(block_idx).int()] = bt;
         try bc.warnUnreachable(stmts);
