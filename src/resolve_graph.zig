@@ -1017,6 +1017,31 @@ fn declare(g: *GraphResolve, name_tok: u32, comptime dup_fmt: []const u8, compti
         try g.emit(.none, g.cur_mod, g.tokens()[name_tok].start, dup_fmt, .{name});
         return null;
     }
+    // A shadow-eligible binding (`:=`, for-var, param — `warn_code != .none`) that hides
+    // an enclosing lexical binding or a seeded builtin, silenced by a leading `_`. Search
+    // OUTER scopes only (`0..len-1`): the current scope's key was just half-inserted by
+    // `getOrPut` above (its value_ptr is still uninitialized), and a same-scope name is a
+    // redeclaration handled above — not a shadow. Read the map directly (not
+    // `lookupLocalOrFn`, which also searches the top scope, marks the outer binding used,
+    // and resolves user module fns — none of which we want here).
+    if (warn_code != .none and !(name.len != 0 and name[0] == '_')) {
+        const off = g.tokens()[name_tok].start;
+        const shadowed: ?u32 = blk: {
+            var i = g.scopes.items.len - 1;
+            while (i > 0) {
+                i -= 1;
+                if (g.scopes.items[i].names.get(name)) |outer_idx| break :blk outer_idx;
+            }
+            break :blk null;
+        };
+        if (shadowed) |outer_idx| {
+            const rel = g.tokens()[g.locals.items[outer_idx].name_tok].start;
+            try g.emitRelated(.W0009, g.cur_mod, off, rel, "'{s}' shadows an outer binding", .{name});
+        } else if (g.tables[g.cur_mod].fns.get(name)) |gid| {
+            if (g.fns.items[gid].kind == .builtin)
+                try g.emit(.W0009, g.cur_mod, off, "'{s}' shadows a builtin", .{name});
+        }
+    }
     const slot = g.slot_next;
     g.slot_next += 1;
     const local_idx: u32 = @intCast(g.locals.items.len);
@@ -1718,6 +1743,210 @@ test "`for k,v in m` both unused warn twice" {
         }
     };
     try withResolvedGraph(".toy-test-unused-kv", files, "main.toy", Check.run);
+}
+
+test "a body local shadowing an outer local warns W0009 with a secondary label" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ if x > 0 {
+    \\  x := 2
+    \\  return x
+    \\ }
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0009));
+            for (r.diags) |d| if (d.code == .W0009) {
+                try testing.expect(std.mem.indexOf(u8, d.message, "'x' shadows an outer binding") != null);
+                try testing.expect(d.related != @import("diagnostics/Diagnostic.zig").NO_RELATED);
+            };
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-local", files, "main.toy", Check.run);
+}
+
+test "a body local shadowing a param warns W0009" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(n: int) -> int {
+    \\ n := 5
+    \\ return n
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-param", files, "main.toy", Check.run);
+}
+
+test "a nested-block local shadowing a shallower local warns W0009" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ if x > 0 {
+    \\  if x > 0 {
+    \\   x := 3
+    \\   return x
+    \\  }
+    \\ }
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-nested", files, "main.toy", Check.run);
+}
+
+test "a `for` var shadowing an outer local warns W0009" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ i := 0
+    \\ for i in 0..3 { return i }
+    \\ return i
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-for", files, "main.toy", Check.run);
+}
+
+test "a param named `panic` shadows a builtin (W0009)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(panic: int) -> int {
+    \\ return panic
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0009));
+            for (r.diags) |d| if (d.code == .W0009)
+                try testing.expect(std.mem.indexOf(u8, d.message, "shadows a builtin") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-builtin", files, "main.toy", Check.run);
+}
+
+test "a `_`-prefixed shadow is silenced (no W0009)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ if x > 0 {
+    \\  _x := 2
+    \\  return x
+    \\ }
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-underscore", files, "main.toy", Check.run);
+}
+
+test "a match binding reusing an in-scope name does not warn W0009" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(o: Option[int]) -> int {
+    \\ x := 1
+    \\ return match o { .some(x) -> x, .none -> x }
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-match", files, "main.toy", Check.run);
+}
+
+test "a same-scope redeclaration stays the redeclaration error, not W0009" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ x := 2
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0009));
+            var saw_dup = false;
+            for (r.diags) |d| if (std.mem.indexOf(u8, d.message, "redeclaration of 'x'") != null) {
+                saw_dup = true;
+            };
+            try testing.expect(saw_dup);
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-dup", files, "main.toy", Check.run);
+}
+
+test "two non-nested sibling blocks reusing a name do not warn W0009" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ if true {
+    \\  x := 1
+    \\  return x
+    \\ }
+    \\ if true {
+    \\  x := 2
+    \\  return x
+    \\ }
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-siblings", files, "main.toy", Check.run);
+}
+
+test "a param named after a core-only intrinsic does not warn outside core" {
+    // `size_of` is a `core_only` intrinsic — it is NOT registered in an ordinary module's
+    // fn table, so a normal-module param named `size_of` shadows nothing (guards case-b gating).
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(size_of: int) -> int {
+    \\ return size_of
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0009));
+        }
+    };
+    try withResolvedGraph(".toy-test-shadow-intrinsic-noncore", files, "main.toy", Check.run);
 }
 
 test "an uncalled private fn warns W0003 with its bare source name" {
