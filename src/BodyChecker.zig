@@ -25,6 +25,7 @@ const conform = @import("types/conform.zig");
 const ControlFlow = @import("ControlFlow.zig");
 const PatternChecker = @import("PatternChecker.zig");
 const Literal = @import("types/literal.zig");
+const nearmiss = @import("diagnostics/nearmiss.zig");
 const Model = Typecheck.Model;
 const FnSym = Typecheck.FnSym;
 const LoopCtx = Typecheck.LoopCtx;
@@ -66,6 +67,58 @@ fn isConcreteValue(ty: Type) bool {
         else => false,
     };
 }
+
+/// Near-miss candidate iterators (`next() ?[]const u8`) for the "did you mean" enrichment
+/// of the field / enum-variant / method not-found diagnostics. `suggest` copies the
+/// iterator by value and its strict-unique-winner rule makes the result order-independent.
+const FieldNameIter = struct {
+    names: []const []const u8,
+    i: usize = 0,
+    pub fn next(self: *FieldNameIter) ?[]const u8 {
+        if (self.i >= self.names.len) return null;
+        defer self.i += 1;
+        return self.names[self.i];
+    }
+};
+
+const VariantNameIter = struct {
+    variants: []const LayoutEngine.VariantSym,
+    i: usize = 0,
+    pub fn next(self: *VariantNameIter) ?[]const u8 {
+        if (self.i >= self.variants.len) return null;
+        defer self.i += 1;
+        return self.variants[self.i].name;
+    }
+};
+
+/// Yields the names of every method callable on `recv`: the concrete-receiver methods
+/// (`recv` type-equals `m.recv` — the same filter `findMethod`/`resolveConformanceMethod`
+/// dispatch on) PLUS, when `recv` is a generic instance (`App`), the template methods of
+/// its ctor (which live in `templates`, keyed by `recv_ctor` — a plain `Vec[int]` has NO
+/// entry in `methods`, so without this a method typo on Vec/Map/Set would get no hint).
+const MethodNameIter = struct {
+    methods: []const Typecheck.Method,
+    recv: Type,
+    templates: []const Typecheck.TemplateMethod = &.{},
+    app_ctor: u32 = 0,
+    app_is_enum: bool = false,
+    app: bool = false,
+    i: usize = 0,
+    ti: usize = 0,
+    pub fn next(self: *MethodNameIter) ?[]const u8 {
+        while (self.i < self.methods.len) {
+            const m = self.methods[self.i];
+            self.i += 1;
+            if (Type.eql(m.recv, self.recv)) return m.name;
+        }
+        if (self.app) while (self.ti < self.templates.len) {
+            const t = self.templates[self.ti];
+            self.ti += 1;
+            if (t.recv_ctor == self.app_ctor and t.recv_is_enum == self.app_is_enum) return t.name;
+        };
+        return null;
+    }
+};
 
 /// A human name for an Option/Result family, for the `?` mismatch diagnostic.
 fn familyName(fam: LayoutEngine.NativeEnumFamily) []const u8 {
@@ -1240,7 +1293,7 @@ pub const BodyChecker = struct {
             for (sym.field_names, 0..) |dn, j| {
                 if (std.mem.eql(u8, dn, fname)) return substTy(bc, sym.field_types[j], e.args);
             }
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
+            try bc.emitNoField(bc.byteOf(n.main_token), fname, sym.name, sym.field_names);
             return .invalid;
         }
         if (!base.isStruct()) {
@@ -1252,7 +1305,7 @@ pub const BodyChecker = struct {
         for (sym.field_names, 0..) |dn, j| {
             if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
         }
-        try bc.sink.emitFmt(bc.byteOf(n.main_token), "no field '{s}' in struct '{s}'", .{ fname, sym.name });
+        try bc.emitNoField(bc.byteOf(n.main_token), fname, sym.name, sym.field_names);
         return .invalid;
     }
 
@@ -1371,7 +1424,7 @@ pub const BodyChecker = struct {
         }
         const variant = if (vi) |i| e.variants[i] else {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.sink.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            try bc.emitNoVariant(bc.byteOf(vtok), e.name, vname, e.variants);
             return .invalid;
         };
 
@@ -1472,7 +1525,7 @@ pub const BodyChecker = struct {
         }
         const variant = if (vi) |i| e.variants[i] else {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.sink.emitFmt(bc.byteOf(vtok), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+            try bc.emitNoVariant(bc.byteOf(vtok), e.name, vname, e.variants);
             return .invalid;
         };
         if (!formMatches(node_form, variant.form)) {
@@ -1890,7 +1943,7 @@ pub const BodyChecker = struct {
             return .invalid;
         }
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+        try bc.emitNoMethod(bc.byteOf(fa.main_token), member, recv_ty);
         return .invalid;
     }
 
@@ -2644,7 +2697,7 @@ pub const BodyChecker = struct {
         }
         // A concrete struct/enum/scalar value with no such method.
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+        try bc.emitNoMethod(bc.byteOf(callee.main_token), member, recv_ty);
         return .invalid;
     }
 
@@ -2792,7 +2845,7 @@ pub const BodyChecker = struct {
         }
         // A generic-type value with no such method.
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+        try bc.emitNoMethod(bc.byteOf(callee.main_token), member, recv_ty);
         return .invalid;
     }
 
@@ -3227,6 +3280,44 @@ pub const BodyChecker = struct {
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
         return refs.typeFromQualified(bc, node_idx, n);
+    }
+
+    /// Emit "no field '{s}' in struct '{s}'", enriched with a "did you mean" hint when a
+    /// declared field name is a close, unambiguous typo of `fname`.
+    fn emitNoField(bc: *BodyChecker, byte: u32, fname: []const u8, sym_name: []const u8, names: []const []const u8) error{OutOfMemory}!void {
+        if (nearmiss.suggest(fname, FieldNameIter{ .names = names })) |cand|
+            try bc.sink.emitFmt(byte, "no field '{s}' in struct '{s}'; did you mean '{s}'?", .{ fname, sym_name, cand })
+        else
+            try bc.sink.emitFmt(byte, "no field '{s}' in struct '{s}'", .{ fname, sym_name });
+    }
+
+    /// Emit "enum '{s}' has no variant '{s}'", enriched with a "did you mean" hint when a
+    /// declared variant name is a close, unambiguous typo of `vname`. `pub` so the pattern
+    /// checker reuses it for a typo'd variant in a match pattern (same message + hint).
+    pub fn emitNoVariant(bc: *BodyChecker, byte: u32, enum_name: []const u8, vname: []const u8, variants: []const LayoutEngine.VariantSym) error{OutOfMemory}!void {
+        if (nearmiss.suggest(vname, VariantNameIter{ .variants = variants })) |cand|
+            try bc.sink.emitFmt(byte, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ enum_name, vname, cand })
+        else
+            try bc.sink.emitFmt(byte, "enum '{s}' has no variant '{s}'", .{ enum_name, vname });
+    }
+
+    /// Emit T0018 "no method '{s}' on type '{s}'", enriched with a "did you mean" hint when
+    /// a method callable on the receiver is a close, unambiguous typo of `member`. The
+    /// candidate set is the concrete-receiver methods plus, for a generic-instance (`App`)
+    /// receiver, its ctor's template methods (so `xs.pushh(1)` on a Vec suggests `push`).
+    fn emitNoMethod(bc: *BodyChecker, byte: u32, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
+        var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
+        if (recv_ty.isApp()) {
+            const e = bc.composite.at(recv_ty.appIdx());
+            iter.app = true;
+            iter.templates = bc.model.templates;
+            iter.app_ctor = e.ctor;
+            iter.app_is_enum = e.ctor_is_enum;
+        }
+        if (nearmiss.suggest(member, iter)) |cand|
+            try bc.sink.emitFmtCode(.T0018, byte, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
+        else
+            try bc.sink.emitFmtCode(.T0018, byte, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
     }
 
     pub fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {

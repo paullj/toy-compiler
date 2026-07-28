@@ -1,0 +1,5 @@
+struct Widget { n: int }
+fn main() -> int {
+  w: Widgett = Widget{ n: 1 }  #~ ERROR [T0001] did you mean 'Widget'?
+  return w.n
+}

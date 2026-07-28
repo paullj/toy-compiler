@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — a close enum-variant typo suggests the declared variant.
+# expect: compile-error "did you mean 'Green'?"
+enum Color { Red, Green, Blue }
+fn main() -> int {
+  _c := Color.Gren
+  return 0
+}

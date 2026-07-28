@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — a close field typo suggests the declared field.
+# expect: compile-error "did you mean 'balance'?"
+struct Account { balance: int, owner: int }
+fn main() -> int {
+  a := Account{ balance: 1, owner: 2 }
+  return a.balnce
+}
