@@ -14,11 +14,6 @@ const std = @import("std");
 const model = @import("model.zig");
 pub const Severity = model.Severity;
 
-/// Stability of a code (for a future `explain`/lint policy). Append-only.
-pub const Status = enum { stable, preview, deprecated, removed };
-/// Whether a diagnostic has an auto-fix (reserved for a future fix engine).
-pub const Fixable = enum { no, safe, unsafe };
-
 /// The append-only code enum. `none` (ordinal 0) is the "uncoded" sentinel every
 /// existing emit site defaults to; it renders with NO `[code]` bracket, byte-identical
 /// to pre-registry output. Non-exhaustive (`_`) so adding a code never breaks a switch.
@@ -111,16 +106,12 @@ pub const Code = enum(u16) {
 
 /// One registry row. `str` is the human code; `slug` is the kebab-case identity used
 /// for docs/fixture filenames; `default_severity` seeds the sink POD (render config
-/// overrides it late). `redirect_to`/`fixable`/`help_slug` are reserved for later.
+/// overrides it late).
 const Entry = struct {
     code: Code,
     str: []const u8,
     slug: []const u8,
     default_severity: Severity = .err,
-    status: Status = .stable,
-    redirect_to: Code = .none,
-    fixable: Fixable = .no,
-    help_slug: []const u8 = "",
 };
 
 /// The append-only registry. Every non-`.none` `Code` MUST have exactly one row (the
@@ -155,8 +146,8 @@ pub const table = [_]Entry{
     .{ .code = .T0004, .str = "T0004", .slug = "recursive-type" },
     .{ .code = .T0005, .str = "T0005", .slug = "empty-struct" },
     .{ .code = .T0006, .str = "T0006", .slug = "empty-enum" },
-    .{ .code = .T0007, .str = "T0007", .slug = "unit-field", .status = .removed },
-    .{ .code = .T0008, .str = "T0008", .slug = "unit-payload", .status = .removed },
+    .{ .code = .T0007, .str = "T0007", .slug = "unit-field" },
+    .{ .code = .T0008, .str = "T0008", .slug = "unit-payload" },
     .{ .code = .T0009, .str = "T0009", .slug = "pub-exposes-non-pub" },
     .{ .code = .T0010, .str = "T0010", .slug = "main-return-type" },
     .{ .code = .T0011, .str = "T0011", .slug = "shadows-builtin" },
