@@ -2181,7 +2181,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             };
         }
         if ((callee_node.tag == .identifier or callee_node.tag == .field_access) and
-            callee_res.func < b.in.sigs.len and sigHasTypeVar(b.in.sigs[callee_res.func]))
+            callee_res.func < b.in.sigs.len and b.in.sigs[callee_res.func].isGenericTemplate())
         {
             // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`: the callee
             // (plain identifier, or a field_access `resolveModuleMember` bound to `.func`)
@@ -2195,16 +2195,24 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             const arg_types = try b.gpa.alloc(Typecheck.Type, value_args.len);
             defer b.gpa.free(arg_types);
             for (value_args, 0..) |va, i| arg_types[i] = b.in.node_types[(va).int()];
-            const targs = (try Infer.infer(b.gpa, genericParamCount(sig), sig.params, arg_types)) orelse {
+            // FIND regime: the composite table is gone, so a container param (`Vec[T]`)
+            // cannot be re-inferred here. The FLAT portion re-runs the shared matcher
+            // (byte-identical to before — pure-flat calls resolve here and never touch
+            // the fallback); a container/mixed call resolves by matching the reified
+            // value-arg types against each instance's already-reified `params`.
+            var ii: ?usize = null;
+            if (sigHasTypeVar(sig)) {
+                if (try Infer.infer(b.gpa, genericParamCount(sig), sig.params, arg_types, null)) |targs| {
+                    defer b.gpa.free(targs);
+                    ii = Mono.find(b.in.instances, callee_res.func, targs);
+                }
+            }
+            if (ii == null) ii = Mono.findByReifiedParams(b.in.instances, callee_res.func, arg_types);
+            const inst = ii orelse {
                 try b.note(callee_node.main_token, "unresolved generic instance in lower");
                 return .none;
             };
-            defer b.gpa.free(targs);
-            const ii = Mono.find(b.in.instances, callee_res.func, targs) orelse {
-                try b.note(callee_node.main_token, "unresolved generic instance in lower");
-                return .none;
-            };
-            callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
+            callee = .{ .kind = .user_fn, .name = b.in.instances[inst].name.? };
         } else {
             callee = b.in.names[callee_res.func];
         }

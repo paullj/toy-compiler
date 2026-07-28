@@ -1,0 +1,14 @@
+# Feature: a bare-inferred container call and its turbofish twin are the SAME
+# monomorph. `total(xs)` and `total[int](xs)` both select `total[int]`, so they dedup
+# to one codegen unit and reloc to the same symbol. Two calls of `xs.len()` (3) => 6.
+# expect: exit 6
+import std/vec
+
+fn total[T](xs: Vec[T]) -> int {
+    return xs.len()
+}
+
+fn main() -> int {
+    xs := [4, 5, 6]
+    return total(xs) + total[int](xs)
+}

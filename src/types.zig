@@ -2192,7 +2192,7 @@ pub fn bindImplParams(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, 
     defer gpa.free(bnd);
     const fp = try gpa.alloc(usize, n_gp);
     defer gpa.free(fp);
-    switch (Infer.match(n_gp, pat, recv_args, out, bnd, fp)) {
+    switch (Infer.match(n_gp, pat, recv_args, out, bnd, fp, composite.decomposer())) {
         .ok => return out,
         else => {
             gpa.free(out);
@@ -2210,11 +2210,17 @@ const DiscoveryView = struct {
     resolutions: []const Resolution,
     node_types: []const Type,
     model: *const Model,
+    composite: *Composite,
     pub fn genericTemplate(self: DiscoveryView, gid: u32) ?Mono.TemplateRef {
         if (gid >= self.model.fns.len) return null;
         const f = self.model.fns[gid];
         if (!f.isGeneric()) return null;
         return .{ .params = f.params, .count = @intCast(f.generic_params.len) };
+    }
+    /// The live-composite decomposer, so a bare container call `total(xs)` infers its
+    /// hidden type-arg here (compute regime) exactly as Pass C does.
+    pub fn decomposer(self: DiscoveryView) Infer.Decomposer {
+        return self.composite.decomposer();
     }
 };
 
@@ -2227,7 +2233,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     const mc = &t.graph.mods[mod];
     const tree = mc.tree;
     const resolutions = mc.resolutions;
-    const view = DiscoveryView{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .model = model };
+    const view = DiscoveryView{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .model = model, .composite = t.composite };
     for (tree.nodes) |n| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
         // The explicit-turbofish `id[int](..)` and bare-inferred `id(7)` shapes route

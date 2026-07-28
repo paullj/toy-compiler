@@ -140,11 +140,54 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Nod
                 if (va.int() >= view.node_types.len) return null; // pre-typecheck view
                 arg_types[k] = view.node_types[va.int()];
             }
-            const targs = (try Infer.infer(gpa, tmpl.count, tmpl.params, arg_types)) orelse return null;
+            // A composite-backed view (compute regime) exposes `decomposer()`, letting
+            // inference see through a container param (`Vec[T]`); a find-regime view
+            // (no composite) passes `null` and container calls resolve via
+            // `findByReifiedParams` instead.
+            const dec = viewDecomposer(view);
+            const targs = (try Infer.infer(gpa, tmpl.count, tmpl.params, arg_types, dec)) orelse return null;
             return .{ .gid = gid, .args = targs };
         },
         else => return null,
     }
+}
+
+/// The view's composite-backed decomposer, or `null` when it has none. A view in the
+/// COMPUTE regime (discovery) carries the live composite and declares `decomposer()`;
+/// a FIND-regime view (the fingerprint's frozen view) has no composite, so structural
+/// inference degrades to the flat rule and container calls resolve via
+/// `findByReifiedParams`. The `@hasDecl` is comptime, so only the taken branch is
+/// analyzed — a view without the decl never needs to define it.
+fn viewDecomposer(view: anytype) ?Infer.Decomposer {
+    const V = @TypeOf(view);
+    const Container = switch (@typeInfo(V)) {
+        .pointer => |p| p.child,
+        else => V,
+    };
+    if (@hasDecl(Container, "decomposer")) return view.decomposer();
+    return null;
+}
+
+/// Find the instance whose reified value-PARAMS accept the call's reified value-ARG
+/// types — the FIND-regime resolver for a bare container call `total(xs)`, where the
+/// composite table is gone (so re-inference is impossible in principle) but every
+/// instance already carries its fully-reified `params`. `Type.assignable(param, arg)`
+/// — NOT `eql` — so a `never`/`invalid` arg slot is accepted (mirroring
+/// `Infer.match`'s skip rule); for concrete types it reduces to `eql` (no coercion).
+/// Deterministic linear scan; allocation-free.
+pub fn findByReifiedParams(insts: []const Instance, gid: u32, arg_types: []const Type) ?usize {
+    for (insts, 0..) |inst, i| {
+        if (inst.template_gid != gid or inst.params.len != arg_types.len) continue;
+        var ok = true;
+        for (inst.params, arg_types) |p, a| {
+            if (!Type.assignable(p, a)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return i;
+    }
+    return null;
 }
 
 /// The index of the instance for `(gid, args)`, or null. A deterministic linear
@@ -378,6 +421,74 @@ test "mangle encodes integer width/sign distinctly" {
     try testing.expect(!std.mem.eql(u8, i8m, im));
     try testing.expect(!std.mem.eql(u8, u32m, im));
     try testing.expect(!std.mem.eql(u8, i8m, u32m));
+}
+
+/// A composite-backed view whose `decomposer()` reads a static decomposed table, so
+/// `callInstanceRef` can infer a container type-arg WITHOUT a real `Composite`.
+const FakeGenericView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolution,
+    node_types: []const Type,
+    gen_gid: u32,
+    gen_params: []const Type,
+    gen_count: u32,
+    entries: []const Infer.Decomposed,
+    fn genericTemplate(self: FakeGenericView, gid: u32) ?TemplateRef {
+        if (gid != self.gen_gid) return null;
+        return .{ .params = self.gen_params, .count = self.gen_count };
+    }
+    fn thunk(ctx: *anyopaque, ty: Type) ?Infer.Decomposed {
+        if (!ty.isApp()) return null;
+        const self: *const FakeGenericView = @ptrCast(@alignCast(ctx));
+        const idx = ty.appIdx();
+        if (idx >= self.entries.len) return null;
+        return self.entries[idx];
+    }
+    fn decomposer(self: *const FakeGenericView) Infer.Decomposer {
+        return .{ .ctx = @constCast(self), .func = thunk };
+    }
+};
+
+test "callInstanceRef infers a CONTAINER type-arg via the view's decomposer" {
+    const gpa = testing.allocator;
+    // `total(xs)`: n0=id, n1=xs(value-arg, typed Vec[int] = app(1)), n2=call.
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.Index.from(0) },
+    };
+    var extra = [_]u32{ 2, 1, 1 };
+    const tree = Ast.Tree{ .nodes = &nodes, .extra = &extra };
+    var resolutions = [_]Resolution{.unresolved} ** 3;
+    resolutions[0] = .{ .func = 5 };
+    // node_types[1] = Vec[int] = app(1).
+    const node_types = [_]Type{ Type.invalid, Type.app(1), Type.invalid };
+    const params = [_]Type{Type.app(0)}; // param Vec[T] = app(0)
+    const entries = [_]Infer.Decomposed{
+        .{ .ctor = 1, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 0: Vec[T]
+        .{ .ctor = 1, .is_enum = false, .args = &.{Type.int} }, // 1: Vec[int]
+    };
+    const view = FakeGenericView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1, .entries = &entries };
+
+    const ref = (try callInstanceRef(gpa, view, nodes[2])).?;
+    defer gpa.free(ref.args);
+    try testing.expectEqual(@as(u32, 5), ref.gid);
+    try testing.expectEqual(@as(usize, 1), ref.args.len);
+    try testing.expect(Type.eql(ref.args[0], Type.int));
+}
+
+test "findByReifiedParams matches on reified params, tolerating a never/invalid slot" {
+    const insts = [_]Instance{
+        .{ .template_gid = 3, .args = &.{Type.int}, .node_types = &.{}, .params = &.{Type.structT(7)}, .ret = Type.int, .name = "total$s7", .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 3, .args = &.{Type.bool}, .node_types = &.{}, .params = &.{ Type.structT(8), Type.int }, .ret = Type.int, .name = "pair$s8", .mod = 0, .decl_node = Ast.none },
+    };
+    // Exact reified match.
+    try testing.expectEqual(@as(?usize, 0), findByReifiedParams(&insts, 3, &.{Type.structT(7)}));
+    // Wrong gid / wrong reified param -> no match.
+    try testing.expectEqual(@as(?usize, null), findByReifiedParams(&insts, 4, &.{Type.structT(7)}));
+    try testing.expectEqual(@as(?usize, null), findByReifiedParams(&insts, 3, &.{Type.structT(9)}));
+    // A `never` arg slot is accepted via `assignable`; the concrete slot disambiguates.
+    try testing.expectEqual(@as(?usize, 1), findByReifiedParams(&insts, 3, &.{ Type.structT(8), Type.never }));
 }
 
 test "find matches on gid + args by Type.eql" {

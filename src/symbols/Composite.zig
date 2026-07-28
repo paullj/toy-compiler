@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const Type = @import("../layout/Type.zig").Type;
+const Infer = @import("Infer.zig");
 
 const Composite = @This();
 
@@ -144,7 +145,35 @@ pub fn appDepth(c: *Composite, ty: Type) u32 {
     return 1 + m;
 }
 
+/// The composite-backed `Infer.Decomposer` for the COMPUTE-regime inference sites
+/// (Pass C + discovery), where this table is live. `Composite → Infer` is the only
+/// edge (Infer never imports Composite), so no cycle. `at` is mutex-guarded, so this
+/// is safe under parallel Pass C.
+fn decomposeThunk(ctx: *anyopaque, ty: Type) ?Infer.Decomposed {
+    if (!ty.isApp()) return null;
+    const c: *Composite = @ptrCast(@alignCast(ctx));
+    const e = c.at(ty.appIdx());
+    return .{ .ctor = e.ctor, .is_enum = e.ctor_is_enum, .args = e.args };
+}
+
+pub fn decomposer(c: *Composite) Infer.Decomposer {
+    return .{ .ctx = c, .func = decomposeThunk };
+}
+
 const testing = std.testing;
+
+test "decomposer feeds Infer's structural descent: Vec[T] vs Vec[int] binds T=int" {
+    const gpa = testing.allocator;
+    var c: Composite = .{};
+    defer c.deinit(gpa);
+    const vec_t = try c.intern(gpa, 1, &.{Type.typeVar(0)}, false);
+    const vec_int = try c.intern(gpa, 1, &.{Type.int}, false);
+    const params = [_]Type{Type.app(vec_t)};
+    const args = [_]Type{Type.app(vec_int)};
+    const got = (try Infer.infer(gpa, 1, &params, &args, c.decomposer())).?;
+    defer gpa.free(got);
+    try testing.expect(Type.eql(got[0], Type.int));
+}
 
 test "intern is content-addressed: structurally-equal Apps share an index" {
     const gpa = testing.allocator;

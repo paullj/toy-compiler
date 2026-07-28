@@ -1,0 +1,14 @@
+# Feature: a type-arg that appears ONLY in a container RETURN is still uninferable
+# (T0016). `make[T]() -> Vec[T]` mentions `T` in no value parameter, so a bare
+# `make()` gives the matcher nothing to bind `T` from. Explicit `make[int]()` compiles.
+# expect: compile-error "T0016"
+import std/vec
+
+fn make[T]() -> Vec[T] {
+    return Vec[T].new()
+}
+
+fn main() -> int {
+    m := make()
+    return m.len()
+}

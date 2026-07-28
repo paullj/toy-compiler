@@ -1,0 +1,14 @@
+# Feature: a container-hidden type-arg still detects a conflict (T0015). `pair[T](a:
+# Vec[T], b: Vec[T])` binds T from BOTH container args; passing a `Vec[int]` and a
+# `Vec[bool]` unifies T against int then bool, so the call is rejected with T0015
+# naming the two argument spans.
+# expect: compile-error "T0015"
+import std/vec
+
+fn pair[T](_a: Vec[T], _b: Vec[T]) -> int { return 0 }
+
+fn main() -> int {
+    xs := [1, 2, 3]
+    ys := [true, false]
+    return pair(xs, ys)
+}

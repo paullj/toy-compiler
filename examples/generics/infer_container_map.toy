@@ -1,0 +1,17 @@
+# Feature: a multi-parameter container infers ALL its type args at once. `keys[K,V](m:
+# Map[K,V])` mentions both `K` and `V` only under `Map[..]`; a bare `keys(m)` unifies
+# `Map[K,V]` against the arg's `Map[str,int]` and binds `K = str`, `V = int` in one
+# structural descent. Returns the entry count (2).
+# expect: exit 2
+import std/map
+
+fn count[K, V](m: Map[K, V]) -> int {
+    return m.len()
+}
+
+fn main() -> int {
+    m := Map[str, int].new()
+    m.set("a", 1)
+    m.set("b", 2)
+    return count(m)
+}

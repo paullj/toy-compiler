@@ -177,7 +177,7 @@ const Frozen = struct {
     pub fn genericTemplate(self: *const Frozen, gid: u32) ?Mono.TemplateRef {
         if (gid >= self.sigs.len) return null;
         const sig = self.sigs[gid];
-        if (!sig.hasTypeVar()) return null;
+        if (!sig.isGenericTemplate()) return null;
         return .{ .params = sig.params, .count = sig.genericParamCount() };
     }
 };

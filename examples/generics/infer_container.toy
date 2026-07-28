@@ -1,0 +1,16 @@
+# Feature: a type parameter that appears ONLY inside a container parameter is
+# inferred from the call argument, with no turbofish. `total[T](xs: Vec[T])` mentions
+# `T` only under `Vec[..]`; a bare `total(xs)` unifies the param `Vec[T]` against the
+# arg's `Vec[int]` and binds `T = int`. The inferred call selects the SAME monomorph
+# `total[int]` the turbofish would, so `xs.len()` (3) * 3 = 9.
+# expect: exit 9
+import std/vec
+
+fn total[T](xs: Vec[T]) -> int {
+    return xs.len()
+}
+
+fn main() -> int {
+    xs := [4, 5, 6]
+    return total(xs) * 3
+}

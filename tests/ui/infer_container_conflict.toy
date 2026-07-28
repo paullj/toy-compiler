@@ -1,0 +1,7 @@
+struct Wrap[T] { v: T }
+fn pair[T](_a: Wrap[T], _b: Wrap[T]) -> int { return 0 }
+fn main() -> int {
+  a := Wrap[int]{ v: 1 }
+  b := Wrap[bool]{ v: true }
+  return pair(a, b)  #~ ERROR [T0015] conflicting types for type parameter
+}
