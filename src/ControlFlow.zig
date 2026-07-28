@@ -326,18 +326,22 @@ pub fn orCoversType(ctx: Ctx, or_idx: Ast.Index, ty: Type) bool {
 
 const testing = std.testing;
 
-const Builder = struct {
+/// Test-support AST builder: appends nodes/extra by hand and hands back indices,
+/// pinning the exact node graph a walk sees without parsing. `pub` because
+/// `BodyChecker`'s in-file `Lint` tests reuse it to exercise the flow-lint walks
+/// (which consume `stmtDiverges` here) against the same hand-built graphs.
+pub const Builder = struct {
     nodes: std.ArrayList(Ast.Node) = .empty,
     extra: std.ArrayList(u32) = .empty,
     resolutions: std.ArrayList(Resolution) = .empty,
     node_types: std.ArrayList(Type) = .empty,
     gpa: std.mem.Allocator,
 
-    fn init(gpa: std.mem.Allocator) Builder {
+    pub fn init(gpa: std.mem.Allocator) Builder {
         return .{ .gpa = gpa };
     }
 
-    fn deinit(b: *Builder) void {
+    pub fn deinit(b: *Builder) void {
         b.nodes.deinit(b.gpa);
         b.extra.deinit(b.gpa);
         b.resolutions.deinit(b.gpa);
@@ -346,7 +350,7 @@ const Builder = struct {
 
     /// Append a node; also grow the parallel `resolutions`/`node_types` arrays so
     /// every node index is addressable. Returns the new node's index.
-    fn add(b: *Builder, node: Ast.Node) !Ast.Index {
+    pub fn add(b: *Builder, node: Ast.Node) !Ast.Index {
         const idx = Ast.Index.from(@intCast(b.nodes.items.len));
         try b.nodes.append(b.gpa, node);
         try b.resolutions.append(b.gpa, .unresolved);
@@ -357,7 +361,7 @@ const Builder = struct {
     /// Append a `{start, len}` range header over `items`, returning the header
     /// cell as an `Ast.Index` (what a `Node`'s lhs/rhs stores). The `Index` run is
     /// written into the `[]u32` `extra` verbatim (layout-identical).
-    fn range(b: *Builder, items: []const Ast.Index) !Ast.Index {
+    pub fn range(b: *Builder, items: []const Ast.Index) !Ast.Index {
         const start: u32 = @intCast(b.extra.items.len);
         const cells: []const u32 = @ptrCast(items);
         try b.extra.appendSlice(b.gpa, cells);
@@ -368,39 +372,39 @@ const Builder = struct {
     }
 
     /// Append a 2-cell header `{a, b}` (if/for/arm), returning its index.
-    fn pair(b: *Builder, a: Ast.Index, c: Ast.Index) !Ast.Index {
+    pub fn pair(b: *Builder, a: Ast.Index, c: Ast.Index) !Ast.Index {
         const header: u32 = @intCast(b.extra.items.len);
         try b.extra.append(b.gpa, a.int());
         try b.extra.append(b.gpa, c.int());
         return Ast.Index.from(header);
     }
 
-    fn block(b: *Builder, stmts: []const Ast.Index) !Ast.Index {
+    pub fn block(b: *Builder, stmts: []const Ast.Index) !Ast.Index {
         const r = try b.range(stmts);
         return b.add(.{ .tag = .block, .main_token = 0, .lhs = r, .rhs = Ast.none });
     }
 
-    fn ret(b: *Builder) !Ast.Index {
+    pub fn ret(b: *Builder) !Ast.Index {
         return b.add(.{ .tag = .return_stmt, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     }
 
     /// A bare `break` (no label): `resolutions[idx]` left `.unresolved`.
-    fn breakBare(b: *Builder) !Ast.Index {
+    pub fn breakBare(b: *Builder) !Ast.Index {
         return b.add(.{ .tag = .break_stmt, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     }
 
     /// A labeled `break @target`: resolves to `target`'s inner construct node.
-    fn breakTo(b: *Builder, target: Ast.Index) !Ast.Index {
+    pub fn breakTo(b: *Builder, target: Ast.Index) !Ast.Index {
         const idx = try b.add(.{ .tag = .break_stmt, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
         b.resolutions.items[idx.int()] = .{ .label = target };
         return idx;
     }
 
-    fn loopOf(b: *Builder, body: Ast.Index) !Ast.Index {
+    pub fn loopOf(b: *Builder, body: Ast.Index) !Ast.Index {
         return b.add(.{ .tag = .loop_expr, .main_token = 0, .lhs = body, .rhs = Ast.none });
     }
 
-    fn ctx(b: *Builder) Ctx {
+    pub fn ctx(b: *Builder) Ctx {
         return .{
             .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },
             .resolutions = b.resolutions.items,

@@ -129,6 +129,81 @@ fn familyName(fam: LayoutEngine.NativeEnumFamily) []const u8 {
     };
 }
 
+/// Reachability + must-use lint DECISIONS as pure functions over a read-only cursor,
+/// mirroring `ControlFlow`. Kept beside the divergence walks they consume; the emitting
+/// `BodyChecker.warn*` methods are thin shims that build a `Ctx`, call these, and render
+/// the diagnostic — so the decision logic is unit-tested here without a `DiagnosticSink`.
+const Lint = struct {
+    /// What the lints read: `ControlFlow.Ctx` (divergence is delegated through it so the
+    /// two coverage paths cannot drift) plus the fn table the panic gate needs. A
+    /// by-value struct-of-slices, allocation-free, built once per block.
+    const Ctx = struct {
+        flow: ControlFlow.Ctx,
+        fns: []const FnSym,
+
+        fn fromChecker(bc: anytype) Ctx {
+            return .{ .flow = ControlFlow.Ctx.fromChecker(bc), .fns = bc.model.fns };
+        }
+    };
+
+    /// Index into `stmts` of the first statement made unreachable by a preceding always-
+    /// diverging statement, or null. (Emit side: W0005, at most once per block.)
+    fn firstUnreachable(ctx: Ctx, stmts: []const Ast.Index) ?usize {
+        if (stmts.len < 2) return null;
+        for (stmts[0 .. stmts.len - 1], 1..) |s, next| {
+            if (divergesForReach(ctx, s)) return next;
+        }
+        return null;
+    }
+
+    /// Whether `stmt_idx` always transfers control away, so a following statement in the
+    /// same block cannot run. `ControlFlow.stmtDiverges` is the shared authority; it is
+    /// NOT modified here. The `never` clause additionally catches a `var_decl` bound to a
+    /// diverging value (`x := loop {}`), which `stmtDiverges` leaves `false`, and
+    /// `panic(..)` — a `unit`-typed builtin call no type-based test can see — is caught
+    /// structurally.
+    fn divergesForReach(ctx: Ctx, stmt_idx: Ast.Index) bool {
+        if (ControlFlow.stmtDiverges(ctx.flow, stmt_idx)) return true;
+        if (ctx.flow.node_types[stmt_idx.int()].kind == .never) return true;
+        return stmtIsPanic(ctx, stmt_idx);
+    }
+
+    /// Whether `stmt_idx` is a bare `panic(..)` call statement. Gated on BOTH the seeded
+    /// builtin kind and the name so a user-declared `fn panic` (a `.user_fn`) never fires.
+    fn stmtIsPanic(ctx: Ctx, stmt_idx: Ast.Index) bool {
+        const tree = ctx.flow.tree;
+        const s = tree.nodes[stmt_idx.int()];
+        if (s.tag != .expr_stmt) return false;
+        const inner = tree.nodes[s.lhs.int()];
+        if (inner.tag != .call) return false;
+        const callee = tree.nodes[inner.lhs.int()];
+        if (callee.tag != .identifier) return false;
+        if (ctx.flow.resolutions[inner.lhs.int()] != .func) return false;
+        const f = ctx.fns[ctx.flow.resolutions[inner.lhs.int()].func];
+        return f.kind == .builtin and std.mem.eql(u8, ctx.flow.tokens[callee.main_token].text(ctx.flow.source), "panic");
+    }
+
+    /// The literal-bool condition token to warn on (a bare `true`/`false`), or null.
+    /// (Emit side: W0007.) Reads only the tree, so it takes it directly.
+    fn constIfCond(tree: Ast.Tree, cond: Ast.Index) ?u32 {
+        const node = tree.nodes[cond.int()];
+        if (node.tag != .literal_bool) return null;
+        return node.main_token;
+    }
+
+    /// The must-use family name to warn about for a dropped expression-statement value,
+    /// or null to stay silent. Split from the intern-table lookup (`optResultFamily`) so
+    /// the poison-suppression + family gate is testable without a `Composite`. A poison
+    /// return type checks the body in statement context, so a trailing value the author
+    /// meant to RETURN reaches the drop check as a "dropped" value; suppress it to avoid
+    /// stacking a spurious drop warning on the already-reported type error.
+    fn droppedMustUseName(cur_ret: Type, fam: LayoutEngine.NativeEnumFamily) ?[]const u8 {
+        if (cur_ret.kind == .invalid) return null;
+        if (fam == .none) return null;
+        return familyName(fam);
+    }
+};
+
 /// Per-function checking context over a FROZEN `*const Model`. Holds the per-fn
 /// scratch (slot_types/cur_ret/loop_stack/expected) and the cursor (tree/tokens/
 /// source/resolutions/node_types/graph_mod) — all set once at construction from
@@ -286,6 +361,10 @@ pub const BodyChecker = struct {
         return ControlFlow.Ctx.fromChecker(bc);
     }
 
+    fn lint(bc: *const BodyChecker) Lint.Ctx {
+        return Lint.Ctx.fromChecker(bc);
+    }
+
     fn blockReturns(bc: *const BodyChecker, block_idx: Ast.Index) bool {
         return ControlFlow.blockReturns(bc.cflow(), block_idx);
     }
@@ -360,13 +439,9 @@ pub const BodyChecker = struct {
     /// emits a diagnostic, so it never perturbs the definite-return / fall-off logic
     /// nor the emitted machine code. At most one W0005 per block (no cascade).
     fn warnUnreachable(bc: *BodyChecker, stmts: []const Ast.Index) error{OutOfMemory}!void {
-        if (stmts.len < 2) return;
-        for (stmts[0 .. stmts.len - 1], 1..) |s, next| {
-            if (!bc.divergesForReach(s)) continue;
-            const dead_tok = bc.tree.nodes[(stmts[next]).int()].main_token;
-            try bc.sink.emitFmtCode(.W0005, bc.byteOf(dead_tok), "unreachable code; the previous statement always diverges", .{});
-            return;
-        }
+        const dead = Lint.firstUnreachable(bc.lint(), stmts) orelse return;
+        const dead_tok = bc.tree.nodes[(stmts[dead]).int()].main_token;
+        try bc.sink.emitFmtCode(.W0005, bc.byteOf(dead_tok), "unreachable code; the previous statement always diverges", .{});
     }
 
     /// Emit W0008 when a discarded expression statement's value is an `Option`/`Result`.
@@ -376,41 +451,9 @@ pub const BodyChecker = struct {
     /// already-memoized value type and never perturbs typing, the value-if path, or the
     /// emitted machine code.
     fn warnDroppedMustUse(bc: *BodyChecker, stmt_idx: Ast.Index, vt: Type) error{OutOfMemory}!void {
-        // A poison return type checks the body in statement context, so a trailing
-        // value the author meant to RETURN reaches here as a "dropped" value; skip it
-        // to avoid a spurious drop warning stacked on the already-reported type error.
-        if (bc.cur_ret.kind == .invalid) return;
-        const fam = bc.optResultFamily(vt);
-        if (fam == .none) return;
+        const name = Lint.droppedMustUseName(bc.cur_ret, bc.optResultFamily(vt)) orelse return;
         const tok = bc.tree.nodes[(stmt_idx).int()].main_token;
-        try bc.sink.emitFmtCode(.W0008, bc.byteOf(tok), "unused {s} value; handle it, bind it with ':=', or propagate with '?'", .{familyName(fam)});
-    }
-
-    /// Whether `stmt_idx` always transfers control away, so a following statement in the
-    /// same block cannot run. `stmtDiverges` is the shared control-flow authority
-    /// (return/break/continue/if-both/loop-no-break/exhaustive-match); it is NOT modified
-    /// here. The `never` clause additionally catches a `var_decl` bound to a diverging
-    /// value (`x := loop {}`), which `stmtDiverges` leaves as `false`. `panic(..)` is a
-    /// `unit`-typed builtin call that no type-based test can see, so it is detected
-    /// structurally.
-    fn divergesForReach(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
-        if (bc.stmtDiverges(stmt_idx)) return true;
-        if (bc.node_types[(stmt_idx).int()].kind == .never) return true;
-        return bc.stmtIsPanic(stmt_idx);
-    }
-
-    /// Whether `stmt_idx` is a bare `panic(..)` call statement. Gated on both the seeded
-    /// builtin kind and the name so a user-declared `fn panic` (a `.user_fn`) never fires.
-    fn stmtIsPanic(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
-        const s = bc.tree.nodes[(stmt_idx).int()];
-        if (s.tag != .expr_stmt) return false;
-        const inner = bc.tree.nodes[(s.lhs).int()];
-        if (inner.tag != .call) return false;
-        const callee = bc.tree.nodes[(inner.lhs).int()];
-        if (callee.tag != .identifier) return false;
-        if (bc.resolutions[(inner.lhs).int()] != .func) return false;
-        const f = bc.model.fns[bc.resolutions[(inner.lhs).int()].func];
-        return f.kind == .builtin and std.mem.eql(u8, bc.nameText(callee.main_token), "panic");
+        try bc.sink.emitFmtCode(.W0008, bc.byteOf(tok), "unused {s} value; handle it, bind it with ':=', or propagate with '?'", .{name});
     }
 
     fn checkStmt(bc: *BodyChecker, stmt_idx: Ast.Index) error{OutOfMemory}!void {
@@ -1782,9 +1825,8 @@ pub const BodyChecker = struct {
     // message argument is the source literal (constant per site, never instance-varying),
     // so per-generic-instance rechecks dedup on scope+offset+code+message.
     fn warnConstIfCond(bc: *BodyChecker, cond: Ast.Index) error{OutOfMemory}!void {
-        const node = bc.tree.nodes[cond.int()];
-        if (node.tag != .literal_bool) return;
-        try bc.sink.emitFmtCode(.W0007, bc.byteOf(node.main_token), "if condition is always {s}", .{bc.nameText(node.main_token)});
+        const tok = Lint.constIfCond(bc.tree, cond) orelse return;
+        try bc.sink.emitFmtCode(.W0007, bc.byteOf(tok), "if condition is always {s}", .{bc.nameText(tok)});
     }
 
     fn typeOfLoop(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, label: ?[]const u8) error{OutOfMemory}!Type {
@@ -3363,3 +3405,106 @@ pub const BodyChecker = struct {
         return &bc.model.graph.mods[bc.graph_mod].alias_ids;
     }
 };
+
+// The flow-lint decision logic lives in the `Lint` namespace as pure functions over a
+// read-only `Lint.Ctx`, so it is unit-tested here on hand-built node graphs (the same
+// idiom `ControlFlow` uses) without standing up a whole `BodyChecker` + `DiagnosticSink`.
+// The `Builder` is reused from `ControlFlow` — the module whose walks `Lint` consumes.
+const testing = std.testing;
+const Builder = @import("ControlFlow.zig").Builder;
+
+test "Lint.stmtIsPanic fires only on the builtin panic call" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // panic()  ==  expr_stmt(call(identifier))
+    const callee = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const call = try b.add(.{ .tag = .call, .main_token = 0, .lhs = callee, .rhs = Ast.none });
+    const stmt = try b.add(.{ .tag = .expr_stmt, .main_token = 0, .lhs = call, .rhs = Ast.none });
+    b.resolutions.items[callee.int()] = .{ .func = 0 };
+    const bare = try b.ret();
+
+    // Build a Lint.Ctx literally so tokens + the fn table can be injected (Builder.ctx
+    // supplies neither). token[0] is the callee name spelled by `src`.
+    const mk = struct {
+        fn ctx(bb: *Builder, toks: []const Token, src: []const u8, fns: []const FnSym) Lint.Ctx {
+            return .{ .flow = .{
+                .tree = .{ .nodes = bb.nodes.items, .extra = bb.extra.items },
+                .resolutions = bb.resolutions.items,
+                .node_types = bb.node_types.items,
+                .enums = &.{},
+                .tokens = toks,
+                .source = src,
+            }, .fns = fns };
+        }
+    }.ctx;
+
+    const panic_toks = [_]Token{.{ .tag = .identifier, .start = 0, .end = 5 }};
+    const builtin_fns = [_]FnSym{.{ .decl_node = Ast.none, .kind = .builtin, .params = &.{}, .ret = .unit }};
+    const user_fns = [_]FnSym{.{ .decl_node = Ast.none, .kind = .user_fn, .params = &.{}, .ret = .unit }};
+
+    // Builtin kind + name "panic" → fires.
+    try testing.expect(Lint.stmtIsPanic(mk(&b, &panic_toks, "panic", &builtin_fns), stmt));
+    // Same spelling but resolving to a user fn → not the builtin panic.
+    try testing.expect(!Lint.stmtIsPanic(mk(&b, &panic_toks, "panic", &user_fns), stmt));
+    // Builtin kind but a different name ("print") → the name gate rejects it.
+    try testing.expect(!Lint.stmtIsPanic(mk(&b, &panic_toks, "print", &builtin_fns), stmt));
+    // A non-call statement never matches.
+    try testing.expect(!Lint.stmtIsPanic(mk(&b, &panic_toks, "panic", &builtin_fns), bare));
+}
+
+test "Lint.divergesForReach unions control-flow divergence, never-typed, and panic" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // loop { return } — diverges via ControlFlow.stmtDiverges.
+    const ret_loop = try b.loopOf(try b.block(&.{try b.ret()}));
+    // A `var_decl` bound to a diverging value is `never`-typed (`x := loop {}`).
+    const never_stmt = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    b.node_types.items[never_stmt.int()] = Type.never;
+    // A plain declaration falls through.
+    const plain = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+
+    const c = Lint.Ctx{ .flow = b.ctx(), .fns = &.{} };
+    try testing.expect(Lint.divergesForReach(c, ret_loop));
+    try testing.expect(Lint.divergesForReach(c, never_stmt));
+    try testing.expect(!Lint.divergesForReach(c, plain));
+}
+
+test "Lint.firstUnreachable returns the first dead index, or null when nothing follows a divergence" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    const ret_loop = try b.loopOf(try b.block(&.{try b.ret()}));
+    const p1 = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const p2 = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+
+    const c = Lint.Ctx{ .flow = b.ctx(), .fns = &.{} };
+    // [diverge, dead, dead] → first unreachable at index 1 (reported once).
+    try testing.expectEqual(@as(?usize, 1), Lint.firstUnreachable(c, &.{ ret_loop, p1, p2 }));
+    // Nothing follows the divergence, or there is no divergence → null.
+    try testing.expectEqual(@as(?usize, null), Lint.firstUnreachable(c, &.{ p1, ret_loop }));
+    try testing.expectEqual(@as(?usize, null), Lint.firstUnreachable(c, &.{p1}));
+    try testing.expectEqual(@as(?usize, null), Lint.firstUnreachable(c, &.{}));
+}
+
+test "Lint.constIfCond returns the token only for a bare literal-bool condition" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    const lit = try b.add(.{ .tag = .literal_bool, .main_token = 7, .lhs = Ast.none, .rhs = Ast.none });
+    const id = try b.add(.{ .tag = .identifier, .main_token = 3, .lhs = Ast.none, .rhs = Ast.none });
+    const tree: Ast.Tree = .{ .nodes = b.nodes.items, .extra = b.extra.items };
+
+    try testing.expectEqual(@as(?u32, 7), Lint.constIfCond(tree, lit));
+    try testing.expectEqual(@as(?u32, null), Lint.constIfCond(tree, id));
+}
+
+test "Lint.droppedMustUseName suppresses poison and non-must-use, else names the family" {
+    // A poison return type suppresses the drop warning (avoids stacking on a real error).
+    try testing.expect(Lint.droppedMustUseName(.invalid, .option) == null);
+    // A non-Option/Result value is never a must-use.
+    try testing.expect(Lint.droppedMustUseName(.unit, .none) == null);
+    try testing.expectEqualStrings("Option", Lint.droppedMustUseName(.unit, .option).?);
+    try testing.expectEqualStrings("Result", Lint.droppedMustUseName(.unit, .result).?);
+}
