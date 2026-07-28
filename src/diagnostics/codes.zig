@@ -99,6 +99,7 @@ pub const Code = enum(u16) {
     W0004, // unused-import
     W0005, // unreachable-code
     W0006, // unreachable-match-arm
+    W0007, // constant-condition
 
     _,
 };
@@ -187,6 +188,7 @@ pub const table = [_]Entry{
     .{ .code = .W0004, .str = "W0004", .slug = "unused-import", .default_severity = .warning },
     .{ .code = .W0005, .str = "W0005", .slug = "unreachable-code", .default_severity = .warning },
     .{ .code = .W0006, .str = "W0006", .slug = "unreachable-match-arm", .default_severity = .warning },
+    .{ .code = .W0007, .str = "W0007", .slug = "constant-condition", .default_severity = .warning },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -413,6 +415,12 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("unreachable-match-arm", slug(.W0006).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0006));
     try testing.expectEqual(Code.W0006, fromStr("W0006").?);
+
+    // Constant-condition warning code — sibling of W0001..W0006, also .warning by default.
+    try testing.expectEqualStrings("W0007", str(.W0007).?);
+    try testing.expectEqualStrings("constant-condition", slug(.W0007).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0007));
+    try testing.expectEqual(Code.W0007, fromStr("W0007").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

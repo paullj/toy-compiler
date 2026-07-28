@@ -2147,6 +2147,141 @@ test "`--allow W0006` silences the unreachable-match-arm warning (exit 0)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
+// The constant-condition warning: an `if` whose condition is a bare `true`/`false`
+// literal (one branch is dead). It must warn W0007 and NOT fail the check (exit 0), be
+// promoted by `--deny-warnings`, and be silenced by `--allow W0007`. Only a DIRECT
+// literal-bool condition warns — a real condition and a `while true` do not.
+const const_if_true_fixture = "fn main() -> int {\n  if true { return 1 } else { return 2 }\n}\n";
+const const_if_false_fixture = "fn main() -> int {\n  if false { return 1 } else { return 2 }\n}\n";
+
+test "`toy check` renders W0007 for `if true` and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-true";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, const_if_true_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0007]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "if condition is always true") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` renders W0007 for `if false` naming the value" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-false";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, const_if_false_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0007]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "if condition is always false") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// A value-position `if` (an `x := if .. {} else {}`) with a literal-bool condition warns
+// through the same helper at the value-if site.
+test "`toy check` renders W0007 for a value-if with a literal condition" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-value";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn main() -> int {\n  x := if true { 1 } else { 2 }\n  return x\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0007]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// A real (non-literal) condition must never warn.
+test "`toy check` does not flag a real if condition" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-real";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn f(n: int) -> int {\n  if n > 0 { return 1 } else { return 2 }\n}\nfn main() -> int { return f(1) }\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0007") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// `while true` is a separate construct (a deliberate infinite loop): out of scope.
+test "`toy check` does not flag a `while true` loop" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-while";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src = "fn main() -> int {\n  while true { break }\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0007") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check --deny-warnings` promotes W0007 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, const_if_true_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0007]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0007` silences the constant-condition warning (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0007-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, const_if_true_fixture, &.{ "check", "--allow", "W0007" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0007") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

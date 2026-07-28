@@ -393,6 +393,7 @@ pub const BodyChecker = struct {
                 const ct = try bc.typeOf(stmt.lhs);
                 if (ct.kind != .invalid and ct.kind != .bool)
                     try bc.sink.emit(bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "if condition must be bool");
+                try bc.warnConstIfCond(stmt.lhs);
                 const h = Ast.ifHeaderAt(bc.tree, (stmt.rhs).int());
                 _ = try bc.checkBlock(h.then_block, false);
                 if (h.else_node != Ast.none) {
@@ -1658,6 +1659,7 @@ pub const BodyChecker = struct {
         const ct = try bc.typeOf(n.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
             try bc.sink.emit(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "if condition must be bool");
+        try bc.warnConstIfCond(n.lhs);
         const h = Ast.ifHeaderAt(bc.tree, (n.rhs).int());
         if (h.else_node == Ast.none) {
             try bc.sink.emit(bc.byteOf(n.main_token), "value-if requires else");
@@ -1675,6 +1677,16 @@ pub const BodyChecker = struct {
             else_ty = if (bc.blockDiverges(h.else_node)) Type.never else e0;
         }
         return bc.merge(n.main_token, then_ty, else_ty);
+    }
+
+    // A bare `true`/`false` literal for a condition means one branch is dead — leftover
+    // debug code or a mistake. Diagnostics-only; nothing here reaches lowering. The
+    // message argument is the source literal (constant per site, never instance-varying),
+    // so per-generic-instance rechecks dedup on scope+offset+code+message.
+    fn warnConstIfCond(bc: *BodyChecker, cond: Ast.Index) error{OutOfMemory}!void {
+        const node = bc.tree.nodes[cond.int()];
+        if (node.tag != .literal_bool) return;
+        try bc.sink.emitFmtCode(.W0007, bc.byteOf(node.main_token), "if condition is always {s}", .{bc.nameText(node.main_token)});
     }
 
     fn typeOfLoop(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, label: ?[]const u8) error{OutOfMemory}!Type {
