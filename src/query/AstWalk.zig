@@ -585,8 +585,8 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         // `callInstanceRef`, keeping every consumer's instance selection in
                         // agreement.
                         const ctag = self.frozen.tree.nodes[c.idx.int()].tag;
-                        if ((ctag == .identifier or ctag == .field_access) and sig.hasTypeVar()) {
-                            try self.foldViaInstanceRef(c.call);
+                        if ((ctag == .identifier or ctag == .field_access) and sig.isGenericTemplate()) {
+                            try self.foldBareInstance(c.call);
                             return;
                         }
                         const nm = self.frozen.names[res.func];
@@ -766,6 +766,42 @@ pub fn CallVisitor(comptime Frozen: type) type {
             const ii = Mono.find(self.frozen.instances, ref.gid, ref.args) orelse return;
             const inst = self.frozen.instances[ii];
             try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
+        }
+
+        /// Fold a bare inferred generic call to its reified INSTANCE identity. The FLAT
+        /// and turbofish shapes route through the shared `callInstanceRef` (this view
+        /// has no composite, so `callInstanceRef` returns null for a pure-container
+        /// call), keeping the flat fingerprint byte-identical. A container/mixed call
+        /// falls to the FIND-regime resolver: match the reified value-arg types against
+        /// each instance's reified `params`, so editing a bare-inferred call's chosen
+        /// instance recompiles its callers.
+        fn foldBareInstance(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
+            const call_node = self.frozen.tree.nodes[call_idx.int()];
+            if (try Mono.callInstanceRef(self.gpa, self.frozen, call_node)) |ref| {
+                defer self.gpa.free(ref.args);
+                if (Mono.find(self.frozen.instances, ref.gid, ref.args)) |ii| {
+                    const inst = self.frozen.instances[ii];
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
+                    return;
+                }
+            }
+            const bres = self.frozen.resolutions[call_node.lhs.int()];
+            if (bres != .func) return;
+            const value_args = Ast.rangeSlice(self.frozen.tree, call_node.rhs.int());
+            // Heap-allocate (not a fixed stack buffer) so a call with any arity still
+            // folds its instance-identity into the fingerprint — a silent skip on a large
+            // arg list would drop the caller's recompile dependency (stale-cache hazard).
+            // Mirrors lower.zig / Mono.callInstanceRef, which alloc the same scratch.
+            const buf = try self.gpa.alloc(Typecheck.Type, value_args.len);
+            defer self.gpa.free(buf);
+            for (value_args, 0..) |va, k| {
+                if (va.int() >= self.frozen.node_types.len) return;
+                buf[k] = self.frozen.node_types[va.int()];
+            }
+            if (Mono.findByReifiedParams(self.frozen.instances, bres.func, buf)) |ii| {
+                const inst = self.frozen.instances[ii];
+                try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
+            }
         }
     };
 }

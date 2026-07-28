@@ -1158,7 +1158,7 @@ pub const BodyChecker = struct {
                 defer bc.gpa.free(bnd);
                 const fp = try bc.gpa.alloc(usize, n_gp);
                 defer bc.gpa.free(fp);
-                switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp)) {
+                switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp, bc.composite.decomposer())) {
                     // A field-vs-field conflict is authoritative, reported at the two
                     // supplier spans — the target type never overrides it.
                     .conflict => |c| {
@@ -1479,7 +1479,7 @@ pub const BodyChecker = struct {
         defer bc.gpa.free(bnd);
         const fp = try bc.gpa.alloc(usize, n_gp);
         defer bc.gpa.free(fp);
-        switch (Infer.match(n_gp, variant.field_types, aligned, out, bnd, fp)) {
+        switch (Infer.match(n_gp, variant.field_types, aligned, out, bnd, fp, bc.composite.decomposer())) {
             // An arg-vs-arg conflict (two payload values disagree) is authoritative and
             // reported at the payload spans — the target type never overrides it.
             .conflict => |c| {
@@ -2488,7 +2488,7 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(bnd);
             const fp = try bc.gpa.alloc(usize, n_gp);
             defer bc.gpa.free(fp);
-            switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp)) {
+            switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp, bc.composite.decomposer())) {
                 .conflict => |c| {
                     // Primary = the LATER arg (source order), related = the earlier one:
                     // a stable, order-independent (symmetric `Type.eql`) span pair that is
@@ -2737,7 +2737,7 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(fp);
             const pat: []const Type = if (mf.self_type.isApp()) bc.composite.at(mf.self_type.appIdx()).args else &.{};
             var bound_ok = pat.len == e.args.len;
-            if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp)) {
+            if (bound_ok) switch (Infer.match(n_gp, pat, e.args, targs, bnd, fp, bc.composite.decomposer())) {
                 .ok => {},
                 else => bound_ok = false, // an unbound impl param: poison, no cascade
             };

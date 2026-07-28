@@ -27,6 +27,17 @@ pub const Sig = struct {
         return false;
     }
 
+    /// True when this sig is a generic template — some param is a bare `type_var`
+    /// (flat generic) OR an `.app` (a type-var hidden inside a container param like
+    /// `Vec[T]`). After reify only a template keeps `.app` params (reify rewrites every
+    /// non-generic fn's container params to a concrete `structT`), so an `.app` param
+    /// is a sound composite-free template signal. Gates the bare-inferred-call sites
+    /// that must resolve to a reified INSTANCE, not the never-lowered template symbol.
+    pub fn isGenericTemplate(sig: Sig) bool {
+        for (sig.params) |p| if (p.isTypeVar() or p.isApp()) return true;
+        return false;
+    }
+
     /// `1 + max type_var ordinal` over the sig's params — the generic-param count
     /// `Infer.infer` needs when only the template's sig (not its `FnSym`) is on hand.
     /// Equals `generic_params.len` for any call that survived Pass C (every var of a
