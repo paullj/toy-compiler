@@ -1162,9 +1162,17 @@ pub const BodyChecker = struct {
                     // A field-vs-field conflict is authoritative, reported at the two
                     // supplier spans — the target type never overrides it.
                     .conflict => |c| {
+                        // Name the clashing LEAF types (`c.prev`/`c.cur`) — a container
+                        // field clash names `int` vs `bool`, not the container ctor. An
+                        // intra-field clash (`Both[T,T]`) shares one supplier span, so
+                        // collapse to a single caret rather than double-underlining it.
                         const later = bc.tree.nodes[(supplier[c.second_pos]).int()].main_token;
-                        const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
-                        try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
+                        if (c.first_pos == c.second_pos) {
+                            try bc.sink.emitFmtCode(.T0015, bc.byteOf(later), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                        } else {
+                            const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
+                            try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                        }
                         return .invalid;
                     },
                     // Target-fill any still-open param from the expected type
@@ -1483,7 +1491,8 @@ pub const BodyChecker = struct {
             // An arg-vs-arg conflict (two payload values disagree) is authoritative and
             // reported at the payload spans — the target type never overrides it.
             .conflict => |c| {
-                try bc.sink.emitFmtCode(.T0015, bc.byteOf(vtok), "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(aligned[c.first_pos]), bc.typeName(aligned[c.second_pos]) });
+                // Name the clashing LEAF types (`c.prev`/`c.cur`), not the container ctor.
+                try bc.sink.emitFmtCode(.T0015, bc.byteOf(vtok), "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
                 return .invalid;
             },
             // Both a full arg-bind (`.ok`) and a partial/nullary bind (`.unbound`) funnel
@@ -1659,6 +1668,12 @@ pub const BodyChecker = struct {
         span_tok: u32,
     ) error{OutOfMemory}!Reconciled {
         switch (Infer.fillExpected(out, bound, exp_args)) {
+            // Unlike the leaf-carrying `match` conflict, this compares the WHOLE
+            // per-ordinal type-args (no structural descent) — a container clash here
+            // could differ at several depths at once (`Map[int,bool]` vs `Map[str,char]`
+            // has two differing leaves), so there is no single leaf to name. Spelling an
+            // `App`'s type-args is a change to the shared `typeName` accessor, out of
+            // scope for this leaf-carry fix; `arg`/`expected` render as-is.
             .conflict => |c| {
                 try bc.sink.emitFmtCode(.T0015, bc.byteOf(span_tok), "conflicting types for type parameter '{s}': {s} inferred from the value, {s} from the expected type", .{ param_names[c.ord], bc.typeName(c.arg), bc.typeName(c.expected) });
                 return .err;
@@ -2490,12 +2505,21 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(fp);
             switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp, bc.composite.decomposer())) {
                 .conflict => |c| {
+                    // Name the clashing LEAF types (`c.prev`/`c.cur`), not the whole arg:
+                    // for a container conflict the arg is `Vec[int]`/`Vec[bool]` but the real
+                    // clash is `int` vs `bool`. Spans still point at the two source args.
                     // Primary = the LATER arg (source order), related = the earlier one:
                     // a stable, order-independent (symmetric `Type.eql`) span pair that is
-                    // reproducible at `-jN`. Emitted before the poison return.
+                    // reproducible at `-jN`. An intra-arg clash (`Map[T,T]` vs `Map[int,bool]`)
+                    // has `first_pos == second_pos`, so both spans are the ONE source arg —
+                    // collapse to a single caret rather than double-underlining one token.
                     const later = bc.tree.nodes[(args[c.second_pos]).int()].main_token;
-                    const earlier = bc.tree.nodes[(args[c.first_pos]).int()].main_token;
-                    try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(arg_types[c.first_pos]), bc.typeName(arg_types[c.second_pos]) });
+                    if (c.first_pos == c.second_pos) {
+                        try bc.sink.emitFmtCode(.T0015, bc.byteOf(later), "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                    } else {
+                        const earlier = bc.tree.nodes[(args[c.first_pos]).int()].main_token;
+                        try bc.sink.emitFmtCodeRelated(.T0015, bc.byteOf(later), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                    }
                     return .invalid;
                 },
                 .unbound => |u| {

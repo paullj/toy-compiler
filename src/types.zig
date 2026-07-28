@@ -6167,7 +6167,50 @@ test "a conflicting bare call reports T0015 naming BOTH argument spans; mints no
     try testing.expect(saw != null);
     // Both spans named: the related (earlier) span is set (not the NO_RELATED sentinel).
     try testing.expect(saw.?.related != DiagnosticSink.NO_RELATED);
+    // A flat param's leaf IS the whole arg, so the message names the real types.
+    try testing.expect(std.mem.indexOf(u8, saw.?.message, "int vs bool") != null);
     // A conflicting call is rejected, so it mints no instance.
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "a container-hidden bare-call conflict names the LEAF types, not the container ctor" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Wrap[T] { v: T }
+        \\fn pair[T](_a: Wrap[T], _b: Wrap[T]) -> int { 0 }
+        \\fn main() -> int { return pair(Wrap[int]{ v: 1 }, Wrap[bool]{ v: true }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    var saw: ?DiagnosticSink.Diagnostic = null;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0015) saw = d;
+    }
+    try testing.expect(saw != null);
+    // The clash is int vs bool inside the two Wrap args, not "Wrap vs Wrap".
+    try testing.expect(std.mem.indexOf(u8, saw.?.message, "int vs bool") != null);
+    // Two distinct source args ⇒ a related (earlier) span is set.
+    try testing.expect(saw.?.related != DiagnosticSink.NO_RELATED);
+    try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "an intra-arg conflict names the LEAF types and collapses to a single caret" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Both[K, V] { x: K, y: V }
+        \\fn single[T](_m: Both[T, T]) -> int { 0 }
+        \\fn main() -> int { return single(Both[int, bool]{ x: 1, y: true }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    var saw: ?DiagnosticSink.Diagnostic = null;
+    for (c.result.diags) |d| {
+        if (d.code == codes.Code.T0015) saw = d;
+    }
+    try testing.expect(saw != null);
+    try testing.expect(std.mem.indexOf(u8, saw.?.message, "int vs bool") != null);
+    // One source arg ⇒ a single caret, no self-referential "previously defined here".
+    try testing.expect(saw.?.related == DiagnosticSink.NO_RELATED);
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
 }
 

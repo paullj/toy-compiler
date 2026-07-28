@@ -1,0 +1,6 @@
+struct Both[K, V] { x: K, y: V }
+fn single[T](_m: Both[T, T]) -> int { return 0 }
+fn main() -> int {
+  m := Both[int, bool]{ x: 1, y: true }
+  return single(m)  #~ ERROR [T0015] conflicting types for type parameter 'T': int vs bool
+}

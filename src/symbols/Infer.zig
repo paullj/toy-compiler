@@ -25,8 +25,11 @@ const Type = @import("../layout/Type.zig").Type;
 pub const Outcome = union(enum) {
     ok,
     /// Type-var `ord` was bound at `first_pos` then matched a different type at
-    /// `second_pos` (always the later index; symmetric via `Type.eql`).
-    conflict: struct { ord: u32, first_pos: usize, second_pos: usize },
+    /// `second_pos` (always the later index; symmetric via `Type.eql`). `prev`/`cur`
+    /// are the two clashing LEAF types — the descended element leaves for a
+    /// container clash (e.g. `int` vs `bool` inside `Vec[int]`/`Vec[bool]`), NOT the
+    /// whole `Vec[..]` — so callers name the real conflict, not the container ctor.
+    conflict: struct { ord: u32, first_pos: usize, second_pos: usize, prev: Type, cur: Type },
     /// Type-var `ord` was never bound by any param (return-only / uninferable).
     unbound: struct { ord: u32 },
 };
@@ -100,7 +103,7 @@ fn unifyOne(p: Type, a: Type, pos: usize, gpc: u32, out: []Type, bound: []bool, 
             bound[ord] = true;
             first_pos[ord] = pos;
         } else if (!Type.eql(out[ord], a)) {
-            return .{ .conflict = .{ .ord = ord, .first_pos = first_pos[ord], .second_pos = pos } };
+            return .{ .conflict = .{ .ord = ord, .first_pos = first_pos[ord], .second_pos = pos, .prev = out[ord], .cur = a } };
         }
         return .ok;
     }
@@ -243,6 +246,9 @@ test "conflict returns BOTH source positions" {
             try testing.expectEqual(@as(u32, 0), c.ord);
             try testing.expectEqual(@as(usize, 0), c.first_pos);
             try testing.expectEqual(@as(usize, 1), c.second_pos);
+            // For a flat param the leaf IS the whole arg.
+            try testing.expect(Type.eql(c.prev, Type.int));
+            try testing.expect(Type.eql(c.cur, Type.@"bool"));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -347,6 +353,9 @@ test "structural: [Vec[T],Vec[T]] vs [Vec[int],Vec[bool]] conflicts at the two S
             try testing.expectEqual(@as(u32, 0), c.ord);
             try testing.expectEqual(@as(usize, 0), c.first_pos);
             try testing.expectEqual(@as(usize, 1), c.second_pos);
+            // The clashing LEAF types are the descended container elements, not `Vec[..]`.
+            try testing.expect(Type.eql(c.prev, Type.int));
+            try testing.expect(Type.eql(c.cur, Type.@"bool"));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -360,6 +369,8 @@ test "structural: intra-arg conflict [Map[T,T]] vs [Map[int,bool]] carets the si
             // Both positions are the single source arg (no synthetic sub-arg spans).
             try testing.expectEqual(@as(usize, 0), c.first_pos);
             try testing.expectEqual(@as(usize, 0), c.second_pos);
+            try testing.expect(Type.eql(c.prev, Type.int));
+            try testing.expect(Type.eql(c.cur, Type.@"bool"));
         },
         else => return error.TestUnexpectedResult,
     }
