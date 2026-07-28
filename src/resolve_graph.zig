@@ -129,6 +129,12 @@ const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: 
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
 
+/// One active block's dead-store state: a local's slot -> the name token of the last
+/// straight-line write to it with no read since. `AutoHashMap` (not an array map) because
+/// it is only ever point-queried (get/put/remove/clear), never iterated, so it cannot
+/// affect emission order.
+const PendingMap = std.AutoHashMapUnmanaged(u32, u32);
+
 const GraphResolve = struct {
     gpa: std.mem.Allocator,
     graph: *const Graph.Graph,
@@ -147,6 +153,11 @@ const GraphResolve = struct {
     locals: std.ArrayList(Local) = .empty,
     slot_next: u32 = 0,
     label_stack: std.ArrayList(LabelEntry) = .empty,
+    /// Per-active-block dead-store state: one `PendingMap` per block currently on the
+    /// resolve stack. Pushed/popped by `resolveBlock` (always balanced, so it is empty at
+    /// every fn boundary); any residue is freed at teardown. Never iterated — only
+    /// point-ops — so it cannot perturb the source-ordered emission the sink sorts by.
+    dead_pending: std.ArrayList(PendingMap) = .empty,
 
     fn tree(g: *GraphResolve, mod: u32) Ast.Tree {
         const m = &g.graph.modules[mod];
@@ -622,10 +633,69 @@ fn resolveTypeRef(g: *GraphResolve, type_idx: Ast.Index) error{OutOfMemory}!void
 fn resolveBlock(g: *GraphResolve, block_idx: Ast.Index) error{OutOfMemory}!void {
     const block = g.nodes()[block_idx.int()];
     try g.pushScope();
+    try g.dead_pending.append(g.gpa, .empty);
     for (Ast.rangeSlice(g.tree(g.cur_mod), block.lhs.int())) |stmt_idx| {
-        try g.resolveStmt(stmt_idx);
+        try g.resolveStmt(stmt_idx); // resolves + taps this statement's reads (all levels)
+        try g.deadStoreStep(stmt_idx); // then classify the WRITE / FLUSH
     }
+    var m = g.dead_pending.pop().?;
+    m.deinit(g.gpa);
     g.popScope();
+}
+
+/// Dead-store classification for one just-resolved statement of the current block. Runs
+/// AFTER `resolveStmt`, so a `var_decl`/`assign` RHS has already tapped its reads (making
+/// `x = x + 1` self-clear). A control-flow statement flushes the block's pending map: a
+/// branch/loop could observe any pending value on some path, so flushing is the zero-FP-
+/// safe default. `else ⇒ flush` catches every dedicated CF tag and any future statement.
+fn deadStoreStep(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
+    const top = &g.dead_pending.items[g.dead_pending.items.len - 1];
+    const stmt = g.nodes()[stmt_idx.int()];
+    switch (stmt.tag) {
+        .var_decl => {
+            const r = g.resolutions[g.cur_mod][stmt_idx.int()];
+            if (r == .local) try g.deadStoreWrite(top, r.local, stmt.main_token);
+        },
+        .assign => {
+            const target = g.nodes()[stmt.lhs.int()];
+            // A place target (`p.x`, `p.0`, `*r`) stores through a base, not into a bare
+            // slot — field/element deadness is out of scope, and its reads were tapped.
+            if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .unary) return;
+            const r = g.resolutions[g.cur_mod][stmt.lhs.int()];
+            if (r == .local) try g.deadStoreWrite(top, r.local, target.main_token);
+        },
+        // A bare expression statement is straight-line UNLESS it wraps a control-flow
+        // expression (a bare `match`/`loop`/`if`/block/`unsafe`/labeled reaches statement
+        // position wrapped in an `expr_stmt`); those flush.
+        .expr_stmt => if (isCfExpr(g.nodes()[stmt.lhs.int()].tag)) top.clearRetainingCapacity(),
+        // Every other statement — `if`/`while`/`for`/`for_in`/`break`/`continue`/`return`,
+        // an unanalyzable `error_node`, and any future statement tag — flushes (the safe
+        // default): pending must never survive across a statement we cannot reason about.
+        else => top.clearRetainingCapacity(),
+    }
+}
+
+/// Arm a write to `slot`. If a straight-line write to it is already pending (no read
+/// since), that earlier write is dead → emit W0010 on it (single caret at the dead
+/// write's name — plain `emit`, since the secondary-label channel spells "previously
+/// defined here", wrong for a store). A leading `_` on the name silences, mirroring the
+/// unused-variable convention (the binding's one name spells the same at both writes).
+fn deadStoreWrite(g: *GraphResolve, top: *PendingMap, slot: u32, name_tok: u32) error{OutOfMemory}!void {
+    if (top.get(slot)) |dead_tok| {
+        const nm = g.nameText(dead_tok);
+        if (!(nm.len != 0 and nm[0] == '_'))
+            try g.emit(.W0010, g.cur_mod, g.tokens()[dead_tok].start, "dead store to '{s}'; the value is never read before it is overwritten", .{nm});
+    }
+    try top.put(g.gpa, slot, name_tok);
+}
+
+/// Whether a node reaching statement position inside an `expr_stmt` is a control-flow
+/// expression (so the block's pending dead-store writes must flush).
+fn isCfExpr(tag: Ast.Node.Tag) bool {
+    return switch (tag) {
+        .match_expr, .loop_expr, .if_stmt, .block, .labeled, .unsafe_block => true,
+        else => false,
+    };
 }
 
 fn resolveStmt(g: *GraphResolve, stmt_idx: Ast.Index) error{OutOfMemory}!void {
@@ -723,6 +793,15 @@ fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         .identifier => {
             const resn = g.lookupName(n.main_token);
             g.res(node_idx, resn);
+            // Dead-store read-tap. A value-read of a local keeps any pending straight-line
+            // write to that slot live. This is the ONE point every local READ resolves, so
+            // tapping here cannot miss a read — and a bare-assign target (resolved via
+            // `lookupName` in `resolveStmt`) and a `var_decl` name (via `declare`) never
+            // reach this arm, so a WRITE is never mistaken for a read. Clear at EVERY active
+            // block level so a read nested arbitrarily deep still keeps an outer write live.
+            if (resn == .local) {
+                for (g.dead_pending.items) |*m| _ = m.remove(resn.local);
+            }
             if (resn == .unresolved) {
                 if (g.tables[g.cur_mod].structs.contains(g.nameText(n.main_token))) return;
                 if (g.tables[g.cur_mod].enums.contains(g.nameText(n.main_token))) return;
@@ -1361,6 +1440,8 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         g.scopes.deinit(gpa);
         g.locals.deinit(gpa);
         g.label_stack.deinit(gpa);
+        for (g.dead_pending.items) |*m| m.deinit(gpa);
+        g.dead_pending.deinit(gpa);
     }
     errdefer {
         for (resolutions) |r| if (r.len != 0) gpa.free(r);
@@ -1947,6 +2028,215 @@ test "a param named after a core-only intrinsic does not warn outside core" {
         }
     };
     try withResolvedGraph(".toy-test-shadow-intrinsic-noncore", files, "main.toy", Check.run);
+}
+
+test "a straight-line overwrite before any read flags the first write W0010" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ x = 2
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
+            for (r.diags) |d| if (d.code == .W0010)
+                try testing.expect(std.mem.indexOf(u8, d.message, "dead store to 'x'") != null);
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-basic", files, "main.toy", Check.run);
+}
+
+test "an overwriting RHS that reads the slot keeps the first write live (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ x = x + 1
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-selfread", files, "main.toy", Check.run);
+}
+
+test "an intervening read between two writes keeps the first live (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ y := x
+    \\ x = 2
+    \\ return x + y
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-interveningread", files, "main.toy", Check.run);
+}
+
+test "control flow between two writes flushes pending (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(c: bool) -> int {
+    \\ x := 1
+    \\ if c { return x }
+    \\ x = 2
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-cf-if", files, "main.toy", Check.run);
+}
+
+test "a `match` between two writes flushes pending (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(n: int) -> int {
+    \\ x := 1
+    \\ match n { _ -> {} }
+    \\ x = 2
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-cf-match", files, "main.toy", Check.run);
+}
+
+test "a `_`-prefixed dead store is silenced (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ _x := 1
+    \\ _x = 2
+    \\ return _x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-underscore", files, "main.toy", Check.run);
+}
+
+test "a field place assign is never a dead store (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\struct P { a: int }
+    \\fn main() -> int {
+    \\ p := P { a: 1 }
+    \\ p.a = 1
+    \\ p.a = 2
+    \\ return p.a
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-field", files, "main.toy", Check.run);
+}
+
+test "a deref place assign is never a dead store (no W0010)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ r := &x
+    \\ *r = 1
+    \\ *r = 2
+    \\ return *r
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-deref", files, "main.toy", Check.run);
+}
+
+test "a single write never read is W0001, not W0010 (no double-warn)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ return 0
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-single", files, "main.toy", Check.run);
+}
+
+test "a nested control-flow expression reading the slot in the RHS is not a false positive" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn f(c: bool) -> int {
+    \\ x := 1
+    \\ y := if c { x } else { 0 }
+    \\ x = 2
+    \\ return x + y
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-nested-cf-rhs", files, "main.toy", Check.run);
+}
+
+test "two dead stores in a straight-line chain both flag W0010" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+    \\fn main() -> int {
+    \\ x := 1
+    \\ x = 2
+    \\ x = 3
+    \\ return x
+    \\}
+    \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 2), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-chain", files, "main.toy", Check.run);
 }
 
 test "an uncalled private fn warns W0003 with its bare source name" {
