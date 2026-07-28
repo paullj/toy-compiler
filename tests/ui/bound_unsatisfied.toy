@@ -13,5 +13,5 @@ struct Q { x: int }
 fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
 
 fn main() -> int {
-    return twice(Q{ x: 1 })  #~ ERROR [T0023] does not conform to protocol 'Doubler'
+    return twice(Q{ x: 1 })  #~ ERROR [T0023] impl Q has Doubler
 }

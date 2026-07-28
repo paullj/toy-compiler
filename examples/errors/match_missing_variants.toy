@@ -1,0 +1,7 @@
+# Feature: SHOULD FAIL — a match missing MULTIPLE variants lists them all in one diagnostic.
+# expect: compile-error "missing variants 'Green', 'Blue'"
+enum Color { Red, Green, Blue }
+fn name(c: Color) -> int {
+  match c { .Red -> 0 }
+}
+fn main() -> int { return name(Color.Red) }

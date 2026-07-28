@@ -91,6 +91,8 @@ pub const Code = enum(u16) {
     T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x`)
     T0037, // extern-invalid-type (an `extern fn` param/return type is not int, float, str, rawptr, or bool)
     T0038, // unsafe-required (a raw-pointer `store`/`load` used outside an `unsafe { }` block)
+    T0039, // arity-mismatch (a fn/method call passes the wrong NUMBER of arguments)
+    T0040, // arg-type-mismatch (a fn/method call passes an argument of the wrong TYPE)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -185,6 +187,8 @@ pub const table = [_]Entry{
     .{ .code = .T0036, .str = "T0036", .slug = "malformed-char-literal" },
     .{ .code = .T0037, .str = "T0037", .slug = "extern-invalid-type" },
     .{ .code = .T0038, .str = "T0038", .slug = "unsafe-required" },
+    .{ .code = .T0039, .str = "T0039", .slug = "arity-mismatch" },
+    .{ .code = .T0040, .str = "T0040", .slug = "arg-type-mismatch" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
@@ -384,6 +388,12 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("T0038", str(.T0038).?);
     try testing.expectEqualStrings("unsafe-required", slug(.T0038).?);
     try testing.expectEqual(Code.T0038, fromStr("T0038").?);
+
+    // Call arity / arg-type mismatch codes (carry the callee signature + defined-here span).
+    try testing.expectEqualStrings("arity-mismatch", slug(.T0039).?);
+    try testing.expectEqual(Code.T0039, fromStr("T0039").?);
+    try testing.expectEqualStrings("arg-type-mismatch", slug(.T0040).?);
+    try testing.expectEqual(Code.T0040, fromStr("T0040").?);
 
     // Unused-variable/parameter warning codes — the `.warning` defaults, proving the
     // warning-by-default wiring end to end.

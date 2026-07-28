@@ -1730,6 +1730,37 @@ pub const BodyChecker = struct {
         return .invalid; // mismatch, no coercion
     }
 
+    fn writeParams(bc: *BodyChecker, out: *std.ArrayList(u8), params: []const Type) error{OutOfMemory}!void {
+        try out.append(bc.gpa, '(');
+        for (params, 0..) |p, i| {
+            if (i != 0) try out.appendSlice(bc.gpa, ", ");
+            try out.appendSlice(bc.gpa, bc.typeName(p));
+        }
+        try out.append(bc.gpa, ')');
+    }
+
+    // The FnSym.decl_node doc mandates keying builtin-ness off `.kind`, not the sentinel.
+    // A cross-module callee's decl offset would render against THIS module's source (the
+    // sink scope == graph_mod), so no label there — the message still carries name+signature.
+    fn calleeDeclSite(bc: *const BodyChecker, f: FnSym) u32 {
+        if (f.kind == .builtin or f.mod != bc.graph_mod) return DiagnosticSink.NO_RELATED;
+        return bc.byteOf(bc.tree.nodes[(f.decl_node).int()].main_token);
+    }
+
+    fn emitArity(bc: *BodyChecker, at: u32, related: u32, name: []const u8, params: []const Type, got: usize) error{OutOfMemory}!void {
+        var sig: std.ArrayList(u8) = .empty;
+        defer sig.deinit(bc.gpa);
+        try bc.writeParams(&sig, params);
+        try bc.sink.emitFmtCodeRelated(.T0039, at, related, "expected {d} argument(s), got {d}; '{s}' takes {s}", .{ params.len, got, name, sig.items });
+    }
+
+    fn emitArgType(bc: *BodyChecker, at: u32, related: u32, idx: usize, want: Type, got: Type, name: []const u8, params: []const Type) error{OutOfMemory}!void {
+        var sig: std.ArrayList(u8) = .empty;
+        defer sig.deinit(bc.gpa);
+        try bc.writeParams(&sig, params);
+        try bc.sink.emitFmtCodeRelated(.T0040, at, related, "argument {d}: expected {s}, got {s}; '{s}' takes {s}", .{ idx, bc.typeName(want), bc.typeName(got), name, sig.items });
+    }
+
     /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
     ///: the `mut self` place gate, arity, and per-arg assignability, typing the call
     /// node as the method's return. `fa` is the `field_access` (`main_token` = member,
@@ -1749,14 +1780,15 @@ pub const BodyChecker = struct {
         const want = mf.params.len - self_off;
         if (args.len != want) {
             for (args) |a| _ = try bc.typeOf(a);
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
+            try bc.emitArity(bc.byteOf(n.main_token), bc.calleeDeclSite(mf), member, mf.params[self_off..], args.len);
             bc.node_types[(node_idx).int()] = mf.ret;
             return mf.ret;
         }
+        const rel = bc.calleeDeclSite(mf);
         for (args, mf.params[self_off..], 0..) |a, pty, i| {
             const at = try bc.typeOfExpected(a, if (pty.kind == .invalid) null else pty);
             if (!Type.assignable(pty, at)) {
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                try bc.emitArgType(bc.byteOf(bc.tree.nodes[(a).int()].main_token), rel, i + 1, pty, at, member, mf.params[self_off..]);
             }
         }
         bc.node_types[(node_idx).int()] = mf.ret;
@@ -1830,14 +1862,20 @@ pub const BodyChecker = struct {
                     const psig = p.method_params[k];
                     const self_off: usize = @min(psig.len, 1);
                     const want = psig.len - self_off;
+                    // No callee FnSym exists for a bound-as-axiom protocol method, so there is
+                    // no decl to point at (NO_RELATED); the signature is the protocol method's
+                    // params grounded to the concrete receiver/protocol args.
+                    const gp = try bc.gpa.alloc(Type, want);
+                    defer bc.gpa.free(gp);
+                    for (psig[self_off..], 0..) |pty, i| gp[i] = Typecheck.groundProtoType(pty, recv_ty, explicit);
                     if (args.len != want) {
                         for (args) |a| _ = try bc.typeOf(a);
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ want, args.len });
-                    } else for (args, psig[self_off..], 0..) |a, pty, i| {
-                        const wt = Typecheck.groundProtoType(pty, recv_ty, explicit);
+                        try bc.emitArity(bc.byteOf(n.main_token), DiagnosticSink.NO_RELATED, member, gp, args.len);
+                    } else for (args, 0..) |a, i| {
+                        const wt = gp[i];
                         const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
                         if (!Type.assignable(wt, at))
-                            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
+                            try bc.emitArgType(bc.byteOf(bc.tree.nodes[(a).int()].main_token), DiagnosticSink.NO_RELATED, i + 1, wt, at, member, gp);
                     }
                     const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, explicit);
                     bc.node_types[(node_idx).int()] = ret;
@@ -1927,9 +1965,14 @@ pub const BodyChecker = struct {
             const targs_opt = try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args);
             defer if (targs_opt) |ta| bc.gpa.free(ta);
             const bound_ok = targs_opt != null;
+            // Render the signature with the impl's type-args substituted (`(int, int)`, not
+            // `(T, T)`); falls back to the raw params when `e.args` don't bind (already diagnosed).
+            const sig_params = try bc.gpa.alloc(Type, mf.params.len);
+            defer bc.gpa.free(sig_params);
+            for (mf.params, 0..) |p, i| sig_params[i] = if (bound_ok) substTy(bc, p, targs_opt.?) else p;
             if (args.len != mf.params.len) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ mf.params.len, args.len });
+                try bc.emitArity(bc.byteOf(n.main_token), bc.calleeDeclSite(mf), member, sig_params, args.len);
                 if (!bound_ok) return .invalid;
                 const ret = substTy(bc, mf.ret, targs_opt.?);
                 bc.node_types[(node_idx).int()] = ret;
@@ -1940,11 +1983,12 @@ pub const BodyChecker = struct {
                 return .invalid;
             }
             const targs = targs_opt.?;
+            const rel = bc.calleeDeclSite(mf);
             for (args, mf.params, 0..) |a, pty, i| {
                 const want_ty = substTy(bc, pty, targs);
                 const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
                 if (!Type.assignable(want_ty, at))
-                    try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(a).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
+                    try bc.emitArgType(bc.byteOf(bc.tree.nodes[(a).int()].main_token), rel, i + 1, want_ty, at, member, sig_params);
             }
             const ret = substTy(bc, mf.ret, targs);
             bc.node_types[(node_idx).int()] = ret;
@@ -2418,13 +2462,15 @@ pub const BodyChecker = struct {
         }
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+            try bc.emitArity(bc.byteOf(n.main_token), bc.calleeDeclSite(f), bc.nameText(callee.main_token), f.params, args.len);
             return f.ret;
         }
+        const name = bc.nameText(callee.main_token);
+        const rel = bc.calleeDeclSite(f);
         for (args, f.params, 0..) |arg, pty, i| {
             const at = try bc.typeOfExpected(arg, if (pty.kind == .invalid) null else pty);
             if (!Type.assignable(pty, at)) {
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(arg).int()].main_token), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                try bc.emitArgType(bc.byteOf(bc.tree.nodes[(arg).int()].main_token), rel, i + 1, pty, at, name, f.params);
             }
         }
         return f.ret;

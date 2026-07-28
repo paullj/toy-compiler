@@ -1,0 +1,5 @@
+fn takes_int(a: int) -> int { return a }
+
+fn main() -> int {
+    return takes_int("hi")  #~ ERROR [T0040] argument 1: expected int, got str
+}

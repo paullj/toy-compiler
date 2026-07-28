@@ -7,5 +7,5 @@ struct Bad { f: float }
 fn needs_display[T has Display](x: T) -> str { x.to_string() }
 
 fn main() {
-    s := needs_display(Bad{ f: 1.5 })  #~ ERROR [T0023] does not conform to protocol 'Display'
+    s := needs_display(Bad{ f: 1.5 })  #~ ERROR [T0023] derives automatically
 }
