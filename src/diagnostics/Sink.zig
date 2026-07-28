@@ -180,12 +180,24 @@ pub fn merge(self: *DiagnosticSink, other: *DiagnosticSink) !void {
     other.owned.clearAndFree(other.gpa);
 }
 
+/// Deterministic stable in-place ordering of an arbitrary diagnostic slice on the
+/// canonical key `(scope, byte_offset, code, message)` — the SAME key a sink's own
+/// `sort` uses. Exists for the driver seam where per-stage slices (parse, resolve,
+/// typecheck) are concatenated with no owning sink: one sort restores a monotonic
+/// (scope, offset) stream so same-scope diagnostics stay contiguous and lines print in
+/// source order. Stable (equal keys keep incoming stage/slot order) + total, so
+/// `-j1`/`-jN` output stays byte-identical. Does NOT dedup: there is no ArrayList to
+/// shrink, and each stage already deduped internally.
+pub fn sortSlice(diags: []Diagnostic) void {
+    std.sort.insertionContext(0, diags.len, SortCtx{ .diags = diags });
+}
+
 /// Deterministic stable total order: key `(scope, byte_offset, code, message)`, with any
 /// residual ties (fully identical tuples) broken by pre-sort (insertion) index.
 /// ONE stable sort drives BOTH modes — single-file degenerates because every
 /// scope == NO_SCOPE. Idempotent; call once after all emits/merges.
 pub fn sort(self: *DiagnosticSink) void {
-    std.sort.insertionContext(0, self.diags.items.len, SortCtx{ .diags = self.diags.items });
+    sortSlice(self.diags.items);
     self.dedupAdjacent();
 }
 
@@ -360,6 +372,25 @@ test "sort orders by (scope, byte_offset) — small smoke check" {
     // (deterministic), not in an arbitrary order an unstable sort could pick.
     try testing.expect(got[0].byte_offset == got[1].byte_offset);
     try testing.expect(got[0].scope == got[1].scope);
+}
+
+test "sortSlice re-orders a cross-stage concatenation into scope-contiguous source order" {
+    // Mirrors the driver seam: two per-stage blocks (each already internally sorted),
+    // concatenated stage-then-stage, must come out ordered by (scope, byte_offset) so a
+    // later-line "resolve" diagnostic no longer precedes an earlier-line "type" one.
+    var diags = [_]Diagnostic{
+        // "resolve" block (sorted within itself): scope 0 @2 and @30.
+        .{ .scope = 0, .byte_offset = 2, .message = "resolve@2" },
+        .{ .scope = 0, .byte_offset = 30, .message = "resolve@30" },
+        // "type" block (sorted within itself): scope 0 @13, scope 1 @5.
+        .{ .scope = 0, .byte_offset = 13, .message = "type@13" },
+        .{ .scope = 1, .byte_offset = 5, .message = "type@5" },
+    };
+    DiagnosticSink.sortSlice(&diags);
+    try testing.expectEqualStrings("resolve@2", diags[0].message);
+    try testing.expectEqualStrings("type@13", diags[1].message); // interleaved by offset, not stage
+    try testing.expectEqualStrings("resolve@30", diags[2].message);
+    try testing.expectEqualStrings("type@5", diags[3].message); // scope 1 sorts after all scope 0
 }
 
 test "single-file (NO_SCOPE) diagnostics survive sort and round-trip untagged" {

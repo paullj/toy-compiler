@@ -1249,6 +1249,44 @@ fn runToyOnFixture(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, src: []
     return .{ .out = got, .term = term };
 }
 
+// Line 2 carries BOTH a resolve W0001 (unused `x`) and a typecheck error (bool + int
+// operand mismatch); line 3 carries a second W0001 (unused `y`). Pre-fix the two resolve
+// warnings printed before the line-2 type error (stage order); post-fix they interleave
+// in SOURCE order (the line-2 error before the line-3 warning).
+const cross_stage_fixture = "fn main() -> int {\n  x := true + 1\n  y := 5\n  return 0\n}\n";
+
+test "cross-stage diagnostics print in monotonic source order (resolve+typecheck seam)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-crossstage-order";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, cross_stage_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+
+    // Both stages fired: two resolve warnings AND a typecheck error.
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused variable 'x'") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused variable 'y'") != null);
+    try testing.expectEqual(@as(usize, 3), countCarets(res.out));
+
+    // Monotonic by source line: the LAST line-2 diagnostic (the type error) must precede
+    // the FIRST line-3 diagnostic (the unused-`y` warning). Asserted via the `-->` header
+    // line:col so it is independent of the type error's exact code/message. Pre-fix, ":3:"
+    // appeared before the last ":2:".
+    const last2 = std.mem.lastIndexOf(u8, res.out, ":2:").?;
+    const first3 = std.mem.indexOf(u8, res.out, ":3:").?;
+    try testing.expect(last2 < first3);
+
+    // The type error still gates the exit at 1 (a future change that swallowed it would
+    // break ordering silently otherwise).
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
 const c3_fixture = "fn main() -> int {\n  return nope\n}\n";
 
 fn countCarets(got: []const u8) usize {
