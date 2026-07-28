@@ -224,7 +224,7 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
         if (count_cov and try variantPayloadIrrefutableSubst(bc, pat_idx, e.variants[i], targs)) cov.@"enum"[i] = true;
         break :blk e.variants[i];
     } else {
-        try bc.sink.emitFmt(bc.byteOf(pat.main_token), "enum '{s}' has no variant '{s}'", .{ e.name, vname });
+        try bc.emitNoVariant(bc.byteOf(pat.main_token), e.name, vname, e.variants);
         return;
     };
     const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (pat.rhs).int());

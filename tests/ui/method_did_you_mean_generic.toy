@@ -1,0 +1,7 @@
+struct Box[T] { v: T }
+impl Box[T] { fn get(self) -> T { return self.v } }
+
+fn main() -> int {
+  b := Box[int]{ v: 1 }
+  return b.gett()  #~ ERROR [T0018] did you mean 'get'?
+}

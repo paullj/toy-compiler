@@ -52,6 +52,7 @@ const reify = @import("types/reify.zig");
 const register = @import("symbols/register.zig");
 const prelude_reg = @import("symbols/Prelude.zig");
 const StdNames = @import("symbols/StdNames.zig");
+const nearmiss = @import("diagnostics/nearmiss.zig");
 const Engine = @import("query/Engine.zig");
 const Io = std.Io;
 
@@ -114,6 +115,38 @@ pub const refs = struct {
     const err_unknown_type = "unknown type '{s}'";
     const err_unknown_module = "unknown module '{s}'";
     const err_module_no_type = "module has no type '{s}'";
+
+    /// Near-miss candidate iterator over every type NAME visible at a use site: the
+    /// builtin type keywords, then the active module's struct / enum / alias keys. Feeds
+    /// `nearmiss.suggest` for the "did you mean" enrichment of the unknown-type diagnostic.
+    /// `keyIterator` takes `*const Self`, so the same `KeyIterator` type serves both the
+    /// mutable (Pass-A) and const (Pass-C) map accessors — one iterator struct for both.
+    const TypeNameIter = struct {
+        builtins: []const []const u8,
+        bi: usize = 0,
+        structs: std.StringHashMapUnmanaged(u32).KeyIterator,
+        enums: std.StringHashMapUnmanaged(u32).KeyIterator,
+        aliases: std.StringHashMapUnmanaged(Type).KeyIterator,
+        pub fn next(self: *TypeNameIter) ?[]const u8 {
+            if (self.bi < self.builtins.len) {
+                defer self.bi += 1;
+                return self.builtins[self.bi];
+            }
+            if (self.structs.next()) |k| return k.*;
+            if (self.enums.next()) |k| return k.*;
+            if (self.aliases.next()) |k| return k.*;
+            return null;
+        }
+    };
+
+    fn typeNameIter(self: anytype) TypeNameIter {
+        return .{
+            .builtins = type_names.keys(),
+            .structs = self.activeStructMap().keyIterator(),
+            .enums = self.activeEnumMap().keyIterator(),
+            .aliases = self.activeAliasMap().keyIterator(),
+        };
+    }
 
     pub fn nameText(self: anytype, tok: u32) []const u8 {
         return self.tokens[tok].text(self.source);
@@ -204,6 +237,13 @@ pub const refs = struct {
                 return .invalid;
             }
         }
+        // The import hint returns only for an EXACT std name, so a typo of a visible type
+        // name falls through here. Runs after the import-hint check so an exact std name
+        // still names the module rather than suggesting a near neighbour.
+        if (nearmiss.suggest(name, refs.typeNameIter(self))) |cand| {
+            self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type ++ "; did you mean '{s}'?", .{ name, cand }) catch {};
+            return .invalid;
+        }
         self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
         return .invalid;
     }
@@ -253,6 +293,10 @@ pub const refs = struct {
                         self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type ++ "; add 'import std/{s}'", .{ bname, hint.module }) catch {};
                         return .invalid;
                     }
+                }
+                if (nearmiss.suggest(bname, refs.typeNameIter(self))) |cand| {
+                    self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type ++ "; did you mean '{s}'?", .{ bname, cand }) catch {};
+                    return .invalid;
                 }
                 self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type, .{bname}) catch {};
                 return .invalid;
@@ -3398,6 +3442,117 @@ test "a call to a missing method emits exactly one T0018 naming the receiver + m
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "nope") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "P") != null);
+}
+
+/// Whether ANY diagnostic's message contains `needle` (order-independent — the check
+/// harness merges diags in fn-id order, but the near-miss suffix is what we assert on).
+fn anyDiagContains(c: Checked, needle: []const u8) bool {
+    for (c.result.diags) |d| {
+        if (std.mem.indexOf(u8, d.message, needle) != null) return true;
+    }
+    return false;
+}
+
+test "did-you-mean: a close field typo suggests the declared field; the base message is preserved" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Account { balance: int, owner: int }
+        \\fn main() -> int {
+        \\ a := Account{ balance: 1, owner: 2 }
+        \\ return a.balnce
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(anyDiagContains(c, "no field 'balnce' in struct 'Account'"));
+    try testing.expect(anyDiagContains(c, "did you mean 'balance'?"));
+}
+
+test "did-you-mean: a distant field name yields no suggestion (base message unchanged)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Account { balance: int, owner: int }
+        \\fn main() -> int {
+        \\ a := Account{ balance: 1, owner: 2 }
+        \\ return a.zzzzzz
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(anyDiagContains(c, "no field 'zzzzzz' in struct 'Account'"));
+    try testing.expect(!anyDiagContains(c, "did you mean"));
+}
+
+test "did-you-mean: a close enum-variant typo suggests the declared variant" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum Color { Red, Green, Blue }
+        \\fn pick() -> Color { return Color.Gren }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(anyDiagContains(c, "enum 'Color' has no variant 'Gren'"));
+    try testing.expect(anyDiagContains(c, "did you mean 'Green'?"));
+}
+
+test "did-you-mean: a close method typo suggests a method callable on the receiver" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Counter { n: int }
+        \\impl Counter { fn increment(self) -> int { return self.n } }
+        \\fn main() -> int {
+        \\ c := Counter{ n: 0 }
+        \\ return c.incrementt()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(anyDiagContains(c, "no method 'incrementt' on type 'Counter'"));
+    try testing.expect(anyDiagContains(c, "did you mean 'increment'?"));
+}
+
+test "did-you-mean: a close type-name typo suggests a visible type (bare + type-app sites)" {
+    const gpa = testing.allocator;
+    var bare = try checkSource(
+        \\struct Widget { n: int }
+        \\fn main() -> int {
+        \\ w: Widgett = Widget{ n: 1 }
+        \\ return w.n
+        \\}
+        \\
+    );
+    defer bare.deinit(gpa);
+    try testing.expect(anyDiagContains(bare, "unknown type 'Widgett'"));
+    try testing.expect(anyDiagContains(bare, "did you mean 'Widget'?"));
+
+    var app = try checkSource(
+        \\struct Wrapper[T] { v: T }
+        \\fn main() -> int {
+        \\ w := Wrappr[int]{ v: 1 }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer app.deinit(gpa);
+    try testing.expect(anyDiagContains(app, "unknown type 'Wrappr'"));
+    try testing.expect(anyDiagContains(app, "did you mean 'Wrapper'?"));
+}
+
+test "did-you-mean: an ambiguous typo (equidistant from two candidates) yields no suggestion" {
+    const gpa = testing.allocator;
+    // `bat` is edit-distance 1 from both `bar` and `bat`... use two same-distance fields.
+    var c = try checkSource(
+        \\struct S { bar: int, cat: int }
+        \\fn main() -> int {
+        \\ s := S{ bar: 1, cat: 2 }
+        \\ return s.bat
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(anyDiagContains(c, "no field 'bat' in struct 'S'"));
+    try testing.expect(!anyDiagContains(c, "did you mean"));
 }
 
 test "`Self` in a method signature resolves to the receiver type" {

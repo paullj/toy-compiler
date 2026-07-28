@@ -1,0 +1,10 @@
+# Feature: SHOULD FAIL — a close variant typo in a MATCH PATTERN suggests the variant.
+# expect: compile-error "has no variant 'greem'; did you mean 'green'?"
+enum Color { red, green, blue }
+fn f(c: Color) -> int {
+  return match c {
+    Color.greem -> 1
+    _ -> 0
+  }
+}
+fn main() -> int { return f(Color.red) }
