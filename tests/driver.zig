@@ -989,6 +989,61 @@ test "a bare `Option.none` with no inferable target reports T0016" {
     try testing.expect(std.mem.indexOf(u8, res.out, "T0016") != null);
 }
 
+test "a trailing else-less `if` in a nested block is an effect statement (compiles and runs)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-effect-if-block";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  x := 5\n  {\n    if x > 0 { return 5 }\n  }\n  return 0\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 5 }, res.term);
+}
+
+test "a trailing value-if WITH else still types as the merged value (compiles and runs)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-value-if-else";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  c := 1\n  if c > 0 { 7 } else { 9 }\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"run"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 7 }, res.term);
+}
+
+test "a fn body ending in an else-less `if` reports fall-off, not value-if-requires-else" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-falloff-if";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  x := 3\n  if x > 0 { return 5 }\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "must return int but may fall off the end") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "value-if requires else") == null);
+}
+
+test "an else-less `if` as a var-decl RHS still reports value-if requires else" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-value-if-vardecl";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n  c := 1\n  x := if c > 0 { 1 }\n  return x\n}\n";
+    const res = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(res.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "value-if requires else") != null);
+}
+
 test "coherence: distinct int widths (int8 vs uint8) conform to the same protocol without a T0020 collision" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

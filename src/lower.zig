@@ -3785,10 +3785,13 @@ fn lowerIfValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutO
 /// wrapped in an `expr_stmt` by the parser when it appears trailing, but it
 /// still yields the block's value, so recognize it by tag and lower it directly.
 fn trailingValueExpr(b: *Builder, stmt_idx: Ast.Index) ?Ast.Index {
-    const tag = b.in.tree.nodes[(stmt_idx).int()].tag;
-    return switch (tag) {
-        .expr_stmt => b.in.tree.nodes[(stmt_idx).int()].lhs,
-        .if_stmt, .match_expr, .loop_expr, .labeled, .block => stmt_idx,
+    const node = b.in.tree.nodes[(stmt_idx).int()];
+    return switch (node.tag) {
+        .expr_stmt => node.lhs,
+        // An else-less `if` produces no value; it lowers as an effect statement,
+        // so it is not this block's trailing value expression.
+        .if_stmt => if (Ast.ifHeaderAt(b.in.tree, (node.rhs).int()).else_node != Ast.none) stmt_idx else null,
+        .match_expr, .loop_expr, .labeled, .block => stmt_idx,
         else => null,
     };
 }
