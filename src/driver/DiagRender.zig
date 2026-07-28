@@ -154,39 +154,30 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
     try renderCapSummary(out, level, visible, drawn);
 }
 
-/// `toy check`: render EVERY diagnostic on a single file (parse + resolve + typecheck,
-/// in that stable stage order) against ONE SourceMap over the file, applying the
-/// severity config and the render cap. Unlike the inspection table's `printFailure`,
-/// this never prints a summary row — the `check` action reports diagnostics only, then a
-/// program-wide `N error(s), M warning(s)` summary. Returns nothing; the caller tallies
-/// the visible counts separately (via `Check.tallyAll`) for the exit gate + summary.
+/// `toy check`: render EVERY diagnostic on a single file against ONE SourceMap over the
+/// file, applying the severity config and the render cap. The caller passes a single
+/// slice already sorted on the canonical (scope, byte_offset, code, message) key, so
+/// parse/resolve/typecheck diagnostics interleave in SOURCE order rather than by stage.
+/// Unlike the inspection table's `printFailure`, this never prints a summary row — the
+/// `check` action reports diagnostics only, then a program-wide `N error(s), M warning(s)`
+/// summary; the caller tallies the visible counts separately for the exit gate + summary.
 pub fn renderFileDiags(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     level: Style.ColorLevel,
     path: []const u8,
     source: []const u8,
-    parse_diags: []const toyc.DiagnosticSink.Diagnostic,
-    resolve_diags: []const toyc.DiagnosticSink.Diagnostic,
-    type_diags: []const toyc.DiagnosticSink.Diagnostic,
+    diags: []const toyc.DiagnosticSink.Diagnostic,
     cfg: SevCfg.SeverityConfig,
 ) !void {
-    const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
-    var total: usize = 0;
-    var visible: usize = 0;
-    for (batches) |batch| {
-        total += batch.len;
-        visible += countVisible(batch, cfg);
-    }
-    if (total == 0) return;
+    if (diags.len == 0) return;
+    const visible = countVisible(diags, cfg);
     var sm = try Rr.SourceMap.init(gpa, path, source);
     defer sm.deinit(gpa);
     var drawn: usize = 0;
-    for (batches) |batch| {
-        for (batch) |d| {
-            if (drawn == DIAG_CAP) break;
-            if (try renderSinkDiag(out, level, &sm, d, cfg)) drawn += 1; // false == --ignore'd
-        }
+    for (diags) |d| {
+        if (drawn == DIAG_CAP) break;
+        if (try renderSinkDiag(out, level, &sm, d, cfg)) drawn += 1; // false == --ignore'd
     }
     try renderCapSummary(out, level, visible, drawn);
 }

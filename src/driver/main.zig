@@ -382,26 +382,8 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         const pass = Decide.passByName(name) orelse return argErrCode(out, level, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
         st.opt.set(pass, false);
     }
-    // Severity overrides. Build the borrowed rule slice in FIXED severity order:
-    // all --deny, then all --warn, then all --allow. With `resolve`'s last-match-wins
-    // this makes allow dominate warn dominate deny for a code named by multiple flags,
-    // deterministically and independent of cross-flag argv position (the flat model
-    // loses cross-flag order — the same documented deviation as --verify/--no-cache). Each
-    // spec must be a known code (R0001) or a band letter (L/P/R/T/W); garbage arg-errors
-    // (exit 1), mirroring --opt validation. `--deny-warnings` promotes any surviving
-    // warning to an error uniformly (build stage-bail AND check exit) via `resolve`.
-    for (p.deny) |m| {
-        if (!Decide.validSpec(m)) return argErrCode(out, level, "--deny: unknown code or band (e.g. R0001 or R)");
-        try sev_rules.append(gpa, .{ .match = m, .action = .err });
-    }
-    for (p.warn) |m| {
-        if (!Decide.validSpec(m)) return argErrCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
-        try sev_rules.append(gpa, .{ .match = m, .action = .warning });
-    }
-    for (p.allow) |m| {
-        if (!Decide.validSpec(m)) return argErrCode(out, level, "--allow: unknown code or band (e.g. R0001 or R)");
-        try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
-    }
+    // Severity overrides; a bad spec is a build arg-error (exit 1). See `buildSevRules`.
+    if (try buildSevRules(gpa, p, sev_rules)) |msg| return argErrCode(out, level, msg);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
@@ -425,23 +407,36 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: 
     };
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
-    // Severity overrides, FIXED order (deny, warn, allow) so allow>warn>deny under
-    // last-match-wins. An unknown code OR band letter is a USAGE error -> exit 2 (not the
-    // build path's 1): `usageCode` prints the styled `error:` line and returns 2.
+    // Severity overrides; a bad spec is a check USAGE error -> exit 2 (not the build
+    // path's 1). See `buildSevRules`.
+    if (try buildSevRules(gpa, p, sev_rules)) |msg| return usageCode(out, level, msg);
+    st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
+    for (p.file) |f| try st.paths.append(gpa, f);
+    return null;
+}
+
+/// Append the `--deny`/`--warn`/`--allow` severity rules onto `sev_rules` in FIXED
+/// severity order — all deny, then all warn, then all allow — so that under `resolve`'s
+/// last-match-wins semantics `allow` dominates `warn` dominates `deny` for a code named
+/// by multiple flags, deterministically and independent of cross-flag argv position (the
+/// flat model loses cross-flag order — the same documented deviation as --verify/--no-cache).
+/// Each spec must be a known code (R0001) or a band letter (L/P/R/T/W). Returns the
+/// offending "<flag>: ..." message on the first invalid spec, or null on success; the
+/// caller maps a non-null message to its own exit code (build exit 1, check exit 2).
+/// `--deny-warnings` (read by the caller) promotes surviving warnings uniformly via `resolve`.
+fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(SevCfg.Rule)) !?[]const u8 {
     for (p.deny) |m| {
-        if (!Decide.validSpec(m)) return usageCode(out, level, "--deny: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return "--deny: unknown code or band (e.g. R0001 or R)";
         try sev_rules.append(gpa, .{ .match = m, .action = .err });
     }
     for (p.warn) |m| {
-        if (!Decide.validSpec(m)) return usageCode(out, level, "--warn: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return "--warn: unknown code or band (e.g. R0001 or R)";
         try sev_rules.append(gpa, .{ .match = m, .action = .warning });
     }
     for (p.allow) |m| {
-        if (!Decide.validSpec(m)) return usageCode(out, level, "--allow: unknown code or band (e.g. R0001 or R)");
+        if (!Decide.validSpec(m)) return "--allow: unknown code or band (e.g. R0001 or R)";
         try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
     }
-    st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
-    for (p.file) |f| try st.paths.append(gpa, f);
     return null;
 }
 
@@ -1171,12 +1166,15 @@ fn runCheck(
         return reportEntryFile(gpa, out, level, &graph, ndjson, &.{}, res.diags, type_diags, sev, exit_zero);
 
     // Multi-module: combine resolve + type diagnostics into ONE slice (single cap + single
-    // tally). `ScopeCache.get` rebuilds on scope change, so a resolve-then-type
-    // concatenation renders correctly and deterministically.
+    // tally). Each stage sorts its own half, but the resolve-then-type concatenation is
+    // not globally ordered — a later-line resolve warning would precede an earlier-line
+    // type error. One stable re-sort on the canonical key restores per-scope contiguity
+    // (renderScopedDiags/emitNdjsonGraph require it) and source-monotonic order.
     const combined = try gpa.alloc(toyc.DiagnosticSink.Diagnostic, res.diags.len + type_diags.len);
     defer gpa.free(combined);
     @memcpy(combined[0..res.diags.len], res.diags);
     @memcpy(combined[res.diags.len..], type_diags);
+    toyc.DiagnosticSink.sortSlice(combined);
     if (ndjson) {
         // NDJSON over the graph's flat slice: each diagnostic's `file` is its OWNING
         // module path (not always the entry), so an imported module's error is attributed
@@ -1198,7 +1196,8 @@ fn runCheck(
 /// single-module graph with no imports — against its on-disk `file`/`source`, then a
 /// program-wide summary and the mapped exit code. The two entry-only cases share this one
 /// render + summary + exit path so their output and exit gate cannot drift. The three
-/// batches are disjoint stages (at most one is non-empty here), rendered in stage order.
+/// stage batches are merged into one slice and re-sorted so diagnostics print in source
+/// order across stages (a resolve warning and a type error interleave by line).
 fn reportEntryFile(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
@@ -1211,26 +1210,29 @@ fn reportEntryFile(
     sev: SevCfg.SeverityConfig,
     exit_zero: bool,
 ) !u8 {
-    const batches = [_][]const toyc.DiagnosticSink.Diagnostic{ parse_diags, resolve_diags, type_diags };
-    var counts: Check.Counts = .{};
+    // Concatenate the (at most three) stage batches into ONE slice and sort on the
+    // canonical key so diagnostics print in source order regardless of which stage
+    // produced them: a resolve warning and a typecheck error on adjacent lines must
+    // interleave by line, not by stage. Heap-allocated, freed on return. Sorting only
+    // permutes the POD structs — message buffers stay borrowed from parse/resolve/type
+    // diags, which outlive this call, so no ownership changes.
+    const combined = try gpa.alloc(toyc.DiagnosticSink.Diagnostic, parse_diags.len + resolve_diags.len + type_diags.len);
+    defer gpa.free(combined);
+    @memcpy(combined[0..parse_diags.len], parse_diags);
+    @memcpy(combined[parse_diags.len..][0..resolve_diags.len], resolve_diags);
+    @memcpy(combined[parse_diags.len + resolve_diags.len ..], type_diags);
+    toyc.DiagnosticSink.sortSlice(combined);
+
     if (ndjson) {
-        // Each batch is pre-sorted and attributed to the entry (scope -> entry file); the
-        // schema matches the multi-module form (`emitNdjsonGraph` is shared).
-        for (batches) |batch| {
-            const c = try Check.emitNdjsonGraph(out, gpa, g, batch, sev);
-            counts.errors += c.errors;
-            counts.warnings += c.warnings;
-        }
+        // The sorted union attributed to the entry (scope -> entry file); schema matches
+        // the multi-module form (`emitNdjsonGraph` is shared).
+        const counts = try Check.emitNdjsonGraph(out, gpa, g, combined, sev);
         try out.flush();
         return Decide.checkExit(counts, exit_zero);
     }
     const e = g.entry();
-    try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, parse_diags, resolve_diags, type_diags, sev);
-    for (batches) |batch| {
-        const c = Check.tallyGraph(batch, sev);
-        counts.errors += c.errors;
-        counts.warnings += c.warnings;
-    }
+    try DiagRender.renderFileDiags(gpa, out, level, e.file, e.source, combined, sev);
+    const counts = Check.tallyGraph(combined, sev);
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
     return Decide.checkExit(counts, exit_zero);
