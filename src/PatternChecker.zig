@@ -403,3 +403,28 @@ fn collectBindings(bc: *BodyChecker, pat_idx: Ast.Index, out: *std.StringHashMap
         else => {},
     }
 }
+
+const testing = std.testing;
+
+test "matchSaturated: wildcard short-circuits; enum needs every variant; bool needs both; int only via wildcard" {
+    // A wildcard saturates regardless of the per-kind coverage state.
+    try testing.expect(matchSaturated(.int, true));
+    var one_unseen = [_]bool{false};
+    try testing.expect(matchSaturated(.{ .@"enum" = &one_unseen }, true));
+
+    // Enum: saturated iff every variant bit is set; an empty variant set is vacuously so.
+    var all_seen = [_]bool{ true, true };
+    var partial = [_]bool{ true, false };
+    try testing.expect(matchSaturated(.{ .@"enum" = &all_seen }, false));
+    try testing.expect(!matchSaturated(.{ .@"enum" = &partial }, false));
+    try testing.expect(matchSaturated(.{ .@"enum" = &.{} }, false));
+
+    // Bool: both cases required.
+    var both = BoolCov{ .t = true, .f = true };
+    var one = BoolCov{ .t = true, .f = false };
+    try testing.expect(matchSaturated(.{ .@"bool" = &both }, false));
+    try testing.expect(!matchSaturated(.{ .@"bool" = &one }, false));
+
+    // Int: an infinite domain — only a wildcard can saturate it.
+    try testing.expect(!matchSaturated(.int, false));
+}
