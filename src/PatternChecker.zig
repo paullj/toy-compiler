@@ -96,9 +96,18 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
     if (!has_wildcard) switch (cov) {
         .@"enum" => |sv| {
             const e = bc.model.enums[enum_id.?];
-            for (e.variants, 0..) |v, i| {
-                if (!sv[i]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing variant '{s}'", .{v.name});
-            }
+            var names: std.ArrayList(u8) = .empty;
+            defer names.deinit(bc.gpa);
+            var n_missing: usize = 0;
+            for (e.variants, 0..) |v, i| if (!sv[i]) {
+                if (n_missing != 0) try names.appendSlice(bc.gpa, ", ");
+                try names.append(bc.gpa, '\'');
+                try names.appendSlice(bc.gpa, v.name);
+                try names.append(bc.gpa, '\'');
+                n_missing += 1;
+            };
+            if (n_missing > 0)
+                try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
         },
         .bool => |bcov| if (!(bcov.t and bcov.f))
             try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),

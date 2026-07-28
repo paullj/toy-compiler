@@ -2393,7 +2393,13 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             try conform.structural(model.structs, model.enums, model.conformances, args[ord], pid, &cmemo, t.gpa, t.composite, &.{}))
             continue;
         _ = t.gphSelect(mod);
-        try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'", .{ t.typeName(args[ord]), model.protocols[pid].name });
+        const tname = t.typeName(args[ord]);
+        const pname = model.protocols[pid].name;
+        if (isDerivableProtocol(model, pid)) {
+            try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
+        } else {
+            try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
+        }
         return;
     }
 
@@ -5313,8 +5319,27 @@ test "a non-conforming type at a bounded call is a use-site T0023 and skips the 
     try testing.expectEqual(codes.Code.T0023, c.result.diags[0].code);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Q") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Doubler") != null);
+    // A user protocol is not structurally derivable → suggest the `impl`.
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "impl Q has Doubler") != null);
     // The non-conforming instantiation is SKIPPED (no twice$Q instance minted).
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
+}
+
+test "a non-conforming type at a DERIVABLE bound suggests structural derivation" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Bad { f: float }
+        \\fn needs_display[T has Display](x: T) -> str { x.to_string() }
+        \\fn main() -> int {
+        \\  s := needs_display(Bad{ f: 1.5 })
+        \\  return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(codes.Code.T0023, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Display") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "derives automatically") != null);
 }
 
 test "a conforming impl whose method signature diverges from the protocol is T0024" {
@@ -6069,7 +6094,41 @@ test "call argument type mismatch (bool to int param)" {
     );
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-    try testing.expectEqualStrings("argument 2: expected int, got bool", c.result.diags[0].message);
+    try testing.expectEqualStrings("argument 2: expected int, got bool; 'add' takes (int, int)", c.result.diags[0].message);
+    try testing.expectEqual(codes.Code.T0040, c.result.diags[0].code);
+    try testing.expect(c.result.diags[0].related != DiagnosticSink.NO_RELATED);
+}
+
+test "call arity mismatch carries the signature and a defined-here span (T0039)" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        "fn add(a: int, b: int) -> int { return a + b }\nfn f() {\n x := add(1)\n return\n}\n",
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0039, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "'add' takes (int, int)") != null);
+    try testing.expect(c.result.diags[0].related != DiagnosticSink.NO_RELATED);
+}
+
+test "a non-exhaustive match lists MULTIPLE missing variants in one diagnostic" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        "enum Color { Red, Green, Blue }\nfn name(c: Color) -> int {\n match c { .Red -> 0 }\n}\nfn main() -> int { return name(Color.Red) }\n",
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "missing variants 'Green', 'Blue'") != null);
+}
+
+test "a non-exhaustive match with ONE missing variant keeps the singular wording" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        "enum S { A, B }\nfn f(s: S) -> int {\n match s { .A -> 1 }\n}\nfn main() -> int { return f(S.A) }\n",
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "missing variant 'B'") != null);
 }
 
 test "return type mismatch" {

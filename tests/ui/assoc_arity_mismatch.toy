@@ -1,0 +1,10 @@
+struct Pair[T] { a: T, b: T }
+
+impl Pair[T] {
+    fn of(x: T, y: T) -> T { x }
+}
+
+fn main() -> int {
+    _p := Pair[int].of(1)  #~ ERROR [T0039] 'of' takes (int, int)
+    return 0
+}

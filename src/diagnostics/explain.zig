@@ -76,6 +76,8 @@ pub const docs = [_]Doc{
     .{ .code = .T0036, .text = @embedFile("errors/T0036.md") },
     .{ .code = .T0037, .text = @embedFile("errors/T0037.md") },
     .{ .code = .T0038, .text = @embedFile("errors/T0038.md") },
+    .{ .code = .T0039, .text = @embedFile("errors/T0039.md") },
+    .{ .code = .T0040, .text = @embedFile("errors/T0040.md") },
     .{ .code = .W0001, .text = @embedFile("errors/W0001.md") },
     .{ .code = .W0002, .text = @embedFile("errors/W0002.md") },
     .{ .code = .W0003, .text = @embedFile("errors/W0003.md") },
