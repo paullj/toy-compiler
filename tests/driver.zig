@@ -2282,6 +2282,193 @@ test "`--allow W0007` silences the constant-condition warning (exit 0)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
+// The must-use warning: an expression statement whose value is a `Result`/`Option` is
+// discarded (the caller never handles the error/absence). It warns W0008 and does NOT
+// fail the check (exit 0), is promoted by `--deny-warnings`, and silenced by
+// `--allow W0008`. Only `Result`/`Option` are in scope; a bound/matched/`?`-consumed/
+// returned value, and a dropped non-Result/Option value, never warn.
+const dropped_result_fixture =
+    "fn mk() -> Result[int, str] { return Result.ok(1) }\n" ++
+    "fn main() -> int {\n  mk()\n  return 0\n}\n";
+const dropped_option_fixture =
+    "fn mk() -> Option[int] { return Option.some(1) }\n" ++
+    "fn main() -> int {\n  mk()\n  return 0\n}\n";
+
+test "`toy check` renders W0008 for a dropped Result and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-result";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, dropped_result_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0008]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused Result value") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check` renders W0008 for a dropped Option naming the family" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-option";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, dropped_option_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0008]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused Option value") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// The trailing expression of a UNIT function body is checked in statement context
+// (`want_value = false`), so a dropped Result there — the last and only statement — warns.
+test "`toy check` renders W0008 at the last stmt of a unit fn" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-last";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src =
+        "fn mk() -> Result[int, str] { return Result.ok(1) }\n" ++
+        "fn sink() {\n  mk()\n}\n" ++
+        "fn main() -> int {\n  sink()\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0008]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "unused Result value") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// A Result used as the function's RETURN value (the value-fn trailing expr, checked
+// `want_value = true`) is NOT dropped and must never warn.
+test "`toy check` does not flag a Result returned as the value" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-return";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src =
+        "fn mk() -> Result[int, str] { Result.ok(1) }\n" ++
+        "fn main() -> int {\n  return match mk() { .ok(v) -> v, .err(_) -> 0 }\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0008") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+// `foo()?` consumes the Result (the statement's value is the unwrapped payload), so it
+// is never flagged. Likewise a `:=`/`_ :=` bind and a `match` all handle the value.
+test "`toy check` does not flag a consumed, bound, or matched Result" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const fixtures = [_][]const u8{
+        // `foo()?`
+        "fn mk() -> Result[int, str] { return Result.ok(1) }\n" ++
+            "fn chain() -> Result[int, str] {\n  mk()?\n  return Result.ok(2)\n}\n" ++
+            "fn main() -> int {\n  return match chain() { .ok(v) -> v, .err(_) -> 0 }\n}\n",
+        // `x := foo()`
+        "fn mk() -> Result[int, str] { return Result.ok(1) }\n" ++
+            "fn main() -> int {\n  x := mk()\n  return match x { .ok(v) -> v, .err(_) -> 0 }\n}\n",
+        // `_ := foo()`
+        "fn mk() -> Result[int, str] { return Result.ok(1) }\n" ++
+            "fn main() -> int {\n  _ := mk()\n  return 0\n}\n",
+        // `match foo() { .. }`
+        "fn mk() -> Result[int, str] { return Result.ok(1) }\n" ++
+            "fn main() -> int {\n  match mk() { .ok(_) -> 0, .err(_) -> 1 }\n  return 0\n}\n",
+    };
+    for (fixtures, 0..) |src, i| {
+        var name_buf: [48]u8 = undefined;
+        const dir_name = std.fmt.bufPrint(&name_buf, ".toy-test-driver-w0008-ok-{d}", .{i}) catch unreachable;
+        defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+        const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "W0008") == null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+}
+
+// Dropping a non-Result/Option value (an `int`, or `()`) is out of scope and never warns.
+test "`toy check` does not flag a dropped int or unit value" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-scope";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const src =
+        "fn g() -> int { return 1 }\n" ++
+        "fn u() {}\n" ++
+        "fn main() -> int {\n  g()\n  u()\n  return 0\n}\n";
+    const res = runToyOnFixture(gpa, io, dir_name, src, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0008") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`toy check --deny-warnings` promotes W0008 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, dropped_result_fixture, &.{ "check", "--deny-warnings" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0008]") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}
+
+test "`--allow W0008` silences the must-use warning (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0008-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, dropped_result_fixture, &.{ "check", "--allow", "W0008" }) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "W0008") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

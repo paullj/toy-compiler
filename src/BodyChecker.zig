@@ -271,13 +271,19 @@ pub const BodyChecker = struct {
         // it, clear it for the non-final walk, then restore for the trailing expr.
         const block_expected = bc.expected;
         bc.expected = null;
-        for (stmts[0 .. stmts.len - 1]) |s| try bc.checkStmt(s); // effect only
+        for (stmts[0 .. stmts.len - 1]) |s| {
+            try bc.checkStmt(s); // effect only
+            const sn = bc.tree.nodes[(s).int()];
+            if (sn.tag == .expr_stmt)
+                try bc.warnDroppedMustUse(s, bc.node_types[(sn.lhs).int()]);
+        }
         const last = stmts[stmts.len - 1];
         const last_n = bc.tree.nodes[(last).int()];
         var bt: Type = .unit;
         if (last_n.tag == .expr_stmt) {
             bt = try bc.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
             bc.node_types[(last).int()] = bt; // the expr_stmt carries the value type
+            if (!want_value) try bc.warnDroppedMustUse(last, bt);
         } else if (want_value and (last_n.tag == .if_stmt or last_n.tag == .block)) {
             bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
         } else {
@@ -301,6 +307,23 @@ pub const BodyChecker = struct {
             try bc.sink.emitFmtCode(.W0005, bc.byteOf(dead_tok), "unreachable code; the previous statement always diverges", .{});
             return;
         }
+    }
+
+    /// Emit W0008 when a discarded expression statement's value is an `Option`/`Result`.
+    /// The message names only the family (not the full type), so a re-check of a generic
+    /// fn per monomorphization instance produces a byte-identical diagnostic that the
+    /// sink dedups on (scope, offset, code, message). Diagnostics-only — it reads the
+    /// already-memoized value type and never perturbs typing, the value-if path, or the
+    /// emitted machine code.
+    fn warnDroppedMustUse(bc: *BodyChecker, stmt_idx: Ast.Index, vt: Type) error{OutOfMemory}!void {
+        // A poison return type checks the body in statement context, so a trailing
+        // value the author meant to RETURN reaches here as a "dropped" value; skip it
+        // to avoid a spurious drop warning stacked on the already-reported type error.
+        if (bc.cur_ret.kind == .invalid) return;
+        const fam = bc.optResultFamily(vt);
+        if (fam == .none) return;
+        const tok = bc.tree.nodes[(stmt_idx).int()].main_token;
+        try bc.sink.emitFmtCode(.W0008, bc.byteOf(tok), "unused {s} value; handle it, bind it with ':=', or propagate with '?'", .{familyName(fam)});
     }
 
     /// Whether `stmt_idx` always transfers control away, so a following statement in the
