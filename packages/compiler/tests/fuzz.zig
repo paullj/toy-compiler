@@ -13,8 +13,8 @@
 //! no-op, so the build forces Debug regardless of `-Doptimize`).
 //!
 //! Inputs come from two sources, both driven by a SEEDED PRNG so a run is exactly
-//! reproducible: (a) MUTATION — load the seed corpus (`tests/ui/**/*.toy` +
-//! `examples/**/*.toy`) and apply random byte edits (bit/byte flip, insert,
+//! reproducible: (a) MUTATION — load the seed corpus (`tests/corpora/**/*.toy`)
+//! and apply random byte edits (bit/byte flip, insert,
 //! delete, truncate, splice); (b) a small GRAMMAR-AWARE generator that emits
 //! random-but-plausible toy programs (fn decls, precedence-climbing exprs over the
 //! real operators, stmts, if/loop/match, struct/enum, imports).
@@ -92,8 +92,8 @@ pub fn main(init: std.process.Init) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
 
-    // Load the seed corpus (all tracked .toy files under tests/ui + examples). A
-    // missing corpus directory is tolerated — the generator alone still exercises
+    // Load the seed corpus (all tracked .toy files under tests/corpora). A missing
+    // corpus directory is tolerated — the generator alone still exercises
     // the front-end — but we surface a note so a mis-run cwd is visible.
     var corpus = try loadCorpus(gpa, io);
     defer {
@@ -183,7 +183,7 @@ fn drive(gpa: std.mem.Allocator, input: []const u8) !bool {
     return true;
 }
 
-/// Walk `tests/ui` and `examples` for `*.toy` files, returning their contents.
+/// Walk `tests/corpora` for `*.toy` files, returning their contents.
 /// Each entry is owned (freed by the caller). Empty files are kept (a valid, if
 /// degenerate, seed). A missing directory is skipped silently.
 fn loadCorpus(gpa: std.mem.Allocator, io: Io) !std.ArrayList([]const u8) {
@@ -192,7 +192,7 @@ fn loadCorpus(gpa: std.mem.Allocator, io: Io) !std.ArrayList([]const u8) {
         for (out.items) |c| gpa.free(c);
         out.deinit(gpa);
     }
-    for ([_][]const u8{ "tests/ui", "examples" }) |root| {
+    for ([_][]const u8{"tests/corpora"}) |root| {
         var dir = Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch continue;
         defer dir.close(io);
         var walker = try dir.walk(gpa);

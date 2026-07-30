@@ -546,7 +546,7 @@ test "io.print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extr
 
     const out_bin = dir_name ++ "/prog";
     {
-        const res = try spawnToy(gpa, io, &.{ "build", "examples/io/char_utf8.toy", "-o", out_bin });
+        const res = try spawnToy(gpa, io, &.{ "build", "tests/corpora/language-features/io/char_utf8.toy", "-o", out_bin });
         defer gpa.free(res.out);
         try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
     }

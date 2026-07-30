@@ -9,7 +9,7 @@
 #       checked under -O0 FIRST so a wrong expected value cannot mask a bug.
 #       compile-error files must be rejected at BOTH opt levels.
 #
-#   (a) DUAL METRIC DROP on examples/bench/*.toy: parse --opt-stats; assert BOTH
+#   (a) DUAL METRIC DROP on benchmark/*.toy: parse --opt-stats; assert BOTH
 #       ir_instrs (before->after) AND emitted aarch64 instrs (text.len/4) drop at
 #       -O1 vs -O0. Smaller IR alone is insufficient -- the fold must survive to
 #       machine code. >=1 bench drops for EACH metric (in fact all of them do).
@@ -26,7 +26,7 @@
 # zig-out/bin/toy, building it via `mise exec -- zig build` if missing.
 set -u
 
-root="$(cd "$(dirname "$0")/../.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
 toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -91,9 +91,10 @@ while IFS= read -r src; do
   if [ "$ok" -eq 1 ]; then echo "  ok: $rel (exit=$r0 O0==O1==#expect)"; corpus_pass=$((corpus_pass+1));
   else corpus_fail=$((corpus_fail+1)); fi
 # Exclude the multi-module dirs whose non-entry files have no standalone `# expect:`
-# (modules/ is its own harness; bench/medium is a multi-file perf program). The
-# single-file opt benches (bench/*.toy) stay — they ARE the differential corpus.
-done < <(find "$root/examples" \( -path "$root/examples/modules" -o -path "$root/examples/bench/medium" \) -prune -o -name '*.toy' -print | sort)
+# (modules/ is its own harness; benchmark/medium is a multi-file perf program). The
+# single-file opt benches (benchmark/*.toy) stay — they ARE the differential corpus,
+# so both corpus roots (language-features + benchmark) are walked.
+done < <(find "$root/tests/corpora/language-features" "$root/tests/corpora/benchmark" \( -path "$root/tests/corpora/language-features/modules" -o -path "$root/tests/corpora/benchmark/medium" \) -prune -o -name '*.toy' -print | sort)
 echo "  corpus: $corpus_pass ok, $corpus_fail fail"
 
 # ---------------------------------------------------------------------------
@@ -114,11 +115,11 @@ pass_counter() { case "$1" in
   *) echo "";; esac; }
 
 echo
-echo "=== (a) DUAL METRIC DROP on examples/bench (ir_instrs AND emitted both fall) ==="
+echo "=== (a) DUAL METRIC DROP on benchmark (ir_instrs AND emitted both fall) ==="
 printf "  %-20s %-12s %-16s %s\n" "bench" "ir B->A" "emitted O0->O1" "result"
 any_ir_drop=0; any_emit_drop=0
 for b in "${benches[@]}"; do
-  src="$root/examples/bench/$b.toy"
+  src="$root/tests/corpora/benchmark/$b.toy"
   s0="$(timeout 30 "$toyc" --no-cache --opt-stats -O0 -o "$work/$b.s0" "$src" 2>&1)"
   s1="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.s1" "$src" 2>&1)"
   ir_before="$(sed -nE 's/.*ir_instrs=([0-9]+)->([0-9]+).*/\1/p' <<<"$s1" | head -1)"
@@ -139,7 +140,7 @@ echo
 echo "=== (c) PER-PASS CONTRIBUTION (counter>0 for target pass; --no-opt regresses emitted) ==="
 printf "  %-20s %-8s %-10s %-12s %-12s %s\n" "bench" "pass" "counter" "full-O1emit" "noopt-emit" "result"
 for b in "${benches[@]}"; do
-  src="$root/examples/bench/$b.toy"
+  src="$root/tests/corpora/benchmark/$b.toy"
   p="$(target_pass "$b")"
   cname="$(pass_counter "$p")"
   # only the target pass on
@@ -163,11 +164,11 @@ done
 # nonzero once a producer pass (fold) has created dead values. Attribute it on
 # const_arith with `--opt=fold,dce`: dced>0, and `-O1 --no-opt=dce` regresses the
 # emitted win (the folded const feeders survive as load/op/store words without it).
-sdce="$(timeout 30 "$toyc" --no-cache --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/examples/bench/const_arith.toy" 2>&1)"
+sdce="$(timeout 30 "$toyc" --no-cache --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 dval="$(stat_field "$sdce" dced)"
-sdcefull="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/dce.full" "$root/examples/bench/const_arith.toy" 2>&1)"
+sdcefull="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/dce.full" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 edcefull="$(stat_field "$sdcefull" emitted_instrs)"
-sdcenoopt="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 --no-opt=dce -o "$work/dce.noopt" "$root/examples/bench/const_arith.toy" 2>&1)"
+sdcenoopt="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 --no-opt=dce -o "$work/dce.noopt" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 edcenoopt="$(stat_field "$sdcenoopt" emitted_instrs)"
 dres="ok"
 if [ -z "$dval" ] || [ "$dval" -le 0 ]; then dres="FAIL(counter=$dval)"; fi

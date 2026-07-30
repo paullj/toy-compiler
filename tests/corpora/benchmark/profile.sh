@@ -9,7 +9,7 @@
 #  lower=codegen+link tail, image+sign. Front-end stages are serial at any -j; only
 #  `lower` scales — so `-j1` is the clean "where does the time go" breakdown.)
 set -eu
-toyc="$(cd "$(dirname "$0")/../.." && pwd)/zig-out/bin/toy"
+toyc="$(cd "$(dirname "$0")/../../.." && pwd)/zig-out/bin/toy"
 entry="${1:?usage: profile.sh <entry.toy> [jobs...]}"; shift || true
 jobs=("$@"); [ "${#jobs[@]}" -eq 0 ] && jobs=(1 2 4 8)
 dir="$(cd "$(dirname "$entry")" && pwd)"; base="$(basename "$entry")"

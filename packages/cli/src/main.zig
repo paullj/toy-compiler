@@ -3,7 +3,7 @@
 //! A bare `toy <file>` builds a signed executable; `--emit lex|parse|check|ir`
 //! inspects the pipeline instead (no binary); `build`/`run` (and any `-o`) force a
 //! build, `run` also execs the binary. See `Cli.zig` for the schema.
-//! - Argument parsing is the typed `toyc.cli` framework (schema `Cli.zig`, parsed
+//! - Argument parsing is the typed `cli` framework (schema `Cli.zig`, parsed
 //!   by `cli.Parser` with a collect-all `cli.Sink`). Diagnostics render through
 //!   `toyc.term.render.Renderer`; status output colourises via `toyc.term.Style`.
 //! - Colour is resolved once per phase from `--color` + a `detectTty(stdout)` probe
@@ -29,11 +29,16 @@ const Engine = toyc.QueryEngine;
 const version = toyc.version;
 // The CLI framework + terminal library, reached through the library module (never
 // via relative `../cli`/`../term` paths). `AppCli` is the sibling app schema.
-const cli = toyc.cli;
+const cli = @import("cli/Cli.zig");
 const term = toyc.term;
 const Style = term.Style;
 const Terminal = term.Terminal;
 const AppCli = @import("Cli.zig");
+const lsp = @import("lsp");
+comptime {
+    // Wire + compile-check the module into the exe; its own tests can't run cross-module.
+    _ = lsp;
+}
 // The extracted status-table + diagnostics-rendering modules (sibling files). The
 // shared status palette (`sty_*`) lives in DiagRender — the lower layer both this and
 // Report style with — so the dependency runs main -> Report -> DiagRender (no cycle).
@@ -1301,4 +1306,12 @@ fn listCodes(out: *Io.Writer, level: Style.ColorLevel) !void {
         };
         try out.print("  {s: <6} {s: <8} {s}\n", .{ e.str, sev, e.slug });
     }
+}
+
+test {
+    _ = @import("cli/Spec.zig");
+    _ = @import("cli/Parsed.zig");
+    _ = @import("cli/Parser.zig");
+    _ = @import("cli/Sink.zig");
+    _ = @import("cli/Help.zig");
 }

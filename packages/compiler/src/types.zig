@@ -5146,7 +5146,7 @@ test "`'A'.to_string()` derives ONE shared char Display witness (UTF-8 encoder, 
     // Display derive: ONE `Display$display$s<charId>` recipe whose emitter is overridden to the
     // UTF-8 encoder. Every char-display site CALLs it (vs the former per-site inline encoder
     // that overflowed the frame past ~6 displays). Suppression ("A" not "char(65)") is upheld
-    // by the overriding emitter — guarded end-to-end by examples/io/char_suppress.toy.
+    // by the overriding emitter — guarded end-to-end by tests/corpora/language-features/io/char_suppress.toy.
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.derives.len);
     try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);

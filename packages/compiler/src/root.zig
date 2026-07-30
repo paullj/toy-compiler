@@ -49,14 +49,6 @@ pub const MachO = @import("link/MachO.zig");
 pub const CodeSign = @import("link/CodeSign.zig");
 pub const link = @import("link/emit.zig");
 pub const version = @import("version.zig");
-pub const cli = struct {
-    pub const Spec = @import("cli/Spec.zig");
-    pub const Parsed = @import("cli/Parsed.zig");
-    pub const Parser = @import("cli/Parser.zig");
-    pub const Sink = @import("cli/Sink.zig");
-    pub const Help = @import("cli/Help.zig");
-    pub const Cli = @import("cli/Cli.zig");
-};
 pub const term = struct {
     pub const ansi = @import("term/ansi.zig");
     pub const Style = @import("term/Style.zig");
@@ -112,12 +104,6 @@ test {
     _ = MachO;
     _ = CodeSign;
     _ = link; // discovers emit.zig's boundary test
-    _ = cli.Spec;
-    _ = cli.Parsed;
-    _ = cli.Parser;
-    _ = cli.Sink;
-    _ = cli.Help;
-    _ = cli.Cli;
     _ = term.ansi;
     _ = term.Style;
     _ = term.Terminal;

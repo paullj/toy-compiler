@@ -2,13 +2,13 @@
 //! (`main.zig`) parses with `cli.Parser`. `build`/`run` are subcommands sharing
 //! the root's option set + variadic `<file>` positional; a bare `toy` builds/inspects.
 //!
-//! Spellings match the old hand-rolled parser byte-for-byte (examples/ + diff.sh depend on them):
+//! Spellings match the old hand-rolled parser byte-for-byte (tests/corpora + diff.sh depend on them):
 //! - `-O` is short-only (Range 0..1) so `-O0`/`-O1`/`-O 1` parse (`-O2` rejected).
 //! - `--opt`/`--no-opt` are plain strings (the grammar can't validate pass names; the driver does).
 //! - `-h`/`--help`/`-V`/`--version` are auto-injected by the framework, so not listed here.
 
 const toyc = @import("toy_compiler");
-const Spec = toyc.cli.Spec;
+const Spec = @import("cli/Cli.zig").Spec;
 // Build-time DEV switch (see build.zig): gates the `--emit lex|parse|ir`
 // pipeline-inspection flag on/off. Read at comptime so a release binary (dev_inspect
 // false) never even registers `--emit`; the default Debug build (and every test

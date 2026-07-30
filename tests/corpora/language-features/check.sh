@@ -4,7 +4,7 @@
 # an expected compile-error) and checks the directives. Exit 0 == corpus matches.
 set -u
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
 toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -48,9 +48,9 @@ while IFS= read -r src; do
   if [ -n "$exp_stdout" ] && [ "$out" != "$exp_stdout" ]; then fail_one "$rel: stdout mismatch"; ok=0; fi
   [ "$ok" -eq 1 ] && { echo "  ok: $rel"; pass=$((pass + 1)); }
 # `modules/` holds multi-file programs whose non-entry files have no `main` (driven
-# by `examples/modules/check.sh`); `bench/` is the perf/opt corpus (driven by
-# `examples/bench/opt-check.sh`). Neither belongs in this single-file expect harness.
-done < <(find "$root/examples" \( -path "$root/examples/modules" -o -path "$root/examples/bench" \) -prune -o -name '*.toy' -print | sort)
+# by `modules/check.sh`); the benchmark corpus is a sibling root (driven by
+# `benchmark/opt-check.sh`). Neither belongs in this single-file expect harness.
+done < <(find "$root/tests/corpora/language-features" -path "$root/tests/corpora/language-features/modules" -prune -o -name '*.toy' -print | sort)
 
 echo "---"
 echo "$pass passed, $fail failed"
