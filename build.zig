@@ -91,16 +91,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    // NOTE: `zig build test` currently DEADLOCKS under the `zig build --listen`
-    // runner because the integration tests in `mod_tests` spawn subprocesses
-    // (codesign, the emitted ./prog) — a Zig 0.16 build-runner/IPC interaction;
-    // the tests themselves all pass. `zig build test-bin` instead COMPILES and
-    // installs the test binary to zig-out/bin/toy-test, which can then be run
-    // DIRECTLY (`./zig-out/bin/toy-test`) to get a normal result without the
-    // runner. This is the reliable way to run the suite until the runner issue
-    // is resolved.
+    // Several tests spawn subprocesses (codesign, the emitted programs) that inherit
+    // the test binary's stdout — which under `zig build test` is the `--listen=-`
+    // results pipe the build runner reads to EOF. Each child is spawned then
+    // immediately `wait`ed, so it is reaped before the test process exits; the pipe
+    // reaches EOF and the runner does not block. `test-bin` installs the binaries so
+    // they can also be run directly (`./zig-out/bin/toy-test`), handy for a
+    // `--test-filter` or a debugger.
     const install_mod_tests = b.addInstallArtifact(mod_tests, .{});
-    const test_bin_step = b.step("test-bin", "Build the test binary; run ./zig-out/bin/toy-test directly (avoids the runner hang)");
+    const test_bin_step = b.step("test-bin", "Install the test binaries to run directly (e.g. ./zig-out/bin/toy-test)");
     test_bin_step.dependOn(&install_mod_tests.step);
     test_bin_step.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
 
@@ -122,7 +121,7 @@ pub fn build(b: *std.Build) void {
         .root_module = integration_mod,
     });
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
-    // Same runner-hang workaround: install the integration binary so it runs directly
+    // Install the integration binary too so it runs directly
     // (`./zig-out/bin/toy-integration-test`) alongside toy-test under `test-bin`.
     test_bin_step.dependOn(&b.addInstallArtifact(integration_tests, .{}).step);
 
