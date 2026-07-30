@@ -9,9 +9,8 @@
 //! holds the library + its inline unit tests; tests/ holds integration tests that
 //! exercise the published surface.
 //!
-//! Run: `zig build test-bin` then `./zig-out/bin/toy-integration-test`
-//! (the `zig build test` runner hangs on the unit suite's subprocess-spawning
-//! tests — see build.zig — so run the installed binary directly).
+//! Run under `zig build test`, or `zig build test-bin` then
+//! `./zig-out/bin/toy-integration-test` to run the installed binary directly.
 
 test {
     _ = @import("query_engine.zig");
