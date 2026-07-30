@@ -4,8 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Compiler identity for the on-disk cache (see src/version.zig). Hashing the
-    // whole `src/` tree at build time means every source file counts toward the
+    // Compiler identity for the on-disk cache (see version.zig). Hashing the whole
+    // compiler source tree at build time means every source file counts toward the
     // stamp automatically — no hand-maintained list to forget to update.
     const options = b.addOptions();
     options.addOption([]const u8, "semver", "0.0.0");
@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "dev_inspect", dev_inspect);
 
     const mod = b.addModule("toy_compiler", .{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("packages/compiler/src/root.zig"),
         .target = target,
     });
     mod.addOptions("build_options", options);
@@ -37,14 +37,22 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("bundled_std", bundled_mod);
 
+    // Stub language-server module: established as its own import path so the driver
+    // wiring lands once. Fleshed out later; the cli exe imports it as `lsp`.
+    const lsp_mod = b.addModule("lsp", .{
+        .root_source_file = b.path("packages/lsp/src/root.zig"),
+        .target = target,
+    });
+
     const exe = b.addExecutable(.{
         .name = "toy",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/driver/main.zig"),
+            .root_source_file = b.path("packages/cli/src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "toy_compiler", .module = mod },
+                .{ .name = "lsp", .module = lsp_mod },
             },
         }),
     });
@@ -73,6 +81,7 @@ pub fn build(b: *std.Build) void {
     // Test executables cover one module at a time, so the exe's root module
     // needs its own test build separate from `mod_tests`.
     const exe_tests = b.addTest(.{
+        .name = "toy-cli-test",
         .root_module = exe.root_module,
     });
 
@@ -93,14 +102,15 @@ pub fn build(b: *std.Build) void {
     const install_mod_tests = b.addInstallArtifact(mod_tests, .{});
     const test_bin_step = b.step("test-bin", "Build the test binary; run ./zig-out/bin/toy-test directly (avoids the runner hang)");
     test_bin_step.dependOn(&install_mod_tests.step);
+    test_bin_step.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
 
-    // Integration tests live in the repo-root tests/ and consume the compiler as a
-    // BLACK BOX through the published `toy_compiler` module (src/root.zig's pub
-    // exports) — `@import("toy_compiler")`, never `../` into src/ (a Zig module can't
-    // import above its root). Their own test artifact keeps them out of the unit-test
-    // (toy-test) binary; src/ stays library + inline unit tests, tests/ is integration.
+    // Integration tests consume the compiler as a BLACK BOX through the published
+    // `toy_compiler` module (root.zig's pub exports) — `@import("toy_compiler")`,
+    // never `../` into the compiler source (a Zig module can't import above its root).
+    // Their own test artifact keeps them out of the unit-test (toy-test) binary; the
+    // compiler source stays library + inline unit tests, these are integration.
     const integration_mod = b.createModule(.{
-        .root_source_file = b.path("tests/integration.zig"),
+        .root_source_file = b.path("packages/compiler/tests/integration.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -127,7 +137,7 @@ pub fn build(b: *std.Build) void {
     const fuzz_exe = b.addExecutable(.{
         .name = "toy-fuzz",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/fuzz.zig"),
+            .root_source_file = b.path("packages/compiler/tests/fuzz.zig"),
             .target = target,
             .optimize = .Debug,
             .imports = &.{
@@ -136,8 +146,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_fuzz = b.addRunArtifact(fuzz_exe);
-    // The fuzzer reads its seed corpus from tests/ui + examples relative to cwd, so
-    // it must run from the build root (the default cwd for `zig build` run steps).
+    // The fuzzer reads its seed corpus from tests/corpora relative to cwd, so it must
+    // run from the build root (the default cwd for `zig build` run steps).
     if (b.args) |args| run_fuzz.addArgs(args);
     const fuzz_step = b.step("fuzz", "Build + run the bounded, seeded front-end fuzzer (FUZZ_SEED / FUZZ_ITERS envs)");
     fuzz_step.dependOn(&run_fuzz.step);
@@ -145,21 +155,22 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(fuzz_exe);
 }
 
-/// Hash the compiler's source into a single 64-bit identity: every `.zig` under
-/// `src/` PLUS every bundled-stdlib `.toy` under `core/` and `std/` (by path +
-/// contents, sorted for determinism). Folding the bundled `.toy` in means a stdlib
-/// edit busts the on-disk cache stamp exactly like a `src/` edit. Done at configure
-/// time with native I/O, so only the digest — not the source bytes — ends up in the
-/// binary. Returns 0 only if src/ can't be read (degrades to one shared cache
-/// namespace); a missing bundled tree is folded as nothing, not a hard degrade.
+/// Hash the compiler's source into a single 64-bit identity: every `.zig` under the
+/// compiler source tree PLUS every bundled-stdlib `.toy` under `packages/lib/core`
+/// and `packages/lib/std` (by path + contents, sorted for determinism). Folding the
+/// bundled `.toy` in means a stdlib edit busts the on-disk cache stamp exactly like a
+/// source edit. Done at configure time with native I/O, so only the digest — not the
+/// source bytes — ends up in the binary. Returns 0 only if the compiler source can't
+/// be read (degrades to one shared cache namespace); a missing bundled tree is folded
+/// as nothing, not a hard degrade.
 fn sourceDigest(b: *std.Build) u64 {
     var hasher = std.hash.Wyhash.init(0);
-    if (!hashDir(b, &hasher, "src", ".zig")) return 0;
-    // Bundled stdlib is best-effort: a source tree that ships without core/std still
-    // gets a meaningful src/-derived identity instead of collapsing to one shared
-    // cache namespace (which would disable cross-version invalidation entirely).
-    _ = hashDir(b, &hasher, "core", ".toy");
-    _ = hashDir(b, &hasher, "std", ".toy");
+    if (!hashDir(b, &hasher, "packages/compiler/src", ".zig")) return 0;
+    // Bundled stdlib is best-effort: a source tree that ships without the stdlib still
+    // gets a meaningful compiler-source-derived identity instead of collapsing to one
+    // shared cache namespace (which would disable cross-version invalidation entirely).
+    _ = hashDir(b, &hasher, "packages/lib/core", ".toy");
+    _ = hashDir(b, &hasher, "packages/lib/std", ".toy");
     return hasher.final();
 }
 
@@ -197,16 +208,22 @@ fn hashDir(b: *std.Build, hasher: *std.hash.Wyhash, sub: []const u8, ext: []cons
 }
 
 /// Generate the `bundled_std.zig` module source: one `Entry{ path, source }` per
-/// `.toy` file under `core/` and `std/`, sorted by import path so the emitted array
-/// (and thus the module's identity) is deterministic regardless of FS walk order.
-/// The import path is `<root>/<rel>` with the trailing `.toy` stripped and OS
-/// separators normalized to `/` (e.g. `core/ffi`).
+/// `.toy` file under `packages/lib/core` and `packages/lib/std`, sorted by import path
+/// so the emitted array (and thus the module's identity) is deterministic regardless of
+/// FS walk order. The EMITTED import path is `<prefix>/<rel>` (prefix `core`/`std`, NOT
+/// the on-disk open path) with the trailing `.toy` stripped and OS separators normalized
+/// to `/` (e.g. `core/ffi`) — the prefix stays `core`/`std` so every in-language `import
+/// core/…`/`import std/…` keeps resolving after the stdlib moved under packages/lib.
 fn bundledModulesSource(b: *std.Build) []const u8 {
     const Entry = struct { path: []const u8, source: []const u8 };
     var entries: std.ArrayList(Entry) = .empty;
 
-    for ([_][]const u8{ "core", "std" }) |root| {
-        var dir = b.build_root.handle.openDir(b.graph.io, root, .{ .iterate = true }) catch continue;
+    const Root = struct { open: []const u8, prefix: []const u8 };
+    for ([_]Root{
+        .{ .open = "packages/lib/core", .prefix = "core" },
+        .{ .open = "packages/lib/std", .prefix = "std" },
+    }) |r| {
+        var dir = b.build_root.handle.openDir(b.graph.io, r.open, .{ .iterate = true }) catch continue;
         defer dir.close(b.graph.io);
         var walker = dir.walk(b.allocator) catch continue;
         defer walker.deinit();
@@ -214,9 +231,9 @@ fn bundledModulesSource(b: *std.Build) []const u8 {
             if (entry.kind != .file) continue;
             if (!std.mem.endsWith(u8, entry.basename, ".toy")) continue;
             const bytes = dir.readFileAlloc(b.graph.io, entry.path, b.allocator, .unlimited) catch continue;
-            // `<root>/<rel-without-.toy>`, separators normalized to `/`.
+            // `<prefix>/<rel-without-.toy>`, separators normalized to `/`.
             const rel = entry.path[0 .. entry.path.len - ".toy".len];
-            const joined = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ root, rel }) catch continue;
+            const joined = std.fmt.allocPrint(b.allocator, "{s}/{s}", .{ r.prefix, rel }) catch continue;
             const norm = b.allocator.dupe(u8, joined) catch continue;
             std.mem.replaceScalar(u8, norm, std.fs.path.sep, '/');
             entries.append(b.allocator, .{ .path = norm, .source = bytes }) catch continue;

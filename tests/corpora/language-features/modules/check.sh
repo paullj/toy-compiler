@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate the MULTI-MODULE corpus. Distinct from examples/check.sh: each program
+# Validate the MULTI-MODULE corpus. Distinct from ../check.sh: each program
 # is a DIRECTORY whose entry file is `main.toy`; the compiler discovers the rest
 # of the module graph from that one entry, so we only ever invoke toyc on main.toy.
 # The `# expect:` directives (same grammar as the single-file corpus) live in the
@@ -7,7 +7,7 @@
 set -u
 
 here="$(cd "$(dirname "$0")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$(cd "$here/../../../.." && pwd)"
 # Resolve the toyc binary without ever invoking `zig build test` (which deadlocks
 # under the --listen runner); build the normal CLI binary if it is missing.
 toyc="$root/zig-out/bin/toy"

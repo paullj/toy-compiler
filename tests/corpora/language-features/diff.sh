@@ -13,7 +13,7 @@
 #     does NOT depend on a primed cache.
 set -u
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
 toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -38,14 +38,14 @@ while IFS= read -r src; do
 
   # Skip the IMPORT SUB-FILES of a multi-module program. A multi-module program is
   # a directory whose entry is `main.toy` (the compiler discovers the rest of the
-  # graph from that one entry — see examples/modules/check.sh); its sibling/nested
+  # graph from that one entry — see modules/check.sh); its sibling/nested
   # non-entry files have no `main` and use entry-relative imports, so compiling one
   # standalone here spuriously fails. The entry `main.toy` itself still compiles
   # and is kept (it adds real determinism coverage). A file is a sub-file iff some
-  # ancestor dir up to examples/ holds a `main.toy` and the file is not that entry.
+  # ancestor dir up to tests/corpora/ holds a `main.toy` and the file is not that entry.
   if [ "$(basename "$src")" != "main.toy" ]; then
     d="$(dirname "$src")"
-    while [ "$d" != "$root/examples" ] && [ "$d" != "$root" ] && [ "$d" != "/" ]; do
+    while [ "$d" != "$root/tests/corpora" ] && [ "$d" != "$root" ] && [ "$d" != "/" ]; do
       if [ -f "$d/main.toy" ]; then continue 2; fi
       d="$(dirname "$d")"
     done
@@ -96,12 +96,14 @@ while IFS= read -r src; do
   fi
 
   [ "$ok" -eq 1 ] && { echo "  ok: $rel (correct, deterministic)"; pass=$((pass + 1)); }
-# Skip examples/modules/ wholesale — those MULTI-module programs (a directory whose
+# Skip the modules/ corpus wholesale — those MULTI-module programs (a directory whose
 # entry is main.toy, the rest reached via imports) have their own harness
-# (examples/modules/check.sh). Multi-module programs OUTSIDE modules/ (e.g.
-# bench/medium) are handled per-file by the sub-file guard at the top of the loop:
-# their entry main.toy is compiled here, their import sub-files are skipped.
-done < <(find "$root/examples" -name '*.toy' -not -path '*/modules/*' | sort)
+# (modules/check.sh). Multi-module programs OUTSIDE modules/ (e.g. benchmark/medium)
+# are handled per-file by the sub-file guard at the top of the loop: their entry
+# main.toy is compiled here, their import sub-files are skipped. Both corpus roots
+# (language-features + benchmark) are walked so the determinism gate keeps its full
+# coverage — the benchmark programs are part of the byte-identity check.
+done < <(find "$root/tests/corpora/language-features" "$root/tests/corpora/benchmark" -name '*.toy' -not -path '*/modules/*' | sort)
 
 echo "---"
 echo "$pass passed, $fail failed"

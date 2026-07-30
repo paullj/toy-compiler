@@ -1,5 +1,5 @@
-//! UI-test harness over `tests/ui/**/*.toy` fixtures with inline expectation
-//! annotations (integration).
+//! UI-test harness over `tests/corpora/diagnostics/**/*.toy` fixtures with inline
+//! expectation annotations (integration).
 //!
 //! Each fixture is a real toy program carrying `#~ ERROR [CODE] <substr>`
 //! annotations. Because `#` is the toy line-comment character (the lexer skips
@@ -35,7 +35,7 @@ const Diagnostic = toyc.diagnostics.Diagnostic.Diagnostic;
 
 const testing = std.testing;
 
-const ui_dir = "tests/ui";
+const ui_dir = "tests/corpora/diagnostics";
 
 /// One parsed `#~ ERROR [CODE] <substr>` annotation. `line` is 1-based (the line
 /// the comment sits on). `matched` is flipped true when a diagnostic satisfies it.
@@ -217,7 +217,7 @@ fn checkFixture(
     return matchExhaustive(gpa, path, anns.items, errs.items);
 }
 
-test "ui fixtures: every tests/ui/**/*.toy matches its inline #~ ERROR annotations exhaustively" {
+test "ui fixtures: every tests/corpora/diagnostics/**/*.toy matches its inline #~ ERROR annotations exhaustively" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

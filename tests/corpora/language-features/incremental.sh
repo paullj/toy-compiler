@@ -22,7 +22,7 @@
 # the finer-incrementality FOUNDATION, not a headline speedup.
 set -u
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
 toyc="$root/zig-out/bin/toy"
 
 echo "building toy..."
