@@ -14,6 +14,10 @@ const std = @import("std");
 const Spec = @import("Spec.zig");
 const Parsed = @import("Parsed.zig");
 const Sink = @import("Sink.zig");
+const toyc = @import("toy_compiler");
+// Reuse the compiler's conservative "did you mean X?" suggester for enum near-misses
+// instead of a second edit-distance; the cli exe imports `toy_compiler` already.
+const nearmiss = toyc.nearmiss;
 
 /// Result of one `parse` call for `cmd`. A struct wrapper (not the bare union)
 /// so the owning arena travels with the value; read `result.value` for the
@@ -194,7 +198,7 @@ fn handleLong(
                     try sink.add(gpa, .{ .kind = .missing_value, .arg = argv[i.*], .expected = valueKindName(o.value) });
                     return;
                 }
-                try applyValue(cmd, o, oi, p, gpa, a, appends, sink, argv[i.*], raw);
+                try applyValue(cmd, o, oi, p, gpa, a, appends, sink, raw);
                 return;
             }
         }
@@ -246,7 +250,7 @@ fn handleShortCluster(
                             try sink.add(gpa, .{ .kind = .missing_value, .arg = argv[i.*], .expected = valueKindName(o.value) });
                             return .none;
                         }
-                        try applyValue(cmd, o, oi, p, gpa, a, appends, sink, argv[i.*], raw);
+                        try applyValue(cmd, o, oi, p, gpa, a, appends, sink, raw);
                         return .none; // value-taking short ends the cluster
                     }
                 }
@@ -281,21 +285,20 @@ fn applyValue(
     a: std.mem.Allocator,
     appends: *AppendLists(cmd),
     sink: *Sink,
-    arg: []const u8,
     raw: []const u8,
 ) !void {
     const name = comptime Parsed.fieldName(o);
     if (comptime o.action == .append) {
         const Elem = ElemOf(cmd, name);
         const coerced = coerceInto(Elem, o.value, raw) orelse {
-            try sink.add(gpa, .{ .kind = .bad_value, .arg = arg, .got = raw, .expected = valueKindName(o.value) });
+            try sink.add(gpa, badValueErr(o.value, optFlagName(o), raw));
             return;
         };
         try appends.appendOpt(oi, a, coerced);
     } else {
         const Scalar = ScalarOf(cmd, name);
         const coerced = coerceInto(Scalar, o.value, raw) orelse {
-            try sink.add(gpa, .{ .kind = .bad_value, .arg = arg, .got = raw, .expected = valueKindName(o.value) });
+            try sink.add(gpa, badValueErr(o.value, optFlagName(o), raw));
             return;
         };
         writeScalar(cmd, name, Scalar, p, coerced);
@@ -318,7 +321,7 @@ fn bindPositional(
             if (pos_filled.* >= pi) {
                 const Elem = ElemOf(cmd, pp.name);
                 const coerced = coerceInto(Elem, pp.value, arg) orelse {
-                    try sink.add(gpa, .{ .kind = .bad_value, .arg = arg, .got = arg, .expected = valueKindName(pp.value) });
+                    try sink.add(gpa, badValueErr(pp.value, pp.name, arg));
                     return;
                 };
                 try appends.appendPos(pi, a, coerced);
@@ -328,7 +331,7 @@ fn bindPositional(
         } else if (pos_filled.* == pi) {
             const Scalar = ScalarOf(cmd, pp.name);
             const coerced = coerceInto(Scalar, pp.value, arg) orelse {
-                try sink.add(gpa, .{ .kind = .bad_value, .arg = arg, .got = arg, .expected = valueKindName(pp.value) });
+                try sink.add(gpa, badValueErr(pp.value, pp.name, arg));
                 // Advance past the rejected slot so the next token binds to the
                 // following positional, not back onto this failed one.
                 pos_filled.* += 1;
@@ -417,6 +420,14 @@ fn optRefMatches(comptime o: Spec.Option, comptime ref: []const u8) bool {
 fn optName(comptime o: Spec.Option) []const u8 {
     if (o.long) |l| return l;
     return &[_]u8{o.short.?};
+}
+
+/// The user-facing flag spelling with its dashes (`--color` / `-O`), for error
+/// messages that name the offending option — the value token that reaches a reject
+/// site is the value, not the flag, so the flag name is reconstructed from the spec.
+fn optFlagName(comptime o: Spec.Option) []const u8 {
+    if (o.long) |l| return "--" ++ l;
+    return "-" ++ [_]u8{o.short.?};
 }
 
 // ---- defaults --------------------------------------------------------------
@@ -516,6 +527,34 @@ fn valueKindName(comptime v: Spec.ValueType) []const u8 {
         .string => "string",
         .@"enum" => "one of the choices",
     };
+}
+
+/// A `next() ?[]const u8` iterator over an enum option's choices, in the shape
+/// `nearmiss.suggest` consumes (it takes the iterator by value). The `[:0]const u8`
+/// choices coerce to `[]const u8` on yield.
+const ChoiceIter = struct {
+    items: []const [:0]const u8,
+    i: usize = 0,
+    pub fn next(self: *ChoiceIter) ?[]const u8 {
+        if (self.i >= self.items.len) return null;
+        defer self.i += 1;
+        return self.items[self.i];
+    }
+};
+
+/// Build a `bad_value` error, attaching the choice list and a near-miss suggestion
+/// for enum options so the renderer can list the choices and offer "did you mean X?".
+/// The `comptime v == .@"enum"` guard prunes the enum-only work (and the nearmiss /
+/// ChoiceIter references) from non-enum instantiations. Both attached strings are
+/// static (a comptime join / a slice into a comptime choice literal), so they honour
+/// the Sink's borrowed-string contract.
+fn badValueErr(comptime v: Spec.ValueType, arg: []const u8, got: []const u8) Sink.Error {
+    var e: Sink.Error = .{ .kind = .bad_value, .arg = arg, .got = got, .expected = valueKindName(v) };
+    if (comptime v == .@"enum") {
+        e.choices = comptime Spec.choicesJoined(v.@"enum");
+        e.suggestion = nearmiss.suggest(got, ChoiceIter{ .items = v.@"enum" }) orelse "";
+    }
+    return e;
 }
 
 // ---- append accumulators ---------------------------------------------------
@@ -806,6 +845,34 @@ test "coercion: valid enum binds the exact reified tag" {
     var r = try parse(testing.allocator, cmd, &.{ "--emit", "asm", "in.zig" }, &sink);
     defer r.deinit();
     try testing.expect(r.value.ok.emit.? == .@"asm");
+}
+
+test "enum bad value carries the choices list; a far token yields no suggestion" {
+    const cmd = comptime repCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "--emit", "wat", "in.zig" }, &sink);
+    defer r.deinit();
+    try testing.expect(r.value == .errors);
+    const e = sink.items()[0];
+    try testing.expectEqual(Sink.Kind.bad_value, e.kind);
+    try testing.expectEqualStrings("ir|asm|obj", e.choices);
+    try testing.expectEqualStrings("", e.suggestion); // "wat" is far from every choice
+}
+
+test "enum bad value suggests a near miss" {
+    const cmd = comptime repCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "--emit", "obk", "in.zig" }, &sink);
+    defer r.deinit();
+    try testing.expect(r.value == .errors);
+    const e = sink.items()[0];
+    try testing.expectEqual(Sink.Kind.bad_value, e.kind);
+    try testing.expectEqualStrings("ir|asm|obj", e.choices);
+    try testing.expectEqualStrings("obj", e.suggestion); // single substitution obk->obj
 }
 
 test "append accumulates into an owned slice; ownership freed by arena deinit" {

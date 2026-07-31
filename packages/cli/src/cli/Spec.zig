@@ -18,6 +18,19 @@ pub const ValueType = union(enum) {
     @"enum": []const [:0]const u8,
 };
 
+/// Comptime "a|b|c" join of an enum option's choices — the single piece shared by
+/// help output and the invalid-value error so their wording can't drift.
+pub fn choicesJoined(comptime choices: []const [:0]const u8) []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        for (choices, 0..) |c, i| {
+            if (i != 0) s = s ++ "|";
+            s = s ++ c;
+        }
+        return s;
+    }
+}
+
 pub const Option = struct {
     long: ?[:0]const u8 = null,
     short: ?u8 = null,
