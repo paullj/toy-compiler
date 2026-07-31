@@ -166,6 +166,11 @@ pub fn main(init: std.process.Init) !void {
             try merged.appendSlice(gpa, argv[verb_idx + 1 ..]);
             inline for (AppCli.spec.root.subcommands, 0..) |sub, j| {
                 if (j == sc.index) {
+                    // The root pass accumulated any pre-verb option errors into `sink`;
+                    // this re-parse covers the same tokens (the full argv minus the verb)
+                    // and re-reports them, so drop the root pass's copies to avoid
+                    // rendering each error twice.
+                    sink.reset();
                     var sub_res = try cli.Parser.parse(gpa, sub, merged.items, &sink);
                     defer sub_res.deinit();
                     switch (sub_res.value) {

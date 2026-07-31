@@ -270,6 +270,32 @@ test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a sum
     try testing.expect(std.mem.indexOf(u8, got, "... and 20 more") != null);
 }
 
+test "a pre-verb CLI error is reported once, not doubled by the subcommand re-parse" {
+    // `toy <bad-root-option> build <file>` parses argv twice — the root pass, then the
+    // matched subcommand — into one shared error sink; without resetting the sink
+    // between passes the same error rendered twice. Assert a single occurrence.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--color", "alwyas", "build", "x.toy" }, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "invalid value 'alwyas'"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "did you mean 'always'?"));
+}
+
 test "explain: a known code prints its doc (exit 0); an unknown code arg-errors (exit 2)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
