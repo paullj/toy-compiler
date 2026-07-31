@@ -32,6 +32,9 @@ result so the example is self-documenting.
 
 ## Running
 
-`./examples/check.sh` builds the compiler, then for each example compiles (and,
-for non-error cases, runs) it and verifies every `# expect:` directive. Exit 0
-means the whole corpus matches its annotations.
+The manifest-driven corpus harness (`packages/compiler/tests/corpus.zig`, enumerated
+by `corpus_manifest.zon`) compiles each example (and, for non-error cases, runs it)
+and verifies every `# expect:` directive in-process. It runs under `zig build test`
+(or `zig build test-bin` then `./zig-out/bin/toy-integration-test`); the single-file
+examples here and the multi-file programs under `modules/` are both covered. A moved,
+renamed, or mis-annotated fixture fails the suite.
