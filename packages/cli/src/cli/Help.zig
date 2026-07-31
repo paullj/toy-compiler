@@ -55,25 +55,25 @@ pub fn renderHelp(comptime cmd: Spec.Command, out: *std.Io.Writer, mode: Mode) !
         inline for (cmd.subcommands) |s| {
             // Subcommands carry only `about`; there is no long variant to fall
             // back to, so both modes render the same one line here.
-            try renderRow(out, s.name, s.about, width);
+            try renderRow(out, s.name, s.about, "", width);
         }
     }
 
     if (cmd.positionals.len != 0) {
         try out.writeAll("\nArguments:\n");
         inline for (cmd.positionals) |p| {
-            try renderRow(out, positionalLabel(p), rowHelp(p.help, "", mode), width);
+            try renderRow(out, positionalLabel(p), rowHelp(p.help, "", mode), "", width);
         }
     }
 
     try out.writeAll("\nOptions:\n");
     inline for (cmd.options) |o| {
-        try renderRow(out, optionLabel(o), rowHelp(o.help, o.long_help, mode), width);
+        try renderRow(out, optionLabel(o), rowHelp(o.help, o.long_help, mode), enumSuffix(o), width);
     }
     // The auto-injected flags are not in the spec's option list; list them last
     // so they always appear, matching the reservation in `Spec`.
-    try renderRow(out, "-h, --help", "Print help", width);
-    try renderRow(out, "-V, --version", "Print version", width);
+    try renderRow(out, "-h, --help", "Print help", "", width);
+    try renderRow(out, "-V, --version", "Print version", "", width);
 }
 
 /// `<name> <version>\n` for `--version`.
@@ -94,16 +94,31 @@ fn renderRow(
     out: *std.Io.Writer,
     comptime label: []const u8,
     help: []const u8,
+    comptime suffix: []const u8,
     comptime width: usize,
 ) !void {
     try out.writeAll("  ");
     try out.writeAll(label);
-    if (help.len != 0) {
+    // `suffix` lands in the (last) help column, so it never disturbs the left-column
+    // alignment `width` measures — an enum option with empty `help` still needs its
+    // choices rendered, hence the two-part guard.
+    if (help.len != 0 or suffix.len != 0) {
         try out.splatByteAll(' ', width - label.len);
         try out.writeAll(gutter);
         try out.writeAll(help);
+        try out.writeAll(suffix);
     }
     try out.writeByte('\n');
+}
+
+/// The ` (one of: a|b|c)` help-column tail for an enum option, empty for every
+/// other value type. Driven off the Spec's own choices so help and the
+/// invalid-value error list the same set.
+fn enumSuffix(comptime o: Spec.Option) []const u8 {
+    return switch (o.value) {
+        .@"enum" => |choices| " (one of: " ++ Spec.choicesJoined(choices) ++ ")",
+        else => "",
+    };
 }
 
 /// The left-column label for a positional in the Arguments section: the name in
@@ -228,7 +243,7 @@ test "renderHelp short is a frozen, column-stable string" {
         \\Options:
         \\  -v, --verbose           Enable verbose output
         \\  -j, --jobs <N>          Parallel jobs
-        \\      --mode <MODE>       Optimization mode
+        \\      --mode <MODE>       Optimization mode (one of: fast|small)
         \\  -D, --define <KEY=VAL>  Define a variable
         \\  -o, --out <FILE>        Output file
         \\  -h, --help              Print help
@@ -256,7 +271,7 @@ test "renderHelp long uses long_about and long_help fallbacks" {
         \\Options:
         \\  -v, --verbose           Enable verbose output
         \\  -j, --jobs <N>          Number of parallel jobs to run
-        \\      --mode <MODE>       Optimization mode
+        \\      --mode <MODE>       Optimization mode (one of: fast|small)
         \\  -D, --define <KEY=VAL>  Define a variable
         \\  -o, --out <FILE>        Output file
         \\  -h, --help              Print help
@@ -308,4 +323,30 @@ test "optional positional is bracketed; long-only value-less option shows no val
     // long-only option: the short slot is padded and no <VALUE> is appended
     try testing.expect(std.mem.indexOf(u8, out, "    --dry-run") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--dry-run <") == null);
+}
+
+test "enum option help shows its choices" {
+    const cmd = comptime Spec.Command{
+        .name = "c",
+        .options = &.{
+            .{ .long = "mode", .value = .{ .@"enum" = &.{ "fast", "small" } }, .value_name = "MODE", .help = "Optimization mode" },
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderHelp(cmd, &w, .short);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "(one of: fast|small)") != null);
+}
+
+test "enum option with empty help still renders its choices" {
+    const cmd = comptime Spec.Command{
+        .name = "c",
+        .options = &.{
+            .{ .long = "mode", .value = .{ .@"enum" = &.{ "fast", "small" } } },
+        },
+    };
+    var buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderHelp(cmd, &w, .short);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "(one of: fast|small)") != null);
 }

@@ -228,7 +228,22 @@ pub fn printCliErrors(out: *Io.Writer, level: Style.ColorLevel, errs: []const cl
         switch (e.kind) {
             .unknown_flag => try out.print("unknown flag: {s}", .{e.arg}),
             .missing_value => try out.print("{s} requires a value ({s})", .{ e.arg, e.expected }),
-            .bad_value => try out.print("invalid value for {s}: '{s}' (expected {s})", .{ e.arg, e.got, e.expected }),
+            // Enum bad_value carries the choice list; list it as `(one of: a|b|c)` and,
+            // when the input was close to a choice, add a faint `did you mean 'X'?` note.
+            // Non-enum values keep the `(expected int)`-style wording, same reordered shape.
+            .bad_value => {
+                if (e.choices.len != 0) {
+                    try out.print("invalid value '{s}' for {s} (one of: {s})", .{ e.got, e.arg, e.choices });
+                    if (e.suggestion.len != 0) {
+                        try out.writeByte('\n');
+                        var buf: [96]u8 = undefined;
+                        const s = std.fmt.bufPrint(&buf, "did you mean '{s}'?", .{e.suggestion}) catch "did you mean";
+                        try sty_faint.styled(out, level, s);
+                    }
+                } else {
+                    try out.print("invalid value '{s}' for {s} (expected {s})", .{ e.got, e.arg, e.expected });
+                }
+            },
             .missing_required => try out.print("missing required argument: {s}", .{e.arg}),
             .unexpected_arg => try out.print("unexpected argument: {s}", .{e.arg}),
             .conflict => try out.print("{s} conflicts with {s}", .{ e.arg, e.where }),
