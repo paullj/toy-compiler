@@ -6,8 +6,9 @@ discovers the rest of the module graph by following that entry's transitive
 imports (`import a/b` -> `<root>/a/b.toy`, root = the entry file's directory).
 
 These live in their own subtree because the non-entry files have no `main` and
-must never be compiled standalone — `examples/check.sh` prunes `modules/`, and
-this directory ships its own harness.
+must never be compiled standalone — the corpus harness prunes `modules/` from the
+single-file walk and drives this directory as its own `module_dir` corpus, keying
+on each `main.toy` entry.
 
 ## Layout
 
@@ -33,7 +34,7 @@ directives live in the entry `main.toy`.
 
 ## Running
 
-`./examples/modules/check.sh` resolves `zig-out/bin/toy` (building it if
-absent — never via `zig build test`), then for each `main.toy` compiles from its
-directory (so the import root is correct) and verifies the directives. Exit 0
-means the module corpus matches its annotations.
+The corpus harness (`packages/compiler/tests/corpus.zig`) drives this subtree as a
+`module_dir` corpus: for each `main.toy` it discovers the module graph from that
+entry and verifies the directives in-process. Run it under `zig build test` (or
+`zig build test-bin` then `./zig-out/bin/toy-integration-test`).

@@ -110,7 +110,7 @@ pub const type_names = std.StaticStringMap(Type).initComptime(.{
 /// same cursor (`tree`/`tokens`/`source`/`graph_mod`/`sink`) and table accessors
 /// (`graphCtx`/`structSyms`/`enumSyms`/`activeStructMap`/`activeEnumMap`), so this
 /// is the single home for the logic AND its diagnostic strings — the two passes
-/// can't drift (diagnostic-string drift is otherwise gated only by `check.sh`).
+/// can't drift (diagnostic-string drift is otherwise gated only by the corpus harness).
 pub const refs = struct {
     const err_unknown_type = "unknown type '{s}'";
     const err_unknown_module = "unknown module '{s}'";
