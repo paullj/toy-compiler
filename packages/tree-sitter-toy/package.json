@@ -1,0 +1,16 @@
+{
+  "name": "tree-sitter-toy",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Tree-sitter grammar for the toy language",
+  "scripts": {
+    "generate": "tree-sitter generate"
+  },
+  "tree-sitter": [
+    {
+      "scope": "source.toy",
+      "file-types": ["toy"],
+      "highlights": ["queries/highlights.scm"]
+    }
+  ]
+}

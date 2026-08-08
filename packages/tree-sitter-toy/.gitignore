@@ -1,0 +1,9 @@
+# The generated parser (src/parser.c, src/grammar.json, src/node-types.json) and the
+# CLI-emitted headers (src/tree_sitter/) ARE checked in on purpose, so the build never
+# needs the tree-sitter CLI. Never ignore src/.
+node_modules/
+*.wasm
+*.o
+*.a
+*.dylib
+*.so
