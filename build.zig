@@ -108,14 +108,30 @@ pub fn build(b: *std.Build) void {
     // never `../` into the compiler source (a Zig module can't import above its root).
     // Their own test artifact keeps them out of the unit-test (toy-test) binary; the
     // compiler source stays library + inline unit tests, these are integration.
+    // The tree-sitter runtime + Zig binding, plus the checked-in generated toy parser,
+    // are linked ONLY into the integration test artifact (which hosts the grammar
+    // agreement test). The default `zig build` and the other test binaries never compile
+    // the parser, so the tree-sitter CLI is needed only to regenerate parser.c.
+    const ts_dep = b.dependency("tree_sitter", .{ .target = target, .optimize = optimize });
+
     const integration_mod = b.createModule(.{
         .root_source_file = b.path("packages/compiler/tests/integration.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "toy_compiler", .module = mod },
+            .{ .name = "tree_sitter", .module = ts_dep.module("tree_sitter") },
         },
     });
+    integration_mod.addCSourceFiles(.{
+        .files = &.{
+            "packages/tree-sitter-toy/src/parser.c",
+            "packages/tree-sitter-toy/src/scanner.c",
+        },
+        .flags = &.{"-std=c11"},
+    });
+    integration_mod.addIncludePath(b.path("packages/tree-sitter-toy/src"));
+    integration_mod.link_libc = true;
     const integration_tests = b.addTest(.{
         .name = "toy-integration-test",
         .root_module = integration_mod,

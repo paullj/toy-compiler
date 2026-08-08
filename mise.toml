@@ -13,3 +13,11 @@ run = "zig build && ./zig-out/bin/toy"
 [tasks."toy:release"]
 description = "Run toy cli in release"
 run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy"
+
+# Regenerate the checked-in tree-sitter-toy parser.c from grammar.js. Needed ONLY after
+# editing the grammar; the checked-in parser.c is authoritative and the build never needs
+# the tree-sitter CLI. Requires tree-sitter CLI 0.26.x (matching the committed parser.c).
+[tasks."ts:generate"]
+description = "Regenerate the checked-in tree-sitter-toy parser.c from grammar.js"
+dir = "packages/tree-sitter-toy"
+run = "tree-sitter generate"

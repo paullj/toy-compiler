@@ -1,5 +1,6 @@
 zig-out/
 .zig-cache/
+zig-pkg/
 .toy/
 .DS_Store
 temp/
