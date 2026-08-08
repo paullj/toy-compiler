@@ -37,11 +37,15 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("bundled_std", bundled_mod);
 
-    // Stub language-server module: established as its own import path so the driver
-    // wiring lands once. Fleshed out later; the cli exe imports it as `lsp`.
+    // The language-server module (server core + transport + check bridge). It consumes
+    // the compiler as a black box through the published `toy_compiler` module; the cli
+    // exe imports it as `lsp`.
     const lsp_mod = b.addModule("lsp", .{
         .root_source_file = b.path("packages/lsp/src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "toy_compiler", .module = mod },
+        },
     });
 
     const exe = b.addExecutable(.{
@@ -140,6 +144,15 @@ pub fn build(b: *std.Build) void {
     // Install the integration binary too so it runs directly
     // (`./zig-out/bin/toy-integration-test`) alongside toy-test under `test-bin`.
     test_bin_step.dependOn(&b.addInstallArtifact(integration_tests, .{}).step);
+
+    // The language-server tests (transport framing, document store, diagnostic mapping,
+    // and the in-process end-to-end JSON-RPC gate) live in the lsp module; give them their
+    // own artifact wired into both `test` and `test-bin`. The e2e/mapping tests read the
+    // diagnostics corpus + write a scratch file relative to cwd, which is the build root
+    // for a `zig build` run step, so those paths resolve.
+    const lsp_tests = b.addTest(.{ .name = "toy-lsp-test", .root_module = lsp_mod });
+    test_step.dependOn(&b.addRunArtifact(lsp_tests).step);
+    test_bin_step.dependOn(&b.addInstallArtifact(lsp_tests, .{}).step);
 
     // `zig build fuzz`: an in-process front-end fuzzer (tests/fuzz.zig). It feeds
     // mutated seed-corpus bytes + grammar-generated programs through lex → parse →

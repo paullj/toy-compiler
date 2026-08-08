@@ -193,7 +193,18 @@ pub fn main(init: std.process.Init) !void {
                             // `explain` is a distinct action (print a code's docs, no
                             // build); it has a `code` positional, not the shared option
                             // set, so it bypasses `applyParsed` entirely.
-                            if (comptime std.mem.eql(u8, sub.name, "explain")) {
+                            if (comptime std.mem.eql(u8, sub.name, "lsp")) {
+                                // The language server: connect the injectable server core
+                                // to real stdin/stdout and run to `exit`. This MUST be the
+                                // first comptime-guarded branch so `applyParsed` (which
+                                // reads build fields `Parsed(lsp)` lacks) is never
+                                // instantiated for it. Streaming stdin: it is a pipe, not
+                                // seekable.
+                                var in_buf: [1 << 16]u8 = undefined;
+                                var stdin_r = Io.File.stdin().readerStreaming(io, &in_buf);
+                                const code = try lsp.serve(gpa, &stdin_r.interface, out);
+                                std.process.exit(@intFromEnum(code));
+                            } else if (comptime std.mem.eql(u8, sub.name, "explain")) {
                                 try runExplain(out, err_level, p.code, p.list);
                                 try out.flush();
                                 return;

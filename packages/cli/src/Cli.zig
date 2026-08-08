@@ -118,6 +118,10 @@ pub const spec: Spec.Cli = .{
             .{ .name = "run", .about = "Build, then execute the binary and report its exit status", .options = shared_opts, .positionals = files_pos },
             .{ .name = "check", .about = "Check syntax and types without building; report all diagnostics", .options = check_opts, .positionals = files_pos },
             .{ .name = "explain", .about = "Print the documentation for a diagnostic code, or --list all codes", .options = explain_opts, .positionals = explain_pos },
+            // The language server over stdio (JSON-RPC). No options or positionals: it
+            // talks LSP on stdin/stdout, so an empty option set is intentional (the
+            // framework accepts `.options = &.{}`).
+            .{ .name = "lsp", .about = "Run the language server over stdio (JSON-RPC)" },
         },
     },
 };
