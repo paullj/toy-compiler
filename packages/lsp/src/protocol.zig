@@ -42,6 +42,22 @@ pub const MarkupContent = struct { kind: []const u8, value: []const u8 };
 /// cursor itself.
 pub const Hover = struct { contents: MarkupContent, range: ?Range = null };
 
+/// LSP `CompletionItemKind` — the subset we produce. The wire values are fixed by the
+/// spec; naming them keeps the enumerators from being bare magic numbers at call sites.
+pub const completion_kind = struct {
+    pub const method: u8 = 2;
+    pub const function: u8 = 3;
+    pub const field: u8 = 5;
+    pub const variable: u8 = 6;
+    pub const module: u8 = 9;
+    pub const @"enum": u8 = 13;
+    pub const keyword: u8 = 14;
+    pub const @"struct": u8 = 22;
+};
+
+/// One completion candidate. `detail` (a type / signature) is omitted when absent.
+pub const CompletionItem = struct { label: []const u8, kind: u8, detail: ?[]const u8 = null };
+
 pub const LspDiagnostic = struct {
     range: Range,
     severity: u8,
@@ -65,6 +81,9 @@ const ServerCapabilities = struct {
     } = .{},
     /// `textDocument/hover` is implemented.
     hoverProvider: bool = true,
+    /// `textDocument/completion` is implemented. `.` re-triggers completion so a
+    /// member/module access completes as the user types the dot.
+    completionProvider: struct { triggerCharacters: []const []const u8 = &.{"."} } = .{},
 };
 
 const ServerInfo = struct { name: []const u8, version: []const u8 };
@@ -120,8 +139,10 @@ test "InitializeResult advertises only the implemented capabilities" {
     try testing.expect(std.mem.indexOf(u8, out, "\"openClose\":true") != null);
     // Hover is advertised now that it is implemented.
     try testing.expect(std.mem.indexOf(u8, out, "\"hoverProvider\":true") != null);
+    // Completion is advertised with the `.` trigger.
+    try testing.expect(std.mem.indexOf(u8, out, "\"completionProvider\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\".\"]") != null);
     // Nothing we do not implement leaks into the advertisement.
-    try testing.expect(std.mem.indexOf(u8, out, "completionProvider") == null);
     try testing.expect(std.mem.indexOf(u8, out, "definitionProvider") == null);
 }
 

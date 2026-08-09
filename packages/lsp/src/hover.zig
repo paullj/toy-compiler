@@ -114,7 +114,7 @@ fn isRenderable(t: Type) bool {
 /// out-of-range line yields null; a character past the line's end clamps to the end (which
 /// `tokenAt` then reads as a gap -> null). u64 arithmetic so the `line + 1` / `line + 2`
 /// index used to bracket the line cannot overflow.
-fn positionToOffset(sm: *const SourceMap, line: u32, character: u32) ?u32 {
+pub fn positionToOffset(sm: *const SourceMap, line: u32, character: u32) ?u32 {
     const lc = sm.lineCount();
     if (line >= lc) return null;
     const ls: u64 = sm.lineStart(@as(usize, line) + 1);
@@ -125,7 +125,7 @@ fn positionToOffset(sm: *const SourceMap, line: u32, character: u32) ?u32 {
 
 /// The token whose half-open `[start, end)` contains `off`, or null for a gap / EOF. Binary
 /// search over the start-sorted, non-overlapping token stream.
-fn tokenAt(tokens: []const Token, off: u32) ?u32 {
+pub fn tokenAt(tokens: []const Token, off: u32) ?u32 {
     var lo: usize = 0;
     var hi: usize = tokens.len;
     while (lo < hi) {
@@ -143,11 +143,11 @@ fn tokenAt(tokens: []const Token, off: u32) ?u32 {
 /// internal scratch file, so the module segment is an artifact the user never wrote — hover
 /// shows the bare declared name. Toy identifiers contain no '.', so the last '.' is the
 /// module separator.
-fn bareName(name: []const u8) []const u8 {
+pub fn bareName(name: []const u8) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
 }
 
-fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) !void {
+pub fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) !void {
     switch (t.kind) {
         .int => try buf.appendSlice(a, t.intName()),
         .bool => try buf.appendSlice(a, "bool"),
@@ -165,7 +165,7 @@ fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layouts: [
 
 /// `fn name(P0, P1, ...) -> R`. `sig` is duck-typed (`Typecheck.Sig` is not re-exported)
 /// so this stays decoupled from the symbol module's surface.
-fn renderSig(a: std.mem.Allocator, buf: *std.ArrayList(u8), sig: anytype, layouts: []const Layout, enum_layouts: []const EnumLayout) !void {
+pub fn renderSig(a: std.mem.Allocator, buf: *std.ArrayList(u8), sig: anytype, layouts: []const Layout, enum_layouts: []const EnumLayout) !void {
     try buf.appendSlice(a, "fn ");
     try buf.appendSlice(a, bareName(sig.name));
     try buf.append(a, '(');
