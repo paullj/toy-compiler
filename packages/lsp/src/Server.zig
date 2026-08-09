@@ -17,6 +17,7 @@ const transport = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const diagnostics = @import("diagnostics.zig");
 const hover = @import("hover.zig");
+const completion = @import("completion.zig");
 const Documents = @import("Documents.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
@@ -200,6 +201,31 @@ pub const Server = struct {
             } else {
                 try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
             }
+            return true;
+        }
+
+        if (eql(method, "textDocument/completion")) {
+            const iv = id orelse return true; // a request must carry an id
+            var comp: ?completion.Completions = null;
+            defer if (comp) |*c| c.deinit(); // after writeResponse has serialized the items
+            var items: []const protocol.CompletionItem = &.{};
+            blk: {
+                const params = objGet(root, "params") orelse break :blk;
+                const td = objGet(params, "textDocument") orelse break :blk;
+                const uri = getStr(td, "uri") orelse break :blk;
+                const pos = objGet(params, "position") orelse break :blk;
+                const line = getInt(pos, "line") orelse break :blk;
+                const character = getInt(pos, "character") orelse break :blk;
+                // Guard the whole u32 range (mirrors hover): an i64 past u32 max would
+                // panic the `@intCast` and crash the server on one malformed request.
+                const max: i64 = std.math.maxInt(u32);
+                if (line < 0 or character < 0 or line > max or character > max) break :blk;
+                const doc = self.docs.get(uri) orelse break :blk; // completion before didOpen
+                comp = completion.completionsAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk;
+                if (comp) |c| items = c.items;
+            }
+            // Always answer with an array (an empty list is a valid "no candidates").
+            try protocol.writeResponse(self.gpa, writer, iv, items);
             return true;
         }
 
@@ -417,7 +443,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             var it = caps.object.iterator();
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
-                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider"));
+                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider"));
             }
         } else if (idv == .integer and idv.integer == 2) {
             saw_shutdown = true;
@@ -550,4 +576,187 @@ fn hoverValue(resp: std.json.Value) ?[]const u8 {
     const result = objGet(resp, "result") orelse return null;
     const contents = objGet(result, "contents") orelse return null;
     return getStr(contents, "value");
+}
+
+/// A 0-based (line, character) position just PAST the last occurrence of `needle` in
+/// `src` — computed from the fixture so completion cursors are never hand-counted
+/// (ASCII, so byte == character).
+fn posAfterLast(src: []const u8, needle: []const u8) protocol.Position {
+    const idx = std.mem.lastIndexOf(u8, src, needle).? + needle.len;
+    var line: u32 = 0;
+    var col: u32 = 0;
+    for (src[0..idx]) |ch| {
+        if (ch == '\n') {
+            line += 1;
+            col = 0;
+        } else col += 1;
+    }
+    return .{ .line = line, .character = col };
+}
+
+/// The response's `result` array (the completion items), or null.
+fn resultArr(resp: std.json.Value) ?[]std.json.Value {
+    const result = objGet(resp, "result") orelse return null;
+    return if (result == .array) result.array.items else null;
+}
+
+/// The `kind` of the first completion item labeled `label`, or null if none.
+fn labelKind(items: []const std.json.Value, label: []const u8) ?i64 {
+    for (items) |it| {
+        const l = getStr(it, "label") orelse continue;
+        if (eql(l, label)) return getInt(it, "kind");
+    }
+    return null;
+}
+
+fn hasLabel(items: []const std.json.Value, label: []const u8) bool {
+    return labelKind(items, label) != null;
+}
+
+test "lsp completion: scope, member (fields+methods), module members, and a broken buffer" {
+    const gpa = testing.allocator;
+
+    const scope_src =
+        \\struct Counter { n: int }
+        \\impl Counter { fn bump(self) -> int { return self.n } }
+        \\fn helper(x: int) -> int { return x }
+        \\fn main(arg: int) -> int {
+        \\    c := Counter { n: 0 }
+        \\    count := 10
+        \\    return count
+        \\}
+    ;
+    const member_src =
+        \\struct Point { x: int, y: int }
+        \\impl Point { fn mag(self) -> int { return self.x } }
+        \\fn main() -> int {
+        \\    p := Point { x: 1, y: 2 }
+        \\    return p.x
+        \\}
+    ;
+    const module_src =
+        \\import std/io
+        \\fn main() -> int {
+        \\    io.println("hi")
+        \\    return 0
+        \\}
+    ;
+    // The trailing `.` is the ONLY parse-level error; the missing return is a
+    // tolerated flow/type error.
+    const broken_src =
+        \\struct S { a: int, b: int }
+        \\fn main() -> int {
+        \\    s := S { a: 1, b: 2 }
+        \\    s.
+        \\}
+    ;
+
+    const u_scope = "file:///scope.toy";
+    const u_member = "file:///member.toy";
+    const u_module = "file:///module.toy";
+    const u_broken = "file:///broken.toy";
+
+    const Pos = struct { line: u32, character: u32 };
+    const complReq = struct {
+        fn make(id: i64, uri: []const u8, p: protocol.Position) struct {
+            jsonrpc: []const u8 = "2.0",
+            id: i64,
+            method: []const u8 = "textDocument/completion",
+            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
+        } {
+            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = p.line, .character = p.character } } };
+        }
+    };
+    const openDoc = struct {
+        fn make(uri: []const u8, text: []const u8) struct {
+            jsonrpc: []const u8 = "2.0",
+            method: []const u8 = "textDocument/didOpen",
+            params: struct { textDocument: struct { uri: []const u8, languageId: []const u8 = "toy", version: i64 = 1, text: []const u8 } },
+        } {
+            return .{ .params = .{ .textDocument = .{ .uri = uri, .text = text } } };
+        }
+    };
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    try frameInto(gpa, &session, openDoc.make(u_scope, scope_src));
+    try frameInto(gpa, &session, openDoc.make(u_member, member_src));
+    try frameInto(gpa, &session, openDoc.make(u_module, module_src));
+    try frameInto(gpa, &session, openDoc.make(u_broken, broken_src));
+    try frameInto(gpa, &session, complReq.make(20, u_scope, posAfterLast(scope_src, "count")));
+    try frameInto(gpa, &session, complReq.make(21, u_member, posAfterLast(member_src, "p.")));
+    try frameInto(gpa, &session, complReq.make(22, u_module, posAfterLast(module_src, "io.")));
+    try frameInto(gpa, &session, complReq.make(23, u_broken, posAfterLast(broken_src, "s.")));
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 99), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    const code = try serve(gpa, &reader, &out.writer);
+    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang/crash
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+
+    var by_id: [100]?std.json.Value = @splat(null);
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method") != null) continue;
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .integer and idv.integer >= 0 and idv.integer < 100) by_id[@intCast(idv.integer)] = v;
+    }
+
+    // Capability: the `.` trigger is advertised.
+    const caps = field(by_id[1].?, "result", "capabilities").?;
+    const cp = objGet(caps, "completionProvider").?;
+    const trigs = objGet(cp, "triggerCharacters").?;
+    try testing.expect(trigs == .array and trigs.array.items.len == 1);
+    try testing.expectEqualStrings(".", trigs.array.items[0].string);
+
+    // (1) SCOPE: enclosing-fn local + param + a visible top-level fn + a type + a keyword.
+    const scope = resultArr(by_id[20].?).?;
+    try testing.expectEqual(@as(?i64, 6), labelKind(scope, "count")); // local
+    try testing.expectEqual(@as(?i64, 6), labelKind(scope, "arg")); // enclosing param
+    try testing.expectEqual(@as(?i64, 3), labelKind(scope, "helper")); // top-level fn
+    try testing.expectEqual(@as(?i64, 22), labelKind(scope, "Counter")); // top-level struct
+    try testing.expectEqual(@as(?i64, 14), labelKind(scope, "if")); // keyword
+    // A method must NOT leak into plain scope as a free fn; another fn's param must not
+    // leak across the fn boundary; a field is not an in-scope name.
+    try testing.expect(!hasLabel(scope, "bump"));
+    try testing.expect(!hasLabel(scope, "x"));
+    try testing.expect(!hasLabel(scope, "n"));
+
+    // (2) MEMBER: the receiver struct's fields + method, and NOT unrelated globals.
+    const member = resultArr(by_id[21].?).?;
+    try testing.expectEqual(@as(?i64, 5), labelKind(member, "x")); // field
+    try testing.expectEqual(@as(?i64, 5), labelKind(member, "y")); // field
+    try testing.expectEqual(@as(?i64, 2), labelKind(member, "mag")); // method
+    try testing.expect(!hasLabel(member, "main"));
+    try testing.expect(!hasLabel(member, "Point"));
+    try testing.expect(!hasLabel(member, "if"));
+
+    // (3) MODULE: the imported module's pub fns, and no scratch-file qualifier leak.
+    const module = resultArr(by_id[22].?).?;
+    try testing.expectEqual(@as(?i64, 3), labelKind(module, "print"));
+    try testing.expectEqual(@as(?i64, 3), labelKind(module, "println"));
+    try testing.expect(!hasLabel(module, "main"));
+    for (module) |it| {
+        const l = getStr(it, "label").?;
+        try testing.expect(std.mem.indexOfScalar(u8, l, '.') == null);
+    }
+
+    // (4) INCOMPLETE (fault-tolerant): a trailing `.` still yields the receiver's fields.
+    const broken = resultArr(by_id[23].?).?;
+    try testing.expectEqual(@as(?i64, 5), labelKind(broken, "a"));
+    try testing.expectEqual(@as(?i64, 5), labelKind(broken, "b"));
 }
