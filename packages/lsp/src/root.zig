@@ -15,5 +15,6 @@ test {
     _ = @import("protocol.zig");
     _ = @import("Documents.zig");
     _ = @import("diagnostics.zig");
+    _ = @import("hover.zig");
     _ = Server;
 }

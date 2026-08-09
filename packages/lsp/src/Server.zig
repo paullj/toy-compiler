@@ -16,6 +16,7 @@ const Writer = std.Io.Writer;
 const transport = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const diagnostics = @import("diagnostics.zig");
+const hover = @import("hover.zig");
 const Documents = @import("Documents.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
@@ -174,6 +175,34 @@ pub const Server = struct {
             return true;
         }
 
+        if (eql(method, "textDocument/hover")) {
+            const iv = id orelse return true; // a request must carry an id
+            var hv: ?hover.Hover = null;
+            defer if (hv) |*h| h.deinit(); // after writeResponse has serialized `value`
+            var result: ?protocol.Hover = null;
+            blk: {
+                const params = objGet(root, "params") orelse break :blk;
+                const td = objGet(params, "textDocument") orelse break :blk;
+                const uri = getStr(td, "uri") orelse break :blk;
+                const pos = objGet(params, "position") orelse break :blk;
+                const line = getInt(pos, "line") orelse break :blk;
+                const character = getInt(pos, "character") orelse break :blk;
+                // Guard the WHOLE u32 range, not just `>= 0`: a valid i64 past u32 max would
+                // panic the `@intCast` below, crashing the server on one malformed request.
+                const max: i64 = std.math.maxInt(u32);
+                if (line < 0 or character < 0 or line > max or character > max) break :blk;
+                const doc = self.docs.get(uri) orelse break :blk; // hover before didOpen
+                hv = hover.hoverAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk;
+                if (hv) |h| result = .{ .contents = .{ .kind = h.kind, .value = h.value } };
+            }
+            if (result) |r| {
+                try protocol.writeResponse(self.gpa, writer, iv, r);
+            } else {
+                try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+            }
+            return true;
+        }
+
         if (eql(method, "shutdown")) {
             self.shutdown_requested = true;
             if (id) |iv| try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
@@ -280,6 +309,17 @@ fn annotatedLine(src: []const u8) u32 {
     return 0;
 }
 
+/// The 0-based byte column of `needle` within line `line_idx` of `src` — computed from the
+/// fixture, so hover positions are never hand-counted (ASCII, so byte == character).
+fn colOf(src: []const u8, line_idx: u32, needle: []const u8) u32 {
+    var it = std.mem.splitScalar(u8, src, '\n');
+    var i: u32 = 0;
+    while (it.next()) |line| : (i += 1) {
+        if (i == line_idx) return @intCast(std.mem.indexOf(u8, line, needle).?);
+    }
+    unreachable;
+}
+
 fn hasCode(diags: std.json.Value, code: []const u8) bool {
     if (diags != .array) return false;
     for (diags.array.items) |d| {
@@ -377,7 +417,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             var it = caps.object.iterator();
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
-                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync"));
+                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider"));
             }
         } else if (idv == .integer and idv.integer == 2) {
             saw_shutdown = true;
@@ -409,4 +449,105 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
     try testing.expect(hasCode(d3, "P0002"));
 
     try testing.expect(saw_init and saw_shutdown);
+}
+
+test "lsp hover: type at a binding/param/expr, signature at a callee, null over a gap and OOB" {
+    const gpa = testing.allocator;
+
+    // The leading indent on line 2 is the deliberate whitespace gap (id 6).
+    const src = "fn add(a: int, b: int) -> int { return a + b }\nfn main() -> int {\n    x := add(1, 2)\n    return x\n}";
+    const uri = "file:///h.toy";
+
+    const Pos = struct { line: i64, character: i64 };
+    const hoverReq = struct {
+        fn make(id: i64, line: u32, character: u32) struct {
+            jsonrpc: []const u8 = "2.0",
+            id: i64,
+            method: []const u8 = "textDocument/hover",
+            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
+        } {
+            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } } };
+        }
+    };
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    // A hover BEFORE the document is opened -> null, no crash.
+    try frameInto(gpa, &session, hoverReq.make(10, 0, 0));
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didOpen",
+        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
+    });
+    try frameInto(gpa, &session, hoverReq.make(2, 2, colOf(src, 2, "x :="))); // binding x
+    try frameInto(gpa, &session, hoverReq.make(3, 0, colOf(src, 0, "a + b"))); // param-use a
+    try frameInto(gpa, &session, hoverReq.make(4, 2, colOf(src, 2, "add("))); // callee add
+    try frameInto(gpa, &session, hoverReq.make(5, 0, colOf(src, 0, "+ b"))); // expr +
+    try frameInto(gpa, &session, hoverReq.make(6, 2, colOf(src, 2, "  "))); // leading-indent gap
+    // Out-of-range line, and a character past u32 max (must NOT panic the @intCast).
+    try frameInto(gpa, &session, hoverReq.make(7, 100000, 0));
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .id = @as(i64, 11),
+        .method = "textDocument/hover",
+        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 0), .character = @as(i64, 3000000000) } },
+    });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 8), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    const code = try serve(gpa, &reader, &out.writer);
+    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+
+    // Collect every response by id (ids run 1..11).
+    var by_id: [12]?std.json.Value = @splat(null);
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method") != null) continue; // a notification (publishDiagnostics)
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .integer and idv.integer >= 0 and idv.integer < 12) by_id[@intCast(idv.integer)] = v;
+    }
+
+    // id 1: hoverProvider is advertised as a boolean.
+    const caps = field(by_id[1].?, "result", "capabilities").?;
+    const hp = objGet(caps, "hoverProvider").?;
+    try testing.expect(hp == .bool and hp.bool);
+
+    // The positive cases FAIL on a null/absent value (non-vacuous).
+    try testing.expectEqualStrings("int", hoverValue(by_id[2].?).?); // binding x
+    try testing.expectEqualStrings("int", hoverValue(by_id[3].?).?); // param a
+    try testing.expectEqualStrings("int", hoverValue(by_id[5].?).?); // expr +
+
+    // id 4: callee signature.
+    const callee = hoverValue(by_id[4].?).?;
+    try testing.expectEqualStrings("fn add(int, int) -> int", callee);
+    // The internal scratch-file module name must never leak into hover output.
+    try testing.expect(std.mem.indexOf(u8, callee, "doc.") == null);
+
+    // Every non-hit path answers with an explicit null result.
+    try testing.expect(objGet(by_id[6].?, "result").? == .null); // whitespace gap
+    try testing.expect(objGet(by_id[10].?, "result").? == .null); // before didOpen
+    try testing.expect(objGet(by_id[7].?, "result").? == .null); // OOB line
+    try testing.expect(objGet(by_id[11].?, "result").? == .null); // char > u32 max
+}
+
+/// The hover `result.contents.value`, or null if the response's result was JSON null.
+fn hoverValue(resp: std.json.Value) ?[]const u8 {
+    const result = objGet(resp, "result") orelse return null;
+    const contents = objGet(result, "contents") orelse return null;
+    return getStr(contents, "value");
 }

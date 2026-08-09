@@ -35,6 +35,13 @@ pub const Range = struct { start: Position, end: Position };
 pub const Location = struct { uri: []const u8, range: Range };
 pub const Related = struct { location: Location, message: []const u8 };
 
+/// LSP `MarkupContent` (or a plain string when `kind == "plaintext"`).
+pub const MarkupContent = struct { kind: []const u8, value: []const u8 };
+
+/// A hover result. `range` is omitted, so the client highlights the token under the
+/// cursor itself.
+pub const Hover = struct { contents: MarkupContent, range: ?Range = null };
+
 pub const LspDiagnostic = struct {
     range: Range,
     severity: u8,
@@ -45,9 +52,9 @@ pub const LspDiagnostic = struct {
     relatedInformation: ?[]const Related = null,
 };
 
-/// The subset of `ServerCapabilities` we actually implement — advertised as-is. No
-/// hover/completion/definition/etc.: advertising a provider we do not implement would
-/// make the client send requests we can only reject.
+/// The subset of `ServerCapabilities` we actually implement — advertised as-is. Only
+/// providers we back with a handler appear here: advertising one we do not implement
+/// would make the client send requests we can only reject.
 const ServerCapabilities = struct {
     /// utf-8 so a byte column equals `character` for ASCII (see `Position`).
     positionEncoding: []const u8 = "utf-8",
@@ -56,6 +63,8 @@ const ServerCapabilities = struct {
         openClose: bool = true,
         change: u8 = 1,
     } = .{},
+    /// `textDocument/hover` is implemented.
+    hoverProvider: bool = true,
 };
 
 const ServerInfo = struct { name: []const u8, version: []const u8 };
@@ -109,8 +118,9 @@ test "InitializeResult advertises only the implemented capabilities" {
     try testing.expect(std.mem.indexOf(u8, out, "\"positionEncoding\":\"utf-8\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"change\":1") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"openClose\":true") != null);
+    // Hover is advertised now that it is implemented.
+    try testing.expect(std.mem.indexOf(u8, out, "\"hoverProvider\":true") != null);
     // Nothing we do not implement leaks into the advertisement.
-    try testing.expect(std.mem.indexOf(u8, out, "hoverProvider") == null);
     try testing.expect(std.mem.indexOf(u8, out, "completionProvider") == null);
     try testing.expect(std.mem.indexOf(u8, out, "definitionProvider") == null);
 }
