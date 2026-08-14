@@ -42,6 +42,22 @@ pub const MarkupContent = struct { kind: []const u8, value: []const u8 };
 /// cursor itself.
 pub const Hover = struct { contents: MarkupContent, range: ?Range = null };
 
+// `label` is a [start,end) byte span into the enclosing SignatureInformation.label (the
+// spec's second, unambiguous form): a plain-string label makes a client highlight the FIRST
+// matching substring, which is wrong when two params share a type name (`fn add(int, int)`).
+// ASCII source => byte offset == UTF-16 unit.
+pub const ParameterInformation = struct { label: [2]u32 };
+pub const SignatureInformation = struct {
+    label: []const u8,
+    parameters: []const ParameterInformation = &.{},
+};
+// Toy has no overloading: exactly one signature, activeSignature always 0.
+pub const SignatureHelp = struct {
+    signatures: []const SignatureInformation,
+    activeSignature: u32 = 0,
+    activeParameter: u32 = 0,
+};
+
 /// LSP `CompletionItemKind` — the subset we produce. The wire values are fixed by the
 /// spec; naming them keeps the enumerators from being bare magic numbers at call sites.
 pub const completion_kind = struct {
@@ -86,6 +102,11 @@ const ServerCapabilities = struct {
     completionProvider: struct { triggerCharacters: []const []const u8 = &.{"."} } = .{},
     /// `textDocument/definition` is implemented (within-file go-to-declaration).
     definitionProvider: bool = true,
+    /// `(` opens the help; `,` retriggers so the active parameter advances as the user types.
+    signatureHelpProvider: struct {
+        triggerCharacters: []const []const u8 = &.{ "(", "," },
+        retriggerCharacters: []const []const u8 = &.{","},
+    } = .{},
 };
 
 const ServerInfo = struct { name: []const u8, version: []const u8 };
@@ -146,6 +167,10 @@ test "InitializeResult advertises only the implemented capabilities" {
     try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\".\"]") != null);
     // Definition is advertised now that it is implemented.
     try testing.expect(std.mem.indexOf(u8, out, "\"definitionProvider\":true") != null);
+    // Signature help is advertised with the `(`/`,` triggers.
+    try testing.expect(std.mem.indexOf(u8, out, "\"signatureHelpProvider\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\"(\",\",\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"retriggerCharacters\":[\",\"]") != null);
 }
 
 test "writeResponse echoes an integer id and omits null optionals in the result" {
