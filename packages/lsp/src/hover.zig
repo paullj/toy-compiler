@@ -123,6 +123,15 @@ pub fn positionToOffset(sm: *const SourceMap, line: u32, character: u32) ?u32 {
     return @intCast(if (want >= le) le else want);
 }
 
+/// LSP (line,character) -> byte offset within `text`, via a throwaway SourceMap. Null for
+/// an out-of-range line; a character past the line end clamps to the line end. This is the
+/// SAME basis the feature handlers use, so a spliced edit and a later hover/definition agree.
+pub fn offsetIn(gpa: std.mem.Allocator, text: []const u8, line: u32, character: u32) !?u32 {
+    var sm = try SourceMap.init(gpa, "d", text);
+    defer sm.deinit(gpa);
+    return positionToOffset(&sm, line, character);
+}
+
 /// The token whose half-open `[start, end)` contains `off`, or null for a gap / EOF. Binary
 /// search over the start-sorted, non-overlapping token stream.
 pub fn tokenAt(tokens: []const Token, off: u32) ?u32 {

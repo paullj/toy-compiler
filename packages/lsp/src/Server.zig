@@ -1,12 +1,19 @@
 //! The JSON-RPC server core: an injectable reader/writer, the lifecycle handshake, the
 //! request/notification dispatch, the document store, and didOpen/didChange -> check ->
-//! publishDiagnostics. Requests are SERIALIZED — one message in, its response(s) out,
-//! before the next is read. No concurrency, no cancellation, no incremental sync.
+//! publishDiagnostics. didChange uses INCREMENTAL sync (ranged deltas spliced in order,
+//! with a whole-document replace as a fallback).
 //!
-//! Every REQUEST produces exactly one response (a result or an error) before dispatch
-//! returns, so a client is never left hanging. Notifications never get a response. Only
-//! OOM / a dead transport are fatal to the loop; a per-message fault is swallowed so one
-//! bad message can neither drop a later response nor kill the session.
+//! The read model is anchor/drain/prescan/process: each turn does one blocking anchor read,
+//! drains only the frames ALREADY buffered into a batch, prescans that batch for
+//! `$/cancelRequest` ids, then processes the batch in order — a request whose id was
+//! cancelled earlier in the same batch is answered RequestCancelled and does zero work. This
+//! is best-effort in-batch cancellation: a serial one-at-a-time reader could never honor a
+//! cancel that trails its request, so we drain what the client already sent before acting.
+//!
+//! Every REQUEST produces exactly one response (a result or an error), so a client is never
+//! left hanging. Notifications never get a response. Only OOM / a dead transport are fatal to
+//! the loop; a per-message fault is swallowed so one bad message can neither drop a later
+//! response nor kill the session.
 
 const std = @import("std");
 const Io = std.Io;
@@ -89,27 +96,62 @@ pub const Server = struct {
 
     fn run(self: *Server, reader: *Reader, writer: *Writer) anyerror!ExitCode {
         while (true) {
-            const body = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
-                // A clean pipe close at a message boundary ends the session.
+            // P1 ANCHOR: one blocking read guarantees forward progress (or EOF => done). This is
+            // the ONLY unconditional read; it blocks exactly like the old serial loop did.
+            const first = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
                 error.EndOfStream => break,
-                // A malformed / truncated frame: terminate cleanly rather than hang.
                 error.UnexpectedEof, error.StreamTooLong, error.MissingContentLength, error.InvalidHeader => break,
                 error.OutOfMemory, error.ReadFailed => return e,
             };
-            defer self.gpa.free(body);
-            const keep = self.dispatch(writer, body) catch |e| switch (e) {
-                // A dead transport or OOM is fatal; any per-message handler fault is not.
-                error.OutOfMemory, error.WriteFailed => return e,
-                else => true,
-            };
-            if (!keep) break;
+            var batch: std.ArrayList([]u8) = .empty;
+            defer {
+                for (batch.items) |b| self.gpa.free(b);
+                batch.deinit(self.gpa);
+            }
+            try batch.append(self.gpa, first);
+
+            // P2 DRAIN: only frames ALREADY buffered. The bufferedLen()>0 gate is the sole thing
+            // that stops us starting a read for a frame the client has not begun sending — never
+            // drop it. It does NOT promise "never blocks": a partially-buffered trailing frame is
+            // finished by readMessage (a bounded, client-is-mid-send wait, same as the old loop).
+            // Fixed reader (test): the whole session is buffered, so this drains EVERY remaining
+            // frame into one batch => a $/cancelRequest anywhere precedes its target in P4.
+            // Streaming pipe (real client): only what a syscall already delivered.
+            var terminal = false;
+            while (reader.bufferedLen() > 0) {
+                const b = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
+                    // OOM/ReadFailed are fatal exactly as in the serial loop; queued-but-unprocessed
+                    // frames in this batch are dropped (freed by defer) — the transport is dying.
+                    error.OutOfMemory, error.ReadFailed => return e,
+                    else => {
+                        terminal = true;
+                        break;
+                    },
+                };
+                try batch.append(self.gpa, b);
+            }
+
+            // P3 PRESCAN: collect cancelled ids across the WHOLE batch, before processing any of it.
+            var cancelled: CancelSet = .{ .gpa = self.gpa };
+            defer cancelled.deinit();
+            for (batch.items) |b| try collectCancel(self.gpa, b, &cancelled);
+
+            // P4 PROCESS in order, honoring cancels. A per-message fault is not fatal (unchanged).
+            for (batch.items) |b| {
+                const keep = self.dispatch(writer, b, &cancelled) catch |e| switch (e) {
+                    error.OutOfMemory, error.WriteFailed => return e,
+                    else => true,
+                };
+                if (!keep) return if (self.shutdown_requested) .ok else .no_shutdown;
+            }
+            if (terminal) break;
         }
         return if (self.shutdown_requested) .ok else .no_shutdown;
     }
 
     /// Handle one message. Returns `false` ONLY on `exit` (stop the loop); `true` keeps
     /// serving. A parse failure or a message that isn't a request-for-us is ignored.
-    fn dispatch(self: *Server, writer: *Writer, body: []const u8) anyerror!bool {
+    fn dispatch(self: *Server, writer: *Writer, body: []const u8, cancelled: *const CancelSet) anyerror!bool {
         var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, body, .{}) catch return true;
         defer parsed.deinit();
         const root = parsed.value;
@@ -122,6 +164,20 @@ pub const Server = struct {
         const method = method_v.string;
         // Present iff this is a request; absent for a notification.
         const id = root.object.get("id");
+
+        // A request the client already cancelled: answer RequestCancelled and do NONE of the
+        // work (no scratch write, no check, no feature call, no publish). Notifications carry
+        // no top-level id and are never cancellable; `$/cancelRequest` carries its target in
+        // params, not a top-level id, so it never self-matches — it falls through to the
+        // ignored-notification path below (a notification is never answered). The gate is
+        // uniform: a cancelled initialize/shutdown is also answered -32800 and its state side
+        // effect is skipped — spec-legal (a server MAY cancel any request); left uniform.
+        if (id) |iv| {
+            if (cancelled.contains(iv)) {
+                try protocol.writeError(self.gpa, writer, iv, protocol.err_code.request_cancelled, "request cancelled");
+                return true;
+            }
+        }
 
         if (eql(method, "exit")) return false;
 
@@ -159,11 +215,33 @@ pub const Server = struct {
             const uri = getStr(td, "uri") orelse return true;
             const version = getInt(td, "version") orelse 0;
             const changes = objGet(params, "contentChanges") orelse return true;
-            if (changes != .array or changes.array.items.len == 0) return true;
-            // Full-text sync: the LAST change carries the whole document.
-            const last = changes.array.items[changes.array.items.len - 1];
-            const text = getStr(last, "text") orelse return true;
-            try self.docs.put(self.gpa, uri, text, version);
+            if (changes != .array) return true;
+            // Incremental sync: apply each change IN ORDER, each relative to the doc AFTER the
+            // previous one. A change with NO `range` is a whole-document replace (clients that
+            // opt out of deltas). Protocol-exact SYNC only: publish() below still re-checks the
+            // whole buffer via the scratch file and re-lexes/re-parses this edited file.
+            for (changes.array.items) |change| {
+                const text = getStr(change, "text") orelse continue;
+                const range = objGet(change, "range") orelse {
+                    try self.docs.put(self.gpa, uri, text, version); // full replace
+                    continue;
+                };
+                const d = self.docs.get(uri) orelse continue; // a didChange before didOpen
+                const s = objGet(range, "start") orelse continue;
+                const e = objGet(range, "end") orelse continue;
+                // Offsets are rebuilt against the CURRENT text: spliceRange reallocs d.text and
+                // each delta's coords are against the post-previous-delta text.
+                const doc_end: u32 = @intCast(d.text.len);
+                const sl = coordU32(getInt(s, "line")) orelse continue;
+                const sc = coordU32(getInt(s, "character")) orelse continue;
+                const el = coordU32(getInt(e, "line")) orelse continue;
+                const ec = coordU32(getInt(e, "character")) orelse continue;
+                const start_off = (try hover.offsetIn(self.gpa, d.text, sl, sc)) orelse doc_end;
+                var end_off = (try hover.offsetIn(self.gpa, d.text, el, ec)) orelse doc_end;
+                if (end_off < start_off) end_off = start_off; // tolerate an inverted range
+                try self.docs.spliceRange(self.gpa, uri, start_off, end_off, text);
+            }
+            self.docs.setVersion(uri, version);
             try self.publish(writer, uri);
             return true;
         }
@@ -355,6 +433,61 @@ fn getInt(v: std.json.Value, key: []const u8) ?i64 {
     };
 }
 
+const CancelId = union(enum) { int: i64, str: []u8 };
+
+/// Request ids cancelled within the CURRENT drain batch. Strings are OWNED — batch bodies
+/// (and their parse arenas) are freed as processed, so a borrowed id would dangle. A fresh
+/// set per batch is deliberate: a cancel only affects requests in its OWN batch, so a cancel
+/// that arrives after its request was already answered (a later batch) is correctly a no-op
+/// (no double-response), and a reused id in a later batch is never poisoned by a stale cancel.
+const CancelSet = struct {
+    gpa: std.mem.Allocator,
+    ids: std.ArrayList(CancelId) = .empty,
+
+    fn deinit(self: *CancelSet) void {
+        for (self.ids.items) |c| switch (c) {
+            .str => |s| self.gpa.free(s),
+            .int => {},
+        };
+        self.ids.deinit(self.gpa);
+    }
+    fn add(self: *CancelSet, id: std.json.Value) !void {
+        switch (id) {
+            .integer => |i| try self.ids.append(self.gpa, .{ .int = i }),
+            .string => |s| try self.ids.append(self.gpa, .{ .str = try self.gpa.dupe(u8, s) }),
+            else => {},
+        }
+    }
+    fn contains(self: *const CancelSet, id: std.json.Value) bool {
+        for (self.ids.items) |c| switch (c) {
+            .int => |i| if (id == .integer and id.integer == i) return true,
+            .str => |s| if (id == .string and eql(id.string, s)) return true,
+        };
+        return false;
+    }
+};
+
+/// Prescan one raw frame: if it is `$/cancelRequest`, record its `params.id`. A parse
+/// failure or non-cancel frame is ignored (it is handled/rejected in the process phase).
+fn collectCancel(gpa: std.mem.Allocator, body: []const u8, set: *CancelSet) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return;
+    defer parsed.deinit();
+    const root = parsed.value;
+    const m = objGet(root, "method") orelse return;
+    if (m != .string or !eql(m.string, "$/cancelRequest")) return;
+    const params = objGet(root, "params") orelse return;
+    const id = objGet(params, "id") orelse return;
+    try set.add(id);
+}
+
+/// An LSP position coordinate -> u32 guarding the whole u32 range; null/negative/over-max
+/// => null so a malformed range skips its change (mirrors the feature handlers' guards).
+fn coordU32(v: ?i64) ?u32 {
+    const i = v orelse return null;
+    if (i < 0 or i > std.math.maxInt(u32)) return null;
+    return @intCast(i);
+}
+
 const testing = std.testing;
 
 /// Append one framed JSON message (built from `payload`) to `session`.
@@ -497,7 +630,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             const caps = field(v, "result", "capabilities").?;
             try testing.expectEqualStrings("utf-8", getStr(caps, "positionEncoding").?);
             const sync = objGet(caps, "textDocumentSync").?;
-            try testing.expectEqual(@as(i64, 1), getInt(sync, "change").?);
+            try testing.expectEqual(@as(i64, 2), getInt(sync, "change").?);
             // The advertised capability set must be a SUBSET of what we implement — no
             // hover/completion/definition/etc. leaking in.
             var it = caps.object.iterator();
@@ -1125,4 +1258,225 @@ test "lsp signatureHelp: active param, innermost nested callee, incomplete call,
     // The internal scratch path/module qualifier must never surface in the response bytes.
     try testing.expect(std.mem.indexOf(u8, raw_by_id[20].?, ".toy-lsp") == null);
     try testing.expect(std.mem.indexOf(u8, raw_by_id[20].?, "doc.") == null);
+}
+
+test "lsp incremental didChange: in-order ranged deltas + no-range full replace reflected by hover/diagnostics" {
+    const gpa = testing.allocator;
+
+    // Every column below is `colOf`-derived, so no offset is hand-counted.
+    const T0 = "fn add(a: int) -> int {\n    return a\n}\nfn main() -> int {\n    return add(0)\n}";
+    const c1_ins = "fn id(x: int) -> int {\n    return x\n}\n";
+    const afterC1 = c1_ins ++ T0;
+    const v2doc = "fn id(x: int) -> int {\n    return x\n}\nfn add(a: int) -> int {\n    return a\n}\nfn main() -> int {\n    return id(0)\n}";
+    // v3doc is v2doc with line-7 `return id(0)` -> `return id(zzz)` (an undefined name).
+    const v3doc = "fn id(x: int) -> int {\n    return x\n}\nfn add(a: int) -> int {\n    return a\n}\nfn main() -> int {\n    return id(zzz)\n}";
+    const T2 = "fn f() -> int {\n    return 3\n}\nfn main() -> int {\n    return f()\n}";
+    const uri = "file:///inc.toy";
+
+    const Pos = struct { line: u32, character: u32 };
+    const Rng = struct { start: Pos, end: Pos };
+    const Ranged = struct { range: Rng, text: []const u8 };
+    const FullReplace = struct { text: []const u8 };
+
+    const hoverReq = struct {
+        fn make(id: i64, line: u32, character: u32) struct {
+            jsonrpc: []const u8 = "2.0",
+            id: i64,
+            method: []const u8 = "textDocument/hover",
+            params: struct { textDocument: struct { uri: []const u8 }, position: struct { line: u32, character: u32 } },
+        } {
+            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } } };
+        }
+    };
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didOpen",
+        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = T0 } },
+    });
+    // v2: TWO in-order ranged deltas. c1 inserts a new fn at (0,0); c2 then renames the call
+    // `add` -> `id` on line 7 — a coordinate that only exists AFTER c1 was applied.
+    const add_col = colOf(afterC1, 7, "add");
+    const c1: Ranged = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } }, .text = c1_ins };
+    const c2: Ranged = .{ .range = .{ .start = .{ .line = 7, .character = add_col }, .end = .{ .line = 7, .character = add_col + 3 } }, .text = "id" };
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didChange",
+        .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 2) }, .contentChanges = &[_]Ranged{ c1, c2 } },
+    });
+    try frameInto(gpa, &session, hoverReq.make(30, 7, colOf(v2doc, 7, "id(")));
+    // v3: ONE ranged delta, `0` -> `zzz`, coordinates against the post-v2 text.
+    const zero_col = colOf(v2doc, 7, "0");
+    const c3: Ranged = .{ .range = .{ .start = .{ .line = 7, .character = zero_col }, .end = .{ .line = 7, .character = zero_col + 1 } }, .text = "zzz" };
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didChange",
+        .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 3) }, .contentChanges = &[_]Ranged{c3} },
+    });
+    // v4: a no-range change is a whole-document replace.
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didChange",
+        .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 4) }, .contentChanges = &[_]FullReplace{.{ .text = T2 }} },
+    });
+    try frameInto(gpa, &session, hoverReq.make(31, 4, colOf(T2, 4, "f(")));
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 99), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    const code = try serve(gpa, &reader, &out.writer);
+    try testing.expectEqual(ExitCode.ok, code);
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+
+    var by_id: [40]?std.json.Value = @splat(null);
+    var publishes: [8]std.json.Value = undefined;
+    var publish_count: usize = 0;
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method")) |m| {
+            if (m == .string and eql(m.string, "textDocument/publishDiagnostics")) {
+                publishes[publish_count] = objGet(v, "params").?;
+                publish_count += 1;
+            }
+            continue;
+        }
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .integer and idv.integer >= 0 and idv.integer < 40) by_id[@intCast(idv.integer)] = v;
+    }
+
+    // Capability: incremental sync advertised.
+    const caps = field(by_id[1].?, "result", "capabilities").?;
+    const sync = objGet(caps, "textDocumentSync").?;
+    try testing.expectEqual(@as(i64, 2), getInt(sync, "change").?);
+
+    // didOpen + three didChange = four publishes, none dropped/added.
+    try testing.expectEqual(@as(usize, 4), publish_count);
+    // T0 is clean.
+    try testing.expectEqual(@as(usize, 0), objGet(publishes[0], "diagnostics").?.array.items.len);
+
+    // In-order multi-edit: a hover on the renamed callee resolves to `id`. Fails under
+    // last-wins (whole doc would become `"id"`) or if c2's line-7 coord hit pre-c1 text.
+    try testing.expectEqualStrings("fn id(int) -> int", hoverValue(by_id[30].?).?);
+
+    // Ranged single delta, offset-exact: the `zzz` edit yields a diagnostic pinned to BOTH the
+    // line AND the exact column of `zzz` (a no-op/wrong-line/off-by-N splice all fail this).
+    const d2 = objGet(publishes[2], "diagnostics").?;
+    const zzz_col: i64 = colOf(v3doc, 7, "zzz");
+    var found_zzz = false;
+    for (d2.array.items) |d| {
+        const start = field(d, "range", "start") orelse continue;
+        if (getInt(start, "line") == @as(i64, 7) and getInt(start, "character") == zzz_col) found_zzz = true;
+    }
+    try testing.expect(found_zzz);
+
+    // Full replace (not append): T2 is clean AND a hover on `f` resolves. Under append, the
+    // (4, colOf(T2,4,"f(")) coordinate would land in the retained old prefix, not `f`.
+    try testing.expectEqual(@as(usize, 0), objGet(publishes[3], "diagnostics").?.array.items.len);
+    try testing.expectEqualStrings("fn f() -> int", hoverValue(by_id[31].?).?);
+}
+
+/// The response frame (parsed) whose top-level `id` is the string `want`, plus a count of
+/// how many response frames carried it — for the double-response guard in the cancel test.
+const StrIdHit = struct { resp: ?std.json.Value = null, count: usize = 0 };
+
+test "lsp cancelRequest: a cancelled request answers -32800 with no result; a normal one still works" {
+    const gpa = testing.allocator;
+
+    const src = "fn main() -> int {\n    x := 1\n    return x\n}"; // line 1 == "    x := 1"
+    const uri = "file:///cancel.toy";
+
+    const x_col = colOf(src, 1, "x");
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didOpen",
+        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
+    });
+    // The request to cancel (a STRING id, exercising CancelId.str) ...
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .id = "cancelme",
+        .method = "textDocument/hover",
+        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 1), .character = @as(i64, x_col) } },
+    });
+    // ... its cancellation (a notification: target id in params, no top-level id) ...
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "$/cancelRequest", .params = .{ .id = "cancelme" } });
+    // ... and a NON-cancelled control request (int id).
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .id = @as(i64, 6),
+        .method = "textDocument/hover",
+        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 1), .character = @as(i64, x_col) } },
+    });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 7), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    const code = try serve(gpa, &reader, &out.writer);
+    try testing.expectEqual(ExitCode.ok, code); // the loop did not hang
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+
+    var by_id: [16]?std.json.Value = @splat(null);
+    var cancel_hit: StrIdHit = .{};
+    var publish_count: usize = 0;
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method")) |m| {
+            if (m == .string and eql(m.string, "textDocument/publishDiagnostics")) publish_count += 1;
+            continue; // a notification is never a response
+        }
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .string and eql(idv.string, "cancelme")) {
+            cancel_hit.count += 1;
+            cancel_hit.resp = v;
+        } else if (idv == .integer and idv.integer >= 0 and idv.integer < 16) {
+            by_id[@intCast(idv.integer)] = v;
+        }
+    }
+
+    // Exactly ONE response carries the cancelled id (no double-response) ...
+    try testing.expectEqual(@as(usize, 1), cancel_hit.count);
+    // ... it is RequestCancelled and produced NO normal work-product (no `result` key). This
+    // response-level pair is the genuine skipped-work proof: the gate returns before any
+    // scratch write / check / feature call, so hover did zero work.
+    const err_obj = objGet(cancel_hit.resp.?, "error").?;
+    try testing.expectEqual(@as(i64, -32800), getInt(err_obj, "code").?);
+    try testing.expect(objGet(cancel_hit.resp.?, "result") == null);
+
+    // The non-cancelled control request is answered normally in the same session.
+    try testing.expectEqualStrings("int", hoverValue(by_id[6].?).?);
+
+    // Sanity (explicitly NOT the skip-work proof — hover never publishes): only the didOpen
+    // publish was emitted; no stray notification leaked from the cancelled request.
+    try testing.expectEqual(@as(usize, 1), publish_count);
 }
