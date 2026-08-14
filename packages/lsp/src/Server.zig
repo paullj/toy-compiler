@@ -18,6 +18,7 @@ const protocol = @import("protocol.zig");
 const diagnostics = @import("diagnostics.zig");
 const hover = @import("hover.zig");
 const completion = @import("completion.zig");
+const definition = @import("definition.zig");
 const Documents = @import("Documents.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
@@ -226,6 +227,36 @@ pub const Server = struct {
             }
             // Always answer with an array (an empty list is a valid "no candidates").
             try protocol.writeResponse(self.gpa, writer, iv, items);
+            return true;
+        }
+
+        if (eql(method, "textDocument/definition")) {
+            const iv = id orelse return true; // a request must carry an id
+            var result: ?protocol.Location = null;
+            blk: {
+                const params = objGet(root, "params") orelse break :blk;
+                const td = objGet(params, "textDocument") orelse break :blk;
+                const uri = getStr(td, "uri") orelse break :blk;
+                const pos = objGet(params, "position") orelse break :blk;
+                const line = getInt(pos, "line") orelse break :blk;
+                const character = getInt(pos, "character") orelse break :blk;
+                // Guard the whole u32 range (mirrors hover/completion): an i64 past u32 max
+                // would panic the `@intCast` and crash the server on one malformed request.
+                const max: i64 = std.math.maxInt(u32);
+                if (line < 0 or character < 0 or line > max or character > max) break :blk;
+                const doc = self.docs.get(uri) orelse break :blk; // definition before didOpen
+                const range = (definition.definitionAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk) orelse break :blk;
+                // The uri comes ONLY from the request (the open doc's real uri); the helper
+                // returns a bare range, so a scratch path can never reach the client. `uri`
+                // borrows the parsed JSON, alive until this dispatch's `parsed.deinit`, and
+                // is serialized before then.
+                result = .{ .uri = uri, .range = range };
+            }
+            if (result) |r| {
+                try protocol.writeResponse(self.gpa, writer, iv, r);
+            } else {
+                try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+            }
             return true;
         }
 
@@ -443,7 +474,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             var it = caps.object.iterator();
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
-                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider"));
+                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider") or eql(k, "definitionProvider"));
             }
         } else if (idv == .integer and idv.integer == 2) {
             saw_shutdown = true;
@@ -759,4 +790,138 @@ test "lsp completion: scope, member (fields+methods), module members, and a brok
     const broken = resultArr(by_id[23].?).?;
     try testing.expectEqual(@as(?i64, 5), labelKind(broken, "a"));
     try testing.expectEqual(@as(?i64, 5), labelKind(broken, "b"));
+}
+
+/// The `range.{start,end}.{line,character}` of a definition `Location` response, or null if
+/// the response's `result` was JSON null.
+const DefRange = struct { start_line: i64, start_char: i64, end_line: i64, end_char: i64 };
+
+fn defRange(resp: std.json.Value) ?DefRange {
+    const result = objGet(resp, "result") orelse return null;
+    if (result != .object) return null; // JSON null (no-hit) is not an object
+    const start = field(result, "range", "start") orelse return null;
+    const end = field(result, "range", "end") orelse return null;
+    return .{
+        .start_line = getInt(start, "line").?,
+        .start_char = getInt(start, "character").?,
+        .end_line = getInt(end, "line").?,
+        .end_char = getInt(end, "character").?,
+    };
+}
+
+test "lsp definition: local, param, top-level fn, type; null over a gap/OOB/pre-open; never leaks the scratch uri" {
+    const gpa = testing.allocator;
+
+    // Needles are pinned to unambiguous substrings so every asserted column comes from
+    // `colOf`, never a hand count. Cross-file (imported symbols) is intentionally OUT of
+    // scope here — this covers WITHIN-file navigation only.
+    const src =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\struct Point { x: int, y: int }
+        \\fn main() -> int {
+        \\    p := Point { x: 1, y: 2 }
+        \\    s := add(p.x, p.y)
+        \\    return s
+        \\}
+    ;
+    const uri = "file:///def.toy";
+
+    const Pos = struct { line: i64, character: i64 };
+    const defReq = struct {
+        fn make(id: i64, line: u32, character: u32) struct {
+            jsonrpc: []const u8 = "2.0",
+            id: i64,
+            method: []const u8 = "textDocument/definition",
+            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
+        } {
+            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } } };
+        }
+    };
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    // A definition BEFORE the document is opened -> null, no crash.
+    try frameInto(gpa, &session, defReq.make(10, 0, 0));
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didOpen",
+        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
+    });
+    try frameInto(gpa, &session, defReq.make(2, 5, colOf(src, 5, "s"))); // use of local `s`
+    try frameInto(gpa, &session, defReq.make(3, 0, colOf(src, 0, "a + b"))); // use of param `a`
+    try frameInto(gpa, &session, defReq.make(4, 4, colOf(src, 4, "add("))); // use of fn `add`
+    try frameInto(gpa, &session, defReq.make(5, 3, colOf(src, 3, "Point"))); // use of type `Point`
+    try frameInto(gpa, &session, defReq.make(6, 3, 0)); // leading-indent gap -> null
+    try frameInto(gpa, &session, defReq.make(7, 100000, 0)); // OOB line -> null
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .id = @as(i64, 11),
+        .method = "textDocument/definition",
+        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 0), .character = @as(i64, 3000000000) } },
+    });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 8), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    const code = try serve(gpa, &reader, &out.writer);
+    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+
+    // Both the parsed value AND the raw frame bytes, by id (ids run 1..11): the leak check
+    // asserts over the RAW response bytes, not the re-serialized parse.
+    var by_id: [12]?std.json.Value = @splat(null);
+    var raw_by_id: [12]?[]const u8 = @splat(null);
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method") != null) continue; // a notification
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .integer and idv.integer >= 0 and idv.integer < 12) {
+            by_id[@intCast(idv.integer)] = v;
+            raw_by_id[@intCast(idv.integer)] = body;
+        }
+    }
+
+    // id 1: definitionProvider is advertised as a boolean.
+    const caps = field(by_id[1].?, "result", "capabilities").?;
+    const dp = objGet(caps, "definitionProvider").?;
+    try testing.expect(dp == .bool and dp.bool);
+
+    // The expected DECL ranges — every column derived from the fixture via `colOf`.
+    const Case = struct { id: usize, line: i64, start: u32, len: u32 };
+    const cases = [_]Case{
+        .{ .id = 2, .line = 4, .start = colOf(src, 4, "s :="), .len = 1 }, // local `s`
+        .{ .id = 3, .line = 0, .start = colOf(src, 0, "a: int"), .len = 1 }, // param `a`
+        .{ .id = 4, .line = 0, .start = colOf(src, 0, "add"), .len = 3 }, // fn `add` (name, not `fn`)
+        .{ .id = 5, .line = 1, .start = colOf(src, 1, "Point"), .len = 5 }, // type `Point`
+    };
+    for (cases) |c| {
+        const r = defRange(by_id[c.id].?).?; // fails on a null result (non-vacuous)
+        try testing.expectEqualStrings(uri, getStr(objGet(by_id[c.id].?, "result").?, "uri").?);
+        try testing.expectEqual(c.line, r.start_line);
+        try testing.expectEqual(@as(i64, c.start), r.start_char);
+        try testing.expectEqual(c.line, r.end_line);
+        try testing.expectEqual(@as(i64, c.start + c.len), r.end_char); // start != end -> non-vacuous
+        // The internal scratch path must never surface in the response bytes.
+        try testing.expect(std.mem.indexOf(u8, raw_by_id[c.id].?, ".toy-lsp") == null);
+        try testing.expect(std.mem.indexOf(u8, raw_by_id[c.id].?, "doc.toy") == null);
+    }
+
+    // Every non-hit path answers with an explicit null result.
+    try testing.expect(objGet(by_id[6].?, "result").? == .null); // whitespace gap
+    try testing.expect(objGet(by_id[7].?, "result").? == .null); // OOB line
+    try testing.expect(objGet(by_id[10].?, "result").? == .null); // before didOpen
+    try testing.expect(objGet(by_id[11].?, "result").? == .null); // char > u32 max
 }
