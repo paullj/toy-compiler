@@ -17,5 +17,6 @@ test {
     _ = @import("diagnostics.zig");
     _ = @import("hover.zig");
     _ = @import("completion.zig");
+    _ = @import("definition.zig");
     _ = Server;
 }

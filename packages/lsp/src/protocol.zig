@@ -84,6 +84,8 @@ const ServerCapabilities = struct {
     /// `textDocument/completion` is implemented. `.` re-triggers completion so a
     /// member/module access completes as the user types the dot.
     completionProvider: struct { triggerCharacters: []const []const u8 = &.{"."} } = .{},
+    /// `textDocument/definition` is implemented (within-file go-to-declaration).
+    definitionProvider: bool = true,
 };
 
 const ServerInfo = struct { name: []const u8, version: []const u8 };
@@ -142,8 +144,8 @@ test "InitializeResult advertises only the implemented capabilities" {
     // Completion is advertised with the `.` trigger.
     try testing.expect(std.mem.indexOf(u8, out, "\"completionProvider\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\".\"]") != null);
-    // Nothing we do not implement leaks into the advertisement.
-    try testing.expect(std.mem.indexOf(u8, out, "definitionProvider") == null);
+    // Definition is advertised now that it is implemented.
+    try testing.expect(std.mem.indexOf(u8, out, "\"definitionProvider\":true") != null);
 }
 
 test "writeResponse echoes an integer id and omits null optionals in the result" {
