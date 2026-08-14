@@ -17,6 +17,8 @@ pub const err_code = struct {
     pub const internal: i32 = -32603;
     /// LSP: a request arrived before `initialize`.
     pub const server_not_initialized: i32 = -32002;
+    /// LSP: the client asked to cancel this request (`$/cancelRequest`); we did no work.
+    pub const request_cancelled: i32 = -32800;
 };
 
 /// LSP `DiagnosticSeverity`.
@@ -90,10 +92,11 @@ pub const LspDiagnostic = struct {
 const ServerCapabilities = struct {
     /// utf-8 so a byte column equals `character` for ASCII (see `Position`).
     positionEncoding: []const u8 = "utf-8",
-    /// `1` == Full-text sync; `openClose` so the client sends didOpen/didClose.
+    /// `2` == Incremental sync (deltas spliced by byte range); `openClose` so the client
+    /// sends didOpen/didClose.
     textDocumentSync: struct {
         openClose: bool = true,
-        change: u8 = 1,
+        change: u8 = 2,
     } = .{},
     /// `textDocument/hover` is implemented.
     hoverProvider: bool = true,
@@ -158,7 +161,7 @@ test "InitializeResult advertises only the implemented capabilities" {
     try std.json.Stringify.value(r, json_opts, &aw.writer);
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "\"positionEncoding\":\"utf-8\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "\"change\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"change\":2") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"openClose\":true") != null);
     // Hover is advertised now that it is implemented.
     try testing.expect(std.mem.indexOf(u8, out, "\"hoverProvider\":true") != null);
