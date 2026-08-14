@@ -19,6 +19,7 @@ const diagnostics = @import("diagnostics.zig");
 const hover = @import("hover.zig");
 const completion = @import("completion.zig");
 const definition = @import("definition.zig");
+const signature = @import("signature.zig");
 const Documents = @import("Documents.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
@@ -260,6 +261,34 @@ pub const Server = struct {
             return true;
         }
 
+        if (eql(method, "textDocument/signatureHelp")) {
+            const iv = id orelse return true; // a request must carry an id
+            var sh: ?signature.Result = null;
+            defer if (sh) |*x| x.deinit(); // after writeResponse has serialized the label
+            var result: ?protocol.SignatureHelp = null;
+            blk: {
+                const params = objGet(root, "params") orelse break :blk;
+                const td = objGet(params, "textDocument") orelse break :blk;
+                const uri = getStr(td, "uri") orelse break :blk;
+                const pos = objGet(params, "position") orelse break :blk;
+                const line = getInt(pos, "line") orelse break :blk;
+                const character = getInt(pos, "character") orelse break :blk;
+                // Guard the whole u32 range (mirrors hover/completion/definition): an i64 past
+                // u32 max would panic the `@intCast` and crash the server on one bad request.
+                const max: i64 = std.math.maxInt(u32);
+                if (line < 0 or character < 0 or line > max or character > max) break :blk;
+                const doc = self.docs.get(uri) orelse break :blk; // signatureHelp before didOpen
+                sh = signature.signatureHelpAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk;
+                if (sh) |x| result = x.help;
+            }
+            if (result) |r| {
+                try protocol.writeResponse(self.gpa, writer, iv, r);
+            } else {
+                try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+            }
+            return true;
+        }
+
         if (eql(method, "shutdown")) {
             self.shutdown_requested = true;
             if (id) |iv| try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
@@ -474,7 +503,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             var it = caps.object.iterator();
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
-                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider") or eql(k, "definitionProvider"));
+                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider") or eql(k, "definitionProvider") or eql(k, "signatureHelpProvider"));
             }
         } else if (idv == .integer and idv.integer == 2) {
             saw_shutdown = true;
@@ -924,4 +953,176 @@ test "lsp definition: local, param, top-level fn, type; null over a gap/OOB/pre-
     try testing.expect(objGet(by_id[7].?, "result").? == .null); // OOB line
     try testing.expect(objGet(by_id[10].?, "result").? == .null); // before didOpen
     try testing.expect(objGet(by_id[11].?, "result").? == .null); // char > u32 max
+}
+
+/// The `result.signatures[0].label` of a signatureHelp response, or null if the result was
+/// JSON null (no-hit).
+fn sigLabel(resp: std.json.Value) ?[]const u8 {
+    const result = objGet(resp, "result") orelse return null;
+    if (result != .object) return null;
+    const sigs = objGet(result, "signatures") orelse return null;
+    if (sigs != .array or sigs.array.items.len == 0) return null;
+    return getStr(sigs.array.items[0], "label");
+}
+
+/// The `result.activeParameter`, or null on a no-hit.
+fn sigActive(resp: std.json.Value) ?i64 {
+    const result = objGet(resp, "result") orelse return null;
+    if (result != .object) return null;
+    return getInt(result, "activeParameter");
+}
+
+/// The `[start,end)` label span of `result.signatures[0].parameters[i]`, or null.
+fn sigParam(resp: std.json.Value, i: usize) ?[2]i64 {
+    const result = objGet(resp, "result") orelse return null;
+    if (result != .object) return null;
+    const sigs = objGet(result, "signatures") orelse return null;
+    if (sigs != .array or sigs.array.items.len == 0) return null;
+    const params = objGet(sigs.array.items[0], "parameters") orelse return null;
+    if (params != .array or i >= params.array.items.len) return null;
+    const span = objGet(params.array.items[i], "label") orelse return null;
+    if (span != .array or span.array.items.len != 2) return null;
+    return .{ span.array.items[0].integer, span.array.items[1].integer };
+}
+
+test "lsp signatureHelp: active param, innermost nested callee, incomplete call, null outside/pre-open/OOB, no scratch leak" {
+    const gpa = testing.allocator;
+
+    const src =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn id(x: int) -> int { return x }
+        \\fn main() -> int {
+        \\    x := add(1, 2)
+        \\    return x
+        \\}
+    ;
+    // Cursor inside the INNER unary call must pick `id`, not the outer `add`.
+    const nested =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn id(x: int) -> int { return x }
+        \\fn main() -> int {
+        \\    y := add(id(1), 2)
+        \\    return y
+        \\}
+    ;
+    // Truncated after the first comma+space: no `)`, no closing `}`.
+    const incomplete = "fn add(a: int, b: int) -> int { return a + b }\nfn main() -> int {\n    x := add(1, ";
+
+    const u_src = "file:///sig.toy";
+    const u_nested = "file:///nested.toy";
+    const u_inc = "file:///inc.toy";
+
+    const Pos = struct { line: u32, character: u32 };
+    const sigReq = struct {
+        fn make(id: i64, uri: []const u8, p: protocol.Position) struct {
+            jsonrpc: []const u8 = "2.0",
+            id: i64,
+            method: []const u8 = "textDocument/signatureHelp",
+            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
+        } {
+            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = p.line, .character = p.character } } };
+        }
+    };
+    const openDoc = struct {
+        fn make(uri: []const u8, text: []const u8) struct {
+            jsonrpc: []const u8 = "2.0",
+            method: []const u8 = "textDocument/didOpen",
+            params: struct { textDocument: struct { uri: []const u8, languageId: []const u8 = "toy", version: i64 = 1, text: []const u8 } },
+        } {
+            return .{ .params = .{ .textDocument = .{ .uri = uri, .text = text } } };
+        }
+    };
+
+    const before_comma = posAfterLast(src, "add(1");
+    const after_comma = posAfterLast(src, "add(1, ");
+    const inner = posAfterLast(nested, "id(1");
+    const inc_pos = posAfterLast(incomplete, "add(1, ");
+    const outside: protocol.Position = .{ .line = 4, .character = colOf(src, 4, "return") };
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    // A signatureHelp BEFORE the document is opened -> null, no crash.
+    try frameInto(gpa, &session, sigReq.make(25, u_src, .{ .line = 0, .character = 0 }));
+    try frameInto(gpa, &session, openDoc.make(u_src, src));
+    try frameInto(gpa, &session, openDoc.make(u_nested, nested));
+    try frameInto(gpa, &session, openDoc.make(u_inc, incomplete));
+    try frameInto(gpa, &session, sigReq.make(20, u_src, before_comma));
+    try frameInto(gpa, &session, sigReq.make(21, u_src, after_comma));
+    try frameInto(gpa, &session, sigReq.make(22, u_nested, inner));
+    try frameInto(gpa, &session, sigReq.make(23, u_inc, inc_pos));
+    try frameInto(gpa, &session, sigReq.make(24, u_src, outside));
+    // A character past u32 max must NOT panic the @intCast.
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .id = @as(i64, 26),
+        .method = "textDocument/signatureHelp",
+        .params = .{ .textDocument = .{ .uri = u_src }, .position = .{ .line = @as(i64, 0), .character = @as(i64, 3000000000) } },
+    });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 99), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    const code = try serve(gpa, &reader, &out.writer);
+    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang/crash
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+
+    var by_id: [100]?std.json.Value = @splat(null);
+    var raw_by_id: [100]?[]const u8 = @splat(null);
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method") != null) continue; // a notification
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .integer and idv.integer >= 0 and idv.integer < 100) {
+            by_id[@intCast(idv.integer)] = v;
+            raw_by_id[@intCast(idv.integer)] = body;
+        }
+    }
+
+    // Capability: the `(`/`,` triggers are advertised.
+    const caps = field(by_id[1].?, "result", "capabilities").?;
+    const shp = objGet(caps, "signatureHelpProvider").?;
+    const trigs = objGet(shp, "triggerCharacters").?;
+    try testing.expect(trigs == .array and trigs.array.items.len == 2);
+    try testing.expectEqualStrings("(", trigs.array.items[0].string);
+    try testing.expectEqualStrings(",", trigs.array.items[1].string);
+
+    // Before the first comma -> active param 0; the label is the exact rendered signature.
+    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(by_id[20].?).?);
+    try testing.expectEqual(@as(?i64, 0), sigActive(by_id[20].?));
+    // The SECOND param's label span is the second `int` occurrence (proves the offset label).
+    try testing.expectEqual([2]i64{ 12, 15 }, sigParam(by_id[20].?, 1).?);
+
+    // After the first comma -> active param 1, same signature.
+    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(by_id[21].?).?);
+    try testing.expectEqual(@as(?i64, 1), sigActive(by_id[21].?));
+
+    // Nested: the cursor in the inner call resolves to the INNERMOST callee `id`.
+    try testing.expectEqualStrings("fn id(int) -> int", sigLabel(by_id[22].?).?);
+    try testing.expectEqual(@as(?i64, 0), sigActive(by_id[22].?));
+
+    // Incomplete `add(1, ` at EOF: does NOT bail, returns the signature with active param 1.
+    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(by_id[23].?).?);
+    try testing.expectEqual(@as(?i64, 1), sigActive(by_id[23].?));
+
+    // Outside any call, before didOpen, and a char past u32 max all answer explicit null.
+    try testing.expect(objGet(by_id[24].?, "result").? == .null); // on the `return` line
+    try testing.expect(objGet(by_id[25].?, "result").? == .null); // before didOpen
+    try testing.expect(objGet(by_id[26].?, "result").? == .null); // char > u32 max
+
+    // The internal scratch path/module qualifier must never surface in the response bytes.
+    try testing.expect(std.mem.indexOf(u8, raw_by_id[20].?, ".toy-lsp") == null);
+    try testing.expect(std.mem.indexOf(u8, raw_by_id[20].?, "doc.") == null);
 }
