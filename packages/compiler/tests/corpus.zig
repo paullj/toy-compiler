@@ -417,7 +417,7 @@ fn compileAndRun(
     entry: []const u8,
     out_name: []const u8,
 ) !RunResult {
-    var graph = try Graph.discover(gpa, io, cache, "aarch64-macos", entry, null);
+    var graph = try Graph.discover(gpa, io, cache, "aarch64-macos", entry, null, null);
     defer graph.deinit(gpa);
     if (graph.err) |err| return .{ .compile_error = try renderGraphErr(gpa, err) };
 

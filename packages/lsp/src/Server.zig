@@ -273,7 +273,7 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // hover before didOpen
-                hv = hover.hoverAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk;
+                hv = hover.hoverAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (hv) |h| result = .{ .contents = .{ .kind = h.kind, .value = h.value } };
             }
             if (result) |r| {
@@ -301,7 +301,7 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // completion before didOpen
-                comp = completion.completionsAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk;
+                comp = completion.completionsAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (comp) |c| items = c.items;
             }
             // Always answer with an array (an empty list is a valid "no candidates").
@@ -312,6 +312,11 @@ pub const Server = struct {
         if (eql(method, "textDocument/definition")) {
             const iv = id orelse return true; // a request must carry an id
             var result: ?protocol.Location = null;
+            var owned_uri: ?[]u8 = null;
+            // Freed at if-branch scope AFTER writeResponse has serialized `result.uri`; must
+            // NOT sit inside `blk` (the happy path sets result inside blk, so an in-blk defer
+            // would free the uri before serialization — a use-after-free).
+            defer if (owned_uri) |u| self.gpa.free(u);
             blk: {
                 const params = objGet(root, "params") orelse break :blk;
                 const td = objGet(params, "textDocument") orelse break :blk;
@@ -324,12 +329,11 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // definition before didOpen
-                const range = (definition.definitionAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk) orelse break :blk;
-                // The uri comes ONLY from the request (the open doc's real uri); the helper
-                // returns a bare range, so a scratch path can never reach the client. `uri`
-                // borrows the parsed JSON, alive until this dispatch's `parsed.deinit`, and
-                // is serialized before then.
-                result = .{ .uri = uri, .range = range };
+                const d = (definition.definitionAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk) orelse break :blk;
+                // The uri is either the request's own open-doc uri or a real imported module's
+                // `file://` path — the helper guarantees it is never the scratch path.
+                owned_uri = d.uri;
+                result = .{ .uri = d.uri, .range = d.range };
             }
             if (result) |r| {
                 try protocol.writeResponse(self.gpa, writer, iv, r);
@@ -356,7 +360,7 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // signatureHelp before didOpen
-                sh = signature.signatureHelpAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character)) catch break :blk;
+                sh = signature.signatureHelpAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (sh) |x| result = x.help;
             }
             if (result) |r| {

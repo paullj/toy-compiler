@@ -1516,7 +1516,7 @@ fn withResolvedGraph(
     var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
 
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, null);
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, null, null);
     defer graph.deinit(gpa);
     try testing.expect(graph.err == null);
 

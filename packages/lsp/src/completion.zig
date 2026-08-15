@@ -33,6 +33,7 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
+const lsp_uri = @import("uri.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -83,6 +84,7 @@ pub fn completionsAt(
     source: []const u8,
     line: u32,
     character: u32,
+    doc_uri: []const u8,
 ) !Completions {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -110,7 +112,11 @@ pub fn completionsAt(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null);
+    // Root sibling imports at the open doc's real dir so `import a/b` resolves off disk.
+    const root = try lsp_uri.dirOfUri(gpa, doc_uri);
+    defer if (root) |r| gpa.free(r);
+
+    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
     defer graph.deinit(gpa);
     // A parse error other than the repaired cursor discards the tree — nothing to offer.
     if (graph.err != null) return empty(arena);

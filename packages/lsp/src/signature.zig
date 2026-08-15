@@ -29,6 +29,7 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
+const lsp_uri = @import("uri.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -173,6 +174,7 @@ pub fn signatureHelpAt(
     source: []const u8,
     line: u32,
     character: u32,
+    doc_uri: []const u8,
 ) !?Result {
     const toks = try toyc.Lexer.tokenize(gpa, source);
     defer gpa.free(toks);
@@ -191,7 +193,11 @@ pub fn signatureHelpAt(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null);
+    // Root sibling imports at the open doc's real dir so `import a/b` resolves off disk.
+    const root = try lsp_uri.dirOfUri(gpa, doc_uri);
+    defer if (root) |r| gpa.free(r);
+
+    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
     defer graph.deinit(gpa);
     if (graph.err != null) return null;
 

@@ -20,6 +20,7 @@ const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
+const lsp_uri = @import("uri.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -60,9 +61,14 @@ pub fn checkBuffer(
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
+    // Root sibling imports at the open doc's real dir so `import a/b` resolves off disk (no
+    // spurious unknown-module against a sibling-importing buffer).
+    const root = try lsp_uri.dirOfUri(gpa, uri);
+    defer if (root) |r| gpa.free(r);
+
     // probe = null: disables the warm read-skip so a same-size edit can't serve stale
     // output (see the file header).
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null);
+    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
     defer graph.deinit(gpa);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
