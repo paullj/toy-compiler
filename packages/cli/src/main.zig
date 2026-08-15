@@ -1129,7 +1129,7 @@ fn runCheck(
     // DISCOVER the whole module graph (following imports), reusing `build`'s discoverer.
     // A true I/O/OOM failure propagates as a Zig error (exit 2); a STRUCTURAL problem
     // (missing import, escape, cycle, tainted parse) is recorded in `graph.err`.
-    var graph = Graph.discover(gpa, cio, cache, target, entry, null) catch |e| {
+    var graph = Graph.discover(gpa, cio, cache, target, entry, null, null) catch |e| {
         try argLine(out, level, @errorName(e));
         return 2;
     };

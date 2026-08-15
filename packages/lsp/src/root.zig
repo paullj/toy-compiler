@@ -19,5 +19,6 @@ test {
     _ = @import("completion.zig");
     _ = @import("definition.zig");
     _ = @import("signature.zig");
+    _ = @import("uri.zig");
     _ = Server;
 }

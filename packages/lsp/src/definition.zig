@@ -7,20 +7,32 @@
 //! symbol still navigates in a partially-broken buffer). Only a missing tree (`graph.err`)
 //! aborts — there is then nothing to resolve against.
 //!
-//! Returns a POD `Range` in the ENTRY document's own coordinates, NOT a `Location`: the
-//! caller supplies the open-doc uri from the dispatch layer, so the helper never handles a
-//! uri and therefore cannot leak the internal scratch path.
+//! Returns a `Def { uri, range }`. The uri is EITHER the open-doc uri (`doc_uri`, for a
+//! within-file target) OR an imported module's REAL on-disk `file://` path (cross-file
+//! target) — NEVER the internal scratch path. The entry buffer lives in a scratch file, but
+//! `doc_uri` supplies its real identity and the check roots sibling imports at the open doc's
+//! real directory (`dirOfUri(doc_uri)`), so `import a/b` resolves to the real project files.
 //!
-//! WITHIN-FILE ONLY. A use of an imported symbol returns null: the buffer is checked from a
-//! scratch directory, so a sibling `import a/b` does not resolve to the real project file,
-//! and a cross-file decl would have to map back to that file's real uri — a scratch-approach
-//! redesign, deferred to its own milestone.
+//! CROSS-FILE go-to-definition is supported for imported PUB fns: a `mod.fn` field-access
+//! resolves to a global `.func` carrying its owning module + decl node, which maps to that
+//! module's real `file` and thus a real `file://` uri. Cross-file TYPES are out of scope: the
+//! resolver leaves an imported type name `.unresolved`, so there is no owning-module handle to
+//! follow — a type use navigates only within the entry module.
+//!
+//! COHERENCY LIMIT: the entry buffer is the unsaved scratch copy, but a module that imports
+//! the OPEN file back loads the on-disk (possibly stale) copy, not the buffer. Fine for the
+//! common DAG (main imports helper).
+//!
+//! A broken import (`graph.err != null`, e.g. a typo'd import path) disables go-to-def for the
+//! WHOLE buffer — there is then no sound tree to resolve against. Pre-existing behavior; once
+//! real imports resolve, a genuinely-broken import still zeroes out def.
 
 const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
+const lsp_uri = @import("uri.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -29,10 +41,19 @@ const Ast = toyc.Ast;
 const Token = toyc.Token;
 const SourceMap = toyc.term.render.SourceMap;
 
-/// The declaration range for the symbol used at (`line`, `character`) in `source`, in the
-/// entry document's coordinates, or null when there is nothing to navigate to (a gap, an
-/// out-of-range or unresolved position, an imported symbol, or a buffer that does not
-/// parse). Never errors on a compile problem — only a hard I/O / OOM fault propagates.
+/// A resolved definition: the target's `file://` uri (always owned) plus the decl range in
+/// that file's coordinates.
+pub const Def = struct {
+    uri: []u8,
+    range: protocol.Range,
+};
+
+/// The definition for the symbol used at (`line`, `character`) in `source`, or null when
+/// there is nothing to navigate to (a gap, an out-of-range or unresolved position, a bundled
+/// or builtin target with no openable file, or a buffer that does not parse). `doc_uri` is the
+/// open document's real uri: it both roots sibling-import resolution at the real project dir
+/// and is returned verbatim for a within-file target. Never errors on a compile problem —
+/// only a hard I/O / OOM fault propagates.
 pub fn definitionAt(
     gpa: std.mem.Allocator,
     io: Io,
@@ -40,36 +61,58 @@ pub fn definitionAt(
     source: []const u8,
     line: u32,
     character: u32,
-) !?protocol.Range {
+    doc_uri: []const u8,
+) !?Def {
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = scratch_path, .data = source });
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null);
+    const root = try lsp_uri.dirOfUri(gpa, doc_uri);
+    defer if (root) |r| gpa.free(r);
+
+    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
     defer graph.deinit(gpa);
-    if (graph.err != null) return null; // no tree -> nothing to resolve
+    if (graph.err != null) return null; // broken import -> no sound tree to resolve
 
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
 
-    const m = graph.entry();
     const entry = graph.entry_index;
+    const m = graph.entry();
 
     var sm = try SourceMap.init(gpa, m.file, m.source);
     defer sm.deinit(gpa);
 
     const off = hover.positionToOffset(&sm, line, character) orelse return null;
     const use_tok = hover.tokenAt(m.tokens, off) orelse return null;
-    const decl_tok = declTokenFor(m, entry, &res, use_tok) orelse return null;
-    return rangeOfToken(&sm, m.tokens, decl_tok);
+    const site = declSiteFor(&graph, entry, &res, use_tok) orelse return null;
+
+    if (site.module == entry) {
+        // Within-file: the OPEN doc uri, never m.file (which is the scratch path).
+        return .{ .uri = try gpa.dupe(u8, doc_uri), .range = rangeOfToken(&sm, m.tokens, site.tok) };
+    }
+
+    const tm = &graph.modules[site.module];
+    // Belt-and-braces: a real module `file` is absolute; refusing a relative path guarantees
+    // no scratch/relative path is ever emitted as a Location (an untitled buffer roots at the
+    // relative scratch dir).
+    if (!std.fs.path.isAbsolute(tm.file)) return null;
+    var tsm = try SourceMap.init(gpa, tm.file, tm.source);
+    defer tsm.deinit(gpa);
+    return .{ .uri = try lsp_uri.pathToUri(gpa, tm.file), .range = rangeOfToken(&tsm, tm.tokens, site.tok) };
 }
 
-/// The declaration NAME token for the symbol whose use is `use_tok`, tried func → local →
-/// type. Func-first mirrors hover: a `mod.fn` field-access and its callee identifier share a
-/// token, and the callable's decl is the intended target. A local shadowing a type name also
-/// wins by this order.
-fn declTokenFor(m: *const Graph.Module, entry: u32, res: *const ResolveGraph.GraphResult, use_tok: u32) ?u32 {
+/// A decl site: the module it lives in and its name token within that module.
+const Site = struct { module: u32, tok: u32 };
+
+/// The decl site for the symbol whose use is `use_tok`, tried func → local → type. Func-first
+/// mirrors hover: a `mod.fn` field-access and its callee identifier share a token, and the
+/// callable's decl is the intended target. A local shadowing a type name also wins by this
+/// order. A `.func` may live in ANOTHER module (an imported pub fn) — its owning module + decl
+/// node come from the global fn table.
+fn declSiteFor(graph: *const Graph.Graph, entry: u32, res: *const ResolveGraph.GraphResult, use_tok: u32) ?Site {
+    const m = &graph.modules[entry];
     const resolutions = res.resolutions[entry];
     var func_id: ?u32 = null;
     var local_slot: ?u32 = null;
@@ -89,11 +132,16 @@ fn declTokenFor(m: *const Graph.Module, entry: u32, res: *const ResolveGraph.Gra
         if (f >= res.fns.len) return null;
         const gf = res.fns[f];
         if (gf.decl_node == Ast.none) return null; // seeded builtin: no source decl
-        if (gf.module != entry) return null; // cross-file: deferred (checked BEFORE indexing m.nodes)
-        return m.nodes[gf.decl_node.int()].main_token; // fn_decl.main_token IS the name token
+        const tm = &graph.modules[gf.module];
+        if (tm.bundled) return null; // embedded stdlib: no openable file
+        return .{ .module = gf.module, .tok = tm.nodes[gf.decl_node.int()].main_token };
     }
-    if (local_slot) |s| return localDeclToken(m, entry, res, use_tok, s);
-    return typeDeclToken(m, use_tok); // a type name is left .unresolved -> name fallback
+    if (local_slot) |s| {
+        const t = localDeclToken(m, entry, res, use_tok, s) orelse return null;
+        return .{ .module = entry, .tok = t };
+    }
+    const t = typeDeclToken(m, use_tok) orelse return null; // a type name is left .unresolved
+    return .{ .module = entry, .tok = t };
 }
 
 /// The binding token for the local in `slot`, within the fn enclosing `use_tok`. The
@@ -192,4 +240,98 @@ test "rangeOfToken maps a token's [start,end) to a 0-based exclusive range" {
     try testing.expectEqual(@as(u32, 3), r.start.character);
     try testing.expectEqual(@as(u32, 0), r.end.line);
     try testing.expectEqual(@as(u32, 6), r.end.character); // exclusive end
+}
+
+/// The 0-based (line, character) of the first byte of `needle` in `src`.
+fn posOf(src: []const u8, needle: []const u8) protocol.Position {
+    const idx = std.mem.indexOf(u8, src, needle).?;
+    var line: u32 = 0;
+    var col: u32 = 0;
+    for (src[0..idx]) |ch| {
+        if (ch == '\n') {
+            line += 1;
+            col = 0;
+        } else col += 1;
+    }
+    return .{ .line = line, .character = col };
+}
+
+test "definition: cross-file jump to an imported pub fn; within-file stays local; imports resolve" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A REAL on-disk two-file project. The entry buffer is checked from a distinct scratch
+    // file, but `doc_uri` roots imports at the real dir so `import helper` resolves.
+    const dir_name = ".lsp-xfile-test";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const helper_src = "pub fn foo() -> int { return 1 }\n"; // MUST be pub for cross-file resolution
+    const main_src =
+        "import helper\n" ++
+        "\n" ++
+        "fn main() -> int {\n" ++
+        "    x := helper.foo()\n" ++
+        "    return x\n" ++
+        "}\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir_name ++ "/helper.toy", .data = helper_src });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir_name ++ "/main.toy", .data = main_src });
+
+    // Root at the realpath so it is ABSOLUTE (definitionAt refuses a relative tm.file) and
+    // canonical (macOS reaches the scratch dir via a /tmp -> /private/tmp symlink). tm.file is
+    // built raw from the root string we pass, so want_uri derives from the SAME abs_dir.
+    const abs_dir_z = try Io.Dir.cwd().realPathFileAlloc(io, dir_name, gpa);
+    defer gpa.free(abs_dir_z);
+    const abs_dir = try gpa.dupe(u8, abs_dir_z);
+    defer gpa.free(abs_dir);
+    const main_path = try std.fs.path.join(gpa, &.{ abs_dir, "main.toy" });
+    defer gpa.free(main_path);
+    const doc_uri = try std.fmt.allocPrint(gpa, "file://{s}", .{main_path});
+    defer gpa.free(doc_uri);
+    const helper_path = try std.fs.path.join(gpa, &.{ abs_dir, "helper.toy" });
+    defer gpa.free(helper_path);
+    const want_uri = try std.fmt.allocPrint(gpa, "file://{s}", .{helper_path});
+    defer gpa.free(want_uri);
+
+    const scratch = dir_name ++ "/.scratch.toy"; // distinct marker; parent exists
+
+    // (1) Cross-file: the `foo` use in `helper.foo()` -> helper.toy's real uri + `foo` decl.
+    {
+        const use = posOf(main_src, "foo()");
+        const d = (try definitionAt(gpa, io, scratch, main_src, use.line, use.character, doc_uri)) orelse
+            return error.CrossFileReturnedNull; // non-vacuous: pub fn MUST resolve cross-file
+        defer gpa.free(d.uri);
+        try testing.expectEqualStrings(want_uri, d.uri);
+        try testing.expectEqual(@as(u32, 0), d.range.start.line);
+        const foo_col: u32 = @intCast(std.mem.indexOf(u8, helper_src, "foo").?);
+        try testing.expectEqual(foo_col, d.range.start.character);
+        try testing.expectEqual(foo_col + 3, d.range.end.character);
+        try testing.expect(std.mem.indexOf(u8, d.uri, ".toy-lsp") == null);
+        try testing.expect(std.mem.indexOf(u8, d.uri, ".scratch") == null);
+    }
+
+    // (2) Within-file: the `x` use in `return x` -> the OPEN doc uri, never scratch.
+    {
+        const rx = posOf(main_src, "return x");
+        const use_char: u32 = rx.character + @as(u32, @intCast("return ".len));
+        const d = (try definitionAt(gpa, io, scratch, main_src, rx.line, use_char, doc_uri)) orelse
+            return error.WithinFileReturnedNull;
+        defer gpa.free(d.uri);
+        try testing.expectEqualStrings(doc_uri, d.uri);
+        try testing.expect(std.mem.indexOf(u8, d.uri, ".toy-lsp") == null);
+        try testing.expect(std.mem.indexOf(u8, d.uri, ".scratch") == null);
+    }
+
+    // (3) Imports resolve cleanly (no spurious unknown-module) when rooted at the real dir.
+    {
+        var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+        const cache = try Driver.openCache(io, &dir_buf);
+        var g = try Graph.discover(gpa, io, cache, "native", scratch, null, abs_dir);
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqual(@as(usize, 2), g.modules.len);
+    }
 }
