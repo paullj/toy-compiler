@@ -46,18 +46,24 @@ pub const Server = struct {
     /// Owns its own compute io (discover / checkGraph). This is separate from the transport
     /// reader/writer, whose io was already consumed by the caller.
     threaded: std.Io.Threaded,
+    /// Backs everything one message allocates (its JSON, the check, the response) and is
+    /// reset after it, keeping its capacity: the heap then plateaus at the largest
+    /// message instead of fragmenting (a wasm heap never shrinks). Documents use `gpa`.
+    arena: std.heap.ArenaAllocator,
     docs: Documents,
     /// false on a host with no filesystem: imports resolve only against open documents.
     disk: bool = true,
     got_initialize: bool = false,
     shutdown_requested: bool = false,
+    exited: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Server {
-        return .{ .gpa = gpa, .threaded = .init(gpa, .{}), .docs = .{} };
+        return .{ .gpa = gpa, .threaded = .init(gpa, .{}), .arena = .init(gpa), .docs = .{} };
     }
 
     pub fn deinit(self: *Server) void {
         self.docs.deinit(self.gpa);
+        self.arena.deinit();
         self.threaded.deinit();
         self.* = undefined;
     }
@@ -66,6 +72,15 @@ pub const Server = struct {
     /// `&self.threaded`, so it must never be cached across the by-value move out of `init`.
     fn workspace(self: *Server) Workspace {
         return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = self.disk };
+    }
+
+    /// Serve every framed message in `input`, then return — for a host that pushes messages
+    /// in (a browser worker) rather than the server pulling from a pipe. False once `exit`
+    /// has been handled.
+    pub fn feed(self: *Server, input: []const u8, writer: *Writer) anyerror!bool {
+        var r = Reader.fixed(input);
+        _ = try self.run(&r, writer);
+        return !self.exited;
     }
 
     fn run(self: *Server, reader: *Reader, writer: *Writer) anyerror!ExitCode {
@@ -116,7 +131,10 @@ pub const Server = struct {
                     error.OutOfMemory, error.WriteFailed => return e,
                     else => true,
                 };
-                if (!keep) return if (self.shutdown_requested) .ok else .no_shutdown;
+                if (!keep) {
+                    self.exited = true;
+                    return if (self.shutdown_requested) .ok else .no_shutdown;
+                }
             }
             if (terminal) break;
         }
@@ -126,9 +144,9 @@ pub const Server = struct {
     /// Handle one message. Returns `false` ONLY on `exit` (stop the loop); `true` keeps
     /// serving. A parse failure or a message that isn't a request-for-us is ignored.
     fn dispatch(self: *Server, writer: *Writer, body: []const u8, cancelled: *const CancelSet) anyerror!bool {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, body, .{}) catch return true;
-        defer parsed.deinit();
-        const root = parsed.value;
+        defer _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        const root = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch return true;
         if (root != .object) return true;
 
         // No `method` => this is a RESPONSE to us; we send no server->client requests, so
@@ -148,7 +166,7 @@ pub const Server = struct {
         // effect is skipped — spec-legal (a server MAY cancel any request); left uniform.
         if (id) |iv| {
             if (cancelled.contains(iv)) {
-                try protocol.writeError(self.gpa, writer, iv, protocol.err_code.request_cancelled, "request cancelled");
+                try protocol.writeError(a, writer, iv, protocol.err_code.request_cancelled, "request cancelled");
                 return true;
             }
         }
@@ -157,17 +175,17 @@ pub const Server = struct {
 
         if (eql(method, "initialize")) {
             if (self.got_initialize) {
-                if (id) |iv| try protocol.writeError(self.gpa, writer, iv, protocol.err_code.invalid_request, "server already initialized");
+                if (id) |iv| try protocol.writeError(a, writer, iv, protocol.err_code.invalid_request, "server already initialized");
                 return true;
             }
             self.got_initialize = true;
-            if (id) |iv| try protocol.writeResponse(self.gpa, writer, iv, protocol.InitializeResult{});
+            if (id) |iv| try protocol.writeResponse(a, writer, iv, protocol.InitializeResult{});
             return true;
         }
 
         // Everything except initialize/exit must wait for initialization.
         if (!self.got_initialize) {
-            if (id) |iv| try protocol.writeError(self.gpa, writer, iv, protocol.err_code.server_not_initialized, "server not initialized");
+            if (id) |iv| try protocol.writeError(a, writer, iv, protocol.err_code.server_not_initialized, "server not initialized");
             return true;
         }
 
@@ -179,7 +197,7 @@ pub const Server = struct {
             const text = getStr(td, "text") orelse return true;
             const version = getInt(td, "version") orelse 0;
             try self.docs.put(self.gpa, uri, text, version);
-            try self.publish(writer, uri);
+            try self.publish(a, writer, uri);
             return true;
         }
 
@@ -210,13 +228,13 @@ pub const Server = struct {
                 const sc = coordU32(getInt(s, "character")) orelse continue;
                 const el = coordU32(getInt(e, "line")) orelse continue;
                 const ec = coordU32(getInt(e, "character")) orelse continue;
-                const start_off = (try hover.offsetIn(self.gpa, d.text, sl, sc)) orelse doc_end;
-                var end_off = (try hover.offsetIn(self.gpa, d.text, el, ec)) orelse doc_end;
+                const start_off = (try hover.offsetIn(a, d.text, sl, sc)) orelse doc_end;
+                var end_off = (try hover.offsetIn(a, d.text, el, ec)) orelse doc_end;
                 if (end_off < start_off) end_off = start_off; // tolerate an inverted range
                 try self.docs.spliceRange(self.gpa, uri, start_off, end_off, text);
             }
             self.docs.setVersion(uri, version);
-            try self.publish(writer, uri);
+            try self.publish(a, writer, uri);
             return true;
         }
 
@@ -226,7 +244,7 @@ pub const Server = struct {
             const version = if (self.docs.get(uri)) |d| d.version else 0;
             self.docs.remove(self.gpa, uri);
             // Clear any diagnostics the client is still showing for the closed doc.
-            try self.sendDiagnostics(writer, uri, version, &.{});
+            try sendDiagnostics(a, writer, uri, version, &.{});
             return true;
         }
 
@@ -247,13 +265,13 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // hover before didOpen
-                hv = hover.hoverAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
+                hv = hover.hoverAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (hv) |h| result = .{ .contents = .{ .kind = h.kind, .value = h.value } };
             }
             if (result) |r| {
-                try protocol.writeResponse(self.gpa, writer, iv, r);
+                try protocol.writeResponse(a, writer, iv, r);
             } else {
-                try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+                try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
             }
             return true;
         }
@@ -275,11 +293,11 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // completion before didOpen
-                comp = completion.completionsAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
+                comp = completion.completionsAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (comp) |c| items = c.items;
             }
             // Always answer with an array (an empty list is a valid "no candidates").
-            try protocol.writeResponse(self.gpa, writer, iv, items);
+            try protocol.writeResponse(a, writer, iv, items);
             return true;
         }
 
@@ -290,7 +308,7 @@ pub const Server = struct {
             // Freed at if-branch scope AFTER writeResponse has serialized `result.uri`; must
             // NOT sit inside `blk` (the happy path sets result inside blk, so an in-blk defer
             // would free the uri before serialization — a use-after-free).
-            defer if (owned_uri) |u| self.gpa.free(u);
+            defer if (owned_uri) |u| a.free(u);
             blk: {
                 const params = objGet(root, "params") orelse break :blk;
                 const td = objGet(params, "textDocument") orelse break :blk;
@@ -303,16 +321,16 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // definition before didOpen
-                const d = (definition.definitionAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk) orelse break :blk;
+                const d = (definition.definitionAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk) orelse break :blk;
                 // The uri is either the request's own open-doc uri or an imported module's
                 // `file://` path.
                 owned_uri = d.uri;
                 result = .{ .uri = d.uri, .range = d.range };
             }
             if (result) |r| {
-                try protocol.writeResponse(self.gpa, writer, iv, r);
+                try protocol.writeResponse(a, writer, iv, r);
             } else {
-                try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+                try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
             }
             return true;
         }
@@ -334,51 +352,51 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // signatureHelp before didOpen
-                sh = signature.signatureHelpAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
+                sh = signature.signatureHelpAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (sh) |x| result = x.help;
             }
             if (result) |r| {
-                try protocol.writeResponse(self.gpa, writer, iv, r);
+                try protocol.writeResponse(a, writer, iv, r);
             } else {
-                try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+                try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
             }
             return true;
         }
 
         if (eql(method, "shutdown")) {
             self.shutdown_requested = true;
-            if (id) |iv| try protocol.writeResponse(self.gpa, writer, iv, std.json.Value{ .null = {} });
+            if (id) |iv| try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
             return true;
         }
 
         // Unknown method: a request is rejected; a notification (incl. `$/…`) is ignored.
-        if (id) |iv| try protocol.writeError(self.gpa, writer, iv, protocol.err_code.method_not_found, "method not found");
+        if (id) |iv| try protocol.writeError(a, writer, iv, protocol.err_code.method_not_found, "method not found");
         return true;
     }
 
     /// Check `uri`'s current buffer and publish the result. ALWAYS publishes (an empty
     /// array clears stale diagnostics on a now-clean document); a check fault publishes an
     /// empty set and continues (it is a notification — never a response, never a hang).
-    fn publish(self: *Server, writer: *Writer, uri: []const u8) !void {
+    fn publish(self: *Server, a: std.mem.Allocator, writer: *Writer, uri: []const u8) !void {
         const doc = self.docs.get(uri) orelse return;
         const version = doc.version;
         const text = doc.text;
-        var mapped = diagnostics.checkBuffer(self.gpa, self.workspace(), uri, text) catch {
-            try self.sendDiagnostics(writer, uri, version, &.{});
+        var mapped = diagnostics.checkBuffer(a, self.workspace(), uri, text) catch {
+            try sendDiagnostics(a, writer, uri, version, &.{});
             return;
         };
         defer mapped.deinit();
-        try self.sendDiagnostics(writer, uri, version, mapped.items);
-    }
-
-    fn sendDiagnostics(self: *Server, writer: *Writer, uri: []const u8, version: i64, items: []const protocol.LspDiagnostic) !void {
-        try protocol.writeNotification(self.gpa, writer, "textDocument/publishDiagnostics", .{
-            .uri = uri,
-            .version = version,
-            .diagnostics = items,
-        });
+        try sendDiagnostics(a, writer, uri, version, mapped.items);
     }
 };
+
+fn sendDiagnostics(a: std.mem.Allocator, writer: *Writer, uri: []const u8, version: i64, items: []const protocol.LspDiagnostic) !void {
+    try protocol.writeNotification(a, writer, "textDocument/publishDiagnostics", .{
+        .uri = uri,
+        .version = version,
+        .diagnostics = items,
+    });
+}
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
@@ -1457,4 +1475,34 @@ test "lsp cancelRequest: a cancelled request answers -32800 with no result; a no
     // Sanity (explicitly NOT the skip-work proof — hover never publishes): only the didOpen
     // publish was emitted; no stray notification leaked from the cancelled request.
     try testing.expectEqual(@as(usize, 1), publish_count);
+}
+
+test "lsp feed: each push is served to completion; the server reports exit" {
+    const gpa = testing.allocator;
+    var s = Server.init(gpa);
+    defer s.deinit();
+    s.disk = false;
+
+    var in: Writer.Allocating = .init(gpa);
+    defer in.deinit();
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 1, .method = "initialize", .params = .{} });
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didOpen", .params = .{
+        .textDocument = .{ .uri = "file:///b/a.toy", .version = 1, .text = "fn main() -> int { return y }\n" },
+    } });
+    try testing.expect(try s.feed(in.written(), &out.writer));
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |f| gpa.free(f);
+        frames.deinit(gpa);
+    }
+    try testing.expectEqual(@as(usize, 2), frames.items.len);
+    try testing.expect(std.mem.indexOf(u8, frames.items[1], "R0001") != null);
+
+    in.clearRetainingCapacity();
+    out.clearRetainingCapacity();
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "exit" });
+    try testing.expect(!try s.feed(in.written(), &out.writer));
 }

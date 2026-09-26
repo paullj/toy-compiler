@@ -181,6 +181,34 @@ pub fn build(b: *std.Build) void {
     fuzz_step.dependOn(&run_fuzz.step);
     // Also install the fuzz binary so it can be run directly for long soak runs.
     b.installArtifact(fuzz_exe);
+
+    // The language server for the docs site's in-browser editors. wasi rather than
+    // freestanding: `std.Io.Threaded` and the path-sized buffers in the front-end need an
+    // OS target, and the host shims the handful of wasi calls a check makes. Always
+    // ReleaseSmall — it ships over the network.
+    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const wasm_compiler = b.createModule(.{
+        .root_source_file = b.path("packages/compiler/src/root.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+        .single_threaded = true,
+    });
+    wasm_compiler.addOptions("build_options", options);
+    wasm_compiler.addImport("bundled_std", b.createModule(.{ .root_source_file = gen, .target = wasm_target }));
+    const lsp_wasm = b.addExecutable(.{
+        .name = "toy-lsp",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/lsp/src/wasm.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+            .single_threaded = true,
+            .imports = &.{.{ .name = "toy_compiler", .module = wasm_compiler }},
+        }),
+    });
+    lsp_wasm.entry = .disabled;
+    lsp_wasm.rdynamic = true;
+    const lsp_wasm_step = b.step("lsp-wasm", "Build the language server as wasm32-wasi (zig-out/bin/toy-lsp.wasm)");
+    lsp_wasm_step.dependOn(&b.addInstallArtifact(lsp_wasm, .{}).step);
 }
 
 /// Hash the compiler's source into a single 64-bit identity: every `.zig` under the

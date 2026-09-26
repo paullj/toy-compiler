@@ -73,6 +73,11 @@ pub const StageProbe = struct {
     put_ns: std.atomic.Value(u64) = .init(0),
 
     fn add(field: *std.atomic.Value(u64), dt: u64) void {
+        // wasm32 has no 64-bit atomics, and a single-threaded build needs none.
+        if (@import("builtin").single_threaded) {
+            field.raw +%= dt;
+            return;
+        }
         _ = field.fetchAdd(dt, .monotonic);
     }
 
