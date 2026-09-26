@@ -22,7 +22,31 @@ description = "Regenerate the checked-in tree-sitter-toy parser.c from grammar.j
 dir = "packages/tree-sitter-toy"
 run = "tree-sitter generate"
 
+# The docs site's editors run the language server in the browser, built from this tree.
+# -Oz trims ~13% on top of ReleaseSmall; the feature flags match what zig emits for wasm32.
+[tasks."site:wasm"]
+description = "Build the in-browser language server into the docs site"
+dir = "packages/site"
+run = [
+  "pnpm install",
+  "zig build lsp-wasm",
+  "pnpm exec wasm-opt -Oz --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals ../../zig-out/bin/toy-lsp.wasm -o static/toy-lsp.wasm",
+]
+
 [tasks."site:dev"]
 description = "Run the docs site dev server"
 dir = "packages/site"
-run = "pnpm install && pnpm dev"
+depends = ["site:wasm"]
+run = "pnpm dev"
+
+[tasks."site:test"]
+description = "Test the docs site (incl. the wasm language server)"
+dir = "packages/site"
+depends = ["site:wasm"]
+run = "pnpm test"
+
+[tasks."site:build"]
+description = "Build the static docs site into packages/site/build"
+dir = "packages/site"
+depends = ["site:wasm"]
+run = "pnpm build"
