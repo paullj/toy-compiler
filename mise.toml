@@ -21,3 +21,8 @@ run = "zig build -Doptimize=ReleaseFast && ./zig-out/bin/toy"
 description = "Regenerate the checked-in tree-sitter-toy parser.c from grammar.js"
 dir = "packages/tree-sitter-toy"
 run = "tree-sitter generate"
+
+[tasks."site:dev"]
+description = "Run the docs site dev server"
+dir = "packages/site"
+run = "pnpm install && pnpm dev"
