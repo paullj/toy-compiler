@@ -67,6 +67,10 @@ pub fn get(self: *Documents, uri: []const u8) ?*Doc {
     return self.map.getPtr(uri);
 }
 
+pub fn textOf(self: *const Documents, uri: []const u8) ?[]const u8 {
+    return if (self.map.get(uri)) |d| d.text else null;
+}
+
 pub fn remove(self: *Documents, gpa: std.mem.Allocator, uri: []const u8) void {
     if (self.map.fetchRemove(uri)) |kv| {
         gpa.free(kv.key);

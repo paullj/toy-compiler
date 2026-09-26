@@ -28,6 +28,7 @@ const completion = @import("completion.zig");
 const definition = @import("definition.zig");
 const signature = @import("signature.zig");
 const Documents = @import("Documents.zig");
+const Workspace = @import("Workspace.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
 
@@ -35,63 +36,36 @@ pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
 /// pipe close. `toy lsp` passes real stdin/stdout; the in-process test passes in-memory
 /// buffers. Returns `.ok` when `shutdown` preceded `exit`, else `.no_shutdown` (exit 1).
 pub fn serve(gpa: std.mem.Allocator, reader: *Reader, writer: *Writer) anyerror!ExitCode {
-    var s = try Server.init(gpa);
+    var s = Server.init(gpa);
     defer s.deinit();
     return s.run(reader, writer);
 }
 
 pub const Server = struct {
     gpa: std.mem.Allocator,
-    /// Owns its own compute io (openCache / discover / checkGraph). This is separate from
-    /// the transport reader/writer, whose io was already consumed by the caller.
+    /// Owns its own compute io (discover / checkGraph). This is separate from the transport
+    /// reader/writer, whose io was already consumed by the caller.
     threaded: std.Io.Threaded,
     docs: Documents,
-    /// One reused scratch dir + file under cwd: the check front-end reads from disk, so an
-    /// unsaved buffer is round-tripped through this file (truncated + rewritten per check).
-    scratch_dir: []u8,
-    scratch_file: []u8,
+    /// false on a host with no filesystem: imports resolve only against open documents.
+    disk: bool = true,
     got_initialize: bool = false,
     shutdown_requested: bool = false,
 
-    pub fn init(gpa: std.mem.Allocator) !Server {
-        var threaded: std.Io.Threaded = .init(gpa, .{});
-        errdefer threaded.deinit();
-        const setup_io = threaded.io();
-
-        // A per-instance dir name keeps two servers (or a test + a real run) from
-        // colliding on the same scratch file under one cwd. The monotonic clock is a
-        // sufficient discriminator — server instances are not created in a tight loop.
-        const ns = Io.Clock.Timestamp.now(setup_io, .awake).raw.nanoseconds;
-        const dir = try std.fmt.allocPrint(gpa, ".toy-lsp-{x}", .{@as(u64, @bitCast(@as(i64, @truncate(ns))))});
-        errdefer gpa.free(dir);
-        try Io.Dir.cwd().createDirPath(setup_io, dir);
-        errdefer Io.Dir.cwd().deleteTree(setup_io, dir) catch {};
-        const file = try std.fmt.allocPrint(gpa, "{s}/doc.toy", .{dir});
-        errdefer gpa.free(file);
-
-        return .{
-            .gpa = gpa,
-            .threaded = threaded,
-            .docs = .{},
-            .scratch_dir = dir,
-            .scratch_file = file,
-        };
+    pub fn init(gpa: std.mem.Allocator) Server {
+        return .{ .gpa = gpa, .threaded = .init(gpa, .{}), .docs = .{} };
     }
 
     pub fn deinit(self: *Server) void {
-        Io.Dir.cwd().deleteTree(self.io(), self.scratch_dir) catch {};
         self.docs.deinit(self.gpa);
-        self.gpa.free(self.scratch_file);
-        self.gpa.free(self.scratch_dir);
         self.threaded.deinit();
         self.* = undefined;
     }
 
-    /// The compute io, recomputed from the PINNED server each call: `Threaded.io()`
-    /// captures `&self.threaded`, so it must never be cached across the by-value move out
-    /// of `init`.
-    fn io(self: *Server) Io {
-        return self.threaded.io();
+    /// Recomputed from the PINNED server each call: `Threaded.io()` captures
+    /// `&self.threaded`, so it must never be cached across the by-value move out of `init`.
+    fn workspace(self: *Server) Workspace {
+        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = self.disk };
     }
 
     fn run(self: *Server, reader: *Reader, writer: *Writer) anyerror!ExitCode {
@@ -166,7 +140,7 @@ pub const Server = struct {
         const id = root.object.get("id");
 
         // A request the client already cancelled: answer RequestCancelled and do NONE of the
-        // work (no scratch write, no check, no feature call, no publish). Notifications carry
+        // work (no check, no feature call, no publish). Notifications carry
         // no top-level id and are never cancellable; `$/cancelRequest` carries its target in
         // params, not a top-level id, so it never self-matches — it falls through to the
         // ignored-notification path below (a notification is never answered). The gate is
@@ -219,7 +193,7 @@ pub const Server = struct {
             // Incremental sync: apply each change IN ORDER, each relative to the doc AFTER the
             // previous one. A change with NO `range` is a whole-document replace (clients that
             // opt out of deltas). Protocol-exact SYNC only: publish() below still re-checks the
-            // whole buffer via the scratch file and re-lexes/re-parses this edited file.
+            // whole buffer and re-lexes/re-parses this edited file.
             for (changes.array.items) |change| {
                 const text = getStr(change, "text") orelse continue;
                 const range = objGet(change, "range") orelse {
@@ -273,7 +247,7 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // hover before didOpen
-                hv = hover.hoverAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
+                hv = hover.hoverAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (hv) |h| result = .{ .contents = .{ .kind = h.kind, .value = h.value } };
             }
             if (result) |r| {
@@ -301,7 +275,7 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // completion before didOpen
-                comp = completion.completionsAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
+                comp = completion.completionsAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (comp) |c| items = c.items;
             }
             // Always answer with an array (an empty list is a valid "no candidates").
@@ -329,9 +303,9 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // definition before didOpen
-                const d = (definition.definitionAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk) orelse break :blk;
-                // The uri is either the request's own open-doc uri or a real imported module's
-                // `file://` path — the helper guarantees it is never the scratch path.
+                const d = (definition.definitionAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk) orelse break :blk;
+                // The uri is either the request's own open-doc uri or an imported module's
+                // `file://` path.
                 owned_uri = d.uri;
                 result = .{ .uri = d.uri, .range = d.range };
             }
@@ -360,7 +334,7 @@ pub const Server = struct {
                 const max: i64 = std.math.maxInt(u32);
                 if (line < 0 or character < 0 or line > max or character > max) break :blk;
                 const doc = self.docs.get(uri) orelse break :blk; // signatureHelp before didOpen
-                sh = signature.signatureHelpAt(self.gpa, self.io(), self.scratch_file, doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
+                sh = signature.signatureHelpAt(self.gpa, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
                 if (sh) |x| result = x.help;
             }
             if (result) |r| {
@@ -389,7 +363,7 @@ pub const Server = struct {
         const doc = self.docs.get(uri) orelse return;
         const version = doc.version;
         const text = doc.text;
-        var mapped = diagnostics.checkBuffer(self.gpa, self.io(), self.scratch_file, uri, text) catch {
+        var mapped = diagnostics.checkBuffer(self.gpa, self.workspace(), uri, text) catch {
             try self.sendDiagnostics(writer, uri, version, &.{});
             return;
         };
@@ -758,7 +732,7 @@ test "lsp hover: type at a binding/param/expr, signature at a callee, null over 
     // id 4: callee signature.
     const callee = hoverValue(by_id[4].?).?;
     try testing.expectEqualStrings("fn add(int, int) -> int", callee);
-    // The internal scratch-file module name must never leak into hover output.
+    // The entry module qualifier must never leak into hover output.
     try testing.expect(std.mem.indexOf(u8, callee, "doc.") == null);
 
     // Every non-hit path answers with an explicit null result.
@@ -1472,7 +1446,7 @@ test "lsp cancelRequest: a cancelled request answers -32800 with no result; a no
     try testing.expectEqual(@as(usize, 1), cancel_hit.count);
     // ... it is RequestCancelled and produced NO normal work-product (no `result` key). This
     // response-level pair is the genuine skipped-work proof: the gate returns before any
-    // scratch write / check / feature call, so hover did zero work.
+    // check / feature call, so hover did zero work.
     const err_obj = objGet(cancel_hit.resp.?, "error").?;
     try testing.expectEqual(@as(i64, -32800), getInt(err_obj, "code").?);
     try testing.expect(objGet(cancel_hit.resp.?, "result") == null);

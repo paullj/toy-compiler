@@ -1,26 +1,15 @@
-//! Bridge from the compiler's check front-end to LSP diagnostics. An open document is
-//! (potentially) UNSAVED and its buffer differs from disk, but the front-end reads source
-//! from disk, so each check round-trips the buffer through ONE reused scratch file that
-//! the server truncates + rewrites per change. That is the documented in-memory strategy:
-//! we do not rewrite the front-end.
-//!
-//! The scratch round-trip is only sound because `Graph.discover` is called with a `null`
-//! probe, which DISABLES the `(mtime,size,ctime)` warm read-skip. Without that, two
-//! document versions that happen to collide on size within one mtime tick could serve the
-//! previous version's stale parse output. With `probe = null` every check reads fresh; the
-//! lex/parse content cache is keyed on `Wyhash(0, source)`, so it stays sound across
-//! versions and only helps.
-//!
-//! The graph sequence mirrors `toy check`: discover -> resolveGraph -> (if resolve is
-//! clean) checkGraph, then stop before lower/codegen. Diagnostics belonging to an IMPORTED
-//! module are dropped from this publish — they carry byte offsets into their own source and
-//! belong to their own URIs.
+//! Bridge from the compiler's check front-end to LSP diagnostics. The graph sequence
+//! mirrors `toy check`: discover -> resolveGraph -> (if resolve is clean) checkGraph, then
+//! stop before lower/codegen. Diagnostics belonging to an IMPORTED module are dropped from
+//! this publish — they carry byte offsets into their own source and belong to their own URIs.
 
 const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const lsp_uri = @import("uri.zig");
+const Workspace = @import("Workspace.zig");
+const Documents = @import("Documents.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -44,31 +33,16 @@ pub const Mapped = struct {
     }
 };
 
-/// Check `source` (an open document's buffer) via the scratch-file round-trip and return
-/// the mapped LSP diagnostics. `uri` is only used as the URI of any related-location. A
+/// Check `source` (an open document's buffer) and return the mapped LSP diagnostics. `uri` is only used as the URI of any related-location. A
 /// hard I/O / OOM failure propagates; a compile problem is reported as diagnostics, never
 /// an error.
 pub fn checkBuffer(
     gpa: std.mem.Allocator,
-    io: Io,
-    scratch_path: []const u8,
+    ws: Workspace,
     uri: []const u8,
     source: []const u8,
 ) !Mapped {
-    // Truncate + rewrite the ONE scratch file with the current buffer.
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = scratch_path, .data = source });
-
-    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
-
-    // Root sibling imports at the open doc's real dir so `import a/b` resolves off disk (no
-    // spurious unknown-module against a sibling-importing buffer).
-    const root = try lsp_uri.dirOfUri(gpa, uri);
-    defer if (root) |r| gpa.free(r);
-
-    // probe = null: disables the warm read-skip so a same-size edit can't serve stale
-    // output (see the file header).
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
+    var graph = try ws.discover(gpa, uri, source);
     defer graph.deinit(gpa);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -102,7 +76,7 @@ pub fn checkBuffer(
     var tc: ?TypecheckGraph.GraphResult = null;
     defer if (tc) |*t| t.deinit(gpa);
     if (!Decide.resolveHasError(res.diags)) {
-        tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
+        tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
     }
     const type_diags: []const Diagnostic = if (tc) |t| t.diags else &.{};
 
@@ -195,11 +169,10 @@ test "checkBuffer maps an arity mismatch to a T0039 on the erroring line" {
     const src = try Io.Dir.cwd().readFileAlloc(io, "tests/corpora/diagnostics/arity_mismatch.toy", gpa, .unlimited);
     defer gpa.free(src);
 
-    const scratch = ".toy-lsp-test-diag/doc.toy";
-    try Io.Dir.cwd().createDirPath(io, ".toy-lsp-test-diag");
-    defer Io.Dir.cwd().deleteTree(io, ".toy-lsp-test-diag") catch {};
-
-    var mapped = try checkBuffer(gpa, io, scratch, "file:///doc.toy", src);
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
+    var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
     defer mapped.deinit();
 
     var found = false;

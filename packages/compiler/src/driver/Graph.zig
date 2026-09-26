@@ -190,6 +190,35 @@ pub fn discover(
     /// real project's imports. The entry module itself is always built from `entry_path`.
     root: ?[]const u8,
 ) !Graph {
+    return discoverWith(gpa, io, cache, target, entry_path, probe, root, null);
+}
+
+/// An in-memory source layer consulted BEFORE disk, keyed by resolved file path (the
+/// entry path verbatim, or `<root>/<import>.toy`). An editor serves unsaved buffers
+/// through it; a host with no filesystem (a browser) sets `disk = false`.
+pub const Overlay = struct {
+    ctx: *const anyopaque,
+    getFn: *const fn (ctx: *const anyopaque, path: []const u8) ?[]const u8,
+    /// false => a path the overlay lacks is missing; the disk is never touched.
+    disk: bool = true,
+
+    fn get(o: Overlay, path: []const u8) ?[]const u8 {
+        return o.getFn(o.ctx, path);
+    }
+};
+
+/// `discover` with an optional source `overlay`. Overlay-served modules skip the warm
+/// manifest and the source cache: their bytes are not a file with a stable stat.
+pub fn discoverWith(
+    gpa: std.mem.Allocator,
+    io: Io,
+    cache: Cache,
+    target: []const u8,
+    entry_path: []const u8,
+    probe: ?*Engine.StageProbe,
+    root: ?[]const u8,
+    overlay: ?Overlay,
+) !Graph {
     var d: Discoverer = .{
         .gpa = gpa,
         .io = io,
@@ -197,6 +226,7 @@ pub fn discover(
         .target = target,
         .probe = probe,
         .root = root orelse dirname(entry_path),
+        .overlay = overlay,
     };
     defer d.deinit();
 
@@ -361,6 +391,7 @@ const Discoverer = struct {
     /// Owns one master copy of each key (raw path) and value (canon); callers get a
     /// fresh dupe so the existing intern/free ownership is unchanged.
     realpath_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
+    overlay: ?Overlay = null,
     err: ?Error = null,
 
     fn deinit(d: *Discoverer) void {
@@ -403,6 +434,11 @@ const Discoverer = struct {
     /// Memoized by raw path (`realpath_cache`): a file reached by multiple importers
     /// realpaths once; later hits return a dupe of the cached canon.
     fn canonicalize(d: *Discoverer, file: []const u8) !?[]u8 {
+        // An overlay path has no inode to resolve, so its spelling IS its identity.
+        if (d.overlay) |o| {
+            if (o.get(file) != null) return try d.gpa.dupe(u8, file);
+            if (!o.disk) return null;
+        }
         if (d.realpath_cache.get(file)) |canon| return try d.gpa.dupe(u8, canon);
         const rp = Io.Dir.cwd().realPathFileAlloc(d.io, file, d.gpa) catch return null;
         // `realPathFileAlloc` returns a sentinel `[:0]u8` (allocated len+1); to keep
@@ -489,11 +525,14 @@ const Discoverer = struct {
     /// which is byte-identical to a fresh parse because the served source is byte-identical
     /// to the bytes the priming build read) — so the graph + emitted bytes are unchanged.
     fn load(d: *Discoverer, id: u32) DiscoverError!void {
-        // BUNDLED: serve the embedded source directly — no disk read, no stat, no
-        // manifest. The lex/parse content cache still applies (keyed by content_fp),
-        // so a bundled module lexes/parses exactly like a disk one. A program that
-        // imports no bundled path never enters this branch (byte-identical).
-        if (d.slots.items[id].bundled_src) |static_src| {
+        // BUNDLED or OVERLAY: serve the in-memory source directly — no disk read, no
+        // stat, no manifest. The lex/parse content cache still applies (keyed by
+        // content_fp), so the module lexes/parses exactly like a disk one. A program that
+        // imports no bundled path and has no overlay never enters this branch
+        // (byte-identical).
+        const mem_src = d.slots.items[id].bundled_src orelse
+            if (d.overlay) |o| o.get(d.slots.items[id].file) else null;
+        if (mem_src) |static_src| {
             const source = try d.gpa.dupe(u8, static_src);
             const engine = Engine.initProbe(d.cache, .normal, d.probe);
             const lexed = engine.lex(d.gpa, d.io, d.target, source, id, true) catch |e| {
@@ -507,9 +546,8 @@ const Discoverer = struct {
                 return e;
             };
             if (parsed.diags.len > 0) {
-                // A bundled module is compiler-authored; a parse error in it is a build
-                // bug, not a user error. Surface the first diagnostic against the
-                // bundled module so it is not silently swallowed.
+                // For a bundled module this is a build bug, not a user error; either way
+                // surface the diagnostics against the module so none is swallowed.
                 const first = parsed.diags[0];
                 const byte_offset = first.byte_offset;
                 const diags_owned = try d.gpa.dupe(Diagnostic, parsed.diags);
@@ -538,6 +576,11 @@ const Discoverer = struct {
         }
 
         const file = d.slots.items[id].file;
+        if (d.overlay) |o| if (!o.disk) return d.fail(.{
+            .kind = .missing,
+            .message = try std.fmt.allocPrint(d.gpa, "cannot read module file '{s}'", .{file}),
+            .module = if (id == 0) null else id,
+        });
         // Snapshot (mtime, size, ctime) FIRST — one cheap stat, BEFORE any read. This is the
         // warm-discover unchanged-predicate (see `warmServe`): a match against the
         // manifest collapses this file's discovery to stat + cache-gets, with NO read.
