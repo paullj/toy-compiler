@@ -568,6 +568,13 @@ dir: []const u8,
 /// default) is the VERBATIM one-file-per-entry path — byte-identical to before.
 pack: ?*Pack = null,
 
+/// False => every `get` misses and every `put` is dropped, with no I/O. A long-lived
+/// editor session checks a fresh buffer per keystroke: a disk cache would grow without
+/// bound, and a browser host has no disk at all.
+enabled: bool = true,
+
+pub const disabled: Cache = .{ .dir = "", .enabled = false };
+
 /// Create the per-stamp cache directory (and the `.toy` root) if needed.
 /// `dir` must already include the compiler stamp.
 pub fn init(io: Io, dir: []const u8) !Cache {
@@ -597,6 +604,7 @@ const checksum_len = @sizeOf(u64);
 /// corrupt). `T` must be a fixed-size value type (e.g. `Token`, `Ast.Node`).
 /// Caller owns the result.
 pub fn get(c: Cache, comptime T: type, gpa: std.mem.Allocator, io: Io, key: Key) !?[]T {
+    if (!c.enabled) return null;
     // PACKED PATH: a hit is a memory lookup + slice into the bulk-loaded pack; a
     // miss means the digest is absent from this build's loaded index (no per-entry
     // syscall). The pack carries the SAME `[u64 checksum][payload]` framing, so a
@@ -636,6 +644,7 @@ pub fn get(c: Cache, comptime T: type, gpa: std.mem.Allocator, io: Io, key: Key)
 /// Store `items` under `key`. `tmp_tag` must be unique among concurrent writers
 /// (the file index works) so temp files never collide.
 pub fn put(c: Cache, comptime T: type, io: Io, key: Key, tmp_tag: usize, items: []const T) !void {
+    if (!c.enabled) return;
     const payload = std.mem.sliceAsBytes(items);
 
     // PACKED PATH: stage `[u64 checksum][payload]` into the in-memory write buffer
@@ -693,6 +702,13 @@ pub fn manifestPut(c: Cache, canon_path: []const u8, e: Pack.ManifestEntry) void
 // digest logic in isolation.
 
 const testing = std.testing;
+
+test "a disabled cache misses every get and drops every put without touching io" {
+    const c = Cache.disabled;
+    const k = Key.fromSource(.lex, "native", "fn main() {}");
+    try c.put(u8, Io.failing, k, 0, &[_]u8{ 1, 2, 3 });
+    try testing.expect((try c.get(u8, testing.allocator, Io.failing, k)) == null);
+}
 
 test "cacheable subset's enum bytes are PINNED (digest byte-identity across the enum collapse)" {
     // `digest()` folds `@intFromEnum(phase)`, so the on-disk entry name for every

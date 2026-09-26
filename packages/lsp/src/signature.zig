@@ -1,17 +1,16 @@
 //! textDocument/signatureHelp: when the cursor sits inside a call's argument list, the
 //! callee's signature plus the ACTIVE PARAMETER index.
 //!
-//! Reuses the scratch round-trip + `probe = null` contract (see `diagnostics.zig` /
-//! `hover.zig`), but detection runs FIRST over a fault-tolerant raw LEX of the buffer — the
-//! enclosing call is found from the token stream, so an outside-any-call cursor is rejected
-//! before any compile. Like completion, this must survive a broken buffer: signature help
+//! Checks through the same `Workspace` as hover, but detection runs FIRST over a
+//! fault-tolerant raw LEX of the buffer — the enclosing call is found from the token stream,
+//! so an outside-any-call cursor is rejected before any compile. Like completion, this must survive a broken buffer: signature help
 //! fires mid-type (`add(1, ` with no closing paren), so an unterminated call is REPAIRED by
 //! appending its missing closers at EOF (offset-preserving) and resolve/type errors are
 //! tolerated — an arity error on the repaired call must not suppress the declared signature.
 //!
 //! The callee's signature is read from `resolutions` -> `sigs` (the same path hover uses for
-//! a callee), rendered through `hover.bareName` so the internal scratch module qualifier
-//! never leaks; param labels are [start,end) byte spans into the rendered label.
+//! a callee), rendered through `hover.bareName` so the module qualifier never leaks; param
+//! labels are [start,end) byte spans into the rendered label.
 //!
 //! KNOWN LIMITATIONS (documented, not bugs):
 //!   * A turbofish call `id[int](` — the token before `(` is `]`, not an identifier — yields
@@ -30,6 +29,7 @@ const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
 const lsp_uri = @import("uri.zig");
+const Workspace = @import("Workspace.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -169,8 +169,7 @@ fn renderLabel(
 /// propagates.
 pub fn signatureHelpAt(
     gpa: std.mem.Allocator,
-    io: Io,
-    scratch_path: []const u8,
+    ws: Workspace,
     source: []const u8,
     line: u32,
     character: u32,
@@ -188,23 +187,14 @@ pub fn signatureHelpAt(
     const repaired = (try repair(gpa, source, toks)) orelse return null;
     defer if (repaired.ptr != source.ptr) gpa.free(repaired);
 
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = scratch_path, .data = repaired });
-
-    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
-
-    // Root sibling imports at the open doc's real dir so `import a/b` resolves off disk.
-    const root = try lsp_uri.dirOfUri(gpa, doc_uri);
-    defer if (root) |r| gpa.free(r);
-
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
+    var graph = try ws.discover(gpa, doc_uri, repaired);
     defer graph.deinit(gpa);
     if (graph.err != null) return null;
 
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
     // UNCONDITIONAL: a repaired arity error must not suppress the declared signature.
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
     defer tc.deinit(gpa);
 
     const m = graph.entry();

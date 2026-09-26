@@ -1,8 +1,7 @@
 //! textDocument/hover: the type (or signature) at a byte offset.
 //!
-//! Reuses `diagnostics.checkBuffer`'s scratch round-trip + `probe = null` contract (see
-//! that file's header for why the round-trip is sound), but instead of mapping diagnostics
-//! it RETAINS the graph/resolve/typecheck results to read `node_types` / `sigs` /
+//! Checks through the same `Workspace` as `diagnostics.checkBuffer`, but instead of mapping
+//! diagnostics it RETAINS the graph/resolve/typecheck results to read `node_types` / `sigs` /
 //! `resolutions`, renders the answer into an owned arena, THEN tears the compiler results
 //! down. The render must precede those deinits: a `Sig.name` and a `Layout.name` are
 //! BORROWED from the resolve/graph tables, so the arena copy is what outlives them.
@@ -17,6 +16,7 @@ const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 const lsp_uri = @import("uri.zig");
+const Workspace = @import("Workspace.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -47,23 +47,13 @@ pub const Hover = struct {
 /// fault propagates.
 pub fn hoverAt(
     gpa: std.mem.Allocator,
-    io: Io,
-    scratch_path: []const u8,
+    ws: Workspace,
     source: []const u8,
     line: u32,
     character: u32,
     doc_uri: []const u8,
 ) !?Hover {
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = scratch_path, .data = source });
-
-    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
-
-    // Root sibling imports at the open doc's real dir so `import a/b` resolves off disk.
-    const root = try lsp_uri.dirOfUri(gpa, doc_uri);
-    defer if (root) |r| gpa.free(r);
-
-    var graph = try Graph.discover(gpa, io, cache, "native", scratch_path, null, root);
+    var graph = try ws.discover(gpa, doc_uri, source);
     defer graph.deinit(gpa);
     if (graph.err != null) return null;
 
@@ -71,7 +61,7 @@ pub fn hoverAt(
     defer res.deinit(gpa);
     if (Decide.resolveHasError(res.diags)) return null;
 
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
     defer tc.deinit(gpa);
 
     const m = graph.entry();
@@ -154,9 +144,8 @@ pub fn tokenAt(tokens: []const Token, off: u32) ?u32 {
 
 /// Render a type as the compiler names it elsewhere. `layouts`/`enum_layouts` supply the
 /// nominal name; the append copies that borrowed name into the caller's arena.
-/// A symbol name minus its leading module qualifier. The LSP checks the buffer through an
-/// internal scratch file, so the module segment is an artifact the user never wrote — hover
-/// shows the bare declared name. Toy identifiers contain no '.', so the last '.' is the
+/// A symbol name minus its leading module qualifier. The qualifier is the entry file's
+/// stem, which the user never wrote at the declaration — hover shows the bare declared name. Toy identifiers contain no '.', so the last '.' is the
 /// module separator.
 pub fn bareName(name: []const u8) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
