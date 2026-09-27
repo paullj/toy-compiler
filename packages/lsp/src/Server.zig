@@ -743,13 +743,13 @@ test "lsp hover: type at a binding/param/expr, signature at a callee, null over 
     try testing.expect(hp == .bool and hp.bool);
 
     // The positive cases FAIL on a null/absent value (non-vacuous).
-    try testing.expectEqualStrings("int", hoverValue(by_id[2].?).?); // binding x
-    try testing.expectEqualStrings("int", hoverValue(by_id[3].?).?); // param a
+    try testing.expectEqualStrings("x: int", hoverValue(by_id[2].?).?); // binding x
+    try testing.expectEqualStrings("a: int", hoverValue(by_id[3].?).?); // param a
     try testing.expectEqualStrings("int", hoverValue(by_id[5].?).?); // expr +
 
     // id 4: callee signature.
     const callee = hoverValue(by_id[4].?).?;
-    try testing.expectEqualStrings("fn add(int, int) -> int", callee);
+    try testing.expectEqualStrings("fn add(a: int, b: int) -> int", callee);
     // The entry module qualifier must never leak into hover output.
     try testing.expect(std.mem.indexOf(u8, callee, "doc.") == null);
 
@@ -761,10 +761,16 @@ test "lsp hover: type at a binding/param/expr, signature at a callee, null over 
 }
 
 /// The hover `result.contents.value`, or null if the response's result was JSON null.
+/// The hover's source text, unwrapped from the ```toy fence it is rendered in.
 fn hoverValue(resp: std.json.Value) ?[]const u8 {
     const result = objGet(resp, "result") orelse return null;
     const contents = objGet(result, "contents") orelse return null;
-    return getStr(contents, "value");
+    if (!eql(getStr(contents, "kind") orelse return null, "markdown")) return null;
+    const v = getStr(contents, "value") orelse return null;
+    const open = "```toy\n";
+    const close = "\n```";
+    if (!std.mem.startsWith(u8, v, open) or !std.mem.endsWith(u8, v, close)) return null;
+    return v[open.len .. v.len - close.len];
 }
 
 /// A 0-based (line, character) position just PAST the last occurrence of `needle` in
@@ -1367,7 +1373,7 @@ test "lsp incremental didChange: in-order ranged deltas + no-range full replace 
 
     // In-order multi-edit: a hover on the renamed callee resolves to `id`. Fails under
     // last-wins (whole doc would become `"id"`) or if c2's line-7 coord hit pre-c1 text.
-    try testing.expectEqualStrings("fn id(int) -> int", hoverValue(by_id[30].?).?);
+    try testing.expectEqualStrings("fn id(x: int) -> int", hoverValue(by_id[30].?).?);
 
     // Ranged single delta, offset-exact: the `zzz` edit yields a diagnostic pinned to BOTH the
     // line AND the exact column of `zzz` (a no-op/wrong-line/off-by-N splice all fail this).
@@ -1470,7 +1476,7 @@ test "lsp cancelRequest: a cancelled request answers -32800 with no result; a no
     try testing.expect(objGet(cancel_hit.resp.?, "result") == null);
 
     // The non-cancelled control request is answered normally in the same session.
-    try testing.expectEqualStrings("int", hoverValue(by_id[6].?).?);
+    try testing.expectEqualStrings("x: int", hoverValue(by_id[6].?).?);
 
     // Sanity (explicitly NOT the skip-work proof — hover never publishes): only the didOpen
     // publish was emitted; no stray notification leaked from the cancelled request.
