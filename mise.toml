@@ -45,6 +45,12 @@ dir = "packages/site"
 depends = ["site:wasm"]
 run = "pnpm test"
 
+[tasks."site:e2e"]
+description = "Drive the built docs site in headless Chromium (editors + language server)"
+dir = "packages/site"
+depends = ["site:wasm"]
+run = "pnpm e2e"
+
 [tasks."site:build"]
 description = "Build the static docs site into packages/site/build"
 dir = "packages/site"
