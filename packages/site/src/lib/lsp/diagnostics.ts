@@ -2,18 +2,11 @@ import { LSPPlugin, type LSPClient, type LSPClientExtension } from '@codemirror/
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint';
 import { ViewPlugin, type EditorView, type ViewUpdate } from '@codemirror/view';
 import { asset } from '$app/paths';
+import type * as lsp from 'vscode-languageserver-protocol';
 
-type LspPosition = { line: number; character: number };
-type LspRange = { start: LspPosition; end: LspPosition };
-type LspDiagnostic = {
-	range: LspRange;
-	severity?: number;
-	code?: string;
-	message: string;
-	relatedInformation?: { location: { uri: string; range: LspRange }; message: string }[];
-};
+type Severity = Diagnostic['severity'];
 
-const SEVERITY = ['error', 'error', 'warning', 'info', 'hint'] as const;
+const SEVERITY: Record<lsp.DiagnosticSeverity, Severity> = { 1: 'error', 2: 'warning', 3: 'info', 4: 'hint' };
 
 // The server republishes after every sync. Re-dispatching an identical set would close an
 // open diagnostic tooltip under the reader's cursor, so an unchanged set is dropped.
@@ -48,25 +41,26 @@ export function toyDiagnostics(): LSPClientExtension {
 	};
 }
 
-function publishDiagnostics(client: LSPClient, params: { uri: string; version?: number; diagnostics: LspDiagnostic[] }) {
+function publishDiagnostics(client: LSPClient, params: lsp.PublishDiagnosticsParams) {
 	const file = client.workspace.getFile(params.uri);
 	if (!file || (params.version != null && params.version !== file.version)) return false;
 	const view = file.getView();
 	const plugin = view && LSPPlugin.get(view);
 	if (!view || !plugin) return false;
 
-	const toPos = (p: LspPosition) => plugin.unsyncedChanges.mapPos(plugin.fromPosition(p, plugin.syncedDoc));
+	const toPos = (p: lsp.Position) => plugin.unsyncedChanges.mapPos(plugin.fromPosition(p, plugin.syncedDoc));
 	const diagnostics: Diagnostic[] = params.diagnostics.map((d) => {
 		const severity = SEVERITY[d.severity ?? 1];
+		const message = typeof d.message === 'string' ? d.message : d.message.value;
 		const related = (d.relatedInformation ?? [])
 			.filter((r) => r.location.uri === params.uri)
 			.map((r) => ({ label: r.message, pos: toPos(r.location.range.start) }));
 		return {
 			from: toPos(d.range.start),
 			to: toPos(d.range.end),
-			severity: severity === 'hint' ? 'hint' : severity,
-			message: d.message,
-			renderMessage: (v) => render(v, severity, d, related)
+			severity,
+			message,
+			renderMessage: (v) => render(v, severity, d.code, message, related)
 		};
 	});
 	const key = JSON.stringify(diagnostics.map((d) => [d.from, d.to, d.severity, d.message]));
@@ -76,17 +70,17 @@ function publishDiagnostics(client: LSPClient, params: { uri: string; version?: 
 	return true;
 }
 
-function render(view: EditorView, severity: string, d: LspDiagnostic, related: { label: string; pos: number }[]) {
+function render(view: EditorView, severity: Severity, code: lsp.Diagnostic['code'], message: string, related: { label: string; pos: number }[]) {
 	const root = el('div', 'toy-diag');
 	const head = root.appendChild(el('div', 'toy-diag-head'));
 	head.appendChild(el('span', `toy-diag-sev toy-diag-sev-${severity}`, severity));
-	if (d.code) {
-		const code = head.appendChild(el('a', 'toy-diag-code', d.code)) as HTMLAnchorElement;
-		code.href = asset(`/docs/errors/#${d.code}`);
-		code.target = '_blank';
-		code.title = `What ${d.code} means and how to fix it`;
+	if (code != null) {
+		const link = head.appendChild(el('a', 'toy-diag-code', String(code))) as HTMLAnchorElement;
+		link.href = asset(`/docs/errors/#${code}`);
+		link.target = '_blank';
+		link.title = `What ${code} means and how to fix it`;
 	}
-	root.appendChild(messageNode(d.message));
+	root.appendChild(messageNode(message));
 	for (const r of related) {
 		const line = view.state.doc.lineAt(r.pos).number;
 		const btn = root.appendChild(el('button', 'toy-diag-related', `↳ ${r.label} · line ${line}`));
