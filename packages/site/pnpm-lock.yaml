@@ -53,6 +53,9 @@ importers:
       codemirror:
         specifier: ^6.0.2
         version: 6.0.2
+      marked:
+        specifier: ^15
+        version: 15.0.12
       mode-watcher:
         specifier: ^1.1.0
         version: 1.1.0(svelte@5.56.4)

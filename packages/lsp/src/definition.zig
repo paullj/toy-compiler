@@ -30,7 +30,6 @@ const lsp_uri = @import("uri.zig");
 const Workspace = @import("Workspace.zig");
 const Documents = @import("Documents.zig");
 
-const Driver = toyc.Driver;
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
 const Ast = toyc.Ast;

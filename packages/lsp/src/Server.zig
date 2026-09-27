@@ -642,7 +642,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
 
     try testing.expectEqual(@as(usize, 3), publish_count); // three publishes, none dropped
 
-    // v1: the arity error surfaces as T0039 on the annotated line, zero-width range.
+    // v1: the arity error surfaces as T0039 on the annotated line, over one line.
     const d1 = objGet(publishes[0], "diagnostics").?;
     try testing.expect(hasCode(d1, "T0039"));
     for (d1.array.items) |d| {
@@ -651,7 +651,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             try testing.expectEqual(@as(i64, arity_line), getInt(start, "line").?);
             const end = field(d, "range", "end").?;
             try testing.expectEqual(getInt(start, "line").?, getInt(end, "line").?);
-            try testing.expectEqual(getInt(start, "character").?, getInt(end, "character").?);
+            try testing.expect(getInt(start, "character").? < getInt(end, "character").?);
         };
     }
 

@@ -66,3 +66,33 @@ test('signature help tracks the active argument', async ({ page }) => {
 	await expect(sig).toContainText('fn add(int, int) -> int');
 	await expect(sig.locator('.cm-lsp-active-parameter')).toHaveText('int');
 });
+
+test('a diagnostic tooltip links its code and jumps to the related definition', async ({ page }) => {
+	const b = await live(page, 'order.toy');
+	await typeAtEndOfLine(page, b, '}', '\nfn add(a: int, b: int) -> int { return a + b }');
+	await typeAtEndOfLine(page, b, 'quantity := 3', '\n_sum := add(1)');
+	const mark = b.locator('.cm-lintRange-error');
+	await expect(mark).toHaveText('(1)');
+	// Let the popups the call opened close first: without this settle the hover is flaky.
+	await page.keyboard.press('Escape');
+	await page.waitForTimeout(300);
+	await mark.hover();
+	const tip = page.locator('.toy-diag');
+	await expect(tip.locator('.toy-diag-code')).toHaveText('T0039');
+	await expect(tip.locator('.toy-diag-code')).toHaveAttribute('href', /\/docs\/errors\/#T0039$/);
+	await expect(tip.locator('.toy-diag-msg code').first()).toHaveText('add');
+	await page.screenshot({ path: 'test-results/diagnostic-tooltip.png' });
+	await tip.locator('.toy-diag-related').dispatchEvent('mousedown');
+	await expect(b.locator('.cm-activeLine, .cm-line').filter({ hasText: 'fn add' })).toBeVisible();
+	const line = await b.evaluate((fig) => {
+		const sel = window.getSelection();
+		return sel?.anchorNode?.parentElement?.closest('.cm-line')?.textContent ?? '';
+	});
+	expect(line).toContain('fn add');
+});
+
+test('the diagnostics reference renders every code from the compiler', async ({ page }) => {
+	await page.goto('/docs/errors/');
+	await expect(page.locator('section#T0039 h3')).toContainText('arity mismatch');
+	await expect(page.locator('section#R0001 h3')).toContainText('undeclared identifier');
+});

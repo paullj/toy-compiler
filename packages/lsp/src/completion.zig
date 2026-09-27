@@ -29,14 +29,11 @@
 //!     `methods`-table entries are).
 
 const std = @import("std");
-const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
-const lsp_uri = @import("uri.zig");
 const Workspace = @import("Workspace.zig");
 
-const Driver = toyc.Driver;
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
