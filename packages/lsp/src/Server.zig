@@ -73,6 +73,21 @@ pub const Server = struct {
         return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = self.disk };
     }
 
+    /// The open document and position a `textDocument/<feature>` request names, or null for
+    /// a malformed request or one about a document that is not open. The whole u32 range is
+    /// guarded, not just `>= 0`: a valid i64 past u32 max would otherwise panic `@intCast`.
+    fn positionAt(self: *Server, root: std.json.Value) ?Position {
+        const params = objGet(root, "params") orelse return null;
+        const uri = getStr(objGet(params, "textDocument") orelse return null, "uri") orelse return null;
+        const pos = objGet(params, "position") orelse return null;
+        const line = coordU32(getInt(pos, "line")) orelse return null;
+        const character = coordU32(getInt(pos, "character")) orelse return null;
+        const doc = self.docs.get(uri) orelse return null;
+        return .{ .uri = uri, .text = doc.text, .line = line, .character = character };
+    }
+
+    const Position = struct { uri: []const u8, text: []const u8, line: u32, character: u32 };
+
     /// Serve every framed message in `input`, then return — for a host that pushes messages
     /// in (a browser worker) rather than the server pulling from a pipe. False once `exit`
     /// has been handled.
@@ -252,118 +267,50 @@ pub const Server = struct {
             return true;
         }
 
+        // The four position requests below allocate their answers from the per-message
+        // arena, so nothing needs freeing: the arena reset after dispatch returns does it.
         if (eql(method, "textDocument/hover")) {
             const iv = id orelse return true; // a request must carry an id
-            var hv: ?hover.Hover = null;
-            defer if (hv) |*h| h.deinit(); // after writeResponse has serialized `value`
-            var result: ?protocol.Hover = null;
-            blk: {
-                const params = objGet(root, "params") orelse break :blk;
-                const td = objGet(params, "textDocument") orelse break :blk;
-                const uri = getStr(td, "uri") orelse break :blk;
-                const pos = objGet(params, "position") orelse break :blk;
-                const line = getInt(pos, "line") orelse break :blk;
-                const character = getInt(pos, "character") orelse break :blk;
-                // Guard the WHOLE u32 range, not just `>= 0`: a valid i64 past u32 max would
-                // panic the `@intCast` below, crashing the server on one malformed request.
-                const max: i64 = std.math.maxInt(u32);
-                if (line < 0 or character < 0 or line > max or character > max) break :blk;
-                const doc = self.docs.get(uri) orelse break :blk; // hover before didOpen
-                hv = hover.hoverAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
-                if (hv) |h| result = .{ .contents = .{ .kind = h.kind, .value = h.value } };
-            }
-            if (result) |r| {
-                try protocol.writeResponse(a, writer, iv, r);
-            } else {
-                try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
-            }
+            const result: ?protocol.Hover = blk: {
+                const at = self.positionAt(root) orelse break :blk null;
+                const h = (hover.hoverAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk null) orelse break :blk null;
+                break :blk .{ .contents = .{ .kind = h.kind, .value = h.value } };
+            };
+            try respond(a, writer, iv, result);
             return true;
         }
 
         if (eql(method, "textDocument/completion")) {
-            const iv = id orelse return true; // a request must carry an id
-            var comp: ?completion.Completions = null;
-            defer if (comp) |*c| c.deinit(); // after writeResponse has serialized the items
-            var items: []const protocol.CompletionItem = &.{};
-            blk: {
-                const params = objGet(root, "params") orelse break :blk;
-                const td = objGet(params, "textDocument") orelse break :blk;
-                const uri = getStr(td, "uri") orelse break :blk;
-                const pos = objGet(params, "position") orelse break :blk;
-                const line = getInt(pos, "line") orelse break :blk;
-                const character = getInt(pos, "character") orelse break :blk;
-                // Guard the whole u32 range (mirrors hover): an i64 past u32 max would
-                // panic the `@intCast` and crash the server on one malformed request.
-                const max: i64 = std.math.maxInt(u32);
-                if (line < 0 or character < 0 or line > max or character > max) break :blk;
-                const doc = self.docs.get(uri) orelse break :blk; // completion before didOpen
-                comp = completion.completionsAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
-                if (comp) |c| items = c.items;
-            }
-            // Always answer with an array (an empty list is a valid "no candidates").
+            const iv = id orelse return true;
+            const items: []const protocol.CompletionItem = blk: {
+                const at = self.positionAt(root) orelse break :blk &.{};
+                const c = completion.completionsAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk &.{};
+                break :blk c.items;
+            };
+            // Always an array: an empty list is a valid "no candidates".
             try protocol.writeResponse(a, writer, iv, items);
             return true;
         }
 
         if (eql(method, "textDocument/definition")) {
-            const iv = id orelse return true; // a request must carry an id
-            var result: ?protocol.Location = null;
-            var owned_uri: ?[]u8 = null;
-            // Freed at if-branch scope AFTER writeResponse has serialized `result.uri`; must
-            // NOT sit inside `blk` (the happy path sets result inside blk, so an in-blk defer
-            // would free the uri before serialization — a use-after-free).
-            defer if (owned_uri) |u| a.free(u);
-            blk: {
-                const params = objGet(root, "params") orelse break :blk;
-                const td = objGet(params, "textDocument") orelse break :blk;
-                const uri = getStr(td, "uri") orelse break :blk;
-                const pos = objGet(params, "position") orelse break :blk;
-                const line = getInt(pos, "line") orelse break :blk;
-                const character = getInt(pos, "character") orelse break :blk;
-                // Guard the whole u32 range (mirrors hover/completion): an i64 past u32 max
-                // would panic the `@intCast` and crash the server on one malformed request.
-                const max: i64 = std.math.maxInt(u32);
-                if (line < 0 or character < 0 or line > max or character > max) break :blk;
-                const doc = self.docs.get(uri) orelse break :blk; // definition before didOpen
-                const d = (definition.definitionAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk) orelse break :blk;
-                // The uri is either the request's own open-doc uri or an imported module's
-                // `file://` path.
-                owned_uri = d.uri;
-                result = .{ .uri = d.uri, .range = d.range };
-            }
-            if (result) |r| {
-                try protocol.writeResponse(a, writer, iv, r);
-            } else {
-                try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
-            }
+            const iv = id orelse return true;
+            const result: ?protocol.Location = blk: {
+                const at = self.positionAt(root) orelse break :blk null;
+                const d = (definition.definitionAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk null) orelse break :blk null;
+                break :blk .{ .uri = d.uri, .range = d.range };
+            };
+            try respond(a, writer, iv, result);
             return true;
         }
 
         if (eql(method, "textDocument/signatureHelp")) {
-            const iv = id orelse return true; // a request must carry an id
-            var sh: ?signature.Result = null;
-            defer if (sh) |*x| x.deinit(); // after writeResponse has serialized the label
-            var result: ?protocol.SignatureHelp = null;
-            blk: {
-                const params = objGet(root, "params") orelse break :blk;
-                const td = objGet(params, "textDocument") orelse break :blk;
-                const uri = getStr(td, "uri") orelse break :blk;
-                const pos = objGet(params, "position") orelse break :blk;
-                const line = getInt(pos, "line") orelse break :blk;
-                const character = getInt(pos, "character") orelse break :blk;
-                // Guard the whole u32 range (mirrors hover/completion/definition): an i64 past
-                // u32 max would panic the `@intCast` and crash the server on one bad request.
-                const max: i64 = std.math.maxInt(u32);
-                if (line < 0 or character < 0 or line > max or character > max) break :blk;
-                const doc = self.docs.get(uri) orelse break :blk; // signatureHelp before didOpen
-                sh = signature.signatureHelpAt(a, self.workspace(), doc.text, @intCast(line), @intCast(character), uri) catch break :blk;
-                if (sh) |x| result = x.help;
-            }
-            if (result) |r| {
-                try protocol.writeResponse(a, writer, iv, r);
-            } else {
-                try protocol.writeResponse(a, writer, iv, std.json.Value{ .null = {} });
-            }
+            const iv = id orelse return true;
+            const result: ?protocol.SignatureHelp = blk: {
+                const at = self.positionAt(root) orelse break :blk null;
+                const sh = (signature.signatureHelpAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk null) orelse break :blk null;
+                break :blk sh.help;
+            };
+            try respond(a, writer, iv, result);
             return true;
         }
 
@@ -393,6 +340,12 @@ pub const Server = struct {
         try sendDiagnostics(a, writer, uri, version, mapped.items);
     }
 };
+
+/// A request's answer, or an explicit JSON `null` result when there is none.
+fn respond(a: std.mem.Allocator, writer: *Writer, id: std.json.Value, result: anytype) !void {
+    if (result) |r| return protocol.writeResponse(a, writer, id, r);
+    try protocol.writeResponse(a, writer, id, std.json.Value{ .null = {} });
+}
 
 fn sendDiagnostics(a: std.mem.Allocator, writer: *Writer, uri: []const u8, version: i64, items: []const protocol.LspDiagnostic) !void {
     try protocol.writeNotification(a, writer, "textDocument/publishDiagnostics", .{
@@ -481,7 +434,7 @@ fn collectCancel(gpa: std.mem.Allocator, body: []const u8, set: *CancelSet) !voi
 }
 
 /// An LSP position coordinate -> u32 guarding the whole u32 range; null/negative/over-max
-/// => null so a malformed range skips its change (mirrors the feature handlers' guards).
+/// => null, so a malformed position is rejected rather than panicking `@intCast`.
 fn coordU32(v: ?i64) ?u32 {
     const i = v orelse return null;
     if (i < 0 or i > std.math.maxInt(u32)) return null;
