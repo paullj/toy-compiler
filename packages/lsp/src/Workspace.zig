@@ -35,6 +35,7 @@ pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []
 }
 
 const untitled_path = "untitled.toy";
+const file_scheme = "file://";
 
 const Layer = struct {
     entry_path: []const u8,
@@ -44,9 +45,9 @@ const Layer = struct {
     fn get(ctx: *const anyopaque, path: []const u8) ?[]const u8 {
         const l: *const Layer = @ptrCast(@alignCast(ctx));
         if (std.mem.eql(u8, path, l.entry_path)) return l.entry_text;
-        // Open documents are keyed by uri; a path too long for the buffer cannot be open.
-        var buf: [4096]u8 = undefined;
-        const uri = std.fmt.bufPrint(&buf, "file://{s}", .{path}) catch return null;
+        // Open documents are keyed by uri (`uri.pathToUri`'s spelling, without allocating).
+        var buf: [file_scheme.len + std.fs.max_path_bytes]u8 = undefined;
+        const uri = std.fmt.bufPrint(&buf, file_scheme ++ "{s}", .{path}) catch return null;
         return l.docs.textOf(uri);
     }
 };
