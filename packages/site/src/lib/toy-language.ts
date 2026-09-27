@@ -14,9 +14,15 @@ const TYPES = new Set([
 ]);
 
 // A small stream tokenizer — good enough for the playground, not a real lexer.
-const toyLanguage = StreamLanguage.define<{ afterFn: boolean }>({
+// `depth` counts open brackets so a new line indents one unit per enclosing bracket.
+const toyLanguage = StreamLanguage.define<{ afterFn: boolean; depth: number }>({
 	name: 'toy',
-	startState: () => ({ afterFn: false }),
+	startState: () => ({ afterFn: false, depth: 0 }),
+	copyState: (s) => ({ ...s }),
+	indent(state, textAfter, cx) {
+		const closing = /^[}\])]/.test(textAfter) ? 1 : 0;
+		return Math.max(0, state.depth - closing) * cx.unit;
+	},
 	token(stream, state) {
 		if (stream.eatSpace()) return null;
 		if (stream.match(/#.*/)) return 'comment';
@@ -36,11 +42,16 @@ const toyLanguage = StreamLanguage.define<{ afterFn: boolean }>({
 			return 'variableName';
 		}
 
-		if (stream.match(/[{}()[\],;:.]|[-+*/%<>=!&|?]+/)) return 'punctuation';
+		const punct = stream.match(/[{}()[\],;:.]|[-+*/%<>=!&|?]+/) as RegExpMatchArray | null;
+		if (punct) {
+			if (/^[{([]$/.test(punct[0])) state.depth++;
+			else if (/^[})\]]$/.test(punct[0])) state.depth = Math.max(0, state.depth - 1);
+			return 'punctuation';
+		}
 		stream.next();
 		return null;
 	},
-	languageData: { commentTokens: { line: '#' } }
+	languageData: { commentTokens: { line: '#' }, indentOnInput: /^\s*[}\])]$/ }
 });
 
 const highlight = HighlightStyle.define([
