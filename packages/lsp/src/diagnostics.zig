@@ -121,7 +121,7 @@ fn mapOne(a: std.mem.Allocator, src: Source, uri: []const u8, d: Diagnostic) !pr
         const arr = try a.alloc(protocol.Related, 1);
         arr[0] = .{
             .location = .{ .uri = try a.dupe(u8, uri), .range = tokenRange(src, d.related) },
-            .message = relatedLabel(d.code),
+            .message = codes.relatedLabel(d.code),
         };
         related = arr;
     }
@@ -132,16 +132,6 @@ fn mapOne(a: std.mem.Allocator, src: Source, uri: []const u8, d: Diagnostic) !pr
         .code = codes.str(d.code),
         .message = try a.dupe(u8, d.message),
         .relatedInformation = related,
-    };
-}
-
-/// What the related location IS, per code: the diagnostic records only an offset.
-fn relatedLabel(code: codes.Code) []const u8 {
-    return switch (code) {
-        .R0002 => "first defined here",
-        .T0015 => "first inferred here",
-        .W0009 => "outer binding declared here",
-        else => "defined here",
     };
 }
 
