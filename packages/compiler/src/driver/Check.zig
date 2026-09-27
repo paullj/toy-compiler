@@ -116,7 +116,7 @@ fn writeNdjsonLine(out: *Io.Writer, gpa: std.mem.Allocator, sm: *const Rr.Source
     // captured into a temp buffer then JSON-escaped so embedded newlines/carets survive
     // as a single valid JSON string.
     var sec_buf: [1]Rr.Diagnostic.Label = undefined;
-    const rich = model.richFromPod(d, eff, codes.str(d.code), &sec_buf);
+    const rich = model.richFromPod(d, eff, codes.str(d.code), codes.relatedLabel(d.code), &sec_buf);
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try Rr.Renderer.render(rich, sm, &aw.writer, .{ .color = Style.ColorLevel.none, .unicode = false });

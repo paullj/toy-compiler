@@ -81,16 +81,16 @@ pub const Diagnostic = struct {
 
 /// Build the rich render `Diagnostic` for a sink POD `d` at already-resolved effective
 /// severity `eff` and resolved `code` string (null => no `[code]` bracket). The primary
-/// is a zero-width point at `d.byte_offset`; a set `d.related` becomes a secondary
-/// "previously defined here" label at the related offset in the same scope. `sec_buf`
-/// backs that borrowed label, so it must outlive the render. Takes `code` as a param
-/// rather than calling `codes.zig` to keep this leaf's one-way import order.
-pub fn richFromPod(d: sink.Diagnostic, eff: Severity, code: ?[]const u8, sec_buf: *[1]Label) Diagnostic {
+/// is a zero-width point at `d.byte_offset`; a set `d.related` becomes a secondary label
+/// reading `related_label` at the related offset in the same scope. `sec_buf` backs that
+/// borrowed label, so it must outlive the render. Takes `code` and `related_label` as
+/// params rather than calling `codes.zig` to keep this leaf's one-way import order.
+pub fn richFromPod(d: sink.Diagnostic, eff: Severity, code: ?[]const u8, related_label: []const u8, sec_buf: *[1]Label) Diagnostic {
     const secondary: []const Label = if (d.related != sink.NO_RELATED) blk: {
         sec_buf[0] = .{
             .kind = .secondary,
             .span = .{ .start = d.related, .end = d.related },
-            .message = "previously defined here",
+            .message = related_label,
             .source = d.scope,
         };
         break :blk sec_buf[0..1];

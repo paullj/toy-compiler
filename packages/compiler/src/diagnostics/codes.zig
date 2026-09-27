@@ -120,6 +120,8 @@ const Entry = struct {
     str: []const u8,
     slug: []const u8,
     default_severity: Severity = .err,
+    /// What a diagnostic's related location IS; only codes that record one read it.
+    related: []const u8 = "defined here",
 };
 
 /// The append-only registry. Every non-`.none` `Code` MUST have exactly one row (the
@@ -139,7 +141,7 @@ pub const table = [_]Entry{
     .{ .code = .P0012, .str = "P0012", .slug = "colon-return-type" },
     .{ .code = .P0013, .str = "P0013", .slug = "stray-semicolon" },
     .{ .code = .R0001, .str = "R0001", .slug = "undeclared-identifier" },
-    .{ .code = .R0002, .str = "R0002", .slug = "duplicate-function" },
+    .{ .code = .R0002, .str = "R0002", .slug = "duplicate-function", .related = "previously defined here" },
     .{ .code = .R0003, .str = "R0003", .slug = "unknown-imported-module" },
     .{ .code = .R0004, .str = "R0004", .slug = "import-namespace-collision" },
     .{ .code = .R0005, .str = "R0005", .slug = "not-exported" },
@@ -162,7 +164,7 @@ pub const table = [_]Entry{
     .{ .code = .T0012, .str = "T0012", .slug = "duplicate-struct" },
     .{ .code = .T0013, .str = "T0013", .slug = "generics-unsupported" },
     .{ .code = .T0014, .str = "T0014", .slug = "mono-depth" },
-    .{ .code = .T0015, .str = "T0015", .slug = "type-arg-inference-conflict" },
+    .{ .code = .T0015, .str = "T0015", .slug = "type-arg-inference-conflict", .related = "first inferred here" },
     .{ .code = .T0016, .str = "T0016", .slug = "type-args-not-inferable" },
     .{ .code = .T0017, .str = "T0017", .slug = "instantiation-too-deep" },
     .{ .code = .T0018, .str = "T0018", .slug = "no-such-method" },
@@ -204,7 +206,7 @@ pub const table = [_]Entry{
     .{ .code = .W0006, .str = "W0006", .slug = "unreachable-match-arm", .default_severity = .warning },
     .{ .code = .W0007, .str = "W0007", .slug = "constant-condition", .default_severity = .warning },
     .{ .code = .W0008, .str = "W0008", .slug = "unused-must-use", .default_severity = .warning },
-    .{ .code = .W0009, .str = "W0009", .slug = "shadowed-binding", .default_severity = .warning },
+    .{ .code = .W0009, .str = "W0009", .slug = "shadowed-binding", .default_severity = .warning, .related = "outer binding declared here" },
     .{ .code = .W0010, .str = "W0010", .slug = "dead-store", .default_severity = .warning },
 };
 
@@ -224,6 +226,12 @@ pub fn defaultSeverity(c: Code) Severity {
     if (c == .none) return .err;
     for (table) |e| if (e.code == c) return e.default_severity;
     unreachable;
+}
+
+/// The label for a code's related location (e.g. "previously defined here").
+pub fn relatedLabel(c: Code) []const u8 {
+    for (table) |e| if (e.code == c) return e.related;
+    return "defined here";
 }
 
 /// The kebab-case slug for a code, or null for `.none`.
@@ -496,4 +504,10 @@ test "registry runtime invariants: unique, in-band prefix, contiguous tails" {
             next += 1;
         }
     }
+}
+
+test "relatedLabel names what each code's related location is" {
+    try testing.expectEqualStrings("previously defined here", relatedLabel(.R0002));
+    try testing.expectEqualStrings("defined here", relatedLabel(.T0039));
+    try testing.expectEqualStrings("outer binding declared here", relatedLabel(.W0009));
 }

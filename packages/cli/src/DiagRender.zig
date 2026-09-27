@@ -85,7 +85,7 @@ fn countVisible(diags: []const toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.Sever
 pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.SourceMap, d: toyc.DiagnosticSink.Diagnostic, cfg: SevCfg.SeverityConfig) !bool {
     const eff = SevCfg.resolve(d.code, d.severity, cfg) orelse return false; // .ignore -> zero bytes
     var sec_buf: [1]Rr.Diagnostic.Label = undefined;
-    const rich = Rr.Diagnostic.richFromPod(d, eff, codes.str(d.code), &sec_buf);
+    const rich = Rr.Diagnostic.richFromPod(d, eff, codes.str(d.code), codes.relatedLabel(d.code), &sec_buf);
     try Rr.Renderer.render(rich, sm, out, renderOpts(level));
     return true;
 }
