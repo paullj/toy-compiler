@@ -1,0 +1,9 @@
+fn sign(n: int) -> int {  #~ ERROR [T0043] function 'sign' must return int but may fall off the end
+    if n > 0 {
+        return 1
+    }
+}
+
+fn main() -> int {
+    return sign(3)
+}

@@ -1,0 +1,6 @@
+struct Point { x: int, y: int }
+
+fn main() -> int {
+    p := Point { x: 6 }  #~ ERROR [T0047] missing field 'y' in 'Point'
+    return p.x
+}

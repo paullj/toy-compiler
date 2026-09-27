@@ -88,6 +88,14 @@ pub const Code = enum(u16) {
     T0038, // unsafe-required (a raw-pointer `store`/`load` used outside an `unsafe { }` block)
     T0039, // arity-mismatch (a fn/method call passes the wrong NUMBER of arguments)
     T0040, // arg-type-mismatch (a fn/method call passes an argument of the wrong TYPE)
+    T0041, // binding-type-mismatch (an `x: T = e` initializer or an assignment's value is not assignable to the binding's type)
+    T0042, // return-type-mismatch (a `return` value's type differs from the fn's declared return type)
+    T0043, // missing-return (a fn with a non-unit return type can reach the end of its body without returning)
+    T0044, // operand-type-mismatch (a unary/binary operator's operand types do not fit the operator)
+    T0045, // condition-not-bool (an `if`/`while` condition or a match guard is not bool)
+    T0046, // no-such-field (a field access, construction, or pattern names a field the struct/variant does not have)
+    T0047, // missing-field (a struct or variant construction omits a declared field)
+    T0048, // non-exhaustive-match (a match does not cover every value of its scrutinee)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -180,6 +188,14 @@ pub const table = [_]Entry{
     .{ .code = .T0038, .str = "T0038", .slug = "unsafe-required" },
     .{ .code = .T0039, .str = "T0039", .slug = "arity-mismatch" },
     .{ .code = .T0040, .str = "T0040", .slug = "arg-type-mismatch" },
+    .{ .code = .T0041, .str = "T0041", .slug = "binding-type-mismatch" },
+    .{ .code = .T0042, .str = "T0042", .slug = "return-type-mismatch" },
+    .{ .code = .T0043, .str = "T0043", .slug = "missing-return" },
+    .{ .code = .T0044, .str = "T0044", .slug = "operand-type-mismatch" },
+    .{ .code = .T0045, .str = "T0045", .slug = "condition-not-bool" },
+    .{ .code = .T0046, .str = "T0046", .slug = "no-such-field" },
+    .{ .code = .T0047, .str = "T0047", .slug = "missing-field" },
+    .{ .code = .T0048, .str = "T0048", .slug = "non-exhaustive-match" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
@@ -385,6 +401,10 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqual(Code.T0039, fromStr("T0039").?);
     try testing.expectEqualStrings("arg-type-mismatch", slug(.T0040).?);
     try testing.expectEqual(Code.T0040, fromStr("T0040").?);
+    try testing.expectEqualStrings("binding-type-mismatch", slug(.T0041).?);
+    try testing.expectEqual(Code.T0041, fromStr("T0041").?);
+    try testing.expectEqualStrings("non-exhaustive-match", slug(.T0048).?);
+    try testing.expectEqual(Code.T0048, fromStr("T0048").?);
 
     // Unused-variable/parameter warning codes — the `.warning` defaults, proving the
     // warning-by-default wiring end to end.

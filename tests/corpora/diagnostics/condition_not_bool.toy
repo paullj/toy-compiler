@@ -1,0 +1,7 @@
+fn main() -> int {
+    n := 3
+    if n {  #~ ERROR [T0045] if condition must be bool
+        return 1
+    }
+    return 0
+}

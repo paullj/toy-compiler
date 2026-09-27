@@ -87,7 +87,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
         if (guarded) {
             const gt = try bc.typeOf(h.guard);
             if (gt.kind != .invalid and gt.kind != .bool)
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(h.guard).int()].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
+                try bc.sink.emitFmtCode(.T0045, bc.byteOf(bc.tree.nodes[(h.guard).int()].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
         }
         const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
         const body_ty: Type = if (armDiverges(bc, h.body)) Type.never else body_ty0;
@@ -107,11 +107,11 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
                 n_missing += 1;
             };
             if (n_missing > 0)
-                try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
+                try bc.sink.emitFmtCode(.T0048, bc.byteOf(n.main_token), "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
         },
         .bool => |bcov| if (!(bcov.t and bcov.f))
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
-        .int => try bc.sink.emitFmt(bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
+            try bc.sink.emitFmtCode(.T0048, bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
+        .int => try bc.sink.emitFmtCode(.T0048, bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
     };
     bc.node_types[(node_idx).int()] = result;
     return result;
@@ -258,7 +258,7 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
                     }
                 }
                 if (!found) {
-                    try bc.sink.emitFmt(bc.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
+                    try bc.sink.emitFmtCode(.T0046, bc.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
                 }
                 // The carrier IS a pattern_binding: if it has a sub-pattern, match
                 // the field against it; else bind the whole field by value.
