@@ -55,7 +55,6 @@ pub const Server = struct {
     disk: bool = true,
     got_initialize: bool = false,
     shutdown_requested: bool = false,
-    exited: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Server {
         return .{ .gpa = gpa, .threaded = .init(gpa, .{}), .arena = .init(gpa), .docs = .{} };
@@ -79,66 +78,71 @@ pub const Server = struct {
     /// has been handled.
     pub fn feed(self: *Server, input: []const u8, writer: *Writer) anyerror!bool {
         var r = Reader.fixed(input);
-        _ = try self.run(&r, writer);
-        return !self.exited;
+        while (true) switch (try self.serveBatch(&r, writer)) {
+            .more => {},
+            .eof => return true,
+            .exit => return false,
+        };
     }
 
     fn run(self: *Server, reader: *Reader, writer: *Writer) anyerror!ExitCode {
-        while (true) {
-            // P1 ANCHOR: one blocking read guarantees forward progress (or EOF => done). This is
-            // the ONLY unconditional read; it blocks exactly like the old serial loop did.
-            const first = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
-                error.EndOfStream => break,
-                error.UnexpectedEof, error.StreamTooLong, error.MissingContentLength, error.InvalidHeader => break,
-                error.OutOfMemory, error.ReadFailed => return e,
-            };
-            var batch: std.ArrayList([]u8) = .empty;
-            defer {
-                for (batch.items) |b| self.gpa.free(b);
-                batch.deinit(self.gpa);
-            }
-            try batch.append(self.gpa, first);
-
-            // P2 DRAIN: only frames ALREADY buffered. The bufferedLen()>0 gate is the sole thing
-            // that stops us starting a read for a frame the client has not begun sending — never
-            // drop it. It does NOT promise "never blocks": a partially-buffered trailing frame is
-            // finished by readMessage (a bounded, client-is-mid-send wait, same as the old loop).
-            // Fixed reader (test): the whole session is buffered, so this drains EVERY remaining
-            // frame into one batch => a $/cancelRequest anywhere precedes its target in P4.
-            // Streaming pipe (real client): only what a syscall already delivered.
-            var terminal = false;
-            while (reader.bufferedLen() > 0) {
-                const b = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
-                    // OOM/ReadFailed are fatal exactly as in the serial loop; queued-but-unprocessed
-                    // frames in this batch are dropped (freed by defer) — the transport is dying.
-                    error.OutOfMemory, error.ReadFailed => return e,
-                    else => {
-                        terminal = true;
-                        break;
-                    },
-                };
-                try batch.append(self.gpa, b);
-            }
-
-            // P3 PRESCAN: collect cancelled ids across the WHOLE batch, before processing any of it.
-            var cancelled: CancelSet = .{ .gpa = self.gpa };
-            defer cancelled.deinit();
-            for (batch.items) |b| try collectCancel(self.gpa, b, &cancelled);
-
-            // P4 PROCESS in order, honoring cancels. A per-message fault is not fatal (unchanged).
-            for (batch.items) |b| {
-                const keep = self.dispatch(writer, b, &cancelled) catch |e| switch (e) {
-                    error.OutOfMemory, error.WriteFailed => return e,
-                    else => true,
-                };
-                if (!keep) {
-                    self.exited = true;
-                    return if (self.shutdown_requested) .ok else .no_shutdown;
-                }
-            }
-            if (terminal) break;
-        }
+        while (try self.serveBatch(reader, writer) == .more) {}
         return if (self.shutdown_requested) .ok else .no_shutdown;
+    }
+
+    const Turn = enum { more, eof, exit };
+
+    /// One turn of the read model (see the file header): anchor, drain, prescan, process.
+    fn serveBatch(self: *Server, reader: *Reader, writer: *Writer) anyerror!Turn {
+        // P1 ANCHOR: one blocking read guarantees forward progress (or EOF => done). This is
+        // the ONLY unconditional read; it blocks exactly like the old serial loop did.
+        const first = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
+            error.EndOfStream => return .eof,
+            error.UnexpectedEof, error.StreamTooLong, error.MissingContentLength, error.InvalidHeader => return .eof,
+            error.OutOfMemory, error.ReadFailed => return e,
+        };
+        var batch: std.ArrayList([]u8) = .empty;
+        defer {
+            for (batch.items) |b| self.gpa.free(b);
+            batch.deinit(self.gpa);
+        }
+        try batch.append(self.gpa, first);
+
+        // P2 DRAIN: only frames ALREADY buffered. The bufferedLen()>0 gate is the sole thing
+        // that stops us starting a read for a frame the client has not begun sending — never
+        // drop it. It does NOT promise "never blocks": a partially-buffered trailing frame is
+        // finished by readMessage (a bounded, client-is-mid-send wait, same as the old loop).
+        // Fixed reader (test): the whole session is buffered, so this drains EVERY remaining
+        // frame into one batch => a $/cancelRequest anywhere precedes its target in P4.
+        // Streaming pipe (real client): only what a syscall already delivered.
+        var terminal = false;
+        while (reader.bufferedLen() > 0) {
+            const b = transport.readMessage(self.gpa, reader) catch |e| switch (e) {
+                // OOM/ReadFailed are fatal exactly as in the serial loop; queued-but-unprocessed
+                // frames in this batch are dropped (freed by defer) — the transport is dying.
+                error.OutOfMemory, error.ReadFailed => return e,
+                else => {
+                    terminal = true;
+                    break;
+                },
+            };
+            try batch.append(self.gpa, b);
+        }
+
+        // P3 PRESCAN: collect cancelled ids across the WHOLE batch, before processing any of it.
+        var cancelled: CancelSet = .{ .gpa = self.gpa };
+        defer cancelled.deinit();
+        for (batch.items) |b| try collectCancel(self.gpa, b, &cancelled);
+
+        // P4 PROCESS in order, honoring cancels. A per-message fault is not fatal (unchanged).
+        for (batch.items) |b| {
+            const keep = self.dispatch(writer, b, &cancelled) catch |e| switch (e) {
+                error.OutOfMemory, error.WriteFailed => return e,
+                else => true,
+            };
+            if (!keep) return .exit;
+        }
+        return if (terminal) .eof else .more;
     }
 
     /// Handle one message. Returns `false` ONLY on `exit` (stop the loop); `true` keeps
