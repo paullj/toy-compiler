@@ -3,7 +3,7 @@ import { ToyServer } from './server';
 // Messages that arrive while the server is busy (or still loading) queue up and are fed
 // as one batch: the server then sees a `$/cancelRequest` alongside the request it cancels.
 let server: ToyServer | null = null;
-const queue: unknown[] = [];
+const queue: string[] = [];
 let scheduled = false;
 
 async function load(url: string) {
@@ -18,7 +18,7 @@ async function load(url: string) {
 function flush() {
 	scheduled = false;
 	if (!server || queue.length === 0) return;
-	for (const reply of server.send(queue.splice(0))) postMessage(JSON.stringify(reply));
+	for (const reply of server.send(queue.splice(0))) postMessage(reply);
 }
 
 self.onmessage = (e: MessageEvent<string | { wasm: string }>) => {
@@ -26,7 +26,7 @@ self.onmessage = (e: MessageEvent<string | { wasm: string }>) => {
 		void load(e.data.wasm);
 		return;
 	}
-	queue.push(JSON.parse(e.data));
+	queue.push(e.data);
 	if (!scheduled && server) {
 		scheduled = true;
 		setTimeout(flush, 0);

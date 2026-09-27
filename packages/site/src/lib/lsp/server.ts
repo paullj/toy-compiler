@@ -10,9 +10,10 @@ type Exports = {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-// The toy language server compiled to wasm32-wasi. `send` takes JSON-RPC messages and
-// returns every message the server wrote in reply (responses and notifications). The
-// server itself speaks LSP base-protocol framing; this class hides it.
+// The toy language server compiled to wasm32-wasi. `send` takes serialized JSON-RPC
+// messages and returns every message the server wrote in reply (responses and
+// notifications), still serialized: the editor's transport speaks strings, so nothing
+// here parses JSON. The server speaks LSP base-protocol framing; this class hides it.
 export class ToyServer {
 	private constructor(private readonly x: Exports) {}
 
@@ -27,9 +28,9 @@ export class ToyServer {
 		return new ToyServer(x);
 	}
 
-	send(messages: unknown[]): unknown[] {
+	send(messages: string[]): string[] {
 		const parts = messages.map((m) => {
-			const body = encoder.encode(JSON.stringify(m));
+			const body = encoder.encode(m);
 			return [encoder.encode(`Content-Length: ${body.length}\r\n\r\n`), body];
 		});
 		const len = parts.flat().reduce((n, p) => n + p.length, 0);
@@ -51,8 +52,8 @@ export class ToyServer {
 	}
 }
 
-function unframe(bytes: Uint8Array): unknown[] {
-	const msgs: unknown[] = [];
+function unframe(bytes: Uint8Array): string[] {
+	const msgs: string[] = [];
 	let i = 0;
 	while (i < bytes.length) {
 		const headerEnd = indexOfCrlfCrlf(bytes, i);
@@ -62,7 +63,7 @@ function unframe(bytes: Uint8Array): unknown[] {
 		if (!m) break;
 		const start = headerEnd + 4;
 		const end = start + Number(m[1]);
-		msgs.push(JSON.parse(decoder.decode(bytes.subarray(start, end))));
+		msgs.push(decoder.decode(bytes.subarray(start, end)));
 		i = end;
 	}
 	return msgs;

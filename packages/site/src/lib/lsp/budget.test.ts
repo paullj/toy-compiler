@@ -1,11 +1,9 @@
-import { readFileSync } from 'node:fs';
 import { brotliCompressSync, constants } from 'node:zlib';
 import { expect, it } from 'vitest';
-import { ToyServer } from './server';
+import { loadServer, WASM } from './rpc.test-util';
 
 // Budgets for what the docs site ships and how fast a check answers. They leave headroom
 // over today's numbers (~190 KB, ~6 ms on an M-series laptop) so only a real regression trips.
-const WASM = readFileSync(new URL('../../../static/toy-lsp.wasm', import.meta.url));
 const MAX_BROTLI_BYTES = 250_000;
 const MAX_MEDIAN_CHECK_MS = 25;
 
@@ -41,7 +39,7 @@ it('the shipped server stays under its brotli size budget', () => {
 });
 
 it('a check of a multi-feature document stays under its latency budget', async () => {
-	const server = await ToyServer.load(new WebAssembly.Module(WASM), () => {});
+	const server = await loadServer();
 	server.send([{ jsonrpc: '2.0', id: 0, method: 'initialize', params: {} }]);
 	const uri = 'file:///examples/budget.toy';
 	server.send([{ jsonrpc: '2.0', method: 'textDocument/didOpen', params: { textDocument: { uri, version: 1, text: doc } } }]);
@@ -50,7 +48,7 @@ it('a check of a multi-feature document stays under its latency budget', async (
 		const t0 = performance.now();
 		const out = server.send([
 			{ jsonrpc: '2.0', method: 'textDocument/didChange', params: { textDocument: { uri, version: v }, contentChanges: [{ text: doc + `# ${v}\n` }] } }
-		]) as any[];
+		]);
 		times.push(performance.now() - t0);
 		expect(out[0].params.diagnostics).toEqual([]);
 	}

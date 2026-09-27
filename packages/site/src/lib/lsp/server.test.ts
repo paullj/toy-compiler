@@ -1,12 +1,10 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { ToyServer } from './server';
-
-const WASM = new URL('../../../static/toy-lsp.wasm', import.meta.url);
+import type { CompletionItem, Diagnostic } from 'vscode-languageserver-protocol';
+import { loadServer } from './rpc.test-util';
 
 async function boot() {
-	const server = await ToyServer.load(new WebAssembly.Module(readFileSync(WASM)));
-	const [init] = server.send([{ jsonrpc: '2.0', id: 0, method: 'initialize', params: {} }]) as any[];
+	const server = await loadServer();
+	const [init] = server.send([{ jsonrpc: '2.0', id: 0, method: 'initialize', params: {} }]);
 	expect(init.result.capabilities.hoverProvider).toBe(true);
 	server.send([{ jsonrpc: '2.0', method: 'initialized', params: {} }]);
 	return server;
@@ -26,7 +24,7 @@ const change = (uri: string, text: string, version: number) => ({
 
 function published(msgs: any[], uri: string) {
 	return msgs.find((m) => m.method === 'textDocument/publishDiagnostics' && m.params.uri === uri)
-		?.params.diagnostics as any[];
+		?.params.diagnostics;
 }
 
 describe('toy-lsp.wasm', () => {
@@ -54,10 +52,10 @@ describe('toy-lsp.wasm', () => {
 			open(typing, add + 'fn main() -> int { return add(1, ad) }\n'),
 			{ jsonrpc: '2.0', id: 1, method: 'textDocument/hover', params: at(clean, 1, 27) },
 			{ jsonrpc: '2.0', id: 2, method: 'textDocument/completion', params: at(typing, 1, 35) }
-		]) as any[];
+		]);
 		expect(out.find((m) => m.id === 1).result.contents.value).toContain('fn add(a: int, b: int) -> int');
-		const items = out.find((m) => m.id === 2).result as any[];
-		expect(items.map((i) => i.label)).toContain('add');
+		const items = out.find((m) => m.id === 2).result;
+		expect(items.map((i: CompletionItem) => i.label)).toContain('add');
 	});
 
 	it('resolves an import against another open document and bundled std', async () => {
@@ -66,7 +64,7 @@ describe('toy-lsp.wasm', () => {
 		const uri = 'file:///blocks/main.toy';
 		const text = 'import helper\nimport std/math\nfn main() -> int { return helper.seven() }\n';
 		const diags = published(server.send([open(uri, text)]), uri);
-		expect(diags.filter((d) => d.severity === 1)).toEqual([]);
+		expect(diags.filter((d: Diagnostic) => d.severity === 1)).toEqual([]);
 	});
 
 	it('keeps its heap flat over many edits', async () => {
