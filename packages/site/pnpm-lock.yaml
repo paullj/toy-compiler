@@ -105,6 +105,9 @@ importers:
       vitest:
         specifier: ^3
         version: 3.2.7(@types/node@24.19.0)(jiti@2.7.0)(lightningcss@1.32.0)
+      vscode-languageserver-protocol:
+        specifier: ^3.17.5
+        version: 3.18.4
 
 packages:
 
