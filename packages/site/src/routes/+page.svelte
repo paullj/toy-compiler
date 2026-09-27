@@ -150,7 +150,7 @@ impl Square has Area {
 		<!-- Content -->
 		<main class="min-w-0 px-6 pb-16 pt-28 sm:px-10 md:px-12 md:pt-[10.5rem]">
 			<!-- 01 Introduction -->
-			<section id="introduction" class="grid scroll-mt-8 grid-cols-[2.75rem_1fr] pb-24">
+			<section id="introduction" class="grid scroll-mt-8 grid-cols-[2.75rem_minmax(0,1fr)] pb-24">
 				<div class="mt-2 font-mono text-[0.7rem]" style="color: var(--fg-muted)">01</div>
 				<div>
 					<h1 class="max-w-[16ch] text-3xl font-bold leading-[1.05] tracking-tight md:text-4xl">
@@ -169,7 +169,7 @@ It aims to be ergonomic and performant but the main goal is for me to learn abou
 			</section>
 
 			<!-- 02 Features -->
-			<section id="features" class="grid scroll-mt-8 grid-cols-[2.75rem_1fr] pb-24">
+			<section id="features" class="grid scroll-mt-8 grid-cols-[2.75rem_minmax(0,1fr)] pb-24">
 				<div class="mt-1.5 font-mono text-[0.7rem]" style="color: var(--fg-muted)">02</div>
 				<div>
 					<h2 class="text-xl font-bold tracking-tight">
@@ -197,7 +197,7 @@ It aims to be ergonomic and performant but the main goal is for me to learn abou
 			</section>
 
 			<!-- 03 Install -->
-			<section id="install" class="grid scroll-mt-8 grid-cols-[2.75rem_1fr] pb-24">
+			<section id="install" class="grid scroll-mt-8 grid-cols-[2.75rem_minmax(0,1fr)] pb-24">
 				<div class="mt-1.5 font-mono text-[0.7rem]" style="color: var(--fg-muted)">03</div>
 				<div>
 					<h2 class="text-xl font-bold tracking-tight">
@@ -211,7 +211,7 @@ It aims to be ergonomic and performant but the main goal is for me to learn abou
 			</section>
 
 			<!-- 04 Learn -->
-			<section id="learn" class="grid scroll-mt-8 grid-cols-[2.75rem_1fr] pb-24">
+			<section id="learn" class="grid scroll-mt-8 grid-cols-[2.75rem_minmax(0,1fr)] pb-24">
 				<div class="mt-1.5 font-mono text-[0.7rem]" style="color: var(--fg-muted)">04</div>
 				<div>
 					<h2 class="text-xl font-bold tracking-tight">

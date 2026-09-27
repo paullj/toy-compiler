@@ -117,3 +117,17 @@ test('the diagnostics reference renders every code from the compiler', async ({ 
 	await expect(page.locator('section#T0039 h3')).toContainText('arity mismatch');
 	await expect(page.locator('section#R0001 h3')).toContainText('undeclared identifier');
 });
+
+test('on a phone, live editors never widen the page', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 800 });
+	for (const file of BLOCKS) await live(page, file);
+	expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBe(0);
+});
+
+test.describe('without JavaScript', () => {
+	test.use({ javaScriptEnabled: false });
+	test('every example still renders as highlighted code', async ({ page }) => {
+		await page.goto('/');
+		for (const file of BLOCKS) await expect(block(page, file).locator('pre .tok-kw').first()).toBeVisible();
+	});
+});
