@@ -59,68 +59,13 @@ mode: Mode = .normal,
 /// don't co-mingle even though both run through this one field.
 probe: ?*StageProbe = null,
 
-/// `--timings` per-stage accumulator, split into the three costs a cache-backed stage
-/// divides into: COMPUTE (the miss path — `lowerOne` for codegen, file-read+tokenize
-/// for lex, the AST build for parse), cache GET I/O (the hit-or-miss read), and cache
-/// PUT I/O (the atomic-rename temp-file write on a miss). Atomic because a stage's
-/// fan-out (codegen, and discovery's per-module queries) runs jobs in parallel and
-/// each adds its own deltas. BORROWED: one probe per stage lives on the
-/// driver frame and a `*StageProbe` is threaded into every job. `null` (the default)
-/// is zero-overhead — no clock is read.
-pub const StageProbe = struct {
-    compute_ns: std.atomic.Value(u64) = .init(0),
-    get_ns: std.atomic.Value(u64) = .init(0),
-    put_ns: std.atomic.Value(u64) = .init(0),
-
-    fn add(field: *std.atomic.Value(u64), dt: u64) void {
-        // wasm32 has no 64-bit atomics, and a single-threaded build needs none.
-        if (@import("builtin").single_threaded) {
-            field.raw +%= dt;
-            return;
-        }
-        _ = field.fetchAdd(dt, .monotonic);
-    }
-
-    /// Charge `now - start` to the COMPUTE bucket from OUTSIDE the query path — for a
-    /// stage's miss-side work that is not itself a cached query (e.g. discovery's
-    /// `readFileAlloc`, which is always paid and is the file-read part of the
-    /// "file-read+lex+parse" discover compute). Reads the clock once; callers gate the
-    /// call on the probe being present so a plain build pays nothing.
-    pub fn lapCompute(self: *StageProbe, io: Io, start: i128) void {
-        lap(io, &self.compute_ns, start);
-    }
-
-    /// Charge `now - start` to the cache-GET bucket from OUTSIDE the query path — for a
-    /// cached serve that doesn't go through `Engine.query`/`lex`/`parse` (the warm-discover
-    /// fast path's direct `cache.get`s of the source/lex/parse blobs). Mirrors `lapCompute`;
-    /// callers gate on the probe being present so a plain build reads no clock.
-    pub fn lapGet(self: *StageProbe, io: Io, start: i128) void {
-        lap(io, &self.get_ns, start);
-    }
-
-    /// The monotonic clock the probe charges against (`Io.Clock`, since Zig 0.16 has no
-    /// `std.time.Timer`). Exposed so an out-of-query caller can snapshot a start stamp.
-    pub fn now(io: Io) i128 {
-        return nowNs(io);
-    }
-};
+pub const StageProbe = @import("StageProbe.zig");
 
 /// The original name of `StageProbe`, kept so call sites that wired the lower-only
 /// probe keep compiling. The probe is stage-agnostic (three compute/get/put buckets),
 /// so the generalized name is `StageProbe`; this alias is the lower stage's view of it.
 pub const LowerProbe = StageProbe;
 
-fn nowNs(io: Io) i128 {
-    return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
-}
-
-/// Charge `dt = now - start` to `field`, but only when a probe is present. Reading
-/// the clock per get/put/compute is cheap relative to the syscalls they bracket, and
-/// it is only paid under `--timings` (probe != null), so a plain build is unaffected.
-fn lap(io: Io, field: *std.atomic.Value(u64), start: i128) void {
-    const dt = nowNs(io) - start;
-    if (dt > 0) StageProbe.add(field, @intCast(dt));
-}
 
 pub fn init(cache: Cache, mode: Mode) Engine {
     return .{ .cache = cache, .mode = mode };
@@ -160,22 +105,22 @@ pub fn query(
 ) !Result(T) {
     // get->compute->put, with the `--timings` probe laps gated on `self.probe != null`
     // so a plain build reads no clock (matching the codegen path's discipline).
-    const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    const get_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
     const hit: ?[]T = if (swallow_get) (self.cache.get(T, gpa, io, key) catch null) else (try self.cache.get(T, gpa, io, key));
-    if (self.probe) |p| lap(io, &p.get_ns, get_t0);
+    if (self.probe) |p| StageProbe.lap(io, &p.get_ns, get_t0);
     if (hit) |h| {
         return .{ .value = h, .cached = true };
     }
-    const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    const comp_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
     const fresh = try compute.run();
-    if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
-    const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    if (self.probe) |p| StageProbe.lap(io, &p.compute_ns, comp_t0);
+    const put_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
     if (swallow_put) {
         self.cache.put(T, io, key, tmp_tag, fresh) catch {};
     } else {
         try self.cache.put(T, io, key, tmp_tag, fresh);
     }
-    if (self.probe) |p| lap(io, &p.put_ns, put_t0);
+    if (self.probe) |p| StageProbe.lap(io, &p.put_ns, put_t0);
     return .{ .value = fresh, .cached = false };
 }
 
@@ -243,30 +188,30 @@ pub fn parse(
 
     // `--timings`: the read+unpack-validate is the GET cost; gated on `self.probe`
     // so a plain build reads no clock (the codegen-probe discipline).
-    const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    const get_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
     const blob: ?[]u8 = if (swallow_get) (cache.get(u8, gpa, io, key) catch null) else (try cache.get(u8, gpa, io, key));
     if (blob) |bytes| {
         defer gpa.free(bytes);
         const unpacked: ?Ast.Tree = if (swallow_get) (Ast.unpack(gpa, bytes) catch null) else (try Ast.unpack(gpa, bytes));
         if (unpacked) |t| {
-            if (self.probe) |p| lap(io, &p.get_ns, get_t0);
+            if (self.probe) |p| StageProbe.lap(io, &p.get_ns, get_t0);
             return .{ .tree = t, .cached = true };
         }
     }
-    if (self.probe) |p| lap(io, &p.get_ns, get_t0);
+    if (self.probe) |p| StageProbe.lap(io, &p.get_ns, get_t0);
 
-    const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    const comp_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
     const res = try Parser.parse(gpa, tokens, source);
-    if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
+    if (self.probe) |p| StageProbe.lap(io, &p.compute_ns, comp_t0);
     // Gate the cache PUT on a clean parse: a tainted (diagnostic-bearing) partial
     // tree must never become a cached "good" parse — the next build would serve it
     // as a hit and skip the diagnostics. A clean parse caches as before.
     if (res.diags.len == 0) {
         if (Ast.pack(gpa, res.tree) catch null) |b| {
             defer gpa.free(b);
-            const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+            const put_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
             cache.put(u8, io, key, tmp_tag, b) catch {};
-            if (self.probe) |p| lap(io, &p.put_ns, put_t0);
+            if (self.probe) |p| StageProbe.lap(io, &p.put_ns, put_t0);
         }
     }
     return .{ .tree = res.tree, .cached = false, .diags = res.diags };
@@ -676,9 +621,9 @@ fn serve(
     }
 
     if (mode != .force) {
-        const get_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+        const get_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
         const got = cache.get(u8, gpa, io, key) catch null;
-        if (self.probe) |p| lap(io, &p.get_ns, get_t0);
+        if (self.probe) |p| StageProbe.lap(io, &p.get_ns, get_t0);
         if (got) |blob| {
             defer gpa.free(blob);
             if (Link.unpack(gpa, blob) catch null) |fc| {
@@ -689,15 +634,15 @@ fn serve(
     }
 
     var opt_out: OptOut = .{};
-    const comp_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+    const comp_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
     var fc = try lowerFresh(ctx, &opt_out);
-    if (self.probe) |p| lap(io, &p.compute_ns, comp_t0);
+    if (self.probe) |p| StageProbe.lap(io, &p.compute_ns, comp_t0);
     errdefer fc.deinit(gpa);
     if (Link.pack(gpa, fc) catch null) |b| {
         defer gpa.free(b);
-        const put_t0: i128 = if (self.probe != null) nowNs(io) else 0;
+        const put_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
         cache.put(u8, io, key, tmp_tag, b) catch {};
-        if (self.probe) |p| lap(io, &p.put_ns, put_t0);
+        if (self.probe) |p| StageProbe.lap(io, &p.put_ns, put_t0);
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
 }
