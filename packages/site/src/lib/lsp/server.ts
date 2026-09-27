@@ -21,7 +21,7 @@ export class ToyServer {
 		let memory: WebAssembly.Memory | undefined;
 		const instance = await WebAssembly.instantiate(
 			module,
-			wasiImports(() => memory!, onStderr)
+			wasiImports(module, () => memory!, onStderr)
 		);
 		const x = instance.exports as unknown as Exports;
 		memory = x.memory;

@@ -5,21 +5,11 @@ const ENOSYS = 52;
 const EBADF = 8;
 const SUCCESS = 0;
 
-export function wasiImports(memory: () => WebAssembly.Memory, onStderr: (line: string) => void) {
+export function wasiImports(module: WebAssembly.Module, memory: () => WebAssembly.Memory, onStderr: (line: string) => void) {
 	const decoder = new TextDecoder();
 	let pending = '';
 
 	const view = () => new DataView(memory().buffer);
-
-	const stub = new Proxy(
-		{},
-		{
-			get: (_t, name) => () => {
-				if (typeof name === 'string' && name.startsWith('fd_')) return EBADF;
-				return ENOSYS;
-			}
-		}
-	) as Record<string, (...args: number[]) => number>;
 
 	const impl: Record<string, (...args: never[]) => number | bigint> = {
 		clock_time_get(_id: number, _precision: bigint, out: number) {
@@ -63,9 +53,9 @@ export function wasiImports(memory: () => WebAssembly.Memory, onStderr: (line: s
 		}
 	};
 
-	return {
-		wasi_snapshot_preview1: new Proxy(impl, {
-			get: (t, name: string) => t[name] ?? stub[name]
-		})
-	};
+	const imports: Record<string, (...args: never[]) => number | bigint> = {};
+	for (const { module: ns, name } of WebAssembly.Module.imports(module)) {
+		if (ns === 'wasi_snapshot_preview1') imports[name] = impl[name] ?? (() => ENOSYS);
+	}
+	return { wasi_snapshot_preview1: imports };
 }
