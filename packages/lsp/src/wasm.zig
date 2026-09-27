@@ -24,7 +24,6 @@ export fn toy_lsp_feed(ptr: [*]u8, len: usize) i32 {
     defer gpa.free(ptr[0..len]);
     if (!started) {
         server = Server.init(gpa);
-        server.disk = false;
         started = true;
     }
     out.clearRetainingCapacity();

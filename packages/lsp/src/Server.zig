@@ -32,6 +32,9 @@ const Workspace = @import("Workspace.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
 
+/// A wasi build runs in a browser worker, where imports resolve only against open documents.
+const host_has_disk = @import("builtin").os.tag != .wasi;
+
 /// Connect the server core to an injected reader + writer and run until `exit` or a clean
 /// pipe close. `toy lsp` passes real stdin/stdout; the in-process test passes in-memory
 /// buffers. Returns `.ok` when `shutdown` preceded `exit`, else `.no_shutdown` (exit 1).
@@ -51,8 +54,6 @@ pub const Server = struct {
     /// message instead of fragmenting (a wasm heap never shrinks). Documents use `gpa`.
     arena: std.heap.ArenaAllocator,
     docs: Documents,
-    /// false on a host with no filesystem: imports resolve only against open documents.
-    disk: bool = true,
     got_initialize: bool = false,
     shutdown_requested: bool = false,
 
@@ -70,7 +71,7 @@ pub const Server = struct {
     /// Recomputed from the PINNED server each call: `Threaded.io()` captures
     /// `&self.threaded`, so it must never be cached across the by-value move out of `init`.
     fn workspace(self: *Server) Workspace {
-        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = self.disk };
+        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk };
     }
 
     /// The open document and position a `textDocument/<feature>` request names, or null for
@@ -1444,7 +1445,6 @@ test "lsp feed: each push is served to completion; the server reports exit" {
     const gpa = testing.allocator;
     var s = Server.init(gpa);
     defer s.deinit();
-    s.disk = false;
 
     var in: Writer.Allocating = .init(gpa);
     defer in.deinit();
