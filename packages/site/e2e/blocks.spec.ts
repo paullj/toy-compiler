@@ -38,7 +38,7 @@ test('every example becomes an editor and checks clean', async ({ page }) => {
 test('hovering a binding shows its inferred type', async ({ page }) => {
 	const b = await live(page, 'order.toy');
 	await b.locator('.cm-line', { hasText: 'quantity := 3' }).hover({ position: { x: 50, y: 6 } });
-	await expect(page.locator('.cm-tooltip-hover')).toHaveText('int');
+	await expect(page.locator('.cm-lsp-hover-tooltip')).toHaveText('quantity: int');
 });
 
 test('completion offers in-scope names with their types', async ({ page }) => {

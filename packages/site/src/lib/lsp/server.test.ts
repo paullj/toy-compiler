@@ -55,7 +55,7 @@ describe('toy-lsp.wasm', () => {
 			{ jsonrpc: '2.0', id: 1, method: 'textDocument/hover', params: at(clean, 1, 27) },
 			{ jsonrpc: '2.0', id: 2, method: 'textDocument/completion', params: at(typing, 1, 35) }
 		]) as any[];
-		expect(out.find((m) => m.id === 1).result.contents.value).toContain('fn add(int, int) -> int');
+		expect(out.find((m) => m.id === 1).result.contents.value).toContain('fn add(a: int, b: int) -> int');
 		const items = out.find((m) => m.id === 2).result as any[];
 		expect(items.map((i) => i.label)).toContain('add');
 	});
