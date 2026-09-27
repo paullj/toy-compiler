@@ -135,8 +135,26 @@ const Describer = struct {
             try renderType(d.a, &d.buf, t, d.tc.layouts, d.tc.enum_layouts);
             return true;
         }
+        if (try d.qualifiedVariant(tok)) return true;
         // A type name is left unresolved by the resolver; match it against the type tables.
         return d.typeDefinition(d.text(tok));
+    }
+
+    /// `Enum.variant` spelled through the type name (`Option.some(x)`): the variant as the
+    /// enum declares it, generic parameters included.
+    fn qualifiedVariant(d: *Describer, tok: u32) !bool {
+        const toks = d.module().tokens;
+        if (tok < 2 or toks[tok - 1].tag != .dot or toks[tok - 2].tag != .identifier) return false;
+        const enum_name = d.text(tok - 2);
+        const mark = d.buf.items.len;
+        if (!try d.typeDefinition(enum_name)) return false;
+        // The declaration is scratch: cut it back off `buf` before writing the answer.
+        const decl = try d.a.dupe(u8, d.buf.items[mark..]);
+        d.buf.shrinkRetainingCapacity(mark);
+        if (!std.mem.startsWith(u8, std.mem.trimStart(u8, decl, "pub "), "enum ")) return false;
+        const item = variantIn(decl, d.text(tok)) orelse return false;
+        try d.buf.print(d.a, "{s}.{s}", .{ enum_name, item });
+        return true;
     }
 
     fn declaration(d: *Describer, i: u32, tok: u32, ty: ?Type) !bool {
@@ -355,6 +373,30 @@ const native_enums = [_]struct { name: []const u8, decl: []const u8 }{
     .{ .name = "Option", .decl = "enum Option[T] { some(T), none }" },
     .{ .name = "Result", .decl = "enum Result[T, E] { ok(T), err(E) }" },
 };
+
+/// The variant `name` as written in a collapsed enum declaration (`enum E { a(T), b }`):
+/// the depth-0 comma-separated item inside the braces that starts with `name`.
+fn variantIn(decl: []const u8, name: []const u8) ?[]const u8 {
+    const open = std.mem.indexOfScalar(u8, decl, '{') orelse return null;
+    const body = decl[open + 1 .. std.mem.lastIndexOfScalar(u8, decl, '}') orelse return null];
+    var depth: u32 = 0;
+    var start: usize = 0;
+    for (body, 0..) |c, i| {
+        switch (c) {
+            '(', '[', '{' => depth += 1,
+            ')', ']', '}' => depth -|= 1,
+            else => {},
+        }
+        if ((c == ',' and depth == 0) or i + 1 == body.len) {
+            const end = if (c == ',' and depth == 0) i else i + 1;
+            const item = std.mem.trim(u8, body[start..end], " ");
+            start = i + 1;
+            if (!std.mem.startsWith(u8, item, name)) continue;
+            if (item.len == name.len or item[name.len] == '(' or item[name.len] == ' ') return item;
+        }
+    }
+    return null;
+}
 
 fn declStartIn(tokens: []const Token, name_tok: u32) u32 {
     var i = name_tok;
@@ -657,6 +699,7 @@ test "hover shows generic, protocol, and prelude types as the user spells them" 
         .{ .line = 9, .needle = "left", .want = "left: int" },
         .{ .line = 10, .needle = "Option", .want = "enum Option[T] { some(T), none }" },
         .{ .line = 10, .needle = "first", .want = "first: Option[int]" },
+        .{ .line = 10, .needle = "some", .want = "Option.some(T)" },
     };
     for (cases) |c| {
         var it = std.mem.splitScalar(u8, src, '\n');
