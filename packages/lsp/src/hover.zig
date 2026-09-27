@@ -13,16 +13,11 @@
 //! call's result); a whitespace/comment GAP carries no token and yields null.
 
 const std = @import("std");
-const Io = std.Io;
 const toyc = @import("toy_compiler");
-const lsp_uri = @import("uri.zig");
 const Workspace = @import("Workspace.zig");
 
-const Driver = toyc.Driver;
-const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
-const Decide = toyc.Decide;
 const Token = toyc.Token;
 const Type = toyc.Typecheck.Type;
 const Layout = toyc.Typecheck.Layout;
@@ -43,7 +38,8 @@ pub const Hover = struct {
 
 /// The type/signature at (`line`, `character`) in `source`, or null when there is nothing
 /// meaningful under the cursor (a gap, an out-of-range or poisoned position, or a document
-/// that does not parse/resolve). Never errors on a compile problem — only a hard I/O / OOM
+/// that does not parse). Resolve and type errors elsewhere do not suppress it: mid-edit, the
+/// rest of the buffer still types. Never errors on a compile problem — only a hard I/O / OOM
 /// fault propagates.
 pub fn hoverAt(
     gpa: std.mem.Allocator,
@@ -59,7 +55,6 @@ pub fn hoverAt(
 
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
-    if (Decide.resolveHasError(res.diags)) return null;
 
     var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
     defer tc.deinit(gpa);
@@ -225,4 +220,15 @@ test "positionToOffset is the exact inverse of lineCol" {
         const round = positionToOffset(&sm, @intCast(lc.line - 1), @intCast(lc.col - 1));
         try testing.expectEqual(@as(?u32, off), round);
     }
+}
+
+test "hover still types a binding when another line has a resolve error" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = "fn main() -> int {\n    count := 3\n    return count + missing\n}\n";
+    var h = (try hoverAt(gpa, ws, src, 1, 5, "file:///b/main.toy")) orelse return error.HoverSuppressed;
+    defer h.deinit();
+    try testing.expectEqualStrings("int", h.value);
 }

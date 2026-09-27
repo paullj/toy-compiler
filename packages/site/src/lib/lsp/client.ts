@@ -7,6 +7,7 @@ import {
 	type Transport
 } from '@codemirror/lsp-client';
 import { asset } from '$app/paths';
+import { publishDiagnostics } from './diagnostics';
 
 let client: LSPClient | null = null;
 
@@ -27,6 +28,9 @@ export function toyClient(): LSPClient {
 
 	client = new LSPClient({
 		rootUri: 'file:///examples/',
+		// Tried before the extensions' handlers; `serverDiagnostics` still supplies the
+		// capability and the idle-time document sync that makes the server republish.
+		notificationHandlers: { 'textDocument/publishDiagnostics': publishDiagnostics },
 		extensions: [serverDiagnostics(), serverCompletion(), hoverTooltips(), signatureHelp()]
 	}).connect(transport);
 	return client;
