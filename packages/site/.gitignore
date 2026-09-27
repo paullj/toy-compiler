@@ -10,3 +10,5 @@ vite.config.ts.timestamp-*
 
 # Built by `mise run site:wasm`.
 /static/toy-lsp.wasm
+/test-results
+/playwright-report

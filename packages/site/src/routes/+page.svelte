@@ -32,9 +32,9 @@
 			title: 'Pattern matching',
 			blurb: 'Enums hold one of several variants. <code class="code">match</code> destructures them, checked for exhaustiveness at compile time.',
 			file: 'shapes.toy',
-			code: `enum Shape { Circle(int), Square(int) }
+			code: `pub enum Shape { Circle(int), Square(int) }
 
-fn area(shape: Shape) -> int {
+pub fn area(shape: Shape) -> int {
     match shape {
         .Circle(r) -> 3 * r * r,
         .Square(side) -> side * side,
@@ -70,7 +70,7 @@ impl Square has Area {
 			title: 'No null',
 			blurb: '<code class="code">Option[T]</code> and <code class="code">Result[T, E]</code> are ordinary enums. The postfix <code class="code">?</code> unwraps a value or returns early on the empty case.',
 			file: 'total.toy',
-			code: `fn total(a: Option[int], b: Option[int]) -> Option[int] {
+			code: `pub fn total(a: Option[int], b: Option[int]) -> Option[int] {
     x := a?
     y := b?
     Option.some(x + y)

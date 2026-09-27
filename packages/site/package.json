@@ -8,13 +8,16 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.20.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
     "@tailwindcss/vite": "^4.0.0",
+    "@types/node": "^24",
     "binaryen": "^132.0.0",
     "svelte": "^5.20.0",
     "svelte-check": "^4.1.0",
@@ -29,8 +32,11 @@
     ]
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
     "@codemirror/commands": "^6.10.4",
     "@codemirror/language": "^6.12.4",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/lsp-client": "^6.3.0",
     "@codemirror/state": "^6.7.1",
     "@codemirror/view": "^6.43.6",
     "@fontsource/hanken-grotesk": "^5.2.8",

@@ -15,6 +15,7 @@ const TYPES = new Set([
 
 // A small stream tokenizer — good enough for the playground, not a real lexer.
 const toyLanguage = StreamLanguage.define<{ afterFn: boolean }>({
+	name: 'toy',
 	startState: () => ({ afterFn: false }),
 	token(stream, state) {
 		if (stream.eatSpace()) return null;
@@ -35,6 +36,7 @@ const toyLanguage = StreamLanguage.define<{ afterFn: boolean }>({
 			return 'variableName';
 		}
 
+		if (stream.match(/[{}()[\],;:.]|[-+*/%<>=!&|?]+/)) return 'punctuation';
 		stream.next();
 		return null;
 	},
@@ -47,6 +49,7 @@ const highlight = HighlightStyle.define([
 	{ tag: t.number, color: 'var(--tok-num)' },
 	{ tag: t.string, color: 'var(--tok-str)' },
 	{ tag: t.comment, color: 'var(--fg-muted)', fontStyle: 'italic' },
+	{ tag: t.punctuation, color: 'var(--fg-muted)' },
 	{ tag: t.definition(t.variableName), color: 'var(--tok-fn)' }
 ]);
 
@@ -74,4 +77,5 @@ const theme = EditorView.theme({
 	}
 });
 
-export const toyExtensions = [toyLanguage, syntaxHighlighting(highlight), theme];
+export const toyHighlighting = [toyLanguage, syntaxHighlighting(highlight)];
+export const toyExtensions = [...toyHighlighting, theme];
