@@ -49,13 +49,34 @@ test('completion offers in-scope names with their types', async ({ page }) => {
 	await expect(list).toContainText('int');
 });
 
+// Budget from the last keystroke to the underline: the sync pause plus a check and the
+// worker round trip, with headroom for a slow CI machine.
+const MAX_DIAGNOSTIC_LATENCY_MS = 600;
+
 test('a type error is reported while typing and cleared once fixed', async ({ page }) => {
 	const b = await live(page, 'order.toy');
 	await typeAtEndOfLine(page, b, 'quantity := 3', '\nlabel: int = "three"');
+	const typed = Date.now();
 	await expect(b.locator('.cm-lintRange-error, .cm-lintPoint-error')).toHaveCount(1);
+	expect(Date.now() - typed).toBeLessThan(MAX_DIAGNOSTIC_LATENCY_MS);
 	for (let i = 0; i < 7; i++) await page.keyboard.press('Backspace');
 	await page.keyboard.type('3');
 	await expect(b.locator('.cm-lintRange-error, .cm-lintPoint-error')).toHaveCount(0);
+});
+
+test('a new line inside a block indents one level per open bracket', async ({ page }) => {
+	const b = await live(page, 'shapes.toy');
+	await typeAtEndOfLine(page, b, '.Square(side)', '\n.Circle(r) -> 0,');
+	await expect(b.locator('.cm-line', { hasText: '.Circle(r) -> 0,' })).toHaveText('        .Circle(r) -> 0,');
+});
+
+test('F12 jumps from a use to its definition', async ({ page }) => {
+	const b = await live(page, 'order.toy');
+	await b.locator('.cm-line', { hasText: 'return price' }).click({ position: { x: 105, y: 6 } });
+	await page.keyboard.press('F12');
+	await expect
+		.poll(() => b.evaluate(() => window.getSelection()?.anchorNode?.parentElement?.closest('.cm-line')?.textContent ?? ''))
+		.toContain('price := 20');
 });
 
 test('signature help tracks the active argument', async ({ page }) => {

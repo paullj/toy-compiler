@@ -1,5 +1,7 @@
 import { EditorView, keymap } from '@codemirror/view';
 import { EditorState } from '@codemirror/state';
+import { indentUnit } from '@codemirror/language';
+import { jumpToDefinitionKeymap } from '@codemirror/lsp-client';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
 import { toyHighlighting } from '$lib/toy-language';
@@ -27,7 +29,8 @@ export function mountBlock(parent: HTMLElement, doc: string, uri: string): Edito
 			extensions: [
 				history(),
 				closeBrackets(),
-				keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, indentWithTab]),
+				indentUnit.of('    '),
+				keymap.of([...closeBracketsKeymap, ...jumpToDefinitionKeymap, ...defaultKeymap, ...historyKeymap, indentWithTab]),
 				...toyHighlighting,
 				blockTheme,
 				lspTheme,
