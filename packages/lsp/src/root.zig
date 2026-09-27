@@ -16,6 +16,9 @@ test {
     _ = @import("Documents.zig");
     _ = @import("diagnostics.zig");
     _ = @import("hover.zig");
+    _ = @import("describe.zig");
+    _ = @import("render.zig");
+    _ = @import("position.zig");
     _ = @import("completion.zig");
     _ = @import("definition.zig");
     _ = @import("signature.zig");

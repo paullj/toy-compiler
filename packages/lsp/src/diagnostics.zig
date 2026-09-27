@@ -8,6 +8,7 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
+const position = @import("position.zig");
 const Workspace = @import("Workspace.zig");
 const Documents = @import("Documents.zig");
 
@@ -153,8 +154,8 @@ fn mapStructural(a: std.mem.Allocator, src: Source, off: u32, message: []const u
 /// client on genuinely multibyte source would need a byte->utf-16 pass over `sm.lineText`
 /// here — out of scope while we advertise utf-8.
 fn tokenRange(src: Source, off: u32) protocol.Range {
-    const end = if (hover.tokenAt(src.tokens, off)) |t| src.tokens[matchingClose(src.tokens, t)].end else off;
-    return .{ .start = position(src.sm, off), .end = position(src.sm, end) };
+    const end = if (position.tokenAt(src.tokens, off)) |t| src.tokens[matchingClose(src.tokens, t)].end else off;
+    return .{ .start = lspPosition(src.sm, off), .end = lspPosition(src.sm, end) };
 }
 
 /// The token closing the group `open` opens, or `open` itself when it opens none (or the
@@ -177,7 +178,7 @@ fn matchingClose(tokens: []const Token, open: u32) u32 {
     return open;
 }
 
-fn position(sm: *const SourceMap, off: u32) protocol.Position {
+fn lspPosition(sm: *const SourceMap, off: u32) protocol.Position {
     const lc = sm.lineCol(off);
     return .{ .line = @intCast(lc.line - 1), .character = @intCast(lc.col - 1) };
 }
