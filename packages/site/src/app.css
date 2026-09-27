@@ -142,15 +142,10 @@ code, pre, kbd, .font-mono {
 .side-link.active { color: var(--accent); font-weight: 700; }
 
 /* toy syntax highlighting — restrained, low-saturation to sit inside the warm-grey palette */
-.tok-kw { color: var(--fg); font-weight: 600; }
-.tok-fn { color: #7a5a2e; }
-.tok-type { color: #3c6a5e; }
-.tok-num { color: #6a5a8a; }
-.tok-str { color: #4a6b3d; }
+.tok-kw { color: var(--tok-kw); font-weight: 600; }
+.tok-fn { color: var(--tok-fn); }
+.tok-type { color: var(--tok-type); }
+.tok-num { color: var(--tok-num); }
+.tok-str { color: var(--tok-str); }
 .tok-com { color: var(--fg-muted); font-style: italic; }
 .tok-punc { color: var(--fg-muted); }
-
-:root.dark .tok-fn { color: #cdae82; }
-:root.dark .tok-type { color: #8fc0b2; }
-:root.dark .tok-num { color: #b6a6d6; }
-:root.dark .tok-str { color: #9cc487; }

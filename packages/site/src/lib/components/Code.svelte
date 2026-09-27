@@ -1,11 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { tokenize } from '$lib/highlight';
+	import { highlightLines } from '$lib/toy-syntax';
 
 	let { code, filename }: { code: string; filename?: string } = $props();
 
 	const source = $derived(code.trim());
-	const tokens = $derived(tokenize(source));
+	const lines = $derived(highlightLines(source));
 
 	let host: HTMLDivElement;
 	let live = $state(false);
@@ -49,8 +49,10 @@
 	{/if}
 	<div bind:this={host} class="overflow-x-auto">
 		{#if !live}
-			<pre class="p-4 font-mono text-[0.75rem] leading-relaxed"><code
-					>{#each tokens as t}<span class={t.cls}>{t.text}</span>{/each}</code
+			<pre class="py-4 font-mono text-[0.75rem] leading-relaxed"><code class="block"
+					>{#each lines as line}<span class="block h-[1lh] px-4"
+							>{#each line as t}<span class={t.cls}>{t.text}</span>{/each}</span
+						>{/each}</code
 				></pre>
 		{/if}
 	</div>
