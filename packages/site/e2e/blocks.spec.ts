@@ -124,6 +124,20 @@ test('on a phone, live editors never widen the page', async ({ page }) => {
 	expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBe(0);
 });
 
+test('a block keeps its size and colours when it becomes an editor', async ({ page, browser }) => {
+	const noJs = await browser.newPage({ javaScriptEnabled: false });
+	await noJs.goto('/');
+	for (const file of BLOCKS) {
+		const staticBox = await block(noJs, file).boundingBox();
+		const staticKeywords = await block(noJs, file).locator('.tok-kw').allTextContents();
+		const b = await live(page, file);
+		const liveBox = await b.boundingBox();
+		expect(Math.abs(liveBox!.height - staticBox!.height)).toBeLessThanOrEqual(1);
+		expect(await b.locator('.tok-kw').allTextContents()).toEqual(staticKeywords);
+	}
+	await noJs.close();
+});
+
 test.describe('without JavaScript', () => {
 	test.use({ javaScriptEnabled: false });
 	test('every example still renders as highlighted code', async ({ page }) => {
