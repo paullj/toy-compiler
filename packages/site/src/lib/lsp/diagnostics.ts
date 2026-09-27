@@ -1,6 +1,6 @@
-import { LSPPlugin, type LSPClient } from '@codemirror/lsp-client';
+import { LSPPlugin, type LSPClient, type LSPClientExtension } from '@codemirror/lsp-client';
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint';
-import type { EditorView } from '@codemirror/view';
+import { ViewPlugin, type EditorView, type ViewUpdate } from '@codemirror/view';
 import { asset } from '$app/paths';
 
 type LspPosition = { line: number; character: number };
@@ -19,10 +19,36 @@ const SEVERITY = ['error', 'error', 'warning', 'info', 'hint'] as const;
 // open diagnostic tooltip under the reader's cursor, so an unchanged set is dropped.
 const shown = new WeakMap<EditorView, string>();
 
-// Replaces the client's plain-text rendering: the tooltip leads with the code (linked to
-// its reference entry), sets quoted names and types in code, and turns each related
-// location into a button that jumps to it.
-export function publishDiagnostics(client: LSPClient, params: { uri: string; version?: number; diagnostics: LspDiagnostic[] }) {
+// A check costs a few milliseconds, so edits are pushed after a short pause (the stock
+// extension waits 500ms): diagnostics then keep up with typing.
+const SYNC_DELAY_MS = 120;
+
+const autoSync = ViewPlugin.fromClass(
+	class {
+		pending: ReturnType<typeof setTimeout> | undefined;
+		update(u: ViewUpdate) {
+			if (!u.docChanged) return;
+			clearTimeout(this.pending);
+			this.pending = setTimeout(() => LSPPlugin.get(u.view)?.client.sync(), SYNC_DELAY_MS);
+		}
+		destroy() {
+			clearTimeout(this.pending);
+		}
+	}
+);
+
+// In place of the client's `serverDiagnostics`: the tooltip leads with the code (linked to
+// its reference entry), sets quoted names in code, and turns each related location into a
+// button that jumps to it.
+export function toyDiagnostics(): LSPClientExtension {
+	return {
+		clientCapabilities: { textDocument: { publishDiagnostics: { versionSupport: true, relatedInformation: true } } },
+		notificationHandlers: { 'textDocument/publishDiagnostics': publishDiagnostics },
+		editorExtension: autoSync
+	};
+}
+
+function publishDiagnostics(client: LSPClient, params: { uri: string; version?: number; diagnostics: LspDiagnostic[] }) {
 	const file = client.workspace.getFile(params.uri);
 	if (!file || (params.version != null && params.version !== file.version)) return false;
 	const view = file.getView();
