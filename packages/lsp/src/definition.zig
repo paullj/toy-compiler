@@ -25,7 +25,7 @@ const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
-const hover = @import("hover.zig");
+const position = @import("position.zig");
 const lsp_uri = @import("uri.zig");
 const Workspace = @import("Workspace.zig");
 const Documents = @import("Documents.zig");
@@ -70,8 +70,8 @@ pub fn definitionAt(
     var sm = try SourceMap.init(gpa, m.file, m.source);
     defer sm.deinit(gpa);
 
-    const off = hover.positionToOffset(&sm, line, character) orelse return null;
-    const use_tok = hover.tokenAt(m.tokens, off) orelse return null;
+    const off = position.positionToOffset(&sm, line, character) orelse return null;
+    const use_tok = position.tokenAt(m.tokens, off) orelse return null;
     const site = declSiteFor(&graph, entry, &res, use_tok) orelse return null;
 
     if (site.module == entry) {

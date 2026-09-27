@@ -9,7 +9,7 @@
 //! tolerated — an arity error on the repaired call must not suppress the declared signature.
 //!
 //! The callee's signature is read from `resolutions` -> `sigs` (the same path hover uses for
-//! a callee), rendered through `hover.bareName` so the module qualifier never leaks; param
+//! a callee), rendered through `render.bareName` so the module qualifier never leaks; param
 //! labels are [start,end) byte spans into the rendered label.
 //!
 //! KNOWN LIMITATIONS (documented, not bugs):
@@ -26,7 +26,8 @@
 const std = @import("std");
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
-const hover = @import("hover.zig");
+const position = @import("position.zig");
+const render = @import("render.zig");
 const Workspace = @import("Workspace.zig");
 
 const ResolveGraph = toyc.ResolveGraph;
@@ -136,7 +137,7 @@ fn repair(gpa: std.mem.Allocator, source: []const u8, toks: []const Token) !?[]c
     return try out.toOwnedSlice(gpa);
 }
 
-/// Mirrors `hover.renderSig` byte-for-byte while capturing each param's [start,end) span, so
+/// Mirrors `render.renderSig` byte-for-byte while capturing each param's [start,end) span, so
 /// a param label always points at the RIGHT occurrence even when two params share a type
 /// name. Type/name bytes are borrowed off the compiler tables; the appends copy them into `a`.
 fn renderLabel(
@@ -148,16 +149,16 @@ fn renderLabel(
     ranges: *std.ArrayList([2]u32),
 ) !void {
     try buf.appendSlice(a, "fn ");
-    try buf.appendSlice(a, hover.bareName(sig.name));
+    try buf.appendSlice(a, render.bareName(sig.name));
     try buf.append(a, '(');
     for (sig.params, 0..) |p, i| {
         if (i != 0) try buf.appendSlice(a, ", ");
         const s: u32 = @intCast(buf.items.len);
-        try hover.renderType(a, buf, p, layouts, enum_layouts);
+        try render.renderType(a, buf, p, layouts, enum_layouts);
         try ranges.append(a, .{ s, @intCast(buf.items.len) });
     }
     try buf.appendSlice(a, ") -> ");
-    try hover.renderType(a, buf, sig.ret, layouts, enum_layouts);
+    try render.renderType(a, buf, sig.ret, layouts, enum_layouts);
 }
 
 /// The signature help at (`line`, `character`) in `source`, or null when the cursor is not
@@ -177,7 +178,7 @@ pub fn signatureHelpAt(
     var sm = try SourceMap.init(gpa, "s", source);
     defer sm.deinit(gpa);
 
-    const off = hover.positionToOffset(&sm, line, character) orelse return null;
+    const off = position.positionToOffset(&sm, line, character) orelse return null;
     const enc = (try enclosingCall(gpa, toks, off)) orelse return null;
 
     const repaired = (try repair(gpa, source, toks)) orelse return null;
@@ -374,7 +375,7 @@ test "renderLabel: matches renderSig and spans the correct param occurrences" {
     try renderLabel(a, &label, sig, no_layouts, no_enums, &ranges);
 
     var expect: std.ArrayList(u8) = .empty;
-    try hover.renderSig(a, &expect, sig, no_layouts, no_enums);
+    try render.renderSig(a, &expect, sig, no_layouts, no_enums);
     try testing.expectEqualStrings(expect.items, label.items);
     try testing.expectEqualStrings("fn add(int, int) -> int", label.items);
 

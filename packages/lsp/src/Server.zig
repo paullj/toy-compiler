@@ -24,6 +24,7 @@ const transport = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const diagnostics = @import("diagnostics.zig");
 const hover = @import("hover.zig");
+const position = @import("position.zig");
 const completion = @import("completion.zig");
 const definition = @import("definition.zig");
 const signature = @import("signature.zig");
@@ -248,8 +249,8 @@ pub const Server = struct {
                 const sc = coordU32(getInt(s, "character")) orelse continue;
                 const el = coordU32(getInt(e, "line")) orelse continue;
                 const ec = coordU32(getInt(e, "character")) orelse continue;
-                const start_off = (try hover.offsetIn(a, d.text, sl, sc)) orelse doc_end;
-                var end_off = (try hover.offsetIn(a, d.text, el, ec)) orelse doc_end;
+                const start_off = (try position.offsetIn(a, d.text, sl, sc)) orelse doc_end;
+                var end_off = (try position.offsetIn(a, d.text, el, ec)) orelse doc_end;
                 if (end_off < start_off) end_off = start_off; // tolerate an inverted range
                 try self.docs.spliceRange(self.gpa, uri, start_off, end_off, text);
             }

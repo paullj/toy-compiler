@@ -31,7 +31,8 @@
 const std = @import("std");
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
-const hover = @import("hover.zig");
+const position = @import("position.zig");
+const render = @import("render.zig");
 const Workspace = @import("Workspace.zig");
 
 const Graph = toyc.Graph;
@@ -93,7 +94,7 @@ pub fn completionsAt(
     var sm = try SourceMap.init(gpa, "c", source);
     defer sm.deinit(gpa);
 
-    const off = hover.positionToOffset(&sm, line, character) orelse return empty(arena);
+    const off = position.positionToOffset(&sm, line, character) orelse return empty(arena);
     const det = classify(toks, off);
     if (det.context == .none) return empty(arena);
 
@@ -245,8 +246,8 @@ fn collectMember(
         const layout = tc.layouts[rt.struct_id];
         for (layout.field_names, layout.field_types) |fname, fty| {
             var buf: std.ArrayList(u8) = .empty;
-            try hover.renderType(col.a, &buf, fty, tc.layouts, tc.enum_layouts);
-            try col.add(hover.bareName(fname), kind.field, buf.items);
+            try render.renderType(col.a, &buf, fty, tc.layouts, tc.enum_layouts);
+            try col.add(render.bareName(fname), kind.field, buf.items);
         }
     }
 
@@ -255,10 +256,10 @@ fn collectMember(
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
         if (mth.fn_id < tc.sigs.len) {
-            try hover.renderSig(col.a, &buf, tc.sigs[mth.fn_id], tc.layouts, tc.enum_layouts);
+            try render.renderSig(col.a, &buf, tc.sigs[mth.fn_id], tc.layouts, tc.enum_layouts);
             detail = buf.items;
         }
-        try col.add(hover.bareName(mth.name), kind.method, detail);
+        try col.add(render.bareName(mth.name), kind.method, detail);
     }
 }
 
@@ -268,7 +269,7 @@ fn collectMember(
 fn collectModule(col: *Collector, mods: []const Graph.Module, res: *const ResolveGraph.GraphResult, mod_id: u32) !void {
     for (res.fns) |gf| {
         if (gf.module != mod_id or !gf.is_pub) continue;
-        try col.add(hover.bareName(gf.name), kind.function, null);
+        try col.add(render.bareName(gf.name), kind.function, null);
     }
     if (mod_id >= mods.len) return;
     const tmod = &mods[mod_id];
@@ -308,10 +309,10 @@ fn collectScope(
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
         if (i < tc.sigs.len) {
-            try hover.renderSig(col.a, &buf, tc.sigs[i], tc.layouts, tc.enum_layouts);
+            try render.renderSig(col.a, &buf, tc.sigs[i], tc.layouts, tc.enum_layouts);
             detail = buf.items;
         }
-        try col.add(hover.bareName(gf.name), kind.function, detail);
+        try col.add(render.bareName(gf.name), kind.function, detail);
     }
 
     // Top-level type decls.
@@ -384,7 +385,7 @@ fn collectEnclosing(
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
         if (fid) |f| if (f < tc.sigs.len and k < tc.sigs[f].params.len) {
-            try hover.renderType(col.a, &buf, tc.sigs[f].params[k], tc.layouts, tc.enum_layouts);
+            try render.renderType(col.a, &buf, tc.sigs[f].params[k], tc.layouts, tc.enum_layouts);
             detail = buf.items;
         };
         try col.add(name, kind.variable, detail);
@@ -399,7 +400,7 @@ fn collectEnclosing(
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
         if (i < node_types.len and isRenderable(node_types[i])) {
-            try hover.renderType(col.a, &buf, node_types[i], tc.layouts, tc.enum_layouts);
+            try render.renderType(col.a, &buf, node_types[i], tc.layouts, tc.enum_layouts);
             detail = buf.items;
         }
         try col.add(name, kind.variable, detail);
