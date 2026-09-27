@@ -1,0 +1,7 @@
+fn name() -> int {
+    return "toy"  #~ ERROR [T0042] return type str does not match declared int
+}
+
+fn main() -> int {
+    return name()
+}

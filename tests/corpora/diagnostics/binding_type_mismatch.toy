@@ -1,0 +1,4 @@
+fn main() -> int {
+    x: int = true  #~ ERROR [T0041] cannot bind bool to 'x' of type int
+    return x
+}

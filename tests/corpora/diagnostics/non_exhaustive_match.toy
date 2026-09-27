@@ -1,0 +1,14 @@
+enum Shape {
+    Empty,
+    Circle(int)
+}
+
+fn area(s: Shape) -> int {
+    match s {  #~ ERROR [T0048] non-exhaustive match: missing variant
+        .Circle(r) -> r * r
+    }
+}
+
+fn main() -> int {
+    return area(.Empty)
+}

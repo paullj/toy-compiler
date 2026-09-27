@@ -1,0 +1,6 @@
+struct Point { x: int, y: int }
+
+fn main() -> int {
+    p := Point { x: 6, y: 7 }
+    return p.z  #~ ERROR [T0046] no field 'z' in struct 'Point'
+}

@@ -346,7 +346,7 @@ pub const BodyChecker = struct {
         // structurally return, OR the body's trailing expression has the declared
         // type. `assignable` folds poison/never/eql exactly as before.
         if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
-            try bc.sink.emitFmt(bc.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
+            try bc.sink.emitFmtCode(.T0043, bc.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
         _ = proto;
     }
@@ -466,7 +466,7 @@ pub const BodyChecker = struct {
                     const declared = bc.typeFromNode(stmt.rhs);
                     const got = try bc.typeOfExpected(stmt.lhs, declared);
                     if (!Type.assignable(declared, got)) {
-                        try bc.sink.emitFmt(bc.byteOf(stmt.main_token), "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
+                        try bc.sink.emitFmtCode(.T0041, bc.byteOf(stmt.main_token), "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
                     }
                     break :blk declared;
                 } else try bc.typeOf(stmt.lhs);
@@ -495,7 +495,7 @@ pub const BodyChecker = struct {
                 bc.node_types[(stmt.lhs).int()] = lhs;
                 const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
-                    try bc.sink.emitFmt(bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
+                    try bc.sink.emitFmtCode(.T0041, bc.byteOf(target.main_token), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
                 }
                 if (bc.targetRootsAtIndexElement(stmt.lhs)) {
                     try bc.sink.emitFmt(bc.byteOf(target.main_token), "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{});
@@ -510,7 +510,7 @@ pub const BodyChecker = struct {
                 // `never` unifies with any declared type — mirrors the trailing-expr
                 // body check above.
                 if (!Type.assignable(bc.cur_ret, ty)) {
-                    try bc.sink.emitFmt(bc.byteOf(stmt.main_token), "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
+                    try bc.sink.emitFmtCode(.T0042, bc.byteOf(stmt.main_token), "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
                 }
             },
             .expr_stmt => _ = try bc.typeOf(stmt.lhs),
@@ -518,7 +518,7 @@ pub const BodyChecker = struct {
             .if_stmt => {
                 const ct = try bc.typeOf(stmt.lhs);
                 if (ct.kind != .invalid and ct.kind != .bool)
-                    try bc.sink.emit(bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "if condition must be bool");
+                    try bc.sink.emitCode(.T0045, bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "if condition must be bool");
                 try bc.warnConstIfCond(stmt.lhs);
                 const h = Ast.ifHeaderAt(bc.tree, (stmt.rhs).int());
                 _ = try bc.checkBlock(h.then_block, false);
@@ -596,7 +596,7 @@ pub const BodyChecker = struct {
         const stmt = bc.tree.nodes[(stmt_idx).int()];
         const ct = try bc.typeOf(stmt.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.sink.emit(bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "while condition must be bool");
+            try bc.sink.emitCode(.T0045, bc.byteOf(bc.tree.nodes[(stmt.lhs).int()].main_token), "while condition must be bool");
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.rhs, false);
         _ = bc.loop_stack.pop();
@@ -910,15 +910,15 @@ pub const BodyChecker = struct {
                 switch (op) {
                     .minus => {
                         if (operand.isInteger()) break :blk operand;
-                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '-' must be int");
+                        try bc.sink.emitCode(.T0044, bc.byteOf(n.main_token), "operand of '-' must be int");
                     },
                     .bang => {
                         if (operand.kind == .bool) break :blk Type.@"bool";
-                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '!' must be bool");
+                        try bc.sink.emitCode(.T0044, bc.byteOf(n.main_token), "operand of '!' must be bool");
                     },
                     .tilde => {
                         if (operand.isInteger()) break :blk operand;
-                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '~' must be int");
+                        try bc.sink.emitCode(.T0044, bc.byteOf(n.main_token), "operand of '~' must be int");
                     },
                     // `&x` boxes `x` into a fresh managed cell, yielding `Ref[T]`. Reify
                     // runs later, so `Ref[T]` is an `.app` during body-check.
@@ -929,7 +929,7 @@ pub const BodyChecker = struct {
                             const e = bc.composite.at(operand.appIdx());
                             if (!e.ctor_is_enum and e.ctor == bc.model.prelude.?.ref_struct.?) break :blk e.args[0];
                         }
-                        try bc.sink.emit(bc.byteOf(n.main_token), "operand of '*' must be a reference");
+                        try bc.sink.emitCode(.T0044, bc.byteOf(n.main_token), "operand of '*' must be a reference");
                     },
                     else => {},
                 }
@@ -974,7 +974,7 @@ pub const BodyChecker = struct {
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
                         const ap = bc.arithProtocol(op);
                         if (!Type.eql(lt, rt)) {
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
                         } else if (bc.conformsToArith(lt, ap.pid)) {
                             break :blk lt;
                         } else {
@@ -988,7 +988,7 @@ pub const BodyChecker = struct {
                         // int/str/bool prelude conformance or user struct/enum `impl T has Ord`,
                         // or a `[T has Ord]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, true)) {
                             break :blk Type.@"bool";
                         } else {
@@ -1002,7 +1002,7 @@ pub const BodyChecker = struct {
                         // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
-                            try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, true)) {
                             break :blk Type.@"bool";
                         } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
@@ -1016,21 +1016,21 @@ pub const BodyChecker = struct {
                     },
                     .amp_amp, .pipe_pipe => {
                         if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
+                        try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must be bool", .{op_text});
                     },
                     .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
+                        try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must be int", .{op_text});
                     },
                     .plus_dot, .minus_dot, .star_dot, .slash_dot => {
                         // The dotted operators are float-ONLY inline machine ops (no protocol
                         // desugar): the non-dotted `+`/`<` on a float falls to T0028/T0027.
                         if (lt.kind == .float and Type.eql(lt, rt)) break :blk lt;
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must both be float", .{op_text});
+                        try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must both be float", .{op_text});
                     },
                     .lt_dot, .gt_dot, .le_dot, .ge_dot => {
                         if (lt.kind == .float and Type.eql(lt, rt)) break :blk Type.@"bool";
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "operands of '{s}' must both be float", .{op_text});
+                        try bc.sink.emitFmtCode(.T0044, bc.byteOf(n.main_token), "operands of '{s}' must both be float", .{op_text});
                     },
                     else => {},
                 }
@@ -1288,11 +1288,11 @@ pub const BodyChecker = struct {
                     try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                 }
             } else {
-                try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, disp_name });
+                try bc.sink.emitFmtCode(.T0046, bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, disp_name });
             }
         }
         for (sym.field_names, 0..) |dn, j| {
-            if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, disp_name });
+            if (!seen[j]) try bc.sink.emitFmtCode(.T0047, bc.byteOf(n.main_token), "missing field '{s}' in '{s}'", .{ dn, disp_name });
         }
         return result;
     }
@@ -1382,7 +1382,7 @@ pub const BodyChecker = struct {
         for (sym.field_names, sym.field_types) |fname, fty| {
             if (std.mem.eql(u8, fname, name)) return fty;
         }
-        try bc.sink.emitFmt(bc.byteOf(n.main_token), "tuple struct '{s}' has no field .{s}", .{ sym.name, name });
+        try bc.sink.emitFmtCode(.T0046, bc.byteOf(n.main_token), "tuple struct '{s}' has no field .{s}", .{ sym.name, name });
         return .invalid;
     }
 
@@ -1634,11 +1634,11 @@ pub const BodyChecker = struct {
                             try bc.sink.emitFmt(bc.byteOf(fi.main_token), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                     } else {
                         if (pretyped == null) _ = try bc.typeOf(fi.lhs);
-                        try bc.sink.emitFmt(bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                        try bc.sink.emitFmtCode(.T0046, bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                     }
                 }
                 for (variant.field_names, 0..) |dn, j| {
-                    if (!seen[j]) try bc.sink.emitFmt(bc.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
+                    if (!seen[j]) try bc.sink.emitFmtCode(.T0047, bc.byteOf(vtok), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
                 }
             },
         }
@@ -1799,7 +1799,7 @@ pub const BodyChecker = struct {
         _ = node_idx;
         const ct = try bc.typeOf(n.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.sink.emit(bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "if condition must be bool");
+            try bc.sink.emitCode(.T0045, bc.byteOf(bc.tree.nodes[(n.lhs).int()].main_token), "if condition must be bool");
         try bc.warnConstIfCond(n.lhs);
         const h = Ast.ifHeaderAt(bc.tree, (n.rhs).int());
         if (h.else_node == Ast.none) {
@@ -3359,9 +3359,9 @@ pub const BodyChecker = struct {
     /// declared field name is a close, unambiguous typo of `fname`.
     fn emitNoField(bc: *BodyChecker, byte: u32, fname: []const u8, sym_name: []const u8, names: []const []const u8) error{OutOfMemory}!void {
         if (nearmiss.suggest(fname, FieldNameIter{ .names = names })) |cand|
-            try bc.sink.emitFmt(byte, "no field '{s}' in struct '{s}'; did you mean '{s}'?", .{ fname, sym_name, cand })
+            try bc.sink.emitFmtCode(.T0046, byte, "no field '{s}' in struct '{s}'; did you mean '{s}'?", .{ fname, sym_name, cand })
         else
-            try bc.sink.emitFmt(byte, "no field '{s}' in struct '{s}'", .{ fname, sym_name });
+            try bc.sink.emitFmtCode(.T0046, byte, "no field '{s}' in struct '{s}'", .{ fname, sym_name });
     }
 
     /// Emit "enum '{s}' has no variant '{s}'", enriched with a "did you mean" hint when a
