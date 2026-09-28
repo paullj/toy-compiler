@@ -28,11 +28,10 @@ test.beforeEach(async ({ page }) => {
 test('every example becomes an editor and checks clean', async ({ page }) => {
 	for (const file of BLOCKS) {
 		const b = await live(page, file);
+		// Wait for the server's first publish; before it, "no marks" proves nothing.
+		await expect(b.locator('.cm-editor[data-checked]')).toBeVisible();
 		await expect(b.locator('.cm-lintRange, .cm-lintPoint')).toHaveCount(0);
 	}
-	// Given time for the server to publish, a clean example must stay clean.
-	await page.waitForTimeout(500);
-	await expect(page.locator('.cm-lintRange, .cm-lintPoint')).toHaveCount(0);
 });
 
 test('hovering a binding shows its inferred type', async ({ page }) => {
