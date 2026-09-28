@@ -93,7 +93,7 @@ test('a diagnostic tooltip links its code and jumps to the related definition', 
 	await typeAtEndOfLine(page, b, '}', '\nfn add(a: int, b: int) -> int { return a + b }');
 	await typeAtEndOfLine(page, b, 'quantity := 3', '\n_sum := add(1)');
 	const mark = b.locator('.cm-lintRange-error');
-	await expect(mark).toHaveText('(1)');
+	await expect(mark).toHaveText('(');
 	// Let the popups the call opened close first: without this settle the hover is flaky.
 	await page.keyboard.press('Escape');
 	await page.waitForTimeout(300);

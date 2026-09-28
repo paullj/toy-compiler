@@ -9,8 +9,9 @@
 //! analyzes exe entrypoints, so any logic that must be covered lives here.
 //!
 //! - The NDJSON line schema is fixed and stable (keys emitted in a constant order, no
-//!   trailing whitespace, RFC-8259 string escaping): `{"code","level","byte","line",
-//!   "col","message","file","rendered","labels"}`. `code` is null for an uncoded
+//!   trailing whitespace, RFC-8259 string escaping): `{"code","level","byte","byte_end",
+//!   "line","col","message","file","rendered","labels"}`. `byte`..`byte_end` is the
+//!   primary span. `code` is null for an uncoded
 //!   diagnostic. `line`/`col` are 1-based, computed from the owning file's SourceMap.
 //!   `file` is the diagnostic's source path (the module path in graph mode, else the
 //!   input file). `rendered` is the PLAIN (uncolored) pretty single-diagnostic render
@@ -107,7 +108,7 @@ fn writeNdjsonLine(out: *Io.Writer, gpa: std.mem.Allocator, sm: *const Rr.Source
     }
     try out.writeAll(",\"level\":\"");
     try writeJsonStr(out, levelWord(eff));
-    try out.print("\",\"byte\":{d},\"line\":{d},\"col\":{d},\"message\":\"", .{ d.byte_offset, lc.line, lc.col });
+    try out.print("\",\"byte\":{d},\"byte_end\":{d},\"line\":{d},\"col\":{d},\"message\":\"", .{ d.byte_offset, d.span().end, lc.line, lc.col });
     try writeJsonStr(out, d.message);
     try out.writeAll("\",\"file\":\"");
     try writeJsonStr(out, file);
@@ -301,7 +302,7 @@ test "writeNdjsonLine emits fixed key order with 1-based line/col, null code, fi
     const got = aw.writer.buffered();
     // Prefix through the shared fields is stable and byte-checkable.
     try testing.expect(std.mem.startsWith(u8, got,
-        "{\"code\":null,\"level\":\"error\",\"byte\":14,\"line\":2,\"col\":3,\"message\":\"boom\",\"file\":\"t.toy\",\"rendered\":\""));
+        "{\"code\":null,\"level\":\"error\",\"byte\":14,\"byte_end\":14,\"line\":2,\"col\":3,\"message\":\"boom\",\"file\":\"t.toy\",\"rendered\":\""));
     // No related location => empty labels array; the line ends with `,"labels":[]}\n`.
     try testing.expect(std.mem.endsWith(u8, got, ",\"labels\":[]}\n"));
     // Every embedded newline in the rendered snippet is escaped (no raw '\n' before the

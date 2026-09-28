@@ -26,6 +26,7 @@
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
 const Graph = @import("driver/Graph.zig");
+const DiagnosticMod = @import("diagnostics/Diagnostic.zig");
 const ResolveGraph = @import("resolve_graph.zig");
 const Typecheck = @import("types.zig");
 
@@ -103,7 +104,9 @@ pub fn checkGraph(
         };
     }
 
-    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, io, ncpu);
+    const result = try Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, io, ncpu);
+    DiagnosticMod.fillSpans(result.diags, graph, Graph.Graph.scopeTokens);
+    return result;
 }
 
 /// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
