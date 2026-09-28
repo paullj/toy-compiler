@@ -91,6 +91,17 @@ pub fn emitFmt(self: *DiagnosticSink, byte_offset: u32, comptime fmt: []const u8
     });
 }
 
+/// `emit` over the offending node's full extent `span` rather than just the token
+/// it starts at.
+pub fn emitSpan(self: *DiagnosticSink, span: model.Span, message: []const u8) !void {
+    try self.recordStatic(.none, span, message);
+}
+
+/// `emitFmt` over the offending node's full extent `span`; same OOM ordering, via `record`.
+pub fn emitFmtSpan(self: *DiagnosticSink, span: model.Span, comptime fmt: []const u8, args: anytype) !void {
+    return self.record(.none, span, diag.NO_RELATED, fmt, args);
+}
+
 /// Record a static (borrowed) coded message: like `emit`, but stamps the stable
 /// `code` and its registry default severity onto the diagnostic. Existing sites keep
 /// calling `emit` (code stays `.none`); coded sites call this or the builder.
