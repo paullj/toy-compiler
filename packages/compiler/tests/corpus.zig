@@ -48,6 +48,8 @@ const Cache = toyc.Cache;
 const codes = toyc.diagnostics.codes;
 const SourceMap = toyc.term.render.SourceMap;
 const Diagnostic = toyc.diagnostics.Diagnostic.Diagnostic;
+const Token = toyc.Token;
+const Span = toyc.diagnostics.model.Span;
 
 const testing = std.testing;
 
@@ -139,8 +141,9 @@ fn collectErrors(
     errdefer out.deinit(gpa);
 
     const push = struct {
-        fn go(list: *std.ArrayList(EmittedError), a: std.mem.Allocator, s: *const SourceMap, diags: []const Diagnostic) !void {
+        fn go(list: *std.ArrayList(EmittedError), a: std.mem.Allocator, s: *const SourceMap, diags: []const Diagnostic, tokens: []const Token, bad_spans: *usize) !void {
             for (diags) |d| {
+                if (!checkSpans(s, tokens, d)) bad_spans.* += 1;
                 // Only ERROR-severity diagnostics are matched against `#~ ERROR`
                 // annotations (the stored registry-default severity; the render-time
                 // config never rewrites it).
@@ -157,11 +160,71 @@ fn collectErrors(
         }
     }.go;
 
-    if (r.diags.len > 0) try push(&out, gpa, &sm, r.diags);
-    if (r.resolve) |res| try push(&out, gpa, &sm, res.diags);
-    if (r.typecheck) |tc| try push(&out, gpa, &sm, tc.diags);
+    var bad_spans: usize = 0;
+    if (r.diags.len > 0) try push(&out, gpa, &sm, r.diags, r.tokens, &bad_spans);
+    if (r.resolve) |res| try push(&out, gpa, &sm, res.diags, r.tokens, &bad_spans);
+    if (r.typecheck) |tc| try push(&out, gpa, &sm, tc.diags, r.tokens, &bad_spans);
+    if (bad_spans > 0) return error.SpanInvariant;
 
     return out;
+}
+
+/// Every diagnostic's spans must be real source extents: non-empty (short of EOF), starting
+/// at a token's start and ending at a token's end, with balanced brackets inside. An
+/// emit site that forgets its span, or gives a subtree span that cuts a bracket pair,
+/// fails here rather than as a stray underline in an editor.
+fn checkSpans(sm: *const SourceMap, tokens: []const Token, d: Diagnostic) bool {
+    var ok = checkSpan(sm, tokens, d, "primary", d.span());
+    if (d.relatedSpan()) |rs| ok = checkSpan(sm, tokens, d, "related", rs) and ok;
+    return ok;
+}
+
+fn checkSpan(sm: *const SourceMap, tokens: []const Token, d: Diagnostic, which: []const u8, sp: Span) bool {
+    const why: ?[]const u8 = blk: {
+        if (sp.start >= sm.bytes.len) break :blk null; // an EOF error has nothing to cover
+        if (sp.end <= sp.start) break :blk "is empty";
+        var first: ?usize = null;
+        var last: ?usize = null;
+        for (tokens, 0..) |t, i| {
+            if (t.start == sp.start) first = i;
+            if (t.end == sp.end) last = i;
+        }
+        if (first == null) break :blk "does not start at a token";
+        if (last == null or last.? < first.?) break :blk "does not end at a token";
+        // One token is always a whole thing, even a stray `)` a parse error points at.
+        if (first.? == last.?) break :blk null;
+        var depth: i32 = 0;
+        for (tokens[first.? .. last.? + 1]) |t| {
+            switch (t.tag) {
+                .l_paren, .l_bracket, .l_brace => depth += 1,
+                .r_paren, .r_bracket, .r_brace => depth -= 1,
+                else => {},
+            }
+            if (depth < 0) break :blk "closes a bracket it does not open";
+        }
+        if (depth != 0) break :blk "leaves a bracket open";
+        break :blk null;
+    };
+    if (why) |w| {
+        const lc = sm.lineCol(sp.start);
+        std.debug.print("{s}:{d}:{d}: {s} span of \"{s}\" {s}: \"{s}\"\n", .{
+            sm.name, lc.line, lc.col, which, d.message, w, sm.bytes[sp.start..@min(sp.end, sm.bytes.len)],
+        });
+        return false;
+    }
+    return true;
+}
+
+/// `checkSpans` over a multi-module graph's diagnostics, each against its own module.
+fn checkGraphSpans(gpa: std.mem.Allocator, graph: *const Graph.Graph, diags: []const Diagnostic) !void {
+    var bad: usize = 0;
+    for (diags) |d| {
+        const m = &graph.modules[if (d.scope == toyc.DiagnosticSink.NO_SCOPE) graph.entry_index else d.scope];
+        var sm = try SourceMap.init(gpa, m.file, m.source);
+        defer sm.deinit(gpa);
+        if (!checkSpans(&sm, m.tokens, d)) bad += 1;
+    }
+    if (bad > 0) return error.SpanInvariant;
 }
 
 fn freeErrors(gpa: std.mem.Allocator, errs: *std.ArrayList(EmittedError)) void {
@@ -419,16 +482,21 @@ fn compileAndRun(
 ) !RunResult {
     var graph = try Graph.discover(gpa, io, cache, "aarch64-macos", entry, null, null);
     defer graph.deinit(gpa);
-    if (graph.err) |err| return .{ .compile_error = try renderGraphErr(gpa, err) };
+    if (graph.err) |err| {
+        try checkGraphSpans(gpa, &graph, err.parse_diags);
+        return .{ .compile_error = try renderGraphErr(gpa, err) };
+    }
 
     var res = try ResolveGraph.resolveGraph(gpa, &graph);
     defer res.deinit(gpa);
     // Typechecking a resolve-broken graph risks spurious diagnostics or a crash, so
     // report the resolve failure and stop before `checkGraph`.
+    try checkGraphSpans(gpa, &graph, res.diags);
     if (countErr(res.diags) > 0) return .{ .compile_error = try renderDiags(gpa, res.diags) };
 
     var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
     defer tc.deinit(gpa);
+    try checkGraphSpans(gpa, &graph, tc.diags);
     if (countErr(tc.diags) > 0) return .{ .compile_error = try renderDiags(gpa, tc.diags) };
 
     if (!can_exec) return .skipped_exec;
