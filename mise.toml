@@ -5,7 +5,7 @@
 zig = "0.16.0"
 # The docs site (packages/site) builds and tests with these.
 node = "24"
-pnpm = "10"
+pnpm = "12.6"
 
 # `<verb>:<mode>`: <verb> is the toy subcommand (build = compile; run = compile +
 # execute), <mode> is the toolchain used to build the toy compiler itself. Pass the

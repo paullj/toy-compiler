@@ -5,7 +5,9 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 const config = {
 	preprocess: vitePreprocess(),
 	kit: {
-		adapter: adapter({ fallback: '404.html' })
+		adapter: adapter({ fallback: '404.html' }),
+		// GitHub Pages serves the site under /<repo>; CI sets this for the Pages build only.
+		paths: { base: process.env.BASE_PATH ?? '' }
 	}
 };
 

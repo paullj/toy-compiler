@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	import { useEventListener } from 'runed';
 	import Code from '$lib/components/Code.svelte';
 	import ThemeToggle from '$lib/components/ThemeToggle.svelte';
@@ -11,9 +12,9 @@
 	];
 
 	const secondary = [
-		{ href: '/tour/', label: 'Tour →' },
-		{ href: '/playground/', label: 'Playground →' },
-		{ href: '/docs/', label: 'Reference →' },
+		{ href: resolve('/tour/'), label: 'Tour →' },
+		{ href: resolve('/playground/'), label: 'Playground →' },
+		{ href: resolve('/docs/'), label: 'Reference →' },
 		{ href: 'https://github.com/paullj/toy-compiler', label: 'Source →' }
 	];
 
@@ -79,9 +80,9 @@ impl Square has Area {
 	];
 
 	const callouts = [
-		{ href: '/tour/', kind: 'Tour', label: 'Take the tour →' },
-		{ href: '/playground/', kind: 'Playground', label: 'Try it in the browser →' },
-		{ href: '/docs/', kind: 'Reference', label: 'Read the docs →' },
+		{ href: resolve('/tour/'), kind: 'Tour', label: 'Take the tour →' },
+		{ href: resolve('/playground/'), kind: 'Playground', label: 'Try it in the browser →' },
+		{ href: resolve('/docs/'), kind: 'Reference', label: 'Read the docs →' },
 		{ href: 'https://github.com/paullj/toy-compiler', kind: 'Source', label: 'View on GitHub →' }
 	];
 
@@ -118,7 +119,7 @@ impl Square has Area {
 			class="sticky top-0 hidden h-screen flex-col border-r px-7 pb-8 pt-28 md:flex"
 			style="border-color: var(--border)"
 		>
-			<a href="/" class="mb-8 inline-flex items-center gap-2 text-xl leading-none">🧸</a>
+			<a href={resolve('/')} class="mb-8 inline-flex items-center gap-2 text-xl leading-none">🧸</a>
 
 			<nav class="flex flex-col gap-1 text-[0.82rem]">
 				{#each nav as s}
