@@ -11,6 +11,7 @@ const ControlFlow = @import("ControlFlow.zig");
 // paths too); the accessors these functions reach for are `pub` on BodyChecker for the
 // same reason, and the compiler enforces that pub-ness.
 const BC = @import("BodyChecker.zig");
+const Typecheck = @import("types.zig");
 const BodyChecker = BC.BodyChecker;
 
 /// Coverage state for a match, by scrutinee kind. Enum: a per-variant seen bitmap.
@@ -439,4 +440,14 @@ test "matchSaturated: wildcard short-circuits; enum needs every variant; bool ne
 
     // Int: an infinite domain — only a wildcard can saturate it.
     try testing.expect(!matchSaturated(.int, false));
+}
+
+test "pattern diagnostics span the pattern or binder list at fault" {
+    try Typecheck.expectSpans(&.{
+        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .a(x) -> x\n  _ -> 0\n }\n}\n", .key = "binds no payload", .want = "(x)" },
+        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .b(x) -> x\n  _ -> 0\n }\n}\n", .key = "binds 2 value(s)", .want = "(x)" },
+        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .a | .b(_q, _r) -> 0\n }\n}\n", .key = "or-pattern", .want = ".a | .b(_q, _r)" },
+        .{ .src = "fn f(x: str) -> int { return match x { _ -> 1 } }\n", .key = "match scrutinee must be", .want = "x" },
+        .{ .src = "enum E { a, b }\nfn f(e: E) -> int {\n return match e {\n  .a -> 1\n  .b -> 2\n  E.a -> 3\n }\n}\n", .key = "unreachable match arm", .want = "E.a" },
+    });
 }

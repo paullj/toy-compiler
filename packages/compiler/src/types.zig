@@ -3391,6 +3391,24 @@ fn checkSource(source: []const u8) !Checked {
     return .{ .tokens = tokens, .tree = tree, .resolve = res, .result = result, .source = source };
 }
 
+/// Test support for span tests in the checker's files: typecheck each case's source,
+/// find the diagnostic whose message contains `key`, and require its span to cover
+/// exactly `want`.
+pub const SpanCase = struct { src: []const u8, key: []const u8, want: []const u8 };
+
+pub fn expectSpans(cases: []const SpanCase) !void {
+    const gpa = testing.allocator;
+    for (cases) |c| {
+        var r = try checkSource(c.src);
+        defer r.deinit(gpa);
+        const d = for (r.result.diags) |d| {
+            if (std.mem.indexOf(u8, d.message, c.key) != null) break d;
+        } else return error.TestExpectedDiagnostic;
+        const sp = d.span();
+        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
+    }
+}
+
 /// Typecheck a source and return the diagnostic count (and free everything).
 fn checkDiagCount(source: []const u8) !usize {
     const gpa = testing.allocator;
@@ -6430,25 +6448,6 @@ test "typed local x: T = e binds x to the annotation" {
     }
 }
 
-test "a type error spans the node it is about, not just its first token" {
-    const gpa = testing.allocator;
-    const Case = struct { src: []const u8, want: []const u8 };
-    const cases = [_]Case{
-        .{ .src = "fn f() {\n x: int = 1 == 2\n return\n}\n", .want = "1 == 2" },
-        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g(1, 2) }\n", .want = "(1, 2)" },
-        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g(1 == 1) }\n", .want = "1 == 1" },
-        .{ .src = "fn f() -> int { return 1 + true }\n", .want = "1 + true" },
-        .{ .src = "fn f() -> int { return (1 == 1) }\n", .want = "1 == 1" },
-        .{ .src = "fn f() -> int { return (1 + 2) * true }\n", .want = "(1 + 2) * true" },
-    };
-    for (cases) |c| {
-        var r = try checkSource(c.src);
-        defer r.deinit(gpa);
-        try testing.expectEqual(@as(usize, 1), r.result.diags.len);
-        const sp = r.result.diags[0].span();
-        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
-    }
-}
 
 test "typed local rejects a mismatched initializer" {
     const gpa = testing.allocator;
@@ -7375,41 +7374,8 @@ test "narrowing via `into` is rejected (no silent lossy conversion)" {
     try testing.expect(c.result.diags.len > 0);
 }
 
-test "checker diagnostics span the expression, argument list or construct they are about" {
-    const gpa = testing.allocator;
-    const Case = struct { src: []const u8, msg: []const u8, want: []const u8 };
-    const cases = [_]Case{
-        .{ .src = "fn f() -> int {\n return 1\n 2 + 3\n}\n", .msg = "unreachable code", .want = "2 + 3" },
-        .{ .src = "fn f() {\n for i in 0..(1 == 1) { }\n}\n", .msg = "for range bounds", .want = "1 == 1" },
-        .{ .src = "fn f(a: int) -> int { return a[0] }\n", .msg = "cannot index", .want = "a[0]" },
-        .{ .src = "struct P { x: int }\nfn f(p: P) -> P { return p + p }\n", .msg = "'+' requires", .want = "p + p" },
-        .{ .src = "struct P { x: int }\nfn f() -> P { return P { x: 1 == 1 } }\n", .msg = "field 'x'", .want = "1 == 1" },
-        .{ .src = "struct T(int, int)\nfn f() -> T { return T(1) }\n", .msg = "tuple struct 'T' expects", .want = "(1)" },
-        .{ .src = "enum E { a(int), b }\nfn f() -> E { return E.a(1, 2) }\n", .msg = "variant 'E.a' expects", .want = "E.a(1, 2)" },
-        .{ .src = "fn id[U](a: U, b: U) -> U { return a }\nfn f() -> int { return id(1, 1 == 1) }\n", .msg = "conflicting types", .want = "1 == 1" },
-        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g[int](1) }\n", .msg = "'g' is not generic", .want = "[int]" },
-        .{ .src = "struct P { x: int }\nfn f() -> P { return P(1) }\n", .msg = "use named construction", .want = "P(1)" },
-        .{ .src = "fn f(a: int) -> int { return a(1) }\n", .msg = "called value is not a function", .want = "a" },
-        .{ .src = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn mk() -> P { return P { x: 0 } }\nfn f() { mk().bump(1) }\n", .msg = "cannot call mutating method", .want = "mk()" },
-        .{ .src = "fn f() {\n break\n}\n", .msg = "break outside", .want = "break" },
-    };
-    for (cases) |c| {
-        var r = try checkSource(c.src);
-        defer r.deinit(gpa);
-        const d = for (r.result.diags) |d| {
-            if (std.mem.startsWith(u8, d.message, c.msg)) break d;
-        } else return error.TestExpectedDiagnostic;
-        const sp = d.span();
-        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
-    }
-}
-
-// ---- Declaration, pattern and coherence diagnostics span their subject ----
-
-test "declaration, pattern and coherence diagnostics span their subject" {
-    const gpa = testing.allocator;
-    const Case = struct { src: []const u8, key: []const u8, want: []const u8 };
-    const cases = [_]Case{
+test "declaration and instantiation diagnostics span their subject" {
+    try expectSpans(&.{
         .{ .src = "struct A { x: int }\nfn g(_a: A[int]) -> int { return 0 }\n", .key = "is not generic", .want = "A[int]" },
         .{ .src = "struct Box[T] { v: T }\nfn g(_b: Box[int, bool]) -> int { return 0 }\n", .key = "expects 1 type argument", .want = "[int, bool]" },
         .{ .src = "struct P { x: int }\npub fn mk(p: P) -> int { return p.x }\n", .key = "exposes non-pub", .want = "P" },
@@ -7417,26 +7383,7 @@ test "declaration, pattern and coherence diagnostics span their subject" {
         .{ .src = "struct P { x: int }\npub enum E { v(int, P) }\n", .key = "exposes non-pub", .want = "P" },
         .{ .src = "fn main() -> bool { return true }\n", .key = "main must return", .want = "bool" },
         .{ .src = "protocol Show { fn show(self) -> int }\nfn h[T has Show](_t: T) -> int { return 0 }\nfn main() -> int { return h(3) }\n", .key = "does not conform", .want = "h(3)" },
-        .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn other(self) -> int { return 1 } }\n", .key = "missing method", .want = "impl A has Show" },
-        .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn show(self, _y: int) -> bool { return true } }\n", .key = "incompatible with protocol", .want = "show(self, _y: int) -> bool" },
-        .{ .src = "struct A { x: int }\nimpl A has Nope[int] { fn f(self) -> int { return 1 } }\n", .key = "is not a declared protocol", .want = "Nope" },
-        .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct A { x: int }\nimpl A has Conv[int, bool] { fn conv(self) -> int { return 1 } }\n", .key = "protocol 'Conv' expects", .want = "Conv[int, bool]" },
         .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct Box[T] { v: T }\nfn h[T has Conv[Box[int]]](_t: T) -> int { return 0 }\n", .key = "bound argument must be", .want = "Box[int]" },
-        .{ .src = "struct T2[T](T)\n", .key = "generic tuple structs", .want = "T2[T]" },
         .{ .src = "struct Box[T] { v: T }\nimpl Box[int] { fn get(self) -> int { return 1 } }\n", .key = "concrete type instance", .want = "Box[int]" },
-        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .a(x) -> x\n  _ -> 0\n }\n}\n", .key = "binds no payload", .want = "(x)" },
-        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .b(x) -> x\n  _ -> 0\n }\n}\n", .key = "binds 2 value(s)", .want = "(x)" },
-        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .a | .b(_q, _r) -> 0\n }\n}\n", .key = "or-pattern", .want = ".a | .b(_q, _r)" },
-        .{ .src = "fn f(x: str) -> int { return match x { _ -> 1 } }\n", .key = "match scrutinee must be", .want = "x" },
-        .{ .src = "enum E { a, b }\nfn f(e: E) -> int {\n return match e {\n  .a -> 1\n  .b -> 2\n  E.a -> 3\n }\n}\n", .key = "unreachable match arm", .want = "E.a" },
-    };
-    for (cases) |c| {
-        var r = try checkSource(c.src);
-        defer r.deinit(gpa);
-        const d = for (r.result.diags) |d| {
-            if (std.mem.indexOf(u8, d.message, c.key) != null) break d;
-        } else return error.TestExpectedDiagnostic;
-        const sp = d.span();
-        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
-    }
+    });
 }

@@ -398,3 +398,9 @@ fn aliasLink(t: *Typecheck, by_name: *const std.StringHashMapUnmanaged(u32), nod
     if (by_name.get(nm)) |j| return j;
     return null;
 }
+
+test "registration diagnostics span the declaration at fault" {
+    try Typecheck.expectSpans(&.{
+        .{ .src = "struct T2[T](T)\n", .key = "generic tuple structs", .want = "T2[T]" },
+    });
+}
