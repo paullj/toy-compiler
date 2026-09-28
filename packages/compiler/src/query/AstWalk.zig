@@ -115,6 +115,60 @@ pub const Event = union(enum) {
     try_operator: struct { idx: Ast.Index },
 };
 
+/// The source extent `[start, end)` of the subtree at `idx`: from its first token to its
+/// last, where the tokens are the main tokens of every node the canonical walk enters,
+/// widened to balance the brackets inside it — a call's `)` or a block's `}` closes a node
+/// but is no node's main token, and a subtree starting inside a parenthesis (`(a + b) * c`)
+/// must take the `(` too; parentheses make no node of their own.
+pub fn nodeSpan(src: Source, idx: Ast.Index) Span {
+    var ext: Extent = .{ .tree = src.tree };
+    walk(src, idx, &ext) catch unreachable;
+    const toks = src.tokens;
+    var first = ext.first;
+    var last = ext.last;
+    var open: u32 = 0; // openers still unclosed at the end
+    var unopened: u32 = 0; // closers with no opener inside the range
+    for (toks[first .. last + 1]) |t| switch (bracketDelta(t.tag)) {
+        1 => open += 1,
+        -1 => if (open > 0) {
+            open -= 1;
+        } else {
+            unopened += 1;
+        },
+        else => {},
+    };
+    while (unopened > 0 and first > 0 and bracketDelta(toks[first - 1].tag) == 1) : (unopened -= 1) first -= 1;
+    while (open > 0 and last + 1 < toks.len and bracketDelta(toks[last + 1].tag) == -1) : (open -= 1) last += 1;
+    return .{ .start = toks[first].start, .end = toks[last].end };
+}
+
+pub const Span = @import("../diagnostics/model.zig").Span;
+
+const Extent = struct {
+    tree: Ast.Tree,
+    first: u32 = std.math.maxInt(u32),
+    last: u32 = 0,
+
+    pub fn on(self: *Extent, ev: Event) void {
+        switch (ev) {
+            .enter => |e| {
+                const tok = self.tree.nodes[e.idx.int()].main_token;
+                self.first = @min(self.first, tok);
+                self.last = @max(self.last, tok);
+            },
+            else => {},
+        }
+    }
+};
+
+fn bracketDelta(tag: TokenTag) i32 {
+    return switch (tag) {
+        .l_paren, .l_bracket, .l_brace => 1,
+        .r_paren, .r_bracket, .r_brace => -1,
+        else => 0,
+    };
+}
+
 /// The error set of `visitor.on`, or the empty set when the visitor has no `on`.
 fn VisitorError(comptime V: type) type {
     const T = @typeInfo(V).pointer.child;
@@ -1940,4 +1994,33 @@ test "a WIDENING `?` folds the resolved `From` witness; the identity `?` folds n
     }
     try testing.expect(outer_has);
     try testing.expect(!same_has);
+}
+
+test "nodeSpan covers a subtree from its first token through the brackets it closes" {
+    const gpa = std.testing.allocator;
+    const src_text = "fn f(a: int, b: int) -> int { return a }\nfn main() -> int {\n    x: int = f(1, [2][0]) + 3\n    return x\n}\n";
+    var b = try build(gpa, src_text);
+    defer b.deinit(gpa);
+    const src: Source = .{ .tree = b.tree, .tokens = b.tokens, .source = b.source };
+    var saw = [_]bool{false} ** 3;
+    for (b.tree.nodes, 0..) |n, i| {
+        const sp = nodeSpan(src, Ast.Index.from(@intCast(i)));
+        const text = src_text[sp.start..sp.end];
+        switch (n.tag) {
+            .call => {
+                try std.testing.expectEqualStrings("f(1, [2][0])", text);
+                saw[0] = true;
+            },
+            .binary => {
+                try std.testing.expectEqualStrings("f(1, [2][0]) + 3", text);
+                saw[1] = true;
+            },
+            .var_decl => {
+                try std.testing.expectEqualStrings("x: int = f(1, [2][0]) + 3", text);
+                saw[2] = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw[0] and saw[1] and saw[2]);
 }

@@ -87,7 +87,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
         if (guarded) {
             const gt = try bc.typeOf(h.guard);
             if (gt.kind != .invalid and gt.kind != .bool)
-                try bc.sink.emitFmtCode(.T0045, bc.byteOf(bc.tree.nodes[(h.guard).int()].main_token), "match guard must be bool, got {s}", .{bc.typeName(gt)});
+                try bc.sink.emitFmtCodeSpan(.T0045, bc.spanOf(h.guard), "match guard must be bool, got {s}", .{bc.typeName(gt)});
         }
         const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
         const body_ty: Type = if (armDiverges(bc, h.body)) Type.never else body_ty0;
@@ -107,11 +107,11 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
                 n_missing += 1;
             };
             if (n_missing > 0)
-                try bc.sink.emitFmtCode(.T0048, bc.byteOf(n.main_token), "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
+                try bc.sink.emitFmtCodeSpan(.T0048, scrutineeSpan(bc, n), "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
         },
         .bool => |bcov| if (!(bcov.t and bcov.f))
-            try bc.sink.emitFmtCode(.T0048, bc.byteOf(n.main_token), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
-        .int => try bc.sink.emitFmtCode(.T0048, bc.byteOf(n.main_token), "non-exhaustive match: int match requires '_'", .{}),
+            try bc.sink.emitFmtCodeSpan(.T0048, scrutineeSpan(bc, n), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
+        .int => try bc.sink.emitFmtCodeSpan(.T0048, scrutineeSpan(bc, n), "non-exhaustive match: int match requires '_'", .{}),
     };
     bc.node_types[(node_idx).int()] = result;
     return result;
@@ -121,6 +121,11 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
 // tree + enum table); the pattern checker below delegates through these thin
 // wrappers. `variantPayloadIrrefutable` is the one that takes a resolved
 // `VariantSym` directly (the caller already has it).
+
+/// `match <scrutinee>`: what a non-exhaustive match underlines, short of its arms.
+fn scrutineeSpan(bc: *const BodyChecker, n: Ast.Node) @import("diagnostics/model.zig").Span {
+    return .{ .start = bc.byteOf(n.main_token), .end = bc.spanOf(n.lhs).end };
+}
 
 fn irrefutable(bc: *const BodyChecker, pat_idx: Ast.Index, ty: Type) bool {
     return ControlFlow.irrefutable(bc.cflow(), pat_idx, ty);

@@ -6369,6 +6369,26 @@ test "typed local x: T = e binds x to the annotation" {
     }
 }
 
+test "a type error spans the node it is about, not just its first token" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "fn f() {\n x: int = 1 == 2\n return\n}\n", .want = "1 == 2" },
+        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g(1, 2) }\n", .want = "(1, 2)" },
+        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g(1 == 1) }\n", .want = "1 == 1" },
+        .{ .src = "fn f() -> int { return 1 + true }\n", .want = "1 + true" },
+        .{ .src = "fn f() -> int { return (1 == 1) }\n", .want = "1 == 1" },
+        .{ .src = "fn f() -> int { return (1 + 2) * true }\n", .want = "(1 + 2) * true" },
+    };
+    for (cases) |c| {
+        var r = try checkSource(c.src);
+        defer r.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), r.result.diags.len);
+        const sp = r.result.diags[0].span();
+        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
+    }
+}
+
 test "typed local rejects a mismatched initializer" {
     const gpa = testing.allocator;
     var c = try checkSource("fn f() {\n x: int = true\n return\n}\n");

@@ -56,6 +56,7 @@ const MAX_DIAGNOSTIC_LATENCY_MS = 600;
 test('a type error is reported while typing and cleared once fixed', async ({ page }) => {
 	const b = await live(page, 'order.toy');
 	await typeAtEndOfLine(page, b, 'quantity := 3', '\nlabel: int = "three"');
+	await expect(b.locator('.cm-lintRange-error')).toHaveText('"three"');
 	const typed = Date.now();
 	await expect(b.locator('.cm-lintRange-error, .cm-lintPoint-error')).toHaveCount(1);
 	expect(Date.now() - typed).toBeLessThan(MAX_DIAGNOSTIC_LATENCY_MS);
@@ -93,7 +94,7 @@ test('a diagnostic tooltip links its code and jumps to the related definition', 
 	await typeAtEndOfLine(page, b, '}', '\nfn add(a: int, b: int) -> int { return a + b }');
 	await typeAtEndOfLine(page, b, 'quantity := 3', '\n_sum := add(1)');
 	const mark = b.locator('.cm-lintRange-error');
-	await expect(mark).toHaveText('(');
+	await expect(mark).toHaveText('(1)');
 	// Let the popups the call opened close first: without this settle the hover is flaky.
 	await page.keyboard.press('Escape');
 	await page.waitForTimeout(300);

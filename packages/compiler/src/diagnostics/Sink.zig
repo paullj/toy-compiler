@@ -172,8 +172,13 @@ pub const Builder = struct {
 
     /// Set the primary span `[s, e)`; the emitted diagnostic's `byte_offset` is `s`.
     pub fn span(b: Builder, s: u32, e: u32) Builder {
+        return b.spanOf(.{ .start = s, .end = e });
+    }
+
+    /// `span` from a `model.Span`.
+    pub fn spanOf(b: Builder, sp: model.Span) Builder {
         var n = b;
-        n.primary = .{ .start = s, .end = e };
+        n.primary = sp;
         return n;
     }
 
