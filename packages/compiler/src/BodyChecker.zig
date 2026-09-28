@@ -3535,3 +3535,27 @@ test "Lint.droppedMustUseName suppresses poison and non-must-use, else names the
     try testing.expectEqualStrings("Option", Lint.droppedMustUseName(.unit, .option).?);
     try testing.expectEqualStrings("Result", Lint.droppedMustUseName(.unit, .result).?);
 }
+
+test "a checker diagnostic spans the node it is about, not just its first token" {
+    try Typecheck.expectSpans(&.{
+        .{ .src = "fn f() {\n x: int = 1 == 2\n return\n}\n", .key = "", .want = "1 == 2" },
+        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g(1, 2) }\n", .key = "", .want = "(1, 2)" },
+        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g(1 == 1) }\n", .key = "", .want = "1 == 1" },
+        .{ .src = "fn f() -> int { return 1 + true }\n", .key = "", .want = "1 + true" },
+        .{ .src = "fn f() -> int { return (1 == 1) }\n", .key = "", .want = "1 == 1" },
+        .{ .src = "fn f() -> int { return (1 + 2) * true }\n", .key = "", .want = "(1 + 2) * true" },
+        .{ .src = "fn f() -> int {\n return 1\n 2 + 3\n}\n", .key = "unreachable code", .want = "2 + 3" },
+        .{ .src = "fn f() {\n for i in 0..(1 == 1) { }\n}\n", .key = "for range bounds", .want = "1 == 1" },
+        .{ .src = "fn f(a: int) -> int { return a[0] }\n", .key = "cannot index", .want = "a[0]" },
+        .{ .src = "struct P { x: int }\nfn f(p: P) -> P { return p + p }\n", .key = "'+' requires", .want = "p + p" },
+        .{ .src = "struct P { x: int }\nfn f() -> P { return P { x: 1 == 1 } }\n", .key = "field 'x'", .want = "1 == 1" },
+        .{ .src = "struct T(int, int)\nfn f() -> T { return T(1) }\n", .key = "tuple struct 'T' expects", .want = "(1)" },
+        .{ .src = "enum E { a(int), b }\nfn f() -> E { return E.a(1, 2) }\n", .key = "variant 'E.a' expects", .want = "E.a(1, 2)" },
+        .{ .src = "fn id[U](a: U, b: U) -> U { return a }\nfn f() -> int { return id(1, 1 == 1) }\n", .key = "conflicting types", .want = "1 == 1" },
+        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g[int](1) }\n", .key = "'g' is not generic", .want = "[int]" },
+        .{ .src = "struct P { x: int }\nfn f() -> P { return P(1) }\n", .key = "use named construction", .want = "P(1)" },
+        .{ .src = "fn f(a: int) -> int { return a(1) }\n", .key = "called value is not a function", .want = "a" },
+        .{ .src = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn mk() -> P { return P { x: 0 } }\nfn f() { mk().bump(1) }\n", .key = "cannot call mutating method", .want = "mk()" },
+        .{ .src = "fn f() {\n break\n}\n", .key = "break outside", .want = "break" },
+    });
+}

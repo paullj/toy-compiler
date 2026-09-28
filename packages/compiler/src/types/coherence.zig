@@ -472,3 +472,12 @@ test "ordEqRefinementReceivers registers exactly one (Eq,T) per Ord recv; explic
         try testing.expect(Type.eql(out.items[1], Q));
     }
 }
+
+test "coherence diagnostics span the impl or signature at fault" {
+    try Typecheck.expectSpans(&.{
+        .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn other(self) -> int { return 1 } }\n", .key = "missing method", .want = "impl A has Show" },
+        .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn show(self, _y: int) -> bool { return true } }\n", .key = "incompatible with protocol", .want = "show(self, _y: int) -> bool" },
+        .{ .src = "struct A { x: int }\nimpl A has Nope[int] { fn f(self) -> int { return 1 } }\n", .key = "is not a declared protocol", .want = "Nope" },
+        .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct A { x: int }\nimpl A has Conv[int, bool] { fn conv(self) -> int { return 1 } }\n", .key = "protocol 'Conv' expects", .want = "Conv[int, bool]" },
+    });
+}
