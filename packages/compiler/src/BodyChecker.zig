@@ -3166,7 +3166,7 @@ pub const BodyChecker = struct {
         try bc.derive_reqs.append(bc.gpa, .{
             .protocol_id = pid,
             .conform_ty = t,
-            .site = .{ .scope = bc.sink.cur_scope, .span = bc.spanOf(site) },
+            .site = .{ .scope = bc.sink.cur_scope, .node = site },
         });
     }
 

@@ -4,6 +4,7 @@
 //! `monomorphize`; the rest are its resolver/fixpoint helpers.
 
 const std = @import("std");
+const AstWalk = @import("../query/AstWalk.zig");
 const Typecheck = @import("../types.zig");
 const Type = Typecheck.Type;
 const Method = Typecheck.Method;
@@ -134,18 +135,12 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     defer memo.deinit(gpa);
 
     // Ord fixpoint.
-    // `ord_seen` doubles as the ord-type SET (keyed `writeKey(ord_pid, .ord, ty)`); the Eq
+    // `ord_work.seen` doubles as the ord-type SET (keyed `writeKey(ord_pid, .ord, ty)`); the Eq
     // fixpoint consults it so an Ord type is NEVER given a separate Eq recipe — a derived
     // `Ord` fills the single `(Eq, T)` slot (precedence), and `==` routes through its
     // `cmp`. The fixpoint chases struct fields AND every enum variant's payload fields,
     // skipping any field with a live explicit conformance (it uses its own witness).
-    var ord_seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = ord_seen.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
-        ord_seen.deinit(gpa);
-    }
-    var ord_work: std.ArrayList(Type) = .empty;
+    var ord_work: Worklist = .{};
     defer ord_work.deinit(gpa);
     var comps: std.ArrayList(Type) = .empty;
     defer comps.deinit(gpa);
@@ -153,12 +148,12 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     if (ord_pid_opt) |ord_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != ord_pid) continue;
-            try enqueueDerive(gpa, &ord_seen, &ord_work, ord_pid, .ord, req.conform_ty);
+            try ord_work.add(gpa, ord_pid, .ord, req.conform_ty, req.site);
         }
         var oi: usize = 0;
-        while (oi < ord_work.items.len) : (oi += 1) {
+        while (oi < ord_work.types.items.len) : (oi += 1) {
             comps.clearRetainingCapacity();
-            try collectComponentTypes(t, ord_work.items[oi], &comps);
+            try collectComponentTypes(t, ord_work.types.items[oi], &comps);
             for (comps.items) |ft| {
                 switch (ft.kind) {
                     .@"struct", .@"enum" => {},
@@ -166,7 +161,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 }
                 if (hasConformanceLive(t, ord_pid, ft)) continue; // explicit Ord field: reuse its witness
                 if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, ord_pid, &memo, gpa, t.composite, &.{}))
-                    try enqueueDerive(gpa, &ord_seen, &ord_work, ord_pid, .ord, ft);
+                    try ord_work.add(gpa, ord_pid, .ord, ft, ord_work.sites.items[oi]);
             }
         }
     }
@@ -199,20 +194,14 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     };
 
     // Eq fixpoint, SKIPPING any Ord type.
-    var eq_seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = eq_seen.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
-        eq_seen.deinit(gpa);
-    }
-    var eq_work: std.ArrayList(Type) = .empty;
+    var eq_work: Worklist = .{};
     defer eq_work.deinit(gpa);
 
     for (t.derive_reqs.items) |req| {
         if (req.protocol_id != eq_pid) continue;
         if (isRefType(t, req.conform_ty)) continue; // a Ref is compared inline (cell identity), no witness
-        if (try ordFills(t, &ord_seen, ord_pid_opt, req.conform_ty)) continue; // Ord fills Eq
-        try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, req.conform_ty);
+        if (try ordFills(t, &ord_work.seen, ord_pid_opt, req.conform_ty)) continue; // Ord fills Eq
+        try eq_work.add(gpa, eq_pid, .eq, req.conform_ty, req.site);
     }
     for (desc_keys.items) |k| {
         // A descriptor'd key carrying an EXPLICIT `impl has Eq`/`Ord` supplies its own `==`
@@ -223,13 +212,13 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         // witness — the SAME guard the aggregate-field Eq walk below applies.
         if (hasConformanceLive(t, eq_pid, k)) continue; // explicit Eq: reuse its witness
         if (ord_pid_opt) |op| if (hasConformanceLive(t, op, k)) continue; // explicit Ord: its cmp fills eq
-        if (try ordFills(t, &ord_seen, ord_pid_opt, k)) continue; // a derived Ord fills the (Eq,K) slot
-        try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, k);
+        if (try ordFills(t, &ord_work.seen, ord_pid_opt, k)) continue; // a derived Ord fills the (Eq,K) slot
+        try eq_work.add(gpa, eq_pid, .eq, k, null);
     }
     var ei: usize = 0;
-    while (ei < eq_work.items.len) : (ei += 1) {
+    while (ei < eq_work.types.items.len) : (ei += 1) {
         comps.clearRetainingCapacity();
-        try collectComponentTypes(t, eq_work.items[ei], &comps);
+        try collectComponentTypes(t, eq_work.types.items[ei], &comps);
         for (comps.items) |ft| {
             switch (ft.kind) {
                 .@"struct", .@"enum" => {},
@@ -237,9 +226,9 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             }
             if (isRefType(t, ft)) continue; // a Ref field is compared inline (cell identity), no witness
             if (hasConformanceLive(t, eq_pid, ft)) continue; // explicit Eq field: reuse its witness
-            if (try ordFills(t, &ord_seen, ord_pid_opt, ft)) continue; // Ord fills Eq: the field's cmp witness serves `==`
+            if (try ordFills(t, &ord_work.seen, ord_pid_opt, ft)) continue; // Ord fills Eq: the field's cmp witness serves `==`
             if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa, t.composite, &.{}))
-                try enqueueDerive(gpa, &eq_seen, &eq_work, eq_pid, .eq, ft);
+                try eq_work.add(gpa, eq_pid, .eq, ft, eq_work.sites.items[ei]);
         }
     }
 
@@ -249,24 +238,13 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     // AND every enum variant's payload — skipping any field with a live explicit `Hash`
     // conformance (it uses its own witness). The SAME `collectComponentTypes` order the
     // emitter walks, so the derived hash is `Eq`-consistent by construction.
-    var hash_seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = hash_seen.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
-        hash_seen.deinit(gpa);
-    }
-    var hash_work: std.ArrayList(Type) = .empty;
+    var hash_work: Worklist = .{};
     defer hash_work.deinit(gpa);
-    // Parallel to `hash_work`: the site of the request each item was reached from. The Hash
-    // fixpoint is the one that can reject a type (a `Ref` field), and must say where.
-    var hash_sites: std.ArrayList(?Typecheck.DeriveSite) = .empty;
-    defer hash_sites.deinit(gpa);
 
     if (hash_pid_opt) |hash_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != hash_pid) continue;
-            if (try claimDerive(gpa, &hash_seen, hash_pid, .hash, req.conform_ty))
-                try pushHash(gpa, &hash_work, &hash_sites, req.conform_ty, req.site);
+            try hash_work.add(gpa, hash_pid, .hash, req.conform_ty, req.site);
         }
         for (desc_keys.items) |k| {
             // A key with an EXPLICIT `impl has Hash` supplies its own hash witness (which the
@@ -274,14 +252,13 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             // collide into an `.ambiguous` resolve. Reuse the live witness — any deterministic
             // hash is consistent with the derived structural eq the map pairs it with.
             if (hasConformanceLive(t, hash_pid, k)) continue; // explicit Hash: reuse its witness
-            if (try claimDerive(gpa, &hash_seen, hash_pid, .hash, k))
-                try pushHash(gpa, &hash_work, &hash_sites, k, null);
+            try hash_work.add(gpa, hash_pid, .hash, k, null);
         }
         var hi: usize = 0;
-        while (hi < hash_work.items.len) : (hi += 1) {
-            const site = hash_sites.items[hi];
+        while (hi < hash_work.types.items.len) : (hi += 1) {
+            const site = hash_work.sites.items[hi];
             comps.clearRetainingCapacity();
-            try collectComponentTypes(t, hash_work.items[hi], &comps);
+            try collectComponentTypes(t, hash_work.types.items[hi], &comps);
             for (comps.items) |ft| {
                 switch (ft.kind) {
                     .@"struct", .@"enum" => {},
@@ -290,13 +267,12 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 // A managed box has no hashable value — its identity is a heap cell, not a
                 // stable key — so a Hash derive over a field that holds one is a compile error.
                 if (isRefType(t, ft)) {
-                    try emitRefHash(t, site, hash_work.items[hi], ft);
+                    try emitRefHash(t, site, hash_work.types.items[hi], ft);
                     continue;
                 }
                 if (hasConformanceLive(t, hash_pid, ft)) continue; // explicit Hash field: reuse its witness
                 if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa, t.composite, &.{}))
-                    if (try claimDerive(gpa, &hash_seen, hash_pid, .hash, ft))
-                        try pushHash(gpa, &hash_work, &hash_sites, ft, site);
+                    try hash_work.add(gpa, hash_pid, .hash, ft, site);
             }
         }
     }
@@ -308,24 +284,18 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     // explicit `Display` conformance (it uses its own witness). The SAME
     // `collectComponentTypes` order the emitter walks, so a nested field's `display` witness
     // is a sibling recipe.
-    var disp_seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = disp_seen.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
-        disp_seen.deinit(gpa);
-    }
-    var disp_work: std.ArrayList(Type) = .empty;
+    var disp_work: Worklist = .{};
     defer disp_work.deinit(gpa);
 
     if (display_pid_opt) |disp_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != disp_pid) continue;
-            try enqueueDerive(gpa, &disp_seen, &disp_work, disp_pid, .display, req.conform_ty);
+            try disp_work.add(gpa, disp_pid, .display, req.conform_ty, req.site);
         }
         var wi: usize = 0;
-        while (wi < disp_work.items.len) : (wi += 1) {
+        while (wi < disp_work.types.items.len) : (wi += 1) {
             comps.clearRetainingCapacity();
-            try collectComponentTypes(t, disp_work.items[wi], &comps);
+            try collectComponentTypes(t, disp_work.types.items[wi], &comps);
             for (comps.items) |ft| {
                 switch (ft.kind) {
                     .@"struct", .@"enum" => {},
@@ -333,7 +303,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 }
                 if (hasConformanceLive(t, disp_pid, ft)) continue; // explicit Display field: reuse its witness
                 if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, disp_pid, &memo, gpa, t.composite, &.{}))
-                    try enqueueDerive(gpa, &disp_seen, &disp_work, disp_pid, .display, ft);
+                    try disp_work.add(gpa, disp_pid, .display, ft, disp_work.sites.items[wi]);
             }
         }
     }
@@ -344,31 +314,25 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     // holds a managed field — a `Ref` field is the trace BOUNDARY and is never enqueued
     // (its cell is marked, its pointee never recursed). The SAME `collectComponentTypes`
     // order the other fixpoints walk, so trace's field projection agrees with eq/hash.
-    var trace_seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer {
-        var it = trace_seen.keyIterator();
-        while (it.next()) |k| gpa.free(k.*);
-        trace_seen.deinit(gpa);
-    }
-    var trace_work: std.ArrayList(Type) = .empty;
+    var trace_work: Worklist = .{};
     defer trace_work.deinit(gpa);
     {
         var tmemo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
         defer tmemo.deinit(gpa);
-        for ([_][]const Type{ ord_work.items, eq_work.items, hash_work.items, disp_work.items }) |lst| {
+        for ([_][]const Type{ ord_work.types.items, eq_work.types.items, hash_work.types.items, disp_work.types.items }) |lst| {
             for (lst) |ty| {
                 switch (ty.kind) {
                     .@"struct", .@"enum" => {},
                     else => continue,
                 }
                 if (try needsTrace(t, ty, false, &tmemo))
-                    try enqueueDerive(gpa, &trace_seen, &trace_work, trace_pid, .trace, ty);
+                    try trace_work.add(gpa, trace_pid, .trace, ty, null);
             }
         }
         var ti: usize = 0;
-        while (ti < trace_work.items.len) : (ti += 1) {
+        while (ti < trace_work.types.items.len) : (ti += 1) {
             comps.clearRetainingCapacity();
-            try collectComponentTypes(t, trace_work.items[ti], &comps);
+            try collectComponentTypes(t, trace_work.types.items[ti], &comps);
             for (comps.items) |ft| {
                 switch (ft.kind) {
                     .@"struct", .@"enum" => {},
@@ -376,7 +340,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 }
                 if (isRefType(t, ft)) continue; // the trace boundary — mark the cell, never recurse
                 if (try needsTrace(t, ft, false, &tmemo))
-                    try enqueueDerive(gpa, &trace_seen, &trace_work, trace_pid, .trace, ft);
+                    try trace_work.add(gpa, trace_pid, .trace, ft, trace_work.sites.items[ti]);
             }
         }
     }
@@ -385,7 +349,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     const ordering_ty: Type = if (pre.ordering_enum) |oid| Type.enumT(oid) else .{ .kind = .invalid };
     if (ord_pid_opt) |ord_pid| {
         const ord_name = t.protocols.items[ord_pid].name;
-        for (ord_work.items) |ty| try t.derives.append(gpa, .{
+        for (ord_work.types.items) |ty| try t.derives.append(gpa, .{
             .protocol_id = ord_pid,
             .protocol_name = ord_name,
             .kind = .ord,
@@ -393,7 +357,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             .ret = ordering_ty,
         });
     }
-    for (eq_work.items) |ty| try t.derives.append(gpa, .{
+    for (eq_work.types.items) |ty| try t.derives.append(gpa, .{
         .protocol_id = eq_pid,
         .protocol_name = eq_name,
         .kind = .eq,
@@ -402,7 +366,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     });
     if (hash_pid_opt) |hash_pid| {
         const hash_name = t.protocols.items[hash_pid].name;
-        for (hash_work.items) |ty| try t.derives.append(gpa, .{
+        for (hash_work.types.items) |ty| try t.derives.append(gpa, .{
             .protocol_id = hash_pid,
             .protocol_name = hash_name,
             .kind = .hash,
@@ -412,7 +376,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     }
     if (display_pid_opt) |disp_pid| {
         const disp_name = t.protocols.items[disp_pid].name;
-        for (disp_work.items) |ty| try t.derives.append(gpa, .{
+        for (disp_work.types.items) |ty| try t.derives.append(gpa, .{
             .protocol_id = disp_pid,
             .protocol_name = disp_name,
             .kind = .display,
@@ -423,7 +387,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
 
     // Trace recipes. The sentinel `trace_pid` sorts these LAST, so no eq/ord/hash/display
     // recipe's position or minted name shifts.
-    for (trace_work.items) |ty| {
+    for (trace_work.types.items) |ty| {
         try t.derives.append(gpa, .{
             .protocol_id = trace_pid,
             .protocol_name = "Trace",
@@ -615,46 +579,50 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
     }
 }
 
-/// Enqueue `ty` for derive `(pid, kind)` once, deduped on the canonical recipe key so a
-/// repeated request / nested field is synthesized a single time. `seen` OWNS the key bytes.
 /// `container`'s Hash derive reached a managed-box field. Reported at the expression that
-/// demanded the derive; a derive seeded only by a descriptor key has no such site, so it
-/// falls back to the box's declaration name.
+/// demanded the derive, measured only now; a derive seeded only by a descriptor key has no
+/// such site, so it falls back to the box's declaration name.
 fn emitRefHash(t: *Typecheck, site: ?Typecheck.DeriveSite, container: Type, ft: Type) !void {
     const sym = t.structs.items[ft.struct_id];
-    const at: Typecheck.DeriveSite = site orelse blk: {
-        const m = t.graph.mods[sym.mod];
-        const tok = m.tree.nodes[sym.decl_node.int()].main_token;
-        break :blk .{ .scope = sym.mod, .span = .{ .start = m.tokens[tok].start, .end = m.tokens[tok].end } };
-    };
-    const prev = t.sink.cur_scope;
-    defer t.sink.setScope(prev);
-    t.sink.setScope(at.scope);
-    try t.sink.report(.{ .span = at.span, .code = .T0030 }, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
+    const scope = if (site) |s| s.scope else sym.mod;
+    const m = &t.graph.mods[scope];
+    const span = if (site) |s|
+        AstWalk.nodeSpan(.{ .tree = m.tree, .tokens = m.tokens, .source = m.source }, s.node)
+    else
+        Typecheck.refs.tokSpan(m, m.tree.nodes[sym.decl_node.int()].main_token);
+    try t.sink.report(.{ .span = span, .code = .T0030, .scope = scope }, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
 }
 
-fn pushHash(gpa: std.mem.Allocator, work: *std.ArrayList(Type), sites: *std.ArrayList(?Typecheck.DeriveSite), ty: Type, site: ?Typecheck.DeriveSite) !void {
-    try work.append(gpa, ty);
-    try sites.append(gpa, site);
-}
+/// One derive fixpoint's queue: each `(protocol, kind, type)` enters once (deduped on the
+/// canonical recipe key, whose bytes `seen` owns), carrying the site of the request it was
+/// reached from, so an impossible derive can say where it was demanded.
+const Worklist = struct {
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    types: std.ArrayList(Type) = .empty,
+    sites: std.ArrayList(?Typecheck.DeriveSite) = .empty,
 
-fn enqueueDerive(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), work: *std.ArrayList(Type), pid: u32, kind: Derive.Kind, ty: Type) !void {
-    if (try claimDerive(gpa, seen, pid, kind, ty)) try work.append(gpa, ty);
-}
+    fn deinit(w: *Worklist, gpa: std.mem.Allocator) void {
+        var it = w.seen.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        w.seen.deinit(gpa);
+        w.types.deinit(gpa);
+        w.sites.deinit(gpa);
+    }
 
-/// Mark `(pid, kind, ty)` as seen; false when it already was.
-fn claimDerive(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), pid: u32, kind: Derive.Kind, ty: Type) !bool {
-    var kb: std.ArrayList(u8) = .empty;
-    defer kb.deinit(gpa);
-    try Derive.writeKey(gpa, &kb, pid, kind, ty);
-    if (seen.contains(kb.items)) return false;
-    const owned = try kb.toOwnedSlice(gpa);
-    errdefer gpa.free(owned);
-    try seen.put(gpa, owned, {});
-    return true;
-}
-
-
+    fn add(w: *Worklist, gpa: std.mem.Allocator, pid: u32, kind: Derive.Kind, ty: Type, site: ?Typecheck.DeriveSite) !void {
+        var kb: std.ArrayList(u8) = .empty;
+        defer kb.deinit(gpa);
+        try Derive.writeKey(gpa, &kb, pid, kind, ty);
+        if (w.seen.contains(kb.items)) return;
+        try w.types.ensureUnusedCapacity(gpa, 1);
+        try w.sites.ensureUnusedCapacity(gpa, 1);
+        const owned = try kb.toOwnedSlice(gpa);
+        errdefer gpa.free(owned);
+        try w.seen.put(gpa, owned, {});
+        w.types.appendAssumeCapacity(ty);
+        w.sites.appendAssumeCapacity(site);
+    }
+};
 
 /// True when `ty` already has (or will have) a DERIVED `Ord` recipe — so its `cmp` fills the
 /// single `(Eq, ty)` slot and the Eq fixpoint must not synthesize a separate Eq unit for it.
