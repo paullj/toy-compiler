@@ -54,6 +54,9 @@ const prelude_reg = @import("symbols/Prelude.zig");
 const StdNames = @import("symbols/StdNames.zig");
 const nearmiss = @import("diagnostics/nearmiss.zig");
 const Engine = @import("query/Engine.zig");
+const AstWalk = @import("query/AstWalk.zig");
+const Span = @import("diagnostics/model.zig").Span;
+const NO_END = @import("diagnostics/Diagnostic.zig").NO_END;
 const Io = std.Io;
 
 const Typecheck = @This();
@@ -156,6 +159,11 @@ pub const refs = struct {
         return self.tokens[tok].start;
     }
 
+    /// The source extent of the subtree at `node` in the active module.
+    pub fn spanOf(self: anytype, node: Ast.Index) Span {
+        return AstWalk.nodeSpan(.{ .tree = self.tree, .tokens = self.tokens, .source = self.source }, node);
+    }
+
     /// Human-readable name of a type (a struct/enum's declared name, else its kind tag).
     pub fn typeName(self: anytype, ty: Type) []const u8 {
         if (ty.kind == .@"struct" and ty.struct_id < self.structSyms().len)
@@ -191,7 +199,7 @@ pub const refs = struct {
         // A type application `Box[int]` (in type position or a struct-construction lhs)
         // resolves to a composite `App`: the base is a generic struct ctor, each
         // arg is recursively resolved (subst-aware), interned to one composite index.
-        if (tn.tag == .type_app) return refs.typeFromTypeApp(self, tn);
+        if (tn.tag == .type_app) return refs.typeFromTypeApp(self, type_node, tn);
         // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
         // receiver binds to a `.module`. Resolve it against the owning module's tables.
         if (tn.tag == .field_access) return refs.typeFromQualified(self, type_node, tn);
@@ -276,7 +284,7 @@ pub const refs = struct {
     /// `type_var` while decoding a template's field/payload patterns), then the
     /// `(ctor, is_enum, args)` tuple is interned to one composite index. A non-generic
     /// base or an arity mismatch is a clean type error.
-    pub fn typeFromTypeApp(self: anytype, tn: Ast.Node) Type {
+    pub fn typeFromTypeApp(self: anytype, node_idx: Ast.Index, tn: Ast.Node) Type {
         const base = self.tree.nodes[tn.lhs.int()];
         var ctor_id: u32 = undefined;
         var is_enum = false;
@@ -317,12 +325,13 @@ pub const refs = struct {
         const gen_params = if (is_enum) self.enumSyms()[ctor_id].generic_params else self.structSyms()[ctor_id].generic_params;
         const gen_is_generic = if (is_enum) self.enumSyms()[ctor_id].is_generic else self.structSyms()[ctor_id].is_generic;
         if (!gen_is_generic) {
-            self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), "'{s}' is not generic; drop the type arguments", .{gen_name}) catch {};
+            self.sink.emitFmtCodeSpan(.T0001, refs.spanOf(self, node_idx), "'{s}' is not generic; drop the type arguments", .{gen_name}) catch {};
             return .invalid;
         }
         const arg_nodes = Ast.rangeSlice(self.tree, tn.rhs.int());
         if (arg_nodes.len != gen_params.len) {
-            self.sink.emitFmtCode(.T0001, refs.byteOf(self, tn.main_token), "'{s}' expects {d} type argument(s), got {d}", .{ gen_name, gen_params.len, arg_nodes.len }) catch {};
+            const args_span: Span = .{ .start = refs.byteOf(self, tn.main_token), .end = refs.spanOf(self, node_idx).end };
+            self.sink.emitFmtCodeSpan(.T0001, args_span, "'{s}' expects {d} type argument(s), got {d}", .{ gen_name, gen_params.len, arg_nodes.len }) catch {};
             return .invalid;
         }
         var buf: [8]Type = undefined;
@@ -2234,8 +2243,9 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     const tree = mc.tree;
     const resolutions = mc.resolutions;
     const view = DiscoveryView{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .model = model, .composite = t.composite };
-    for (tree.nodes) |n| {
+    for (tree.nodes, 0..) |n, ci| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
+        const call_at: Anchor = .{ .node = Ast.Index.from(@intCast(ci)), .whole = true };
         // The explicit-turbofish `id[int](..)` and bare-inferred `id(7)` shapes route
         // through the SAME arg-extraction the fingerprint fold uses (`callInstanceRef`),
         // so discovery selects the exact instance the caller's fingerprint targets.
@@ -2250,7 +2260,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 break;
             };
             if (!conc) continue;
-            try t.enqueueInstance(model, ref.gid, ref.args, worklist, seen, mc.tokens[n.main_token].start, mod);
+            try t.enqueueInstance(model, ref.gid, ref.args, worklist, seen, call_at, mod);
             continue;
         }
         const callee = tree.nodes[n.lhs.int()];
@@ -2277,7 +2287,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 }
             }
             if (!conc) continue;
-            try t.enqueueInstance(model, m.fn_id, out, worklist, seen, mc.tokens[n.main_token].start, mod);
+            try t.enqueueInstance(model, m.fn_id, out, worklist, seen, call_at, mod);
         }
     }
     // An annotated empty-list literal `xs: Vec[int] = []` desugars to the type's
@@ -2287,7 +2297,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         if (n.tag != .empty_list) continue;
         for (StdNames.desugarMethods(.empty_list)) |dm| {
             const recv = desugarRecvType(node_types, n, i, dm.recv);
-            try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, mc.tokens[n.main_token].start, mod);
+            try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)), .whole = false }, mod);
         }
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
@@ -2301,7 +2311,9 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             .list_literal, .for_in_stmt, .for_in2_stmt => {
                 for (StdNames.desugarMethods(n.tag)) |dm| {
                     const recv = desugarRecvType(node_types, n, i, dm.recv);
-                    try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, mc.tokens[n.main_token].start, mod);
+                    // A `for` node is the whole loop, body included; it keeps its token.
+                    const at: Anchor = .{ .node = Ast.Index.from(@intCast(i)), .whole = n.tag == .list_literal };
+                    try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, at, mod);
                 }
             },
             .index => {
@@ -2310,7 +2322,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 const elem = node_types[i];
                 if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
                     const args = [_]Type{elem};
-                    try t.enqueueInstance(model, gid, &args, worklist, seen, mc.tokens[n.main_token].start, mod);
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)), .whole = true }, mod);
                 };
             },
             // A value-headed `type_app` is a value index the parser could not tell from a
@@ -2321,7 +2333,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 const elem = node_types[i];
                 if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
                     const args = [_]Type{elem};
-                    try t.enqueueInstance(model, gid, &args, worklist, seen, mc.tokens[n.main_token].start, mod);
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)), .whole = true }, mod);
                 };
             },
             else => {},
@@ -2354,21 +2366,32 @@ fn desugarRecvType(node_types: []const Type, n: Ast.Node, i: usize, src: StdName
 /// `App` receiver `recv` (binding the impl's params by matching the template's `Self`
 /// pattern against `recv`'s args — the same `Infer.match` Pass C runs). A miss on any
 /// step (not an App, no such template, non-concrete binding) enqueues nothing.
-fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []const u8, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at_byte: u32, mod: u32) !void {
+fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []const u8, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at: Anchor, mod: u32) !void {
     if (!recv.isApp()) return;
     const re = t.composite.at(recv.appIdx());
     const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, name) orelse return;
     const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse return;
     defer t.gpa.free(out);
     for (out) |ta| if (!isConcreteValue(ta)) return;
-    try t.enqueueInstance(model, m.fn_id, out, worklist, seen, at_byte, mod);
+    try t.enqueueInstance(model, m.fn_id, out, worklist, seen, at, mod);
+}
+
+/// Where an instantiation diagnostic lands: a node of the scanned module, spanned whole or
+/// by its main token. Measured only when a diagnostic fires, since discovery visits
+/// every call of every instance.
+const Anchor = struct { node: Ast.Index, whole: bool };
+
+fn anchorSpan(t: *const Typecheck, mod: u32, a: Anchor) Span {
+    const mc = &t.graph.mods[mod];
+    if (!a.whole) return .{ .start = mc.tokens[mc.tree.nodes[a.node.int()].main_token].start, .end = NO_END };
+    return AstWalk.nodeSpan(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, a.node);
 }
 
 /// Enqueue `(gid, args)` for instantiation, deduped on the canonical key. `args` is
 /// BORROWED (the caller keeps its scratch); a fresh owned copy is stored on the
 /// worklist. Shared by the explicit and inferred `scanCalls` branches so their dedup
-/// path is byte-identical. `at_byte`/`mod` anchor the T0017 termination diagnostic.
-fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at_byte: u32, mod: u32) !void {
+/// path is byte-identical. `at`/`mod` anchor the T0017 termination diagnostic.
+fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at: Anchor, mod: u32) !void {
     // A BOUNDED template poisoned by its bound-as-axiom body check (a definition
     // error) is never instantiated — the error was reported once at the template; a
     // per-instance re-check would only re-cascade it.
@@ -2386,7 +2409,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
     if (maxd > max_instantiation_depth) {
         if (!t.mono_depth_capped) {
             _ = t.gphSelect(mod);
-            try t.sink.emitCode(.T0017, at_byte, "instantiation too deep: generic type nesting exceeds the depth limit");
+            try t.sink.err(.T0017).spanOf(t.anchorSpan(mod, at)).emit("instantiation too deep: generic type nesting exceeds the depth limit");
             t.mono_depth_capped = true;
         }
         return;
@@ -2446,9 +2469,9 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         const tname = t.typeName(args[ord]);
         const pname = model.protocols[pid].name;
         if (isDerivableProtocol(model, pid)) {
-            try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
+            try t.sink.emitFmtCodeSpan(.T0023, t.anchorSpan(mod, at), "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
         } else {
-            try t.sink.emitFmtCode(.T0023, at_byte, "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
+            try t.sink.emitFmtCodeSpan(.T0023, t.anchorSpan(mod, at), "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
         }
         return;
     }
@@ -2791,10 +2814,10 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
         const decl = t.tree.nodes[f.decl_node.int()];
         const proto = Ast.protoAt(t.tree, decl.lhs.int());
         for (proto.params, f.params) |param_idx, pty| {
-            try t.checkPubType(pty, t.tree.nodes[param_idx.int()].main_token, "function", gf.name);
+            try t.checkPubType(pty, t.fieldTypeSpan(param_idx), "function", gf.name);
         }
         if (proto.ret_type != Ast.none)
-            try t.checkPubType(f.ret, t.tree.nodes[proto.ret_type.int()].main_token, "function", gf.name);
+            try t.checkPubType(f.ret, t.spanOf(proto.ret_type), "function", gf.name);
     }
 
     // A `pub` struct FIELD or `pub` enum variant PAYLOAD that names a non-pub type
@@ -2808,7 +2831,7 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
         _ = t.gphSelect(s.mod);
         const field_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[s.decl_node.int()].lhs.int());
         for (s.field_types, 0..) |fty, fi| {
-            const at = if (fi < field_nodes.len) t.tree.nodes[field_nodes[fi].int()].main_token else t.tree.nodes[s.decl_node.int()].main_token;
+            const at = if (fi < field_nodes.len) t.fieldTypeSpan(field_nodes[fi]) else t.tokSpan(t.tree.nodes[s.decl_node.int()].main_token);
             try t.checkPubType(fty, at, "struct", s.name);
         }
     }
@@ -2817,9 +2840,14 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
         _ = t.gphSelect(e.mod);
         const variant_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[e.decl_node.int()].lhs.int());
         for (e.variants, 0..) |v, vi| {
-            const at = if (vi < variant_nodes.len) t.tree.nodes[variant_nodes[vi].int()].main_token else t.tree.nodes[e.decl_node.int()].main_token;
-            for (v.field_types) |fty| {
-                try t.checkPubType(fty, at, "enum", e.name);
+            const vnode: ?Ast.Node = if (vi < variant_nodes.len) t.tree.nodes[variant_nodes[vi].int()] else null;
+            const payload: []const Ast.Index = if (vnode) |vn| switch (vn.tag) {
+                .enum_variant_tuple, .enum_variant_struct => Ast.rangeSlice(t.tree, vn.lhs.int()),
+                else => &.{},
+            } else &.{};
+            const name_at = t.tokSpan(if (vnode) |vn| vn.main_token else t.tree.nodes[e.decl_node.int()].main_token);
+            for (v.field_types, 0..) |fty, k| {
+                try t.checkPubType(fty, if (k < payload.len) t.fieldTypeSpan(payload[k]) else name_at, "enum", e.name);
             }
         }
     }
@@ -2828,14 +2856,27 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
 /// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
 /// `owner_kind`/`owner_name` describe the exposing decl ("function" `lib.make`,
 /// "struct" `lib.Outer`, "enum" `lib.E`).
-fn checkPubType(t: *Typecheck, ty: Type, at_tok: u32, owner_kind: []const u8, owner_name: []const u8) !void {
+fn checkPubType(t: *Typecheck, ty: Type, at: Span, owner_kind: []const u8, owner_name: []const u8) !void {
     const non_pub = switch (ty.kind) {
         .@"struct" => !t.structs.items[ty.struct_id].pub_export,
         .@"enum" => !t.enums.items[ty.enum_id].pub_export,
         else => false,
     };
     if (non_pub)
-        try t.sink.emitFmtCode(.T0009, t.byteOf(at_tok), "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+        try t.sink.emitFmtCodeSpan(.T0009, at, "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+}
+
+/// The type-ref of a `name: T` param or field, or the node itself when it is a bare
+/// type (a tuple field / tuple-variant payload).
+fn fieldTypeSpan(t: *const Typecheck, node: Ast.Index) Span {
+    const n = t.tree.nodes[node.int()];
+    if (n.tag == .param) return if (n.lhs != Ast.none) t.spanOf(n.lhs) else t.tokSpan(n.main_token);
+    return t.spanOf(node);
+}
+
+/// The token at `tok` alone; `fillSpans` measures its extent.
+fn tokSpan(t: *const Typecheck, tok: u32) Span {
+    return .{ .start = t.byteOf(tok), .end = NO_END };
 }
 
 /// Rule 7: the entry `main` may only yield `int` (the process exit code) or `()`
@@ -2853,13 +2894,16 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
         const tree = t.graph.mods[entry_mod].tree;
         const tokens = t.graph.mods[entry_mod].tokens;
         const source = t.graph.mods[entry_mod].source;
-        const main_tok = tree.nodes[f.decl_node.int()].main_token;
+        const main_decl = tree.nodes[f.decl_node.int()];
+        const main_tok = main_decl.main_token;
         if (!std.mem.eql(u8, tokens[main_tok].text(source), "main")) continue;
         if (f.ret.kind != .int and f.ret.kind != .unit and f.ret.kind != .invalid) {
             // Select the entry module so the sink stamps this diagnostic with the
             // entry module's scope (gphSelect -> sink.setScope).
             _ = t.gphSelect(entry_mod);
-            try t.sink.emitCode(.T0010, tokens[main_tok].start, "main must return int or ()");
+            const ret_node = Ast.protoAt(tree, main_decl.lhs.int()).ret_type;
+            const at: Span = if (ret_node != Ast.none) t.spanOf(ret_node) else t.tokSpan(main_tok);
+            try t.sink.err(.T0010).spanOf(at).emit("main must return int or ()");
         }
         return; // only the first `main` is the entry
     }
@@ -3037,7 +3081,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                     for (arg_nodes, 0..) |an, k| {
                         const aty = t.typeFromNode(an);
                         if (aty.isApp()) {
-                            try t.sink.emit(t.byteOf(t.tree.nodes[an.int()].main_token), "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)");
+                            try t.sink.err(.none).spanOf(t.spanOf(an)).emit("a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)");
                             av[k] = .invalid;
                         } else av[k] = aty;
                     }
@@ -3089,7 +3133,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 any_var = true;
             };
             if (!any_var) {
-                try t.sink.emit(t.byteOf(decl.main_token), "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')");
+                try t.sink.err(.none).spanOf(t.spanOf(recv_type)).emit("an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')");
                 return;
             }
             try t.templates.append(t.gpa, .{
@@ -3130,14 +3174,14 @@ fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         if (externTypeOk(pty)) {
             params[i] = pty;
         } else {
-            try t.sink.emitFmtCode(.T0037, t.byteOf(param.main_token), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
+            try t.sink.emitFmtCodeSpan(.T0037, t.fieldTypeSpan(param_idx), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
             params[i] = .invalid;
         }
     }
     var ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
     // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI scalar.
     if (proto.ret_type != Ast.none and !externTypeOk(ret)) {
-        try t.sink.emitFmtCode(.T0037, t.byteOf(t.tree.nodes[proto.ret_type.int()].main_token), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
+        try t.sink.emitFmtCodeSpan(.T0037, t.spanOf(proto.ret_type), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
         ret = .invalid;
     }
     try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .import, .params = params, .ret = ret, .mod = mod });
@@ -3204,6 +3248,10 @@ pub fn nameText(t: *const Typecheck, tok: u32) []const u8 {
 
 pub fn byteOf(t: *const Typecheck, tok: u32) u32 {
     return refs.byteOf(t, tok);
+}
+
+pub fn spanOf(t: *const Typecheck, node: Ast.Index) Span {
+    return refs.spanOf(t, node);
 }
 
 fn graphCtx(t: *const Typecheck) *GraphCtx {
@@ -3301,6 +3349,7 @@ const Checked = struct {
         gpa.free(self.tokens);
         gpa.free(self.tree.nodes);
         gpa.free(self.tree.extra);
+        if (self.tree.pub_bits.len != 0) gpa.free(@constCast(self.tree.pub_bits));
     }
 };
 
@@ -6427,8 +6476,8 @@ test "rule 7: main returning bool is rejected" {
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), c.result.diags.len);
     try testing.expectEqualStrings("main must return int or ()", c.result.diags[0].message);
-    // The diagnostic points at main's name token (col 4), not the return.
-    try testing.expectEqual(@as(u32, 3), c.result.diags[0].byte_offset);
+    // The diagnostic spans the offending return type.
+    try testing.expectEqual(@as(u32, 13), c.result.diags[0].byte_offset);
 }
 
 test "rule 7: main returning a struct is rejected" {
@@ -7337,6 +7386,43 @@ test "checker diagnostics span the expression, argument list or construct they a
         defer r.deinit(gpa);
         const d = for (r.result.diags) |d| {
             if (std.mem.startsWith(u8, d.message, c.msg)) break d;
+        } else return error.TestExpectedDiagnostic;
+        const sp = d.span();
+        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
+    }
+}
+
+// ---- Declaration, pattern and coherence diagnostics span their subject ----
+
+test "declaration, pattern and coherence diagnostics span their subject" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, key: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "struct A { x: int }\nfn g(_a: A[int]) -> int { return 0 }\n", .key = "is not generic", .want = "A[int]" },
+        .{ .src = "struct Box[T] { v: T }\nfn g(_b: Box[int, bool]) -> int { return 0 }\n", .key = "expects 1 type argument", .want = "[int, bool]" },
+        .{ .src = "struct P { x: int }\npub fn mk(p: P) -> int { return p.x }\n", .key = "exposes non-pub", .want = "P" },
+        .{ .src = "struct P { x: int }\npub struct S { f: P }\n", .key = "exposes non-pub", .want = "P" },
+        .{ .src = "struct P { x: int }\npub enum E { v(int, P) }\n", .key = "exposes non-pub", .want = "P" },
+        .{ .src = "fn main() -> bool { return true }\n", .key = "main must return", .want = "bool" },
+        .{ .src = "protocol Show { fn show(self) -> int }\nfn h[T has Show](_t: T) -> int { return 0 }\nfn main() -> int { return h(3) }\n", .key = "does not conform", .want = "h(3)" },
+        .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn other(self) -> int { return 1 } }\n", .key = "missing method", .want = "impl A has Show" },
+        .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn show(self, _y: int) -> bool { return true } }\n", .key = "incompatible with protocol", .want = "show(self, _y: int) -> bool" },
+        .{ .src = "struct A { x: int }\nimpl A has Nope[int] { fn f(self) -> int { return 1 } }\n", .key = "is not a declared protocol", .want = "Nope" },
+        .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct A { x: int }\nimpl A has Conv[int, bool] { fn conv(self) -> int { return 1 } }\n", .key = "protocol 'Conv' expects", .want = "Conv[int, bool]" },
+        .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct Box[T] { v: T }\nfn h[T has Conv[Box[int]]](_t: T) -> int { return 0 }\n", .key = "bound argument must be", .want = "Box[int]" },
+        .{ .src = "struct T2[T](T)\n", .key = "generic tuple structs", .want = "T2[T]" },
+        .{ .src = "struct Box[T] { v: T }\nimpl Box[int] { fn get(self) -> int { return 1 } }\n", .key = "concrete type instance", .want = "Box[int]" },
+        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .a(x) -> x\n  _ -> 0\n }\n}\n", .key = "binds no payload", .want = "(x)" },
+        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .b(x) -> x\n  _ -> 0\n }\n}\n", .key = "binds 2 value(s)", .want = "(x)" },
+        .{ .src = "enum E { a, b(int, int) }\nfn f(e: E) -> int {\n return match e {\n  .a | .b(_q, _r) -> 0\n }\n}\n", .key = "or-pattern", .want = ".a | .b(_q, _r)" },
+        .{ .src = "fn f(x: str) -> int { return match x { _ -> 1 } }\n", .key = "match scrutinee must be", .want = "x" },
+        .{ .src = "enum E { a, b }\nfn f(e: E) -> int {\n return match e {\n  .a -> 1\n  .b -> 2\n  E.a -> 3\n }\n}\n", .key = "unreachable match arm", .want = "E.a" },
+    };
+    for (cases) |c| {
+        var r = try checkSource(c.src);
+        defer r.deinit(gpa);
+        const d = for (r.result.diags) |d| {
+            if (std.mem.indexOf(u8, d.message, c.key) != null) break d;
         } else return error.TestExpectedDiagnostic;
         const sp = d.span();
         try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);

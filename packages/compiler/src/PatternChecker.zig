@@ -1,5 +1,6 @@
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
+const Token = @import("ast/Token.zig").Token;
 const LayoutEngine = @import("layout/Engine.zig");
 const Type = @import("layout/Type.zig").Type;
 const VariantSym = LayoutEngine.VariantSym;
@@ -51,7 +52,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
     const enum_id = bc.scrutEnumId(st);
     if (enum_id == null and st.kind != .int and st.kind != .bool) {
         for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
-        try bc.sink.emitFmt(bc.byteOf(n.main_token), "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
+        try bc.sink.err(.none).spanOf(bc.spanOf(n.lhs)).emitFmt("match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
         bc.node_types[(node_idx).int()] = .invalid;
         return .invalid;
     }
@@ -80,7 +81,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
         // saturated by prior unguarded arms warns. Argument-free so per-generic-instance
         // rechecks dedupe. First one only — no cascade.
         if (!warned and matchSaturated(cov, has_wildcard)) {
-            try bc.sink.emitFmtCode(.W0006, bc.byteOf(bc.tree.nodes[(arm.lhs).int()].main_token), "unreachable match arm; every value is already matched by an earlier arm", .{});
+            try bc.sink.emitFmtCodeSpan(.W0006, patternSpan(bc, arm.lhs), "unreachable match arm; every value is already matched by an earlier arm", .{});
             warned = true;
         }
         try checkPattern(bc, arm.lhs, st, &cov, &has_wildcard, !guarded);
@@ -125,6 +126,25 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
 /// `match <scrutinee>`: what a non-exhaustive match underlines, short of its arms.
 fn scrutineeSpan(bc: *const BodyChecker, n: Ast.Node) @import("diagnostics/model.zig").Span {
     return .{ .start = bc.byteOf(n.main_token), .end = bc.spanOf(n.lhs).end };
+}
+
+/// The source extent of a pattern. An inferred variant `.V` makes no node of its `.`,
+/// so a pattern that starts with one would otherwise begin at the name.
+fn patternSpan(bc: *const BodyChecker, pat_idx: Ast.Index) @import("diagnostics/model.zig").Span {
+    var sp = bc.spanOf(pat_idx);
+    const first = std.sort.lowerBound(Token, bc.tokens, sp.start, struct {
+        fn order(start: u32, t: Token) std.math.Order {
+            return std.math.order(start, t.start);
+        }
+    }.order);
+    if (first > 0 and bc.tokens[first - 1].tag == .dot) sp.start = bc.tokens[first - 1].start;
+    return sp;
+}
+
+/// A variant pattern's binder list `(a, b)` / `{ x, y }`, which follows its name.
+fn payloadSpan(bc: *const BodyChecker, pat_idx: Ast.Index) @import("diagnostics/model.zig").Span {
+    const name_tok = bc.tree.nodes[pat_idx.int()].main_token;
+    return .{ .start = bc.byteOf(name_tok + 1), .end = bc.spanOf(pat_idx).end };
 }
 
 fn irrefutable(bc: *const BodyChecker, pat_idx: Ast.Index, ty: Type) bool {
@@ -196,7 +216,7 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
     // `substTy(..., &.{})` below is the identity — byte-identical to the earlier behavior.
     const enum_id = bc.scrutEnumId(expected) orelse {
         if (expected.kind != .invalid)
-            try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
+            try bc.sink.err(.none).spanOf(patternSpan(bc, pat_idx)).emitFmt("variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
         return;
     };
     const targs: []const Type = if (expected.isApp()) bc.composite.at(expected.appIdx()).args else &.{};
@@ -206,9 +226,9 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
         const tname = bc.nameText(bc.tree.nodes[(pat.lhs).int()].main_token);
         if (bc.activeEnumMap().get(tname)) |qid| {
             if (qid != enum_id)
-                try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(pat.lhs).int()].main_token), "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+                try bc.sink.err(.none).spanOf(bc.spanOf(pat.lhs)).emitFmt("pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
         } else {
-            try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(pat.lhs).int()].main_token), "'{s}' is not an enum type", .{tname});
+            try bc.sink.err(.none).spanOf(bc.spanOf(pat.lhs)).emitFmt("'{s}' is not an enum type", .{tname});
         }
     }
     const vname = bc.nameText(pat.main_token);
@@ -236,11 +256,11 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
     switch (variant.form) {
         .unit => {
             if (binders.len != 0)
-                try bc.sink.emitFmt(bc.byteOf(pat.main_token), "unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
+                try bc.sink.err(.none).spanOf(payloadSpan(bc, pat_idx)).emitFmt("unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
         },
         .tuple => {
             if (binders.len != variant.field_types.len) {
-                try bc.sink.emitFmt(bc.byteOf(pat.main_token), "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
+                try bc.sink.err(.none).spanOf(payloadSpan(bc, pat_idx)).emitFmt("variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
                 return;
             }
             for (binders, variant.field_types) |b_idx, fty_pat| {
@@ -387,7 +407,7 @@ fn checkOrBindings(bc: *BodyChecker, or_idx: Ast.Index) error{OutOfMemory}!void 
         if (!ok) break;
     }
     if (!ok)
-        try bc.sink.emitFmt(bc.byteOf(bc.tree.nodes[(or_idx).int()].main_token), "or-pattern alternatives must bind the same names and types", .{});
+        try bc.sink.err(.none).spanOf(patternSpan(bc, or_idx)).emitFmt("or-pattern alternatives must bind the same names and types", .{});
 }
 
 fn collectBindings(bc: *BodyChecker, pat_idx: Ast.Index, out: *std.StringHashMapUnmanaged(Type)) error{OutOfMemory}!void {

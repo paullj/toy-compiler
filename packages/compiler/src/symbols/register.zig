@@ -12,6 +12,7 @@ const LayoutEngine = @import("../layout/Engine.zig");
 const Typecheck = @import("../types.zig");
 const Type = Typecheck.Type;
 const VariantForm = Typecheck.VariantForm;
+const Span = @import("../diagnostics/model.zig").Span;
 const VariantSym = LayoutEngine.VariantSym;
 const type_names = Typecheck.type_names;
 
@@ -35,11 +36,11 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
         }
         if (decl.tag == .tuple_struct_decl) {
             if (decl.rhs != Ast.none) {
-                try t.sink.emitFmt(t.byteOf(decl.main_token), "generic tuple structs are not yet supported", .{});
+                try t.sink.err(.none).spanOf(genericsSpan(t, decl.main_token)).emitFmt("generic tuple structs are not yet supported", .{});
                 continue;
             }
             if (Ast.rangeSlice(t.tree, decl.lhs.int()).len > LayoutEngine.tuple_field_cap) {
-                try t.sink.emitFmt(t.byteOf(decl.main_token), "tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
+                try t.sink.err(.none).spanOf(t.spanOf(decl_idx)).emitFmt("tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
                 // Registered anyway so references resolve; layoutStruct clamps the name
                 // index so the (already-errored, codegen-gated) program never OOBs.
             }
@@ -166,6 +167,25 @@ pub fn decodeTemplateVariants(t: *Typecheck) !void {
         t.enums.items[id].@"align" = 8;
         t.enums.items[id].state = .done;
     }
+}
+
+/// `Name[T, ..]`: a declaration's name through its generic-parameter list.
+fn genericsSpan(t: *const Typecheck, name_tok: u32) Span {
+    var tok = name_tok + 1;
+    var depth: u32 = 0;
+    while (tok < t.tokens.len) : (tok += 1) switch (t.tokens[tok].tag) {
+        .l_bracket => depth += 1,
+        .r_bracket => {
+            depth -|= 1;
+            if (depth == 0) break;
+        },
+        .identifier, .comma, .dot, .kw_has => {},
+        else => {
+            tok -= 1;
+            break;
+        },
+    };
+    return .{ .start = t.byteOf(name_tok), .end = t.tokens[@min(tok, t.tokens.len - 1)].end };
 }
 
 /// Register the enum decls among `decl_nodes` (of the currently-active tree).
