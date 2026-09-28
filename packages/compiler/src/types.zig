@@ -7313,3 +7313,32 @@ test "narrowing via `into` is rejected (no silent lossy conversion)" {
     defer c.deinit(gpa);
     try testing.expect(c.result.diags.len > 0);
 }
+
+test "checker diagnostics span the expression, argument list or construct they are about" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, msg: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "fn f() -> int {\n return 1\n 2 + 3\n}\n", .msg = "unreachable code", .want = "2 + 3" },
+        .{ .src = "fn f() {\n for i in 0..(1 == 1) { }\n}\n", .msg = "for range bounds", .want = "1 == 1" },
+        .{ .src = "fn f(a: int) -> int { return a[0] }\n", .msg = "cannot index", .want = "a[0]" },
+        .{ .src = "struct P { x: int }\nfn f(p: P) -> P { return p + p }\n", .msg = "'+' requires", .want = "p + p" },
+        .{ .src = "struct P { x: int }\nfn f() -> P { return P { x: 1 == 1 } }\n", .msg = "field 'x'", .want = "1 == 1" },
+        .{ .src = "struct T(int, int)\nfn f() -> T { return T(1) }\n", .msg = "tuple struct 'T' expects", .want = "(1)" },
+        .{ .src = "enum E { a(int), b }\nfn f() -> E { return E.a(1, 2) }\n", .msg = "variant 'E.a' expects", .want = "E.a(1, 2)" },
+        .{ .src = "fn id[U](a: U, b: U) -> U { return a }\nfn f() -> int { return id(1, 1 == 1) }\n", .msg = "conflicting types", .want = "1 == 1" },
+        .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g[int](1) }\n", .msg = "'g' is not generic", .want = "[int]" },
+        .{ .src = "struct P { x: int }\nfn f() -> P { return P(1) }\n", .msg = "use named construction", .want = "P(1)" },
+        .{ .src = "fn f(a: int) -> int { return a(1) }\n", .msg = "called value is not a function", .want = "a" },
+        .{ .src = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn mk() -> P { return P { x: 0 } }\nfn f() { mk().bump(1) }\n", .msg = "cannot call mutating method", .want = "mk()" },
+        .{ .src = "fn f() {\n break\n}\n", .msg = "break outside", .want = "break" },
+    };
+    for (cases) |c| {
+        var r = try checkSource(c.src);
+        defer r.deinit(gpa);
+        const d = for (r.result.diags) |d| {
+            if (std.mem.startsWith(u8, d.message, c.msg)) break d;
+        } else return error.TestExpectedDiagnostic;
+        const sp = d.span();
+        try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
+    }
+}
