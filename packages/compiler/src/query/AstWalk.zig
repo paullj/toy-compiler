@@ -152,9 +152,15 @@ const Extent = struct {
     pub fn on(self: *Extent, ev: Event) void {
         switch (ev) {
             .enter => |e| {
-                const tok = self.tree.nodes[e.idx.int()].main_token;
-                self.first = @min(self.first, tok);
-                self.last = @max(self.last, tok);
+                const n = self.tree.nodes[e.idx.int()];
+                // An inferred variant (`.a(1)`, a `.a` pattern) is spelled from its `.`,
+                // which is no node's main token.
+                const lead: u32 = switch (n.tag) {
+                    .enum_init_unit, .enum_init_tuple, .enum_init_struct, .pattern_variant => if (n.lhs == Ast.none) 1 else 0,
+                    else => 0,
+                };
+                self.first = @min(self.first, n.main_token - lead);
+                self.last = @max(self.last, n.main_token);
             },
             else => {},
         }
@@ -2023,4 +2029,19 @@ test "nodeSpan covers a subtree from its first token through the brackets it clo
         }
     }
     try std.testing.expect(saw[0] and saw[1] and saw[2]);
+}
+
+test "nodeSpan starts an inferred variant at its dot" {
+    const gpa = std.testing.allocator;
+    const src_text = "enum E { a(int), b }\nfn f() -> E { return .a(1) }\n";
+    var b = try build(gpa, src_text);
+    defer b.deinit(gpa);
+    const src: Source = .{ .tree = b.tree, .tokens = b.tokens, .source = b.source };
+    for (b.tree.nodes, 0..) |n, i| {
+        if (n.tag != .enum_init_tuple) continue;
+        const sp = nodeSpan(src, Ast.Index.from(@intCast(i)));
+        try std.testing.expectEqualStrings(".a(1)", src_text[sp.start..sp.end]);
+        return;
+    }
+    return error.NoVariantInit;
 }
