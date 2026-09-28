@@ -989,7 +989,7 @@ pub const BodyChecker = struct {
                         // or a `[T has Ord]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, true)) {
+                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, node_idx)) {
                             break :blk Type.@"bool";
                         } else {
                             try bc.sink.emitFmtCodeSpan(.T0027, bc.spanOf(node_idx), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
@@ -1003,7 +1003,7 @@ pub const BodyChecker = struct {
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, true)) {
+                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, node_idx)) {
                             break :blk Type.@"bool";
                         } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
                             // A struct that would derive `Eq` but for one non-conforming
@@ -2718,7 +2718,7 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
-            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().hash, true)) {
+            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().hash, node_idx)) {
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
@@ -2744,7 +2744,7 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
-            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, true)) {
+            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, node_idx)) {
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2926,7 +2926,7 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
-            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, true)) {
+            if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, node_idx)) {
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -3111,12 +3111,12 @@ pub const BodyChecker = struct {
     /// `pid`. A prelude-less caller (`pid_opt == null`) denies conformance, so the operator
     /// emits its T002x rather than miscompiling.
     /// After those misses, a struct (or enum) whose fields all conform with NO explicit impl
-    /// conforms STRUCTURALLY. When `record_derive`, record the derive request (so the serial
+    /// conforms STRUCTURALLY. With a `record_at` expression, record the derive request (so the serial
     /// synthesis barrier emits the source-less witness) and return true. `Conform.classify`
     /// tries the direct (existence ∨ axiom) tier first, keeping an explicit/refinement type
     /// off the structural path (no double-fire). Fallible (`Conform.structural` + the request
     /// record allocate) and takes `*BodyChecker` (records into the thread-local `derive_reqs`).
-    fn conformsTo(bc: *BodyChecker, t: Type, pid_opt: ?u32, record_derive: bool) error{OutOfMemory}!bool {
+    fn conformsTo(bc: *BodyChecker, t: Type, pid_opt: ?u32, record_at: ?Ast.Index) error{OutOfMemory}!bool {
         const pid = pid_opt orelse return false;
         switch (try Conform.classify(bc.model, bc.composite, bc.bound_protocols, &bc.conforms_memo, bc.gpa, t, pid)) {
             .none => return false,
@@ -3126,7 +3126,7 @@ pub const BodyChecker = struct {
                 // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition
                 // check) is accepted-but-not-recorded — its concrete instance re-check
                 // records the ground `Box[int]`, which reify+synthesize can mint a witness for.
-                if (record_derive and bc.isGround(t)) try bc.recordDeriveReq(pid, t);
+                if (record_at) |site| if (bc.isGround(t)) try bc.recordDeriveReq(pid, t, site);
                 return true;
             },
         }
@@ -3157,9 +3157,13 @@ pub const BodyChecker = struct {
 
     /// Record a structural derive request once per (protocol, type) in this fn (a fn may
     /// `==` a type repeatedly; the synthesis barrier dedups across fns too).
-    fn recordDeriveReq(bc: *BodyChecker, pid: u32, t: Type) error{OutOfMemory}!void {
+    fn recordDeriveReq(bc: *BodyChecker, pid: u32, t: Type, site: Ast.Index) error{OutOfMemory}!void {
         for (bc.derive_reqs.items) |r| if (r.protocol_id == pid and Type.eql(r.conform_ty, t)) return;
-        try bc.derive_reqs.append(bc.gpa, .{ .protocol_id = pid, .conform_ty = t });
+        try bc.derive_reqs.append(bc.gpa, .{
+            .protocol_id = pid,
+            .conform_ty = t,
+            .site = .{ .scope = bc.sink.cur_scope, .span = bc.spanOf(site) },
+        });
     }
 
     /// Record a descriptor request once per type in this fn (a fn may `descriptor_of[T]`

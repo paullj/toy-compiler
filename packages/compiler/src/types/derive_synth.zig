@@ -257,11 +257,16 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     }
     var hash_work: std.ArrayList(Type) = .empty;
     defer hash_work.deinit(gpa);
+    // Parallel to `hash_work`: the site of the request each item was reached from. The Hash
+    // fixpoint is the one that can reject a type (a `Ref` field), and must say where.
+    var hash_sites: std.ArrayList(?Typecheck.DeriveSite) = .empty;
+    defer hash_sites.deinit(gpa);
 
     if (hash_pid_opt) |hash_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != hash_pid) continue;
-            try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, req.conform_ty);
+            if (try claimDerive(gpa, &hash_seen, hash_pid, .hash, req.conform_ty))
+                try pushHash(gpa, &hash_work, &hash_sites, req.conform_ty, req.site);
         }
         for (desc_keys.items) |k| {
             // A key with an EXPLICIT `impl has Hash` supplies its own hash witness (which the
@@ -269,10 +274,12 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             // collide into an `.ambiguous` resolve. Reuse the live witness — any deterministic
             // hash is consistent with the derived structural eq the map pairs it with.
             if (hasConformanceLive(t, hash_pid, k)) continue; // explicit Hash: reuse its witness
-            try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, k);
+            if (try claimDerive(gpa, &hash_seen, hash_pid, .hash, k))
+                try pushHash(gpa, &hash_work, &hash_sites, k, null);
         }
         var hi: usize = 0;
         while (hi < hash_work.items.len) : (hi += 1) {
+            const site = hash_sites.items[hi];
             comps.clearRetainingCapacity();
             try collectComponentTypes(t, hash_work.items[hi], &comps);
             for (comps.items) |ft| {
@@ -283,12 +290,13 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 // A managed box has no hashable value — its identity is a heap cell, not a
                 // stable key — so a Hash derive over a field that holds one is a compile error.
                 if (isRefType(t, ft)) {
-                    try t.sink.emitFmtCode(.T0030, 0, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.structs.items[ft.struct_id].name});
+                    try emitRefHash(t, site, hash_work.items[hi], ft);
                     continue;
                 }
                 if (hasConformanceLive(t, hash_pid, ft)) continue; // explicit Hash field: reuse its witness
                 if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa, t.composite, &.{}))
-                    try enqueueDerive(gpa, &hash_seen, &hash_work, hash_pid, .hash, ft);
+                    if (try claimDerive(gpa, &hash_seen, hash_pid, .hash, ft))
+                        try pushHash(gpa, &hash_work, &hash_sites, ft, site);
             }
         }
     }
@@ -609,16 +617,44 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
 
 /// Enqueue `ty` for derive `(pid, kind)` once, deduped on the canonical recipe key so a
 /// repeated request / nested field is synthesized a single time. `seen` OWNS the key bytes.
+/// `container`'s Hash derive reached a managed-box field. Reported at the expression that
+/// demanded the derive; a derive seeded only by a descriptor key has no such site, so it
+/// falls back to the box's declaration name.
+fn emitRefHash(t: *Typecheck, site: ?Typecheck.DeriveSite, container: Type, ft: Type) !void {
+    const sym = t.structs.items[ft.struct_id];
+    const at: Typecheck.DeriveSite = site orelse blk: {
+        const m = t.graph.mods[sym.mod];
+        const tok = m.tree.nodes[sym.decl_node.int()].main_token;
+        break :blk .{ .scope = sym.mod, .span = .{ .start = m.tokens[tok].start, .end = m.tokens[tok].end } };
+    };
+    const prev = t.sink.cur_scope;
+    defer t.sink.setScope(prev);
+    t.sink.setScope(at.scope);
+    try t.sink.emitFmtCodeSpan(.T0030, at.span, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
+}
+
+fn pushHash(gpa: std.mem.Allocator, work: *std.ArrayList(Type), sites: *std.ArrayList(?Typecheck.DeriveSite), ty: Type, site: ?Typecheck.DeriveSite) !void {
+    try work.append(gpa, ty);
+    try sites.append(gpa, site);
+}
+
 fn enqueueDerive(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), work: *std.ArrayList(Type), pid: u32, kind: Derive.Kind, ty: Type) !void {
+    if (try claimDerive(gpa, seen, pid, kind, ty)) try work.append(gpa, ty);
+}
+
+/// Mark `(pid, kind, ty)` as seen; false when it already was.
+fn claimDerive(gpa: std.mem.Allocator, seen: *std.StringHashMapUnmanaged(void), pid: u32, kind: Derive.Kind, ty: Type) !bool {
     var kb: std.ArrayList(u8) = .empty;
     defer kb.deinit(gpa);
     try Derive.writeKey(gpa, &kb, pid, kind, ty);
-    if (seen.contains(kb.items)) return;
+    if (seen.contains(kb.items)) return false;
     const owned = try kb.toOwnedSlice(gpa);
     errdefer gpa.free(owned);
     try seen.put(gpa, owned, {});
-    try work.append(gpa, ty);
+    return true;
 }
+
+
 
 /// True when `ty` already has (or will have) a DERIVED `Ord` recipe — so its `cmp` fills the
 /// single `(Eq, ty)` slot and the Eq fixpoint must not synthesize a separate Eq unit for it.
