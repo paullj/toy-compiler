@@ -94,8 +94,8 @@ pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.So
 /// and a primary label at `[off, off)` carrying `message`; a non-empty `detail`
 /// becomes a `= note:` footer. With no offset, fall back to `renderPlainError`
 /// (detail inline as `(detail)`), preserving the old no-location shape.
-fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, byte_offset: ?u32, message: []const u8, detail: []const u8) !void {
-    const off = byte_offset orelse return renderPlainError(out, level, name, message, detail);
+fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, span: ?Rr.Diagnostic.Span, message: []const u8, detail: []const u8) !void {
+    const primary = span orelse return renderPlainError(out, level, name, message, detail);
     var sm = try Rr.SourceMap.init(gpa, name, src);
     defer sm.deinit(gpa);
     var notes_buf: [1]Rr.Diagnostic.Note = undefined;
@@ -106,7 +106,7 @@ fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLeve
     const d = Rr.Diagnostic.Diagnostic{
         .severity = .err,
         .message = message,
-        .primary = .{ .kind = .primary, .span = .{ .start = off, .end = off }, .message = message },
+        .primary = .{ .kind = .primary, .span = primary, .message = message },
         .notes = notes,
     };
     try Rr.Renderer.render(d, &sm, out, renderOpts(level));
@@ -200,7 +200,7 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
     const has_src = e.module != null or g.modules.len > 0;
     if (e.byte_offset != null and has_src) {
         const src: []const u8 = if (e.module) |m| moduleAt(g, m).source else g.entry().source;
-        try renderLocated(gpa, out, level, name, src, e.byte_offset, e.message, e.detail);
+        try renderLocated(gpa, out, level, name, src, g.errorSpan(e), e.message, e.detail);
     } else {
         try renderPlainError(out, level, name, e.message, e.detail);
     }
@@ -211,7 +211,8 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
 pub fn renderGraphEmit(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Codegen.EmitError) !void {
     const m = if (e.module) |mi| moduleAt(g, mi) else g.entry();
     if (e.byte_offset) |off| {
-        try renderLocated(gpa, out, level, m.path, m.source, off, e.message, "");
+        const span: Rr.Diagnostic.Span = .{ .start = off, .end = toyc.DiagnosticSink.tokenEnd(m.tokens, off) };
+        try renderLocated(gpa, out, level, m.path, m.source, span, e.message, "");
     } else {
         try renderPlainError(out, level, m.path, e.message, "");
     }

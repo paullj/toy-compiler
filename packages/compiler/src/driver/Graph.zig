@@ -22,7 +22,9 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
-const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
+const DiagnosticMod = @import("../diagnostics/Diagnostic.zig");
+const Span = @import("../diagnostics/model.zig").Span;
+const Diagnostic = DiagnosticMod.Diagnostic;
 const BundledStd = @import("bundled_std");
 
 /// The `.toy` source extension that an import path maps onto.
@@ -146,6 +148,21 @@ pub const Graph = struct {
     err: ?Error = null,
 
     pub const Ownership = enum { owned, borrowed };
+
+    /// The span of structural error `e`: the token at its offset, in the module it is
+    /// reported against. Null when it has no location.
+    pub fn errorSpan(g: *const Graph, e: Error) ?Span {
+        const off = e.byte_offset orelse return null;
+        const m = e.module orelse g.entry_index;
+        if (m >= g.modules.len) return .{ .start = off, .end = off };
+        return .{ .start = off, .end = DiagnosticMod.tokenEnd(g.modules[m].tokens, off) };
+    }
+
+    /// The tokens of the module a diagnostic's `scope` names (the entry for an unscoped
+    /// one): what `Diagnostic.fillSpans` measures its default spans against.
+    pub fn scopeTokens(g: *const Graph, scope: u32) []const Token {
+        return g.modules[if (scope == DiagnosticMod.NO_SCOPE) g.entry_index else scope].tokens;
+    }
 
     /// Tear down per `ownership`: the right teardown is impossible to pick wrong
     /// because the value records who built it.
@@ -551,6 +568,8 @@ const Discoverer = struct {
                 const first = parsed.diags[0];
                 const byte_offset = first.byte_offset;
                 const diags_owned = try d.gpa.dupe(Diagnostic, parsed.diags);
+            DiagnosticMod.fillModuleSpans(diags_owned, tokens);
+                DiagnosticMod.fillModuleSpans(diags_owned, tokens);
                 const message_owned = d.gpa.dupe(u8, first.message) catch |e| {
                     d.gpa.free(diags_owned);
                     return e;

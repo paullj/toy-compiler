@@ -39,7 +39,8 @@ const std = @import("std");
 const Token = @import("ast/Token.zig").Token;
 const Ast = @import("ast/Ast.zig");
 const Graph = @import("driver/Graph.zig");
-const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
+const DiagnosticMod = @import("diagnostics/Diagnostic.zig");
+const Diagnostic = DiagnosticMod.Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const nearmiss = @import("diagnostics/nearmiss.zig");
 const codes = @import("diagnostics/codes.zig");
@@ -1468,6 +1469,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
 
     g.sink.sort();
     const owned = try g.sink.toOwned();
+    DiagnosticMod.fillSpans(owned.diags, graph, Graph.Graph.scopeTokens);
     return GraphResult{
         .resolutions = resolutions,
         .fns = try g.fns.toOwnedSlice(gpa),

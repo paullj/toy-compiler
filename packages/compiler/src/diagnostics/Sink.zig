@@ -27,6 +27,9 @@ const diag = @import("Diagnostic.zig");
 pub const NO_SCOPE = diag.NO_SCOPE;
 pub const NO_RELATED = diag.NO_RELATED;
 pub const Diagnostic = diag.Diagnostic;
+pub const tokenEnd = diag.tokenEnd;
+pub const fillSpans = diag.fillSpans;
+pub const fillModuleSpans = diag.fillModuleSpans;
 
 // The code registry + model types the coded builder threads into each diagnostic.
 const codes = @import("codes.zig");
@@ -92,8 +95,13 @@ pub fn emitFmt(self: *DiagnosticSink, byte_offset: u32, comptime fmt: []const u8
 /// `code` and its registry default severity onto the diagnostic. Existing sites keep
 /// calling `emit` (code stays `.none`); coded sites call this or the builder.
 pub fn emitCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, message: []const u8) !void {
+    try self.recordStatic(code, .{ .start = byte_offset, .end = diag.NO_END }, message);
+}
+
+fn recordStatic(self: *DiagnosticSink, code: codes.Code, span: model.Span, message: []const u8) !void {
     try self.diags.append(self.gpa, .{
-        .byte_offset = byte_offset,
+        .byte_offset = span.start,
+        .end = span.end,
         .message = message,
         .scope = self.cur_scope,
         .code = code,
@@ -104,21 +112,39 @@ pub fn emitCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, messa
 /// Format + own a coded message. Same load-bearing reserve->allocPrint->track OOM
 /// ordering as `emitFmt`; additionally stamps `code` + its default severity.
 pub fn emitFmtCode(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, comptime fmt: []const u8, args: anytype) !void {
-    return self.emitFmtCodeRelated(code, byte_offset, diag.NO_RELATED, fmt, args);
+    return self.record(code, .{ .start = byte_offset, .end = diag.NO_END }, diag.NO_RELATED, fmt, args);
+}
+
+/// Like `emitFmtCode`, but over the offending node's full extent `span` rather than
+/// just the token it starts at.
+pub fn emitFmtCodeSpan(self: *DiagnosticSink, code: codes.Code, span: model.Span, comptime fmt: []const u8, args: anytype) !void {
+    return self.record(code, span, diag.NO_RELATED, fmt, args);
 }
 
 /// Like `emitFmtCode`, but also records a RELATED prior location: `related` is a byte
 /// offset in the SAME scope (e.g. a duplicate's first definition), rendered as a
-/// secondary "previously defined here" label. Same load-bearing reserve->allocPrint->
-/// track OOM ordering; `related` is a memcpy-trivial `u32` on the POD, not part of the
+/// secondary label; it is a memcpy-trivial `u32` on the POD, not part of the
 /// sort/dedup key.
 pub fn emitFmtCodeRelated(self: *DiagnosticSink, code: codes.Code, byte_offset: u32, related: u32, comptime fmt: []const u8, args: anytype) !void {
+    return self.record(code, .{ .start = byte_offset, .end = diag.NO_END }, related, fmt, args);
+}
+
+/// `emitFmtCodeRelated` over the offending node's full extent `span`.
+pub fn emitFmtCodeSpanRelated(self: *DiagnosticSink, code: codes.Code, span: model.Span, related: u32, comptime fmt: []const u8, args: anytype) !void {
+    return self.record(code, span, related, fmt, args);
+}
+
+/// The one owning coded append. Load-bearing OOM ordering: reserve the diag slot FIRST
+/// (so the final append is infallible), THEN allocPrint, THEN track in `owned`. A span
+/// `end` of `NO_END` means "the token at `start`", filled in by `fillSpans`.
+fn record(self: *DiagnosticSink, code: codes.Code, span: model.Span, related: u32, comptime fmt: []const u8, args: anytype) !void {
     try self.diags.ensureUnusedCapacity(self.gpa, 1);
     const msg = try std.fmt.allocPrint(self.gpa, fmt, args);
     errdefer self.gpa.free(msg);
     try self.owned.append(self.gpa, msg);
     self.diags.appendAssumeCapacity(.{
-        .byte_offset = byte_offset,
+        .byte_offset = span.start,
+        .end = span.end,
         .message = msg,
         .scope = self.cur_scope,
         .code = code,
@@ -144,25 +170,25 @@ pub const Builder = struct {
     severity: model.Severity,
     primary: ?model.Span = null,
 
-    /// Set the primary span; the emitted diagnostic's `byte_offset` is `s`.
+    /// Set the primary span `[s, e)`; the emitted diagnostic's `byte_offset` is `s`.
     pub fn span(b: Builder, s: u32, e: u32) Builder {
         var n = b;
         n.primary = .{ .start = s, .end = e };
         return n;
     }
 
-    fn offset(b: Builder) u32 {
-        return if (b.primary) |p| p.start else 0;
+    fn fullSpan(b: Builder) model.Span {
+        return b.primary orelse .{ .start = 0, .end = diag.NO_END };
     }
 
     /// Terminate with a static (borrowed) message.
     pub fn emit(b: Builder, message: []const u8) !void {
-        try b.sink.emitCode(b.code, b.offset(), message);
+        try b.sink.recordStatic(b.code, b.fullSpan(), message);
     }
 
     /// Terminate with an owned formatted message.
     pub fn emitFmt(b: Builder, comptime fmt: []const u8, args: anytype) !void {
-        try b.sink.emitFmtCode(b.code, b.offset(), fmt, args);
+        try b.sink.record(b.code, b.fullSpan(), diag.NO_RELATED, fmt, args);
     }
 };
 
