@@ -18,7 +18,17 @@ async function load(url: string) {
 function flush() {
 	scheduled = false;
 	if (!server || queue.length === 0) return;
-	for (const reply of server.send(queue.splice(0))) postMessage(reply);
+	let replies: string[];
+	try {
+		replies = server.send(queue.splice(0));
+	} catch (err) {
+		// A trap leaves the wasm instance unusable; the page replaces this worker.
+		console.error('[toy-lsp]', err);
+		server = null;
+		postMessage({ crashed: true });
+		return;
+	}
+	for (const reply of replies) postMessage(reply);
 }
 
 self.onmessage = (e: MessageEvent<string | { wasm: string }>) => {

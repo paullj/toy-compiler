@@ -67,6 +67,13 @@ describe('toy-lsp.wasm', () => {
 		expect(diags.filter((d: Diagnostic) => d.severity === 1)).toEqual([]);
 	});
 
+	it('answers an emptied for-iterable mid-edit instead of hanging', async () => {
+		const server = await boot();
+		const uri = 'file:///blocks/edit.toy';
+		const diags = published(server.send([open(uri, 'fn main() -> int {\n    for j in {\n    }\n    return 0\n}\n')]), uri);
+		expect(diags.length).toBeGreaterThan(0);
+	});
+
 	it('keeps its heap flat over many edits', async () => {
 		const server = await boot();
 		const uri = 'file:///blocks/loop.toy';
