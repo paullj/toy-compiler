@@ -64,7 +64,7 @@ fn structEqAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: I
             // The synthesis barrier proved every aggregate field conforms before emitting
             // this unit, so a miss here is an internal invariant break — note-and-drop to
             // stay well-formed rather than miscompile.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: no witness for an aggregate field in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Eq: no witness for an aggregate field in lower" });
             b.had_error = true;
             return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
         },
@@ -140,7 +140,7 @@ fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
         // AND-fold), so no field_addr/load — emit the constant `true`.
         .unit => return try b.emit(.{ .bconst = true }, Typecheck.Type.@"bool"),
         else => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: unsupported field type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Eq: unsupported field type in lower" });
             b.had_error = true;
             return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
         },
@@ -283,7 +283,7 @@ fn deriveFieldCmp(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Va
         // lexicographic fold), so no field_addr/load — emit the `Equal` discriminant.
         .unit => return try b.emit(.{ .iconst = L.ord_eq }, int_ty),
         else => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: unsupported field type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Ord: unsupported field type in lower" });
             b.had_error = true;
             return try b.emit(.{ .iconst = L.ord_eq }, int_ty);
         },
@@ -311,7 +311,7 @@ fn cmpAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.Slo
         .none, .ambiguous => {
             // The synthesis barrier proved every aggregate field conforms before emitting
             // this unit, so a miss here is an internal invariant break — note-and-drop.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: no cmp witness for an aggregate field in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Ord: no cmp witness for an aggregate field in lower" });
             b.had_error = true;
             return try b.emit(.{ .iconst = L.ord_eq }, Typecheck.Type.int);
         },
@@ -628,7 +628,7 @@ fn lowerDeriveEq(
         },
         else => blk: {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Eq: unsupported conform type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Eq: unsupported conform type in lower" });
             b.had_error = true;
             break :blk try b.emit(.{ .bconst = false }, bool_ty);
         },
@@ -690,7 +690,7 @@ fn lowerDeriveOrd(
         .@"enum" => try deriveEnumCmp(&b, cty, self_base, other_base, join),
         else => {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Ord: unsupported conform type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Ord: unsupported conform type in lower" });
             b.had_error = true;
             const eqc = try b.emit(.{ .iconst = L.ord_eq }, int_ty);
             try L.brTo(&b, join, .{ .value = eqc });
@@ -724,7 +724,7 @@ fn hashAtSlot(b: *L.Builder, ty: Typecheck.Type, slot: Ir.SlotId) error{OutOfMem
             return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, int_ty);
         },
         .none, .ambiguous => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: no hash witness for an aggregate field in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Hash: no hash witness for an aggregate field in lower" });
             b.had_error = true;
             return try b.emit(.{ .iconst = 0 }, int_ty);
         },
@@ -776,7 +776,7 @@ fn deriveFieldHash(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.V
         // `()` are equal; matches the bare-unit `.hash()` seed in lower).
         .unit => return try b.emit(.{ .iconst = L.hash_seed }, int_ty),
         else => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: unsupported field type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Hash: unsupported field type in lower" });
             b.had_error = true;
             return try b.emit(.{ .iconst = 0 }, int_ty);
         },
@@ -881,7 +881,7 @@ fn lowerDeriveHash(
         },
         else => blk: {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Hash: unsupported conform type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Hash: unsupported conform type in lower" });
             b.had_error = true;
             break :blk try b.emit(.{ .iconst = 0 }, int_ty);
         },
@@ -1037,7 +1037,7 @@ fn lowerErasedHash(
             break :blk try hashKeyAtSlot(&b, ty, slot);
         },
         else => blk: {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "erased hash: unsupported key type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "erased hash: unsupported key type in lower" });
             b.had_error = true;
             break :blk try b.emit(.{ .iconst = 0 }, int_ty);
         },
@@ -1103,7 +1103,7 @@ fn lowerErasedEq(
             break :blk try eqKeyAtSlots(&b, ty, lslot, rslot);
         },
         else => blk: {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "erased eq: unsupported key type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "erased eq: unsupported key type in lower" });
             b.had_error = true;
             break :blk try b.emit(.{ .bconst = false }, bool_ty);
         },
@@ -1135,7 +1135,7 @@ fn deriveFieldDisplay(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: I
         },
         .unit => .none,
         else => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported field type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Display: unsupported field type in lower" });
             b.had_error = true;
             return try L.emitStrLiteralSlot(b, "");
         },
@@ -1259,7 +1259,7 @@ fn lowerDeriveDisplay(
         },
         else => {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Display: unsupported conform type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Display: unsupported conform type in lower" });
             b.had_error = true;
             if (!b.termSet()) try L.brTo(&b, exit, .{ .slot = acc });
         },
@@ -1372,7 +1372,7 @@ fn lowerDeriveTrace(
         },
         else => {
             // Unreachable: the synthesis barrier only authorizes struct/enum recipes.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "auto-derive Trace: unsupported conform type in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Trace: unsupported conform type in lower" });
             b.had_error = true;
         },
     }

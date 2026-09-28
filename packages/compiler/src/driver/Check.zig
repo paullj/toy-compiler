@@ -298,7 +298,7 @@ test "writeNdjsonLine emits fixed key order with 1-based line/col, null code, fi
     defer aw.deinit();
     // offset of the 'x' on line 2: after "fn main() {\n  " == 14
     const off: u32 = 14;
-    try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "t.toy", .{ .byte_offset = off, .message = "boom", .code = .none, .severity = .err }, .err);
+    try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "t.toy", .{ .byte_offset = off, .end = off, .message = "boom", .code = .none, .severity = .err }, .err);
     const got = aw.writer.buffered();
     // Prefix through the shared fields is stable and byte-checkable.
     try testing.expect(std.mem.startsWith(u8, got,
@@ -316,8 +316,8 @@ test "writeNdjsonLine emits a secondary label for a related location (duplicate-
     defer sm.deinit(testing.allocator);
     var aw: Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    // primary at the second `f` (offset 13), related at the first `f` (offset 3).
-    try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "dup.toy", .{ .byte_offset = 13, .message = "duplicate function 'f'", .code = .R0002, .severity = .err, .related = 3 }, .err);
+    // primary at the second `f` (13..14), related at the first `f` (3..4).
+    try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "dup.toy", .{ .byte_offset = 13, .end = 14, .message = "duplicate function 'f'", .code = .R0002, .severity = .err, .related = 3, .related_end = 4 }, .err);
     const got = aw.writer.buffered();
     try testing.expect(std.mem.indexOf(u8, got, "\"labels\":[{\"message\":\"previously defined here\",\"file\":\"dup.toy\"") != null);
     try testing.expect(std.mem.indexOf(u8, got, "\"is_primary\":false") != null);
@@ -340,7 +340,7 @@ test "anyHardError: err with no diagnostics is hard; err with diagnostics is not
 
     // A compile diagnostic: `err` set to a stage sentinel BUT diagnostics present ->
     // NOT a hard error (that path is exit 1). One parse diagnostic is enough.
-    const dummy = [_]Diagnostic{.{ .byte_offset = 0, .message = "boom", .code = .none, .severity = .err }};
+    const dummy = [_]Diagnostic{.{ .byte_offset = 0, .end = 0, .message = "boom", .code = .none, .severity = .err }};
     const soft = [_]Driver.FileResult{.{ .path = "x", .err = error.ParseError, .diags = &dummy }};
     try testing.expect(!anyHardError(&soft));
 

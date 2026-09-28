@@ -8,6 +8,7 @@
 //! types.zig, shared with the mono tail.
 
 const std = @import("std");
+const Span = @import("../diagnostics/model.zig").Span;
 const Ast = @import("../ast/Ast.zig");
 const Mono = @import("../symbols/Mono.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
@@ -69,8 +70,8 @@ pub fn reifyAppTo(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
             const decl_node = if (e.ctor_is_enum) t.enums.items[e.ctor].decl_node else t.structs.items[e.ctor].decl_node;
             // An AST-less prelude template (Option/Result) has decl_node == Ast.none; anchor
             // the diagnostic at byte 0 rather than OOB-derefing the tree on maxInt(u32).
-            const at: u32 = if (decl_node == Ast.none) 0 else t.byteOf(t.tree.nodes[decl_node.int()].main_token);
-            try t.sink.emitCode(.T0017, at, "instantiation too deep: generic type nesting exceeds the depth limit");
+            const at: Span = if (decl_node == Ast.none) .{ .start = 0, .end = 0 } else t.tokSpan(t.tree.nodes[decl_node.int()].main_token);
+            try t.sink.report(.{ .span = at, .code = .T0017 }, "instantiation too deep: generic type nesting exceeds the depth limit", .{});
             t.mono_depth_capped = true;
         }
         return Type.invalid; // NOT memoized: a re-entry re-bails + re-latches (quietly)

@@ -17,6 +17,7 @@ const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Type = @import("Type.zig").Type;
 const Kind = @import("Type.zig").Kind;
+const Span = @import("../diagnostics/model.zig").Span;
 
 /// Positional field names for tuple structs, borrowed by `layoutStruct` (never freed
 /// individually — the StructSym teardown frees only the outer `field_names` array, and
@@ -250,13 +251,13 @@ pub const Env = struct {
     /// Resolve a type-reference node in the active module to a `Type`.
     typeFromNode: *const fn (ctx: *anyopaque, n: Ast.Index) Type,
     nameText: *const fn (ctx: *anyopaque, tok: u32) []const u8,
-    byteOf: *const fn (ctx: *anyopaque, tok: u32) u32,
-    /// "recursive type '{s}' has infinite size" at `byte`, naming `requester`.
-    emitRecursive: *const fn (ctx: *anyopaque, byte: u32, requester: []const u8) error{OutOfMemory}!void,
-    /// "empty struct '{s}' is not allowed" at `byte`.
-    emitEmptyStruct: *const fn (ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void,
-    /// "empty enum '{s}' is not allowed" at `byte`.
-    emitEmptyEnum: *const fn (ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void,
+    tokSpan: *const fn (ctx: *anyopaque, tok: u32) Span,
+    /// "recursive type '{s}' has infinite size" at `at`, naming `requester`.
+    emitRecursive: *const fn (ctx: *anyopaque, at: Span, requester: []const u8) error{OutOfMemory}!void,
+    /// "empty struct '{s}' is not allowed" at `at`.
+    emitEmptyStruct: *const fn (ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void,
+    /// "empty enum '{s}' is not allowed" at `at`.
+    emitEmptyEnum: *const fn (ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void,
     /// The active tree (after `gphSelect`). Resolved lazily inside the engine so
     /// the read happens AFTER the active-module swap (mirroring the checker).
     tree: *const fn (ctx: *anyopaque) Ast.Tree,
@@ -291,7 +292,7 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
     // hazard (no eightbytes, a degenerate sret). Reject it with a clean diagnostic.
     var empty_poison = false;
     if (n == 0) {
-        try env.emitEmptyStruct(env.ctx, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name);
+        try env.emitEmptyStruct(env.ctx, env.tokSpan(env.ctx, decl.main_token), env.structs.items[id].name);
         empty_poison = true;
     }
 
@@ -322,7 +323,7 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         sizing[i] = size_ty;
     }
 
-    const acc = try accumulateOffsets(env, sizing, offsets, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name);
+    const acc = try accumulateOffsets(env, sizing, offsets, env.tokSpan(env.ctx, decl.main_token), env.structs.items[id].name);
     // A `()` field is a zero-sized member (offset well-defined, contributes 0 bytes).
     // But a struct whose fields are ALL `()` lays out to size 0 — the same
     // zero-sized-aggregate ABI hazard the empty-struct guard exists to prevent — so
@@ -335,7 +336,7 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         all_unit = false;
         break;
     };
-    if (all_unit) try env.emitEmptyStruct(env.ctx, env.byteOf(env.ctx, decl.main_token), env.structs.items[id].name);
+    if (all_unit) try env.emitEmptyStruct(env.ctx, env.tokSpan(env.ctx, decl.main_token), env.structs.items[id].name);
     const poisoned = acc.poisoned or empty_poison or all_unit;
 
     env.structs.items[id].field_names = names;
@@ -368,7 +369,7 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
     // AST-less template; anchor the (poison-only) diagnostic at byte 0 rather than
     // OOB-derefing the tree on maxInt(u32). A concrete instance never poisons.
     const decl_node = env.structs.items[id].decl_node;
-    const at: u32 = if (decl_node == Ast.none) 0 else env.byteOf(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
+    const at: Span = if (decl_node == Ast.none) .{ .start = 0, .end = 0 } else env.tokSpan(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
     const name = env.structs.items[id].name;
 
     const offsets = try env.gpa.alloc(u32, types.len);
@@ -415,7 +416,7 @@ pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
     // Ast.none from its AST-less template; anchor the (poison-only) diagnostic at byte 0
     // rather than OOB-derefing the tree on maxInt(u32). A concrete instance never poisons.
     const decl_node = env.enums.items[id].decl_node;
-    const at: u32 = if (decl_node == Ast.none) 0 else env.byteOf(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
+    const at: Span = if (decl_node == Ast.none) .{ .start = 0, .end = 0 } else env.tokSpan(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
     const name = env.enums.items[id].name;
     const variants = env.enums.items[id].variants;
 
@@ -449,7 +450,7 @@ pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
 /// A `laying` referent means a cycle (direct or indirect): set `*requester_poison`
 /// and emit a recursion diagnostic at `at` naming `requester`. A scalar/str uses
 /// the natural sizes; `invalid`/`unit` size to 0 (the caller diagnoses `unit`).
-fn layoutReferent(env: Env, ty: Type, at: u32, requester: []const u8, requester_poison: *bool) error{OutOfMemory}!struct { size: u32, @"align": u32 } {
+fn layoutReferent(env: Env, ty: Type, at: Span, requester: []const u8, requester_poison: *bool) error{OutOfMemory}!struct { size: u32, @"align": u32 } {
     switch (ty.kind) {
         .@"struct" => {
             if (env.structs.items[ty.struct_id].state == .laying) {
@@ -483,7 +484,7 @@ const Accum = struct { size: u32, @"align": u32, poisoned: bool };
 /// (surfaced in `.poisoned`); a `unit`/`invalid` sizing type contributes nothing. The
 /// caller must have already reified any `App` and emitted any unit diagnostic — the
 /// kernel is diagnostic-free (bar the recursion diagnostic intrinsic to `layoutReferent`).
-fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, at: u32, requester: []const u8) error{OutOfMemory}!Accum {
+fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, at: Span, requester: []const u8) error{OutOfMemory}!Accum {
     std.debug.assert(offsets_out.len == sizing_types.len);
     var running: u32 = 0;
     var max_align: u32 = 1;
@@ -508,7 +509,7 @@ fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, a
 /// (payload-LOCAL offsets, size = roundUp(total, max_align)); the distinct name keeps the
 /// two enum payload callers (`layoutEnum`/`layoutReifiedEnum`) reading naturally while
 /// sharing the one kernel.
-fn accumulatePayload(env: Env, sizing_types: []const Type, offsets_out: []u32, at: u32, requester: []const u8) error{OutOfMemory}!Accum {
+fn accumulatePayload(env: Env, sizing_types: []const Type, offsets_out: []u32, at: Span, requester: []const u8) error{OutOfMemory}!Accum {
     return accumulateOffsets(env, sizing_types, offsets_out, at, requester);
 }
 
@@ -530,7 +531,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
 
     var poisoned = false;
     if (nv == 0) {
-        try env.emitEmptyEnum(env.ctx, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name);
+        try env.emitEmptyEnum(env.ctx, env.tokSpan(env.ctx, decl.main_token), env.enums.items[id].name);
         poisoned = true;
     }
 
@@ -592,7 +593,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             const size_ty: Type = if (pty.isApp()) try env.reifyApp(env.ctx, pty.appIdx()) else pty;
             sizing[pi] = size_ty;
         }
-        const acc = try accumulatePayload(env, sizing, foffs, env.byteOf(env.ctx, decl.main_token), env.enums.items[id].name);
+        const acc = try accumulatePayload(env, sizing, foffs, env.tokSpan(env.ctx, decl.main_token), env.enums.items[id].name);
         poisoned = poisoned or acc.poisoned;
         variants[vi] = .{
             .name = vname,
@@ -893,7 +894,7 @@ const Harness = struct {
             .gphSelect = stubGphSelect,
             .typeFromNode = stubTypeFromNode,
             .nameText = stubNameText,
-            .byteOf = stubByteOf,
+            .tokSpan = stubTokSpan,
             .emitRecursive = stubEmitRecursive,
             .emitEmptyStruct = stubEmitEmptyStruct,
             .emitEmptyEnum = stubEmitEmptyEnum,
@@ -919,22 +920,23 @@ fn stubTypeFromNode(ctx: *anyopaque, n: Ast.Index) Type {
 fn stubNameText(ctx: *anyopaque, t: u32) []const u8 {
     return hcast(ctx).names.items[t];
 }
-fn stubByteOf(ctx: *anyopaque, t: u32) u32 {
-    return hcast(ctx).starts.items[t];
+fn stubTokSpan(ctx: *anyopaque, t: u32) Span {
+    const start = hcast(ctx).starts.items[t];
+    return .{ .start = start, .end = start };
 }
 fn pushDiag(ctx: *anyopaque, byte: u32, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!void {
     const h = hcast(ctx);
     const msg = try std.fmt.allocPrint(h.gpa, fmt, args);
     try h.diags.append(h.gpa, .{ .msg = msg, .byte = byte });
 }
-fn stubEmitRecursive(ctx: *anyopaque, byte: u32, requester: []const u8) error{OutOfMemory}!void {
-    return pushDiag(ctx, byte, "recursive type '{s}' has infinite size", .{requester});
+fn stubEmitRecursive(ctx: *anyopaque, at: Span, requester: []const u8) error{OutOfMemory}!void {
+    return pushDiag(ctx, at.start, "recursive type '{s}' has infinite size", .{requester});
 }
-fn stubEmitEmptyStruct(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
-    return pushDiag(ctx, byte, "empty struct '{s}' is not allowed", .{name});
+fn stubEmitEmptyStruct(ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void {
+    return pushDiag(ctx, at.start, "empty struct '{s}' is not allowed", .{name});
 }
-fn stubEmitEmptyEnum(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
-    return pushDiag(ctx, byte, "empty enum '{s}' is not allowed", .{name});
+fn stubEmitEmptyEnum(ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void {
+    return pushDiag(ctx, at.start, "empty enum '{s}' is not allowed", .{name});
 }
 fn stubReifyApp(_: *anyopaque, _: u32) error{OutOfMemory}!Type {
     // The layout unit tests never build a struct with a concrete `App` field, so this

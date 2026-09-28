@@ -269,7 +269,7 @@ pub const Builder = struct {
 
     fn note(b: *Builder, tok: u32, msg: []const u8) error{OutOfMemory}!void {
         b.had_error = true;
-        try b.diags.append(b.gpa, .{ .byte_offset = b.in.tokens[tok].start, .message = msg });
+        try b.diags.append(b.gpa, .{ .byte_offset = b.in.tokens[tok].start, .end = b.in.tokens[tok].end, .message = msg });
     }
 };
 
@@ -1628,7 +1628,7 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
             // A str VALUE operand never reaches here: `to_string(str)` returns the receiver
             // operand directly. Note-and-empty rather than miscompile keeps lower total for
             // the unreachable-for-well-typed case.
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "display: str operand is not a slot in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "display: str operand is not a slot in lower" });
             b.had_error = true;
             return try emitStrLiteralSlot(b, "");
         },
@@ -1669,13 +1669,13 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
                 return slot;
             },
             .none, .ambiguous => {
-                try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "display: no display witness for an aggregate in lower" });
+                try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "display: no display witness for an aggregate in lower" });
                 b.had_error = true;
                 return try emitStrLiteralSlot(b, "");
             },
         },
         else => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "display: unsupported operand kind in lower" });
+            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "display: unsupported operand kind in lower" });
             b.had_error = true;
             return try emitStrLiteralSlot(b, "");
         },
@@ -2779,7 +2779,7 @@ fn convWitnessCallee(b: *Builder, kind: Derive.Kind) ?Link.SymName {
 fn convCallWitness(b: *Builder, kind: Derive.Kind, v: Ir.ValueId, call_ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const slot = try b.addSlot(call_ty);
     const callee = convWitnessCallee(b, kind) orelse {
-        try b.diags.append(b.gpa, .{ .byte_offset = 0, .message = "conv witness missing in lower" });
+        try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "conv witness missing in lower" });
         b.had_error = true;
         return .{ .slot = slot };
     };

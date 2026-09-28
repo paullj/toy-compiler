@@ -97,7 +97,7 @@ pub const Module = struct {
 
 /// What went wrong during discovery. Carries the OWNING module's index (into
 /// `modules`, or `entry_index` for the entry) so the driver can render the error
-/// against that module's source at `byte_offset` (the offending import token).
+/// against that module's source over `span` (e.g. the offending import token).
 /// `cycle` is a `/`-joined arrow path naming the import cycle; owned when present.
 pub const Error = struct {
     pub const Kind = enum {
@@ -116,7 +116,7 @@ pub const Error = struct {
     /// location). `null` for the entry-not-found case (no module loaded yet).
     module: ?u32 = null,
     /// Byte offset into that module's source for `line:col`, or `null`.
-    byte_offset: ?u32 = null,
+    span: ?Span = null,
     /// For `cycle`/`missing`/`escape`: a heap string (the cycle path or the
     /// resolved file path) the caller may want in the message. Owned when set.
     detail: []const u8 = &.{},
@@ -149,20 +149,6 @@ pub const Graph = struct {
 
     pub const Ownership = enum { owned, borrowed };
 
-    /// The span of structural error `e`: the token at its offset, in the module it is
-    /// reported against. Null when it has no location.
-    pub fn errorSpan(g: *const Graph, e: Error) ?Span {
-        const off = e.byte_offset orelse return null;
-        const m = e.module orelse g.entry_index;
-        if (m >= g.modules.len) return .{ .start = off, .end = off };
-        return .{ .start = off, .end = DiagnosticMod.tokenEnd(g.modules[m].tokens, off) };
-    }
-
-    /// The tokens of the module a diagnostic's `scope` names (the entry for an unscoped
-    /// one): what `Diagnostic.fillSpans` measures its default spans against.
-    pub fn scopeTokens(g: *const Graph, scope: u32) []const Token {
-        return g.modules[if (scope == DiagnosticMod.NO_SCOPE) g.entry_index else scope].tokens;
-    }
 
     /// Tear down per `ownership`: the right teardown is impossible to pick wrong
     /// because the value records who built it.
@@ -566,7 +552,7 @@ const Discoverer = struct {
                 // For a bundled module this is a build bug, not a user error; either way
                 // surface the diagnostics against the module so none is swallowed.
                 const first = parsed.diags[0];
-                const byte_offset = first.byte_offset;
+                const span = first.span();
                 const diags_owned = try d.gpa.dupe(Diagnostic, parsed.diags);
                 const message_owned = d.gpa.dupe(u8, first.message) catch |e| {
                     d.gpa.free(diags_owned);
@@ -580,7 +566,7 @@ const Discoverer = struct {
                 s.source = source;
                 s.tokens = tokens;
                 s.loaded = true;
-                return d.fail(.{ .kind = .parse, .message = message_owned, .module = id, .byte_offset = byte_offset, .parse_diags = diags_owned });
+                return d.fail(.{ .kind = .parse, .message = message_owned, .module = id, .span = span, .parse_diags = diags_owned });
             }
             const s = &d.slots.items[id];
             s.source = source;
@@ -653,7 +639,7 @@ const Discoverer = struct {
             // `check` to render every one) BEFORE freeing the tree — no leak if a dupe
             // OOMs. The slot only adopts `source`/`tokens`.
             const first = parsed.diags[0];
-            const byte_offset = first.byte_offset;
+            const span = first.span();
             const message_static = first.message;
             // No errdefer: `fail` always returns `error.Structural`, which would fire an
             // errdefer on ownership already moved into the Error. Clean up by hand instead.
@@ -674,7 +660,7 @@ const Discoverer = struct {
                 .kind = .parse,
                 .message = message_owned,
                 .module = id,
-                .byte_offset = byte_offset,
+                .span = span,
                 .parse_diags = diags_owned,
             });
         }
@@ -805,7 +791,7 @@ const Discoverer = struct {
 
             // Rebuild the `/`-joined import path from the segment TOKEN indices.
             const seg_tokens = Ast.importPathToks(tree, decl);
-            const import_off = s_tokens[decl.main_token].start; // last-seg token, for diag
+            const import_span: Span = .{ .start = s_tokens[decl.main_token].start, .end = s_tokens[decl.main_token].end }; // last-seg token, for diag
             const path = try joinPath(d.gpa, s_tokens, s_source, seg_tokens);
             defer d.gpa.free(path);
 
@@ -843,7 +829,7 @@ const Discoverer = struct {
                     .kind = .escape,
                     .message = try std.fmt.allocPrint(d.gpa, "import path '{s}' escapes the module root", .{path}),
                     .module = id,
-                    .byte_offset = import_off,
+                    .span = import_span,
                 }),
                 else => |err| return err,
             };
@@ -862,7 +848,7 @@ const Discoverer = struct {
                     .kind = .missing,
                     .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (looked for '{s}')", .{ path, file }),
                     .module = id,
-                    .byte_offset = import_off,
+                    .span = import_span,
                 });
             };
 
@@ -885,7 +871,7 @@ const Discoverer = struct {
                         .kind = .missing,
                         .message = msg,
                         .module = id,
-                        .byte_offset = import_off,
+                        .span = import_span,
                     });
                 }
             }
@@ -946,7 +932,7 @@ const Discoverer = struct {
             .kind = .cycle,
             .message = msg,
             .module = from,
-            .byte_offset = importTokenOffset(d, from, target),
+            .span = importTokenSpan(d, from, target),
             .detail = detail,
         };
     }
@@ -981,7 +967,7 @@ const Discoverer = struct {
 
 /// The byte offset of the import statement in module `from` that targets module
 /// `target` (for the cycle diagnostic location). Falls back to 0.
-fn importTokenOffset(d: *Discoverer, from: u32, target: u32) ?u32 {
+fn importTokenSpan(d: *Discoverer, from: u32, target: u32) ?Span {
     const s = &d.slots.items[from];
     if (s.nodes.len == 0) return null;
     const tree: Ast.Tree = .{ .nodes = s.nodes, .extra = s.extra };
@@ -993,9 +979,9 @@ fn importTokenOffset(d: *Discoverer, from: u32, target: u32) ?u32 {
         const seg_tokens = Ast.importPathToks(tree, decl);
         const path = joinPath(d.gpa, s.tokens, s.source, seg_tokens) catch return null;
         defer d.gpa.free(path);
-        if (std.mem.eql(u8, path, d.slots.items[target].name)) return s.tokens[decl.main_token].start;
+        if (std.mem.eql(u8, path, d.slots.items[target].name)) return .{ .start = s.tokens[decl.main_token].start, .end = s.tokens[decl.main_token].end };
     }
-    return s.tokens[0].start;
+    return .{ .start = s.tokens[0].start, .end = s.tokens[0].end };
 }
 
 /// Join the import path segments with `/`. Segments are TOKEN indices.
@@ -1179,7 +1165,7 @@ test "discover: missing import errors cleanly with location" {
             try testing.expect(g.err != null);
             try testing.expectEqual(Error.Kind.missing, g.err.?.kind);
             try testing.expectEqual(@as(?u32, 0), g.err.?.module); // reported in entry
-            try testing.expect(g.err.?.byte_offset != null);
+            try testing.expect(g.err.?.span != null);
             try testing.expect(std.mem.indexOf(u8, g.err.?.message, "nope/missing") != null);
         }
     };
@@ -1221,7 +1207,7 @@ test "discover: a parse error is reported and owns its source (no leak/double-fr
             // The FULL coded diagnostic list is retained (not just `message`) so `check`
             // renders every one; the first matches the structural error's offset.
             try testing.expect(g.err.?.parse_diags.len >= 1);
-            try testing.expectEqual(g.err.?.byte_offset, g.err.?.parse_diags[0].byte_offset);
+            try testing.expectEqual(g.err.?.span.?, g.err.?.parse_diags[0].span());
         }
     };
     try withFixture(".toy-test-graph-parseerr", files, "main.toy", Check.run);
