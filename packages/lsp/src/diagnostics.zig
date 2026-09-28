@@ -174,11 +174,11 @@ test "checkBuffer maps an arity mismatch to a T0039 on the erroring line" {
     for (mapped.items) |d| {
         if (d.code) |c| if (std.mem.eql(u8, c, "T0039")) {
             found = true;
-            // `add(1)` sits on source line 4 (0-based 3) in the fixture; the range is the
-            // compiler's span of the reported token.
+            // `add(1)` sits on source line 4 (0-based 3) in the fixture; the compiler spans
+            // exactly its argument list `(1)`.
             try testing.expectEqual(@as(u32, 3), d.range.start.line);
             try testing.expectEqual(d.range.start.line, d.range.end.line);
-            try testing.expect(d.range.start.character < d.range.end.character);
+            try testing.expectEqual(d.range.start.character + 3, d.range.end.character);
             try testing.expectEqualStrings("defined here", d.relatedInformation.?[0].message);
         };
     }
