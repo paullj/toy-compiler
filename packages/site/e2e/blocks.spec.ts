@@ -65,6 +65,12 @@ test('a type error is reported while typing and cleared once fixed', async ({ pa
 	await expect(b.locator('.cm-lintRange-error, .cm-lintPoint-error')).toHaveCount(0);
 });
 
+test('diagnostics land on the right characters after non-ASCII text', async ({ page }) => {
+	const b = await live(page, 'order.toy');
+	await typeAtEndOfLine(page, b, 'quantity := 3', '\nlabel := "日本" == "x" || nope');
+	await expect(b.locator('.cm-lintRange-error')).toHaveText('nope');
+});
+
 test('a new line inside a block indents one level per open bracket', async ({ page }) => {
 	const b = await live(page, 'shapes.toy');
 	await typeAtEndOfLine(page, b, '.Square(side)', '\n.Circle(r) -> 0,');

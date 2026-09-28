@@ -9,6 +9,7 @@ const Io = std.Io;
 const toyc = @import("toy_compiler");
 const Documents = @import("Documents.zig");
 const lsp_uri = @import("uri.zig");
+const position = @import("position.zig");
 
 const Graph = toyc.Graph;
 const Cache = toyc.Cache;
@@ -20,6 +21,8 @@ docs: *const Documents,
 /// false on a host with no filesystem (the browser): an import resolves only against open
 /// documents.
 disk: bool = true,
+/// How the client counts `character` in the positions it sends and reads back.
+encoding: position.Encoding = .utf16,
 
 /// Discover the module graph rooted at `uri`, whose current text is `text` (which may differ
 /// from the stored document: completion and signature help check a repaired copy). A

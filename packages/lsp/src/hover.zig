@@ -63,7 +63,7 @@ pub fn hoverAt(
     var sm = try SourceMap.init(gpa, m.file, m.source);
     defer sm.deinit(gpa);
 
-    const off = position.positionToOffset(&sm, line, character) orelse return null;
+    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
     const tok = position.tokenAt(m.tokens, off) orelse return null;
 
     var arena = std.heap.ArenaAllocator.init(gpa);

@@ -5,27 +5,77 @@ const toyc = @import("toy_compiler");
 
 const Token = toyc.Token;
 const SourceMap = toyc.term.render.SourceMap;
+const protocol = @import("protocol.zig");
 
-/// The byte offset of an LSP position (`off = line_starts[line] + character`). An
-/// out-of-range line yields null; a character past the line's end clamps to the end (which
-/// `tokenAt` then reads as a gap -> null). u64 arithmetic so the `line + 1` / `line + 2`
-/// index used to bracket the line cannot overflow.
-pub fn positionToOffset(sm: *const SourceMap, line: u32, character: u32) ?u32 {
+/// How an LSP `character` counts: UTF-8 bytes, or UTF-16 code units (the protocol's
+/// default, and what browser editors count in). Negotiated at `initialize`.
+pub const Encoding = enum {
+    utf8,
+    utf16,
+
+    pub fn name(e: Encoding) []const u8 {
+        return switch (e) {
+            .utf8 => "utf-8",
+            .utf16 => "utf-16",
+        };
+    }
+};
+
+/// The byte offset of an LSP position. An out-of-range line yields null; a character past
+/// the line's end clamps to the end (which `tokenAt` then reads as a gap -> null), as does
+/// a UTF-16 position inside a surrogate pair's first half.
+pub fn positionToOffset(sm: *const SourceMap, line: u32, character: u32, enc: Encoding) ?u32 {
     const lc = sm.lineCount();
     if (line >= lc) return null;
-    const ls: u64 = sm.lineStart(@as(usize, line) + 1);
-    const le: u64 = if (@as(usize, line) + 1 < lc) sm.lineStart(@as(usize, line) + 2) else sm.bytes.len;
-    const want: u64 = ls + character;
-    return @intCast(if (want >= le) le else want);
+    const ls: u32 = sm.lineStart(@as(usize, line) + 1);
+    const le: u32 = if (@as(usize, line) + 1 < lc) sm.lineStart(@as(usize, line) + 2) else @intCast(sm.bytes.len);
+    var off = ls;
+    var units: u32 = 0;
+    while (off < le and units < character) {
+        const n = std.unicode.utf8ByteSequenceLength(sm.bytes[off]) catch 1;
+        units += switch (enc) {
+            .utf8 => n,
+            .utf16 => if (n == 4) 2 else 1,
+        };
+        off = @min(le, off + n);
+    }
+    return off;
 }
 
-/// LSP (line,character) -> byte offset within `text`, via a throwaway SourceMap. Null for
-/// an out-of-range line; a character past the line end clamps to the line end. This is the
-/// SAME basis the feature handlers use, so a spliced edit and a later hover/definition agree.
-pub fn offsetIn(gpa: std.mem.Allocator, text: []const u8, line: u32, character: u32) !?u32 {
+/// The LSP position of byte `off`: its 0-based line, and the `character` counted in `enc`
+/// from the line's start.
+pub fn offsetToPosition(sm: *const SourceMap, off: u32, enc: Encoding) protocol.Position {
+    const lc = sm.lineCol(off);
+    const line: u32 = @intCast(lc.line - 1);
+    const ls = sm.lineStart(lc.line);
+    const end = @min(off, @as(u32, @intCast(sm.bytes.len)));
+    const character: u32 = switch (enc) {
+        .utf8 => end - ls,
+        .utf16 => blk: {
+            var units: u32 = 0;
+            var i = ls;
+            while (i < end) {
+                const n = std.unicode.utf8ByteSequenceLength(sm.bytes[i]) catch 1;
+                units += if (n == 4) 2 else 1;
+                i += n;
+            }
+            break :blk units;
+        },
+    };
+    return .{ .line = line, .character = character };
+}
+
+/// The LSP range of the byte span `[start, end)`.
+pub fn rangeOf(sm: *const SourceMap, start: u32, end: u32, enc: Encoding) protocol.Range {
+    return .{ .start = offsetToPosition(sm, start, enc), .end = offsetToPosition(sm, end, enc) };
+}
+
+/// LSP (line,character) -> byte offset within `text`, via a throwaway SourceMap. The SAME
+/// basis the feature handlers use, so a spliced edit and a later hover/definition agree.
+pub fn offsetIn(gpa: std.mem.Allocator, text: []const u8, line: u32, character: u32, enc: Encoding) !?u32 {
     var sm = try SourceMap.init(gpa, "d", text);
     defer sm.deinit(gpa);
-    return positionToOffset(&sm, line, character);
+    return positionToOffset(&sm, line, character, enc);
 }
 
 /// The token whose half-open `[start, end)` contains `off`, or null for a gap / EOF. Binary
@@ -64,14 +114,14 @@ test "positionToOffset: basis, OOB line, char past EOL clamps" {
     var sm = try SourceMap.init(gpa, "t", src);
     defer sm.deinit(gpa);
 
-    try testing.expectEqual(@as(?u32, 0), positionToOffset(&sm, 0, 0));
-    try testing.expectEqual(@as(?u32, 1), positionToOffset(&sm, 0, 1));
-    try testing.expectEqual(@as(?u32, 3), positionToOffset(&sm, 1, 0)); // start of "cde"
-    try testing.expectEqual(@as(?u32, 5), positionToOffset(&sm, 1, 2));
+    try testing.expectEqual(@as(?u32, 0), positionToOffset(&sm, 0, 0, .utf8));
+    try testing.expectEqual(@as(?u32, 1), positionToOffset(&sm, 0, 1, .utf8));
+    try testing.expectEqual(@as(?u32, 3), positionToOffset(&sm, 1, 0, .utf8)); // start of "cde"
+    try testing.expectEqual(@as(?u32, 5), positionToOffset(&sm, 1, 2, .utf8));
     // A char past the line end clamps to the line's end (the trailing '\n' index).
-    try testing.expectEqual(@as(?u32, 3), positionToOffset(&sm, 0, 50));
+    try testing.expectEqual(@as(?u32, 3), positionToOffset(&sm, 0, 50, .utf8));
     // OOB line -> null.
-    try testing.expectEqual(@as(?u32, null), positionToOffset(&sm, 99, 0));
+    try testing.expectEqual(@as(?u32, null), positionToOffset(&sm, 99, 0, .utf8));
 }
 
 test "positionToOffset is the exact inverse of lineCol" {
@@ -83,7 +133,27 @@ test "positionToOffset is the exact inverse of lineCol" {
     var off: u32 = 0;
     while (off <= src.len) : (off += 1) {
         const lc = sm.lineCol(off);
-        const round = positionToOffset(&sm, @intCast(lc.line - 1), @intCast(lc.col - 1));
+        const round = positionToOffset(&sm, @intCast(lc.line - 1), @intCast(lc.col - 1), .utf8);
         try testing.expectEqual(@as(?u32, off), round);
+    }
+}
+
+test "utf-16 positions count code units, and round-trip with byte offsets" {
+    const gpa = testing.allocator;
+    // `é` is 2 bytes / 1 unit; `𝄞` is 4 bytes / 2 units (a surrogate pair).
+    const src = "a\u{e9}b \u{1d11e}c\nx\n";
+    var sm = try SourceMap.init(gpa, "t", src);
+    defer sm.deinit(gpa);
+    const c_off: u32 = @intCast(std.mem.indexOfScalar(u8, src, 'c').?);
+    try testing.expectEqual(@as(?u32, c_off), positionToOffset(&sm, 0, 6, .utf16));
+    try testing.expectEqual(@as(?u32, c_off), positionToOffset(&sm, 0, 9, .utf8));
+    try testing.expectEqual(protocol.Position{ .line = 0, .character = 6 }, offsetToPosition(&sm, c_off, .utf16));
+    var off: u32 = 0;
+    while (off <= src.len) : (off += 1) {
+        if (off < src.len and (src[off] & 0xC0) == 0x80) continue; // not a char boundary
+        for ([_]Encoding{ .utf8, .utf16 }) |enc| {
+            const p = offsetToPosition(&sm, off, enc);
+            try testing.expectEqual(@as(?u32, off), positionToOffset(&sm, p.line, p.character, enc));
+        }
     }
 }

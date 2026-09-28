@@ -9,6 +9,7 @@ const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const hover = @import("hover.zig");
 const Workspace = @import("Workspace.zig");
+const position = @import("position.zig");
 const Documents = @import("Documents.zig");
 
 const Graph = toyc.Graph;
@@ -57,13 +58,13 @@ pub fn checkBuffer(
         // A tainted parse in the ENTRY carries its full coded diagnostic list; map it.
         const in_entry = ge.module == null or ge.module == graph.entry_index;
         if (ge.kind == .parse and in_entry) {
-            try mapInto(a, &sm, &graph, uri, &out, ge.parse_diags);
+            try mapInto(a, &sm, ws.encoding, &graph, uri, &out, ge.parse_diags);
         } else if (in_entry) {
             // Any other structural error that belongs to the entry and carries an offset
             // (an unresolvable/mis-cased import token) becomes one diagnostic there.
             if (graph.errorSpan(ge)) |span| {
                 try out.append(a, .{
-                    .range = lspRange(&sm, span),
+                    .range = position.rangeOf(&sm, span.start, span.end, ws.encoding),
                     .severity = protocol.severity.err,
                     .message = try a.dupe(u8, ge.message),
                 });
@@ -91,7 +92,7 @@ pub fn checkBuffer(
     @memcpy(combined[res.diags.len..], type_diags);
     Sink.sortSlice(combined);
 
-    try mapInto(a, &sm, &graph, uri, &out, combined);
+    try mapInto(a, &sm, ws.encoding, &graph, uri, &out, combined);
     return .{ .arena = arena, .items = out.items };
 }
 
@@ -100,6 +101,7 @@ pub fn checkBuffer(
 fn mapInto(
     a: std.mem.Allocator,
     sm: *const SourceMap,
+    enc: position.Encoding,
     graph: *const Graph.Graph,
     uri: []const u8,
     out: *std.ArrayList(protocol.LspDiagnostic),
@@ -107,41 +109,28 @@ fn mapInto(
 ) !void {
     for (diags) |d| {
         if (d.scope != Sink.NO_SCOPE and d.scope != graph.entry_index) continue;
-        try out.append(a, try mapOne(a, sm, uri, d));
+        try out.append(a, try mapOne(a, sm, enc, uri, d));
     }
 }
 
-fn mapOne(a: std.mem.Allocator, sm: *const SourceMap, uri: []const u8, d: Diagnostic) !protocol.LspDiagnostic {
+fn mapOne(a: std.mem.Allocator, sm: *const SourceMap, enc: position.Encoding, uri: []const u8, d: Diagnostic) !protocol.LspDiagnostic {
     var related: ?[]const protocol.Related = null;
     if (d.relatedSpan()) |rs| {
         const arr = try a.alloc(protocol.Related, 1);
         arr[0] = .{
-            .location = .{ .uri = try a.dupe(u8, uri), .range = lspRange(sm, rs) },
+            .location = .{ .uri = try a.dupe(u8, uri), .range = position.rangeOf(sm, rs.start, rs.end, enc) },
             .message = codes.relatedLabel(d.code),
         };
         related = arr;
     }
     return .{
-        .range = lspRange(sm, d.span()),
+        .range = position.rangeOf(sm, d.span().start, d.span().end, enc),
         .severity = lspSeverity(d.severity),
         // A static registry string; safe to reference after the graph is freed.
         .code = codes.str(d.code),
         .message = try a.dupe(u8, d.message),
         .relatedInformation = related,
     };
-}
-
-/// A compiler span as an LSP range. `SourceMap.lineCol` is 1-based line + 1-based BYTE
-/// column; LSP wants 0-based line + 0-based character. Byte column equals the UTF-16
-/// character for ASCII; a utf-16-only client on genuinely multibyte source would need a
-/// byte->utf-16 pass over `sm.lineText` here — out of scope while we advertise utf-8.
-fn lspRange(sm: *const SourceMap, span: model.Span) protocol.Range {
-    return .{ .start = lspPosition(sm, span.start), .end = lspPosition(sm, span.end) };
-}
-
-fn lspPosition(sm: *const SourceMap, off: u32) protocol.Position {
-    const lc = sm.lineCol(off);
-    return .{ .line = @intCast(lc.line - 1), .character = @intCast(lc.col - 1) };
 }
 
 fn lspSeverity(s: model.Severity) u8 {

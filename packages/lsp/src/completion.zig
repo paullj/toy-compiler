@@ -94,7 +94,7 @@ pub fn completionsAt(
     var sm = try SourceMap.init(gpa, "c", source);
     defer sm.deinit(gpa);
 
-    const off = position.positionToOffset(&sm, line, character) orelse return empty(arena);
+    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return empty(arena);
     const det = classify(toks, off);
     if (det.context == .none) return empty(arena);
 

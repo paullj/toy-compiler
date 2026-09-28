@@ -70,13 +70,13 @@ pub fn definitionAt(
     var sm = try SourceMap.init(gpa, m.file, m.source);
     defer sm.deinit(gpa);
 
-    const off = position.positionToOffset(&sm, line, character) orelse return null;
+    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
     const use_tok = position.tokenAt(m.tokens, off) orelse return null;
     const site = declSiteFor(&graph, entry, &res, use_tok) orelse return null;
 
     if (site.module == entry) {
         // Within-file: the request's uri verbatim (m.file is its decoded path).
-        return .{ .uri = try gpa.dupe(u8, doc_uri), .range = rangeOfToken(&sm, m.tokens, site.tok) };
+        return .{ .uri = try gpa.dupe(u8, doc_uri), .range = rangeOfToken(&sm, m.tokens, site.tok, ws.encoding) };
     }
 
     const tm = &graph.modules[site.module];
@@ -85,7 +85,7 @@ pub fn definitionAt(
     if (!std.fs.path.isAbsolute(tm.file)) return null;
     var tsm = try SourceMap.init(gpa, tm.file, tm.source);
     defer tsm.deinit(gpa);
-    return .{ .uri = try lsp_uri.pathToUri(gpa, tm.file), .range = rangeOfToken(&tsm, tm.tokens, site.tok) };
+    return .{ .uri = try lsp_uri.pathToUri(gpa, tm.file), .range = rangeOfToken(&tsm, tm.tokens, site.tok, ws.encoding) };
 }
 
 /// A decl site: the module it lives in and its name token within that module.
@@ -197,16 +197,8 @@ fn typeDeclToken(m: *const Graph.Module, use_tok: u32) ?u32 {
     return null;
 }
 
-/// The 0-based LSP range of token `t`. `SourceMap.lineCol` yields 1-based line + 1-based
-/// byte column (per `diagnostics.pointRange`), so both drop by one; the token's exclusive
-/// end offset maps straight to the LSP exclusive end character.
-fn rangeOfToken(sm: *const SourceMap, tokens: []const Token, t: u32) protocol.Range {
-    const s = sm.lineCol(tokens[t].start);
-    const e = sm.lineCol(tokens[t].end);
-    return .{
-        .start = .{ .line = @intCast(s.line - 1), .character = @intCast(s.col - 1) },
-        .end = .{ .line = @intCast(e.line - 1), .character = @intCast(e.col - 1) },
-    };
+fn rangeOfToken(sm: *const SourceMap, tokens: []const Token, t: u32, enc: position.Encoding) protocol.Range {
+    return position.rangeOf(sm, tokens[t].start, tokens[t].end, enc);
 }
 
 const testing = std.testing;
@@ -220,7 +212,7 @@ test "rangeOfToken maps a token's [start,end) to a 0-based exclusive range" {
     // The `add` name token spans bytes [3, 6).
     const add = std.mem.indexOf(u8, src, "add").?;
     const toks = [_]Token{.{ .tag = .identifier, .start = @intCast(add), .end = @intCast(add + 3) }};
-    const r = rangeOfToken(&sm, &toks, 0);
+    const r = rangeOfToken(&sm, &toks, 0, .utf8);
     try testing.expectEqual(@as(u32, 0), r.start.line);
     try testing.expectEqual(@as(u32, 3), r.start.character);
     try testing.expectEqual(@as(u32, 0), r.end.line);
