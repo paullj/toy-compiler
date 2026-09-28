@@ -965,8 +965,9 @@ pub const DeriveReq = struct {
     site: ?DeriveSite = null,
 };
 
-/// A source location in a module: the module id a diagnostic is scoped to, plus the span.
-pub const DeriveSite = struct { scope: u32, span: @import("diagnostics/model.zig").Span };
+/// An expression node in a module. Kept as the node, not a measured span: every `==` and
+/// `.hash()` records one, and only a derive that turns out impossible ever measures it.
+pub const DeriveSite = struct { scope: u32, node: Ast.Index };
 
 /// A struct field that blocks a structural derive: its declared name + type.
 /// Named (not an anonymous struct) so `firstNonConformingField` and the BodyChecker's
