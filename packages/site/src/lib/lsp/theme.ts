@@ -17,7 +17,6 @@ export const lspTheme = EditorView.theme({
 	'.cm-tooltip-hover pre': { margin: '0' },
 	'.cm-lsp-active-parameter': { color: 'var(--accent)', fontWeight: '600' },
 	'.cm-tooltip.cm-tooltip-autocomplete > ul': { fontFamily: 'var(--font-mono)', maxHeight: '14rem' },
-	// The site sets prose `li` in the serif face; completions are code.
 	'.cm-tooltip.cm-tooltip-autocomplete > ul > li': { padding: '0.15rem 0.6rem', fontFamily: 'var(--font-mono)' },
 	'.cm-tooltip-autocomplete ul li[aria-selected]': {
 		backgroundColor: 'color-mix(in srgb, var(--accent) 10%, transparent)',

@@ -42,9 +42,7 @@
 			class="flex items-center gap-2 border-b px-4 py-2 font-mono text-[0.7rem]"
 			style="border-color: var(--border); color: var(--fg-muted)"
 		>
-			<span class="h-2.5 w-2.5 rounded-full border" style="border-color: var(--fg-muted)"></span>
 			{filename}
-			{#if live}<span class="ml-auto">editable</span>{/if}
 		</figcaption>
 	{/if}
 	<div bind:this={host} class="overflow-x-auto">

@@ -15,7 +15,7 @@
 	type="button"
 	onclick={cycle}
 	title="Theme: click to cycle system / light / dark"
-	class="theme-btn font-mono leading-none lowercase {klass}"
+	class="theme-btn font-display leading-none lowercase {klass}"
 >
 	{userPrefersMode.current}
 </button>
