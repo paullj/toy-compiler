@@ -131,7 +131,9 @@ pub fn sort(self: *DiagnosticSink) void {
 /// tiebreak pulls the two `A`s together). One linear compaction keeps the first of
 /// each adjacent run and drops later exact repeats. Idempotent (dedup of an
 /// already-deduped array is a no-op). COLLECTION stays complete: this is a post-sort
-/// view collapse of identical repeats, never distinct errors.
+/// view collapse of identical repeats, never distinct errors. The span's end is not
+/// part of the key: a repeat reported from two passes that measured the same construct
+/// differently (a token vs. the whole node) is still one error, and the first kept wins.
 ///
 /// Frees NOTHING: a dropped duplicate's message buffer stays tracked in the
 /// parallel `owned` list and is freed exactly once on `deinit`/`Owned.deinit`. Only

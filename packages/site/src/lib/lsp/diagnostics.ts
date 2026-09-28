@@ -66,6 +66,8 @@ function publishDiagnostics(client: LSPClient, params: lsp.PublishDiagnosticsPar
 			renderMessage: (v) => render(v, severity, d.code, message, related)
 		};
 	});
+	// Marks the editor as checked at least once, for tests that assert on "no diagnostics".
+	view.dom.dataset.checked = String(params.version ?? '');
 	const key = JSON.stringify(diagnostics.map((d) => [d.from, d.to, d.severity, d.message]));
 	if (shown.get(view) === key) return true;
 	shown.set(view, key);

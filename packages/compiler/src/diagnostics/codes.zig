@@ -112,6 +112,9 @@ pub const Code = enum(u16) {
     _,
 };
 
+/// What a related location is, unless a row names it more precisely.
+const default_related = "defined here";
+
 /// One registry row. `str` is the human code; `slug` is the kebab-case identity used
 /// for docs/fixture filenames; `default_severity` seeds the sink POD (render config
 /// overrides it late).
@@ -121,7 +124,7 @@ const Entry = struct {
     slug: []const u8,
     default_severity: Severity = .err,
     /// What a diagnostic's related location IS; only codes that record one read it.
-    related: []const u8 = "defined here",
+    related: []const u8 = default_related,
 };
 
 /// The append-only registry. Every non-`.none` `Code` MUST have exactly one row (the
@@ -231,7 +234,7 @@ pub fn defaultSeverity(c: Code) Severity {
 /// The label for a code's related location (e.g. "previously defined here").
 pub fn relatedLabel(c: Code) []const u8 {
     for (table) |e| if (e.code == c) return e.related;
-    return "defined here";
+    return default_related;
 }
 
 /// The kebab-case slug for a code, or null for `.none`.
