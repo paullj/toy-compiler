@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	import { onMount } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { useDebounce, useEventListener, watch } from 'runed';
@@ -167,7 +168,7 @@
 <div class="mx-auto flex h-screen max-w-6xl flex-col border-x" style="border-color: var(--border)">
 	<!-- Header -->
 	<header class="flex h-14 shrink-0 items-center gap-4 border-b px-5" style="border-color: var(--border)">
-		<a href="/" class="flex items-center gap-2 font-mono text-sm font-medium">
+		<a href={resolve('/')} class="flex items-center gap-2 font-mono text-sm font-medium">
 			<span class="text-base leading-none">🧸</span> toy
 		</a>
 		<span class="font-mono text-[0.7rem] uppercase tracking-[0.2em]" style="color: var(--fg-muted)">

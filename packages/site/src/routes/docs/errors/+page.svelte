@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	let { data } = $props();
 
 	const bands = [
@@ -15,7 +16,7 @@
 </svelte:head>
 
 <div class="mx-auto min-h-screen max-w-6xl border-x px-6 pb-24 pt-20 sm:px-10 md:px-12" style="border-color: var(--border)">
-	<a href="/" class="link text-[0.82rem]">← toy</a>
+	<a href={resolve('/')} class="link text-[0.82rem]">← toy</a>
 	<h1 class="mt-8 text-3xl font-bold tracking-tight">Diagnostics</h1>
 	<p class="mt-3 max-w-[56ch] text-base leading-snug" style="color: var(--fg-muted)">
 		Every coded error and warning the compiler reports. The same text ships in the compiler as
