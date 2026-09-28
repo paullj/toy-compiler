@@ -172,29 +172,21 @@ pub const Graph = struct {
     }
 };
 
-/// Discover the module graph from `entry_path`. Reuses the on-disk lex/parse
-/// cache (`cache`) so warm rebuilds are free. Returns a `Graph`; the caller owns
-/// it and must `deinit`. A structural error is reported via `Graph.err` (NOT a
-/// thrown error) so the driver can render it against the owning module's source;
-/// only true I/O / OOM failures propagate as Zig errors.
-pub fn discover(
-    gpa: std.mem.Allocator,
-    io: Io,
-    cache: Cache,
-    target: []const u8,
-    entry_path: []const u8,
+/// Options for `discover`; every field is optional.
+pub const DiscoverOptions = struct {
     /// `--timings` probe for the discover stage's lex+parse queries (file-read+lex+parse
     /// COMPUTE vs served from the lex/parse content cache). BORROWED; null on a plain
     /// build => the front-end queries read no clock.
-    probe: ?*Engine.StageProbe,
-    /// Import-resolution root override. null => `dirname(entry_path)` (unchanged). A
-    /// non-null ABSOLUTE value roots sibling imports at a directory OTHER than the entry
-    /// file's own dir: an editor integration checks a scratch buffer but must resolve the
-    /// real project's imports. The entry module itself is always built from `entry_path`.
-    root: ?[]const u8,
-) !Graph {
-    return discoverWith(gpa, io, cache, target, entry_path, probe, root, null);
-}
+    probe: ?*Engine.StageProbe = null,
+    /// Import-resolution root override. null => `dirname(entry_path)`. A non-null ABSOLUTE
+    /// value roots sibling imports at a directory OTHER than the entry file's own dir: an
+    /// editor integration checks a buffer but must resolve the real project's imports.
+    root: ?[]const u8 = null,
+    /// In-memory sources consulted before disk (see `Overlay`). Overlay-served modules
+    /// skip the warm manifest and the source cache: their bytes are not a file with a
+    /// stable stat.
+    overlay: ?Overlay = null,
+};
 
 /// An in-memory source layer consulted BEFORE disk, keyed by resolved file path (the
 /// entry path verbatim, or `<root>/<import>.toy`). An editor serves unsaved buffers
@@ -210,26 +202,27 @@ pub const Overlay = struct {
     }
 };
 
-/// `discover` with an optional source `overlay`. Overlay-served modules skip the warm
-/// manifest and the source cache: their bytes are not a file with a stable stat.
-pub fn discoverWith(
+/// Discover the module graph from `entry_path`. Reuses the on-disk lex/parse
+/// cache (`cache`) so warm rebuilds are free. Returns a `Graph`; the caller owns
+/// it and must `deinit`. A structural error is reported via `Graph.err` (NOT a
+/// thrown error) so the driver can render it against the owning module's source;
+/// only true I/O / OOM failures propagate as Zig errors.
+pub fn discover(
     gpa: std.mem.Allocator,
     io: Io,
     cache: Cache,
     target: []const u8,
     entry_path: []const u8,
-    probe: ?*Engine.StageProbe,
-    root: ?[]const u8,
-    overlay: ?Overlay,
+    opts: DiscoverOptions,
 ) !Graph {
     var d: Discoverer = .{
         .gpa = gpa,
         .io = io,
         .cache = cache,
         .target = target,
-        .probe = probe,
-        .root = root orelse dirname(entry_path),
-        .overlay = overlay,
+        .probe = opts.probe,
+        .root = opts.root orelse dirname(entry_path),
+        .overlay = opts.overlay,
     };
     defer d.deinit();
 
@@ -1075,7 +1068,7 @@ fn withFixture(
     var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
 
-    var g = try discover(gpa, io, cache, "native", entry_path, null, null);
+    var g = try discover(gpa, io, cache, "native", entry_path, .{});
     defer g.deinit(gpa);
     try check(gpa, &g);
 }
@@ -1303,7 +1296,7 @@ test "discover: a same-size edit that MOVES the mtime is NOT served stale" {
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expect(g.err == null);
         try testing.expectEqualStrings("1", firstNumberLiteral(g.entry()).?);
@@ -1327,7 +1320,7 @@ test "discover: a same-size edit that MOVES the mtime is NOT served stale" {
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expect(g.err == null);
         try testing.expectEqualStrings(v2, g.entry().source);
@@ -1376,7 +1369,7 @@ test "discover: a touch -r style edit (mtime restored, ctime moved) is NOT serve
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expectEqualStrings("1", firstNumberLiteral(g.entry()).?);
         pack.flush(io, cache_dir);
@@ -1418,7 +1411,7 @@ test "discover: a touch -r style edit (mtime restored, ctime moved) is NOT serve
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expect(g.err == null);
         try testing.expectEqualStrings(v2, g.entry().source);
@@ -1450,7 +1443,7 @@ test "discover: a changed file whose mtime moves is re-read (size-changing edit)
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expectEqualStrings("1", firstNumberLiteral(g.entry()).?);
         pack.flush(io, cache_dir);
@@ -1461,7 +1454,7 @@ test "discover: a changed file whose mtime moves is re-read (size-changing edit)
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expectEqualStrings(v2, g.entry().source);
         try testing.expectEqualStrings("22", firstNumberLiteral(g.entry()).?);
@@ -1491,7 +1484,7 @@ test "discover: an unchanged file is served warm (literal preserved across a cle
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expect(g.err == null);
         try testing.expectEqualStrings("7", firstNumberLiteral(g.entry()).?);
@@ -1539,7 +1532,7 @@ test "discover: the warm path serves from cache WITHOUT reading the file" {
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expect(g.err == null);
         try testing.expectEqualStrings("5", firstNumberLiteral(g.entry()).?);
@@ -1571,7 +1564,7 @@ test "discover: the warm path serves from cache WITHOUT reading the file" {
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         // Served from cache: no parse error despite the garbage on disk, and the GOOD tree.
         try testing.expect(g.err == null);
@@ -1626,7 +1619,7 @@ test "discover: warm path FALLS BACK to a read when the cache blobs are missing"
         defer pack.deinit();
         pack.load(gpa, io, cache_dir);
         const cache = try Cache.initPack(io, cache_dir, &pack);
-        var g = try discover(gpa, io, cache, "native", file, null, null);
+        var g = try discover(gpa, io, cache, "native", file, .{});
         defer g.deinit(gpa);
         try testing.expect(g.err == null);
         try testing.expectEqualStrings(src, g.entry().source);

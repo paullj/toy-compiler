@@ -56,7 +56,7 @@ fn checkEntry(gpa: std.mem.Allocator, io: Io, entry: []const u8) !CheckOutcome {
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
 
-    var graph = try Graph.discover(gpa, io, cache, "native", entry, null, null);
+    var graph = try Graph.discover(gpa, io, cache, "native", entry, .{});
     defer graph.deinit(gpa);
     if (graph.err != null) return .{ .structural = true, .errors = 0 };
 
@@ -246,7 +246,7 @@ test "coherence: overlapping cross-module impls with a mismatched sig report T00
 
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = try Driver.openCache(io, &dir_buf);
-    var graph = try Graph.discover(gpa, io, cache, "native", dir ++ "/main.toy", null, null);
+    var graph = try Graph.discover(gpa, io, cache, "native", dir ++ "/main.toy", .{});
     defer graph.deinit(gpa);
     try testing.expect(graph.err == null);
 

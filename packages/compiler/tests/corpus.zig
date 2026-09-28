@@ -480,7 +480,7 @@ fn compileAndRun(
     entry: []const u8,
     out_name: []const u8,
 ) !RunResult {
-    var graph = try Graph.discover(gpa, io, cache, "aarch64-macos", entry, null, null);
+    var graph = try Graph.discover(gpa, io, cache, "aarch64-macos", entry, .{});
     defer graph.deinit(gpa);
     if (graph.err) |err| {
         try checkGraphSpans(gpa, &graph, err.parse_diags);
