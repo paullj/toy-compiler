@@ -192,14 +192,6 @@ const GraphResolve = struct {
         const segs = Ast.importPathToks(g.tree(mod), decl);
         return .{ .start = m.tokens[segs[0].int()].start, .end = m.tokens[segs[segs.len - 1].int()].end };
     }
-    /// The whole `extern fn name(..) -> R` declaration; its node starts at the name.
-    fn externSigSpan(g: *GraphResolve, mod: u32, decl_idx: Ast.Index) Span {
-        const m = &g.graph.modules[mod];
-        const name_tok = m.nodes[decl_idx.int()].main_token;
-        const sp = g.nodeSpan(mod, decl_idx);
-        const start = if (name_tok >= 2 and m.tokens[name_tok - 2].tag == .kw_extern) m.tokens[name_tok - 2].start else sp.start;
-        return .{ .start = start, .end = sp.end };
-    }
 
 /// A synthetic builtin the resolver seeds after the user fns. `core_only` gates
 /// registration into per-module fn tables: `false` = global prelude (every module),
@@ -317,7 +309,7 @@ fn collectGlobals(g: *GraphResolve) !void {
                     // bundled `core/` module. Anywhere else it is never registered, so
                     // any use of the name is undeclared (R0001).
                     if (!m.isCore()) {
-                        try g.sink.report(.{ .span = g.externSigSpan(mod, decl_idx), .code = .R0010, .scope = mod }, "'extern' functions are only allowed in 'core/' modules", .{});
+                        try g.sink.report(.{ .span = g.nodeSpan(mod, decl_idx), .code = .R0010, .scope = mod }, "'extern' functions are only allowed in 'core/' modules", .{});
                         continue;
                     }
                     const gop = try g.tables[mod].fns.getOrPut(g.gpa, name);
