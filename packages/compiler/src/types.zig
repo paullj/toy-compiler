@@ -956,7 +956,13 @@ fn isDerivableProtocol(model: *const Model, pid: u32) bool {
 pub const DeriveReq = struct {
     protocol_id: u32,
     conform_ty: Type,
+    /// The expression that demanded the derive (`s.hash()`, `a == b`): where a derive the
+    /// synthesis later finds impossible is reported, since synthesis itself has no source.
+    site: ?DeriveSite = null,
 };
+
+/// A source location in a module: the module id a diagnostic is scoped to, plus the span.
+pub const DeriveSite = struct { scope: u32, span: @import("diagnostics/model.zig").Span };
 
 /// A struct field that blocks a structural derive: its declared name + type.
 /// Named (not an anonymous struct) so `firstNonConformingField` and the BodyChecker's
@@ -3238,7 +3244,7 @@ fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
     return refs.typeFromQualified(t, node_idx, n);
 }
 
-fn typeName(t: *const Typecheck, ty: Type) []const u8 {
+pub fn typeName(t: *const Typecheck, ty: Type) []const u8 {
     return refs.typeName(t, ty);
 }
 
