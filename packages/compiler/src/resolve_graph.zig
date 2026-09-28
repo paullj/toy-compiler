@@ -44,6 +44,8 @@ const Diagnostic = DiagnosticMod.Diagnostic;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const nearmiss = @import("diagnostics/nearmiss.zig");
 const codes = @import("diagnostics/codes.zig");
+const Span = @import("diagnostics/model.zig").Span;
+const AstWalk = @import("query/AstWalk.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
@@ -180,6 +182,24 @@ const GraphResolve = struct {
     fn nameText(g: *GraphResolve, tok: u32) []const u8 {
         return g.nameOf(g.cur_mod, tok);
     }
+    fn nodeSpan(g: *GraphResolve, mod: u32, idx: Ast.Index) Span {
+        const m = &g.graph.modules[mod];
+        return AstWalk.nodeSpan(.{ .tree = g.tree(mod), .tokens = m.tokens, .source = m.source }, idx);
+    }
+    /// An import's module path `a/b/c`: what an error about the imported module underlines.
+    fn importPathSpan(g: *GraphResolve, mod: u32, decl: Ast.Node) Span {
+        const m = &g.graph.modules[mod];
+        const segs = Ast.importPathToks(g.tree(mod), decl);
+        return .{ .start = m.tokens[segs[0].int()].start, .end = m.tokens[segs[segs.len - 1].int()].end };
+    }
+    /// The whole `extern fn name(..) -> R` declaration; its node starts at the name.
+    fn externSigSpan(g: *GraphResolve, mod: u32, decl_idx: Ast.Index) Span {
+        const m = &g.graph.modules[mod];
+        const name_tok = m.nodes[decl_idx.int()].main_token;
+        const sp = g.nodeSpan(mod, decl_idx);
+        const start = if (name_tok >= 2 and m.tokens[name_tok - 2].tag == .kw_extern) m.tokens[name_tok - 2].start else sp.start;
+        return .{ .start = start, .end = sp.end };
+    }
 
 /// A synthetic builtin the resolver seeds after the user fns. `core_only` gates
 /// registration into per-module fn tables: `false` = global prelude (every module),
@@ -297,7 +317,7 @@ fn collectGlobals(g: *GraphResolve) !void {
                     // bundled `core/` module. Anywhere else it is never registered, so
                     // any use of the name is undeclared (R0001).
                     if (!m.isCore()) {
-                        try g.emit(.R0010, mod, m.tokens[decl.main_token].start, "'extern' functions are only allowed in 'core/' modules", .{});
+                        try g.emitSpan(.R0010, mod, g.externSigSpan(mod, decl_idx), "'extern' functions are only allowed in 'core/' modules", .{});
                         continue;
                     }
                     const gop = try g.tables[mod].fns.getOrPut(g.gpa, name);
@@ -424,7 +444,7 @@ fn collectNamespaces(g: *GraphResolve) !void {
             const target = g.importTarget(mod, decl) orelse {
                 // Discovery already proved every import resolves; a miss here is
                 // defensive (e.g. a stale graph). Report against this module.
-                try g.emit(.R0003, mod, m.tokens[decl.main_token].start, "unknown imported module", .{});
+                try g.emitSpan(.R0003, mod, g.importPathSpan(mod, decl), "unknown imported module", .{});
                 continue;
             };
 
@@ -1345,7 +1365,7 @@ fn warnUnusedImports(g: *GraphResolve) !void {
             if (bound != target) continue;
             if (ns_name.len != 0 and ns_name[0] == '_') continue; // deliberate side-effect-only import
             if (g.importIsUsed(target, ns_name, &ref_idents, &own_types, has_list, has_forkv, has_impl[target])) continue;
-            try g.emit(.W0004, mod, m.tokens[decl.main_token].start, "unused import '{s}'; remove it", .{g.graph.modules[target].path});
+            try g.emitSpan(.W0004, mod, g.importPathSpan(mod, decl), "unused import '{s}'; remove it", .{g.graph.modules[target].path});
         }
     }
 }
@@ -1412,6 +1432,12 @@ fn emit(g: *GraphResolve, code: codes.Code, mod: u32, byte_offset: u32, comptime
 fn emitRelated(g: *GraphResolve, code: codes.Code, mod: u32, byte_offset: u32, related: u32, comptime fmt: []const u8, args: anytype) !void {
     g.sink.setScope(mod);
     try g.sink.emitFmtCodeRelated(code, byte_offset, related, fmt, args);
+}
+
+/// Like `emit`, but over `span` in module `mod` rather than the token at its start.
+fn emitSpan(g: *GraphResolve, code: codes.Code, mod: u32, span: Span, comptime fmt: []const u8, args: anytype) !void {
+    g.sink.setScope(mod);
+    try g.sink.emitFmtCodeSpan(code, span, fmt, args);
 }
 };
 
@@ -3084,4 +3110,33 @@ test "an `as _`-aliased unused import is a deliberate silence (no W0004)" {
         }
     };
     try withResolvedGraph(".toy-test-w4-silence", files, "main.toy", Check.run);
+}
+
+test "an import diagnostic spans the module path; the extern gate spans the declaration" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util/lib as l
+        \\extern fn labs(x: int) -> int
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "util/lib.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            var seen: u32 = 0;
+            for (r.diags) |d| {
+                const src = g.modules[d.scope].source;
+                const text = src[d.byte_offset..d.end];
+                switch (d.code) {
+                    .W0004 => try testing.expectEqualStrings("util/lib", text),
+                    .R0010 => try testing.expectEqualStrings("extern fn labs(x: int) -> int", text),
+                    else => continue,
+                }
+                seen += 1;
+            }
+            try testing.expectEqual(@as(u32, 2), seen);
+        }
+    };
+    try withResolvedGraph(".toy-test-import-spans", files, "main.toy", Check.run);
 }

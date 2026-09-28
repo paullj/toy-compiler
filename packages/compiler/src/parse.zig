@@ -534,11 +534,12 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     // still precede the `fn_decl` node.
     var generics: std.ArrayList(Ast.Index) = .empty;
     defer generics.deinit(p.gpa);
+    const generics_start = p.peek().start;
     if (p.at(.l_bracket)) try p.parseGenericParams(&generics);
     // An `extern fn` is a bare C-ABI symbol: it cannot be generic. Report and drop
     // any generic params so the rest of the signature still parses.
     if (kind == .extern_top_level and generics.items.len > 0) {
-        try p.warn(p.peek(), .P0003, "'extern' functions cannot be generic");
+        try p.warnSpan(generics_start, p.prevEnd(), .P0003, "'extern' functions cannot be generic");
         generics.clearRetainingCapacity();
     }
 
@@ -1057,9 +1058,10 @@ fn parseMatchArm(p: *Parser) Error!Ast.Index {
     const arrow = p.index;
     if (p.at(.eq)) {
         // `=>` lexes as `.eq` then `.gt`; consume both so the arm body still parses.
-        try p.warn(p.peek(), .P0009, "match arms use '->', not '=>'");
+        const eq_start = p.peek().start;
         p.advance();
         _ = p.eat(.gt);
+        try p.warnSpan(eq_start, p.prevEnd(), .P0009, "match arms use '->', not '=>'");
     } else {
         try p.expect(.arrow, "expected '->' after a match pattern");
     }
@@ -1442,8 +1444,9 @@ fn parseType(p: *Parser) Error!Ast.Index {
         // `parseType` is reached ONLY in type position (annotation/return/param/field/
         // nested type-arg/alias/protocol-ref); no expression parses here, so a `<` can
         // never be a comparison — it is unambiguously the C++/Rust generic spelling.
-        try p.warn(p.peek(), .P0010, "type arguments use '[]', not '<>': write 'Vec[int]'");
+        const lt_start = p.peek().start;
         p.skipAngleTypeArgs();
+        try p.warnSpan(lt_start, p.prevEnd(), .P0010, "type arguments use '[]', not '<>': write 'Vec[int]'");
     }
     return ty;
 }
@@ -1785,7 +1788,6 @@ fn parseFor(p: *Parser) Error!Ast.Index {
 /// body block, when present, is parsed and discarded; the whole construct
 /// collapses to one `error_node` so exactly one diagnostic fires.
 fn recoverCStyleFor(p: *Parser, for_tok: u32) Error!Ast.Index {
-    try p.warn(p.peek(), .P0011, "toy has no C-style 'for (init; cond; step)'; write 'for x in xs { }'");
     var depth: u32 = 0;
     while (!p.at(.eof)) {
         const tag = p.peek().tag;
@@ -1800,6 +1802,7 @@ fn recoverCStyleFor(p: *Parser, for_tok: u32) Error!Ast.Index {
         p.advance();
         if (tag == .r_paren and depth == 0) break;
     }
+    try p.warnSpan(p.tokens[for_tok].start, p.prevEnd(), .P0011, "toy has no C-style 'for (init; cond; step)'; write 'for x in xs { }'");
     if (p.at(.l_brace)) {
         _ = p.parseBlock() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -2367,12 +2370,24 @@ fn expect(p: *Parser, tag: token.Tag, message: []const u8) Error!void {
 /// is the diagnostic's registry category (a P#### parse code) and rides the same
 /// cascade-latched append as the message.
 fn warn(p: *Parser, tok: Token, code: Code, message: []const u8) error{OutOfMemory}!void {
+    return p.warnSpan(tok.start, tok.end, code, message);
+}
+
+/// `warn` over the source bytes `[start, end)`, for an error about a run of tokens
+/// (a `<...>` type-argument list, a C-style `for` header) rather than one.
+fn warnSpan(p: *Parser, start: u32, end: u32, code: Code, message: []const u8) error{OutOfMemory}!void {
     // Cascade suppression: once a diagnostic has fired for the current unresynced
     // region, swallow the derived ones (arm the latch on the FIRST). The caller
     // still gets its `error_node`/unwind — only the duplicate append is dropped.
     if (p.in_error) return;
     p.in_error = true;
-    try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message, .code = code });
+    try p.diags.append(p.gpa, .{ .byte_offset = start, .end = end, .message = message, .code = code });
+}
+
+/// The end of the token just consumed: where a span over the run the parser has
+/// walked past so far stops.
+fn prevEnd(p: *const Parser) u32 {
+    return p.tokens[if (p.index == 0) 0 else p.index - 1].end;
 }
 
 /// Emit a depth-limit BACKSTOP diagnostic. Unlike `warn` this bypasses the
@@ -2382,7 +2397,7 @@ fn warn(p: *Parser, tok: Token, code: Code, message: []const u8) error{OutOfMemo
 /// latch either: the ordinary unwind noise (unclosed `}`) is still governed by the
 /// normal `warn` latch, so this collapses to one backstop message plus one closer.
 fn backstop(p: *Parser, tok: Token, code: Code, message: []const u8) error{OutOfMemory}!void {
-    try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .message = message, .code = code });
+    try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .end = tok.end, .message = message, .code = code });
 }
 
 /// Report a diagnostic and unwind the current producer via `error.ParseError`.
@@ -4592,4 +4607,25 @@ test "P0004 preserved: a non-`;` unexpected terminator token still reports P0004
     defer freeTree(gpa, res.tree);
     try testing.expect(res.diags.len >= 1);
     try testing.expectEqual(codes.Code.P0004, res.diags[0].code);
+}
+
+test "a parse diagnostic leaves the parser with its span: one token, or the whole mistaken run" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "fn f() -> int {\n  return 0 )\n}\n", .want = ")" },
+        .{ .src = "fn f(x: Map<Vec<int>>) -> int {\n  return 0\n}\n", .want = "<Vec<int>>" },
+        .{ .src = "fn f() {\n  for (i = 0; i < 3; i++) { }\n}\n", .want = "for (i = 0; i < 3; i++)" },
+        .{ .src = "fn f(e: int) -> int {\n  return match e {\n    _ => 1\n  }\n}\n", .want = "=>" },
+        .{ .src = "extern fn foo[T](x: int) -> int\n", .want = "[T]" },
+    };
+    for (cases) |c| {
+        const res = try parseResult(gpa, c.src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        const d = res.diags[0];
+        try testing.expect(d.end != @import("diagnostics/Diagnostic.zig").NO_END);
+        try testing.expectEqualStrings(c.want, c.src[d.byte_offset..d.end]);
+    }
 }

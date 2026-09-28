@@ -568,8 +568,6 @@ const Discoverer = struct {
                 const first = parsed.diags[0];
                 const byte_offset = first.byte_offset;
                 const diags_owned = try d.gpa.dupe(Diagnostic, parsed.diags);
-            DiagnosticMod.fillModuleSpans(diags_owned, tokens);
-                DiagnosticMod.fillModuleSpans(diags_owned, tokens);
                 const message_owned = d.gpa.dupe(u8, first.message) catch |e| {
                     d.gpa.free(diags_owned);
                     return e;

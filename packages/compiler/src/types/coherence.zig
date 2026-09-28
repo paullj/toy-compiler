@@ -11,6 +11,7 @@ const Type = Typecheck.Type;
 const Conformance = Typecheck.Conformance;
 const FnSym = Typecheck.FnSym;
 const GraphModuleInput = Typecheck.GraphModuleInput;
+const Span = @import("../diagnostics/model.zig").Span;
 
 const testing = std.testing;
 
@@ -61,7 +62,8 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // key to form; nothing more to check for this impl).
             const proto_ref = Ast.implProtocol(t.tree, decl).?;
             const pid = t.protocolIdFromNode(proto_ref) orelse {
-                const ref_tok = t.tree.nodes[proto_ref.int()].main_token;
+                // A generic ref `P[int]` is a `type_app` whose main token is its `[`.
+                const ref_tok = t.tree.nodes[Ast.protocolRefBase(t.tree, proto_ref).int()].main_token;
                 try t.sink.emitFmtCode(.T0021, t.byteOf(ref_tok), "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
                 continue;
             };
@@ -77,7 +79,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     }
                 }
                 if (!found)
-                    try t.sink.emitFmtCode(.T0021, t.byteOf(decl.main_token), "impl of protocol '{s}' for '{s}' is missing method '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token), req });
+                    try t.sink.emitFmtCodeSpan(.T0021, implHeaderSpan(t, decl, proto_ref), "impl of protocol '{s}' for '{s}' is missing method '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token), req });
             }
 
             const prot = t.protocols.items[pid];
@@ -106,7 +108,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // (so a later valid sibling still registers cleanly).
             const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
             if (arg_nodes.len != prot.generic_params.len) {
-                try t.sink.emitFmt(t.byteOf(decl.main_token), "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
+                try t.sink.err(.none).spanOf(t.spanOf(proto_ref)).emitFmt("protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
                 continue;
             }
             var pargs_buf: std.ArrayList(Type) = .empty;
@@ -118,7 +120,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     .int, .bool, .str, .unit, .@"struct", .@"enum" => {},
                     .invalid => pargs_ok = false, // typeFromNode already emitted T0001
                     else => {
-                        try t.sink.emit(t.byteOf(t.tree.nodes[an.int()].main_token), "a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)");
+                        try t.sink.err(.none).spanOf(t.spanOf(an)).emit("a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)");
                         pargs_ok = false;
                     },
                 }
@@ -175,10 +177,8 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     }
                     if (!mismatch and !Type.eql(Typecheck.groundProtoTypeDeep(t, want_ret, recv, pargs), impl_fn.ret)) mismatch = true;
                 }
-                if (mismatch) {
-                    const at_tok = t.tree.nodes[method_node.int()].main_token;
-                    try t.sink.emitFmtCode(.T0024, t.byteOf(at_tok), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
-                }
+                if (mismatch)
+                    try t.sink.emitFmtCodeSpan(.T0024, sigSpan(t, method_node), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
                 // STAMP this witness `Method` entry with the conformance's
                 // `(protocol_id, protocol_args)` so the multi-conformance resolver can pick
                 // it by args. Runs BEFORE `buildModel` (the Model aliases `t.methods.items`
@@ -196,7 +196,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             try writeCoherenceKey(t.gpa, &keybuf, pid, recv, pargs);
             const gop = try seen.getOrPut(t.gpa, keybuf.items);
             if (gop.found_existing) {
-                try t.sink.emitFmtCode(.T0020, t.byteOf(decl.main_token), "overlapping impl of protocol '{s}' for type '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token) });
+                try t.sink.emitFmtCodeSpan(.T0020, implHeaderSpan(t, decl, proto_ref), "overlapping impl of protocol '{s}' for type '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token) });
             } else {
                 gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
                 try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = recv, .protocol_args = try t.gpa.dupe(Type, pargs) });
@@ -242,7 +242,7 @@ fn recordGenericConformance(
 
     const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
     if (arg_nodes.len != prot.generic_params.len) {
-        try t.sink.emitFmt(t.byteOf(decl.main_token), "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
+        try t.sink.err(.none).spanOf(t.spanOf(proto_ref)).emitFmt("protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
         return;
     }
     // The protocol-arg PATTERN: an arg naming an impl type-param becomes `type_var(ord)`
@@ -302,10 +302,8 @@ fn recordGenericConformance(
             }
             if (!mismatch and !Type.eql(Typecheck.groundProtoTypeDeep(t, want_ret, recv_app, pargs), impl_fn.ret)) mismatch = true;
         }
-        if (mismatch) {
-            const at_tok = t.tree.nodes[method_node.int()].main_token;
-            try t.sink.emitFmtCode(.T0024, t.byteOf(at_tok), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
-        }
+        if (mismatch)
+            try t.sink.emitFmtCodeSpan(.T0024, sigSpan(t, method_node), "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
     }
 
     // Duplicate detection: a 'G'-tagged key so it never aliases a concrete
@@ -318,11 +316,43 @@ fn recordGenericConformance(
     for (pargs) |a| try appendKeyType(t.gpa, keybuf, a);
     const gop = try seen.getOrPut(t.gpa, keybuf.items);
     if (gop.found_existing) {
-        try t.sink.emitFmtCode(.T0020, t.byteOf(decl.main_token), "overlapping impl of protocol '{s}' for type '{s}'", .{ prot.name, t.nameText(decl.main_token) });
+        try t.sink.emitFmtCodeSpan(.T0020, implHeaderSpan(t, decl, proto_ref), "overlapping impl of protocol '{s}' for type '{s}'", .{ prot.name, t.nameText(decl.main_token) });
         return;
     }
     gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
     try t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = try t.gpa.dupe(Type, pargs) });
+}
+
+/// `impl T has P`: the header of a conformance block, short of its methods. The decl
+/// node's main token is the receiver's last segment, so walk back to `impl`.
+fn implHeaderSpan(t: *const Typecheck, decl: Ast.Node, proto_ref: Ast.Index) Span {
+    var tok = decl.main_token;
+    while (tok > 0 and t.tokens[tok].tag != .kw_impl) tok -= 1;
+    return .{ .start = t.byteOf(tok), .end = t.spanOf(proto_ref).end };
+}
+
+/// `name[..](..) -> R`: a method's signature, short of its body. Measured from the
+/// tokens, not the param nodes: a synthesized `self` param's type-ref is the impl's
+/// receiver, far above the method.
+fn sigSpan(t: *const Typecheck, fn_idx: Ast.Index) Span {
+    const name_tok = t.tree.nodes[fn_idx.int()].main_token;
+    const proto = Ast.protoAt(t.tree, t.tree.nodes[fn_idx.int()].lhs.int());
+    if (proto.ret_type != Ast.none) return .{ .start = t.byteOf(name_tok), .end = t.spanOf(proto.ret_type).end };
+    var tok = name_tok + 1;
+    var depth: u32 = 0;
+    while (tok < t.tokens.len) : (tok += 1) switch (t.tokens[tok].tag) {
+        .l_paren, .l_bracket => depth += 1,
+        .r_paren, .r_bracket => {
+            depth -|= 1;
+            if (depth == 0 and t.tokens[tok].tag == .r_paren) break;
+        },
+        .l_brace, .eof => {
+            tok -= 1;
+            break;
+        },
+        else => {},
+    };
+    return .{ .start = t.byteOf(name_tok), .end = t.tokens[@min(tok, t.tokens.len - 1)].end };
 }
 
 /// Whether `conf` already records a `(pid, recv)` conformance (any protocol_args).
