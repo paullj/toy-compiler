@@ -43,6 +43,8 @@ export class ToyServer {
 		}
 		const outLen = this.x.toy_lsp_feed(ptr, len);
 		if (outLen < 0) throw new Error('toy-lsp: fatal server fault');
+		// An empty reply's buffer pointer is a sentinel, not an address in memory.
+		if (outLen === 0) return [];
 		const out = new Uint8Array(this.x.memory.buffer, this.x.toy_lsp_output(), outLen).slice();
 		return unframe(out);
 	}

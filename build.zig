@@ -184,13 +184,15 @@ pub fn build(b: *std.Build) void {
 
     // The language server for the docs site's in-browser editors. wasi rather than
     // freestanding: `std.Io.Threaded` and the path-sized buffers in the front-end need an
-    // OS target, and the host shims the handful of wasi calls a check makes. Always
-    // ReleaseSmall — it ships over the network.
+    // OS target, and the host shims the handful of wasi calls a check makes. ReleaseSafe,
+    // stripped: a latent bug must trap (the page restarts the server) rather than run on
+    // as undefined behaviour, which in a release build can hang the page's editors.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .wasi });
+    const wasm_optimize: std.builtin.OptimizeMode = .ReleaseSafe;
     const wasm_compiler = b.createModule(.{
         .root_source_file = b.path("packages/compiler/src/root.zig"),
         .target = wasm_target,
-        .optimize = .ReleaseSmall,
+        .optimize = wasm_optimize,
         .single_threaded = true,
     });
     wasm_compiler.addOptions("build_options", options);
@@ -200,12 +202,13 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("packages/lsp/src/wasm.zig"),
             .target = wasm_target,
-            .optimize = .ReleaseSmall,
+            .optimize = wasm_optimize,
             .single_threaded = true,
             .imports = &.{.{ .name = "toy_compiler", .module = wasm_compiler }},
         }),
     });
     lsp_wasm.entry = .disabled;
+    lsp_wasm.root_module.strip = true;
     lsp_wasm.rdynamic = true;
     const lsp_wasm_step = b.step("lsp-wasm", "Build the language server as wasm32-wasi (zig-out/bin/toy-lsp.wasm)");
     lsp_wasm_step.dependOn(&b.addInstallArtifact(lsp_wasm, .{}).step);

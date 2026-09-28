@@ -3,8 +3,9 @@ import { expect, it } from 'vitest';
 import { loadServer, WASM } from './rpc.test-util';
 
 // Budgets for what the docs site ships and how fast a check answers. They leave headroom
-// over today's numbers (~190 KB, ~6 ms on an M-series laptop) so only a real regression trips.
-const MAX_BROTLI_BYTES = 250_000;
+// over today's numbers (~325 KB with runtime safety on; well under 1 ms per check on an
+// M-series laptop) so only a real regression trips.
+const MAX_BROTLI_BYTES = 400_000;
 const MAX_MEDIAN_CHECK_MS = 25;
 
 const doc = `pub protocol Area {

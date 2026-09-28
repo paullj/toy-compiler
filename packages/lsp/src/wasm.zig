@@ -11,6 +11,15 @@ const Server = @import("Server.zig").Server;
 
 const gpa = std.heap.wasm_allocator;
 
+/// Safety checks stay on in this build, so a latent bug traps instead of running on in
+/// undefined behaviour; the host catches the trap and restarts the server. A trap is all
+/// the host can observe, so the message and stack-trace machinery would be dead weight.
+pub const panic = std.debug.FullPanic(struct {
+    fn call(_: []const u8, _: ?usize) noreturn {
+        @trap();
+    }
+}.call);
+
 var server: Server = undefined;
 var started = false;
 var out: std.Io.Writer.Allocating = .init(gpa);

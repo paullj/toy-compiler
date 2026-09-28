@@ -23,7 +23,7 @@ dir = "packages/tree-sitter-toy"
 run = "tree-sitter generate"
 
 # The docs site's editors run the language server in the browser, built from this tree.
-# -Oz trims ~13% on top of ReleaseSmall; the feature flags match what zig emits for wasm32.
+# -Oz shrinks zig's output further; the feature flags match what zig emits for wasm32.
 [tasks."site:wasm"]
 description = "Build the in-browser language server into the docs site"
 dir = "packages/site"
