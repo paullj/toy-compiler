@@ -373,11 +373,11 @@ test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
     // struct_id/enum_id for those kinds while appendKeyBytes always writes them.
     const gpa = testing.allocator;
     const canon = [_]Type{
-        Type.invalid,   Type.unit,       Type.bool,       Type.str,        Type.never,
-        Type.int,       Type.uint,       Type.int8,       Type.int16,      Type.int32,
-        Type.int64,     Type.uint8,      Type.uint16,     Type.uint32,     Type.uint64,
-        Type.structT(0), Type.structT(1), Type.enumT(0),  Type.enumT(1),   Type.typeVar(0),
-        Type.typeVar(1), Type.app(0),     Type.app(1),     Type.float,      Type.rawptr,
+        Type.invalid,    Type.unit,       Type.bool,     Type.str,      Type.never,
+        Type.int,        Type.uint,       Type.int8,     Type.int16,    Type.int32,
+        Type.int64,      Type.uint8,      Type.uint16,   Type.uint32,   Type.uint64,
+        Type.structT(0), Type.structT(1), Type.enumT(0), Type.enumT(1), Type.typeVar(0),
+        Type.typeVar(1), Type.app(0),     Type.app(1),   Type.float,    Type.rawptr,
     };
     for (canon) |a| {
         for (canon) |b| {

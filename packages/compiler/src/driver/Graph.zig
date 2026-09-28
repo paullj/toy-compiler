@@ -149,7 +149,6 @@ pub const Graph = struct {
 
     pub const Ownership = enum { owned, borrowed };
 
-
     /// Tear down per `ownership`: the right teardown is impossible to pick wrong
     /// because the value records who built it.
     pub fn deinit(g: *Graph, gpa: std.mem.Allocator) void {

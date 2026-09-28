@@ -184,7 +184,7 @@ fn registerHashable(
     const params = try gpa.alloc([]const Type, 2);
     params[0] = try gpa.dupe(Type, &.{Type.typeVar(0)});
     params[1] = try gpa.dupe(Type, &.{ Type.typeVar(0), Type.typeVar(0) });
-    const rets = try gpa.dupe(Type, &.{ Type.int, Type.@"bool" });
+    const rets = try gpa.dupe(Type, &.{ Type.int, Type.bool });
     const pid: u32 = @intCast(protocols.items.len);
     prelude.protocols.hashable = pid;
     try protocols.append(gpa, .{
@@ -197,7 +197,7 @@ fn registerHashable(
         .method_rets = rets,
         .generic_params = &.{},
     });
-    for ([_]Type{ Type.int, Type.@"bool", Type.str, Type.unit }) |recv|
+    for ([_]Type{ Type.int, Type.bool, Type.str, Type.unit }) |recv|
         try conformances.append(gpa, .{ .protocol = pid, .recv = recv });
 }
 
@@ -447,7 +447,7 @@ test "Into=9/TryInto=10 after From; ConvErr appended after Result" {
         if (c.protocol != prelude.protocols.hashable.?) continue;
         hashable_rows += 1;
         // Every Hashable row is one of Hash's scalar receivers.
-        try testing.expect(Type.eql(c.recv, Type.int) or Type.eql(c.recv, Type.@"bool") or
+        try testing.expect(Type.eql(c.recv, Type.int) or Type.eql(c.recv, Type.bool) or
             Type.eql(c.recv, Type.str) or Type.eql(c.recv, Type.unit));
     }
     try testing.expectEqual(@as(usize, 4), hashable_rows);

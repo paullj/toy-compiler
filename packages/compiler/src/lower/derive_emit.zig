@@ -39,7 +39,7 @@ fn structEqAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: I
             errdefer b.gpa.free(args);
             args[0] = .{ .slot = lslot };
             args[1] = .{ .slot = rslot };
-            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool);
         },
         .none, .ambiguous => {},
     }
@@ -58,7 +58,7 @@ fn structEqAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: I
             const base = try b.emit(.{ .slot_addr = rslot_ord }, Typecheck.Type.int);
             const tag = try b.emit(.{ .get_tag = base }, Typecheck.Type.int);
             const k = try b.emit(.{ .iconst = L.ord_eq }, Typecheck.Type.int);
-            return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = k } }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = k } }, Typecheck.Type.bool);
         },
         .none, .ambiguous => {
             // The synthesis barrier proved every aggregate field conforms before emitting
@@ -66,7 +66,7 @@ fn structEqAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: I
             // stay well-formed rather than miscompile.
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Eq: no witness for an aggregate field in lower" });
             b.had_error = true;
-            return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .bconst = false }, Typecheck.Type.bool);
         },
     }
 }
@@ -82,7 +82,7 @@ fn eqKeyAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.S
             errdefer b.gpa.free(args);
             args[0] = .{ .slot = lslot };
             args[1] = .{ .slot = rslot };
-            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool);
         },
         .none, .ambiguous => {},
     };
@@ -103,7 +103,7 @@ fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
         const lv = try b.emit(.{ .load = .{ .addr = la, .ty = int_ty } }, int_ty);
         const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = int_ty } }, int_ty);
         const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = int_ty } }, int_ty);
-        return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
+        return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.bool);
     }
     switch (fty.kind) {
         .int, .bool => {
@@ -111,14 +111,14 @@ fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
             const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
             const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
             const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
-            return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.bool);
         },
         .float => {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
             const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
             const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
             const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
-            return try b.emit(.{ .fcmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .fcmp = .{ .cc = .eq, .lhs = lv, .rhs = rv } }, Typecheck.Type.bool);
         },
         .str => {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
@@ -138,11 +138,11 @@ fn deriveFieldEq(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Val
         },
         // A `()` field is zero-sized: two `()` are always equal (the identity in the
         // AND-fold), so no field_addr/load — emit the constant `true`.
-        .unit => return try b.emit(.{ .bconst = true }, Typecheck.Type.@"bool"),
+        .unit => return try b.emit(.{ .bconst = true }, Typecheck.Type.bool),
         else => {
             try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "auto-derive Eq: unsupported field type in lower" });
             b.had_error = true;
-            return try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+            return try b.emit(.{ .bconst = false }, Typecheck.Type.bool);
         },
     }
 }
@@ -159,7 +159,7 @@ fn emitVariantLadder(
     comptime perVariant: anytype,
 ) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     for (e.variants, 0..) |_, vi| {
         const last = vi + 1 == e.variants.len;
         if (last) {
@@ -184,7 +184,7 @@ fn emitVariantLadder(
 /// method table)` — a fixed walk handing ids monotonically — so a double-lower is identical.
 fn deriveEnumEq(b: *L.Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const e = b.in.enum_layouts[cty.enum_id];
 
     const lt = try b.emit(.{ .get_tag = self_base }, int_ty);
@@ -216,7 +216,7 @@ fn deriveEnumEq(b: *L.Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other
 /// `join`: `true` for an empty variant, else a multiply-accumulate over the payload fields.
 fn emitVariantPayloadEq(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_base: Ir.ValueId, other_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const v = e.variants[vi];
     if (v.field_types.len == 0) {
         const tv = try b.emit(.{ .bconst = true }, bool_ty);
@@ -240,7 +240,7 @@ fn emitVariantPayloadEq(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_
 /// the small non-negative enum tags.
 fn threeWayInt(b: *L.Builder, lv: Ir.ValueId, rv: Ir.ValueId, unsigned: bool) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const gt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ugt else .gt, .lhs = lv, .rhs = rv } }, bool_ty);
     const lt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ult else .lt, .lhs = lv, .rhs = rv } }, bool_ty);
     const diff = try b.emit(.{ .sub = .{ .lhs = gt, .rhs = lt } }, int_ty);
@@ -325,7 +325,7 @@ fn cmpAtSlots(b: *L.Builder, ty: Typecheck.Type, lslot: Ir.SlotId, rslot: Ir.Slo
 /// `payload_off`). Pure of `(layout, method table)`, so `--verify`-stable.
 fn deriveLexChain(b: *L.Builder, ftys: []const Typecheck.Type, offs: []const u32, base_off: u32, self_base: Ir.ValueId, other_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     if (ftys.len == 0) {
         const eqc = try b.emit(.{ .iconst = L.ord_eq }, int_ty);
         try L.brTo(b, join, .{ .value = eqc });
@@ -357,7 +357,7 @@ fn deriveLexChain(b: *L.Builder, ftys: []const Typecheck.Type, offs: []const u32
 /// variant-decl order) mirrors `deriveEnumEq`.
 fn deriveEnumCmp(b: *L.Builder, cty: Typecheck.Type, self_base: Ir.ValueId, other_base: Ir.ValueId, join: Ir.BlockId) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const e = b.in.enum_layouts[cty.enum_id];
 
     const st = try b.emit(.{ .get_tag = self_base }, int_ty);
@@ -471,7 +471,7 @@ fn lowerConvCharByte(
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const ret = d.ret; // Result[byte, ConvErr]
 
     var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = ret, .diags = out_diags };
@@ -522,7 +522,7 @@ fn lowerConvFloatInt(
 ) error{OutOfMemory}!Ir.Function {
     const int_ty = Typecheck.Type.int;
     const float_ty = Typecheck.Type.float;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const ret = d.ret; // Result[int, ConvErr]
 
     var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = ret, .diags = out_diags };
@@ -574,7 +574,7 @@ fn lowerDeriveEq(
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const cty = d.conform_ty;
 
     var b: L.Builder = .{ .gpa = gpa, .in = in, .ret_type = bool_ty, .diags = out_diags };
@@ -911,7 +911,7 @@ pub fn lowerErased(
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const rawptr_ty = Typecheck.Type.rawptr;
     return switch (kind) {
         .hash => lowerErasedHash(gpa, in, ty, sym, out_diags, int_ty, rawptr_ty),
@@ -1682,7 +1682,7 @@ test "derive Eq/Ord/Hash walk struct fields in the same layout order" {
     const ct = Typecheck.Type.structT(0);
     const sym: Link.SymName = .{ .kind = .user_fn, .name = "D" };
 
-    var eq_f = try lowerDeriveEq(gpa, in, .{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = ct, .ret = Typecheck.Type.@"bool" }, sym, &diags);
+    var eq_f = try lowerDeriveEq(gpa, in, .{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = ct, .ret = Typecheck.Type.bool }, sym, &diags);
     defer eq_f.deinit(gpa);
     var ord_f = try lowerDeriveOrd(gpa, in, .{ .protocol_id = 0, .protocol_name = "Ord", .kind = .ord, .conform_ty = ct, .ret = Typecheck.Type.int }, sym, &diags);
     defer ord_f.deinit(gpa);
@@ -1721,7 +1721,7 @@ test "derive Eq on a Ref field compares by pointer identity (icmp eq, no witness
         .{ .name = "Ref$int", .field_names = &ref_fnames, .field_types = &ref_ftys, .offsets = &ref_offs, .size = 8, .@"align" = 8, .native_family = .ref },
     };
     const sym: Link.SymName = .{ .kind = .user_fn, .name = "D" };
-    var func = try lowerDeriveEq(gpa, intStructInputs(&layouts), .{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Typecheck.Type.structT(0), .ret = Typecheck.Type.@"bool" }, sym, &diags);
+    var func = try lowerDeriveEq(gpa, intStructInputs(&layouts), .{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Typecheck.Type.structT(0), .ret = Typecheck.Type.bool }, sym, &diags);
     defer func.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), diags.items.len);
 

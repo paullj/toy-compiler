@@ -566,7 +566,7 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
         },
         .literal_bool => {
             const t = b.in.tokens[n.main_token].tag == .kw_true;
-            return .{ .value = try b.emit(.{ .bconst = t }, Typecheck.Type.@"bool") };
+            return .{ .value = try b.emit(.{ .bconst = t }, Typecheck.Type.bool) };
         },
         .literal_unit => {
             _ = try b.emit(.unit, null);
@@ -694,7 +694,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
         },
         .bang => {
             const v = try lowerExpr(b, n.lhs);
-            return .{ .value = try b.emit(.{ .bnot = operandValue(v) }, Typecheck.Type.@"bool") };
+            return .{ .value = try b.emit(.{ .bnot = operandValue(v) }, Typecheck.Type.bool) };
         },
         .tilde => {
             const v = try lowerExpr(b, n.lhs);
@@ -764,7 +764,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
 /// per-call order so `--verify` re-lower stays byte-identical.
 fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Terminator.PanicReason) error{OutOfMemory}!void {
     const zero = try b.emit(.{ .iconst = 0 }, ty);
-    const is_zero = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = rhs, .rhs = zero } }, Typecheck.Type.@"bool");
+    const is_zero = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = rhs, .rhs = zero } }, Typecheck.Type.bool);
     const cont = try b.addBlock();
     const panic_blk = try b.addBlock();
     b.setTerm(.{ .cond_br = .{ .cond = is_zero, .t = panic_blk, .f = cont } });
@@ -812,7 +812,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
                 const cc = condFromToken(op, lt.isUnsignedInt());
-                return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+                return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
             }
             return try lowerOrdValue(b, lt, n.lhs, n.rhs, op);
         },
@@ -824,7 +824,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
                 const cc = condFromToken(op, lt.isUnsignedInt());
-                return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+                return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
             }
             return try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq);
         },
@@ -880,7 +880,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                 .ge_dot => .ge,
                 else => unreachable,
             };
-            return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+            return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
         },
         else => {
             try b.note(n.main_token, "binary operator unsupported in lower");
@@ -897,7 +897,7 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
     const eval_b = try b.addBlock();
     const short = try b.addBlock(); // the short-circuit constant block
     const join = try b.addBlock();
-    const merge = try b.addParam(join, Typecheck.Type.@"bool");
+    const merge = try b.addParam(join, Typecheck.Type.bool);
 
     // Condition on `a`: for &&, a-true → eval_b, a-false → short. For ||, swap.
     if (op == .amp_amp) {
@@ -908,7 +908,7 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 
     // short block: the short-circuit constant (&&→false, ||→true) → join(const).
     b.switchTo(short);
-    const c = try b.emit(.{ .bconst = (op == .pipe_pipe) }, Typecheck.Type.@"bool");
+    const c = try b.emit(.{ .bconst = (op == .pipe_pipe) }, Typecheck.Type.bool);
     try brTo(b, join, .{ .value = c });
 
     // eval_b block: evaluate b, branch to join with its value.
@@ -1009,14 +1009,14 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
             const lv = operandValue(try lowerExpr(b, lhs_node));
             const rv = operandValue(try lowerExpr(b, rhs_node));
             const cc: Ir.Cond = if (negate) .ne else .eq;
-            return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lv, .rhs = rv } }, Typecheck.Type.@"bool") };
+            return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lv, .rhs = rv } }, Typecheck.Type.bool) };
         },
         .@"struct", .@"enum" => return try lowerStructEq(b, operand_ty, lhs_node, rhs_node, negate),
         .float => {
             const lhs = operandValue(try lowerExpr(b, lhs_node));
             const rhs = operandValue(try lowerExpr(b, rhs_node));
             const cc: Ir.FCond = if (negate) .ne else .eq;
-            return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+            return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
         },
         else => {},
     }
@@ -1024,17 +1024,17 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
         .unit => blk: {
             _ = try lowerExpr(b, lhs_node);
             _ = try lowerExpr(b, rhs_node);
-            break :blk try b.emit(.{ .bconst = true }, Typecheck.Type.@"bool");
+            break :blk try b.emit(.{ .bconst = true }, Typecheck.Type.bool);
         },
         .str => try lowerStrEq(b, lhs_node, rhs_node),
         else => blk: {
             // Unreachable for a well-typed program (int/bool never routed here; any other
             // kind is a type error caught before lower). Note-and-drop to stay well-formed.
             try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "'==' operand type unsupported in lower");
-            break :blk try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
+            break :blk try b.emit(.{ .bconst = false }, Typecheck.Type.bool);
         },
     };
-    if (negate) return .{ .value = try b.emit(.{ .bnot = raw }, Typecheck.Type.@"bool") };
+    if (negate) return .{ .value = try b.emit(.{ .bnot = raw }, Typecheck.Type.bool) };
     return .{ .value = raw };
 }
 
@@ -1052,8 +1052,8 @@ fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
             const args = try b.gpa.alloc(Ir.Operand, 2);
             args[0] = try lowerExpr(b, lhs_node); // self, by value
             args[1] = try lowerExpr(b, rhs_node);
-            const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool");
-            if (negate) return .{ .value = try b.emit(.{ .bnot = v }, Typecheck.Type.@"bool") };
+            const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool);
+            if (negate) return .{ .value = try b.emit(.{ .bnot = v }, Typecheck.Type.bool) };
             return .{ .value = v };
         },
         .none, .ambiguous => {
@@ -1065,12 +1065,12 @@ fn lowerStructEq(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
                     const d = try lowerCmpDiscriminant(b, operand_ty, lhs_node, rhs_node);
                     const k = try b.emit(.{ .iconst = ord_eq }, Typecheck.Type.int);
                     const cc: Ir.Cond = if (negate) .ne else .eq;
-                    return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = d, .rhs = k } }, Typecheck.Type.@"bool") };
+                    return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = d, .rhs = k } }, Typecheck.Type.bool) };
                 },
                 .none, .ambiguous => {
                     try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "no unique 'Eq' or 'Ord' witness for '==' in lower");
-                    const fv = try b.emit(.{ .bconst = false }, Typecheck.Type.@"bool");
-                    if (negate) return .{ .value = try b.emit(.{ .bnot = fv }, Typecheck.Type.@"bool") };
+                    const fv = try b.emit(.{ .bconst = false }, Typecheck.Type.bool);
+                    if (negate) return .{ .value = try b.emit(.{ .bnot = fv }, Typecheck.Type.bool) };
                     return .{ .value = fv };
                 },
             }
@@ -1092,7 +1092,7 @@ fn lowerOrdValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
         else => unreachable,
     };
     const k = try b.emit(.{ .iconst = spec.thr }, Typecheck.Type.int);
-    return .{ .value = try b.emit(.{ .icmp = .{ .cc = spec.cc, .lhs = d, .rhs = k } }, Typecheck.Type.@"bool") };
+    return .{ .value = try b.emit(.{ .icmp = .{ .cc = spec.cc, .lhs = d, .rhs = k } }, Typecheck.Type.bool) };
 }
 
 /// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of `lhs`/`rhs`:
@@ -1203,7 +1203,7 @@ fn lowerStrCmp(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutO
 /// `field_addr(self, off)`), where there is no slot to name — only an address.
 pub fn strCmpAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
 
     // ptr@0 + len@8 of each {ptr,len} aggregate.
     const lp = try b.emit(.{ .load = .{ .addr = lbase, .ty = int_ty } }, int_ty);
@@ -1305,7 +1305,7 @@ pub fn strCmpAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{Out
 /// string (equal lengths -> `hdr` sees `i >= 0` immediately -> `eq_blk`).
 fn lowerStrEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
 
     // Evaluate both str operands in the current block; each travels by slot.
     const lhs_op = try lowerExpr(b, lhs_node);
@@ -1329,7 +1329,7 @@ fn lowerStrEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOf
 /// `field_addr(self, off)`), where there is no slot to name — only an address.
 pub fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
 
     // ptr@0 + len@8 of each {ptr,len} aggregate.
     const lp = try b.emit(.{ .load = .{ .addr = lbase, .ty = int_ty } }, int_ty);
@@ -1431,7 +1431,7 @@ pub fn witnessRet(b: *Builder, m: Typecheck.Method) Typecheck.Type {
 /// hash value in the loop-exit block.
 pub fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
 
     // ptr@0 + len@8 of the {ptr,len} aggregate.
     const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
@@ -1687,7 +1687,7 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
 /// .to_string` shares the receiver (immutable ⇒ safe); `len`/`byte_at` read the value.
 fn lowerStrMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, recv_node: Ast.Index, member: []const u8) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const recv_ty = b.in.node_types[(recv_node).int()];
 
     if (std.mem.eql(u8, member, "concat")) {
@@ -1846,7 +1846,7 @@ fn packLE(b: *Builder, bytes: []const Ir.ValueId) error{OutOfMemory}!Ir.ValueId 
 /// `len` bytes are ever read. Returns the built `str` slot in the join block.
 pub fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.SlotId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
 
     const cp_base = try b.emit(.{ .slot_addr = slot }, int_ty);
     const cp = try b.emit(.{ .load = .{ .addr = cp_base, .ty = Typecheck.Type.uint32 } }, int_ty);
@@ -2042,7 +2042,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         if (isInlineEq(recv_ty.kind)) {
             const lhs = operandValue(try lowerExpr(b, ba.recv));
             const rhs = operandValue(try lowerExpr(b, ba.arg));
-            return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool") };
+            return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
         }
         return try lowerEqValue(b, recv_ty, ba.recv, ba.arg, false);
     } else if (builtinScalarHashCallee(b, n)) |bh| {
@@ -2163,7 +2163,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     const args = try b.gpa.alloc(Ir.Operand, 2);
                     args[0] = .{ .value = ap };
                     args[1] = .{ .value = bp };
-                    return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.@"bool") };
+                    return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool) };
                 },
                 .store_byte => {
                     const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
@@ -2507,7 +2507,7 @@ fn optionResultMethodCallee(b: *Builder, n: Ast.Node) ?OptResultCall {
 /// exclude native calls so it won't misroute as a variant construction).
 fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const recv_ty = b.in.node_types[(om.recv).int()];
     const e = b.in.enum_layouts[recv_ty.enum_id];
 
@@ -2628,7 +2628,7 @@ fn loadCharCodepoint(b: *Builder, recv: Ast.Index) error{OutOfMemory}!Ir.ValueId
 /// branch-free and `--verify`-stable.
 pub fn validScalarValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!Ir.ValueId {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const zero = try b.emit(.{ .iconst = 0 }, int_ty);
     const ge0 = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = v, .rhs = zero } }, bool_ty);
     const maxcp = try b.emit(.{ .iconst = 0x10FFFF }, int_ty);
@@ -2657,7 +2657,7 @@ pub fn validScalarValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!Ir.ValueI
 /// The reified layout of the call's own result enum drives every tag/offset — no prelude id.
 fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.@"bool";
+    const bool_ty = Typecheck.Type.bool;
     const recv_ty = b.in.node_types[(cv.recv).int()];
     const recv_is_char = isCharTy(b, recv_ty);
 
@@ -3441,7 +3441,7 @@ fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typec
     const tag = try b.emit(.{ .get_tag = op_base }, int_ty);
     const one = try b.emit(.{ .iconst = 1 }, int_ty);
     // tag != 1 → happy (tag 0 = some/ok); tag == 1 → residual (none/err).
-    const is_happy = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = tag, .rhs = one } }, Typecheck.Type.@"bool");
+    const is_happy = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = tag, .rhs = one } }, Typecheck.Type.bool);
     const happy_bb = try b.addBlock();
     const residual_bb = try b.addBlock();
     b.setTerm(.{ .cond_br = .{ .cond = is_happy, .t = happy_bb, .f = residual_bb } });
@@ -3623,7 +3623,7 @@ fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_t
             const addr = try slotFieldAddr(b, base, off, val_ty);
             const cur = try b.emit(.{ .load = .{ .addr = addr, .ty = val_ty } }, val_ty);
             const litv = try b.emit(.{ .iconst = lit }, Typecheck.Type.int);
-            const c = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = cur, .rhs = litv } }, Typecheck.Type.@"bool");
+            const c = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = cur, .rhs = litv } }, Typecheck.Type.bool);
             const ok = try b.addBlock();
             b.setTerm(.{ .cond_br = .{ .cond = c, .t = fail, .f = ok } });
             b.switchTo(ok);
@@ -3660,7 +3660,7 @@ fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_t
             const enum_ptr = if (off == 0) ptr else try b.emit(.{ .field_addr = .{ .base = ptr, .off = off, .ty = val_ty } }, Typecheck.Type.int);
             const tagv = try b.emit(.{ .get_tag = enum_ptr }, Typecheck.Type.int);
             const want = try b.emit(.{ .iconst = @intCast(vi) }, Typecheck.Type.int);
-            const c = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = tagv, .rhs = want } }, Typecheck.Type.@"bool");
+            const c = try b.emit(.{ .icmp = .{ .cc = .ne, .lhs = tagv, .rhs = want } }, Typecheck.Type.bool);
             const ok = try b.addBlock();
             b.setTerm(.{ .cond_br = .{ .cond = c, .t = fail, .f = ok } });
             b.switchTo(ok);
@@ -3867,7 +3867,7 @@ fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMem
     const hi = operandValue(try lowerExpr(b, h.hi)); // re-eval each iteration
     const iaddr = try b.emit(.{ .slot_addr = islot }, Typecheck.Type.int);
     const iv = try b.emit(.{ .load = .{ .addr = iaddr, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
-    const cmp = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = iv, .rhs = hi } }, Typecheck.Type.@"bool");
+    const cmp = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = iv, .rhs = hi } }, Typecheck.Type.bool);
     b.setTerm(.{ .cond_br = .{ .cond = cmp, .t = done, .f = body } });
 
     b.switchTo(body);
@@ -3956,7 +3956,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
         const tag = try b.emit(.{ .get_tag = base }, int_ty);
         const zero = try b.emit(.{ .iconst = 0 }, int_ty);
-        const is_some = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, Typecheck.Type.@"bool");
+        const is_some = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, Typecheck.Type.bool);
         b.setTerm(.{ .cond_br = .{ .cond = is_some, .t = body, .f = done } }); // variant 0 = some
     }
 
@@ -4041,7 +4041,7 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
         const tag = try b.emit(.{ .get_tag = base }, int_ty);
         const zero = try b.emit(.{ .iconst = 0 }, int_ty);
-        const is_some = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, Typecheck.Type.@"bool");
+        const is_some = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, Typecheck.Type.bool);
         b.setTerm(.{ .cond_br = .{ .cond = is_some, .t = body, .f = done } }); // variant 0 = some
     }
 
@@ -4299,7 +4299,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
                         const rhs = operandValue(try lowerExpr(b, n.rhs));
                         const cc = condFromToken(op, lt.isUnsignedInt());
-                        const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool");
+                        const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool);
                         b.setTerm(.{ .cond_br = .{ .cond = c, .t = true_bb, .f = false_bb } });
                     } else {
                         const v = operandValue(try lowerOrdValue(b, lt, n.lhs, n.rhs, op));
@@ -4315,7 +4315,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
                         const rhs = operandValue(try lowerExpr(b, n.rhs));
                         const cc = condFromToken(op, lt.isUnsignedInt());
-                        const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.@"bool");
+                        const c = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool);
                         b.setTerm(.{ .cond_br = .{ .cond = c, .t = true_bb, .f = false_bb } });
                     } else {
                         const v = operandValue(try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq));
@@ -4445,7 +4445,7 @@ fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
 fn typeFromRef(in: Inputs, ref: Ast.Index) Typecheck.Type {
     const name = in.tokens[in.tree.nodes[(ref).int()].main_token].text(in.source);
     if (std.mem.eql(u8, name, "str")) return Typecheck.Type.str;
-    if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.@"bool";
+    if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.bool;
     if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
     for (in.layouts, 0..) |l, id| {
         if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));

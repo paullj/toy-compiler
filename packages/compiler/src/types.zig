@@ -5043,7 +5043,7 @@ test "firstNonConformingField names the field blocking a `Hash` derive (T0030 su
     // Register Hash for int/bool/unit but DELIBERATELY not str, so the `name: str` field blocks.
     const confs = [_]Conformance{
         .{ .protocol = hash_pid, .recv = Type.int },
-        .{ .protocol = hash_pid, .recv = Type.@"bool" },
+        .{ .protocol = hash_pid, .recv = Type.bool },
         .{ .protocol = hash_pid, .recv = Type.unit },
     };
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
@@ -6447,7 +6447,6 @@ test "typed local x: T = e binds x to the annotation" {
         if (n.tag == .var_decl and n.rhs != Ast.none) try testing.expectEqual(Type.int, c.result.node_types[0][i]);
     }
 }
-
 
 test "typed local rejects a mismatched initializer" {
     const gpa = testing.allocator;

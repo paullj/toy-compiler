@@ -4410,9 +4410,11 @@ test "cross-serializer parity: every int-aware identity serializer folds int_des
     const gpa = testing.allocator;
     const Type = Typecheck.Type;
     const ints = [_]Type{
-        Type.int,   Type.uint,
-        Type.int8,  Type.int16,  Type.int32,  Type.int64,
-        Type.uint8, Type.uint16, Type.uint32, Type.uint64,
+        Type.int,    Type.uint,
+        Type.int8,   Type.int16,
+        Type.int32,  Type.int64,
+        Type.uint8,  Type.uint16,
+        Type.uint32, Type.uint64,
     };
 
     // appendTouched only reads `frozen` on the struct/enum branches; an int never reaches

@@ -2217,13 +2217,16 @@ fn infixBp(tag: token.Tag) ?u8 {
 fn checkInfixTable() ?[]const u8 {
     const infix_ops = [_]token.Tag{
         .pipe_pipe, .amp_amp,
-        .pipe,      .caret,     .amp,
-        .eq_eq,     .bang_eq,
-        .lt,        .lt_eq,     .gt,   .gt_eq,
-        .lt_lt,     .gt_gt,
-        .plus,      .minus,
-        .star,      .slash,     .percent,
-        .lt_dot,    .gt_dot,    .le_dot, .ge_dot,
+        .pipe,      .caret,
+        .amp,       .eq_eq,
+        .bang_eq,   .lt,
+        .lt_eq,     .gt,
+        .gt_eq,     .lt_lt,
+        .gt_gt,     .plus,
+        .minus,     .star,
+        .slash,     .percent,
+        .lt_dot,    .gt_dot,
+        .le_dot,    .ge_dot,
         .plus_dot,  .minus_dot,
         .star_dot,  .slash_dot,
     };

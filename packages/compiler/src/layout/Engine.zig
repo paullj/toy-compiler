@@ -1257,7 +1257,7 @@ test "engine: native payload helpers read the fixed some=0/err=1 ordinal" {
     // (err) carries bool, both at payload-local offset 0, aggregate payload at 8.
     var ok_ft = [_]Type{Type.int};
     var ok_off = [_]u32{0};
-    var err_ft = [_]Type{Type.@"bool"};
+    var err_ft = [_]Type{Type.bool};
     var err_off = [_]u32{0};
     var vars = [_]VariantLayout{
         .{ .name = "ok", .form = .tuple, .field_names = &.{}, .field_types = &ok_ft, .offsets = &ok_off },

@@ -689,8 +689,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     // (stale-cache soundness — mirrors the plain-func fold above).
                     if (cn.tag == .field_access and res != .func and cn.lhs.int() < self.frozen.node_types.len) {
                         const recv = self.frozen.node_types[cn.lhs.int()];
-                        if (recv.kind == .@"struct" or recv.kind == .@"enum" or recv.isScalar())
-                        {
+                        if (recv.kind == .@"struct" or recv.kind == .@"enum" or recv.isScalar()) {
                             const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
                             // A struct/enum `x.to_string()` relocs to x's DISPLAY witness
                             // (there is no `to_string` symbol — lower routes it through
@@ -941,7 +940,7 @@ pub fn typeRefToType(frozen: anytype, type_node: Ast.Index) Typecheck.Type {
     if (n.tag == .literal_unit) return Typecheck.Type.unit;
     const name = frozen.tokens[n.main_token].text(frozen.source);
     if (std.mem.eql(u8, name, "int")) return Typecheck.Type.int;
-    if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.@"bool";
+    if (std.mem.eql(u8, name, "bool")) return Typecheck.Type.bool;
     if (std.mem.eql(u8, name, "str")) return Typecheck.Type.str;
     for (frozen.layouts, 0..) |l, id| {
         if (std.mem.eql(u8, l.name, name)) return Typecheck.Type.structT(@intCast(id));

@@ -227,9 +227,9 @@ const FakeComposite = struct {
 
 test "first-binding-wins over [T,U]" {
     // snd[T,U](a:T,b:U): T<-bool at 0, U<-int at 1.
-    const r = runMatch(2, &.{ Type.typeVar(0), Type.typeVar(1) }, &.{ Type.@"bool", Type.int });
+    const r = runMatch(2, &.{ Type.typeVar(0), Type.typeVar(1) }, &.{ Type.bool, Type.int });
     try testing.expectEqual(Outcome.ok, r.out);
-    try testing.expect(Type.eql(r.args[0], Type.@"bool"));
+    try testing.expect(Type.eql(r.args[0], Type.bool));
     try testing.expect(Type.eql(r.args[1], Type.int));
 }
 
@@ -240,7 +240,7 @@ test "first-binding-wins over [T,T] with agreeing args" {
 }
 
 test "conflict returns BOTH source positions" {
-    const r = runMatch(1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.int, Type.@"bool" });
+    const r = runMatch(1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.int, Type.bool });
     switch (r.out) {
         .conflict => |c| {
             try testing.expectEqual(@as(u32, 0), c.ord);
@@ -248,14 +248,14 @@ test "conflict returns BOTH source positions" {
             try testing.expectEqual(@as(usize, 1), c.second_pos);
             // For a flat param the leaf IS the whole arg.
             try testing.expect(Type.eql(c.prev, Type.int));
-            try testing.expect(Type.eql(c.cur, Type.@"bool"));
+            try testing.expect(Type.eql(c.cur, Type.bool));
         },
         else => return error.TestUnexpectedResult,
     }
 }
 
 test "conflict is symmetric — swapping the two args yields the same ord, positions track source order" {
-    const r = runMatch(1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.@"bool", Type.int });
+    const r = runMatch(1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.bool, Type.int });
     switch (r.out) {
         .conflict => |c| {
             try testing.expectEqual(@as(u32, 0), c.ord);
@@ -309,14 +309,14 @@ test "unbound reports the LOWEST still-open ordinal" {
 const fake_entries = [_]Decomposed{
     .{ .ctor = 1, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 0: Vec[T]
     .{ .ctor = 1, .is_enum = false, .args = &.{Type.int} }, // 1: Vec[int]
-    .{ .ctor = 1, .is_enum = false, .args = &.{Type.@"bool"} }, // 2: Vec[bool]
+    .{ .ctor = 1, .is_enum = false, .args = &.{Type.bool} }, // 2: Vec[bool]
     .{ .ctor = 2, .is_enum = false, .args = &.{ Type.typeVar(0), Type.typeVar(1) } }, // 3: Map[K,V]
     .{ .ctor = 2, .is_enum = false, .args = &.{ Type.str, Type.int } }, // 4: Map[str,int]
     .{ .ctor = 1, .is_enum = false, .args = &.{Type.app(0)} }, // 5: Vec[Vec[T]]
     .{ .ctor = 1, .is_enum = false, .args = &.{Type.app(1)} }, // 6: Vec[Vec[int]]
     .{ .ctor = 3, .is_enum = true, .args = &.{Type.int} }, // 7: enum E3[int]
     .{ .ctor = 2, .is_enum = false, .args = &.{ Type.typeVar(0), Type.typeVar(0) } }, // 8: Map[T,T]
-    .{ .ctor = 2, .is_enum = false, .args = &.{ Type.int, Type.@"bool" } }, // 9: Map[int,bool]
+    .{ .ctor = 2, .is_enum = false, .args = &.{ Type.int, Type.bool } }, // 9: Map[int,bool]
     .{ .ctor = 3, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 10: struct S3[T]
     .{ .ctor = 2, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 11: bad-arity Map[T]
     .{ .ctor = 1, .is_enum = false, .args = &.{Type.never} }, // 12: Vec[never]
@@ -355,7 +355,7 @@ test "structural: [Vec[T],Vec[T]] vs [Vec[int],Vec[bool]] conflicts at the two S
             try testing.expectEqual(@as(usize, 1), c.second_pos);
             // The clashing LEAF types are the descended container elements, not `Vec[..]`.
             try testing.expect(Type.eql(c.prev, Type.int));
-            try testing.expect(Type.eql(c.cur, Type.@"bool"));
+            try testing.expect(Type.eql(c.cur, Type.bool));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -370,7 +370,7 @@ test "structural: intra-arg conflict [Map[T,T]] vs [Map[int,bool]] carets the si
             try testing.expectEqual(@as(usize, 0), c.first_pos);
             try testing.expectEqual(@as(usize, 0), c.second_pos);
             try testing.expect(Type.eql(c.prev, Type.int));
-            try testing.expect(Type.eql(c.cur, Type.@"bool"));
+            try testing.expect(Type.eql(c.cur, Type.bool));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -427,16 +427,16 @@ test "structural: dec==null reproduces the flat matcher (App param binds nothing
 
 test "infer returns owned args on ok" {
     const gpa = testing.allocator;
-    const got = (try infer(gpa, 2, &.{ Type.typeVar(0), Type.typeVar(1) }, &.{ Type.int, Type.@"bool" }, null)).?;
+    const got = (try infer(gpa, 2, &.{ Type.typeVar(0), Type.typeVar(1) }, &.{ Type.int, Type.bool }, null)).?;
     defer gpa.free(got);
     try testing.expect(Type.eql(got[0], Type.int));
-    try testing.expect(Type.eql(got[1], Type.@"bool"));
+    try testing.expect(Type.eql(got[1], Type.bool));
 }
 
 test "infer returns null on arity mismatch and on conflict" {
     const gpa = testing.allocator;
     try testing.expectEqual(@as(?[]Type, null), try infer(gpa, 1, &.{Type.typeVar(0)}, &.{ Type.int, Type.int }, null));
-    try testing.expectEqual(@as(?[]Type, null), try infer(gpa, 1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.int, Type.@"bool" }, null));
+    try testing.expectEqual(@as(?[]Type, null), try infer(gpa, 1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.int, Type.bool }, null));
 }
 
 /// Run `fillExpected` over stack scratch seeded from `out_init`/`bound_init`.
@@ -462,11 +462,11 @@ test "fillExpected: an arg-bound var that AGREES with the target is no conflict"
 }
 
 test "fillExpected: an arg-bound var that DISAGREES with the target is a conflict" {
-    const r = runFill(&.{Type.@"bool"}, &.{true}, &.{Type.int});
+    const r = runFill(&.{Type.bool}, &.{true}, &.{Type.int});
     switch (r.out) {
         .conflict => |c| {
             try testing.expectEqual(@as(u32, 0), c.ord);
-            try testing.expect(Type.eql(c.arg, Type.@"bool"));
+            try testing.expect(Type.eql(c.arg, Type.bool));
             try testing.expect(Type.eql(c.expected, Type.int));
         },
         else => return error.TestUnexpectedResult,
@@ -487,18 +487,18 @@ test "fillExpected: null target with all vars already bound is ok" {
 }
 
 test "fillExpected: two arg-bound vars agreeing with the target is ok" {
-    const r = runFill(&.{ Type.int, Type.@"bool" }, &.{ true, true }, &.{ Type.int, Type.@"bool" });
+    const r = runFill(&.{ Type.int, Type.bool }, &.{ true, true }, &.{ Type.int, Type.bool });
     try testing.expectEqual(FillOutcome.ok, r.out);
 }
 
 test "fillExpected: partial — one arg-bound, one filled from the target" {
-    const r = runFill(&.{ Type.int, Type.invalid }, &.{ true, false }, &.{ Type.int, Type.@"bool" });
+    const r = runFill(&.{ Type.int, Type.invalid }, &.{ true, false }, &.{ Type.int, Type.bool });
     try testing.expectEqual(FillOutcome.ok, r.out);
-    try testing.expect(Type.eql(r.args[1], Type.@"bool"));
+    try testing.expect(Type.eql(r.args[1], Type.bool));
 }
 
 test "fillExpected: an agreeing ord0 does not mask a conflicting ord1" {
-    const r = runFill(&.{ Type.@"bool", Type.@"bool" }, &.{ true, true }, &.{ Type.@"bool", Type.int });
+    const r = runFill(&.{ Type.bool, Type.bool }, &.{ true, true }, &.{ Type.bool, Type.int });
     switch (r.out) {
         .conflict => |c| try testing.expectEqual(@as(u32, 1), c.ord),
         else => return error.TestUnexpectedResult,
@@ -506,7 +506,7 @@ test "fillExpected: an agreeing ord0 does not mask a conflicting ord1" {
 }
 
 test "fillExpected: an arity mismatch is treated as no target (no-op)" {
-    const r = runFill(&.{Type.invalid}, &.{false}, &.{ Type.int, Type.@"bool" });
+    const r = runFill(&.{Type.invalid}, &.{false}, &.{ Type.int, Type.bool });
     switch (r.out) {
         .unbound => |u| try testing.expectEqual(@as(u32, 0), u.ord),
         else => return error.TestUnexpectedResult,
