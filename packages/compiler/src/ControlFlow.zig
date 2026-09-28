@@ -587,7 +587,7 @@ test "match diverges iff exhaustive and every arm diverges" {
     const match_fall = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms_fall });
 
     // Set the scrutinee's type in node_types.
-    b.node_types.items[scrut.int()] =scrut_ty;
+    b.node_types.items[scrut.int()] = scrut_ty;
 
     const c: Ctx = .{
         .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },
@@ -636,7 +636,7 @@ test "guarded arm never contributes coverage" {
     const scrut = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     const arms = try b.range(&.{ armA, armB });
     const match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms });
-    b.node_types.items[scrut.int()] =Type.enumT(0);
+    b.node_types.items[scrut.int()] = Type.enumT(0);
 
     const c: Ctx = .{
         .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },
@@ -673,7 +673,7 @@ test "wildcard arm makes a match exhaustive" {
     const scrut = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     const arms = try b.range(&.{ armA, armW });
     const match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = arms });
-    b.node_types.items[scrut.int()] =Type.enumT(0);
+    b.node_types.items[scrut.int()] = Type.enumT(0);
 
     const c: Ctx = .{
         .tree = .{ .nodes = b.nodes.items, .extra = b.extra.items },

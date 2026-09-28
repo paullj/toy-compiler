@@ -738,8 +738,8 @@ test "deriveFingerprint: a conform-layout edit flips the derive unit's key" {
     // serves a stale derived-eq blob.
     const v1 = TouchedType{ .kind = .@"struct", .layout = "P\x00x" };
     const v2 = TouchedType{ .kind = .@"struct", .layout = "P\x00x\x00y" };
-    const h1 = deriveFingerprint("Eq", .eq, v1, &.{ .inline_kind });
-    const h2 = deriveFingerprint("Eq", .eq, v2, &.{ .inline_kind });
+    const h1 = deriveFingerprint("Eq", .eq, v1, &.{.inline_kind});
+    const h2 = deriveFingerprint("Eq", .eq, v2, &.{.inline_kind});
     try testing.expect(h1 != h2);
 }
 

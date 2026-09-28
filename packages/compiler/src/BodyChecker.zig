@@ -855,7 +855,7 @@ pub const BodyChecker = struct {
         const ty: Type = switch (n.tag) {
             .literal_number => try bc.typeNumericLiteral(n.main_token, bc.expected),
             .literal_float => Type.float,
-            .literal_bool => Type.@"bool",
+            .literal_bool => Type.bool,
             .literal_string => Type.str,
             .literal_char => try bc.typeCharLiteral(n.main_token),
             .identifier => switch (bc.resolutions[(node_idx).int()]) {
@@ -913,7 +913,7 @@ pub const BodyChecker = struct {
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '-' must be int", .{});
                     },
                     .bang => {
-                        if (operand.kind == .bool) break :blk Type.@"bool";
+                        if (operand.kind == .bool) break :blk Type.bool;
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '!' must be bool", .{});
                     },
                     .tilde => {
@@ -990,7 +990,7 @@ pub const BodyChecker = struct {
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, node_idx)) {
-                            break :blk Type.@"bool";
+                            break :blk Type.bool;
                         } else {
                             try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0027 }, "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
                         }
@@ -1004,7 +1004,7 @@ pub const BodyChecker = struct {
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, node_idx)) {
-                            break :blk Type.@"bool";
+                            break :blk Type.bool;
                         } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
                             // A struct that would derive `Eq` but for one non-conforming
                             // field names that field (T0029). A payload enum / other type
@@ -1015,7 +1015,7 @@ pub const BodyChecker = struct {
                         }
                     },
                     .amp_amp, .pipe_pipe => {
-                        if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
+                        if (lt.kind == .bool and rt.kind == .bool) break :blk Type.bool;
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must be bool", .{op_text});
                     },
                     .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
@@ -1029,7 +1029,7 @@ pub const BodyChecker = struct {
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
                     },
                     .lt_dot, .gt_dot, .le_dot, .ge_dot => {
-                        if (lt.kind == .float and Type.eql(lt, rt)) break :blk Type.@"bool";
+                        if (lt.kind == .float and Type.eql(lt, rt)) break :blk Type.bool;
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
                     },
                     else => {},
@@ -1982,8 +1982,7 @@ pub const BodyChecker = struct {
         }
         const recv_ty = try bc.typeOf(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
-        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar())
-        {
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar()) {
             switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, explicit)) {
                 .one => |m| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, m),
                 else => {
@@ -2397,8 +2396,8 @@ pub const BodyChecker = struct {
                             if (p2.kind != .rawptr and p2.kind != .invalid)
                                 try bc.sink.report(.{ .span = bc.spanOf(args[2]) }, "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p2)});
                         }
-                        bc.node_types[(node_idx).int()] = Type.@"bool";
-                        return Type.@"bool";
+                        bc.node_types[(node_idx).int()] = Type.bool;
+                        return Type.bool;
                     },
                     .store => {
                         if (args.len != 2) {
@@ -2628,8 +2627,7 @@ pub const BodyChecker = struct {
     fn dispatchValueMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
         const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return Type.invalid; // receiver already errored → no cascade
-        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar() or recv_ty.kind == .float)
-        {
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar() or recv_ty.kind == .float) {
             return try bc.dispatchConcreteMethod(node_idx, n, callee, recv_ty);
         } else if (recv_ty.kind == .app) {
             return try bc.dispatchAppMethod(node_idx, n, callee, recv_ty);

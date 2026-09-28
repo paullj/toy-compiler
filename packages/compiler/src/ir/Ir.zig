@@ -749,7 +749,7 @@ test "render: float const/arith/compare render deterministically (hex fconst)" {
     values[0] = .{ .type = Type.float };
     values[1] = .{ .type = Type.float };
     values[2] = .{ .type = Type.float };
-    values[3] = .{ .type = Type.@"bool" };
+    values[3] = .{ .type = Type.bool };
 
     var instrs = try gpa.alloc(Instr, 4);
     instrs[0] = .{ .result = 0, .op = .{ .fconst = 3.0 } };
@@ -767,7 +767,7 @@ test "render: float const/arith/compare render deterministically (hex fconst)" {
     var func = Function{
         .name = .{ .kind = .user_fn, .name = "f" },
         .params = try gpa.alloc(SlotId, 0),
-        .ret_type = Type.@"bool",
+        .ret_type = Type.bool,
         .slots = try gpa.alloc(Slot, 0),
         .values = values,
         .blocks = blocks,

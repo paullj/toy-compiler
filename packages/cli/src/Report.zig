@@ -236,7 +236,7 @@ fn dumpArtifact(out: *Io.Writer, r: Driver.FileResult, emit: Driver.Emit) !void 
     switch (emit) {
         .lex => for (r.tokens, 0..) |tok, i| {
             try out.print("    [{d: >4}] {s: <12} {d: >5}..{d: <5} {s}\n", .{
-                i, @tagName(tok.tag), tok.start, tok.end,
+                i,                                               @tagName(tok.tag), tok.start, tok.end,
                 if (tok.tag == .eof) "" else tok.text(r.source),
             });
         },

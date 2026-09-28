@@ -301,8 +301,7 @@ test "writeNdjsonLine emits fixed key order with 1-based line/col, null code, fi
     try writeNdjsonLine(&aw.writer, testing.allocator, &sm, "t.toy", .{ .byte_offset = off, .end = off, .message = "boom", .code = .none, .severity = .err }, .err);
     const got = aw.writer.buffered();
     // Prefix through the shared fields is stable and byte-checkable.
-    try testing.expect(std.mem.startsWith(u8, got,
-        "{\"code\":null,\"level\":\"error\",\"byte\":14,\"byte_end\":14,\"line\":2,\"col\":3,\"message\":\"boom\",\"file\":\"t.toy\",\"rendered\":\""));
+    try testing.expect(std.mem.startsWith(u8, got, "{\"code\":null,\"level\":\"error\",\"byte\":14,\"byte_end\":14,\"line\":2,\"col\":3,\"message\":\"boom\",\"file\":\"t.toy\",\"rendered\":\""));
     // No related location => empty labels array; the line ends with `,"labels":[]}\n`.
     try testing.expect(std.mem.endsWith(u8, got, ",\"labels\":[]}\n"));
     // Every embedded newline in the rendered snippet is escaped (no raw '\n' before the

@@ -220,7 +220,7 @@ test "wrapTo normalizes narrow widths (mirrors codegen)" {
     // plat / w64 / bool are identity.
     try std.testing.expectEqual(@as(i64, 200), wrapTo(Ir.Type.int, 200));
     try std.testing.expectEqual(@as(i64, -56), wrapTo(Ir.Type.int64, -56));
-    try std.testing.expectEqual(@as(i64, 5), wrapTo(Ir.Type.@"bool", 5));
+    try std.testing.expectEqual(@as(i64, 5), wrapTo(Ir.Type.bool, 5));
 }
 
 test "unsigned icmp contrasts signed on bit63-set operands" {

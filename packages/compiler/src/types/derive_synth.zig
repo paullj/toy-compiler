@@ -362,7 +362,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
         .protocol_name = eq_name,
         .kind = .eq,
         .conform_ty = ty,
-        .ret = Type.@"bool",
+        .ret = Type.bool,
     });
     if (hash_pid_opt) |hash_pid| {
         const hash_name = t.protocols.items[hash_pid].name;

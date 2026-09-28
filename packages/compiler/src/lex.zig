@@ -407,7 +407,8 @@ test "char literals lex to a single char_lit spanning both quotes" {
     // `char_lit` ends a statement, so a newline after it inserts a terminator.
     try expectTags("c := 'A'\nd := 'B'\n", &.{
         .identifier, .colon_eq, .char_lit, .newline,
-        .identifier, .colon_eq, .char_lit, .newline, .eof,
+        .identifier, .colon_eq, .char_lit, .newline,
+        .eof,
     });
 }
 
@@ -487,8 +488,8 @@ test "a valid program tokenizes exactly as before" {
     , &.{
         // `{` does not end a statement, so the newline after it inserts no
         // terminator; the newline after `b` does.
-        .kw_fn,      .identifier, .l_paren, .identifier, .colon,     .identifier,
-        .comma,      .identifier, .colon,   .identifier, .r_paren,   .arrow,
+        .kw_fn,      .identifier, .l_paren,   .identifier, .colon,   .identifier,
+        .comma,      .identifier, .colon,     .identifier, .r_paren, .arrow,
         .identifier, .l_brace,    .kw_return, .identifier, .plus,    .identifier,
         .newline,    .r_brace,    .eof,
     });

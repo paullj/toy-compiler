@@ -37,7 +37,11 @@ pub fn resolve(code: codes.Code, default: model.Severity, cfg: SeverityConfig) ?
     var eff: ?model.Severity = default;
     for (cfg.rules) |r| {
         if (!matches(r, code)) continue;
-        eff = switch (r.action) { .err => .err, .warning => .warning, .ignore => null };
+        eff = switch (r.action) {
+            .err => .err,
+            .warning => .warning,
+            .ignore => null,
+        };
     }
     // -Werror: a surviving warning becomes an error. An `.ignore`d code is already
     // null here and stays null — deny never resurrects a dropped diagnostic.

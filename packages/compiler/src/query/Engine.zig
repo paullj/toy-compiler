@@ -66,7 +66,6 @@ pub const StageProbe = @import("StageProbe.zig");
 /// so the generalized name is `StageProbe`; this alias is the lower stage's view of it.
 pub const LowerProbe = StageProbe;
 
-
 pub fn init(cache: Cache, mode: Mode) Engine {
     return .{ .cache = cache, .mode = mode };
 }

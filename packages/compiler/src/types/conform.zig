@@ -453,7 +453,7 @@ test "structural conformance: scalar/struct/nested/empty-enum/payload-enum recur
     // struct#0 {x:int, y:bool} — all scalars conform; struct#1 {inner: struct#0} — nested;
     // struct#2 {c: enum#1} — an all-conforming payload-enum field; struct#3 {d: enum#2}
     // — a NON-conforming payload-enum field (str payload, no prelude Eq).
-    const s0_ft = [_]Type{ Type.int, Type.@"bool" };
+    const s0_ft = [_]Type{ Type.int, Type.bool };
     const s0_fn = [_][]const u8{ "x", "y" };
     const s1_ft = [_]Type{Type.structT(0)};
     const s1_fn = [_][]const u8{"inner"};
@@ -477,7 +477,7 @@ test "structural conformance: scalar/struct/nested/empty-enum/payload-enum recur
         .{ .decl_node = Ast.none, .name = "E1", .variants = &e1_vars },
         .{ .decl_node = Ast.none, .name = "E2", .variants = &e2_vars },
     };
-    const confs = [_]Conformance{ .{ .protocol = eq_pid, .recv = Type.int }, .{ .protocol = eq_pid, .recv = Type.@"bool" } };
+    const confs = [_]Conformance{ .{ .protocol = eq_pid, .recv = Type.int }, .{ .protocol = eq_pid, .recv = Type.bool } };
 
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);

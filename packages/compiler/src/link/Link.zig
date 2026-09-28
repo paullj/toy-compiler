@@ -614,7 +614,7 @@ fn fnLinkJob(
     const f = fns[i];
     const fh = site_h[i];
     const base = offsets[fh];
-    @memcpy(text[base..][0 .. f.code.len], f.code);
+    @memcpy(text[base..][0..f.code.len], f.code);
 
     var call_i: usize = call_base[i];
     for (f.relocs) |rl| {

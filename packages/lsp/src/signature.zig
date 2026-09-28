@@ -254,9 +254,9 @@ test "activeParam: counts only top-level commas" {
 test "activeParam: a comma nested in inner parens does not count" {
     // `f(g(1,2), 3)` — f( g( 1 , 2 ) , 3 )
     const toks = [_]Token{
-        tok(.identifier, 0, 1), tok(.l_paren, 1, 2),  tok(.identifier, 2, 3),
-        tok(.l_paren, 3, 4),    tok(.number, 4, 5),   tok(.comma, 5, 6),
-        tok(.number, 6, 7),     tok(.r_paren, 7, 8),  tok(.comma, 8, 9),
+        tok(.identifier, 0, 1), tok(.l_paren, 1, 2),   tok(.identifier, 2, 3),
+        tok(.l_paren, 3, 4),    tok(.number, 4, 5),    tok(.comma, 5, 6),
+        tok(.number, 6, 7),     tok(.r_paren, 7, 8),   tok(.comma, 8, 9),
         tok(.number, 10, 11),   tok(.r_paren, 11, 12),
     };
     // Cursor past the OUTER comma (offset 10): the inner `,` at depth 1 is excluded.
@@ -266,7 +266,7 @@ test "activeParam: a comma nested in inner parens does not count" {
 test "activeParam: a bracket comma does not count" {
     // `f(a[i,j], 3)`
     const toks = [_]Token{
-        tok(.identifier, 0, 1), tok(.l_paren, 1, 2),   tok(.identifier, 2, 3),
+        tok(.identifier, 0, 1), tok(.l_paren, 1, 2),    tok(.identifier, 2, 3),
         tok(.l_bracket, 3, 4),  tok(.identifier, 4, 5), tok(.comma, 5, 6),
         tok(.identifier, 6, 7), tok(.r_bracket, 7, 8),  tok(.comma, 8, 9),
         tok(.number, 10, 11),   tok(.r_paren, 11, 12),

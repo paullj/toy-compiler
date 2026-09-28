@@ -19,7 +19,7 @@ const BodyChecker = BC.BodyChecker;
 /// domain — exhaustiveness only via `_`).
 const Cov = union(enum) {
     @"enum": []bool,
-    @"bool": *BoolCov,
+    bool: *BoolCov,
     int,
 };
 const BoolCov = struct { t: bool = false, f: bool = false };
@@ -33,7 +33,7 @@ fn matchSaturated(cov: Cov, has_wildcard: bool) bool {
         .@"enum" => |sv| for (sv) |s| {
             if (!s) break false;
         } else true,
-        .@"bool" => |b| b.t and b.f,
+        .bool => |b| b.t and b.f,
         .int => false,
     };
 }
@@ -65,7 +65,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
         @memset(seen, false);
         break :blk .{ .@"enum" = seen };
     } else switch (st.kind) {
-        .bool => .{ .@"bool" = &bool_cov },
+        .bool => .{ .bool = &bool_cov },
         else => .int,
     };
     defer if (enum_id != null) bc.gpa.free(seen);
@@ -175,7 +175,7 @@ fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov,
             const lt: Type = if (bc.tokens[pat.main_token].tag == .number)
                 try bc.typeNumericLiteral(pat.main_token, expected)
             else
-                Type.@"bool";
+                Type.bool;
             if (expected.kind != .invalid and !Type.eql(lt, expected))
                 try bc.sink.report(.{ .span = bc.tokSpan(pat.main_token) }, "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
             // A bool literal records its case toward coverage; int never covers.
@@ -435,8 +435,8 @@ test "matchSaturated: wildcard short-circuits; enum needs every variant; bool ne
     // Bool: both cases required.
     var both = BoolCov{ .t = true, .f = true };
     var one = BoolCov{ .t = true, .f = false };
-    try testing.expect(matchSaturated(.{ .@"bool" = &both }, false));
-    try testing.expect(!matchSaturated(.{ .@"bool" = &one }, false));
+    try testing.expect(matchSaturated(.{ .bool = &both }, false));
+    try testing.expect(!matchSaturated(.{ .bool = &one }, false));
 
     // Int: an infinite domain — only a wildcard can saturate it.
     try testing.expect(!matchSaturated(.int, false));

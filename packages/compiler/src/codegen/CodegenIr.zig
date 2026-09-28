@@ -1482,7 +1482,7 @@ test "ir-codegen: normalizeWidth value-domain matches arith.wrapTo across all wi
         Type.int16, Type.uint16,
         Type.int32, Type.uint32,
         Type.int64, Type.uint64,
-        Type.@"bool", // non-integer → identity arm
+        Type.bool, // non-integer → identity arm
     };
     const probes = [_]i64{
         0x1122_3344_5566_7788, -1, 0x80, 0x8000, 0x8000_0000, 0,
