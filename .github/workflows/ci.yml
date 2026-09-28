@@ -7,7 +7,8 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A cancelled main run would skip its Pages deploy.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The backend emits arm64 macOS Mach-O executables and ad-hoc code-signs them;
 # the run/emit tests SkipZigTest on anything but macos+aarch64. Every job therefore
@@ -23,9 +24,9 @@ jobs:
         os: [macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: actions/cache@v6
         with:
           path: .zig-cache
           key: zig-cache-test-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
@@ -44,9 +45,9 @@ jobs:
         os: [macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: actions/cache@v6
         with:
           path: .zig-cache
           key: zig-cache-fuzz-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
@@ -68,9 +69,9 @@ jobs:
         os: [macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: actions/cache@v6
         with:
           path: .zig-cache
           key: zig-cache-lint-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
@@ -92,9 +93,9 @@ jobs:
       run:
         working-directory: packages/site
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: actions/cache@v6
         with:
           path: .zig-cache
           key: zig-cache-site-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
@@ -110,3 +111,33 @@ jobs:
         run: pnpm exec playwright install chromium
       - name: End-to-end tests
         run: pnpm e2e
+      # After e2e: its preview build has no base path and would overwrite this one.
+      - name: Build for GitHub Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: pnpm build
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: packages/site/build
+
+  pages:
+    name: Deploy docs site
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, fuzz, lint, site]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v5
