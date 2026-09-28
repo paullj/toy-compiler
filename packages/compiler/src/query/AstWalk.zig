@@ -123,9 +123,21 @@ pub const Event = union(enum) {
 pub fn nodeSpan(src: Source, idx: Ast.Index) Span {
     var ext: Extent = .{ .tree = src.tree };
     walk(src, idx, &ext) catch unreachable;
+    // The canonical walk does not descend into a protocol (its method signatures carry
+    // no fingerprinted body), so its extent takes them here.
+    const root = src.tree.nodes[idx.int()];
+    if (root.tag == .protocol_decl) for (Ast.rangeSlice(src.tree, root.lhs.int())) |m| walk(src, m, &ext) catch unreachable;
     const toks = src.tokens;
     var first = ext.first;
     var last = ext.last;
+    // A declaration's main token is its name, and it is spelled from its keywords. Every
+    // real child follows the name; one that seems to precede it is synthesized (a protocol
+    // method's `self` type points at the protocol's name), so the name bounds the start.
+    const is_decl = switch (root.tag) {
+        .fn_decl, .extern_fn_decl, .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl, .type_alias_decl => true,
+        else => false,
+    };
+    if (is_decl) first = root.main_token;
     var open: u32 = 0; // openers still unclosed at the end
     var unopened: u32 = 0; // closers with no opener inside the range
     for (toks[first .. last + 1]) |t| switch (bracketDelta(t.tag)) {
@@ -137,8 +149,25 @@ pub fn nodeSpan(src: Source, idx: Ast.Index) Span {
         },
         else => {},
     };
-    while (unopened > 0 and first > 0 and bracketDelta(toks[first - 1].tag) == 1) : (unopened -= 1) first -= 1;
-    while (open > 0 and last + 1 < toks.len and bracketDelta(toks[last + 1].tag) == -1) : (open -= 1) last += 1;
+    if (is_decl) while (first > 0) switch (toks[first - 1].tag) {
+        .kw_pub, .kw_fn, .kw_extern, .kw_struct, .kw_enum, .kw_protocol, .kw_type => first -= 1,
+        else => break,
+    };
+    // Newlines are tokens; a multi-line construct's closer sits on a later line.
+    while (unopened > 0) {
+        var i = first;
+        while (i > 0 and toks[i - 1].tag == .newline) i -= 1;
+        if (i == 0 or bracketDelta(toks[i - 1].tag) != 1) break;
+        first = i - 1;
+        unopened -= 1;
+    }
+    while (open > 0) {
+        var i = last + 1;
+        while (i < toks.len and toks[i].tag == .newline) i += 1;
+        if (i >= toks.len or bracketDelta(toks[i].tag) != -1) break;
+        last = i;
+        open -= 1;
+    }
     return .{ .start = toks[first].start, .end = toks[last].end };
 }
 
@@ -2029,6 +2058,21 @@ test "nodeSpan covers a subtree from its first token through the brackets it clo
         }
     }
     try std.testing.expect(saw[0] and saw[1] and saw[2]);
+}
+
+test "nodeSpan reaches a closing bracket on a later line" {
+    const gpa = std.testing.allocator;
+    const src_text = "fn g(a: int, b: int) -> int { return a }\nfn f() -> int {\n    return g(1,\n        2,\n    ) + 3\n}\n";
+    var b = try build(gpa, src_text);
+    defer b.deinit(gpa);
+    const src: Source = .{ .tree = b.tree, .tokens = b.tokens, .source = b.source };
+    for (b.tree.nodes, 0..) |n, i| {
+        if (n.tag != .binary) continue;
+        const sp = nodeSpan(src, Ast.Index.from(@intCast(i)));
+        try std.testing.expectEqualStrings("g(1,\n        2,\n    ) + 3", src_text[sp.start..sp.end]);
+        return;
+    }
+    return error.NoBinary;
 }
 
 test "nodeSpan starts an inferred variant at its dot" {
