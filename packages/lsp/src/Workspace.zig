@@ -32,28 +32,36 @@ pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []
     defer gpa.free(path);
     const root = std.fs.path.dirname(path) orelse "";
 
-    const layer: Layer = .{ .entry_path = path, .entry_text = text, .docs = ws.docs };
-    const overlay: Graph.Overlay = .{ .ctx = &layer, .getFn = Layer.get, .disk = ws.disk };
+    // The front-end asks for sources by decoded path, but a client's uri may percent-encode
+    // it (`file:///a%20b/x.toy`): index the open documents by path, not by rebuilt uri.
+    var by_path: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer {
+        var it = by_path.keyIterator();
+        while (it.next()) |k| gpa.free(k.*);
+        by_path.deinit(gpa);
+    }
+    var docs = ws.docs.map.iterator();
+    while (docs.next()) |e| {
+        const doc_path = (try lsp_uri.uriToPath(gpa, e.key_ptr.*)) orelse continue;
+        const gop = try by_path.getOrPut(gpa, doc_path);
+        if (gop.found_existing) gpa.free(doc_path);
+        gop.value_ptr.* = e.value_ptr.text;
+    }
+    // The entry's current text (possibly a repaired copy) wins over its stored document.
+    const entry = try by_path.getOrPut(gpa, path);
+    if (!entry.found_existing) entry.key_ptr.* = try gpa.dupe(u8, path);
+    entry.value_ptr.* = text;
+
+    const overlay: Graph.Overlay = .{ .ctx = &by_path, .getFn = lookup, .disk = ws.disk };
     return Graph.discoverWith(gpa, ws.io, Cache.disabled, "native", path, null, root, overlay);
 }
 
 const untitled_path = "untitled.toy";
-const file_scheme = "file://";
 
-const Layer = struct {
-    entry_path: []const u8,
-    entry_text: []const u8,
-    docs: *const Documents,
-
-    fn get(ctx: *const anyopaque, path: []const u8) ?[]const u8 {
-        const l: *const Layer = @ptrCast(@alignCast(ctx));
-        if (std.mem.eql(u8, path, l.entry_path)) return l.entry_text;
-        // Open documents are keyed by uri (`uri.pathToUri`'s spelling, without allocating).
-        var buf: [file_scheme.len + std.fs.max_path_bytes]u8 = undefined;
-        const uri = std.fmt.bufPrint(&buf, file_scheme ++ "{s}", .{path}) catch return null;
-        return l.docs.textOf(uri);
-    }
-};
+fn lookup(ctx: *const anyopaque, path: []const u8) ?[]const u8 {
+    const by_path: *const std.StringHashMapUnmanaged([]const u8) = @ptrCast(@alignCast(ctx));
+    return by_path.get(path);
+}
 
 const testing = std.testing;
 
@@ -80,6 +88,31 @@ test "with the disk off, an import no document provides is a missing module, not
     defer g.deinit(gpa);
     try testing.expect(g.err != null);
     try testing.expectEqual(Graph.Error.Kind.missing, g.err.?.kind);
+}
+
+test "the entry's text wins over its own open document, without leaking" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///ws/main.toy", "fn main() -> int { return nope }\n", 1);
+
+    const ws: Workspace = .{ .io = Io.failing, .docs = &docs, .disk = false };
+    var g = try ws.discover(gpa, "file:///ws/main.toy", "fn main() -> int { return 0 }\n");
+    defer g.deinit(gpa);
+    try testing.expectEqualStrings("fn main() -> int { return 0 }\n", g.entry().source);
+}
+
+test "an import finds an open document whose uri percent-encodes its path" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///my%20ws/helper.toy", "pub fn seven() -> int { return 7 }\n", 1);
+
+    const ws: Workspace = .{ .io = Io.failing, .docs = &docs, .disk = false };
+    var g = try ws.discover(gpa, "file:///my%20ws/main.toy", "import helper\nfn main() -> int { return helper.seven() }\n");
+    defer g.deinit(gpa);
+    try testing.expect(g.err == null);
+    try testing.expectEqual(@as(usize, 2), g.modules.len);
 }
 
 test "an untitled buffer still checks and can import bundled std" {
