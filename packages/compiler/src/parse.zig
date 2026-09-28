@@ -1758,6 +1758,9 @@ fn parseFor(p: *Parser) Error!Ast.Index {
         const val_leaf = try p.addNode(.{ .tag = .identifier, .main_token = val_tok, .lhs = Ast.none, .rhs = Ast.none });
         try p.expect(.kw_in, "expected 'in' after the loop variables");
         var nb2 = NoBlockScope.enter(p, true);
+        // An error in the iterable unwinds past `end`: without this the flag stays
+        // set, every later `{` fails unconsumed, and the block loop stops progressing.
+        errdefer nb2.end();
         const iter = try p.parseExpr(0);
         nb2.end();
         const body = try p.parseBlock();
@@ -1766,6 +1769,7 @@ fn parseFor(p: *Parser) Error!Ast.Index {
     }
     try p.expect(.kw_in, "expected 'in' after the loop variable");
     var nb = NoBlockScope.enter(p, true);
+    errdefer nb.end(); // see the two-binding form above
     const first = try p.parseExpr(0); // halts at `..` (no infix bp)
     if (p.at(.dotdot)) {
         p.bump(.dotdot);
@@ -4627,5 +4631,20 @@ test "a parse diagnostic leaves the parser with its span: one token, or the whol
         const d = res.diags[0];
         try testing.expect(d.end != @import("diagnostics/Diagnostic.zig").NO_END);
         try testing.expectEqualStrings(c.want, c.src[d.byte_offset..d.end]);
+    }
+}
+
+test "a broken for iterable does not leave blocks disabled for the rest of the fn" {
+    // Mid-edit shapes: an emptied range/iterable leaves `for x in {`. The error must not
+    // leak the header's no-block mode, or the block loop stops making progress.
+    const gpa = testing.allocator;
+    const heads = [_][]const u8{ "for j in {", "for j in 0.. {", "for j in xs. {", "for k, v in {" };
+    for (heads) |head| {
+        const src = try std.fmt.allocPrint(gpa, "fn f() -> int {{\n    {s}\n    }}\n    return 0\n}}\n", .{head});
+        defer gpa.free(src);
+        const res = try parseResult(gpa, src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expect(res.diags.len >= 1);
     }
 }
