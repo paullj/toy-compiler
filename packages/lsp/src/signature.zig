@@ -178,7 +178,7 @@ pub fn signatureHelpAt(
     var sm = try SourceMap.init(gpa, "s", source);
     defer sm.deinit(gpa);
 
-    const off = position.positionToOffset(&sm, line, character) orelse return null;
+    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
     const enc = (try enclosingCall(gpa, toks, off)) orelse return null;
 
     const repaired = (try repair(gpa, source, toks)) orelse return null;

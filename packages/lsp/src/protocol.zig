@@ -90,8 +90,9 @@ pub const LspDiagnostic = struct {
 /// providers we back with a handler appear here: advertising one we do not implement
 /// would make the client send requests we can only reject.
 const ServerCapabilities = struct {
-    /// utf-8 so a byte column equals `character` for ASCII (see `Position`).
-    positionEncoding: []const u8 = "utf-8",
+    /// Negotiated at `initialize` (`position.Encoding`): utf-8 when the client offers it,
+    /// else the protocol's utf-16 default.
+    positionEncoding: []const u8 = "utf-16",
     /// `2` == Incremental sync (deltas spliced by byte range); `openClose` so the client
     /// sends didOpen/didClose.
     textDocumentSync: struct {
@@ -160,7 +161,7 @@ test "InitializeResult advertises only the implemented capabilities" {
     const r: InitializeResult = .{};
     try std.json.Stringify.value(r, json_opts, &aw.writer);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "\"positionEncoding\":\"utf-8\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"positionEncoding\":\"utf-16\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"change\":2") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"openClose\":true") != null);
     // Hover is advertised now that it is implemented.

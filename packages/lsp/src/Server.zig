@@ -55,6 +55,8 @@ pub const Server = struct {
     /// message instead of fragmenting (a wasm heap never shrinks). Documents use `gpa`.
     arena: std.heap.ArenaAllocator,
     docs: Documents,
+    /// How the client counts `character`; utf-16 unless it offers utf-8 at `initialize`.
+    encoding: position.Encoding = .utf16,
     got_initialize: bool = false,
     shutdown_requested: bool = false,
 
@@ -72,7 +74,7 @@ pub const Server = struct {
     /// Recomputed from the PINNED server each call: `Threaded.io()` captures
     /// `&self.threaded`, so it must never be cached across the by-value move out of `init`.
     fn workspace(self: *Server) Workspace {
-        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk };
+        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk, .encoding = self.encoding };
     }
 
     /// The open document and position a `textDocument/<feature>` request names, or null for
@@ -200,7 +202,10 @@ pub const Server = struct {
                 return true;
             }
             self.got_initialize = true;
-            if (id) |iv| try protocol.writeResponse(a, writer, iv, protocol.InitializeResult{});
+            self.encoding = negotiateEncoding(root);
+            if (id) |iv| try protocol.writeResponse(a, writer, iv, protocol.InitializeResult{
+                .capabilities = .{ .positionEncoding = self.encoding.name() },
+            });
             return true;
         }
 
@@ -249,8 +254,8 @@ pub const Server = struct {
                 const sc = coordU32(getInt(s, "character")) orelse continue;
                 const el = coordU32(getInt(e, "line")) orelse continue;
                 const ec = coordU32(getInt(e, "character")) orelse continue;
-                const start_off = (try position.offsetIn(a, d.text, sl, sc)) orelse doc_end;
-                var end_off = (try position.offsetIn(a, d.text, el, ec)) orelse doc_end;
+                const start_off = (try position.offsetIn(a, d.text, sl, sc, self.encoding)) orelse doc_end;
+                var end_off = (try position.offsetIn(a, d.text, el, ec, self.encoding)) orelse doc_end;
                 if (end_off < start_off) end_off = start_off; // tolerate an inverted range
                 try self.docs.spliceRange(self.gpa, uri, start_off, end_off, text);
             }
@@ -347,6 +352,16 @@ pub const Server = struct {
 fn respond(a: std.mem.Allocator, writer: *Writer, id: std.json.Value, result: anytype) !void {
     if (result) |r| return protocol.writeResponse(a, writer, id, r);
     try protocol.writeResponse(a, writer, id, std.json.Value{ .null = {} });
+}
+
+/// utf-8 when the client lists it in `general.positionEncodings` (our native unit), else
+/// utf-16, which the protocol makes every client support.
+fn negotiateEncoding(root: std.json.Value) position.Encoding {
+    const general = field(objGet(root, "params") orelse return .utf16, "capabilities", "general") orelse return .utf16;
+    const offered = objGet(general, "positionEncodings") orelse return .utf16;
+    if (offered != .array) return .utf16;
+    for (offered.array.items) |e| if (e == .string and eql(e.string, "utf-8")) return .utf8;
+    return .utf16;
 }
 
 fn sendDiagnostics(a: std.mem.Allocator, writer: *Writer, uri: []const u8, version: i64, items: []const protocol.LspDiagnostic) !void {
@@ -1469,4 +1484,50 @@ test "lsp feed: each push is served to completion; the server reports exit" {
     out.clearRetainingCapacity();
     try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "exit" });
     try testing.expect(!try s.feed(in.written(), &out.writer));
+}
+
+test "lsp positions: utf-16 unless the client offers utf-8, both directions" {
+    const gpa = testing.allocator;
+    // `日本` is 6 bytes but 2 UTF-16 units, so `zz` sits at byte column 30 but unit 26.
+    const src = "fn main() -> bool {\n    return \"\u{65e5}\u{672c}\" == \"x\" || zz\n}\n";
+    for ([_]struct { offer: ?[]const u8, want_char: i64 }{
+        .{ .offer = null, .want_char = 26 },
+        .{ .offer = "utf-8", .want_char = 30 },
+    }) |c| {
+        var s = Server.init(gpa);
+        defer s.deinit();
+        var in: Writer.Allocating = .init(gpa);
+        defer in.deinit();
+        var out: Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        if (c.offer) |o| {
+            try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 1, .method = "initialize", .params = .{ .capabilities = .{ .general = .{ .positionEncodings = &[_][]const u8{o} } } } });
+        } else {
+            try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 1, .method = "initialize", .params = .{} });
+        }
+        try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didOpen", .params = .{
+            .textDocument = .{ .uri = "file:///b/u.toy", .version = 1, .text = src },
+        } });
+        // A ranged edit in the client's units: rename `zz` to `yy`.
+        try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didChange", .params = .{
+            .textDocument = .{ .uri = "file:///b/u.toy", .version = 2 },
+            .contentChanges = &[_]struct { range: protocol.Range, text: []const u8 }{.{
+                .range = .{ .start = .{ .line = 1, .character = @intCast(c.want_char) }, .end = .{ .line = 1, .character = @intCast(c.want_char + 2) } },
+                .text = "yy",
+            }},
+        } });
+        _ = try s.feed(in.written(), &out.writer);
+        try testing.expect(std.mem.indexOf(u8, s.docs.textOf("file:///b/u.toy").?, "|| yy") != null);
+
+        var frames = try splitFrames(gpa, out.written());
+        defer {
+            for (frames.items) |f| gpa.free(f);
+            frames.deinit(gpa);
+        }
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const last = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), frames.items[frames.items.len - 1], .{});
+        const d = objGet(last, "params").?.object.get("diagnostics").?.array.items[0];
+        try testing.expectEqual(c.want_char, getInt(field(d, "range", "start").?, "character").?);
+    }
 }

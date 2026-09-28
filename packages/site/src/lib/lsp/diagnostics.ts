@@ -48,7 +48,10 @@ function publishDiagnostics(client: LSPClient, params: lsp.PublishDiagnosticsPar
 	const plugin = view && LSPPlugin.get(view);
 	if (!view || !plugin) return false;
 
-	const toPos = (p: lsp.Position) => plugin.unsyncedChanges.mapPos(plugin.fromPosition(p, plugin.syncedDoc));
+	// Clamped: a position past the synced text (a trailing line with no newline) would make
+	// `mapPos` throw, taking the whole publish down with it.
+	const toPos = (p: lsp.Position) =>
+		plugin.unsyncedChanges.mapPos(Math.min(plugin.fromPosition(p, plugin.syncedDoc), plugin.syncedDoc.length));
 	const diagnostics: Diagnostic[] = params.diagnostics.map((d) => {
 		const severity = SEVERITY[d.severity ?? 1];
 		const message = typeof d.message === 'string' ? d.message : d.message.value;
