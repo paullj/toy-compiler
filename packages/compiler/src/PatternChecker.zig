@@ -52,7 +52,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
     const enum_id = bc.scrutEnumId(st);
     if (enum_id == null and st.kind != .int and st.kind != .bool) {
         for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
-        try bc.sink.err(.none).spanOf(bc.spanOf(n.lhs)).emitFmt("match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
+        try bc.sink.report(.{ .span = bc.spanOf(n.lhs) }, "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
         bc.node_types[(node_idx).int()] = .invalid;
         return .invalid;
     }
@@ -81,14 +81,14 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
         // saturated by prior unguarded arms warns. Argument-free so per-generic-instance
         // rechecks dedupe. First one only — no cascade.
         if (!warned and matchSaturated(cov, has_wildcard)) {
-            try bc.sink.emitFmtCodeSpan(.W0006, bc.spanOf(arm.lhs), "unreachable match arm; every value is already matched by an earlier arm", .{});
+            try bc.sink.report(.{ .span = bc.spanOf(arm.lhs), .code = .W0006 }, "unreachable match arm; every value is already matched by an earlier arm", .{});
             warned = true;
         }
         try checkPattern(bc, arm.lhs, st, &cov, &has_wildcard, !guarded);
         if (guarded) {
             const gt = try bc.typeOf(h.guard);
             if (gt.kind != .invalid and gt.kind != .bool)
-                try bc.sink.emitFmtCodeSpan(.T0045, bc.spanOf(h.guard), "match guard must be bool, got {s}", .{bc.typeName(gt)});
+                try bc.sink.report(.{ .span = bc.spanOf(h.guard), .code = .T0045 }, "match guard must be bool, got {s}", .{bc.typeName(gt)});
         }
         const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
         const body_ty: Type = if (armDiverges(bc, h.body)) Type.never else body_ty0;
@@ -108,11 +108,11 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
                 n_missing += 1;
             };
             if (n_missing > 0)
-                try bc.sink.emitFmtCodeSpan(.T0048, scrutineeSpan(bc, n), "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
+                try bc.sink.report(.{ .span = scrutineeSpan(bc, n), .code = .T0048 }, "non-exhaustive match: missing {s} {s}; add the missing arm(s) or a '_' arm", .{ if (n_missing == 1) "variant" else "variants", names.items });
         },
         .bool => |bcov| if (!(bcov.t and bcov.f))
-            try bc.sink.emitFmtCodeSpan(.T0048, scrutineeSpan(bc, n), "non-exhaustive match: bool requires both true and false (or '_')", .{}),
-        .int => try bc.sink.emitFmtCodeSpan(.T0048, scrutineeSpan(bc, n), "non-exhaustive match: int match requires '_'", .{}),
+            try bc.sink.report(.{ .span = scrutineeSpan(bc, n), .code = .T0048 }, "non-exhaustive match: bool requires both true and false (or '_')", .{}),
+        .int => try bc.sink.report(.{ .span = scrutineeSpan(bc, n), .code = .T0048 }, "non-exhaustive match: int match requires '_'", .{}),
     };
     bc.node_types[(node_idx).int()] = result;
     return result;
@@ -176,7 +176,7 @@ fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov,
             else
                 Type.@"bool";
             if (expected.kind != .invalid and !Type.eql(lt, expected))
-                try bc.sink.emitFmt(bc.byteOf(pat.main_token), "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
+                try bc.sink.report(.{ .span = bc.tokSpan(pat.main_token) }, "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
             // A bool literal records its case toward coverage; int never covers.
             if (count_cov) switch (cov.*) {
                 .bool => |bcov| {
@@ -203,7 +203,7 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
     // `substTy(..., &.{})` below is the identity — byte-identical to the earlier behavior.
     const enum_id = bc.scrutEnumId(expected) orelse {
         if (expected.kind != .invalid)
-            try bc.sink.err(.none).spanOf(bc.spanOf(pat_idx)).emitFmt("variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
+            try bc.sink.report(.{ .span = bc.spanOf(pat_idx) }, "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
         return;
     };
     const targs: []const Type = if (expected.isApp()) bc.composite.at(expected.appIdx()).args else &.{};
@@ -213,9 +213,9 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
         const tname = bc.nameText(bc.tree.nodes[(pat.lhs).int()].main_token);
         if (bc.activeEnumMap().get(tname)) |qid| {
             if (qid != enum_id)
-                try bc.sink.err(.none).spanOf(bc.spanOf(pat.lhs)).emitFmt("pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+                try bc.sink.report(.{ .span = bc.spanOf(pat.lhs) }, "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
         } else {
-            try bc.sink.err(.none).spanOf(bc.spanOf(pat.lhs)).emitFmt("'{s}' is not an enum type", .{tname});
+            try bc.sink.report(.{ .span = bc.spanOf(pat.lhs) }, "'{s}' is not an enum type", .{tname});
         }
     }
     const vname = bc.nameText(pat.main_token);
@@ -236,18 +236,18 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
         if (count_cov and try variantPayloadIrrefutableSubst(bc, pat_idx, e.variants[i], targs)) cov.@"enum"[i] = true;
         break :blk e.variants[i];
     } else {
-        try bc.emitNoVariant(bc.byteOf(pat.main_token), e.name, vname, e.variants);
+        try bc.emitNoVariant(bc.tokSpan(pat.main_token), e.name, vname, e.variants);
         return;
     };
     const binders = if (pat.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (pat.rhs).int());
     switch (variant.form) {
         .unit => {
             if (binders.len != 0)
-                try bc.sink.err(.none).spanOf(payloadSpan(bc, pat_idx)).emitFmt("unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
+                try bc.sink.report(.{ .span = payloadSpan(bc, pat_idx) }, "unit variant '{s}.{s}' binds no payload", .{ e.name, vname });
         },
         .tuple => {
             if (binders.len != variant.field_types.len) {
-                try bc.sink.err(.none).spanOf(payloadSpan(bc, pat_idx)).emitFmt("variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
+                try bc.sink.report(.{ .span = payloadSpan(bc, pat_idx) }, "variant '{s}.{s}' binds {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, binders.len });
                 return;
             }
             for (binders, variant.field_types) |b_idx, fty_pat| {
@@ -270,7 +270,7 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
                     }
                 }
                 if (!found) {
-                    try bc.sink.emitFmtCode(.T0046, bc.byteOf(b.main_token), "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
+                    try bc.sink.report(.{ .span = bc.tokSpan(b.main_token), .code = .T0046 }, "no field '{s}' in '{s}.{s}'", .{ src_name, e.name, vname });
                 }
                 // The carrier IS a pattern_binding: if it has a sub-pattern, match
                 // the field against it; else bind the whole field by value.
@@ -394,7 +394,7 @@ fn checkOrBindings(bc: *BodyChecker, or_idx: Ast.Index) error{OutOfMemory}!void 
         if (!ok) break;
     }
     if (!ok)
-        try bc.sink.err(.none).spanOf(bc.spanOf(or_idx)).emitFmt("or-pattern alternatives must bind the same names and types", .{});
+        try bc.sink.report(.{ .span = bc.spanOf(or_idx) }, "or-pattern alternatives must bind the same names and types", .{});
 }
 
 fn collectBindings(bc: *BodyChecker, pat_idx: Ast.Index, out: *std.StringHashMapUnmanaged(Type)) error{OutOfMemory}!void {

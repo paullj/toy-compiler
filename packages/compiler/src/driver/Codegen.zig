@@ -6,6 +6,7 @@
 //! assemble → applyDataRelocs → sign-last pipeline. Distinct from the per-file
 //! front-end (`Driver.run`/`pipeline`, discover → lex/parse/check).
 const std = @import("std");
+const Span = @import("../diagnostics/model.zig").Span;
 const builtin = @import("builtin");
 const Io = std.Io;
 const Token = @import("../ast/Token.zig").Token;
@@ -48,14 +49,14 @@ fn traceNameFor(tc: *const Typecheck.GraphResult, ty: Typecheck.Type) ?[]const u
     return erasedNameFor(tc, ty, .trace);
 }
 
-/// A user-facing failure while emitting code: a message plus the source byte
-/// offset to render as `line:col` (or `null` for whole-file errors). The driver
-/// returns these to `main`, which renders them and exits non-zero.
+/// A user-facing failure while emitting code: a message plus the source span to
+/// render (or `null` for whole-file errors). The driver returns these to `main`,
+/// which renders them and exits non-zero.
 pub const EmitError = struct {
     message: []const u8,
-    byte_offset: ?u32,
+    span: ?Span,
     /// Graph builds: the owning module id (index into `Graph.modules`) whose
-    /// source `byte_offset` points into. `null` (single-file path, or a
+    /// source `span` points into. `null` (single-file path, or a
     /// whole-program error with no single owner) renders against the entry file.
     module: ?u32 = null,
 };
@@ -216,8 +217,8 @@ fn relink(
     }
 
     var lp = linkAndTail(io, gpa, fns.items, names, entry_fn, desc_plan) catch |e| switch (e) {
-        error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range", .byte_offset = null } },
-        error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .byte_offset = null } },
+        error.CallTargetTooFar => return .{ .err = .{ .message = "call target out of range", .span = null } },
+        error.UnresolvedSymbol, error.NoEntry => return .{ .err = .{ .message = "internal: unresolved symbol after codegen", .span = null } },
         else => |err| return err,
     };
     lp.diags = try gpa.alloc(CodegenIr.Diagnostic, 0);
@@ -458,7 +459,7 @@ pub fn lowerGraphProgram(
 
     const eid = entry_id orelse return .{ .err = .{
         .message = "-o requires a function named 'main' in the entry module",
-        .byte_offset = null,
+        .span = null,
     } };
 
     // Parameters on main are unsupported (codegen also guards; cleaner up front).
@@ -468,7 +469,7 @@ pub fn lowerGraphProgram(
         const main_proto = Ast.protoAt(em.tree(), main_decl.lhs.int());
         if (main_proto.params.len > 0) return .{ .err = .{
             .message = "parameters on main are unsupported",
-            .byte_offset = em.tokens[main_decl.main_token].start,
+            .span = .{ .start = em.tokens[main_decl.main_token].start, .end = em.tokens[main_decl.main_token].end },
             .module = graph.entry_index,
         } };
 
@@ -479,7 +480,7 @@ pub fn lowerGraphProgram(
         const main_ret = tc.sigs[eid].ret;
         if (main_ret.kind != .int and main_ret.kind != .unit) return .{ .err = .{
             .message = "main must return int or ()",
-            .byte_offset = em.tokens[main_decl.main_token].start,
+            .span = .{ .start = em.tokens[main_decl.main_token].start, .end = em.tokens[main_decl.main_token].end },
             .module = graph.entry_index,
         } };
     }

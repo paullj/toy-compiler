@@ -94,8 +94,8 @@ test "checkExit: --exit-zero dominates errors and warnings" {
 }
 
 test "resolveHasError: only error severity blocks typecheck" {
-    const err: Diagnostic = .{ .severity = .err, .message = "", .byte_offset = 0 };
-    const warn: Diagnostic = .{ .severity = .warning, .message = "", .byte_offset = 0 };
+    const err: Diagnostic = .{ .severity = .err, .message = "", .byte_offset = 0, .end = 0 };
+    const warn: Diagnostic = .{ .severity = .warning, .message = "", .byte_offset = 0, .end = 0 };
     try std.testing.expect(!resolveHasError(&.{}));
     try std.testing.expect(!resolveHasError(&.{warn}));
     try std.testing.expect(resolveHasError(&.{ warn, err }));

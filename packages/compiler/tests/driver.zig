@@ -2732,7 +2732,7 @@ test "codegen reports missing main and lowers a simple main" {
         try testing.expect(r.err == null);
         var lowered = try lowerSingleFile(gpa, io, cache, "aarch64-macos", &r, .normal, .O0);
         switch (lowered) {
-            .err => |e| try testing.expect(e.byte_offset == null),
+            .err => |e| try testing.expect(e.span == null),
             .ok => |*lp| {
                 lp.deinit(gpa);
                 return error.TestUnexpectedResult;

@@ -62,7 +62,7 @@ pub fn checkBuffer(
         } else if (in_entry) {
             // Any other structural error that belongs to the entry and carries an offset
             // (an unresolvable/mis-cased import token) becomes one diagnostic there.
-            if (graph.errorSpan(ge)) |span| {
+            if (ge.span) |span| {
                 try out.append(a, .{
                     .range = position.rangeOf(&sm, span.start, span.end, ws.encoding),
                     .severity = protocol.severity.err,

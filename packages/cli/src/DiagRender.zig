@@ -3,7 +3,7 @@
 //! the shared status palette (below) — the one hue set both this and Report use.
 //!
 //! Location fallback: the Renderer needs a Span to draw a snippet, so a Graph.Error
-//! or EmitError with no `byte_offset` (or no loaded source) renders through
+//! or EmitError with no `span` (or no loaded source) renders through
 //! `renderPlainError` as the plain no-location `path: error: msg (detail)` shape.
 
 const std = @import("std");
@@ -198,9 +198,9 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
     }
     const name = if (e.module) |m| moduleAt(g, m).path else if (g.modules.len > 0) g.entry().path else "<entry>";
     const has_src = e.module != null or g.modules.len > 0;
-    if (e.byte_offset != null and has_src) {
+    if (e.span != null and has_src) {
         const src: []const u8 = if (e.module) |m| moduleAt(g, m).source else g.entry().source;
-        try renderLocated(gpa, out, level, name, src, g.errorSpan(e), e.message, e.detail);
+        try renderLocated(gpa, out, level, name, src, e.span, e.message, e.detail);
     } else {
         try renderPlainError(out, level, name, e.message, e.detail);
     }
@@ -210,8 +210,7 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
 /// (or the entry module when `module` is null). EmitError carries no detail.
 pub fn renderGraphEmit(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Codegen.EmitError) !void {
     const m = if (e.module) |mi| moduleAt(g, mi) else g.entry();
-    if (e.byte_offset) |off| {
-        const span: Rr.Diagnostic.Span = .{ .start = off, .end = toyc.DiagnosticSink.tokenEnd(m.tokens, off) };
+    if (e.span) |span| {
         try renderLocated(gpa, out, level, m.path, m.source, span, e.message, "");
     } else {
         try renderPlainError(out, level, m.path, e.message, "");

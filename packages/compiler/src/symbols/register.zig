@@ -27,20 +27,20 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
         if (decl.tag != .struct_decl and decl.tag != .tuple_struct_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.sink.emitFmtCode(.T0011, t.byteOf(decl.main_token), "struct '{s}' shadows a builtin type", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0011 }, "struct '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null) {
-            try t.sink.emitFmtCode(.T0012, t.byteOf(decl.main_token), "duplicate struct declaration '{s}'", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0012 }, "duplicate struct declaration '{s}'", .{name});
             continue;
         }
         if (decl.tag == .tuple_struct_decl) {
             if (decl.rhs != Ast.none) {
-                try t.sink.err(.none).spanOf(genericsSpan(t, decl.main_token)).emitFmt("generic tuple structs are not yet supported", .{});
+                try t.sink.report(.{ .span = genericsSpan(t, decl.main_token) }, "generic tuple structs are not yet supported", .{});
                 continue;
             }
             if (Ast.rangeSlice(t.tree, decl.lhs.int()).len > LayoutEngine.tuple_field_cap) {
-                try t.sink.err(.none).spanOf(t.spanOf(decl_idx)).emitFmt("tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
+                try t.sink.report(.{ .span = t.spanOf(decl_idx) }, "tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
                 // Registered anyway so references resolve; layoutStruct clamps the name
                 // index so the (already-errored, codegen-gated) program never OOBs.
             }
@@ -197,11 +197,11 @@ pub fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !vo
         if (decl.tag != .enum_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.sink.emitFmt(t.byteOf(decl.main_token), "enum '{s}' shadows a builtin type", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token) }, "enum '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null or t.activeEnumMap().get(name) != null) {
-            try t.sink.emitFmt(t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token) }, "duplicate type declaration '{s}'", .{name});
             continue;
         }
         // A generic template `enum Either[L,R] { .. }` carries its generic-param run in
@@ -335,11 +335,11 @@ pub fn registerAliases(t: *Typecheck, decl_nodes: []const Ast.Index) !void {
         if (decl.tag != .type_alias_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.sink.emitFmtCode(.T0011, t.byteOf(decl.main_token), "type alias '{s}' shadows a builtin type", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0011 }, "type alias '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null or t.activeEnumMap().get(name) != null or by_name.contains(name)) {
-            try t.sink.emitFmtCode(.T0012, t.byteOf(decl.main_token), "duplicate type declaration '{s}'", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0012 }, "duplicate type declaration '{s}'", .{name});
             continue;
         }
         try by_name.put(t.gpa, name, @intCast(entries.items.len));
@@ -366,7 +366,7 @@ fn resolveAlias(t: *Typecheck, entries: []AliasEntry, start: usize, map: *std.St
         switch (entries[i].state) {
             .done => break map.get(entries[i].name).?,
             .resolving => {
-                try t.sink.emitFmtCode(.T0035, t.byteOf(entries[i].tok), "type alias '{s}' forms a cycle", .{entries[i].name});
+                try t.sink.report(.{ .span = t.tokSpan(entries[i].tok), .code = .T0035 }, "type alias '{s}' forms a cycle", .{entries[i].name});
                 break Type.invalid;
             },
             .unvisited => {},

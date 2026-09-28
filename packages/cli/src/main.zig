@@ -926,7 +926,7 @@ fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel,
                         .err => |ee| try DiagRender.renderGraphEmit(gpa, out, level, g, ee),
                         .ok => |lp| for (lp.diags) |d| try DiagRender.renderGraphEmit(gpa, out, level, g, .{
                             .message = d.message,
-                            .byte_offset = d.byte_offset,
+                            .span = d.span(),
                             // Carry the diagnostic's owning module so it renders against the
                             // right source once multi-module lowering emits per-module diags;
                             // NO_SCOPE (single-file) stays null -> entry module.

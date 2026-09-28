@@ -222,11 +222,11 @@ pub fn lowerIr(
     const fl = FrameLayout.compute(gpa, func, layouts, enum_layouts) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FrameTooLarge => {
-            try out_diags.append(gpa, .{ .byte_offset = 0, .message = "function frame too large for codegen (too many locals)" });
+            try out_diags.append(gpa, .{ .byte_offset = 0, .end = 0, .message = "function frame too large for codegen (too many locals)" });
             return emptyFn(gpa, func.name);
         },
         error.ParamOffsetTooLarge => {
-            try out_diags.append(gpa, .{ .byte_offset = 0, .message = "too many parameters for codegen (stack-arg offset out of range)" });
+            try out_diags.append(gpa, .{ .byte_offset = 0, .end = 0, .message = "too many parameters for codegen (stack-arg offset out of range)" });
             return emptyFn(gpa, func.name);
         },
     };

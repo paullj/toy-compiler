@@ -348,7 +348,7 @@ pub const BodyChecker = struct {
         // structurally return, OR the body's trailing expression has the declared
         // type. `assignable` folds poison/never/eql exactly as before.
         if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
-            try bc.sink.emitFmtCode(.T0043, bc.byteOf(decl.main_token), "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
+            try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
         _ = proto;
     }
@@ -442,7 +442,7 @@ pub const BodyChecker = struct {
     /// nor the emitted machine code. At most one W0005 per block (no cascade).
     fn warnUnreachable(bc: *BodyChecker, stmts: []const Ast.Index) error{OutOfMemory}!void {
         const dead = Lint.firstUnreachable(bc.lint(), stmts) orelse return;
-        try bc.sink.emitFmtCodeSpan(.W0005, bc.spanOf(stmts[dead]), "unreachable code; the previous statement always diverges", .{});
+        try bc.sink.report(.{ .span = bc.spanOf(stmts[dead]), .code = .W0005 }, "unreachable code; the previous statement always diverges", .{});
     }
 
     /// Emit W0008 when a discarded expression statement's value is an `Option`/`Result`.
@@ -453,7 +453,7 @@ pub const BodyChecker = struct {
     /// emitted machine code.
     fn warnDroppedMustUse(bc: *BodyChecker, stmt_idx: Ast.Index, vt: Type) error{OutOfMemory}!void {
         const name = Lint.droppedMustUseName(bc.cur_ret, bc.optResultFamily(vt)) orelse return;
-        try bc.sink.emitFmtCodeSpan(.W0008, bc.spanOf(stmt_idx), "unused {s} value; handle it, bind it with ':=', or propagate with '?'", .{name});
+        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .W0008 }, "unused {s} value; handle it, bind it with ':=', or propagate with '?'", .{name});
     }
 
     fn checkStmt(bc: *BodyChecker, stmt_idx: Ast.Index) error{OutOfMemory}!void {
@@ -466,7 +466,7 @@ pub const BodyChecker = struct {
                     const declared = bc.typeFromNode(stmt.rhs);
                     const got = try bc.typeOfExpected(stmt.lhs, declared);
                     if (!Type.assignable(declared, got)) {
-                        try bc.sink.emitFmtCodeSpan(.T0041, bc.spanOf(stmt.lhs), "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0041 }, "cannot bind {s} to '{s}' of type {s}", .{ bc.typeName(got), bc.nameText(stmt.main_token), bc.typeName(declared) });
                     }
                     break :blk declared;
                 } else try bc.typeOf(stmt.lhs);
@@ -495,10 +495,10 @@ pub const BodyChecker = struct {
                 bc.node_types[(stmt.lhs).int()] = lhs;
                 const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
-                    try bc.sink.emitFmtCodeSpan(.T0041, bc.spanOf(stmt.rhs), "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
+                    try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
                 }
                 if (bc.targetRootsAtIndexElement(stmt.lhs)) {
-                    try bc.sink.emitFmtSpan(bc.spanOf(stmt.lhs), "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{});
+                    try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs) }, "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{});
                 }
             },
             .return_stmt => {
@@ -510,7 +510,7 @@ pub const BodyChecker = struct {
                 // `never` unifies with any declared type — mirrors the trailing-expr
                 // body check above.
                 if (!Type.assignable(bc.cur_ret, ty)) {
-                    try bc.sink.emitFmtCodeSpan(.T0042, bc.spanOf(if (stmt.lhs == Ast.none) stmt_idx else stmt.lhs), "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
+                    try bc.sink.report(.{ .span = bc.spanOf(if (stmt.lhs == Ast.none) stmt_idx else stmt.lhs), .code = .T0042 }, "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
                 }
             },
             .expr_stmt => _ = try bc.typeOf(stmt.lhs),
@@ -518,7 +518,7 @@ pub const BodyChecker = struct {
             .if_stmt => {
                 const ct = try bc.typeOf(stmt.lhs);
                 if (ct.kind != .invalid and ct.kind != .bool)
-                    try bc.sink.err(.T0045).spanOf(bc.spanOf(stmt.lhs)).emit("if condition must be bool");
+                    try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0045 }, "if condition must be bool", .{});
                 try bc.warnConstIfCond(stmt.lhs);
                 const h = Ast.ifHeaderAt(bc.tree, (stmt.rhs).int());
                 _ = try bc.checkBlock(h.then_block, false);
@@ -539,7 +539,7 @@ pub const BodyChecker = struct {
                     // No matching context: a bare break with an empty stack ("outside a
                     // loop"); a labeled break is reported by resolve as undefined.
                     if (bc.resolutions[(stmt_idx).int()] != .label)
-                        try bc.sink.emitSpan(bc.spanOf(stmt_idx), "break outside of a loop");
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "break outside of a loop", .{});
                     if (stmt.lhs != Ast.none) _ = try bc.typeOf(stmt.lhs);
                     return;
                 };
@@ -550,7 +550,7 @@ pub const BodyChecker = struct {
                     const vt = try bc.typeOf(stmt.lhs);
                     if (!ctx.is_value) {
                         if (vt.kind != .invalid and vt.kind != .unit)
-                            try bc.sink.emitSpan(bc.spanOf(stmt_idx), "cannot break with a value out of a while/for loop");
+                            try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "cannot break with a value out of a while/for loop", .{});
                     } else {
                         ctx.saw_value_break = true;
                         ctx.join = try bc.merge(stmt.main_token, ctx.join, vt);
@@ -560,12 +560,12 @@ pub const BodyChecker = struct {
             .continue_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
                     if (bc.resolutions[(stmt_idx).int()] != .label)
-                        try bc.sink.emitSpan(bc.spanOf(stmt_idx), "continue outside of a loop");
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "continue outside of a loop", .{});
                     return;
                 };
                 // `continue` is meaningful only on a loop; a labeled bare block is not.
                 if (ctx.kind == .labeled_block)
-                    try bc.sink.emitSpan(bc.spanOf(stmt_idx), "cannot continue a labeled block (not a loop)");
+                    try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "cannot continue a labeled block (not a loop)", .{});
             },
             // A poison leaf as a statement: already-diagnosed, no further check.
             .error_node => {},
@@ -596,7 +596,7 @@ pub const BodyChecker = struct {
         const stmt = bc.tree.nodes[(stmt_idx).int()];
         const ct = try bc.typeOf(stmt.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.sink.err(.T0045).spanOf(bc.spanOf(stmt.lhs)).emit("while condition must be bool");
+            try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0045 }, "while condition must be bool", .{});
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.rhs, false);
         _ = bc.loop_stack.pop();
@@ -608,9 +608,9 @@ pub const BodyChecker = struct {
         const lo = try bc.typeOf(h.lo);
         const hi = try bc.typeOf(h.hi);
         if (lo.kind != .invalid and lo.kind != .int)
-            try bc.sink.emitSpan(bc.spanOf(h.lo), "for range bounds must be int");
+            try bc.sink.report(.{ .span = bc.spanOf(h.lo) }, "for range bounds must be int", .{});
         if (hi.kind != .invalid and hi.kind != .int)
-            try bc.sink.emitSpan(bc.spanOf(h.hi), "for range bounds must be int");
+            try bc.sink.report(.{ .span = bc.spanOf(h.hi) }, "for range bounds must be int", .{});
         if (bc.resolutions[(stmt_idx).int()] == .local) try bc.setSlot(bc.resolutions[(stmt_idx).int()].local, Type.int);
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.lhs, false);
@@ -629,14 +629,14 @@ pub const BodyChecker = struct {
         const iter_ty = bc.resolveIterType(recv) orelse blk: {
             // A non-iterable receiver: name the protocol so the error is greppable.
             if (recv.kind != .invalid)
-                try bc.sink.emitFmtCodeSpan(.T0023, bc.spanOf(stmt.rhs), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+                try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
             break :blk Type.invalid;
         };
         const item: Type = if (iter_ty.kind == .invalid)
             .invalid
         else
             try conform.iteratorItem(bc.model, bc.composite, bc.gpa, iter_ty) orelse blk: {
-                try bc.sink.emitFmtCodeSpan(.T0023, bc.spanOf(stmt.rhs), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+                try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
                 break :blk Type.invalid;
             };
         bc.node_types[(stmt_idx).int()] = iter_ty;
@@ -656,11 +656,11 @@ pub const BodyChecker = struct {
         const recv = try bc.typeOf(stmt.rhs);
         const iter_ty = bc.resolveIterType(recv) orelse blk: {
             if (recv.kind != .invalid)
-                try bc.sink.emitFmtCodeSpan(.T0023, bc.spanOf(stmt.rhs), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+                try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
             break :blk Type.invalid;
         };
         const item: Type = if (iter_ty.kind == .invalid) .invalid else try conform.iteratorItem(bc.model, bc.composite, bc.gpa, iter_ty) orelse blk: {
-            try bc.sink.emitFmtCodeSpan(.T0023, bc.spanOf(stmt.rhs), "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
+            try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
             break :blk Type.invalid;
         };
         var kty: Type = .invalid;
@@ -672,10 +672,10 @@ pub const BodyChecker = struct {
                 kty = e.args[0];
                 vty = e.args[1];
             } else {
-                try bc.sink.emitFmtCodeSpan(.T0023, bc.spanOf(stmt.rhs), "'for k, v' requires an iterator over 'Entry' pairs", .{});
+                try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "'for k, v' requires an iterator over 'Entry' pairs", .{});
             }
         } else if (item.kind != .invalid) {
-            try bc.sink.emitFmtCodeSpan(.T0023, bc.spanOf(stmt.rhs), "'for k, v' requires an iterator over 'Entry' pairs", .{});
+            try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "'for k, v' requires an iterator over 'Entry' pairs", .{});
         }
         bc.node_types[stmt_idx.int()] = iter_ty;
         if (bc.resolutions[stmt_idx.int()] == .local) try bc.setSlot(bc.resolutions[stmt_idx.int()].local, kty);
@@ -771,7 +771,7 @@ pub const BodyChecker = struct {
         const raw = bc.tokens[main_token].text(bc.source);
         if (expected) |e| if (e.isInteger()) {
             if (!Literal.fitsWidth(raw, e, false))
-                try bc.sink.emitFmtCode(.T0034, bc.byteOf(main_token), "literal out of range for type '{s}'", .{bc.typeName(e)});
+                try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0034 }, "literal out of range for type '{s}'", .{bc.typeName(e)});
             return e;
         };
         // Unannotated default is platform `int`: route the range verdict through the
@@ -782,7 +782,7 @@ pub const BodyChecker = struct {
         // or an over-u64 pattern against a bool scrutinee) keeps relying on its own mismatch
         // diagnostic — emitting T0034 there too would recreate the paired report this avoids.
         if (expected == null and Literal.value(raw) == null)
-            try bc.sink.emitFmtCode(.T0034, bc.byteOf(main_token), "literal out of range for type '{s}'", .{bc.typeName(Type.int)});
+            try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0034 }, "literal out of range for type '{s}'", .{bc.typeName(Type.int)});
         return Type.int;
     }
 
@@ -795,14 +795,14 @@ pub const BodyChecker = struct {
         const raw = bc.tokens[main_token].text(bc.source);
         switch (Literal.decodeChar(raw)) {
             .ok => {},
-            .empty => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "empty char literal"),
-            .too_many => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal must hold exactly one codepoint; use double quotes for a string"),
-            .dangling_backslash => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal ends with a dangling backslash"),
-            .unknown_escape => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "unknown escape in char literal"),
-            .bad_hex_escape => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "malformed '\\x'/'\\u' escape in char literal"),
-            .bad_codepoint => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "'\\u{...}' escape is not a Unicode scalar value"),
-            .bad_utf8 => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "char literal is not valid UTF-8"),
-            .malformed => try bc.sink.emitCode(.T0036, bc.byteOf(main_token), "malformed char literal"),
+            .empty => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "empty char literal", .{}),
+            .too_many => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "char literal must hold exactly one codepoint; use double quotes for a string", .{}),
+            .dangling_backslash => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "char literal ends with a dangling backslash", .{}),
+            .unknown_escape => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "unknown escape in char literal", .{}),
+            .bad_hex_escape => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "malformed '\\x'/'\\u' escape in char literal", .{}),
+            .bad_codepoint => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "'\\u{{...}}' escape is not a Unicode scalar value", .{}),
+            .bad_utf8 => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "char literal is not valid UTF-8", .{}),
+            .malformed => try bc.sink.report(.{ .span = bc.tokSpan(main_token), .code = .T0036 }, "malformed char literal", .{}),
         }
         if (bc.model.prelude) |p| if (p.char_struct) |cid| return Type.structT(cid);
         return .invalid;
@@ -827,7 +827,7 @@ pub const BodyChecker = struct {
         const vec_ctor = bc.activeStructMap().get(StdNames.vec_struct);
         if (!rt.isApp()) {
             if (rt.kind != .invalid)
-                try bc.sink.emitFmtSpan(bc.spanOf(site), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+                try bc.sink.report(.{ .span = bc.spanOf(site) }, "cannot index a value of type '{s}'", .{bc.typeName(rt)});
             return Type.invalid;
         }
         const e = bc.composite.at(rt.appIdx());
@@ -836,16 +836,16 @@ pub const BodyChecker = struct {
         // generic reject, exactly as `Vec` is recognized by name.
         if (bc.activeStructMap().get(StdNames.map_struct)) |map_ctor| {
             if (!e.ctor_is_enum and e.ctor == map_ctor) {
-                try bc.sink.emitFmtSpan(bc.spanOf(site), "Map has no index operator; use .get", .{});
+                try bc.sink.report(.{ .span = bc.spanOf(site) }, "Map has no index operator; use .get", .{});
                 return Type.invalid;
             }
         }
         if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1) {
-            try bc.sink.emitFmtSpan(bc.spanOf(site), "cannot index a value of type '{s}'", .{bc.typeName(rt)});
+            try bc.sink.report(.{ .span = bc.spanOf(site) }, "cannot index a value of type '{s}'", .{bc.typeName(rt)});
             return Type.invalid;
         }
         if (it.kind != .int and it.kind != .invalid)
-            try bc.sink.emitFmtSpan(bc.spanOf(idx), "an index must be 'int', got '{s}'", .{bc.typeName(it)});
+            try bc.sink.report(.{ .span = bc.spanOf(idx) }, "an index must be 'int', got '{s}'", .{bc.typeName(it)});
         return e.args[0];
     }
 
@@ -861,7 +861,7 @@ pub const BodyChecker = struct {
             .identifier => switch (bc.resolutions[(node_idx).int()]) {
                 .local => |slot| bc.slotType(slot),
                 .func => blk: {
-                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "function '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "function '{s}' is not a value", .{bc.nameText(n.main_token)});
                     break :blk bc.poison();
                 },
                 .unresolved => blk: {
@@ -871,7 +871,7 @@ pub const BodyChecker = struct {
                     // struct name used as a value (`q := P`, `P.x`) reaches here with
                     // no diagnostic — report it so it never escapes to codegen.
                     if (bc.activeStructMap().get(bc.nameText(n.main_token)) != null) {
-                        try bc.sink.emitFmt(bc.byteOf(n.main_token), "type '{s}' is not a value", .{bc.nameText(n.main_token)});
+                        try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "type '{s}' is not a value", .{bc.nameText(n.main_token)});
                         break :blk bc.poison();
                     }
                     // Else: an ordinary undeclared name already reported by resolve
@@ -883,7 +883,7 @@ pub const BodyChecker = struct {
                     // A bare imported-namespace name used as a value (`x := mod`):
                     // a module is not a value. (A `mod.member` access never reaches
                     // here — the receiver is consumed by typeOfFieldAccess/Call.)
-                    try bc.sink.emitFmt(bc.byteOf(n.main_token), "module '{s}' is not a value", .{bc.nameText(n.main_token)});
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "module '{s}' is not a value", .{bc.nameText(n.main_token)});
                     break :blk bc.poison();
                 },
             },
@@ -900,7 +900,7 @@ pub const BodyChecker = struct {
                         const lit_tok = bc.tree.nodes[n.lhs.int()].main_token;
                         const raw = bc.tokens[lit_tok].text(bc.source);
                         if (!Literal.fitsWidth(raw, e, true))
-                            try bc.sink.emitFmtCodeSpan(.T0034, bc.spanOf(node_idx), "literal out of range for type '{s}'", .{bc.typeName(e)});
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0034 }, "literal out of range for type '{s}'", .{bc.typeName(e)});
                         bc.node_types[n.lhs.int()] = e;
                         break :blk e;
                     };
@@ -910,15 +910,15 @@ pub const BodyChecker = struct {
                 switch (op) {
                     .minus => {
                         if (operand.isInteger()) break :blk operand;
-                        try bc.sink.err(.T0044).spanOf(bc.spanOf(node_idx)).emit("operand of '-' must be int");
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '-' must be int", .{});
                     },
                     .bang => {
                         if (operand.kind == .bool) break :blk Type.@"bool";
-                        try bc.sink.err(.T0044).spanOf(bc.spanOf(node_idx)).emit("operand of '!' must be bool");
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '!' must be bool", .{});
                     },
                     .tilde => {
                         if (operand.isInteger()) break :blk operand;
-                        try bc.sink.err(.T0044).spanOf(bc.spanOf(node_idx)).emit("operand of '~' must be int");
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '~' must be int", .{});
                     },
                     // `&x` boxes `x` into a fresh managed cell, yielding `Ref[T]`. Reify
                     // runs later, so `Ref[T]` is an `.app` during body-check.
@@ -929,7 +929,7 @@ pub const BodyChecker = struct {
                             const e = bc.composite.at(operand.appIdx());
                             if (!e.ctor_is_enum and e.ctor == bc.model.prelude.?.ref_struct.?) break :blk e.args[0];
                         }
-                        try bc.sink.err(.T0044).spanOf(bc.spanOf(node_idx)).emit("operand of '*' must be a reference");
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '*' must be a reference", .{});
                     },
                     else => {},
                 }
@@ -974,11 +974,11 @@ pub const BodyChecker = struct {
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
                         const ap = bc.arithProtocol(op);
                         if (!Type.eql(lt, rt)) {
-                            try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                         } else if (bc.conformsToArith(lt, ap.pid)) {
                             break :blk lt;
                         } else {
-                            try bc.sink.emitFmtCodeSpan(.T0028, bc.spanOf(node_idx), "'{s}' requires an '{s}' impl for type '{s}'", .{ op_text, ap.name, bc.typeName(lt) });
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0028 }, "'{s}' requires an '{s}' impl for type '{s}'", .{ op_text, ap.name, bc.typeName(lt) });
                         }
                     },
                     .lt, .lt_eq, .gt, .gt_eq => {
@@ -988,11 +988,11 @@ pub const BodyChecker = struct {
                         // int/str/bool prelude conformance or user struct/enum `impl T has Ord`,
                         // or a `[T has Ord]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
-                            try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, node_idx)) {
                             break :blk Type.@"bool";
                         } else {
-                            try bc.sink.emitFmtCodeSpan(.T0027, bc.spanOf(node_idx), "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0027 }, "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
                         }
                     },
                     .eq_eq, .bang_eq => {
@@ -1002,35 +1002,35 @@ pub const BodyChecker = struct {
                         // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
-                            try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must have the same type", .{op_text});
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, node_idx)) {
                             break :blk Type.@"bool";
                         } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
                             // A struct that would derive `Eq` but for one non-conforming
                             // field names that field (T0029). A payload enum / other type
                             // keeps the "no Eq impl" T0026 below.
-                            try bc.sink.emitFmtCodeSpan(.T0029, bc.spanOf(node_idx), "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0029 }, "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
                         } else {
-                            try bc.sink.emitFmtCodeSpan(.T0026, bc.spanOf(node_idx), "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().eq) });
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0026 }, "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().eq) });
                         }
                     },
                     .amp_amp, .pipe_pipe => {
                         if (lt.kind == .bool and rt.kind == .bool) break :blk Type.@"bool";
-                        try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must be bool", .{op_text});
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must be bool", .{op_text});
                     },
                     .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
                         if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
-                        try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must be int", .{op_text});
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must be int", .{op_text});
                     },
                     .plus_dot, .minus_dot, .star_dot, .slash_dot => {
                         // The dotted operators are float-ONLY inline machine ops (no protocol
                         // desugar): the non-dotted `+`/`<` on a float falls to T0028/T0027.
                         if (lt.kind == .float and Type.eql(lt, rt)) break :blk lt;
-                        try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must both be float", .{op_text});
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
                     },
                     .lt_dot, .gt_dot, .le_dot, .ge_dot => {
                         if (lt.kind == .float and Type.eql(lt, rt)) break :blk Type.@"bool";
-                        try bc.sink.emitFmtCodeSpan(.T0044, bc.spanOf(node_idx), "operands of '{s}' must both be float", .{op_text});
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
                     },
                     else => {},
                 }
@@ -1042,16 +1042,16 @@ pub const BodyChecker = struct {
                 // constructor. With no expected type (a bare `xs := []`) the element type
                 // is uninferable — require an annotation.
                 const exp = bc.expected orelse {
-                    try bc.sink.emitSpan(bc.spanOf(node_idx), "an empty list literal '[]' requires a type annotation, e.g. 'xs: Vec[int] = []'");
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "an empty list literal '[]' requires a type annotation, e.g. 'xs: Vec[int] = []'", .{});
                     break :blk Type.invalid;
                 };
                 if (!exp.isApp()) {
-                    try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
                     break :blk Type.invalid;
                 }
                 const e = bc.composite.at(exp.appIdx());
                 if (e.ctor_is_enum or Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, StdNames.method_new) == null) {
-                    try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
                     break :blk Type.invalid;
                 }
                 break :blk exp;
@@ -1063,7 +1063,7 @@ pub const BodyChecker = struct {
                 const elems = Ast.rangeSlice(bc.tree, n.rhs.int());
                 const vec_ctor = bc.activeStructMap().get(StdNames.vec_struct) orelse {
                     for (elems) |ei| _ = try bc.typeOf(ei);
-                    try bc.sink.emitSpan(bc.spanOf(node_idx), "a list literal requires 'Vec' in scope (try 'import std/vec')");
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "a list literal requires 'Vec' in scope (try 'import std/vec')", .{});
                     break :blk Type.invalid;
                 };
                 var seed: ?Type = null;
@@ -1076,13 +1076,13 @@ pub const BodyChecker = struct {
                 for (elems[1..], 1..) |ei, k| {
                     const at = try bc.typeOfExpected(ei, v_ty);
                     if (!Type.assignable(v_ty, at))
-                        try bc.sink.emitFmtSpan(bc.spanOf(ei), "list element {d}: expected '{s}', got '{s}'", .{ k, bc.typeName(v_ty), bc.typeName(at) });
+                        try bc.sink.report(.{ .span = bc.spanOf(ei) }, "list element {d}: expected '{s}', got '{s}'", .{ k, bc.typeName(v_ty), bc.typeName(at) });
                 }
                 if (bc.expected) |exp| if (!Type.eql(result, exp)) {
                     if (seed) |s|
-                        try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "list element type '{s}' does not match the annotation's '{s}'", .{ bc.typeName(v_ty), bc.typeName(s) })
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "list element type '{s}' does not match the annotation's '{s}'", .{ bc.typeName(v_ty), bc.typeName(s) })
                     else
-                        try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "a list literal of type '{s}' cannot produce '{s}'", .{ bc.typeName(result), bc.typeName(exp) });
+                        try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "a list literal of type '{s}' cannot produce '{s}'", .{ bc.typeName(result), bc.typeName(exp) });
                     break :blk Type.invalid;
                 };
                 break :blk result;
@@ -1096,7 +1096,7 @@ pub const BodyChecker = struct {
                 if (!bc.appHeadIsValue(node_idx)) break :blk Type.invalid;
                 const targs = Ast.rangeSlice(bc.tree, (n.rhs).int());
                 if (targs.len != 1) {
-                    try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "cannot index a value with {d} subscripts", .{targs.len});
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "cannot index a value with {d} subscripts", .{targs.len});
                     break :blk Type.invalid;
                 }
                 break :blk try bc.typeOfIndexParts(node_idx, n.lhs, targs[0]);
@@ -1156,7 +1156,7 @@ pub const BodyChecker = struct {
             disp_name = bc.nameText(lhs.main_token);
             const id = bc.activeStructMap().get(disp_name) orelse {
                 for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
-                try bc.sink.emitFmt(bc.byteOf(lhs.main_token), "unknown struct type '{s}'", .{disp_name});
+                try bc.sink.report(.{ .span = bc.tokSpan(lhs.main_token) }, "unknown struct type '{s}'", .{disp_name});
                 return .invalid;
             };
             // A generic struct constructed WITHOUT type args (`Box{ v: 1 }`) infers its
@@ -1209,10 +1209,10 @@ pub const BodyChecker = struct {
                         // intra-field clash (`Both[T,T]`) shares one supplier span, so
                         // collapse to a single caret rather than double-underlining it.
                         if (c.first_pos == c.second_pos) {
-                            try bc.sink.emitFmtCodeSpan(.T0015, bc.spanOf(supplier[c.second_pos]), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                            try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
                         } else {
                             const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
-                            try bc.sink.emitFmtCodeSpanRelated(.T0015, bc.spanOf(supplier[c.second_pos]), bc.byteOf(earlier), "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                            try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015, .related = bc.tokSpan(earlier) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
                         }
                         return .invalid;
                     },
@@ -1226,7 +1226,7 @@ pub const BodyChecker = struct {
                         },
                         .err => return .invalid,
                         .unbound => |ord| {
-                            try bc.sink.emitFmtCode(.T0016, bc.byteOf(lhs.main_token), "cannot infer type parameter '{s}' for '{s}'; add explicit type arguments, e.g. {s}[int]{{ .. }}", .{ gsym.generic_params[ord], disp_name, disp_name });
+                            try bc.sink.report(.{ .span = bc.tokSpan(lhs.main_token), .code = .T0016 }, "cannot infer type parameter '{s}' for '{s}'; add explicit type arguments, e.g. {s}[int]{{ .. }}", .{ gsym.generic_params[ord], disp_name, disp_name });
                             return .invalid;
                         },
                     },
@@ -1276,7 +1276,7 @@ pub const BodyChecker = struct {
             }
             if (found) |j| {
                 if (seen[j]) {
-                    try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
+                    try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token) }, "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
                 }
                 seen[j] = true;
                 // Substitute the (possibly generic) declared field type through the
@@ -1284,14 +1284,14 @@ pub const BodyChecker = struct {
                 // `substTy` is the identity and this is byte-identical.
                 const fty = substTy(bc, sym.field_types[j], targs);
                 if (!Type.assignable(fty, vt)) {
-                    try bc.sink.emitFmtSpan(bc.spanOf(fi.lhs), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
+                    try bc.sink.report(.{ .span = bc.spanOf(fi.lhs) }, "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                 }
             } else {
-                try bc.sink.emitFmtCode(.T0046, bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}'", .{ fname, disp_name });
+                try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token), .code = .T0046 }, "unknown field '{s}' in '{s}'", .{ fname, disp_name });
             }
         }
         for (sym.field_names, 0..) |dn, j| {
-            if (!seen[j]) try bc.sink.emitFmtCodeSpan(.T0047, bc.spanOf(node_idx), "missing field '{s}' in '{s}'", .{ dn, disp_name });
+            if (!seen[j]) try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0047 }, "missing field '{s}' in '{s}'", .{ dn, disp_name });
         }
         return result;
     }
@@ -1350,11 +1350,11 @@ pub const BodyChecker = struct {
             for (sym.field_names, 0..) |dn, j| {
                 if (std.mem.eql(u8, dn, fname)) return substTy(bc, sym.field_types[j], e.args);
             }
-            try bc.emitNoField(bc.byteOf(n.main_token), fname, sym.name, sym.field_names);
+            try bc.emitNoField(bc.tokSpan(n.main_token), fname, sym.name, sym.field_names);
             return .invalid;
         }
         if (!base.isStruct()) {
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
             return .invalid;
         }
         const sym = bc.model.structs[base.struct_id];
@@ -1362,7 +1362,7 @@ pub const BodyChecker = struct {
         for (sym.field_names, 0..) |dn, j| {
             if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
         }
-        try bc.emitNoField(bc.byteOf(n.main_token), fname, sym.name, sym.field_names);
+        try bc.emitNoField(bc.tokSpan(n.main_token), fname, sym.name, sym.field_names);
         return .invalid;
     }
 
@@ -1370,7 +1370,7 @@ pub const BodyChecker = struct {
         const base = try bc.typeOf(n.lhs);
         if (base.kind == .invalid) return .invalid; // no cascade on an already-poisoned base
         if (!base.isStruct() or !bc.model.structs[base.struct_id].is_tuple) {
-            try bc.sink.emitFmt(bc.byteOf(n.main_token), "'.{s}' positional access requires a tuple struct, got {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "'.{s}' positional access requires a tuple struct, got {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
             return .invalid;
         }
         const sym = bc.model.structs[base.struct_id];
@@ -1381,7 +1381,7 @@ pub const BodyChecker = struct {
         for (sym.field_names, sym.field_types) |fname, fty| {
             if (std.mem.eql(u8, fname, name)) return fty;
         }
-        try bc.sink.emitFmtCode(.T0046, bc.byteOf(n.main_token), "tuple struct '{s}' has no field .{s}", .{ sym.name, name });
+        try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0046 }, "tuple struct '{s}' has no field .{s}", .{ sym.name, name });
         return .invalid;
     }
 
@@ -1416,13 +1416,13 @@ pub const BodyChecker = struct {
             const tname = bc.nameText(lhs_node.main_token);
             enum_id = bc.activeEnumMap().get(tname) orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.sink.emitFmt(bc.byteOf(lhs_node.main_token), "'{s}' is not an enum type", .{tname});
+                try bc.sink.report(.{ .span = bc.tokSpan(lhs_node.main_token) }, "'{s}' is not an enum type", .{tname});
                 return .invalid;
             };
         } else {
             const exp = bc.expected orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "cannot infer the enum type for '.{s}' here", .{bc.nameText(n.main_token)});
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "cannot infer the enum type for '.{s}' here", .{bc.nameText(n.main_token)});
                 return .invalid;
             };
             // The expected type may be a plain `enumT` or a generic-enum instance `App`
@@ -1432,7 +1432,7 @@ pub const BodyChecker = struct {
             enum_id = bc.scrutEnumId(exp) orelse {
                 try bc.typeArgsForEffect(node_form, args);
                 if (exp.kind != .invalid)
-                    try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "'.{s}' expects an enum type, but {s} was expected here", .{ bc.nameText(n.main_token), bc.typeName(exp) });
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "'.{s}' expects an enum type, but {s} was expected here", .{ bc.nameText(n.main_token), bc.typeName(exp) });
                 return .invalid;
             };
         }
@@ -1480,7 +1480,7 @@ pub const BodyChecker = struct {
         }
         const variant = if (vi) |i| e.variants[i] else {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.emitNoVariant(bc.byteOf(vtok), e.name, vname, e.variants);
+            try bc.emitNoVariant(bc.tokSpan(vtok), e.name, vname, e.variants);
             return .invalid;
         };
 
@@ -1542,7 +1542,7 @@ pub const BodyChecker = struct {
             // reported at the payload spans — the target type never overrides it.
             .conflict => |c| {
                 // Name the clashing LEAF types (`c.prev`/`c.cur`), not the container ctor.
-                try bc.sink.emitFmtCodeSpan(.T0015, bc.spanOf(supplier[c.second_pos]), "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ e.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
                 return .invalid;
             },
             // Both a full arg-bind (`.ok`) and a partial/nullary bind (`.unbound`) funnel
@@ -1552,7 +1552,7 @@ pub const BodyChecker = struct {
                 .ok => return bc.checkVariantPayloads(site, enum_id, vtok, node_form, args, out, pre),
                 .err => return .invalid,
                 .unbound => |ord| {
-                    try bc.sink.emitFmtCode(.T0016, bc.byteOf(vtok), "cannot infer type parameter '{s}' for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ e.generic_params[ord], e.name, vname, e.name, vname });
+                    try bc.sink.report(.{ .span = bc.tokSpan(vtok), .code = .T0016 }, "cannot infer type parameter '{s}' for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ e.generic_params[ord], e.name, vname, e.name, vname });
                     return .invalid;
                 },
             },
@@ -1591,12 +1591,12 @@ pub const BodyChecker = struct {
         }
         const variant = if (vi) |i| e.variants[i] else {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.emitNoVariant(bc.byteOf(vtok), e.name, vname, e.variants);
+            try bc.emitNoVariant(bc.tokSpan(vtok), e.name, vname, e.variants);
             return .invalid;
         };
         if (!formMatches(node_form, variant.form)) {
             try bc.typeArgsForEffect(node_form, args);
-            try bc.sink.emitFmtSpan(bc.spanOf(site), "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
+            try bc.sink.report(.{ .span = bc.spanOf(site) }, "variant '{s}.{s}' is constructed with the wrong form", .{ e.name, vname });
             return result;
         }
         switch (variant.form) {
@@ -1607,14 +1607,14 @@ pub const BodyChecker = struct {
                     if (pretyped == null) {
                         for (elems) |a| _ = try bc.typeOf(a);
                     }
-                    try bc.sink.emitFmtSpan(bc.spanOf(site), "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
+                    try bc.sink.report(.{ .span = bc.spanOf(site) }, "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
                     return result;
                 }
                 for (elems, variant.field_types, 0..) |a, fty_pat, i| {
                     const fty = substTy(bc, fty_pat, targs);
                     const at = if (pretyped) |pt| pt[i] else try bc.typeOfExpected(a, fty);
                     if (!Type.assignable(fty, at))
-                        try bc.sink.emitFmtSpan(bc.spanOf(a), "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
+                        try bc.sink.report(.{ .span = bc.spanOf(a) }, "variant '{s}.{s}': expected {s}, got {s}", .{ e.name, vname, bc.typeName(fty), bc.typeName(at) });
                 }
             },
             .@"struct" => {
@@ -1633,19 +1633,19 @@ pub const BodyChecker = struct {
                         }
                     }
                     if (found) |j| {
-                        if (seen[j]) try bc.sink.emitFmt(bc.byteOf(fi.main_token), "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                        if (seen[j]) try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token) }, "duplicate field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                         seen[j] = true;
                         const fty = substTy(bc, variant.field_types[j], targs);
                         const vt = if (pretyped) |pt| pt[ii] else try bc.typeOfExpected(fi.lhs, fty);
                         if (!Type.assignable(fty, vt))
-                            try bc.sink.emitFmtSpan(bc.spanOf(fi.lhs), "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
+                            try bc.sink.report(.{ .span = bc.spanOf(fi.lhs) }, "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                     } else {
                         if (pretyped == null) _ = try bc.typeOf(fi.lhs);
-                        try bc.sink.emitFmtCode(.T0046, bc.byteOf(fi.main_token), "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
+                        try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token), .code = .T0046 }, "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                     }
                 }
                 for (variant.field_names, 0..) |dn, j| {
-                    if (!seen[j]) try bc.sink.emitFmtCodeSpan(.T0047, bc.spanOf(site), "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
+                    if (!seen[j]) try bc.sink.report(.{ .span = bc.spanOf(site), .code = .T0047 }, "missing field '{s}' in '{s}.{s}'", .{ dn, e.name, vname });
                 }
             },
         }
@@ -1658,13 +1658,13 @@ pub const BodyChecker = struct {
         const elems = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (n.rhs).int());
         if (elems.len != sym.field_types.len) {
             for (elems) |a| _ = try bc.typeOf(a); // surface inner arg errors first
-            try bc.sink.emitFmtSpan(bc.argsSpan(call), "tuple struct '{s}' expects {d} value(s), got {d}", .{ sym.name, sym.field_types.len, elems.len });
+            try bc.sink.report(.{ .span = bc.argsSpan(call) }, "tuple struct '{s}' expects {d} value(s), got {d}", .{ sym.name, sym.field_types.len, elems.len });
             return result;
         }
         for (elems, sym.field_types) |a, fty| {
             const at = try bc.typeOfExpected(a, fty); // expected type drives literal narrowing (integer widths)
             if (!Type.assignable(fty, at))
-                try bc.sink.emitFmtSpan(bc.spanOf(a), "tuple struct '{s}': expected {s}, got {s}", .{ sym.name, bc.typeName(fty), bc.typeName(at) });
+                try bc.sink.report(.{ .span = bc.spanOf(a) }, "tuple struct '{s}': expected {s}, got {s}", .{ sym.name, bc.typeName(fty), bc.typeName(at) });
         }
         return result;
     }
@@ -1724,7 +1724,7 @@ pub const BodyChecker = struct {
             // `App`'s type-args is a change to the shared `typeName` accessor, out of
             // scope for this leaf-carry fix; `arg`/`expected` render as-is.
             .conflict => |c| {
-                try bc.sink.emitFmtCode(.T0015, bc.byteOf(span_tok), "conflicting types for type parameter '{s}': {s} inferred from the value, {s} from the expected type", .{ param_names[c.ord], bc.typeName(c.arg), bc.typeName(c.expected) });
+                try bc.sink.report(.{ .span = bc.tokSpan(span_tok), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} inferred from the value, {s} from the expected type", .{ param_names[c.ord], bc.typeName(c.arg), bc.typeName(c.expected) });
                 return .err;
             },
             .unbound => |u| return .{ .unbound = u.ord },
@@ -1734,7 +1734,7 @@ pub const BodyChecker = struct {
                     // instantiation; admit it (the instance re-check re-gates concretely).
                     if (bc.abstract_template and ta.isTypeVar()) continue;
                     if (!isConcreteValue(ta)) {
-                        try bc.sink.emitCode(.T0013, bc.byteOf(span_tok), "inferred type argument must be a concrete value type; add explicit type arguments");
+                        try bc.sink.report(.{ .span = bc.tokSpan(span_tok), .code = .T0013 }, "inferred type argument must be a concrete value type; add explicit type arguments", .{});
                         return .err;
                     }
                 }
@@ -1774,11 +1774,11 @@ pub const BodyChecker = struct {
         } else Type.invalid;
 
         if (op_fam == .none) {
-            try bc.sink.emitFmtCodeSpan(.T0032, bc.spanOf(node_idx), "'?' operand must be an Option or Result, got {s}", .{bc.typeName(ot)});
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0032 }, "'?' operand must be an Option or Result, got {s}", .{bc.typeName(ot)});
         } else if (ret_fam == .none) {
-            try bc.sink.emitFmtCodeSpan(.T0032, bc.spanOf(node_idx), "'?' requires the enclosing function to return an Option or Result, but it returns {s}", .{bc.typeName(bc.cur_ret)});
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0032 }, "'?' requires the enclosing function to return an Option or Result, but it returns {s}", .{bc.typeName(bc.cur_ret)});
         } else if (op_fam != ret_fam) {
-            try bc.sink.emitFmtCodeSpan(.T0033, bc.spanOf(node_idx), "'?' on {s} in a function returning {s}", .{ familyName(op_fam), familyName(ret_fam) });
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0033 }, "'?' on {s} in a function returning {s}", .{ familyName(op_fam), familyName(ret_fam) });
         } else if (op_fam == .result) {
             const op_args = bc.composite.at(ot.appIdx()).args;
             const ret_args = bc.composite.at(bc.cur_ret.appIdx()).args;
@@ -1794,7 +1794,7 @@ pub const BodyChecker = struct {
                 else
                     false;
                 if (!widened)
-                    try bc.sink.emitFmtCodeSpan(.T0033, bc.spanOf(node_idx), "'?' error type {s} does not match the enclosing Result error type {s}", .{ bc.typeName(op_args[1]), bc.typeName(ret_args[1]) });
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0033 }, "'?' error type {s} does not match the enclosing Result error type {s}", .{ bc.typeName(op_args[1]), bc.typeName(ret_args[1]) });
             }
         }
         bc.node_types[(node_idx).int()] = payload;
@@ -1805,11 +1805,11 @@ pub const BodyChecker = struct {
         _ = node_idx;
         const ct = try bc.typeOf(n.lhs);
         if (ct.kind != .invalid and ct.kind != .bool)
-            try bc.sink.err(.T0045).spanOf(bc.spanOf(n.lhs)).emit("if condition must be bool");
+            try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0045 }, "if condition must be bool", .{});
         try bc.warnConstIfCond(n.lhs);
         const h = Ast.ifHeaderAt(bc.tree, (n.rhs).int());
         if (h.else_node == Ast.none) {
-            try bc.sink.emit(bc.byteOf(n.main_token), "value-if requires else");
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "value-if requires else", .{});
             _ = try bc.checkBlock(h.then_block, false); // validate the arm anyway
             return .invalid;
         }
@@ -1832,7 +1832,7 @@ pub const BodyChecker = struct {
     // so per-generic-instance rechecks dedup on scope+offset+code+message.
     fn warnConstIfCond(bc: *BodyChecker, cond: Ast.Index) error{OutOfMemory}!void {
         const tok = Lint.constIfCond(bc.tree, cond) orelse return;
-        try bc.sink.emitFmtCode(.W0007, bc.byteOf(tok), "if condition is always {s}", .{bc.nameText(tok)});
+        try bc.sink.report(.{ .span = bc.tokSpan(tok), .code = .W0007 }, "if condition is always {s}", .{bc.nameText(tok)});
     }
 
     fn typeOfLoop(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, label: ?[]const u8) error{OutOfMemory}!Type {
@@ -1849,7 +1849,7 @@ pub const BodyChecker = struct {
         if (a.kind == .never) return b; // covers never+never → never
         if (b.kind == .never) return a;
         if (Type.eql(a, b)) return a; // agreement → one phi type
-        try bc.sink.emitFmt(bc.byteOf(at), "branches yield different types ({s} vs {s})", .{ bc.typeName(a), bc.typeName(b) });
+        try bc.sink.report(.{ .span = bc.tokSpan(at) }, "branches yield different types ({s} vs {s})", .{ bc.typeName(a), bc.typeName(b) });
         return .invalid; // mismatch, no coercion
     }
 
@@ -1865,15 +1865,19 @@ pub const BodyChecker = struct {
     // The FnSym.decl_node doc mandates keying builtin-ness off `.kind`, not the sentinel.
     // A cross-module callee's decl offset would render against THIS module's source (the
     // sink scope == graph_mod), so no label there — the message still carries name+signature.
-    fn calleeDeclSite(bc: *const BodyChecker, f: FnSym) u32 {
-        if (f.kind == .builtin or f.mod != bc.graph_mod) return DiagnosticSink.NO_RELATED;
-        return bc.byteOf(bc.tree.nodes[(f.decl_node).int()].main_token);
+    fn calleeDeclSite(bc: *const BodyChecker, f: FnSym) ?Span {
+        if (f.kind == .builtin or f.mod != bc.graph_mod) return null;
+        return bc.tokSpan(bc.tree.nodes[(f.decl_node).int()].main_token);
     }
 
     /// The source extent of the subtree at `node`: what a diagnostic about the whole
     /// expression or statement underlines.
     pub fn spanOf(bc: *const BodyChecker, node: Ast.Index) Span {
-        return AstWalk.nodeSpan(.{ .tree = bc.tree, .tokens = bc.tokens, .source = bc.source }, node);
+        return refs.spanOf(bc, node);
+    }
+
+    pub fn tokSpan(bc: *const BodyChecker, tok: u32) Span {
+        return refs.tokSpan(bc, tok);
     }
 
     /// A call's argument list `(…)`: from the call's `(` to its end.
@@ -1886,18 +1890,18 @@ pub const BodyChecker = struct {
         return .{ .start = bc.byteOf(bc.tree.nodes[app.int()].main_token), .end = bc.spanOf(app).end };
     }
 
-    fn emitArity(bc: *BodyChecker, call: Ast.Index, related: u32, name: []const u8, params: []const Type, got: usize) error{OutOfMemory}!void {
+    fn emitArity(bc: *BodyChecker, call: Ast.Index, related: ?Span, name: []const u8, params: []const Type, got: usize) error{OutOfMemory}!void {
         var sig: std.ArrayList(u8) = .empty;
         defer sig.deinit(bc.gpa);
         try bc.writeParams(&sig, params);
-        try bc.sink.emitFmtCodeSpanRelated(.T0039, bc.argsSpan(call), related, "expected {d} argument(s), got {d}; '{s}' takes {s}", .{ params.len, got, name, sig.items });
+        try bc.sink.report(.{ .span = bc.argsSpan(call), .code = .T0039, .related = related }, "expected {d} argument(s), got {d}; '{s}' takes {s}", .{ params.len, got, name, sig.items });
     }
 
-    fn emitArgType(bc: *BodyChecker, arg: Ast.Index, related: u32, idx: usize, want: Type, got: Type, name: []const u8, params: []const Type) error{OutOfMemory}!void {
+    fn emitArgType(bc: *BodyChecker, arg: Ast.Index, related: ?Span, idx: usize, want: Type, got: Type, name: []const u8, params: []const Type) error{OutOfMemory}!void {
         var sig: std.ArrayList(u8) = .empty;
         defer sig.deinit(bc.gpa);
         try bc.writeParams(&sig, params);
-        try bc.sink.emitFmtCodeSpanRelated(.T0040, bc.spanOf(arg), related, "argument {d}: expected {s}, got {s}; '{s}' takes {s}", .{ idx, bc.typeName(want), bc.typeName(got), name, sig.items });
+        try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0040, .related = related }, "argument {d}: expected {s}, got {s}; '{s}' takes {s}", .{ idx, bc.typeName(want), bc.typeName(got), name, sig.items });
     }
 
     /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
@@ -1910,9 +1914,9 @@ pub const BodyChecker = struct {
         const mf = bc.model.fns[m.fn_id];
         if (m.mut_self) {
             if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
-                try bc.sink.emitFmtCode(.T0022, bc.byteOf(fa.main_token), "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
+                try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
             } else if (!bc.isMutablePlace(fa.lhs)) {
-                try bc.sink.emitFmtCodeSpan(.T0019, bc.spanOf(fa.lhs), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+                try bc.sink.report(.{ .span = bc.spanOf(fa.lhs), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
             }
         }
         const self_off: usize = @min(mf.params.len, 1);
@@ -1955,7 +1959,7 @@ pub const BodyChecker = struct {
                 try names.append(bc.gpa, ']');
             }
         }
-        try bc.sink.emitFmtCode(.T0025, bc.byteOf(at_tok), "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
+        try bc.sink.report(.{ .span = bc.tokSpan(at_tok), .code = .T0025 }, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
     }
 
     /// Type an explicit-protocol-args method call `v.m[int](args)`: the callee is a
@@ -1984,7 +1988,7 @@ pub const BodyChecker = struct {
                 .one => |m| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, m),
                 else => {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on type '{s}' for the given protocol type arguments", .{ member, bc.typeName(recv_ty) });
+                    try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on type '{s}' for the given protocol type arguments", .{ member, bc.typeName(recv_ty) });
                     return .invalid;
                 },
             }
@@ -2009,27 +2013,27 @@ pub const BodyChecker = struct {
                     for (psig[self_off..], 0..) |pty, i| gp[i] = Typecheck.groundProtoType(pty, recv_ty, explicit);
                     if (args.len != want) {
                         for (args) |a| _ = try bc.typeOf(a);
-                        try bc.emitArity(node_idx, DiagnosticSink.NO_RELATED, member, gp, args.len);
+                        try bc.emitArity(node_idx, null, member, gp, args.len);
                     } else for (args, 0..) |a, i| {
                         const wt = gp[i];
                         const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
                         if (!Type.assignable(wt, at))
-                            try bc.emitArgType(a, DiagnosticSink.NO_RELATED, i + 1, wt, at, member, gp);
+                            try bc.emitArgType(a, null, i + 1, wt, at, member, gp);
                     }
                     const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, explicit);
                     bc.node_types[(node_idx).int()] = ret;
                     return ret;
                 };
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
+                try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
                 return .invalid;
             }
             for (args) |a| _ = try bc.typeOf(a);
-            try bc.sink.emitFmtCode(.T0018, bc.byteOf(fa.main_token), "no method '{s}' on unbounded type parameter", .{member});
+            try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on unbounded type parameter", .{member});
             return .invalid;
         }
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.emitNoMethod(bc.byteOf(fa.main_token), member, recv_ty);
+        try bc.emitNoMethod(bc.tokSpan(fa.main_token), member, recv_ty);
         return .invalid;
     }
 
@@ -2094,7 +2098,7 @@ pub const BodyChecker = struct {
             const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member) orelse return null;
             if (m.has_self) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an instance method, not an associated function; call it on a value", .{member});
+                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
                 return .invalid;
             }
             // Load-bearing: the reified receiver flows to scanCalls / reify / lower off
@@ -2142,7 +2146,7 @@ pub const BodyChecker = struct {
                     Typecheck.findGenericMethod(bc.model.templates, sid, false, member) != null)
                 {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtCode(.T0016, bc.byteOf(recv.main_token), "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
+                    try bc.sink.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0016 }, "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
                     return .invalid;
                 }
             }
@@ -2190,9 +2194,9 @@ pub const BodyChecker = struct {
                     const val_args = Ast.rangeSlice(bc.tree, (n.rhs).int());
                     for (val_args) |arg| _ = try bc.typeOf(arg);
                     if (targ_nodes.len != 1)
-                        try bc.sink.emitFmtSpan(bc.typeArgsSpan(n.lhs), "'{s}' expects exactly one type argument", .{bn});
+                        try bc.sink.report(.{ .span = bc.typeArgsSpan(n.lhs) }, "'{s}' expects exactly one type argument", .{bn});
                     if (val_args.len != 0)
-                        try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "'{s}' takes no value arguments", .{bn});
+                        try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "'{s}' takes no value arguments", .{bn});
                     bc.node_types[(node_idx).int()] = Type.int;
                     return Type.int;
                 }
@@ -2207,9 +2211,9 @@ pub const BodyChecker = struct {
                     const val_args = Ast.rangeSlice(bc.tree, (n.rhs).int());
                     for (val_args) |arg| _ = try bc.typeOf(arg);
                     if (targ_nodes.len != 1)
-                        try bc.sink.emitFmtSpan(bc.typeArgsSpan(n.lhs), "'descriptor_of' expects exactly one type argument", .{});
+                        try bc.sink.report(.{ .span = bc.typeArgsSpan(n.lhs) }, "'descriptor_of' expects exactly one type argument", .{});
                     if (val_args.len != 0)
-                        try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "'descriptor_of' takes no value arguments", .{});
+                        try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "'descriptor_of' takes no value arguments", .{});
                     if (targ_nodes.len == 1) {
                         const t = bc.node_types[(targ_nodes[0]).int()];
                         // Only a ground type is recorded here: a `type_var` from a generic
@@ -2238,11 +2242,11 @@ pub const BodyChecker = struct {
                     const val_args = Ast.rangeSlice(bc.tree, (n.rhs).int());
                     for (val_args) |arg| _ = try bc.typeOf(arg);
                     if (targ_nodes.len != 1) {
-                        try bc.sink.emitFmtSpan(bc.typeArgsSpan(n.lhs), "'{s}' expects exactly one type argument", .{bn});
+                        try bc.sink.report(.{ .span = bc.typeArgsSpan(n.lhs) }, "'{s}' expects exactly one type argument", .{bn});
                         return .invalid;
                     }
                     if (val_args.len != 1)
-                        try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "'{s}' expects exactly one value argument", .{bn});
+                        try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "'{s}' expects exactly one value argument", .{bn});
                     const elem = bc.node_types[(targ_nodes[0]).int()];
                     const box = bc.model.prelude.?.gc_array_struct.?;
                     const app = Type.app(bc.composite.intern(bc.gpa, box, &.{elem}, false) catch return .invalid);
@@ -2282,13 +2286,13 @@ pub const BodyChecker = struct {
             // Type the args anyway so their own errors surface, then poison.
             for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
             if (callee_res == .local) {
-                try bc.sink.emitSpan(bc.spanOf(n.lhs), "called value is not a function");
+                try bc.sink.report(.{ .span = bc.spanOf(n.lhs) }, "called value is not a function", .{});
             } else if (bc.tree.nodes[(n.lhs).int()].tag == .identifier) {
                 // A struct-named callee `Point(1,2)` is positional construction, which
                 // we reject — point at named construction instead.
                 const cname = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
                 if (bc.activeStructMap().get(cname) != null)
-                    try bc.sink.emitFmtSpan(bc.spanOf(node_idx), "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname });
             } else if (callee_res == .unresolved and bc.tree.nodes[(n.lhs).int()].tag == .field_access) {
                 // A qualified call `recv.member(...)` whose callee stayed `.unresolved`:
                 // resolve neither bound it to a fn nor reported it (e.g. `recv` is a
@@ -2298,7 +2302,7 @@ pub const BodyChecker = struct {
                 // dropped and `-o` later crashes in codegen with no user error.
                 const fa = bc.tree.nodes[(n.lhs).int()];
                 const member = bc.nameText(fa.main_token);
-                try bc.sink.emitFmt(bc.byteOf(fa.main_token), "cannot resolve member '{s}' to a callable function", .{member});
+                try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token) }, "cannot resolve member '{s}' to a callable function", .{member});
             }
             // Any remaining `.unresolved` was already reported by resolve.
             return .invalid;
@@ -2318,11 +2322,11 @@ pub const BodyChecker = struct {
                     .gc_alloc => {
                         if (args.len != 1) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
                         } else {
                             const st = try bc.typeOf(args[0]);
                             if (st.kind != .int and st.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'gc_alloc' size must be an 'int', got '{s}'", .{bc.typeName(st)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'gc_alloc' size must be an 'int', got '{s}'", .{bc.typeName(st)});
                         }
                         bc.node_types[(node_idx).int()] = Type.rawptr;
                         return Type.rawptr;
@@ -2330,7 +2334,7 @@ pub const BodyChecker = struct {
                     .gc_span_count => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                         }
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
@@ -2338,7 +2342,7 @@ pub const BodyChecker = struct {
                     .gc_collect => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                         }
                         bc.node_types[(node_idx).int()] = Type.unit;
                         return Type.unit;
@@ -2346,7 +2350,7 @@ pub const BodyChecker = struct {
                     .gc_stats => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                         }
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
@@ -2354,7 +2358,7 @@ pub const BodyChecker = struct {
                     .text_base => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                         }
                         bc.node_types[(node_idx).int()] = Type.rawptr;
                         return Type.rawptr;
@@ -2362,16 +2366,16 @@ pub const BodyChecker = struct {
                     .call_hash => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
                         } else {
                             const p0 = try bc.typeOf(args[0]);
                             const p1 = try bc.typeOf(args[1]);
                             if (!bc.in_unsafe)
-                                try bc.sink.emitFmtCodeSpan(.T0038, bc.spanOf(node_idx), "raw pointer 'call_hash' requires an 'unsafe' block", .{});
+                                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0038 }, "raw pointer 'call_hash' requires an 'unsafe' block", .{});
                             if (p0.kind != .rawptr and p0.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'call_hash' expects a 'rawptr', got '{s}'", .{bc.typeName(p0)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'call_hash' expects a 'rawptr', got '{s}'", .{bc.typeName(p0)});
                             if (p1.kind != .rawptr and p1.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[1]), "'call_hash' expects a 'rawptr', got '{s}'", .{bc.typeName(p1)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[1]) }, "'call_hash' expects a 'rawptr', got '{s}'", .{bc.typeName(p1)});
                         }
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
@@ -2379,19 +2383,19 @@ pub const BodyChecker = struct {
                     .call_eq => {
                         if (args.len != 3) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 3), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 3), args.len });
                         } else {
                             const p0 = try bc.typeOf(args[0]);
                             const p1 = try bc.typeOf(args[1]);
                             const p2 = try bc.typeOf(args[2]);
                             if (!bc.in_unsafe)
-                                try bc.sink.emitFmtCodeSpan(.T0038, bc.spanOf(node_idx), "raw pointer 'call_eq' requires an 'unsafe' block", .{});
+                                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0038 }, "raw pointer 'call_eq' requires an 'unsafe' block", .{});
                             if (p0.kind != .rawptr and p0.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p0)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p0)});
                             if (p1.kind != .rawptr and p1.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[1]), "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p1)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[1]) }, "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p1)});
                             if (p2.kind != .rawptr and p2.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[2]), "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p2)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[2]) }, "'call_eq' expects a 'rawptr', got '{s}'", .{bc.typeName(p2)});
                         }
                         bc.node_types[(node_idx).int()] = Type.@"bool";
                         return Type.@"bool";
@@ -2399,14 +2403,14 @@ pub const BodyChecker = struct {
                     .store => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             _ = try bc.typeOf(args[1]);
                             if (!bc.in_unsafe)
-                                try bc.sink.emitFmtCodeSpan(.T0038, bc.spanOf(node_idx), "raw pointer 'store' requires an 'unsafe' block", .{});
+                                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0038 }, "raw pointer 'store' requires an 'unsafe' block", .{});
                             if (pt.kind != .rawptr and pt.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'store' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'store' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
                         }
                         bc.node_types[(node_idx).int()] = Type.unit;
                         return Type.unit;
@@ -2414,13 +2418,13 @@ pub const BodyChecker = struct {
                     .load => {
                         if (args.len != 1) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             if (!bc.in_unsafe)
-                                try bc.sink.emitFmtCodeSpan(.T0038, bc.spanOf(node_idx), "raw pointer 'load' requires an 'unsafe' block", .{});
+                                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0038 }, "raw pointer 'load' requires an 'unsafe' block", .{});
                             if (pt.kind != .rawptr and pt.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'load' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'load' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
                         }
                         // A `load` used where a scalar value type is expected (a generic
                         // `ga_get[T]` returning `load(..)`) yields that element type, so a
@@ -2446,15 +2450,15 @@ pub const BodyChecker = struct {
                         // stay gated.
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
                         } else {
                             const bt = try bc.typeOf(args[0]);
                             const it = try bc.typeOf(args[1]);
                             const base_ok = bt.kind == .rawptr or bt.kind == .int or bt.kind == .invalid or bc.isRefPayload(bt);
                             if (!base_ok)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'offset' base must be a 'rawptr' or 'int', got '{s}'", .{bc.typeName(bt)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'offset' base must be a 'rawptr' or 'int', got '{s}'", .{bc.typeName(bt)});
                             if (it.kind != .int and it.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[1]), "'offset' index must be an 'int', got '{s}'", .{bc.typeName(it)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[1]) }, "'offset' index must be an 'int', got '{s}'", .{bc.typeName(it)});
                         }
                         bc.node_types[(node_idx).int()] = Type.rawptr;
                         return Type.rawptr;
@@ -2463,20 +2467,20 @@ pub const BodyChecker = struct {
                         // The bare-call form `gc_array(p)` is rejected; the wrapping form
                         // is `gc_array[T](p)`, intercepted in `typeOfCall` as a `type_app`.
                         for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emit(bc.byteOf(callee.main_token), "'gc_array' requires a type argument, e.g. gc_array[int](p)");
+                        try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token) }, "'gc_array' requires a type argument, e.g. gc_array[int](p)", .{});
                         return .invalid;
                     },
                     .store_byte => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             _ = try bc.typeOf(args[1]);
                             if (!bc.in_unsafe)
-                                try bc.sink.emitFmtCodeSpan(.T0038, bc.spanOf(node_idx), "raw pointer 'store_byte' requires an 'unsafe' block", .{});
+                                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0038 }, "raw pointer 'store_byte' requires an 'unsafe' block", .{});
                             if (pt.kind != .rawptr and pt.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'store_byte' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'store_byte' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
                         }
                         bc.node_types[(node_idx).int()] = Type.unit;
                         return Type.unit;
@@ -2484,13 +2488,13 @@ pub const BodyChecker = struct {
                     .load_byte => {
                         if (args.len != 1) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             if (!bc.in_unsafe)
-                                try bc.sink.emitFmtCodeSpan(.T0038, bc.spanOf(node_idx), "raw pointer 'load_byte' requires an 'unsafe' block", .{});
+                                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0038 }, "raw pointer 'load_byte' requires an 'unsafe' block", .{});
                             if (pt.kind != .rawptr and pt.kind != .invalid)
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "'load_byte' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "'load_byte' expects a 'rawptr', got '{s}'", .{bc.typeName(pt)});
                         }
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
@@ -2501,14 +2505,14 @@ pub const BodyChecker = struct {
                     // (mirroring `.gc_array`), never fall through to the generic path.
                     .size_of, .align_of, .descriptor_of => {
                         for (args) |arg| _ = try bc.typeOf(arg);
-                        try bc.sink.emitFmt(bc.byteOf(callee.main_token), "'{s}' requires a type argument, e.g. {s}[int]()", .{ bn, bn });
+                        try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token) }, "'{s}' requires a type argument, e.g. {s}[int]()", .{ bn, bn });
                         return .invalid;
                     },
                 };
             }
             if (args.len != 1) {
                 for (args) |arg| _ = try bc.typeOf(arg);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
@@ -2524,7 +2528,7 @@ pub const BodyChecker = struct {
             // call `.unit` regardless so a bad arg reports exactly once without cascading.
             if (callee.tag == .identifier and std.mem.eql(u8, bc.nameText(callee.main_token), "panic")) {
                 if (at.kind != .str)
-                    try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
+                    try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
@@ -2549,14 +2553,14 @@ pub const BodyChecker = struct {
             // explicit type args.
             if (callee.tag != .identifier and callee.tag != .field_access) {
                 for (args) |arg| _ = try bc.typeOf(arg);
-                try bc.sink.err(.T0013).spanOf(bc.spanOf(n.lhs)).emit("generic call requires explicit type arguments, e.g. f[int](..)");
+                try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0013 }, "generic call requires explicit type arguments, e.g. f[int](..)", .{});
                 return .invalid;
             }
             const arg_types = try bc.gpa.alloc(Type, args.len);
             defer bc.gpa.free(arg_types);
             for (args, 0..) |arg, i| arg_types[i] = try bc.typeOf(arg); // synth once (self-typing)
             if (args.len != f.params.len) {
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
                 return .invalid; // never leak f.ret (a type_var) on the error path
             }
             const n_gp: u32 = @intCast(f.generic_params.len);
@@ -2577,14 +2581,14 @@ pub const BodyChecker = struct {
                     // has `first_pos == second_pos`, so both spans are the ONE source arg —
                     // collapse to a single caret rather than double-underlining one token.
                     if (c.first_pos == c.second_pos) {
-                        try bc.sink.emitFmtCodeSpan(.T0015, bc.spanOf(args[c.second_pos]), "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                        try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
                     } else {
-                        try bc.sink.emitFmtCodeSpanRelated(.T0015, bc.spanOf(args[c.second_pos]), bc.spanOf(args[c.first_pos]).start, "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                        try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015, .related = bc.spanOf(args[c.first_pos]) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
                     }
                     return .invalid;
                 },
                 .unbound => |u| {
-                    try bc.sink.emitFmtCodeSpan(.T0016, bc.spanOf(node_idx), "cannot infer type parameter '{s}'; add explicit type arguments, e.g. f[int](..)", .{f.generic_params[u.ord]});
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}'; add explicit type arguments, e.g. f[int](..)", .{f.generic_params[u.ord]});
                     return .invalid;
                 },
                 .ok => {
@@ -2597,7 +2601,7 @@ pub const BodyChecker = struct {
                         // instantiation; admit it (the instance re-check re-gates concretely).
                         if (bc.abstract_template and ta.isTypeVar()) continue;
                         if (!isConcreteValue(ta)) {
-                            try bc.sink.err(.T0013).spanOf(bc.spanOf(node_idx)).emit("inferred type argument must be a concrete value type; add explicit type arguments");
+                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0013 }, "inferred type argument must be a concrete value type; add explicit type arguments", .{});
                             return .invalid;
                         }
                     }
@@ -2651,7 +2655,7 @@ pub const BodyChecker = struct {
                 // never on a value receiver.
                 if (m.is_static) {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an associated function; call it as '{s}.{s}(..)'", .{ member, bc.typeName(recv_ty), member });
+                    try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an associated function; call it as '{s}.{s}(..)'", .{ member, bc.typeName(recv_ty), member });
                     return .invalid;
                 }
                 return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m);
@@ -2676,7 +2680,7 @@ pub const BodyChecker = struct {
                 if (Typecheck.builtinConvMethod(recv_ty, exp, member, char_id)) |cm| {
                     if (args.len != 0) {
                         for (args) |a| _ = try bc.typeOf(a);
-                        try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                     }
                     const ret: Type = switch (cm.kind) {
                         .widen, .char_to_int, .byte_to_char, .int_to_float => cm.target,
@@ -2714,7 +2718,7 @@ pub const BodyChecker = struct {
         {
             if (args.len != 0) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
@@ -2723,7 +2727,7 @@ pub const BodyChecker = struct {
                 return Type.int;
             }
             if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().hash)) |blocker| {
-                try bc.sink.emitFmtCodeSpan(.T0030, bc.spanOf(node_idx), "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0030 }, "cannot derive 'Hash' for '{s}': field '{s}' of type '{s}' does not conform to 'Hash'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
                 return .invalid;
             }
             // No structural derive and no nameable blocker: fall through to T0018.
@@ -2740,7 +2744,7 @@ pub const BodyChecker = struct {
         {
             if (args.len != 0) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2749,7 +2753,7 @@ pub const BodyChecker = struct {
                 return Type.str;
             }
             if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().display)) |blocker| {
-                try bc.sink.emitFmtCodeSpan(.T0031, bc.spanOf(node_idx), "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
                 return .invalid;
             }
             // No structural derive and no nameable blocker: fall through to T0018.
@@ -2764,11 +2768,11 @@ pub const BodyChecker = struct {
         if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
             if (args.len != bm.arity) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ bm.arity, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ bm.arity, args.len });
             } else for (args) |a| {
                 const at = try bc.typeOfExpected(a, recv_ty);
                 if (!Type.assignable(recv_ty, at))
-                    try bc.sink.emitFmtSpan(bc.spanOf(a), "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
+                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument 1: expected {s}, got {s}", .{ bc.typeName(recv_ty), bc.typeName(at) });
             }
             bc.node_types[(node_idx).int()] = bm.ret;
             return bm.ret;
@@ -2778,18 +2782,18 @@ pub const BodyChecker = struct {
         if (Typecheck.builtinStrMethod(recv_ty, member)) |bm| {
             if (args.len != bm.params.len) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ bm.params.len, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ bm.params.len, args.len });
             } else for (args, bm.params, 0..) |a, pty, i| {
                 const at = try bc.typeOfExpected(a, pty);
                 if (!Type.assignable(pty, at))
-                    try bc.sink.emitFmtSpan(bc.spanOf(a), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
             }
             bc.node_types[(node_idx).int()] = bm.ret;
             return bm.ret;
         }
         // A concrete struct/enum/scalar value with no such method.
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.emitNoMethod(bc.byteOf(callee.main_token), member, recv_ty);
+        try bc.emitNoMethod(bc.tokSpan(callee.main_token), member, recv_ty);
         return .invalid;
     }
 
@@ -2809,7 +2813,7 @@ pub const BodyChecker = struct {
             // it must be reached via `Type[args].fn()`.
             if (!m.has_self) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "'{s}' is an associated function; call it as '{s}[..].{s}(..)'", .{ member, bc.typeName(recv_ty), member });
+                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an associated function; call it as '{s}[..].{s}(..)'", .{ member, bc.typeName(recv_ty), member });
                 return .invalid;
             }
             const mf = bc.model.fns[m.fn_id];
@@ -2829,13 +2833,13 @@ pub const BodyChecker = struct {
             // A `mut self` method mutates the receiver in place, so it may
             // only be called on a mutable place (reuse the mut-self gate + T0019).
             if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
-                try bc.sink.emitFmtCodeSpan(.T0019, bc.spanOf(callee.lhs), "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+                try bc.sink.report(.{ .span = bc.spanOf(callee.lhs), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
             }
             const self_off: usize = @min(mf.params.len, 1);
             const want = mf.params.len - self_off;
             if (args.len != want) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ want, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ want, args.len });
                 if (!bound_ok) return .invalid;
                 const ret = substTy(bc, mf.ret, targs);
                 bc.node_types[(node_idx).int()] = ret;
@@ -2849,7 +2853,7 @@ pub const BodyChecker = struct {
                 const want_ty = substTy(bc, pty, targs);
                 const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
                 if (!Type.assignable(want_ty, at)) {
-                    try bc.sink.emitFmtSpan(bc.spanOf(a), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
+                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
                 }
             }
             const ret = substTy(bc, mf.ret, targs);
@@ -2886,7 +2890,7 @@ pub const BodyChecker = struct {
                     .is_tag0, .is_tag1 => {
                         if (args.len != 0) {
                             for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                         }
                         bc.node_types[(node_idx).int()] = Type.bool;
                         return Type.bool;
@@ -2894,7 +2898,7 @@ pub const BodyChecker = struct {
                     .unwrap => {
                         if (args.len != 0) {
                             for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                         }
                         bc.node_types[(node_idx).int()] = t_ty;
                         return t_ty;
@@ -2902,11 +2906,11 @@ pub const BodyChecker = struct {
                     .unwrap_or => {
                         if (args.len != 1) {
                             for (args) |a| _ = try bc.typeOfExpected(a, null);
-                            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
                         } else {
                             const at = try bc.typeOfExpected(args[0], if (t_ty.kind == .invalid) null else t_ty);
                             if (!Type.assignable(t_ty, at))
-                                try bc.sink.emitFmtSpan(bc.spanOf(args[0]), "argument 1: expected {s}, got {s}", .{ bc.typeName(t_ty), bc.typeName(at) });
+                                try bc.sink.report(.{ .span = bc.spanOf(args[0]) }, "argument 1: expected {s}, got {s}", .{ bc.typeName(t_ty), bc.typeName(at) });
                         }
                         bc.node_types[(node_idx).int()] = t_ty;
                         return t_ty;
@@ -2922,7 +2926,7 @@ pub const BodyChecker = struct {
         if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null) {
             if (args.len != 0) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2931,13 +2935,13 @@ pub const BodyChecker = struct {
                 return Type.str;
             }
             if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().display)) |blocker| {
-                try bc.sink.emitFmtCodeSpan(.T0031, bc.spanOf(node_idx), "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
                 return .invalid;
             }
         }
         // A generic-type value with no such method.
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.emitNoMethod(bc.byteOf(callee.main_token), member, recv_ty);
+        try bc.emitNoMethod(bc.tokSpan(callee.main_token), member, recv_ty);
         return .invalid;
     }
 
@@ -2966,7 +2970,7 @@ pub const BodyChecker = struct {
             {
                 if (args.len != 0) {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                    try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
                 }
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
@@ -2986,23 +2990,23 @@ pub const BodyChecker = struct {
                 const want = psig.len - self_off;
                 if (args.len != want) {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ want, args.len });
+                    try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ want, args.len });
                 } else for (args, psig[self_off..], 0..) |a, pty, i| {
                     const wt = Typecheck.groundProtoType(pty, recv_ty, pargs);
                     const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
                     if (!Type.assignable(wt, at))
-                        try bc.sink.emitFmtSpan(bc.spanOf(a), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
+                        try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
                 }
                 const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, pargs);
                 bc.node_types[(node_idx).int()] = ret;
                 return ret;
             }
             for (args) |a| _ = try bc.typeOf(a);
-            try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
+            try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "no method '{s}' on type parameter bounded by protocol '{s}'", .{ member, p.name });
             return .invalid;
         }
         for (args) |a| _ = try bc.typeOf(a);
-        try bc.sink.emitFmtCode(.T0018, bc.byteOf(callee.main_token), "no method '{s}' on unbounded type parameter", .{member});
+        try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "no method '{s}' on unbounded type parameter", .{member});
         return .invalid;
     }
 
@@ -3022,7 +3026,7 @@ pub const BodyChecker = struct {
             // The base of a `[..]` callee that is not a fn: nothing else takes type
             // args (no generic types in value position), so it is a plain
             // not-a-function.
-            try bc.sink.emitSpan(bc.spanOf(n.lhs), "called value is not a function");
+            try bc.sink.report(.{ .span = bc.spanOf(n.lhs) }, "called value is not a function", .{});
             return .invalid;
         }
         const f = bc.model.fns[base_res.func];
@@ -3030,13 +3034,13 @@ pub const BodyChecker = struct {
         if (!f.isGeneric()) {
             for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
             for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.sink.emitFmtSpan(bc.typeArgsSpan(n.lhs), "'{s}' is not generic; drop the type arguments", .{bc.nameText(bc.tree.nodes[(callee.lhs).int()].main_token)});
+            try bc.sink.report(.{ .span = bc.typeArgsSpan(n.lhs) }, "'{s}' is not generic; drop the type arguments", .{bc.nameText(bc.tree.nodes[(callee.lhs).int()].main_token)});
             return f.ret;
         }
         if (targ_nodes.len != f.generic_params.len) {
             for (targ_nodes) |tn| bc.node_types[(tn).int()] = bc.typeFromNode(tn);
             for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.sink.emitFmtSpan(bc.typeArgsSpan(n.lhs), "expected {d} type argument(s), got {d}", .{ f.generic_params.len, targ_nodes.len });
+            try bc.sink.report(.{ .span = bc.typeArgsSpan(n.lhs) }, "expected {d} type argument(s), got {d}", .{ f.generic_params.len, targ_nodes.len });
             return .invalid;
         }
         const targs = try bc.gpa.alloc(Type, targ_nodes.len);
@@ -3058,7 +3062,7 @@ pub const BodyChecker = struct {
                 // A `type_var` is not a monomorphizable type-arg. A ground `App`
                 // (`Box[int]`) IS — it reifies to a concrete struct in the mono tail — and
                 // `unit` IS (a zero-sized `()` type-arg); `isConcreteValue` admits both.
-                try bc.sink.err(.T0013).spanOf(bc.spanOf(tn)).emit("type argument must be a concrete value type");
+                try bc.sink.report(.{ .span = bc.spanOf(tn), .code = .T0013 }, "type argument must be a concrete value type", .{});
                 all_concrete = false;
             }
         }
@@ -3067,7 +3071,7 @@ pub const BodyChecker = struct {
         // sound — else poison so no `type_var`/half-substituted type is stored.
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.sink.emitFmtSpan(bc.argsSpan(node_idx), "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
             if (!all_concrete) return .invalid;
             const ret = substTy(bc, f.ret, targs);
             bc.node_types[(node_idx).int()] = ret;
@@ -3094,7 +3098,7 @@ pub const BodyChecker = struct {
             const want = substTy(bc, pty, targs);
             const at = if (pretyped) |pt| pt[i] else try bc.typeOfExpected(arg, if (want.kind == .invalid) null else want);
             if (!Type.assignable(want, at)) {
-                try bc.sink.emitFmtSpan(bc.spanOf(arg), "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want), bc.typeName(at) });
+                try bc.sink.report(.{ .span = bc.spanOf(arg) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want), bc.typeName(at) });
             }
         }
         const ret = substTy(bc, f.ret, targs);
@@ -3380,28 +3384,28 @@ pub const BodyChecker = struct {
 
     /// Emit "no field '{s}' in struct '{s}'", enriched with a "did you mean" hint when a
     /// declared field name is a close, unambiguous typo of `fname`.
-    fn emitNoField(bc: *BodyChecker, byte: u32, fname: []const u8, sym_name: []const u8, names: []const []const u8) error{OutOfMemory}!void {
+    fn emitNoField(bc: *BodyChecker, at: Span, fname: []const u8, sym_name: []const u8, names: []const []const u8) error{OutOfMemory}!void {
         if (nearmiss.suggest(fname, FieldNameIter{ .names = names })) |cand|
-            try bc.sink.emitFmtCode(.T0046, byte, "no field '{s}' in struct '{s}'; did you mean '{s}'?", .{ fname, sym_name, cand })
+            try bc.sink.report(.{ .span = at, .code = .T0046 }, "no field '{s}' in struct '{s}'; did you mean '{s}'?", .{ fname, sym_name, cand })
         else
-            try bc.sink.emitFmtCode(.T0046, byte, "no field '{s}' in struct '{s}'", .{ fname, sym_name });
+            try bc.sink.report(.{ .span = at, .code = .T0046 }, "no field '{s}' in struct '{s}'", .{ fname, sym_name });
     }
 
     /// Emit "enum '{s}' has no variant '{s}'", enriched with a "did you mean" hint when a
     /// declared variant name is a close, unambiguous typo of `vname`. `pub` so the pattern
     /// checker reuses it for a typo'd variant in a match pattern (same message + hint).
-    pub fn emitNoVariant(bc: *BodyChecker, byte: u32, enum_name: []const u8, vname: []const u8, variants: []const LayoutEngine.VariantSym) error{OutOfMemory}!void {
+    pub fn emitNoVariant(bc: *BodyChecker, at: Span, enum_name: []const u8, vname: []const u8, variants: []const LayoutEngine.VariantSym) error{OutOfMemory}!void {
         if (nearmiss.suggest(vname, VariantNameIter{ .variants = variants })) |cand|
-            try bc.sink.emitFmt(byte, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ enum_name, vname, cand })
+            try bc.sink.report(.{ .span = at }, "enum '{s}' has no variant '{s}'; did you mean '{s}'?", .{ enum_name, vname, cand })
         else
-            try bc.sink.emitFmt(byte, "enum '{s}' has no variant '{s}'", .{ enum_name, vname });
+            try bc.sink.report(.{ .span = at }, "enum '{s}' has no variant '{s}'", .{ enum_name, vname });
     }
 
     /// Emit T0018 "no method '{s}' on type '{s}'", enriched with a "did you mean" hint when
     /// a method callable on the receiver is a close, unambiguous typo of `member`. The
     /// candidate set is the concrete-receiver methods plus, for a generic-instance (`App`)
     /// receiver, its ctor's template methods (so `xs.pushh(1)` on a Vec suggests `push`).
-    fn emitNoMethod(bc: *BodyChecker, byte: u32, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
+    fn emitNoMethod(bc: *BodyChecker, at: Span, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
         var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());
@@ -3411,9 +3415,9 @@ pub const BodyChecker = struct {
             iter.app_is_enum = e.ctor_is_enum;
         }
         if (nearmiss.suggest(member, iter)) |cand|
-            try bc.sink.emitFmtCode(.T0018, byte, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
+            try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
         else
-            try bc.sink.emitFmtCode(.T0018, byte, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+            try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
     }
 
     pub fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {

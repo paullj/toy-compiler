@@ -4629,7 +4629,6 @@ test "a parse diagnostic leaves the parser with its span: one token, or the whol
         defer freeTree(gpa, res.tree);
         try testing.expectEqual(@as(usize, 1), res.diags.len);
         const d = res.diags[0];
-        try testing.expect(d.end != @import("diagnostics/Diagnostic.zig").NO_END);
         try testing.expectEqualStrings(c.want, c.src[d.byte_offset..d.end]);
     }
 }

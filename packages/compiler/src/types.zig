@@ -56,7 +56,6 @@ const nearmiss = @import("diagnostics/nearmiss.zig");
 const Engine = @import("query/Engine.zig");
 const AstWalk = @import("query/AstWalk.zig");
 const Span = @import("diagnostics/model.zig").Span;
-const NO_END = @import("diagnostics/Diagnostic.zig").NO_END;
 const Io = std.Io;
 
 const Typecheck = @This();
@@ -159,6 +158,11 @@ pub const refs = struct {
         return self.tokens[tok].start;
     }
 
+    /// The single token `tok`: what a diagnostic about a name spans.
+    pub fn tokSpan(self: anytype, tok: u32) Span {
+        return .{ .start = self.tokens[tok].start, .end = self.tokens[tok].end };
+    }
+
     /// The source extent of the subtree at `node` in the active module.
     pub fn spanOf(self: anytype, node: Ast.Index) Span {
         return AstWalk.nodeSpan(.{ .tree = self.tree, .tokens = self.tokens, .source = self.source }, node);
@@ -211,7 +215,7 @@ pub const refs = struct {
             // A generic struct named WITHOUT type args (`x: Box`) is not a value type —
             // it needs its args. Diagnose rather than mis-resolve it to `structT`.
             if (id < self.structSyms().len and self.structSyms()[id].is_generic) {
-                self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
+                self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
                 return .invalid;
             }
             return Type.structT(id);
@@ -221,7 +225,7 @@ pub const refs = struct {
             // it needs its args. Diagnose rather than mis-resolve it to `enumT`
             // (mirror the generic-struct gate above).
             if (id < self.enumSyms().len and self.enumSyms()[id].is_generic) {
-                self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
+                self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, "generic type '{s}' requires type arguments, e.g. {s}[int]", .{ name, name }) catch {};
                 return .invalid;
             }
             return Type.enumT(id);
@@ -241,7 +245,7 @@ pub const refs = struct {
         // it falls through to the bare message unchanged.
         if (StdNames.importHintFor(name)) |hint| {
             if (hint.spelling == null) {
-                self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type ++ "; add 'import std/{s}'", .{ name, hint.module }) catch {};
+                self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, err_unknown_type ++ "; add 'import std/{s}'", .{ name, hint.module }) catch {};
                 return .invalid;
             }
         }
@@ -249,10 +253,10 @@ pub const refs = struct {
         // name falls through here. Runs after the import-hint check so an exact std name
         // still names the module rather than suggesting a near neighbour.
         if (nearmiss.suggest(name, refs.typeNameIter(self))) |cand| {
-            self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type ++ "; did you mean '{s}'?", .{ name, cand }) catch {};
+            self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, err_unknown_type ++ "; did you mean '{s}'?", .{ name, cand }) catch {};
             return .invalid;
         }
-        self.sink.emitFmtCode(.T0001, refs.byteOf(self, tok), err_unknown_type, .{name}) catch {};
+        self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, err_unknown_type, .{name}) catch {};
         return .invalid;
     }
 
@@ -267,13 +271,13 @@ pub const refs = struct {
         if (recv.tag != .identifier) return .invalid;
         const recv_name = refs.nameText(self, recv.main_token);
         const target = g.namespaceOfIn(self.graph_mod, recv_name) orelse {
-            self.sink.emitFmtCode(.T0002, refs.byteOf(self, recv.main_token), err_unknown_module, .{recv_name}) catch {};
+            self.sink.report(.{ .span = refs.tokSpan(self, recv.main_token), .code = .T0002 }, err_unknown_module, .{recv_name}) catch {};
             return .invalid;
         };
         const member = refs.nameText(self, n.main_token);
         if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
         if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-        self.sink.emitFmtCode(.T0003, refs.byteOf(self, n.main_token), err_module_no_type, .{member}) catch {};
+        self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .T0003 }, err_module_no_type, .{member}) catch {};
         return .invalid;
     }
 
@@ -298,15 +302,15 @@ pub const refs = struct {
             } else {
                 if (StdNames.importHintFor(bname)) |hint| {
                     if (hint.spelling == null) {
-                        self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type ++ "; add 'import std/{s}'", .{ bname, hint.module }) catch {};
+                        self.sink.report(.{ .span = refs.tokSpan(self, base.main_token), .code = .T0001 }, err_unknown_type ++ "; add 'import std/{s}'", .{ bname, hint.module }) catch {};
                         return .invalid;
                     }
                 }
                 if (nearmiss.suggest(bname, refs.typeNameIter(self))) |cand| {
-                    self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type ++ "; did you mean '{s}'?", .{ bname, cand }) catch {};
+                    self.sink.report(.{ .span = refs.tokSpan(self, base.main_token), .code = .T0001 }, err_unknown_type ++ "; did you mean '{s}'?", .{ bname, cand }) catch {};
                     return .invalid;
                 }
-                self.sink.emitFmtCode(.T0001, refs.byteOf(self, base.main_token), err_unknown_type, .{bname}) catch {};
+                self.sink.report(.{ .span = refs.tokSpan(self, base.main_token), .code = .T0001 }, err_unknown_type, .{bname}) catch {};
                 return .invalid;
             }
         } else if (base.tag == .field_access) {
@@ -325,13 +329,13 @@ pub const refs = struct {
         const gen_params = if (is_enum) self.enumSyms()[ctor_id].generic_params else self.structSyms()[ctor_id].generic_params;
         const gen_is_generic = if (is_enum) self.enumSyms()[ctor_id].is_generic else self.structSyms()[ctor_id].is_generic;
         if (!gen_is_generic) {
-            self.sink.emitFmtCodeSpan(.T0001, refs.spanOf(self, node_idx), "'{s}' is not generic; drop the type arguments", .{gen_name}) catch {};
+            self.sink.report(.{ .span = refs.spanOf(self, node_idx), .code = .T0001 }, "'{s}' is not generic; drop the type arguments", .{gen_name}) catch {};
             return .invalid;
         }
         const arg_nodes = Ast.rangeSlice(self.tree, tn.rhs.int());
         if (arg_nodes.len != gen_params.len) {
             const args_span: Span = .{ .start = refs.byteOf(self, tn.main_token), .end = refs.spanOf(self, node_idx).end };
-            self.sink.emitFmtCodeSpan(.T0001, args_span, "'{s}' expects {d} type argument(s), got {d}", .{ gen_name, gen_params.len, arg_nodes.len }) catch {};
+            self.sink.report(.{ .span = args_span, .code = .T0001 }, "'{s}' expects {d} type argument(s), got {d}", .{ gen_name, gen_params.len, arg_nodes.len }) catch {};
             return .invalid;
         }
         var buf: [8]Type = undefined;
@@ -1479,7 +1483,7 @@ pub fn activeProtocolMap(t: *Typecheck) *std.StringHashMapUnmanaged(u32) {
 
 /// The layout engine's view of this checker: its tables + the per-module accessors
 /// the layout recursion needs, wired to the existing methods. The `emit*` thunks
-/// forward to `sink.emitFmt` with the SAME literal format strings the layout code
+/// forward to `sink.report` with the SAME literal format strings the layout code
 /// used in-line, so the emitted diagnostics stay byte-identical.
 pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
     const T = struct {
@@ -1496,20 +1500,20 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
         fn castNameText(ctx: *anyopaque, tok: u32) []const u8 {
             return nameText(@ptrCast(@alignCast(ctx)), tok);
         }
-        fn castByteOf(ctx: *anyopaque, tok: u32) u32 {
-            return byteOf(@ptrCast(@alignCast(ctx)), tok);
+        fn castTokSpan(ctx: *anyopaque, tok: u32) Span {
+            return tokSpan(@ptrCast(@alignCast(ctx)), tok);
         }
-        fn emitRecursive(ctx: *anyopaque, byte: u32, requester: []const u8) error{OutOfMemory}!void {
+        fn emitRecursive(ctx: *anyopaque, at: Span, requester: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmtCode(.T0004, byte, "recursive type '{s}' has infinite size", .{requester});
+            try tc.sink.report(.{ .span = at, .code = .T0004 }, "recursive type '{s}' has infinite size", .{requester});
         }
-        fn emitEmptyStruct(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
+        fn emitEmptyStruct(ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmtCode(.T0005, byte, "empty struct '{s}' is not allowed", .{name});
+            try tc.sink.report(.{ .span = at, .code = .T0005 }, "empty struct '{s}' is not allowed", .{name});
         }
-        fn emitEmptyEnum(ctx: *anyopaque, byte: u32, name: []const u8) error{OutOfMemory}!void {
+        fn emitEmptyEnum(ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
-            try tc.sink.emitFmtCode(.T0006, byte, "empty enum '{s}' is not allowed", .{name});
+            try tc.sink.report(.{ .span = at, .code = .T0006 }, "empty enum '{s}' is not allowed", .{name});
         }
         fn reifyApp(ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
@@ -1524,7 +1528,7 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
         .gphSelect = T.castGph,
         .typeFromNode = T.castTypeFromNode,
         .nameText = T.castNameText,
-        .byteOf = T.castByteOf,
+        .tokSpan = T.castTokSpan,
         .emitRecursive = T.emitRecursive,
         .emitEmptyStruct = T.emitEmptyStruct,
         .emitEmptyEnum = T.emitEmptyEnum,
@@ -2050,7 +2054,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
                 const f = model.fns[worklist.items[idx].gid];
                 _ = t.gphSelect(f.mod);
                 const decl = t.tree.nodes[f.decl_node.int()];
-                try t.sink.emitCode(.T0014, t.byteOf(decl.main_token), "monomorphization instance limit exceeded");
+                try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0014 }, "monomorphization instance limit exceeded", .{});
                 capped = true;
             }
             break;
@@ -2251,7 +2255,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     const view = DiscoveryView{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .model = model, .composite = t.composite };
     for (tree.nodes, 0..) |n, ci| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
-        const call_at: Anchor = .{ .node = Ast.Index.from(@intCast(ci)), .whole = true };
+        const call_at: Anchor = .{ .node = Ast.Index.from(@intCast(ci)) };
         // The explicit-turbofish `id[int](..)` and bare-inferred `id(7)` shapes route
         // through the SAME arg-extraction the fingerprint fold uses (`callInstanceRef`),
         // so discovery selects the exact instance the caller's fingerprint targets.
@@ -2303,7 +2307,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         if (n.tag != .empty_list) continue;
         for (StdNames.desugarMethods(.empty_list)) |dm| {
             const recv = desugarRecvType(node_types, n, i, dm.recv);
-            try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)), .whole = false }, mod);
+            try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, .{ .token_of = Ast.Index.from(@intCast(i)) }, mod);
         }
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
@@ -2318,7 +2322,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 for (StdNames.desugarMethods(n.tag)) |dm| {
                     const recv = desugarRecvType(node_types, n, i, dm.recv);
                     // A `for` node is the whole loop, body included; it keeps its token.
-                    const at: Anchor = .{ .node = Ast.Index.from(@intCast(i)), .whole = n.tag == .list_literal };
+                    const at: Anchor = if (n.tag == .list_literal) .{ .node = Ast.Index.from(@intCast(i)) } else .{ .token_of = Ast.Index.from(@intCast(i)) };
                     try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, at, mod);
                 }
             },
@@ -2328,7 +2332,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 const elem = node_types[i];
                 if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
                     const args = [_]Type{elem};
-                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)), .whole = true }, mod);
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };
             },
             // A value-headed `type_app` is a value index the parser could not tell from a
@@ -2339,7 +2343,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                 const elem = node_types[i];
                 if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
                     const args = [_]Type{elem};
-                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)), .whole = true }, mod);
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };
             },
             else => {},
@@ -2382,15 +2386,17 @@ fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []co
     try t.enqueueInstance(model, m.fn_id, out, worklist, seen, at, mod);
 }
 
-/// Where an instantiation diagnostic lands: a node of the scanned module, spanned whole or
-/// by its main token. Measured only when a diagnostic fires, since discovery visits
+/// Where an instantiation diagnostic lands in the scanned module: a whole node, or just a
+/// node's main token. Measured only when a diagnostic fires, since discovery visits
 /// every call of every instance.
-const Anchor = struct { node: Ast.Index, whole: bool };
+const Anchor = union(enum) { node: Ast.Index, token_of: Ast.Index };
 
 fn anchorSpan(t: *const Typecheck, mod: u32, a: Anchor) Span {
     const mc = &t.graph.mods[mod];
-    if (!a.whole) return .{ .start = mc.tokens[mc.tree.nodes[a.node.int()].main_token].start, .end = NO_END };
-    return AstWalk.nodeSpan(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, a.node);
+    return switch (a) {
+        .node => |n| AstWalk.nodeSpan(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, n),
+        .token_of => |n| refs.tokSpan(mc, mc.tree.nodes[n.int()].main_token),
+    };
 }
 
 /// Enqueue `(gid, args)` for instantiation, deduped on the canonical key. `args` is
@@ -2415,7 +2421,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
     if (maxd > max_instantiation_depth) {
         if (!t.mono_depth_capped) {
             _ = t.gphSelect(mod);
-            try t.sink.err(.T0017).spanOf(t.anchorSpan(mod, at)).emit("instantiation too deep: generic type nesting exceeds the depth limit");
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0017 }, "instantiation too deep: generic type nesting exceeds the depth limit", .{});
             t.mono_depth_capped = true;
         }
         return;
@@ -2475,9 +2481,9 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         const tname = t.typeName(args[ord]);
         const pname = model.protocols[pid].name;
         if (isDerivableProtocol(model, pid)) {
-            try t.sink.emitFmtCodeSpan(.T0023, t.anchorSpan(mod, at), "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
         } else {
-            try t.sink.emitFmtCodeSpan(.T0023, t.anchorSpan(mod, at), "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
         }
         return;
     }
@@ -2869,7 +2875,7 @@ fn checkPubType(t: *Typecheck, ty: Type, at: Span, owner_kind: []const u8, owner
         else => false,
     };
     if (non_pub)
-        try t.sink.emitFmtCodeSpan(.T0009, at, "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+        try t.sink.report(.{ .span = at, .code = .T0009 }, "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
 }
 
 /// The type-ref of a `name: T` param or field, or the node itself when it is a bare
@@ -2880,9 +2886,8 @@ fn fieldTypeSpan(t: *const Typecheck, node: Ast.Index) Span {
     return t.spanOf(node);
 }
 
-/// The token at `tok` alone; `fillSpans` measures its extent.
-fn tokSpan(t: *const Typecheck, tok: u32) Span {
-    return .{ .start = t.byteOf(tok), .end = NO_END };
+pub fn tokSpan(t: *const Typecheck, tok: u32) Span {
+    return refs.tokSpan(t, tok);
 }
 
 /// Rule 7: the entry `main` may only yield `int` (the process exit code) or `()`
@@ -2909,7 +2914,7 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
             _ = t.gphSelect(entry_mod);
             const ret_node = Ast.protoAt(tree, main_decl.lhs.int()).ret_type;
             const at: Span = if (ret_node != Ast.none) t.spanOf(ret_node) else t.tokSpan(main_tok);
-            try t.sink.err(.T0010).spanOf(at).emit("main must return int or ()");
+            try t.sink.report(.{ .span = at, .code = .T0010 }, "main must return int or ()", .{});
         }
         return; // only the first `main` is the entry
     }
@@ -3073,7 +3078,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
             const bound = Ast.genericParamBound(t.tree, gp);
             gbounds[i] = if (bound) |bn| (t.protocolIdFromNode(bn) orelse blk: {
                 const ref_tok = t.tree.nodes[Ast.protocolRefBase(t.tree, bn).int()].main_token;
-                try t.sink.emitFmtCode(.T0021, t.byteOf(ref_tok), "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
+                try t.sink.report(.{ .span = t.tokSpan(ref_tok), .code = .T0021 }, "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
                 break :blk null;
             }) else null;
             // Decode the bound's protocol type-args. A composite `App` arg is out of
@@ -3087,7 +3092,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                     for (arg_nodes, 0..) |an, k| {
                         const aty = t.typeFromNode(an);
                         if (aty.isApp()) {
-                            try t.sink.err(.none).spanOf(t.spanOf(an)).emit("a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)");
+                            try t.sink.report(.{ .span = t.spanOf(an) }, "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)", .{});
                             av[k] = .invalid;
                         } else av[k] = aty;
                     }
@@ -3139,7 +3144,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 any_var = true;
             };
             if (!any_var) {
-                try t.sink.err(.none).spanOf(t.spanOf(recv_type)).emit("an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')");
+                try t.sink.report(.{ .span = t.spanOf(recv_type) }, "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')", .{});
                 return;
             }
             try t.templates.append(t.gpa, .{
@@ -3180,14 +3185,14 @@ fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
         if (externTypeOk(pty)) {
             params[i] = pty;
         } else {
-            try t.sink.emitFmtCodeSpan(.T0037, t.fieldTypeSpan(param_idx), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
+            try t.sink.report(.{ .span = t.fieldTypeSpan(param_idx), .code = .T0037 }, "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
             params[i] = .invalid;
         }
     }
     var ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
     // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI scalar.
     if (proto.ret_type != Ast.none and !externTypeOk(ret)) {
-        try t.sink.emitFmtCodeSpan(.T0037, t.spanOf(proto.ret_type), "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
+        try t.sink.report(.{ .span = t.spanOf(proto.ret_type), .code = .T0037 }, "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
         ret = .invalid;
     }
     try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .import, .params = params, .ret = ret, .mod = mod });

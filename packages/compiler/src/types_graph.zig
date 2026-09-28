@@ -26,7 +26,6 @@
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
 const Graph = @import("driver/Graph.zig");
-const DiagnosticMod = @import("diagnostics/Diagnostic.zig");
 const ResolveGraph = @import("resolve_graph.zig");
 const Typecheck = @import("types.zig");
 
@@ -104,9 +103,7 @@ pub fn checkGraph(
         };
     }
 
-    const result = try Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, io, ncpu);
-    DiagnosticMod.fillSpans(result.diags, graph, Graph.Graph.scopeTokens);
-    return result;
+    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, io, ncpu);
 }
 
 /// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
@@ -552,6 +549,7 @@ fn diagsUnder(
     for (tr.diags, 0..) |d, i| copy[i] = .{
         .scope = d.scope,
         .byte_offset = d.byte_offset,
+        .end = d.end,
         .message = try gpa.dupe(u8, d.message),
     };
     return copy;

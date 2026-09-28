@@ -630,7 +630,7 @@ fn emitRefHash(t: *Typecheck, site: ?Typecheck.DeriveSite, container: Type, ft: 
     const prev = t.sink.cur_scope;
     defer t.sink.setScope(prev);
     t.sink.setScope(at.scope);
-    try t.sink.emitFmtCodeSpan(.T0030, at.span, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
+    try t.sink.report(.{ .span = at.span, .code = .T0030 }, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
 }
 
 fn pushHash(gpa: std.mem.Allocator, work: *std.ArrayList(Type), sites: *std.ArrayList(?Typecheck.DeriveSite), ty: Type, site: ?Typecheck.DeriveSite) !void {
