@@ -1,4 +1,4 @@
-# 🧸 toy
+# <img src="docs/images/icon-small.png" alt="" width="36" align="top"> toy
 
 A high level, general purpose programming language. Statically typed and compiled to native code with a runtime.
 

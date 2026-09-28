@@ -29,15 +29,15 @@ importers:
       '@codemirror/view':
         specifier: ^6.43.6
         version: 6.43.6
+      '@fontsource/cherry-bomb-one':
+        specifier: ^5.3.0
+        version: 5.3.0
       '@fontsource/hanken-grotesk':
         specifier: ^5.2.8
         version: 5.2.8
       '@fontsource/lato':
         specifier: ^5.2.7
         version: 5.2.7
-      '@fontsource/newsreader':
-        specifier: ^5.2.10
-        version: 5.2.10
       '@lezer/highlight':
         specifier: ^1.2.3
         version: 1.2.3
@@ -300,14 +300,14 @@ packages:
   '@floating-ui/utils@0.2.12':
     resolution: {integrity: sha512-HpCo8tmWzLVad5s2d19EhAz5zqrrQ6s69qd6moPMQvkOuSwDT1YgRfWSVuc4ennqrgv3OHppiOGMQ7oC13yIww==}
 
+  '@fontsource/cherry-bomb-one@5.3.0':
+    resolution: {integrity: sha512-iSBbBw+xmNsvws9m3m12J+2X5tlC0FORiuk0oLe7LWOzuolvFb/Paeck36eLONiXRzad4RVcZ+ip77hjFB1zQA==}
+
   '@fontsource/hanken-grotesk@5.2.8':
     resolution: {integrity: sha512-J/e6hdfNCbyc4WK5hmZtk0zjaIsFx3pvCdPVxY25iYw2C9v1ZggGz4nfHnRjMhcz4WfaadUuwLNtvj8sQ70tkg==}
 
   '@fontsource/lato@5.2.7':
     resolution: {integrity: sha512-k5mum1ADbDW5cTw1Ett1eQVWeoZ6gq0ct6SFBibEhB4LRxhniChJZTBgd6ph5yBxLkN1fcnsnmicBNA4S/3nbw==}
-
-  '@fontsource/newsreader@5.2.10':
-    resolution: {integrity: sha512-TFaYzoFhDqarUyV2yYjgZZEwT4bpaj6sGBnXSnFknQ/QB8/9LzfY6IO9+inHOX4zzPp87Z7/KuG1OI5gr91Q3A==}
 
   '@internationalized/date@3.12.2':
     resolution: {integrity: sha512-FY1Y+H64NDs+HAF6omlnWxm3mEpfgaCSWtL5l551ZZfImA+kGjPFgrnJrGjH6lfmLL0g8Z/mBu1R3kufeCp6Jw==}
@@ -1351,11 +1351,11 @@ snapshots:
 
   '@floating-ui/utils@0.2.12': {}
 
+  '@fontsource/cherry-bomb-one@5.3.0': {}
+
   '@fontsource/hanken-grotesk@5.2.8': {}
 
   '@fontsource/lato@5.2.7': {}
-
-  '@fontsource/newsreader@5.2.10': {}
 
   '@internationalized/date@3.12.2':
     dependencies:
