@@ -198,8 +198,8 @@ pub fn signatureHelpAt(
     const resolutions = res.resolutions[graph.entry_index];
 
     // The callee node keys on its identifier token's source start (robust to node/token
-    // reshuffle). Its resolution is `.func`; the call node's own main_token is the `(`, a
-    // different start, so the two never collide.
+    // reshuffle). Its resolution is `.func`; the call node's own main_token is the `(` (or
+    // the `|>` of a piped call), a different start, so the two never collide.
     var fid: ?u32 = null;
     for (m.nodes, 0..) |n, i| {
         if (m.tokens[n.main_token].start != enc.callee_start) continue;

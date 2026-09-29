@@ -100,7 +100,11 @@ const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, 
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
-const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .l_bracket, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .amp, .star });
+const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .l_bracket, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .amp, .star, .pipe_gt });
+/// FIRST(postfix): `parsePostfix`'s arms except `{`, which after a pipe RHS is a block
+/// body (`if x |> f { .. }`). After a pipe RHS each one is a P0014 rather than a silent
+/// `(x |> f).len()` reading, because the RHS is a fixed shape.
+const postfix_first = setOf(&.{ .dot, .l_bracket, .l_paren, .question });
 /// FIRST(type): an identifier (dot-chained) or the unit type `()`.
 const type_first = setOf(&.{ .identifier, .l_paren });
 /// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
@@ -123,6 +127,10 @@ const arm_recovery = field_recovery;
 /// closer `]`, separator `,`. No newline (a `[ .. ]` list stays on one line, like
 /// the `( .. )` param list).
 const generic_recovery = setOf(&.{ .r_bracket, .comma }).unionWith(decl_anchors);
+/// Where a missing pipe target stops without consuming: the token belongs to an
+/// enclosing construct or to the next statement. `|>` is here so a run of pipes is
+/// consumed by `continueInfix`'s loop, not by recursion that skips the depth guard.
+const pipe_target_recovery = setOf(&.{ .newline, .r_paren, .r_brace, .r_bracket, .comma, .pipe_gt }).unionWith(decl_anchors);
 /// `findNextStmt`'s STOP set (at the block's brace-depth). Must contain `.newline`
 /// so a post-recovery `expectTerminator` does NOT spuriously cascade (resync lands
 /// on a newline that `skipNewlines` then swallows).
@@ -136,7 +144,7 @@ comptime {
     if (!tuple_recovery.contains(.r_paren) or !tuple_recovery.contains(.comma)) @compileError("tuple_recovery missing own closer/separator");
     if (!field_recovery.contains(.r_brace) or !field_recovery.contains(.newline)) @compileError("field_recovery missing own closer/separator");
     if (!stmt_recovery.contains(.newline)) @compileError("stmt_recovery must contain .newline (ASI anti-cascade)");
-    for ([_]TagSet{ param_recovery, tuple_recovery, field_recovery, stmt_recovery, decl_anchors }) |s| {
+    for ([_]TagSet{ param_recovery, tuple_recovery, field_recovery, stmt_recovery, pipe_target_recovery, decl_anchors }) |s| {
         if (!s.contains(.eof)) @compileError("recovery set missing .eof anchor");
     }
 }
@@ -1541,6 +1549,10 @@ fn expectTerminator(p: *Parser) Error!void {
             p.skipNewlines();
         },
         .r_brace, .eof => p.in_error = false,
+        // A statement form (`if`/`while`/`for` statement, `continue`) is not an
+        // expression, so it cannot be a pipe lhs. The lexer glues a leading-`|>` line
+        // onto it because `}` / `continue` end a statement.
+        .pipe_gt => return p.fail(p.peek(), .P0014, err_pipe_stmt_lhs),
         else => {
             const tok = p.peek();
             // A run of stray bytes coalesces into ONE `.invalid` token, so a doubled
@@ -1835,14 +1847,18 @@ fn parseExpr(p: *Parser, min_bp: u8) Error!Ast.Index {
     // guard is compiled in ALL modes — it defends a real crash.
     p.depth += 1;
     defer p.depth -= 1;
-    if (p.depth > MAX_EXPR_DEPTH) {
-        try p.backstop(p.peek(), .P0005, "expression nested too deeply");
-        const et = p.index;
-        while (!p.at(.eof) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
-        return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
-    }
+    if (p.depth > MAX_EXPR_DEPTH) return p.exprTooDeep();
     const lhs = try p.parsePostfix(try p.parsePrefix());
     return p.continueInfix(lhs, min_bp);
+}
+
+/// The P0005 backstop for expressions: consume to a boundary so the surrounding
+/// list/infix loop terminates via its anchor/eof guard.
+fn exprTooDeep(p: *Parser) Error!Ast.Index {
+    try p.backstop(p.peek(), .P0005, "expression nested too deeply");
+    const et = p.index;
+    while (!p.at(.eof) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
+    return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
 }
 
 /// The infix precedence-climbing loop, starting from an already-parsed `lhs`.
@@ -1850,10 +1866,21 @@ fn parseExpr(p: *Parser, min_bp: u8) Error!Ast.Index {
 /// a `.`-rooted place that turned out not to be an assignment target.
 fn continueInfix(p: *Parser, lhs0: Ast.Index, min_bp: u8) Error!Ast.Index {
     var lhs = lhs0;
+    // Each pipe nests its lhs one call deeper, the same tree as a written `f(f(..))`.
+    // This loop does not recurse, so count the pipes against the depth cap by hand, or a
+    // long chain would pass the parser and overflow the checker's recursion instead.
+    const depth0 = p.depth;
+    defer p.depth = depth0;
     while (infixBp(p.peek().tag)) |bp| {
         if (bp <= min_bp) break;
         const op = p.index;
         p.advance();
+        if (p.tokens[op].tag == .pipe_gt) {
+            p.depth += 1;
+            if (p.depth > MAX_EXPR_DEPTH) return p.exprTooDeep();
+            lhs = try p.parsePipeRhs(lhs, op);
+            continue;
+        }
         const rhs = try p.parseExpr(bp);
         lhs = try p.addNode(.{ .tag = .binary, .main_token = op, .lhs = lhs, .rhs = rhs });
     }
@@ -1924,6 +1951,15 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
         .kw_match => {
             if (p.no_block) return p.fail(tok, .P0002, "expected an expression");
             return p.parseMatch(); // a match as a value expression
+        },
+        // Reached after a bare `return` / `break` / `:=` etc., often because a leading-
+        // `|>` line was glued onto a line with no value. Parse the RHS anyway so the
+        // rest of the line is consumed under this one diagnostic.
+        .pipe_gt => {
+            try p.warn(tok, .P0014, err_pipe_no_lhs);
+            p.advance();
+            const missing = try p.addNode(.{ .tag = .error_node, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
+            return p.parsePipeRhs(missing, at_tok);
         },
         .kw_unsafe => {
             if (p.no_block) return p.fail(tok, .P0002, "expected an expression");
@@ -2142,9 +2178,16 @@ fn upgradeStructInit(p: *Parser, node: Ast.Index, qualified: Ast.Index) Error!As
 
 fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     const lparen = p.index;
-    p.bump(.l_paren);
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
+    try p.parseCallArgs(&args);
+    const header = try p.addRange(args.items);
+    return p.addNode(.{ .tag = .call, .main_token = lparen, .lhs = callee, .rhs = header });
+}
+
+/// `( arg, .. )`, appended to `args`.
+fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index)) Error!void {
+    p.bump(.l_paren);
     // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
     var nb = NoBlockScope.enter(p, false);
@@ -2164,8 +2207,65 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
         std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
     }
     try p.expect(.r_paren, "expected ')' to close call");
+}
+
+const err_pipe_target = "pipe target must be a function or a call";
+const err_pipe_extended = err_pipe_target ++ "; wrap the pipe in parentheses to use its result";
+const err_pipe_no_lhs = "a pipe needs a value on its left";
+const err_pipe_stmt_lhs = "only a value can be piped, and this statement has none";
+
+/// `lhs |> path [(args)] [?]`, the cursor just past `|>`, where `path` is dotted names
+/// with at most one turbofish (`f[int]`, `Option[int].some`). Desugars to a `.call`
+/// with `lhs` as argument 0 (packages/docs/pipe.md). `main_token` is the `|>` token,
+/// not `(`: that is how later stages tell a piped call from a written one without a
+/// new node tag. `lhs` is older than every RHS node, so children still precede parents.
+fn parsePipeRhs(p: *Parser, lhs: Ast.Index, pipe_tok: u32) Error!Ast.Index {
+    if (!p.at(.identifier)) {
+        const at_tok = p.index;
+        if (pipe_target_recovery.contains(p.peek().tag)) {
+            const t = p.tokens[pipe_tok];
+            try p.warnSpan(t.start, t.end, .P0014, err_pipe_target);
+        } else {
+            try p.warn(p.peek(), .P0014, err_pipe_target);
+            _ = try p.parseExpr(prefix_bp);
+        }
+        return p.addNode(.{ .tag = .error_node, .main_token = at_tok, .lhs = Ast.none, .rhs = Ast.none });
+    }
+    var callee = try p.leaf(.identifier, p.index);
+    var turbofish = false;
+    while (true) {
+        if (p.at(.dot) and p.peek2().tag == .identifier) {
+            callee = try p.parseFieldAccess(callee);
+        } else if (p.at(.l_bracket) and !turbofish) {
+            // Always a turbofish here: an index can never be a pipe target, so the
+            // `turbofishFollows` guess (which reads a bare `f[int]` as an index) is skipped.
+            callee = try p.parseTypeApp(callee);
+            turbofish = true;
+        } else break;
+    }
+
+    var args: std.ArrayList(Ast.Index) = .empty;
+    defer args.deinit(p.gpa);
+    try args.append(p.gpa, lhs);
+    if (p.at(.l_paren)) try p.parseCallArgs(&args);
     const header = try p.addRange(args.items);
-    return p.addNode(.{ .tag = .call, .main_token = lparen, .lhs = callee, .rhs = header });
+    var result = try p.addNode(.{ .tag = .call, .main_token = pipe_tok, .lhs = callee, .rhs = header });
+    if (p.at(.question)) {
+        const q = p.index;
+        p.bump(.question);
+        result = try p.addNode(.{ .tag = .try_expr, .main_token = q, .lhs = result, .rhs = Ast.none });
+    }
+
+    // Without this check the infix loop would bind a following operator to the pipe
+    // result, so `x |> f == y` would read as `f(x) == y` — not what "lowest
+    // precedence" promises. Recovery keeps that reading under the one diagnostic.
+    const next = p.peek().tag;
+    const extends = postfix_first.contains(next) or (next != .pipe_gt and infixBp(next) != null);
+    if (extends) {
+        try p.warn(p.peek(), .P0014, err_pipe_extended);
+        if (postfix_first.contains(next)) result = try p.parsePostfix(result);
+    }
+    return result;
 }
 
 /// Infix binding power indexed by `token.Tag` ordinal; `-1` marks a non-infix
@@ -2174,33 +2274,35 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
 /// stays densely numbered, and a mistyped tag field name is a `@compileError`.
 /// Higher binds tighter.
 const infix_bp_table = std.enums.directEnumArrayDefault(token.Tag, i16, -1, 0, .{
-    .pipe_pipe = 1,
-    .amp_amp = 2,
-    .pipe = 3, // bitwise OR
-    .caret = 4, // bitwise XOR
-    .amp = 5, // bitwise AND
-    .eq_eq = 6,
-    .bang_eq = 6,
-    .lt = 7,
-    .lt_eq = 7,
-    .gt = 7,
-    .gt_eq = 7,
-    .lt_lt = 8, // shifts
-    .gt_gt = 8,
-    .plus = 9,
-    .minus = 9,
-    .star = 10,
-    .slash = 10,
-    .percent = 10,
+    // Lowest, so `a + b |> f` pipes the whole `a + b`.
+    .pipe_gt = 1,
+    .pipe_pipe = 2,
+    .amp_amp = 3,
+    .pipe = 4, // bitwise OR
+    .caret = 5, // bitwise XOR
+    .amp = 6, // bitwise AND
+    .eq_eq = 7,
+    .bang_eq = 7,
+    .lt = 8,
+    .lt_eq = 8,
+    .gt = 8,
+    .gt_eq = 8,
+    .lt_lt = 9, // shifts
+    .gt_gt = 9,
+    .plus = 10,
+    .minus = 10,
+    .star = 11,
+    .slash = 11,
+    .percent = 11,
     // Dotted float operators share the binding power of their integer twins.
-    .lt_dot = 7,
-    .gt_dot = 7,
-    .le_dot = 7,
-    .ge_dot = 7,
-    .plus_dot = 9,
-    .minus_dot = 9,
-    .star_dot = 10,
-    .slash_dot = 10,
+    .lt_dot = 8,
+    .gt_dot = 8,
+    .le_dot = 8,
+    .ge_dot = 8,
+    .plus_dot = 10,
+    .minus_dot = 10,
+    .star_dot = 11,
+    .slash_dot = 11,
 });
 
 /// Infix binding power, or null if the tag is not an infix operator. Higher
@@ -2216,24 +2318,24 @@ fn infixBp(tag: token.Tag) ?u8 {
 /// error string on violation, else null.
 fn checkInfixTable() ?[]const u8 {
     const infix_ops = [_]token.Tag{
-        .pipe_pipe, .amp_amp,
-        .pipe,      .caret,
-        .amp,       .eq_eq,
-        .bang_eq,   .lt,
-        .lt_eq,     .gt,
-        .gt_eq,     .lt_lt,
-        .gt_gt,     .plus,
-        .minus,     .star,
-        .slash,     .percent,
-        .lt_dot,    .gt_dot,
-        .le_dot,    .ge_dot,
-        .plus_dot,  .minus_dot,
-        .star_dot,  .slash_dot,
+        .pipe_gt,   .pipe_pipe, .amp_amp,
+        .pipe,      .caret,     .amp,
+        .eq_eq,     .bang_eq,   .lt,
+        .lt_eq,     .gt,        .gt_eq,
+        .lt_lt,     .gt_gt,     .plus,
+        .minus,     .star,      .slash,
+        .percent,   .lt_dot,    .gt_dot,
+        .le_dot,    .ge_dot,    .plus_dot,
+        .minus_dot, .star_dot,  .slash_dot,
     };
-    // Every listed operator has a positive bp.
+    // Every listed operator has a positive bp, below the prefix bp (a unary operand
+    // must never swallow an infix operator: `-a * b` is `(-a) * b`).
     for (infix_ops) |op| {
         if (infix_bp_table[@intFromEnum(op)] <= 0) {
             return "infix operator missing a positive binding power in infix_bp_table";
+        }
+        if (infix_bp_table[@intFromEnum(op)] >= prefix_bp) {
+            return "infix binding power must stay below prefix_bp";
         }
     }
     // No tag outside the list carries a non-sentinel bp (the two sets match).
@@ -2254,7 +2356,7 @@ comptime {
 }
 
 /// Prefix operators bind tighter than any infix operator.
-const prefix_bp: u8 = 11;
+const prefix_bp: u8 = 12;
 
 fn leaf(p: *Parser, tag: Node.Tag, tok_index: u32) Error!Ast.Index {
     p.advance();
@@ -4570,6 +4672,10 @@ test "fix-suggesting parse codes: category, count, and hint text" {
         .{ .src = "fn a() -> int {\n  for (i := 0; i < 3; i = i + 1) {\n  }\n  return 0\n}\n", .code = .P0011, .hint = "for x in xs" },
         .{ .src = "fn f(): int {\n  return 0\n}\n", .code = .P0012, .hint = "'-> T'" },
         .{ .src = "fn a() -> int {\n  x := 1;\n  return x\n}\n", .code = .P0013, .hint = "remove the ';'" },
+        .{ .src = "fn a() {\n  y := x |> 5\n}\n", .code = .P0014, .hint = "function or a call" },
+        .{ .src = "fn a() {\n  y := x |> f == y\n}\n", .code = .P0014, .hint = "wrap the pipe in parentheses" },
+        .{ .src = "fn a() {\n  y := |> f\n}\n", .code = .P0014, .hint = "value on its left" },
+        .{ .src = "fn a() {\n  if c {\n  }\n  |> f\n}\n", .code = .P0014, .hint = "this statement has none" },
     };
     for (cases) |c| {
         const res = try parseResult(gpa, c.src);
@@ -4649,4 +4755,141 @@ test "a broken for iterable does not leave blocks disabled for the rest of the f
         defer freeTree(gpa, res.tree);
         try testing.expect(res.diags.len >= 1);
     }
+}
+
+test "pipe desugars to a call with the lhs as argument 0" {
+    try expectSexpr("x |> f", "(call f x)");
+    try expectSexpr("x |> f(a, b)", "(call f x a b)");
+    try expectSexpr("x |> m.f(a)", "(call (. m f) x a)");
+    try expectSexpr("x |> v.push", "(call (. v push) x)");
+    try expectSexpr("5 |> Option.some", "(call (. Option some) 5)");
+    try expectSexpr("x |> f[int]", "(call (tyapp f int) x)");
+    try expectSexpr("x |> f[int](a)", "(call (tyapp f int) x a)");
+    try expectSexpr("5 |> Option[int].some", "(call (. (tyapp Option int) some) 5)");
+    try expectSexpr("x |> f?", "(try (call f x))");
+    try expectSexpr("x |> f(a)?", "(try (call f x a))");
+    try expectSexpr("x |> f |> g(a)", "(call g (call f x) a)");
+}
+
+test "pipe binds loosest and associates left" {
+    try expectSexpr("a + b |> f", "(call f (+ a b))");
+    try expectSexpr("y == x |> f", "(call f (== y x))");
+    try expectSexpr("a || b |> f", "(call f (|| a b))");
+    try expectSexpr("-x |> f", "(call f (- x))");
+    try expectSexpr("(x |> f) == y", "(== (call f x) y)");
+    try expectSexpr("g(x |> f, 1)", "(call g (call f x) 1)");
+}
+
+test "a piped call's main_token is the |> token" {
+    const gpa = testing.allocator;
+    const src = "x |> f(a)";
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    var diag: ?Diagnostic = null;
+    const tree = (try parseExprOnly(gpa, tokens, src, &diag)) orelse return error.UnexpectedParseFailure;
+    defer freeTree(gpa, tree);
+    const call = tree.nodes[Ast.root(tree.nodes).int()];
+    try testing.expectEqual(Node.Tag.call, call.tag);
+    try testing.expectEqual(token.Tag.pipe_gt, tokens[call.main_token].tag);
+}
+
+test "multi-line pipes parse as one statement" {
+    try expectProgram(
+        "fn f() {\n  y := x\n    |> g\n    # step two\n    |> h(1)\n  z := y |>\n    g\n}\n",
+        "(program (fn f () _ (block (:= y (call h (call g x) 1)) (:= z (call g y)))))",
+    );
+    try expectProgram(
+        "fn f() -> int {\n  return x\n    |> g\n}\n",
+        "(program (fn f () int (block (return (call g x)))))",
+    );
+}
+
+test "P0014: invalid pipe forms report exactly one diagnostic" {
+    const gpa = testing.allocator;
+    const srcs = [_][]const u8{
+        "fn a() {\n  y := x |> 5\n}\n",
+        "fn a() {\n  y := x |> (f)\n}\n",
+        "fn a() {\n  y := x |> f().len()\n}\n",
+        "fn a() {\n  y := x |> f == y\n}\n",
+        "fn a() {\n  y := x |> f + 1\n}\n",
+        "fn a() {\n  y := x |> f.0\n}\n",
+        "fn a() {\n  y := x |> f??\n}\n",
+        "fn a() {\n  y := x |>\n}\n",
+        "fn a() {\n  g(x |> , 1)\n}\n",
+        "fn a() {\n  y := |> f\n}\n",
+        "fn a() {\n  return\n    |> f(x)\n}\n",
+        "fn a() {\n  loop {\n    break\n      |> f\n  }\n}\n",
+        "fn a() {\n  if c {\n  }\n  |> f\n}\n",
+        "fn a() {\n  for i in 0..3 {\n    continue\n      |> f\n  }\n}\n",
+        "fn a() {\n  g(|> f)\n}\n",
+        "fn a() {\n  y := x |> |> |> f\n}\n",
+        "fn a() {\n  y := x |> f[int][bool]\n}\n",
+    };
+    for (srcs) |src| {
+        const res = try parseResult(gpa, src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        errdefer std.debug.print("source:\n{s}\n", .{src});
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(codes.Code.P0014, res.diags[0].code);
+    }
+}
+
+test "P0014 recovery does not swallow an independent error on the next line" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "fn a() {\n  y := x |> 5\n  z := )\n}\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 2), res.diags.len);
+    try testing.expectEqual(codes.Code.P0014, res.diags[0].code);
+    try testing.expectEqual(codes.Code.P0002, res.diags[1].code);
+}
+
+test "a block expression is a value and pipes normally" {
+    try expectProgram(
+        "fn f() {\n  x := if c { 1 } else { 2 }\n    |> g\n  match x {\n    _ -> 1\n  }\n    |> h\n}\n",
+        "(program (fn f () _ (block (:= x (call g (if c (block 1) (block 2)))) (call h (match x (arm (_) 1))))))",
+    );
+}
+
+test "P0014 for a missing target points at the |>" {
+    const gpa = testing.allocator;
+    const src = "fn a() {\n  y := x |>\n}\n";
+    const res = try parseResult(gpa, src);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "|>").?)), res.diags[0].byte_offset);
+}
+
+test "a long run of |> is bounded (no recursion per pipe)" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "fn f() {\n  y := 1");
+    var i: usize = 0;
+    while (i < 20_000) : (i += 1) try buf.appendSlice(gpa, " |>");
+    try buf.appendSlice(gpa, " g\n}\n");
+    const res = try parseResult(gpa, buf.items);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    // The P0005 depth backstop always reports, even under the P0014 latch.
+    try testing.expectEqual(@as(usize, 2), res.diags.len);
+    try testing.expectEqual(codes.Code.P0014, res.diags[0].code);
+    try testing.expectEqual(codes.Code.P0005, res.diags[1].code);
+}
+
+test "a long pipe chain hits the same nesting cap as written nested calls" {
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "fn f() {\n  y := 0");
+    var i: usize = 0;
+    while (i < 800) : (i += 1) try buf.appendSlice(gpa, " |> g");
+    try buf.appendSlice(gpa, "\n  z := 1\n}\n");
+    const res = try parseResult(gpa, buf.items);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqual(codes.Code.P0005, res.diags[0].code);
 }

@@ -34,6 +34,7 @@ pub const Code = enum(u16) {
     P0011, // c-style-for          (C-style `for (init; cond; step)` header)
     P0012, // colon-return-type    (`fn f(): T` return type written `:` not `->`)
     P0013, // stray-semicolon      (a `;` statement terminator)
+    P0014, // invalid-pipe-target  (`|>` RHS is not a function/call, or has no value on its left)
 
     // Resolve band (R####).
     R0001, // undeclared-identifier
@@ -143,6 +144,7 @@ pub const table = [_]Entry{
     .{ .code = .P0011, .str = "P0011", .slug = "c-style-for" },
     .{ .code = .P0012, .str = "P0012", .slug = "colon-return-type" },
     .{ .code = .P0013, .str = "P0013", .slug = "stray-semicolon" },
+    .{ .code = .P0014, .str = "P0014", .slug = "invalid-pipe-target" },
     .{ .code = .R0001, .str = "R0001", .slug = "undeclared-identifier" },
     .{ .code = .R0002, .str = "R0002", .slug = "duplicate-function", .related = "previously defined here" },
     .{ .code = .R0003, .str = "R0003", .slug = "unknown-imported-module" },
@@ -263,18 +265,19 @@ const prefix_bands = "LPRTW";
 comptime {
     @setEvalBranchQuota(40_000);
     // Coverage + uniqueness: every enum value except `none` and the `_` sentinel has
-    // exactly one table row.
-    for (@typeInfo(Code).@"enum".fields) |f| {
-        if (std.mem.eql(u8, f.name, "none")) continue;
-        var seen: usize = 0;
-        for (table) |e| {
-            if (std.mem.eql(u8, @tagName(e.code), f.name)) seen += 1;
-        }
-        if (seen == 0) @compileError("code " ++ f.name ++ " has no registry row");
-        if (seen > 1) @compileError("code " ++ f.name ++ " has duplicate registry rows");
+    // exactly one table row. A per-ordinal count keeps this linear; a fields x table
+    // name compare outgrew the quota as the registry grew.
+    const fields = @typeInfo(Code).@"enum".fields;
+    var seen = [_]u8{0} ** fields.len;
+    for (table) |e| seen[@intFromEnum(e.code)] += 1;
+    for (fields) |f| {
+        if (f.value == @intFromEnum(Code.none)) continue;
+        if (seen[f.value] == 0) @compileError("code " ++ f.name ++ " has no registry row");
+        if (seen[f.value] > 1) @compileError("code " ++ f.name ++ " has duplicate registry rows");
     }
-    // str==tag name; prefix membership; slug non-empty; no duplicate str.
-    for (table, 0..) |e, i| {
+    // str==tag name (which, with one row per code, also makes every str unique);
+    // prefix membership; slug non-empty.
+    for (table) |e| {
         if (!std.mem.eql(u8, e.str, @tagName(e.code)))
             @compileError("code str must equal its tag name: " ++ e.str);
         if (e.slug.len == 0) @compileError("code " ++ e.str ++ " has an empty slug");
@@ -283,10 +286,6 @@ comptime {
             band_ok = true;
         };
         if (!band_ok) @compileError("code " ++ e.str ++ " has an out-of-band prefix");
-        for (table[i + 1 ..]) |o| {
-            if (e.code == o.code) @compileError("duplicate code enum in table: " ++ e.str);
-            if (std.mem.eql(u8, e.str, o.str)) @compileError("duplicate code str in table: " ++ e.str);
-        }
     }
     // Per-band contiguity: for each band, the numeric tails present must be exactly
     // 1..=count with no gaps. (Walk the table in declaration order per band.)
