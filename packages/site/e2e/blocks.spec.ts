@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-const BLOCKS = ['order.toy', 'shapes.toy', 'pair.toy', 'area.toy', 'total.toy'];
+const BLOCKS = ['order.toy', 'shapes.toy', 'pair.toy', 'area.toy', 'pipeline.toy', 'total.toy'];
 
 function block(page: Page, file: string) {
 	return page.locator('figure', { has: page.locator('figcaption', { hasText: file }) });
@@ -92,6 +92,15 @@ test('signature help tracks the active argument', async ({ page }) => {
 	const sig = page.locator('.cm-lsp-signature-tooltip');
 	await expect(sig).toContainText('fn add(int, int) -> int');
 	await expect(sig.locator('.cm-lsp-active-parameter')).toHaveText('int');
+});
+
+test('signature help counts the piped value as the first argument', async ({ page }) => {
+	const b = await live(page, 'pipeline.toy');
+	await typeAtEndOfLine(page, b, 'fn add(', '\nfn tag(n: int, s: str) -> int { n }');
+	await typeAtEndOfLine(page, b, '|> add(36)', '\n_t := score |> tag(', 60);
+	const sig = page.locator('.cm-lsp-signature-tooltip');
+	await expect(sig).toContainText('fn tag(int, str) -> int');
+	await expect(sig.locator('.cm-lsp-active-parameter')).toHaveText('str');
 });
 
 test('a diagnostic tooltip links its code and jumps to the related definition', async ({ page }) => {

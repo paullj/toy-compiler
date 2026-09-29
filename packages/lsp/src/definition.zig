@@ -220,18 +220,7 @@ test "rangeOfToken maps a token's [start,end) to a 0-based exclusive range" {
 }
 
 /// The 0-based (line, character) of the first byte of `needle` in `src`.
-fn posOf(src: []const u8, needle: []const u8) protocol.Position {
-    const idx = std.mem.indexOf(u8, src, needle).?;
-    var line: u32 = 0;
-    var col: u32 = 0;
-    for (src[0..idx]) |ch| {
-        if (ch == '\n') {
-            line += 1;
-            col = 0;
-        } else col += 1;
-    }
-    return .{ .line = line, .character = col };
-}
+const posOf = @import("test_util.zig").posOf;
 
 test "definition: cross-file jump to an imported pub fn; within-file stays local; imports resolve" {
     const gpa = testing.allocator;
@@ -317,4 +306,36 @@ test "definition: cross-file jump into another OPEN document, disk off" {
     try testing.expectEqualStrings("file:///blocks/helper.toy", d.uri);
     const foo_col: u32 = @intCast(std.mem.indexOf(u8, helper_src, "foo").?);
     try testing.expectEqual(foo_col, d.range.start.character);
+}
+
+test "definition: a piped callee jumps to its declaration" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn main() -> int {
+        \\    x := 1 |> add(2)
+        \\    y := x
+        \\        |> add(3)
+        \\    return y
+        \\}
+        \\
+    ;
+    const cases = [_]struct { use: []const u8, decl: []const u8 }{
+        .{ .use = "add(2)", .decl = "add(a" },
+        .{ .use = "add(3)", .decl = "add(a" },
+    };
+    for (cases) |c| {
+        const use = posOf(src, c.use);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no definition for '{s}'\n", .{c.use});
+            return error.NoDefinition;
+        };
+        defer gpa.free(d.uri);
+        const want = posOf(src, c.decl);
+        try testing.expectEqual(want.line, d.range.start.line);
+        try testing.expectEqual(want.character, d.range.start.character);
+    }
 }

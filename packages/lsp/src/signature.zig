@@ -15,9 +15,9 @@
 //! KNOWN LIMITATIONS (documented, not bugs):
 //!   * A turbofish call `id[int](` — the token before `(` is `]`, not an identifier — yields
 //!     no help. Free fns and module-qualified free fns (`io.f(`) are correct.
-//!   * An instance-method call `recv.m(` renders the full signature including the `self`
-//!     param as param 0, so `activeParameter` is off by one for methods. Only free / module-
-//!     qualified free fns are exact.
+//!   * An instance-method call `recv.m(` (piped or not) yields no help: a method callee
+//!     does not resolve to a `.func`. Free and module-qualified free fns are exact.
+//!   * A bare pipe target `x |> f` has no `(`, so it yields no help of its own.
 //!   * A parse error OTHER than the appended closers (or a stray unmatched closer) re-triggers
 //!     discovery's whole-tree discard -> null (the single-edit repair limit, as in completion).
 //!   * Signature help may fire inside a fn DECLARATION's own param parens (`(` preceded by the
@@ -200,16 +200,24 @@ pub fn signatureHelpAt(
     // The callee node keys on its identifier token's source start (robust to node/token
     // reshuffle). Its resolution is `.func`; the call node's own main_token is the `(` (or
     // the `|>` of a piped call), a different start, so the two never collide.
-    var fid: ?u32 = null;
-    for (m.nodes, 0..) |n, i| {
+    const hit: ?struct { fid: u32, node: usize } = for (m.nodes, 0..) |n, i| {
         if (m.tokens[n.main_token].start != enc.callee_start) continue;
         if (i < resolutions.len and resolutions[i] == .func and resolutions[i].func < tc.sigs.len) {
-            fid = resolutions[i].func;
-            break;
+            break .{ .fid = resolutions[i].func, .node = i };
         }
+    } else null;
+    const callee = hit orelse return null;
+    const sig = tc.sigs[callee.fid];
+
+    // In `x |> f(a, ..)` the piped `x` is argument 0 but sits left of the `(`, so the comma
+    // count is one short. The tree, not the tokens, says whether the call is piped: a token
+    // look-back from the callee would miss an `m.f` callee.
+    var active = enc.active;
+    for (m.nodes, 0..) |n, ci| {
+        if (n.tag != .call or n.lhs.int() != callee.node) continue;
+        if (toyc.Ast.isPipedCall(m.tree(), m.tokens, toyc.Ast.Index.from(@intCast(ci)))) active += 1;
+        break;
     }
-    const f = fid orelse return null;
-    const sig = tc.sigs[f];
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -222,7 +230,6 @@ pub fn signatureHelpAt(
     const params = try a.alloc(protocol.ParameterInformation, ranges.items.len);
     for (ranges.items, 0..) |r, i| params[i] = .{ .label = r };
 
-    var active = enc.active;
     if (sig.params.len == 0) {
         active = 0;
     } else if (active > sig.params.len - 1) {
@@ -236,6 +243,7 @@ pub fn signatureHelpAt(
 }
 
 const testing = std.testing;
+const test_util = @import("test_util.zig");
 
 fn tok(tag: toyc.Tag, start: u32, end: u32) Token {
     return .{ .tag = tag, .start = start, .end = end };
@@ -404,4 +412,72 @@ test "renderLabel: a zero-param sig has no ranges" {
     try renderLabel(a, &label, sig, no_layouts, no_enums, &ranges);
     try testing.expectEqualStrings("fn foo() -> int", label.items);
     try testing.expectEqual(@as(usize, 0), ranges.items.len);
+}
+
+test "signatureHelpAt: a piped call's active param counts the piped value" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn add3(a: int, b: int, c: int) -> int { return a + b + c }
+        \\fn main() -> int {
+        \\    x := 1 |> add(2)
+        \\    y := 1 |> add3(2, 3)
+        \\    z := add(1, 2) |> add(3)
+        \\    return x + y + z
+        \\}
+        \\
+    ;
+    const cases = [_]struct { after: []const u8, label: []const u8, active: u32 }{
+        .{ .after = "1 |> add(", .label = "fn add(int, int) -> int", .active = 1 },
+        .{ .after = "1 |> add3(2, ", .label = "fn add3(int, int, int) -> int", .active = 2 },
+        .{ .after = "z := add(1, ", .label = "fn add(int, int) -> int", .active = 1 },
+        .{ .after = "z := add(", .label = "fn add(int, int) -> int", .active = 0 },
+        .{ .after = "|> add(", .label = "fn add(int, int) -> int", .active = 1 },
+    };
+    for (cases) |c| {
+        const p = test_util.posAfterLast(src, c.after);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no signature help after '{s}'\n", .{c.after});
+            return error.NoSignatureHelp;
+        };
+        defer r.deinit();
+        try testing.expectEqualStrings(c.label, r.help.signatures[0].label);
+        try testing.expectEqual(c.active, r.help.activeParameter);
+    }
+}
+
+test "signatureHelpAt: a piped module-qualified call counts the piped value" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///p/helper.toy", "pub fn add(a: int, b: int, c: int) -> int { return a + b + c }\n", 1);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = "import helper\nfn main() -> int {\n    return 1 |> helper.add(2, 3)\n}\n";
+    const cases = [_]struct { after: []const u8, active: u32 }{
+        .{ .after = "helper.add(", .active = 1 },
+        .{ .after = "helper.add(2, ", .active = 2 },
+    };
+    for (cases) |c| {
+        const p = test_util.posAfterLast(src, c.after);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse
+            return error.NoSignatureHelp;
+        defer r.deinit();
+        try testing.expectEqualStrings("fn add(int, int, int) -> int", r.help.signatures[0].label);
+        try testing.expectEqual(c.active, r.help.activeParameter);
+    }
+}
+
+test "signatureHelpAt: a method call yields no help, piped or not" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = "struct Acc { n: int }\nimpl Acc {\n    fn plus(self, k: int) -> int { return self.n + k }\n}\nfn main() -> int {\n    acc := Acc { n: 1 }\n    x := acc.plus(1)\n    y := 1 |> acc.plus()\n    return x + y\n}\n";
+    for ([_][]const u8{ "x := acc.plus(", "|> acc.plus(" }) |after| {
+        const p = test_util.posAfterLast(src, after);
+        try testing.expect((try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) == null);
+    }
 }
