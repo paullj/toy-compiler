@@ -1,0 +1,10 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/multiline.toy.
+fn double(x: int) -> int { return x * 2 }
+fn add(a: int, b: int) -> int { return a + b }
+fn sub(a: int, b: int) -> int { return a - b }
+
+fn main() -> int {
+    leading := add(double(5), 1)
+    trailing := sub(double(5), 3)
+    return add(leading + trailing, 24)
+}

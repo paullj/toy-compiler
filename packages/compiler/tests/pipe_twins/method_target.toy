@@ -1,0 +1,11 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/method_target.toy.
+import std/vec
+
+fn main() -> int {
+    v := Vec[int].new()
+    v.push(3)
+    v.push(4)
+    v.push(5)
+    last := v.get(2)
+    return v.len() + last.unwrap() + 4
+}
