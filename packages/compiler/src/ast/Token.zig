@@ -75,7 +75,7 @@ pub const Tag = enum(u8) {
     gt_eq,
     amp_amp,
     pipe_pipe,
-    /// `|` — the or-pattern separator in pattern position (not a general operator).
+    /// `|` — the or-pattern separator in pattern position; bitwise OR in expressions.
     pipe,
     l_paren,
     r_paren,
@@ -215,6 +215,10 @@ pub const Tag = enum(u8) {
     // row below. `rawptr` stays a PLAIN identifier (like `int`/`bool`) — no keyword.
     kw_extern, // `extern fn name(..) -> R`
     kw_unsafe, // `unsafe { .. }`
+
+    // Pipe. Appended at the END (frozen ordinal; `[]Token` is memcpy'd to/from the
+    // content cache). NOT a keyword. See packages/docs/pipe.md.
+    pipe_gt, // |>
 };
 
 /// Maps identifier text to its keyword tag, if any.
