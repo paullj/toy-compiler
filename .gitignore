@@ -4,3 +4,5 @@ zig-pkg/
 .toy/
 .DS_Store
 temp/
+# Scratch dirs of integration tests; normally deleted, left only by a killed run.
+.toy-test-*/
