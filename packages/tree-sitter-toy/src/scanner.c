@@ -9,6 +9,10 @@
 // `_newline` is not in `valid_symbols`) is never terminated — the newline stays trivia
 // and the expression continues onto the next line, exactly as the compiler does.
 //
+// The one exception mirrors `atPipeGt` in lex.zig: when the next non-blank, non-comment
+// line starts with `|>`, that line continues the previous expression (the leading-pipe
+// style), so no terminator is emitted. Blank lines and comments between are skipped.
+//
 // `_newline` is trivia-excluded from the agreement comparison, so its presence changes
 // only the grouping of the parse, never the leaf token stream.
 
@@ -39,19 +43,27 @@ bool tree_sitter_toy_external_scanner_scan(void *payload, TSLexer *lexer, const 
     lexer->result_symbol = NEWLINE;
     lexer->mark_end(lexer);
 
+    bool crossed_newline = false;
     for (;;) {
         int32_t c = lexer->lookahead;
-        if (c == '\n') return true;                 // a line break ahead -> insert a terminator
-        if (c == ' ' || c == '\t' || c == '\r') {   // horizontal whitespace: keep looking
+        if (c == '\n') {
+            crossed_newline = true;
             lexer->advance(lexer, true);
             continue;
         }
-        if (c == '#') {                             // a `#` line comment runs to the newline
+        if (c == ' ' || c == '\t' || c == '\r') {
+            lexer->advance(lexer, true);
+            continue;
+        }
+        if (c == '#') {
             while (lexer->lookahead != '\n' && lexer->lookahead != 0) {
                 lexer->advance(lexer, true);
             }
             continue;
         }
-        return false;                               // a real token on this line -> no terminator
+        if (!crossed_newline) return false;         // a real token on this line -> no terminator
+        if (c != '|') return true;
+        lexer->advance(lexer, true);
+        return lexer->lookahead != '>';
     }
 }
