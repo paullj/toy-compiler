@@ -6,49 +6,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const harness = @import("harness.zig");
 
-fn skipUnlessBackend(io: Io) !void {
-    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
-}
+const skipUnlessBackend = harness.skipUnlessBackend;
 
-fn compile(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8, flags: []const []const u8) ![:0]u8 {
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+const compile = harness.compile;
 
-    try Io.Dir.cwd().createDirPath(io, dir_name);
-    const main_path = try std.fmt.allocPrint(gpa, "{s}/main.toy", .{dir_name});
-    defer gpa.free(main_path);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = entry_src });
-
-    const out_bin = try std.fmt.allocPrint(gpa, "{s}/prog", .{dir_name});
-    defer gpa.free(out_bin);
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try argv.append(gpa, bin_abs);
-    try argv.append(gpa, "build");
-    try argv.append(gpa, main_path);
-    try argv.append(gpa, "-o");
-    try argv.append(gpa, out_bin);
-    for (flags) |f| try argv.append(gpa, f);
-
-    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe, .stderr = .pipe });
-    const term = try child.wait(io);
-    if (term != .exited or term.exited != 0) return error.CompileFailed;
-
-    return Io.Dir.cwd().realPathFileAlloc(io, out_bin, gpa);
-}
-
-fn runExit(gpa: std.mem.Allocator, io: Io, prog: []const u8) !u8 {
-    var run = try std.process.spawn(io, .{ .argv = &.{prog} });
-    const term = try run.wait(io);
-    _ = gpa;
-    return switch (term) {
-        .exited => |c| c,
-        else => error.ChildCrashed,
-    };
-}
+const runExit = harness.runExit;
 
 fn runStdout(gpa: std.mem.Allocator, io: Io, prog: []const u8) ![]u8 {
     var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .pipe });
