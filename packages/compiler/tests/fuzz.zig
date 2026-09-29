@@ -277,7 +277,7 @@ fn mutate(
 /// A byte biased toward source-relevant characters (so inserts land near real
 /// tokens more often than pure noise would), with a tail of fully random bytes.
 fn randByte(rand: std.Random) u8 {
-    const interesting = "(){}[]<>+-*/=!,.:;\n \t\"abcdefgh0123_";
+    const interesting = "(){}[]<>+-*/=!,.:;|?\n \t\"abcdefgh0123_";
     if (rand.boolean()) return interesting[rand.uintLessThan(usize, interesting.len)];
     return rand.int(u8);
 }
@@ -285,7 +285,7 @@ fn randByte(rand: std.Random) u8 {
 const max_gen_depth: usize = 4;
 const idents = [_][]const u8{ "a", "b", "c", "x", "y", "foo", "bar", "n", "acc" };
 const types = [_][]const u8{ "int", "bool", "str", "()" };
-const bin_ops = [_][]const u8{ "+", "-", "*", "/", "==", "!=", "<", ">", "<=", ">=", "and", "or" };
+const bin_ops = [_][]const u8{ "+", "-", "*", "/", "==", "!=", "<", ">", "<=", ">=", "and", "or", "|>", "\n|>" };
 
 /// Emit a random-but-plausible program: 1..4 top-level items (fn/struct/enum/
 /// import). At least one `fn main`-like function so the whole-program check has an
@@ -451,7 +451,7 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
         try genAtom(gpa, out, rand);
         return;
     }
-    switch (rand.uintLessThan(u8, 4)) {
+    switch (rand.uintLessThan(u8, 5)) {
         0 => { // binary op (feeds the real precedence table)
             try genExpr(gpa, out, rand, depth + 1);
             try out.append(gpa, ' ');
@@ -478,6 +478,16 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
                 try genExpr(gpa, out, rand, depth + 1);
             }
             try out.append(gpa, ')');
+        },
+        4 => { // well-formed pipe, so pipes also reach resolve/typecheck
+            try genExpr(gpa, out, rand, depth + 1);
+            try out.appendSlice(gpa, if (rand.boolean()) " |> " else "\n    |> ");
+            try out.appendSlice(gpa, pick(idents, rand));
+            if (rand.boolean()) {
+                try out.append(gpa, '(');
+                if (rand.boolean()) try genExpr(gpa, out, rand, depth + 1);
+                try out.append(gpa, ')');
+            }
         },
         else => unreachable,
     }

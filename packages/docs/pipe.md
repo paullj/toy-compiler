@@ -32,6 +32,7 @@ fn main() -> int {
 | `x \|> T.ctor` | `T.ctor(x)` (e.g. `5 \|> Option.some`) |
 | `x \|> f[T]` | `f[T](x)` |
 | `x \|> f[T](a)` | `f[T](x, a)` |
+| `x \|> T[A].ctor` | `T[A].ctor(x)` (e.g. `5 \|> Option[int].some`) |
 | `x \|> f?` | `f(x)?` |
 | `x \|> f(a)?` | `f(x, a)?` |
 | `x \|> f \|> g(a)` | `g(f(x), a)` |
@@ -44,8 +45,8 @@ syntax, and the resolver decides later what each one is. So a pipe into a method
 
 ```
 pipe_expr  := expr "|>" pipe_rhs
-pipe_rhs   := path turbofish? call_args? "?"?
-path       := identifier ("." identifier)*
+pipe_rhs   := path call_args? "?"?
+path       := identifier ("." identifier | turbofish)*    # at most one turbofish
 turbofish  := "[" type ("," type)* "]"
 call_args  := "(" (expr ("," expr)*)? ")"
 ```
@@ -63,14 +64,17 @@ call_args  := "(" (expr ("," expr)*)? ")"
   `x |> f == y` as `f(x) == y`. That result is not the same as "lowest precedence".
   Parentheses make the intent explicit: `(x |> f) == y`.
 - Binary operators on the **left** bind tighter: `y == x |> f` is `f(y == x)`.
+- `..` is not an operator. It exists only in a `for` head, and each side is a full
+  expression: `for i in 0..3 |> f { }` is `0..f(3)`.
+- **Nesting cap:** each pipe nests its lhs one call deeper, so a pipe chain counts
+  against the same depth cap (256) as written nested calls. A longer chain is **P0005**.
 
 ## Evaluation order
 
-The piped value is argument 0, so evaluation order is the same as reading order:
-
-1. The lhs.
-2. The callee path (for example, the receiver `v` in `x |> v.push`).
-3. The written arguments, left to right.
+The pipe evaluates exactly like the call it desugars to. The piped value is argument 0,
+so it is evaluated before the written arguments, which then go left to right. The
+receiver of a method target (the `v` in `x |> v.push`) follows the normal method-call
+rule. The order is visible only when the lhs has a side effect on that receiver.
 
 ## Multi-line pipes
 
@@ -95,18 +99,35 @@ ys_total := 3 |>
 
 ### P0014 — invalid pipe target (new)
 
-This error occurs when the RHS does not match `pipe_rhs`:
+This error occurs when the RHS does not match `pipe_rhs`, or when a pipe has no value on
+its left:
 
-| Source | Why |
-|--------|-----|
-| `x \|> 5` | literal, not a function |
-| `x \|> (f)` | parenthesized callee |
-| `x \|> f().len()` | postfix after the call |
-| `x \|> f == y` | parses as `x \|> (f == y)` |
+| Source | Why | Message |
+|--------|-----|---------|
+| `x \|> 5` | literal, not a function | `pipe target must be a function or a call` |
+| `x \|> (f)` | parenthesized callee | same |
+| `x \|>` then newline / `}` / `)` / `]` / `,` / `\|>` / a declaration / EOF | no target (the caret is on the `\|>`) | same |
+| `x \|> f().len()` | postfix after the RHS | same, plus `; wrap the pipe in parentheses to use its result` |
+| `x \|> f == y` | binary operator after the RHS | same as the row above |
+| `y := \|> f`, `return⏎\|> f(x)`, `break⏎\|> f` | no value on the left | `a pipe needs a value on its left` |
+| `if c { .. }⏎\|> f`, `continue⏎\|> f` | a statement form is not a value | `only a value can be piped, and this statement has none` |
 
-Message: `pipe target must be a function or a call`. The hint tells the user to put the
-pipe in parentheses, for example `(x |> f()).len()`. Recovery keeps the lhs and puts an
-`.err` node in place of the call. The code has a `toy explain` page (`P0014.md`).
+The last two rows come from the multi-line rule. `}`, `return`, `break` and `continue` end a
+statement, so the lexer joins a following leading-`|>` line onto them. A block **expression**
+(`x := if c { 1 } else { 2 }⏎|> f`, or a statement-level `match`) is a value and pipes normally.
+
+Recovery, with one diagnostic per pipe:
+
+- **Bad or missing target:** the parser reads the bad operand (if any) and puts an
+  `.error_node` in place of the call. A missing target consumes nothing, so a run of
+  `|> |> |>` is handled one pipe at a time by the infix loop, not by recursion.
+- **Postfix or operator after the RHS:** the parser keeps the call and continues as if the
+  user had written the parentheses. The cascade latch suppresses follow-on errors in the
+  same statement.
+- **Statement form on the left:** the statement is kept, and recovery skips to the next
+  statement.
+
+The code has a `toy explain` page (`P0014.md`).
 
 ### Piped-call attribution (T0039 / T0040)
 

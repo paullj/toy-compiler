@@ -72,7 +72,7 @@ pub const Node = extern struct {
     tag: Tag,
     /// Index into the token array of the token that best represents this node:
     /// the operator for `unary`/`binary`, the name/literal token otherwise, the
-    /// `(`/`{` for `call`/`block`, the function name for `fn_decl`.
+    /// `(`/`{` for `call`/`block` (`|>` for a piped call), the function name for `fn_decl`.
     main_token: u32,
     /// Child node indices, OR an index into `extra` of a range/proto header.
     /// Meaning depends on `tag`; `none` when unused.
@@ -105,8 +105,10 @@ pub const Node = extern struct {
         // Appended below; the six above keep their ordinals (Tag is enum(u8) and
         // nodes are memcpy'd to/from the cache, so reordering breaks old blobs).
 
-        /// Postfix `callee(args...)`. `main_token` is `(`. `lhs` is the callee
-        /// expression node. `rhs` is the `extra` header of an args `Range`.
+        /// Postfix `callee(args...)`. `main_token` is `(`, or `|>` for a piped call
+        /// (`x |> f(a)` is `f(x, a)`; the piped value is argument 0), or 0 for a
+        /// synthetic call. `lhs` is the callee expression node. `rhs` is the `extra`
+        /// header of an args `Range`.
         call,
         /// `name := expr`. `main_token` is the name identifier. `lhs` is the
         /// initializer expression. `rhs` is `none`.
