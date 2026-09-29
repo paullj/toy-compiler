@@ -196,3 +196,35 @@ test "hover shows generic, protocol, and prelude types as the user spells them" 
         try testing.expectEqualStrings(want, h.value);
     }
 }
+
+test "hover on a piped callee shows its signature, also on a leading-pipe line" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn main() -> int {
+        \\    x := 1 |> add(2)
+        \\    y := x
+        \\        |> add(3)
+        \\    return y
+        \\}
+        \\
+    ;
+    const cases = [_]struct { needle: []const u8, want: []const u8 }{
+        .{ .needle = "add(2)", .want = "fn add(a: int, b: int) -> int" },
+        .{ .needle = "add(3)", .want = "fn add(a: int, b: int) -> int" },
+    };
+    for (cases) |c| {
+        const p = @import("test_util.zig").posOf(src, c.needle);
+        var h = (try hoverAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.needle});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}

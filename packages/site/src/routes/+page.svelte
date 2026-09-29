@@ -68,6 +68,20 @@ impl Square has Area {
 }`
 		},
 		{
+			title: 'Pipes',
+			blurb: '<code class="code">x |> f(a)</code> is <code class="code">f(x, a)</code>: the value on the left becomes the first argument, so a chain of calls reads in the order it runs.',
+			file: 'pipeline.toy',
+			code: `fn double(x: int) -> int { x * 2 }
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() -> int {
+    score := 3
+        |> double
+        |> add(36)     # add(double(3), 36)
+    return score
+}`
+		},
+		{
 			title: 'No null',
 			blurb: '<code class="code">Option[T]</code> and <code class="code">Result[T, E]</code> are ordinary enums. The postfix <code class="code">?</code> unwraps a value or returns early on the empty case.',
 			file: 'total.toy',

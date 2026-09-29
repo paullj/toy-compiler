@@ -173,3 +173,46 @@ test "checkBuffer maps an arity mismatch to a T0039 on the erroring line" {
     }
     try testing.expect(found);
 }
+
+test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annotated line" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
+
+    {
+        const src = "fn add(a: int, b: int) -> int { return a + b }\nfn main() -> int {\n    x := 1 |> add\n    return x\n}\n";
+        var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+        defer mapped.deinit();
+        try testing.expectEqual(@as(usize, 1), mapped.items.len);
+        const d = mapped.items[0];
+        try testing.expectEqualStrings("T0039", d.code.?);
+        const line = "    x := 1 |> add";
+        try testing.expectEqual(@as(u32, 2), d.range.start.line);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, line, "|>").?)), d.range.start.character);
+        try testing.expectEqual(@as(u32, @intCast(line.len)), d.range.end.character);
+    }
+    {
+        const src = try Io.Dir.cwd().readFileAlloc(io, "tests/corpora/diagnostics/pipe_target.toy", gpa, .unlimited);
+        defer gpa.free(src);
+        var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+        defer mapped.deinit();
+        // Every P0014 lands on a line the fixture annotates with it, and each annotation
+        // gets one, so a range that drifts to another line fails.
+        var lines: std.ArrayList([]const u8) = .empty;
+        defer lines.deinit(gpa);
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |l| try lines.append(gpa, l);
+        var p0014: usize = 0;
+        for (mapped.items) |d| {
+            const c = d.code orelse continue;
+            if (!std.mem.eql(u8, c, "P0014")) continue;
+            p0014 += 1;
+            try testing.expect(std.mem.indexOf(u8, lines.items[d.range.start.line], "#~ ERROR [P0014]") != null);
+        }
+        try testing.expectEqual(std.mem.count(u8, src, "#~ ERROR [P0014]"), p0014);
+    }
+}

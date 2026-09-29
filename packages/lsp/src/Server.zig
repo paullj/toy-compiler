@@ -747,21 +747,7 @@ fn hoverValue(resp: std.json.Value) ?[]const u8 {
     return v[open.len .. v.len - close.len];
 }
 
-/// A 0-based (line, character) position just PAST the last occurrence of `needle` in
-/// `src` — computed from the fixture so completion cursors are never hand-counted
-/// (ASCII, so byte == character).
-fn posAfterLast(src: []const u8, needle: []const u8) protocol.Position {
-    const idx = std.mem.lastIndexOf(u8, src, needle).? + needle.len;
-    var line: u32 = 0;
-    var col: u32 = 0;
-    for (src[0..idx]) |ch| {
-        if (ch == '\n') {
-            line += 1;
-            col = 0;
-        } else col += 1;
-    }
-    return .{ .line = line, .character = col };
-}
+const posAfterLast = @import("test_util.zig").posAfterLast;
 
 /// The response's `result` array (the completion items), or null.
 fn resultArr(resp: std.json.Value) ?[]std.json.Value {
