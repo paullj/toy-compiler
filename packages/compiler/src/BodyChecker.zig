@@ -1607,7 +1607,7 @@ pub const BodyChecker = struct {
                     if (pretyped == null) {
                         for (elems) |a| _ = try bc.typeOf(a);
                     }
-                    try bc.sink.report(.{ .span = bc.spanOf(site) }, "variant '{s}.{s}' expects {d} value(s), got {d}", .{ e.name, vname, variant.field_types.len, elems.len });
+                    try bc.sink.report(.{ .span = bc.countSpan(site) }, "variant '{s}.{s}' expects {d} value(s), got {d}{s}", .{ e.name, vname, variant.field_types.len, elems.len, bc.pipedArityHint(site) });
                     return result;
                 }
                 for (elems, variant.field_types, 0..) |a, fty_pat, i| {
@@ -1658,7 +1658,7 @@ pub const BodyChecker = struct {
         const elems = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (n.rhs).int());
         if (elems.len != sym.field_types.len) {
             for (elems) |a| _ = try bc.typeOf(a); // surface inner arg errors first
-            try bc.sink.report(.{ .span = bc.argsSpan(call) }, "tuple struct '{s}' expects {d} value(s), got {d}", .{ sym.name, sym.field_types.len, elems.len });
+            try bc.sink.report(.{ .span = bc.argsSpan(call) }, "tuple struct '{s}' expects {d} value(s), got {d}{s}", .{ sym.name, sym.field_types.len, elems.len, bc.pipedArityHint(call) });
             return result;
         }
         for (elems, sym.field_types) |a, fty| {
@@ -1880,7 +1880,9 @@ pub const BodyChecker = struct {
         return refs.tokSpan(bc, tok);
     }
 
-    /// A call's argument list `(…)`: from the call's `(` to its end.
+    /// A call's argument list `(…)`: from the call's `(` to its end. For a piped call
+    /// that is from the `|>`: the step `|> f(a)` is what the user wrote wrong, and a
+    /// span from the lhs would cover the whole chain before it.
     fn argsSpan(bc: *const BodyChecker, call: Ast.Index) Span {
         return .{ .start = bc.byteOf(bc.tree.nodes[call.int()].main_token), .end = bc.spanOf(call).end };
     }
@@ -1890,18 +1892,34 @@ pub const BodyChecker = struct {
         return .{ .start = bc.byteOf(bc.tree.nodes[app.int()].main_token), .end = bc.spanOf(app).end };
     }
 
+    // The piped value is invisible in the written argument list, so without these a
+    // count or position that includes it reads as off by one. Empty for a plain call.
+    fn pipedArityHint(bc: *const BodyChecker, call: Ast.Index) []const u8 {
+        return if (Ast.isPipedCall(bc.tree, bc.tokens, call)) " (the piped value is argument 1)" else "";
+    }
+
+    fn pipedArgHint(bc: *const BodyChecker, call: Ast.Index, idx: usize) []const u8 {
+        return if (idx == 1 and Ast.isPipedCall(bc.tree, bc.tokens, call)) " (the piped value)" else "";
+    }
+
+    /// Where a count error on a construction or call points: its argument list for a
+    /// piped call (the failing `|> ..` step, see `argsSpan`), else the whole node.
+    fn countSpan(bc: *const BodyChecker, site: Ast.Index) Span {
+        return if (Ast.isPipedCall(bc.tree, bc.tokens, site)) bc.argsSpan(site) else bc.spanOf(site);
+    }
+
     fn emitArity(bc: *BodyChecker, call: Ast.Index, related: ?Span, name: []const u8, params: []const Type, got: usize) error{OutOfMemory}!void {
         var sig: std.ArrayList(u8) = .empty;
         defer sig.deinit(bc.gpa);
         try bc.writeParams(&sig, params);
-        try bc.sink.report(.{ .span = bc.argsSpan(call), .code = .T0039, .related = related }, "expected {d} argument(s), got {d}; '{s}' takes {s}", .{ params.len, got, name, sig.items });
+        try bc.sink.report(.{ .span = bc.argsSpan(call), .code = .T0039, .related = related }, "expected {d} argument(s), got {d}{s}; '{s}' takes {s}", .{ params.len, got, bc.pipedArityHint(call), name, sig.items });
     }
 
-    fn emitArgType(bc: *BodyChecker, arg: Ast.Index, related: ?Span, idx: usize, want: Type, got: Type, name: []const u8, params: []const Type) error{OutOfMemory}!void {
+    fn emitArgType(bc: *BodyChecker, call: Ast.Index, arg: Ast.Index, related: ?Span, idx: usize, want: Type, got: Type, name: []const u8, params: []const Type) error{OutOfMemory}!void {
         var sig: std.ArrayList(u8) = .empty;
         defer sig.deinit(bc.gpa);
         try bc.writeParams(&sig, params);
-        try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0040, .related = related }, "argument {d}: expected {s}, got {s}; '{s}' takes {s}", .{ idx, bc.typeName(want), bc.typeName(got), name, sig.items });
+        try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0040, .related = related }, "argument {d}{s}: expected {s}, got {s}; '{s}' takes {s}", .{ idx, bc.pipedArgHint(call, idx), bc.typeName(want), bc.typeName(got), name, sig.items });
     }
 
     /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
@@ -1931,7 +1949,7 @@ pub const BodyChecker = struct {
         for (args, mf.params[self_off..], 0..) |a, pty, i| {
             const at = try bc.typeOfExpected(a, if (pty.kind == .invalid) null else pty);
             if (!Type.assignable(pty, at)) {
-                try bc.emitArgType(a, rel, i + 1, pty, at, member, mf.params[self_off..]);
+                try bc.emitArgType(node_idx, a, rel, i + 1, pty, at, member, mf.params[self_off..]);
             }
         }
         bc.node_types[(node_idx).int()] = mf.ret;
@@ -2017,7 +2035,7 @@ pub const BodyChecker = struct {
                         const wt = gp[i];
                         const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
                         if (!Type.assignable(wt, at))
-                            try bc.emitArgType(a, null, i + 1, wt, at, member, gp);
+                            try bc.emitArgType(node_idx, a, null, i + 1, wt, at, member, gp);
                     }
                     const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, explicit);
                     bc.node_types[(node_idx).int()] = ret;
@@ -2130,7 +2148,7 @@ pub const BodyChecker = struct {
                 const want_ty = substTy(bc, pty, targs);
                 const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
                 if (!Type.assignable(want_ty, at))
-                    try bc.emitArgType(a, rel, i + 1, want_ty, at, member, sig_params);
+                    try bc.emitArgType(node_idx, a, rel, i + 1, want_ty, at, member, sig_params);
             }
             const ret = substTy(bc, mf.ret, targs);
             bc.node_types[(node_idx).int()] = ret;
@@ -2321,7 +2339,7 @@ pub const BodyChecker = struct {
                     .gc_alloc => {
                         if (args.len != 1) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 1), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const st = try bc.typeOf(args[0]);
                             if (st.kind != .int and st.kind != .invalid)
@@ -2333,7 +2351,7 @@ pub const BodyChecker = struct {
                     .gc_span_count => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                         }
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
@@ -2341,7 +2359,7 @@ pub const BodyChecker = struct {
                     .gc_collect => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                         }
                         bc.node_types[(node_idx).int()] = Type.unit;
                         return Type.unit;
@@ -2349,7 +2367,7 @@ pub const BodyChecker = struct {
                     .gc_stats => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                         }
                         bc.node_types[(node_idx).int()] = Type.int;
                         return Type.int;
@@ -2357,7 +2375,7 @@ pub const BodyChecker = struct {
                     .text_base => {
                         if (args.len != 0) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                         }
                         bc.node_types[(node_idx).int()] = Type.rawptr;
                         return Type.rawptr;
@@ -2365,7 +2383,7 @@ pub const BodyChecker = struct {
                     .call_hash => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 2), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const p0 = try bc.typeOf(args[0]);
                             const p1 = try bc.typeOf(args[1]);
@@ -2382,7 +2400,7 @@ pub const BodyChecker = struct {
                     .call_eq => {
                         if (args.len != 3) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 3), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 3), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const p0 = try bc.typeOf(args[0]);
                             const p1 = try bc.typeOf(args[1]);
@@ -2402,7 +2420,7 @@ pub const BodyChecker = struct {
                     .store => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 2), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             _ = try bc.typeOf(args[1]);
@@ -2417,7 +2435,7 @@ pub const BodyChecker = struct {
                     .load => {
                         if (args.len != 1) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 1), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             if (!bc.in_unsafe)
@@ -2449,7 +2467,7 @@ pub const BodyChecker = struct {
                         // stay gated.
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 2), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const bt = try bc.typeOf(args[0]);
                             const it = try bc.typeOf(args[1]);
@@ -2472,7 +2490,7 @@ pub const BodyChecker = struct {
                     .store_byte => {
                         if (args.len != 2) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 2), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 2), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             _ = try bc.typeOf(args[1]);
@@ -2487,7 +2505,7 @@ pub const BodyChecker = struct {
                     .load_byte => {
                         if (args.len != 1) {
                             for (args) |arg| _ = try bc.typeOf(arg);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 1), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const pt = try bc.typeOf(args[0]);
                             if (!bc.in_unsafe)
@@ -2511,7 +2529,7 @@ pub const BodyChecker = struct {
             }
             if (args.len != 1) {
                 for (args) |arg| _ = try bc.typeOf(arg);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 1), args.len, bc.pipedArityHint(node_idx) });
                 bc.node_types[(node_idx).int()] = Type.unit;
                 return Type.unit;
             }
@@ -2559,7 +2577,7 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(arg_types);
             for (args, 0..) |arg, i| arg_types[i] = try bc.typeOf(arg); // synth once (self-typing)
             if (args.len != f.params.len) {
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ f.params.len, args.len, bc.pipedArityHint(node_idx) });
                 return .invalid; // never leak f.ret (a type_var) on the error path
             }
             const n_gp: u32 = @intCast(f.generic_params.len);
@@ -2618,7 +2636,7 @@ pub const BodyChecker = struct {
         for (args, f.params, 0..) |arg, pty, i| {
             const at = try bc.typeOfExpected(arg, if (pty.kind == .invalid) null else pty);
             if (!Type.assignable(pty, at)) {
-                try bc.emitArgType(arg, rel, i + 1, pty, at, name, f.params);
+                try bc.emitArgType(node_idx, arg, rel, i + 1, pty, at, name, f.params);
             }
         }
         return f.ret;
@@ -2678,7 +2696,7 @@ pub const BodyChecker = struct {
                 if (Typecheck.builtinConvMethod(recv_ty, exp, member, char_id)) |cm| {
                     if (args.len != 0) {
                         for (args) |a| _ = try bc.typeOf(a);
-                        try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                        try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                     }
                     const ret: Type = switch (cm.kind) {
                         .widen, .char_to_int, .byte_to_char, .int_to_float => cm.target,
@@ -2716,7 +2734,7 @@ pub const BodyChecker = struct {
         {
             if (args.len != 0) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
@@ -2742,7 +2760,7 @@ pub const BodyChecker = struct {
         {
             if (args.len != 0) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2766,7 +2784,7 @@ pub const BodyChecker = struct {
         if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
             if (args.len != bm.arity) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ bm.arity, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ bm.arity, args.len, bc.pipedArityHint(node_idx) });
             } else for (args) |a| {
                 const at = try bc.typeOfExpected(a, recv_ty);
                 if (!Type.assignable(recv_ty, at))
@@ -2780,11 +2798,11 @@ pub const BodyChecker = struct {
         if (Typecheck.builtinStrMethod(recv_ty, member)) |bm| {
             if (args.len != bm.params.len) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ bm.params.len, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ bm.params.len, args.len, bc.pipedArityHint(node_idx) });
             } else for (args, bm.params, 0..) |a, pty, i| {
                 const at = try bc.typeOfExpected(a, pty);
                 if (!Type.assignable(pty, at))
-                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(pty), bc.typeName(at) });
+                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}{s}: expected {s}, got {s}", .{ i + 1, bc.pipedArgHint(node_idx, i + 1), bc.typeName(pty), bc.typeName(at) });
             }
             bc.node_types[(node_idx).int()] = bm.ret;
             return bm.ret;
@@ -2837,7 +2855,7 @@ pub const BodyChecker = struct {
             const want = mf.params.len - self_off;
             if (args.len != want) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ want, args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ want, args.len, bc.pipedArityHint(node_idx) });
                 if (!bound_ok) return .invalid;
                 const ret = substTy(bc, mf.ret, targs);
                 bc.node_types[(node_idx).int()] = ret;
@@ -2851,7 +2869,7 @@ pub const BodyChecker = struct {
                 const want_ty = substTy(bc, pty, targs);
                 const at = try bc.typeOfExpected(a, if (want_ty.kind == .invalid) null else want_ty);
                 if (!Type.assignable(want_ty, at)) {
-                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want_ty), bc.typeName(at) });
+                    try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}{s}: expected {s}, got {s}", .{ i + 1, bc.pipedArgHint(node_idx, i + 1), bc.typeName(want_ty), bc.typeName(at) });
                 }
             }
             const ret = substTy(bc, mf.ret, targs);
@@ -2888,7 +2906,7 @@ pub const BodyChecker = struct {
                     .is_tag0, .is_tag1 => {
                         if (args.len != 0) {
                             for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                         }
                         bc.node_types[(node_idx).int()] = Type.bool;
                         return Type.bool;
@@ -2896,7 +2914,7 @@ pub const BodyChecker = struct {
                     .unwrap => {
                         if (args.len != 0) {
                             for (args) |a| _ = try bc.typeOf(a);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                         }
                         bc.node_types[(node_idx).int()] = t_ty;
                         return t_ty;
@@ -2904,7 +2922,7 @@ pub const BodyChecker = struct {
                     .unwrap_or => {
                         if (args.len != 1) {
                             for (args) |a| _ = try bc.typeOfExpected(a, null);
-                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 1), args.len });
+                            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 1), args.len, bc.pipedArityHint(node_idx) });
                         } else {
                             const at = try bc.typeOfExpected(args[0], if (t_ty.kind == .invalid) null else t_ty);
                             if (!Type.assignable(t_ty, at))
@@ -2924,7 +2942,7 @@ pub const BodyChecker = struct {
         if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null) {
             if (args.len != 0) {
                 for (args) |a| _ = try bc.typeOf(a);
-                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2968,7 +2986,7 @@ pub const BodyChecker = struct {
             {
                 if (args.len != 0) {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ @as(usize, 0), args.len });
+                    try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ @as(usize, 0), args.len, bc.pipedArityHint(node_idx) });
                 }
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
@@ -2988,12 +3006,12 @@ pub const BodyChecker = struct {
                 const want = psig.len - self_off;
                 if (args.len != want) {
                     for (args) |a| _ = try bc.typeOf(a);
-                    try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ want, args.len });
+                    try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ want, args.len, bc.pipedArityHint(node_idx) });
                 } else for (args, psig[self_off..], 0..) |a, pty, i| {
                     const wt = Typecheck.groundProtoType(pty, recv_ty, pargs);
                     const at = try bc.typeOfExpected(a, if (wt.kind == .invalid) null else wt);
                     if (!Type.assignable(wt, at))
-                        try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(wt), bc.typeName(at) });
+                        try bc.sink.report(.{ .span = bc.spanOf(a) }, "argument {d}{s}: expected {s}, got {s}", .{ i + 1, bc.pipedArgHint(node_idx, i + 1), bc.typeName(wt), bc.typeName(at) });
                 }
                 const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, pargs);
                 bc.node_types[(node_idx).int()] = ret;
@@ -3069,7 +3087,7 @@ pub const BodyChecker = struct {
         // sound — else poison so no `type_var`/half-substituted type is stored.
         if (args.len != f.params.len) {
             for (args) |arg| _ = try bc.typeOf(arg);
-            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}", .{ f.params.len, args.len });
+            try bc.sink.report(.{ .span = bc.argsSpan(node_idx) }, "expected {d} argument(s), got {d}{s}", .{ f.params.len, args.len, bc.pipedArityHint(node_idx) });
             if (!all_concrete) return .invalid;
             const ret = substTy(bc, f.ret, targs);
             bc.node_types[(node_idx).int()] = ret;
@@ -3096,7 +3114,7 @@ pub const BodyChecker = struct {
             const want = substTy(bc, pty, targs);
             const at = if (pretyped) |pt| pt[i] else try bc.typeOfExpected(arg, if (want.kind == .invalid) null else want);
             if (!Type.assignable(want, at)) {
-                try bc.sink.report(.{ .span = bc.spanOf(arg) }, "argument {d}: expected {s}, got {s}", .{ i + 1, bc.typeName(want), bc.typeName(at) });
+                try bc.sink.report(.{ .span = bc.spanOf(arg) }, "argument {d}{s}: expected {s}, got {s}", .{ i + 1, bc.pipedArgHint(node_idx, i + 1), bc.typeName(want), bc.typeName(at) });
             }
         }
         const ret = substTy(bc, f.ret, targs);

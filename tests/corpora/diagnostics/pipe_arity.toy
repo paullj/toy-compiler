@@ -1,0 +1,37 @@
+fn add(a: int, b: int) -> int { return a + b }
+fn neg(a: int) -> int { return 0 - a }
+
+struct Acc { n: int }
+
+impl Acc {
+    fn plus(self, k: int) -> int { return self.n + k }
+}
+
+struct Box[T] { x: T }
+
+impl Box[T] {
+    fn make(a: T, b: T) -> Box[T] { return Box[T]{ x: a + b } }
+}
+
+protocol Scale[U] {
+    fn scale(self, k: U) -> U
+}
+
+impl Acc has Scale[int] {
+    fn scale(self, k: int) -> int { return self.n * k }
+}
+
+fn use_scale[T has Scale[int]](v: T) -> int {
+    return true |> v.scale[int]  #~ ERROR [T0040] argument 1 (the piped value): expected int, got bool
+}
+
+fn main() -> int {
+    acc := Acc { n: 1 }
+    a := 1 |> add(2, 3)      #~ ERROR [T0039] got 3 (the piped value is argument 1); 'add' takes (int, int)
+    b := 1 |> add            #~ ERROR [T0039] got 1 (the piped value is argument 1)
+    c := 1 |> acc.plus(2)    #~ ERROR [T0039] got 2 (the piped value is argument 1)
+    d := true |> neg         #~ ERROR [T0040] argument 1 (the piped value): expected int, got bool
+    e := 1 |> add(false)     #~ ERROR [T0040] argument 2: expected int, got bool
+    f := 1 |> Box[int].make  #~ ERROR [T0039] got 1 (the piped value is argument 1); 'make' takes (int, int)
+    return a + b + c + d + e + f.x + use_scale(acc)
+}

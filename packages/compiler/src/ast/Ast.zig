@@ -547,6 +547,13 @@ pub fn isMutParam(tree: Tree, tokens: []const Token, param_idx: Index) bool {
     return n.tag == .param and n.main_token > 0 and tokens[n.main_token - 1].tag == .kw_mut;
 }
 
+/// True when the `call` at `idx` came from `x |> f(..)` (see the `.call` tag). A
+/// synthetic call's `main_token` 0 is excluded, since `tokens[0]` is unrelated to it.
+pub fn isPipedCall(tree: Tree, tokens: []const Token, idx: Index) bool {
+    const n = tree.nodes[idx.int()];
+    return n.tag == .call and n.main_token != 0 and tokens[n.main_token].tag == .pipe_gt;
+}
+
 /// The root (top-level) node of a non-empty tree — by construction the last.
 pub fn root(nodes: []const Node) Index {
     return Index.from(@intCast(nodes.len - 1));

@@ -1,0 +1,13 @@
+fn f(x: int) -> int { return x }
+
+fn g(c: bool) -> int {
+    if c {
+    }
+        |> f                 #~ ERROR [P0014] this statement has none
+    return
+        |> f(1)              #~ ERROR [P0014] value on its left
+}
+
+fn main() -> int {
+    return 0
+}

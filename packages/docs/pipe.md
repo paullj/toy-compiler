@@ -133,11 +133,22 @@ The code has a `toy explain` page (`P0014.md`).
 
 A piped `.call` node stores the `|>` token as its `main_token`. A plain call stores `(`.
 Synthetic calls already store `0`, so no consumer depends on `(`. This gives a "piped"
-flag without an AST schema change.
+flag without an AST schema change. `Ast.isPipedCall` reads it.
 
 - **T0039 arity mismatch:** the argument count includes the piped value. The message
-  adds `(the piped value is argument 1)`.
-- **T0040 argument type mismatch:** for argument 1, the caret points at the lhs expression.
+  adds `(the piped value is argument 1)`. The caret starts at the `|>` of the failing
+  step, not at the lhs, so it does not cover the whole chain before that step.
+- **T0040 argument type mismatch:** for argument 1, the message adds `(the piped value)`
+  and the caret covers the lhs expression.
+
+```
+error[T0039]: expected 2 argument(s), got 1 (the piped value is argument 1); 'add' takes (int, int)
+error[T0040]: argument 1 (the piped value): expected int, got bool; 'neg' takes (int)
+```
+
+The uncoded count and type messages (generic fns, methods of generic impls, protocol-bound
+methods, built-in methods, enum variant and tuple-struct constructors) get the same hints
+and the same `|>`-first caret.
 
 ## Out of scope
 

@@ -6394,6 +6394,67 @@ test "call arity mismatch carries the signature and a defined-here span (T0039)"
     try testing.expect(c.result.diags[0].related != DiagnosticSink.NO_RELATED);
 }
 
+test "piped T0039 counts the piped value and points at the failing |> step" {
+    const gpa = testing.allocator;
+    const src = "fn add(a: int, b: int) -> int { return a + b }\nfn f() {\n x := 1 |> add\n return\n}\n";
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    const d = c.result.diags[0];
+    try testing.expectEqual(codes.Code.T0039, d.code);
+    try testing.expectEqualStrings("expected 2 argument(s), got 1 (the piped value is argument 1); 'add' takes (int, int)", d.message);
+    try testing.expect(d.related != DiagnosticSink.NO_RELATED);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "|> add").?)), d.byte_offset);
+}
+
+test "piped T0040 marks argument 1 as the piped value and covers the lhs" {
+    const gpa = testing.allocator;
+    const src = "fn neg(a: int) -> int { return 0 - a }\nfn f() {\n x := !true |> neg\n return\n}\n";
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    const d = c.result.diags[0];
+    try testing.expectEqual(codes.Code.T0040, d.code);
+    try testing.expectEqualStrings("argument 1 (the piped value): expected int, got bool; 'neg' takes (int)", d.message);
+    const lhs = std.mem.indexOf(u8, src, "!true").?;
+    try testing.expectEqual(@as(u32, @intCast(lhs)), d.byte_offset);
+    try testing.expectEqual(@as(u32, @intCast(lhs + "!true".len)), d.end);
+}
+
+test "uncoded generic, method and variant count errors carry the piped hint" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "x := 1 |> pair", .want = "expected 2 argument(s), got 1 (the piped value is argument 1)" },
+        .{ .body = "x := 1 |> pair[int]", .want = "expected 2 argument(s), got 1 (the piped value is argument 1)" },
+        .{ .body = "x := true |> pair[int](2)", .want = "argument 1 (the piped value): expected int, got bool" },
+        .{ .body = "b := Box[int]{ x: 1 }\n x := true |> b.put", .want = "argument 1 (the piped value): expected int, got bool" },
+        .{ .body = "x := 1 |> Shape.circle(2)", .want = "variant 'Shape.circle' expects 1 value(s), got 2 (the piped value is argument 1)" },
+        // A plain call through the same paths keeps its message unchanged.
+        .{ .body = "x := pair(1)", .want = "expected 2 argument(s), got 1" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa,
+            \\struct Box[T] {{ x: T }}
+            \\impl Box[T] {{
+            \\ fn put(self, y: T) -> T {{ return y }}
+            \\}}
+            \\enum Shape {{ circle(int) }}
+            \\fn pair[T](a: T, b: T) -> T {{ return a }}
+            \\fn f() {{
+            \\ {s}
+            \\ return
+            \\}}
+            \\
+        , .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer std.debug.print("case: {s}\n", .{cs.body});
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
+    }
+}
+
 test "a non-exhaustive match lists MULTIPLE missing variants in one diagnostic" {
     const gpa = testing.allocator;
     var c = try checkSource(
