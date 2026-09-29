@@ -6421,16 +6421,16 @@ test "piped T0040 marks argument 1 as the piped value and covers the lhs" {
     try testing.expectEqual(@as(u32, @intCast(lhs + "!true".len)), d.end);
 }
 
-test "uncoded generic, method and variant count errors carry the piped hint" {
+test "generic, method and variant count errors carry the piped hint" {
     const gpa = testing.allocator;
     const cases = [_]struct { body: []const u8, want: []const u8 }{
-        .{ .body = "x := 1 |> pair", .want = "expected 2 argument(s), got 1 (the piped value is argument 1)" },
-        .{ .body = "x := 1 |> pair[int]", .want = "expected 2 argument(s), got 1 (the piped value is argument 1)" },
-        .{ .body = "x := true |> pair[int](2)", .want = "argument 1 (the piped value): expected int, got bool" },
-        .{ .body = "b := Box[int]{ x: 1 }\n x := true |> b.put", .want = "argument 1 (the piped value): expected int, got bool" },
+        .{ .body = "x := 1 |> pair", .want = "expected 2 argument(s), got 1 (the piped value is argument 1); 'pair' takes (T, T)" },
+        .{ .body = "x := 1 |> pair[int]", .want = "expected 2 argument(s), got 1 (the piped value is argument 1); 'pair' takes (int, int)" },
+        .{ .body = "x := true |> pair[int](2)", .want = "argument 1 (the piped value): expected int, got bool; 'pair' takes (int, int)" },
+        .{ .body = "b := Box[int]{ x: 1 }\n x := true |> b.put", .want = "argument 1 (the piped value): expected int, got bool; 'put' takes (int)" },
         .{ .body = "x := 1 |> Shape.circle(2)", .want = "variant 'Shape.circle' expects 1 value(s), got 2 (the piped value is argument 1)" },
-        // A plain call through the same paths keeps its message unchanged.
-        .{ .body = "x := pair(1)", .want = "expected 2 argument(s), got 1" },
+        // A plain call through the same paths carries no hint.
+        .{ .body = "x := pair(1)", .want = "expected 2 argument(s), got 1; 'pair' takes (T, T)" },
     };
     for (cases) |cs| {
         const src = try std.fmt.allocPrint(gpa,
@@ -6451,6 +6451,45 @@ test "uncoded generic, method and variant count errors carry the piped hint" {
         defer c.deinit(gpa);
         errdefer std.debug.print("case: {s}\n", .{cs.body});
         try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
+    }
+}
+
+test "call-shape checks: one coded diagnostic per failing call, on every call path" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{
+        // The call's expected type is its result's, so a mismatched count must not also
+        // judge a literal arg against it (no extra out-of-range error).
+        .{ .body = "_x: int8 = small(300)", .code = .T0039, .want = "expected 2 argument(s), got 1; 'small' takes (int, int)" },
+        .{ .body = "_x := b.put(1, 2)", .code = .T0039, .want = "expected 1 argument(s), got 2; 'put' takes (int)" },
+        .{ .body = "_x := Box[int].make(true)", .code = .T0040, .want = "argument 1: expected int, got bool; 'make' takes (int)" },
+        .{ .body = "_x := 1.eq(true)", .code = .T0040, .want = "argument 1: expected int, got bool; 'eq' takes (int)" },
+        .{ .body = "_x := \"a\".len(1)", .code = .T0039, .want = "expected 0 argument(s), got 1; 'len' takes ()" },
+        .{ .body = "_x := pair[int](1, true)", .code = .T0040, .want = "argument 2: expected int, got bool; 'pair' takes (int, int)" },
+        .{ .body = "_x := b.x |> pair[int](true)", .code = .T0040, .want = "argument 2: expected int, got bool; 'pair' takes (int, int)" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa,
+            \\struct Box[T] {{ x: T }}
+            \\impl Box[T] {{
+            \\ fn put(self, y: T) -> T {{ return y }}
+            \\ fn make(x: T) -> Box[T] {{ return Box[T]{{ x: x }} }}
+            \\}}
+            \\fn small(a: int, b: int) -> int8 {{ return 1 }}
+            \\fn pair[T](a: T, b: T) -> T {{ return a }}
+            \\fn f() {{
+            \\ b := Box[int]{{ x: 1 }}
+            \\ {s}
+            \\ return
+            \\}}
+            \\
+        , .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer std.debug.print("case: {s}\n", .{cs.body});
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(cs.code, c.result.diags[0].code);
         try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
     }
 }
