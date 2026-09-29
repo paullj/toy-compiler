@@ -1,0 +1,14 @@
+# Feature: `x |> f(a)` passes `x` as the FIRST argument, so it means `f(x, a)`. A bare
+# `x |> f` is `f(x)`. Pipes chain left to right and bind looser than every other operator,
+# so `1 + 2 |> double` pipes the whole `1 + 2`.
+# expect: exit 42
+fn double(x: int) -> int { return x * 2 }
+fn add(a: int, b: int) -> int { return a + b }
+fn sub(a: int, b: int) -> int { return a - b }
+
+fn main() -> int {
+    a := 1 + 2 |> double           # double(3) = 6
+    b := a |> add(4) |> sub(1)     # sub(add(6, 4), 1) = 9
+    c := (b |> double) + 9         # parentheses use a pipe's result: 18 + 9 = 27
+    return a + b + c               # 6 + 9 + 27 = 42
+}

@@ -1,0 +1,20 @@
+# Feature: multi-line pipes. A line that STARTS with `|>` continues the line before it
+# (leading style); a line that ENDS with `|>` continues onto the next (trailing style).
+# Comments and blank lines may sit between the steps.
+# expect: exit 42
+fn double(x: int) -> int { return x * 2 }
+fn add(a: int, b: int) -> int { return a + b }
+fn sub(a: int, b: int) -> int { return a - b }
+
+fn main() -> int {
+    leading := 5
+        |> double          # 10
+        # a comment between steps
+
+        |> add(1)          # 11
+    trailing := 5 |>
+        double |>          # 10
+        sub(3)             # sub(10, 3) = 7
+    return leading + trailing
+        |> add(24)         # 18 + 24 = 42
+}

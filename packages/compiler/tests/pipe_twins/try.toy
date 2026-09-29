@@ -1,0 +1,20 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/try.toy.
+fn check(a: int) -> Result[int, str] {
+    if a < 0 { return Result[int, str].err("negative") }
+    return Result.ok(a)
+}
+
+fn step(a: int, by: int) -> Result[int, str] {
+    return check(a - by)
+}
+
+fn run(a: int) -> Result[int, str] {
+    x := step(step(check(a)?, 1)?, 2)?
+    return Result.ok(x * 2)
+}
+
+fn main() -> int {
+    good := match run(24) { .ok(v) -> v, .err(_) -> 0 }
+    bad := match run(2) { .ok(_) -> 99, .err(_) -> 0 }
+    return good + bad
+}

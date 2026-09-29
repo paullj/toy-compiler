@@ -1,0 +1,10 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/qualified.toy.
+import std/io
+import std/math
+
+fn main() -> int {
+    x := math.abs(-7)
+    io.println(x)
+    cube := math.pow(2, 3)
+    return math.max(x, 3) + cube - 6
+}

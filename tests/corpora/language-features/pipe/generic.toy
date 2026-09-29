@@ -1,0 +1,14 @@
+# Feature: pipes into generic functions — inferred (`7 |> id`), bare turbofish
+# (`7 |> id[int]`), and called turbofish (`7 |> first[int](1)`). A pipe target's
+# `name[..]` is always read as type arguments, never as an index.
+# expect: exit 28
+fn id[T](x: T) -> T { return x }
+fn first[T](a: T, _b: T) -> T { return a }
+
+fn main() -> int {
+    a := 7 |> id
+    b := 7 |> id[int]
+    c := 7 |> first[int](1)
+    d := true |> id |> first(false)
+    return a + b + c + (if d { 7 } else { 0 })
+}

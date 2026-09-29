@@ -1,0 +1,11 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/basic.toy.
+fn double(x: int) -> int { return x * 2 }
+fn add(a: int, b: int) -> int { return a + b }
+fn sub(a: int, b: int) -> int { return a - b }
+
+fn main() -> int {
+    a := double(1 + 2)
+    b := sub(add(a, 4), 1)
+    c := double(b) + 9
+    return a + b + c
+}

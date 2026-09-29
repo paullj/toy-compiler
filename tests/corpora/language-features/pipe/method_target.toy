@@ -1,0 +1,13 @@
+# Feature: a pipe target can be a method on ANOTHER value: `3 |> v.push` is `v.push(3)`.
+# The parser does not classify the callee path; the checker resolves `v.push` as a method.
+# expect: exit 12
+import std/vec
+
+fn main() -> int {
+    v := Vec[int].new()
+    3 |> v.push
+    4 |> v.push
+    5 |> v.push
+    last := 2 |> v.get             # v.get(2) = Option.some(5)
+    return v.len() + last.unwrap() + 4
+}

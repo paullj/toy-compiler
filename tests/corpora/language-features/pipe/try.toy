@@ -1,0 +1,22 @@
+# Feature: a trailing `?` on a pipe target applies to the call: `s |> parse?` is
+# `parse(s)?`. A Result pipeline stops at the first `err`.
+# expect: exit 42
+fn check(a: int) -> Result[int, str] {
+    if a < 0 { return Result[int, str].err("negative") }
+    return Result.ok(a)
+}
+
+fn step(a: int, by: int) -> Result[int, str] {
+    return check(a - by)
+}
+
+fn run(a: int) -> Result[int, str] {
+    x := a |> check? |> step(1)? |> step(2)?
+    return Result.ok(x * 2)
+}
+
+fn main() -> int {
+    good := match run(24) { .ok(v) -> v, .err(_) -> 0 }     # (24 - 1 - 2) * 2 = 42
+    bad := match run(2) { .ok(_) -> 99, .err(_) -> 0 }      # step(1, 2) is err
+    return good + bad
+}

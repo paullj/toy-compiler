@@ -1,0 +1,14 @@
+# Feature: a pipe target can be a module-qualified function. `-7 |> math.abs` is
+# `math.abs(-7)`, and `2 |> math.pow(3)` is `math.pow(2, 3)` = 8 (a last-argument pipe
+# would give `math.pow(3, 2)` = 9).
+# expect: stdout "7\n"
+# expect: exit 9
+import std/io
+import std/math
+
+fn main() -> int {
+    x := -7 |> math.abs
+    x |> io.println
+    cube := 2 |> math.pow(3)
+    return (x |> math.max(3)) + cube - 6      # 7 + 8 - 6 = 9
+}

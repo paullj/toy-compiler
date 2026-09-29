@@ -1,0 +1,16 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/constructor.toy.
+enum Shape {
+    circle(int),
+    rect(int, int),
+}
+
+fn width(s: Shape) -> int {
+    return match s { .circle(r) -> 2 * r, .rect(w, _h) -> w }
+}
+
+fn main() -> int {
+    a := Option.some(5)
+    b := Option[int].some(2)
+    r := width(Shape.rect(3, 1))
+    return a.unwrap() + b.unwrap() + r + 2
+}

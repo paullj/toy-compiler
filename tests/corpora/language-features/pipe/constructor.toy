@@ -1,0 +1,19 @@
+# Feature: an enum constructor is a pipe target: `5 |> Option.some` is `Option.some(5)`,
+# and a turbofish path `Option[int].some` works too. `3 |> Shape.rect(1)` is
+# `Shape.rect(3, 1)`, so its width is 3 (a last-argument pipe would give width 1).
+# expect: exit 12
+enum Shape {
+    circle(int),
+    rect(int, int),
+}
+
+fn width(s: Shape) -> int {
+    return match s { .circle(r) -> 2 * r, .rect(w, _h) -> w }
+}
+
+fn main() -> int {
+    a := 5 |> Option.some
+    b := 2 |> Option[int].some
+    r := 3 |> Shape.rect(1) |> width   # width(Shape.rect(3, 1)) = 3
+    return a.unwrap() + b.unwrap() + r + 2
+}

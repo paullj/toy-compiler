@@ -1,0 +1,18 @@
+# Feature: a pipe evaluates like the call it desugars to. The piped value is argument 1,
+# so it runs before the written arguments, which run left to right: the output follows
+# reading order.
+# expect: stdout "a\nb\nc\nd\n"
+# expect: exit 10
+import std/io
+
+fn tag(s: str, v: int) -> int {
+    s |> io.println
+    return v
+}
+
+fn add(a: int, b: int) -> int { return a + b }
+fn add3(a: int, b: int, c: int) -> int { return a + b + c }
+
+fn main() -> int {
+    return tag("a", 1) |> add(tag("b", 2)) |> add3(tag("c", 3), tag("d", 4))
+}

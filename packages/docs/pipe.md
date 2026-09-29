@@ -1,6 +1,9 @@
 # Pipe operator `|>`
 
-Status: **spec, not implemented**. Decisions were locked in a /grill-me pass on 2026-09-28.
+Status: **implemented** (lexer, parser, diagnostics, tree-sitter; LSP and docsite: P6). Decisions were locked in a /grill-me
+pass on 2026-09-28. Run examples: `tests/corpora/language-features/pipe/`. Proof that a pipe
+is pure syntax: `packages/compiler/tests/pipe.zig` builds each example and its hand-desugared
+twin (`packages/compiler/tests/pipe_twins/`) and requires identical binaries.
 
 ## Summary
 

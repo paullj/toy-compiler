@@ -1,0 +1,11 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/generic.toy.
+fn id[T](x: T) -> T { return x }
+fn first[T](a: T, _b: T) -> T { return a }
+
+fn main() -> int {
+    a := id(7)
+    b := id[int](7)
+    c := first[int](7, 1)
+    d := first(id(true), false)
+    return a + b + c + (if d { 7 } else { 0 })
+}
