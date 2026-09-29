@@ -6,14 +6,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const harness = @import("harness.zig");
 
 const cases_dir = "tests/corpora/language-features/pipe";
 const twins_dir = "packages/compiler/tests/pipe_twins";
 
-fn skipUnlessBackend(io: Io) !void {
-    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
-}
+const skipUnlessBackend = harness.skipUnlessBackend;
 
 /// Build `src_path` as `<dir>/main.toy` -> `<dir>/prog` and return the binary's bytes.
 /// The binary embeds the input and output basenames, so both sides of a pair must use
