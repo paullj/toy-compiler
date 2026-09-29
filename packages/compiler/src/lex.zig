@@ -68,8 +68,10 @@ pub fn next(l: *Lexer) Token {
     const crossed_newline = l.skipTrivia();
 
     // Go-style terminator insertion: a newline that follows a statement-ending
-    // token becomes an implicit terminator. It is zero-width at the cursor.
-    if (crossed_newline and canEndStatement(l.prev)) {
+    // token becomes an implicit terminator. It is zero-width at the cursor. The
+    // leading-`|>` style needs the exception: a line that starts with `|>` continues
+    // the previous expression.
+    if (crossed_newline and canEndStatement(l.prev) and !l.atPipeGt()) {
         l.prev = .newline;
         return .{ .tag = .newline, .start = l.index, .end = l.index };
     }
@@ -78,6 +80,13 @@ pub fn next(l: *Lexer) Token {
     l.prev = tok.tag;
     if (isError(tok.tag)) l.error_count += 1;
     return tok;
+}
+
+/// Whether the cursor sits on a `|>`. A byte peek, not a lex, so it neither makes
+/// a token nor touches `error_count`. tree-sitter-toy/src/scanner.c must apply the
+/// same rule, or the highlighter and the compiler disagree on where a statement ends.
+fn atPipeGt(l: *const Lexer) bool {
+    return l.index + 1 < l.source.len and l.source[l.index] == '|' and l.source[l.index + 1] == '>';
 }
 
 /// Whether a tag is one of the lexer's error tokens. Kept in one place so the
@@ -111,8 +120,8 @@ fn lexToken(l: *Lexer) Token {
 
 /// Whether a token of this tag can end a statement, and so triggers terminator
 /// insertion when a newline follows it. `r_bracket` is here so a line-final `]`
-/// terminates on a newline (e.g. an annotated empty-list literal `xs: Vec[int] = []`);
-/// a future line-continued expression whose first line ends in `]` would need a wrap.
+/// terminates on a newline (e.g. an annotated empty-list literal `xs: Vec[int] = []`),
+/// unless the next line starts with `|>` (see `next`).
 fn canEndStatement(tag: Tag) bool {
     return switch (tag) {
         .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .kw_return, .kw_break, .kw_continue, .r_paren, .r_brace, .r_bracket, .question => true,
@@ -262,7 +271,7 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
         '&' => if (l.eat('&')) .amp_amp else .amp,
         '^' => .caret,
         '~' => .tilde,
-        '|' => if (l.eat('|')) .pipe_pipe else .pipe,
+        '|' => if (l.eat('|')) .pipe_pipe else if (l.eat('>')) .pipe_gt else .pipe,
         '(' => .l_paren,
         ')' => .r_paren,
         '{' => .l_brace,
@@ -350,11 +359,21 @@ test "logical && and || are two-char operators" {
     try expectTags("a && b || c", &.{ .identifier, .amp_amp, .identifier, .pipe_pipe, .identifier, .eof });
 }
 
-test "lone & is bitwise-and; lone | is a pattern separator" {
+test "lone & and | are single-char operators" {
     try expectTags("&", &.{ .amp, .eof });
     try expectTags("&&", &.{ .amp_amp, .eof });
     try expectTags("|", &.{ .pipe, .eof });
     try expectTags("||", &.{ .pipe_pipe, .eof });
+}
+
+test "pipe |> is one token, distinct from | and ||" {
+    try expectTags("a |> b", &.{ .identifier, .pipe_gt, .identifier, .eof });
+    try expectTags("a|>b", &.{ .identifier, .pipe_gt, .identifier, .eof });
+    try expectTags("a || b", &.{ .identifier, .pipe_pipe, .identifier, .eof });
+    try expectTags("a | b", &.{ .identifier, .pipe, .identifier, .eof });
+    try expectTags("a | > b", &.{ .identifier, .pipe, .gt, .identifier, .eof });
+    try expectTags("a ||> b", &.{ .identifier, .pipe_pipe, .gt, .identifier, .eof });
+    try expectSpansTile("x := a |> f(1) |> g\n");
 }
 
 test "bitwise and shift operators lex to their tags" {
@@ -538,6 +557,32 @@ test "newline inserts terminator only after statement-ending tokens" {
         \\y =
         \\42
     , &.{ .identifier, .newline, .identifier, .eq, .number, .eof });
+}
+
+test "a leading |> continues the previous line" {
+    try expectTags("a\n|> b", &.{ .identifier, .pipe_gt, .identifier, .eof });
+    try expectTags("f(1)\n    |> g", &.{ .identifier, .l_paren, .number, .r_paren, .pipe_gt, .identifier, .eof });
+    try expectTags("a\n# c\n\n|> b", &.{ .identifier, .pipe_gt, .identifier, .eof });
+    try expectTags("a\n|> b\n|> c\nd", &.{ .identifier, .pipe_gt, .identifier, .pipe_gt, .identifier, .newline, .identifier, .eof });
+    try expectTags("a\r\n|> b", &.{ .identifier, .pipe_gt, .identifier, .eof });
+    try expectTags("a\n|>", &.{ .identifier, .pipe_gt, .eof });
+    // Every statement-ending tag defers to the pipe, including the less obvious ones.
+    // Whether `}` / `return` then form a legal pipe lhs is the parser's decision.
+    try expectTags("a[0]\n|> f", &.{ .identifier, .l_bracket, .number, .r_bracket, .pipe_gt, .identifier, .eof });
+    try expectTags("x?\n|> f", &.{ .identifier, .question, .pipe_gt, .identifier, .eof });
+    try expectTags("}\n|> f", &.{ .r_brace, .pipe_gt, .identifier, .eof });
+    try expectTags("return\n|> f", &.{ .kw_return, .pipe_gt, .identifier, .eof });
+}
+
+test "a trailing |> continues onto the next line" {
+    try expectTags("a |>\nb", &.{ .identifier, .pipe_gt, .identifier, .eof });
+    try expectTags("a |> # c\n\nb", &.{ .identifier, .pipe_gt, .identifier, .eof });
+}
+
+test "only |> suppresses the terminator, not | or ||" {
+    try expectTags("a\n| b", &.{ .identifier, .newline, .pipe, .identifier, .eof });
+    try expectTags("a\n|| b", &.{ .identifier, .newline, .pipe_pipe, .identifier, .eof });
+    try expectTags("a\n|", &.{ .identifier, .newline, .pipe, .eof });
 }
 
 test "blank lines and trailing newline collapse to one terminator" {
