@@ -1,0 +1,11 @@
+fn f(x: int) -> int { return x }
+
+fn main() -> int {
+    a := 1 |> 5              #~ ERROR [P0014] must be a function or a call
+    b := 1 |> (f)            #~ ERROR [P0014] must be a function or a call
+    c := f(1 |> )            #~ ERROR [P0014] must be a function or a call
+    d := 1 |> f().len()      #~ ERROR [P0014] wrap the pipe in parentheses
+    e := 1 |> f == 2         #~ ERROR [P0014] wrap the pipe in parentheses
+    g := |> f                #~ ERROR [P0014] value on its left
+    return 0
+}

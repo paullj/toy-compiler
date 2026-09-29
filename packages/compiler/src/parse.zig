@@ -4790,7 +4790,7 @@ test "a piped call's main_token is the |> token" {
     defer freeTree(gpa, tree);
     const call = tree.nodes[Ast.root(tree.nodes).int()];
     try testing.expectEqual(Node.Tag.call, call.tag);
-    try testing.expectEqual(token.Tag.pipe_gt, tokens[call.main_token].tag);
+    try testing.expect(Ast.isPipedCall(tree, tokens, Ast.root(tree.nodes)));
 }
 
 test "multi-line pipes parse as one statement" {
