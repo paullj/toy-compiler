@@ -8,6 +8,7 @@
 	import Editor from '$lib/components/Editor.svelte';
 	import Terminal from '$lib/components/Terminal.svelte';
 	import ThemeToggle from '$lib/components/ThemeToggle.svelte';
+	import icon from '$lib/images/icon.webp';
 	import * as vfs from '$lib/vfs';
 
 	const SEED = [
@@ -169,7 +170,7 @@
 	<!-- Header -->
 	<header class="flex h-14 shrink-0 items-center gap-4 border-b px-5" style="border-color: var(--border)">
 		<a href={resolve('/')} class="flex items-center gap-2 font-mono text-sm font-medium">
-			<span class="text-base leading-none">🧸</span> toy
+			<img src={icon} alt="" width="20" height="20" class="h-5 w-5" /> toy
 		</a>
 		<span class="font-mono text-[0.7rem] uppercase tracking-[0.2em]" style="color: var(--fg-muted)">
 			Playground

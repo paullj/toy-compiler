@@ -4,37 +4,42 @@
 
 @theme {
 	--font-sans: 'Hanken Grotesk', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
-	--font-serif: 'Newsreader', Georgia, 'Times New Roman', ui-serif, serif;
+	--font-display: 'Cherry Bomb One', var(--font-sans);
 	--font-mono: 'Ioskeley Mono', ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
 :root {
-	--bg: #fefefc;
+	--bg: #fffbf5;
 	--bg-elev: #ffffff;
-	--fg: #1a1a19;
-	--fg-muted: #706f6b;
-	--border: #ecebe5;
-	--code-bg: #f7f6f2;
-	--accent: #d0492c;
+	--fg: #1f2a3c;
+	--fg-muted: #6b7180;
+	--border: #f0e6d8;
+	--code-bg: #fdf5ea;
+	--accent: #e8553f;
+	--toy-red: #f06a52;
+	--toy-yellow: #f7b92e;
+	--toy-teal: #38b2c6;
+	--toy-navy: #2b4059;
 	--tok-kw: var(--fg);
-	--tok-fn: #7a5a2e;
-	--tok-type: #3c6a5e;
-	--tok-num: #6a5a8a;
-	--tok-str: #4a6b3d;
+	--tok-fn: #1d8597;
+	--tok-type: #c9432e;
+	--tok-num: #5b51a8;
+	--tok-str: #9a6d06;
 }
 
 :root.dark {
-	--bg: #161615;
-	--bg-elev: #1a1a19;
-	--fg: #f7f6f5;
-	--fg-muted: #8f8e8a;
-	--border: #2a2a29;
-	--code-bg: #1a1a19;
-	--accent: #ef7a52;
-	--tok-fn: #cdae82;
-	--tok-type: #8fc0b2;
-	--tok-num: #b6a6d6;
-	--tok-str: #9cc487;
+	--bg: #131a24;
+	--bg-elev: #18212e;
+	--fg: #f7f2ea;
+	--fg-muted: #939aa8;
+	--border: #263243;
+	--code-bg: #18212e;
+	--accent: #ff7a62;
+	--toy-navy: #6f8fb5;
+	--tok-fn: #5fcfe0;
+	--tok-type: #ff8f78;
+	--tok-num: #b5a9ff;
+	--tok-str: #f7c44f;
 }
 
 html {
@@ -42,19 +47,24 @@ html {
 	color: var(--fg);
 }
 
-/* antjs typographic system: sans UI/headings, serif prose, mono code. */
 body {
 	font-family: var(--font-sans);
 	-webkit-font-smoothing: antialiased;
 }
 
-h1, h2, h3, h4, h5, h6 {
-	font-family: var(--font-sans);
-	letter-spacing: -0.01em;
-}
-
-p, li, blockquote, figcaption {
-	font-family: var(--font-serif);
+/* In the base layer so utilities (font-mono, uppercase) still win on label-style headings.
+   Cherry Bomb One ships a single weight; synthesis would smear a fake bold. */
+@layer base {
+	h1, h2, h3, h4, h5, h6 {
+		font-family: var(--font-display);
+		font-weight: 400;
+		font-synthesis: none;
+		text-transform: lowercase;
+		letter-spacing: 0;
+	}
+	:is(h1, h2, h3, h4, h5, h6) :is(code, .font-mono) {
+		text-transform: none;
+	}
 }
 
 code, pre, kbd, .font-mono {
@@ -97,7 +107,7 @@ code, pre, kbd, .font-mono {
 	border-radius: 0;
 	transition: opacity 0.15s, background-color 0.15s;
 }
-.btn-fill { background: var(--fg); color: var(--bg); }
+.btn-fill { background: var(--accent); color: #fff; }
 .btn-fill:hover { opacity: 0.88; }
 .btn-border { border: 1px solid var(--border); }
 .btn-border:hover { background: var(--code-bg); }
@@ -106,15 +116,35 @@ code, pre, kbd, .font-mono {
 .theme-btn {
 	display: inline-flex;
 	align-items: center;
-	border-radius: 0;
-	padding: 0.15rem 0.5rem;
+	border-radius: 999px;
+	padding: 0.25rem 0.65rem;
 	background: var(--code-bg);
+	border: 1px solid var(--border);
 	color: var(--fg-muted);
-	transition: background-color 0.15s, color 0.15s;
+	transition: background-color 0.15s, color 0.15s, border-color 0.15s, transform 0.1s;
 }
 .theme-btn:hover {
-	background: color-mix(in srgb, var(--fg) 8%, var(--code-bg));
-	color: var(--fg);
+	background: color-mix(in srgb, var(--accent) 10%, var(--code-bg));
+	border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+	color: var(--accent);
+}
+.theme-btn:active { transform: scale(0.94); }
+
+/* Link cards: a hard offset shadow in the card's block colour reads as a stacked toy block. */
+.toy-card {
+	border: 1px solid var(--border);
+	border-radius: 1rem;
+	background: var(--bg);
+	transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+}
+.toy-card:hover {
+	transform: translate(-2px, -2px);
+	border-color: var(--block);
+	box-shadow: 4px 4px 0 var(--block);
+}
+.toy-card:active {
+	transform: none;
+	box-shadow: 1px 1px 0 var(--block);
 }
 
 /* Resizable pane handles (paneforge). */
@@ -141,7 +171,7 @@ code, pre, kbd, .font-mono {
 .side-link:hover { color: var(--accent); }
 .side-link.active { color: var(--accent); font-weight: 700; }
 
-/* toy syntax highlighting — restrained, low-saturation to sit inside the warm-grey palette */
+/* toy syntax highlighting — hues drawn from the block icon (teal, red, yellow) */
 .tok-kw { color: var(--tok-kw); font-weight: 600; }
 .tok-fn { color: var(--tok-fn); }
 .tok-type { color: var(--tok-type); }
