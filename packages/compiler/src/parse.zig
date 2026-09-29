@@ -100,7 +100,7 @@ const decl_first = setOf(&.{ .kw_import, .kw_pub, .kw_fn, .kw_struct, .kw_enum, 
 /// The universal inherited ancestor anchor: `decl_first` ∪ {eof}.
 const decl_anchors = decl_first.unionWith(setOf(&.{.eof}));
 /// FIRST(expr): exactly `parsePrefix`'s accepted switch arms.
-const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .l_bracket, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .amp, .star, .pipe_gt });
+const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .kw_true, .kw_false, .l_paren, .l_brace, .l_bracket, .kw_if, .kw_loop, .kw_match, .kw_unsafe, .at, .dot, .minus, .bang, .tilde, .amp, .star, .pipe_gt });
 /// FIRST(postfix): `parsePostfix`'s arms except `{`, which after a pipe RHS is a block
 /// body (`if x |> f { .. }`). After a pipe RHS each one is a P0014 rather than a silent
 /// `(x |> f).len()` reading, because the RHS is a fixed shape.
@@ -4892,4 +4892,9 @@ test "a long pipe chain hits the same nesting cap as written nested calls" {
     defer freeTree(gpa, res.tree);
     try testing.expectEqual(@as(usize, 1), res.diags.len);
     try testing.expectEqual(codes.Code.P0005, res.diags[0].code);
+}
+
+test "bitwise-not starts an argument and a list element" {
+    try expectSexpr("f(~1)", "(call f (~ 1))");
+    try expectSexpr("[~1, 2]", "(list (~ 1) 2)");
 }
