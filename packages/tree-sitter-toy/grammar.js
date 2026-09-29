@@ -14,6 +14,8 @@
 /// but ERROR-free parse still agrees on the leaf token stream.
 
 const PREC = {
+  // Lowest: `a + b |> f` pipes the whole `a + b` (packages/docs/pipe.md).
+  pipe: 0,
   or: 1,
   and: 2,
   bit_or: 3,
@@ -246,6 +248,7 @@ module.exports = grammar({
         $.unary_expression,
         $.reference_expression,
         $.binary_expression,
+        $.pipe_expression,
         $._primary_expression,
         $.if_expression,
         $.match_expression,
@@ -329,6 +332,11 @@ module.exports = grammar({
         ),
       );
     },
+
+    // Parse-permissive like the rest of this grammar: the compiler restricts the RHS to
+    // `path [(args)] [?]` (P0014), but agreement only needs an ERROR-free parse.
+    pipe_expression: ($) =>
+      prec.left(PREC.pipe, seq(field("value", $._expression), "|>", field("target", $._expression))),
 
     call_expression: ($) =>
       prec(PREC.postfix, seq(field("function", $._primary_expression), $.arguments)),
