@@ -1852,6 +1852,28 @@ fn parseExpr(p: *Parser, min_bp: u8) Error!Ast.Index {
     return p.continueInfix(lhs, min_bp);
 }
 
+/// The P0005 backstop for a too-long infix or postfix chain. Unlike `exprTooDeep` it skips
+/// balanced brackets, so the rest of a chain like `f()()()..` is consumed under the one
+/// diagnostic instead of stopping at its next `)`.
+fn chainTooDeep(p: *Parser) Error!Ast.Index {
+    try p.backstop(p.peek(), .P0005, "expression nested too deeply");
+    p.in_error = true;
+    const et = p.index;
+    var depth: usize = 0;
+    while (!p.at(.eof)) : (p.advance()) {
+        switch (p.peek().tag) {
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            .newline, .comma => if (depth == 0) break,
+            else => {},
+        }
+    }
+    return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
+}
+
 /// The P0005 backstop for expressions: consume to a boundary so the surrounding
 /// list/infix loop terminates via its anchor/eof guard.
 fn exprTooDeep(p: *Parser) Error!Ast.Index {
@@ -1866,18 +1888,18 @@ fn exprTooDeep(p: *Parser) Error!Ast.Index {
 /// a `.`-rooted place that turned out not to be an assignment target.
 fn continueInfix(p: *Parser, lhs0: Ast.Index, min_bp: u8) Error!Ast.Index {
     var lhs = lhs0;
-    // Each pipe nests its lhs one call deeper, the same tree as a written `f(f(..))`.
-    // This loop does not recurse, so count the pipes against the depth cap by hand, or a
-    // long chain would pass the parser and overflow the checker's recursion instead.
+    // Each operator nests its lhs one level deeper (`a + b + c` is `(a + b) + c`, and a pipe
+    // is `f(f(..))`). This loop does not recurse, so it counts against the depth cap by hand:
+    // the cap is what keeps the later stages' recursion over the tree off the stack limit.
     const depth0 = p.depth;
     defer p.depth = depth0;
     while (infixBp(p.peek().tag)) |bp| {
         if (bp <= min_bp) break;
         const op = p.index;
         p.advance();
+        p.depth += 1;
+        if (p.depth > MAX_EXPR_DEPTH) return p.chainTooDeep();
         if (p.tokens[op].tag == .pipe_gt) {
-            p.depth += 1;
-            if (p.depth > MAX_EXPR_DEPTH) return p.exprTooDeep();
             lhs = try p.parsePipeRhs(lhs, op);
             continue;
         }
@@ -2028,6 +2050,9 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
 /// `f(g(x))` compose.
 fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
     var lhs = lhs0;
+    // A postfix chain nests like an infix one (see `continueInfix`), so it counts too.
+    const depth0 = p.depth;
+    defer p.depth = depth0;
     while (true) {
         switch (p.peek().tag) {
             .l_paren => {
@@ -2098,6 +2123,8 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             },
             else => break,
         }
+        p.depth += 1;
+        if (p.depth > MAX_EXPR_DEPTH) return p.chainTooDeep();
     }
     return lhs;
 }
@@ -4897,4 +4924,24 @@ test "a long pipe chain hits the same nesting cap as written nested calls" {
 test "bitwise-not starts an argument and a list element" {
     try expectSexpr("f(~1)", "(call f (~ 1))");
     try expectSexpr("[~1, 2]", "(list (~ 1) 2)");
+}
+
+test "a long flat infix chain or postfix chain hits the depth cap, not the checker's stack" {
+    const gpa = testing.allocator;
+    const Case = struct { head: []const u8, rep: []const u8 };
+    for ([_]Case{ .{ .head = "0", .rep = " + 1" }, .{ .head = "x", .rep = ".f" }, .{ .head = "f", .rep = "()" } }) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "fn f() {\n  y := ");
+        try buf.appendSlice(gpa, c.head);
+        var i: usize = 0;
+        while (i < 1000) : (i += 1) try buf.appendSlice(gpa, c.rep);
+        try buf.appendSlice(gpa, "\n  z := 1\n}\n");
+        const res = try parseResult(gpa, buf.items);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        errdefer std.debug.print("case: {s}\n", .{c.rep});
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(codes.Code.P0005, res.diags[0].code);
+    }
 }
