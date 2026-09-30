@@ -183,8 +183,8 @@ const closure_seed: u64 = 0x43_4c_4f_53; // "CLOS"
 
 /// Fold an owner body's closure facts (`Closure.ownerFacts`: its boxed slots and its
 /// lambdas' env layouts, which its own code writes but its body walk does not see) into
-/// its fingerprint `body_fp`. The identity on empty facts, so a body with no capturing lambda
-/// keeps its key.
+/// its fingerprint `body_fp`. The identity on empty facts, so a body with no env slot and no
+/// boxed local keeps its key.
 pub fn foldClosure(body_fp: u64, facts: []const u8) u64 {
     if (facts.len == 0) return body_fp;
     var h = std.hash.Wyhash.init(closure_seed);

@@ -265,9 +265,17 @@ pub const BodyChecker = struct {
     ret_infer: bool = false,
     ret_join: Type = .never,
     /// The local slots a `mut self` method call writes through (the root of its receiver
-    /// place), recorded only in a fn with lambdas: a captured one must be boxed like an
-    /// assigned one.
+    /// place): a captured one must be boxed like an assigned one.
     mutself_roots: std.ArrayList(u32) = .empty,
+    /// The locals a bound method value captures as its receiver (`f := acc.plus`), each
+    /// with its receiver node.
+    bound_roots: std.ArrayList(BoundRoot) = .empty,
+    /// The locals an assignment writes (`x = ..`, or a place store rooted at `x`).
+    assigned_roots: std.ArrayList(u32) = .empty,
+    /// The assignment target being typed, or none: the member it names is a field, never a
+    /// bound method, so `acc.plus = f` stays a missing field. A node, not a flag, so the
+    /// rest of the place (a call's arguments, a lambda's body) still binds.
+    place_target: Ast.Index = Ast.none,
     /// This body's boxed locals, ascending: filled by `classifyCaptures` at the end of the
     /// walk and moved out by the caller.
     boxed: std.ArrayList(u32) = .empty,
@@ -354,10 +362,14 @@ pub const BodyChecker = struct {
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
 
+    pub const BoundRoot = struct { slot: u32, recv: Ast.Index };
+
     pub fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
         bc.mutself_roots.deinit(bc.gpa);
+        bc.bound_roots.deinit(bc.gpa);
+        bc.assigned_roots.deinit(bc.gpa);
         bc.boxed.deinit(bc.gpa);
         bc.sink.deinit();
         bc.derive_reqs.deinit(bc.gpa);
@@ -394,51 +406,88 @@ pub const BodyChecker = struct {
     /// Decide how each captured local is held. A closure copies a capture when it is made,
     /// which is sound only for a local that nothing assigns; a captured local that is
     /// assigned (`x = ..`, a place store rooted at it, a `mut self` call on it) is boxed
-    /// instead, into `bc.boxed`. A `mut self` receiver's slot holds the caller's address, not
-    /// a value a cell could hold, so any capture of it is an error, reported at its first
-    /// captured use in source order. A bounded template's abstract check skips this: each
-    /// instance re-check decides for itself (the sink dedups repeated reports), and a
-    /// template that reported here would be poisoned.
+    /// instead, into `bc.boxed`. A bound method value captures its local receiver the same
+    /// way. A `mut self` receiver's slot holds the caller's address, not a value a cell
+    /// could hold, so any capture of it is an error, reported at its first captured use in
+    /// source order. A bounded template's abstract check skips this: each instance
+    /// re-check decides for itself (the sink dedups repeated reports), and a template that
+    /// reported here would be poisoned.
     fn classifyCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
         if (bc.abstract_template) return;
-        const fc = bc.closures orelse return;
+        if (bc.closures == null and bc.bound_roots.items.len == 0) return;
         const mut_recv = proto.params.len > 0 and Ast.isMutParam(bc.tree, bc.tokens, proto.params[0]);
         std.mem.sort(u32, bc.mutself_roots.items, {}, std.sort.asc(u32));
-        // Boundaries are in node order, where a nested lambda precedes its parent; the rank
-        // is source (pre-) order, so the first boundary by rank holds a slot's first use.
-        const by_rank = try bc.gpa.alloc(u32, fc.boundaries.len);
-        defer bc.gpa.free(by_rank);
-        for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
+        const assigned = sortedSet(bc.assigned_roots.items);
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen.deinit(bc.gpa);
-        for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
-            if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
-            if (mut_recv and c.slot == 0) {
-                const use = bc.tree.nodes[c.first_use.int()];
-                try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{bc.nameText(use.main_token)});
-            } else if (Closure.contains(fc.assigned, c.slot) or Closure.contains(bc.mutself_roots.items, c.slot)) {
-                try bc.boxed.append(bc.gpa, c.slot);
+        if (bc.closures) |fc| {
+            // Boundaries are in node order, where a nested lambda precedes its parent; the
+            // rank is source (pre-) order, so the first boundary by rank holds a slot's first use.
+            const by_rank = try bc.gpa.alloc(u32, fc.boundaries.len);
+            defer bc.gpa.free(by_rank);
+            for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
+            for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
+                if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
+                if (mut_recv and c.slot == 0) {
+                    try bc.reportMutSelfCapture(c.first_use);
+                } else if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutself_roots.items, c.slot)) {
+                    try bc.boxed.append(bc.gpa, c.slot);
+                }
+            };
+        }
+        for (bc.bound_roots.items) |br| {
+            if ((try seen.getOrPut(bc.gpa, br.slot)).found_existing) continue;
+            if (mut_recv and br.slot == 0) {
+                try bc.reportMutSelfCapture(br.recv);
+            } else if (Closure.contains(assigned, br.slot) or Closure.contains(bc.mutself_roots.items, br.slot)) {
+                try bc.boxed.append(bc.gpa, br.slot);
             }
-        };
+        }
         std.mem.sort(u32, bc.boxed.items, {}, std.sort.asc(u32));
     }
 
-    /// Record the local a `mut self` call writes through: the root of its receiver place.
-    /// Only a fn with lambdas needs it.
-    fn noteMutSelfRoot(bc: *BodyChecker, recv: Ast.Index) error{OutOfMemory}!void {
-        if (bc.closures == null) return;
-        var cur = recv;
+    fn reportMutSelfCapture(bc: *BodyChecker, use_idx: Ast.Index) error{OutOfMemory}!void {
+        const use = bc.tree.nodes[use_idx.int()];
+        try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{bc.nameText(use.main_token)});
+    }
+
+    /// Sort `items` in place and drop repeats, returning the deduped prefix.
+    fn sortedSet(items: []u32) []const u32 {
+        std.mem.sort(u32, items, {}, std.sort.asc(u32));
+        var n: usize = 0;
+        for (items) |x| {
+            if (n > 0 and items[n - 1] == x) continue;
+            items[n] = x;
+            n += 1;
+        }
+        return items[0..n];
+    }
+
+    /// The local whose own storage a place `x`, `x.f` or `x.0` names. Null for a place
+    /// rooted anywhere else (an index, a call): a store there does not write a local.
+    fn placeRoot(bc: *const BodyChecker, place: Ast.Index) ?u32 {
+        var cur = place;
         while (true) {
             const nn = bc.tree.nodes[cur.int()];
             switch (nn.tag) {
                 .field_access, .tuple_field => cur = nn.lhs,
-                .identifier => {
-                    if (bc.resolutions[cur.int()] == .local) try bc.mutself_roots.append(bc.gpa, bc.resolutions[cur.int()].local);
-                    return;
+                .identifier => return switch (bc.resolutions[cur.int()]) {
+                    .local => |slot| slot,
+                    else => null,
                 },
-                else => return,
+                else => return null,
             }
         }
+    }
+
+    /// Record the local an assignment to `place` writes.
+    fn noteAssignedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!void {
+        if (bc.placeRoot(place)) |slot| try bc.assigned_roots.append(bc.gpa, slot);
+    }
+
+    /// Record the local a `mut self` call writes through: the root of its receiver place.
+    fn noteMutSelfRoot(bc: *BodyChecker, recv: Ast.Index) error{OutOfMemory}!void {
+        if (bc.placeRoot(recv)) |slot| try bc.mutself_roots.append(bc.gpa, slot);
     }
 
     /// `fn(params) -> R { body }`: a value of type `fn(P..) -> R`. A param's type is its
@@ -761,10 +810,16 @@ pub const BodyChecker = struct {
                         .invalid,
                     // A `.`-rooted place or a `*r` deref place types as an expression
                     // (the `.unary` case types the boxed `T`, poisoning on a non-reference).
-                    .field_access, .tuple_field, .unary => try bc.typeOf(stmt.lhs),
+                    .field_access, .tuple_field, .unary => blk: {
+                        const was = bc.place_target;
+                        bc.place_target = stmt.lhs;
+                        defer bc.place_target = was;
+                        break :blk try bc.typeOf(stmt.lhs);
+                    },
                     else => .invalid,
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
+                if (target.tag != .unary) try bc.noteAssignedRoot(stmt.lhs);
                 const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
@@ -1636,15 +1691,18 @@ pub const BodyChecker = struct {
         // through the App's type-args so `v` on `Box[int]` types as `int`.
         if (base.isApp()) {
             const e = bc.composite.at(base.appIdx());
+            if (e.ctor_is_enum) if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
             const sym = bc.model.structs[e.ctor];
             const fname = bc.nameText(n.main_token);
             for (sym.field_names, 0..) |dn, j| {
                 if (std.mem.eql(u8, dn, fname)) return substTy(bc, sym.field_types[j], e.args);
             }
+            if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
             try bc.emitNoField(bc.tokSpan(n.main_token), fname, sym.name, sym.field_names);
             return .invalid;
         }
         if (!base.isStruct()) {
+            if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
             try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "cannot access field '{s}' of non-struct type {s}", .{ bc.nameText(n.main_token), bc.typeName(base) });
             return .invalid;
         }
@@ -1653,8 +1711,125 @@ pub const BodyChecker = struct {
         for (sym.field_names, 0..) |dn, j| {
             if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
         }
+        if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
         try bc.emitNoField(bc.tokSpan(n.main_token), fname, sym.name, sym.field_names);
         return .invalid;
+    }
+
+    /// `recv.m` in value position where `m` is no field: a bound method, the closure that
+    /// captures the receiver and calls `recv.m(..)`. It types as the method's fn type
+    /// without `self`, and its selection sits on the `field_access` itself. Null when `m`
+    /// names no method, so the caller reports the missing field. A method the compiler
+    /// expands at each call (a builtin, a native `Option`/`Result` method, a protocol
+    /// method of a type parameter) has no code a value could point at.
+    fn tryBoundMethod(bc: *BodyChecker, node_idx: Ast.Index, fa: Ast.Node, recv_ty: Type) error{OutOfMemory}!?Type {
+        if (node_idx == bc.place_target) return null;
+        const member = bc.nameText(fa.main_token);
+        if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar() or recv_ty.kind == .float) {
+            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null)) {
+                .one => |mi| {
+                    const m = bc.model.methods[mi];
+                    if (m.is_static) return try bc.reportStaticBound(fa, member);
+                    const mf = bc.model.fns[m.fn_id];
+                    if (mf.isGeneric()) return try bc.reportNotAValue(fa, member, "a generic method");
+                    if (!try bc.bindReceiver(node_idx, fa, recv_ty, member, m.mut_self)) return bc.poison();
+                    const ty = refs.internFn(bc, mf.params[@min(mf.params.len, 1)..], mf.ret);
+                    if (ty.kind == .invalid) return error.OutOfMemory;
+                    bc.setCalleeAt(node_idx, Callee.boundMethod(mi));
+                    return ty;
+                },
+                .ambiguous => {
+                    try bc.emitAmbiguousConformance(fa.main_token, recv_ty, member);
+                    return bc.poison();
+                },
+                .none => {},
+            }
+            if (bc.isBuiltinMethod(recv_ty, member)) return try bc.reportNotAValue(fa, member, "a built-in method");
+            return null;
+        }
+        if (recv_ty.isApp()) {
+            const e = bc.composite.at(recv_ty.appIdx());
+            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member)) |m| {
+                if (!m.has_self) return try bc.reportStaticBound(fa, member);
+                const mf = bc.model.fns[m.fn_id];
+                // An unbound param is the method's own `[U]`, which a value could not fix.
+                const targs = (try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args)) orelse
+                    return try bc.reportNotAValue(fa, member, "a generic method");
+                defer bc.gpa.free(targs);
+                if (!try bc.bindReceiver(node_idx, fa, recv_ty, member, m.mut_self)) return bc.poison();
+                const ps = mf.params[@min(mf.params.len, 1)..];
+                const sub = try bc.gpa.alloc(Type, ps.len);
+                defer bc.gpa.free(sub);
+                for (ps, sub) |p, *o| o.* = substTy(bc, p, targs);
+                const ty = refs.internFn(bc, sub, substTy(bc, mf.ret, targs));
+                if (ty.kind == .invalid) return error.OutOfMemory;
+                bc.setCalleeAt(node_idx, Callee.pending_bound);
+                return ty;
+            }
+            const native = e.ctor_is_enum and Typecheck.optionResultMethod(Typecheck.optResultFamilyOf(bc.model, e.ctor), member) != null;
+            const display = std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null;
+            if (native or display) return try bc.reportNotAValue(fa, member, "a built-in method");
+            return null;
+        }
+        if (recv_ty.isTypeVar()) {
+            const ord = recv_ty.typeVarOrd();
+            const pid = (if (ord < bc.bound_protocols.len) bc.bound_protocols[ord] else null) orelse return null;
+            for (bc.model.protocols[pid].methods) |mn| if (std.mem.eql(u8, mn, member))
+                return try bc.reportNotAValue(fa, member, "a protocol method of a type parameter");
+            if (bc.model.preludeProtocols().display) |d| if (d == pid and std.mem.eql(u8, member, "to_string"))
+                return try bc.reportNotAValue(fa, member, "a built-in method");
+            return null;
+        }
+        return null;
+    }
+
+    /// Whether `member` on concrete `recv` is a method the compiler provides with no
+    /// `methods` row: a scalar or `str` builtin, a target-directed conversion, or the
+    /// derivable `hash`/`to_string` of a struct or enum.
+    fn isBuiltinMethod(bc: *const BodyChecker, recv: Type, member: []const u8) bool {
+        if (Typecheck.builtinScalarMethod(recv, member) != null or Typecheck.builtinStrMethod(recv, member) != null) return true;
+        const char_id = if (bc.model.prelude) |p| p.char_struct else null;
+        if ((recv.isInteger() or recv.kind == .float or Typecheck.isCharTy(recv, char_id)) and
+            (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) return true;
+        if (recv.kind != .@"struct" and recv.kind != .@"enum") return false;
+        const pp = bc.model.preludeProtocols();
+        return (std.mem.eql(u8, member, "hash") and pp.hash != null) or (std.mem.eql(u8, member, "to_string") and pp.display != null);
+    }
+
+    fn reportNotAValue(bc: *BodyChecker, fa: Ast.Node, member: []const u8, what: []const u8) error{OutOfMemory}!Type {
+        try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0049 }, "'{s}' is {s} and cannot be used as a value; wrap the call in a lambda", .{ member, what });
+        return bc.poison();
+    }
+
+    fn reportStaticBound(bc: *BodyChecker, fa: Ast.Node, member: []const u8) error{OutOfMemory}!Type {
+        try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{s}' is an associated function, not a method; it has no receiver to bind", .{member});
+        return bc.poison();
+    }
+
+    /// Check the receiver of bound method `member` and record it as captured. A `mut self`
+    /// method writes its receiver through the closure, so the receiver must be a local
+    /// variable, which then lives in a box; a copy of a field or of a temporary would drop
+    /// every write. Returns false after reporting.
+    fn bindReceiver(bc: *BodyChecker, node_idx: Ast.Index, fa: Ast.Node, recv_ty: Type, member: []const u8, mut_self: bool) error{OutOfMemory}!bool {
+        const recv = fa.lhs;
+        const local = Closure.boundRecvLocal(bc.tree, bc.resolutions, node_idx);
+        if (mut_self) {
+            if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum" and !recv_ty.isApp()) {
+                try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
+                return false;
+            }
+            if (!bc.isMutablePlace(recv)) {
+                try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0019 }, "cannot bind mutating method '{s}' to a temporary; the receiver must be a local variable", .{member});
+                return false;
+            }
+            const slot = local orelse {
+                try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0052 }, "binding the 'mut self' method '{s}' needs a local receiver, not a field; bind it on a local variable", .{member});
+                return false;
+            };
+            try bc.mutself_roots.append(bc.gpa, slot);
+        }
+        if (local) |slot| try bc.bound_roots.append(bc.gpa, .{ .slot = slot, .recv = recv });
+        return true;
     }
 
     fn typeOfTupleField(bc: *BodyChecker, n: Ast.Node) error{OutOfMemory}!Type {
@@ -2329,10 +2504,11 @@ pub const BodyChecker = struct {
         slot.* = c;
     }
 
-    /// Write `c` at `slot` itself: a value call's `callSlot`, or a fn named as a value.
+    /// Write `c` at `slot` itself: a value call's `callSlot`, or a fn or method named as a
+    /// value.
     fn setCalleeAt(bc: *BodyChecker, slot: Ast.Index, c: Callee) void {
         // A bounded template is never lowered, and its instances record their own refs.
-        if (c.tag == .fn_ref and bc.abstract_template) return;
+        if (bc.abstract_template and (c.tag == .fn_ref or c.tag == .bound_method or c.tag == .pending)) return;
         const cell = &bc.callees[slot.int()];
         if (builtin.mode == .Debug) std.debug.assert(cell.tag == .none or std.meta.eql(cell.*, c));
         cell.* = c;

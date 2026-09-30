@@ -853,9 +853,7 @@ pub fn codegenClosure(
     };
     var irf = switch (unit) {
         .lambda => |ui| try lower.lowerLambda(gpa, in, ui, sym, &diags),
-        .adapter => |a| switch (a.kind) {
-            .fn_value => try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
-        },
+        .adapter => |a| try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
     };
     defer irf.deinit(gpa);
     if (diags.items.len > 0) return error.CodegenDiagnostic;

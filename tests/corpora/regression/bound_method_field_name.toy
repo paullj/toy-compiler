@@ -1,0 +1,15 @@
+# Regression: a struct field named like a method made W0010 report a store as dead
+# when a bound method value read it, so `--deny-warnings` rejected a valid program.
+# expect: exit 15
+struct Other { get: int }
+struct C { n: int }
+impl C { fn get(self) -> int { self.n } }
+fn main() -> int {
+    o := Other { get: 1 }
+    c := C { n: 1 }
+    g := c.get
+    c = C { n: 5 }
+    x := g()
+    c = C { n: 9 }
+    return x + g() + o.get
+}

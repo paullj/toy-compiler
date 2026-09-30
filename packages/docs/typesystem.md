@@ -319,6 +319,36 @@ body is not a capture: the unit rebuilds the pair from its own code and the env 
 called with, which is the value its caller holds, so recursion costs no allocation and
 the value compares equal to itself inside and out.
 
+## Bound methods
+
+`recv.m` in value position, where `m` is a method and no field of `recv`, is a bound
+method: a closure that captures the receiver and calls `recv.m(..)`. It has the
+method's function type without `self` (`acc.plus` for `fn plus(self, x: int) -> int`
+is `fn(int) -> int`), so it is passed, stored and called like any function value. A
+field of that name wins, and an assignment target never binds (`acc.plus = f` is
+T0046, no field). Methods of generic-type instances bind too (`b.get` on a `Box[int]`,
+`xs.len` on a `Vec[int]`), through the instance's own method.
+
+The receiver is captured like any other variable. A bare local receiver that is
+assigned anywhere in the function (including by a `mut self` call) is boxed, and the
+value holds its cell, so the value and the function see each other's writes; one that
+nothing assigns is copied into the value. Any other receiver (a field `p.inner.m`, a
+call result) is evaluated once, when the value is made, and copied. A `mut self`
+method writes its receiver through the value, so binding one boxes its receiver, which
+must be a local variable: a temporary is **T0019**, a field **T0052**. A method bound
+on the `mut self` receiver of the enclosing method would capture it (**T0052**). An
+associated function has no receiver to bind (**T0018**), a generic method has no single
+instance (**T0049**), and a method the compiler expands at each call (a scalar or
+`str` builtin such as `s.len`, a conversion, the derivable `hash`/`to_string`, a native
+`Option`/`Result` method, a protocol method of a type parameter) is **T0049**; wrap
+the call in a lambda instead.
+
+At runtime a bound method is `{its adapter, env}`. The env is a fresh GC cell each time
+the value is made, so two evaluations compare unequal: `<witness>$bound(env,
+params..)` passes the receiver copy in the env as `self`, and `<witness>$boundbox`
+reads the receiver through the boxed local's cell (for `mut self`, it passes the cell
+itself as the receiver's address).
+
 ## Protocols, the prelude, and builtin-scalar conformance
 
 `has` is the single conformance relation: `impl T has P { .. }` conforms `T` to a

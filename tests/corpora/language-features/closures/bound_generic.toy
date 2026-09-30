@@ -1,0 +1,39 @@
+# Feature: methods of generic-type instances bound as values, including std Vec methods passed to higher-order functions
+# expect: stdout "5\n3\n"
+# expect: exit 77
+import std/vec
+import std/io
+
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn get(self) -> T { self.v }
+    fn with(self, x: T) -> Box[T] { Box[T] { v: x } }
+}
+
+fn call0(f: fn() -> int) -> int { f() }
+
+fn each_into(xs: Vec[int], sink: fn(int)) {
+    for x in xs { sink(x) }
+}
+
+fn getter[T](b: Box[T]) -> fn() -> T {
+    b.get
+}
+
+fn main() -> int {
+    b := Box[int] { v: 5 }
+    g := b.get
+    io.println(g())
+    xs: Vec[int] = [1, 2, 3]
+    n := xs.len
+    io.println(call0(n))
+    ys: Vec[int] = []
+    push := ys.push
+    each_into(xs, push)
+    each_into(xs, push)
+    s := Box[str] { v: "abcd" }
+    sg := getter(s)
+    w := b.with
+    return g() + call0(n) * 10 + ys.len() * 5 + sg().len() + w(8).get()
+}

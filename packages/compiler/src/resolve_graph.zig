@@ -173,11 +173,15 @@ const GraphResolve = struct {
     open: std.ArrayList(OpenBoundary) = .empty,
     /// This fn's closed lambdas, moved into `closures` when the fn ends.
     fn_boundaries: std.ArrayList(Closure.Boundary) = .empty,
-    /// This fn's assigned slots, with repeats.
-    fn_assigned: std.ArrayList(u32) = .empty,
-    /// The slots a closed lambda of this fn captures. Any later call may run that closure,
-    /// which can read or write the slot, so a write to one is never a dead store.
+    /// The slots a closed lambda or a bound method value of this fn captures. Any later
+    /// call may run that closure, which can read or write the slot, so a write to one is
+    /// never a dead store.
     captured_so_far: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Every method name in the graph. A value-position `x.m` naming one may be a bound
+    /// method, which captures `x`. Without types the resolver cannot tell it from a field
+    /// read of the same name, so it keeps `x` live either way: a missed dead store is safe,
+    /// a false one fails `--deny-warnings` on a correct program.
+    bound_names: std.StringHashMapUnmanaged(void) = .empty,
     /// The next lambda's rank in this fn (pre-order).
     next_rank: u32 = 0,
     /// Per module: the fns holding a lambda, in resolve (= node) order.
@@ -389,6 +393,7 @@ const GraphResolve = struct {
                             const method = m.nodes[method_idx.int()];
                             if (method.tag != .fn_decl) continue;
                             const mname = g.nameOf(mod, method.main_token);
+                            try g.bound_names.put(g.gpa, mname, {});
                             const qname = try std.fmt.allocPrint(g.gpa, "{s}.{s}.{s}{s}", .{ m.path, recv_name, mname, proto_suffix });
                             const gop = try method_names.getOrPut(g.gpa, qname);
                             if (gop.found_existing) {
@@ -598,7 +603,6 @@ const GraphResolve = struct {
         g.slot_next = 0;
         g.label_stack.clearRetainingCapacity();
         std.debug.assert(g.open.items.len == 0 and g.fn_boundaries.items.len == 0);
-        g.fn_assigned.clearRetainingCapacity();
         g.captured_so_far.clearRetainingCapacity();
         g.next_rank = 0;
 
@@ -638,8 +642,8 @@ const GraphResolve = struct {
         try g.flushClosures(fn_idx);
     }
 
-    /// Move this fn's lambda boundaries (sorted by node) and its assigned slots into the
-    /// module's closure list. A fn with no lambda records nothing.
+    /// Move this fn's lambda boundaries (sorted by node) into the module's closure list. A
+    /// fn with no lambda records nothing.
     fn flushClosures(g: *GraphResolve, fn_idx: Ast.Index) error{OutOfMemory}!void {
         if (g.fn_boundaries.items.len == 0) return;
         std.mem.sort(Closure.Boundary, g.fn_boundaries.items, {}, struct {
@@ -647,23 +651,13 @@ const GraphResolve = struct {
                 return a.node.int() < b.node.int();
             }
         }.lt);
-        const asg = g.fn_assigned.items;
-        std.mem.sort(u32, asg, {}, std.sort.asc(u32));
-        var n: usize = 0;
-        for (asg) |x| {
-            if (n > 0 and asg[n - 1] == x) continue;
-            asg[n] = x;
-            n += 1;
-        }
-        const assigned = try g.gpa.dupe(u32, asg[0..n]);
-        errdefer g.gpa.free(assigned);
         const list = &g.closures[g.cur_mod];
         // `findFn` binary-searches by `fn_node`; fns resolve in declaration order, and a
         // later declaration's nodes all follow an earlier one's.
         std.debug.assert(list.items.len == 0 or list.items[list.items.len - 1].fn_node.int() < fn_idx.int());
         try list.ensureUnusedCapacity(g.gpa, 1);
         const boundaries = try g.fn_boundaries.toOwnedSlice(g.gpa);
-        list.appendAssumeCapacity(.{ .fn_node = fn_idx, .boundaries = boundaries, .assigned = assigned });
+        list.appendAssumeCapacity(.{ .fn_node = fn_idx, .boundaries = boundaries });
     }
 
     /// `fn(params) -> R { body }`: its params are locals of the enclosing fn (slots above
@@ -729,25 +723,6 @@ const GraphResolve = struct {
             if (!seen) {
                 try b.captures.append(g.gpa, .{ .slot = slot, .first_use = use });
                 for (g.dead_pending.items) |*m| _ = m.remove(slot);
-            }
-        }
-    }
-
-    /// Record the local a place store `x.f = ..` / `x.0 = ..` writes, walking the place to
-    /// its root identifier. A store through anything else (an index, a call) does not
-    /// write the root's own storage.
-    fn noteAssignedPlace(g: *GraphResolve, place: Ast.Index) error{OutOfMemory}!void {
-        var cur = place;
-        while (true) {
-            const nn = g.nodes()[cur.int()];
-            switch (nn.tag) {
-                .field_access, .tuple_field => cur = nn.lhs,
-                .identifier => {
-                    const r = g.resolutions[g.cur_mod][cur.int()];
-                    if (r == .local) try g.fn_assigned.append(g.gpa, r.local);
-                    return;
-                },
-                else => return,
             }
         }
     }
@@ -871,7 +846,6 @@ const GraphResolve = struct {
                 // expression (its root name is checked there), not as a bare assignable name.
                 if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .unary) {
                     try g.resolveExpr(stmt.lhs);
-                    if (target.tag != .unary) try g.noteAssignedPlace(stmt.lhs);
                 } else {
                     const resn = g.lookupName(target.main_token);
                     g.res(stmt.lhs, resn);
@@ -881,10 +855,7 @@ const GraphResolve = struct {
                         .module => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
                         .local => |slot| if (g.locals.items[slot].is_fn) {
                             try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to function '{s}'", .{g.nameText(target.main_token)});
-                        } else {
-                            try g.fn_assigned.append(g.gpa, slot);
-                            try g.noteCapture(slot, stmt.lhs);
-                        },
+                        } else try g.noteCapture(slot, stmt.lhs),
                         .label => {},
                     }
                 }
@@ -1014,17 +985,20 @@ const GraphResolve = struct {
                 // function value fetched by index, so its subscript is an expression.
                 const callee = g.nodes()[n.lhs.int()];
                 if (callee.tag == .type_app) {
-                    try g.resolveExpr(callee.lhs);
+                    try g.resolveCallee(callee.lhs);
                     if (g.nodes()[callee.lhs.int()].tag == .identifier and
                         symbols_res.leftmostHeadIsValue(g.tree(g.cur_mod), g.resolutions[g.cur_mod], callee.lhs))
                         for (Ast.rangeSlice(g.tree(g.cur_mod), callee.rhs.int())) |a| try g.resolveExpr(a);
-                } else try g.resolveExpr(n.lhs);
+                } else try g.resolveCallee(n.lhs);
                 for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |arg| try g.resolveExpr(arg);
             },
             .struct_init => {
                 for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs);
             },
-            .field_access => try g.resolveFieldAccess(node_idx, n),
+            .field_access => {
+                try g.resolveFieldAccess(node_idx, n);
+                try g.noteBoundReceiver(n);
+            },
             .tuple_field => try g.resolveExpr(n.lhs),
             // A type-application callee `id[int](..)`: resolve ONLY the base callee
             // (`n.lhs`). The type-arg Range is NOT descended — resolving a type name
@@ -1078,6 +1052,27 @@ const GraphResolve = struct {
             .lambda => try g.resolveLambda(node_idx, n),
             else => {},
         }
+    }
+
+    /// A call's callee: a member callee `x.m(..)` is a method call, never a bound value.
+    fn resolveCallee(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
+        const n = g.nodes()[idx.int()];
+        if (n.tag == .field_access) return g.resolveFieldAccess(idx, n);
+        return g.resolveExpr(idx);
+    }
+
+    /// `x.m` in value position where `m` names a method: possibly a bound method, which
+    /// captures the local `x` like a lambda does, so no later write to `x` is dead.
+    fn noteBoundReceiver(g: *GraphResolve, n: Ast.Node) error{OutOfMemory}!void {
+        if (g.bound_names.count() == 0) return;
+        if (g.nodes()[n.lhs.int()].tag != .identifier) return;
+        const slot = switch (g.resolutions[g.cur_mod][n.lhs.int()]) {
+            .local => |slot| slot,
+            else => return,
+        };
+        if (!g.bound_names.contains(g.nameText(n.main_token))) return;
+        try g.captured_so_far.put(g.gpa, slot, {});
+        for (g.dead_pending.items) |*m| _ = m.remove(slot);
     }
 
     /// Resolve a `field_access` node. The `.` 4th meaning: if the receiver is a bare
@@ -1613,14 +1608,13 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         g.open.deinit(gpa);
         for (g.fn_boundaries.items) |b| gpa.free(b.captures);
         g.fn_boundaries.deinit(gpa);
-        g.fn_assigned.deinit(gpa);
         g.captured_so_far.deinit(gpa);
+        g.bound_names.deinit(gpa);
         // Emptied by the ownership move below on success.
         for (closures) |*c| {
             for (c.items) |fc| {
                 for (fc.boundaries) |b| gpa.free(b.captures);
                 gpa.free(fc.boundaries);
-                gpa.free(fc.assigned);
             }
             c.deinit(gpa);
         }
@@ -3461,29 +3455,6 @@ test "a nested lambda's outer capture is recorded by every boundary it crosses" 
     }.run);
 }
 
-test "assigned records bare and place-rooted targets" {
-    try withResolvedSource(
-        \\struct Q { y: int }
-        \\struct P { x: int, q: Q }
-        \\fn main() -> int {
-        \\ a := 1
-        \\ p := P { x: 1, q: Q { y: 2 } }
-        \\ c := 3
-        \\ a = 2
-        \\ p.q.y = 5
-        \\ a = 4
-        \\ f := fn() { }
-        \\ f()
-        \\ return a + p.q.y + c
-        \\}
-        \\
-    , struct {
-        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
-            try testing.expectEqualSlices(u32, &.{ 0, 1 }, r.closures[0][0].assigned);
-        }
-    }.run);
-}
-
 test "an unused lambda param is W0002; _x silences" {
     try withResolvedSource(
         \\fn main() -> int {
@@ -3760,8 +3731,6 @@ test "assigning a local fn is R0007" {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), countCode(r, .R0007));
             try testing.expectEqualStrings("cannot assign to function 'f'", firstError(r).message);
-            // The rejected store does not make `f` an assigned (boxed) capture.
-            try testing.expectEqual(@as(usize, 0), r.closures[0][0].assigned.len);
         }
     }.run);
 }
@@ -3793,6 +3762,39 @@ test "mutual recursion between local fns is R0001" {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), countCode(r, .R0001));
             try testing.expectEqualStrings("undeclared identifier 'b'", firstError(r).message);
+        }
+    }.run);
+}
+
+test "a write to a bound method's receiver is never a dead store; a field read's still is" {
+    // `B.plus` is a field named like `Acc.plus`: the resolver cannot tell `acc.plus` from a
+    // field read, and must still keep `acc`'s writes live.
+    try withResolvedSource(
+        \\struct Acc { n: int }
+        \\struct P { v: int }
+        \\struct B { plus: int }
+        \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
+        \\fn main() -> int {
+        \\ acc := Acc { n: 1 }
+        \\ f := acc.plus
+        \\ acc = Acc { n: 10 }
+        \\ a := f(1)
+        \\ acc = Acc { n: 20 }
+        \\ p := P { v: 1 }
+        \\ b := p.v
+        \\ p = P { v: 2 }
+        \\ p = P { v: 3 }
+        \\ q := B { plus: 0 }
+        \\ return a + f(1) + b + p.v + acc.plus(0) + q.plus
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            // `v` names no method, so `p.v` binds nothing and `p`'s first overwrite stays dead.
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
+            for (r.diags) |d| if (d.code == .W0010) {
+                try testing.expect(std.mem.indexOf(u8, d.message, "'p'") != null);
+            };
         }
     }.run);
 }

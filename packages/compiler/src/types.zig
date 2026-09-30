@@ -581,31 +581,58 @@ fn freeAdapters(gpa: std.mem.Allocator, adapters: []const Closure.Adapter) void 
     gpa.free(adapters);
 }
 
-/// The fn-value thunk table: one `.fn_value` adapter per fn a module body or an instance
-/// body names as a value (`Callee.fn_ref`), deduped and sorted by gid. Serial over the
-/// finished tables, so it is identical at any `-j`.
+/// The adapter table, sorted by `(kind, key)` and deduped: one `.fn_value` thunk per fn a
+/// module body or an instance body names as a value (`Callee.fn_ref`), and one bound
+/// adapter per method bound as a value (`Callee.bound_method`), boxed or copying as its
+/// receiver is held in the owner. Serial over the finished tables, so it is identical at
+/// any `-j`.
 fn buildAdapters(
     gpa: std.mem.Allocator,
+    graph: *const GraphCtx,
     callees: []const []const Callee,
     instances: []const Mono.Instance,
     fns: []const GraphFnInput,
+    fsyms: []const FnSym,
     sigs: []const Sig,
+    methods: []const Method,
+    derives: []const DeriveRecipe,
+    base_boxed: []const []const u32,
 ) ![]Closure.Adapter {
-    var gids: std.ArrayList(u32) = .empty;
-    defer gids.deinit(gpa);
+    const Key = struct { kind: Closure.AdapterKind, key: u32 };
+    var keys: std.ArrayList(Key) = .empty;
+    defer keys.deinit(gpa);
+    var any_bound = false;
     for (callees) |cs| for (cs) |c| switch (c.view()) {
-        .fn_ref => |gid| try gids.append(gpa, gid),
+        .fn_ref => |gid| try keys.append(gpa, .{ .kind = .fn_value, .key = gid }),
+        .bound_method => any_bound = true,
         .none, .method, .protocol, .builtin, .value => {},
     };
     for (instances) |inst| for (inst.callees) |c| switch (c.view()) {
-        .fn_ref => |gid| try gids.append(gpa, gid),
+        .fn_ref => |gid| try keys.append(gpa, .{ .kind = .fn_value, .key = gid }),
+        .bound_method => any_bound = true,
         .none, .method, .protocol, .builtin, .value => {},
     };
-    std.mem.sort(u32, gids.items, {}, std.sort.asc(u32));
+    // Whether a bound value boxes depends on its owner's boxed list, so bound values are
+    // found per owner, by walking the owner's body.
+    if (any_bound) {
+        for (fns, 0..) |f, gid| {
+            if (!isBaseOwner(f, fsyms[gid])) continue;
+            const mc = &graph.mods[f.module];
+            const boxed: []const u32 = if (gid < base_boxed.len) base_boxed[gid] else &.{};
+            try collectBound(gpa, mc, f.decl_node, callees[f.module], boxed, &keys);
+        }
+        for (instances) |inst| try collectBound(gpa, &graph.mods[inst.mod], inst.decl_node, inst.callees, inst.boxed, &keys);
+    }
+    std.mem.sort(Key, keys.items, {}, struct {
+        fn lt(_: void, a: Key, b: Key) bool {
+            if (a.kind != b.kind) return @intFromEnum(a.kind) < @intFromEnum(b.kind);
+            return a.key < b.key;
+        }
+    }.lt);
     var n: usize = 0;
-    for (gids.items) |g| {
-        if (n > 0 and gids.items[n - 1] == g) continue;
-        gids.items[n] = g;
+    for (keys.items) |k| {
+        if (n > 0 and std.meta.eql(keys.items[n - 1], k)) continue;
+        keys.items[n] = k;
         n += 1;
     }
     const out = try gpa.alloc(Closure.Adapter, n);
@@ -614,17 +641,69 @@ fn buildAdapters(
         for (out[0..built]) |a| gpa.free(a.name);
         gpa.free(out);
     }
-    for (gids.items[0..n], out) |gid, *a| {
-        a.* = .{
-            .kind = .fn_value,
-            .key = gid,
-            .name = try Closure.adapterName(gpa, fns[gid].name, .fn_value),
-            .target = .{ .kind = fns[gid].kind, .name = fns[gid].name },
-            .sig = .{ .params = sigs[gid].params, .ret = sigs[gid].ret },
-        };
+    for (keys.items[0..n], out) |k, *a| {
+        switch (k.kind) {
+            .fn_value => a.* = .{
+                .kind = .fn_value,
+                .key = k.key,
+                .name = try Closure.adapterName(gpa, fns[k.key].name, .fn_value),
+                .target = .{ .kind = fns[k.key].kind, .name = fns[k.key].name },
+                .sig = .{ .params = sigs[k.key].params, .ret = sigs[k.key].ret },
+            },
+            .bound_copy, .bound_box => {
+                const m = methods[k.key];
+                const target = witnessSym(m, derives, instances, fns).?;
+                const sig = witnessSig(m, derives, instances, sigs).?;
+                a.* = .{
+                    .kind = k.kind,
+                    .key = k.key,
+                    .name = try Closure.adapterName(gpa, target.name, k.kind),
+                    .target = target,
+                    .sig = .{ .params = sig.params[@min(sig.params.len, 1)..], .ret = sig.ret },
+                    .recv = m.recv,
+                    .mut_self = m.mut_self,
+                };
+            },
+        }
         built += 1;
     }
     return out;
+}
+
+/// Append the `(kind, method)` adapter key of every bound method value in the body at
+/// `decl` (its lambdas included), read from `callees`, the owner's own slice.
+fn collectBound(
+    gpa: std.mem.Allocator,
+    mc: *const GraphCtx.ModuleCtx,
+    decl: Ast.Index,
+    callees: []const Callee,
+    boxed: []const u32,
+    keys: anytype,
+) error{OutOfMemory}!void {
+    const V = struct {
+        gpa: std.mem.Allocator,
+        tree: Ast.Tree,
+        resolutions: []const Resolution,
+        callees: []const Callee,
+        boxed: []const u32,
+        keys: @TypeOf(keys),
+        pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
+            const e = switch (ev) {
+                .enter => |e| e,
+                else => return,
+            };
+            if (e.idx.int() >= self.callees.len) return;
+            switch (self.callees[e.idx.int()].view()) {
+                .bound_method => |mi| try self.keys.append(self.gpa, .{
+                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.boxed),
+                    .key = mi,
+                }),
+                .none, .method, .protocol, .builtin, .value, .fn_ref => {},
+            }
+        }
+    };
+    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .callees = callees, .boxed = boxed, .keys = keys };
+    try AstWalk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, decl, &v);
 }
 
 /// The lambda-unit table: for each lowerable owner in canonical order (non-generic fns by
@@ -841,6 +920,26 @@ pub const Method = struct {
     /// is unaffected.
     derive: ?u32 = null,
 };
+
+/// The symbol method row `m` calls: a source-less derive's unit (checked first: a derive
+/// row has `fn_id == 0`), a generic-type instance, else the fn itself. `names` is indexed
+/// by fn id and gives `.kind` and `.name`. Null when `m` indexes past a table (a partial
+/// view).
+pub fn witnessSym(m: Method, derives: []const DeriveRecipe, instances: []const Mono.Instance, names: anytype) ?symbols.SymName {
+    if (m.derive) |di| return if (di < derives.len) .{ .kind = .user_fn, .name = derives[di].name.? } else null;
+    if (m.instance) |ii| return if (ii < instances.len) .{ .kind = .user_fn, .name = instances[ii].name.? } else null;
+    if (m.fn_id >= names.len) return null;
+    return .{ .kind = names[m.fn_id].kind, .name = names[m.fn_id].name };
+}
+
+/// The signature of the symbol `witnessSym` picks, from the same three sources; `sigs` is
+/// indexed by fn id. Null as for `witnessSym`.
+pub fn witnessSig(m: Method, derives: []const DeriveRecipe, instances: []const Mono.Instance, sigs: anytype) ?struct { params: []const Type, ret: Type } {
+    if (m.derive) |di| return if (di < derives.len) .{ .params = derives[di].params, .ret = derives[di].ret } else null;
+    if (m.instance) |ii| return if (ii < instances.len) .{ .params = instances[ii].params, .ret = instances[ii].ret } else null;
+    if (m.fn_id >= sigs.len) return null;
+    return .{ .params = sigs[m.fn_id].params, .ret = sigs[m.fn_id].ret };
+}
 
 /// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }`. Kept in
 /// its OWN table (never `Method`) precisely because it carries NO `recv: Type`: a template's
@@ -2144,7 +2243,7 @@ pub fn checkGraph(
         gpa.free(erased_units);
     }
 
-    const adapters = try buildAdapters(gpa, callees, instances, fns, sigs);
+    const adapters = try buildAdapters(gpa, t.graph, callees, instances, fns, t.fns.items, sigs, methods, derives, t.base_boxed);
     errdefer freeAdapters(gpa, adapters);
 
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
@@ -2441,9 +2540,10 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // Seed: scan every non-generic user fn's body (in fn-id order) for call-position
     // generic calls, reading the Pass-C-populated per-module node_types.
     const nts = t.gph_node_types orelse return; // graph mode always sets it
+    const cs = t.gph_callees.?;
     for (model.fns) |f| {
         if (f.kind != .user_fn or f.isGeneric()) continue; // bodyless builtins/externs have no calls
-        try t.scanCalls(model, f.mod, nts[f.mod], &worklist, &seen);
+        try t.scanCalls(model, f.mod, nts[f.mod], cs[f.mod], &worklist, &seen);
     }
 
     var capped = false;
@@ -2463,7 +2563,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         const inst = try t.recheck(model, p.gid, p.args);
         try t.mono.append(t.gpa, inst);
         // Discover nested generic calls in the instance body (its own node_types).
-        try t.scanCalls(model, inst.mod, inst.node_types, &worklist, &seen);
+        try t.scanCalls(model, inst.mod, inst.node_types, inst.callees, &worklist, &seen);
     }
 
     // Reification: mint a fresh concrete `struct_id` for every reachable ground
@@ -2567,7 +2667,7 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
         const fa = mc.tree.nodes[i];
         const member = mc.tokens[fa.main_token].text(mc.source);
         c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null)) {
-            .one => |mi| Callee.method(mi),
+            .one => |mi| if (c.sub == Callee.pending_bound.sub) Callee.boundMethod(mi) else Callee.method(mi),
             .none, .ambiguous => .{},
         };
     }
@@ -2670,12 +2770,13 @@ const DiscoveryView = struct {
     }
 };
 
-/// Scan module `mod`'s nodes for call-position generic calls, reading `node_types`
-/// for the concrete type-args, and enqueue each new `(gid, args)`. Uniform for the
+/// Scan module `mod`'s nodes for call-position generic calls (and generic-type methods
+/// bound as values, from `callees`), reading `node_types` for the concrete type-args,
+/// and enqueue each new `(gid, args)`. Uniform for the
 /// base seed (module node_types) and an instance re-check (the instance's own
 /// node_types — other fns' nodes stay `.invalid` there, so only THIS body's calls
 /// are seen).
-fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
+fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const Type, callees: []const Callee, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
     const mc = &t.graph.mods[mod];
     const tree = mc.tree;
     const resolutions = mc.resolutions;
@@ -2772,6 +2873,12 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                     const args = [_]Type{elem};
                     try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };
+            },
+            // A bound method on a generic-type receiver (`get := b.get`) calls the method's
+            // instance from its adapter, though no call names it.
+            .field_access => if (i < callees.len and std.meta.eql(callees[i], Callee.pending_bound)) {
+                const member = mc.tokens[n.main_token].text(mc.source);
+                try t.discoverRecvMethod(model, node_types[n.lhs.int()], member, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
             },
             else => {},
         }
@@ -9067,6 +9174,7 @@ test "boxed = captured ∩ (assigned ∪ mut self receivers)" {
     const gpa = testing.allocator;
     const pre =
         \\struct P { x: int }
+        \\struct Q { p: P }
         \\struct C { n: int }
         \\impl C {
         \\ fn bump(mut self) { self.n = self.n + 1 }
@@ -9082,6 +9190,8 @@ test "boxed = captured ∩ (assigned ∪ mut self receivers)" {
         // A field store, inside or outside.
         "fn main() -> int {\n p := P { x: 1 }\n f := fn() { p.x = 2 }\n f()\n return p.x\n}\n",
         "fn main() -> int {\n p := P { x: 1 }\n f := fn() -> int { p.x }\n p.x = 4\n return f()\n}\n",
+        // A nested field store.
+        "fn main() -> int {\n q := Q { p: P { x: 1 } }\n f := fn() -> int { q.p.x }\n q.p.x = 5\n return f()\n}\n",
         // A `mut self` call, outside or inside.
         "fn main() -> int {\n c := C { n: 0 }\n f := fn() -> int { c.get() }\n c.bump()\n return f()\n}\n",
         "fn main() -> int {\n c := C { n: 0 }\n f := fn() { c.bump() }\n f()\n return c.n\n}\n",
@@ -9410,5 +9520,260 @@ test "missing return in a local fn is T0043" {
         defer c.deinit(gpa);
         try testing.expect(hasCode(&c, .T0051));
         try testing.expect(anyDiagContains(c, "cannot break a loop outside this local function"));
+    }
+}
+
+/// The `nth` (node order) value-position `field_access` spelled `member`: one no call
+/// has as its member.
+fn valueMember(c: *const Checked, member: []const u8, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .field_access) continue;
+        if (!std.mem.eql(u8, c.tokens[n.main_token].text(c.source), member)) continue;
+        const idx = Ast.Index.from(@intCast(i));
+        if (isCallMember(c.tree, idx)) continue;
+        if (seen == nth) return idx;
+        seen += 1;
+    }
+    return error.TestMemberNotFound;
+}
+
+fn expectOneDiag(src: []const u8, code: codes.Code, message: []const u8) !void {
+    const gpa = testing.allocator;
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| if (d.code == code and std.mem.eql(u8, d.message, message)) return;
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    return error.TestExpectedDiagnostic;
+}
+
+test "acc.plus as a value types fn(int) -> int and records bound_method" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
+        \\fn main() -> int {
+        \\ acc := Acc { n: 1 }
+        \\ f := acc.plus
+        \\ return f(2)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const fa = try valueMember(&c, "plus", 0);
+    const ty = c.result.node_types[0][fa.int()];
+    try testing.expect(LayoutEngine.isFnStruct(ty, c.result.layouts));
+    const fs = c.result.layouts[ty.struct_id].fn_sig.?;
+    try testing.expectEqual(@as(usize, 1), fs.params.len);
+    try testing.expectEqual(Kind.int, fs.params[0].kind);
+    try testing.expectEqual(Kind.int, fs.ret.kind);
+    const mi = c.result.callees[0][fa.int()].view().bound_method;
+    try testing.expectEqualStrings("plus", c.result.methods[mi].name);
+    // The receiver is never assigned, so the value copies it and nothing is boxed.
+    try testing.expectEqual(@as(usize, 0), c.result.owner_closures.len);
+    try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+    const a = c.result.adapters[0];
+    try testing.expectEqual(Closure.AdapterKind.bound_copy, a.kind);
+    try testing.expectEqual(mi, a.key);
+    try testing.expectEqualStrings("main.Acc.plus$bound", a.name);
+    try testing.expectEqualStrings("main.Acc.plus", a.target.name);
+    try testing.expectEqual(@as(usize, 1), a.sig.params.len);
+    try testing.expectEqualStrings("Acc", c.result.layouts[a.recv.struct_id].name);
+    try testing.expect(!a.mut_self);
+}
+
+test "b.get on Box[int] seals to the instance method" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn get(self) -> T { self.v } }
+        \\fn main() -> int {
+        \\ b := Box[int] { v: 5 }
+        \\ g := b.get
+        \\ return g()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const fa = try valueMember(&c, "get", 0);
+    const mi = c.result.callees[0][fa.int()].view().bound_method;
+    const ii = c.result.methods[mi].instance.?;
+    // No call names `get`, so only the bound value discovered the instance.
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    const fs = c.result.layouts[c.result.node_types[0][fa.int()].struct_id].fn_sig.?;
+    try testing.expectEqual(@as(usize, 0), fs.params.len);
+    try testing.expectEqual(Kind.int, fs.ret.kind);
+    try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+    try testing.expectEqualStrings(c.result.instances[ii].name.?, c.result.adapters[0].target.name);
+    for (c.result.callees[0]) |x| try testing.expect(x.tag != .pending);
+}
+
+test "a mut self bound method boxes its local receiver" {
+    const gpa = testing.allocator;
+    const pre =
+        \\struct C { n: int }
+        \\impl C {
+        \\ fn bump(mut self) { self.n = self.n + 1 }
+        \\ fn get(self) -> int { self.n }
+        \\}
+        \\
+    ;
+    const boxes = [_][]const u8{
+        // A `mut self` method writes the receiver through the value.
+        "fn main() -> int {\n c := C { n: 0 }\n inc := c.bump\n inc()\n return c.n\n}\n",
+        // A plain method on a receiver assigned later, or mutated by a call.
+        "fn main() -> int {\n c := C { n: 0 }\n g := c.get\n c = C { n: 2 }\n return g()\n}\n",
+        "fn main() -> int {\n c := C { n: 0 }\n g := c.get\n c.bump()\n return g()\n}\n",
+        // The same with a lambda in the fn.
+        "fn main() -> int {\n c := C { n: 0 }\n g := c.get\n h := fn() -> int { 1 }\n c = C { n: 2 }\n return g() + h()\n}\n",
+        // A param receiver.
+        "fn k(c: C) -> int {\n inc := c.bump\n inc()\n c.n\n}\nfn main() -> int { return k(C { n: 0 }) }\n",
+    };
+    for (boxes) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, body });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+        const fa = c.tree.nodes[(try valueMember(&c, if (std.mem.indexOf(u8, body, "c.bump\n") != null) "bump" else "get", 0)).int()];
+        const slot = c.resolve.resolutions[0][fa.lhs.int()].local;
+        try testing.expectEqual(@as(usize, 1), c.result.owner_closures.len);
+        try testing.expectEqualSlices(u32, &.{slot}, c.result.owner_closures[0].boxed);
+        try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+        try testing.expectEqual(Closure.AdapterKind.bound_box, c.result.adapters[0].kind);
+        try testing.expect(std.mem.endsWith(u8, c.result.adapters[0].name, "$boundbox"));
+    }
+    var bumped = try checkSource(pre ++ "fn main() -> int {\n c := C { n: 0 }\n inc := c.bump\n inc()\n return c.n\n}\n");
+    defer bumped.deinit(gpa);
+    try testing.expect(bumped.result.adapters[0].mut_self);
+    // A receiver no one writes stays a copy.
+    var ro = try checkSource(pre ++ "fn main() -> int {\n c := C { n: 3 }\n g := c.get\n return g() + c.n\n}\n");
+    defer ro.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ro.result.owner_closures.len);
+    try testing.expectEqual(Closure.AdapterKind.bound_copy, ro.result.adapters[0].kind);
+}
+
+test "mut self bound on a temporary is T0019, on a field T0052" {
+    const pre =
+        \\struct C { n: int }
+        \\struct H { c: C }
+        \\impl C {
+        \\ fn bump(mut self) { self.n = self.n + 1 }
+        \\ fn get(self) -> int { self.n }
+        \\}
+        \\fn mk() -> C { C { n: 0 } }
+        \\
+    ;
+    try expectOneDiag(pre ++ "fn main() -> int {\n inc := mk().bump\n inc()\n return 0\n}\n", .T0019, "cannot bind mutating method 'bump' to a temporary; the receiver must be a local variable");
+    try expectOneDiag(pre ++ "fn main() -> int {\n h := H { c: C { n: 0 } }\n inc := h.c.bump\n inc()\n return h.c.n\n}\n", .T0052, "binding the 'mut self' method 'bump' needs a local receiver, not a field; bind it on a local variable");
+    // A bound method captures its receiver, and a `mut self` receiver cannot be captured.
+    try expectOneDiag(pre ++ "impl H {\n fn peek(mut self) -> int {\n  g := self.total\n  g()\n }\n fn total(self) -> int { self.c.n }\n}\nfn main() -> int {\n h := H { c: C { n: 0 } }\n return h.peek()\n}\n", .T0052, "a closure cannot capture the 'mut self' receiver 'self'; copy it to a local first");
+    // A plain method on a field or a temporary copies the receiver once: no error.
+    const gpa = testing.allocator;
+    var ok = try checkSource(pre ++ "fn main() -> int {\n h := H { c: C { n: 1 } }\n g := h.c.get\n t := mk().get\n return g() + t()\n}\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), ok.result.owner_closures.len);
+}
+
+test "a builtin method as a value is T0049" {
+    const msg = "'len' is a built-in method and cannot be used as a value; wrap the call in a lambda";
+    try expectOneDiag("fn main() -> int {\n s := \"hi\"\n f := s.len\n return f()\n}\n", .T0049, msg);
+    try expectOneDiag("fn main() -> int {\n n := 1\n f := n.eq\n return if f(1) { 1 } else { 0 }\n}\n", .T0049, "'eq' is a built-in method and cannot be used as a value; wrap the call in a lambda");
+    try expectOneDiag("fn main() -> int {\n o: Option[int] = .some(1)\n f := o.unwrap\n return f()\n}\n", .T0049, "'unwrap' is a built-in method and cannot be used as a value; wrap the call in a lambda");
+    try expectOneDiag("struct P { x: int }\nfn main() -> int {\n p := P { x: 1 }\n f := p.to_string\n return 0\n}\n", .T0049, "'to_string' is a built-in method and cannot be used as a value; wrap the call in a lambda");
+    try expectOneDiag(
+        \\protocol Shape { fn area(self) -> int }
+        \\struct Sq { s: int }
+        \\impl Sq has Shape { fn area(self) -> int { self.s * self.s } }
+        \\fn first[T has Shape](x: T) -> int {
+        \\ f := x.area
+        \\ f()
+        \\}
+        \\fn main() -> int { return first(Sq { s: 2 }) }
+        \\
+    , .T0049, "'area' is a protocol method of a type parameter and cannot be used as a value; wrap the call in a lambda");
+}
+
+test "a static method as a value is T0018" {
+    const msg = "'make' is an associated function, not a method; it has no receiver to bind";
+    try expectOneDiag(
+        \\struct Acc { n: int }
+        \\impl Acc { fn make() -> Acc { Acc { n: 0 } } }
+        \\fn main() -> int {
+        \\ a := Acc { n: 1 }
+        \\ f := a.make
+        \\ return 0
+        \\}
+        \\
+    , .T0018, msg);
+    try expectOneDiag(
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn make(v: T) -> Box[T] { Box[T] { v: v } } }
+        \\fn main() -> int {
+        \\ b := Box[int] { v: 1 }
+        \\ f := b.make
+        \\ return 0
+        \\}
+        \\
+    , .T0018, msg);
+}
+
+test "a field wins over a method in value position" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct S { run: fn(int) -> int }
+        \\impl S { fn run(self, x: int) -> int { x + 100 } }
+        \\fn dbl(x: int) -> int { x * 2 }
+        \\fn main() -> int {
+        \\ s := S { run: dbl }
+        \\ f := s.run
+        \\ return f(1) + s.run(1)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const fa = try valueMember(&c, "run", 0);
+    try testing.expectEqual(Callee.View.none, c.result.callees[0][fa.int()].view());
+    for (c.result.adapters) |a| try testing.expectEqual(Closure.AdapterKind.fn_value, a.kind);
+    // An assignment target names a field, never a bound method.
+    try expectOneDiag(
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
+        \\fn one(x: int) -> int { x }
+        \\fn main() -> int {
+        \\ a := Acc { n: 1 }
+        \\ a.plus = one
+        \\ return a.n
+        \\}
+        \\
+    , .T0046, "no field 'plus' in struct 'Acc'");
+    // Only the target's own member: the rest of the place, a call argument or a lambda
+    // body in it, still binds.
+    var inner = try checkSource(
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
+        \\fn mk(f: fn(int) -> int) -> Ref[int] { &f(1) }
+        \\fn main() -> int {
+        \\ acc := Acc { n: 1 }
+        \\ r := mk(acc.plus)
+        \\ *mk(acc.plus) = 7
+        \\ *fn() -> Ref[int] {
+        \\  g := acc.plus
+        \\  _h := g
+        \\  r
+        \\ }() = 8
+        \\ return *r
+        \\}
+        \\
+    );
+    defer inner.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), inner.result.diags.len);
+    for (0..3) |k| {
+        const m = try valueMember(&inner, "plus", k);
+        try testing.expect(inner.result.callees[0][m.int()].view() == .bound_method);
     }
 }
