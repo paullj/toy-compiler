@@ -804,6 +804,26 @@ test "gc: a bound method's receiver env survives a collection" {
     );
 }
 
+test "gc: a specialized call's lambda env survives a collection inside the callee" {
+    try expectClosureGc(".toy-test-gc-spec",
+        \\fn twice_gc[T](f: fn(T) -> T, x: T) -> T {
+        \\    y := f(x)
+        \\    if !collect() { return x }
+        \\    f(y)
+        \\}
+        \\fn main() -> int {
+        \\    n := 20
+        \\    s := "ab".concat("c")
+        \\    a := twice_gc(fn(x: int) -> int { x + n + s.len() - 3 }, 2)
+        \\    if a != 42 { return 1 }
+        \\    b := twice_gc(make_adder(21), 0)
+        \\    if b != 42 { return 2 }
+        \\    return a
+        \\}
+        \\
+    );
+}
+
 test "gc: per-iteration boxes survive" {
     try expectClosureGc(".toy-test-gc-box-loop",
         \\fn fill() -> Vec[fn() -> int] {

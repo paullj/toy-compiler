@@ -276,12 +276,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.opt_stats, st.timings, st.jlimit, threads, st.sev));
+        std.process.exit(try emitExecutable(gpa, out, level, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (st.emit == .ir) {
-        std.process.exit(try emitIr(gpa, out, level, st.target, st.paths.items, st.opt, st.jlimit, st.sev));
+        std.process.exit(try emitIr(gpa, out, level, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev));
     }
 
     const results = try Driver.run(gpa, io, st.emit, st.target, st.paths.items);
@@ -325,6 +325,7 @@ const State = struct {
     // opt level / pass selection. Default -O0. Base -O then --opt (resets+sets) then
     // each --no-opt; the flat model loses cross-flag argv order (documented deviation).
     opt: Opt.Config = .O0,
+    specialize: bool = true,
     opt_stats: bool = false,
     timings: bool = false,
     // the `-j N` jobs knob. `.unlimited` => cpu pool; `.limited(0)` (-j1) => serial;
@@ -351,6 +352,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     st.dump = p.dump;
     st.codegen_stats = p.codegen_stats;
     st.opt_stats = p.opt_stats;
+    st.specialize = !p.no_specialize;
     st.timings = p.timings;
     // --no-cache DOMINATES --verify when both are given: the flat model loses argv
     // order, so apply .verify first then let .force win (no script passes both).
@@ -672,6 +674,7 @@ fn emitExecutable(
     mode: Engine.Mode,
     codegen_stats: bool,
     opt: Opt.Config,
+    specialize: bool,
     opt_stats: bool,
     timings: bool,
     jlimit: Io.Limit,
@@ -796,6 +799,7 @@ fn emitExecutable(
         .gt_contribs = &gt_contribs,
         .mode = mode,
         .opt = opt,
+        .specialize = specialize,
         .discover_probe = discover_probe_ptr,
         .probe = probe_ptr,
         .link_ns = link_ns_ptr,
@@ -957,6 +961,7 @@ fn emitIr(
     target: []const u8,
     paths: []const []const u8,
     opt: Opt.Config,
+    specialize: bool,
     jlimit: Io.Limit,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
@@ -1013,6 +1018,7 @@ fn emitIr(
         .gt_contribs = &gt_contribs,
         .mode = .normal,
         .opt = opt,
+        .specialize = specialize,
         .discover_probe = null,
         .probe = null,
         .link_ns = null,

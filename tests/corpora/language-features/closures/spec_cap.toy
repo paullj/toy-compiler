@@ -1,0 +1,17 @@
+# Feature: a generic fn gets at most 8 specialized instances; call sites past the cap (the last lambda units by name) use the erased instance
+# expect: exit 55
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+
+fn main() -> int {
+    a := apply(fn(x: int) { x + 1 }, 0)
+    b := apply(fn(x: int) { x + 2 }, 0)
+    c := apply(fn(x: int) { x + 3 }, 0)
+    d := apply(fn(x: int) { x + 4 }, 0)
+    e := apply(fn(x: int) { x + 5 }, 0)
+    f := apply(fn(x: int) { x + 6 }, 0)
+    g := apply(fn(x: int) { x + 7 }, 0)
+    h := apply(fn(x: int) { x + 8 }, 0)
+    i := apply(fn(x: int) { x + 9 }, 0)
+    j := apply(fn(x: int) { x + 10 }, 0)
+    return a + b + c + d + e + f + g + h + i + j
+}

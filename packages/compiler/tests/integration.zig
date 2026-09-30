@@ -19,6 +19,7 @@ test {
     _ = @import("differential.zig");
     _ = @import("corpus.zig");
     _ = @import("heap.zig");
+    _ = @import("closures.zig");
     _ = @import("ref.zig");
     _ = @import("vec.zig");
     _ = @import("desc.zig");

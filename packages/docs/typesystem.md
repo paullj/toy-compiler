@@ -251,7 +251,7 @@ different function types are T0044. A function value has no methods (T0018) and 
 no protocol bound (T0023), so it is neither a `Map` key nor `Display`-able. A generic
 function with a function-typed parameter (`fn apply[T](f: fn(T) -> T, x: T)`) infers
 through it and instantiates on the value's signature; the value is called through its
-pair.
+pair, unless the call is specialized (see [Specialized generic calls](#specialized-generic-calls)).
 
 At runtime a named function value is `{its thunk, null}`: the thunk `<fn>$fnval(env,
 params..)` drops the env and calls the function, so every value is called the same
@@ -348,6 +348,28 @@ the value is made, so two evaluations compare unequal: `<witness>$bound(env,
 params..)` passes the receiver copy in the env as `self`, and `<witness>$boundbox`
 reads the receiver through the boxed local's cell (for `mut self`, it passes the cell
 itself as the receiver's address).
+
+## Specialized generic calls
+
+A generic call whose argument for a function-typed parameter is a named function
+(`apply(inc, 1)`) or a lambda literal (`apply(fn(x: int) { x + k }, 1)`) goes to a copy
+of its instance, `<instance>$sp<p>$<target>` for each such argument in parameter order.
+A call of a generic type's method (`b.apply(inc)` on a `Box[int]`) is a generic call of
+its instance too; `p` counts `self`, so its first argument is parameter 1.
+In the copy a call of that parameter is a direct call of the target: a named function
+without an env, a lambda's unit with the env of the pair the parameter holds. The copy
+keeps the instance's signature, so the caller passes the same arguments, and a use of
+the parameter as a value (stored, passed on, compared) still sees the pair. Any other
+argument (a local holding a function, a local function, a field, a call result, a
+bound method) goes through the erased instance, which calls the pair indirectly; so
+does the parameter when the copy passes it on (`repeat(f, ..)` inside `repeat`).
+
+A parameter is specialized only when its function never assigns it, and a generic
+function that contains a lambda or a local function specializes none. Each generic
+function or method gets at most 8 copies over all its instances: the first 8 by name, so which
+call sites keep theirs does not depend on the order the compiler visits them. Past the
+cap a call uses the erased instance. `toy build --no-specialize` sends every call
+through the erased instance; it changes the code, never the behavior.
 
 ## Protocols, the prelude, and builtin-scalar conformance
 

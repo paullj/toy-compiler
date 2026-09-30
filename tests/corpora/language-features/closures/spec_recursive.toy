@@ -1,0 +1,15 @@
+# Feature: a specialized generic fn that recurses with its own fn param calls the erased instance for the inner call (there the param is a value), while its own calls of the param stay direct
+# expect: exit 45
+fn inc(x: int) -> int { x + 1 }
+fn repeat[T](f: fn(T) -> T, x: T, n: int) -> T {
+    if n == 0 { return x }
+    repeat(f, f(x), n - 1)
+}
+
+fn main() -> int {
+    k := 2
+    a := repeat(inc, 0, 5)                         # 5
+    b := repeat(fn(x: int) { x * k }, 1, 5)        # 32
+    c := repeat(inc, repeat(inc, 0, 3), 5)         # 8
+    return a + b + c                               # 45
+}

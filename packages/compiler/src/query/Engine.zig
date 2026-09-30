@@ -32,6 +32,7 @@ const lower = @import("../lower.zig");
 const DeriveEmit = @import("../lower/derive_emit.zig");
 const AdapterEmit = @import("../lower/adapter_emit.zig");
 const Closure = @import("../symbols/Closure.zig");
+const Mono = @import("../symbols/Mono.zig");
 const Phase = @import("Phase.zig");
 
 const Engine = @This();
@@ -803,14 +804,17 @@ pub fn codegenErased(
 }
 
 /// A closure-class codegen unit: a lambda (its index in `frozen.closure.lambda_units`,
-/// lowered under its owner's view) or a source-less adapter.
-pub const ClosureUnit = union(enum) { lambda: u32, adapter: Closure.Adapter };
+/// lowered under its owner's view), a source-less adapter, or a spec unit (its index in
+/// `frozen.closure.specs.units`, lowered under its instance's view).
+pub const ClosureUnit = union(enum) { lambda: u32, adapter: Closure.Adapter, spec: u32 };
 
 /// Lower one closure-class unit, UNCACHED like `codegenErased`: it is pure over its table
-/// entry, the layouts and (for a lambda) its owner's frozen tables, and the tables are
-/// built serially in canonical order, so it is `-jN`-deterministic without a cache key.
-/// A lambda needs no key of its own: its body is part of its owner's fingerprint, and it
-/// is rebuilt every build. `--verify` runs the spill tripwire, as for AST units.
+/// entry, the layouts and (for a lambda or a spec unit) its owner's frozen tables, and the
+/// tables are built serially in canonical order, so it is `-jN`-deterministic without a
+/// cache key. A lambda needs no key of its own: its body is part of its owner's
+/// fingerprint, and it is rebuilt every build. A spec unit is its instance's body with some
+/// value calls made direct, and each caller folds the spec unit's name. `--verify` runs the
+/// spill tripwire, as for AST units.
 pub fn codegenClosure(
     self: Engine,
     gpa: std.mem.Allocator,
@@ -827,7 +831,12 @@ pub fn codegenClosure(
     const sym = Link.SymName{ .kind = .user_fn, .name = switch (unit) {
         .lambda => |ui| frozen.closure.lambda_units[ui].name,
         .adapter => |a| a.name,
+        .spec => |si| frozen.closure.specs.units[si].name,
     } };
+    const spec_inst: ?Mono.Instance = switch (unit) {
+        .spec => |si| frozen.instances[frozen.closure.specs.units[si].inst],
+        .lambda, .adapter => null,
+    };
 
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -842,7 +851,7 @@ pub fn codegenClosure(
         .layouts = frozen.layouts,
         .enum_layouts = frozen.enum_layouts,
         .names = frozen.names,
-        .sig = null,
+        .sig = if (spec_inst) |inst| .{ .kind = .user_fn, .name = sym.name, .params = inst.params, .ret = inst.ret } else null,
         .instances = frozen.instances,
         .sigs = frozen.sigs,
         .methods = frozen.methods,
@@ -854,6 +863,7 @@ pub fn codegenClosure(
     var irf = switch (unit) {
         .lambda => |ui| try lower.lowerLambda(gpa, in, ui, sym, &diags),
         .adapter => |a| try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
+        .spec => try lower.lowerFn(gpa, in, spec_inst.?.decl_node, sym, false, &diags),
     };
     defer irf.deinit(gpa);
     if (diags.items.len > 0) return error.CodegenDiagnostic;

@@ -1,0 +1,24 @@
+# Feature: a generic call whose fn argument is a named fn gets its own specialized instance, which calls the fn directly (scalar, sret-struct and two-arg targets)
+# expect: exit 42
+import std/vec
+
+struct P { x: int, y: int, z: int }
+
+fn add(x: int) -> int { x + 3 }
+fn grow(p: P) -> P { P { x: p.x + 1, y: p.y + 2, z: p.z + 3 } }
+fn sum(acc: int, x: int) -> int { acc + x }
+
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn fold[T, A](xs: Vec[T], init: A, f: fn(A, T) -> A) -> A {
+    acc := init
+    for x in xs { acc = f(acc, x) }
+    acc
+}
+
+fn main() -> int {
+    a := apply(add, 3)                         # 6
+    p := apply(grow, P { x: 1, y: 2, z: 3 })   # 2 + 4 + 6 = 12
+    xs: Vec[int] = [4, 5, 6, 9]
+    s := fold(xs, 0, sum)                      # 24
+    return a + p.x + p.y + p.z + s             # 42
+}

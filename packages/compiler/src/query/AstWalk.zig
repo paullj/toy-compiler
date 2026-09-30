@@ -30,6 +30,7 @@ const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const Mono = @import("../symbols/Mono.zig");
 const Callee = @import("../symbols/Callee.zig").Callee;
+const Spec = @import("../symbols/Spec.zig");
 
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 const Fingerprint = @import("Fingerprint.zig");
@@ -703,7 +704,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         {
                             try self.foldCalleeTable(c.call);
                         } else {
-                            try self.foldViaInstanceRef(c.call);
+                            try self.foldInstance(c.call);
                         }
                         return;
                     }
@@ -724,7 +725,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                         // agreement.
                         const ctag = self.frozen.tree.nodes[c.idx.int()].tag;
                         if ((ctag == .identifier or ctag == .field_access) and sig.isGenericTemplate()) {
-                            try self.foldBareInstance(c.call);
+                            try self.foldInstance(c.call);
                             return;
                         }
                         const nm = self.frozen.names[res.func];
@@ -802,7 +803,16 @@ pub fn CallVisitor(comptime Frozen: type) type {
                 // A value call's code is not known statically; `.fn_ref` and `.bound_method`
                 // never sit on a call's slot (they fold at their own node's `.enter`).
                 .none, .protocol, .value, .fn_ref, .bound_method => {},
-                .method => |i| if (i < fr.methods.len) try self.foldWitness(fr.methods[i]),
+                .method => |i| if (i < fr.methods.len) {
+                    // A specialized call relocs to its spec unit, which has the instance's sig.
+                    if (Spec.methodSite(fr, call_idx)) |site| if (site.ii < fr.instances.len) {
+                        if (try Spec.select(self.gpa, fr, call_idx, site)) |name| {
+                            const inst = fr.instances[site.ii];
+                            return self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret });
+                        }
+                    };
+                    try self.foldWitness(fr.methods[i]);
+                },
                 .builtin => |k| switch (k) {
                     // `to_string` relocs to the receiver's Display witness (there is no
                     // `to_string` symbol), so that witness is what callers depend on.
@@ -835,56 +845,46 @@ pub fn CallVisitor(comptime Frozen: type) type {
             try self.out.append(self.gpa, .{ .kind = sym.kind, .name = sym.name, .params = sig.params, .ret = sig.ret });
         }
 
-        /// Recover the generic call's `(gid, type-args)` via the SHARED `callInstanceRef`
-        /// (explicit turbofish or bare inference), find the reified instance, and fold its
-        /// INSTANCE sig. A miss (pre-typecheck view, arity/conflict/unbound, or an unminted
-        /// instance) folds nothing, so exactly one-or-zero Sig per call is preserved and the
-        /// fold tracks the SAME `Instance` mono discovery enqueued.
-        fn foldViaInstanceRef(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
-            const call_node = self.frozen.tree.nodes[call_idx.int()];
-            const ref = (try Mono.callInstanceRef(self.gpa, self.frozen, call_node)) orelse return;
-            defer self.gpa.free(ref.args);
-            const ii = Mono.find(self.frozen.instances, ref.gid, ref.args) orelse return;
+        /// Fold generic call `call_idx`'s reified INSTANCE identity (see `instanceOfCall`), or
+        /// the spec unit's name when the call goes to one (the instance's sig either way). A
+        /// miss (pre-typecheck view, arity/conflict/unbound, or an unminted instance) folds
+        /// nothing, so exactly one-or-zero Sig per call is preserved and the fold tracks the
+        /// SAME `Instance` mono discovery enqueued.
+        fn foldInstance(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
+            const ii = (try instanceOfCall(self.gpa, self.frozen, call_idx)) orelse return;
             const inst = self.frozen.instances[ii];
-            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
-        }
-
-        /// Fold a bare inferred generic call to its reified INSTANCE identity. The FLAT
-        /// and turbofish shapes route through the shared `callInstanceRef` (this view
-        /// has no composite, so `callInstanceRef` returns null for a pure-container
-        /// call), keeping the flat fingerprint byte-identical. A container/mixed call
-        /// falls to the FIND-regime resolver: match the reified value-arg types against
-        /// each instance's reified `params`, so editing a bare-inferred call's chosen
-        /// instance recompiles its callers.
-        fn foldBareInstance(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
-            const call_node = self.frozen.tree.nodes[call_idx.int()];
-            if (try Mono.callInstanceRef(self.gpa, self.frozen, call_node)) |ref| {
-                defer self.gpa.free(ref.args);
-                if (Mono.find(self.frozen.instances, ref.gid, ref.args)) |ii| {
-                    const inst = self.frozen.instances[ii];
-                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
-                    return;
-                }
-            }
-            const bres = self.frozen.resolutions[call_node.lhs.int()];
-            if (bres != .func) return;
-            const value_args = Ast.rangeSlice(self.frozen.tree, call_node.rhs.int());
-            // Heap-allocate (not a fixed stack buffer) so a call with any arity still
-            // folds its instance-identity into the fingerprint — a silent skip on a large
-            // arg list would drop the caller's recompile dependency (stale-cache hazard).
-            // Mirrors lower.zig / Mono.callInstanceRef, which alloc the same scratch.
-            const buf = try self.gpa.alloc(Typecheck.Type, value_args.len);
-            defer self.gpa.free(buf);
-            for (value_args, 0..) |va, k| {
-                if (va.int() >= self.frozen.node_types.len) return;
-                buf[k] = self.frozen.node_types[va.int()];
-            }
-            if (Mono.findByReifiedParams(self.frozen.instances, bres.func, buf)) |ii| {
-                const inst = self.frozen.instances[ii];
-                try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
-            }
+            const name = (try Spec.select(self.gpa, self.frozen, call_idx, .{ .ii = ii, .self_n = 0 })) orelse inst.name.?;
+            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret });
         }
     };
+}
+
+/// The reified instance generic call `call` selects: the template gid and type-args the
+/// SHARED `callInstanceRef` recovers (explicit turbofish or bare inference), found in the
+/// instance table. This view has no composite, so `callInstanceRef` returns null for a
+/// pure-container call; that call falls to the FIND regime: match the reified value-arg
+/// types against each instance's reified `params`. Null on a miss (pre-typecheck view,
+/// arity/conflict/unbound, or an unminted instance).
+pub fn instanceOfCall(gpa: std.mem.Allocator, frozen: anytype, call: Ast.Index) error{OutOfMemory}!?usize {
+    const call_node = frozen.tree.nodes[call.int()];
+    if (try Mono.callInstanceRef(gpa, frozen, call_node)) |ref| {
+        defer gpa.free(ref.args);
+        if (Mono.find(frozen.instances, ref.gid, ref.args)) |ii| return ii;
+    }
+    const bres = frozen.resolutions[call_node.lhs.int()];
+    if (bres != .func) return null;
+    const value_args = Ast.rangeSlice(frozen.tree, call_node.rhs.int());
+    // Heap-allocate (not a fixed stack buffer) so a call with any arity still
+    // folds its instance-identity into the fingerprint — a silent skip on a large
+    // arg list would drop the caller's recompile dependency (stale-cache hazard).
+    // Mirrors lower.zig / Mono.callInstanceRef, which alloc the same scratch.
+    const buf = try gpa.alloc(Typecheck.Type, value_args.len);
+    defer gpa.free(buf);
+    for (value_args, 0..) |va, k| {
+        if (va.int() >= frozen.node_types.len) return null;
+        buf[k] = frozen.node_types[va.int()];
+    }
+    return Mono.findByReifiedParams(frozen.instances, bres.func, buf);
 }
 
 /// Records each touched type's layout in body-walk order: at a `.touch` event the
@@ -1199,6 +1199,13 @@ const FakeFrozen = struct {
     methods: []const Typecheck.Method = &.{},
     derives: []const Typecheck.DeriveRecipe = &.{},
     prelude_ids: Typecheck.PreludeProtocolIds = .{},
+    closure: FakeClosure = .{},
+
+    const FakeClosure = struct {
+        specs: Spec.Table = .{},
+        lambda_units: []const @import("../symbols/Closure.zig").LambdaUnit = &.{},
+        owner: ?@import("../symbols/Closure.zig").Owner = null,
+    };
 
     pub fn genericTemplate(self: *const FakeFrozen, gid: u32) ?Mono.TemplateRef {
         if (gid >= self.sigs.len) return null;
@@ -2310,6 +2317,11 @@ const Checked = struct {
 
     /// Fold the callee Sigs of top-level fn `fn_name` against `callees`.
     fn fold(self: *const Checked, gpa: std.mem.Allocator, callees: []const Callee, fn_name: []const u8, out: *std.ArrayList(Sig)) !void {
+        return self.foldWith(gpa, callees, fn_name, .{}, out);
+    }
+
+    /// `fold` under the given closure tables.
+    fn foldWith(self: *const Checked, gpa: std.mem.Allocator, callees: []const Callee, fn_name: []const u8, closure: FakeFrozen.FakeClosure, out: *std.ArrayList(Sig)) !void {
         const frozen = FakeFrozen{
             .tree = self.tree,
             .tokens = self.tokens,
@@ -2324,6 +2336,7 @@ const Checked = struct {
             .instances = self.tc.instances,
             .methods = self.tc.methods,
             .prelude_ids = self.tc.prelude_ids,
+            .closure = closure,
         };
         const prog = self.tree.nodes[Ast.root(self.tree.nodes).int()];
         for (Ast.rangeSlice(self.tree, prog.lhs.int())) |idx| {
@@ -2537,4 +2550,47 @@ test "a bound method value folds its witness" {
     }
     try testing.expectEqual(fps[0], fps[1]);
     try testing.expect(fps[0] != fps[2]);
+}
+
+test "a specialized call site folds the spec unit's name" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
+        \\fn inc(x: int) -> int { x + 1 }
+        \\fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+        \\fn use_it() -> int { apply(inc, 1) + apply(fn(x: int) { x }, 2) }
+        \\
+    );
+    defer fx.destroy(gpa);
+    const inst_i = for (fx.tc.instances, 0..) |inst, i| {
+        if (std.mem.eql(u8, inst.name.?, "main.apply$int")) break i;
+    } else return error.TestExpectedInstance;
+    const inst = fx.tc.instances[inst_i];
+    const inc: Spec.Target = .{ .param = 0, .kind = .named, .sym = .{ .kind = .user_fn, .name = "main.inc" } };
+    const units = [_]Spec.Unit{.{ .inst = @intCast(inst_i), .name = "main.apply$int$sp0$main.inc", .targets = &.{inc} }};
+    const masks = [_]Spec.TemplateMask{.{ .gid = inst.template_gid, .eligible = 1 }};
+    const owner: @import("../symbols/Closure.zig").Owner = for (fx.res.fns, 0..) |gf, i| {
+        if (std.mem.eql(u8, gf.name, "main.use_it")) break .{ .base = @intCast(i) };
+    } else return error.TestExpectedFn;
+    const closure: FakeFrozen.FakeClosure = .{ .specs = .{ .units = &units, .masks = &masks }, .lambda_units = fx.tc.lambda_units, .owner = owner };
+
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.foldWith(gpa, fx.tc.callees[0], "use_it", closure, &sigs);
+    // The specialized call (a call folds before its args), `inc` as a value, then the
+    // lambda's call: its unit is not in the table (past the cap, say), so it folds the
+    // erased instance.
+    try testing.expectEqual(@as(usize, 3), sigs.items.len);
+    try testing.expectEqualStrings("main.apply$int$sp0$main.inc", sigs.items[0].name);
+    try testing.expectEqualStrings("main.inc", sigs.items[1].name);
+    try testing.expectEqualStrings("main.apply$int", sigs.items[2].name);
+    // Either way the call folds the instance's signature.
+    for ([_]Sig{ sigs.items[0], sigs.items[2] }) |sg| {
+        try testing.expect(Typecheck.eqlTypeVec(inst.params, sg.params));
+        try testing.expect(Typecheck.Type.eql(inst.ret, sg.ret));
+    }
+
+    // With no table the same call folds the erased instance's name.
+    sigs.clearRetainingCapacity();
+    try fx.fold(gpa, fx.tc.callees[0], "use_it", &sigs);
+    try testing.expectEqualStrings("main.apply$int", sigs.items[0].name);
 }

@@ -13,7 +13,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `control-flow/` | if/else, while/loop/for, break/continue, labels, `&&`/`\|\|` |
 | `structs/`      | construction, by-value copy, field stores, struct returns |
 | `io/`           | runtime output via `print`                                |
-| `closures/`     | function types, function values, lambdas, local fns and bound methods |
+| `closures/`     | function types, function values, lambdas, local fns, bound methods and specialized generic calls |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 
 ## Annotation convention

@@ -34,6 +34,7 @@ const symbols_res = @import("symbols/Resolution.zig");
 const Typecheck = @import("types.zig");
 const Callee = @import("symbols/Callee.zig").Callee;
 const Closure = @import("symbols/Closure.zig");
+const Spec = @import("symbols/Spec.zig");
 const LayoutEngine = @import("layout/Engine.zig");
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
@@ -130,6 +131,12 @@ pub const ClosureInputs = struct {
     /// The owner's boxed locals (resolver slots, ascending): each lives in a GC cell for its
     /// whole lifetime, in the owner and in every lambda unit of it.
     boxed: []const u32 = &.{},
+    /// The specialized copies generic calls may go to; empty means every call takes the
+    /// erased instance.
+    specs: Spec.Table = .{},
+    /// A spec unit's own targets, ascending by param: a call of one of these params jumps
+    /// straight to its code. Empty for every other body.
+    spec_targets: []const Spec.Target = &.{},
 
     pub const none: ClosureInputs = .{ .adapters = &.{}, .lambda_units = &.{} };
 };
@@ -2102,6 +2109,10 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             // both (`names[m.fn_id]` would be `names[0]`, a wrong-symbol miscompile).
             const m = b.in.methods[mi];
             callee = witnessCallee(b, m);
+            if (m.instance) |ii| {
+                if (try Spec.select(b.gpa, &b.in, node_idx, .{ .ii = ii, .self_n = @intFromBool(!m.is_static) })) |name|
+                    callee = .{ .kind = .user_fn, .name = name };
+            }
             // An associated function (`Vec[int].new()`) takes no `self`: its receiver is a type.
             self_recv = if (m.is_static) Ast.none else b.in.tree.nodes[Callee.memberNode(b.in.tree, n).?.int()].lhs;
             self_mut = m.mut_self;
@@ -2176,7 +2187,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 try b.note(callee_node.main_token, "unresolved generic instance in lower");
                 return .none;
             };
-            callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
+            callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, &b.in, node_idx, .{ .ii = ii, .self_n = 0 })) orelse b.in.instances[ii].name.? };
         } else {
             // The callee identifier resolves to a `.func` index into `names`.
             const callee_res = b.in.resolutions[(n.lhs).int()];
@@ -2303,7 +2314,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     try b.note(callee_node.main_token, "unresolved generic instance in lower");
                     return .none;
                 };
-                callee = .{ .kind = .user_fn, .name = b.in.instances[inst].name.? };
+                callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, &b.in, node_idx, .{ .ii = inst, .self_n = 0 })) orelse b.in.instances[inst].name.? };
             } else {
                 callee = b.in.names[callee_res.func];
             }
@@ -2552,6 +2563,7 @@ fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
 /// A call of a function-typed value: evaluate the callee to its `{code, env}` pair, then
 /// the args left to right, and `blr` the code with the env as the hidden first argument.
 fn lowerValueCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    if (specTarget(b, n.lhs)) |t| return lowerSpecTargetCall(b, node_idx, n, t);
     const int_ty = Typecheck.Type.int;
     const pair = try operandPtr(b, try lowerExpr(b, n.lhs));
     if (pair == Ir.none_value) {
@@ -2567,6 +2579,41 @@ fn lowerValueCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemo
     args[0] = .{ .value = env };
     for (arg_nodes, 1..) |arg, i| args[i] = try lowerExpr(b, arg);
     return try emitCall(b, .{ .indirect = code }, args, b.in.node_types[(node_idx).int()], n.main_token);
+}
+
+/// The target of a spec unit's param when `callee` names one directly. Resolver slots
+/// hand params out first, so param `p` is slot `p`; a param is never assigned in a body
+/// that specializes it, so the slot still holds the caller's argument.
+fn specTarget(b: *const Builder, callee: Ast.Index) ?Spec.Target {
+    if (b.in.closure.spec_targets.len == 0) return null;
+    if (b.in.tree.nodes[callee.int()].tag != .identifier) return null;
+    const slot = switch (b.in.resolutions[callee.int()]) {
+        .local => |s| s,
+        else => return null,
+    };
+    for (b.in.closure.spec_targets) |t| if (t.param == slot) return t;
+    return null;
+}
+
+/// A spec unit's call of param `t.param`: a direct call of the code the caller passed. A
+/// named fn takes no env; a lambda takes the env of the pair the param holds.
+fn lowerSpecTargetCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, t: Spec.Target) error{OutOfMemory}!Ir.Operand {
+    const arg_nodes = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+    const lead: usize = @intFromBool(t.kind == .lambda);
+    const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len + lead);
+    errdefer b.gpa.free(args);
+    if (t.kind == .lambda) {
+        const pair = try operandPtr(b, try lowerExpr(b, n.lhs));
+        if (pair == Ir.none_value) {
+            try b.note(n.main_token, "called function value is not a slot in lower");
+            b.gpa.free(args);
+            return .none;
+        }
+        const env_addr = try b.emit(.{ .field_addr = .{ .base = pair, .off = 8, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
+        args[0] = .{ .value = try b.emit(.{ .load = .{ .addr = env_addr, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr) };
+    }
+    for (arg_nodes, lead..) |arg, i| args[i] = try lowerExpr(b, arg);
+    return try emitCall(b, .{ .direct = t.sym }, args, b.in.node_types[(node_idx).int()], n.main_token);
 }
 
 /// A named fn in value position: the pair `{its thunk's address, null env}` in a fresh
@@ -6843,6 +6890,142 @@ test "a bound mut self method passes the box pointer" {
         \\  %23 = field_addr %22, 0 : int
         \\  %24 = load %23 : int
         \\  br b1(%24)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    , ir);
+}
+
+/// Lower instance `inst_name` as a spec unit with `targets` and return its rendered IR,
+/// gpa-owned. Mirrors `Codegen.renderGraphIr`'s spec class.
+fn renderSpecG(gpa: std.mem.Allocator, src: []const u8, inst_name: []const u8, targets: []const Spec.Target) ![]u8 {
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
+
+    const names = try gpa.alloc(Link.SymName, rr.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (rr.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    const k: u32 = for (tc.instances, 0..) |inst, i| {
+        if (std.mem.eql(u8, inst.name.?, inst_name)) break @intCast(i);
+    } else return error.TestUnexpectedResult;
+    const inst = tc.instances[k];
+    const in = Inputs{
+        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
+        .tokens = tokens,
+        .source = src,
+        .resolutions = rr.resolutions[0],
+        .node_types = inst.node_types,
+        .callees = inst.callees,
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sig = .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret },
+        .instances = tc.instances,
+        .sigs = tc.sigs,
+        .methods = tc.methods,
+        .derives = tc.derives,
+        .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = k }, .boxed = inst.boxed, .spec_targets = targets },
+    };
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var func = try lowerFn(gpa, in, inst.decl_node, .{ .kind = .user_fn, .name = "spec" }, false, &diags);
+    defer func.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
+    return gpa.dupe(u8, w.buffered());
+}
+
+const spec_src =
+    \\fn add(x: int, y: int) -> int { x + y }
+    \\fn both[T](f: fn(T, T) -> T, g: fn(T, T) -> T, x: T) -> T { g(f(x, x), x) }
+    \\fn main() -> int { both(add, add, 1) }
+    \\
+;
+
+test "a spec unit calls its named target directly" {
+    const gpa = testing.allocator;
+    const add: Link.SymName = .{ .kind = .user_fn, .name = "main.add" };
+    const ir = try renderSpecG(gpa, spec_src, "main.both$int", &.{.{ .param = 1, .kind = .named, .sym = add }});
+    defer gpa.free(ir);
+    // `g` (param 1) is a direct call without an env; `f` (param 0, no target) stays a value
+    // call through its pair.
+    try testing.expectEqualStrings(
+        \\fn spec(s0, s1, s2) -> int {
+        \\  slots: s0:fn$int$int$int s1:fn$int$int$int s2:int
+        \\b0:
+        \\  %1 = slot_addr s0
+        \\  %2 = load %1 : int
+        \\  %3 = field_addr %1, 8 : rawptr
+        \\  %4 = load %3 : rawptr
+        \\  %5 = slot_addr s2
+        \\  %6 = load %5 : int
+        \\  %7 = slot_addr s2
+        \\  %8 = load %7 : int
+        \\  %9 = call_indirect %2(%4, %6, %8)
+        \\  %10 = slot_addr s2
+        \\  %11 = load %10 : int
+        \\  %12 = call @main.add(%9, %11)
+        \\  br b1(%12)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    , ir);
+}
+
+test "a lambda target receives the env from the pair" {
+    const gpa = testing.allocator;
+    const lam: Link.SymName = .{ .kind = .user_fn, .name = "main$l0" };
+    const ir = try renderSpecG(gpa, spec_src, "main.both$int", &.{.{ .param = 0, .kind = .lambda, .sym = lam }});
+    defer gpa.free(ir);
+    // The env word at +8 of `f`'s pair is the lambda unit's hidden first arg; there is no
+    // code load and no indirect call for `f`.
+    try testing.expectEqualStrings(
+        \\fn spec(s0, s1, s2) -> int {
+        \\  slots: s0:fn$int$int$int s1:fn$int$int$int s2:int
+        \\b0:
+        \\  %1 = slot_addr s1
+        \\  %2 = load %1 : int
+        \\  %3 = field_addr %1, 8 : rawptr
+        \\  %4 = load %3 : rawptr
+        \\  %5 = slot_addr s0
+        \\  %6 = field_addr %5, 8 : rawptr
+        \\  %7 = load %6 : rawptr
+        \\  %8 = slot_addr s2
+        \\  %9 = load %8 : int
+        \\  %10 = slot_addr s2
+        \\  %11 = load %10 : int
+        \\  %12 = call @main$l0(%7, %9, %11)
+        \\  %13 = slot_addr s2
+        \\  %14 = load %13 : int
+        \\  %15 = call_indirect %2(%4, %12, %14)
+        \\  br b1(%15)
         \\b1(%0:int):
         \\  ret %0
         \\}

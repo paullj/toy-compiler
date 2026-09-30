@@ -501,7 +501,7 @@ fn compileAndRun(
 
     if (!can_exec) return .skipped_exec;
 
-    var lowered = try DriverCodegen.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, null, null, 0);
+    var lowered = try DriverCodegen.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, true, null, null, 0);
     const lp = switch (lowered) {
         .ok => |*ok| ok,
         // A codegen `EmitError` after a clean typecheck is a real back-end failure,

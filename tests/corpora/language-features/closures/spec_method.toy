@@ -1,0 +1,13 @@
+# Feature: a method of a generic type whose fn param gets a named fn or a lambda literal is specialized like a generic fn, at the param after `self` and any earlier params
+# expect: exit 23
+struct Box[T] { v: T }
+impl Box[T] {
+    fn apply(self, f: fn(T) -> T) -> T { f(self.v) }
+    fn twice(self, _k: int, f: fn(T) -> T) -> T { f(f(self.v)) }
+}
+fn inc(x: int) -> int { x + 1 }
+fn main() -> int {
+    b := Box[int] { v: 4 }
+    k := 3
+    return b.apply(inc) + b.apply(fn(x: int) { x * 2 }) + b.twice(0, fn(x: int) { x + k })
+}
