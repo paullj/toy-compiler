@@ -416,6 +416,11 @@ pub const GraphResult = struct {
     /// the sibling tree/source (never freed here); only the slice is owned. Consumed during
     /// checking (dispatch + the mono reification tail); exposed for introspection/tests.
     templates: []TemplateMethod = &.{},
+    /// The protocol table, indexed by the protocol id a `.protocol` Callee names. Names
+    /// are borrowed source / prelude strings; the arrays are owned (`freeProtocolEntries`).
+    /// Read by the LSP only. An `App`-typed entry in `method_params`/`method_rets` is
+    /// opaque here: the composite table it indexed died with the checker.
+    protocols: []ProtocolSym = &.{},
     /// The authorized structural auto-derive recipes, in canonical order. Empty
     /// for a program with no derived `Eq` use. Each recipe's `name`, `params`, and
     /// `field_witnesses` OUTER slice are OWNED here; the `FieldWitness` name slices +
@@ -488,6 +493,8 @@ pub const GraphResult = struct {
         freeMethodEntries(gpa, self.methods);
         gpa.free(self.methods);
         gpa.free(self.templates);
+        freeProtocolEntries(gpa, self.protocols);
+        gpa.free(self.protocols);
         // Derive recipes: free each unit's minted `name`, its `params`, and its
         // `field_witnesses` OUTER slice (the FieldWitness name slices are borrowed), then the
         // backing array.
@@ -801,6 +808,18 @@ pub fn findConformanceMethod(methods: []const Method, recv: Type, name: []const 
 /// reified generic-dispatch entry defaults to `&.{}`, so freeing it is a no-op.
 pub fn freeMethodEntries(gpa: std.mem.Allocator, methods: []const Method) void {
     for (methods) |m| if (m.protocol_args.len > 0) gpa.free(@constCast(m.protocol_args));
+}
+
+/// Free the per-protocol owned arrays: `methods`, `generic_params` (outer arrays; the name
+/// slices are borrowed), and the decoded `method_params` (inner + outer) and `method_rets`.
+pub fn freeProtocolEntries(gpa: std.mem.Allocator, protocols: []const ProtocolSym) void {
+    for (protocols) |p| {
+        gpa.free(@constCast(p.methods));
+        if (p.generic_params.len > 0) gpa.free(@constCast(p.generic_params));
+        for (p.method_params) |mp| gpa.free(@constCast(mp));
+        if (p.method_params.len > 0) gpa.free(@constCast(p.method_params));
+        if (p.method_rets.len > 0) gpa.free(@constCast(p.method_rets));
+    }
 }
 
 /// Look up an inherent method by receiver type + source name. A linear scan over
@@ -1708,18 +1727,8 @@ pub fn checkGraph(
         // The template table owns no per-entry heap data (names are borrowed source);
         // on success `toOwnedSlice` empties it, so this frees only the backing array.
         t.templates.deinit(gpa);
-        // The protocol table: each entry owns its `methods` outer array (the
-        // name slices are borrowed source); the conformance list owns only its array.
-        // Each entry also owns its decoded `method_params` (inner + outer) +
-        // `method_rets` arrays (the element Types are PODs). The `generic_params`
-        // outer array (name slices borrowed).
-        for (t.protocols.items) |p| {
-            gpa.free(@constCast(p.methods));
-            if (p.generic_params.len > 0) gpa.free(@constCast(p.generic_params));
-            for (p.method_params) |mp| gpa.free(@constCast(mp));
-            if (p.method_params.len > 0) gpa.free(@constCast(p.method_params));
-            if (p.method_rets.len > 0) gpa.free(@constCast(p.method_rets));
-        }
+        // On success `toOwnedSlice` empties the protocol table (the result frees it).
+        freeProtocolEntries(gpa, t.protocols.items);
         t.protocols.deinit(gpa);
         // Each conformance may own a `protocol_args` dupe.
         for (t.conformances.items) |c| if (c.protocol_args.len > 0) gpa.free(@constCast(c.protocol_args));
@@ -1814,6 +1823,12 @@ pub fn checkGraph(
     const templates_out = try t.templates.toOwnedSlice(gpa);
     errdefer gpa.free(templates_out);
 
+    const protocols = try t.protocols.toOwnedSlice(gpa);
+    errdefer {
+        freeProtocolEntries(gpa, protocols);
+        gpa.free(protocols);
+    }
+
     // Transfer the derive recipes out of the live list before the teardown defer
     // sees them (mirrors instances/methods). `toOwnedSlice` empties `t.derives`; on the
     // error path here the recipes' owned data is freed (else it would leak).
@@ -1853,6 +1868,7 @@ pub fn checkGraph(
         .instances = instances,
         .methods = methods,
         .templates = templates_out,
+        .protocols = protocols,
         .derives = derives,
         .descriptor_types = descriptor_types,
         .erased_units = erased_units,

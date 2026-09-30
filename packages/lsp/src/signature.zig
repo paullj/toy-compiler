@@ -8,15 +8,20 @@
 //! appending its missing closers at EOF (offset-preserving) and resolve/type errors are
 //! tolerated — an arity error on the repaired call must not suppress the declared signature.
 //!
-//! The callee's signature is read from `resolutions` -> `sigs` (the same path hover uses for
-//! a callee), rendered through `render.bareName` so the module qualifier never leaks; param
-//! labels are [start,end) byte spans into the rendered label.
+//! A free fn's signature is read from `resolutions` -> `sigs` (the same path hover uses for
+//! a callee), rendered through `render.bareName` so the module qualifier never leaks. A
+//! method call's comes from the checker's Callee table (`callee_sig`), shown without its
+//! `self`: the receiver is left of the `.`, never inside the parens. Param labels are
+//! [start,end) byte spans into the rendered label.
 //!
 //! KNOWN LIMITATIONS (documented, not bugs):
-//!   * A turbofish call `id[int](` — the token before `(` is `]`, not an identifier — yields
-//!     no help. Free fns and module-qualified free fns (`io.f(`) are correct.
-//!   * An instance-method call `recv.m(` (piped or not) yields no help: a method callee
-//!     does not resolve to a `.func`. Free and module-qualified free fns are exact.
+//!   * A turbofish call `id[int](` or `v.m[int](` — the token before `(` is `]`, not an
+//!     identifier — yields no help. Free fns and module-qualified free fns (`io.f(`) are
+//!     correct.
+//!   * A builtin method on a concrete receiver inside a bounded template (`(3).eq(`) shows
+//!     no receiver type: the template's node types are scratch, so its param renders `?`.
+//!   * A method call inside a generic body can yield no help at all, and a generic
+//!     protocol's method shows the protocol's own params: see `callee_sig`'s limitations.
 //!   * A bare pipe target `x |> f` has no `(`, so it yields no help of its own.
 //!   * A parse error OTHER than the appended closers (or a stray unmatched closer) re-triggers
 //!     discovery's whole-tree discard -> null (the single-edit repair limit, as in completion).
@@ -28,6 +33,7 @@ const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const position = @import("position.zig");
 const render = @import("render.zig");
+const callee_sig = @import("callee_sig.zig");
 const Workspace = @import("Workspace.zig");
 
 const ResolveGraph = toyc.ResolveGraph;
@@ -137,28 +143,64 @@ fn repair(gpa: std.mem.Allocator, source: []const u8, toks: []const Token) !?[]c
     return try out.toOwnedSlice(gpa);
 }
 
-/// Mirrors `render.renderSig` byte-for-byte while capturing each param's [start,end) span, so
-/// a param label always points at the RIGHT occurrence even when two params share a type
-/// name. Type/name bytes are borrowed off the compiler tables; the appends copy them into `a`.
+/// Mirrors `render.renderSig` byte-for-byte (for empty `var_names`) while capturing each
+/// param's [start,end) span, so a param label always points at the RIGHT occurrence even when
+/// two params share a type name. Type/name bytes are borrowed off the compiler tables; the
+/// appends copy them into `a`.
 fn renderLabel(
     a: std.mem.Allocator,
     buf: *std.ArrayList(u8),
-    sig: anytype,
-    layouts: anytype,
-    enum_layouts: anytype,
+    name: []const u8,
+    params: []const Type,
+    ret: Type,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+    var_names: []const []const u8,
     ranges: *std.ArrayList([2]u32),
 ) !void {
     try buf.appendSlice(a, "fn ");
-    try buf.appendSlice(a, render.bareName(sig.name));
+    try buf.appendSlice(a, name);
     try buf.append(a, '(');
-    for (sig.params, 0..) |p, i| {
+    for (params, 0..) |p, i| {
         if (i != 0) try buf.appendSlice(a, ", ");
         const s: u32 = @intCast(buf.items.len);
-        try render.renderType(a, buf, p, layouts, enum_layouts);
+        try render.renderTypeNamed(a, buf, p, layouts, enum_layouts, var_names);
         try ranges.append(a, .{ s, @intCast(buf.items.len) });
     }
     try buf.appendSlice(a, ") -> ");
-    try render.renderType(a, buf, sig.ret, layouts, enum_layouts);
+    try render.renderTypeNamed(a, buf, ret, layouts, enum_layouts, var_names);
+}
+
+/// A user protocol method's label spelled from its declaration, as hover shows it: a
+/// protocol's generic types (`Option[int]`) are opaque once typecheck is done, so the
+/// checked types would render `?`.
+fn renderDeclLabel(
+    a: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    pm: *const toyc.Graph.Module,
+    decl: u32,
+    name: []const u8,
+    has_self: bool,
+    ranges: *std.ArrayList([2]u32),
+) !void {
+    const proto = toyc.Ast.protoAt(pm.tree(), pm.nodes[decl].lhs.int());
+    try buf.appendSlice(a, "fn ");
+    try buf.appendSlice(a, name);
+    try buf.append(a, '(');
+    const params = proto.params[@min(@intFromBool(has_self), proto.params.len)..];
+    for (params, 0..) |p, i| {
+        if (i != 0) try buf.appendSlice(a, ", ");
+        const s: u32 = @intCast(buf.items.len);
+        try appendTypeText(a, buf, pm, pm.nodes[p.int()].lhs);
+        try ranges.append(a, .{ s, @intCast(buf.items.len) });
+    }
+    try buf.appendSlice(a, ") -> ");
+    if (proto.ret_type == toyc.Ast.none) try buf.appendSlice(a, "()") else try appendTypeText(a, buf, pm, proto.ret_type);
+}
+
+fn appendTypeText(a: std.mem.Allocator, buf: *std.ArrayList(u8), pm: *const toyc.Graph.Module, ty: toyc.Ast.Index) !void {
+    const sp = toyc.AstWalk.nodeSpan(.{ .tree = pm.tree(), .tokens = pm.tokens, .source = pm.source }, ty);
+    try render.appendCollapsed(a, buf, pm.source[sp.start..sp.end]);
 }
 
 /// The signature help at (`line`, `character`) in `source`, or null when the cursor is not
@@ -194,20 +236,32 @@ pub fn signatureHelpAt(
     var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
     defer tc.deinit(gpa);
 
+    const entry = graph.entry_index;
     const m = graph.entry();
-    const resolutions = res.resolutions[graph.entry_index];
+    const resolutions = res.resolutions[entry];
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
 
     // The callee node keys on its identifier token's source start (robust to node/token
-    // reshuffle). Its resolution is `.func`; the call node's own main_token is the `(` (or
-    // the `|>` of a piped call), a different start, so the two never collide.
-    const hit: ?struct { fid: u32, node: usize } = for (m.nodes, 0..) |n, i| {
-        if (m.tokens[n.main_token].start != enc.callee_start) continue;
-        if (i < resolutions.len and resolutions[i] == .func and resolutions[i].func < tc.sigs.len) {
-            break .{ .fid = resolutions[i].func, .node = i };
+    // reshuffle): a free fn's resolves to `.func`, a method's member node records a Callee.
+    // The call node's own main_token is the `(` (or the `|>` of a piped call), a different
+    // start, so the two never collide.
+    const Hit = union(enum) { func: u32, method: callee_sig.CalleeSig };
+    const hit: ?struct { what: Hit, node: usize } = for (m.nodes, 0..) |n, i| {
+        if (m.tokens[n.main_token].start != enc.callee_start or i >= resolutions.len) continue;
+        if (resolutions[i] == .func and resolutions[i].func < tc.sigs.len) {
+            break .{ .what = .{ .func = resolutions[i].func }, .node = i };
+        }
+        if (n.tag == .field_access and resolutions[i] != .func) {
+            if (try callee_sig.of(a, &graph, &res, &tc, entry, @intCast(i))) |ms| break .{ .what = .{ .method = ms }, .node = i };
         }
     } else null;
-    const callee = hit orelse return null;
-    const sig = tc.sigs[callee.fid];
+    const callee = hit orelse {
+        arena.deinit();
+        return null;
+    };
 
     // In `x |> f(a, ..)` the piped `x` is argument 0 but sits left of the `(`, so the comma
     // count is one short. The tree, not the tokens, says whether the call is piped: a token
@@ -219,21 +273,26 @@ pub fn signatureHelpAt(
         break;
     }
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
     var label: std.ArrayList(u8) = .empty;
     var ranges: std.ArrayList([2]u32) = .empty;
-    try renderLabel(a, &label, sig, tc.layouts, tc.enum_layouts, &ranges);
+    switch (callee.what) {
+        .func => |fid| {
+            const sig = tc.sigs[fid];
+            try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
+        },
+        .method => |ms| if (ms.decl != null and tc.callees[entry][callee.node].view() == .protocol)
+            try renderDeclLabel(a, &label, &graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
+        else
+            try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges),
+    }
 
     const params = try a.alloc(protocol.ParameterInformation, ranges.items.len);
     for (ranges.items, 0..) |r, i| params[i] = .{ .label = r };
 
-    if (sig.params.len == 0) {
+    if (ranges.items.len == 0) {
         active = 0;
-    } else if (active > sig.params.len - 1) {
-        active = @intCast(sig.params.len - 1);
+    } else if (active > ranges.items.len - 1) {
+        active = @intCast(ranges.items.len - 1);
     }
 
     const sigs = try a.alloc(protocol.SignatureInformation, 1);
@@ -380,7 +439,7 @@ test "renderLabel: matches renderSig and spans the correct param occurrences" {
 
     var label: std.ArrayList(u8) = .empty;
     var ranges: std.ArrayList([2]u32) = .empty;
-    try renderLabel(a, &label, sig, no_layouts, no_enums, &ranges);
+    try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.ret, no_layouts, no_enums, &.{}, &ranges);
 
     var expect: std.ArrayList(u8) = .empty;
     try render.renderSig(a, &expect, sig, no_layouts, no_enums);
@@ -409,7 +468,7 @@ test "renderLabel: a zero-param sig has no ranges" {
 
     var label: std.ArrayList(u8) = .empty;
     var ranges: std.ArrayList([2]u32) = .empty;
-    try renderLabel(a, &label, sig, no_layouts, no_enums, &ranges);
+    try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.ret, no_layouts, no_enums, &.{}, &ranges);
     try testing.expectEqualStrings("fn foo() -> int", label.items);
     try testing.expectEqual(@as(usize, 0), ranges.items.len);
 }
@@ -470,14 +529,87 @@ test "signatureHelpAt: a piped module-qualified call counts the piped value" {
     }
 }
 
-test "signatureHelpAt: a method call yields no help, piped or not" {
+test "signatureHelpAt: method calls show the selected method, piped or not" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};
     defer docs.deinit(gpa);
     const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
-    const src = "struct Acc { n: int }\nimpl Acc {\n    fn plus(self, k: int) -> int { return self.n + k }\n}\nfn main() -> int {\n    acc := Acc { n: 1 }\n    x := acc.plus(1)\n    y := 1 |> acc.plus()\n    return x + y\n}\n";
-    for ([_][]const u8{ "x := acc.plus(", "|> acc.plus(" }) |after| {
-        const p = test_util.posAfterLast(src, after);
-        try testing.expect((try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) == null);
+    const src = test_util.method_fixture;
+    const plus = "fn plus(int, int) -> int";
+    const cases = [_]struct { after: []const u8, label: []const u8, active: u32 }{
+        .{ .after = "x := acc.plus(", .label = plus, .active = 0 },
+        .{ .after = "acc.plus(1, ", .label = plus, .active = 1 },
+        .{ .after = "1 |> acc.plus(", .label = plus, .active = 1 },
+        .{ .after = "Box[int].make(", .label = "fn make(int) -> Box[int]", .active = 0 },
+        .{ .after = "b.get(", .label = "fn get() -> int", .active = 0 },
+        .{ .after = "v.dbl(", .label = "fn dbl() -> int", .active = 0 },
+        .{ .after = "\"hi\".concat(", .label = "fn concat(str) -> str", .active = 0 },
+        .{ .after = "(3).eq(", .label = "fn eq(int) -> bool", .active = 0 },
+        .{ .after = "o.unwrap_or(", .label = "fn unwrap_or(int) -> int", .active = 0 },
+    };
+    for (cases) |c| {
+        const p = test_util.posAfterLast(src, c.after);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no signature help after '{s}'\n", .{c.after});
+            return error.NoSignatureHelp;
+        };
+        defer r.deinit();
+        try testing.expectEqualStrings(c.label, r.help.signatures[0].label);
+        try testing.expectEqual(c.active, r.help.activeParameter);
     }
+}
+
+test "signatureHelpAt: a user protocol's method is labelled from its declaration" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\protocol Finder { fn find(self, k: Option[int], n: int) -> Option[int] }
+        \\struct P { x: int }
+        \\impl P has Finder { fn find(self, k: Option[int], n: int) -> Option[int] { k } }
+        \\fn look[T has Finder](v: T) -> int { return v.find(Option.some(1), 2).unwrap_or(0) }
+        \\fn main() -> int { return look(P { x: 1 }) }
+        \\
+    ;
+    const cases = [_]struct { after: []const u8, active: u32 }{
+        .{ .after = "v.find(", .active = 0 },
+        .{ .after = "v.find(Option.some(1), ", .active = 1 },
+    };
+    for (cases) |c| {
+        const p = test_util.posAfterLast(src, c.after);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse
+            return error.NoSignatureHelp;
+        defer r.deinit();
+        const label = "fn find(Option[int], int) -> Option[int]";
+        try testing.expectEqualStrings(label, r.help.signatures[0].label);
+        try testing.expectEqual(c.active, r.help.activeParameter);
+        const params = r.help.signatures[0].parameters;
+        try testing.expectEqual(@as(usize, 2), params.len);
+        try testing.expectEqualStrings("Option[int]", label[params[0].label[0]..params[0].label[1]]);
+        try testing.expectEqualStrings("int", label[params[1].label[0]..params[1].label[1]]);
+    }
+}
+
+test "signatureHelpAt: an unterminated method call keeps its selection" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    // The repaired `acc.plus(1, )` is an arity error; the selection survives it.
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc {
+        \\    fn plus(self, a: int, b: int) -> int { return self.n + a + b }
+        \\}
+        \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
+        \\
+    ++ "    x := acc.plus(1, ";
+    const p = test_util.posAfterLast(src, "acc.plus(1, ");
+    var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse
+        return error.NoSignatureHelp;
+    defer r.deinit();
+    try testing.expectEqualStrings("fn plus(int, int) -> int", r.help.signatures[0].label);
+    try testing.expectEqual(@as(u32, 1), r.help.activeParameter);
 }

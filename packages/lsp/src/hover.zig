@@ -228,3 +228,111 @@ test "hover on a piped callee shows its signature, also on a leading-pipe line" 
         try testing.expectEqualStrings(want, h.value);
     }
 }
+
+test "hover on a method callee shows the selected method" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const test_util = @import("test_util.zig");
+    const src = test_util.method_fixture;
+    const plus = "fn plus(self: Acc, a: int, b: int) -> int";
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "plus(1, 2)"), .want = plus },
+        .{ .at = test_util.posOf(src, "plus(2)"), .want = plus },
+        .{ .at = test_util.posOf(src, "make(3)"), .want = "fn make(v: int) -> Box[int]" },
+        .{ .at = test_util.posOf(src, "get()"), .want = "fn get(self: Box[int]) -> int" },
+        // A bounded receiver's method is the protocol's, shown as written.
+        .{ .at = test_util.posOf(src, "dbl()"), .want = "fn dbl(self) -> int" },
+        .{ .at = test_util.posOf(src, "concat("), .want = "fn concat(self: str, other: str) -> str" },
+        .{ .at = test_util.posOf(src, "eq(3)"), .want = "fn eq(self: int, other: int) -> bool" },
+        .{ .at = test_util.posOf(src, "unwrap()"), .want = "fn unwrap(self: Option[int]) -> int" },
+        .{ .at = test_util.posOf(src, "unwrap_or(0)"), .want = "fn unwrap_or(self: Option[int], default: int) -> int" },
+        // A derive's method row has no fn of its own (`fn_id` 0 names some other fn).
+        .{ .at = test_util.posOf(src, "hash()"), .want = "fn hash(self: Key) -> int" },
+        .{ .at = test_util.posOf(src, "len()"), .want = "fn len(self: str) -> int" },
+        // A variant sharing a method's name selects no method: it keeps its type hover.
+        .{ .at = test_util.posAfterLast(src, "Kind."), .want = "Kind" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.want});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover inside a bounded template: a prelude bound spells Self, a scratch receiver shows its name" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const test_util = @import("test_util.zig");
+    const src =
+        \\protocol One { fn one(self) -> int }
+        \\impl int has One { fn one(self) -> int { self } }
+        \\fn h[T has Hash](v: T) -> int {
+        \\    e := if (3).eq(3) { 1 } else { 0 }
+        \\    return v.hash() + e
+        \\}
+        \\fn o[T has Ord](v: T, w: T) -> Ordering { v.cmp(w) }
+        \\fn f[T has One](v: T) -> int { v.one() }
+        \\fn main() -> int {
+        \\    _o := o(1, 2)
+        \\    return h(7) + f(1)
+        \\}
+        \\
+    ;
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "hash()"), .want = "fn hash(self: Self) -> int" },
+        .{ .at = test_util.posOf(src, "cmp(w)"), .want = "fn cmp(self: Self, other: Self) -> Ordering" },
+        // A one-line protocol's method shows without the protocol's braces.
+        .{ .at = test_util.posOf(src, "one() }"), .want = "fn one(self) -> int" },
+        // The template body's node types are scratch, so the receiver type is unknown here.
+        .{ .at = test_util.posOf(src, "eq(3)"), .want = "fn eq(self, other) -> bool" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.want});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on a method call with an argument error still shows the selected method" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const test_util = @import("test_util.zig");
+    const src =
+        \\struct Key { a: int }
+        \\fn main() -> int {
+        \\    k := Key { a: 1 }
+        \\    return k.hash(1) + k.to_string(2).len()
+        \\}
+        \\
+    ;
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "hash(1)"), .want = "fn hash(self: Key) -> int" },
+        .{ .at = test_util.posOf(src, "to_string(2)"), .want = "fn to_string(self: Key) -> str" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.want});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}

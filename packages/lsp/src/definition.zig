@@ -1,10 +1,12 @@
 //! textDocument/definition: from a USE of a symbol, the source range of its DECLARATION.
 //!
-//! Checks through the same `Workspace` as hover, but needs only discover→resolve: a
-//! declaration is found from `resolutions` + the merged fn table + the AST, never from a
-//! `Type`, so typecheck is skipped and UNRELATED resolve errors are tolerated (a valid
-//! symbol still navigates in a partially-broken buffer). Only a missing tree (`graph.err`)
-//! aborts — there is then nothing to resolve against.
+//! Checks through the same `Workspace` as hover, but a free fn, a local or a type needs only
+//! discover→resolve: its declaration is found from `resolutions` + the merged fn table + the
+//! AST. Only a method call's member token also runs typecheck, because the method a call
+//! selects is the checker's Callee record, so every other request keeps the resolve-only
+//! cost. UNRELATED resolve and type errors are tolerated (a valid symbol still navigates in
+//! a partially-broken buffer). Only a missing tree (`graph.err`) aborts — there is then
+//! nothing to resolve against.
 //!
 //! Returns a `Def { uri, range }`. The uri is EITHER the open-doc uri (`doc_uri`, for a
 //! within-file target) OR an imported module's `file://` path (cross-file target, an open
@@ -29,9 +31,12 @@ const position = @import("position.zig");
 const lsp_uri = @import("uri.zig");
 const Workspace = @import("Workspace.zig");
 const Documents = @import("Documents.zig");
+const callee_sig = @import("callee_sig.zig");
 
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
+const TypecheckGraph = toyc.TypecheckGraph;
+const Callee = toyc.Callee;
 const Ast = toyc.Ast;
 const Token = toyc.Token;
 const SourceMap = toyc.term.render.SourceMap;
@@ -72,7 +77,7 @@ pub fn definitionAt(
 
     const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
     const use_tok = position.tokenAt(m.tokens, off) orelse return null;
-    const site = declSiteFor(&graph, entry, &res, use_tok) orelse return null;
+    const site = (try declSiteFor(gpa, ws.io, &graph, entry, &res, use_tok)) orelse return null;
 
     if (site.module == entry) {
         // Within-file: the request's uri verbatim (m.file is its decoded path).
@@ -91,12 +96,13 @@ pub fn definitionAt(
 /// A decl site: the module it lives in and its name token within that module.
 const Site = struct { module: u32, tok: u32 };
 
-/// The decl site for the symbol whose use is `use_tok`, tried func → local → type. Func-first
-/// mirrors hover: a `mod.fn` field-access and its callee identifier share a token, and the
-/// callable's decl is the intended target. A local shadowing a type name also wins by this
-/// order. A `.func` may live in ANOTHER module (an imported pub fn) — its owning module + decl
-/// node come from the global fn table.
-fn declSiteFor(graph: *const Graph.Graph, entry: u32, res: *const ResolveGraph.GraphResult, use_tok: u32) ?Site {
+/// The decl site for the symbol whose use is `use_tok`, tried func → local → method → type.
+/// Func-first mirrors hover: a `mod.fn` field-access and its callee identifier share a token,
+/// and the callable's decl is the intended target. A local shadowing a type name also wins by
+/// this order. A `.func` may live in ANOTHER module (an imported pub fn) — its owning module +
+/// decl node come from the global fn table. A method's decl is where the checker's selection
+/// points: the impl's fn, or a bounded receiver's protocol signature.
+fn declSiteFor(gpa: std.mem.Allocator, io: Io, graph: *const Graph.Graph, entry: u32, res: *const ResolveGraph.GraphResult, use_tok: u32) !?Site {
     const m = &graph.modules[entry];
     const resolutions = res.resolutions[entry];
     var func_id: ?u32 = null;
@@ -116,17 +122,47 @@ fn declSiteFor(graph: *const Graph.Graph, entry: u32, res: *const ResolveGraph.G
     if (func_id) |f| {
         if (f >= res.fns.len) return null;
         const gf = res.fns[f];
-        if (gf.decl_node == Ast.none) return null; // seeded builtin: no source decl
-        const tm = &graph.modules[gf.module];
-        if (tm.bundled) return null; // embedded stdlib: no openable file
-        return .{ .module = gf.module, .tok = tm.nodes[gf.decl_node.int()].main_token };
+        return sourceSite(graph, gf.module, gf.decl_node);
     }
     if (local_slot) |s| {
         const t = localDeclToken(m, entry, res, use_tok, s) orelse return null;
         return .{ .module = entry, .tok = t };
     }
+    if (methodMember(m, resolutions, use_tok)) |fa| {
+        var tc = try TypecheckGraph.checkGraph(gpa, graph, res, io, 0);
+        defer tc.deinit(gpa);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        // A derive, a builtin or a prelude protocol method has no source to jump to.
+        if (try callee_sig.of(arena.allocator(), graph, res, &tc, entry, fa)) |sig| {
+            const decl = sig.decl orelse return null;
+            return sourceSite(graph, decl.module, Ast.Index.from(decl.node));
+        }
+    }
     const t = typeDeclToken(m, use_tok) orelse return null; // a type name is left .unresolved
     return .{ .module = entry, .tok = t };
+}
+
+/// The name token of the `decl` node in `module`, or null when there is no openable source: a
+/// seeded builtin has no decl, and the embedded stdlib has no file a client can open.
+fn sourceSite(graph: *const Graph.Graph, module: u32, decl: Ast.Index) ?Site {
+    if (decl == Ast.none) return null;
+    const tm = &graph.modules[module];
+    if (tm.bundled) return null;
+    return .{ .module = module, .tok = tm.nodes[decl.int()].main_token };
+}
+
+/// The member node of a method call whose member token is `use_tok`: a `recv.m` field access
+/// heading some call. A `mod.f` access resolves to `.func` and is handled before this.
+fn methodMember(m: *const Graph.Module, resolutions: []const ResolveGraph.Resolution, use_tok: u32) ?u32 {
+    for (m.nodes, 0..) |n, i| {
+        if (n.main_token != use_tok or n.tag != .field_access or i >= resolutions.len or resolutions[i] == .func) continue;
+        for (m.nodes) |call| {
+            const member = Callee.memberNode(m.tree(), call) orelse continue;
+            if (member.int() == i) return @intCast(i);
+        }
+    }
+    return null;
 }
 
 /// The binding token for the local in `slot`, within the fn enclosing `use_tok`. The
@@ -335,6 +371,46 @@ test "definition: a piped callee jumps to its declaration" {
         };
         defer gpa.free(d.uri);
         const want = posOf(src, c.decl);
+        try testing.expectEqual(want.line, d.range.start.line);
+        try testing.expectEqual(want.character, d.range.start.character);
+    }
+}
+
+test "definition: a method callee jumps to its declaration" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = @import("test_util.zig").method_fixture;
+    const cases = [_]struct { use: []const u8, decl: ?[]const u8 }{
+        .{ .use = "plus(1, 2)", .decl = "plus(self" },
+        .{ .use = "plus(2)", .decl = "plus(self" },
+        .{ .use = "get()", .decl = "get(self" },
+        .{ .use = "make(3)", .decl = "make(v" },
+        // The bounded receiver reaches the protocol's signature, not one impl of it.
+        .{ .use = "dbl()", .decl = "dbl(self) -> int\n}" },
+        .{ .use = "concat(", .decl = null },
+        .{ .use = "eq(3)", .decl = null },
+        .{ .use = "unwrap_or(", .decl = null },
+        .{ .use = "hash()", .decl = null },
+    };
+    for (cases) |c| {
+        const use = posOf(src, c.use);
+        const got = try definitionAt(gpa, ws, src, use.line, use.character, "file:///p/main.toy");
+        defer if (got) |d| gpa.free(d.uri);
+        const want_decl = c.decl orelse {
+            if (got != null) {
+                std.debug.print("unexpected definition for '{s}'\n", .{c.use});
+                return error.UnexpectedDefinition;
+            }
+            continue;
+        };
+        const d = got orelse {
+            std.debug.print("no definition for '{s}'\n", .{c.use});
+            return error.NoDefinition;
+        };
+        try testing.expectEqualStrings("file:///p/main.toy", d.uri);
+        const want = posOf(src, want_decl);
         try testing.expectEqual(want.line, d.range.start.line);
         try testing.expectEqual(want.character, d.range.start.character);
     }

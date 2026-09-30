@@ -38,6 +38,36 @@ pub fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layout
     }
 }
 
+/// `renderType`, except a `type_var(i)` with `i < var_names.len` prints `var_names[i]`: a
+/// protocol method's signature is written over `Self` and the protocol's own params.
+pub fn renderTypeNamed(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layouts: []const Layout, enum_layouts: []const EnumLayout, var_names: []const []const u8) !void {
+    if (t.kind == .type_var and t.typeVarOrd() < var_names.len) return buf.appendSlice(a, var_names[t.typeVarOrd()]);
+    return renderType(a, buf, t, layouts, enum_layouts);
+}
+
+/// Whether `renderTypeNamed` has a name for `t` (see `isRenderable`).
+pub fn isRenderableNamed(t: Type, var_names: []const []const u8) bool {
+    return isRenderable(t) or (t.kind == .type_var and t.typeVarOrd() < var_names.len);
+}
+
+/// `text` with each whitespace run (newlines included) collapsed to one space, and none
+/// inside brackets: a declaration spread over lines reads as one signature.
+pub fn appendCollapsed(a: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
+    var gap = false;
+    for (text) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            gap = true;
+            continue;
+        }
+        if (gap and buf.items.len > 0) {
+            const prev = buf.items[buf.items.len - 1];
+            if (prev != '(' and prev != '[' and c != ')' and c != ']' and c != ',') try buf.append(a, ' ');
+        }
+        gap = false;
+        try buf.append(a, c);
+    }
+}
+
 /// A nominal type's name as the user spells it. A generic instance is minted as
 /// `Template$arg$…` (see `Mono.mangle`), with a struct/enum argument as `s<id>`/`e<id>`
 /// into the same tables — rendered back as `Template[arg, …]`.
@@ -78,4 +108,31 @@ pub fn renderSig(a: std.mem.Allocator, buf: *std.ArrayList(u8), sig: anytype, la
 /// protocol method (`id$int`, `area$Area`): the user wrote neither.
 pub fn unmangled(name: []const u8) []const u8 {
     return name[0 .. std.mem.indexOfScalar(u8, name, '$') orelse name.len];
+}
+
+const testing = std.testing;
+
+test "renderTypeNamed spells type vars and falls back to ?" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const names: []const []const u8 = &.{ "Self", "U" };
+    const cases = [_]struct { t: Type, want: []const u8 }{
+        .{ .t = Type.typeVar(0), .want = "Self" },
+        .{ .t = Type.typeVar(1), .want = "U" },
+        .{ .t = Type.typeVar(2), .want = "?" },
+        .{ .t = Type.app(0), .want = "?" },
+        .{ .t = Type.int, .want = "int" },
+        .{ .t = Type.str, .want = "str" },
+    };
+    for (cases) |c| {
+        var named: std.ArrayList(u8) = .empty;
+        try renderTypeNamed(a, &named, c.t, &.{}, &.{}, names);
+        try testing.expectEqualStrings(c.want, named.items);
+        try testing.expectEqual(!std.mem.eql(u8, c.want, "?"), isRenderableNamed(c.t, names));
+        if (c.t.kind == .type_var) continue;
+        var plain: std.ArrayList(u8) = .empty;
+        try renderType(a, &plain, c.t, &.{}, &.{});
+        try testing.expectEqualStrings(plain.items, named.items);
+    }
 }
