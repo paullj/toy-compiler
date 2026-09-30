@@ -52,6 +52,7 @@ const symbols_res = @import("symbols/Resolution.zig");
 const SymKind = @import("symbols/Sym.zig").SymKind;
 const Intrinsic = @import("symbols/Intrinsic.zig");
 const StdNames = @import("symbols/StdNames.zig");
+const Closure = @import("symbols/Closure.zig");
 
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
@@ -85,8 +86,12 @@ pub const GraphResult = struct {
     /// Diagnostics, each tagged with its owning module via `Diagnostic.scope`.
     diags: []Diagnostic,
     owned_msgs: [][]u8,
+    /// Per module: the fns (and methods) whose body holds a lambda, sorted by `fn_node`.
+    closures: [][]Closure.FnClosures = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
+        for (self.closures) |c| Closure.deinitFnClosures(gpa, c);
+        gpa.free(self.closures);
         for (self.resolutions) |r| gpa.free(r);
         gpa.free(self.resolutions);
         for (self.fns) |f| gpa.free(@constCast(f.name));
@@ -129,6 +134,8 @@ const ModuleTables = struct {
 const prelude_enum_names = [_][]const u8{ "Ordering", "Option", "Result" };
 
 const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none };
+/// A lambda whose body is being resolved: its captures grow as outer locals are named.
+const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, captures: std.ArrayList(Closure.Capture) = .empty };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
 
@@ -161,6 +168,16 @@ const GraphResolve = struct {
     /// every fn boundary); any residue is freed at teardown. Never iterated — only
     /// point-ops — so it cannot perturb the source-ordered emission the sink sorts by.
     dead_pending: std.ArrayList(PendingMap) = .empty,
+    /// The lambdas around the cursor, innermost last. Empty at every fn boundary.
+    open: std.ArrayList(OpenBoundary) = .empty,
+    /// This fn's closed lambdas, moved into `closures` when the fn ends.
+    fn_boundaries: std.ArrayList(Closure.Boundary) = .empty,
+    /// This fn's assigned slots, with repeats.
+    fn_assigned: std.ArrayList(u32) = .empty,
+    /// The next lambda's rank in this fn (pre-order).
+    next_rank: u32 = 0,
+    /// Per module: the fns holding a lambda, in resolve (= node) order.
+    closures: []std.ArrayList(Closure.FnClosures) = &.{},
 
     fn tree(g: *GraphResolve, mod: u32) Ast.Tree {
         const m = &g.graph.modules[mod];
@@ -576,6 +593,9 @@ const GraphResolve = struct {
         g.locals.clearRetainingCapacity();
         g.slot_next = 0;
         g.label_stack.clearRetainingCapacity();
+        std.debug.assert(g.open.items.len == 0 and g.fn_boundaries.items.len == 0);
+        g.fn_assigned.clearRetainingCapacity();
+        g.next_rank = 0;
 
         const decl = g.nodes()[fn_idx.int()];
         const proto = Ast.protoAt(g.tree(g.cur_mod), decl.lhs.int());
@@ -607,6 +627,98 @@ const GraphResolve = struct {
                 .W0001 => try g.sink.report(.{ .span = off, .code = .W0001, .scope = g.cur_mod }, "unused variable '{s}'; prefix with '_' (as '_{s}') to silence", .{ nm, nm }),
                 .W0002 => try g.sink.report(.{ .span = off, .code = .W0002, .scope = g.cur_mod }, "unused parameter '{s}'; prefix with '_' (as '_{s}') to silence", .{ nm, nm }),
                 else => unreachable,
+            }
+        }
+        try g.flushClosures(fn_idx);
+    }
+
+    /// Move this fn's lambda boundaries (sorted by node) and its assigned slots into the
+    /// module's closure list. A fn with no lambda records nothing.
+    fn flushClosures(g: *GraphResolve, fn_idx: Ast.Index) error{OutOfMemory}!void {
+        if (g.fn_boundaries.items.len == 0) return;
+        std.mem.sort(Closure.Boundary, g.fn_boundaries.items, {}, struct {
+            fn lt(_: void, a: Closure.Boundary, b: Closure.Boundary) bool {
+                return a.node.int() < b.node.int();
+            }
+        }.lt);
+        const asg = g.fn_assigned.items;
+        std.mem.sort(u32, asg, {}, std.sort.asc(u32));
+        var n: usize = 0;
+        for (asg) |x| {
+            if (n > 0 and asg[n - 1] == x) continue;
+            asg[n] = x;
+            n += 1;
+        }
+        const assigned = try g.gpa.dupe(u32, asg[0..n]);
+        errdefer g.gpa.free(assigned);
+        const list = &g.closures[g.cur_mod];
+        // `findFn` binary-searches by `fn_node`; fns resolve in declaration order, and a
+        // later declaration's nodes all follow an earlier one's.
+        std.debug.assert(list.items.len == 0 or list.items[list.items.len - 1].fn_node.int() < fn_idx.int());
+        try list.ensureUnusedCapacity(g.gpa, 1);
+        const boundaries = try g.fn_boundaries.toOwnedSlice(g.gpa);
+        list.appendAssumeCapacity(.{ .fn_node = fn_idx, .boundaries = boundaries, .assigned = assigned });
+    }
+
+    /// `fn(params) -> R { body }`: its params are locals of the enclosing fn (slots above
+    /// every slot declared so far), each written as `.local` on its param node; the body
+    /// resolves in the lambda's own scope, recording the outer locals it names.
+    fn resolveLambda(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+        const proto = Ast.protoAt(g.tree(g.cur_mod), n.lhs.int());
+        try g.open.append(g.gpa, .{ .node = node_idx, .rank = g.next_rank, .slot_floor = g.slot_next, .label_floor = g.label_stack.items.len });
+        g.next_rank += 1;
+        try g.pushScope();
+        for (proto.params) |param_idx| {
+            const param = g.nodes()[param_idx.int()];
+            if (try g.declare(param.main_token, "duplicate parameter '{s}'", .W0002)) |slot| g.res(param_idx, .{ .local = slot });
+            try g.resolveTypeRef(param.lhs);
+        }
+        try g.resolveTypeRef(proto.ret_type);
+        try g.resolveBlock(n.rhs);
+        g.popScope();
+        var ob = g.open.pop().?;
+        errdefer ob.captures.deinit(g.gpa);
+        std.mem.sort(Closure.Capture, ob.captures.items, {}, struct {
+            fn lt(_: void, a: Closure.Capture, b: Closure.Capture) bool {
+                return a.slot < b.slot;
+            }
+        }.lt);
+        try g.fn_boundaries.ensureUnusedCapacity(g.gpa, 1);
+        const caps = try ob.captures.toOwnedSlice(g.gpa);
+        g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .captures = caps });
+    }
+
+    /// Record a use of local `slot` at node `use` as a capture of every open lambda it
+    /// crosses. A lambda's slots are all at or above its floor, so a slot below the floor
+    /// is declared outside it; boundaries nest, so the first one it is inside stops the walk.
+    fn noteCapture(g: *GraphResolve, slot: u32, use: Ast.Index) error{OutOfMemory}!void {
+        var i = g.open.items.len;
+        while (i > 0) {
+            i -= 1;
+            const b = &g.open.items[i];
+            if (slot >= b.slot_floor) return;
+            const seen = for (b.captures.items) |c| {
+                if (c.slot == slot) break true;
+            } else false;
+            if (!seen) try b.captures.append(g.gpa, .{ .slot = slot, .first_use = use });
+        }
+    }
+
+    /// Record the local a place store `x.f = ..` / `x.0 = ..` writes, walking the place to
+    /// its root identifier. A store through anything else (an index, a call) does not
+    /// write the root's own storage.
+    fn noteAssignedPlace(g: *GraphResolve, place: Ast.Index) error{OutOfMemory}!void {
+        var cur = place;
+        while (true) {
+            const nn = g.nodes()[cur.int()];
+            switch (nn.tag) {
+                .field_access, .tuple_field => cur = nn.lhs,
+                .identifier => {
+                    const r = g.resolutions[g.cur_mod][cur.int()];
+                    if (r == .local) try g.fn_assigned.append(g.gpa, r.local);
+                    return;
+                },
+                else => return,
             }
         }
     }
@@ -729,6 +841,7 @@ const GraphResolve = struct {
                 // expression (its root name is checked there), not as a bare assignable name.
                 if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .unary) {
                     try g.resolveExpr(stmt.lhs);
+                    if (target.tag != .unary) try g.noteAssignedPlace(stmt.lhs);
                 } else {
                     const resn = g.lookupName(target.main_token);
                     g.res(stmt.lhs, resn);
@@ -736,7 +849,11 @@ const GraphResolve = struct {
                         .unresolved => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "assignment to undeclared name '{s}'; declare it first with ':='", .{g.nameText(target.main_token)}),
                         .func => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to function '{s}'", .{g.nameText(target.main_token)}),
                         .module => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
-                        .local, .label => {},
+                        .local => |slot| {
+                            try g.fn_assigned.append(g.gpa, slot);
+                            try g.noteCapture(slot, stmt.lhs);
+                        },
+                        .label => {},
                     }
                 }
                 try g.resolveExpr(stmt.rhs);
@@ -818,6 +935,7 @@ const GraphResolve = struct {
                 // block level so a read nested arbitrarily deep still keeps an outer write live.
                 if (resn == .local) {
                     for (g.dead_pending.items) |*m| _ = m.remove(resn.local);
+                    try g.noteCapture(resn.local, node_idx);
                 }
                 if (resn == .unresolved) {
                     if (g.tables[g.cur_mod].structs.contains(g.nameText(n.main_token))) return;
@@ -924,6 +1042,7 @@ const GraphResolve = struct {
                         try g.resolveBlock(h.else_node);
                 }
             },
+            .lambda => try g.resolveLambda(node_idx, n),
             else => {},
         }
     }
@@ -999,7 +1118,11 @@ const GraphResolve = struct {
     fn resolveLabeled(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
         const n = g.nodes()[idx.int()];
         const name = g.nameText(n.main_token);
-        for (g.label_stack.items) |e| {
+        // A lambda's labels are its own: one may reuse a label of the code around it.
+        // Outer labels stay on the stack, so a jump to one resolves and the checker can
+        // report it as leaving the lambda.
+        const floor = if (g.open.items.len > 0) g.open.items[g.open.items.len - 1].label_floor else 0;
+        for (g.label_stack.items[floor..]) |e| {
             if (std.mem.eql(u8, e.name, name)) {
                 try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, n.main_token), .code = .R0008, .scope = g.cur_mod }, "duplicate label '{s}'", .{name});
                 break;
@@ -1432,6 +1555,9 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
     const resolutions = try gpa.alloc([]Resolution, n);
     @memset(resolutions, &.{});
 
+    const closures = try gpa.alloc(std.ArrayList(Closure.FnClosures), n);
+    for (closures) |*c| c.* = .empty;
+
     var g: GraphResolve = .{
         .gpa = gpa,
         .graph = graph,
@@ -1439,6 +1565,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         .resolutions = resolutions,
         .fns = .empty,
         .sink = DiagnosticSink.init(gpa),
+        .closures = closures,
     };
     defer {
         for (tables) |*t| t.deinit(gpa);
@@ -1449,6 +1576,21 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         g.label_stack.deinit(gpa);
         for (g.dead_pending.items) |*m| m.deinit(gpa);
         g.dead_pending.deinit(gpa);
+        for (g.open.items) |*o| o.captures.deinit(gpa);
+        g.open.deinit(gpa);
+        for (g.fn_boundaries.items) |b| gpa.free(b.captures);
+        g.fn_boundaries.deinit(gpa);
+        g.fn_assigned.deinit(gpa);
+        // Emptied by the ownership move below on success.
+        for (closures) |*c| {
+            for (c.items) |fc| {
+                for (fc.boundaries) |b| gpa.free(b.captures);
+                gpa.free(fc.boundaries);
+                gpa.free(fc.assigned);
+            }
+            c.deinit(gpa);
+        }
+        gpa.free(closures);
     }
     errdefer {
         for (resolutions) |r| if (r.len != 0) gpa.free(r);
@@ -1473,6 +1615,14 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
     try g.warnUnusedFns();
     try g.warnUnusedImports();
 
+    const out_closures = try gpa.alloc([]Closure.FnClosures, n);
+    @memset(out_closures, &.{});
+    errdefer {
+        for (out_closures) |c| Closure.deinitFnClosures(gpa, c);
+        gpa.free(out_closures);
+    }
+    for (closures, out_closures) |*c, *o| o.* = try c.toOwnedSlice(gpa);
+
     g.sink.sort();
     const owned = try g.sink.toOwned();
     return GraphResult{
@@ -1480,6 +1630,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         .fns = try g.fns.toOwnedSlice(gpa),
         .diags = owned.diags,
         .owned_msgs = owned.owned,
+        .closures = out_closures,
     };
 }
 
@@ -3169,4 +3320,220 @@ test "a value-index callee resolves its subscript (no W0001)" {
         }
     };
     try withResolvedGraph(".toy-test-value-index-callee", files, "main.toy", Check.run);
+}
+
+/// Resolve `source` as the trivial one-module graph and hand the tree and result to `check`.
+fn withResolvedSource(source: []const u8, check: *const fn (tree: Ast.Tree, tokens: []const Token, src: []const u8, r: *GraphResult) anyerror!void) !void {
+    const gpa = testing.allocator;
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, source);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+        if (tree.pub_bits.len != 0) gpa.free(@constCast(tree.pub_bits));
+    }
+    var g = try Graph.single(gpa, "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var r = try resolveGraph(gpa, &g);
+    defer r.deinit(gpa);
+    try check(tree, tokens, source, &r);
+}
+
+/// The `nth` (node order) identifier node spelled `name`.
+fn nthIdent(tree: Ast.Tree, tokens: []const Token, src: []const u8, name: []const u8, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag != .identifier or !std.mem.eql(u8, tokens[n.main_token].text(src), name)) continue;
+        if (seen == nth) return Ast.Index.from(@intCast(i));
+        seen += 1;
+    }
+    return error.TestIdentNotFound;
+}
+
+test "lambda params get slots above the owner's and carry .local on the param node" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ a := 1
+        \\ f := fn(x: int, y: int) -> int { x + y }
+        \\ return a + f(1, 2)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            try testing.expectEqual(@as(usize, 1), r.closures[0].len);
+            const fc = r.closures[0][0];
+            try testing.expectEqual(Ast.Node.Tag.fn_decl, tree.nodes[fc.fn_node.int()].tag);
+            try testing.expectEqual(@as(usize, 1), fc.boundaries.len);
+            const b = fc.boundaries[0];
+            try testing.expectEqual(@as(u32, 0), b.rank);
+            try testing.expectEqual(@as(u32, 1), b.slot_floor);
+            try testing.expectEqual(@as(usize, 0), b.captures.len);
+            const proto = Ast.protoAt(tree, tree.nodes[b.node.int()].lhs.int());
+            try testing.expectEqual(Resolution{ .local = 1 }, r.resolutions[0][proto.params[0].int()]);
+            try testing.expectEqual(Resolution{ .local = 2 }, r.resolutions[0][proto.params[1].int()]);
+        }
+    }.run);
+}
+
+test "a lambda records its captures in slot order with the first use" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ b := 2
+        \\ a := 1
+        \\ f := fn() -> int { a + b + a }
+        \\ return f()
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            const caps = r.closures[0][0].boundaries[0].captures;
+            try testing.expectEqual(@as(usize, 2), caps.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = try nthIdent(tree, toks, src, "b", 0) }, caps[0]);
+            try testing.expectEqual(Closure.Capture{ .slot = 1, .first_use = try nthIdent(tree, toks, src, "a", 0) }, caps[1]);
+        }
+    }.run);
+}
+
+test "a nested lambda's outer capture is recorded by every boundary it crosses" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ a := 1
+        \\ f := fn(x: int) -> int {
+        \\  g := fn(y: int) -> int { y + x + a }
+        \\  g(x)
+        \\ }
+        \\ return f(1)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 2), bs.len);
+            // Node order: the inner lambda is a child of the outer one, so it comes first.
+            const inner = bs[0];
+            const outer = bs[1];
+            try testing.expectEqual(@as(u32, 1), inner.rank);
+            try testing.expectEqual(@as(u32, 0), outer.rank);
+            try testing.expect(inner.slot_floor > outer.slot_floor);
+            const a_use = try nthIdent(tree, toks, src, "a", 0);
+            try testing.expectEqual(@as(usize, 2), inner.captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = a_use }, inner.captures[0]);
+            try testing.expectEqual(outer.slot_floor, inner.captures[1].slot); // x, the outer lambda's param
+            try testing.expectEqual(@as(usize, 1), outer.captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = a_use }, outer.captures[0]);
+        }
+    }.run);
+}
+
+test "assigned records bare and place-rooted targets" {
+    try withResolvedSource(
+        \\struct Q { y: int }
+        \\struct P { x: int, q: Q }
+        \\fn main() -> int {
+        \\ a := 1
+        \\ p := P { x: 1, q: Q { y: 2 } }
+        \\ c := 3
+        \\ a = 2
+        \\ p.q.y = 5
+        \\ a = 4
+        \\ f := fn() { }
+        \\ f()
+        \\ return a + p.q.y + c
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqualSlices(u32, &.{ 0, 1 }, r.closures[0][0].assigned);
+        }
+    }.run);
+}
+
+test "an unused lambda param is W0002; _x silences" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ f := fn(x: int, _y: int) -> int { 0 }
+        \\ return f(1, 2)
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), r.diags.len);
+            try testing.expectEqual(codes.Code.W0002, r.diags[0].code);
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "'x'") != null);
+        }
+    }.run);
+}
+
+test "a lambda may reuse an enclosing label; a duplicate inside it is still R0008" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ t := 0
+        \\ @scan for i in 0..3 {
+        \\  f := fn(n: int) -> int {
+        \\   k := 0
+        \\   @scan loop {
+        \\    if k >= n { break @scan }
+        \\    k = k + 2
+        \\   }
+        \\   @dup loop { @dup loop { break @dup } }
+        \\   k
+        \\  }
+        \\  t = t + f(i)
+        \\ }
+        \\ return t
+        \\}
+        \\
+    , struct {
+        fn run(t: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0008));
+            try testing.expect(std.mem.indexOf(u8, firstError(r).message, "'dup'") != null);
+            // The lambda's `break @scan` targets the lambda's own loop.
+            const brk: u32 = @intCast(std.mem.indexOf(u8, src, "break @scan").?);
+            const inner_loop: u32 = @intCast(std.mem.indexOf(u8, src, "@scan loop").? + "@scan ".len);
+            var seen = false;
+            for (t.nodes, 0..) |n, i| if (n.tag == .break_stmt and toks[n.main_token].start == brk) {
+                const target = r.resolutions[0][i].label;
+                try testing.expectEqual(inner_loop, toks[t.nodes[target.int()].main_token].start);
+                seen = true;
+            };
+            try testing.expect(seen);
+        }
+    }.run);
+}
+
+test "a lambda param shadowing an outer local is W0009" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ x := 1
+        \\ f := fn(x: int) -> int { x }
+        \\ return f(x)
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0009));
+            try testing.expectEqual(@as(usize, 0), r.closures[0][0].boundaries[0].captures.len);
+        }
+    }.run);
+}
+
+test "no closures entry for a fn without lambdas" {
+    try withResolvedSource(
+        \\fn plain(a: int) -> int { a + 1 }
+        \\fn main() -> int {
+        \\ f := fn(x: int) -> int { x }
+        \\ return f(plain(1))
+        \\}
+        \\fn also() -> int { 2 }
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), r.closures[0].len);
+            const fn_node = r.closures[0][0].fn_node;
+            try testing.expectEqualStrings("main", toks[tree.nodes[fn_node.int()].main_token].text(src));
+            try testing.expect(Closure.findFn(r.closures[0], fn_node) != null);
+        }
+    }.run);
 }

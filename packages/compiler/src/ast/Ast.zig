@@ -434,6 +434,14 @@ pub const Node = extern struct {
         /// `extra` header of a `Range` over the param type-ref nodes; `rhs` is the return
         /// type-ref node, or `none` for a unit return (`fn(int)`).
         fn_type,
+
+        /// A lambda `fn(x, y: T) -> R { .. }` in expression position. Appended at END
+        /// (frozen ordinal; `parse_version` bumped 19->20). `main_token` is the `fn`; `lhs`
+        /// is a 5-cell `FnProto` header (`protoAt`) with an empty generic run; `rhs` is the
+        /// body `block`. Unlike a `fn_decl`, a proto `ret_type` of `none` means the return
+        /// type is INFERRED from the body, and a lambda `param`'s type-ref `lhs` may be
+        /// `none` (the type comes from the expected function type).
+        lambda,
     };
 };
 
@@ -667,7 +675,7 @@ pub const parse_magic: u32 = 0x544f5950;
 
 /// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
 /// so the writer and the reader can never disagree.
-pub const parse_version: u32 = 19;
+pub const parse_version: u32 = 20;
 
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
@@ -919,8 +927,29 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeByte(')');
         },
         .param => {
-            try out.print("(param {s} ", .{tok_text});
-            try renderNode(out, tree, tokens, source, n.lhs);
+            if (n.lhs == none) {
+                try out.print("(param {s})", .{tok_text});
+            } else {
+                try out.print("(param {s} ", .{tok_text});
+                try renderNode(out, tree, tokens, source, n.lhs);
+                try out.writeByte(')');
+            }
+        },
+        .lambda => {
+            const proto = protoAt(tree, n.lhs.int());
+            try out.writeAll("(lambda (");
+            for (proto.params, 0..) |pidx, i| {
+                if (i != 0) try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, pidx);
+            }
+            try out.writeAll(") ");
+            if (proto.ret_type == none) {
+                try out.writeByte('_');
+            } else {
+                try renderNode(out, tree, tokens, source, proto.ret_type);
+            }
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
             try out.writeByte(')');
         },
         .fn_decl => {
@@ -1327,6 +1356,34 @@ test "renders the unit literal" {
     var w = std.Io.Writer.fixed(&buf);
     try renderNode(&w, tree, &.{Token{ .tag = .l_paren, .start = 0, .end = 1 }}, "()", Index.from(0));
     try testing.expectEqualStrings("()", w.buffered());
+}
+
+test "renderNode spells a lambda with an untyped param" {
+    // `fn(x) { x }`: an untyped param (lhs none), an inferred ret (none), a block body.
+    const src = "fn(x) { x }";
+    const toks = [_]Token{
+        .{ .tag = .kw_fn, .start = 0, .end = 2 },
+        .{ .tag = .l_paren, .start = 2, .end = 3 },
+        .{ .tag = .identifier, .start = 3, .end = 4 },
+        .{ .tag = .r_paren, .start = 4, .end = 5 },
+        .{ .tag = .l_brace, .start = 6, .end = 7 },
+        .{ .tag = .identifier, .start = 8, .end = 9 },
+        .{ .tag = .r_brace, .start = 10, .end = 11 },
+    };
+    // extra: [0] params run, [1] block stmt run, [2..4] block Range header,
+    // [4..9] FnProto {ret none, params 0/1, generics 4/0}.
+    var extra = [_]u32{ 0, 1, 1, 1, std.math.maxInt(u32), 0, 1, 4, 0 };
+    var nodes = [_]Node{
+        .{ .tag = .param, .main_token = 2, .lhs = none, .rhs = none },
+        .{ .tag = .identifier, .main_token = 5, .lhs = none, .rhs = none },
+        .{ .tag = .block, .main_token = 4, .lhs = Index.from(2), .rhs = none },
+        .{ .tag = .lambda, .main_token = 0, .lhs = Index.from(4), .rhs = Index.from(2) },
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderNode(&w, tree, &toks, src, Index.from(3));
+    try testing.expectEqualStrings("(lambda ((param x)) _ (block x))", w.buffered());
 }
 
 test "unpack rejects a foreign blob" {

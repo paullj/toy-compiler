@@ -1,0 +1,25 @@
+# Feature: capture-free lambdas: called in place, passed to a higher-order function, stored in a local, a struct field and a Vec, and returned
+# expect: exit 80
+import std/vec
+
+pub struct Op { run: fn(int) -> int }
+
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+
+fn make(double: bool) -> fn(int) -> int {
+    if double { fn(x) { x * 2 } } else { fn(x: int) -> int { x + 100 } }
+}
+
+fn main() -> int {
+    total := fn(x: int) -> int { x + 1 }(41)          # 42
+    inc := fn(x: int) { x + 1 }
+    total = total + apply(inc, 1)                     # 44
+    total = total + apply(fn(x) { x * 3 }, 2)         # 50
+    op := Op { run: fn(x) { x - 1 } }
+    total = total + op.run(11)                        # 60
+    fs: Vec[fn(int) -> int] = []
+    fs.push(fn(x) { x * x })
+    total = total + fs[0](3)                          # 69
+    total = total + make(true)(5) + make(false)(1)    # 180
+    return total - 100
+}

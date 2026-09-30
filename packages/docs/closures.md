@@ -37,7 +37,7 @@ fn main() -> int {
 - **Where they are allowed:** a function type is an ordinary type. It can be a parameter, a return type, a struct field, a type argument (`Vec[fn(int) -> int]`) or a local.
 - **Equality:** `==` is identity: it compares the code pointer and the environment pointer.
   - A named function equals itself.
-  - Two evaluations of the same lambda are not equal, because each has its own environment.
+  - Two evaluations of the same lambda are equal only if it captures nothing: its environment is then null. A capturing lambda gets a new environment each time, so its evaluations are not equal.
 - **Protocols:** function values do not conform to `Hash` or `Display` (see issue #22).
 
 ## Lambdas

@@ -316,7 +316,13 @@ const GraphFrozen = struct {
     /// The count of BASE fns + Mono instances + derive units; `fn_decls`/`fn_modules`
     /// entries at `[erased_base, adapter_base)` are the erased units (parallel to `erased_units`).
     erased_base: usize = 0,
-    /// The fn-value thunks, appended after the erased units as a FIFTH class of lowerable
+    /// The lambda units, appended after the erased units as a FIFTH class of lowerable
+    /// units (parallel to `lambda_units`). Each lowers under its owner's view. Routed to
+    /// `Engine.codegenClosure` (uncached).
+    lambda_units: []const Closure.LambdaUnit = &.{},
+    /// Entries at `[lambda_base, adapter_base)` are the lambda units.
+    lambda_base: usize,
+    /// The fn-value thunks, appended after the lambda units as a SIXTH class of lowerable
     /// units (parallel to `adapters`). Routed to `Engine.codegenClosure` (uncached).
     adapters: []const Closure.Adapter = &.{},
     /// Entries at `[adapter_base..]` are the adapter units.
@@ -333,18 +339,32 @@ const GraphFrozen = struct {
     fn frozenFor(gf: *const GraphFrozen, lower_i: usize, fn_node_buf: *[1]Ast.Index) Frozen {
         const mod = gf.fn_modules[lower_i];
         fn_node_buf[0] = gf.fn_decls[lower_i];
-        // Three lowerable-unit classes: base fns `[0, base_count)`, Mono instances
-        // `[base_count, derive_base)`, source-less units (derive, erased, adapter)
-        // `[derive_base, ..)`. An instance reads its OWN per-lower_i `node_types` (so two
-        // instances of one template never alias); a source-less unit reads NO
-        // AST/node_types (its emitter is table-driven), so leave them empty. A base fn
-        // reads its module's slice.
-        const is_inst = lower_i >= gf.base_count and lower_i < gf.derive_base;
-        const is_derive = lower_i >= gf.derive_base;
-        const nts: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].node_types else if (is_derive) &.{} else gf.node_types[mod];
-        const cs: []const Typecheck.Callee = if (is_inst) gf.instances[lower_i - gf.base_count].callees else if (is_derive) &.{} else gf.callees[mod];
-        const targs: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].args else &.{};
-        const confs: []const Mono.ResolvedConformance = if (is_inst) gf.instances[lower_i - gf.base_count].conformances else &.{};
+        // The lowerable-unit classes: base fns `[0, base_count)`, Mono instances
+        // `[base_count, derive_base)`, the source-less derive and erased units
+        // `[derive_base, lambda_base)`, lambda units `[lambda_base, adapter_base)`, and the
+        // source-less adapters `[adapter_base, ..)`. A body reads its owner's tables: an
+        // instance its OWN per-instance `node_types` (so two instances of one template never
+        // alias), a base fn its module's slice, a lambda unit whichever its owner reads. A
+        // source-less unit reads NO AST/node_types (its emitter is table-driven), so leave
+        // them empty.
+        const is_lambda = lower_i >= gf.lambda_base and lower_i < gf.adapter_base;
+        const owner: ?Closure.Owner = if (is_lambda)
+            gf.lambda_units[lower_i - gf.lambda_base].owner
+        else if (lower_i < gf.base_count)
+            .{ .base = gf.lower_ids[lower_i] }
+        else if (lower_i < gf.derive_base)
+            .{ .instance = @intCast(lower_i - gf.base_count) }
+        else
+            null;
+        const inst: ?*const Mono.Instance = if (owner) |o| switch (o) {
+            .instance => |k| &gf.instances[k],
+            .base => null,
+        } else null;
+        const is_derive = owner == null;
+        const nts: []const Typecheck.Type = if (inst) |i| i.node_types else if (is_derive) &.{} else gf.node_types[mod];
+        const cs: []const Typecheck.Callee = if (inst) |i| i.callees else if (is_derive) &.{} else gf.callees[mod];
+        const targs: []const Typecheck.Type = if (inst) |i| i.args else &.{};
+        const confs: []const Mono.ResolvedConformance = if (inst) |i| i.conformances else &.{};
         return .{
             .tree = gf.trees[mod],
             .tokens = gf.tokens[mod],
@@ -366,7 +386,7 @@ const GraphFrozen = struct {
             .erased_units = gf.erased_units,
             .prelude_ids = gf.prelude_ids,
             .char_struct = gf.char_struct,
-            .closure = if (is_derive) .none else .{ .adapters = gf.adapters },
+            .closure = if (is_derive) .none else .{ .adapters = gf.adapters, .lambda_units = gf.lambda_units, .owner = owner },
         };
     }
 };
@@ -475,6 +495,13 @@ pub fn lowerGraphProgram(
         try fn_decls.append(gpa, Ast.none);
         try fn_modules.append(gpa, u.mod);
     }
+    // The lambda units follow, in canonical `(owner, node)` order, each under its owner's
+    // module (and, through `frozenFor`, its owner's tables).
+    const lambda_base = fn_decls.items.len;
+    for (tc.lambda_units) |u| {
+        try fn_decls.append(gpa, u.fn_node);
+        try fn_modules.append(gpa, u.mod);
+    }
     // The fn-value thunks follow, in canonical `(kind, key)` order. An adapter reads no
     // AST; module 0 only gives its `Frozen` a tree to carry.
     const adapter_base = fn_decls.items.len;
@@ -535,6 +562,8 @@ pub fn lowerGraphProgram(
         .derive_base = derive_base,
         .erased_units = tc.erased_units,
         .erased_base = erased_base,
+        .lambda_units = tc.lambda_units,
+        .lambda_base = lambda_base,
         .adapters = tc.adapters,
         .adapter_base = adapter_base,
         .opt = opt,
@@ -608,6 +637,7 @@ pub fn lowerGraphProgram(
     for (tc.derives, 0..) |d, k| lowered_names[derive_base + k] = .{ .kind = .user_fn, .name = d.name.? };
     // Erased units carry their synthetic mangled SymName (borrowed from `tc.erased_units`).
     for (tc.erased_units, 0..) |u, k| lowered_names[erased_base + k] = .{ .kind = .user_fn, .name = u.name.? };
+    for (tc.lambda_units, 0..) |u, k| lowered_names[lambda_base + k] = .{ .kind = .user_fn, .name = u.name };
     for (tc.adapters, 0..) |a, k| lowered_names[adapter_base + k] = .{ .kind = .user_fn, .name = a.name };
 
     // Build the descriptor plan (canonical order = `tc.descriptor_types`), each entry's
@@ -688,7 +718,13 @@ fn graphFnJobInner(
     if (lower_i >= gf.adapter_base) {
         // A fn-value thunk: source-less and uncached, like an erased unit.
         const engine = Engine.initProbe(cache, mode, gf.probe);
-        try engine.codegenClosure(gpa, io, target, &frozen, gf.adapters[lower_i - gf.adapter_base], lower_i, slot);
+        try engine.codegenClosure(gpa, io, target, &frozen, .{ .adapter = gf.adapters[lower_i - gf.adapter_base] }, lower_i, slot);
+        return;
+    } else if (lower_i >= gf.lambda_base) {
+        // A lambda body: uncached, so its owner's key alone (which folds the lambda's body)
+        // decides reuse; the unit is rebuilt from the owner's tables every build.
+        const engine = Engine.initProbe(cache, mode, gf.probe);
+        try engine.codegenClosure(gpa, io, target, &frozen, .{ .lambda = @intCast(lower_i - gf.lambda_base) }, lower_i, slot);
         return;
     } else if (lower_i >= gf.erased_base) {
         // An ERASED hash/eq unit: layout-driven, uncached (pure over `(ty, kind, layout)` +
@@ -794,7 +830,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) } },
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -807,7 +843,7 @@ pub fn renderGraphIr(
 
     // Render each monomorphized instance as a concrete unit (its own node_types +
     // substituted sig), in canonical order — the same units codegen lowers.
-    for (tc.instances) |inst| {
+    for (tc.instances, 0..) |inst, k| {
         const m = &graph.modules[inst.mod];
         const sym = Link.SymName{ .kind = .user_fn, .name = inst.name.? };
         const in = lower.Inputs{
@@ -827,7 +863,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = @intCast(k) } },
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
@@ -899,6 +935,43 @@ pub fn renderGraphIr(
             .closure = .none,
         };
         var func = try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, sym, &diags);
+        defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
+        if (!first) try aw.writer.writeAll("\n");
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        first = false;
+    }
+
+    // Render each lambda unit under its owner's tables, in canonical order — the same
+    // units codegen lowers.
+    for (tc.lambda_units, 0..) |u, ui| {
+        const m = &graph.modules[u.mod];
+        const sym = Link.SymName{ .kind = .user_fn, .name = u.name };
+        const inst: ?*const Mono.Instance = switch (u.owner) {
+            .instance => |k| &tc.instances[k],
+            .base => null,
+        };
+        const in = lower.Inputs{
+            .tree = m.tree(),
+            .tokens = m.tokens,
+            .source = m.source,
+            .resolutions = res.resolutions[u.mod],
+            .node_types = if (inst) |i| i.node_types else tc.node_types[u.mod],
+            .callees = if (inst) |i| i.callees else tc.callees[u.mod],
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = names,
+            .sig = null,
+            .instances = tc.instances,
+            .sigs = tc.sigs,
+            .methods = tc.methods,
+            .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
+            .char_struct = tc.char_struct,
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner },
+        };
+        var func = try lower.lowerLambda(gpa, in, @intCast(ui), sym, &diags);
         defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
         try Opt.run(gpa, &func, opt, &opt_st);

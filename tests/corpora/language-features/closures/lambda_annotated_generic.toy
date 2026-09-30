@@ -1,0 +1,11 @@
+# Feature: a fully annotated lambda passed to a generic function drives its inference
+# expect: exit 42
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn twice[T, U](f: fn(T) -> U, g: fn(U) -> T, x: T) -> T { g(f(x)) }
+
+fn main() -> int {
+    a := apply(fn(x: int) { x * 2 }, 21)                                   # 42
+    s := apply(fn(s: str) -> str { s }, "abc")
+    b := twice(fn(x: int) -> bool { x > 0 }, fn(b: bool) -> int { if b { 0 } else { 1 } }, 5)
+    return a + s.len() - 3 + b
+}

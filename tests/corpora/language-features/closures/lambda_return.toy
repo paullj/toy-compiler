@@ -1,0 +1,37 @@
+# Feature: `return` and `?` inside a lambda exit the lambda, not the enclosing function; an unannotated return type is inferred from the returns and the body
+# expect: exit 78
+import std/vec
+
+fn main() -> int {
+    clamp := fn(x: int) -> int {
+        if x > 10 { return 10 }
+        if x < 0 { return 0 }
+        x
+    }
+    total := clamp(50) + clamp(-3) + clamp(7)              # 17
+    first := fn(xs: Vec[int]) -> Option[int] {
+        v := xs.get(0)?
+        .some(v * 2)
+    }
+    empty: Vec[int] = []
+    total = total + first([20, 1]).unwrap_or(0)            # 57
+    total = total + first(empty).unwrap_or(5)              # 62
+    five := fn() { return 5 }
+    sign := fn(b: bool) {
+        if b { return 1 }
+        return 2
+    }
+    early := fn(n: int) {
+        for i in 0..n {
+            if i == 3 { return i * 2 }
+        }
+        0
+    }
+    total = total + five() + sign(false) + early(10) + early(2)   # 75
+    for k in 0..2 {
+        # a lambda's `return` leaves the lambda; the loop goes on
+        f := fn(i: int) { return i + 1 }
+        total = total + f(k)
+    }
+    return total                                           # 78
+}

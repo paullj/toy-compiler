@@ -140,8 +140,8 @@ const stmt_recovery = setOf(&.{ .newline, .r_brace, .eof }).unionWith(stmt_first
 
 comptime {
     // The headline audit: the 3-way list arms are unambiguous only if FIRST(expr)
-    // is disjoint from FIRST(decl) — otherwise a stray `fn` inside `f(` could be
-    // read as an argument instead of bailing to the decl loop.
+    // is disjoint from FIRST(decl). `fn` stays a decl anchor; `fn (` is recognized by
+    // 2-token lookahead (`atLambda`), so a stray `fn name` still bails to the decl loop.
     if (expr_first.intersectWith(decl_first).count() != 0) @compileError("expr_first overlaps decl_first: 3-way arms ambiguous");
     if (!tuple_recovery.contains(.r_paren) or !tuple_recovery.contains(.comma)) @compileError("tuple_recovery missing own closer/separator");
     if (!field_recovery.contains(.r_brace) or !field_recovery.contains(.newline)) @compileError("field_recovery missing own closer/separator");
@@ -177,7 +177,9 @@ fn findNextDecl(p: *Parser) void {
     while (!p.at(.eof)) {
         std.debug.assert(fuel != 0);
         fuel -= 1;
-        if (decl_first.contains(p.peek().tag)) return;
+        // A lambda's `fn(` sits inside a body, so stopping there would report every
+        // lambda after a broken region as a declaration missing its name.
+        if (decl_first.contains(p.peek().tag) and !p.atLambda()) return;
         p.advance();
     }
 }
@@ -1472,6 +1474,72 @@ fn startsType(p: *const Parser) bool {
     return type_first.contains(tag) or (tag == .kw_fn and p.peek2().tag == .l_paren);
 }
 
+/// Whether the cursor starts a lambda: `fn (`. `fn name` is a declaration.
+fn atLambda(p: *const Parser) bool {
+    return p.at(.kw_fn) and p.peek2().tag == .l_paren;
+}
+
+/// Whether the cursor starts an expression in a list context: `expr_first`, or a lambda
+/// (whose `fn` is a decl anchor, so it is not in `expr_first`).
+fn startsExpr(p: *const Parser) bool {
+    return expr_first.contains(p.peek().tag) or p.atLambda();
+}
+
+/// Whether a statement loop stops at the cursor to bail a broken block to the decl loop.
+/// A lambda statement (`fn(..) { .. }(..)`) starts with a decl keyword but is not one.
+fn atBlockAnchor(p: *const Parser) bool {
+    return decl_anchors.contains(p.peek().tag) and !p.atLambda();
+}
+
+/// `fn(x, y: T) -> R { .. }` in expression position. A param's `: T` is optional (the
+/// checker takes it from the expected function type) and a missing `-> R` is inferred
+/// from the body, so the proto's `ret_type` of `none` means "inferred", not unit.
+fn parseLambda(p: *Parser) Error!Ast.Index {
+    const fn_tok = p.index;
+    p.bump(.kw_fn);
+    p.bump(.l_paren);
+    var params: std.ArrayList(Ast.Index) = .empty;
+    defer params.deinit(p.gpa);
+    while (!p.at(.r_paren) and !p.at(.eof)) {
+        const entry = p.index;
+        if (p.at(.kw_mut)) {
+            try p.warn(p.peek(), .P0006, "'mut' may only qualify a 'self' receiver");
+            p.advance();
+        }
+        if (p.at(.identifier)) {
+            const param_name = p.index;
+            p.bump(.identifier);
+            const type_node: Ast.Index = if (p.eat(.colon)) try p.parseType() else Ast.none;
+            try params.append(p.gpa, try p.addNode(.{ .tag = .param, .main_token = param_name, .lhs = type_node, .rhs = Ast.none }));
+            if (!p.eat(.comma)) {
+                if (p.at(.r_paren)) break;
+                // Without this, `fn(x int)` would silently read `int` as a second param.
+                if (!param_recovery.contains(p.peek().tag)) try p.warn(p.peek(), .P0001, "expected ',' or ')' after a lambda parameter");
+            }
+        } else if (param_recovery.contains(p.peek().tag)) {
+            break;
+        } else if (p.index == entry) {
+            _ = try p.advanceWithError(.P0006, "expected a parameter name or ')'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
+    }
+    try p.expect(.r_paren, "expected ')' to close a lambda's parameters");
+    const ret_type: Ast.Index = if (p.eat(.arrow)) try p.parseType() else Ast.none;
+    const body = try p.parseBlock();
+
+    const params_start: u32 = @intCast(p.extra.items.len);
+    const param_cells: []const u32 = @ptrCast(params.items);
+    try p.extra.appendSlice(p.gpa, param_cells);
+    const proto_header = try p.addExtra(&.{
+        ret_type.int(),
+        params_start,
+        @intCast(params.items.len),
+        @intCast(p.extra.items.len),
+        0,
+    });
+    return p.addNode(.{ .tag = .lambda, .main_token = fn_tok, .lhs = proto_header, .rhs = body });
+}
+
 /// `fn(A, B) -> R` — a function type. `-> R` is optional (a unit return) and
 /// right-associative: `fn(int) -> fn(int) -> int` returns a function, because the ret is
 /// parsed by `parseType` itself (depth-guarded there).
@@ -1555,13 +1623,13 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
     while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
-        if (decl_anchors.contains(p.peek().tag)) break;
+        if (p.atBlockAnchor()) break;
         const entry = p.index;
         const stmt = p.parseStmt() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ParseError => {
                 p.findNextStmt();
-                std.debug.assert(p.index > entry or p.at(.r_brace) or decl_anchors.contains(p.peek().tag));
+                std.debug.assert(p.index > entry or p.at(.r_brace) or p.atBlockAnchor());
                 continue;
             },
         };
@@ -2049,7 +2117,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             defer nb.end();
             while (!p.at(.r_bracket) and !p.at(.eof)) {
                 const entry = p.index;
-                if (expr_first.contains(p.peek().tag)) {
+                if (p.startsExpr()) {
                     try elems.append(p.gpa, try p.parseExpr(0));
                     if (!p.eat(.comma)) {
                         if (p.at(.r_bracket)) break;
@@ -2064,6 +2132,10 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
             try p.expect(.r_bracket, "expected ']' to close a list literal");
             const header = try p.addRange(elems.items);
             return p.addNode(.{ .tag = .list_literal, .main_token = at_tok, .lhs = Ast.none, .rhs = header });
+        },
+        .kw_fn => {
+            if (p.atLambda()) return p.parseLambda();
+            return p.advanceWithError(.P0002, "expected an expression; 'fn name(..)' declares a function");
         },
         // No valid expression start. When the offending token is a structural
         // CLOSER an open enclosing construct still needs (`)` of a call/group, `}`
@@ -2183,7 +2255,7 @@ fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast
     defer nb.end();
     while (!p.at(.r_paren) and !p.at(.eof)) {
         const entry = p.index;
-        if (expr_first.contains(p.peek().tag)) {
+        if (p.startsExpr()) {
             try args.append(p.gpa, try p.parseExpr(0));
             if (!p.eat(.comma)) {
                 if (p.at(.r_paren)) break;
@@ -2263,7 +2335,7 @@ fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index)) Error!void {
     defer nb.end();
     while (!p.at(.r_paren) and !p.at(.eof)) {
         const entry = p.index;
-        if (expr_first.contains(p.peek().tag)) {
+        if (p.startsExpr()) {
             try args.append(p.gpa, try p.parseExpr(0));
             if (!p.eat(.comma)) {
                 if (p.at(.r_paren)) break;
@@ -3156,7 +3228,7 @@ test "root is program and children precede parents" {
             // Postfix `?`: the operand is `lhs`, created before the try_expr node.
             .try_expr => try testing.expect(n.lhs.int() < self),
             .return_stmt => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
-            .param => try testing.expect(n.lhs.int() < self),
+            .param => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
             .call => {
                 try testing.expect(n.lhs.int() < self);
                 for (Ast.rangeSlice(tree, n.rhs.int())) |c| try testing.expect(c.int() < self);
@@ -3309,6 +3381,14 @@ test "root is program and children precede parents" {
             .fn_type => {
                 for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
                 if (n.rhs != Ast.none) try testing.expect(n.rhs.int() < self);
+            },
+            // `fn(..) -> R { .. }`: a fn_decl-shaped proto in `lhs`, the body in `rhs`.
+            .lambda => {
+                const proto = Ast.protoAt(tree, n.lhs.int());
+                if (proto.ret_type != Ast.none) try testing.expect(proto.ret_type.int() < self);
+                for (proto.params) |c| try testing.expect(c.int() < self);
+                try testing.expect(proto.generic_params.len == 0);
+                try testing.expect(n.rhs.int() < self);
             },
         }
     }
@@ -4655,6 +4735,97 @@ test "fn without '(' in type position is P0001" {
     try testing.expect(res.diags.len >= 1);
     try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
     try testing.expectEqualStrings("expected '(' after 'fn' in a function type", res.diags[0].message);
+}
+
+test "fn( in expression position is a lambda; fn name still bails the block" {
+    try expectProgram(
+        "fn main() {\n  f := fn(x: int) -> int { x }\n}\n",
+        "(program (fn main () _ (block (:= f (lambda ((param x int)) int (block x))))))",
+    );
+    const gpa = testing.allocator;
+    // A nested `fn name` still ends the block: the decl loop picks `g` up.
+    {
+        const res = try parseResult(gpa, "fn main() {\n  f := fn() { }\n  fn g() {}\n}\n");
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expect(res.diags.len >= 1);
+        try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+        try testing.expectEqualStrings("expected '}' to close block", res.diags[0].message);
+        var lambdas: usize = 0;
+        for (res.tree.nodes) |n| {
+            if (n.tag == .lambda) lambdas += 1;
+        }
+        try testing.expectEqual(@as(usize, 1), lambdas);
+        // The block stops AT `fn g` (the P0001 is reported there), exactly as before lambdas.
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, "fn main() {\n  f := fn() { }\n  fn g() {}\n}\n", "fn g").?)), res.diags[0].byte_offset);
+    }
+    // `fn name` where an expression is expected names the fix.
+    {
+        const res = try parseResult(gpa, "fn main() {\n  f := fn g() {}\n}\n");
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expect(res.diags.len >= 1);
+        try testing.expectEqual(codes.Code.P0002, res.diags[0].code);
+        try testing.expectEqualStrings("expected an expression; 'fn name(..)' declares a function", res.diags[0].message);
+    }
+}
+
+test "lambda params may omit their types" {
+    try expectSexpr("fn(x) { x }", "(lambda ((param x)) _ (block x))");
+    try expectSexpr("fn(a: int, b) { a }", "(lambda ((param a int) (param b)) _ (block a))");
+    try expectSexpr("fn() { }", "(lambda () _ (block))");
+    try expectSexpr("fn(f: fn(int) -> int) -> fn(int) -> int { f }", "(lambda ((param f (fnty (int) int))) (fnty (int) int) (block f))");
+}
+
+test "a lambda is a call arg, list element, tuple element, return value and trailing value" {
+    try expectSexpr("apply(fn(x) { x }, 1)", "(call apply (lambda ((param x)) _ (block x)) 1)");
+    try expectSexpr("[fn() { 1 }, fn() { 2 }]", "(list (lambda () _ (block 1)) (lambda () _ (block 2)))");
+    try expectSexpr("fn(x: int) { x }(41)", "(call (lambda ((param x int)) _ (block x)) 41)");
+    try expectProgram(
+        "fn h() { .some(fn(x) { x }) }\n",
+        "(program (fn h () _ (block (enew.tuple some (lambda ((param x)) _ (block x))))))",
+    );
+    try expectProgram(
+        "fn f() -> fn() -> int {\n  return fn() { 1 }\n}\nfn g() -> fn() -> int { fn() -> int { 2 } }\n",
+        "(program (fn f () (fnty () int) (block (return (lambda () _ (block 1))))) (fn g () (fnty () int) (block (lambda () int (block 2)))))",
+    );
+}
+
+test "a lambda statement does not end the block" {
+    try expectProgram(
+        "fn main() {\n  fn() { }()\n  x := 1\n}\n",
+        "(program (fn main () _ (block (call (lambda () _ (block))) (:= x 1))))",
+    );
+}
+
+test "if apply(fn(x: int) { x > 0 }, 1) { .. } parses" {
+    try expectProgram(
+        "fn main() {\n  if apply(fn(x: int) { x > 0 }, 1) { g() }\n}\n",
+        "(program (fn main () _ (block (if (call apply (lambda ((param x int)) _ (block (> x 0))) 1) (block (call g))))))",
+    );
+}
+
+test "decl resync after a broken region skips the lambdas in it" {
+    const gpa = testing.allocator;
+    const src = "fn main() -> int {\n  x := 1\n  }\n  f := fn(a: int) -> int { a + 1 }\n  g := fn() -> int { f(2) }\n  h()\n}\nfn h() -> int { 2 }\n";
+    const res = try parseResult(gpa, src);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqual(codes.Code.P0003, res.diags[0].code);
+    var buf: [512]u8 = undefined;
+    const rendered = try renderResult(res, src, &buf);
+    try testing.expect(std.mem.indexOf(u8, rendered, "(fn h () int (block 2))") != null);
+}
+
+test "a lambda param without ',' or ')' after it is P0001" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "fn main() {\n  f := fn(x int) { x }\n}\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expect(res.diags.len >= 1);
+    try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+    try testing.expectEqualStrings("expected ',' or ')' after a lambda parameter", res.diags[0].message);
 }
 
 test "a stray `fn name` in a tuple-struct field list still bails to the decl loop" {

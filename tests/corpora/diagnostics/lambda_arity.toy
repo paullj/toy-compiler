@@ -1,0 +1,6 @@
+fn apply(f: fn(int) -> int) -> int { f(1) }
+
+fn main() -> int {
+    _q: fn(int) -> int = fn(x, _y) { x }  #~ ERROR [T0039] lambda takes 2 parameter(s), but the expected type fn(int) -> int takes 1
+    return apply(fn() { 1 })  #~ ERROR [T0039] lambda takes 0 parameter(s), but the expected type fn(int) -> int takes 1
+}

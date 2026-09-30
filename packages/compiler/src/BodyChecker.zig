@@ -6,6 +6,7 @@ const TokenTag = @import("ast/Token.zig").Tag;
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
 const Callee = @import("symbols/Callee.zig").Callee;
+const Closure = @import("symbols/Closure.zig");
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const AstWalk = @import("query/AstWalk.zig");
 const Span = @import("diagnostics/model.zig").Span;
@@ -249,6 +250,18 @@ pub const BodyChecker = struct {
     /// Whether the checker is inside an `unsafe { .. }` block. Gates the raw-pointer
     /// `store`/`load` ops — a use outside `unsafe` is a T0038 error.
     in_unsafe: bool = false,
+    /// The argument a bare generic call is typing: its type args are inferred from the
+    /// arguments, so a lambda there gets no expected type yet.
+    generic_arg: Ast.Index = Ast.none,
+    /// This fn's lambdas as the resolver recorded them, or null when it has none.
+    closures: ?*const Closure.FnClosures = null,
+    /// The `loop_stack` depth at the innermost enclosing lambda: a jump may target only
+    /// the contexts at or above it. 0 outside every lambda.
+    loop_floor: usize = 0,
+    /// Inside a lambda whose return type is neither annotated nor expected: each
+    /// `return` joins its operand into `ret_join` instead of checking it against `cur_ret`.
+    ret_infer: bool = false,
+    ret_join: Type = .never,
 
     // Local diagnostic sink (merged into the shared result by the Pass-C driver).
     // Its scope is set once in `bodyCheckerFor` to the fn's owning module (graph)
@@ -365,6 +378,143 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
         _ = proto;
+        try bc.reportCaptures();
+    }
+
+    /// Captures are not lowered yet, so every one is an error at its first use. A bounded
+    /// template's abstract check skips them: each instance re-check reports them (the sink
+    /// dedups the repeats), and a template that reported here would be poisoned.
+    fn reportCaptures(bc: *BodyChecker) error{OutOfMemory}!void {
+        if (bc.abstract_template) return;
+        const fc = bc.closures orelse return;
+        for (fc.boundaries) |b| for (b.captures) |c| {
+            const use = bc.tree.nodes[c.first_use.int()];
+            try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "this lambda captures '{s}'; closures cannot capture variables yet", .{bc.nameText(use.main_token)});
+        };
+    }
+
+    /// `fn(params) -> R { body }`: a value of type `fn(P..) -> R`. A param's type is its
+    /// annotation, else the expected fn type's; the return type is the annotation, else the
+    /// expected fn type's, else the join of the body's value and its `return`s. `return`
+    /// and `?` exit the lambda, and no jump leaves it. A part of the expected type that
+    /// still holds a type variable (a generic callee) provides nothing.
+    fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        const proto = Ast.protoAt(bc.tree, n.lhs.int());
+        var exp_params: []const Type = &.{};
+        var exp_ret: ?Type = null;
+        var arity_err = false;
+        if (bc.expected) |e| if (e.isFunc()) {
+            const parts = Composite.fnParts(bc.composite.at(e.funcIdx()));
+            if (parts.params.len == proto.params.len) {
+                exp_params = parts.params;
+                if (bc.isGround(parts.ret)) exp_ret = parts.ret;
+            } else {
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "lambda takes {d} parameter(s), but the expected type {s} takes {d}", .{ proto.params.len, bc.typeName(e), parts.params.len });
+                arity_err = true;
+            }
+        };
+        const params = try bc.gpa.alloc(Type, proto.params.len);
+        defer bc.gpa.free(params);
+        var poisoned = arity_err;
+        for (proto.params, 0..) |p, i| {
+            const pn = bc.tree.nodes[p.int()];
+            const ty: Type = if (pn.lhs != Ast.none)
+                bc.typeFromNode(pn.lhs)
+            else if (i < exp_params.len and bc.isGround(exp_params[i]))
+                exp_params[i]
+            else blk: {
+                // After an arity error no expected type lines up with the params.
+                if (!arity_err) {
+                    const hint = if (i < exp_params.len or node_idx == bc.generic_arg) " (a generic call does not provide one yet)" else "";
+                    try bc.sink.report(.{ .span = bc.tokSpan(pn.main_token), .code = .T0050 }, "cannot infer the type of lambda parameter '{s}'; annotate it{s}", .{ bc.nameText(pn.main_token), hint });
+                }
+                break :blk bc.poison();
+            };
+            if (ty.kind == .invalid) poisoned = true;
+            params[i] = ty;
+            bc.node_types[p.int()] = ty;
+            if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
+        }
+
+        const save_ret = bc.cur_ret;
+        const save_infer = bc.ret_infer;
+        const save_join = bc.ret_join;
+        const save_floor = bc.loop_floor;
+        const save_exp = bc.expected;
+        defer {
+            bc.cur_ret = save_ret;
+            bc.ret_infer = save_infer;
+            bc.ret_join = save_join;
+            bc.loop_floor = save_floor;
+            bc.expected = save_exp;
+        }
+        bc.expected = null;
+        bc.loop_floor = bc.loop_stack.items.len;
+
+        const declared: ?Type = if (proto.ret_type != Ast.none) bc.typeFromNode(proto.ret_type) else exp_ret;
+        var ret: Type = undefined;
+        if (declared) |r| {
+            bc.cur_ret = r;
+            bc.ret_infer = false;
+            const want_value = r.kind != .unit and r.kind != .invalid;
+            const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) r else null);
+            if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(r, body_ty))
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+            ret = r;
+        } else {
+            bc.cur_ret = Type.unit;
+            bc.ret_infer = true;
+            bc.ret_join = .never;
+            const body_ty = try bc.typeOfBlockExpected(n.rhs, true, null);
+            const tail: Type = if (bc.blockDiverges(n.rhs)) .never else body_ty;
+            ret = try bc.joinLambdaTail(n, tail);
+        }
+        if (ret.kind == .invalid) poisoned = true;
+        const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
+        bc.node_types[node_idx.int()] = ty;
+        return ty;
+    }
+
+    /// Join a `return` operand into the inferred lambda return type.
+    fn joinLambdaReturn(bc: *BodyChecker, at: Ast.Index, ty: Type) error{OutOfMemory}!void {
+        const j = bc.ret_join;
+        if (j.kind == .invalid or ty.kind == .invalid) {
+            bc.ret_join = .invalid;
+        } else if (j.kind == .never) {
+            bc.ret_join = ty;
+        } else if (ty.kind != .never and !Type.eql(j, ty)) {
+            try bc.sink.report(.{ .span = bc.spanOf(at), .code = .T0042 }, "return type {s} does not match the lambda's earlier return type {s}", .{ bc.typeName(ty), bc.typeName(j) });
+            bc.ret_join = .invalid;
+        }
+    }
+
+    /// The inferred return type: the `return`s' join with the body's trailing value (`never`
+    /// when the body diverges). A lambda that never yields a value returns `()`.
+    fn joinLambdaTail(bc: *BodyChecker, n: Ast.Node, tail: Type) error{OutOfMemory}!Type {
+        const j = bc.ret_join;
+        if (j.kind == .invalid or tail.kind == .invalid) return .invalid;
+        if (j.kind == .never) return if (tail.kind == .never) Type.unit else tail;
+        if (tail.kind == .never or Type.eql(j, tail)) return j;
+        if (tail.kind == .unit) {
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(j)});
+        } else {
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0042 }, "lambda's value {s} does not match its return type {s}", .{ bc.typeName(tail), bc.typeName(j) });
+        }
+        return .invalid;
+    }
+
+    /// A `break`/`continue` at `stmt_idx` whose target lies outside the innermost lambda:
+    /// its label names a construct below `loop_floor`, or (bare) a loop is open below it.
+    fn jumpLeavesLambda(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
+        if (bc.loop_floor == 0) return false;
+        const outer = bc.loop_stack.items[0..bc.loop_floor];
+        if (bc.resolutions[(stmt_idx).int()] == .label) {
+            const target = bc.resolutions[(stmt_idx).int()].label;
+            for (outer) |c| if (c.construct_node == target) return true;
+            return false;
+        }
+        for (outer) |c| if (c.kind != .labeled_block) return true;
+        return false;
     }
 
     // The control-flow / divergence / break family lives in `ControlFlow.zig` as
@@ -516,6 +666,10 @@ pub const BodyChecker = struct {
                 }
             },
             .return_stmt => {
+                if (bc.ret_infer) {
+                    const rt: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, null);
+                    return bc.joinLambdaReturn(if (stmt.lhs == Ast.none) stmt_idx else stmt.lhs, rt);
+                }
                 const ty: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, if (bc.cur_ret.kind == .invalid) null else bc.cur_ret);
                 // Skip when either side is poison so an unknown return type (already
                 // reported) doesn't trigger a spurious second diagnostic here. A
@@ -552,7 +706,9 @@ pub const BodyChecker = struct {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
                     // No matching context: a bare break with an empty stack ("outside a
                     // loop"); a labeled break is reported by resolve as undefined.
-                    if (bc.resolutions[(stmt_idx).int()] != .label)
+                    if (bc.jumpLeavesLambda(stmt_idx))
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0051 }, "cannot break a loop outside this lambda", .{})
+                    else if (bc.resolutions[(stmt_idx).int()] != .label)
                         try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "break outside of a loop", .{});
                     if (stmt.lhs != Ast.none) _ = try bc.typeOf(stmt.lhs);
                     return;
@@ -573,7 +729,9 @@ pub const BodyChecker = struct {
             },
             .continue_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
-                    if (bc.resolutions[(stmt_idx).int()] != .label)
+                    if (bc.jumpLeavesLambda(stmt_idx))
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0051 }, "cannot continue a loop outside this lambda", .{})
+                    else if (bc.resolutions[(stmt_idx).int()] != .label)
                         try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "continue outside of a loop", .{});
                     return;
                 };
@@ -588,7 +746,7 @@ pub const BodyChecker = struct {
     }
 
     fn targetCtx(bc: *BodyChecker, stmt_idx: Ast.Index) ?*LoopCtx {
-        const items = bc.loop_stack.items;
+        const items = bc.loop_stack.items[bc.loop_floor..];
         if (bc.resolutions[(stmt_idx).int()] == .label) {
             const target = bc.resolutions[(stmt_idx).int()].label;
             var i = items.len;
@@ -1133,6 +1291,7 @@ pub const BodyChecker = struct {
             .if_stmt => try bc.typeOfIf(node_idx, n),
             .loop_expr => return bc.typeOfLoop(node_idx, n, null), // sets node_types itself
             .labeled => return bc.checkLabeled(node_idx, true), // sets node_types itself
+            .lambda => return bc.typeOfLambda(node_idx, n), // sets node_types itself
             // A poison leaf types as the poison `invalid` — already-diagnosed, so
             // no diagnostic here and no cascade (`assignable` absorbs `.invalid`).
             .error_node => Type.invalid, // already diagnosed in the parser (exempt)
@@ -1279,7 +1438,6 @@ pub const BodyChecker = struct {
         for (inits, 0..) |fi_idx, ii| {
             const fi = bc.tree.nodes[(fi_idx).int()];
             const fname = bc.nameText(fi.main_token);
-            const vt = if (pretyped) |pt| pt[ii] else try bc.typeOf(fi.lhs);
             // Find the declared field by name.
             var found: ?usize = null;
             for (sym.field_names, 0..) |dn, j| {
@@ -1288,15 +1446,20 @@ pub const BodyChecker = struct {
                     break;
                 }
             }
+            // Substitute the (possibly generic) declared field type through the
+            // instance's type-args; a non-generic struct has `targs.len == 0`, so
+            // `substTy` is the identity.
+            const want: ?Type = if (found) |j| substTy(bc, sym.field_types[j], targs) else null;
+            // Only a fn-typed field hands its type down (a lambda's params come from it):
+            // every other field value keeps its old typing and diagnostics.
+            const fn_want: ?Type = if (want) |w| (if (w.isFunc()) w else null) else null;
+            const vt = if (pretyped) |pt| pt[ii] else if (fn_want) |w| try bc.typeOfExpected(fi.lhs, w) else try bc.typeOf(fi.lhs);
             if (found) |j| {
                 if (seen[j]) {
                     try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token) }, "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
                 }
                 seen[j] = true;
-                // Substitute the (possibly generic) declared field type through the
-                // instance's type-args; a non-generic struct has `targs.len == 0`, so
-                // `substTy` is the identity and this is byte-identical.
-                const fty = substTy(bc, sym.field_types[j], targs);
+                const fty = want.?;
                 if (!Type.assignable(fty, vt)) {
                     try bc.sink.report(.{ .span = bc.spanOf(fi.lhs) }, "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                 }
@@ -1798,6 +1961,8 @@ pub const BodyChecker = struct {
 
         if (op_fam == .none) {
             try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0032 }, "'?' operand must be an Option or Result, got {s}", .{bc.typeName(ot)});
+        } else if (bc.ret_infer) {
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0032 }, "'?' in a lambda needs its return type; annotate -> Option[..] or Result[..]", .{});
         } else if (ret_fam == .none) {
             try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0032 }, "'?' requires the enclosing function to return an Option or Result, but it returns {s}", .{bc.typeName(bc.cur_ret)});
         } else if (op_fam != ret_fam) {
@@ -2716,7 +2881,12 @@ pub const BodyChecker = struct {
             }
             const arg_types = try bc.gpa.alloc(Type, args.len);
             defer bc.gpa.free(arg_types);
-            for (args, 0..) |arg, i| arg_types[i] = try bc.typeOf(arg); // synth once (self-typing)
+            for (args, 0..) |arg, i| { // synth once (self-typing)
+                const was = bc.generic_arg;
+                bc.generic_arg = arg;
+                defer bc.generic_arg = was;
+                arg_types[i] = try bc.typeOf(arg);
+            }
             const sig = bc.fnSig(f, bc.nameText(callee.main_token));
             if (args.len != f.params.len) {
                 try bc.reportArity(node_idx, args.len, sig);

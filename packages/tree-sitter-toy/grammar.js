@@ -69,6 +69,10 @@ module.exports = grammar({
     // discard whichever hits an ERROR — so a genuine struct literal (`P{ x: 1 }`) and a
     // condition-then-block (`if a == b { .. }`) each resolve to their error-free parse.
     [$._expression, $.struct_literal],
+    // `fn(..)` in a bracket list is a function-type argument or a lambda; only a
+    // lambda's `{` body tells them apart.
+    [$.parameter_list, $.function_type],
+    [$.parameter, $.type_name],
   ],
 
   rules: {
@@ -283,7 +287,13 @@ module.exports = grammar({
         $.field_expression,
         $.try_expression,
         $.struct_literal,
+        $.lambda_expression,
       ),
+
+    // `fn(x, y: T) -> R { .. }` in expression position: a param's type is optional (it
+    // comes from the expected function type) and a missing `-> R` is inferred.
+    lambda_expression: ($) =>
+      seq("fn", $.parameter_list, optional(seq("->", field("return_type", $._type))), $.block),
 
     unit_expression: ($) => seq("(", ")"),
 
