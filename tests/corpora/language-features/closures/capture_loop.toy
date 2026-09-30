@@ -1,0 +1,12 @@
+# Feature: each loop iteration's closure copies that iteration's value of the loop variable
+# expect: stdout "0\n1\n2\n"
+# expect: exit 3
+import std/vec
+import std/io
+
+fn main() -> int {
+    fs: Vec[fn() -> int] = []
+    for i in 0..3 { fs.push(fn() { i }) }
+    for j in 0..fs.len() { io.println(fs[j]()) }
+    return fs.len()
+}

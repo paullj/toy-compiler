@@ -386,20 +386,50 @@ pub fn lowerLambda(
 
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
-    try params.append(gpa, try b.addSlot(Typecheck.Type.rawptr));
+    const env_slot = try b.addSlot(Typecheck.Type.rawptr);
+    try params.append(gpa, env_slot);
     for (unit.sig.params, unit.param_slots) |pty, li| {
         const sid = try b.addSlot(pty);
         try params.append(gpa, sid);
         try b.local_slots.put(gpa, li, sid);
     }
     const body = in.tree.nodes[unit.node.int()].rhs;
-    const blocks = try lowerBodyBlocks(&b, body, unit.sig.ret);
+    const blocks = try openBodyBlocks(&b, unit.sig.ret);
+    try bindCaptures(&b, unit, env_slot);
+    try lowerBodyInto(&b, body, unit.sig.ret, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
 
+/// A lambda unit's prologue: copy each capture out of the env into a local slot of its
+/// own and bind the owner's slot to it, so the body (and any lambda nested in it, which
+/// copies from these slots in turn) reads captures like any local.
+fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) error{OutOfMemory}!void {
+    if (unit.env_size == 0) return;
+    const tok = b.in.tree.nodes[unit.node.int()].main_token;
+    const env_sa = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
+    const env = try b.emit(.{ .load = .{ .addr = env_sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
+    for (unit.env) |es| {
+        const sid = try b.addSlot(es.ty);
+        try b.local_slots.put(b.gpa, es.slot, sid);
+        const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
+        const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+        try copyCapture(b, dst, src, es.ty, tok);
+    }
+}
+
+const BodyBlocks = struct { entry: Ir.BlockId, exit: Ir.BlockId };
+
 /// Open the entry block (b0) and the single EXIT block, whose one param is the return
 /// value (none for a unit function), then lower `body` into them.
-fn lowerBodyBlocks(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type) error{OutOfMemory}!struct { entry: Ir.BlockId, exit: Ir.BlockId } {
+fn lowerBodyBlocks(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type) error{OutOfMemory}!BodyBlocks {
+    const blocks = try openBodyBlocks(b, ret_type);
+    try lowerBodyInto(b, body, ret_type, blocks.exit);
+    return blocks;
+}
+
+/// Open the entry block (b0, left current) and the single EXIT block, whose one param is
+/// the return value (none for a unit function).
+fn openBodyBlocks(b: *Builder, ret_type: Typecheck.Type) error{OutOfMemory}!BodyBlocks {
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
@@ -421,7 +451,11 @@ fn lowerBodyBlocks(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type) error
     else
         .{ .ret = .{ .value = b.ret_param } };
     b.blocks.items[exit].term_set = true;
+    return .{ .entry = entry, .exit = exit };
+}
 
+/// Lower `body` from the current block into `exit`.
+fn lowerBodyInto(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type, exit: Ir.BlockId) error{OutOfMemory}!void {
     // Lower the body. A non-unit fn's body is a VALUE block (implicit return):
     // its trailing expression is the return value, branched to the exit. A unit fn
     // lowers for effect and falls through with no value. If the body diverges
@@ -434,7 +468,6 @@ fn lowerBodyBlocks(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type) error
         try lowerBlockStmts(b, body);
         if (!b.termSet()) try brTo(b, exit, .none);
     }
-    return .{ .entry = entry, .exit = exit };
 }
 
 /// Materialize the builder into a flat `Ir.Function`, transferring ownership of every
@@ -760,15 +793,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
         // cell pointer. The cell is never freed (correct for a terminating program).
         .amp => {
             const t = b.in.node_types[(n.lhs).int()];
-            const size_v = try b.emit(.{ .iconst = @intCast(Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)) }, Typecheck.Type.int);
-            // Scope the `args` errdefer to the alloc→emit window: once emit succeeds the
-            // block instruction owns `args`, so a later OOM must NOT re-free it here.
-            const cellptr = cell: {
-                const args = try b.gpa.alloc(Ir.Operand, 1);
-                errdefer b.gpa.free(args);
-                args[0] = .{ .value = size_v };
-                break :cell try b.emit(.{ .call = .{ .callee = gc_alloc_sym, .args = args, .ret_slot = Ir.none_slot } }, box_repr_ty);
-            };
+            const cellptr = try emitGcAlloc(b, Abi.typeSize(t, b.in.layouts, b.in.enum_layouts));
             switch (passKind(b, t)) {
                 .box => {
                     const v = try lowerExpr(b, n.lhs);
@@ -1753,6 +1778,18 @@ fn copyStrSlot(b: *Builder, dst: Ir.SlotId, src: Ir.SlotId) error{OutOfMemory}!v
 /// bypasses the core-only allowlist by construction.
 const gc_alloc_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_alloc" };
 
+/// A fresh zeroed `gc_alloc(size)` cell pointer, typed as a managed box so the precise
+/// root map sees it.
+fn emitGcAlloc(b: *Builder, size: u32) error{OutOfMemory}!Ir.ValueId {
+    const size_v = try b.emit(.{ .iconst = @intCast(size) }, Typecheck.Type.int);
+    // Scope the `args` errdefer to the alloc→emit window: once emit succeeds the
+    // block instruction owns `args`, so a later OOM must NOT re-free it here.
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = size_v };
+    return try b.emit(.{ .call = .{ .callee = gc_alloc_sym, .args = args, .ret_slot = Ir.none_slot } }, box_repr_ty);
+}
+
 /// The IR value type a managed-box PRODUCER records. A box is erased to a scalar
 /// cell pointer, but typing it `.int` hides it from the precise root map (an integer
 /// word and a live heap handle look identical). `.rawptr` is ABI-identical to `.int`
@@ -2474,10 +2511,12 @@ fn lowerFnValue(b: *Builder, node_idx: Ast.Index, gid: u32, ty: Typecheck.Type) 
         try b.note(n.main_token, "function value has no thunk in lower");
         return .none;
     };
-    return try emitFnPair(b, b.in.closure.adapters[ai].name, ty);
+    return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, null);
 }
 
-/// A lambda in value position: the pair `{its unit's address, null env}`.
+/// A lambda in value position: the pair `{its unit's address, env}`. A capturing lambda
+/// allocates its env cell first, then copies each capture's current value in at the
+/// table's offset; a capture-free one carries a null env.
 fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const n = b.in.tree.nodes[(node_idx).int()];
     const owner = b.in.closure.owner orelse {
@@ -2488,19 +2527,50 @@ fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
         try b.note(n.main_token, "lambda has no unit in lower");
         return .none;
     };
-    return try emitFnPair(b, b.in.closure.lambda_units[ui].name, ty);
+    const unit = b.in.closure.lambda_units[ui];
+    if (unit.env_size == 0) return try emitFnPair(b, unit.name, ty, null);
+    const env = try emitGcAlloc(b, unit.env_size);
+    for (unit.env) |es| {
+        const sid = b.local_slots.get(es.slot) orelse {
+            try b.note(n.main_token, "captured local has no slot in lower");
+            continue;
+        };
+        const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
+        try copyCapture(b, dst, try rootAddr(b, sid), es.ty, n.main_token);
+    }
+    return try emitFnPair(b, unit.name, ty, env);
 }
 
-/// The function value `{address of code_sym, null env}` in a fresh slot of pair type `ty`.
-fn emitFnPair(b: *Builder, code_sym: []const u8, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+/// Copy one captured value of type `ty` from `src` to `dst` (both addresses): a scalar or
+/// box word by load/store, an aggregate by `copy`.
+fn copyCapture(b: *Builder, dst: Ir.ValueId, src: Ir.ValueId, ty: Typecheck.Type, tok: u32) error{OutOfMemory}!void {
+    const int_ty = Typecheck.Type.int;
+    switch (passKind(b, ty)) {
+        .box => {
+            const v = try b.emit(.{ .load = .{ .addr = src, .ty = int_ty } }, box_repr_ty);
+            _ = try b.emit(.{ .store = .{ .addr = dst, .val = v, .ty = int_ty } }, null);
+        },
+        .int, .bool, .float, .rawptr => {
+            const v = try b.emit(.{ .load = .{ .addr = src, .ty = ty } }, ty);
+            _ = try b.emit(.{ .store = .{ .addr = dst, .val = v, .ty = ty } }, null);
+        },
+        .str, .@"struct", .@"enum" => _ = try b.emit(.{ .copy = .{ .dst = dst, .src = src, .ty = ty } }, null),
+        .unit => {},
+        .never, .invalid => try b.note(tok, "captured type unsupported in lower"),
+    }
+}
+
+/// The function value `{address of code_sym, env}` in a fresh slot of pair type `ty`; a
+/// null `env` stores a null env word.
+fn emitFnPair(b: *Builder, code_sym: []const u8, ty: Typecheck.Type, env: ?Ir.ValueId) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
     const slot = try b.addSlot(ty);
     const base = try b.emit(.{ .slot_addr = slot }, int_ty);
     const code = try b.emit(.{ .fn_addr = .{ .kind = .user_fn, .name = code_sym } }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = code, .ty = int_ty } }, null);
     const env_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = Typecheck.Type.rawptr } }, int_ty);
-    const env = try b.emit(.{ .iconst = 0 }, Typecheck.Type.rawptr);
-    _ = try b.emit(.{ .store = .{ .addr = env_addr, .val = env, .ty = Typecheck.Type.rawptr } }, null);
+    const env_v = env orelse try b.emit(.{ .iconst = 0 }, Typecheck.Type.rawptr);
+    _ = try b.emit(.{ .store = .{ .addr = env_addr, .val = env_v, .ty = Typecheck.Type.rawptr } }, null);
     return .{ .slot = slot };
 }
 
@@ -4943,6 +5013,82 @@ test "lowerLambda binds env as slot 0 and params by resolver slot" {
         \\  br b4(%6)
         \\b4(%1:int):
         \\  br b1(%1)
+        \\}
+        \\
+    , ir);
+}
+
+test "a capturing lambda allocates its env once and stores each capture at its offset" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn f() -> int {
+        \\ n := 5
+        \\ s := "ab"
+        \\ g := fn(k: int) -> int { k + n + s.len() }
+        \\ return g(1)
+        \\}
+        \\
+    , "f");
+    defer gpa.free(ir);
+    // One 24-byte cell, allocated before it is filled: n at +0 by value, s at +8 by copy;
+    // then the cell is the pair's env word.
+    try testing.expect(std.mem.indexOf(u8, ir,
+        \\  %8 = iconst 24
+        \\  %9 = call @gc_alloc(%8)
+        \\  %10 = field_addr %9, 0 : int
+        \\  %11 = slot_addr s0
+        \\  %12 = load %11 : int
+        \\  store %10, %12 : int
+        \\  %13 = field_addr %9, 8 : str
+        \\  %14 = slot_addr s1
+        \\  copy %13 <- %14 : str
+        \\  %15 = slot_addr s3
+        \\  %16 = fn_addr @main.f$l0
+        \\  store %15, %16 : int
+        \\  %17 = field_addr %15, 8 : rawptr
+        \\  store %17, %9 : rawptr
+        \\
+    ) != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "call @gc_alloc("));
+}
+
+test "a lambda prologue copies captures into locals" {
+    const gpa = testing.allocator;
+    const ir = try renderLambdaG(gpa,
+        \\fn f() -> int {
+        \\ n := 5
+        \\ s := "ab"
+        \\ g := fn(k: int) -> int { k + n + s.len() }
+        \\ return g(1)
+        \\}
+        \\
+    , "main.f$l0");
+    defer gpa.free(ir);
+    try testing.expectEqualStrings(
+        \\fn main.f$l0(s0, s1) -> int {
+        \\  slots: s0:rawptr s1:int s2:int s3:str
+        \\b0:
+        \\  %1 = slot_addr s0
+        \\  %2 = load %1 : rawptr
+        \\  %3 = field_addr %2, 0 : int
+        \\  %4 = slot_addr s2
+        \\  %5 = load %3 : int
+        \\  store %4, %5 : int
+        \\  %6 = field_addr %2, 8 : str
+        \\  %7 = slot_addr s3
+        \\  copy %7 <- %6 : str
+        \\  %8 = slot_addr s1
+        \\  %9 = load %8 : int
+        \\  %10 = slot_addr s2
+        \\  %11 = load %10 : int
+        \\  %12 = add %9, %11
+        \\  %13 = slot_addr s3
+        \\  %14 = field_addr %13, 8 : int
+        \\  %15 = load %14 : int
+        \\  %16 = add %12, %15
+        \\  br b1(%16)
+        \\b1(%0:int):
+        \\  ret %0
         \\}
         \\
     , ir);

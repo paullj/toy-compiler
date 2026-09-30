@@ -262,6 +262,10 @@ pub const BodyChecker = struct {
     /// `return` joins its operand into `ret_join` instead of checking it against `cur_ret`.
     ret_infer: bool = false,
     ret_join: Type = .never,
+    /// The local slots a `mut self` method call writes through (the root of its receiver
+    /// place), recorded only in a fn with lambdas: a capture of one is a copy that would
+    /// miss the write.
+    mutself_roots: std.ArrayList(u32) = .empty,
 
     // Local diagnostic sink (merged into the shared result by the Pass-C driver).
     // Its scope is set once in `bodyCheckerFor` to the fn's owning module (graph)
@@ -348,6 +352,7 @@ pub const BodyChecker = struct {
     pub fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
+        bc.mutself_roots.deinit(bc.gpa);
         bc.sink.deinit();
         bc.derive_reqs.deinit(bc.gpa);
         bc.descriptor_reqs.deinit(bc.gpa);
@@ -377,20 +382,56 @@ pub const BodyChecker = struct {
         if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
             try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
-        _ = proto;
-        try bc.reportCaptures();
+        try bc.reportCaptures(proto);
     }
 
-    /// Captures are not lowered yet, so every one is an error at its first use. A bounded
-    /// template's abstract check skips them: each instance re-check reports them (the sink
-    /// dedups the repeats), and a template that reported here would be poisoned.
-    fn reportCaptures(bc: *BodyChecker) error{OutOfMemory}!void {
+    /// A closure copies each capture when it is made, which is sound only for a local that
+    /// nothing assigns: a captured local that is assigned (`x = ..`, a place store rooted at
+    /// it, a `mut self` call on it) is an error, reported once at its first captured use in
+    /// source order. So is any capture of a `mut self` receiver, whose slot holds the
+    /// caller's address rather than the value. A bounded template's abstract check skips
+    /// this: each instance re-check reports (the sink dedups the repeats), and a template
+    /// that reported here would be poisoned.
+    fn reportCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
         if (bc.abstract_template) return;
         const fc = bc.closures orelse return;
-        for (fc.boundaries) |b| for (b.captures) |c| {
+        const mut_recv = proto.params.len > 0 and Ast.isMutParam(bc.tree, bc.tokens, proto.params[0]);
+        std.mem.sort(u32, bc.mutself_roots.items, {}, std.sort.asc(u32));
+        // Boundaries are in node order, where a nested lambda precedes its parent; the rank
+        // is source (pre-) order, so the first boundary by rank holds a slot's first use.
+        const by_rank = try bc.gpa.alloc(u32, fc.boundaries.len);
+        defer bc.gpa.free(by_rank);
+        for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(bc.gpa);
+        for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
+            if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
             const use = bc.tree.nodes[c.first_use.int()];
-            try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "this lambda captures '{s}'; closures cannot capture variables yet", .{bc.nameText(use.main_token)});
+            const name = bc.nameText(use.main_token);
+            if (mut_recv and c.slot == 0) {
+                try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{name});
+            } else if (Closure.contains(fc.assigned, c.slot) or Closure.contains(bc.mutself_roots.items, c.slot)) {
+                try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "'{s}' is captured by a closure and assigned; closures cannot capture assigned variables yet", .{name});
+            }
         };
+    }
+
+    /// Record the local a `mut self` call writes through: the root of its receiver place.
+    /// Only a fn with lambdas needs it.
+    fn noteMutSelfRoot(bc: *BodyChecker, recv: Ast.Index) error{OutOfMemory}!void {
+        if (bc.closures == null) return;
+        var cur = recv;
+        while (true) {
+            const nn = bc.tree.nodes[cur.int()];
+            switch (nn.tag) {
+                .field_access, .tuple_field => cur = nn.lhs,
+                .identifier => {
+                    if (bc.resolutions[cur.int()] == .local) try bc.mutself_roots.append(bc.gpa, bc.resolutions[cur.int()].local);
+                    return;
+                },
+                else => return,
+            }
+        }
     }
 
     /// `fn(params) -> R { body }`: a value of type `fn(P..) -> R`. A param's type is its
@@ -2305,6 +2346,7 @@ pub const BodyChecker = struct {
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const mf = bc.model.fns[m.fn_id];
         if (m.mut_self) {
+            try bc.noteMutSelfRoot(fa.lhs);
             if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
             } else if (!bc.isMutablePlace(fa.lhs)) {
@@ -3142,6 +3184,7 @@ pub const BodyChecker = struct {
                 else => bound_ok = false, // an unbound impl param: poison, no cascade
             };
             if (bound_ok) bc.setCallee(n, Callee.pending);
+            if (m.mut_self) try bc.noteMutSelfRoot(callee.lhs);
             // A `mut self` method mutates the receiver in place, so it may
             // only be called on a mutable place (reuse the mut-self gate + T0019).
             if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {

@@ -178,6 +178,23 @@ pub fn fingerprint(
     return h.final();
 }
 
+/// The distinct seed for an owner's closure-facts fold.
+const closure_seed: u64 = 0x43_4c_4f_53; // "CLOS"
+
+/// Fold an owner body's closure facts (`Closure.ownerFacts`: its boxed slots and its
+/// lambdas' env layouts, which its own code writes but its body walk does not see) into
+/// its fingerprint `body_fp`. The identity on empty facts, so a body with no capturing lambda
+/// keeps its key.
+pub fn foldClosure(body_fp: u64, facts: []const u8) u64 {
+    if (facts.len == 0) return body_fp;
+    var h = std.hash.Wyhash.init(closure_seed);
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, body_fp, .little);
+    h.update(&buf);
+    AstWalk.updateLeaf(&h, facts);
+    return h.final();
+}
+
 /// The distinct seed for a SOURCE-LESS derive unit. Different from `seed` so a
 /// derive fingerprint can never alias a real fn's body-walk fingerprint even if the
 /// folded bytes happened to coincide.
@@ -834,4 +851,35 @@ test "conformance fold (e) empty protocol-args folds nothing (byte-identical)" {
     const h_default = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_default);
     const h_empty = fingerprint(b.tree, b.tokens, b.source, decl, &.{}, &.{}, &.{}, &rc_empty);
     try testing.expectEqual(h_default, h_empty);
+}
+
+test "foldClosure is the identity on empty facts" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(p: int) -> int {\n return p\n}\n");
+    defer b.deinit(gpa);
+    const h = fp(&b, 0);
+    try testing.expectEqual(h, foldClosure(h, &.{}));
+    try testing.expect(foldClosure(h, "\x00") != h);
+}
+
+test "a changed capture offset flips the fold" {
+    const gpa = testing.allocator;
+    const Closure = @import("../symbols/Closure.zig");
+    const Type = @import("../layout/Type.zig").Type;
+    const sig: @import("../layout/Engine.zig").FnSig = .{ .params = &.{}, .ret = Type.int };
+    const env_a = [_]Closure.EnvSlot{ .{ .slot = 0, .ty = Type.int, .mode = .copy, .off = 0 }, .{ .slot = 1, .ty = Type.str, .mode = .copy, .off = 8 } };
+    const env_b = [_]Closure.EnvSlot{ .{ .slot = 0, .ty = Type.int, .mode = .copy, .off = 0 }, .{ .slot = 1, .ty = Type.str, .mode = .copy, .off = 16 } };
+    const unit: Closure.LambdaUnit = .{ .owner = .{ .base = 0 }, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "f$l0", .sig = sig, .param_slots = &.{}, .env = &env_a, .env_size = 24 };
+    var moved = unit;
+    moved.env = &env_b;
+    moved.env_size = 32;
+    const fa = try Closure.ownerFacts(gpa, &.{unit}, &.{});
+    defer gpa.free(fa);
+    const fb = try Closure.ownerFacts(gpa, &.{moved}, &.{});
+    defer gpa.free(fb);
+    const fa2 = try Closure.ownerFacts(gpa, &.{unit}, &.{});
+    defer gpa.free(fa2);
+    const h: u64 = 0x1234;
+    try testing.expect(foldClosure(h, fa) != foldClosure(h, fb));
+    try testing.expectEqual(foldClosure(h, fa), foldClosure(h, fa2));
 }

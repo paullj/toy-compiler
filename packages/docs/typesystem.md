@@ -276,13 +276,23 @@ bidirectionally, like a literal:
 * `return` and `?` exit the lambda: they check against the lambda's return type, and
   `?` needs one that is annotated or expected (T0032 otherwise). A `break`/`continue`
   cannot target a loop or labeled block outside the lambda (**T0051**).
-* A lambda may not yet name a local of the function around it (**T0052**).
+* A lambda may name the locals and parameters of the function around it: it captures
+  them. A capture is copied when the lambda's value is made, so a captured local may not
+  be assigned anywhere in the function (`x = ..`, `x.f = ..`, or a `mut self` call on
+  `x`), and a `mut self` receiver may not be captured at all (**T0052**). A captured
+  `Vec`/`Map` is its handle, so pushes through it are shared.
 
 Each lambda is its own function `<owner>$l<rank>(env, params..)`, where the owner is
 the enclosing function or generic instance and the rank is the lambda's pre-order
 index in it; a lambda in a generic function has one per instance. Its value is
-`{its address, null env}`, called like any function value; two evaluations of one
-lambda therefore compare equal.
+`{its address, env}`, called like any function value. A lambda with captures gets a
+fresh GC cell as its env each time its value is made, holding the captured values
+(ascending slot, each at the next multiple of its alignment, the cell rounded to 8
+bytes); the unit copies them into locals on entry, and a nested lambda copies them on
+from there. A lambda that captures nothing (or only zero-sized values) has a null env,
+so two evaluations of it compare equal; two evaluations of a capturing lambda do not.
+The env cell is word-scanned by the collector, so captured handles, strings and other
+closures stay alive with it.
 
 ## Protocols, the prelude, and builtin-scalar conformance
 

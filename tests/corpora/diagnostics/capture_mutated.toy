@@ -1,0 +1,27 @@
+struct P { x: int }
+struct C { n: int }
+
+impl C {
+    fn bump(mut self) { self.n = self.n + 1 }
+    fn get(self) -> int { self.n }
+    fn peek(mut self) -> int {
+        f := fn() -> int { self.n }  #~ ERROR [T0052] a closure cannot capture the 'mut self' receiver 'self'
+        f()
+    }
+}
+
+fn main() -> int {
+    base := 10
+    _ok := fn(v: int) -> int { v + base }
+    a := 1
+    _f := fn() -> int { a }  #~ ERROR [T0052] 'a' is captured by a closure and assigned
+    a = 2
+    p := P { x: 1 }
+    _g := fn() { p.x = 2 }  #~ ERROR [T0052] 'p' is captured by a closure and assigned
+    c := C { n: 0 }
+    _h := fn() -> int { c.get() }  #~ ERROR [T0052] 'c' is captured by a closure and assigned
+    c.bump()
+    d := C { n: 0 }
+    _k := fn() { d.bump() }  #~ ERROR [T0052] 'd' is captured by a closure and assigned
+    return a + c.n
+}

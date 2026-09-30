@@ -977,6 +977,12 @@ fn lambdaTablesUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *Re
         try out.appendSlice(gpa, std.mem.sliceAsBytes(u.param_slots));
         for (u.sig.params) |p| try out.appendSlice(gpa, if (p.isStruct()) tr.layouts[p.struct_id].name else @tagName(p.kind));
         try out.appendSlice(gpa, if (u.sig.ret.isStruct()) tr.layouts[u.sig.ret.struct_id].name else @tagName(u.sig.ret.kind));
+        try out.appendSlice(gpa, std.mem.asBytes(&u.env_size));
+        for (u.env) |es| {
+            try out.appendSlice(gpa, std.mem.asBytes(&es.slot));
+            try out.appendSlice(gpa, std.mem.asBytes(&es.off));
+            try out.appendSlice(gpa, if (es.ty.isStruct()) tr.layouts[es.ty.struct_id].name else @tagName(es.ty.kind));
+        }
     }
     for (graph.modules, 0..) |m, mi| for (m.nodes, 0..) |n, k| {
         if (n.tag != .lambda) continue;
@@ -1004,15 +1010,19 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
     // More bodies than the Pass-C fan-out threshold, each with a lambda of a signature of
-    // its own (so fn types intern in racing order) and a nested one; the generic `wrap`
-    // holds a lambda, so its units follow the instance order.
+    // its own (so fn types intern in racing order) and a nested one that captures through
+    // its parent; the generic `wrap` holds a capturing lambda, so its units (and their
+    // env layouts) follow the instance order.
     var src: std.Io.Writer.Allocating = .init(gpa);
     defer src.deinit();
     try src.writer.writeAll(
         \\import std/vec
         \\pub struct S0 { v: int }
         \\fn wrap[T](x: T) -> T {
-        \\    id := fn(y: T) -> T { y }
+        \\    id := fn(y: T) -> T {
+        \\        _k := x
+        \\        y
+        \\    }
         \\    id(x)
         \\}
         \\
@@ -1020,16 +1030,18 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
     for (1..70) |k| try src.writer.print("pub struct S{d} {{ v: int }}\n", .{k});
     for (0..70) |k| try src.writer.print(
         \\fn _u{d}() -> int {{
+        \\    base := S{d} {{ v: {d} }}
         \\    f := fn(s: S{d}) -> Vec[S{d}] {{
         \\        xs: Vec[S{d}] = []
         \\        xs.push(s)
+        \\        xs.push(base)
         \\        xs
         \\    }}
-        \\    g := fn() -> fn(int) -> int {{ fn(x) {{ x + {d} }} }}
+        \\    g := fn() -> fn(int) -> int {{ fn(x) {{ x + base.v }} }}
         \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v
         \\}}
         \\
-    , .{ k, k, k, k, k, k, k, k });
+    , .{ k, k, k, k, k, k, k, k, k });
     try src.writer.writeAll("fn main() -> int { return 0 }\n");
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1055,6 +1067,34 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
     // Three per `_u` body, plus one per `wrap` instance (int and each S{k}).
     try testing.expectEqual(@as(usize, 70 * 3 + 71), serial_n);
     try testing.expectEqual(serial_n, parallel_n);
+}
+
+test "push on a captured Vec is not a mutation" {
+    try withCheckedGraph(".toy-test-capture-vec-push", &.{
+        .{ .path = "main.toy", .source =
+        \\import std/vec
+        \\fn main() -> int {
+        \\    xs: Vec[int] = []
+        \\    add := fn(v: int) { xs.push(v) }
+        \\    add(1)
+        \\    xs.push(2)
+        \\    return xs.len()
+        \\}
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(_: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            for (tr.diags) |d| try testing.expect(d.severity != .err);
+            try testing.expectEqual(@as(usize, 1), tr.lambda_units.len);
+            const u = tr.lambda_units[0];
+            try testing.expectEqual(@as(usize, 1), u.env.len);
+            try testing.expectEqual(@as(u32, 8), u.env_size);
+            // The captured handle: a `Vec` struct whose one field is the shared backing.
+            const vl = tr.layouts[u.env[0].ty.struct_id];
+            try testing.expect(std.mem.startsWith(u8, vl.name, "Vec"));
+            try testing.expect(Typecheck.isRefStruct(vl.field_types[0], tr.layouts));
+        }
+    }.check);
 }
 
 test "fn values in std containers and sinks: Map key and Display are T0023; fs[i](x) calls the element" {

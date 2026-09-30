@@ -177,6 +177,9 @@ const Frozen = struct {
     char_struct: ?u32 = null,
     /// The function-value tables this job's lowering reads. Shared read-only.
     closure: lower.ClosureInputs,
+    /// This owner body's closure facts (`Closure.ownerFacts`), folded into its key; empty
+    /// for every other unit and for a body with no capturing lambda.
+    closure_facts: []const u8,
 
     /// The template facts `Mono.callInstanceRef` needs for this job's read-only view:
     /// derived from the callee's `Sig` (the fingerprint side of the shared discovery/
@@ -327,6 +330,9 @@ const GraphFrozen = struct {
     adapters: []const Closure.Adapter = &.{},
     /// Entries at `[adapter_base..]` are the adapter units.
     adapter_base: usize,
+    /// Per base fn and instance unit (`[0, derive_base)`), its closure facts; empty (no
+    /// entries) when the program has no lambda.
+    closure_facts: []const []const u8,
     opt: Opt.Config,
 
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
@@ -387,9 +393,41 @@ const GraphFrozen = struct {
             .prelude_ids = gf.prelude_ids,
             .char_struct = gf.char_struct,
             .closure = if (is_derive) .none else .{ .adapters = gf.adapters, .lambda_units = gf.lambda_units, .owner = owner },
+            .closure_facts = if (lower_i < gf.closure_facts.len) gf.closure_facts[lower_i] else &.{},
         };
     }
 };
+
+/// Each base fn and instance unit's closure facts, indexed like `fn_decls[0..derive_base)`:
+/// its own lambda units (a contiguous run of the `(owner, node)`-sorted table) laid out by
+/// `Closure.ownerFacts`. Serial, once per owner. Empty when there is no lambda unit.
+fn buildClosureFacts(gpa: std.mem.Allocator, units: []const Closure.LambdaUnit, lower_ids: []const u32, base_count: usize, derive_base: usize) ![]const []const u8 {
+    if (units.len == 0) return &.{};
+    const facts = try gpa.alloc([]const u8, derive_base);
+    @memset(facts, &.{});
+    errdefer freeClosureFacts(gpa, facts);
+    var i: usize = 0;
+    while (i < units.len) {
+        var j = i + 1;
+        while (j < units.len and std.meta.eql(units[j].owner, units[i].owner)) j += 1;
+        const at: ?usize = switch (units[i].owner) {
+            .base => |gid| std.sort.binarySearch(u32, lower_ids, gid, struct {
+                fn order(key: u32, x: u32) std.math.Order {
+                    return std.math.order(key, x);
+                }
+            }.order),
+            .instance => |k| base_count + k,
+        };
+        if (at) |ui| facts[ui] = try Closure.ownerFacts(gpa, units[i..j], &.{});
+        i = j;
+    }
+    return facts;
+}
+
+fn freeClosureFacts(gpa: std.mem.Allocator, facts: []const []const u8) void {
+    for (facts) |f| gpa.free(f);
+    gpa.free(facts);
+}
 
 /// Lower EVERY function across the whole module `graph` (in parallel, memoized
 /// through the codegen cache), then run the serial relink tail. The entry `main`
@@ -538,6 +576,9 @@ pub fn lowerGraphProgram(
         } };
     }
 
+    const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, lower_ids.items, base_count, derive_base);
+    defer freeClosureFacts(gpa, closure_facts);
+
     const gf = GraphFrozen{
         .trees = trees,
         .tokens = toks,
@@ -566,6 +607,7 @@ pub fn lowerGraphProgram(
         .lambda_base = lambda_base,
         .adapters = tc.adapters,
         .adapter_base = adapter_base,
+        .closure_facts = closure_facts,
         .opt = opt,
         .probe = probe,
     };

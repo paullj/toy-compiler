@@ -541,7 +541,7 @@ pub fn codegen(
     }
     try AstWalk.walkConformances(gpa, frozen, frozen.conformances, &confs);
 
-    const fp = Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items, confs.items);
+    const fp = Fingerprint.foldClosure(Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items, confs.items), frozen.closure_facts);
     // The uniform codegen key: the content fingerprint xor'd with the opt level
     // and the fn's OWN emitted symbol, target-sensitive. `Key.codegen` is the ONE
     // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).

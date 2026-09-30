@@ -1,0 +1,19 @@
+# Feature: captured structs (a 16-byte pair and a >16-byte struct) and a captured str are copied into the env by value
+# expect: stdout "hello\n"
+# expect: exit 44
+import std/io
+
+struct P { x: int, y: int }
+struct Big { a: int, b: int, c: int, d: int }
+
+fn main() -> int {
+    p := P { x: 1, y: 2 }
+    big := Big { a: 3, b: 4, c: 5, d: 6 }
+    s := "hello"
+    f := fn() -> int { p.x + p.y + big.a + big.b + big.c + big.d + s.len() }
+    show := fn() { io.println(s) }
+    show()
+    q := p
+    total := f() + q.x
+    return total + big.d * 2 + s.len()
+}

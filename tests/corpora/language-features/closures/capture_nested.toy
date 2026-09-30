@@ -1,0 +1,14 @@
+# Feature: a capture three lambdas deep is carried through each enclosing lambda's env
+# expect: exit 66
+fn main() -> int {
+    a := 1
+    b := 20
+    c := 45
+    outer := fn() -> fn() -> fn() -> int {
+        fn() -> fn() -> int {
+            mid := b
+            fn() -> int { a + mid + c }
+        }
+    }
+    return outer()()()
+}

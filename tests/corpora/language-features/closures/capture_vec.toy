@@ -1,0 +1,17 @@
+# Feature: a captured Vec is its handle: pushes through the capture and outside it land in the same Vec
+# expect: exit 32
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = []
+    add := fn(v: int) { xs.push(v) }
+    add(10)
+    xs.push(20)
+    add(1)
+    total := fn() -> int {
+        t := 0
+        for i in 0..xs.len() { t = t + xs[i] }
+        t
+    }
+    return total() + xs.len() - 2
+}
