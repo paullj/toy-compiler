@@ -34,11 +34,16 @@ pub const SymName = symbols.SymName;
 ///   * `.none`   — no target. For a reloc whose patched value is derived purely from its
 ///                 own site + addend (the `.movw_g0`/`.movw_g1` self-locate), so there is
 ///                 nothing to name or free.
+///   * `.text_off` — a `__text` byte offset, link-internal: `link` rewrites a `.func`
+///                 address reloc (adrp/add of a function) to it once the callee's offset
+///                 is known, so the cross-segment pass needs no symbol table. Never
+///                 lowered and never cached.
 pub const SymbolId = union(enum) {
     func: SymName,
     cstr: u64,
     import: SymName,
     none,
+    text_off: u32,
 
     /// The heap-owned name this target carries, if any. THE single source of truth for
     /// the "which targets own a name" rule — every free/dupe boundary asks here instead
@@ -46,7 +51,7 @@ pub const SymbolId = union(enum) {
     pub fn name(self: SymbolId) ?[]const u8 {
         return switch (self) {
             .func, .import => |s| s.name,
-            .cstr, .none => null,
+            .cstr, .none, .text_off => null,
         };
     }
 };

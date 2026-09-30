@@ -1451,6 +1451,7 @@ fn intStructInputs(layouts: []const Typecheck.Layout) L.Inputs {
         .names = &.{},
         .methods = &.{},
         .derives = &.{},
+        .closure = .none,
     };
 }
 

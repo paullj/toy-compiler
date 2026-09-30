@@ -1,0 +1,25 @@
+# Feature: generic functions with function-typed parameters instantiate on the value's signature (erased form: the fn value is called through its pair)
+# expect: exit 29
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }
+fn call[T](f: fn() -> T) -> T { f() }
+fn compose[A, B](f: fn(A) -> B, g: fn(B) -> A, x: A) -> A { g(f(x)) }
+
+fn inc(x: int) -> int { x + 1 }
+fn neg(b: bool) -> bool { !b }
+fn seven() -> int { 7 }
+fn is_pos(x: int) -> bool { x > 0 }
+fn from_bool(b: bool) -> int { if b { 10 } else { 20 } }
+fn via_local() -> int {
+    h := inc
+    apply(h, 1)
+}
+
+fn main() -> int {
+    a := apply(inc, 1)                         # 2
+    b := twice(inc, 5)                         # 7
+    c := call(seven)                           # 7
+    d := compose(is_pos, from_bool, 3)         # 10
+    e := if apply(neg, false) { 1 } else { 0 } # 1
+    return a + b + c + d + e + via_local()     # 27 + 2
+}

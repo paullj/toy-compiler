@@ -27,7 +27,7 @@ const Ir = @import("../ir/Ir.zig");
 /// compile here rather than silently escaping the walk.
 fn eachInstrUseOperand(op: *Ir.Op, ctx: anytype, comptime each: anytype) void {
     switch (op.*) {
-        .iconst, .bconst, .unit, .slot_addr, .cstr_ptr, .fconst => {},
+        .iconst, .bconst, .unit, .slot_addr, .cstr_ptr, .fconst, .fn_addr => {},
         .add, .sub, .mul, .sdiv, .udiv, .smod, .umod, .band, .bor, .bxor, .shl, .lshr, .ashr, .fadd, .fsub, .fmul, .fdiv => |*bin| {
             each(ctx, &bin.lhs);
             each(ctx, &bin.rhs);

@@ -1,0 +1,19 @@
+# Function values compare by identity and conform to no protocol. The harness front-end is
+# single-file, so `[T has Display]` / `[K has Hashable]` proxies stand in for `io.println`
+# and a `Map` key.
+fn show[T has Display](x: T) -> str { x.to_string() }
+fn key[K has Hashable](_k: K) -> int { 0 }
+
+fn inc(x: int) -> int { x + 1 }
+fn dec(x: int) -> int { x - 1 }
+fn not(b: bool) -> bool { !b }
+
+fn main() -> int {
+    f := inc
+    _h := f.hash()  #~ ERROR [T0018] function values have no methods ('hash' on 'fn(int) -> int')
+    _s := show(f)  #~ ERROR [T0023] function type 'fn(int) -> int' does not conform to protocol 'Display'
+    _k := key(f)  #~ ERROR [T0023] function type 'fn(int) -> int' does not conform to protocol 'Hashable'
+    _lt := f < dec  #~ ERROR [T0027] '<' requires an 'Ord' impl for type 'fn(int) -> int'
+    _ne := f == not  #~ ERROR [T0044] operands of '==' must have the same type
+    return 0
+}

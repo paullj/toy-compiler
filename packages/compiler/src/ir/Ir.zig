@@ -184,6 +184,10 @@ pub const Op = union(enum) {
     fcvtzs: ValueId,
 
     call_indirect: CallIndirect,
+
+    /// The code address of a function → int value. The name is borrowed (like
+    /// `Call.callee`); codegen dupes it into the reloc. Pure, no operands.
+    fn_addr: SymName,
 };
 
 /// One instruction: an op plus its result value id (`none_value` when the op
@@ -509,6 +513,7 @@ fn renderInstr(
             }
             try out.writeAll(")\n");
         },
+        .fn_addr => |f| try out.print("fn_addr @{s}\n", .{f.name}),
     }
 }
 

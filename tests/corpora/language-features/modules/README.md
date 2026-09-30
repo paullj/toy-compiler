@@ -15,6 +15,7 @@ on each `main.toy` entry.
 | Program                       | Exercises                                                       |
 | ----------------------------- | -------------------------------------------------------------- |
 | `app/`                        | diamond import, `as` alias, cross-module type by value, prelude, pub/private |
+| `fn_values/`                  | a qualified fn (`ops.add`) as a value; fn identity across modules |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
 | `errors/cycle/`               | an import cycle (graph must be a DAG)                           |
 | `errors/missing/`             | importing a module file that does not exist                    |

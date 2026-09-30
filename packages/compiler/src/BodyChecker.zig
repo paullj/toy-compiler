@@ -874,10 +874,7 @@ pub const BodyChecker = struct {
             .literal_char => try bc.typeCharLiteral(n.main_token),
             .identifier => switch (bc.resolutions[(node_idx).int()]) {
                 .local => |slot| bc.slotType(slot),
-                .func => blk: {
-                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token) }, "function '{s}' is not a value", .{bc.nameText(n.main_token)});
-                    break :blk bc.poison();
-                },
+                .func => |gid| try bc.typeOfFnValue(node_idx, gid, n.main_token),
                 .unresolved => blk: {
                     // Resolve quietly skips a struct-named identifier (it expects this
                     // to be a struct type-name in a position it doesn't bind, or a
@@ -1017,6 +1014,9 @@ pub const BodyChecker = struct {
                         // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
                         if (!Type.eql(lt, rt)) {
                             try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
+                        } else if (lt.isFunc()) {
+                            // Function values compare by identity (code and env), not `Eq`.
+                            break :blk Type.bool;
                         } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, node_idx)) {
                             break :blk Type.bool;
                         } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
@@ -1324,6 +1324,11 @@ pub const BodyChecker = struct {
     }
 
     fn typeOfFieldAccess(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        // A qualified `mod.f` in value position: the resolver bound the access itself.
+        switch (bc.resolutions[(node_idx).int()]) {
+            .func => |gid| return bc.typeOfFnValue(node_idx, gid, n.main_token),
+            else => {},
+        }
         // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
         // identifier (resolved quietly to .unresolved). Treat it as construction.
         const recv = bc.tree.nodes[(n.lhs).int()];
@@ -2050,6 +2055,80 @@ pub const BodyChecker = struct {
         slot.* = c;
     }
 
+    /// Write `c` at `slot` itself: a value call's `callSlot`, or a fn named as a value.
+    fn setCalleeAt(bc: *BodyChecker, slot: Ast.Index, c: Callee) void {
+        // A bounded template is never lowered, and its instances record their own refs.
+        if (c.tag == .fn_ref and bc.abstract_template) return;
+        const cell = &bc.callees[slot.int()];
+        if (builtin.mode == .Debug) std.debug.assert(cell.tag == .none or std.meta.eql(cell.*, c));
+        cell.* = c;
+    }
+
+    /// A named fn in value position (`add`, `mod.f`): its fn type, recording the
+    /// reference on the name's own node. A builtin (compiler-expanded), an extern (a
+    /// foreign symbol) or a generic template (only instances exist) has no code a value
+    /// could point at.
+    fn typeOfFnValue(bc: *BodyChecker, node_idx: Ast.Index, gid: u32, tok: u32) error{OutOfMemory}!Type {
+        const f = bc.model.fns[gid];
+        const what: ?[]const u8 = if (f.kind == .builtin)
+            "a builtin"
+        else if (f.kind == .import)
+            "an extern function"
+        else if (f.isGeneric())
+            "a generic function"
+        else
+            null;
+        if (what) |w| {
+            try bc.sink.report(.{ .span = bc.tokSpan(tok), .code = .T0049 }, "'{s}' is {s} and cannot be used as a value", .{ bc.nameText(tok), w });
+            return bc.poison();
+        }
+        const ty = refs.internFn(bc, f.params, f.ret);
+        if (ty.kind == .invalid) return error.OutOfMemory;
+        bc.setCalleeAt(node_idx, Callee.fnRef(gid));
+        return ty;
+    }
+
+    /// A call of the function value typed `fn_ty` (already typed on the callee node):
+    /// the args check against its params, so their expected types flow in as for a
+    /// direct call, and the call types as its return.
+    fn typeOfValueCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, fn_ty: Type) error{OutOfMemory}!Type {
+        const parts = Composite.fnParts(bc.composite.at(fn_ty.funcIdx()));
+        if (Callee.callSlot(bc.tree, n)) |slot| bc.setCalleeAt(slot, Callee.value_call);
+        _ = try bc.checkCall(node_idx, Ast.rangeSlice(bc.tree, (n.rhs).int()), .{ .params = parts.params });
+        bc.node_types[(node_idx).int()] = parts.ret;
+        return parts.ret;
+    }
+
+    /// A call whose callee is an arbitrary expression (`get()(1)`, `fs[0](1)`): type the
+    /// callee, then call it if it is a function value.
+    fn typeOfExprCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        const ct = try bc.typeOfExpected(n.lhs, null);
+        if (ct.isFunc()) return bc.typeOfValueCall(node_idx, n, ct);
+        try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
+        if (ct.kind == .invalid) return .invalid;
+        try bc.sink.report(.{ .span = bc.spanOf(n.lhs) }, "called value is not a function", .{});
+        return .invalid;
+    }
+
+    /// `recv.member(..)` where `member` names no method but a fn-typed field of the
+    /// struct receiver: a call of the field's value. `field_ty` is the field's type,
+    /// already substituted through an App receiver's args.
+    fn typeOfFieldCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, field_ty: Type) error{OutOfMemory}!Type {
+        bc.node_types[(n.lhs).int()] = field_ty;
+        return bc.typeOfValueCall(node_idx, n, field_ty);
+    }
+
+    /// The fn-typed field `member` of struct `sid`, substituted through `targs`, or null.
+    fn fnField(bc: *BodyChecker, sid: u32, member: []const u8, targs: []const Type) ?Type {
+        const sym = bc.model.structs[sid];
+        for (sym.field_names, sym.field_types) |fname, fty| {
+            if (!std.mem.eql(u8, fname, member)) continue;
+            const t = if (targs.len > 0) substTy(bc, fty, targs) else fty;
+            return if (t.isFunc()) t else null;
+        }
+        return null;
+    }
+
     /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
     ///: the `mut self` place gate, arity, and per-arg assignability, typing the call
     /// node as the method's return. `fa` is the `field_access` (`main_token` = member,
@@ -2269,6 +2348,10 @@ pub const BodyChecker = struct {
                 if (try bc.dispatchValueMethod(node_idx, n, callee)) |t| return t;
             }
         }
+        // A value index `fs[i](x)` the parser read as a turbofish: its head is a local, so
+        // it is a function value fetched from a container, not a generic instance.
+        if (callee.tag == .type_app and bc.tree.nodes[(callee.lhs).int()].tag == .identifier and bc.appHeadIsValue(n.lhs))
+            return bc.typeOfExprCall(node_idx, n);
         // An explicit-protocol-args method call `v.into[int](..)`: the callee is a
         // `type_app` OVER a `field_access` NOT bound to a `.func` (a qualified generic fn
         // `mod.f[int]()` binds its field_access to `.func` and stays a generic FUNCTION
@@ -2380,6 +2463,20 @@ pub const BodyChecker = struct {
     fn typeOfDirectCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         const callee = bc.tree.nodes[(n.lhs).int()];
         const callee_res = bc.resolutions[(n.lhs).int()];
+        if (callee_res == .local) {
+            const st = bc.slotType(callee_res.local);
+            if (st.isFunc()) {
+                bc.node_types[(n.lhs).int()] = st;
+                return bc.typeOfValueCall(node_idx, n, st);
+            }
+            // A local poisoned by an earlier error may well hold a function.
+            if (st.kind == .invalid) {
+                try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
+                return .invalid;
+            }
+        }
+        if (callee_res != .func and callee.tag != .identifier and callee.tag != .field_access)
+            return bc.typeOfExprCall(node_idx, n);
         if (callee_res != .func) {
             // Type the args anyway so their own errors surface, then poison.
             for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |arg| _ = try bc.typeOf(arg);
@@ -2687,8 +2784,12 @@ pub const BodyChecker = struct {
             return try bc.dispatchAppMethod(node_idx, n, callee, recv_ty);
         } else if (recv_ty.isTypeVar()) {
             return try bc.dispatchTypeVarMethod(node_idx, n, callee, recv_ty);
+        } else if (recv_ty.isFunc()) {
+            try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
+            try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "function values have no methods ('{s}' on '{s}')", .{ bc.nameText(callee.main_token), bc.typeName(recv_ty) });
+            return Type.invalid;
         }
-        // No final else: an unhandled receiver kind (.never/.func) falls through to the
+        // No final else: an unhandled receiver kind (.never) falls through to the
         // callee_res != .func path in typeOfCall.
         return null;
     }
@@ -2828,6 +2929,9 @@ pub const BodyChecker = struct {
             bc.node_types[(node_idx).int()] = bm.ret;
             return bm.ret;
         }
+        // No method: a fn-typed field of that name is called as a value (`h.run(4)`).
+        if (recv_ty.kind == .@"struct") if (bc.fnField(recv_ty.struct_id, member, &.{})) |fty|
+            return bc.typeOfFieldCall(node_idx, n, fty);
         // A concrete struct/enum/scalar value with no such method.
         try bc.drainArgs(args);
         try bc.emitNoMethod(bc.tokSpan(callee.main_token), member, recv_ty);
@@ -2947,6 +3051,9 @@ pub const BodyChecker = struct {
                 return .invalid;
             }
         }
+        // No method: a fn-typed field of that name, its type substituted through the args.
+        if (!e.ctor_is_enum) if (bc.fnField(e.ctor, member, e.args)) |fty|
+            return bc.typeOfFieldCall(node_idx, n, fty);
         // A generic-type value with no such method.
         try bc.drainArgs(args);
         try bc.emitNoMethod(bc.tokSpan(callee.main_token), member, recv_ty);
@@ -3534,6 +3641,9 @@ test "a checker diagnostic spans the node it is about, not just its first token"
         .{ .src = "fn g(a: int) -> int { return a }\nfn f() -> int { return g[int](1) }\n", .key = "'g' is not generic", .want = "[int]" },
         .{ .src = "struct P { x: int }\nfn f() -> P { return P(1) }\n", .key = "use named construction", .want = "P(1)" },
         .{ .src = "fn f(a: int) -> int { return a(1) }\n", .key = "called value is not a function", .want = "a" },
+        .{ .src = "fn g() -> int { return 1 }\nfn f() -> int { return g()(1) }\n", .key = "called value is not a function", .want = "g()" },
+        .{ .src = "fn f() {\n x := panic\n}\n", .key = "cannot be used as a value", .want = "panic" },
+        .{ .src = "fn id[T](x: T) -> T { return x }\nfn f() {\n x := id\n}\n", .key = "cannot be used as a value", .want = "id" },
         .{ .src = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn mk() -> P { return P { x: 0 } }\nfn f() { mk().bump(1) }\n", .key = "cannot call mutating method", .want = "mk()" },
         .{ .src = "fn f() {\n break\n}\n", .key = "break outside", .want = "break" },
     });

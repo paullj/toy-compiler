@@ -9,11 +9,12 @@
 //! container and makes this file the seam that incremental/parallel codegen +
 //! relink reuses: re-lower one changed function, then re-`link` the set.
 //!
-//! So far the only relocation is `.call26` — an AArch64 `bl`, PC-relative by a
-//! signed word offset. Intra-module `bl` needs NO runtime relocation under PIE/
-//! ASLR: the patched offset is the (target − site) word delta, fixed at link
-//! time. `link()` is itself in Stage B; Stage A only needs the types below so
-//! `Codegen` can emit `FnCode`/`Reloc` values.
+//! A function is named by two relocation shapes: `.call26` — an AArch64 `bl`,
+//! PC-relative by a signed word offset — and an adrp/add pair taking its address (a
+//! function value). Intra-module `bl` needs NO runtime relocation under PIE/ASLR: the
+//! patched offset is the (target − site) word delta, fixed at link time. The address
+//! pair is resolved to its callee's `__text` offset here and patched with the other
+//! cross-segment relocs once vmaddrs are known.
 
 const std = @import("std");
 const Io = std.Io;
@@ -325,16 +326,16 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     // SymInterner's StringHashMap `get` allocates a scratch key, so it is NOT safe to
     // call concurrently. Resolving here (single-threaded, source order) makes the
     // per-fn jobs pure disjoint-region writers over read-only state. `site_h` is the
-    // owning fn's handle; `targets[i]` holds each call26 target's handle in the same
+    // owning fn's handle; `targets[i]` holds each `.func` target's handle in the same
     // flat order the per-fn loop visits relocs (so the job indexes it by a running
-    // per-fn cursor). A stale call26 target name surfaces as UnresolvedSymbol here,
+    // per-fn cursor). A stale target name surfaces as UnresolvedSymbol here,
     // exactly where the old serial loop raised it.
     const site_h = try gpa.alloc(u32, fns.len);
     defer gpa.free(site_h);
     var n_call26: usize = 0;
     for (fns, 0..) |f, i| {
         site_h[i] = (try si.get(gpa, f.sym)).?;
-        for (f.relocs) |rl| if (rl.kind == .call26) {
+        for (f.relocs) |rl| if (needsFuncHandle(rl)) {
             n_call26 += 1;
         };
     }
@@ -343,21 +344,21 @@ pub fn link(io: Io, gpa: std.mem.Allocator, fns: []const FnCode, si: *SymInterne
     {
         var k: usize = 0;
         for (fns) |f| {
-            for (f.relocs) |rl| if (rl.kind == .call26) {
+            for (f.relocs) |rl| if (needsFuncHandle(rl)) {
                 call_targets[k] = (try si.get(gpa, rl.target.func)) orelse return error.UnresolvedSymbol;
                 k += 1;
             };
         }
     }
-    // First-call26-index of each fn, so a job can slice its own targets without
-    // re-scanning earlier fns (exclusive prefix-sum over per-fn call26 counts).
+    // First-target index of each fn, so a job can slice its own targets without
+    // re-scanning earlier fns (exclusive prefix-sum over per-fn target counts).
     const call_base = try gpa.alloc(usize, fns.len);
     defer gpa.free(call_base);
     {
         var acc: usize = 0;
         for (fns, 0..) |f, i| {
             call_base[i] = acc;
-            for (f.relocs) |rl| if (rl.kind == .call26) {
+            for (f.relocs) |rl| if (needsFuncHandle(rl)) {
                 acc += 1;
             };
         }
@@ -586,6 +587,14 @@ fn buildSymTable(gpa: std.mem.Allocator, fns: []const FnCode, site_h: []const u3
     return buildSideTable(gpa, rows, blob);
 }
 
+/// Whether a reloc names a function whose `__text` offset the link resolves: every
+/// `bl` (`.call26`) and every function-address adrp/add pair. The ONE predicate the
+/// target pre-resolution and the per-fn job's handle cursor both use, so the cursor
+/// can never drift from the resolved-target order.
+fn needsFuncHandle(rl: Reloc) bool {
+    return rl.target == .func;
+}
+
 /// One per-fn link job's output: the cross-segment relocs this fn contributed (in
 /// its own in-fn order) plus any error it hit. The job writes ONLY this slot and
 /// its own `text` region; the caller stable-concatenates `relocs` in source order.
@@ -624,7 +633,7 @@ fn fnLinkJob(
             // offset (its callee's handle → `offsets`); the movw self-locate is
             // site-relative, so `target_off` is unused there.
             .intra => {
-                const target_off: u32 = if (rl.kind == .call26) blk: {
+                const target_off: u32 = if (needsFuncHandle(rl)) blk: {
                     const off = offsets[call_targets[call_i]];
                     call_i += 1;
                     break :blk off;
@@ -634,11 +643,17 @@ fn fnLinkJob(
                 };
             },
             // Cross-segment: defer to `applyDataRelocs` (needs vmaddrs), rebased to an
-            // absolute __text site.
+            // absolute __text site. A function-address target is resolved to its __text
+            // offset here, where the handles are known.
             .cross => {
+                const target: SymbolId = if (needsFuncHandle(rl)) blk: {
+                    const off = offsets[call_targets[call_i]];
+                    call_i += 1;
+                    break :blk .{ .text_off = off };
+                } else rl.target;
                 slot.relocs.append(gpa, .{
                     .site = site_abs,
-                    .target = rl.target,
+                    .target = target,
                     .kind = rl.kind,
                     .addend = rl.addend,
                 }) catch |e| {
@@ -712,7 +727,8 @@ fn dataRelocJob(
         // The relink tail already rewrote the content hash to a blob offset.
         .cstr => |off| cstring_vmaddr + off,
         .import => |s| got_vmaddr + @as(u64, import_slots.get(s.name).?) * 8,
-        // Only cross-segment targets (`.cstr`/`.import`) reach `applyDataRelocs`.
+        .text_off => |off| text_vmaddr + off,
+        // Only cross-segment targets (`.cstr`/`.import`/`.text_off`) reach `applyDataRelocs`.
         .func, .none => unreachable,
     };
     const word = std.mem.readInt(u32, text[rl.site..][0..4], .little);
@@ -839,6 +855,7 @@ pub fn pack(gpa: std.mem.Allocator, fc: FnCode) ![]u8 {
                 name_cursor += @intCast(s.name.len);
             },
             .none => rec.tgt_tag = 3,
+            .text_off => return error.UnserializableReloc,
         }
         @memcpy(buf[off .. off + @sizeOf(RelocRec)], std.mem.asBytes(&rec));
         off += @sizeOf(RelocRec);
@@ -1463,6 +1480,84 @@ test "link rebases non-call26 relocs into data_relocs and leaves call26 in place
     try testing.expectEqual(@as(u32, 4), linked.data_relocs[0].site);
     try testing.expectEqual(RelocKind.adrp_page, linked.data_relocs[0].kind);
     try testing.expectEqual(@as(u64, 0x10), linked.data_relocs[0].target.cstr);
+}
+
+test "a .func adrp/add pair resolves in the cross pass to the callee's text address and counts as a call target" {
+    const gpa = testing.allocator;
+    // fn0 (4 words) at 0: bl f2 @0, adrp/add of f1 @4/@8, bl f2 @12. f1 at 16, f2 at 20.
+    // The two calls on either side of the address pair must still reach f2, so the
+    // handle cursor advances over the pair's two targets.
+    var fns = [_]FnCode{
+        try makeFn(gpa, 0, 4, &.{
+            .{ .site = 0, .target = .{ .func = fname(2) }, .kind = .call26 },
+            .{ .site = 4, .target = .{ .func = fname(1) }, .kind = .adrp_page },
+            .{ .site = 8, .target = .{ .func = fname(1) }, .kind = .add_lo12 },
+            .{ .site = 12, .target = .{ .func = fname(2) }, .kind = .call26 },
+        }),
+        try makeFn(gpa, 1, 1, &.{}),
+        try makeFn(gpa, 2, 1, &.{}),
+    };
+    defer freeFns(gpa, &fns);
+    std.mem.writeInt(u32, fns[0].code[4..8], Aarch64.adrp(9, 0), .little);
+    std.mem.writeInt(u32, fns[0].code[8..12], Aarch64.addImm(9, 9, 0), .little);
+
+    var linked = try linkTest(gpa, &fns, 0);
+    defer gpa.free(linked.text);
+    defer gpa.free(linked.data_relocs);
+
+    try testing.expectEqual(@as(i64, 20), decodeBlDelta(std.mem.readInt(u32, linked.text[0..4], .little)));
+    try testing.expectEqual(@as(i64, 8), decodeBlDelta(std.mem.readInt(u32, linked.text[12..16], .little)));
+    try testing.expectEqual(@as(usize, 2), linked.data_relocs.len);
+    for (linked.data_relocs, [_]u32{ 4, 8 }, [_]RelocKind{ .adrp_page, .add_lo12 }) |rl, site, kind| {
+        try testing.expectEqual(site, rl.site);
+        try testing.expectEqual(kind, rl.kind);
+        try testing.expectEqual(@as(u32, 16), rl.target.text_off);
+        try testing.expectEqual(@as(?[]const u8, null), rl.target.name());
+    }
+
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer threaded.deinit();
+    var import_slots: std.StringHashMapUnmanaged(u32) = .empty;
+    const text_vmaddr: u64 = 0x100000460;
+    applyDataRelocs(threaded.io(), linked.text, linked.data_relocs, text_vmaddr, 0, 0, &import_slots);
+    const add_word = std.mem.readInt(u32, linked.text[8..12], .little);
+    try testing.expectEqual(@as(u32, @truncate((text_vmaddr + 16) & 0xFFF)), (add_word >> 10) & 0xFFF);
+    try testing.expectEqual(Aarch64.adrp(9, 0), std.mem.readInt(u32, linked.text[4..8], .little)); // same 4 KiB page
+}
+
+test "a .func address reloc to a missing symbol is UnresolvedSymbol" {
+    const gpa = testing.allocator;
+    var fns = [_]FnCode{try makeFn(gpa, 0, 1, &.{.{ .site = 0, .target = .{ .func = fname(7) }, .kind = .adrp_page }})};
+    defer freeFns(gpa, &fns);
+    try testing.expectError(error.UnresolvedSymbol, linkTest(gpa, &fns, 0));
+}
+
+test "pack rejects a text_off reloc" {
+    const gpa = testing.allocator;
+    var relocs = [_]Reloc{.{ .site = 0, .target = .{ .text_off = 16 }, .kind = .adrp_page }};
+    var code = [_]u8{ 0, 0, 0, 0 };
+    const fc = FnCode{ .sym = .{ .kind = .user_fn, .name = "f" }, .code = &code, .relocs = &relocs, .literals = &.{} };
+    try testing.expectError(error.UnserializableReloc, pack(gpa, fc));
+}
+
+test "pack/unpack round-trips a .func adrp_page reloc" {
+    const gpa = testing.allocator;
+    var relocs = [_]Reloc{
+        .{ .site = 0, .target = .{ .func = .{ .kind = .user_fn, .name = "add$fnval" } }, .kind = .adrp_page },
+        .{ .site = 4, .target = .{ .func = .{ .kind = .user_fn, .name = "add$fnval" } }, .kind = .add_lo12 },
+    };
+    var code = [_]u8{0} ** 8;
+    const fc = FnCode{ .sym = .{ .kind = .user_fn, .name = "main" }, .code = &code, .relocs = &relocs, .literals = &.{} };
+    const blob = try pack(gpa, fc);
+    defer gpa.free(blob);
+    var got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer got.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), got.relocs.len);
+    for (got.relocs, relocs) |g, want| {
+        try testing.expectEqual(want.kind, g.kind);
+        try testing.expectEqual(want.site, g.site);
+        try testing.expect(g.target.func.eql(want.target.func));
+    }
 }
 
 test "applyDataRelocs reproduces clang adrp/add/ldr words" {

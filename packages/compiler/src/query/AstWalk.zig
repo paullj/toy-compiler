@@ -647,6 +647,20 @@ pub fn CallVisitor(comptime Frozen: type) type {
 
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
+                // A named fn taken as a value: its thunk is the reloc target, so the caller
+                // depends on the fn's identity and signature exactly as a direct call does.
+                .enter => |e| {
+                    const fr = self.frozen;
+                    if (e.idx.int() >= fr.callees.len) return;
+                    switch (fr.callees[e.idx.int()].view()) {
+                        .fn_ref => |gid| if (gid < fr.names.len and gid < fr.sigs.len) {
+                            const nm = fr.names[gid];
+                            const sig = fr.sigs[gid];
+                            try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+                        },
+                        .none, .method, .protocol, .builtin, .value => {},
+                    }
+                },
                 .callee => |c| {
                     // A generic call `id[int](..)`: the callee node is a
                     // `type_app` whose base identifier carries the template's `.func`.
@@ -761,7 +775,9 @@ pub fn CallVisitor(comptime Frozen: type) type {
             const recv_idx = fr.tree.nodes[fa.int()].lhs;
             const recv: Typecheck.Type = if (recv_idx.int() < fr.node_types.len) fr.node_types[recv_idx.int()] else .{ .kind = .invalid };
             switch (fr.callees[fa.int()].view()) {
-                .none, .protocol => {},
+                // A value call's code is not known statically; `.fn_ref` never sits on a
+                // call's slot (it folds at its own node's `.enter`).
+                .none, .protocol, .value, .fn_ref => {},
                 .method => |i| if (i < fr.methods.len) try self.foldWitness(fr.methods[i]),
                 .builtin => |k| switch (k) {
                     // `to_string` relocs to the receiver's Display witness (there is no
@@ -2283,4 +2299,79 @@ test "builtin eq and hash sentinels keep their receiver-kind params" {
         try testing.expect(Typecheck.eqlTypeVec(c.params, sigs.items[0].params));
         try testing.expect(T.eql(c.ret, sigs.items[0].ret));
     }
+}
+
+/// The full codegen fingerprint of top-level fn `fn_name` in `fx`, with its callee Sigs
+/// folded from the Callee table (no touched types, type-args or conformances).
+fn fnFingerprint(fx: *const Checked, gpa: std.mem.Allocator, fn_name: []const u8) !u64 {
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.fold(gpa, fx.tc.callees[0], fn_name, &sigs);
+    const prog = fx.tree.nodes[Ast.root(fx.tree.nodes).int()];
+    for (Ast.rangeSlice(fx.tree, prog.lhs.int())) |idx| {
+        const n = fx.tree.nodes[idx.int()];
+        if (n.tag != .fn_decl or !std.mem.eql(u8, fx.tokens[n.main_token].text(fx.src), fn_name)) continue;
+        return Fingerprint.fingerprint(fx.tree, fx.tokens, fx.src, idx, sigs.items, &.{}, &.{}, &.{});
+    }
+    return error.TestExpectedFn;
+}
+
+test "a fn value reference folds the referenced fn's symbol and sig; a body change does not flip it" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
+        \\fn g(x: int) -> int { x + 1 }
+        \\fn use_it() -> int {
+        \\    h := g
+        \\    h(2)
+        \\}
+        \\
+    );
+    defer fx.destroy(gpa);
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.fold(gpa, fx.tc.callees[0], "use_it", &sigs);
+    // Exactly the reference: the value call `h(2)` folds nothing (its code is dynamic).
+    try testing.expectEqual(@as(usize, 1), sigs.items.len);
+    try testing.expectEqualStrings("main.g", sigs.items[0].name);
+    try testing.expectEqual(@as(usize, 1), sigs.items[0].params.len);
+    try testing.expectEqual(Typecheck.Kind.int, sigs.items[0].ret.kind);
+
+    // Without the table the reference folds nothing, so the fold is what the key rests on.
+    const blank = try gpa.alloc(Callee, fx.tc.callees[0].len);
+    defer gpa.free(blank);
+    @memset(blank, .{});
+    sigs.clearRetainingCapacity();
+    try fx.fold(gpa, blank, "use_it", &sigs);
+    try testing.expectEqual(@as(usize, 0), sigs.items.len);
+
+    // `use_it`'s own text is fixed; only `g` changes: its body must not flip the key,
+    // its signature must.
+    const srcs = [_][]const u8{
+        "fn g(x: int) -> int { x + 1 }\nfn use_it() -> int {\n    _h := g\n    0\n}\n",
+        "fn g(x: int) -> int { x + 100 }\nfn use_it() -> int {\n    _h := g\n    0\n}\n",
+        "fn g(_x: bool) -> int { 1 }\nfn use_it() -> int {\n    _h := g\n    0\n}\n",
+    };
+    var fps: [srcs.len]u64 = undefined;
+    for (srcs, &fps) |src, *fp| {
+        const c = try Checked.create(gpa, src);
+        defer c.destroy(gpa);
+        fp.* = try fnFingerprint(c, gpa, "use_it");
+    }
+    try testing.expectEqual(fps[0], fps[1]);
+    try testing.expect(fps[0] != fps[2]);
+}
+
+test "a direct call folds exactly once" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
+        \\fn g(x: int) -> int { x + 1 }
+        \\fn use_it() -> int { g(2) }
+        \\
+    );
+    defer fx.destroy(gpa);
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.fold(gpa, fx.tc.callees[0], "use_it", &sigs);
+    try testing.expectEqual(@as(usize, 1), sigs.items.len);
+    try testing.expectEqualStrings("main.g", sigs.items[0].name);
 }

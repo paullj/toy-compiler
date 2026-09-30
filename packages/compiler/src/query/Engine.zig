@@ -30,6 +30,8 @@ const Ir = @import("../ir/Ir.zig");
 const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
 const DeriveEmit = @import("../lower/derive_emit.zig");
+const AdapterEmit = @import("../lower/adapter_emit.zig");
+const Closure = @import("../symbols/Closure.zig");
 const Phase = @import("Phase.zig");
 
 const Engine = @This();
@@ -437,6 +439,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .derives = frozen.derives,
         .prelude_ids = frozen.prelude_ids,
         .char_struct = frozen.char_struct,
+        .closure = frozen.closure,
     };
     var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
     defer irf.deinit(gpa);
@@ -670,6 +673,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
         .derives = frozen.derives,
         .prelude_ids = frozen.prelude_ids,
         .char_struct = frozen.char_struct,
+        .closure = frozen.closure,
     };
     var irf = try DeriveEmit.lower(gpa, in, d, sym, &diags);
     defer irf.deinit(gpa);
@@ -779,6 +783,7 @@ pub fn codegenErased(
         .derives = frozen.derives,
         .prelude_ids = frozen.prelude_ids,
         .char_struct = frozen.char_struct,
+        .closure = frozen.closure,
     };
     var irf = try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, sym, &diags);
     defer irf.deinit(gpa);
@@ -793,6 +798,73 @@ pub fn codegenErased(
         var tmp = fc;
         tmp.deinit(gpa);
         return error.CodegenDiagnostic;
+    }
+    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
+}
+
+/// Lower one closure-class unit (a fn-value thunk), UNCACHED like `codegenErased`: it is
+/// pure over its table entry and the layouts, and the table is built serially in
+/// canonical order, so it is `-jN`-deterministic without a cache key. `--verify` runs
+/// the spill tripwire, as for AST units.
+pub fn codegenClosure(
+    self: Engine,
+    gpa: std.mem.Allocator,
+    io: Io,
+    target: []const u8,
+    frozen: anytype,
+    a: Closure.Adapter,
+    tmp_tag: usize,
+    slot: anytype,
+) !void {
+    _ = io;
+    _ = target;
+    _ = tmp_tag;
+    const sym = Link.SymName{ .kind = .user_fn, .name = a.name };
+
+    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+
+    const in: lower.Inputs = .{
+        .tree = frozen.tree,
+        .tokens = frozen.tokens,
+        .source = frozen.source,
+        .resolutions = frozen.resolutions,
+        .node_types = frozen.node_types,
+        .callees = frozen.callees,
+        .layouts = frozen.layouts,
+        .enum_layouts = frozen.enum_layouts,
+        .names = frozen.names,
+        .sig = null,
+        .instances = frozen.instances,
+        .sigs = frozen.sigs,
+        .methods = frozen.methods,
+        .derives = frozen.derives,
+        .prelude_ids = frozen.prelude_ids,
+        .char_struct = frozen.char_struct,
+        .closure = frozen.closure,
+    };
+    var irf = switch (a.kind) {
+        .fn_value => try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
+    };
+    defer irf.deinit(gpa);
+    if (diags.items.len > 0) return error.CodegenDiagnostic;
+
+    var opt_st: Opt.Stats = .{};
+    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
+    const ir_instrs = Ir.instrCount(&irf);
+
+    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);
+    if (diags.items.len > 0) {
+        var tmp = fc;
+        tmp.deinit(gpa);
+        return error.CodegenDiagnostic;
+    }
+    if (self.mode == .verify) {
+        CodegenIr.verifyRefsSpilled(gpa, &irf, frozen.layouts, frozen.enum_layouts) catch |e| {
+            var tmp = fc;
+            tmp.deinit(gpa);
+            return e;
+        };
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
 }

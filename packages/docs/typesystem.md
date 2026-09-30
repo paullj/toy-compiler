@@ -233,6 +233,30 @@ template's signature keeps a `.func`. A function type conforms to no protocol (n
 `Eq`/`Hash`/`Display`/`Ord`), and neither does an aggregate holding one. A `Vec` of
 them gets a trace unit, because the `env` word is a managed pointer.
 
+## Function values
+
+A named function is a value of its function type: `f := add`, `apply(add, 2, 3)`, a
+struct field `Handler { run: double }`, a `Vec[fn(int) -> int]` element, or a return
+value. A builtin (`panic`), an `extern` and a generic function have no single code
+address and are **T0049** as values. Qualified `mod.f` works the same way.
+
+Any expression of function type can be called: a local `f(1)`, an index `fs[i](x)`, a
+call `get_op()(2)`, a pipe `x |> g`. The args are checked against the type's params, so
+their expected types flow in as for a direct call. `recv.m(..)` selects a method first
+and only then a fn-typed field named `m`. A call of a non-function is "called value is
+not a function", whatever the callee's shape.
+
+`==`/`!=` on two values of the same function type is identity (both words of the pair);
+different function types are T0044. A function value has no methods (T0018) and meets
+no protocol bound (T0023), so it is neither a `Map` key nor `Display`-able. A generic
+function with a function-typed parameter (`fn apply[T](f: fn(T) -> T, x: T)`) infers
+through it and instantiates on the value's signature; the value is called through its
+pair.
+
+At runtime a named function value is `{its thunk, null}`: the thunk `<fn>$fnval(env,
+params..)` drops the env and calls the function, so every value is called the same
+way, with the env as the hidden first argument.
+
 ## Protocols, the prelude, and builtin-scalar conformance
 
 `has` is the single conformance relation: `impl T has P { .. }` conforms `T` to a

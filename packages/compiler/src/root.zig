@@ -27,6 +27,7 @@ pub const diagnostics = struct {
 };
 pub const Resolve = @import("resolve.zig");
 pub const Callee = @import("symbols/Callee.zig").Callee;
+pub const Closure = @import("symbols/Closure.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
 pub const Derive = @import("symbols/Derive.zig");
@@ -43,6 +44,7 @@ pub const Ir = @import("ir/Ir.zig");
 pub const Opt = @import("opt/Opt.zig");
 pub const lower = @import("lower.zig");
 pub const DeriveEmit = @import("lower/derive_emit.zig");
+pub const AdapterEmit = @import("lower/adapter_emit.zig");
 pub const Fingerprint = @import("query/Fingerprint.zig");
 pub const AstWalk = @import("query/AstWalk.zig");
 pub const Link = @import("link/Link.zig");
@@ -85,6 +87,7 @@ test {
     _ = diagnostics.severity_config;
     _ = Resolve;
     _ = @import("symbols/Callee.zig");
+    _ = Closure;
     _ = ResolveGraph;
     _ = Typecheck;
     _ = Derive;
@@ -100,6 +103,7 @@ test {
     _ = Opt;
     _ = lower;
     _ = DeriveEmit; // discovers derive_emit.zig's boundary tests
+    _ = AdapterEmit;
     _ = Fingerprint;
     _ = AstWalk;
     _ = Link;

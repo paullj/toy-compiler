@@ -33,6 +33,8 @@ const Resolve = @import("resolve.zig");
 const symbols_res = @import("symbols/Resolution.zig");
 const Typecheck = @import("types.zig");
 const Callee = @import("symbols/Callee.zig").Callee;
+const Closure = @import("symbols/Closure.zig");
+const LayoutEngine = @import("layout/Engine.zig");
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
 const Abi = @import("codegen/abi/Abi.zig");
@@ -110,6 +112,18 @@ pub const Inputs = struct {
     /// the `.into()`/`.try_into()` recognizer + char-literal lowering key the char cases
     /// off the same id the checker used. Null for a prelude-less test caller (no char).
     char_struct: ?u32 = null,
+    /// The function-value tables. NO default (the `methods` discipline): a unit that
+    /// names a fn as a value must find its thunk, so every build site threads this,
+    /// passing `ClosureInputs.none` only for a unit that reads no AST.
+    closure: ClosureInputs,
+};
+
+/// The closure tables one lowering reads, borrowed from the typecheck result.
+pub const ClosureInputs = struct {
+    /// The fn-value thunks, sorted by `(kind, key)`.
+    adapters: []const Closure.Adapter,
+
+    pub const none: ClosureInputs = .{ .adapters = &.{} };
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -651,6 +665,7 @@ fn lowerStrLiteral(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Opera
 }
 
 fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    if (fnValueRef(b, node_idx)) |gid| return try lowerFnValue(b, node_idx, gid, ty);
     const slot = try localSlot(b, node_idx, ty);
     // A managed box reads as an 8-byte scalar cell pointer (its own value), not by slot.
     switch (passKind(b, ty)) {
@@ -999,6 +1014,7 @@ fn operandSlot(op: Ir.Operand) Ir.SlotId {
 ///              bool, byte-identical to the `p.eq(q)` method form (see `lowerStructEq`).
 /// `!=` wraps the resulting bool in a `bnot`.
 fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
+    if (LayoutEngine.isFnStruct(operand_ty, b.in.layouts)) return try lowerFnIdentityEq(b, lhs_node, rhs_node, negate);
     const pk = passKind(b, operand_ty);
     // A managed box compares by CELL IDENTITY: an 8-byte pointer `icmp`, not a structural
     // deref. Two independent `&41` are distinct cells (unequal); `r == r` is the same cell.
@@ -1748,6 +1764,34 @@ fn passKind(b: *Builder, t: Typecheck.Type) PassKind {
     };
 }
 
+/// The operand a value of `ty` held in `slot` is passed as: a scalar is loaded, an
+/// aggregate travels by its slot. For a source-less unit forwarding its params.
+pub fn slotOperand(b: *Builder, slot: Ir.SlotId, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    switch (passKind(b, ty)) {
+        .box => {
+            const addr = try b.emit(.{ .slot_addr = slot }, int_ty);
+            return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = int_ty } }, box_repr_ty) };
+        },
+        .int, .bool, .float, .rawptr => {
+            const addr = try b.emit(.{ .slot_addr = slot }, int_ty);
+            return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty) };
+        },
+        .str, .@"struct", .@"enum" => return .{ .slot = slot },
+        .unit, .never, .invalid => return .none,
+    }
+}
+
+/// The exit block's param type for a fn returning `ret`, or null when it returns no
+/// value (the `lowerFn` rule: a managed box returns as its 8-byte cell pointer).
+pub fn exitParamType(b: *Builder, ret: Typecheck.Type) ?Typecheck.Type {
+    if (ret.kind == .unit or ret.kind == .never) return null;
+    return switch (passKind(b, ret)) {
+        .box => box_repr_ty,
+        else => ret,
+    };
+}
+
 /// Whether `t` is a by-slot aggregate for lowering (str/struct/enum), EXCLUDING a
 /// managed-box handle (`Ref`/`gc_array`), which is a scalar 8-byte cell pointer.
 fn isAggTy(b: *Builder, t: Typecheck.Type) bool {
@@ -1925,6 +1969,12 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             self_mut = m.mut_self;
         },
         .builtin => |k| return lowerBuiltinMethod(b, node_idx, n, k),
+        .value => return lowerValueCall(b, node_idx, n),
+        .fn_ref => {
+            // A call's slot never carries one: a direct callee is not typed as a value.
+            try b.note(n.main_token, "function reference in callee position");
+            return .none;
+        },
         .protocol => {
             // Only bounded-template spans carry one, and templates are never lowered. A note,
             // not `unreachable`, which ReleaseFast would turn into UB.
@@ -2145,34 +2195,50 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         args[self_n + i] = try lowerExpr(b, arg);
     }
 
+    return try emitCall(b, .{ .direct = callee }, args, result_ty, n.main_token);
+}
+
+/// What a call instruction invokes: a symbol (`bl`), or a computed code address (`blr`).
+pub const CallTarget = union(enum) { direct: Link.SymName, indirect: Ir.ValueId };
+
+fn callOp(target: CallTarget, args: []Ir.Operand, ret_slot: Ir.SlotId) Ir.Op {
+    return switch (target) {
+        .direct => |callee| .{ .call = .{ .callee = callee, .args = args, .ret_slot = ret_slot } },
+        .indirect => |t| .{ .call_indirect = .{ .target = t, .args = args, .ret_slot = ret_slot } },
+    };
+}
+
+/// Emit the call of `target` with the already-lowered `args` (ownership passes to the
+/// instruction) and place its `result_ty` result. `tok` anchors the unsupported-type note.
+pub fn emitCall(b: *Builder, target: CallTarget, args: []Ir.Operand, result_ty: Typecheck.Type, tok: u32) error{OutOfMemory}!Ir.Operand {
     // A managed-box result is an 8-byte scalar cell pointer (returned in a register),
     // not an aggregate — read it as a scalar value, no ret_slot.
     // Result placement: scalar → an Instr.result value; aggregate → a fresh
     // ret_slot; unit → neither. The ABI (reg vs sret) is decided in codegen.
     switch (passKind(b, result_ty)) {
         .box => {
-            const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, box_repr_ty);
+            const v = try b.emit(callOp(target, args, Ir.none_slot), box_repr_ty);
             return .{ .value = v };
         },
         .int, .bool, .float, .rawptr => {
-            const v = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, result_ty);
+            const v = try b.emit(callOp(target, args, Ir.none_slot), result_ty);
             return .{ .value = v };
         },
         .str, .@"struct", .@"enum" => {
             // Aggregate result lands in a fresh slot; the ABI (reg-pair vs sret)
             // is decided in codegen from `ret_slot`.
             const slot = try b.addSlot(result_ty);
-            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
+            _ = try b.emit(callOp(target, args, slot), null);
             return .{ .slot = slot };
         },
         .unit, .never => {
-            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, null);
+            _ = try b.emit(callOp(target, args, Ir.none_slot), null);
             return .none;
         },
         .invalid => {
             const slot = try b.addSlot(result_ty);
-            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
-            try b.note(n.main_token, "call result type unsupported in lower");
+            _ = try b.emit(callOp(target, args, slot), null);
+            try b.note(tok, "call result type unsupported in lower");
             return .{ .slot = slot };
         },
     }
@@ -2333,11 +2399,85 @@ pub fn isCharTy(b: *const Builder, ty: Typecheck.Type) bool {
 
 const OptResultCall = struct { recv: Ast.Index, op: Typecheck.OptResultMethod };
 
-/// The checker's selection for call `n`, read from its member node's slot.
+/// The checker's selection for call `n`, read from its slot.
 fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
-    const fa = Callee.memberNode(b.in.tree, n) orelse return .none;
-    if (fa.int() >= b.in.callees.len) return .none;
-    return b.in.callees[fa.int()].view();
+    const slot = Callee.callSlot(b.in.tree, n) orelse return .none;
+    if (slot.int() >= b.in.callees.len) return .none;
+    return b.in.callees[slot.int()].view();
+}
+
+/// A call of a function-typed value: evaluate the callee to its `{code, env}` pair, then
+/// the args left to right, and `blr` the code with the env as the hidden first argument.
+fn lowerValueCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const pair = try operandPtr(b, try lowerExpr(b, n.lhs));
+    if (pair == Ir.none_value) {
+        try b.note(n.main_token, "called function value is not a slot in lower");
+        return .none;
+    }
+    const code = try b.emit(.{ .load = .{ .addr = pair, .ty = int_ty } }, int_ty);
+    const env_addr = try b.emit(.{ .field_addr = .{ .base = pair, .off = 8, .ty = Typecheck.Type.rawptr } }, int_ty);
+    const env = try b.emit(.{ .load = .{ .addr = env_addr, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
+    const arg_nodes = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+    const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len + 1);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = env };
+    for (arg_nodes, 1..) |arg, i| args[i] = try lowerExpr(b, arg);
+    return try emitCall(b, .{ .indirect = code }, args, b.in.node_types[(node_idx).int()], n.main_token);
+}
+
+/// A named fn in value position: the pair `{its thunk's address, null env}` in a fresh
+/// slot. The thunk gives every function value the same `(env, params..)` call shape.
+fn lowerFnValue(b: *Builder, node_idx: Ast.Index, gid: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const ai = Closure.findAdapter(b.in.closure.adapters, .fn_value, gid) orelse {
+        try b.note(n.main_token, "function value has no thunk in lower");
+        return .none;
+    };
+    const slot = try b.addSlot(ty);
+    const base = try b.emit(.{ .slot_addr = slot }, int_ty);
+    const code = try b.emit(.{ .fn_addr = .{ .kind = .user_fn, .name = b.in.closure.adapters[ai].name } }, int_ty);
+    _ = try b.emit(.{ .store = .{ .addr = base, .val = code, .ty = int_ty } }, null);
+    const env_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = Typecheck.Type.rawptr } }, int_ty);
+    const env = try b.emit(.{ .iconst = 0 }, Typecheck.Type.rawptr);
+    _ = try b.emit(.{ .store = .{ .addr = env_addr, .val = env, .ty = Typecheck.Type.rawptr } }, null);
+    return .{ .slot = slot };
+}
+
+/// The fn a value-position name refers to, when the checker typed it as a fn value.
+fn fnValueRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
+    if (b.in.resolutions[(node_idx).int()] != .func) return null;
+    if (node_idx.int() >= b.in.callees.len) return null;
+    return switch (b.in.callees[node_idx.int()].view()) {
+        .fn_ref => |gid| gid,
+        else => null,
+    };
+}
+
+/// `==` on function values is identity: both the code and the env words match.
+fn lowerFnIdentityEq(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index, negate: bool) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.bool;
+    const lp = try operandPtr(b, try lowerExpr(b, lhs_node));
+    const rp = try operandPtr(b, try lowerExpr(b, rhs_node));
+    if (lp == Ir.none_value or rp == Ir.none_value) {
+        try b.note(b.in.tree.nodes[(lhs_node).int()].main_token, "function value operand is not a slot in lower");
+        return .{ .value = try b.emit(.{ .bconst = false }, bool_ty) };
+    }
+    const lc = try b.emit(.{ .load = .{ .addr = lp, .ty = int_ty } }, int_ty);
+    const rc = try b.emit(.{ .load = .{ .addr = rp, .ty = int_ty } }, int_ty);
+    const le_addr = try b.emit(.{ .field_addr = .{ .base = lp, .off = 8, .ty = int_ty } }, int_ty);
+    const le = try b.emit(.{ .load = .{ .addr = le_addr, .ty = int_ty } }, int_ty);
+    const re_addr = try b.emit(.{ .field_addr = .{ .base = rp, .off = 8, .ty = int_ty } }, int_ty);
+    const re = try b.emit(.{ .load = .{ .addr = re_addr, .ty = int_ty } }, int_ty);
+    // Both words at once, branch-free: (lc ^ rc) | (le ^ re) is zero iff identical.
+    const dc = try b.emit(.{ .bxor = .{ .lhs = lc, .rhs = rc } }, int_ty);
+    const de = try b.emit(.{ .bxor = .{ .lhs = le, .rhs = re } }, int_ty);
+    const any = try b.emit(.{ .bor = .{ .lhs = dc, .rhs = de } }, int_ty);
+    const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+    const cc: Ir.Cond = if (negate) .ne else .eq;
+    return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = any, .rhs = zero } }, bool_ty) };
 }
 
 /// Inline a native `Option`/`Result` method. The receiver is materialized into a
@@ -2942,6 +3082,7 @@ fn aggregateValue(b: *Builder, expr: Ast.Index, ty: Typecheck.Type) error{OutOfM
 /// slot). A local-rooted base reads in place; an rvalue base (a call/construction)
 /// is materialized to a temp first.
 fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    if (fnValueRef(b, node_idx)) |gid| return try lowerFnValue(b, node_idx, gid, ty);
     // A qualified enum unit-variant `N.V` reaches here as field_access but is a
     // construction, not a field read.
     if (ty.kind == .@"enum" and !isLocalRootedPlace(b, node_idx)) {
@@ -4429,6 +4570,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
 
     var target: Ast.Index = Ast.none;
@@ -4518,6 +4660,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -4590,6 +4733,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -4603,6 +4747,63 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
     var w = std.Io.Writer.fixed(&buf);
     try Ir.render(&w, &func, in.layouts, in.enum_layouts);
     return gpa.dupe(u8, w.buffered());
+}
+
+test "a fn value lowers to fn_addr of its thunk and a null env" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn g(x: int) -> int { return x }
+        \\fn f() -> int {
+        \\ h := g
+        \\ return h(1)
+        \\}
+        \\
+    , "f");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.g$fnval\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "iconst 0\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, ", 8 : rawptr\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "call @") == null);
+}
+
+test "a value call passes env as argument 0" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn apply(f: fn(int, bool) -> int, x: int) -> int { return f(x, true) }
+        \\
+    , "apply");
+    defer gpa.free(ir);
+    // The code is the pair's word at +0 and the env its rawptr word at +8, both loaded
+    // before the args are evaluated.
+    try testing.expect(std.mem.indexOf(u8, ir,
+        \\  %1 = slot_addr s0
+        \\  %2 = load %1 : int
+        \\  %3 = field_addr %1, 8 : rawptr
+        \\  %4 = load %3 : rawptr
+        \\
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "%8 = call_indirect %2(%4, %6, %7)\n") != null);
+}
+
+test "fn identity == compares both words, no Eq call" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn same(a: fn(int) -> int, b: fn(int) -> int) -> bool { return a == b }
+        \\fn diff(a: fn(int) -> int, b: fn(int) -> int) -> bool { return a != b }
+        \\
+    , "same");
+    defer gpa.free(ir);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, ir, "bxor"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "bor"));
+    try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
+    const ne = try renderLoweredG(gpa,
+        \\fn diff(a: fn(int) -> int, b: fn(int) -> int) -> bool { return a != b }
+        \\
+    , "diff");
+    defer gpa.free(ne);
+    try testing.expect(std.mem.indexOf(u8, ne, "icmp ne") != null);
+    try testing.expect(std.mem.indexOf(u8, ne, "call") == null);
 }
 
 test "struct == lowers to a call to the Eq witness (no inline icmp)" {
@@ -4995,6 +5196,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -5067,6 +5269,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -5127,6 +5330,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -5522,6 +5726,7 @@ fn lowerMainWithCallee(gpa: std.mem.Allocator, src: []const u8, member: []const 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);

@@ -32,6 +32,7 @@ const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 pub const Callee = @import("symbols/Callee.zig").Callee;
+const Closure = @import("symbols/Closure.zig");
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
@@ -496,6 +497,9 @@ pub const GraphResult = struct {
     /// lower `Inputs` so the conversion recognizer + char-literal lowering key off it.
     /// Null only for a prelude-less internal caller.
     char_struct: ?u32 = null,
+    /// The fn-value thunks, sorted by `(kind, key)`: one per fn some body names as a
+    /// value. Each `name` is owned; `target`/`sig` borrow `sigs` and the resolver names.
+    adapters: []Closure.Adapter = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -558,9 +562,61 @@ pub const GraphResult = struct {
         gpa.free(self.descriptor_types);
         for (self.erased_units) |u| if (u.name) |nm| gpa.free(nm);
         gpa.free(self.erased_units);
+        freeAdapters(gpa, self.adapters);
         self.* = undefined;
     }
 };
+
+fn freeAdapters(gpa: std.mem.Allocator, adapters: []const Closure.Adapter) void {
+    for (adapters) |a| gpa.free(a.name);
+    gpa.free(adapters);
+}
+
+/// The fn-value thunk table: one `.fn_value` adapter per fn a module body or an instance
+/// body names as a value (`Callee.fn_ref`), deduped and sorted by gid. Serial over the
+/// finished tables, so it is identical at any `-j`.
+fn buildAdapters(
+    gpa: std.mem.Allocator,
+    callees: []const []const Callee,
+    instances: []const Mono.Instance,
+    fns: []const GraphFnInput,
+    sigs: []const Sig,
+) ![]Closure.Adapter {
+    var gids: std.ArrayList(u32) = .empty;
+    defer gids.deinit(gpa);
+    for (callees) |cs| for (cs) |c| switch (c.view()) {
+        .fn_ref => |gid| try gids.append(gpa, gid),
+        .none, .method, .protocol, .builtin, .value => {},
+    };
+    for (instances) |inst| for (inst.callees) |c| switch (c.view()) {
+        .fn_ref => |gid| try gids.append(gpa, gid),
+        .none, .method, .protocol, .builtin, .value => {},
+    };
+    std.mem.sort(u32, gids.items, {}, std.sort.asc(u32));
+    var n: usize = 0;
+    for (gids.items) |g| {
+        if (n > 0 and gids.items[n - 1] == g) continue;
+        gids.items[n] = g;
+        n += 1;
+    }
+    const out = try gpa.alloc(Closure.Adapter, n);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |a| gpa.free(a.name);
+        gpa.free(out);
+    }
+    for (gids.items[0..n], out) |gid, *a| {
+        a.* = .{
+            .kind = .fn_value,
+            .key = gid,
+            .name = try Closure.adapterName(gpa, fns[gid].name, .fn_value),
+            .target = .{ .kind = fns[gid].kind, .name = fns[gid].name },
+            .sig = .{ .params = sigs[gid].params, .ret = sigs[gid].ret },
+        };
+        built += 1;
+    }
+    return out;
+}
 
 /// Free the per-recipe owned data of a derive table: each `name`, `params`, and
 /// `field_witnesses` outer slice. The `FieldWitness` name slices + `protocol_name` stay
@@ -1911,6 +1967,9 @@ pub fn checkGraph(
         gpa.free(erased_units);
     }
 
+    const adapters = try buildAdapters(gpa, callees, instances, fns, sigs);
+    errdefer freeAdapters(gpa, adapters);
+
     const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
@@ -1937,6 +1996,7 @@ pub fn checkGraph(
         .erased_units = erased_units,
         .prelude_ids = gatherPreludeIds(t),
         .char_struct = if (t.prelude) |p| p.char_struct else null,
+        .adapters = adapters,
     };
 }
 
@@ -2663,7 +2723,10 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         _ = t.gphSelect(mod);
         const tname = t.typeName(args[ord]);
         const pname = model.protocols[pid].name;
-        if (isDerivableProtocol(model, pid)) {
+        if (args[ord].isFunc()) {
+            // No impl can be written for a function type, so the usual fixes do not apply.
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; function values support only '==' (identity)", .{ tname, pname });
+        } else if (isDerivableProtocol(model, pid)) {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
         } else {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
@@ -6180,6 +6243,281 @@ test "a struct with a fn field derives no Eq/Hash/Display" {
     try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
+/// The `nth` (node order) value-position identifier spelled `name` that resolves to a fn.
+fn fnIdent(c: *const Checked, name: []const u8, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .identifier or c.resolve.resolutions[0][i] != .func) continue;
+        if (!std.mem.eql(u8, c.tokens[n.main_token].text(c.source), name)) continue;
+        if (seen == nth) return Ast.Index.from(@intCast(i));
+        seen += 1;
+    }
+    return error.TestIdentNotFound;
+}
+
+/// The `nth` (node order) `.call` node.
+fn nthCall(c: *const Checked, nth: usize) !Ast.Node {
+    var seen: usize = 0;
+    for (c.tree.nodes) |n| {
+        if (n.tag != .call) continue;
+        if (seen == nth) return n;
+        seen += 1;
+    }
+    return error.TestCallNotFound;
+}
+
+fn hasCode(c: *const Checked, code: codes.Code) bool {
+    for (c.result.diags) |d| if (d.code == code) return true;
+    return false;
+}
+
+test "a named fn in value position types as its fn type and records fn_ref" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn g(x: int) -> int { return x }
+        \\fn main() -> int {
+        \\ h := g
+        \\ return h(1)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const g = try fnIdent(&c, "g", 0);
+    const ty = c.result.node_types[0][g.int()];
+    try testing.expect(LayoutEngine.isFnStruct(ty, c.result.layouts));
+    const fs = c.result.layouts[ty.struct_id].fn_sig.?;
+    try testing.expectEqual(@as(usize, 1), fs.params.len);
+    try testing.expectEqual(Kind.int, fs.params[0].kind);
+    try testing.expectEqual(Kind.int, fs.ret.kind);
+    const gid = c.resolve.resolutions[0][g.int()].func;
+    try testing.expectEqual(Callee.View{ .fn_ref = gid }, c.result.callees[0][g.int()].view());
+}
+
+test "calling a fn-typed local records value at callSlot" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn g(x: int) -> int { return x }
+        \\fn main() -> int {
+        \\ h := g
+        \\ return h(1)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const call = try nthCall(&c, 0);
+    const slot = Callee.callSlot(c.tree, call).?;
+    try testing.expectEqual(call.lhs, slot);
+    try testing.expectEqual(Callee.View.value, c.result.callees[0][slot.int()].view());
+}
+
+test "a direct call records no fn_ref on its callee" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn g(x: int) -> int { return x }\nfn main() -> int { return g(1) }\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const call = try nthCall(&c, 0);
+    try testing.expectEqual(Callee.View.none, c.result.callees[0][call.lhs.int()].view());
+    try testing.expectEqual(@as(usize, 0), c.result.adapters.len);
+}
+
+test "s.f(1) picks the method when both exist, else the fn-typed field" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct S { run: fn(int) -> int, go: fn(int) -> int }
+        \\impl S { fn run(self, x: int) -> int { return x + 100 } }
+        \\fn dbl(x: int) -> int { return x * 2 }
+        \\fn main() -> int {
+        \\ s := S { run: dbl, go: dbl }
+        \\ return s.run(1) + s.go(3)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqualStrings("run", (try calleeMethod(&c, "run", 0)).name);
+    try testing.expectEqual(Callee.View.value, try calleeView(&c, "go", 0));
+    const go = try memberSlot(&c, "go", 0);
+    try testing.expect(LayoutEngine.isFnStruct(c.result.node_types[0][go.int()], c.result.layouts));
+}
+
+test "a generic struct's fn-typed field is called through its substituted type" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Box[T] { f: fn(T) -> T, v: T }
+        \\fn dbl(x: int) -> int { return x * 2 }
+        \\fn main() -> int {
+        \\ b := Box[int] { f: dbl, v: 4 }
+        \\ return b.f(b.v)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(Callee.View.value, try calleeView(&c, "f", 0));
+}
+
+test "calling a local poisoned by an earlier error adds no second error" {
+    const gpa = testing.allocator;
+    var c = try checkSource("fn main() -> int {\n f := 1 + true\n return f(1)\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0044, c.result.diags[0].code);
+    // A local that is no function is still reported.
+    var d = try checkSource("fn main() -> int {\n f := 1\n return f(1)\n}\n");
+    defer d.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), d.result.diags.len);
+    try testing.expect(std.mem.indexOf(u8, d.result.diags[0].message, "called value is not a function") != null);
+}
+
+test "a call whose callee is a call or an index is checked, not silently poisoned" {
+    const gpa = testing.allocator;
+    {
+        var c = try checkSource("fn get() -> int { return 1 }\nfn main() -> int { return get()(1) }\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "called value is not a function") != null);
+    }
+    {
+        var c = try checkSource("fn get() -> int { return 1 }\nfn main() -> int { return 1(2) }\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    }
+    {
+        var c = try checkSource(
+            \\fn inc(x: int) -> int { return x + 1 }
+            \\fn get() -> fn(int) -> int { return inc }
+            \\fn main() -> int { return get()(2) }
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+        // The outer call's slot is the inner call node.
+        const outer = for (c.tree.nodes) |n| {
+            if (n.tag == .call and c.tree.nodes[n.lhs.int()].tag == .call) break n;
+        } else return error.TestCallNotFound;
+        try testing.expectEqual(outer.lhs, Callee.callSlot(c.tree, outer).?);
+        try testing.expectEqual(Callee.View.value, c.result.callees[0][outer.lhs.int()].view());
+    }
+    {
+        var c = try checkSource(
+            \\fn inc(x: int) -> int { return x + 1 }
+            \\fn get() -> fn(int) -> int { return inc }
+            \\fn main() -> int { return get()(true) }
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0040, c.result.diags[0].code);
+    }
+}
+
+test "== on fn values is bool; different fn types T0044; f.hash() T0018; f < g T0027" {
+    const gpa = testing.allocator;
+    {
+        var c = try checkSource(
+            \\fn inc(x: int) -> int { return x + 1 }
+            \\fn dec(x: int) -> int { return x - 1 }
+            \\fn main() -> int {
+            \\ f := inc
+            \\ if f == inc { return 1 }
+            \\ if f != dec { return 2 }
+            \\ return 0
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    }
+    const cases = [_]struct { body: []const u8, code: codes.Code }{
+        .{ .body = " b := inc == not\n", .code = .T0044 },
+        .{ .body = " h := inc.hash()\n", .code = .T0018 },
+        .{ .body = " f := inc\n s := f.to_string()\n", .code = .T0018 },
+        .{ .body = " b := inc < dec\n", .code = .T0027 },
+    };
+    for (cases) |cs| {
+        const src = try std.mem.concat(gpa, u8, &.{
+            "fn inc(x: int) -> int { return x + 1 }\nfn dec(x: int) -> int { return x - 1 }\nfn not(b: bool) -> bool { return !b }\nfn main() {\n",
+            cs.body,
+            "}\n",
+        });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try testing.expect(hasCode(&c, cs.code));
+    }
+}
+
+test "apply[T](f: fn(T) -> T, x: T) instantiates once on T=int" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn apply[T](f: fn(T) -> T, x: T) -> T { return f(x) }
+        \\fn inc(x: int) -> int { return x + 1 }
+        \\fn dec(x: int) -> int { return x - 1 }
+        \\fn main() -> int { return apply(inc, 1) + apply(dec, 5) }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances[0].args.len);
+    try testing.expectEqual(Kind.int, c.result.instances[0].args[0].kind);
+}
+
+test "call[T](f: fn() -> T) infers T from the fn's ret" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn call[T](f: fn() -> T) -> T { return f() }
+        \\fn seven() -> int { return 7 }
+        \\fn yes() -> bool { return true }
+        \\fn main() -> int {
+        \\ if call(yes) { return call(seven) }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.instances.len);
+    var kinds: [2]Kind = undefined;
+    for (c.result.instances, 0..) |inst, i| kinds[i] = inst.args[0].kind;
+    try testing.expect((kinds[0] == .int and kinds[1] == .bool) or (kinds[0] == .bool and kinds[1] == .int));
+}
+
+test "adapters are the deduped, sorted fn_refs, including refs inside an instance body" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn a1(x: int) -> int { return x }
+        \\fn b2(x: int) -> int { return x }
+        \\fn c3(x: int) -> int { return x }
+        \\fn use[T](v: T) -> T {
+        \\ f := a1
+        \\ f(1)
+        \\ return v
+        \\}
+        \\fn main() -> int {
+        \\ g := c3
+        \\ h := b2
+        \\ k := c3
+        \\ return g(1) + h(2) + k(3) + use(4)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 3), c.result.adapters.len);
+    for (c.result.adapters[1..], c.result.adapters[0 .. c.result.adapters.len - 1]) |cur, prev| try testing.expect(prev.key < cur.key);
+    for (c.result.adapters) |a| {
+        try testing.expectEqual(Closure.AdapterKind.fn_value, a.kind);
+        try testing.expect(std.mem.endsWith(u8, a.name, "$fnval"));
+        try testing.expect(std.mem.startsWith(u8, a.name, a.target.name));
+        try testing.expectEqual(@as(usize, 1), a.sig.params.len);
+    }
+    // `a1` is named only inside the generic body, so only the instance slice holds it.
+    try testing.expectEqualStrings("main.a1", c.result.adapters[0].target.name);
+}
+
 test "Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {
     const gpa = testing.allocator;
     var c = try checkSource("struct Box[T] { v: T }\nfn main() -> int {\n b := Box[int]{ v: 41 }\n c := Box[int]{ v: 1 }\n return b.v + c.v\n}\n");
@@ -6741,12 +7079,13 @@ fn identTypeOf(c: *const Checked, name: []const u8) Type {
     unreachable;
 }
 
-test "value-poison: a function used as a value reports and poisons the node" {
+test "value-poison: a builtin used as a value reports T0049 and poisons the node" {
     const gpa = testing.allocator;
-    var c = try checkSource("fn g() -> int { return 1 }\nfn f() -> int {\n return g\n}\n");
+    var c = try checkSource("fn f() {\n p := panic\n}\n");
     defer c.deinit(gpa);
     try testing.expect(c.result.diags.len >= 1);
-    try testing.expectEqual(Kind.invalid, identTypeOf(&c, "g").kind);
+    try testing.expectEqual(codes.Code.T0049, c.result.diags[0].code);
+    try testing.expectEqual(Kind.invalid, identTypeOf(&c, "panic").kind);
 }
 
 test "value-poison: a bare struct name used as a value reports and poisons the node" {

@@ -97,6 +97,7 @@ pub const Code = enum(u16) {
     T0046, // no-such-field (a field access, construction, or pattern names a field the struct/variant does not have)
     T0047, // missing-field (a struct or variant construction omits a declared field)
     T0048, // non-exhaustive-match (a match does not cover every value of its scrutinee)
+    T0049, // fn-not-a-value (a builtin, extern or generic function is named as a value)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -203,6 +204,7 @@ pub const table = [_]Entry{
     .{ .code = .T0046, .str = "T0046", .slug = "no-such-field" },
     .{ .code = .T0047, .str = "T0047", .slug = "missing-field" },
     .{ .code = .T0048, .str = "T0048", .slug = "non-exhaustive-match" },
+    .{ .code = .T0049, .str = "T0049", .slug = "fn-not-a-value" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },

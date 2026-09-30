@@ -859,15 +859,15 @@ const GraphResolve = struct {
                 // a value subscript. Resolve only the base callee; never descend the type-args
                 // (resolving `int` would fire R0001). Going through the generic `.type_app` arm
                 // would misread `v.into[int]` as a value index (leftmost `v` is `.local`) and
-                // descend `int`. The language has no first-class function values, so a value
-                // index in callee position (`xs[i]()`) is never a valid call anyway — leaving
-                // its subscript's names unbound here is harmless (a later stage rejects the
-                // call), so this base-only resolution is safe for both readings.
+                // descend `int`. A bare local head (`fs[i](x)`) is the exception: it is a
+                // function value fetched by index, so its subscript is an expression.
                 const callee = g.nodes()[n.lhs.int()];
-                if (callee.tag == .type_app)
-                    try g.resolveExpr(callee.lhs)
-                else
-                    try g.resolveExpr(n.lhs);
+                if (callee.tag == .type_app) {
+                    try g.resolveExpr(callee.lhs);
+                    if (g.nodes()[callee.lhs.int()].tag == .identifier and
+                        symbols_res.leftmostHeadIsValue(g.tree(g.cur_mod), g.resolutions[g.cur_mod], callee.lhs))
+                        for (Ast.rangeSlice(g.tree(g.cur_mod), callee.rhs.int())) |a| try g.resolveExpr(a);
+                } else try g.resolveExpr(n.lhs);
                 for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |arg| try g.resolveExpr(arg);
             },
             .struct_init => {
@@ -3141,4 +3141,32 @@ test "an import diagnostic spans the module path; the extern gate spans the decl
         }
     };
     try withResolvedGraph(".toy-test-import-spans", files, "main.toy", Check.run);
+}
+
+test "a value-index callee resolves its subscript (no W0001)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+        \\import std/vec
+        \\fn main() -> int {
+        \\ fs: Vec[fn(int) -> int] = []
+        \\ i := 0
+        \\ return fs[i](1)
+        \\}
+        \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const m = &g.modules[g.entry_index];
+            const res = r.resolutions[g.entry_index];
+            var seen = false;
+            for (m.nodes) |n| {
+                if (n.tag != .type_app or res[n.lhs.int()] != .local) continue;
+                const sub = Ast.rangeSlice(m.tree(), n.rhs.int())[0];
+                try testing.expect(res[sub.int()] == .local);
+                seen = true;
+            }
+            try testing.expect(seen);
+        }
+    };
+    try withResolvedGraph(".toy-test-value-index-callee", files, "main.toy", Check.run);
 }
