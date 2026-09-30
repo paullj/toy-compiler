@@ -634,3 +634,88 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
             (prev.scope == cur.scope and prev.byte_offset <= cur.byte_offset));
     }
 }
+
+/// The callee tables of one check of `graph` under a `limit`-worker pool, as raw bytes:
+/// every module slice, then each instance's `template_gid` and slice. `tags` counts
+/// every slot by tag. Requires an error-free check.
+fn calleesUnder(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *ResolveGraph.GraphResult,
+    limit: Io.Limit,
+    tags: *[@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize,
+) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
+    defer tr.deinit(gpa);
+    for (tr.diags) |d| try testing.expect(d.severity != .err);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    @memset(tags, 0);
+    for (tr.callees) |cs| {
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(cs));
+        for (cs) |c| tags[@intFromEnum(c.tag)] += 1;
+    }
+    for (tr.instances) |inst| {
+        try out.appendSlice(gpa, std.mem.asBytes(&inst.template_gid));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(inst.callees));
+        for (inst.callees) |c| tags[@intFromEnum(c.tag)] += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "callee tables are byte-identical at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-callees-jn";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // Every Callee shape, plus enough fns (> the Pass-C fan-out threshold) that the
+    // parallel check really splits the bodies across workers.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll("import std/vec\n");
+    try src.writer.writeAll(Typecheck.dispatch_shapes_src);
+    try src.writer.writeAll(
+        \\fn _vecs() -> int {
+        \\    v := Vec[int].new()
+        \\    v.push(1)
+        \\    return v.len()
+        \\}
+        \\
+    );
+    for (0..70) |k| try src.writer.print("fn _pad{d}(a: Acc) -> int {{ a.plus({d}, 1) + \"x\".len() + ({d}).hash() }}\n", .{ k, k, k });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r.diags.len);
+
+    var serial_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
+    var parallel_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
+    const serial = try calleesUnder(gpa, &graph, &r, .limited(0), &serial_tags);
+    defer gpa.free(serial);
+    const parallel = try calleesUnder(gpa, &graph, &r, .limited(8), &parallel_tags);
+    defer gpa.free(parallel);
+
+    try testing.expectEqualSlices(u8, serial, parallel);
+    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.method)] > 0);
+    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.builtin)] > 0);
+    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.protocol)] > 0);
+    try testing.expectEqual(@as(usize, 0), serial_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
+}

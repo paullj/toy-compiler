@@ -1445,6 +1445,7 @@ fn intStructInputs(layouts: []const Typecheck.Layout) L.Inputs {
         .source = "",
         .resolutions = &.{},
         .node_types = &.{},
+        .callees = &.{},
         .layouts = layouts,
         .enum_layouts = &.{},
         .names = &.{},

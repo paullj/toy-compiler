@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
 const TokenTag = @import("ast/Token.zig").Tag;
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
+const Callee = @import("symbols/Callee.zig").Callee;
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const AstWalk = @import("query/AstWalk.zig");
 const Span = @import("diagnostics/model.zig").Span;
@@ -225,6 +227,10 @@ pub const BodyChecker = struct {
     source: []const u8,
     resolutions: []const Resolution,
     node_types: []Type,
+    /// The method-call selections, parallel to `node_types` and written under the same
+    /// own-span-only rule. Written whenever a selection is made, whether or not the args
+    /// then check, so an argument error keeps the pick.
+    callees: []Callee,
     graph_mod: u32,
 
     // Per-fn scratch.
@@ -2026,12 +2032,24 @@ pub const BodyChecker = struct {
         try out.append(bc.gpa, ')');
     }
 
+    fn setCallee(bc: *BodyChecker, call: Ast.Node, c: Callee) void {
+        // A bounded template's receiver types live in a discarded scratch, so the seal
+        // could never resolve a pending slot there.
+        if (c.tag == .pending and bc.abstract_template) return;
+        const fa = Callee.memberNode(bc.tree, call) orelse return;
+        const slot = &bc.callees[fa.int()];
+        if (builtin.mode == .Debug) std.debug.assert(slot.tag == .none or std.meta.eql(slot.*, c));
+        slot.* = c;
+    }
+
     /// Type-check a resolved method call `recv.m(args)` against the selected witness `m`
     ///: the `mut self` place gate, arity, and per-arg assignability, typing the call
     /// node as the method's return. `fa` is the `field_access` (`main_token` = member,
     /// `lhs` = receiver). Shared by the bare-dispatch path and the explicit-protocol-args
     /// (`v.m[int]()`) path so both type identically. `args` is `n`'s value-arg range.
-    fn dispatchMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, fa: Ast.Node, recv_ty: Type, member: []const u8, m: Typecheck.Method) error{OutOfMemory}!Type {
+    fn dispatchMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, fa: Ast.Node, recv_ty: Type, member: []const u8, mi: u32) error{OutOfMemory}!Type {
+        bc.setCallee(n, Callee.method(mi));
+        const m = bc.model.methods[mi];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const mf = bc.model.fns[m.fn_id];
         if (m.mut_self) {
@@ -2091,8 +2109,8 @@ pub const BodyChecker = struct {
         const recv_ty = try bc.typeOf(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar()) {
-            switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, explicit)) {
-                .one => |m| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, m),
+            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, explicit)) {
+                .one => |mi| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, mi),
                 else => {
                     try bc.drainArgs(args);
                     try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on type '{s}' for the given protocol type arguments", .{ member, bc.typeName(recv_ty) });
@@ -2109,6 +2127,7 @@ pub const BodyChecker = struct {
             if (pid_opt) |pid| {
                 const p = bc.model.protocols[pid];
                 for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
+                    bc.setCallee(n, Callee.protocolMethod(pid, @intCast(k)));
                     const psig = p.method_params[k];
                     // No callee FnSym exists for a bound-as-axiom protocol method, so there is
                     // no decl to point at.
@@ -2201,6 +2220,7 @@ pub const BodyChecker = struct {
             // Load-bearing: the reified receiver flows to scanCalls / reify / lower off
             // `node_types[type_app]`.
             bc.node_types[(callee.lhs).int()] = app_ty;
+            bc.setCallee(n, Callee.pending);
             const mf = bc.model.fns[m.fn_id];
             const targs_opt = try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args);
             defer if (targs_opt) |ta| bc.gpa.free(ta);
@@ -2672,16 +2692,16 @@ pub const BodyChecker = struct {
         // `findMethod` for every existing program (inherent / single
         // conformance / prelude); `.ambiguous` (a doubly-conforming generic
         // protocol used with no type-args) is T0025 — never an arbitrary pick.
-        switch (Typecheck.resolveConformanceMethod(bc.model.methods, recv_ty, member, null, null)) {
-            .one => |m| {
+        switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null)) {
+            .one => |mi| {
                 // An associated (self-less) function must be reached via `Type[..].fn()`,
                 // never on a value receiver.
-                if (m.is_static) {
+                if (bc.model.methods[mi].is_static) {
                     try bc.drainArgs(args);
                     try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an associated function; call it as '{s}.{s}(..)'", .{ member, bc.typeName(recv_ty), member });
                     return .invalid;
                 }
-                return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, m);
+                return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, mi);
             },
             .ambiguous => {
                 try bc.drainArgs(args);
@@ -2701,6 +2721,7 @@ pub const BodyChecker = struct {
         if ((recv_ty.isInteger() or recv_is_char or recv_ty.kind == .float) and (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) {
             if (bc.expected) |exp| {
                 if (Typecheck.builtinConvMethod(recv_ty, exp, member, char_id)) |cm| {
+                    bc.setCallee(n, Callee.builtinMethod(if (std.mem.eql(u8, member, "into")) .conv_into else .conv_try_into));
                     _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
                     const ret: Type = switch (cm.kind) {
                         .widen, .char_to_int, .byte_to_char, .int_to_float => cm.target,
@@ -2737,10 +2758,12 @@ pub const BodyChecker = struct {
             (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
         {
             if (!try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member })) {
+                if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().hash, node_idx)) bc.setCallee(n, Callee.pending);
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
             if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().hash, node_idx)) {
+                bc.setCallee(n, Callee.pending);
                 bc.node_types[(node_idx).int()] = Type.int;
                 return Type.int;
             }
@@ -2761,10 +2784,12 @@ pub const BodyChecker = struct {
             (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
         {
             if (!try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member })) {
+                bc.setCallee(n, Callee.builtinMethod(.display_to_string));
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
             if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, node_idx)) {
+                bc.setCallee(n, Callee.builtinMethod(.display_to_string));
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2782,6 +2807,7 @@ pub const BodyChecker = struct {
         // `impl int has P` was already handled above (its real `fn_id` is in the
         // method table), so this only fires for the builtins.
         if (Typecheck.builtinScalarMethod(recv_ty, member)) |bm| {
+            bc.setCallee(n, Callee.builtinMethod(bm.builtin));
             const self_param = [_]Type{recv_ty};
             _ = try bc.checkCall(node_idx, args, .{ .params = self_param[0..bm.arity], .name = member });
             bc.node_types[(node_idx).int()] = bm.ret;
@@ -2790,6 +2816,7 @@ pub const BodyChecker = struct {
         // The string builtin methods (`concat`/`len`/`byte_at`/`to_string`) — kept out of
         // `builtinScalarMethod` so lower's `eq`-keyed classifier cannot misroute them.
         if (Typecheck.builtinStrMethod(recv_ty, member)) |bm| {
+            bc.setCallee(n, Callee.builtinMethod(bm.builtin));
             _ = try bc.checkCall(node_idx, args, .{ .params = bm.params, .name = member });
             bc.node_types[(node_idx).int()] = bm.ret;
             return bm.ret;
@@ -2833,6 +2860,7 @@ pub const BodyChecker = struct {
                 .ok => {},
                 else => bound_ok = false, // an unbound impl param: poison, no cascade
             };
+            if (bound_ok) bc.setCallee(n, Callee.pending);
             // A `mut self` method mutates the receiver in place, so it may
             // only be called on a mutable place (reuse the mut-self gate + T0019).
             if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
@@ -2868,24 +2896,27 @@ pub const BodyChecker = struct {
                     // 8-byte scalar cell pointer, so it rides the scalar unwrap path.
                     .unwrap, .unwrap_or => t_ty.kind != .invalid,
                 };
-                if (native_ok) switch (op) {
-                    .is_tag0, .is_tag1 => {
-                        _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
-                        bc.node_types[(node_idx).int()] = Type.bool;
-                        return Type.bool;
-                    },
-                    .unwrap => {
-                        _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
-                        bc.node_types[(node_idx).int()] = t_ty;
-                        return t_ty;
-                    },
-                    .unwrap_or => {
-                        const payload = [_]Type{t_ty};
-                        _ = try bc.checkCall(node_idx, args, .{ .params = &payload, .name = member });
-                        bc.node_types[(node_idx).int()] = t_ty;
-                        return t_ty;
-                    },
-                };
+                if (native_ok) {
+                    bc.setCallee(n, Callee.builtinMethod(Typecheck.optResultBuiltin(op)));
+                    switch (op) {
+                        .is_tag0, .is_tag1 => {
+                            _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
+                            bc.node_types[(node_idx).int()] = Type.bool;
+                            return Type.bool;
+                        },
+                        .unwrap => {
+                            _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
+                            bc.node_types[(node_idx).int()] = t_ty;
+                            return t_ty;
+                        },
+                        .unwrap_or => {
+                            const payload = [_]Type{t_ty};
+                            _ = try bc.checkCall(node_idx, args, .{ .params = &payload, .name = member });
+                            bc.node_types[(node_idx).int()] = t_ty;
+                            return t_ty;
+                        },
+                    }
+                }
             }
         }
         // The universal `to_string` on a reified generic instance (e.g. `Option[int]`):
@@ -2895,10 +2926,12 @@ pub const BodyChecker = struct {
         // `x.to_string()` at `x: Option[int]` — types `str` and records the derive.
         if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null) {
             if (!try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member })) {
+                bc.setCallee(n, Callee.builtinMethod(.display_to_string));
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
             if (try bc.conformsTo(recv_ty, bc.model.preludeProtocols().display, node_idx)) {
+                bc.setCallee(n, Callee.builtinMethod(.display_to_string));
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
             }
@@ -2936,6 +2969,7 @@ pub const BodyChecker = struct {
             if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null and
                 pid == bc.model.preludeProtocols().display.?)
             {
+                bc.setCallee(n, Callee.builtinMethod(.display_to_string));
                 _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
                 bc.node_types[(node_idx).int()] = Type.str;
                 return Type.str;
@@ -2950,6 +2984,7 @@ pub const BodyChecker = struct {
                 break;
             };
             if (mi) |k| {
+                bc.setCallee(n, Callee.protocolMethod(pid, @intCast(k)));
                 const psig = p.method_params[k]; // [self, ...]
                 _ = try bc.checkCall(node_idx, args, .{
                     .params = psig[@min(psig.len, 1)..],

@@ -24,12 +24,14 @@
 //! `identifier` nodes whose text we map straight onto a `Type`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Token = @import("ast/Token.zig").Token;
 const Ast = @import("ast/Ast.zig");
 const Resolve = @import("resolve.zig");
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
+pub const Callee = @import("symbols/Callee.zig").Callee;
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
@@ -388,6 +390,10 @@ pub const GraphFnInput = struct {
 pub const GraphResult = struct {
     /// One `[]Type` per module (parallel to that module's node array).
     node_types: [][]Type,
+    /// One `[]Callee` per module, parallel to `node_types`: each method call's
+    /// selection, on its member node. Generic instances carry their own
+    /// (`Mono.Instance.callees`); a bounded template's span here holds its abstract picks.
+    callees: [][]Callee,
     /// Diagnostics tagged with their owning module id via `Diagnostic.scope`.
     diags: []Diagnostic,
     owned_msgs: [][]u8,
@@ -435,6 +441,8 @@ pub const GraphResult = struct {
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
         gpa.free(self.node_types);
+        for (self.callees) |cs| gpa.free(cs);
+        gpa.free(self.callees);
         gpa.free(self.diags);
         for (self.owned_msgs) |m| gpa.free(m);
         gpa.free(self.owned_msgs);
@@ -462,6 +470,7 @@ pub const GraphResult = struct {
         for (self.instances) |*inst| {
             gpa.free(@constCast(inst.args));
             gpa.free(inst.node_types);
+            gpa.free(inst.callees);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name.?));
             // Each conformance's `witness_syms` + `protocol_args` OUTER slices +
@@ -721,27 +730,40 @@ pub const Prelude = struct {
 /// binds its own protocol's witness or nothing. Those methods stay callable through the
 /// general `v.m(..)` path (`witness_pid == null`).
 pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, witness_pid: ?u32, explicit_args: ?[]const Type) MethodPick {
+    return switch (pickMethodIndex(methods, recv, name, witness_pid, explicit_args)) {
+        .none => .none,
+        .one => |i| .{ .one = methods[i] },
+        .ambiguous => .ambiguous,
+    };
+}
+
+/// `resolveConformanceMethod`'s pick as an index into `methods`, for a caller that
+/// records the selection (an index stays valid as the table grows; a `Method` copy
+/// cannot be told apart from a same-content sibling).
+pub const MethodIndexPick = union(enum) { none, one: u32, ambiguous };
+
+pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, witness_pid: ?u32, explicit_args: ?[]const Type) MethodIndexPick {
     if (explicit_args) |ea| {
-        for (methods) |m| {
+        for (methods, 0..) |m, i| {
             if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name) and
                 m.protocol_id != null and eqlTypeVec(m.protocol_args, ea))
             {
                 if (witness_pid) |want| if (m.protocol_id.? != want) continue;
-                return .{ .one = m };
+                return .{ .one = @intCast(i) };
             }
         }
         return .none;
     }
-    var first: ?Method = null;
+    var first: ?u32 = null;
     var total: usize = 0;
     var conform_count: usize = 0;
-    for (methods) |m| {
+    for (methods, 0..) |m, i| {
         if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name)) {
             if (witness_pid) |want| {
                 const got = m.protocol_id orelse continue;
                 if (got != want) continue;
             }
-            if (first == null) first = m;
+            if (first == null) first = @intCast(i);
             total += 1;
             if (m.protocol_id != null) conform_count += 1;
         }
@@ -818,13 +840,13 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
 /// ship `eq` -> bool: `int`/`bool` lower to an inline `icmp`; `str` to a heap-free
 /// byte-compare (`load_byte` loop); `unit` to a trivially-true `bconst` (the two
 /// `()` values are always equal). None gets a `t.fns` entry — each lowers to a machine op.
-pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, arity: usize } {
+pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, arity: usize, builtin: Callee.Builtin } {
     if (!recv.isScalar()) return null;
     // `eq(self, other) -> bool` is 2-ary (arity counts the non-self args = 1); `hash
     // (self) -> int` is 1-ary (0 non-self args). The `arity` lets the shared
     // method-dispatch consumers gate arg count without hardcoding a per-method constant.
-    if (std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool, .arity = 1 };
-    if (std.mem.eql(u8, name, "hash")) return .{ .ret = Type.int, .arity = 0 };
+    if (std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool, .arity = 1, .builtin = .scalar_eq };
+    if (std.mem.eql(u8, name, "hash")) return .{ .ret = Type.int, .arity = 0, .builtin = .scalar_hash };
     return null;
 }
 
@@ -835,15 +857,15 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
 /// lower so the two consumers cannot drift. `to_string` on int/bool/str/unit produces a str
 /// (it is `self.display()` for every Display-conforming scalar); struct/enum `to_string` is
 /// gated separately (it may record a structural Display derive), so it is NOT recognized here.
-pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, params: []const Type } {
+pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, params: []const Type, builtin: Callee.Builtin } {
     if (recv.kind == .str) {
-        if (std.mem.eql(u8, name, "concat")) return .{ .ret = Type.str, .params = &.{Type.str} };
-        if (std.mem.eql(u8, name, "len")) return .{ .ret = Type.int, .params = &.{} };
-        if (std.mem.eql(u8, name, "byte_at")) return .{ .ret = Type.int, .params = &.{Type.int} };
-        if (std.mem.eql(u8, name, "to_string")) return .{ .ret = Type.str, .params = &.{} };
+        if (std.mem.eql(u8, name, "concat")) return .{ .ret = Type.str, .params = &.{Type.str}, .builtin = .str_concat };
+        if (std.mem.eql(u8, name, "len")) return .{ .ret = Type.int, .params = &.{}, .builtin = .str_len };
+        if (std.mem.eql(u8, name, "byte_at")) return .{ .ret = Type.int, .params = &.{Type.int}, .builtin = .str_byte_at };
+        if (std.mem.eql(u8, name, "to_string")) return .{ .ret = Type.str, .params = &.{}, .builtin = .scalar_to_string };
     }
     if ((recv.isInteger() or recv.kind == .bool or recv.kind == .unit) and std.mem.eql(u8, name, "to_string"))
-        return .{ .ret = Type.str, .params = &.{} };
+        return .{ .ret = Type.str, .params = &.{}, .builtin = .scalar_to_string };
     return null;
 }
 
@@ -917,6 +939,15 @@ pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8, char_id
 /// same tag-0/tag-1 test; `unwrap`/`unwrap_or` are shared. Variant order is FIXED by
 /// `registerPrelude` (payload = index 0, absence/error = index 1).
 pub const OptResultMethod = enum { is_tag0, is_tag1, unwrap, unwrap_or };
+
+pub fn optResultBuiltin(op: OptResultMethod) Callee.Builtin {
+    return switch (op) {
+        .is_tag0 => .opt_is_tag0,
+        .is_tag1 => .opt_is_tag1,
+        .unwrap => .opt_unwrap,
+        .unwrap_or => .opt_unwrap_or,
+    };
+}
 
 pub fn optionResultMethod(family: LayoutEngine.NativeEnumFamily, name: []const u8) ?OptResultMethod {
     switch (family) {
@@ -1119,6 +1150,11 @@ sink: DiagnosticSink,
 /// Graph mode only: per-module node_types slices. `gphSelect` redirects the
 /// active `node_types` to the selected module's slice. Null single-file.
 gph_node_types: ?[][]Type = null,
+/// Per-module Callee slices, parallel to `gph_node_types`.
+gph_callees: ?[][]Callee = null,
+/// `t.methods.items.len` when `sealCallees` ran; a Debug guard that no method row is
+/// appended after the seal (a pending slot could have needed it).
+sealed_methods_len: usize = 0,
 
 /// Function table, parallel to `Resolve`'s `func` indices: the resolver assigns
 /// function indices in source order, and so do we (Pass A below).
@@ -1399,10 +1435,15 @@ fn buildModel(t: *Typecheck) Model {
     };
 }
 
+/// The node-parallel tables one BodyChecker writes. Passed whole so a caller must
+/// choose both slices: an instance re-check handing only its own `node_types` would
+/// otherwise write its callees into the module slice.
+pub const NodeSlots = struct { node_types: []Type, callees: []Callee };
+
 /// Construct a `BodyChecker` for fn `f`, wiring its cursor to the fn's owning
-/// module (`graph.mods[f.mod]` + the module's node_types slice). The per-fn
+/// module (`graph.mods[f.mod]`) and the node tables in `slots`. The per-fn
 /// scratch starts empty.
-fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecker {
+fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym, slots: NodeSlots) BodyChecker {
     var bc: BodyChecker = .{
         .model = model,
         .gpa = t.gpa,
@@ -1410,7 +1451,8 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
         .tokens = t.tokens,
         .source = t.source,
         .resolutions = t.resolutions,
-        .node_types = t.node_types,
+        .node_types = slots.node_types,
+        .callees = slots.callees,
         .graph_mod = 0,
         .sink = DiagnosticSink.init(t.gpa),
         .gph_fn_names = t.gph_fn_names,
@@ -1424,7 +1466,6 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym) BodyChecke
     bc.graph_mod = f.mod;
     // Every diagnostic this BodyChecker emits is tagged with the fn's owning module.
     bc.sink.setScope(f.mod);
-    if (t.gph_node_types) |nts| bc.node_types = nts[f.mod];
     // A method: put its receiver type in scope so a `Self` type-ref in a body
     // annotation resolves to it. `.invalid` ⟺ not a method (leave the hook null).
     if (f.self_type.kind != .invalid) bc.cur_self_type = f.self_type;
@@ -1576,6 +1617,18 @@ pub fn checkGraph(
         node_types[i] = nt;
         nt_built += 1;
     }
+    const callees = try gpa.alloc([]Callee, mods.len);
+    var cs_built: usize = 0;
+    errdefer {
+        for (callees[0..cs_built]) |cs| gpa.free(cs);
+        gpa.free(callees);
+    }
+    for (mods, 0..) |m, i| {
+        const cs = try gpa.alloc(Callee, m.tree.nodes.len);
+        @memset(cs, .{});
+        callees[i] = cs;
+        cs_built += 1;
+    }
 
     // The composite (`App`) intern table. Heap-allocated so its address is stable
     // across the whole run (every `BodyChecker` borrows `*Composite`); freed below.
@@ -1620,6 +1673,7 @@ pub fn checkGraph(
         for (t.mono.items) |*inst| {
             gpa.free(@constCast(inst.args));
             gpa.free(inst.node_types);
+            gpa.free(inst.callees);
             gpa.free(@constCast(inst.params));
             freeInstanceConformances(gpa, inst.conformances);
         }
@@ -1694,6 +1748,7 @@ pub fn checkGraph(
     // by wiring each module's slice here (checkFn/layout set t via the ctx tree but
     // node_types is not part of ctx, so set it alongside graph_mod transitions).
     t.gph_node_types = node_types;
+    t.gph_callees = callees;
 
     // The qualified fn names (parallel to the global fn table). Borrowed for the
     // duration of the check (the `fns` table outlives runGraph).
@@ -1726,6 +1781,7 @@ pub fn checkGraph(
         for (instances) |*inst| {
             gpa.free(@constCast(inst.args));
             gpa.free(inst.node_types);
+            gpa.free(inst.callees);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name.?));
             freeInstanceConformances(gpa, inst.conformances);
@@ -1737,6 +1793,7 @@ pub fn checkGraph(
     // sees it. `toOwnedSlice` empties `t.methods`; the entries' names stay borrowed.
     // Each entry may own a `protocol_args` dupe, freed on the error path here (the
     // window after transfer, before the result owns it) — else it would leak.
+    if (builtin.mode == .Debug) std.debug.assert(t.methods.items.len == t.sealed_methods_len);
     const methods = try t.methods.toOwnedSlice(gpa);
     errdefer {
         freeMethodEntries(gpa, methods);
@@ -1778,6 +1835,7 @@ pub fn checkGraph(
 
     return GraphResult{
         .node_types = node_types,
+        .callees = callees,
         .diags = owned.diags,
         .owned_msgs = owned.owned,
         .sigs = sigs,
@@ -2142,9 +2200,35 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // methods the erased walk delegates to already exist.
     try derive_synth.synthesizeDescriptors(t);
 
+    t.sealCallees();
+
     // The mono tail may have emitted instance-body diagnostics (and T0014); re-sort
     // the shared stream so the final (scope, byte_offset) order is deterministic.
     t.sink.sort();
+}
+
+/// Resolve every `.pending` slot: only now are receiver types reified and every method row appended.
+fn sealCallees(t: *Typecheck) void {
+    for (t.gph_node_types.?, t.gph_callees.?, 0..) |nts, cs, m| t.sealSlice(@intCast(m), nts, cs);
+    for (t.mono.items) |inst| t.sealSlice(inst.mod, inst.node_types, inst.callees);
+    if (builtin.mode == .Debug) t.sealed_methods_len = t.methods.items.len;
+}
+
+/// Each slot is a pure lookup over the final method table by reified receiver and
+/// member, so the order slots are sealed in cannot matter. An unresolvable slot becomes
+/// `.none` rather than a panic: `toy check` accepts such a program and only codegen
+/// rejects it.
+fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) void {
+    const mc = &t.graph.mods[mod];
+    for (cs, 0..) |*c, i| {
+        if (c.tag != .pending) continue;
+        const fa = mc.tree.nodes[i];
+        const member = mc.tokens[fa.main_token].text(mc.source);
+        c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null)) {
+            .one => |mi| Callee.method(mi),
+            .none, .ambiguous => .{},
+        };
+    }
 }
 
 /// Whether module `importer` directly imports the module with id `target` (any namespace
@@ -2510,6 +2594,9 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     const inst_nt = try t.gpa.alloc(Type, node_count);
     errdefer t.gpa.free(inst_nt);
     @memset(inst_nt, .invalid);
+    const inst_callees = try t.gpa.alloc(Callee, node_count);
+    errdefer t.gpa.free(inst_callees);
+    @memset(inst_callees, .{});
 
     const args_owned = try t.gpa.dupe(Type, args);
     errdefer t.gpa.free(args_owned);
@@ -2522,9 +2609,8 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     fsub.params = params;
     fsub.ret = ret;
 
-    var bc = t.bodyCheckerFor(model, fsub);
+    var bc = t.bodyCheckerFor(model, fsub, .{ .node_types = inst_nt, .callees = inst_callees });
     defer bc.deinit();
-    bc.node_types = inst_nt;
     bc.subst = .{ .names = f.generic_params, .types = args };
     try bc.checkBody(gid, fsub);
     // Merge the instance's diagnostics into the shared stream (sorted at the end).
@@ -2553,6 +2639,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
         .template_gid = gid,
         .args = args_owned,
         .node_types = inst_nt,
+        .callees = inst_callees,
         .params = params,
         .ret = ret,
         .name = null, // minted in canonical order after the sort
@@ -2754,8 +2841,6 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
         break;
     };
     if (f.isGeneric() and !any_bound) return; // unbounded template: skip as before
-    var bc = t.bodyCheckerFor(model, f);
-    defer bc.deinit();
     // A bounded template's `type_var`-typed nodes must NOT land in the shared module
     // node_types (reify/codegen would choke on an ungrounded `type_var`). Type it into a
     // SCRATCH buffer so the module's slots stay `.invalid` for template nodes exactly as
@@ -2763,13 +2848,14 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
     // reified instances are, and each instance re-check writes its OWN node_types).
     var scratch: []Type = &.{};
     var tvars: []Type = &.{};
+    defer if (scratch.len > 0) t.gpa.free(scratch);
+    defer if (tvars.len > 0) t.gpa.free(tvars);
     if (f.isGeneric()) {
         scratch = t.gpa.alloc(Type, t.graph.mods[f.mod].tree.nodes.len) catch {
             out.err = error.OutOfMemory;
             return;
         };
         @memset(scratch, .invalid);
-        bc.node_types = scratch;
         // Resolve the template's OWN generic-param type-refs (a body annotation /
         // turbofish spelling a param, e.g. `return Map[K, V] { .. }` or `mp_find[K, V]`)
         // to their ordinal `type_var`s — the SAME mapping `decodeFnSig` used for the
@@ -2781,11 +2867,17 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
             return;
         };
         for (tvars, 0..) |*tv, i| tv.* = Type.typeVar(@intCast(i));
+    }
+    var bc = t.bodyCheckerFor(model, f, .{
+        .node_types = if (f.isGeneric()) scratch else t.gph_node_types.?[f.mod],
+        // Kept on the module slice even for a bounded template: the LSP reads its picks.
+        .callees = t.gph_callees.?[f.mod],
+    });
+    defer bc.deinit();
+    if (f.isGeneric()) {
         bc.subst = .{ .names = f.generic_params, .types = tvars };
         bc.abstract_template = true;
     }
-    defer if (scratch.len > 0) t.gpa.free(scratch);
-    defer if (tvars.len > 0) t.gpa.free(tvars);
     bc.checkBody(fid, f) catch |e| {
         out.err = e;
         return;
@@ -7485,4 +7577,338 @@ test "declaration and instantiation diagnostics span their subject" {
         .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct Box[T] { v: T }\nfn h[T has Conv[Box[int]]](_t: T) -> int { return 0 }\n", .key = "bound argument must be", .want = "Box[int]" },
         .{ .src = "struct Box[T] { v: T }\nimpl Box[int] { fn get(self) -> int { return 1 } }\n", .key = "concrete type instance", .want = "Box[int]" },
     });
+}
+
+fn isCallMember(tree: Ast.Tree, fa: Ast.Index) bool {
+    for (tree.nodes) |n| {
+        if (n.tag != .call) continue;
+        if (Callee.memberNode(tree, n)) |m| if (m == fa) return true;
+    }
+    return false;
+}
+
+/// The `nth` (node order) method-call member node spelled `member`.
+fn memberSlot(c: *const Checked, member: []const u8, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .field_access) continue;
+        if (!std.mem.eql(u8, c.tokens[n.main_token].text(c.source), member)) continue;
+        const idx = Ast.Index.from(@intCast(i));
+        if (!isCallMember(c.tree, idx)) continue;
+        if (seen == nth) return idx;
+        seen += 1;
+    }
+    return error.TestMemberNotFound;
+}
+
+fn calleeView(c: *const Checked, member: []const u8, nth: usize) !Callee.View {
+    return c.result.callees[0][(try memberSlot(c, member, nth)).int()].view();
+}
+
+fn calleeMethod(c: *const Checked, member: []const u8, nth: usize) !Method {
+    return switch (try calleeView(c, member, nth)) {
+        .method => |i| c.result.methods[i],
+        else => error.TestExpectedMethodCallee,
+    };
+}
+
+fn expectNoPending(r: *const GraphResult) !void {
+    for (r.callees) |cs| for (cs) |x| try testing.expect(x.tag != .pending);
+    for (r.instances) |inst| for (inst.callees) |x| try testing.expect(x.tag != .pending);
+}
+
+test "pickMethodIndex selects what resolveConformanceMethod returns" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Into[U] { fn into(self) -> U }
+        \\protocol Tag { fn tag(self) -> int }
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, a: int) -> int { self.n + a } }
+        \\impl Acc has Into[int] { fn into(self) -> int { self.n } }
+        \\impl Acc has Into[bool] { fn into(self) -> bool { self.n > 0 } }
+        \\impl Acc has Tag { fn tag(self) -> int { self.n } }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const ms = c.result.methods;
+    const plus = findMethodIndexNamed(ms, "plus").?;
+    const tag = findMethodIndexNamed(ms, "tag").?;
+    const into = findMethodIndexNamed(ms, "into").?;
+    const acc = ms[plus].recv;
+    const tag_pid = ms[tag].protocol_id.?;
+    const into_pid = ms[into].protocol_id.?;
+
+    const Case = struct { name: []const u8, pid: ?u32 = null, args: ?[]const Type = null, want: std.meta.Tag(MethodIndexPick) };
+    const cases = [_]Case{
+        .{ .name = "plus", .want = .one },
+        .{ .name = "tag", .want = .one },
+        .{ .name = "into", .want = .ambiguous },
+        .{ .name = "into", .args = &.{Type.int}, .want = .one },
+        .{ .name = "into", .args = &.{Type.bool}, .want = .one },
+        .{ .name = "nope", .want = .none },
+        .{ .name = "tag", .pid = tag_pid, .want = .one },
+        .{ .name = "tag", .pid = into_pid, .want = .none },
+        .{ .name = "plus", .pid = tag_pid, .want = .none },
+    };
+    for (cases) |k| {
+        const idx = pickMethodIndex(ms, acc, k.name, k.pid, k.args);
+        const whole = resolveConformanceMethod(ms, acc, k.name, k.pid, k.args);
+        try testing.expectEqual(k.want, std.meta.activeTag(idx));
+        switch (idx) {
+            .none => try testing.expect(whole == .none),
+            .ambiguous => try testing.expect(whole == .ambiguous),
+            .one => |i| {
+                try testing.expect(std.meta.eql(ms[i], whole.one));
+                try testing.expectEqualStrings(k.name, ms[i].name);
+                if (k.args) |a| try testing.expect(eqlTypeVec(ms[i].protocol_args, a));
+            },
+        }
+    }
+}
+
+fn findMethodIndexNamed(ms: []const Method, name: []const u8) ?u32 {
+    for (ms, 0..) |m, i| if (std.mem.eql(u8, m.name, name)) return @intCast(i);
+    return null;
+}
+
+/// Every source-method callee shape in one program; the body of
+/// tests/corpora/language-features/methods/dispatch_shapes.toy, shared by the callee tests
+/// here and in types_graph.zig.
+pub const dispatch_shapes_src =
+    \\protocol Doubler {
+    \\    fn dbl(self) -> int
+    \\}
+    \\protocol Into[U] {
+    \\    fn into(self) -> U
+    \\}
+    \\protocol Twice {
+    \\    fn twice(self) -> int
+    \\}
+    \\struct Acc { n: int }
+    \\impl Acc {
+    \\    fn plus(self, a: int, b: int) -> int { self.n + a + b }
+    \\    fn bump(mut self) { self.n = self.n + 1 }
+    \\    fn shade(self) -> Shade { if self.n > 1 { Shade.dark } else { Shade.light } }
+    \\}
+    \\impl Acc has Doubler {
+    \\    fn dbl(self) -> int { self.n * 2 }
+    \\}
+    \\impl Acc has Into[int] {
+    \\    fn into(self) -> int { self.n }
+    \\}
+    \\impl Acc has Into[bool] {
+    \\    fn into(self) -> bool { self.n > 0 }
+    \\}
+    \\impl int has Twice {
+    \\    fn twice(self) -> int { self * 2 }
+    \\}
+    \\struct Box[T] { v: T }
+    \\impl Box[T] {
+    \\    fn make(v: T) -> Box[T] { Box[T] { v: v } }
+    \\    fn get(self) -> T { self.v }
+    \\}
+    \\struct Key { a: int, b: bool }
+    \\enum Shade { light, dark }
+    \\fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+    \\fn main() -> int {
+    \\    acc := Acc { n: 1 }
+    \\    acc.bump()
+    \\    if acc.plus(1, 2) != 5 { return 1 }
+    \\    piped := 1 |> acc.plus(2)
+    \\    if piped != 5 { return 2 }
+    \\    if acc.into[int]() != 2 { return 3 }
+    \\    if !acc.into[bool]() { return 4 }
+    \\    if twice(acc) != 8 { return 5 }
+    \\    if (3).twice() != 6 { return 6 }
+    \\    b := Box[int].make(7)
+    \\    if b.get() != 7 { return 7 }
+    \\    k := Key { a: 1, b: true }
+    \\    if k.hash() == 0 { return 8 }
+    \\    if k.to_string().len() == 0 { return 9 }
+    \\    if Shade.dark.to_string().len() == 0 { return 10 }
+    \\    lit := match acc.shade() { .light -> 0, .dark -> 1 }
+    \\    if lit != 1 { return 14 }
+    \\    o: Option[int] = Option.some(1)
+    \\    if o.to_string().len() == 0 { return 11 }
+    \\    c := 'x'
+    \\    cp: int = c.into()
+    \\    if cp != 120 { return 12 }
+    \\    if c.to_string().len() != 1 { return 13 }
+    \\    return 42
+    \\}
+    \\
+;
+
+test "every dispatch branch records its callee" {
+    const gpa = testing.allocator;
+    {
+        var c = try checkSource(dispatch_shapes_src);
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+
+        for ([_]usize{ 0, 1 }) |nth| {
+            const m = try calleeMethod(&c, "plus", nth);
+            try testing.expectEqualStrings("plus", m.name);
+            try testing.expect(m.instance == null);
+        }
+        try testing.expect((try calleeMethod(&c, "bump", 0)).mut_self);
+        const into_int = try calleeMethod(&c, "into", 0);
+        try testing.expect(eqlTypeVec(into_int.protocol_args, &.{Type.int}));
+        const into_bool = try calleeMethod(&c, "into", 1);
+        try testing.expect(eqlTypeVec(into_bool.protocol_args, &.{Type.bool}));
+        try testing.expectEqualStrings("twice", (try calleeMethod(&c, "twice", 0)).name);
+        try testing.expectEqualStrings("shade", (try calleeMethod(&c, "shade", 0)).name);
+        try testing.expect((try calleeMethod(&c, "get", 0)).instance != null);
+        const make = try calleeMethod(&c, "make", 0);
+        try testing.expect(make.is_static and make.instance != null);
+        try testing.expect((try calleeMethod(&c, "hash", 0)).derive != null);
+        // k, Shade.dark, Option[int], char
+        for (0..4) |nth| try testing.expectEqual(Callee.View{ .builtin = .display_to_string }, try calleeView(&c, "to_string", nth));
+        try testing.expectEqual(Callee.View{ .builtin = .conv_into }, try calleeView(&c, "into", 2));
+        for (0..4) |nth| try testing.expectEqual(Callee.View{ .builtin = .str_len }, try calleeView(&c, "len", nth));
+        try expectNoPending(&c.result);
+    }
+    {
+        var c = try checkSource(
+            \\fn main() -> int {
+            \\    s := "abc"
+            \\    t := s.concat("de")
+            \\    if t.len() != 5 { return 1 }
+            \\    if t.byte_at(1) != 98 { return 2 }
+            \\    if !s.eq("abc") { return 3 }
+            \\    if !(7).eq(7) { return 4 }
+            \\    if !true.eq(true) { return 5 }
+            \\    if !().eq(()) { return 6 }
+            \\    h := s.hash() + (3).hash() + false.hash() + ().hash()
+            \\    if h == 0 { return 7 }
+            \\    if (12).to_string().len() != 2 { return 8 }
+            \\    if true.to_string().len() != 4 { return 9 }
+            \\    if s.to_string().len() != 3 { return 10 }
+            \\    if ().to_string().len() == 0 { return 11 }
+            \\    some: Option[int] = Option.some(40)
+            \\    none: Option[int] = Option.none
+            \\    if !some.is_some() { return 12 }
+            \\    if !none.is_none() { return 13 }
+            \\    ok: Result[int, bool] = Result.ok(1)
+            \\    err: Result[int, bool] = Result.err(false)
+            \\    if !ok.is_ok() { return 14 }
+            \\    if !err.is_err() { return 15 }
+            \\    small: uint8 = 5
+            \\    w: uint = small.into()
+            \\    big: uint = 300
+            \\    back: uint8 = big.try_into().unwrap_or(0)
+            \\    if back != 0 { return 16 }
+            \\    if w != 5 { return 17 }
+            \\    return some.unwrap() + none.unwrap_or(2)
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+        const Want = struct { member: []const u8, count: usize, k: Callee.Builtin };
+        const wants = [_]Want{
+            .{ .member = "concat", .count = 1, .k = .str_concat },
+            .{ .member = "len", .count = 5, .k = .str_len },
+            .{ .member = "byte_at", .count = 1, .k = .str_byte_at },
+            .{ .member = "eq", .count = 4, .k = .scalar_eq },
+            .{ .member = "hash", .count = 4, .k = .scalar_hash },
+            .{ .member = "to_string", .count = 4, .k = .scalar_to_string },
+            .{ .member = "is_some", .count = 1, .k = .opt_is_tag0 },
+            .{ .member = "is_ok", .count = 1, .k = .opt_is_tag0 },
+            .{ .member = "is_none", .count = 1, .k = .opt_is_tag1 },
+            .{ .member = "is_err", .count = 1, .k = .opt_is_tag1 },
+            .{ .member = "into", .count = 1, .k = .conv_into },
+            .{ .member = "try_into", .count = 1, .k = .conv_try_into },
+            .{ .member = "unwrap", .count = 1, .k = .opt_unwrap },
+            .{ .member = "unwrap_or", .count = 2, .k = .opt_unwrap_or },
+        };
+        for (wants) |w| {
+            for (0..w.count) |nth| try testing.expectEqual(Callee.View{ .builtin = w.k }, try calleeView(&c, w.member, nth));
+            try testing.expectError(error.TestMemberNotFound, memberSlot(&c, w.member, w.count));
+        }
+        try expectNoPending(&c.result);
+    }
+}
+
+test "template spans: the module slice holds the abstract pick, each instance slice its own" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Doubler { fn dbl(self) -> int }
+        \\struct Acc { n: int }
+        \\impl Acc has Doubler { fn dbl(self) -> int { self.n * 2 } }
+        \\struct Pt { x: int, y: int }
+        \\fn hashit[T](x: T) -> int { x.hash() }
+        \\fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+        \\fn main() -> int { hashit(Pt { x: 1, y: 2 }) + hashit(7) + twice(Acc { n: 1 }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+
+    const hash_fa = (try memberSlot(&c, "hash", 0)).int();
+    try testing.expectEqual(Callee.View.none, c.result.callees[0][hash_fa].view());
+    const dbl_fa = (try memberSlot(&c, "dbl", 0)).int();
+    const abstract = switch (c.result.callees[0][dbl_fa].view()) {
+        .protocol => |p| p,
+        else => return error.TestExpectedProtocolCallee,
+    };
+    try testing.expectEqual(@as(u16, 0), abstract.method);
+
+    var saw_int = false;
+    var saw_pt = false;
+    var saw_acc = false;
+    for (c.result.instances) |inst| {
+        const name = c.resolve.fns[inst.template_gid].name;
+        if (std.mem.endsWith(u8, name, "hashit")) {
+            const v = inst.callees[hash_fa].view();
+            if (inst.args[0].kind == .int) {
+                try testing.expectEqual(Callee.View{ .builtin = .scalar_hash }, v);
+                saw_int = true;
+            } else {
+                try testing.expect(c.result.methods[v.method].derive != null);
+                saw_pt = true;
+            }
+        } else if (std.mem.endsWith(u8, name, "twice")) {
+            const mi = inst.callees[dbl_fa].view().method;
+            try testing.expectEqual(@as(?u32, abstract.protocol), c.result.methods[mi].protocol_id);
+            saw_acc = true;
+        }
+    }
+    try testing.expect(saw_int and saw_pt and saw_acc);
+    try expectNoPending(&c.result);
+}
+
+test "argument errors keep the selection; selection failures leave none" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, a: int) -> int { self.n + a } }
+        \\struct Key { a: int }
+        \\fn main() -> int {
+        \\  acc := Acc { n: 1 }
+        \\  a := acc.plus(true)
+        \\  b := acc.nope()
+        \\  c := "s".len(1)
+        \\  k := Key { a: 1 }
+        \\  d := k.hash(1)
+        \\  e := k.to_string(1)
+        \\  return a + b + c + d + e.len()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    var t0018 = false;
+    for (c.result.diags) |d| {
+        if (d.code == .T0018) t0018 = true;
+    }
+    try testing.expect(t0018);
+    try testing.expect(c.result.diags.len >= 5);
+    try testing.expectEqualStrings("plus", (try calleeMethod(&c, "plus", 0)).name);
+    try testing.expectEqual(Callee.View.none, try calleeView(&c, "nope", 0));
+    try testing.expectEqual(Callee.View{ .builtin = .str_len }, try calleeView(&c, "len", 0));
+    try testing.expect((try calleeMethod(&c, "hash", 0)).derive != null);
+    try testing.expectEqual(Callee.View{ .builtin = .display_to_string }, try calleeView(&c, "to_string", 0));
+    try expectNoPending(&c.result);
 }
