@@ -8,6 +8,7 @@ const Ast = @import("../ast/Ast.zig");
 const Sym = @import("Sym.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Type = @import("../layout/Type.zig").Type;
+const Resolution = @import("Resolution.zig").Resolution;
 
 /// A local named inside a lambda but declared outside it: `slot` is the owner fn's
 /// resolver slot, `first_use` the first identifier node (in resolve order) naming it.
@@ -36,16 +37,12 @@ pub const FnClosures = struct {
     fn_node: Ast.Index,
     /// Sorted by node index.
     boundaries: []const Boundary,
-    /// The slots written by `x = ..` or by a place store rooted at `x` (`x.f = ..`),
-    /// sorted and deduped.
-    assigned: []const u32,
 };
 
 pub fn deinitFnClosures(gpa: std.mem.Allocator, list: []const FnClosures) void {
     for (list) |fc| {
         for (fc.boundaries) |b| gpa.free(b.captures);
         gpa.free(fc.boundaries);
-        gpa.free(fc.assigned);
     }
     gpa.free(list);
 }
@@ -244,31 +241,60 @@ pub fn contains(sorted: []const u32, x: u32) bool {
     }.order) != null;
 }
 
-pub const AdapterKind = enum(u8) { fn_value };
+pub const AdapterKind = enum(u8) { fn_value, bound_copy, bound_box };
 
 /// A source-less unit that turns a named callee into the `(env, params..)` shape every
 /// function value is called with. `.fn_value` is the thunk a named fn taken as a value
-/// points at: it ignores the env and calls the fn directly.
+/// points at: it ignores the env and calls the fn directly. A bound method's adapter
+/// passes the receiver its env holds as `self`: `.bound_copy` holds a copy of the
+/// receiver value, `.bound_box` the cell of a boxed local receiver.
 pub const Adapter = struct {
     kind: AdapterKind,
-    /// `.fn_value`: the referenced fn's global id.
+    /// `.fn_value`: the referenced fn's global id. `.bound_*`: the method's index.
     key: u32,
     /// Owned.
     name: []const u8,
     /// The callee's symbol; the name is borrowed from the typecheck result's tables.
     target: Sym.SymName,
-    /// The value signature, without the env: borrowed from the callee's typecheck sig.
+    /// The value signature, without the env or `self`: borrowed from the callee's
+    /// typecheck sig.
     sig: LayoutEngine.FnSig,
+    /// `.bound_*`: the method's receiver type.
+    recv: Type = Type.unit,
+    /// `.bound_*`: the method takes `mut self`, so it is passed the receiver's address.
+    mut_self: bool = false,
 };
 
 /// The thunk / adapter symbol for `target_sym`. `$` is not a source identifier char, and
-/// no generic-instance mangle spells an arg `fnval` (see the test), so the name is
-/// disjoint from every user fn, instance, derive and erased unit.
+/// no generic-instance mangle spells an arg `fnval`, `bound` or `boundbox` (see the
+/// test), so the name is disjoint from every user fn, instance, derive and erased unit.
 pub fn adapterName(gpa: std.mem.Allocator, target_sym: []const u8, kind: AdapterKind) ![]u8 {
     const suffix = switch (kind) {
         .fn_value => "$fnval",
+        .bound_copy => "$bound",
+        .bound_box => "$boundbox",
     };
     return std.mem.concat(gpa, u8, &.{ target_sym, suffix });
+}
+
+/// The adapter a bound method value goes through: the receiver's cell when the receiver
+/// is a local its owner boxes (the closure then sees later writes to it), else a copy of
+/// the receiver taken when the value is made.
+pub fn boundKind(recv_local: ?u32, boxed: []const u32) AdapterKind {
+    const slot = recv_local orelse return .bound_copy;
+    return if (contains(boxed, slot)) .bound_box else .bound_copy;
+}
+
+/// The slot of bound method `fa`'s receiver when it is a bare local (`acc` in
+/// `acc.plus`): the one receiver a bound value captures as a variable rather than as a
+/// value computed once.
+pub fn boundRecvLocal(tree: Ast.Tree, resolutions: []const Resolution, fa: Ast.Index) ?u32 {
+    const recv = tree.nodes[fa.int()].lhs;
+    if (tree.nodes[recv.int()].tag != .identifier) return null;
+    return switch (resolutions[recv.int()]) {
+        .local => |slot| slot,
+        else => null,
+    };
 }
 
 fn adapterLess(kind: AdapterKind, key: u32, a: Adapter) std.math.Order {
@@ -301,20 +327,34 @@ test "lambda and adapter names never equal a generic-instance mangle or each oth
     const spellings = [_]Type{ Type.int, Type.bool, Type.str, Type.unit, Type.float, Type.structT(3), Type.enumT(4), Type.rawptr };
     const ad = try adapterName(gpa, "f", .fn_value);
     defer gpa.free(ad);
+    const bc = try adapterName(gpa, "f", .bound_copy);
+    defer gpa.free(bc);
+    const bb = try adapterName(gpa, "f", .bound_box);
+    defer gpa.free(bb);
     const l0 = try lambdaName(gpa, "f", 0);
     defer gpa.free(l0);
     const l12 = try lambdaName(gpa, "f", 12);
     defer gpa.free(l12);
     try testing.expectEqualStrings("f$l0", l0);
     try testing.expectEqualStrings("f$l12", l12);
-    for ([_][]const u8{ ad, l0, l12 }) |unit| {
+    try testing.expectEqualStrings("f$bound", bc);
+    try testing.expectEqualStrings("f$boundbox", bb);
+    const units = [_][]const u8{ ad, bc, bb, l0, l12 };
+    for (units) |unit| {
         for (spellings) |t| {
             const m = try Mono.mangle(gpa, "f", &.{t});
             defer gpa.free(m);
             try testing.expect(!std.mem.eql(u8, m, unit));
         }
     }
-    try testing.expect(!std.mem.eql(u8, ad, l0));
+    for (units, 0..) |a, i| for (units[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
+}
+
+test "boundKind boxes only a boxed local receiver" {
+    try testing.expectEqual(AdapterKind.bound_box, boundKind(3, &.{ 1, 3 }));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(2, &.{ 1, 3 }));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(null, &.{ 1, 3 }));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(1, &.{}));
 }
 
 test "findFn and contains binary-search their sorted tables" {
@@ -324,8 +364,8 @@ test "findFn and contains binary-search their sorted tables" {
         .{ .node = idx(9), .rank = 0, .slot_floor = 1, .captures = &.{} },
     };
     const fcs = [_]FnClosures{
-        .{ .fn_node = idx(10), .boundaries = &bs, .assigned = &.{} },
-        .{ .fn_node = idx(30), .boundaries = &.{}, .assigned = &.{} },
+        .{ .fn_node = idx(10), .boundaries = &bs },
+        .{ .fn_node = idx(30), .boundaries = &.{} },
     };
     try testing.expectEqual(idx(30), findFn(&fcs, idx(30)).?.fn_node);
     try testing.expect(findFn(&fcs, idx(20)) == null);
@@ -367,10 +407,15 @@ test "findAdapter binary-searches by (kind, key)" {
         .{ .kind = .fn_value, .key = 2, .name = "a", .target = t, .sig = sig },
         .{ .kind = .fn_value, .key = 5, .name = "b", .target = t, .sig = sig },
         .{ .kind = .fn_value, .key = 9, .name = "c", .target = t, .sig = sig },
+        .{ .kind = .bound_copy, .key = 2, .name = "d", .target = t, .sig = sig },
+        .{ .kind = .bound_box, .key = 2, .name = "e", .target = t, .sig = sig },
     };
     try testing.expectEqual(@as(?u32, 0), findAdapter(&ads, .fn_value, 2));
     try testing.expectEqual(@as(?u32, 1), findAdapter(&ads, .fn_value, 5));
     try testing.expectEqual(@as(?u32, 2), findAdapter(&ads, .fn_value, 9));
+    try testing.expectEqual(@as(?u32, 3), findAdapter(&ads, .bound_copy, 2));
+    try testing.expectEqual(@as(?u32, 4), findAdapter(&ads, .bound_box, 2));
+    try testing.expectEqual(@as(?u32, null), findAdapter(&ads, .bound_copy, 9));
     try testing.expectEqual(@as(?u32, null), findAdapter(&ads, .fn_value, 4));
     try testing.expectEqual(@as(?u32, null), findAdapter(&.{}, .fn_value, 4));
 }

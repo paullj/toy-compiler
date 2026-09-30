@@ -1,28 +1,30 @@
-//! What a call node, or a value-position function name, selects, recorded once by the
-//! checker. A peer data module: types produces it, lower / the fingerprint / the LSP
+//! What a call node, or a function or method named as a value, selects, recorded once
+//! by the checker. A peer data module: types produces it, lower / the fingerprint / the LSP
 //! consume it — each depends on this DATA, not on the checker's dispatch rules.
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 
 /// The selection for one call, stored on the call's slot (see `callSlot`), or for one
-/// function named as a value, stored on that name's own node, in a slice parallel to
-/// `node_types`. Zero is `.none`, so a fresh table is all-unselected.
+/// function or method named as a value, stored on that name's own node, in a slice
+/// parallel to `node_types`. Zero is `.none`, so a fresh table is all-unselected.
 pub const Callee = extern struct {
     tag: Tag = .none,
     /// `.builtin`: the `Builtin` ordinal.
     sub: u8 = 0,
     /// `.protocol`: the method's index within its protocol.
     aux: u16 = 0,
-    /// `.method`: an index into `GraphResult.methods`. `.protocol`: the protocol id.
-    /// `.fn_ref`: the referenced fn's global id.
+    /// `.method`, `.bound_method`: an index into `GraphResult.methods`. `.protocol`: the
+    /// protocol id. `.fn_ref`: the referenced fn's global id.
     id: u32 = 0,
 
     /// `.pending` is checker-internal: the method row only exists once the mono tail
-    /// has reified the receiver, so the seal resolves it; no consumer ever sees it.
+    /// has reified the receiver, so the seal resolves it (to `.bound_method` when `sub`
+    /// is 1, else `.method`); no consumer ever sees it.
     /// `.value`: a call of a function-typed value (`f(1)`, `h.run(4)`, `fs[i](x)`).
     /// `.fn_ref`: a named function used as a value (`f := add`), on the name's node.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending, value, fn_ref };
+    /// `.bound_method`: a method used as a value (`f := acc.plus`), on the `field_access`.
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending, value, fn_ref, bound_method };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -52,9 +54,13 @@ pub const Callee = extern struct {
         builtin: Builtin,
         value,
         fn_ref: u32,
+        bound_method: u32,
     };
 
     pub const pending: Callee = .{ .tag = .pending };
+
+    /// A bound method on a generic-type receiver, resolved by the seal like `pending`.
+    pub const pending_bound: Callee = .{ .tag = .pending, .sub = 1 };
 
     pub const value_call: Callee = .{ .tag = .value };
 
@@ -64,6 +70,10 @@ pub const Callee = extern struct {
 
     pub fn method(index: u32) Callee {
         return .{ .tag = .method, .id = index };
+    }
+
+    pub fn boundMethod(index: u32) Callee {
+        return .{ .tag = .bound_method, .id = index };
     }
 
     pub fn protocolMethod(protocol: u32, k: u16) Callee {
@@ -83,6 +93,7 @@ pub const Callee = extern struct {
             .builtin => .{ .builtin = @enumFromInt(c.sub) },
             .value => .value,
             .fn_ref => .{ .fn_ref = c.id },
+            .bound_method => .{ .bound_method = c.id },
         };
     }
 
@@ -135,6 +146,12 @@ test "view round-trips value and fn_ref" {
     try std.testing.expectEqual(Callee.View.value, Callee.value_call.view());
     try std.testing.expectEqual(Callee.View{ .fn_ref = 42 }, Callee.fnRef(42).view());
     try std.testing.expect(!std.meta.eql(Callee.value_call, Callee{}));
+}
+
+test "view round-trips bound_method, and a pending bound method reads as none" {
+    try std.testing.expectEqual(Callee.View{ .bound_method = 9 }, Callee.boundMethod(9).view());
+    try std.testing.expectEqual(Callee.View.none, Callee.pending_bound.view());
+    try std.testing.expect(!std.meta.eql(Callee.pending_bound, Callee.pending));
 }
 
 test "memberNode: plain, explicit-args and non-member callees" {

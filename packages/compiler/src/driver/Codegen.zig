@@ -178,7 +178,7 @@ const Frozen = struct {
     /// The function-value tables this job's lowering reads. Shared read-only.
     closure: lower.ClosureInputs,
     /// This owner body's closure facts (`Closure.ownerFacts`), folded into its key; empty
-    /// for every other unit and for a body with no capturing lambda.
+    /// for every other unit and for a body with no env slot and no boxed local.
     closure_facts: []const u8,
 
     /// The template facts `Mono.callInstanceRef` needs for this job's read-only view:
@@ -333,7 +333,7 @@ const GraphFrozen = struct {
     /// Each owner's boxed locals, sorted by owner; a lambda unit reads its owner's.
     owner_closures: []const Closure.OwnerClosure = &.{},
     /// Per base fn and instance unit (`[0, derive_base)`), its closure facts; empty (no
-    /// entries) when the program has no lambda.
+    /// entries) when the program has no lambda unit and no boxed local.
     closure_facts: []const []const u8,
     opt: Opt.Config,
 

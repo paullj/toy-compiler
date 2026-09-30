@@ -1548,9 +1548,7 @@ pub fn strEqAtPtrs(b: *Builder, lbase: Ir.ValueId, rbase: Ir.ValueId) error{OutO
 /// `structEqAtSlots` (an aggregate FIELD of a derived struct) so both pick the same
 /// symbol lower's reloc + the fingerprint fold target.
 pub fn witnessCallee(b: *Builder, m: Typecheck.Method) Link.SymName {
-    if (m.derive) |di| return .{ .kind = .user_fn, .name = b.in.derives[di].name.? };
-    if (m.instance) |ii| return .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
-    return b.in.names[m.fn_id];
+    return Typecheck.witnessSym(m, b.in.derives, b.in.instances, b.in.names).?;
 }
 
 /// The ret type of a resolved conformance-witness `Method`: a source-less derive's recipe
@@ -1559,9 +1557,7 @@ pub fn witnessCallee(b: *Builder, m: Typecheck.Method) Link.SymName {
 /// the fn's own sig ret. Shared by every witness CALL that must size a ret_slot from the
 /// witness return type. `derive` is checked FIRST (mirroring `witnessCallee`).
 pub fn witnessRet(b: *Builder, m: Typecheck.Method) Typecheck.Type {
-    if (m.derive) |di| return b.in.derives[di].ret;
-    if (m.instance) |ii| return b.in.instances[ii].ret;
-    return b.in.sigs[m.fn_id].ret;
+    return Typecheck.witnessSig(m, b.in.derives, b.in.instances, b.in.sigs).?.ret;
 }
 
 /// Heap-free per-byte hash of a str aggregate given the ADDRESS of its `{ptr@0, len@8}`
@@ -1918,6 +1914,22 @@ pub fn slotOperand(b: *Builder, slot: Ir.SlotId, ty: Typecheck.Type) error{OutOf
     }
 }
 
+/// The operand for a value of type `ty` stored at `addr`: a scalar or box word loaded,
+/// an aggregate copied into a fresh slot.
+pub fn addrOperand(b: *Builder, addr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    switch (passKind(b, ty)) {
+        .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) },
+        .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty) },
+        .str, .@"struct", .@"enum" => {
+            const slot = try b.addSlot(ty);
+            const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = ty } }, null);
+            return .{ .slot = slot };
+        },
+        .unit, .never, .invalid => return .none,
+    }
+}
+
 /// Whether `t` is a by-slot aggregate for lowering (str/struct/enum), EXCLUDING a
 /// managed-box handle (`Ref`/`gc_array`), which is a scalar 8-byte cell pointer.
 fn isAggTy(b: *Builder, t: Typecheck.Type) bool {
@@ -2099,6 +2111,11 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         .fn_ref => {
             // A call's slot never carries one: a direct callee is not typed as a value.
             try b.note(n.main_token, "function reference in callee position");
+            return .none;
+        },
+        .bound_method => {
+            // `recv.m(..)` is a method call; only a value-position `recv.m` binds.
+            try b.note(n.main_token, "bound method in callee position");
             return .none;
         },
         .protocol => {
@@ -2643,6 +2660,54 @@ fn fnValueRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
         .fn_ref => |gid| gid,
         else => null,
     };
+}
+
+/// Whether `field_access` `node_idx` names a field of its struct base.
+fn namesField(b: *const Builder, node_idx: Ast.Index) bool {
+    const n = b.in.tree.nodes[(node_idx).int()];
+    if (n.tag != .field_access) return true;
+    const base_ty = b.in.node_types[(n.lhs).int()];
+    if (base_ty.kind != .@"struct" or base_ty.struct_id >= b.in.layouts.len) return false;
+    const fname = b.in.tokens[n.main_token].text(b.in.source);
+    for (b.in.layouts[base_ty.struct_id].field_names) |dn| if (std.mem.eql(u8, dn, fname)) return true;
+    return false;
+}
+
+/// The method a value-position `recv.m` binds, when the checker typed it as one.
+fn boundMethodRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
+    if (node_idx.int() >= b.in.callees.len) return null;
+    return switch (b.in.callees[node_idx.int()].view()) {
+        .bound_method => |mi| mi,
+        else => null,
+    };
+}
+
+/// A bound method `recv.m` in value position: the pair `{its adapter's address, env}`.
+/// The env holds the receiver: the cell of a boxed local receiver, so the closure and its
+/// owner see each other's writes, else a copy of the receiver value, evaluated once here.
+fn lowerBoundValue(b: *Builder, node_idx: Ast.Index, mi: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const recv_local = Closure.boundRecvLocal(b.in.tree, b.in.resolutions, node_idx);
+    const kind = Closure.boundKind(recv_local, b.in.closure.boxed);
+    const ai = Closure.findAdapter(b.in.closure.adapters, kind, mi) orelse {
+        try b.note(n.main_token, "bound method has no adapter in lower");
+        return .none;
+    };
+    const recv_ty = b.in.node_types[(n.lhs).int()];
+    if (kind == .bound_box) {
+        const sid = try bindingSlot(b, n.lhs, recv_ty);
+        if (!b.isBoxSlot(sid)) {
+            try b.note(n.main_token, "bound receiver has no cell in lower");
+            return .none;
+        }
+        const cell = try rootAddr(b, sid);
+        const env = try emitGcAlloc(b, 8);
+        _ = try b.emit(.{ .store = .{ .addr = env, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
+        return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
+    }
+    const env = try emitGcAlloc(b, @max(8, Abi.typeSize(recv_ty, b.in.layouts, b.in.enum_layouts)));
+    try lowerExprInto(b, n.lhs, env, recv_ty);
+    return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
 }
 
 /// `==` on function values is identity: both the code and the env words match.
@@ -3273,6 +3338,13 @@ fn aggregateValue(b: *Builder, expr: Ast.Index, ty: Typecheck.Type) error{OutOfM
 /// is materialized to a temp first.
 fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     if (fnValueRef(b, node_idx)) |gid| return try lowerFnValue(b, node_idx, gid, ty);
+    if (boundMethodRef(b, node_idx)) |mi| return try lowerBoundValue(b, node_idx, mi, ty);
+    // A function-typed member that is no field of its base is a bound method the seal
+    // could not resolve; reading it as a field would read the base itself.
+    if (LayoutEngine.isFnStruct(ty, b.in.layouts) and !namesField(b, node_idx)) {
+        try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "bound method unresolved in lower");
+        return .none;
+    }
     // A qualified enum unit-variant `N.V` reaches here as field_access but is a
     // construction, not a field read.
     if (ty.kind == .@"enum" and !isLocalRootedPlace(b, node_idx)) {
@@ -6666,4 +6738,114 @@ test "a local fn's prologue materializes its self value" {
         \\}
         \\
     , owner_ir);
+}
+
+test "a bound method creates {adapter, env} and the adapter calls the witness" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
+        \\fn f() -> int {
+        \\ acc := Acc { n: 1 }
+        \\ g := acc.plus
+        \\ return g(2)
+        \\}
+        \\
+    ;
+    const ir = try renderLoweredG(gpa, src, "f");
+    defer gpa.free(ir);
+    // The env is a fresh cell holding a copy of `acc`, made once; the pair's code is the
+    // adapter, which `adapter_emit` lowers to a call of `main.Acc.plus` with that copy.
+    try testing.expectEqualStrings(
+        \\fn main.f() -> int {
+        \\  slots: s0:Acc s1:fn$int$int s2:fn$int$int
+        \\b0:
+        \\  %1 = slot_addr s0
+        \\  %2 = field_addr %1, 0 : int
+        \\  %3 = iconst 1
+        \\  store %2, %3 : int
+        \\  %4 = slot_addr s1
+        \\  %5 = iconst 8
+        \\  %6 = call @gc_alloc(%5)
+        \\  %7 = slot_addr s0
+        \\  copy %6 <- %7 : Acc
+        \\  %8 = slot_addr s2
+        \\  %9 = fn_addr @main.Acc.plus$bound
+        \\  store %8, %9 : int
+        \\  %10 = field_addr %8, 8 : rawptr
+        \\  store %10, %6 : rawptr
+        \\  %11 = slot_addr s2
+        \\  copy %4 <- %11 : fn$int$int
+        \\  %12 = slot_addr s1
+        \\  %13 = load %12 : int
+        \\  %14 = field_addr %12, 8 : rawptr
+        \\  %15 = load %14 : rawptr
+        \\  %16 = iconst 2
+        \\  %17 = call_indirect %13(%15, %16)
+        \\  br b1(%17)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    , ir);
+}
+
+test "a bound mut self method passes the box pointer" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct C { n: int }
+        \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
+        \\fn f() -> int {
+        \\ c := C { n: 0 }
+        \\ inc := c.bump
+        \\ inc()
+        \\ return c.n
+        \\}
+        \\
+    ;
+    const ir = try renderLoweredG(gpa, src, "f");
+    defer gpa.free(ir);
+    // `c` lives in a cell (s0 holds its pointer), and the env holds that pointer, so the
+    // adapter's `bump` and the later `c.n` reach the same storage.
+    try testing.expectEqualStrings(
+        \\fn main.f() -> int {
+        \\  slots: s0:rawptr s1:fn$unit s2:fn$unit
+        \\b0:
+        \\  %1 = iconst 8
+        \\  %2 = call @gc_alloc(%1)
+        \\  %3 = slot_addr s0
+        \\  store %3, %2 : rawptr
+        \\  %4 = slot_addr s0
+        \\  %5 = load %4 : rawptr
+        \\  %6 = field_addr %5, 0 : int
+        \\  %7 = iconst 0
+        \\  store %6, %7 : int
+        \\  %8 = slot_addr s1
+        \\  %9 = slot_addr s0
+        \\  %10 = load %9 : rawptr
+        \\  %11 = iconst 8
+        \\  %12 = call @gc_alloc(%11)
+        \\  store %12, %10 : rawptr
+        \\  %13 = slot_addr s2
+        \\  %14 = fn_addr @main.C.bump$boundbox
+        \\  store %13, %14 : int
+        \\  %15 = field_addr %13, 8 : rawptr
+        \\  store %15, %12 : rawptr
+        \\  %16 = slot_addr s2
+        \\  copy %8 <- %16 : fn$unit
+        \\  %17 = slot_addr s1
+        \\  %18 = load %17 : int
+        \\  %19 = field_addr %17, 8 : rawptr
+        \\  %20 = load %19 : rawptr
+        \\  call_indirect %18(%20)
+        \\  %21 = slot_addr s0
+        \\  %22 = load %21 : rawptr
+        \\  %23 = field_addr %22, 0 : int
+        \\  %24 = load %23 : int
+        \\  br b1(%24)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    , ir);
 }

@@ -73,7 +73,7 @@ fn select(
     const name = m.tokens[fa_node.main_token].text(m.source);
     switch (tc.callees[mod][fa].view()) {
         // A function value's signature is its type, not a declaration's.
-        .none, .value, .fn_ref => return null,
+        .none, .value, .fn_ref, .bound_method => return null,
         .method => |i| {
             if (i >= tc.methods.len) return null;
             const meth = tc.methods[i];

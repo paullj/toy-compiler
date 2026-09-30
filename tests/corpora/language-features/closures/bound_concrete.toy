@@ -1,0 +1,56 @@
+# Feature: a method named as a value binds its receiver: a local assigned later is shared, anything else is copied once
+# expect: stdout "3\n12\n"
+# expect: exit 51
+import std/vec
+import std/io
+
+struct Acc { n: int }
+struct Pair { left: Acc, right: Acc }
+enum Dir { up, down }
+
+impl Acc {
+    fn plus(self, x: int) -> int { self.n + x }
+}
+
+impl Dir {
+    fn step(self, x: int) -> int {
+        match self {
+            .up -> x + 1,
+            .down -> x - 1,
+        }
+    }
+}
+
+impl int {
+    fn times(self, x: int) -> int { self * x }
+}
+
+struct Handler { run: fn(int) -> int }
+
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+
+fn main() -> int {
+    acc := Acc { n: 1 }
+    f := acc.plus
+    io.println(f(2))
+    acc = Acc { n: 10 }
+    io.println(f(2))
+
+    fixed := Acc { n: 5 }
+    g := fixed.plus
+    p := Pair { left: Acc { n: 20 }, right: Acc { n: 30 } }
+    left := p.left.plus
+    p.left = Acc { n: 0 }
+    d := Dir.down
+    step := d.step
+    three := 3
+    triple := three.times
+
+    h := Handler { run: g }
+    fs: Vec[fn(int) -> int] = [f, left, triple]
+    total := 0
+    for k in fs { total = total + k(1) }
+    same := if g == g { 1 } else { 0 }
+    fresh := if fixed.plus == fixed.plus { 0 } else { 1 }
+    return total + apply(step, 10) + h.run(0) + same + fresh + p.left.n
+}

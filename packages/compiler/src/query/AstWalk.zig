@@ -669,8 +669,9 @@ pub fn CallVisitor(comptime Frozen: type) type {
 
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
-                // A named fn taken as a value: its thunk is the reloc target, so the caller
-                // depends on the fn's identity and signature exactly as a direct call does.
+                // A named fn or a method taken as a value: its adapter is the reloc target
+                // and calls the fn or the method's witness, so the caller depends on that
+                // identity and signature exactly as a direct call does.
                 .enter => |e| {
                     const fr = self.frozen;
                     if (e.idx.int() >= fr.callees.len) return;
@@ -680,6 +681,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             const sig = fr.sigs[gid];
                             try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
                         },
+                        .bound_method => |mi| if (mi < fr.methods.len) try self.foldWitness(fr.methods[mi]),
                         .none, .method, .protocol, .builtin, .value => {},
                     }
                 },
@@ -797,9 +799,9 @@ pub fn CallVisitor(comptime Frozen: type) type {
             const recv_idx = fr.tree.nodes[fa.int()].lhs;
             const recv: Typecheck.Type = if (recv_idx.int() < fr.node_types.len) fr.node_types[recv_idx.int()] else .{ .kind = .invalid };
             switch (fr.callees[fa.int()].view()) {
-                // A value call's code is not known statically; `.fn_ref` never sits on a
-                // call's slot (it folds at its own node's `.enter`).
-                .none, .protocol, .value, .fn_ref => {},
+                // A value call's code is not known statically; `.fn_ref` and `.bound_method`
+                // never sit on a call's slot (they fold at their own node's `.enter`).
+                .none, .protocol, .value, .fn_ref, .bound_method => {},
                 .method => |i| if (i < fr.methods.len) try self.foldWitness(fr.methods[i]),
                 .builtin => |k| switch (k) {
                     // `to_string` relocs to the receiver's Display witness (there is no
@@ -825,32 +827,12 @@ pub fn CallVisitor(comptime Frozen: type) type {
         /// method carries the mono `instance` index -> fold the INSTANCE identity
         /// (the real reloc target), not the never-lowered template's `names/sigs[fn_id]`.
         fn foldWitness(self: *Self, m: Typecheck.Method) error{OutOfMemory}!void {
-            // A SOURCE-LESS derived witness: fold the synthetic unit's identity (its
-            // mangled name + `[T,T]->bool` sig) so the caller's fingerprint tracks the
-            // derive — a nested-field override flips the unit's key AND, via this fold, the
-            // caller's. Checked FIRST (a derive Method has `fn_id == 0`). `dv.params` is a
-            // borrowed slice into the stable `derives` table, so storing it is safe.
-            if (m.derive) |di| {
-                if (di < self.frozen.derives.len) {
-                    const dv = &self.frozen.derives[di];
-                    // Fold the recipe's TRUE ret (`bool` for an Eq derive, `Ordering` for an
-                    // Ord derive) rather than a hardcoded bool, so an Ord-derive witness folds
-                    // its real sig. The mangled name already disambiguates, so this is
-                    // correctness-neutral — done for cleanliness.
-                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = dv.name.?, .params = dv.params, .ret = dv.ret });
-                }
-                return;
-            }
-            if (m.instance) |ii| {
-                if (ii < self.frozen.instances.len) {
-                    const inst = self.frozen.instances[ii];
-                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret });
-                }
-            } else if (m.fn_id < self.frozen.names.len and m.fn_id < self.frozen.sigs.len) {
-                const nm = self.frozen.names[m.fn_id];
-                const sig = self.frozen.sigs[m.fn_id];
-                try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
-            }
+            // A source-less derive folds its synthetic unit, so a nested-field override
+            // that flips the unit's key flips the caller's too. A partial view folds nothing.
+            const fr = self.frozen;
+            const sym = Typecheck.witnessSym(m, fr.derives, fr.instances, fr.names) orelse return;
+            const sig = Typecheck.witnessSig(m, fr.derives, fr.instances, fr.sigs) orelse return;
+            try self.out.append(self.gpa, .{ .kind = sym.kind, .name = sym.name, .params = sig.params, .ret = sig.ret });
         }
 
         /// Recover the generic call's `(gid, type-args)` via the SHARED `callInstanceRef`
@@ -2512,4 +2494,47 @@ test "a direct call folds exactly once" {
     try fx.fold(gpa, fx.tc.callees[0], "use_it", &sigs);
     try testing.expectEqual(@as(usize, 1), sigs.items.len);
     try testing.expectEqualStrings("main.g", sigs.items[0].name);
+}
+
+test "a bound method value folds its witness" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
+        \\fn use_it(acc: Acc) -> int {
+        \\    f := acc.plus
+        \\    f(2)
+        \\}
+        \\
+    );
+    defer fx.destroy(gpa);
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.fold(gpa, fx.tc.callees[0], "use_it", &sigs);
+    // The value's adapter calls `Acc.plus`; the value call `f(2)` folds nothing.
+    try testing.expectEqual(@as(usize, 1), sigs.items.len);
+    try testing.expectEqualStrings("main.Acc.plus", sigs.items[0].name);
+    try testing.expectEqual(@as(usize, 2), sigs.items[0].params.len);
+
+    const blank = try gpa.alloc(Callee, fx.tc.callees[0].len);
+    defer gpa.free(blank);
+    @memset(blank, .{});
+    sigs.clearRetainingCapacity();
+    try fx.fold(gpa, blank, "use_it", &sigs);
+    try testing.expectEqual(@as(usize, 0), sigs.items.len);
+
+    // A body edit of the method keeps `use_it`'s key; a signature edit flips it.
+    const srcs = [_][]const u8{
+        "struct Acc { n: int }\nimpl Acc { fn plus(self, x: int) -> int { self.n + x } }\nfn use_it(acc: Acc) -> int {\n    _f := acc.plus\n    0\n}\n",
+        "struct Acc { n: int }\nimpl Acc { fn plus(self, x: int) -> int { self.n * x } }\nfn use_it(acc: Acc) -> int {\n    _f := acc.plus\n    0\n}\n",
+        "struct Acc { n: int }\nimpl Acc { fn plus(self, _x: bool) -> int { self.n } }\nfn use_it(acc: Acc) -> int {\n    _f := acc.plus\n    0\n}\n",
+    };
+    var fps: [srcs.len]u64 = undefined;
+    for (srcs, &fps) |src, *fp| {
+        const c = try Checked.create(gpa, src);
+        defer c.destroy(gpa);
+        fp.* = try fnFingerprint(c, gpa, "use_it");
+    }
+    try testing.expectEqual(fps[0], fps[1]);
+    try testing.expect(fps[0] != fps[2]);
 }

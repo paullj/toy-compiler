@@ -771,6 +771,39 @@ test "gc: a local fn's env survives collections, inside its own recursion too" {
     );
 }
 
+test "gc: a bound method's receiver env survives a collection" {
+    try expectClosureGc(".toy-test-gc-bound",
+        \\struct Acc { n: int }
+        \\impl Acc {
+        \\    fn plus(self, x: int) -> int { self.n + x }
+        \\    fn bump(mut self) { self.n = self.n + 1 }
+        \\}
+        \\fn make_bound(n: int) -> Op {
+        \\    a := Acc { n: n }
+        \\    a.plus
+        \\}
+        \\fn make_counter() -> fn() -> int {
+        \\    c := Acc { n: 0 }
+        \\    inc := c.bump
+        \\    fn() -> int {
+        \\        inc()
+        \\        c.n
+        \\    }
+        \\}
+        \\fn main() -> int {
+        \\    f := make_bound(32)
+        \\    fs: Vec[Op] = []
+        \\    for i in 0..3 { fs.push(make_bound(i)) }
+        \\    g := make_counter()
+        \\    g()
+        \\    if !collect() { return 1 }
+        \\    # 34 + (1 + 2 + 3) + 2
+        \\    return f(2) + fs[0](1) + fs[1](1) + fs[2](1) + g()
+        \\}
+        \\
+    );
+}
+
 test "gc: per-iteration boxes survive" {
     try expectClosureGc(".toy-test-gc-box-loop",
         \\fn fill() -> Vec[fn() -> int] {
