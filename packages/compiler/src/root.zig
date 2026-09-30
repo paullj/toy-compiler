@@ -26,6 +26,7 @@ pub const diagnostics = struct {
     pub const severity_config = @import("diagnostics/severity_config.zig");
 };
 pub const Resolve = @import("resolve.zig");
+pub const Callee = @import("symbols/Callee.zig").Callee;
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
 pub const Derive = @import("symbols/Derive.zig");
@@ -83,6 +84,7 @@ test {
     _ = diagnostics.explain;
     _ = diagnostics.severity_config;
     _ = Resolve;
+    _ = @import("symbols/Callee.zig");
     _ = ResolveGraph;
     _ = Typecheck;
     _ = Derive;

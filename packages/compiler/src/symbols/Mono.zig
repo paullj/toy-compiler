@@ -16,6 +16,7 @@
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Type = @import("../layout/Type.zig").Type;
+const Callee = @import("Callee.zig").Callee;
 const Infer = @import("Infer.zig");
 
 /// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
@@ -58,6 +59,9 @@ pub const Instance = struct {
     /// (written by the per-instance re-check). NEVER the module's shared slice, so
     /// two instances of one template do not alias each other's node slots.
     node_types: []Type,
+    /// This instance's method-call selections, sized and owned like `node_types` (and
+    /// likewise never the module's shared slice).
+    callees: []Callee,
     /// The template's params/ret with every `type_var` substituted to concrete.
     params: []const Type,
     ret: Type,
@@ -479,8 +483,8 @@ test "callInstanceRef infers a CONTAINER type-arg via the view's decomposer" {
 
 test "findByReifiedParams matches on reified params, tolerating a never/invalid slot" {
     const insts = [_]Instance{
-        .{ .template_gid = 3, .args = &.{Type.int}, .node_types = &.{}, .params = &.{Type.structT(7)}, .ret = Type.int, .name = "total$s7", .mod = 0, .decl_node = Ast.none },
-        .{ .template_gid = 3, .args = &.{Type.bool}, .node_types = &.{}, .params = &.{ Type.structT(8), Type.int }, .ret = Type.int, .name = "pair$s8", .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 3, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{Type.structT(7)}, .ret = Type.int, .name = "total$s7", .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 3, .args = &.{Type.bool}, .node_types = &.{}, .callees = &.{}, .params = &.{ Type.structT(8), Type.int }, .ret = Type.int, .name = "pair$s8", .mod = 0, .decl_node = Ast.none },
     };
     // Exact reified match.
     try testing.expectEqual(@as(?usize, 0), findByReifiedParams(&insts, 3, &.{Type.structT(7)}));
@@ -493,8 +497,8 @@ test "findByReifiedParams matches on reified params, tolerating a never/invalid 
 
 test "find matches on gid + args by Type.eql" {
     const insts = [_]Instance{
-        .{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .params = &.{Type.int}, .ret = Type.int, .name = "id$int", .mod = 0, .decl_node = Ast.none },
-        .{ .template_gid = 0, .args = &.{Type.structT(0)}, .node_types = &.{}, .params = &.{Type.structT(0)}, .ret = Type.structT(0), .name = "id$s0", .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{Type.int}, .ret = Type.int, .name = "id$int", .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 0, .args = &.{Type.structT(0)}, .node_types = &.{}, .callees = &.{}, .params = &.{Type.structT(0)}, .ret = Type.structT(0), .name = "id$s0", .mod = 0, .decl_node = Ast.none },
     };
     try testing.expectEqual(@as(?usize, 0), find(&insts, 0, &.{Type.int}));
     try testing.expectEqual(@as(?usize, 1), find(&insts, 0, &.{Type.structT(0)}));
@@ -510,6 +514,7 @@ test "an instance carries its resolved conformances" {
         .template_gid = 5,
         .args = &.{Type.structT(3)},
         .node_types = &.{},
+        .callees = &.{},
         .params = &.{Type.structT(3)},
         .ret = Type.int,
         .name = "use$s3",
@@ -526,14 +531,14 @@ test "an instance carries its resolved conformances" {
     try testing.expect(Type.eql(Type.int, inst.conformances[0].protocol_args[0]));
     // An instance built WITHOUT conformances defaults to the empty slice (warm-cache
     // byte-identity for unbounded templates); its conformance's protocol_args default too.
-    const plain = Instance{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .params = &.{Type.int}, .ret = Type.int, .name = "id$int", .mod = 0, .decl_node = Ast.none };
+    const plain = Instance{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{Type.int}, .ret = Type.int, .name = "id$int", .mod = 0, .decl_node = Ast.none };
     try testing.expectEqual(@as(usize, 0), plain.conformances.len);
 }
 
 test "lessThan is a total canonical order (gid then arg triples)" {
-    const a = Instance{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .params = &.{}, .ret = Type.int, .name = "", .mod = 0, .decl_node = Ast.none };
-    const b = Instance{ .template_gid = 0, .args = &.{Type.structT(0)}, .node_types = &.{}, .params = &.{}, .ret = Type.int, .name = "", .mod = 0, .decl_node = Ast.none };
-    const c = Instance{ .template_gid = 1, .args = &.{Type.int}, .node_types = &.{}, .params = &.{}, .ret = Type.int, .name = "", .mod = 0, .decl_node = Ast.none };
+    const a = Instance{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{}, .ret = Type.int, .name = "", .mod = 0, .decl_node = Ast.none };
+    const b = Instance{ .template_gid = 0, .args = &.{Type.structT(0)}, .node_types = &.{}, .callees = &.{}, .params = &.{}, .ret = Type.int, .name = "", .mod = 0, .decl_node = Ast.none };
+    const c = Instance{ .template_gid = 1, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{}, .ret = Type.int, .name = "", .mod = 0, .decl_node = Ast.none };
     // int (kind 2) < struct (kind 6), so a < b; gid 0 < gid 1, so a < c.
     try testing.expect(lessThan({}, a, b));
     try testing.expect(!lessThan({}, b, a));

@@ -426,6 +426,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .source = frozen.source,
         .resolutions = frozen.resolutions,
         .node_types = frozen.node_types,
+        .callees = frozen.callees,
         .layouts = frozen.layouts,
         .enum_layouts = frozen.enum_layouts,
         .names = frozen.names,
@@ -658,6 +659,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
         .source = frozen.source,
         .resolutions = frozen.resolutions,
         .node_types = frozen.node_types, // &.{} for a derive unit — the emitter reads none
+        .callees = frozen.callees,
         .layouts = frozen.layouts,
         .enum_layouts = frozen.enum_layouts,
         .names = frozen.names,
@@ -766,6 +768,7 @@ pub fn codegenErased(
         .source = frozen.source,
         .resolutions = frozen.resolutions,
         .node_types = frozen.node_types, // &.{} for an erased unit — the emitter reads none
+        .callees = frozen.callees,
         .layouts = frozen.layouts,
         .enum_layouts = frozen.enum_layouts,
         .names = frozen.names,

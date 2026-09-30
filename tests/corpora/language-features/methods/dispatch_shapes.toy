@@ -1,0 +1,64 @@
+# Feature: every source-method callee shape in one program, so the Callee table's
+# method/pending/protocol arms are exercised by the corpus gates.
+# expect: exit 42
+protocol Doubler {
+    fn dbl(self) -> int
+}
+protocol Into[U] {
+    fn into(self) -> U
+}
+protocol Twice {
+    fn twice(self) -> int
+}
+struct Acc { n: int }
+impl Acc {
+    fn plus(self, a: int, b: int) -> int { self.n + a + b }
+    fn bump(mut self) { self.n = self.n + 1 }
+    fn shade(self) -> Shade { if self.n > 1 { Shade.dark } else { Shade.light } }
+}
+impl Acc has Doubler {
+    fn dbl(self) -> int { self.n * 2 }
+}
+impl Acc has Into[int] {
+    fn into(self) -> int { self.n }
+}
+impl Acc has Into[bool] {
+    fn into(self) -> bool { self.n > 0 }
+}
+impl int has Twice {
+    fn twice(self) -> int { self * 2 }
+}
+struct Box[T] { v: T }
+impl Box[T] {
+    fn make(v: T) -> Box[T] { Box[T] { v: v } }
+    fn get(self) -> T { self.v }
+}
+struct Key { a: int, b: bool }
+enum Shade { light, dark }
+fn twice[T has Doubler](v: T) -> int { v.dbl() + v.dbl() }
+fn main() -> int {
+    acc := Acc { n: 1 }
+    acc.bump()
+    if acc.plus(1, 2) != 5 { return 1 }
+    piped := 1 |> acc.plus(2)
+    if piped != 5 { return 2 }
+    if acc.into[int]() != 2 { return 3 }
+    if !acc.into[bool]() { return 4 }
+    if twice(acc) != 8 { return 5 }
+    if (3).twice() != 6 { return 6 }
+    b := Box[int].make(7)
+    if b.get() != 7 { return 7 }
+    k := Key { a: 1, b: true }
+    if k.hash() == 0 { return 8 }
+    if k.to_string().len() == 0 { return 9 }
+    if Shade.dark.to_string().len() == 0 { return 10 }
+    lit := match acc.shade() { .light -> 0, .dark -> 1 }
+    if lit != 1 { return 14 }
+    o: Option[int] = Option.some(1)
+    if o.to_string().len() == 0 { return 11 }
+    c := 'x'
+    cp: int = c.into()
+    if cp != 120 { return 12 }
+    if c.to_string().len() != 1 { return 13 }
+    return 42
+}

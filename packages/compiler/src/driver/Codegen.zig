@@ -131,6 +131,8 @@ const Frozen = struct {
     source: []const u8,
     resolutions: []const Resolve.Resolution,
     node_types: []const Typecheck.Type,
+    /// Parallel to `node_types`: the checker's method-call selections.
+    callees: []const Typecheck.Callee,
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
@@ -264,6 +266,7 @@ const GraphFrozen = struct {
     sources: []const []const u8,
     resolutions: []const []const Resolve.Resolution,
     node_types: []const []const Typecheck.Type,
+    callees: []const []const Typecheck.Callee,
     /// Program-wide tables (global ids).
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
@@ -329,6 +332,7 @@ const GraphFrozen = struct {
         const is_inst = lower_i >= gf.base_count and lower_i < gf.derive_base;
         const is_derive = lower_i >= gf.derive_base;
         const nts: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].node_types else if (is_derive) &.{} else gf.node_types[mod];
+        const cs: []const Typecheck.Callee = if (is_inst) gf.instances[lower_i - gf.base_count].callees else if (is_derive) &.{} else gf.callees[mod];
         const targs: []const Typecheck.Type = if (is_inst) gf.instances[lower_i - gf.base_count].args else &.{};
         const confs: []const Mono.ResolvedConformance = if (is_inst) gf.instances[lower_i - gf.base_count].conformances else &.{};
         return .{
@@ -337,6 +341,7 @@ const GraphFrozen = struct {
             .source = gf.sources[mod],
             .resolutions = gf.resolutions[mod],
             .node_types = nts,
+            .callees = cs,
             .layouts = gf.layouts,
             .enum_layouts = gf.enum_layouts,
             .names = gf.names,
@@ -390,12 +395,15 @@ pub fn lowerGraphProgram(
     defer gpa.free(resols);
     const ntypes = try gpa.alloc([]const Typecheck.Type, n_mods);
     defer gpa.free(ntypes);
+    const cs = try gpa.alloc([]const Typecheck.Callee, n_mods);
+    defer gpa.free(cs);
     for (graph.modules, 0..) |*m, i| {
         trees[i] = m.tree();
         toks[i] = m.tokens;
         srcs[i] = m.source;
         resols[i] = res.resolutions[i];
         ntypes[i] = tc.node_types[i];
+        cs[i] = tc.callees[i];
     }
 
     // Mirrors the resolver's global fn order exactly: a user fn -> {user_fn, its
@@ -491,6 +499,7 @@ pub fn lowerGraphProgram(
         .sources = srcs,
         .resolutions = resols,
         .node_types = ntypes,
+        .callees = cs,
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -748,6 +757,7 @@ pub fn renderGraphIr(
             .source = m.source,
             .resolutions = res.resolutions[gf.module],
             .node_types = tc.node_types[gf.module],
+            .callees = tc.callees[gf.module],
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,
@@ -779,6 +789,7 @@ pub fn renderGraphIr(
             .source = m.source,
             .resolutions = res.resolutions[inst.mod],
             .node_types = inst.node_types,
+            .callees = inst.callees,
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,
@@ -812,6 +823,7 @@ pub fn renderGraphIr(
             .source = m.source,
             .resolutions = res.resolutions[d.mod],
             .node_types = &.{},
+            .callees = &.{},
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,
@@ -844,6 +856,7 @@ pub fn renderGraphIr(
             .source = m.source,
             .resolutions = res.resolutions[u.mod],
             .node_types = &.{},
+            .callees = &.{},
             .layouts = tc.layouts,
             .enum_layouts = tc.enum_layouts,
             .names = names,

@@ -26,12 +26,14 @@
 //! to `br dest(value)`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
 const TokenTag = @import("ast/Token.zig").Tag;
 const Resolve = @import("resolve.zig");
 const symbols_res = @import("symbols/Resolution.zig");
 const Typecheck = @import("types.zig");
+const Callee = @import("symbols/Callee.zig").Callee;
 const Link = @import("link/Link.zig");
 const Ir = @import("ir/Ir.zig");
 const Abi = @import("codegen/abi/Abi.zig");
@@ -53,6 +55,8 @@ pub const Inputs = struct {
     source: []const u8,
     resolutions: []const Resolve.Resolution,
     node_types: []const Typecheck.Type,
+    /// The checker's per-call method selection (symbols/Callee.zig), parallel to `node_types`.
+    callees: []const Callee,
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
@@ -313,6 +317,7 @@ pub fn lowerFn(
     is_entry: bool,
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
+    std.debug.assert(in.callees.len == in.node_types.len);
     _ = is_entry; // the is_entry unit-main x0=0 contract is a codegen concern.
 
     const decl = in.tree.nodes[(fn_decl).int()];
@@ -1951,6 +1956,7 @@ fn genericParamCount(sig: Sig) u32 {
 }
 
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    if (builtin.mode == .Debug) shadowCallee(b, n);
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
     // A method call `recv.m(args)`: dispatch to the method's mangled symbol and
@@ -2304,9 +2310,20 @@ fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool
     // unresolved field_access with no `t.methods` entry and is not an
     // `optionResultMethodCallee`, so exclude it too — else it misroutes as a variant
     // construction (silent miscompile).
-    return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
+    const legacy = ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
         b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null and
         optionResultMethodCallee(b, n) == null and builtinConvCallee(b, n) == null;
+    if (builtin.mode == .Debug) shadowCtorCall(b, n, ty, legacy);
+    return legacy;
+}
+
+noinline fn shadowCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type, legacy: bool) void {
+    const table = calleeOf(b, n);
+    const from_table = ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
+        b.in.resolutions[(n.lhs).int()] != .func and table == .none;
+    if (from_table == legacy) return;
+    if (legacy and receiverMethodExempt(b, n, .none, table)) return;
+    std.debug.panic("callee shadow: ctor predicate at token {d} legacy {any} table {any}", .{ n.main_token, legacy, table });
 }
 
 /// A tuple-struct constructor call `N(args)` in lower. A struct-typed `.call` over an
@@ -2340,6 +2357,10 @@ fn lowerTupleStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueI
 /// `Method` (not just `fn_id`) so the caller reads `mut_self` for the by-address
 /// receiver ABI; `null`-semantics are unchanged for the ctor-call classifier.
 fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
+    return b.in.methods[methodIdxOf(b, n) orelse return null];
+}
+
+fn methodIdxOf(b: *const Builder, n: Ast.Node) ?u32 {
     // Two callee shapes are method dispatch: a bare `field_access` `v.m` (explicit args
     // null), and an explicit-protocol-args `type_app` over a `field_access` `v.m[int]`
     //. A qualified fn / qualified generic fn binds its field_access to `.func` and
@@ -2376,16 +2397,16 @@ fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
     // The SAME multi-conformance disambiguation the checker + fingerprint use, so all
     // three select the identical witness (a divergence would be a miscompile or `-jN`
     // break). `.ambiguous`/`.none` -> not dispatchable here (the checker already erred).
-    const m = switch (Typecheck.resolveConformanceMethod(b.in.methods, recv, member, null, explicit_args)) {
-        .one => |mm| mm,
+    const mi = switch (Typecheck.pickMethodIndex(b.in.methods, recv, member, null, explicit_args)) {
+        .one => |i| i,
         else => return null,
     };
     // Defense in depth: a `mut self` method on a builtin scalar is rejected at check
     // time (T0022) because the by-address self ABI has no write-back path. Never
     // dispatch one here so a stray lower can't turn the receiver's slot address into
     // the callee's value slot; a well-typed program never reaches this.
-    if (m.mut_self and recv.kind != .@"struct" and recv.kind != .@"enum") return null;
-    return m;
+    if (b.in.methods[mi].mut_self and recv.kind != .@"struct" and recv.kind != .@"enum") return null;
+    return mi;
 }
 
 /// A builtin scalar `eq` call `recv.eq(arg)`: the callee is a `field_access` NOT
@@ -2494,6 +2515,55 @@ fn optionResultMethodCallee(b: *Builder, n: Ast.Node) ?OptResultCall {
     const member = b.in.tokens[cn.main_token].text(b.in.source);
     const op = Typecheck.optionResultMethod(fam, member) orelse return null;
     return .{ .recv = cn.lhs, .op = op };
+}
+
+/// The checker's selection for call `n`, read from its member node's slot.
+fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
+    const fa = Callee.memberNode(b.in.tree, n) orelse return .none;
+    if (fa.int() >= b.in.callees.len) return .none;
+    return b.in.callees[fa.int()].view();
+}
+
+/// The selection `lowerCall`'s classifier chain makes, in the chain's order.
+noinline fn legacyCallee(b: *Builder, n: Ast.Node) Callee.View {
+    if (methodIdxOf(b, n)) |i| return .{ .method = i };
+    if (b.in.tree.nodes[(n.lhs).int()].tag == .type_app) return .none;
+    if (builtinScalarEqCallee(b, n) != null) return .{ .builtin = .scalar_eq };
+    if (builtinScalarHashCallee(b, n) != null) return .{ .builtin = .scalar_hash };
+    if (builtinStrMethodCallee(b, n)) |sm|
+        return .{ .builtin = Typecheck.builtinStrMethod(b.in.node_types[(sm.recv).int()], sm.member).?.builtin };
+    if (displayToStringCallee(b, n) != null) return .{ .builtin = .display_to_string };
+    if (optionResultMethodCallee(b, n)) |om| return .{ .builtin = Typecheck.optResultBuiltin(om.op) };
+    if (builtinConvCallee(b, n)) |cv|
+        return .{ .builtin = if (std.mem.eql(u8, cv.member, "into")) .conv_into else .conv_try_into };
+    return .none;
+}
+
+const CalleeMismatch = struct { legacy: Callee.View, table: Callee.View };
+
+noinline fn calleeMismatch(b: *Builder, n: Ast.Node) ?CalleeMismatch {
+    const legacy = legacyCallee(b, n);
+    const table = calleeOf(b, n);
+    if (std.meta.eql(legacy, table)) return null;
+    if (receiverMethodExempt(b, n, legacy, table)) return null;
+    return .{ .legacy = legacy, .table = table };
+}
+
+/// The checker dispatches methods on float and rawptr receivers, but `methodIdxOf`'s
+/// kind gate rejects them (lower then reports "call target unsupported"). The table is
+/// right; the legacy chain is the known gap, which closes once lower reads the table.
+fn receiverMethodExempt(b: *const Builder, n: Ast.Node, legacy: Callee.View, table: Callee.View) bool {
+    if (legacy != .none or table != .method) return false;
+    const fa = Callee.memberNode(b.in.tree, n) orelse return false;
+    const recv = b.in.tree.nodes[fa.int()].lhs;
+    if (recv.int() >= b.in.node_types.len) return false;
+    const kind = b.in.node_types[recv.int()].kind;
+    return kind == .float or kind == .rawptr;
+}
+
+noinline fn shadowCallee(b: *Builder, n: Ast.Node) void {
+    const m = calleeMismatch(b, n) orelse return;
+    std.debug.panic("callee shadow: token {d} legacy {any} table {any}", .{ n.main_token, m.legacy, m.table });
 }
 
 /// Inline a native `Option`/`Result` method. The receiver is materialized into a
@@ -4578,6 +4648,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .source = src,
         .resolutions = rr.resolutions[0],
         .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -4663,6 +4734,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
         .source = src,
         .resolutions = rr.resolutions[0],
         .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -4734,6 +4806,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
         .source = src,
         .resolutions = rr.resolutions[0],
         .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -5141,6 +5214,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         .source = src,
         .resolutions = rr.resolutions[0],
         .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -5212,6 +5286,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .source = src,
         .resolutions = rr.resolutions[0],
         .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -5271,6 +5346,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
         .source = src,
         .resolutions = rr.resolutions[0],
         .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -5607,4 +5683,65 @@ test "whole-self value read copies the pointee into a fresh temp" {
             "  ret %0\n" ++
             "}\n",
     );
+}
+
+test "callee shadow flags a table that disagrees with the legacy chain" {
+    if (builtin.mode != .Debug) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, a: int) -> int { self.n + a } }
+        \\fn main() -> int {
+        \\  acc := Acc { n: 1 }
+        \\  return acc.plus(1)
+        \\}
+        \\
+    ;
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const tc = fe.typecheck;
+    try testing.expectEqual(@as(usize, 0), tc.diags.len);
+
+    const cs = try gpa.dupe(Callee, tc.callees[0]);
+    defer gpa.free(cs);
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var b: Builder = .{
+        .gpa = gpa,
+        .in = .{
+            .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
+            .tokens = tokens,
+            .source = src,
+            .resolutions = fe.resolve.resolutions[0],
+            .node_types = tc.node_types[0],
+            .callees = cs,
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = &.{},
+            .methods = tc.methods,
+            .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
+        },
+        .ret_type = Typecheck.Type.int,
+        .diags = &diags,
+    };
+    defer b.deinit();
+
+    const call = for (tree.nodes) |n| {
+        if (n.tag == .call and Callee.memberNode(b.in.tree, n) != null) break n;
+    } else return error.TestExpectedMethodCall;
+    try testing.expect(calleeMismatch(&b, call) == null);
+    cs[Callee.memberNode(b.in.tree, call).?.int()] = .{};
+    const m = calleeMismatch(&b, call) orelse return error.TestExpectedMismatch;
+    try testing.expect(m.legacy == .method);
+    try testing.expect(m.table == .none);
 }
