@@ -26,7 +26,6 @@
 //! to `br dest(value)`.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Ast = @import("ast/Ast.zig");
 const Token = @import("ast/Token.zig").Token;
 const TokenTag = @import("ast/Token.zig").Tag;
@@ -86,11 +85,8 @@ pub const Inputs = struct {
     /// `node_types` to select the SAME `Mono.Instance` Pass C created, instead of
     /// emitting the template symbol. Empty for a program with no generics.
     sigs: []const Sig = &.{},
-    /// The program-wide inherent-method table. A call whose callee is a
-    /// `field_access` over a VALUE receiver dispatches through this: the receiver's
-    /// concrete type + the member name select the method's global fn id (the mangled
-    /// SymName in `names`), and the receiver is prepended as the `self` arg. Empty for
-    /// a program with no methods; content-keyed (`findMethod`), so `-jN` deterministic.
+    /// The program-wide method table. `callees` selects a method call's entry by index;
+    /// the operator/derive/`?`-widen witness sites resolve theirs here by protocol.
     ///
     /// NO default: a build site that forgets to thread this must be a COMPILE error,
     /// not a silent "no methods" miss (a method call would then hit "call target
@@ -1687,54 +1683,6 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
     }
 }
 
-/// Lower a builtin string method (`concat`/`len`/`byte_at`/`to_string`) inline. All are
-/// immutable/functional: `concat`/int&bool `to_string` produce a fresh `str`; `str
-/// .to_string` shares the receiver (immutable ⇒ safe); `len`/`byte_at` read the value.
-fn lowerStrMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, recv_node: Ast.Index, member: []const u8) error{OutOfMemory}!Ir.Operand {
-    const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.bool;
-    const recv_ty = b.in.node_types[(recv_node).int()];
-
-    if (std.mem.eql(u8, member, "concat")) {
-        const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-        return try lowerStrConcat(b, node_idx, recv_node, args[0]);
-    }
-    if (std.mem.eql(u8, member, "len")) {
-        const base = try strBase(b, recv_node);
-        const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
-        return .{ .value = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty) };
-    }
-    if (std.mem.eql(u8, member, "byte_at")) {
-        const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-        const base = try strBase(b, recv_node);
-        const i = operandValue(try lowerExpr(b, args[0]));
-        const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
-        const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
-        // Two guards to a shared panic block (emitZeroGuard-style): i < 0, then i >= len.
-        const zero = try b.emit(.{ .iconst = 0 }, int_ty);
-        const neg = try b.emit(.{ .icmp = .{ .cc = .lt, .lhs = i, .rhs = zero } }, bool_ty);
-        const chk2 = try b.addBlock();
-        const panic_blk = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = neg, .t = panic_blk, .f = chk2 } });
-        b.switchTo(chk2);
-        const over = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = i, .rhs = len } }, bool_ty);
-        const cont = try b.addBlock();
-        b.setTerm(.{ .cond_br = .{ .cond = over, .t = panic_blk, .f = cont } });
-        b.switchTo(panic_blk);
-        b.setTerm(.{ .panic = .index_oob });
-        b.switchTo(cont);
-        const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
-        const bx = try b.emit(.{ .add = .{ .lhs = ptr, .rhs = i } }, int_ty);
-        return .{ .value = try b.emit(.{ .load_byte = bx }, int_ty) };
-    }
-    // `to_string`: the `displayToSlot` renderer. `str` is identity (share the immutable
-    // receiver, no alloc); int/bool/unit build a fresh str (via `__int_to_str` / the
-    // literal cond / the const-data `"()"`).
-    if (recv_ty.kind == .str) return try lowerExpr(b, recv_node);
-    const op = try lowerExpr(b, recv_node);
-    return .{ .slot = try displayToSlot(b, recv_ty, op) };
-}
-
 /// Copy a source str slot's two words into `dst`. Used by `bool.to_string` to funnel both
 /// literal arms into one result slot.
 fn copyStrSlot(b: *Builder, dst: Ir.SlotId, src: Ir.SlotId) error{OutOfMemory}!void {
@@ -1956,7 +1904,6 @@ fn genericParamCount(sig: Sig) u32 {
 }
 
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
-    if (builtin.mode == .Debug) shadowCallee(b, n);
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
     // A method call `recv.m(args)`: dispatch to the method's mangled symbol and
@@ -1966,262 +1913,208 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     // A `mut self` method: pass the receiver's ADDRESS (a place) as arg 0 instead
     // of a by-value copy, so the callee mutates the caller's storage.
     var self_mut = false;
-    if (methodGidOf(b, n)) |m| {
-        // Method dispatch: callee = the method's mangled global symbol; the
-        // receiver is prepended as `self` in the arg build below. TRIED FIRST so an
-        // explicit-protocol-args method call `v.into[int]()` (a `type_app` over a
-        // `field_access`) is not misread as a generic FUNCTION call by the `type_app`
-        // branch below. The receiver is the field_access's lhs — reached through the
-        // `type_app` for the explicit-args shape, else the callee (field_access) directly.
-        // A method on a GENERIC-type instance: the resolver returns the
-        // reified-dispatch entry carrying the mono `instance` index — dispatch to THAT
-        // instance's mangled symbol (its own per-instance codegen unit), not the
-        // never-lowered template's `names[fn_id]`. A SOURCE-LESS derive Method (
-        // `fn_id == 0`) dispatches to its synthetic unit — a DIRECT `.hash()` call is
-        // the first derive method reached here (Eq/Ord fire only via operators), so use the
-        // shared `witnessCallee` (derive-first) rather than `names[m.fn_id]` (would be
-        // `names[0]` — a wrong-symbol miscompile).
-        callee = witnessCallee(b, m);
-        // An ASSOCIATED function (`Vec[int].new()`) takes no `self` arg — the receiver is
-        // a type, not a value — so leave `self_recv` unset.
-        self_recv = if (m.is_static) Ast.none else if (callee_node.tag == .type_app) b.in.tree.nodes[(callee_node.lhs).int()].lhs else callee_node.lhs;
-        self_mut = m.mut_self;
-    } else if (callee_node.tag == .type_app) {
-        // `size_of[T]()` / `align_of[T]()`: the base resolves to a core-only builtin.
-        // Fold to a compile-time ABI constant (no call, no reloc). Checked BEFORE the
-        // generic-instance resolution below.
-        {
-            const bres = b.in.resolutions[(callee_node.lhs).int()];
-            if (bres == .func and bres.func < b.in.names.len and b.in.names[bres.func].kind == .builtin) {
-                const bn = b.in.names[bres.func].name;
-                const bik = Intrinsic.lookup(bn);
-                if (bik == .size_of or bik == .align_of) {
-                    const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-                    const t = b.in.node_types[(tnodes[0]).int()];
-                    const c: u32 = if (bik == .size_of)
-                        Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
-                    else
-                        Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
-                    return .{ .value = try b.emit(.{ .iconst = @intCast(c) }, Typecheck.Type.int) };
-                }
-                // `gc_array[T](p)` wraps a raw cell pointer into an 8-byte handle: a
-                // checker-only type change, so lower yields the pointer operand directly.
-                if (bik == .gc_array) {
-                    const vargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    return .{ .value = operandValue(try lowerExpr(b, vargs[0])) };
-                }
-                // `descriptor_of[T]()`: materialize the address of T's descriptor entry via
-                // the reserved-sentinel `cstr_ptr` path (NOT folded to a constant — the
-                // address is a link-time-resolved reloc, exactly like a string literal ptr).
-                if (bik == .descriptor_of) {
-                    const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-                    const t = b.in.node_types[(tnodes[0]).int()];
-                    return .{ .value = try b.emit(.{ .cstr_ptr = try Link.descHash(b.gpa, t) }, Typecheck.Type.rawptr) };
+    switch (calleeOf(b, n)) {
+        .method => |mi| {
+            // A generic-type instance method dispatches to its instance's own symbol, and a
+            // source-less derive (`fn_id == 0`) to its synthetic unit; `witnessCallee` knows
+            // both (`names[m.fn_id]` would be `names[0]`, a wrong-symbol miscompile).
+            const m = b.in.methods[mi];
+            callee = witnessCallee(b, m);
+            // An associated function (`Vec[int].new()`) takes no `self`: its receiver is a type.
+            self_recv = if (m.is_static) Ast.none else b.in.tree.nodes[Callee.memberNode(b.in.tree, n).?.int()].lhs;
+            self_mut = m.mut_self;
+        },
+        .builtin => |k| return lowerBuiltinMethod(b, node_idx, n, k),
+        .protocol => {
+            // Only bounded-template spans carry one, and templates are never lowered. A note,
+            // not `unreachable`, which ReleaseFast would turn into UB.
+            try b.note(n.main_token, "protocol callee in lower");
+            return .none;
+        },
+        .none => if (callee_node.tag == .type_app) {
+            // `size_of[T]()` / `align_of[T]()`: the base resolves to a core-only builtin.
+            // Fold to a compile-time ABI constant (no call, no reloc). Checked BEFORE the
+            // generic-instance resolution below.
+            {
+                const bres = b.in.resolutions[(callee_node.lhs).int()];
+                if (bres == .func and bres.func < b.in.names.len and b.in.names[bres.func].kind == .builtin) {
+                    const bn = b.in.names[bres.func].name;
+                    const bik = Intrinsic.lookup(bn);
+                    if (bik == .size_of or bik == .align_of) {
+                        const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+                        const t = b.in.node_types[(tnodes[0]).int()];
+                        const c: u32 = if (bik == .size_of)
+                            Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
+                        else
+                            Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
+                        return .{ .value = try b.emit(.{ .iconst = @intCast(c) }, Typecheck.Type.int) };
+                    }
+                    // `gc_array[T](p)` wraps a raw cell pointer into an 8-byte handle: a
+                    // checker-only type change, so lower yields the pointer operand directly.
+                    if (bik == .gc_array) {
+                        const vargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        return .{ .value = operandValue(try lowerExpr(b, vargs[0])) };
+                    }
+                    // `descriptor_of[T]()`: materialize the address of T's descriptor entry via
+                    // the reserved-sentinel `cstr_ptr` path (NOT folded to a constant — the
+                    // address is a link-time-resolved reloc, exactly like a string literal ptr).
+                    if (bik == .descriptor_of) {
+                        const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+                        const t = b.in.node_types[(tnodes[0]).int()];
+                        return .{ .value = try b.emit(.{ .cstr_ptr = try Link.descHash(b.gpa, t) }, Typecheck.Type.rawptr) };
+                    }
                 }
             }
-        }
-        // A generic call `id[int](..)`: the callee is a `type_app` whose base
-        // identifier carries the template gid. Resolve to the reified instance's
-        // mangled SymName by matching (gid + the concrete type-args the checker
-        // wrote into node_types) against the instance table — a pure read of
-        // concrete types, no substitution needed here.
-        const base_res = b.in.resolutions[(callee_node.lhs).int()];
-        if (base_res != .func) {
-            try b.note(n.main_token, "call target unsupported in lower");
-            return .none;
-        }
-        const targ_nodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-        const targs = try b.gpa.alloc(Typecheck.Type, targ_nodes.len);
-        defer b.gpa.free(targs);
-        for (targ_nodes, 0..) |tn, i| targs[i] = b.in.node_types[(tn).int()];
-        const ii = Mono.find(b.in.instances, base_res.func, targs) orelse {
-            try b.note(callee_node.main_token, "unresolved generic instance in lower");
-            return .none;
-        };
-        callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
-    } else if (builtinScalarEqCallee(b, n)) |ba| {
-        // A builtin scalar `.eq()`. int/bool lower to an inline `icmp eq` (no
-        // `.call`, no symbol/reloc — the recognizer is pure). str/unit route through the
-        // SAME `lowerEqValue` the `==` operator uses (heap-free byte-compare / trivially
-        // -true bconst), so `a.eq(b)` and `a == b` emit identical IR.
-        const recv_ty = b.in.node_types[(ba.recv).int()];
-        if (isInlineEq(recv_ty.kind)) {
-            const lhs = operandValue(try lowerExpr(b, ba.recv));
-            const rhs = operandValue(try lowerExpr(b, ba.arg));
-            return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
-        }
-        return try lowerEqValue(b, recv_ty, ba.recv, ba.arg, false);
-    } else if (builtinScalarHashCallee(b, n)) |bh| {
-        // A builtin scalar `.hash()` (completeness layer so `[T has Hash]` works at a
-        // scalar T). No `.call`/symbol — like the scalar `.eq()`, the recognizer is pure:
-        // int/bool hash to their own VALUE (identity — an int is its own hash, a bool is
-        // 0/1); str folds its bytes via the SAME heap-free polynomial the derive uses
-        // (`hashStrAtPtr`); unit hashes to the fixed seed (the sole `()` value).
-        const recv_ty = b.in.node_types[(bh.recv).int()];
-        switch (recv_ty.kind) {
-            .int, .bool => return .{ .value = operandValue(try lowerExpr(b, bh.recv)) },
-            .str => {
-                const op = try lowerExpr(b, bh.recv);
-                const s = operandSlot(op);
-                if (s == Ir.none_slot) {
-                    try b.note(callee_node.main_token, "str '.hash()' operand is not a slot in lower");
-                    return .{ .value = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int) };
-                }
-                const base = try b.emit(.{ .slot_addr = s }, Typecheck.Type.int);
-                return .{ .value = try hashStrAtPtr(b, base) };
-            },
-            else => {
-                _ = try lowerExpr(b, bh.recv); // unit: evaluate for effect, hash a constant
-                return .{ .value = try b.emit(.{ .iconst = hash_seed }, Typecheck.Type.int) };
-            },
-        }
-    } else if (builtinStrMethodCallee(b, n)) |sm| {
-        return try lowerStrMethod(b, node_idx, n, sm.recv, sm.member);
-    } else if (displayToStringCallee(b, n)) |ds| {
-        // A struct/enum (incl `char`) `.to_string()`: render through the `displayToSlot`
-        // authority. A custom `impl Display` and a structural derive land in the same
-        // witness call, which is what makes `to_string` universal.
-        const recv_ty = b.in.node_types[(ds.recv).int()];
-        const op = try lowerExpr(b, ds.recv);
-        return .{ .slot = try displayToSlot(b, recv_ty, op) };
-    } else if (optionResultMethodCallee(b, n)) |om| {
-        // A native inherent method on a reified `Option`/`Result` instance: no
-        // `.call`/symbol — inline the tag test / payload load per the reified layout.
-        return try lowerOptionResultMethod(b, n, om);
-    } else if (builtinConvCallee(b, n)) |cv| {
-        // A target-directed `.into()`/`.try_into()` int conversion: no `.call`/symbol —
-        // inline the mask/extend or the range-checked `Result` build.
-        return try lowerConvMethod(b, node_idx, cv);
-    } else {
-        // The callee identifier resolves to a `.func` index into `names`.
-        const callee_res = b.in.resolutions[(n.lhs).int()];
-        if (callee_res != .func) {
-            try b.note(n.main_token, "call target unsupported in lower");
-            return .none;
-        }
-        // The core-only raw-memory/pointer intrinsics (`store`/`load`/`offset`/... and the
-        // `call_hash`/`call_eq` indirect-dispatch helpers) lower directly to IR memory ops
-        // with no call/reloc — intercept them BEFORE the plain-name resolution below.
-        if (callee_res.func < b.in.names.len) {
-            const nm = b.in.names[callee_res.func];
-            // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
-            // no reloc). The checker fenced them in `unsafe { }` and typed the rawptr
-            // operand; this milestone reads/writes a 64-bit int through the pointer.
-            if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| switch (ik) {
-                .store => {
-                    const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const vty = b.in.node_types[(sargs[1]).int()];
-                    const addr = operandValue(try lowerExpr(b, sargs[0]));
-                    // A zero-sized value (`()`) occupies no bytes: evaluate the value
-                    // expr for its effects, emit no store (the erased Map's value column
-                    // when V = ()). Also prevents an OOB write — the cell stride is
-                    // size_of[K]+0, so offset(cell, size_of[K]) points past the cell.
-                    if (vty.kind == .unit) {
-                        _ = try lowerExpr(b, sargs[1]);
-                        return .none;
-                    }
-                    if (isAggTy(b, vty)) {
-                        const src = try operandPtr(b, try lowerExpr(b, sargs[1]));
-                        if (src != Ir.none_value) _ = try b.emit(.{ .copy = .{ .dst = addr, .src = src, .ty = vty } }, null);
-                        return .none;
-                    }
-                    const val = operandValue(try lowerExpr(b, sargs[1]));
-                    _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = vty } }, null);
-                    return .none;
-                },
-                .load => {
-                    const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const addr = operandValue(try lowerExpr(b, largs[0]));
-                    const lty = b.in.node_types[(node_idx).int()];
-                    // A load typed `()` yields the zero-sized unit value (`.none`): the
-                    // address was already evaluated for effect; read nothing (mp_val_at /
-                    // mp_grow when V = ()).
-                    if (lty.kind == .unit) return .none;
-                    if (isAggTy(b, lty)) {
-                        const slot = try b.addSlot(lty);
-                        const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
-                        _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = lty } }, null);
-                        return .{ .slot = slot };
-                    }
-                    return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = lty } }, lty) };
-                },
-                .offset => {
-                    // `offset(base, i)` is a plain 64-bit pointer add: the base's isRefTy
-                    // value already lowers to its 8-byte cell pointer, so no unwrap needed.
-                    const oargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const base = operandValue(try lowerExpr(b, oargs[0]));
-                    const idx = operandValue(try lowerExpr(b, oargs[1]));
-                    return .{ .value = try b.emit(.{ .add = .{ .lhs = base, .rhs = idx } }, Typecheck.Type.rawptr) };
-                },
-                .call_hash => {
-                    const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const fp = operandValue(try lowerExpr(b, a[0]));
-                    const kp = operandValue(try lowerExpr(b, a[1]));
-                    const args = try b.gpa.alloc(Ir.Operand, 1);
-                    args[0] = .{ .value = kp };
-                    return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int) };
-                },
-                .call_eq => {
-                    const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const fp = operandValue(try lowerExpr(b, a[0]));
-                    const ap = operandValue(try lowerExpr(b, a[1]));
-                    const bp = operandValue(try lowerExpr(b, a[2]));
-                    const args = try b.gpa.alloc(Ir.Operand, 2);
-                    args[0] = .{ .value = ap };
-                    args[1] = .{ .value = bp };
-                    return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool) };
-                },
-                .store_byte => {
-                    const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const addr = operandValue(try lowerExpr(b, sargs[0]));
-                    const val = operandValue(try lowerExpr(b, sargs[1]));
-                    _ = try b.emit(.{ .store_byte = .{ .addr = addr, .val = val } }, null);
-                    return .none;
-                },
-                .load_byte => {
-                    const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                    const addr = operandValue(try lowerExpr(b, largs[0]));
-                    return .{ .value = try b.emit(.{ .load_byte = addr }, Typecheck.Type.int) };
-                },
-                else => {},
-            };
-        }
-        if ((callee_node.tag == .identifier or callee_node.tag == .field_access) and
-            callee_res.func < b.in.sigs.len and b.in.sigs[callee_res.func].isGenericTemplate())
-        {
-            // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`: the callee
-            // (plain identifier, or a field_access `resolveModuleMember` bound to `.func`)
-            // resolves to a generic template (its sig params carry `type_var`s). Re-run
-            // the SHARED matcher over the value-arg node_types to pick the SAME instance
-            // Pass C / scanCalls selected, then use its mangled name (mirroring the
-            // type_app branch). A miss (arity/conflict/unbound/unminted) is an internal
-            // invariant break — Pass C already gated it — so note-and-drop.
-            const sig = b.in.sigs[callee_res.func];
-            const value_args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-            const arg_types = try b.gpa.alloc(Typecheck.Type, value_args.len);
-            defer b.gpa.free(arg_types);
-            for (value_args, 0..) |va, i| arg_types[i] = b.in.node_types[(va).int()];
-            // FIND regime: the composite table is gone, so a container param (`Vec[T]`)
-            // cannot be re-inferred here. The FLAT portion re-runs the shared matcher
-            // (byte-identical to before — pure-flat calls resolve here and never touch
-            // the fallback); a container/mixed call resolves by matching the reified
-            // value-arg types against each instance's already-reified `params`.
-            var ii: ?usize = null;
-            if (sigHasTypeVar(sig)) {
-                if (try Infer.infer(b.gpa, genericParamCount(sig), sig.params, arg_types, null)) |targs| {
-                    defer b.gpa.free(targs);
-                    ii = Mono.find(b.in.instances, callee_res.func, targs);
-                }
+            // A generic call `id[int](..)`: the callee is a `type_app` whose base
+            // identifier carries the template gid. Resolve to the reified instance's
+            // mangled SymName by matching (gid + the concrete type-args the checker
+            // wrote into node_types) against the instance table — a pure read of
+            // concrete types, no substitution needed here.
+            const base_res = b.in.resolutions[(callee_node.lhs).int()];
+            if (base_res != .func) {
+                try b.note(n.main_token, "call target unsupported in lower");
+                return .none;
             }
-            if (ii == null) ii = Mono.findByReifiedParams(b.in.instances, callee_res.func, arg_types);
-            const inst = ii orelse {
+            const targ_nodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+            const targs = try b.gpa.alloc(Typecheck.Type, targ_nodes.len);
+            defer b.gpa.free(targs);
+            for (targ_nodes, 0..) |tn, i| targs[i] = b.in.node_types[(tn).int()];
+            const ii = Mono.find(b.in.instances, base_res.func, targs) orelse {
                 try b.note(callee_node.main_token, "unresolved generic instance in lower");
                 return .none;
             };
-            callee = .{ .kind = .user_fn, .name = b.in.instances[inst].name.? };
+            callee = .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
         } else {
-            callee = b.in.names[callee_res.func];
-        }
+            // The callee identifier resolves to a `.func` index into `names`.
+            const callee_res = b.in.resolutions[(n.lhs).int()];
+            if (callee_res != .func) {
+                try b.note(n.main_token, "call target unsupported in lower");
+                return .none;
+            }
+            // The core-only raw-memory/pointer intrinsics (`store`/`load`/`offset`/... and the
+            // `call_hash`/`call_eq` indirect-dispatch helpers) lower directly to IR memory ops
+            // with no call/reloc — intercept them BEFORE the plain-name resolution below.
+            if (callee_res.func < b.in.names.len) {
+                const nm = b.in.names[callee_res.func];
+                // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
+                // no reloc). The checker fenced them in `unsafe { }` and typed the rawptr
+                // operand; this milestone reads/writes a 64-bit int through the pointer.
+                if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| switch (ik) {
+                    .store => {
+                        const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const vty = b.in.node_types[(sargs[1]).int()];
+                        const addr = operandValue(try lowerExpr(b, sargs[0]));
+                        // A zero-sized value (`()`) occupies no bytes: evaluate the value
+                        // expr for its effects, emit no store (the erased Map's value column
+                        // when V = ()). Also prevents an OOB write — the cell stride is
+                        // size_of[K]+0, so offset(cell, size_of[K]) points past the cell.
+                        if (vty.kind == .unit) {
+                            _ = try lowerExpr(b, sargs[1]);
+                            return .none;
+                        }
+                        if (isAggTy(b, vty)) {
+                            const src = try operandPtr(b, try lowerExpr(b, sargs[1]));
+                            if (src != Ir.none_value) _ = try b.emit(.{ .copy = .{ .dst = addr, .src = src, .ty = vty } }, null);
+                            return .none;
+                        }
+                        const val = operandValue(try lowerExpr(b, sargs[1]));
+                        _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = vty } }, null);
+                        return .none;
+                    },
+                    .load => {
+                        const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const addr = operandValue(try lowerExpr(b, largs[0]));
+                        const lty = b.in.node_types[(node_idx).int()];
+                        // A load typed `()` yields the zero-sized unit value (`.none`): the
+                        // address was already evaluated for effect; read nothing (mp_val_at /
+                        // mp_grow when V = ()).
+                        if (lty.kind == .unit) return .none;
+                        if (isAggTy(b, lty)) {
+                            const slot = try b.addSlot(lty);
+                            const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+                            _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = lty } }, null);
+                            return .{ .slot = slot };
+                        }
+                        return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = lty } }, lty) };
+                    },
+                    .offset => {
+                        // `offset(base, i)` is a plain 64-bit pointer add: the base's isRefTy
+                        // value already lowers to its 8-byte cell pointer, so no unwrap needed.
+                        const oargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const base = operandValue(try lowerExpr(b, oargs[0]));
+                        const idx = operandValue(try lowerExpr(b, oargs[1]));
+                        return .{ .value = try b.emit(.{ .add = .{ .lhs = base, .rhs = idx } }, Typecheck.Type.rawptr) };
+                    },
+                    .call_hash => {
+                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const fp = operandValue(try lowerExpr(b, a[0]));
+                        const kp = operandValue(try lowerExpr(b, a[1]));
+                        const args = try b.gpa.alloc(Ir.Operand, 1);
+                        args[0] = .{ .value = kp };
+                        return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int) };
+                    },
+                    .call_eq => {
+                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const fp = operandValue(try lowerExpr(b, a[0]));
+                        const ap = operandValue(try lowerExpr(b, a[1]));
+                        const bp = operandValue(try lowerExpr(b, a[2]));
+                        const args = try b.gpa.alloc(Ir.Operand, 2);
+                        args[0] = .{ .value = ap };
+                        args[1] = .{ .value = bp };
+                        return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool) };
+                    },
+                    .store_byte => {
+                        const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const addr = operandValue(try lowerExpr(b, sargs[0]));
+                        const val = operandValue(try lowerExpr(b, sargs[1]));
+                        _ = try b.emit(.{ .store_byte = .{ .addr = addr, .val = val } }, null);
+                        return .none;
+                    },
+                    .load_byte => {
+                        const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const addr = operandValue(try lowerExpr(b, largs[0]));
+                        return .{ .value = try b.emit(.{ .load_byte = addr }, Typecheck.Type.int) };
+                    },
+                    else => {},
+                };
+            }
+            if ((callee_node.tag == .identifier or callee_node.tag == .field_access) and
+                callee_res.func < b.in.sigs.len and b.in.sigs[callee_res.func].isGenericTemplate())
+            {
+                // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`: the callee
+                // (plain identifier, or a field_access `resolveModuleMember` bound to `.func`)
+                // resolves to a generic template (its sig params carry `type_var`s). Re-run
+                // the SHARED matcher over the value-arg node_types to pick the SAME instance
+                // Pass C / scanCalls selected, then use its mangled name (mirroring the
+                // type_app branch). A miss (arity/conflict/unbound/unminted) is an internal
+                // invariant break — Pass C already gated it — so note-and-drop.
+                const sig = b.in.sigs[callee_res.func];
+                const value_args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                const arg_types = try b.gpa.alloc(Typecheck.Type, value_args.len);
+                defer b.gpa.free(arg_types);
+                for (value_args, 0..) |va, i| arg_types[i] = b.in.node_types[(va).int()];
+                // FIND regime: the composite table is gone, so a container param (`Vec[T]`)
+                // cannot be re-inferred here. The FLAT portion re-runs the shared matcher
+                // (byte-identical to before — pure-flat calls resolve here and never touch
+                // the fallback); a container/mixed call resolves by matching the reified
+                // value-arg types against each instance's already-reified `params`.
+                var ii: ?usize = null;
+                if (sigHasTypeVar(sig)) {
+                    if (try Infer.infer(b.gpa, genericParamCount(sig), sig.params, arg_types, null)) |targs| {
+                        defer b.gpa.free(targs);
+                        ii = Mono.find(b.in.instances, callee_res.func, targs);
+                    }
+                }
+                if (ii == null) ii = Mono.findByReifiedParams(b.in.instances, callee_res.func, arg_types);
+                const inst = ii orelse {
+                    try b.note(callee_node.main_token, "unresolved generic instance in lower");
+                    return .none;
+                };
+                callee = .{ .kind = .user_fn, .name = b.in.instances[inst].name.? };
+            } else {
+                callee = b.in.names[callee_res.func];
+            }
+        },
     }
     const result_ty = b.in.node_types[(node_idx).int()];
 
@@ -2299,31 +2192,10 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
 /// Misclassifying a call as construction inlines a wrong-layout variant and drops
 /// the call → silent miscompile / infinite recursion.
 fn isQualifiedVariantCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool {
-    // A method returning an enum ALSO parses as `.call` over an unresolved
-    // field_access callee, so it would otherwise be misrouted to variant
-    // construction. Distinguish by the receiver being a VALUE with a resolved method.
-    // A native `Option`/`Result` method returning an enum payload (agg-T `unwrap`) ALSO
-    // parses as `.call` over an unresolved field_access and has no `t.methods` entry, so
-    // exclude it explicitly — else it misroutes as a variant construction. Scalar-T
-    // is unaffected (its result is int/bool, so `ty.kind != .@"enum"` short-circuits).
-    // A `.try_into()` returning `Result[T, ConvErr]` ALSO parses as `.call` over an
-    // unresolved field_access with no `t.methods` entry and is not an
-    // `optionResultMethodCallee`, so exclude it too — else it misroutes as a variant
-    // construction (silent miscompile).
-    const legacy = ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
-        b.in.resolutions[(n.lhs).int()] != .func and methodGidOf(b, n) == null and
-        optionResultMethodCallee(b, n) == null and builtinConvCallee(b, n) == null;
-    if (builtin.mode == .Debug) shadowCtorCall(b, n, ty, legacy);
-    return legacy;
-}
-
-noinline fn shadowCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type, legacy: bool) void {
-    const table = calleeOf(b, n);
-    const from_table = ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
-        b.in.resolutions[(n.lhs).int()] != .func and table == .none;
-    if (from_table == legacy) return;
-    if (legacy and receiverMethodExempt(b, n, .none, table)) return;
-    std.debug.panic("callee shadow: ctor predicate at token {d} legacy {any} table {any}", .{ n.main_token, legacy, table });
+    // A method or builtin returning an enum has this same call shape; only the checker's
+    // Callee tells the two apart.
+    return ty.kind == .@"enum" and b.in.tree.nodes[(n.lhs).int()].tag == .field_access and
+        b.in.resolutions[(n.lhs).int()] != .func and calleeOf(b, n) == .none;
 }
 
 /// A tuple-struct constructor call `N(args)` in lower. A struct-typed `.call` over an
@@ -2349,147 +2221,109 @@ fn lowerTupleStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueI
     }
 }
 
-/// The `Method` a method call `recv.m(args)` dispatches to, or null when `n` is
-/// not a method call. A method callee is a `field_access` NOT bound to a `.func`
-/// (that is a qualified module call) whose receiver types to a concrete struct/enum
-/// with a matching entry in the method table. A pure content-keyed lookup (no
-/// hashmap/thread order), so it is identical at any `-jN`. Returns the whole
-/// `Method` (not just `fn_id`) so the caller reads `mut_self` for the by-address
-/// receiver ABI; `null`-semantics are unchanged for the ctor-call classifier.
-fn methodGidOf(b: *Builder, n: Ast.Node) ?Typecheck.Method {
-    return b.in.methods[methodIdxOf(b, n) orelse return null];
-}
-
-fn methodIdxOf(b: *const Builder, n: Ast.Node) ?u32 {
-    // Two callee shapes are method dispatch: a bare `field_access` `v.m` (explicit args
-    // null), and an explicit-protocol-args `type_app` over a `field_access` `v.m[int]`
-    //. A qualified fn / qualified generic fn binds its field_access to `.func` and
-    // is NOT a method — exclude both shapes on that.
-    var cn = b.in.tree.nodes[(n.lhs).int()];
-    var fa_idx = n.lhs;
-    var explicit_args: ?[]const Typecheck.Type = null;
-    var explicit_buf: [8]Typecheck.Type = undefined;
-    if (cn.tag == .type_app) {
-        const inner_idx = cn.lhs;
-        if (b.in.tree.nodes[(inner_idx).int()].tag != .field_access) return null;
-        if (b.in.resolutions[(inner_idx).int()] == .func) return null; // qualified generic fn
-        const targ_nodes = Ast.rangeSlice(b.in.tree, (cn.rhs).int());
-        if (targ_nodes.len > explicit_buf.len) return null; // defensive; a well-typed call is small
-        for (targ_nodes, 0..) |tn, i| explicit_buf[i] = b.in.node_types[(tn).int()];
-        explicit_args = explicit_buf[0..targ_nodes.len];
-        fa_idx = inner_idx;
-        cn = b.in.tree.nodes[(inner_idx).int()];
-    } else {
-        if (cn.tag != .field_access) return null;
-        if (b.in.resolutions[(n.lhs).int()] == .func) return null;
-    }
-    const recv = b.in.node_types[(cn.lhs).int()];
-    // Dispatch through the real Method path for any nominal OR builtin scalar receiver
-    //: a user `impl int has P` registered a real `fn_id` on `recv = Type.int`, so
-    // the resolver selects it. A builtin scalar `eq` has NO method entry (the recognizer
-    // is pure) → this misses → `lowerCall`'s `builtinScalarEqCallee` branch fires. Reject
-    // only the non-dispatchable kinds (invalid/never/type_var/app never reach lower).
-    switch (recv.kind) {
-        .@"struct", .@"enum", .int, .bool, .str, .unit => {},
-        else => return null,
-    }
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    // The SAME multi-conformance disambiguation the checker + fingerprint use, so all
-    // three select the identical witness (a divergence would be a miscompile or `-jN`
-    // break). `.ambiguous`/`.none` -> not dispatchable here (the checker already erred).
-    const mi = switch (Typecheck.pickMethodIndex(b.in.methods, recv, member, null, explicit_args)) {
-        .one => |i| i,
-        else => return null,
-    };
-    // Defense in depth: a `mut self` method on a builtin scalar is rejected at check
-    // time (T0022) because the by-address self ABI has no write-back path. Never
-    // dispatch one here so a stray lower can't turn the receiver's slot address into
-    // the callee's value slot; a well-typed program never reaches this.
-    if (b.in.methods[mi].mut_self and recv.kind != .@"struct" and recv.kind != .@"enum") return null;
-    return mi;
-}
-
-/// A builtin scalar `eq` call `recv.eq(arg)`: the callee is a `field_access` NOT
-/// bound to a `.func`, the receiver types to a scalar the recognizer accepts, and there
-/// is exactly one arg (the checker already gated arity). Returns the receiver + arg
-/// nodes so `lowerCall` can emit an inline `icmp eq` (no `.call`, no external symbol, so
-/// nothing folds into a reloc — pure a-function-of-source, `--verify`-stable). Null when
-/// `n` is not such a call (so `lowerCall` falls through to its normal resolution).
-fn builtinScalarEqCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index, arg: Ast.Index } {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    if (Typecheck.builtinScalarMethod(b.in.node_types[(cn.lhs).int()], member) == null) return null;
+// noinline keeps the builtin arms' locals out of the frame of `lowerCall`, which the
+// lowerer re-enters once per nested call.
+/// A builtin method call the checker recorded as `k`: no `.call`/symbol, each lowers
+/// inline to machine ops. The string builtins are immutable/functional: `concat` and an
+/// int/bool `to_string` produce a fresh `str`, a `str` `to_string` shares the receiver,
+/// `len`/`byte_at` read the value.
+noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k: Callee.Builtin) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.bool;
+    const fa_node = b.in.tree.nodes[Callee.memberNode(b.in.tree, n).?.int()];
+    const recv = fa_node.lhs;
     const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-    if (args.len != 1) return null;
-    return .{ .recv = cn.lhs, .arg = args[0] };
+    switch (k) {
+        .scalar_eq => {
+            // int/bool lower to an inline `icmp eq`. str/unit route through the SAME
+            // `lowerEqValue` the `==` operator uses (heap-free byte-compare / trivially
+            // -true bconst), so `a.eq(b)` and `a == b` emit identical IR.
+            std.debug.assert(args.len == 1);
+            const recv_ty = b.in.node_types[(recv).int()];
+            if (isInlineEq(recv_ty.kind)) {
+                const lhs = operandValue(try lowerExpr(b, recv));
+                const rhs = operandValue(try lowerExpr(b, args[0]));
+                return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
+            }
+            return try lowerEqValue(b, recv_ty, recv, args[0], false);
+        },
+        .scalar_hash => {
+            // The completeness layer so `[T has Hash]` works at a scalar T: int/bool hash
+            // to their own VALUE (an int is its own hash, a bool is 0/1); str folds its
+            // bytes via the SAME heap-free polynomial the derive uses (`hashStrAtPtr`);
+            // unit hashes to the fixed seed (the sole `()` value).
+            const recv_ty = b.in.node_types[(recv).int()];
+            switch (recv_ty.kind) {
+                .int, .bool => return .{ .value = operandValue(try lowerExpr(b, recv)) },
+                .str => {
+                    const op = try lowerExpr(b, recv);
+                    const s = operandSlot(op);
+                    if (s == Ir.none_slot) {
+                        try b.note(fa_node.main_token, "str '.hash()' operand is not a slot in lower");
+                        return .{ .value = try b.emit(.{ .iconst = 0 }, Typecheck.Type.int) };
+                    }
+                    const base = try b.emit(.{ .slot_addr = s }, Typecheck.Type.int);
+                    return .{ .value = try hashStrAtPtr(b, base) };
+                },
+                else => {
+                    _ = try lowerExpr(b, recv); // unit: evaluate for effect, hash a constant
+                    return .{ .value = try b.emit(.{ .iconst = hash_seed }, Typecheck.Type.int) };
+                },
+            }
+        },
+        .str_concat => return try lowerStrConcat(b, node_idx, recv, args[0]),
+        .str_len => {
+            const base = try strBase(b, recv);
+            const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+            return .{ .value = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty) };
+        },
+        .str_byte_at => {
+            const base = try strBase(b, recv);
+            const i = operandValue(try lowerExpr(b, args[0]));
+            const len_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = int_ty } }, int_ty);
+            const len = try b.emit(.{ .load = .{ .addr = len_addr, .ty = int_ty } }, int_ty);
+            // Two guards to a shared panic block (emitZeroGuard-style): i < 0, then i >= len.
+            const zero = try b.emit(.{ .iconst = 0 }, int_ty);
+            const neg = try b.emit(.{ .icmp = .{ .cc = .lt, .lhs = i, .rhs = zero } }, bool_ty);
+            const chk2 = try b.addBlock();
+            const panic_blk = try b.addBlock();
+            b.setTerm(.{ .cond_br = .{ .cond = neg, .t = panic_blk, .f = chk2 } });
+            b.switchTo(chk2);
+            const over = try b.emit(.{ .icmp = .{ .cc = .ge, .lhs = i, .rhs = len } }, bool_ty);
+            const cont = try b.addBlock();
+            b.setTerm(.{ .cond_br = .{ .cond = over, .t = panic_blk, .f = cont } });
+            b.switchTo(panic_blk);
+            b.setTerm(.{ .panic = .index_oob });
+            b.switchTo(cont);
+            const ptr = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
+            const bx = try b.emit(.{ .add = .{ .lhs = ptr, .rhs = i } }, int_ty);
+            return .{ .value = try b.emit(.{ .load_byte = bx }, int_ty) };
+        },
+        .scalar_to_string => {
+            // The `displayToSlot` renderer. `str` is identity (share the immutable receiver,
+            // no alloc); int/bool/unit build a fresh str (via `__int_to_str` / the literal
+            // cond / the const-data `"()"`).
+            const recv_ty = b.in.node_types[(recv).int()];
+            if (recv_ty.kind == .str) return try lowerExpr(b, recv);
+            const op = try lowerExpr(b, recv);
+            return .{ .slot = try displayToSlot(b, recv_ty, op) };
+        },
+        .display_to_string => {
+            // A struct/enum (incl `char`) `.to_string()`: render through the `displayToSlot`
+            // authority. A custom `impl Display` and a structural derive land in the same
+            // witness call, which is what makes `to_string` universal.
+            const recv_ty = b.in.node_types[(recv).int()];
+            const op = try lowerExpr(b, recv);
+            return .{ .slot = try displayToSlot(b, recv_ty, op) };
+        },
+        .opt_is_tag0, .opt_is_tag1, .opt_unwrap, .opt_unwrap_or => return try lowerOptionResultMethod(b, n, .{ .recv = recv, .op = Typecheck.builtinOptResult(k).? }),
+        .conv_into => return try lowerConvMethod(b, node_idx, .{ .recv = recv, .into = true }),
+        .conv_try_into => return try lowerConvMethod(b, node_idx, .{ .recv = recv, .into = false }),
+    }
 }
 
-/// A builtin scalar `.hash()` call `recv.hash()`: the callee is a `field_access` NOT
-/// bound to a `.func`, the member is `hash`, the receiver types to a scalar the recognizer
-/// accepts, and there are zero args. Returns the receiver node so `lowerCall` can emit the
-/// identity value / byte polynomial / constant inline (no `.call`, no external symbol —
-/// pure a-function-of-source, `--verify`-stable). Null when `n` is not such a call (a
-/// struct/enum `.hash()` was already dispatched to its derive unit by `methodGidOf`).
-fn builtinScalarHashCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index } {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    if (!std.mem.eql(u8, member, "hash")) return null;
-    const bm = Typecheck.builtinScalarMethod(b.in.node_types[(cn.lhs).int()], member) orelse return null;
-    if (bm.arity != 0) return null;
-    if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
-    return .{ .recv = cn.lhs };
-}
-
-/// A builtin string method call `recv.concat(o)`/`.len()`/`.byte_at(i)`/`.to_string()`:
-/// the callee is a `field_access` NOT bound to a `.func` whose receiver the recognizer
-/// accepts. A separate classifier from `builtinScalarEqCallee` (which keys on any arity-1
-/// scalar method WITHOUT checking the name) so `concat`/`byte_at` cannot misroute to `eq`.
-fn builtinStrMethodCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index, member: []const u8 } {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    if (Typecheck.builtinStrMethod(b.in.node_types[(cn.lhs).int()], member) == null) return null;
-    return .{ .recv = cn.lhs, .member = member };
-}
-
-/// A struct/enum (incl `char`) `recv.to_string()`: the callee is a `field_access` NOT bound
-/// to a `.func` (a user `fn to_string` in an `impl` binds `.func` and stays on normal
-/// dispatch), the member is `to_string`, the receiver types to a struct/enum, and there are
-/// zero args. The aggregate counterpart to `builtinStrMethodCallee` (which handles the
-/// str/int/bool receivers); both route their result through `displayToSlot`.
-fn displayToStringCallee(b: *Builder, n: Ast.Node) ?struct { recv: Ast.Index } {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    if (!std.mem.eql(u8, member, "to_string")) return null;
-    const rt = b.in.node_types[(cn.lhs).int()];
-    if (rt.kind != .@"struct" and rt.kind != .@"enum") return null;
-    if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
-    return .{ .recv = cn.lhs };
-}
-
-/// A target-directed `.into()` / `.try_into()` conversion call on an integer receiver:
-/// the callee is a `field_access` NOT bound to a `.func`, the receiver types to an
-/// integer, the member is `into`/`try_into`, and there are zero args (the checker already
-/// gated arity + the target). Returns the receiver node + member so `lowerCall` can emit
-/// the inline mask/extend (`into`) or the range-checked `Result` build (`try_into`) — no
-/// `.call`, no external symbol, so it is a pure function of source (`--verify`-stable).
-/// Null when `n` is not such a call. A user `protocol Into` on a STRUCT never matches
-/// (integer-receiver guard), so it stays on the normal method-dispatch path.
-const ConvCall = struct { recv: Ast.Index, member: []const u8 };
-
-fn builtinConvCallee(b: *Builder, n: Ast.Node) ?ConvCall {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    const recv_ty = b.in.node_types[(cn.lhs).int()];
-    if (!recv_ty.isInteger() and !isCharTy(b, recv_ty) and recv_ty.kind != .float) return null;
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    if (!std.mem.eql(u8, member, "into") and !std.mem.eql(u8, member, "try_into")) return null;
-    if (Ast.rangeSlice(b.in.tree, (n.rhs).int()).len != 0) return null;
-    return .{ .recv = cn.lhs, .member = member };
-}
+/// `into` picks the lossless `into` over the fallible `try_into`.
+const ConvCall = struct { recv: Ast.Index, into: bool };
 
 /// Whether `ty` is the compiler-provided `char` struct (the id the checker used, threaded
 /// via `Inputs.char_struct`). Null (a prelude-less test caller) means no type is char.
@@ -2497,73 +2331,13 @@ pub fn isCharTy(b: *const Builder, ty: Typecheck.Type) bool {
     return Typecheck.isCharTy(ty, b.in.char_struct);
 }
 
-/// A native inherent method call on a reified `Option`/`Result` instance: the
-/// callee is a `field_access` NOT bound to a `.func`, the receiver types to a reified
-/// enum whose `native_family` is set (the robust per-instance key — a user `enum Option`
-/// mangles to the same `Option$int` yet has `.none`), and the member is one of the 8
-/// names. Returns the receiver node + the recognized op so `lowerCall` can inline the
-/// tag test / payload load (no `.call`, no external symbol — pure a-function-of-source,
-/// `--verify`-stable). Null when `n` is not such a call.
 const OptResultCall = struct { recv: Ast.Index, op: Typecheck.OptResultMethod };
-
-fn optionResultMethodCallee(b: *Builder, n: Ast.Node) ?OptResultCall {
-    const cn = b.in.tree.nodes[(n.lhs).int()];
-    if (cn.tag != .field_access or b.in.resolutions[(n.lhs).int()] == .func) return null;
-    const recv_ty = b.in.node_types[(cn.lhs).int()];
-    if (recv_ty.kind != .@"enum" or recv_ty.enum_id >= b.in.enum_layouts.len) return null;
-    const fam = b.in.enum_layouts[recv_ty.enum_id].native_family;
-    const member = b.in.tokens[cn.main_token].text(b.in.source);
-    const op = Typecheck.optionResultMethod(fam, member) orelse return null;
-    return .{ .recv = cn.lhs, .op = op };
-}
 
 /// The checker's selection for call `n`, read from its member node's slot.
 fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
     const fa = Callee.memberNode(b.in.tree, n) orelse return .none;
     if (fa.int() >= b.in.callees.len) return .none;
     return b.in.callees[fa.int()].view();
-}
-
-/// The selection `lowerCall`'s classifier chain makes, in the chain's order.
-noinline fn legacyCallee(b: *Builder, n: Ast.Node) Callee.View {
-    if (methodIdxOf(b, n)) |i| return .{ .method = i };
-    if (b.in.tree.nodes[(n.lhs).int()].tag == .type_app) return .none;
-    if (builtinScalarEqCallee(b, n) != null) return .{ .builtin = .scalar_eq };
-    if (builtinScalarHashCallee(b, n) != null) return .{ .builtin = .scalar_hash };
-    if (builtinStrMethodCallee(b, n)) |sm|
-        return .{ .builtin = Typecheck.builtinStrMethod(b.in.node_types[(sm.recv).int()], sm.member).?.builtin };
-    if (displayToStringCallee(b, n) != null) return .{ .builtin = .display_to_string };
-    if (optionResultMethodCallee(b, n)) |om| return .{ .builtin = Typecheck.optResultBuiltin(om.op) };
-    if (builtinConvCallee(b, n)) |cv|
-        return .{ .builtin = if (std.mem.eql(u8, cv.member, "into")) .conv_into else .conv_try_into };
-    return .none;
-}
-
-const CalleeMismatch = struct { legacy: Callee.View, table: Callee.View };
-
-noinline fn calleeMismatch(b: *Builder, n: Ast.Node) ?CalleeMismatch {
-    const legacy = legacyCallee(b, n);
-    const table = calleeOf(b, n);
-    if (std.meta.eql(legacy, table)) return null;
-    if (receiverMethodExempt(b, n, legacy, table)) return null;
-    return .{ .legacy = legacy, .table = table };
-}
-
-/// The checker dispatches methods on float and rawptr receivers, but `methodIdxOf`'s
-/// kind gate rejects them (lower then reports "call target unsupported"). The table is
-/// right; the legacy chain is the known gap, which closes once lower reads the table.
-fn receiverMethodExempt(b: *const Builder, n: Ast.Node, legacy: Callee.View, table: Callee.View) bool {
-    if (legacy != .none or table != .method) return false;
-    const fa = Callee.memberNode(b.in.tree, n) orelse return false;
-    const recv = b.in.tree.nodes[fa.int()].lhs;
-    if (recv.int() >= b.in.node_types.len) return false;
-    const kind = b.in.node_types[recv.int()].kind;
-    return kind == .float or kind == .rawptr;
-}
-
-noinline fn shadowCallee(b: *Builder, n: Ast.Node) void {
-    const m = calleeMismatch(b, n) orelse return;
-    std.debug.panic("callee shadow: token {d} legacy {any} table {any}", .{ n.main_token, m.legacy, m.table });
 }
 
 /// Inline a native `Option`/`Result` method. The receiver is materialized into a
@@ -2573,8 +2347,8 @@ noinline fn shadowCallee(b: *Builder, n: Ast.Node) void {
 /// `tag == 0` means present. `is_some`/`is_ok` = `tag == 0`; `is_none`/`is_err` =
 /// `tag == 1`; `unwrap` cond-branches to a `.trap` on absence; `unwrap_or` merges the
 /// payload / the default through a join block-arg. Scalar-payload T only (the accept
-/// set is int/bool); aggregate-payload T is deferred (the classifiers below already
-/// exclude native calls so it won't misroute as a variant construction).
+/// set is int/bool); aggregate-payload T is deferred (its builtin Callee already keeps it
+/// from misrouting as a variant construction).
 fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.bool;
@@ -2731,7 +2505,7 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     const recv_ty = b.in.node_types[(cv.recv).int()];
     const recv_is_char = isCharTy(b, recv_ty);
 
-    if (std.mem.eql(u8, cv.member, "into")) {
+    if (cv.into) {
         if (recv_is_char) {
             // char -> int: the codepoint field, re-canonicalized (uxt) to a clean value.
             const v = try loadCharCodepoint(b, cv.recv);
@@ -5685,20 +5459,21 @@ test "whole-self value read copies the pointee into a fresh temp" {
     );
 }
 
-test "callee shadow flags a table that disagrees with the legacy chain" {
-    if (builtin.mode != .Debug) return error.SkipZigTest;
-    const gpa = testing.allocator;
+/// `fn main` of `src` lowered with the Callee slot of its `member` call replaced by
+/// `slot`, keeping the IR text and every lower diagnostic message.
+const OverriddenLowering = struct {
+    ir: []u8,
+    notes: [][]const u8,
+
+    fn deinit(self: OverriddenLowering, gpa: std.mem.Allocator) void {
+        gpa.free(self.ir);
+        gpa.free(self.notes);
+    }
+};
+
+fn lowerMainWithCallee(gpa: std.mem.Allocator, src: []const u8, member: []const u8, slot: Callee) !OverriddenLowering {
     const Lexer = @import("lex.zig");
     const Parser = @import("parse.zig");
-    const src =
-        \\struct Acc { n: int }
-        \\impl Acc { fn plus(self, a: int) -> int { self.n + a } }
-        \\fn main() -> int {
-        \\  acc := Acc { n: 1 }
-        \\  return acc.plus(1)
-        \\}
-        \\
-    ;
     const tokens = try Lexer.tokenize(gpa, src);
     defer gpa.free(tokens);
     const tree = try Parser.expectTree(gpa, tokens, src);
@@ -5708,40 +5483,108 @@ test "callee shadow flags a table that disagrees with the legacy chain" {
     }
     var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
     defer fe.deinit(gpa);
+    const rr = fe.resolve;
     const tc = fe.typecheck;
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
+    const names = try gpa.alloc(Link.SymName, rr.fns.len);
+    defer gpa.free(names);
+    var main_gid: ?usize = null;
+    for (rr.fns, 0..) |gf, i| {
+        names[i] = .{ .kind = if (gf.decl_node == Ast.none) .builtin else .user_fn, .name = gf.name };
+        if (gf.decl_node != Ast.none and std.mem.eql(u8, gf.name, "main")) main_gid = i;
+    }
+    const gid = main_gid orelse return error.TestExpectedMain;
+
     const cs = try gpa.dupe(Callee, tc.callees[0]);
     defer gpa.free(cs);
+    const t: Ast.Tree = .{ .nodes = tree.nodes, .extra = tree.extra };
+    const fa = for (tree.nodes) |n| {
+        if (n.tag != .call) continue;
+        const f = Callee.memberNode(t, n) orelse continue;
+        if (std.mem.eql(u8, tokens[tree.nodes[f.int()].main_token].text(src), member)) break f;
+    } else return error.TestExpectedMethodCall;
+    cs[fa.int()] = slot;
+
+    const in = Inputs{
+        .tree = t,
+        .tokens = tokens,
+        .source = src,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
+        .callees = cs,
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .sig = tc.sigs[gid],
+        .instances = tc.instances,
+        .sigs = tc.sigs,
+        .methods = tc.methods,
+        .derives = tc.derives,
+        .prelude_ids = tc.prelude_ids,
+    };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
-    var b: Builder = .{
-        .gpa = gpa,
-        .in = .{
-            .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
-            .tokens = tokens,
-            .source = src,
-            .resolutions = fe.resolve.resolutions[0],
-            .node_types = tc.node_types[0],
-            .callees = cs,
-            .layouts = tc.layouts,
-            .enum_layouts = tc.enum_layouts,
-            .names = &.{},
-            .methods = tc.methods,
-            .derives = tc.derives,
-            .prelude_ids = tc.prelude_ids,
-        },
-        .ret_type = Typecheck.Type.int,
-        .diags = &diags,
-    };
-    defer b.deinit();
+    var func = try lowerFn(gpa, in, rr.fns[gid].decl_node, names[gid], true, &diags);
+    defer func.deinit(gpa);
 
-    const call = for (tree.nodes) |n| {
-        if (n.tag == .call and Callee.memberNode(b.in.tree, n) != null) break n;
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
+    const ir = try gpa.dupe(u8, w.buffered());
+    errdefer gpa.free(ir);
+    const notes = try gpa.alloc([]const u8, diags.items.len);
+    for (diags.items, notes) |d, *msg| msg.* = d.message;
+    return .{ .ir = ir, .notes = notes };
+}
+
+const acc_plus_src =
+    \\struct Acc { n: int }
+    \\impl Acc { fn plus(self, a: int) -> int { self.n + a } }
+    \\fn main() -> int {
+    \\  acc := Acc { n: 1 }
+    \\  return acc.plus(1)
+    \\}
+    \\
+;
+
+test "lowerCall dispatches through the Callee table" {
+    const gpa = testing.allocator;
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+    const tokens = try Lexer.tokenize(gpa, acc_plus_src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, acc_plus_src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, acc_plus_src);
+    defer fe.deinit(gpa);
+    const picked = for (tree.nodes) |n| {
+        if (n.tag != .call) continue;
+        const fa = Callee.memberNode(.{ .nodes = tree.nodes, .extra = tree.extra }, n) orelse continue;
+        break fe.typecheck.callees[0][fa.int()];
     } else return error.TestExpectedMethodCall;
-    try testing.expect(calleeMismatch(&b, call) == null);
-    cs[Callee.memberNode(b.in.tree, call).?.int()] = .{};
-    const m = calleeMismatch(&b, call) orelse return error.TestExpectedMismatch;
-    try testing.expect(m.legacy == .method);
-    try testing.expect(m.table == .none);
+    try testing.expect(picked.view() == .method);
+
+    const dispatched = try lowerMainWithCallee(gpa, acc_plus_src, "plus", picked);
+    defer dispatched.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), dispatched.notes.len);
+    try testing.expect(std.mem.indexOf(u8, dispatched.ir, "call @main.Acc.plus(") != null);
+
+    const blanked = try lowerMainWithCallee(gpa, acc_plus_src, "plus", .{});
+    defer blanked.deinit(gpa);
+    try testing.expect(std.mem.indexOf(u8, blanked.ir, "call @main.Acc.plus(") == null);
+    for (blanked.notes) |msg| {
+        if (std.mem.eql(u8, msg, "call target unsupported in lower")) break;
+    } else return error.TestExpectedUnsupportedNote;
+}
+
+test "a protocol callee reaching lower is a note, not UB" {
+    const gpa = testing.allocator;
+    const lowered = try lowerMainWithCallee(gpa, acc_plus_src, "plus", Callee.protocolMethod(0, 0));
+    defer lowered.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), lowered.notes.len);
+    try testing.expectEqualStrings("protocol callee in lower", lowered.notes[0]);
 }
