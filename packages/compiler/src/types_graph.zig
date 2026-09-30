@@ -719,3 +719,135 @@ test "callee tables are byte-identical at -j1 and -jN" {
     try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.protocol)] > 0);
     try testing.expectEqual(@as(usize, 0), serial_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
 }
+
+/// The reified layout table of one check of `graph` under a `limit`-worker pool, as
+/// bytes: every layout's name, then its fn signature's kind/id bytes when it is a fn
+/// pair; then every instance name. Requires an error-free check.
+fn fnLayoutsUnder(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *ResolveGraph.GraphResult,
+    limit: Io.Limit,
+    pairs: *usize,
+) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
+    defer tr.deinit(gpa);
+    for (tr.diags) |d| try testing.expect(d.severity != .err);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    pairs.* = 0;
+    for (tr.layouts) |l| {
+        try out.appendSlice(gpa, l.name);
+        try out.append(gpa, 0);
+        if (l.fn_sig) |fs| {
+            pairs.* += 1;
+            for (fs.params) |p| try p.appendKeyBytes(gpa, &out);
+            try fs.ret.appendKeyBytes(gpa, &out);
+        }
+    }
+    for (tr.instances) |inst| {
+        try out.appendSlice(gpa, inst.name.?);
+        try out.append(gpa, 0);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "fn-type reification is identical at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-fntypes-jn";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // Each body interns one distinct and one shared fn type during the parallel Pass C
+    // (inside a `Vec[..]` annotation, so the composite index order depends on which
+    // worker gets there first), across more fns than the fan-out threshold.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll(
+        \\import std/vec
+        \\pub struct H { id: int, run: fn(str) -> bool }
+        \\pub fn keep(h: H, _g: fn(H) -> int) -> int { h.id }
+        \\
+    );
+    const scalars = [_][]const u8{ "int", "bool", "str" };
+    for (0..70) |k| {
+        try src.writer.print("fn _f{d}() -> int {{\n    v: Vec[fn(", .{k});
+        var rest = k;
+        for (0..4) |i| {
+            if (i != 0) try src.writer.writeAll(", ");
+            try src.writer.writeAll(scalars[rest % 3]);
+            rest /= 3;
+        }
+        try src.writer.writeAll(
+            \\) -> int] = []
+            \\    w: Vec[fn(int) -> Vec[int]] = []
+            \\    return v.len() + w.len()
+            \\}
+            \\
+        );
+    }
+    try src.writer.writeAll("fn main() -> int { return 0 }\n");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r.diags.len);
+
+    var serial_pairs: usize = 0;
+    var parallel_pairs: usize = 0;
+    const serial = try fnLayoutsUnder(gpa, &graph, &r, .limited(0), &serial_pairs);
+    defer gpa.free(serial);
+    const parallel = try fnLayoutsUnder(gpa, &graph, &r, .limited(8), &parallel_pairs);
+    defer gpa.free(parallel);
+
+    try testing.expectEqualSlices(u8, serial, parallel);
+    // 70 distinct, the shared one, H's field and keep's param.
+    try testing.expectEqual(@as(usize, 73), serial_pairs);
+    try testing.expectEqual(serial_pairs, parallel_pairs);
+}
+
+test "Vec[fn(int) -> int] mints a trace unit and no hash/eq unit for the pair" {
+    try withCheckedGraph(".toy-test-fn-trace", &.{
+        .{ .path = "main.toy", .source =
+        \\import std/vec
+        \\fn main() -> int {
+        \\    v: Vec[fn(int) -> int] = []
+        \\    return v.len()
+        \\}
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(_: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            for (tr.diags) |d| try testing.expect(d.severity != .err);
+            var traces: usize = 0;
+            for (tr.erased_units) |u| {
+                if (!@import("layout/Engine.zig").isFnStruct(u.ty, tr.layouts)) continue;
+                try testing.expectEqual(@import("symbols/Derive.zig").ErasedKind.trace, u.kind);
+                traces += 1;
+            }
+            try testing.expectEqual(@as(usize, 1), traces);
+            var descs: usize = 0;
+            for (tr.descriptor_types) |d| if (@import("layout/Engine.zig").isFnStruct(d.ty, tr.layouts)) {
+                try testing.expect(!d.hashable);
+                descs += 1;
+            };
+            try testing.expectEqual(@as(usize, 1), descs);
+        }
+    }.check);
+}

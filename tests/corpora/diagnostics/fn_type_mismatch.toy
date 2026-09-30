@@ -1,0 +1,8 @@
+pub fn check(g: fn(int) -> int) -> int {
+    _h: fn(bool) -> int = g  #~ ERROR [T0041] cannot bind fn(int) -> int to '_h' of type fn(bool) -> int
+    return 0
+}
+
+fn main() -> int {
+    return 0
+}

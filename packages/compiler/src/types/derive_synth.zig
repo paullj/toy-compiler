@@ -11,6 +11,7 @@ const Method = Typecheck.Method;
 const DeriveRecipe = Typecheck.DeriveRecipe;
 const Derive = @import("../symbols/Derive.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
+const LayoutEngine = @import("../layout/Engine.zig");
 
 const conforms = Typecheck.conform.structural;
 
@@ -51,6 +52,9 @@ fn needsTrace(t: *Typecheck, ty: Type, count_str: bool, memo: *std.AutoHashMapUn
         .@"struct", .@"enum" => {},
         else => return false,
     }
+    // A fn pair's env word is a managed pointer the element walk must mark; its `rawptr`
+    // component type alone reads as unmanaged.
+    if (count_str and LayoutEngine.isFnStruct(ty, t.structs.items)) return true;
     const key = (@as(u64, ty.nominalId()) << 1) | @intFromBool(ty.kind == .@"enum");
     if (memo.get(key)) |v| return v;
     // Pre-seed `false` so a self-referential probe (should not occur for by-value types, but

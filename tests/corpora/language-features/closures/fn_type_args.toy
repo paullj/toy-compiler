@@ -1,0 +1,9 @@
+# Feature: a function type as a type argument in expression position (`Vec[fn(int) -> int].new()`, `Map[K, fn() -> V].new()`)
+# expect: exit 7
+import std/map
+import std/vec
+fn main() -> int {
+    v := Vec[fn(int) -> int].new()
+    m := Map[int, fn() -> bool].new()
+    return 7 + v.len() + m.len()
+}

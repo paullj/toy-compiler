@@ -381,10 +381,10 @@ fn renderType(
                 try out.print("enum#{d}", .{ty.enum_id});
             }
         },
-        // A check-time generic type-var / composite `App` is substituted/reified to a
-        // concrete kind before any IR is built (monomorphization tail), so it
-        // never reaches rendering.
-        .type_var, .app => unreachable,
+        // A check-time generic type-var / composite `App` / fn type is substituted/
+        // reified to a concrete kind before any IR is built (monomorphization tail), so
+        // it never reaches rendering.
+        .type_var, .app, .func => unreachable,
     }
 }
 

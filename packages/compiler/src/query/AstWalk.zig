@@ -508,6 +508,13 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .count = @intCast(args.len) });
             for (args) |a| try walkInner(src, a, collect, visitor);
         },
+        .fn_type => {
+            const params = Ast.rangeSlice(tree, n.lhs.int());
+            try emit(visitor, .{ .count = @intCast(params.len) }); // fn(int) != fn(int, int)
+            for (params) |p| try walkInner(src, p, collect, visitor);
+            try emit(visitor, .{ .flag = n.rhs != Ast.none }); // fn(int) != fn(int) -> int
+            if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor);
+        },
         .pattern_binding => {
             try emit(visitor, .{ .leaf = leaf });
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // rename vs pun
@@ -1483,6 +1490,27 @@ test "[CROSS-MODULE TYPE-REF] threaded fn_sig folds the sig's type, not a bare-n
     }
     try testing.expect(found != null);
     try testing.expectEqualSlices(u8, expect_buf.items, found.?);
+}
+
+test "a fn_type annotation folds arity and ret presence" {
+    const gpa = testing.allocator;
+    const sources = [_][]const u8{
+        "fn f(g: fn(int) -> int) {}\n",
+        "fn f(g: fn(int)) {}\n",
+        "fn f(g: fn(int, int) -> int) {}\n",
+        "fn f(g: fn(int) -> bool) {}\n",
+        "fn f(g: fn() -> int) {}\n",
+    };
+    var fps: [sources.len]u64 = undefined;
+    for (sources, 0..) |src, i| {
+        var b = try build(gpa, src);
+        defer b.deinit(gpa);
+        var h = std.hash.Wyhash.init(0);
+        var hv = HashVisitor{ .h = &h };
+        try walk(b.src(), b.fnDecl(0), &hv);
+        fps[i] = h.final();
+    }
+    for (fps, 0..) |a, i| for (fps[i + 1 ..]) |c| try testing.expect(a != c);
 }
 
 test "the .operator event is IGNORED by the hash (int == fingerprint unchanged)" {

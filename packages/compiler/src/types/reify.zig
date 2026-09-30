@@ -3,6 +3,8 @@
 //! checker's fields directly). `reifyApps` is the whole-program driver run from
 //! `monomorphize`: it collects every reachable ground `App`, reifies each to a concrete
 //! `structT`/`enumT` in a deterministic order, and rewrites all `.app` occurrences to it.
+//! A function type (`.func`) rides the same collect/sort/rewrite and reifies to one
+//! `{code: int, env: rawptr}` pair struct per grounded signature.
 //! `reifyAppTo` is the single dispatcher/memo/termination-guard that the `layoutEnv`
 //! thunk also drives on-demand. `max_instantiation_depth` (the T0017 cap) lives in
 //! types.zig, shared with the mono tail.
@@ -11,6 +13,7 @@ const std = @import("std");
 const Span = @import("../diagnostics/model.zig").Span;
 const Ast = @import("../ast/Ast.zig");
 const Mono = @import("../symbols/Mono.zig");
+const Composite = @import("../symbols/Composite.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Typecheck = @import("../types.zig");
 const Type = Typecheck.Type;
@@ -28,29 +31,36 @@ fn reifyItemLess(_: void, a: ReifyItem, b: ReifyItem) bool {
     return std.mem.lessThan(u8, a.key, b.key);
 }
 
-/// Recursively add `ty`'s composite index (and its nested `App` args) to `set` if it
-/// is an `App`. Dedup on the index so each ground `App` is reified once.
+/// Recursively add `ty`'s composite index (and its nested composite args) to `set` if it
+/// is an `App` or a function type. Dedup on the index so each ground composite is
+/// reified once.
 fn collectApp(t: *Typecheck, ty: Type, set: *std.AutoArrayHashMapUnmanaged(u32, void)) !void {
-    if (!ty.isApp()) return;
-    const gop = try set.getOrPut(t.gpa, ty.appIdx());
+    if (!ty.isApp() and !ty.isFunc()) return;
+    const gop = try set.getOrPut(t.gpa, ty.struct_id);
     if (gop.found_existing) return;
-    const e = t.composite.at(ty.appIdx());
+    const e = t.composite.at(ty.struct_id);
     for (e.args) |a| try collectApp(t, a, set);
 }
 
-/// If `ty` is an `App`, rewrite it in place to the concrete type it reified to
-/// (`structT` for a struct-App, `enumT` for an enum-App). The stored `Type` was decided
-/// once at reification, so this never has to re-dispatch on `ctor_is_enum`.
+/// If `ty` is an `App` or a function type, rewrite it in place to the concrete type it
+/// reified to (`structT` for a struct-App or a fn type, `enumT` for an enum-App). The
+/// stored `Type` was decided once at reification, so this never re-dispatches.
 fn rewriteApp(t: *Typecheck, ty: *Type) void {
-    if (ty.isApp()) {
-        if (t.reify_map.get(ty.appIdx())) |rt| ty.* = rt;
+    if (ty.isApp() or ty.isFunc()) {
+        if (t.reify_map.get(ty.struct_id)) |rt| ty.* = rt;
     }
+}
+
+/// A composite arg grounded to the concrete type it reifies to; anything else as-is.
+fn groundTy(t: *Typecheck, ty: Type) error{OutOfMemory}!Type {
+    return if (ty.isApp() or ty.isFunc()) reifyAppTo(t, ty.struct_id) else ty;
 }
 
 /// Reify a composite `App` to the concrete `Type` it stands for — the single
 /// dispatcher + memo + termination guard. Memoizes on the composite index so each
 /// ground `App` reifies to exactly one concrete type; dispatches to `reifyAppToStruct`
-/// (-> `structT`) or `reifyAppToEnum` (-> `enumT`) on the `ctor_is_enum` discriminator.
+/// (-> `structT`) or `reifyAppToEnum` (-> `enumT`) on the `ctor_is_enum` discriminator,
+/// and a fn entry to `reifyFnToStruct` (-> its pair `structT`).
 /// The `reify_depth` counter latches T0017 past `max_instantiation_depth` — an unbounded
 /// generic-enum type-growth chain (`enum L[T] { cons(T, L[Box[T]]) }`) recurses through
 /// `reifyAppToEnum -> substReify -> reifyAppTo` with a strictly-growing arg, and each
@@ -65,9 +75,10 @@ pub fn reifyAppTo(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
     if (t.reify_depth > Typecheck.max_instantiation_depth) {
         if (!t.mono_depth_capped) {
             const e = t.composite.at(app_idx);
-            const mod = if (e.ctor_is_enum) t.enums.items[e.ctor].mod else t.structs.items[e.ctor].mod;
+            // A fn entry's `ctor` is its arity, not a struct/enum id: no decl to anchor at.
+            const mod = if (e.is_fn) 0 else if (e.ctor_is_enum) t.enums.items[e.ctor].mod else t.structs.items[e.ctor].mod;
             _ = t.gphSelect(mod);
-            const decl_node = if (e.ctor_is_enum) t.enums.items[e.ctor].decl_node else t.structs.items[e.ctor].decl_node;
+            const decl_node = if (e.is_fn) Ast.none else if (e.ctor_is_enum) t.enums.items[e.ctor].decl_node else t.structs.items[e.ctor].decl_node;
             // An AST-less prelude template (Option/Result) has decl_node == Ast.none; anchor
             // the diagnostic at byte 0 rather than OOB-derefing the tree on maxInt(u32).
             const at: Span = if (decl_node == Ast.none) .{ .start = 0, .end = 0 } else t.tokSpan(t.tree.nodes[decl_node.int()].main_token);
@@ -77,8 +88,64 @@ pub fn reifyAppTo(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
         return Type.invalid; // NOT memoized: a re-entry re-bails + re-latches (quietly)
     }
     const e = t.composite.at(app_idx);
+    if (e.is_fn) return Type.structT(try reifyFnToStruct(t, app_idx));
     if (e.ctor_is_enum) return reifyAppToEnum(t, app_idx);
     return Type.structT(try reifyAppToStruct(t, app_idx));
+}
+
+/// Reify a function type to its `{code, env}` pair struct, memoized by the `reifyAppTo`
+/// dispatcher. The params/ret ground first (bottom-up, like an App's args).
+fn reifyFnToStruct(t: *Typecheck, fn_idx: u32) error{OutOfMemory}!u32 {
+    const parts = Composite.fnParts(t.composite.at(fn_idx));
+    var pbuf: [8]Type = undefined;
+    const params: []Type = if (parts.params.len <= pbuf.len) pbuf[0..parts.params.len] else try t.gpa.alloc(Type, parts.params.len);
+    defer if (parts.params.len > pbuf.len) t.gpa.free(params);
+    for (parts.params, 0..) |p, i| params[i] = try groundTy(t, p);
+    const ret = try groundTy(t, parts.ret);
+    const sid = try fnStructFor(t, params, ret);
+    try t.reify_map.put(t.gpa, fn_idx, Type.structT(sid));
+    return sid;
+}
+
+/// The ONE pair struct for the grounded signature `fn(params) -> ret`, minted on first
+/// use. Deduped on the grounded bytes, not the composite index: two indices can ground to
+/// one signature (`fn(Vec[T])` at `T = int` and a written `fn(Vec[int])`), and the index
+/// is run-order-dependent, so only the grounded key keeps ids and names `-jN`-stable.
+fn fnStructFor(t: *Typecheck, params: []const Type, ret: Type) error{OutOfMemory}!u32 {
+    var kb: std.ArrayList(u8) = .empty;
+    defer kb.deinit(t.gpa);
+    for (params) |p| try p.appendKeyBytes(t.gpa, &kb);
+    try ret.appendKeyBytes(t.gpa, &kb);
+    if (t.fn_struct_dedup.get(kb.items)) |sid| return sid;
+
+    const sid: u32 = @intCast(t.structs.items.len);
+    const sig_args = try t.gpa.alloc(Type, params.len + 1);
+    defer t.gpa.free(sig_args);
+    @memcpy(sig_args[0..params.len], params);
+    sig_args[params.len] = ret;
+    const name = try Mono.mangle(t.gpa, "fn", sig_args);
+    try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
+    {
+        const fnames = try t.gpa.dupe([]const u8, &.{ "code", "env" });
+        errdefer t.gpa.free(fnames);
+        const ftypes = try t.gpa.dupe(Type, &.{ Type.int, Type.rawptr });
+        errdefer t.gpa.free(ftypes);
+        const owned_params = try t.gpa.dupe(Type, params);
+        errdefer t.gpa.free(owned_params);
+        try t.structs.append(t.gpa, .{
+            .decl_node = Ast.none,
+            .name = name,
+            .mod = 0,
+            .field_names = fnames,
+            .field_types = ftypes,
+            .fn_sig = .{ .params = owned_params, .ret = ret },
+        });
+    }
+    const key = try t.gpa.dupe(u8, kb.items);
+    errdefer t.gpa.free(key);
+    try t.fn_struct_dedup.put(t.gpa, key, sid);
+    try LayoutEngine.layoutReified(t.layoutEnv(), sid);
+    return sid;
 }
 
 /// Reify a struct-`App` (`Box[int]`) to a fresh concrete `struct_id`, memoized by
@@ -94,7 +161,7 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
     var abuf: [8]Type = undefined;
     const cargs: []Type = if (e.args.len <= abuf.len) abuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
     defer if (e.args.len > abuf.len) t.gpa.free(cargs);
-    for (e.args, 0..) |a, i| cargs[i] = if (a.isApp()) try reifyAppTo(t, a.appIdx()) else a;
+    for (e.args, 0..) |a, i| cargs[i] = try groundTy(t, a);
 
     const tmpl = t.structs.items[e.ctor]; // value copy; its field slices are stable
     const sid: u32 = @intCast(t.structs.items.len);
@@ -142,7 +209,7 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
     var abuf: [8]Type = undefined;
     const cargs: []Type = if (e.args.len <= abuf.len) abuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
     defer if (e.args.len > abuf.len) t.gpa.free(cargs);
-    for (e.args, 0..) |a, i| cargs[i] = if (a.isApp()) try reifyAppTo(t, a.appIdx()) else a;
+    for (e.args, 0..) |a, i| cargs[i] = try groundTy(t, a);
 
     const tmpl = t.enums.items[e.ctor]; // value copy; its variant slices are stable
     const eid: u32 = @intCast(t.enums.items.len);
@@ -189,12 +256,25 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
 /// Substitute a template field-type PATTERN through a reified instance's concrete args,
 /// always yielding a CONCRETE type: a `type_var(ord)` becomes `cargs[ord]`; a
 /// nested `App(c, [pat..])` (a field like `b: Box[T]`) grounds its args, re-interns,
-/// and reifies to `structT` (bottom-up, so `layoutReified` only ever sees `structT`);
-/// anything else passes through.
+/// and reifies to `structT` (bottom-up, so `layoutReified` only ever sees `structT`); a
+/// fn type grounds its params/ret and maps to its pair struct; anything else passes
+/// through.
 fn substReify(t: *Typecheck, ty: Type, cargs: []const Type) error{OutOfMemory}!Type {
     if (ty.isTypeVar()) {
         const ord = ty.typeVarOrd();
         return if (ord < cargs.len) cargs[ord] else Type.invalid;
+    }
+    if (ty.isFunc()) {
+        // No re-intern: a grounded fn entry would be a second composite index for a
+        // signature some source spelling already interned, and `reify_map`'s inverse
+        // (`reifiedStaticRecv`) needs one index per pair struct.
+        const parts = Composite.fnParts(t.composite.at(ty.funcIdx()));
+        var pbuf: [8]Type = undefined;
+        const params: []Type = if (parts.params.len <= pbuf.len) pbuf[0..parts.params.len] else try t.gpa.alloc(Type, parts.params.len);
+        defer if (parts.params.len > pbuf.len) t.gpa.free(params);
+        for (parts.params, 0..) |p, i| params[i] = try substReify(t, p, cargs);
+        const ret = try substReify(t, parts.ret, cargs);
+        return Type.structT(try fnStructFor(t, params, ret));
     }
     if (ty.isApp()) {
         const e = t.composite.at(ty.appIdx());
@@ -285,8 +365,9 @@ pub fn reifyApps(t: *Typecheck, nts: [][]Type) !void {
         for (to_reify.keys(), 0..) |ai, i| {
             var kb: std.ArrayList(u8) = .empty;
             errdefer kb.deinit(t.gpa);
-            try t.composite.writeStructuralKey(t.gpa, Type.app(ai), &kb);
-            items[i] = .{ .idx = ai, .depth = t.composite.appDepth(Type.app(ai)), .key = try kb.toOwnedSlice(t.gpa) };
+            const ty = t.composite.typeAt(ai);
+            try t.composite.writeStructuralKey(t.gpa, ty, &kb);
+            items[i] = .{ .idx = ai, .depth = t.composite.appDepth(ty), .key = try kb.toOwnedSlice(t.gpa) };
         }
         std.mem.sort(ReifyItem, items, {}, reifyItemLess);
         for (items) |it| _ = try reifyAppTo(t, it.idx);

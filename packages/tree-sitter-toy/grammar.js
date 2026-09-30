@@ -181,9 +181,15 @@ module.exports = grammar({
 
     // ---- Types ------------------------------------------------------------
 
-    _type: ($) => choice($.unit_type, seq($.type_name, optional($.type_arguments))),
+    _type: ($) => choice($.unit_type, $.function_type, seq($.type_name, optional($.type_arguments))),
 
     unit_type: ($) => seq("(", ")"),
+
+    // `fn(A, B) -> R`; `-> R` is optional and right-associative (`fn() -> fn() -> int`).
+    function_type: ($) =>
+      prec.right(
+        seq("fn", "(", optional(commaList($._type)), ")", optional(seq("->", field("return_type", $._type)))),
+      ),
 
     type_name: ($) => sepBy1(".", $.identifier),
 
@@ -344,10 +350,11 @@ module.exports = grammar({
     arguments: ($) => seq("(", optional(commaList($._expression)), ")"),
 
     // A single unified bracket postfix: type-application (`Vec[int]`), explicit call
-    // type-args / turbofish (`id[int]`, `v.into[int]`), and value indexing
-    // (`counts["the"]`) share one production — the grammar need not tell them apart.
+    // type-args / turbofish (`id[int]`, `v.into[int]`, `Vec[fn(int) -> int]`), and value
+    // indexing (`counts["the"]`) share one production — the grammar need not tell them
+    // apart. A function type is not an expression, so the list admits it by name.
     index_expression: ($) =>
-      prec(PREC.postfix, seq(field("value", $._primary_expression), "[", commaList($._expression), "]")),
+      prec(PREC.postfix, seq(field("value", $._primary_expression), "[", commaList(choice($._expression, $.function_type)), "]")),
 
     // Member access. The name after `.` is an identifier (field/method) or an integer
     // (`x.0` tuple index). A `float` is intentionally NOT accepted here so `x.0.0` and

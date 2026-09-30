@@ -620,6 +620,10 @@ const GraphResolve = struct {
     fn resolveTypeRef(g: *GraphResolve, type_idx: Ast.Index) error{OutOfMemory}!void {
         if (type_idx == Ast.none) return;
         const n = g.nodes()[type_idx.int()];
+        if (n.tag == .fn_type) {
+            for (Ast.rangeSlice(g.tree(g.cur_mod), n.lhs.int())) |p| try g.resolveTypeRef(p);
+            return g.resolveTypeRef(n.rhs);
+        }
         if (n.tag != .field_access) return; // bare name / unit: nothing to bind here
         const recv = g.nodes()[n.lhs.int()];
         if (recv.tag != .identifier) return;
@@ -2394,6 +2398,31 @@ test "a private fn named cross-module is R0005 and W0003 in its own module" {
         }
     };
     try withResolvedGraph(".toy-test-xmod-private-fn", files, "main.toy", Check.run);
+}
+
+test "a qualified type inside a fn type is checked for export (R0005/R0006)" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import geo
+        \\pub fn area(_f: fn(geo.P) -> int, _g: fn() -> geo.Q) -> int { return 0 }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "geo.toy", .source =
+        \\struct P { x: int }
+        \\pub fn mk() -> int { return 0 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0005));
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0006));
+            try testing.expectEqual(@as(usize, 2), errorCount(r));
+        }
+    };
+    try withResolvedGraph(".toy-test-xmod-fn-type", files, "main.toy", Check.run);
 }
 
 test "cross-module call resolves to a global fn with a qualified name" {

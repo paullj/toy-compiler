@@ -284,7 +284,7 @@ fn randByte(rand: std.Random) u8 {
 
 const max_gen_depth: usize = 4;
 const idents = [_][]const u8{ "a", "b", "c", "x", "y", "foo", "bar", "n", "acc" };
-const types = [_][]const u8{ "int", "bool", "str", "()" };
+const types = [_][]const u8{ "int", "bool", "str", "()", "fn(int) -> int", "fn()" };
 const bin_ops = [_][]const u8{ "+", "-", "*", "/", "==", "!=", "<", ">", "<=", ">=", "and", "or", "|>", "\n|>" };
 
 /// Emit a random-but-plausible program: 1..4 top-level items (fn/struct/enum/
@@ -494,7 +494,7 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
 }
 
 fn genAtom(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random) error{OutOfMemory}!void {
-    switch (rand.uintLessThan(u8, 5)) {
+    switch (rand.uintLessThan(u8, 6)) {
         0 => try out.appendSlice(gpa, pick(idents, rand)),
         1 => {
             var buf: [8]u8 = undefined;
@@ -504,6 +504,8 @@ fn genAtom(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random) er
         2 => try out.appendSlice(gpa, "true"),
         3 => try out.appendSlice(gpa, "false"),
         4 => try out.appendSlice(gpa, "\"s\""),
+        // A turbofish type argument, which may be a function type.
+        5 => try out.print(gpa, "Vec[{s}].new()", .{pick(types, rand)}),
         else => unreachable,
     }
 }

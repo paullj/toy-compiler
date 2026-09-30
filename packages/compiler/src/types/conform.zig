@@ -255,6 +255,9 @@ fn conformsRec(
             ok = true;
             break :find;
         };
+        // A function value conforms to nothing (no Eq/Hash/Display/Ord), so neither does an
+        // aggregate holding one.
+        if (LayoutEngine.isFnStruct(recv, structs)) break :find;
         if (recv.kind == .@"struct") {
             if (recv.struct_id < structs.len) {
                 ok = true;
