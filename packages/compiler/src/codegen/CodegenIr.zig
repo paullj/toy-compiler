@@ -509,6 +509,7 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
         .cstr_ptr => |h| try genCstrPtr(g, ins.result, h),
         .call => |c| try genCall(g, ins.result, c),
         .call_indirect => |c| try genCallIndirect(g, ins.result, c),
+        .fn_addr => |f| try genFnAddr(g, ins.result, f),
         .band => |b| try genArith(g, ins.result, b, .band),
         .bor => |b| try genArith(g, ins.result, b, .bor),
         .bxor => |b| try genArith(g, ins.result, b, .bxor),
@@ -649,6 +650,20 @@ fn genCstrPtr(g: *Gen, result: Ir.ValueId, h: u64) error{OutOfMemory}!void {
     site = @intCast(g.code.items.len);
     try g.relocs.append(g.gpa, .{ .site = site, .target = .{ .cstr = h }, .kind = .add_lo12 });
     try g.emit(Aarch64.addImm(S0, S0, 0));
+    try g.storeValue(S0, result);
+}
+
+/// `fn_addr sym`: materialize a function's code address via adrp+add, the `genCstrPtr`
+/// shape with `.func` targets the link resolves to the callee's `__text` offset. `adr`
+/// would save a word but reaches only ±1 MiB, which a large program's text exceeds.
+fn genFnAddr(g: *Gen, result: Ir.ValueId, f: Ir.SymName) error{OutOfMemory}!void {
+    inline for (.{ Link.RelocKind.adrp_page, Link.RelocKind.add_lo12 }) |kind| {
+        const name_copy = try g.gpa.dupe(u8, f.name);
+        errdefer g.gpa.free(name_copy);
+        const site: u32 = @intCast(g.code.items.len);
+        try g.relocs.append(g.gpa, .{ .site = site, .target = .{ .func = .{ .kind = f.kind, .name = name_copy } }, .kind = kind });
+        try g.emit(if (kind == .adrp_page) Aarch64.adrp(S0, 0) else Aarch64.addImm(S0, S0, 0));
+    }
     try g.storeValue(S0, result);
 }
 
@@ -1130,6 +1145,50 @@ test "ir-codegen: store_byte emits a strb into the address register" {
     // val loaded into S1, address into S0, then strb w(S1),[x(S0)].
     try testing.expect(codeHasWord(fc, Aarch64.strb(S1, S0, 0)));
     try testing.expect(codeHasWord(fc, Aarch64.ldrbRegUoff(S0, S0, 0)));
+}
+
+test "ir-codegen: fn_addr emits adrp+add with two .func relocs" {
+    const gpa = testing.allocator;
+
+    // %0 = fn_addr @g ; ret %0.
+    var values = try gpa.alloc(Ir.ValueDef, 1);
+    values[0] = .{ .type = Type.int };
+    var instrs = try gpa.alloc(Ir.Instr, 1);
+    instrs[0] = .{ .result = 0, .op = .{ .fn_addr = .{ .kind = .user_fn, .name = "g$fnval" } } };
+    var blocks = try gpa.alloc(Ir.Block, 1);
+    blocks[0] = .{
+        .params = try gpa.alloc(Ir.ValueId, 0),
+        .instrs = instrs,
+        .term = .{ .ret = .{ .value = 0 } },
+    };
+    var func = Ir.Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(Ir.SlotId, 0),
+        .ret_type = Type.int,
+        .slots = try gpa.alloc(Ir.Slot, 0),
+        .values = values,
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+        .literals = try gpa.alloc(Ir.Literal, 0),
+    };
+    defer func.deinit(gpa);
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var fc = try lowerIr(gpa, &func, &.{}, &.{}, false, &diags);
+    defer fc.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    try testing.expectEqual(@as(usize, 2), fc.relocs.len);
+    const kinds = [_]Link.RelocKind{ .adrp_page, .add_lo12 };
+    for (fc.relocs, kinds) |rl, kind| {
+        try testing.expectEqual(kind, rl.kind);
+        try testing.expect(rl.target.func.eql(.{ .kind = .user_fn, .name = "g$fnval" }));
+    }
+    try testing.expectEqual(fc.relocs[0].site + 4, fc.relocs[1].site);
+    try testing.expectEqual(Aarch64.adrp(S0, 0), std.mem.readInt(u32, fc.code[fc.relocs[0].site..][0..4], .little));
+    try testing.expectEqual(Aarch64.addImm(S0, S0, 0), std.mem.readInt(u32, fc.code[fc.relocs[1].site..][0..4], .little));
 }
 
 // A unit-returning ENTRY function must force x0=0 in the return path.

@@ -515,3 +515,46 @@ test "gc: a multi-entry Map[str,Ref] keeps EVERY value's pointee across a collec
     );
     try std.testing.expectEqual(@as(u8, 7), code);
 }
+
+/// Three named fns pushed into a `Vec[fn(int) -> int]`, then a forced collection and a
+/// churn of same-size-class allocations before the elements are read back and called.
+/// The pairs survive only if the Vec's backing is traced through the fn pair's trace unit.
+/// triple(2) + double(3) + 1 forced + 5 churn collections = 18.
+const fn_vec_src =
+    \\import std/vec
+    \\import core/mem_selftest
+    \\fn double(x: int) -> int { x * 2 }
+    \\fn triple(x: int) -> int { x * 3 }
+    \\fn square(x: int) -> int { x * x }
+    \\fn main() -> int {
+    \\    fs: Vec[fn(int) -> int] = []
+    \\    fs.push(double)
+    \\    fs.push(triple)
+    \\    fs.push(square)
+    \\    n := mem_selftest.forced_collect_count()
+    \\    c := mem_selftest.churn_collects()
+    \\    return fs[1](2) + fs[0](3) + n + c
+    \\}
+    \\
+;
+
+test "gc: a Vec of fn values survives a forced collection" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-fn-vec", fn_vec_src);
+    try std.testing.expectEqual(@as(u8, 18), code);
+}
+
+test "fn-value programs are byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const b1 = try compileBytes(gpa, io, ".toy-test-fn-jN-1", fn_vec_src, &.{ "--no-cache", "-j1" });
+    defer gpa.free(b1);
+    const b8 = try compileBytes(gpa, io, ".toy-test-fn-jN-8", fn_vec_src, &.{ "--no-cache", "-j8" });
+    defer gpa.free(b8);
+    try std.testing.expectEqualSlices(u8, b1, b8);
+}

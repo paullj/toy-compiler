@@ -1,0 +1,15 @@
+# Feature: a function value called straight off an index or a call: `fs[i](x)`, `fs[0](x)`, `get_op()(x)`
+# expect: exit 26
+import std/vec
+
+fn double(x: int) -> int { x * 2 }
+fn triple(x: int) -> int { x * 3 }
+fn get_op() -> fn(int) -> int { triple }
+
+fn main() -> int {
+    fs: Vec[fn(int) -> int] = []
+    fs.push(double)
+    fs.push(triple)
+    i := 1
+    return fs[i](4) + fs[0](4) + get_op()(2)   # 12 + 8 + 6
+}

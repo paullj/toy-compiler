@@ -851,3 +851,152 @@ test "Vec[fn(int) -> int] mints a trace unit and no hash/eq unit for the pair" {
         }
     }.check);
 }
+
+/// The callee tables plus the adapter table of one check of `graph` under a
+/// `limit`-worker pool, as bytes. Requires an error-free check.
+fn closureTablesUnder(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *ResolveGraph.GraphResult,
+    limit: Io.Limit,
+    tags: *[@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize,
+    n_adapters: *usize,
+) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
+    defer tr.deinit(gpa);
+    for (tr.diags) |d| try testing.expect(d.severity != .err);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    @memset(tags, 0);
+    for (tr.callees) |cs| {
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(cs));
+        for (cs) |c| tags[@intFromEnum(c.tag)] += 1;
+    }
+    for (tr.instances) |inst| {
+        try out.appendSlice(gpa, inst.name.?);
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(inst.callees));
+        for (inst.callees) |c| tags[@intFromEnum(c.tag)] += 1;
+    }
+    for (tr.adapters) |a| {
+        try out.appendSlice(gpa, std.mem.asBytes(&a.key));
+        try out.appendSlice(gpa, a.name);
+        try out.append(gpa, 0);
+        try out.appendSlice(gpa, a.target.name);
+        try out.append(gpa, 0);
+    }
+    n_adapters.* = tr.adapters.len;
+    return out.toOwnedSlice(gpa);
+}
+
+test "fn_ref/value callee tables and the adapter table are identical at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-fnvalues-jn";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // More bodies than the Pass-C fan-out threshold, each naming a distinct and a
+    // shared fn as a value and calling both; the generic `pass` names one inside its
+    // instance body, so the table also depends on the instance slices.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll(
+        \\import std/vec
+        \\fn shared(x: int) -> int { x }
+        \\fn pass[T](v: T) -> T {
+        \\    f := shared
+        \\    f(1)
+        \\    v
+        \\}
+        \\
+    );
+    for (0..70) |k| try src.writer.print("fn _t{d}(x: int) -> int {{ x + {d} }}\n", .{ k, k });
+    for (0..70) |k| try src.writer.print(
+        \\fn _u{d}() -> int {{
+        \\    fs: Vec[fn(int) -> int] = []
+        \\    fs.push(_t{d})
+        \\    g := shared
+        \\    fs[0](1) + g(2) + pass({d})
+        \\}}
+        \\
+    , .{ k, k, k });
+    try src.writer.writeAll("fn main() -> int { return 0 }\n");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+
+    const n_tags = @typeInfo(Typecheck.Callee.Tag).@"enum".fields.len;
+    var serial_tags: [n_tags]usize = undefined;
+    var parallel_tags: [n_tags]usize = undefined;
+    var serial_n: usize = 0;
+    var parallel_n: usize = 0;
+    const serial = try closureTablesUnder(gpa, &graph, &r, .limited(0), &serial_tags, &serial_n);
+    defer gpa.free(serial);
+    const parallel = try closureTablesUnder(gpa, &graph, &r, .limited(8), &parallel_tags, &parallel_n);
+    defer gpa.free(parallel);
+
+    try testing.expectEqualSlices(u8, serial, parallel);
+    try testing.expectEqual(@as(usize, 71), serial_n);
+    try testing.expectEqual(serial_n, parallel_n);
+    // 70 pushes + 70 `g := shared` + one ref per `pass` instance.
+    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.fn_ref)] >= 141);
+    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.value)] >= 140);
+}
+
+test "fn values in std containers and sinks: Map key and Display are T0023; fs[i](x) calls the element" {
+    try withCheckedGraph(".toy-test-fn-std", &.{
+        .{ .path = "main.toy", .source =
+        \\import std/vec
+        \\import std/map
+        \\import std/io
+        \\type Op = fn(int) -> int
+        \\fn inc(x: int) -> int { x + 1 }
+        \\fn main() -> int {
+        \\    m := Map[Op, int].new()
+        \\    io.println(inc)
+        \\    fs: Vec[Op] = []
+        \\    fs.push(inc)
+        \\    i := 0
+        \\    return fs[i](1) + m.len()
+        \\}
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(g: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            var hashable: usize = 0;
+            var display: usize = 0;
+            for (tr.diags) |d| {
+                if (d.severity != .err) continue;
+                try testing.expectEqual(@import("diagnostics/codes.zig").Code.T0023, d.code);
+                try testing.expect(std.mem.indexOf(u8, d.message, "function type 'fn(int) -> int'") != null);
+                if (std.mem.indexOf(u8, d.message, "'Hashable'") != null) hashable += 1;
+                if (std.mem.indexOf(u8, d.message, "'Display'") != null) display += 1;
+            }
+            try testing.expect(hashable >= 1);
+            try testing.expectEqual(@as(usize, 1), display);
+            const m = &g.modules[g.entry_index];
+            var calls: usize = 0;
+            for (m.nodes, 0..) |n, k| {
+                if (n.tag != .type_app or tr.callees[g.entry_index][k].view() != .value) continue;
+                calls += 1;
+            }
+            try testing.expectEqual(@as(usize, 1), calls);
+        }
+    }.check);
+}

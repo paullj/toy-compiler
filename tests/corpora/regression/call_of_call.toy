@@ -1,0 +1,7 @@
+# Regression: a call whose callee is itself a call used to pass `toy check` silently
+# when the inner call returned a non-function; the checker now types the callee.
+# expect: compile-error "called value is not a function"
+fn get() -> int { 1 }
+fn main() -> int {
+    return get()(1)
+}

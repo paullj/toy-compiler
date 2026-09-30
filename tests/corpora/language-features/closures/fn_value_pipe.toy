@@ -1,0 +1,15 @@
+# Feature: `x |> g` with a local `g` of function type calls the value, as pipe.md promises
+# expect: stdout "hi!\nhi!!\n"
+# expect: exit 5
+import std/io
+
+fn shout(s: str) -> str { s.concat("!") }
+fn count(s: str) -> int { s.len() }
+
+fn main() -> int {
+    g := shout
+    "hi" |> g |> io.println
+    "hi" |> g |> g |> io.println
+    c := count
+    return "hi!!!" |> c
+}

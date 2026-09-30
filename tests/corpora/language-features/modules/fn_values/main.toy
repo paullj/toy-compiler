@@ -1,0 +1,15 @@
+# expect: exit 43
+# A qualified `ops.add` is a function value; a value made in `ops` and one made here
+# name the same function, so they compare equal. 7 + 25 + 10 + 1 == 43.
+import ops
+
+fn apply(f: fn(int, int) -> int, a: int, b: int) -> int { f(a, b) }
+
+fn main() -> int {
+    f := ops.add
+    x := apply(ops.sub, 10, 3)
+    y := f(20, 5)
+    same := if f == ops.get_add() { 10 } else { 0 }
+    diff := if f != ops.sub { 1 } else { 0 }
+    return x + y + same + diff
+}

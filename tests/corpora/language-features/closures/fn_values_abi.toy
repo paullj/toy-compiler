@@ -1,0 +1,24 @@
+# Feature: calls through a function value keep every calling convention: 9 args (one on the stack), a >16-byte struct param and sret return, a str param, a float fn, and a value taken inside a generic body
+# expect: exit 96
+struct Big { a: int, b: int, c: int }
+
+fn sum9(a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int) -> int { a + b + c + d + e + f + g + h + i }
+fn grow(x: Big, k: int) -> Big { Big { a: x.a + k, b: x.b + k, c: x.c + k } }
+fn slen(s: str) -> int { s.len() }
+fn half(x: float) -> float { x /. 2.0 }
+fn nine[T](_x: T) -> int {
+    g := sum9
+    g(1, 1, 1, 1, 1, 1, 1, 1, 1)
+}
+
+fn main() -> int {
+    f := sum9
+    s := f(1, 2, 3, 4, 5, 6, 7, 8, 9)          # 45
+    gr := grow
+    big := gr(Big { a: 1, b: 2, c: 3 }, 10)    # 11 + 12 + 13 = 36
+    l := slen
+    n := l("hello")                            # 5
+    hf := half
+    q := if hf(9.0) >. 4.0 { 1 } else { 0 }    # 1
+    return s + big.a + big.b + big.c + n + q + nine(true)   # 45 + 36 + 5 + 1 + 9
+}

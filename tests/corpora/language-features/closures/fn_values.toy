@@ -1,0 +1,34 @@
+# Feature: named functions as values: bound to a local, passed, stored in a struct field and a Vec, returned, called and compared by identity
+# expect: exit 99
+import std/vec
+
+pub struct Handler { id: int, run: fn(int) -> int }
+
+fn add(a: int, b: int) -> int { a + b }
+fn mul(a: int, b: int) -> int { a * b }
+fn double(x: int) -> int { x * 2 }
+fn triple(x: int) -> int { x * 3 }
+fn apply(f: fn(int, int) -> int, a: int, b: int) -> int { f(a, b) }
+fn pick(b: bool) -> fn(int) -> int { if b { double } else { triple } }
+
+fn main() -> int {
+    f := add
+    total := apply(add, 2, 3)                  # 5
+    total = total + f(1, 1)                    # 7
+    h := Handler { id: 1, run: double }
+    total = total + h.run(4)                   # 15
+    fs: Vec[fn(int) -> int] = []
+    fs.push(double)
+    fs.push(triple)
+    total = total + fs[0](5)                   # 25
+    total = total + fs.get(1).unwrap()(5)      # 40
+    total = total + pick(false)(10)            # 70
+    total = total + pick(true)(10)             # 90
+    if f == add { total = total + 1 }          # 91
+    if f != mul { total = total + 1 }          # 92
+    if pick(true) == pick(true) { total = total + 1 }   # 93
+    if pick(true) != pick(false) { total = total + 1 }  # 94
+    g := pick(true)
+    if g == double { total = total + h.id * 5 }         # 99
+    return total
+}

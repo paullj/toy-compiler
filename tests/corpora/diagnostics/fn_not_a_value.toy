@@ -1,0 +1,7 @@
+fn id[T](x: T) -> T { x }
+
+fn main() -> int {
+    _p := panic  #~ ERROR [T0049] 'panic' is a builtin and cannot be used as a value
+    _q := id  #~ ERROR [T0049] 'id' is a generic function and cannot be used as a value
+    return 0
+}
