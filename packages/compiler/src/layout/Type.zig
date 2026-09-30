@@ -8,7 +8,7 @@
 //! dedup, and mangling all route through.
 //!
 //! HIDES: that `IntDesc` bit-packs sign+width into the spare pad byte; that a
-//! `type_var` ordinal and an `app` index both alias `struct_id`; the exact leaf
+//! `type_var` ordinal and an `app`/`func` index all alias `struct_id`; the exact leaf
 //! key byte layout.
 
 const std = @import("std");
@@ -35,7 +35,15 @@ const std = @import("std");
 /// `idField(.rawptr) == .none` and all rawptrs are equal by kind. It carries no
 /// heap-reference semantics (`isReference()` is false); its only functional client
 /// this milestone is as an `extern` param/return type.
-pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app, float, rawptr };
+///
+/// `func` (APPENDED — ordinals frozen) is a CHECK-TIME function type `fn(A, B) -> R`:
+/// like `app`, it reuses `struct_id` as an index into the composite table (a fn entry
+/// holding `params ++ [ret]`). Every reachable ground `func` is REIFIED during the
+/// serial monomorphization tail to ONE plain 16-byte `{code: int, env: rawptr}` struct
+/// per grounded signature (its `Layout.fn_sig` set), BEFORE the layout snapshot, so a
+/// `func` never reaches lower/codegen (Debug-asserted there); only a generic template's
+/// signature keeps one.
+pub const Kind = enum(u8) { invalid, unit, int, bool, str, never, @"struct", @"enum", type_var, app, float, rawptr, func };
 
 /// The width class of an integer type. `plat` is the platform-word `int`/`uint`
 /// (currently 64-bit); the numbered classes are the fixed-width `int8..int64`.
@@ -126,13 +134,28 @@ pub const Type = struct {
         return t.struct_id;
     }
 
+    /// A check-time function type. Reuses `struct_id` as the interned composite-table
+    /// index of its fn entry (`symbols/Composite.zig`) — NO widening.
+    pub fn func(idx: u32) Type {
+        return .{ .kind = .func, .struct_id = idx };
+    }
+
+    pub fn isFunc(t: Type) bool {
+        return t.kind == .func;
+    }
+
+    /// The composite-table index of a `func` (content-addressed like `appIdx`).
+    pub fn funcIdx(t: Type) u32 {
+        return t.struct_id;
+    }
+
     /// Which field carries this kind's nominal identity. Exhaustive (no `else`) so a
     /// NEW `Kind` is a build error here rather than a silent identity drop in one of the
-    /// serializers that route through this. `type_var`/`app` alias `struct_id` (the id
-    /// space they reuse), so this hides that aliasing from every caller.
+    /// serializers that route through this. `type_var`/`app`/`func` alias `struct_id` (the
+    /// id space they reuse), so this hides that aliasing from every caller.
     pub fn idField(kind: Kind) IdField {
         return switch (kind) {
-            .@"struct", .type_var, .app => .struct_id,
+            .@"struct", .type_var, .app, .func => .struct_id,
             .@"enum" => .enum_id,
             .invalid, .unit, .int, .bool, .str, .never, .float, .rawptr => .none,
         };
@@ -363,6 +386,20 @@ test "algebra: app round-trips its composite index and eql is per-index" {
     try testing.expect(!Type.assignable(a0, a1));
 }
 
+test "func round-trips its index and is distinct from app and struct" {
+    try testing.expectEqual(@as(usize, 12), @sizeOf(Type));
+    const f0 = Type.func(0);
+    try testing.expect(f0.isFunc());
+    try testing.expect(!f0.isApp() and !f0.isStruct());
+    try testing.expectEqual(@as(u32, 0), f0.funcIdx());
+    try testing.expectEqual(@as(u32, 7), Type.func(7).funcIdx());
+    try testing.expect(Type.eql(f0, Type.func(0)));
+    try testing.expect(!Type.eql(f0, Type.func(1)));
+    try testing.expect(!Type.eql(f0, Type.app(0)));
+    try testing.expect(!Type.eql(f0, Type.structT(0)));
+    try testing.expectEqual(IdField.struct_id, Type.idField(.func));
+}
+
 test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
     // The dedup/interning correctness property the flat serializer exists to
     // guarantee: an under-discriminating key folds two distinct types into one
@@ -378,6 +415,7 @@ test "algebra: appendKeyBytes discriminates exactly what eql discriminates" {
         Type.int64,      Type.uint8,      Type.uint16,   Type.uint32,   Type.uint64,
         Type.structT(0), Type.structT(1), Type.enumT(0), Type.enumT(1), Type.typeVar(0),
         Type.typeVar(1), Type.app(0),     Type.app(1),   Type.float,    Type.rawptr,
+        Type.func(0),    Type.func(1),
     };
     for (canon) |a| {
         for (canon) |b| {

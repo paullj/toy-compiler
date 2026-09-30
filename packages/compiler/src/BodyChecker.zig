@@ -40,14 +40,22 @@ const refs = Typecheck.refs;
 const InitForm = enum { unit, tuple, @"struct" };
 
 /// Substitute a template type through a concrete type-arg tuple: a
-/// `type_var(ord)` becomes `targs[ord]`; an `App(ctor, [pat..])` recursively
-/// substitutes each arg and re-interns (so a template's field pattern `Box[T]`
-/// grounds to `Box[int]`); any concrete type passes through. Needs the intern table,
-/// hence the `bc` receiver. The sibling of `Typecheck.substType`.
+/// `type_var(ord)` becomes `targs[ord]`; an `App(ctor, [pat..])` or a fn type
+/// recursively substitutes each arg and re-interns (so a template's field pattern
+/// `Box[T]` grounds to `Box[int]`); any concrete type passes through. Needs the intern
+/// table, hence the `bc` receiver. The sibling of `Typecheck.substType`.
 pub fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
     if (ty.isTypeVar()) {
         const ord = ty.typeVarOrd();
         return if (ord < targs.len) targs[ord] else Type.invalid;
+    }
+    if (ty.isFunc()) {
+        const parts = Composite.fnParts(bc.composite.at(ty.funcIdx()));
+        var buf: [8]Type = undefined;
+        const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (bc.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
+        defer if (parts.params.len > buf.len) bc.gpa.free(sub);
+        for (parts.params, 0..) |p, i| sub[i] = substTy(bc, p, targs);
+        return refs.internFn(bc, sub, substTy(bc, parts.ret, targs));
     }
     if (ty.isApp()) {
         const e = bc.composite.at(ty.appIdx());
@@ -63,11 +71,11 @@ pub fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
 
 /// True when `ty` is a concrete value type usable as a monomorphization type-arg. This
 /// predicate admits a ground `App` (a generic-struct instance used as a type-arg) and
-/// `unit` (a concrete zero-sized type-arg, as in `Map[T, ()]`). Mirrors
-/// `Typecheck.isConcreteValue`.
+/// `unit` (a concrete zero-sized type-arg, as in `Map[T, ()]`) and a function type.
+/// Mirrors `Typecheck.isConcreteValue`.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .float, .str, .@"struct", .@"enum", .app, .unit => true,
+        .int, .bool, .float, .str, .@"struct", .@"enum", .app, .unit, .func => true,
         else => false,
     };
 }
@@ -2493,13 +2501,14 @@ pub const BodyChecker = struct {
                         // `ga_get[T]` returning `load(..)`) yields that element type, so a
                         // `bool` element round-trips as `bool`; every other context reads a
                         // 64-bit `int` (mem_selftest is unaffected — its loads are int-typed).
-                        // A generic-instance element type (`Vec[int]`, `Option[int]`) is still
-                        // an `App` during the pre-reify instance recheck, so accept `.app` too —
+                        // A generic-instance element type (`Vec[int]`, `Option[int]`) or a fn
+                        // type is still check-time during the pre-reify instance recheck, so
+                        // accept `.app`/`.func` too —
                         // reify later rewrites the load's node type to the concrete
                         // `structT`/`enumT`. (A ref-family element already rides `isRefPayload`; a
                         // scalar/`str`/float/struct/enum element rides its own kind.)
                         const lt: Type = if (bc.expected) |e|
-                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str or e.kind == .app or bc.isRefPayload(e)) e else Type.int)
+                            (if (e.isScalar() or e.kind == .float or e.kind == .@"struct" or e.kind == .@"enum" or e.kind == .str or e.kind == .app or e.kind == .func or bc.isRefPayload(e)) e else Type.int)
                         else
                             Type.int;
                         bc.node_types[(node_idx).int()] = lt;
@@ -3106,12 +3115,13 @@ pub const BodyChecker = struct {
     }
 
     /// Whether `t` is fully ground: no `type_var` anywhere. A struct/enum id and any
-    /// scalar are ground; a `type_var` is not; an `App` is ground iff every arg is. Gates
-    /// `recordDeriveReq` so the synthesis barrier only ever sees a concrete (reifiable) type.
+    /// scalar are ground; a `type_var` is not; an `App` or a fn type is ground iff every
+    /// arg is. Gates `recordDeriveReq` so the synthesis barrier only ever sees a concrete
+    /// (reifiable) type.
     fn isGround(bc: *BodyChecker, t: Type) bool {
         if (t.isTypeVar()) return false;
-        if (t.isApp()) {
-            const e = bc.composite.at(t.appIdx());
+        if (t.isApp() or t.isFunc()) {
+            const e = bc.composite.at(t.struct_id);
             for (e.args) |a| if (!bc.isGround(a)) return false;
             return true;
         }

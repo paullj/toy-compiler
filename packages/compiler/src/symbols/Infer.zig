@@ -34,9 +34,10 @@ pub const Outcome = union(enum) {
     unbound: struct { ord: u32 },
 };
 
-/// One decomposed `App`: its ctor id, whether that id lives in the enum id space,
-/// and its type-args. Type-erased so this leaf never learns the `Composite` table.
-pub const Decomposed = struct { ctor: u32, is_enum: bool, args: []const Type };
+/// One decomposed composite: its ctor id, whether that id lives in the enum id space,
+/// and its type-args. A function type sets `is_fn`, with its param count in `ctor` and
+/// `params ++ [ret]` in `args`. Type-erased so this leaf never learns the `Composite` table.
+pub const Decomposed = struct { ctor: u32, is_enum: bool, is_fn: bool = false, args: []const Type };
 
 /// A type-erased hook that turns an `App` `Type` into its `(ctor, is_enum, args)` —
 /// the ONLY way this pure leaf can see through a container param (`Vec[T]`) to its
@@ -86,9 +87,9 @@ pub fn match(
 /// span the callers map with `args[first_pos]`/`args[second_pos]`), even when the
 /// clash is inside a container.
 ///
-/// Structural descent (`p` an `App`) is recursive: it needs a `dec` to see through a
-/// container, and terminates because interned `App`s are a finite, acyclic,
-/// depth-bounded (T0017) structure. With `dec == null` an `.app` param binds nothing
+/// Structural descent (`p` an `App` or a function type) is recursive: it needs a `dec` to
+/// see through a container, and terminates because interned composites are a finite,
+/// acyclic, depth-bounded (T0017) structure. With `dec == null` an `.app` param binds nothing
 /// (the pre-descent behavior — a container param left its var unbound), so passing
 /// `null` reproduces the flat matcher byte-for-byte.
 fn unifyOne(p: Type, a: Type, pos: usize, gpc: u32, out: []Type, bound: []bool, first_pos: []usize, dec: ?Decomposer) Outcome {
@@ -107,14 +108,14 @@ fn unifyOne(p: Type, a: Type, pos: usize, gpc: u32, out: []Type, bound: []bool, 
         }
         return .ok;
     }
-    if (p.isApp()) {
+    if (p.isApp() or p.isFunc()) {
         const d = dec orelse return .ok; // no composite ⇒ can't descend; binds nothing
         const pe = d.call(p) orelse return .ok;
-        const ae = d.call(a) orelse return .ok; // arg not an App ⇒ no structural match
-        // Same ctor, same id-space, same arity — else these are unrelated containers
-        // and there is nothing sound to bind (a genuine arg mismatch is diagnosed
-        // elsewhere; here we only fill still-open vars).
-        if (pe.ctor != ae.ctor or pe.is_enum != ae.is_enum or pe.args.len != ae.args.len) return .ok;
+        const ae = d.call(a) orelse return .ok; // arg not a composite ⇒ no structural match
+        // Same shape, same ctor, same id-space, same arity — else these are unrelated
+        // composites and there is nothing sound to bind (a genuine arg mismatch is
+        // diagnosed elsewhere; here we only fill still-open vars).
+        if (pe.is_fn != ae.is_fn or pe.ctor != ae.ctor or pe.is_enum != ae.is_enum or pe.args.len != ae.args.len) return .ok;
         for (pe.args, ae.args) |pk, ak| switch (unifyOne(pk, ak, pos, gpc, out, bound, first_pos, dec)) {
             .ok => {},
             else => |o| return o,
@@ -214,9 +215,9 @@ fn runMatchDec(n: u32, params: []const Type, args: []const Type, dec: ?Decompose
 const FakeComposite = struct {
     entries: []const Decomposed,
     fn thunk(ctx: *anyopaque, ty: Type) ?Decomposed {
-        if (!ty.isApp()) return null;
+        if (!ty.isApp() and !ty.isFunc()) return null;
         const self: *const FakeComposite = @ptrCast(@alignCast(ctx));
-        const idx = ty.appIdx();
+        const idx = ty.struct_id;
         if (idx >= self.entries.len) return null;
         return self.entries[idx];
     }
@@ -320,6 +321,9 @@ const fake_entries = [_]Decomposed{
     .{ .ctor = 3, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 10: struct S3[T]
     .{ .ctor = 2, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 11: bad-arity Map[T]
     .{ .ctor = 1, .is_enum = false, .args = &.{Type.never} }, // 12: Vec[never]
+    .{ .ctor = 1, .is_enum = false, .is_fn = true, .args = &.{ Type.typeVar(0), Type.typeVar(1) } }, // 13: fn(T) -> U
+    .{ .ctor = 1, .is_enum = false, .is_fn = true, .args = &.{ Type.int, Type.bool } }, // 14: fn(int) -> bool
+    .{ .ctor = 1, .is_enum = false, .args = &.{ Type.int, Type.bool } }, // 15: an App shaped like 14
 };
 
 fn runStructMatch(n: u32, params: []const Type, args: []const Type) MatchResult {
@@ -411,6 +415,29 @@ test "structural guard: a non-App arg against an App param binds nothing" {
 
 test "structural: a never element skips at the nested level (var stays unbound)" {
     const r = runStructMatch(1, &.{Type.app(0)}, &.{Type.app(12)}); // Vec[T] vs Vec[never]
+    switch (r.out) {
+        .unbound => |u| try testing.expectEqual(@as(u32, 0), u.ord),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fn(T) -> U against fn(int) -> bool binds both" {
+    const r = runStructMatch(2, &.{Type.func(13)}, &.{Type.func(14)});
+    try testing.expectEqual(Outcome.ok, r.out);
+    try testing.expect(Type.eql(r.args[0], Type.int));
+    try testing.expect(Type.eql(r.args[1], Type.bool));
+}
+
+test "a fn param never unifies with an App of equal arity" {
+    const r = runStructMatch(2, &.{Type.func(13)}, &.{Type.app(15)});
+    switch (r.out) {
+        .unbound => |u| try testing.expectEqual(@as(u32, 0), u.ord),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "no decomposer binds nothing through a fn param" {
+    const r = runMatchDec(2, &.{Type.func(13)}, &.{Type.func(14)}, null);
     switch (r.out) {
         .unbound => |u| try testing.expectEqual(@as(u32, 0), u.ord),
         else => return error.TestUnexpectedResult,

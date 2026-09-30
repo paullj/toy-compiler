@@ -1,0 +1,12 @@
+# Feature: function types in a param, return, field, variant payload, alias and Vec argument; no function value yet
+# expect: exit 42
+import std/vec
+type Op = fn(int, int) -> int
+pub struct Handler { id: int, run: fn(int) -> int }
+pub enum Slot { empty, full(fn() -> int) }
+pub fn describe(_op: Op, h: Handler, _s: Slot) -> int { h.id }
+pub fn keep(g: fn(int) -> int) -> fn(int) -> int { g }
+fn main() -> int {
+    ops: Vec[fn(int, int) -> bool] = []
+    return 42 + ops.len()
+}

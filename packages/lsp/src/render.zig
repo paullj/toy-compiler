@@ -7,10 +7,11 @@ const Type = toyc.Typecheck.Type;
 const Layout = toyc.Typecheck.Layout;
 const EnumLayout = toyc.Typecheck.EnumLayout;
 
-/// A type worth showing. The poison/check-only kinds (`invalid`, `type_var`, `app`) never
-/// reach a hover answer — a slot left at the `@memset(.invalid)` default is "no info".
+/// A type worth showing. The poison/check-only kinds (`invalid`, `type_var`, `app`,
+/// `func`) never reach a hover answer — a slot left at the `@memset(.invalid)` default is
+/// "no info".
 pub fn isRenderable(t: Type) bool {
-    return t.kind != .invalid and t.kind != .type_var and t.kind != .app;
+    return t.kind != .invalid and t.kind != .type_var and t.kind != .app and t.kind != .func;
 }
 
 /// A symbol name minus its leading module qualifier. The qualifier is the entry file's
@@ -22,7 +23,7 @@ pub fn bareName(name: []const u8) []const u8 {
 
 /// Render a type as the compiler names it elsewhere. `layouts`/`enum_layouts` supply the
 /// nominal name; the append copies that borrowed name into the caller's arena.
-pub fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) !void {
+pub fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layouts: []const Layout, enum_layouts: []const EnumLayout) error{OutOfMemory}!void {
     switch (t.kind) {
         .int => try buf.appendSlice(a, t.intName()),
         .bool => try buf.appendSlice(a, "bool"),
@@ -31,11 +32,27 @@ pub fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layout
         .unit => try buf.appendSlice(a, "()"),
         .rawptr => try buf.appendSlice(a, "rawptr"),
         .never => try buf.appendSlice(a, "never"),
-        .@"struct" => if (t.struct_id < layouts.len) try renderNominal(a, buf, layouts[t.struct_id].name, layouts, enum_layouts) else try buf.appendSlice(a, "struct"),
+        .@"struct" => if (t.struct_id < layouts.len) {
+            if (layouts[t.struct_id].fn_sig) |fs| try renderFnType(a, buf, fs, layouts, enum_layouts) else try renderNominal(a, buf, layouts[t.struct_id].name, layouts, enum_layouts);
+        } else try buf.appendSlice(a, "struct"),
         .@"enum" => if (t.enum_id < enum_layouts.len) try renderNominal(a, buf, enum_layouts[t.enum_id].name, layouts, enum_layouts) else try buf.appendSlice(a, "enum"),
         // Filtered out by `isRenderable` before we get here; kept total for the compiler.
-        .invalid, .type_var, .app => try buf.appendSlice(a, "?"),
+        .invalid, .type_var, .app, .func => try buf.appendSlice(a, "?"),
     }
+}
+
+/// `fn(A, B) -> R`, the spelling of the pair struct a function type reifies to. A unit
+/// return is left off, as in the source.
+fn renderFnType(a: std.mem.Allocator, buf: *std.ArrayList(u8), fs: toyc.LayoutEngine.FnSig, layouts: []const Layout, enum_layouts: []const EnumLayout) error{OutOfMemory}!void {
+    try buf.appendSlice(a, "fn(");
+    for (fs.params, 0..) |p, i| {
+        if (i != 0) try buf.appendSlice(a, ", ");
+        try renderType(a, buf, p, layouts, enum_layouts);
+    }
+    try buf.append(a, ')');
+    if (fs.ret.kind == .unit) return;
+    try buf.appendSlice(a, " -> ");
+    try renderType(a, buf, fs.ret, layouts, enum_layouts);
 }
 
 /// `renderType`, except a `type_var(i)` with `i < var_names.len` prints `var_names[i]`: a
@@ -80,7 +97,7 @@ pub fn renderNominal(a: std.mem.Allocator, buf: *std.ArrayList(u8), name: []cons
         first = false;
         const id = if (arg.len > 1) std.fmt.parseInt(u32, arg[1..], 10) catch null else null;
         if (arg[0] == 's' and id != null and id.? < layouts.len) {
-            try renderNominal(a, buf, layouts[id.?].name, layouts, enum_layouts);
+            try renderType(a, buf, Type.structT(id.?), layouts, enum_layouts);
         } else if (arg[0] == 'e' and id != null and id.? < enum_layouts.len) {
             try renderNominal(a, buf, enum_layouts[id.?].name, layouts, enum_layouts);
         } else {
@@ -135,4 +152,32 @@ test "renderTypeNamed spells type vars and falls back to ?" {
         try renderType(a, &plain, c.t, &.{}, &.{});
         try testing.expectEqualStrings(plain.items, named.items);
     }
+}
+
+test "renders a fn-pair struct as fn(A) -> R and inside Vec[..]" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pair_names = [_][]const u8{ "code", "env" };
+    const pair_types = [_]Type{ Type.int, Type.rawptr };
+    const pair_offs = [_]u32{ 0, 8 };
+    const pair: Layout = .{ .name = "fn$int$int", .field_names = @constCast(&pair_names), .field_types = @constCast(&pair_types), .offsets = @constCast(&pair_offs), .size = 16, .@"align" = 8, .fn_sig = .{ .params = &.{Type.int}, .ret = Type.int } };
+    var unit_ret = pair;
+    unit_ret.name = "fn$str$unit";
+    unit_ret.fn_sig = .{ .params = &.{ Type.str, Type.structT(0) }, .ret = Type.unit };
+    var vec = pair;
+    vec.name = "Vec$s0";
+    vec.fn_sig = null;
+    const layouts = [_]Layout{ pair, unit_ret, vec };
+    const cases = [_]struct { t: Type, want: []const u8 }{
+        .{ .t = Type.structT(0), .want = "fn(int) -> int" },
+        .{ .t = Type.structT(1), .want = "fn(str, fn(int) -> int)" },
+        .{ .t = Type.structT(2), .want = "Vec[fn(int) -> int]" },
+    };
+    for (cases) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        try renderType(a, &buf, c.t, &layouts, &.{});
+        try testing.expectEqualStrings(c.want, buf.items);
+    }
+    try testing.expect(!isRenderable(Type.func(0)));
 }

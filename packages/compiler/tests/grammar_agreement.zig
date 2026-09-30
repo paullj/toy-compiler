@@ -319,6 +319,9 @@ test "grammar agreement: deterministic control snippets agree span-for-span" {
         "import a/b as r\nfn main() -> int { return 0 }\n",
         "fn f() -> int {\n  @outer loop { break @outer 1 }\n}\n",
         "fn f(counts: Map[str, int]) -> int { return counts[\"the\"] }\n",
+        "fn f(g: fn(int, bool) -> fn() -> int) {}\n", // function types, `->` right-assoc
+        "struct S { f: fn() }\n",
+        "type F = fn(Vec[int]) -> int\n",
     };
     for (snippets) |src| {
         _ = compareFile(a, src, classifyTag, true) catch |err| {

@@ -408,7 +408,7 @@ fn collectEnclosing(
 }
 
 fn isRenderable(t: Type) bool {
-    return t.kind != .invalid and t.kind != .type_var and t.kind != .app;
+    return t.kind != .invalid and t.kind != .type_var and t.kind != .app and t.kind != .func;
 }
 
 const testing = std.testing;

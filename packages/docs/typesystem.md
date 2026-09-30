@@ -19,6 +19,7 @@ it being trivially comparable and hashable.
 | `unit` | `()` | the empty type; one value, also spelled `()` |
 | `@"struct"` | a struct name | carries `struct_id` into the struct table |
 | `@"enum"` | an enum name | carries `enum_id` into the enum table |
+| `func` | `fn(A, B) -> R` | check-time; reified to a `{code, env}` pair struct (see below) |
 | `never` | — (not spellable) | the bottom type; a value that never exists |
 | `invalid` | — (not spellable) | the poison/error type |
 
@@ -211,6 +212,26 @@ type-args of strictly-growing generic-nesting depth. The serial mono worklist ca
 that depth and rejects the program with **T0017 "instantiation too deep"** —
 deterministically at `-j1`/`-jN`, never hanging or running out of memory — while a
 legitimately deep-but-finite generic program still compiles.
+
+## Function types
+
+`fn(A, B) -> R` is a type like any other: a parameter, a return type, a struct field,
+a variant payload, an alias target or a type argument (`Vec[fn(int) -> int]`). `-> R`
+is optional (a unit return, as in a declaration) and right-associative:
+`fn(int) -> fn(int) -> int` returns a function. Assignability is structural
+equality, so an alias names the same type as its spelling.
+
+A function type is `Kind.func` (appended, frozen ordinal): a fn entry in the same
+composite table as `App`, holding `params ++ [ret]` and its pre-rendered label, which
+diagnostics print (`cannot bind fn(int) -> bool to 'h' of type fn(int) -> int`).
+Inference descends it like an `App` (`fn(T) -> U` against `fn(int) -> bool` binds
+both). Reification maps every ground fn type to ONE 16-byte struct per grounded
+signature, `{code: int @0, env: rawptr @8}`, whose `Layout.fn_sig` records the
+signature; the pair is deduplicated on the grounded bytes, so `fn(Vec[T])` at
+`T = int` and a written `fn(Vec[int])` are one struct. Past reify only a generic
+template's signature keeps a `.func`. A function type conforms to no protocol (no
+`Eq`/`Hash`/`Display`/`Ord`), and neither does an aggregate holding one. A `Vec` of
+them gets a trace unit, because the `env` word is a managed pointer.
 
 ## Protocols, the prelude, and builtin-scalar conformance
 

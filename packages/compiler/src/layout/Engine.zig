@@ -49,6 +49,16 @@ pub const Layout = struct {
     /// else `.none`. Copied from `StructSym` in `snapshotLayouts`; lets the table-aware
     /// reference predicate recognize a managed box per-instance (not by live App index).
     native_family: NativeStructFamily = .none,
+    /// Set on the `{code, env}` pair a function type reifies to; `params` owned.
+    fn_sig: ?FnSig = null,
+};
+
+/// A function type's signature. Pre-reify it borrows a composite fn entry's `args`; on a
+/// reified fn-pair struct (`StructSym`/`Layout.fn_sig`) its types are grounded and
+/// `params` is owned by that table.
+pub const FnSig = struct {
+    params: []const Type,
+    ret: Type,
 };
 
 /// The prelude managed-box family a reified concrete instance belongs to, or `.none`
@@ -153,6 +163,9 @@ pub const StructSym = struct {
     /// else `.none`. Set in `reifyAppToStruct` (keyed off the prelude template id);
     /// copied into the snapshot `Layout`.
     native_family: NativeStructFamily = .none,
+    /// Set on the `{code: int, env: rawptr}` pair a function type reifies to (grounded,
+    /// `params` owned); copied into the snapshot `Layout`.
+    fn_sig: ?FnSig = null,
 };
 
 /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`): a reified struct whose entry
@@ -168,6 +181,13 @@ pub const StructSym = struct {
 pub fn isRefStruct(t: Type, table: anytype) bool {
     return t.isStruct() and t.struct_id < table.len and
         table[t.struct_id].native_family != .none;
+}
+
+/// Whether `t` is the reified `{code, env}` pair of a function type. POST-reify only;
+/// `table` is the layout snapshot or the live struct table, as for `isRefStruct`.
+pub fn isFnStruct(t: Type, table: anytype) bool {
+    return t.isStruct() and t.struct_id < table.len and
+        table[t.struct_id].fn_sig != null;
 }
 
 /// One variant in the scratch enum table (during layout). `field_names`/`name`
@@ -267,7 +287,8 @@ pub const Env = struct {
     /// field/payload type `b: Box[int]` / `e: Either[int,bool]` (which decodes to an
     /// `App`) into a plain `structT`/`enumT` BEFORE it is stored/laid out, so no `App`
     /// ever lands in a laid aggregate's `field_types`. Returns a `Type` (not a bare
-    /// `struct_id`) so a generic-ENUM field/payload reifies to an `enumT`.
+    /// `struct_id`) so a generic-ENUM field/payload reifies to an `enumT`. A fn-typed
+    /// field/payload (a composite fn entry) reifies to its `{code, env}` pair struct.
     reifyApp: *const fn (ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type,
 };
 
@@ -319,7 +340,7 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         // checks compare it against the (same-interned) `App` a value expression produces
         // — the mono-tail rewrite turns both into the reified `structT`/`enumT` before
         // the snapshot. `reifyApp` returns the concrete type directly.
-        const size_ty: Type = if (fty.isApp()) try env.reifyApp(env.ctx, fty.appIdx()) else fty;
+        const size_ty: Type = if (fty.isApp() or fty.isFunc()) try env.reifyApp(env.ctx, fty.struct_id) else fty;
         sizing[i] = size_ty;
     }
 
@@ -590,7 +611,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             // construction checks compare it against the same-interned `App`; the mono-tail
             // rewrite turns it into the reified `structT`/`enumT` before the snapshot, so
             // no `App` survives into the enum layout/fingerprint.
-            const size_ty: Type = if (pty.isApp()) try env.reifyApp(env.ctx, pty.appIdx()) else pty;
+            const size_ty: Type = if (pty.isApp() or pty.isFunc()) try env.reifyApp(env.ctx, pty.struct_id) else pty;
             sizing[pi] = size_ty;
         }
         const acc = try accumulatePayload(env, sizing, foffs, env.tokSpan(env.ctx, decl.main_token), env.enums.items[id].name);
@@ -648,6 +669,7 @@ pub fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]La
             .@"align" = s.@"align",
             .is_tuple = s.is_tuple,
             .native_family = s.native_family,
+            .fn_sig = if (s.fn_sig) |fs| .{ .params = try gpa.dupe(Type, fs.params), .ret = fs.ret } else null,
         };
         built += 1;
     }
@@ -661,6 +683,7 @@ pub fn freeLayouts(gpa: std.mem.Allocator, layouts: []const Layout) void {
         gpa.free(l.field_names);
         gpa.free(l.field_types);
         gpa.free(l.offsets);
+        if (l.fn_sig) |fs| gpa.free(fs.params);
     }
     gpa.free(layouts);
 }

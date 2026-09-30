@@ -783,6 +783,28 @@ test "roots: an enum unions its variants' box payload offsets; a () field contri
     try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // a Ref box → conservative tag 0
 }
 
+test "a fn-pair struct slot projects one root at +8" {
+    const gpa = testing.allocator;
+    // The {code: int @0, env: rawptr @8} pair a function type reifies to: the code word
+    // is not a managed pointer, the env word is.
+    var ls: [1]Layout = undefined;
+    ls[0] = try mkLayoutFields(gpa, &.{ Type.int, Type.rawptr }, &.{ 0, 8 }, 16, .none);
+    ls[0].fn_sig = .{ .params = &.{Type.int}, .ret = Type.int };
+    defer {
+        gpa.free(ls[0].field_types);
+        gpa.free(ls[0].offsets);
+    }
+    var func = try buildSimple(gpa, &.{Type.structT(0)}, &.{}, 0, Type.unit);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &ls, &.{});
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &ls, &.{});
+    defer gpa.free(bm);
+    try testing.expectEqual(@as(u32, 1), rootCount(bm));
+    try testing.expectEqual(fl.slot_off[0] + 8, rootAt(bm, 0));
+    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0));
+}
+
 test "roots: projection is deterministic (two calls byte-identical)" {
     const gpa = testing.allocator;
     var func = try buildSimple(gpa, &.{ Type.int, Type.str }, &.{ Type.rawptr, Type.int }, 0, Type.int);

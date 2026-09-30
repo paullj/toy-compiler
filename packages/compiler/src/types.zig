@@ -190,6 +190,7 @@ pub const refs = struct {
                 if (e.ctor < self.structSyms().len) return self.structSyms()[e.ctor].name;
             }
         }
+        if (ty.kind == .func) return self.composite.at(ty.funcIdx()).name;
         // An integer type renders its sign/width spelling (`int8`/`uint`/…), not the
         // bare `int` kind tag — the single source both passes share.
         if (ty.kind == .int) return ty.intName();
@@ -206,6 +207,7 @@ pub const refs = struct {
         // resolves to a composite `App`: the base is a generic struct ctor, each
         // arg is recursively resolved (subst-aware), interned to one composite index.
         if (tn.tag == .type_app) return refs.typeFromTypeApp(self, type_node, tn);
+        if (tn.tag == .fn_type) return refs.typeFromFnType(self, tn);
         // A qualified cross-module type-ref `mod.Type` parses as a field_access whose
         // receiver binds to a `.module`. Resolve it against the owning module's tables.
         if (tn.tag == .field_access) return refs.typeFromQualified(self, type_node, tn);
@@ -260,6 +262,58 @@ pub const refs = struct {
         }
         self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, err_unknown_type, .{name}) catch {};
         return .invalid;
+    }
+
+    /// Resolve a function type `fn(A, B) -> R` (a `fn_type` node) to its interned `func`.
+    /// A missing `-> R` is unit, as in a declaration; any invalid part poisons the whole.
+    pub fn typeFromFnType(self: anytype, tn: Ast.Node) Type {
+        const param_nodes = Ast.rangeSlice(self.tree, tn.lhs.int());
+        var buf: [8]Type = undefined;
+        const params: []Type = if (param_nodes.len <= buf.len) buf[0..param_nodes.len] else (self.gpa.alloc(Type, param_nodes.len) catch return .invalid);
+        defer if (param_nodes.len > buf.len) self.gpa.free(params);
+        var bad = false;
+        for (param_nodes, 0..) |pn, i| {
+            params[i] = refs.typeFromNode(self, pn);
+            if (params[i].kind == .invalid) bad = true;
+        }
+        const ret = refs.typeFromNode(self, tn.rhs);
+        if (bad or ret.kind == .invalid) return .invalid;
+        return refs.internFn(self, params, ret);
+    }
+
+    /// Intern the function type `fn(params) -> ret`. The label is rendered BEFORE the
+    /// intern: `typeName` reads the composite table, whose spinlock is not reentrant.
+    /// Out of memory poisons to `.invalid`.
+    pub fn internFn(self: anytype, params: []const Type, ret: Type) Type {
+        var label: std.ArrayList(u8) = .empty;
+        refs.renderFnLabel(self, &label, params, ret) catch {
+            label.deinit(self.gpa);
+            return .invalid;
+        };
+        const name = label.toOwnedSlice(self.gpa) catch {
+            label.deinit(self.gpa);
+            return .invalid;
+        };
+        const idx = self.composite.internFn(self.gpa, params, ret, name) catch return .invalid;
+        return Type.func(idx);
+    }
+
+    /// `fn(A, B) -> R`, with a unit `-> ()` left off as in the source spelling.
+    fn renderFnLabel(self: anytype, out: *std.ArrayList(u8), params: []const Type, ret: Type) !void {
+        try out.appendSlice(self.gpa, "fn(");
+        for (params, 0..) |p, i| {
+            if (i != 0) try out.appendSlice(self.gpa, ", ");
+            try out.appendSlice(self.gpa, refs.typeNameOrUnit(self, p));
+        }
+        try out.append(self.gpa, ')');
+        if (ret.kind != .unit) {
+            try out.appendSlice(self.gpa, " -> ");
+            try out.appendSlice(self.gpa, refs.typeNameOrUnit(self, ret));
+        }
+    }
+
+    fn typeNameOrUnit(self: anytype, ty: Type) []const u8 {
+        return if (ty.kind == .unit) "()" else refs.typeName(self, ty);
     }
 
     /// Resolve a qualified `mod.Type` type-reference (a `field_access` in type
@@ -459,6 +513,7 @@ pub const GraphResult = struct {
             gpa.free(l.field_names);
             gpa.free(l.field_types);
             gpa.free(l.offsets);
+            if (l.fn_sig) |fs| gpa.free(fs.params);
         }
         gpa.free(self.layouts);
         for (self.enum_layouts) |e| {
@@ -1308,6 +1363,10 @@ reify_map: std.AutoHashMapUnmanaged(u32, Type) = .empty,
 /// — covering the same latent hazard for `reifyAppToStruct` for free.
 reify_depth: u32 = 0,
 
+/// The pair struct minted for each grounded function signature (`reify.fnStructFor`):
+/// grounded `params ++ [ret]` key bytes (owned) -> struct id. Freed at teardown.
+fn_struct_dedup: std.StringHashMapUnmanaged(u32) = .empty,
+
 /// OWNS the mangled names minted for reified generic-struct instances. A reified
 /// `StructSym.name` is a view into one of these; `snapshotLayouts` dupes it, so these
 /// are freed wholesale at teardown (the struct teardown frees `field_*`/`offsets` but
@@ -1684,6 +1743,9 @@ pub fn checkGraph(
         composite.deinit(gpa);
         gpa.destroy(composite);
         t.reify_map.deinit(gpa);
+        var fdk = t.fn_struct_dedup.keyIterator();
+        while (fdk.next()) |k| gpa.free(k.*);
+        t.fn_struct_dedup.deinit(gpa);
         for (t.reified_names.items) |nm| gpa.free(nm);
         t.reified_names.deinit(gpa);
         for (t.fns.items) |f| {
@@ -1753,6 +1815,7 @@ pub fn checkGraph(
             gpa.free(s.field_names);
             gpa.free(s.field_types);
             gpa.free(s.offsets);
+            if (s.fn_sig) |fs| gpa.free(fs.params);
             // A generic template's `generic_params` array is owned; a reified /
             // non-generic struct's default `&.{}` frees to a no-op.
             if (s.generic_params.len > 0) gpa.free(@constCast(s.generic_params));
@@ -2074,22 +2137,31 @@ pub const max_instantiation_depth: u32 = 64;
 /// reaching a type-arg slot in a CHECKED body is always ground (templates are never
 /// body-checked; an instance re-check grounds its `type_var`s via `bc.subst`). Admits
 /// `unit`: `()` is a concrete zero-sized value type-arg (as in `Map[T, ()]`), reified
-/// to a 0-byte field/payload. Still excludes `type_var` and poison.
+/// to a 0-byte field/payload. Admits a function type (reified to its pair struct). Still
+/// excludes `type_var` and poison.
 fn isConcreteValue(ty: Type) bool {
     return switch (ty.kind) {
-        .int, .bool, .float, .str, .@"struct", .@"enum", .app, .unit => true,
+        .int, .bool, .float, .str, .@"struct", .@"enum", .app, .unit, .func => true,
         else => false,
     };
 }
 
 /// Substitute a template type through a concrete arg tuple: a `type_var(ord)`
-/// becomes `args[ord]`; an `App(ctor, [pat..])` recursively substitutes each arg and
-/// re-interns (so a template param spelled `Box[T]` grounds to `Box[int]`); anything
-/// else passes through unchanged.
+/// becomes `args[ord]`; an `App(ctor, [pat..])` or a fn type recursively substitutes
+/// each arg and re-interns (so a template param spelled `Box[T]` grounds to `Box[int]`);
+/// anything else passes through unchanged.
 fn substType(t: *Typecheck, ty: Type, args: []const Type) Type {
     if (ty.isTypeVar()) {
         const ord = ty.typeVarOrd();
         return if (ord < args.len) args[ord] else Type.invalid;
+    }
+    if (ty.isFunc()) {
+        const parts = Composite.fnParts(t.composite.at(ty.funcIdx()));
+        var buf: [8]Type = undefined;
+        const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (t.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
+        defer if (parts.params.len > buf.len) t.gpa.free(sub);
+        for (parts.params, 0..) |p, i| sub[i] = t.substType(p, args);
+        return refs.internFn(t, sub, t.substType(parts.ret, args));
     }
     if (ty.isApp()) {
         const e = t.composite.at(ty.appIdx());
@@ -2298,7 +2370,7 @@ fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type, app_of_
             if (ord >= args.len) return null;
             var s = args[ord];
             if (s.kind == .@"struct" or s.kind == .@"enum") {
-                if (app_of_reified.get(reifiedKey(s))) |ai| s = Type.app(ai);
+                if (app_of_reified.get(reifiedKey(s))) |ai| s = t.composite.typeAt(ai);
             }
             sub[i] = s;
         } else sub[i] = a;
@@ -3130,7 +3202,7 @@ pub fn groundProtoType(ty: Type, recv: Type, protocol_args: []const Type) Type {
     return if (ord - 1 < protocol_args.len) protocol_args[ord - 1] else ty;
 }
 
-/// `groundProtoType` extended to recurse into composite `App`s: a protocol return
+/// `groundProtoType` extended to recurse into composite `App`s and fn types: a protocol return
 /// spelled `Option[Item]` decodes to `App(Option, [type_var(1)])`, whose `type_var(1)`
 /// (Item) must ground THROUGH the App to the conformance's arg pattern before the T0024
 /// signature comparison. Shallow `groundProtoType` leaves it as `App(Option, [tv1])`,
@@ -3140,6 +3212,14 @@ pub fn groundProtoType(ty: Type, recv: Type, protocol_args: []const Type) Type {
 /// verdicts are byte-identical. A bad intern degrades to `.invalid` (already an error path).
 pub fn groundProtoTypeDeep(t: *Typecheck, ty: Type, recv: Type, protocol_args: []const Type) Type {
     if (ty.isTypeVar()) return groundProtoType(ty, recv, protocol_args);
+    if (ty.isFunc()) {
+        const parts = Composite.fnParts(t.composite.at(ty.funcIdx()));
+        var buf: [8]Type = undefined;
+        const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (t.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
+        defer if (parts.params.len > buf.len) t.gpa.free(sub);
+        for (parts.params, 0..) |p, i| sub[i] = groundProtoTypeDeep(t, p, recv, protocol_args);
+        return refs.internFn(t, sub, groundProtoTypeDeep(t, parts.ret, recv, protocol_args));
+    }
     if (ty.isApp()) {
         const e = t.composite.at(ty.appIdx());
         var buf: [8]Type = undefined;
@@ -3210,7 +3290,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                     const av = try t.gpa.alloc(Type, arg_nodes.len);
                     for (arg_nodes, 0..) |an, k| {
                         const aty = t.typeFromNode(an);
-                        if (aty.isApp()) {
+                        if (aty.isApp() or aty.isFunc()) {
                             try t.sink.report(.{ .span = t.spanOf(an) }, "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)", .{});
                             av[k] = .invalid;
                         } else av[k] = aty;
@@ -4875,6 +4955,29 @@ test "a From impl whose `from` returns the WRONG type still trips T0024 (coheren
     try testing.expectEqual(codes.Code.T0024, c.result.diags[0].code);
 }
 
+test "a protocol method's fn-typed param grounds Self for the coherence signature check" {
+    const gpa = testing.allocator;
+    var ok = try checkSource(
+        \\protocol Apply { fn app(self, f: fn(Self) -> int) -> int }
+        \\pub struct S { x: int }
+        \\impl S has Apply { fn app(self, _f: fn(S) -> int) -> int { self.x } }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    var bad = try checkSource(
+        \\protocol Apply { fn app(self, f: fn(Self) -> int) -> int }
+        \\pub struct S { x: int }
+        \\impl S has Apply { fn app(self, _f: fn(int) -> int) -> int { self.x } }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer bad.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), bad.result.diags.len);
+    try testing.expectEqual(codes.Code.T0024, bad.result.diags[0].code);
+}
+
 test "`<`/`>`/`<=`/`>=` on a struct with `impl P has Ord` type to bool, zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
@@ -5894,6 +5997,187 @@ test "a [T has Convert[U]] bound resolves after substituting U at the mono workl
     try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances.len);
     try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances[0].protocol_args.len);
     try testing.expectEqual(Kind.int, c.result.instances[0].conformances[0].protocol_args[0].kind);
+}
+
+/// The layout ids of every reified function-type pair in a checked program.
+fn fnPairIds(c: *const Checked, out: []u32) []u32 {
+    var n: usize = 0;
+    for (c.result.layouts, 0..) |l, i| if (l.fn_sig != null) {
+        out[n] = @intCast(i);
+        n += 1;
+    };
+    return out[0..n];
+}
+
+test "fn types are assignable iff structurally equal, aliases included" {
+    const gpa = testing.allocator;
+    var ok = try checkSource(
+        \\type F = fn(int) -> int
+        \\pub fn a(g: fn(int) -> int) -> int {
+        \\ h: F = g
+        \\ k: fn(int) -> int = h
+        \\ return 0
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    try testing.expect(Type.eql(identTypeOf(&ok, "g"), identTypeOf(&ok, "h")));
+
+    var bad = try checkSource(
+        \\pub fn keep(g: fn(int) -> int) -> int { return 0 }
+        \\pub fn a(g: fn(int) -> bool, u: fn(int, int) -> int) -> int {
+        \\ h: fn(int) -> int = g
+        \\ v: fn(int) -> int = u
+        \\ w: fn() = g
+        \\ return keep(g)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer bad.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4), bad.result.diags.len);
+    try testing.expectEqual(codes.Code.T0041, bad.result.diags[0].code);
+    try testing.expectEqualStrings("cannot bind fn(int) -> bool to 'h' of type fn(int) -> int", bad.result.diags[0].message);
+    try testing.expectEqualStrings("cannot bind fn(int, int) -> int to 'v' of type fn(int) -> int", bad.result.diags[1].message);
+    try testing.expectEqualStrings("cannot bind fn(int) -> bool to 'w' of type fn()", bad.result.diags[2].message);
+    try testing.expectEqual(codes.Code.T0040, bad.result.diags[3].code);
+    try testing.expectEqualStrings("argument 1: expected fn(int) -> int, got fn(int) -> bool; 'keep' takes (fn(int) -> int)", bad.result.diags[3].message);
+}
+
+test "a fn-typed param, field and generic-struct arg reify to one 16-byte pair per signature" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Box[T] { v: T }
+        \\struct Holder[T] { f: fn(Box[T]) -> int }
+        \\pub struct H { run: fn(int) -> int }
+        \\pub fn p(g: fn(int) -> int, b: Box[fn(int) -> int], h: H) -> int { return 0 }
+        \\pub fn q(g: fn(Box[int]) -> int) -> int { return 0 }
+        \\pub fn r(h: Holder[int]) -> int { return 0 }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var buf: [8]u32 = undefined;
+    const pairs = fnPairIds(&c, &buf);
+    try testing.expectEqual(@as(usize, 2), pairs.len);
+    for (pairs) |id| {
+        const l = c.result.layouts[id];
+        try testing.expectEqual(@as(u32, 16), l.size);
+        try testing.expectEqual(@as(u32, 8), l.@"align");
+        try testing.expectEqualSlices(u32, &.{ 0, 8 }, l.offsets);
+        try testing.expect(Type.eql(l.field_types[0], Type.int));
+        try testing.expect(Type.eql(l.field_types[1], Type.rawptr));
+        try testing.expectEqualStrings("code", l.field_names[0]);
+        try testing.expectEqualStrings("env", l.field_names[1]);
+        try testing.expectEqual(LayoutEngine.NativeStructFamily.none, l.native_family);
+    }
+    const sig_of = struct {
+        fn f(cc: *const Checked, name: []const u8) Sig {
+            for (cc.result.sigs) |sg| if (std.mem.eql(u8, sg.name, name)) return sg;
+            unreachable;
+        }
+    }.f;
+    const p = sig_of(&c, "main.p");
+    const int_pair = p.params[0];
+    try testing.expect(LayoutEngine.isFnStruct(int_pair, c.result.layouts));
+    const ip = c.result.layouts[int_pair.struct_id].fn_sig.?;
+    try testing.expectEqualSlices(Type, &.{Type.int}, ip.params);
+    try testing.expect(Type.eql(ip.ret, Type.int));
+    try testing.expectEqualStrings("fn$int$int", c.result.layouts[int_pair.struct_id].name);
+    // The same signature spelled as a Box arg and as a struct field is the same pair.
+    const box = c.result.layouts[p.params[1].struct_id];
+    try testing.expect(Type.eql(box.field_types[0], int_pair));
+    const hl = c.result.layouts[p.params[2].struct_id];
+    try testing.expect(Type.eql(hl.field_types[0], int_pair));
+    // A written fn(Box[int]) -> int and Holder[T]'s fn(Box[T]) -> int at T = int ground
+    // to one pair.
+    const q = sig_of(&c, "main.q");
+    const holder = c.result.layouts[sig_of(&c, "main.r").params[0].struct_id];
+    try testing.expect(LayoutEngine.isFnStruct(q.params[0], c.result.layouts));
+    try testing.expect(Type.eql(holder.field_types[0], q.params[0]));
+    const bp = c.result.layouts[q.params[0].struct_id].fn_sig.?;
+    try testing.expectEqualStrings("Box$int", c.result.layouts[bp.params[0].struct_id].name);
+}
+
+test "a struct field of fn type lays out 16 bytes at offset 8" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\pub struct S { id: int, run: fn(int) -> int }
+        \\pub fn f(s: S) -> int { return s.id }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const s = for (c.result.layouts) |l| {
+        if (std.mem.eql(u8, l.name, "S")) break l;
+    } else unreachable;
+    try testing.expectEqualSlices(u32, &.{ 0, 8 }, s.offsets);
+    try testing.expectEqual(@as(u32, 24), s.size);
+    try testing.expect(LayoutEngine.isFnStruct(s.field_types[1], c.result.layouts));
+}
+
+test "no .func survives reify" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\pub enum E { a(fn() -> int), b }
+        \\pub struct S { run: fn(int) -> int }
+        \\fn apply[T](f: fn(T) -> T, x: T) -> T { return x }
+        \\pub fn use(g: fn(int) -> int, s: S, e: E) -> int {
+        \\ h: fn(int) -> int = g
+        \\ return apply[int](h, 1) + apply(s.run, 2)
+        \\}
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    const no_func = struct {
+        fn ok(t: Type) bool {
+            return t.kind != .func and t.kind != .app and t.kind != .type_var;
+        }
+    }.ok;
+    for (c.result.node_types) |mnt| for (mnt) |ty| try testing.expect(no_func(ty));
+    for (c.result.instances) |inst| {
+        for (inst.node_types) |ty| try testing.expect(no_func(ty));
+        for (inst.args) |a| try testing.expect(no_func(a));
+        for (inst.params) |pp| try testing.expect(no_func(pp));
+        try testing.expect(no_func(inst.ret));
+    }
+    for (c.result.sigs) |sg| {
+        if (sg.isGenericTemplate()) continue;
+        for (sg.params) |pp| try testing.expect(no_func(pp));
+        try testing.expect(no_func(sg.ret));
+    }
+    // Layout tables also hold the (never-lowered) prelude templates, whose payloads keep
+    // their type_var patterns; none of them holds a fn type.
+    for (c.result.layouts) |l| for (l.field_types) |ft| try testing.expect(ft.kind != .func);
+    for (c.result.enum_layouts) |el| for (el.variants) |v| for (v.field_types) |ft| try testing.expect(ft.kind != .func);
+    // The template keeps its fn-typed param, so it still reads as a template.
+    for (c.result.sigs) |sg| if (std.mem.eql(u8, sg.name, "main.apply")) try testing.expect(sg.isGenericTemplate());
+}
+
+test "a struct with a fn field derives no Eq/Hash/Display" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\pub struct S { id: int, run: fn(int) -> int }
+        \\pub fn eq(a: S, b: S) -> bool { return a == b }
+        \\pub fn h(a: S) -> int { return a.hash() }
+        \\pub fn d(a: S) -> str { return a.to_string() }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0029, c.result.diags[0].code);
+    try testing.expectEqual(codes.Code.T0030, c.result.diags[1].code);
+    try testing.expectEqual(codes.Code.T0031, c.result.diags[2].code);
+    for (c.result.diags) |dg| try testing.expect(std.mem.indexOf(u8, dg.message, "'fn(int) -> int'") != null);
+    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
 }
 
 test "Box[int] monomorphizes to a reified 1-int concrete struct (size 8)" {

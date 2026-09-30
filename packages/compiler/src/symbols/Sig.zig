@@ -28,13 +28,14 @@ pub const Sig = struct {
     }
 
     /// True when this sig is a generic template — some param is a bare `type_var`
-    /// (flat generic) OR an `.app` (a type-var hidden inside a container param like
-    /// `Vec[T]`). After reify only a template keeps `.app` params (reify rewrites every
-    /// non-generic fn's container params to a concrete `structT`), so an `.app` param
-    /// is a sound composite-free template signal. Gates the bare-inferred-call sites
-    /// that must resolve to a reified INSTANCE, not the never-lowered template symbol.
+    /// (flat generic) OR an `.app`/`.func` (a type-var hidden inside a container or fn
+    /// param like `Vec[T]` / `fn(T) -> int`). After reify only a template keeps
+    /// `.app`/`.func` params (reify rewrites every non-generic fn's composite params to a
+    /// concrete `structT`), so such a param is a sound composite-free template signal.
+    /// Gates the bare-inferred-call sites that must resolve to a reified INSTANCE, not
+    /// the never-lowered template symbol.
     pub fn isGenericTemplate(sig: Sig) bool {
-        for (sig.params) |p| if (p.isTypeVar() or p.isApp()) return true;
+        for (sig.params) |p| if (p.isTypeVar() or p.isApp() or p.isFunc()) return true;
         return false;
     }
 
@@ -50,3 +51,11 @@ pub const Sig = struct {
         return m + 1;
     }
 };
+
+test "a template whose only type var is inside a fn param is generic" {
+    const Type = types.Type;
+    const tmpl: Sig = .{ .kind = .user_fn, .name = "apply", .params = &.{ Type.func(0), Type.int }, .ret = Type.int };
+    try @import("std").testing.expect(tmpl.isGenericTemplate());
+    const plain: Sig = .{ .kind = .user_fn, .name = "keep", .params = &.{ Type.structT(3), Type.int }, .ret = Type.func(1) };
+    try @import("std").testing.expect(!plain.isGenericTemplate());
+}

@@ -105,7 +105,9 @@ const expr_first = setOf(&.{ .identifier, .number, .float, .string, .char_lit, .
 /// body (`if x |> f { .. }`). After a pipe RHS each one is a P0014 rather than a silent
 /// `(x |> f).len()` reading, because the RHS is a fixed shape.
 const postfix_first = setOf(&.{ .dot, .l_bracket, .l_paren, .question });
-/// FIRST(type): an identifier (dot-chained) or the unit type `()`.
+/// FIRST(type): an identifier (dot-chained) or the unit type `()`. A function type also
+/// starts a type, but its `fn` is a decl anchor, so it is recognized by `startsType`'s
+/// 2-token lookahead instead (a stray `fn name` still bails to the decl loop).
 const type_first = setOf(&.{ .identifier, .l_paren });
 /// FIRST(sub-pattern): a literal, a binding/wildcard identifier, or a `.V`/`N.V`.
 const pattern_first = setOf(&.{ .identifier, .number, .kw_true, .kw_false, .dot });
@@ -841,7 +843,7 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
         defer types.deinit(p.gpa);
         while (!p.at(.r_paren) and !p.at(.eof)) {
             const t_entry = p.index;
-            if (type_first.contains(p.peek().tag)) {
+            if (p.startsType()) {
                 try types.append(p.gpa, try p.parseType());
                 if (!p.eat(.comma)) {
                     if (p.at(.r_paren)) break;
@@ -944,7 +946,7 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
                 defer types.deinit(p.gpa);
                 while (!p.at(.r_paren) and !p.at(.eof)) {
                     const t_entry = p.index;
-                    if (type_first.contains(p.peek().tag)) {
+                    if (p.startsType()) {
                         try types.append(p.gpa, try p.parseType());
                         if (!p.eat(.comma)) {
                             if (p.at(.r_paren)) break;
@@ -1306,7 +1308,7 @@ fn parseTypeApp(p: *Parser, base: Ast.Index) Error!Ast.Index {
     defer args.deinit(p.gpa);
     while (!p.at(.r_bracket) and !p.at(.eof)) {
         const entry = p.index;
-        if (type_first.contains(p.peek().tag)) {
+        if (p.startsType()) {
             try args.append(p.gpa, try p.parseType());
             if (!p.eat(.comma)) {
                 if (p.at(.r_bracket)) break;
@@ -1353,9 +1355,11 @@ fn turbofishFollows(p: *const Parser) bool {
 /// Peek across the bracketed run `[ .. ]` at the cursor and report whether every token
 /// in it (at any nesting depth) is drawn from the type-syntax alphabet. Type arguments
 /// this tier are only bare/qualified names (`int`, `mod.T`), nested applications
-/// (`Box[Vec[int]]`), or the unit type `()` — never a literal or an operator. So a run
-/// containing a number (`xs[0]`) or an operator (`xs[i+1]`) cannot be a real type-app and
-/// is a value index, even when a `.`/`(` follower would otherwise look like a turbofish.
+/// (`Box[Vec[int]]`), the unit type `()` or a function type (`fn(int) -> int`) — never a
+/// literal or an operator. So a run containing a number (`xs[0]`) or an operator
+/// (`xs[i+1]`) cannot be a real type-app and is a value index, even when a `.`/`(`
+/// follower would otherwise look like a turbofish. A lambda in an index has a `{` body,
+/// which is outside the alphabet, so it stays an index.
 /// Parens are admitted for the unit type `()`, which leaves a value index whose content is
 /// a call or a parenthesized expr (`xs[f()]`, `xs[(i)]`) still read as type-shaped; that
 /// case is later rejected cleanly by the checker rather than miscompiled. Unbalanced/eof
@@ -1370,7 +1374,7 @@ fn bracketIsTypeShaped(p: *const Parser) bool {
                 depth -= 1;
                 if (depth == 0) return true;
             },
-            .identifier, .dot, .comma, .l_paren, .r_paren => {},
+            .identifier, .dot, .comma, .l_paren, .r_paren, .kw_fn, .arrow => {},
             .eof => return false,
             else => return false,
         }
@@ -1434,6 +1438,7 @@ fn parseType(p: *Parser) Error!Ast.Index {
         while (!p.at(.eof) and !p.at(.r_bracket) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
         return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
     }
+    if (p.at(.kw_fn)) return p.parseFnType();
     if (p.at(.l_paren) and p.peek2().tag == .r_paren) {
         const at_tok = p.index;
         p.bump(.l_paren);
@@ -1457,6 +1462,43 @@ fn parseType(p: *Parser) Error!Ast.Index {
         try p.warnSpan(lt_start, p.prevEnd(), .P0010, "type arguments use '[]', not '<>': write 'Vec[int]'");
     }
     return ty;
+}
+
+/// Whether the cursor starts a type in a list context: `type_first`, or `fn (` (a
+/// function type). `fn` alone is a decl anchor, so the 2-token test keeps `fn name`
+/// bailing to the decl loop exactly as before.
+fn startsType(p: *const Parser) bool {
+    const tag = p.peek().tag;
+    return type_first.contains(tag) or (tag == .kw_fn and p.peek2().tag == .l_paren);
+}
+
+/// `fn(A, B) -> R` — a function type. `-> R` is optional (a unit return) and
+/// right-associative: `fn(int) -> fn(int) -> int` returns a function, because the ret is
+/// parsed by `parseType` itself (depth-guarded there).
+fn parseFnType(p: *Parser) Error!Ast.Index {
+    const fn_tok = p.index;
+    p.bump(.kw_fn);
+    try p.expect(.l_paren, "expected '(' after 'fn' in a function type");
+    var params: std.ArrayList(Ast.Index) = .empty;
+    defer params.deinit(p.gpa);
+    while (!p.at(.r_paren) and !p.at(.eof)) {
+        const entry = p.index;
+        if (p.startsType()) {
+            try params.append(p.gpa, try p.parseType());
+            if (!p.eat(.comma)) {
+                if (p.at(.r_paren)) break;
+            }
+        } else if (tuple_recovery.contains(p.peek().tag)) {
+            break;
+        } else {
+            _ = try p.advanceWithError(.P0006, "expected a type");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
+    }
+    try p.expect(.r_paren, "expected ')' to close a function type's parameters");
+    const header = try p.addRange(params.items);
+    const ret: Ast.Index = if (p.eat(.arrow)) try p.parseType() else Ast.none;
+    return p.addNode(.{ .tag = .fn_type, .main_token = fn_tok, .lhs = header, .rhs = ret });
 }
 
 /// Skip a mistaken `<...>` angle-bracket type-argument run at the cursor so the
@@ -2846,6 +2888,28 @@ test "bracketed postfix: a value index disambiguates from a turbofish type-app" 
     }
 }
 
+test "a function type is a turbofish type argument in expression position" {
+    const gpa = testing.allocator;
+    const srcs = [_][]const u8{ "Vec[fn(int) -> int].new()", "Map[int, fn() -> bool].new()", "id[fn(int) -> int](inc)" };
+    for (srcs) |src| {
+        const tokens = try Lexer.tokenize(gpa, src);
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, src, &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        try testing.expect(diag == null);
+        var fn_types: usize = 0;
+        var apps: usize = 0;
+        for (tree.nodes) |n| switch (n.tag) {
+            .fn_type => fn_types += 1,
+            .type_app => apps += 1,
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), fn_types);
+        try testing.expectEqual(@as(usize, 1), apps);
+    }
+}
+
 test "parse error reports an offset and leaves a diagnostic" {
     // The missing operand after `+` no longer bails — `parsePrefix`'s else-arm
     // repairs it with a single-token DELETION (an `error_node` over the offending
@@ -3241,6 +3305,11 @@ test "root is program and children precede parents" {
             },
             // `unsafe { .. }`: the inner block is `lhs`, created before this node.
             .unsafe_block => try testing.expect(n.lhs.int() < self),
+            // `fn(P..) -> R`: the param type-refs are a Range in `lhs`, the ret is `rhs`.
+            .fn_type => {
+                for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
+                if (n.rhs != Ast.none) try testing.expect(n.rhs.int() < self);
+            },
         }
     }
 }
@@ -4526,6 +4595,86 @@ test "parse diagnostics carry P-codes by syntactic category" {
         try testing.expect(res.diags.len >= 1);
         try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
     }
+}
+
+test "parses a function type in a param, a field, a tuple field, a variant payload, a type argument and an alias" {
+    try expectProgram(
+        "fn f(g: fn(int) -> bool) {}\n",
+        "(program (fn f ((param g (fnty (int) bool))) _ (block)))",
+    );
+    try expectProgram(
+        "struct S { run: fn(int, str) -> int }\n",
+        "(program (struct S (param run (fnty (int str) int))))",
+    );
+    try expectProgram(
+        "struct T(fn() -> int, int)\n",
+        "(program (struct.tuple T (fnty () int) int))",
+    );
+    try expectProgram(
+        "enum E { full(fn(int)) }\n",
+        "(program (enum E (variant.tuple full (fnty (int)))))",
+    );
+    try expectProgram(
+        "fn f(v: Vec[fn(int) -> int]) {}\n",
+        "(program (fn f ((param v (tyapp Vec (fnty (int) int)))) _ (block)))",
+    );
+    try expectProgram(
+        "type Op = fn(int, int) -> int\n",
+        "(program (alias Op (fnty (int int) int)))",
+    );
+}
+
+test "-> in a function type is right-associative" {
+    try expectProgram(
+        "fn f(g: fn(int) -> fn(int) -> int) {}\n",
+        "(program (fn f ((param g (fnty (int) (fnty (int) int)))) _ (block)))",
+    );
+    // A function type as a declaration's return type ends before the body `{`.
+    try expectProgram(
+        "fn f() -> fn() -> int { g }\n",
+        "(program (fn f () (fnty () int) (block g)))",
+    );
+}
+
+test "fn() alone is a unit-returning function type" {
+    try expectProgram(
+        "fn f(g: fn()) {}\n",
+        "(program (fn f ((param g (fnty ()))) _ (block)))",
+    );
+    try expectProgram(
+        "fn f() -> fn() { g }\n",
+        "(program (fn f () (fnty ()) (block g)))",
+    );
+}
+
+test "fn without '(' in type position is P0001" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "fn f(g: fn int) {}\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expect(res.diags.len >= 1);
+    try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+    try testing.expectEqualStrings("expected '(' after 'fn' in a function type", res.diags[0].message);
+}
+
+test "a stray `fn name` in a tuple-struct field list still bails to the decl loop" {
+    const gpa = testing.allocator;
+    const source = "struct S(int, fn main() -> int { return 0 }\nfn g() -> int { return 1 }\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    // The list stops AT the `fn` (not reading `fn main` as a field type), exactly as
+    // before function types existed.
+    try testing.expect(res.diags.len >= 1);
+    try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+    try testing.expectEqualStrings("expected ')' to close a tuple struct", res.diags[0].message);
+    try testing.expectEqual(@as(u32, 14), res.diags[0].byte_offset);
+    var fn_decls: usize = 0;
+    for (res.tree.nodes) |n| {
+        if (n.tag == .fn_decl) fn_decls += 1;
+        try testing.expect(n.tag != .fn_type);
+    }
+    try testing.expect(fn_decls >= 1);
 }
 
 test "a self-less method parses with no P0006 in BOTH a conformance and an inherent impl" {

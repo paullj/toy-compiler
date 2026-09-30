@@ -428,6 +428,12 @@ pub const Node = extern struct {
         /// `.identifier` leaf owning the SECOND binding's token + resolution. The
         /// iterator must yield `Entry[K, V]`; `key` binds field 0, `val` field 1.
         for_in2_stmt,
+
+        /// A function type `fn(A, B) -> R` in type position. Appended at END (frozen
+        /// ordinal; `parse_version` bumped 18->19). `main_token` is the `fn`; `lhs` is the
+        /// `extra` header of a `Range` over the param type-ref nodes; `rhs` is the return
+        /// type-ref node, or `none` for a unit return (`fn(int)`).
+        fn_type,
     };
 };
 
@@ -659,6 +665,10 @@ pub fn protocolRefArgs(tree: Tree, node: Index) []const Index {
 /// "TOYP" — a magic so a foreign/corrupt blob is treated as a cache miss.
 pub const parse_magic: u32 = 0x544f5950;
 
+/// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
+/// so the writer and the reader can never disagree.
+pub const parse_version: u32 = 19;
+
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
     magic: u32,
@@ -666,7 +676,7 @@ pub const ParseHeader = extern struct {
     /// ordinal, a `FnProto`/header cell-layout change, or a new node-shape a prior
     /// compiler never produced. `unpack` rejects a mismatched version so a stale blob
     /// misses cleanly instead of misdecoding bytes whose meaning shifted.
-    version: u32 = 18,
+    version: u32 = parse_version,
     node_count: u32,
     extra_count: u32,
     /// Number of `u32` words in the `pub_bits` section (`pubBitsLen(node_count)`).
@@ -727,7 +737,7 @@ pub fn unpack(gpa: std.mem.Allocator, bytes: []const u8) !?Tree {
     if (bytes.len < @sizeOf(ParseHeader)) return null;
     var hdr: ParseHeader = undefined;
     @memcpy(std.mem.asBytes(&hdr), bytes[0..@sizeOf(ParseHeader)]);
-    if (hdr.magic != parse_magic or hdr.version != 18) return null;
+    if (hdr.magic != parse_magic or hdr.version != parse_version) return null;
     const need = @sizeOf(ParseHeader) +
         @as(usize, hdr.node_count) * @sizeOf(Node) +
         @as(usize, hdr.extra_count) * 4 +
@@ -801,6 +811,19 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             for (rangeSlice(tree, n.rhs.int())) |arg| {
                 try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, arg);
+            }
+            try out.writeByte(')');
+        },
+        .fn_type => {
+            try out.writeAll("(fnty (");
+            for (rangeSlice(tree, n.lhs.int()), 0..) |p, i| {
+                if (i != 0) try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, p);
+            }
+            try out.writeByte(')');
+            if (n.rhs != none) {
+                try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, n.rhs);
             }
             try out.writeByte(')');
         },
@@ -1541,6 +1564,29 @@ test "pack/unpack round-trips tuple_struct_decl and tuple_field (v14)" {
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
     try testing.expectEqual(Node.Tag.tuple_struct_decl, got.nodes[1].tag);
     try testing.expectEqual(Node.Tag.tuple_field, got.nodes[3].tag);
+}
+
+test "pack/unpack round-trips a fn_type node under parse_version" {
+    const gpa = testing.allocator;
+    // `fn(int) -> int`: two type-ref leaves, the fn_type (lhs = Range header, rhs = ret).
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 2, .lhs = none, .rhs = none },
+        .{ .tag = .identifier, .main_token = 5, .lhs = none, .rhs = none },
+        .{ .tag = .fn_type, .main_token = 0, .lhs = Index.from(1), .rhs = Index.from(1) },
+    };
+    var extra = [_]u32{ 0, 0, 1 };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    const blob = try pack(gpa, tree);
+    defer gpa.free(blob);
+    try testing.expectEqual(parse_version, std.mem.readInt(u32, blob[4..8], @import("builtin").cpu.arch.endian()));
+    const got = (try unpack(gpa, blob)) orelse return error.UnexpectedMiss;
+    defer gpa.free(got.nodes);
+    defer gpa.free(got.extra);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(tree.nodes), std.mem.sliceAsBytes(got.nodes));
+    try testing.expectEqualSlices(u32, tree.extra, got.extra);
+    // A blob from the previous encoding misses cleanly.
+    std.mem.writeInt(u32, blob[4..8], parse_version - 1, @import("builtin").cpu.arch.endian());
+    try testing.expect((try unpack(gpa, blob)) == null);
 }
 
 test "contentFp ignores Node padding (cold-build fp determinism foundation)" {
