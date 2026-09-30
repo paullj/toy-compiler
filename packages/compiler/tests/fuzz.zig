@@ -387,7 +387,7 @@ fn genBlock(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, d
 fn genStmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, depth: usize) error{OutOfMemory}!void {
     // Cap nesting so control-flow bodies stay bounded (the parser has its own depth
     // guard, but keeping the generator shallow avoids gigantic buffers).
-    const kind = if (depth >= max_gen_depth) rand.uintLessThan(u8, 3) else rand.uintLessThan(u8, 6);
+    const kind = if (depth >= max_gen_depth) rand.uintLessThan(u8, 3) else rand.uintLessThan(u8, 7);
     switch (kind) {
         0 => { // binding
             try out.appendSlice(gpa, pick(idents, rand));
@@ -440,6 +440,13 @@ fn genStmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
             }
             try out.append(gpa, '}');
         },
+        6 => { // a lambda called in place, as a statement
+            try out.appendSlice(gpa, "fn(x: int) { ");
+            try genExpr(gpa, out, rand, 0);
+            try out.appendSlice(gpa, " }(");
+            try genExpr(gpa, out, rand, 0);
+            try out.append(gpa, ')');
+        },
         else => unreachable,
     }
 }
@@ -451,7 +458,7 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
         try genAtom(gpa, out, rand);
         return;
     }
-    switch (rand.uintLessThan(u8, 5)) {
+    switch (rand.uintLessThan(u8, 6)) {
         0 => { // binary op (feeds the real precedence table)
             try genExpr(gpa, out, rand, depth + 1);
             try out.append(gpa, ' ');
@@ -488,6 +495,24 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
                 if (rand.boolean()) try genExpr(gpa, out, rand, depth + 1);
                 try out.append(gpa, ')');
             }
+        },
+        5 => switch (rand.uintLessThan(u8, 3)) { // well-formed lambdas
+            0 => {
+                try out.appendSlice(gpa, "fn(x: int) { ");
+                try genExpr(gpa, out, rand, depth + 1);
+                try out.appendSlice(gpa, " }");
+            },
+            1 => {
+                // Untyped params: they reach the checker's expected-type path (or T0050).
+                try out.appendSlice(gpa, "fn(a, b) ");
+                try genBlock(gpa, out, rand, max_gen_depth);
+            },
+            2 => {
+                try out.appendSlice(gpa, "fn() -> int { return ");
+                try genExpr(gpa, out, rand, depth + 1);
+                try out.appendSlice(gpa, " }");
+            },
+            else => unreachable,
         },
         else => unreachable,
     }

@@ -66,6 +66,7 @@ pub fn checkGraph(
             .tokens = m.tokens,
             .source = m.source,
             .resolutions = res.resolutions[i],
+            .closures = if (i < res.closures.len) res.closures[i] else &.{},
         };
     }
 
@@ -957,6 +958,103 @@ test "fn_ref/value callee tables and the adapter table are identical at -j1 and 
     // 70 pushes + 70 `g := shared` + one ref per `pass` instance.
     try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.fn_ref)] >= 141);
     try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.value)] >= 140);
+}
+
+/// The lambda-unit table and every lambda node's reified type (by layout name) of one
+/// check of `graph` under a `limit`-worker pool, as bytes. Requires an error-free check.
+fn lambdaTablesUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_units: *usize) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
+    defer tr.deinit(gpa);
+    for (tr.diags) |d| try testing.expect(d.severity != .err);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (tr.lambda_units) |u| {
+        try out.appendSlice(gpa, u.name);
+        try out.append(gpa, 0);
+        try out.appendSlice(gpa, std.mem.asBytes(&u.node));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(u.param_slots));
+        for (u.sig.params) |p| try out.appendSlice(gpa, if (p.isStruct()) tr.layouts[p.struct_id].name else @tagName(p.kind));
+        try out.appendSlice(gpa, if (u.sig.ret.isStruct()) tr.layouts[u.sig.ret.struct_id].name else @tagName(u.sig.ret.kind));
+    }
+    for (graph.modules, 0..) |m, mi| for (m.nodes, 0..) |n, k| {
+        if (n.tag != .lambda) continue;
+        const t = tr.node_types[mi][k];
+        if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
+    };
+    for (tr.instances) |inst| for (graph.modules[inst.mod].nodes, 0..) |n, k| {
+        if (n.tag != .lambda) continue;
+        const t = inst.node_types[k];
+        if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
+    };
+    n_units.* = tr.lambda_units.len;
+    return out.toOwnedSlice(gpa);
+}
+
+test "closure tables and lambda node types are identical at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-lambdas-jn";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // More bodies than the Pass-C fan-out threshold, each with a lambda of a signature of
+    // its own (so fn types intern in racing order) and a nested one; the generic `wrap`
+    // holds a lambda, so its units follow the instance order.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll(
+        \\import std/vec
+        \\pub struct S0 { v: int }
+        \\fn wrap[T](x: T) -> T {
+        \\    id := fn(y: T) -> T { y }
+        \\    id(x)
+        \\}
+        \\
+    );
+    for (1..70) |k| try src.writer.print("pub struct S{d} {{ v: int }}\n", .{k});
+    for (0..70) |k| try src.writer.print(
+        \\fn _u{d}() -> int {{
+        \\    f := fn(s: S{d}) -> Vec[S{d}] {{
+        \\        xs: Vec[S{d}] = []
+        \\        xs.push(s)
+        \\        xs
+        \\    }}
+        \\    g := fn() -> fn(int) -> int {{ fn(x) {{ x + {d} }} }}
+        \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v
+        \\}}
+        \\
+    , .{ k, k, k, k, k, k, k, k });
+    try src.writer.writeAll("fn main() -> int { return 0 }\n");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+
+    var serial_n: usize = 0;
+    var parallel_n: usize = 0;
+    const serial = try lambdaTablesUnder(gpa, &graph, &r, .limited(0), &serial_n);
+    defer gpa.free(serial);
+    const parallel = try lambdaTablesUnder(gpa, &graph, &r, .limited(8), &parallel_n);
+    defer gpa.free(parallel);
+    try testing.expectEqualSlices(u8, serial, parallel);
+    // Three per `_u` body, plus one per `wrap` instance (int and each S{k}).
+    try testing.expectEqual(@as(usize, 70 * 3 + 71), serial_n);
+    try testing.expectEqual(serial_n, parallel_n);
 }
 
 test "fn values in std containers and sinks: Map key and Display are T0023; fs[i](x) calls the element" {

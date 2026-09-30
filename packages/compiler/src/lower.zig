@@ -122,8 +122,13 @@ pub const Inputs = struct {
 pub const ClosureInputs = struct {
     /// The fn-value thunks, sorted by `(kind, key)`.
     adapters: []const Closure.Adapter,
+    /// The lambda units, sorted by `(owner, node)`.
+    lambda_units: []const Closure.LambdaUnit,
+    /// The body being lowered, as the owner of the lambdas written in it (a lambda unit
+    /// lowers under its owner's). Null for a unit with no source body.
+    owner: ?Closure.Owner = null,
 
-    pub const none: ClosureInputs = .{ .adapters = &.{} };
+    pub const none: ClosureInputs = .{ .adapters = &.{}, .lambda_units = &.{} };
 };
 
 /// The mutable builder state for ONE function lowering. All index spaces
@@ -359,8 +364,42 @@ pub fn lowerFn(
         try b.local_slots.put(gpa, @intCast(i), sid);
     }
 
-    // entry block (b0) and the single EXIT block. The exit's one param is the
-    // return value (none for a unit function). Allocate entry first so it is b0.
+    const blocks = try lowerBodyBlocks(&b, decl.rhs, ret_type);
+    return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
+}
+
+/// Lower one lambda unit: the lambda's body under its owner's tables, as a function of
+/// `(env, params..)`. Its params bind the resolver slots the owner's body gave them, and
+/// its return type is the unit's (a lambda's missing `-> R` is inferred, not unit, so
+/// `returnType`/`paramType` do not apply).
+pub fn lowerLambda(
+    gpa: std.mem.Allocator,
+    in: Inputs,
+    unit_i: u32,
+    sym: Link.SymName,
+    out_diags: *std.ArrayList(Diagnostic),
+) error{OutOfMemory}!Ir.Function {
+    std.debug.assert(in.callees.len == in.node_types.len);
+    const unit = in.closure.lambda_units[unit_i];
+    var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = unit.sig.ret, .diags = out_diags };
+    errdefer b.deinit();
+
+    var params: std.ArrayList(Ir.SlotId) = .empty;
+    errdefer params.deinit(gpa);
+    try params.append(gpa, try b.addSlot(Typecheck.Type.rawptr));
+    for (unit.sig.params, unit.param_slots) |pty, li| {
+        const sid = try b.addSlot(pty);
+        try params.append(gpa, sid);
+        try b.local_slots.put(gpa, li, sid);
+    }
+    const body = in.tree.nodes[unit.node.int()].rhs;
+    const blocks = try lowerBodyBlocks(&b, body, unit.sig.ret);
+    return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
+}
+
+/// Open the entry block (b0) and the single EXIT block, whose one param is the return
+/// value (none for a unit function), then lower `body` into them.
+fn lowerBodyBlocks(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type) error{OutOfMemory}!struct { entry: Ir.BlockId, exit: Ir.BlockId } {
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
@@ -370,7 +409,7 @@ pub fn lowerFn(
         // the struct reg-pair/sret ABI, so the exit param is `int`. The body value flows
         // in as a scalar (every Ref producer yields `.value`), and the call site reads it
         // as a scalar too.
-        const ret_param_ty: Typecheck.Type = switch (passKind(&b, ret_type)) {
+        const ret_param_ty: Typecheck.Type = switch (passKind(b, ret_type)) {
             .box => box_repr_ty,
             else => ret_type,
         };
@@ -389,14 +428,13 @@ pub fn lowerFn(
     // (every path returns), the trailing fall-through edge is simply not emitted.
     const body_is_value = (b.ret_param != Ir.none_value);
     if (body_is_value) {
-        const v = try lowerBlockValue(&b, decl.rhs, ret_type);
-        if (!b.termSet()) try brTo(&b, exit, v);
+        const v = try lowerBlockValue(b, body, ret_type);
+        if (!b.termSet()) try brTo(b, exit, v);
     } else {
-        try lowerBlockStmts(&b, decl.rhs);
-        if (!b.termSet()) try brTo(&b, exit, .none);
+        try lowerBlockStmts(b, body);
+        if (!b.termSet()) try brTo(b, exit, .none);
     }
-
-    return try finishFn(&b, gpa, sym, &params, entry, exit);
+    return .{ .entry = entry, .exit = exit };
 }
 
 /// Materialize the builder into a flat `Ir.Function`, transferring ownership of every
@@ -634,6 +672,8 @@ fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
             const targs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             return try lowerIndexCore(b, n.lhs, targs[0], n.main_token, ty);
         },
+        // Its body is its own unit; here it is only a value.
+        .lambda => return try lowerLambdaValue(b, node_idx, ty),
         // A poison leaf must never reach lower: a tainted tree is gated out before
         // codegen, and it is not produced anywhere yet.
         .error_node => unreachable,
@@ -2429,15 +2469,34 @@ fn lowerValueCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemo
 /// A named fn in value position: the pair `{its thunk's address, null env}` in a fresh
 /// slot. The thunk gives every function value the same `(env, params..)` call shape.
 fn lowerFnValue(b: *Builder, node_idx: Ast.Index, gid: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
-    const int_ty = Typecheck.Type.int;
     const n = b.in.tree.nodes[(node_idx).int()];
     const ai = Closure.findAdapter(b.in.closure.adapters, .fn_value, gid) orelse {
         try b.note(n.main_token, "function value has no thunk in lower");
         return .none;
     };
+    return try emitFnPair(b, b.in.closure.adapters[ai].name, ty);
+}
+
+/// A lambda in value position: the pair `{its unit's address, null env}`.
+fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const n = b.in.tree.nodes[(node_idx).int()];
+    const owner = b.in.closure.owner orelse {
+        try b.note(n.main_token, "lambda outside a closure owner in lower");
+        return .none;
+    };
+    const ui = Closure.findUnit(b.in.closure.lambda_units, owner, node_idx) orelse {
+        try b.note(n.main_token, "lambda has no unit in lower");
+        return .none;
+    };
+    return try emitFnPair(b, b.in.closure.lambda_units[ui].name, ty);
+}
+
+/// The function value `{address of code_sym, null env}` in a fresh slot of pair type `ty`.
+fn emitFnPair(b: *Builder, code_sym: []const u8, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    const int_ty = Typecheck.Type.int;
     const slot = try b.addSlot(ty);
     const base = try b.emit(.{ .slot_addr = slot }, int_ty);
-    const code = try b.emit(.{ .fn_addr = .{ .kind = .user_fn, .name = b.in.closure.adapters[ai].name } }, int_ty);
+    const code = try b.emit(.{ .fn_addr = .{ .kind = .user_fn, .name = code_sym } }, int_ty);
     _ = try b.emit(.{ .store = .{ .addr = base, .val = code, .ty = int_ty } }, null);
     const env_addr = try b.emit(.{ .field_addr = .{ .base = base, .off = 8, .ty = Typecheck.Type.rawptr } }, int_ty);
     const env = try b.emit(.{ .iconst = 0 }, Typecheck.Type.rawptr);
@@ -2855,7 +2914,7 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         .labeled => try lowerLabeledValueInto(b, expr, dst_ptr, ty),
         .match_expr => try lowerMatchInto(b, expr, dst_ptr, ty),
         .try_expr => try lowerTryInto(b, expr, dst_ptr, ty),
-        .identifier => try copyAggInto(b, expr, dst_ptr, ty),
+        .identifier, .lambda => try copyAggInto(b, expr, dst_ptr, ty),
         // An empty list literal `[]`: construct via `new()` into a temp, then copy the
         // handle into the destination (mirrors a `.new()` call routed through copyAggInto).
         .empty_list => {
@@ -4570,7 +4629,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units },
     };
 
     var target: Ast.Index = Ast.none;
@@ -4660,7 +4719,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) } },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -4733,7 +4792,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) } },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -4747,6 +4806,146 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
     var w = std.Io.Writer.fixed(&buf);
     try Ir.render(&w, &func, in.layouts, in.enum_layouts);
     return gpa.dupe(u8, w.buffered());
+}
+
+/// Lower the lambda unit named `unit_name` (a base owner's) and return its rendered IR,
+/// gpa-owned. Mirrors `Codegen.renderGraphIr`'s lambda class.
+fn renderLambdaG(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8) ![]u8 {
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
+
+    const names = try gpa.alloc(Link.SymName, rr.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (rr.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    const ui: u32 = for (tc.lambda_units, 0..) |u, i| {
+        if (std.mem.eql(u8, u.name, unit_name)) break @intCast(i);
+    } else return error.TestUnexpectedResult;
+    const u = tc.lambda_units[ui];
+    try testing.expect(u.owner == .base);
+
+    const in = Inputs{
+        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
+        .tokens = tokens,
+        .source = src,
+        .resolutions = rr.resolutions[0],
+        .node_types = tc.node_types[0],
+        .callees = tc.callees[0],
+        .layouts = tc.layouts,
+        .enum_layouts = tc.enum_layouts,
+        .names = names,
+        .instances = tc.instances,
+        .sigs = tc.sigs,
+        .methods = tc.methods,
+        .derives = tc.derives,
+        .prelude_ids = tc.prelude_ids,
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner },
+    };
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var func = try lowerLambda(gpa, in, ui, .{ .kind = .user_fn, .name = u.name }, &diags);
+    defer func.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
+    return gpa.dupe(u8, w.buffered());
+}
+
+test "a lambda value is fn_addr of <owner>$l0 with a null env" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn f() -> int {
+        \\ g := fn(x: int) -> int { x + 1 }
+        \\ return g(1)
+        \\}
+        \\
+    , "f");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.f$l0") != null);
+    // The env word is a null rawptr: `iconst 0` stored at +8 as rawptr.
+    try testing.expect(std.mem.indexOf(u8, ir, "iconst 0\n  store %") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, " : rawptr\n") != null);
+    // The lambda's body is not lowered into its owner.
+    try testing.expect(std.mem.indexOf(u8, ir, "add ") == null);
+    try testing.expect(std.mem.indexOf(u8, ir, "call_indirect") != null);
+}
+
+test "two lambdas and a nested one get ranks 0, 1, 2 in pre-order" {
+    const gpa = testing.allocator;
+    const src =
+        \\fn f() -> int {
+        \\ a := fn() -> int { 1 }
+        \\ b := fn() -> fn() -> int { fn() { 3 } }
+        \\ return a() + b()()
+        \\}
+        \\
+    ;
+    const ir = try renderLoweredG(gpa, src, "f");
+    defer gpa.free(ir);
+    const l0 = std.mem.indexOf(u8, ir, "fn_addr @main.f$l0").?;
+    const l1 = std.mem.indexOf(u8, ir, "fn_addr @main.f$l1").?;
+    try testing.expect(l0 < l1);
+    // The nested lambda is created by its parent's unit, not by `f`.
+    try testing.expect(std.mem.indexOf(u8, ir, "main.f$l2") == null);
+    const outer = try renderLambdaG(gpa, src, "main.f$l1");
+    defer gpa.free(outer);
+    try testing.expect(std.mem.indexOf(u8, outer, "fn_addr @main.f$l2") != null);
+}
+
+test "lowerLambda binds env as slot 0 and params by resolver slot" {
+    const gpa = testing.allocator;
+    const ir = try renderLambdaG(gpa,
+        \\fn f() -> int {
+        \\ a := 5
+        \\ g := fn(x: int, y: bool) -> int { if y { x } else { 0 } }
+        \\ return a + g(1, true)
+        \\}
+        \\
+    , "main.f$l0");
+    defer gpa.free(ir);
+    try testing.expectEqualStrings(
+        \\fn main.f$l0(s0, s1, s2) -> int {
+        \\  slots: s0:rawptr s1:int s2:bool
+        \\b0:
+        \\  %2 = slot_addr s2
+        \\  %3 = load %2 : bool
+        \\  cond_br %3, b2, b3
+        \\b1(%0:int):
+        \\  ret %0
+        \\b2:
+        \\  %4 = slot_addr s1
+        \\  %5 = load %4 : int
+        \\  br b4(%5)
+        \\b3:
+        \\  %6 = iconst 0
+        \\  br b4(%6)
+        \\b4(%1:int):
+        \\  br b1(%1)
+        \\}
+        \\
+    , ir);
 }
 
 test "a fn value lowers to fn_addr of its thunk and a null env" {
@@ -5196,7 +5395,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -5269,7 +5468,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -5330,7 +5529,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -5726,7 +5925,7 @@ fn lowerMainWithCallee(gpa: std.mem.Allocator, src: []const u8, member: []const 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units },
     };
     var diags: std.ArrayList(Diagnostic) = .empty;
     defer diags.deinit(gpa);

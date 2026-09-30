@@ -87,7 +87,7 @@ pub const Code = enum(u16) {
     T0036, // malformed-char-literal (a `'…'` is empty, holds more than one codepoint, or has a bad escape / out-of-range `\u`/`\x`)
     T0037, // extern-invalid-type (an `extern fn` param/return type is not int, float, str, rawptr, or bool)
     T0038, // unsafe-required (a raw-pointer `store`/`load` used outside an `unsafe { }` block)
-    T0039, // arity-mismatch (a fn/method call passes the wrong NUMBER of arguments)
+    T0039, // arity-mismatch (a fn/method call passes the wrong NUMBER of arguments, or a lambda has the wrong number of params)
     T0040, // arg-type-mismatch (a fn/method call passes an argument of the wrong TYPE)
     T0041, // binding-type-mismatch (an `x: T = e` initializer or an assignment's value is not assignable to the binding's type)
     T0042, // return-type-mismatch (a `return` value's type differs from the fn's declared return type)
@@ -98,6 +98,9 @@ pub const Code = enum(u16) {
     T0047, // missing-field (a struct or variant construction omits a declared field)
     T0048, // non-exhaustive-match (a match does not cover every value of its scrutinee)
     T0049, // fn-not-a-value (a builtin, extern or generic function is named as a value)
+    T0050, // lambda-param-type-unknown (an unannotated lambda param with no expected fn type)
+    T0051, // jump-across-lambda (break/continue targeting a loop outside the lambda)
+    T0052, // capture-unsupported (a lambda names a local of the enclosing fn)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -205,6 +208,9 @@ pub const table = [_]Entry{
     .{ .code = .T0047, .str = "T0047", .slug = "missing-field" },
     .{ .code = .T0048, .str = "T0048", .slug = "non-exhaustive-match" },
     .{ .code = .T0049, .str = "T0049", .slug = "fn-not-a-value" },
+    .{ .code = .T0050, .str = "T0050", .slug = "lambda-param-type-unknown" },
+    .{ .code = .T0051, .str = "T0051", .slug = "jump-across-lambda" },
+    .{ .code = .T0052, .str = "T0052", .slug = "capture-unsupported" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },

@@ -1,0 +1,18 @@
+# Feature: a lambda's labels are its own, so a loop in it may reuse a label of the loop around it
+# expect: exit 4
+fn main() -> int {
+    t := 0
+    @scan for i in 0..4 {
+        f := fn(n: int) -> int {
+            k := 0
+            @scan loop {
+                if k >= n { break @scan }
+                k = k + 2
+            }
+            k
+        }
+        if i == 3 { break @scan }
+        t = t + f(i)
+    }
+    return t
+}

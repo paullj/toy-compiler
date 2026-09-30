@@ -1,0 +1,12 @@
+# A `return` inside a lambda does not return from the enclosing function.
+fn main() -> int {  #~ ERROR [T0043] function 'main' must return int but may fall off the end
+    _f := fn(o: Option[int]) { o? }  #~ ERROR [T0032] '?' in a lambda needs its return type
+    _g := fn(b: bool) -> int {  #~ ERROR [T0043] lambda must return int but may fall off the end
+        if b { return 1 }
+    }
+    _h := fn(b: bool) {
+        if b { return 1 }
+        return "one"  #~ ERROR [T0042] does not match the lambda's earlier return type int
+    }
+    _k := fn() { return 2 }
+}

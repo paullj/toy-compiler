@@ -1,0 +1,13 @@
+# Feature: lambdas returning lambdas (none captures anything), nested three deep; each gets its own unit, and two evaluations of one capture-free lambda compare equal
+# expect: exit 39
+fn main() -> int {
+    mk := fn(double: bool) -> fn(int) -> int {
+        if double { return fn(x) { x * 2 } }
+        fn(x) { x + 1 }
+    }
+    f := mk(true)
+    g := mk(false)
+    h := fn() -> fn() -> fn() -> int { fn() { fn() { 7 } } }
+    same := if f == mk(true) && f != g { 1 } else { 0 }
+    return f(10) + g(10) + h()()() + same
+}

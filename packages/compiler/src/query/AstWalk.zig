@@ -515,6 +515,19 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try emit(visitor, .{ .flag = n.rhs != Ast.none }); // fn(int) != fn(int) -> int
             if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor);
         },
+        // No `type_ref`: that event folds the OWNING fn's sig by ordinal, and a lambda's
+        // params are not the owner's. Its param/ret type-refs fold by spelling instead.
+        .lambda => {
+            const proto = Ast.protoAt(tree, n.lhs.int());
+            try emit(visitor, .{ .count = @intCast(proto.params.len) });
+            for (proto.params) |p| {
+                try emit(visitor, .{ .flag = tree.nodes[p.int()].lhs != Ast.none }); // fn(x) != fn(x: int)
+                try walkInner(src, p, collect, visitor);
+            }
+            try emit(visitor, .{ .flag = proto.ret_type != Ast.none }); // inferred != -> R
+            if (proto.ret_type != Ast.none) try walkInner(src, proto.ret_type, collect, visitor);
+            try walkInner(src, n.rhs, collect, visitor);
+        },
         .pattern_binding => {
             try emit(visitor, .{ .leaf = leaf });
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // rename vs pun
@@ -1527,6 +1540,65 @@ test "a fn_type annotation folds arity and ret presence" {
         fps[i] = h.final();
     }
     for (fps, 0..) |a, i| for (fps[i + 1 ..]) |c| try testing.expect(a != c);
+}
+
+test "a lambda folds param-type and ret presence" {
+    const gpa = testing.allocator;
+    const sources = [_][]const u8{
+        "fn f() { g := fn(x) { x } }\n",
+        "fn f() { g := fn(x: int) { x } }\n",
+        "fn f() { g := fn(x: int) -> int { x } }\n",
+        "fn f() { g := fn(x, y) { x } }\n",
+        "fn f() { g := fn() { x } }\n",
+    };
+    var fps: [sources.len]u64 = undefined;
+    for (sources, 0..) |src, i| {
+        var b = try build(gpa, src);
+        defer b.deinit(gpa);
+        var h = std.hash.Wyhash.init(0);
+        var hv = HashVisitor{ .h = &h };
+        try walk(b.src(), b.fnDecl(0), &hv);
+        fps[i] = h.final();
+    }
+    for (fps, 0..) |a, i| for (fps[i + 1 ..]) |c| try testing.expect(a != c);
+}
+
+test "an owner fingerprint includes its lambda body" {
+    const gpa = testing.allocator;
+    const sources = [_][]const u8{
+        "fn f() -> int { g := fn(x: int) -> int { x + 1 }\n return g(1) }\n",
+        "fn f() -> int { g := fn(x: int) -> int { x + 2 }\n return g(1) }\n",
+        "fn f() -> int { g := fn(x: int) -> int { x - 1 }\n return g(1) }\n",
+    };
+    var fps: [sources.len]u64 = undefined;
+    for (sources, 0..) |src, i| {
+        var b = try build(gpa, src);
+        defer b.deinit(gpa);
+        var h = std.hash.Wyhash.init(0);
+        var hv = HashVisitor{ .h = &h };
+        try walk(b.src(), b.fnDecl(0), &hv);
+        fps[i] = h.final();
+    }
+    for (fps, 0..) |a, i| for (fps[i + 1 ..]) |c| try testing.expect(a != c);
+}
+
+test "a lambda walk emits no type_ref" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(a: int) -> int { g := fn(x: int, y: bool) -> int { x }\n return g(a, true) }\n");
+    defer b.deinit(gpa);
+    var stream: std.ArrayList(StreamStep) = .empty;
+    defer stream.deinit(gpa);
+    var rec = StreamRecorder{ .out = &stream, .gpa = gpa };
+    try walk(b.src(), b.fnDecl(0), &rec);
+    var type_refs: usize = 0;
+    var lambdas: usize = 0;
+    for (stream.items) |st| {
+        if (st.kind == .type_ref) type_refs += 1;
+        if (st.kind == .enter and b.tree.nodes[st.idx.int()].tag == .lambda) lambdas += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), lambdas);
+    // Only the owner's own `a: int` and `-> int`.
+    try testing.expectEqual(@as(usize, 2), type_refs);
 }
 
 test "the .operator event is IGNORED by the hash (int == fingerprint unchanged)" {

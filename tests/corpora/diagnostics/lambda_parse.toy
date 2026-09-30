@@ -1,0 +1,9 @@
+fn main() -> int {
+    _f := fn g() { 1 }  #~ ERROR [P0002] expected an expression; 'fn name(..)' declares a function
+    return 0
+}
+
+fn other() -> int {
+    _h := fn(x int) { x }  #~ ERROR [P0001] expected ',' or ')' after a lambda parameter
+    return 0
+}

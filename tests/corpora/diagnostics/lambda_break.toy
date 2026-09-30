@@ -1,0 +1,19 @@
+fn main() -> int {
+    for _i in 0..3 {
+        _f := fn() { break }  #~ ERROR [T0051] cannot break a loop outside this lambda
+        _g := fn() { continue }  #~ ERROR [T0051] cannot continue a loop outside this lambda
+        _h := fn(x: int) -> int { x + 1 }
+    }
+    for _i in 0..3 {
+        _m := fn() { for _j in 0..2 { break } }
+    }
+    @outer while true {
+        _k := fn() {
+            for _j in 0..2 {
+                break @outer  #~ ERROR [T0051] cannot break a loop outside this lambda
+            }
+        }
+        break
+    }
+    return 0
+}

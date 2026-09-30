@@ -802,24 +802,32 @@ pub fn codegenErased(
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
 }
 
-/// Lower one closure-class unit (a fn-value thunk), UNCACHED like `codegenErased`: it is
-/// pure over its table entry and the layouts, and the table is built serially in
-/// canonical order, so it is `-jN`-deterministic without a cache key. `--verify` runs
-/// the spill tripwire, as for AST units.
+/// A closure-class codegen unit: a lambda (its index in `frozen.closure.lambda_units`,
+/// lowered under its owner's view) or a source-less adapter.
+pub const ClosureUnit = union(enum) { lambda: u32, adapter: Closure.Adapter };
+
+/// Lower one closure-class unit, UNCACHED like `codegenErased`: it is pure over its table
+/// entry, the layouts and (for a lambda) its owner's frozen tables, and the tables are
+/// built serially in canonical order, so it is `-jN`-deterministic without a cache key.
+/// A lambda needs no key of its own: its body is part of its owner's fingerprint, and it
+/// is rebuilt every build. `--verify` runs the spill tripwire, as for AST units.
 pub fn codegenClosure(
     self: Engine,
     gpa: std.mem.Allocator,
     io: Io,
     target: []const u8,
     frozen: anytype,
-    a: Closure.Adapter,
+    unit: ClosureUnit,
     tmp_tag: usize,
     slot: anytype,
 ) !void {
     _ = io;
     _ = target;
     _ = tmp_tag;
-    const sym = Link.SymName{ .kind = .user_fn, .name = a.name };
+    const sym = Link.SymName{ .kind = .user_fn, .name = switch (unit) {
+        .lambda => |ui| frozen.closure.lambda_units[ui].name,
+        .adapter => |a| a.name,
+    } };
 
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
@@ -843,8 +851,11 @@ pub fn codegenClosure(
         .char_struct = frozen.char_struct,
         .closure = frozen.closure,
     };
-    var irf = switch (a.kind) {
-        .fn_value => try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
+    var irf = switch (unit) {
+        .lambda => |ui| try lower.lowerLambda(gpa, in, ui, sym, &diags),
+        .adapter => |a| switch (a.kind) {
+            .fn_value => try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
+        },
     };
     defer irf.deinit(gpa);
     if (diags.items.len > 0) return error.CodegenDiagnostic;

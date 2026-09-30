@@ -1,0 +1,42 @@
+# Feature: a lambda inside a generic function or a generic impl's method gets one unit per instance, typed by that instance's arguments; a lambda inside a plain method belongs to the method
+# expect: exit 40
+pub struct Box[T] { v: T }
+
+impl Box[T] {
+    fn apply_twice(self, f: fn(T) -> T) -> T {
+        twice := fn(x: T, g: fn(T) -> T) -> T { g(g(x)) }
+        twice(self.v, f)
+    }
+}
+
+pub struct Counter { n: int }
+
+impl Counter {
+    fn bumped(self) -> int {
+        inc := fn(x: int) -> int { x + 1 }
+        inc(self.n)
+    }
+}
+
+fn wrap[T](x: T) -> T {
+    id := fn(y: T) -> T { y }
+    id(x)
+}
+
+fn pick[T](a: T, b: T, first: bool) -> T {
+    choose := fn(p: T, q: T, f: bool) -> T { if f { p } else { q } }
+    choose(a, b, first)
+}
+
+fn main() -> int {
+    n := wrap(5)
+    b := wrap(true)
+    s := wrap("four")
+    total := n + s.len()                                   # 9
+    if b { total = total + 10 }                            # 19
+    total = total + pick(1, 2, false) + pick(2, 7, true)   # 23
+    total = total + Box { v: 3 }.apply_twice(fn(x) { x * 2 })   # 35
+    t := Box { v: true }.apply_twice(fn(x) { !x })         # true
+    if t { total = total + Counter { n: 4 }.bumped() }     # 40
+    return total
+}

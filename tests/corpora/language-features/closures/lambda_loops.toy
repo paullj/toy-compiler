@@ -1,0 +1,42 @@
+# Feature: loops, labeled breaks and continues, and loop values inside a lambda body; a lambda called from inside an outer loop
+# expect: exit 41
+fn main() -> int {
+    sum_to := fn(n: int) -> int {
+        total := 0
+        for i in 0..n { total = total + i }
+        total
+    }
+    find := fn(limit: int) -> int {
+        hits := 0
+        @outer for i in 0..10 {
+            for j in 0..10 {
+                if j > i { continue }
+                if i * j > limit { break @outer }
+                hits = hits + 1
+            }
+        }
+        hits
+    }
+    first_over := fn(limit: int) -> int {
+        i := 0
+        loop {
+            i = i + 1
+            if i * i > limit { break i }
+        }
+    }
+    labeled := fn(x: int) -> int {
+        @blk {
+            if x > 5 { break @blk 1 }
+            0
+        }
+    }
+    total := sum_to(5) + find(12) + first_over(50) + labeled(9) + labeled(2)   # 10 + 14 + 8 + 1 + 0
+    for k in 0..4 {
+        total = total + fn(x: int) -> int {
+            n := 0
+            while n < x { n = n + 2 }
+            n
+        }(k)
+    }
+    return total   # 33 + (0 + 2 + 2 + 4)
+}

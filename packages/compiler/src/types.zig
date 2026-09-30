@@ -500,6 +500,9 @@ pub const GraphResult = struct {
     /// The fn-value thunks, sorted by `(kind, key)`: one per fn some body names as a
     /// value. Each `name` is owned; `target`/`sig` borrow `sigs` and the resolver names.
     adapters: []Closure.Adapter = &.{},
+    /// One unit per lambda per lowerable owner (a non-generic fn, or an instance), sorted
+    /// by `(owner, node)`. Owned.
+    lambda_units: []Closure.LambdaUnit = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -563,6 +566,7 @@ pub const GraphResult = struct {
         for (self.erased_units) |u| if (u.name) |nm| gpa.free(nm);
         gpa.free(self.erased_units);
         freeAdapters(gpa, self.adapters);
+        Closure.freeLambdaUnits(gpa, self.lambda_units);
         self.* = undefined;
     }
 };
@@ -616,6 +620,82 @@ fn buildAdapters(
         built += 1;
     }
     return out;
+}
+
+/// The lambda-unit table: for each lowerable owner in canonical order (non-generic fns by
+/// global id, then instances in instance order), one unit per lambda in its body, in node
+/// order. Each unit's signature is the reified pair the lambda's node types to. Serial
+/// over the finished tables, so it is identical at any `-j`.
+fn buildLambdaUnits(
+    gpa: std.mem.Allocator,
+    graph: *const GraphCtx,
+    fns: []const GraphFnInput,
+    fsyms: []const FnSym,
+    node_types: []const []const Type,
+    instances: []const Mono.Instance,
+    layouts: []const Layout,
+) ![]Closure.LambdaUnit {
+    var units: std.ArrayList(Closure.LambdaUnit) = .empty;
+    errdefer {
+        for (units.items) |u| {
+            gpa.free(u.name);
+            gpa.free(u.sig.params);
+            gpa.free(u.param_slots);
+        }
+        units.deinit(gpa);
+    }
+    for (fns, 0..) |f, gid| {
+        if (f.decl_node == Ast.none or f.kind != .user_fn or fsyms[gid].isGeneric()) continue;
+        const mc = &graph.mods[f.module];
+        const fc = Closure.findFn(mc.closures, f.decl_node) orelse continue;
+        try appendLambdaUnits(gpa, &units, .{ .base = @intCast(gid) }, f.module, f.name, fc, mc, node_types[f.module], layouts);
+    }
+    for (instances, 0..) |inst, k| {
+        const mc = &graph.mods[inst.mod];
+        const fc = Closure.findFn(mc.closures, inst.decl_node) orelse continue;
+        try appendLambdaUnits(gpa, &units, .{ .instance = @intCast(k) }, inst.mod, inst.name.?, fc, mc, inst.node_types, layouts);
+    }
+    return units.toOwnedSlice(gpa);
+}
+
+fn appendLambdaUnits(
+    gpa: std.mem.Allocator,
+    units: *std.ArrayList(Closure.LambdaUnit),
+    owner: Closure.Owner,
+    mod: u32,
+    owner_sym: []const u8,
+    fc: *const Closure.FnClosures,
+    mc: *const GraphCtx.ModuleCtx,
+    node_types: []const Type,
+    layouts: []const Layout,
+) !void {
+    for (fc.boundaries) |b| {
+        const t = node_types[b.node.int()];
+        // Only a program with type errors leaves a lambda untyped, and it is never lowered.
+        if (!LayoutEngine.isFnStruct(t, layouts)) continue;
+        const fs = layouts[t.struct_id].fn_sig.?;
+        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[b.node.int()].lhs.int());
+        const name = try Closure.lambdaName(gpa, owner_sym, b.rank);
+        errdefer gpa.free(name);
+        const params = try gpa.dupe(Type, fs.params);
+        errdefer gpa.free(params);
+        const slots = try gpa.alloc(u32, proto.params.len);
+        errdefer gpa.free(slots);
+        for (proto.params, slots) |p, *sl| sl.* = switch (mc.resolutions[p.int()]) {
+            .local => |l| l,
+            else => std.math.maxInt(u32),
+        };
+        try units.append(gpa, .{
+            .owner = owner,
+            .mod = mod,
+            .fn_node = fc.fn_node,
+            .node = b.node,
+            .rank = b.rank,
+            .name = name,
+            .sig = .{ .params = params, .ret = fs.ret },
+            .param_slots = slots,
+        });
+    }
 }
 
 /// Free the per-recipe owned data of a derive table: each `name`, `params`, and
@@ -1495,6 +1575,8 @@ pub const GraphCtx = struct {
         source: []const u8,
         /// This module's resolution array (parallel to its node array).
         resolutions: []const Resolution,
+        /// The resolver's lambda boundaries of this module's fns, sorted by fn node.
+        closures: []const Closure.FnClosures = &.{},
         /// Bare struct name → GLOBAL struct id (this module's own decls only).
         struct_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Bare enum name → GLOBAL enum id.
@@ -1621,6 +1703,7 @@ fn bodyCheckerFor(t: *const Typecheck, model: *const Model, f: FnSym, slots: Nod
     // The generic-param names, so an innermost-failure diagnostic can render an
     // abstract `App`'s failing `type_var` as its source param name.
     bc.gph_generic_params = f.generic_params;
+    bc.closures = Closure.findFn(mc.closures, f.decl_node);
     return bc;
 }
 
@@ -1975,6 +2058,9 @@ pub fn checkGraph(
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
     errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
+    const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, node_types, instances, layouts);
+    errdefer Closure.freeLambdaUnits(gpa, lambda_units);
+
     // Diagnostics already carry their owning module in `scope`, sorted by
     // runGraph. Hand the owned slices to the result.
     const owned = try t.sink.toOwned();
@@ -1997,6 +2083,7 @@ pub fn checkGraph(
         .prelude_ids = gatherPreludeIds(t),
         .char_struct = if (t.prelude) |p| p.char_struct else null,
         .adapters = adapters,
+        .lambda_units = lambda_units,
     };
 }
 
@@ -8560,4 +8647,284 @@ test "argument errors keep the selection; selection failures leave none" {
     try testing.expect((try calleeMethod(&c, "hash", 0)).derive != null);
     try testing.expectEqual(Callee.View{ .builtin = .display_to_string }, try calleeView(&c, "to_string", 0));
     try expectNoPending(&c.result);
+}
+
+/// The `nth` (node order) `.lambda` node.
+fn nthLambda(c: *const Checked, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .lambda) continue;
+        if (seen == nth) return Ast.Index.from(@intCast(i));
+        seen += 1;
+    }
+    return error.TestLambdaNotFound;
+}
+
+/// The type the checker gave param `pi` of lambda `lam`.
+fn lambdaParamType(c: *const Checked, lam: Ast.Index, pi: usize) Type {
+    const proto = Ast.protoAt(c.tree, c.tree.nodes[lam.int()].lhs.int());
+    return c.result.node_types[0][proto.params[pi].int()];
+}
+
+/// The reified signature of lambda `lam`'s value.
+fn lambdaSig(c: *const Checked, lam: Ast.Index) LayoutEngine.FnSig {
+    const t = c.result.node_types[0][lam.int()];
+    std.debug.assert(LayoutEngine.isFnStruct(t, c.result.layouts));
+    return c.result.layouts[t.struct_id].fn_sig.?;
+}
+
+test "a lambda takes its param types from the expected fn type" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct H { run: fn(int) -> int }
+        \\struct Box[T] { v: T }
+        \\impl Box[T] {
+        \\ fn with(self, v: T) -> Box[T] { Box { v: v } }
+        \\}
+        \\fn apply(f: fn(int) -> int) -> int { return f(1) }
+        \\fn ret() -> fn(bool) -> bool { return fn(b) { !b } }
+        \\fn tail() -> fn(str) -> int { fn(s) { s.len() } }
+        \\fn main() -> int {
+        \\ f: fn(int) -> int = fn(x) { x + 1 }
+        \\ n := apply(fn(y) { y * 2 })
+        \\ h := H { run: fn(z) { z } }
+        \\ b := Box { v: f }
+        \\ b2 := b.with(fn(w) { w - 1 })
+        \\ if ret()(true) { return 0 }
+        \\ return f(n) + h.run(1) + b2.v(3) + tail()("ab")
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const want = [_]Type{ Type.bool, Type.str, Type.int, Type.int, Type.int, Type.int };
+    for (want, 0..) |w, i| {
+        const lam = try nthLambda(&c, i);
+        try testing.expect(Type.eql(w, lambdaParamType(&c, lam, 0)));
+        // The expected fn type's return is the lambda's too.
+        const sig = lambdaSig(&c, lam);
+        try testing.expect(Type.eql(if (i == 0) Type.bool else Type.int, sig.ret));
+    }
+}
+
+test "an unannotated param with no expected type is T0050 (incl. a generic call arg)" {
+    const gpa = testing.allocator;
+    const srcs = [_][]const u8{
+        "fn main() -> int {\n f := fn(x) { x }\n return f(1)\n}\n",
+        "fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x) { x }, 1) }\n",
+        "fn main() -> int { return fn(x) { x }(1) }\n",
+    };
+    for (srcs) |src| {
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try testing.expect(hasCode(&c, .T0050));
+        for (c.result.diags) |d| if (d.code == .T0050) try testing.expect(std.mem.indexOf(u8, d.message, "'x'") != null);
+    }
+    // An annotated param needs nothing from the context.
+    var ok = try checkSource("fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x: int) { x * 2 }, 21) }\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
+test "T0050 names a generic call only when one expected the lambda" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { src: []const u8, generic: bool }{
+        .{ .src = "fn main() -> int {\n f := fn(x) { x }\n return f(1)\n}\n", .generic = false },
+        .{ .src = "fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x) { x }, 1) }\n", .generic = true },
+    };
+    for (cases) |cs| {
+        var c = try checkSource(cs.src);
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0050, c.result.diags[0].code);
+        try testing.expectEqual(cs.generic, std.mem.indexOf(u8, c.result.diags[0].message, "generic call") != null);
+    }
+}
+
+test "a lambda whose arity differs from the expected fn type is one T0039" {
+    const gpa = testing.allocator;
+    const srcs = [_][]const u8{
+        "fn apply(f: fn(int) -> int) -> int { f(1) }\nfn main() -> int { return apply(fn(a, b) { a }) }\n",
+        "fn apply(f: fn(int) -> int) -> int { f(1) }\nfn main() -> int { return apply(fn(a: int, b: int) { a }) }\n",
+        "fn main() -> int {\n q: fn(int) -> int = fn() { 1 }\n return q(1)\n}\n",
+    };
+    for (srcs) |src| {
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0039, c.result.diags[0].code);
+        try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "the expected type fn(int) -> int takes 1") != null);
+    }
+}
+
+test "the return type is inferred from the body and returns" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ a := fn(x: int) { x > 1 }
+        \\ b := fn(x: int) {
+        \\  if x > 0 { return "pos" }
+        \\  "neg"
+        \\ }
+        \\ d := fn() { return 3 }
+        \\ e := fn() { }
+        \\ g := fn(x: int) -> int { x }
+        \\ e()
+        \\ if a(2) { return b(1).len() + d() + g(1) }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const rets = [_]Type{ Type.bool, Type.str, Type.int, Type.unit, Type.int };
+    for (rets, 0..) |r, i| try testing.expect(Type.eql(r, lambdaSig(&c, try nthLambda(&c, i)).ret));
+}
+
+test "return and ? are local to the lambda" {
+    const gpa = testing.allocator;
+    {
+        // A lambda's `return` does not return from the owner, which still needs its own.
+        var c = try checkSource("fn main() -> int {\n f := fn() { return 1 }\n _x := f()\n}\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0043, c.result.diags[0].code);
+        try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "function 'main'") != null);
+    }
+    {
+        // `?` checks against the lambda's return type, not the owner's `int`.
+        var c = try checkSource(
+            \\fn main() -> int {
+            \\ f := fn(o: Option[int]) -> Option[int] {
+            \\  v := o?
+            \\  .some(v + 1)
+            \\ }
+            \\ return f(.some(1)).unwrap_or(0)
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    }
+    {
+        // An inferred return type cannot take a `?`; a mismatched return and a fall-off are coded.
+        var c = try checkSource(
+            \\fn main() -> int {
+            \\ f := fn(o: Option[int]) { o? }
+            \\ g := fn(b: bool) -> int {
+            \\  if b { return 1 }
+            \\ }
+            \\ h := fn(b: bool) {
+            \\  if b { return 1 }
+            \\  return true
+            \\ }
+            \\ return 0
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expect(hasCode(&c, .T0032));
+        try testing.expect(hasCode(&c, .T0043));
+        try testing.expect(hasCode(&c, .T0042));
+    }
+}
+
+test "break/continue across a lambda is T0051, labeled or not; loops inside work" {
+    const gpa = testing.allocator;
+    const bad = [_][]const u8{
+        "fn main() {\n for i in 0..3 {\n  f := fn() { break }\n }\n}\n",
+        "fn main() {\n while true {\n  f := fn() { continue }\n  break\n }\n}\n",
+        "fn main() {\n @o loop {\n  f := fn() {\n   for i in 0..2 { break @o }\n  }\n  break\n }\n}\n",
+        "fn main() {\n @b {\n  f := fn() { break @b }\n }\n}\n",
+    };
+    for (bad) |src| {
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try testing.expect(hasCode(&c, .T0051));
+    }
+    var ok = try checkSource(
+        \\fn main() -> int {
+        \\ f := fn(n: int) -> int {
+        \\  t := 0
+        \\  @o for i in 0..n {
+        \\   for j in 0..n {
+        \\    if j > i { continue }
+        \\    if i > 3 { break @o }
+        \\    t = t + j
+        \\   }
+        \\  }
+        \\  loop { break t }
+        \\ }
+        \\ return f(5)
+        \\}
+        \\
+    );
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    // With no loop anywhere, a jump keeps its plain (uncoded) message.
+    var none = try checkSource("fn main() {\n f := fn() { break }\n f()\n}\n");
+    defer none.deinit(gpa);
+    try testing.expect(!hasCode(&none, .T0051));
+    try testing.expect(anyDiagContains(none, "break outside of a loop"));
+}
+
+test "a capture is T0052 at its first use" {
+    const gpa = testing.allocator;
+    const src =
+        \\fn main() -> int {
+        \\ base := 10
+        \\ f := fn(x: int) -> int { x + base + base }
+        \\ return f(1)
+        \\}
+        \\
+    ;
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    const d = c.result.diags[0];
+    try testing.expectEqual(codes.Code.T0052, d.code);
+    try testing.expectEqualStrings("this lambda captures 'base'; closures cannot capture variables yet", d.message);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "base +").?)), d.byte_offset);
+}
+
+test "lambda units: one per boundary per lowerable owner, named by rank" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn wrap[T](x: T) -> T {
+        \\ id := fn(y: T) -> T { y }
+        \\ id(x)
+        \\}
+        \\fn main() -> int {
+        \\ a := fn(x: int) -> int { x }
+        \\ b := fn() -> fn() -> int { fn() { 2 } }
+        \\ if wrap(true) { return a(1) + b()() + wrap(3) }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const units = c.result.lambda_units;
+    // main's three lambdas (outer-first ranks, node order), then one per wrap instance.
+    try testing.expectEqual(@as(usize, 5), units.len);
+    for (units[1..], units[0 .. units.len - 1]) |cur, prev| {
+        try testing.expect(Closure.ownerLess(prev.owner, cur.owner) or (std.meta.eql(prev.owner, cur.owner) and prev.node.int() < cur.node.int()));
+    }
+    try testing.expectEqualStrings("main$l0", units[0].name);
+    try testing.expectEqualStrings("main$l2", units[1].name); // the inner `fn() { 2 }` precedes its parent
+    try testing.expectEqualStrings("main$l1", units[2].name);
+    try testing.expect(units[0].owner == .base and units[1].owner == .base);
+    try testing.expect(units[3].owner == .instance and units[4].owner == .instance);
+    for (units[3..]) |u| {
+        const inst = c.result.instances[u.owner.instance];
+        try testing.expect(std.mem.endsWith(u8, u.name, "$l0"));
+        try testing.expect(std.mem.startsWith(u8, u.name, inst.name.?));
+        try testing.expectEqual(@as(usize, 1), u.sig.params.len);
+        try testing.expect(Type.eql(inst.args[0], u.sig.params[0]));
+        try testing.expect(Type.eql(inst.args[0], u.sig.ret));
+    }
+    // A param binds the resolver slot the owner body gave it.
+    const a_lam = try nthLambda(&c, 1);
+    const a_param = Ast.protoAt(c.tree, c.tree.nodes[a_lam.int()].lhs.int()).params[0];
+    try testing.expectEqual(c.resolve.resolutions[0][a_param.int()].local, units[0].param_slots[0]);
 }

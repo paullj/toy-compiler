@@ -257,6 +257,33 @@ At runtime a named function value is `{its thunk, null}`: the thunk `<fn>$fnval(
 params..)` drops the env and calls the function, so every value is called the same
 way, with the env as the hidden first argument.
 
+## Lambdas
+
+`fn(x, y: T) -> R { .. }` in expression position is a lambda, a value of type
+`fn(X, T) -> R`. `fn (` starts a lambda; `fn name` stays a declaration. It is checked
+bidirectionally, like a literal:
+
+* A parameter's type is its annotation, else the matching parameter of the function
+  type expected where the lambda is written: an annotated binding, an assignment, a
+  parameter of a known function or method (a `Vec[fn(int) -> int]`'s `push` too), a
+  struct field, a list element, a `return` or a trailing value. An expected function of
+  another arity, or a part holding a type variable (a generic callee's `fn(T) -> T`),
+  provides nothing; a parameter left with no type is **T0050**. A generic call does not
+  yet infer a lambda's parameters, so a lambda passed to one is annotated.
+* The return type is the annotation, else the expected function's, else the join of
+  the body's trailing value and its `return`s (`()` when there is none). A declared or
+  expected non-unit return must be produced on every path (T0043).
+* `return` and `?` exit the lambda: they check against the lambda's return type, and
+  `?` needs one that is annotated or expected (T0032 otherwise). A `break`/`continue`
+  cannot target a loop or labeled block outside the lambda (**T0051**).
+* A lambda may not yet name a local of the function around it (**T0052**).
+
+Each lambda is its own function `<owner>$l<rank>(env, params..)`, where the owner is
+the enclosing function or generic instance and the rank is the lambda's pre-order
+index in it; a lambda in a generic function has one per instance. Its value is
+`{its address, null env}`, called like any function value; two evaluations of one
+lambda therefore compare equal.
+
 ## Protocols, the prelude, and builtin-scalar conformance
 
 `has` is the single conformance relation: `impl T has P { .. }` conforms `T` to a

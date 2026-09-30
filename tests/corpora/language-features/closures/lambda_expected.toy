@@ -1,0 +1,37 @@
+# Feature: an unannotated lambda takes its param and return types from the function type expected where it is written
+# expect: exit 119
+import std/vec
+
+pub struct Handler { run: fn(int) -> int }
+
+impl Handler {
+    fn swap(self, f: fn(int) -> int) -> Handler { Handler { run: f } }
+}
+
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+
+fn pick(neg: bool) -> fn(int) -> int {
+    if neg { return fn(x) { 0 - x } }
+    fn(x) { x }
+}
+
+fn main() -> int {
+    f: fn(int) -> int = fn(x) { x + 1 }                 # annotated binding
+    total := f(1)                                         # 2
+    f = fn(x) { x * 10 }                                  # assignment
+    total = total + f(1)                                  # 12
+    total = total + apply(fn(x) { x + 3 }, 4)             # 19   non-generic call argument
+    total = total + pick(false)(5) + pick(true)(1)        # 23   return and trailing value
+    h := Handler { run: fn(x) { x * 2 } }                 # struct field
+    total = total + h.run(5)                              # 33
+    h2 := h.swap(fn(x) { x + 7 })                         # method argument
+    total = total + h2.run(0)                             # 40
+    fs: Vec[fn(int) -> int] = [fn(x) { x }, fn(x) { x + 1 }]   # list elements
+    fs.push(fn(x) { x + 2 })                              # Vec push
+    for g in fs { total = total + g(10) }                 # 73
+    twice: fn(fn(int) -> int, int) -> int = fn(g, x) { g(g(x)) }
+    total = total + twice(fn(x) { x + 3 }, 0)             # 79   value-call argument
+    adder: fn(int) -> fn(int) -> int = fn(_a) { fn(b) { b + 1 } }
+    total = total + adder(1)(39)                          # 119  a lambda's own return type
+    return total
+}
