@@ -103,7 +103,7 @@ while IFS= read -r src; do
 # main.toy is compiled here, their import sub-files are skipped. Both corpus roots
 # (language-features + benchmark) are walked so the determinism gate keeps its full
 # coverage — the benchmark programs are part of the byte-identity check.
-done < <(find "$root/tests/corpora/language-features" "$root/tests/corpora/benchmark" -name '*.toy' -not -path '*/modules/*' | sort)
+done < <(find "$root/tests/corpora/language-features" "$root/tests/corpora/benchmark" -type f -name '*.toy' -not -path '*/modules/*' | sort)
 
 echo "---"
 echo "$pass passed, $fail failed"

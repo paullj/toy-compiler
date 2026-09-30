@@ -94,7 +94,7 @@ while IFS= read -r src; do
 # (modules/ is its own harness; benchmark/medium is a multi-file perf program). The
 # single-file opt benches (benchmark/*.toy) stay — they ARE the differential corpus,
 # so both corpus roots (language-features + benchmark) are walked.
-done < <(find "$root/tests/corpora/language-features" "$root/tests/corpora/benchmark" \( -path "$root/tests/corpora/language-features/modules" -o -path "$root/tests/corpora/benchmark/medium" \) -prune -o -name '*.toy' -print | sort)
+done < <(find "$root/tests/corpora/language-features" "$root/tests/corpora/benchmark" \( -path "$root/tests/corpora/language-features/modules" -o -path "$root/tests/corpora/benchmark/medium" \) -prune -o -type f -name '*.toy' -print | sort)
 echo "  corpus: $corpus_pass ok, $corpus_fail fail"
 
 # ---------------------------------------------------------------------------
