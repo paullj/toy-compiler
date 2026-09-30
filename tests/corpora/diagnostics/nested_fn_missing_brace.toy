@@ -1,0 +1,14 @@
+# A '}' is missing after the if block, so main's own '}' closes the if instead and
+# helper below parses as a function nested in main. The error surfaces at the end of the
+# file and points back at helper, the column-1 fn it swallowed.
+fn main() -> int {
+    x := 1
+    if x > 0 {
+        x = 2
+    return x
+}
+
+fn helper() -> int {
+    return 3
+}
+#~ ERROR [P0001] expected '}' to close block; a 'fn' inside it was parsed as a nested function — is a '}' missing before it?

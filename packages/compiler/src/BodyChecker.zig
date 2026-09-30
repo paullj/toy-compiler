@@ -255,9 +255,11 @@ pub const BodyChecker = struct {
     generic_arg: Ast.Index = Ast.none,
     /// This fn's lambdas as the resolver recorded them, or null when it has none.
     closures: ?*const Closure.FnClosures = null,
-    /// The `loop_stack` depth at the innermost enclosing lambda: a jump may target only
-    /// the contexts at or above it. 0 outside every lambda.
+    /// The `loop_stack` depth at the innermost enclosing lambda or local fn: a jump may
+    /// target only the contexts at or above it. 0 outside every one.
     loop_floor: usize = 0,
+    /// Whether that innermost one is a local fn, which T0051 names.
+    floor_is_local_fn: bool = false,
     /// Inside a lambda whose return type is neither annotated nor expected: each
     /// `return` joins its operand into `ret_join` instead of checking it against `cur_ret`.
     ret_infer: bool = false,
@@ -482,20 +484,8 @@ pub const BodyChecker = struct {
             if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
         }
 
-        const save_ret = bc.cur_ret;
-        const save_infer = bc.ret_infer;
-        const save_join = bc.ret_join;
-        const save_floor = bc.loop_floor;
-        const save_exp = bc.expected;
-        defer {
-            bc.cur_ret = save_ret;
-            bc.ret_infer = save_infer;
-            bc.ret_join = save_join;
-            bc.loop_floor = save_floor;
-            bc.expected = save_exp;
-        }
-        bc.expected = null;
-        bc.loop_floor = bc.loop_stack.items.len;
+        const frame = bc.enterBody(false);
+        defer bc.leaveBody(frame);
 
         const declared: ?Type = if (proto.ret_type != Ast.none) bc.typeFromNode(proto.ret_type) else exp_ret;
         var ret: Type = undefined;
@@ -519,6 +509,74 @@ pub const BodyChecker = struct {
         const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
         bc.node_types[node_idx.int()] = ty;
         return ty;
+    }
+
+    /// `fn name(params) -> R { body }` in a block: a value of type `fn(P..) -> R` (a missing
+    /// `-> R` is unit), bound to `name` before the body is checked so the body can call
+    /// itself. The body checks like an annotated lambda's: `return` exits the local fn and
+    /// no jump leaves it.
+    fn checkLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+        const proto = Ast.protoAt(bc.tree, n.lhs.int());
+        const params = try bc.gpa.alloc(Type, proto.params.len);
+        defer bc.gpa.free(params);
+        var poisoned = false;
+        for (proto.params, params) |p, *pty| {
+            const ty = bc.typeFromNode(bc.tree.nodes[p.int()].lhs);
+            if (ty.kind == .invalid) poisoned = true;
+            pty.* = ty;
+            bc.node_types[p.int()] = ty;
+            if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
+        }
+        const ret = bc.typeFromNode(proto.ret_type);
+        if (ret.kind == .invalid) poisoned = true;
+        const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
+        bc.node_types[idx.int()] = ty;
+        if (bc.resolutions[idx.int()] == .local) try bc.setSlot(bc.resolutions[idx.int()].local, ty);
+
+        const frame = bc.enterBody(true);
+        defer bc.leaveBody(frame);
+        bc.cur_ret = ret;
+        bc.ret_infer = false;
+        const want_value = ret.kind != .unit and ret.kind != .invalid;
+        const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) ret else null);
+        if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty))
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(n.main_token), bc.typeName(ret) });
+    }
+
+    /// The per-body state a lambda or local fn body replaces while it is checked.
+    const BodyFrame = struct {
+        cur_ret: Type,
+        ret_infer: bool,
+        ret_join: Type,
+        loop_floor: usize,
+        floor_is_local_fn: bool,
+        expected: ?Type,
+    };
+
+    /// Enter a lambda or local fn body: no expected type flows in and no jump leaves it.
+    /// The caller sets the return state; `leaveBody` restores the enclosing body's.
+    fn enterBody(bc: *BodyChecker, is_local_fn: bool) BodyFrame {
+        const saved: BodyFrame = .{
+            .cur_ret = bc.cur_ret,
+            .ret_infer = bc.ret_infer,
+            .ret_join = bc.ret_join,
+            .loop_floor = bc.loop_floor,
+            .floor_is_local_fn = bc.floor_is_local_fn,
+            .expected = bc.expected,
+        };
+        bc.expected = null;
+        bc.loop_floor = bc.loop_stack.items.len;
+        bc.floor_is_local_fn = is_local_fn;
+        return saved;
+    }
+
+    fn leaveBody(bc: *BodyChecker, f: BodyFrame) void {
+        bc.cur_ret = f.cur_ret;
+        bc.ret_infer = f.ret_infer;
+        bc.ret_join = f.ret_join;
+        bc.loop_floor = f.loop_floor;
+        bc.floor_is_local_fn = f.floor_is_local_fn;
+        bc.expected = f.expected;
     }
 
     /// Join a `return` operand into the inferred lambda return type.
@@ -547,6 +605,10 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0042 }, "lambda's value {s} does not match its return type {s}", .{ bc.typeName(tail), bc.typeName(j) });
         }
         return .invalid;
+    }
+
+    fn jumpFloorName(bc: *const BodyChecker) []const u8 {
+        return if (bc.floor_is_local_fn) "local function" else "lambda";
     }
 
     /// A `break`/`continue` at `stmt_idx` whose target lies outside the innermost lambda:
@@ -748,12 +810,13 @@ pub const BodyChecker = struct {
             .for_in_stmt => try bc.checkForIn(stmt_idx, null),
             .for_in2_stmt => try bc.checkForIn2(stmt_idx, null),
             .labeled => _ = try bc.checkLabeled(stmt_idx, false),
+            .local_fn => try bc.checkLocalFn(stmt_idx, stmt),
             .break_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
                     // No matching context: a bare break with an empty stack ("outside a
                     // loop"); a labeled break is reported by resolve as undefined.
                     if (bc.jumpLeavesLambda(stmt_idx))
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0051 }, "cannot break a loop outside this lambda", .{})
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0051 }, "cannot break a loop outside this {s}", .{bc.jumpFloorName()})
                     else if (bc.resolutions[(stmt_idx).int()] != .label)
                         try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "break outside of a loop", .{});
                     if (stmt.lhs != Ast.none) _ = try bc.typeOf(stmt.lhs);
@@ -776,7 +839,7 @@ pub const BodyChecker = struct {
             .continue_stmt => {
                 const ctx = bc.targetCtx(stmt_idx) orelse {
                     if (bc.jumpLeavesLambda(stmt_idx))
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0051 }, "cannot continue a loop outside this lambda", .{})
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0051 }, "cannot continue a loop outside this {s}", .{bc.jumpFloorName()})
                     else if (bc.resolutions[(stmt_idx).int()] != .label)
                         try bc.sink.report(.{ .span = bc.spanOf(stmt_idx) }, "continue outside of a loop", .{});
                     return;

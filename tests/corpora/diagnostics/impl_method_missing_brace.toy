@@ -1,0 +1,11 @@
+# A method body lost its '}', so the next method starts inside it. A local fn never
+# takes 'self', so the parser ends the body at that method and reports the missing
+# '}' there, not at the end of the file.
+struct C { n: int }
+impl C {
+    fn a(self) -> int {
+        if true { 1 } else { 2 }
+
+    fn b(self) -> int { 2 }  #~ ERROR [P0001] expected '}' to close block
+}
+fn main() -> int { 0 }

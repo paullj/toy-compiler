@@ -72,6 +72,10 @@ depth: u16 = 0,
 /// `findNextStmt` lands on the TAIL of the same broken statement (e.g. the `x` in
 /// a broken `let x =`) matches real tokens without having crossed a boundary.
 in_error: bool = false,
+/// The `fn` tokens of the local functions parsed so far in the current top-level decl
+/// (cleared per decl). A block that runs into EOF with one of these may have swallowed
+/// a top-level fn whose enclosing `}` is missing, so its diagnostic points there.
+nested_fns: std.ArrayList(u32) = .empty,
 
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
@@ -140,8 +144,9 @@ const stmt_recovery = setOf(&.{ .newline, .r_brace, .eof }).unionWith(stmt_first
 
 comptime {
     // The headline audit: the 3-way list arms are unambiguous only if FIRST(expr)
-    // is disjoint from FIRST(decl). `fn` stays a decl anchor; `fn (` is recognized by
-    // 2-token lookahead (`atLambda`), so a stray `fn name` still bails to the decl loop.
+    // is disjoint from FIRST(decl). `fn` stays a decl anchor everywhere but a block's
+    // statement loop; `fn (` is recognized by 2-token lookahead (`atLambda`), so a stray
+    // `fn name` in a list still bails to the decl loop.
     if (expr_first.intersectWith(decl_first).count() != 0) @compileError("expr_first overlaps decl_first: 3-way arms ambiguous");
     if (!tuple_recovery.contains(.r_paren) or !tuple_recovery.contains(.comma)) @compileError("tuple_recovery missing own closer/separator");
     if (!field_recovery.contains(.r_brace) or !field_recovery.contains(.newline)) @compileError("field_recovery missing own closer/separator");
@@ -164,13 +169,14 @@ comptime {
 /// on a decl keyword (a decl that failed AT its own keyword), advance once first
 /// so we always make progress.
 ///
-/// A decl keyword is an UNCONDITIONAL anchor here, ignoring brace depth: this
-/// grammar has no nested declarations, so `fn`/`struct`/`enum`/`import`/`pub`
-/// never legitimately appears inside a balanced brace/paren region. Depth-gating
-/// this stop (as the nested-block-aware `findNextStmt` must) would let an
-/// UNbalanced stray `{` — e.g. the trailing `{` of `fn f( ) ) ) {` — inflate the
-/// counter and swallow the next real `fn g`. Making decls a hard anchor keeps
-/// recovery landing on the next declaration regardless.
+/// A decl keyword is an UNCONDITIONAL anchor here, ignoring brace depth. The only
+/// nested declaration is a local `fn` inside a block, and landing on one merely
+/// reparses it as a top-level fn; `struct`/`enum`/`import`/`pub` never legitimately
+/// appear inside a balanced brace/paren region. Depth-gating this stop (as the
+/// nested-block-aware `findNextStmt` must) would let an UNbalanced stray `{` — e.g.
+/// the trailing `{` of `fn f( ) ) ) {` — inflate the counter and swallow the next
+/// real `fn g`. Making decls a hard anchor keeps recovery landing on the next
+/// declaration regardless.
 fn findNextDecl(p: *Parser) void {
     if (decl_first.contains(p.peek().tag)) p.advance();
     var fuel: usize = p.tokens.len + 1;
@@ -187,7 +193,8 @@ fn findNextDecl(p: *Parser) void {
 /// Scan to the next statement boundary at the block's brace-depth: a newline
 /// (`skipNewlines` swallows it — anti-cascade), `r_brace` (block loop breaks), a
 /// stmt-FIRST token (reparse the next statement), or a decl keyword (bail the
-/// wrecked block to the decl loop so it cannot eat the next fn).
+/// wrecked block to the decl loop so it cannot eat the next decl; a `fn` there
+/// reparses as a local function).
 fn findNextStmt(p: *Parser) void {
     var depth: i32 = 0;
     var fuel: usize = p.tokens.len + 1;
@@ -330,6 +337,7 @@ fn deinitAll(p: *Parser) void {
     p.nodes.deinit(p.gpa);
     p.extra.deinit(p.gpa);
     p.pub_decls.deinit(p.gpa);
+    p.nested_fns.deinit(p.gpa);
     p.diags.deinit(p.gpa);
 }
 
@@ -364,6 +372,7 @@ fn parseProgram(p: *Parser) error{OutOfMemory}!Ast.Tree {
     // the success path (an OOM in this tail goes through `parse`'s `deinitAll`,
     // which re-`deinit`s the now-empty lists harmlessly).
     p.pub_decls.deinit(p.gpa);
+    p.nested_fns.deinit(p.gpa);
     return Ast.Tree{ .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
 }
 
@@ -379,6 +388,7 @@ fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) error{OutOfMemory}!v
         // Each top-level decl is a fresh recovery unit: clear the cascade latch so
         // an independent error in THIS decl reports even after a prior decl broke.
         p.in_error = false;
+        p.nested_fns.clearRetainingCapacity();
         const entry = p.index;
         p.parseDeclRecoverable(decls) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -472,13 +482,15 @@ fn parseImport(p: *Parser) Error!Ast.Index {
     });
 }
 
-/// The four legal shapes a `fn` decl can take, one per call site. Modelled as a tagged
+/// The legal shapes a `fn` decl can take, one per call site. Modelled as a tagged
 /// union so the receiver payload attaches ONLY to the two method forms and the derived
 /// body-less / self-optional / self-synthesis behaviour comes from the tag — an illegal
 /// combination is unrepresentable rather than merely discouraged by a comment.
 ///
 ///   - `top_level`: an ordinary `fn`; no receiver, so a bare `self` just parses as a
 ///     param named `self`. Parses a real body.
+///   - `local`: a `fn name(..)` statement inside a block, shaped like `top_level` but
+///     never generic, tagged `local_fn`.
 ///   - `protocol_sig`: a protocol method SIGNATURE (`fn m(self, ..) -> R` with no
 ///     `{ .. }`). `proto_tok` is the protocol name, used as the synthetic `self`
 ///     receiver token; the body is a synthesized empty `block` node (bodyless) so
@@ -505,13 +517,14 @@ const FnKind = union(enum) {
     /// (like `protocol_sig` it synthesizes an empty block). Tagged `extern_fn_decl`
     /// at `addNode` so resolve/typecheck register it as a dyld import.
     extern_top_level,
+    local,
 
     const Recv = struct { recv_tok: u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index };
 };
 
 fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     const self_recv_tok: ?u32 = switch (kind) {
-        .top_level, .extern_top_level => null,
+        .top_level, .extern_top_level, .local => null,
         .protocol_sig => |ps| ps.proto_tok,
         .inherent_method, .conformance_method => |recv| recv.recv_tok,
     };
@@ -552,6 +565,12 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     // any generic params so the rest of the signature still parses.
     if (kind == .extern_top_level and generics.items.len > 0) {
         try p.warnSpan(generics_start, p.prevEnd(), .P0003, "'extern' functions cannot be generic");
+        generics.clearRetainingCapacity();
+    }
+    // A local fn is checked inline in its owner's body, which has no instance of its own
+    // to substitute a type parameter in.
+    if (kind == .local and generics.items.len > 0) {
+        try p.warnSpan(generics_start, p.prevEnd(), .P0003, "local functions cannot be generic");
         generics.clearRetainingCapacity();
     }
 
@@ -659,7 +678,11 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         @intCast(impl_gparams.len + generics.items.len),
     });
 
-    const decl_tag: Ast.Node.Tag = if (kind == .extern_top_level) .extern_fn_decl else .fn_decl;
+    const decl_tag: Ast.Node.Tag = switch (kind) {
+        .extern_top_level => .extern_fn_decl,
+        .local => .local_fn,
+        else => .fn_decl,
+    };
     return p.addNode(.{ .tag = decl_tag, .main_token = name_tok, .lhs = proto_header, .rhs = body });
 }
 
@@ -1486,9 +1509,23 @@ fn startsExpr(p: *const Parser) bool {
 }
 
 /// Whether a statement loop stops at the cursor to bail a broken block to the decl loop.
-/// A lambda statement (`fn(..) { .. }(..)`) starts with a decl keyword but is not one.
+/// `fn` does not: `fn name(` is a local function and `fn(` a lambda, so a block that
+/// lost its `}` runs on through the next top-level fn (the EOF diagnostic names it). A
+/// `fn` with a `self` receiver does: no local fn has one, so it is the next method of an
+/// impl whose previous method lost its `}`, and the block's missing `}` is reported there.
 fn atBlockAnchor(p: *const Parser) bool {
-    return decl_anchors.contains(p.peek().tag) and !p.atLambda();
+    if (p.at(.kw_fn)) return p.atMethodFn();
+    return decl_anchors.contains(p.peek().tag);
+}
+
+/// `fn name(self` or `fn name(mut self` (a `self` with no `: T`) at the cursor.
+fn atMethodFn(p: *const Parser) bool {
+    var i = p.index + 1;
+    if (i + 2 >= p.tokens.len or p.tokens[i].tag != .identifier or p.tokens[i + 1].tag != .l_paren) return false;
+    i += 2;
+    if (p.tokens[i].tag == .kw_mut) i += 1;
+    if (i + 1 >= p.tokens.len or p.tokens[i].tag != .identifier) return false;
+    return std.mem.eql(u8, p.tokens[i].text(p.src), "self") and p.tokens[i + 1].tag != .colon;
 }
 
 /// `fn(x, y: T) -> R { .. }` in expression position. A param's `: T` is optional (the
@@ -1618,8 +1655,8 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
     // Resilient statement loop (Zig-std model): a broken statement resyncs to the
     // next statement boundary rather than unwinding the whole block. The `while`
     // exits at eof; the trailing `expect(.r_brace)` reports a missing `}` ONCE
-    // (no mid-loop unwind of the enclosing fn). A decl keyword at loop top bails
-    // the wrecked block to the decl loop so it cannot eat the next fn.
+    // (no mid-loop unwind of the enclosing fn). A decl keyword other than `fn` at loop
+    // top bails the wrecked block to the decl loop so it cannot eat the next decl.
     while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
@@ -1642,10 +1679,38 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
             error.ParseError => p.findNextStmt(),
         };
     }
+    if (p.at(.eof) and p.nested_fns.items.len != 0) return p.failMissingBraceBeforeFn();
     try p.expect(.r_brace, "expected '}' to close block");
 
     const header = try p.addRange(stmts.items);
     return p.addNode(.{ .tag = .block, .main_token = lbrace, .lhs = header, .rhs = Ast.none });
+}
+
+/// A block that runs into EOF after a local fn was parsed in this decl: most likely a
+/// `}` is missing before a top-level fn, which then parsed as a nested one. A `fn` in
+/// column 1 is the likeliest such fn, so it is named in preference to an indented one.
+fn failMissingBraceBeforeFn(p: *Parser) Error {
+    var pick = p.nested_fns.items[0];
+    for (p.nested_fns.items) |fn_tok| {
+        const start = p.tokens[fn_tok].start;
+        if (start == 0 or p.src[start - 1] == '\n') {
+            pick = fn_tok;
+            break;
+        }
+    }
+    const tok = p.peek();
+    if (!p.in_error) {
+        p.in_error = true;
+        try p.diags.append(p.gpa, .{
+            .byte_offset = tok.start,
+            .end = tok.end,
+            .code = .P0001,
+            .message = "expected '}' to close block; a 'fn' inside it was parsed as a nested function — is a '}' missing before it?",
+            .related = p.tokens[pick].start,
+            .related_end = p.tokens[pick + 1].end,
+        });
+    }
+    return error.ParseError;
 }
 
 /// A statement ends at a `.newline`, or implicitly before `}`/EOF (Go ASI).
@@ -1714,6 +1779,10 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             const label_tok = try p.parseOptLabel();
             return p.addNode(.{ .tag = .continue_stmt, .main_token = continue_tok, .lhs = Ast.none, .rhs = Ast.Index.from(label_tok.int()) });
         },
+        .kw_fn => if (p.peek2().tag == .identifier) {
+            try p.nested_fns.append(p.gpa, p.index);
+            return p.parseFnDecl(.local);
+        } else return p.parseExprStmt(),
         // `@label <construct>` as a statement routes through parseExprStmt (like a
         // bare `loop`/`if`/block), so a trailing labeled loop/block is wrapped in an
         // expr_stmt and its value can satisfy a non-unit fn's trailing-expr rule.
@@ -2777,6 +2846,7 @@ fn parseExprOnly(gpa: std.mem.Allocator, tokens: []const Token, source: []const 
         .diags = .empty,
     };
     defer p.diags.deinit(p.gpa);
+    defer p.nested_fns.deinit(p.gpa);
     const run = struct {
         fn go(pp: *Parser) Error!Ast.Tree {
             _ = try pp.parseExpr(0);
@@ -3382,8 +3452,8 @@ test "root is program and children precede parents" {
                 for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self);
                 if (n.rhs != Ast.none) try testing.expect(n.rhs.int() < self);
             },
-            // `fn(..) -> R { .. }`: a fn_decl-shaped proto in `lhs`, the body in `rhs`.
-            .lambda => {
+            // A lambda or a local fn: a fn_decl-shaped proto in `lhs`, the body in `rhs`.
+            .lambda, .local_fn => {
                 const proto = Ast.protoAt(tree, n.lhs.int());
                 if (proto.ret_type != Ast.none) try testing.expect(proto.ret_type.int() < self);
                 for (proto.params) |c| try testing.expect(c.int() < self);
@@ -4737,28 +4807,21 @@ test "fn without '(' in type position is P0001" {
     try testing.expectEqualStrings("expected '(' after 'fn' in a function type", res.diags[0].message);
 }
 
-test "fn( in expression position is a lambda; fn name still bails the block" {
+test "fn name( inside a block is a local_fn statement; fn( is still a lambda" {
     try expectProgram(
         "fn main() {\n  f := fn(x: int) -> int { x }\n}\n",
         "(program (fn main () _ (block (:= f (lambda ((param x int)) int (block x))))))",
     );
+    try expectProgram(
+        "fn main() {\n  f := fn() { }\n  fn g(n: int) -> int { n }\n  fn h() {}\n}\n",
+        "(program (fn main () _ (block (:= f (lambda () _ (block))) (local-fn g ((param n int)) int (block n)) (local-fn h () _ (block)))))",
+    );
+    // A local fn nests in a local fn and in a lambda.
+    try expectProgram(
+        "fn main() {\n  fn a() {\n    fn b() {}\n  }\n  f := fn() { fn c() {} }\n}\n",
+        "(program (fn main () _ (block (local-fn a () _ (block (local-fn b () _ (block)))) (:= f (lambda () _ (block (local-fn c () _ (block))))))))",
+    );
     const gpa = testing.allocator;
-    // A nested `fn name` still ends the block: the decl loop picks `g` up.
-    {
-        const res = try parseResult(gpa, "fn main() {\n  f := fn() { }\n  fn g() {}\n}\n");
-        defer gpa.free(@constCast(res.diags));
-        defer freeTree(gpa, res.tree);
-        try testing.expect(res.diags.len >= 1);
-        try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
-        try testing.expectEqualStrings("expected '}' to close block", res.diags[0].message);
-        var lambdas: usize = 0;
-        for (res.tree.nodes) |n| {
-            if (n.tag == .lambda) lambdas += 1;
-        }
-        try testing.expectEqual(@as(usize, 1), lambdas);
-        // The block stops AT `fn g` (the P0001 is reported there), exactly as before lambdas.
-        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, "fn main() {\n  f := fn() { }\n  fn g() {}\n}\n", "fn g").?)), res.diags[0].byte_offset);
-    }
     // `fn name` where an expression is expected names the fix.
     {
         const res = try parseResult(gpa, "fn main() {\n  f := fn g() {}\n}\n");
@@ -4768,6 +4831,121 @@ test "fn( in expression position is a lambda; fn name still bails the block" {
         try testing.expectEqual(codes.Code.P0002, res.diags[0].code);
         try testing.expectEqualStrings("expected an expression; 'fn name(..)' declares a function", res.diags[0].message);
     }
+    // A local fn is not a top-level decl.
+    {
+        const res = try parseResult(gpa, "fn main() {\n  fn g() {}\n}\n");
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 0), res.diags.len);
+        var fn_decls: usize = 0;
+        var local_fns: usize = 0;
+        for (res.tree.nodes) |n| switch (n.tag) {
+            .fn_decl => fn_decls += 1,
+            .local_fn => local_fns += 1,
+            else => {},
+        };
+        try testing.expectEqual(@as(usize, 1), fn_decls);
+        try testing.expectEqual(@as(usize, 1), local_fns);
+    }
+}
+
+test "pub/struct/enum/impl/import still stop a broken block" {
+    const gpa = testing.allocator;
+    const heads = [_][]const u8{ "pub fn g() {}", "struct S { x: int }", "enum E { A }", "impl S { fn m(self) {} }", "import std/io" };
+    for (heads) |head| {
+        const src = try std.fmt.allocPrint(gpa, "fn main() {{\n  x := 1\n{s}\n", .{head});
+        defer gpa.free(src);
+        const res = try parseResult(gpa, src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expect(res.diags.len >= 1);
+        try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+        try testing.expectEqualStrings("expected '}' to close block", res.diags[0].message);
+        // The block stops AT the decl keyword, not at EOF.
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, head).?)), res.diags[0].byte_offset);
+        for (res.tree.nodes) |n| try testing.expect(n.tag != .local_fn);
+    }
+}
+
+test "EOF inside a fn with a nested fn adds the missing-} hint naming the column-1 fn" {
+    const gpa = testing.allocator;
+    const src = "fn main() -> int {\n  fn helper() -> int { 1 }\n  if true {\n    return helper()\n  return 0\n}\n\nfn other() -> int {\n  return 2\n}\n";
+    const res = try parseResult(gpa, src);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    const d = res.diags[0];
+    try testing.expectEqual(codes.Code.P0001, d.code);
+    try testing.expectEqualStrings("expected '}' to close block; a 'fn' inside it was parsed as a nested function — is a '}' missing before it?", d.message);
+    try testing.expectEqual(@as(u32, @intCast(src.len)), d.byte_offset);
+    // The column-1 `fn other` is named over the indented `fn helper` before it.
+    const other: u32 = @intCast(std.mem.indexOf(u8, src, "fn other").?);
+    try testing.expectEqual(other, d.related);
+    try testing.expectEqual(other + @as(u32, "fn other".len), d.related_end);
+    // Without a column-1 fn, the first nested fn is named.
+    {
+        const src2 = "fn main() {\n  fn a() {}\n  if true {\n    fn b() {}\n";
+        const res2 = try parseResult(gpa, src2);
+        defer gpa.free(@constCast(res2.diags));
+        defer freeTree(gpa, res2.tree);
+        try testing.expectEqual(@as(usize, 1), res2.diags.len);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src2, "fn a").?)), res2.diags[0].related);
+    }
+    // A missing `}` with no nested fn keeps the plain message and no related span.
+    {
+        const res3 = try parseResult(gpa, "fn main() -> int {\n  return 1\n");
+        defer gpa.free(@constCast(res3.diags));
+        defer freeTree(gpa, res3.tree);
+        try testing.expectEqual(@as(usize, 1), res3.diags.len);
+        try testing.expectEqualStrings("expected '}' to close block", res3.diags[0].message);
+        try testing.expect(res3.diags[0].relatedSpan() == null);
+    }
+    // The list is per top-level decl: a nested fn in an earlier, closed decl does not hint.
+    {
+        const res4 = try parseResult(gpa, "fn a() {\n  fn b() {}\n}\nfn main() -> int {\n  return 1\n");
+        defer gpa.free(@constCast(res4.diags));
+        defer freeTree(gpa, res4.tree);
+        try testing.expectEqual(@as(usize, 1), res4.diags.len);
+        try testing.expectEqualStrings("expected '}' to close block", res4.diags[0].message);
+    }
+}
+
+test "a method with a self receiver ends a method body that lost its }" {
+    const gpa = testing.allocator;
+    const heads = [_][]const u8{ "fn b(self)", "fn b(mut self)", "fn b(self, k: int)" };
+    for (heads) |head| {
+        const src = try std.fmt.allocPrint(gpa, "struct C {{ n: int }}\nimpl C {{\n  fn a(self) -> int {{\n    if true {{ 1 }} else {{ 2 }}\n\n  {s} -> int {{ 2 }}\n}}\nfn main() -> int {{ 0 }}\n", .{head});
+        defer gpa.free(src);
+        const res = try parseResult(gpa, src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+        try testing.expectEqualStrings("expected '}' to close block", res.diags[0].message);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, head).?)), res.diags[0].byte_offset);
+    }
+    // A local fn may name a param `self` when it annotates it.
+    const ok = "fn main() -> int {\n  fn f(self: int) -> int { self }\n  f(1)\n}\n";
+    const res = try parseResult(gpa, ok);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+}
+
+test "a local fn cannot be generic (P0003)" {
+    const gpa = testing.allocator;
+    const src = "fn main() {\n  fn id[T](x: T) -> T { x }\n}\n";
+    const res = try parseResult(gpa, src);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqual(codes.Code.P0003, res.diags[0].code);
+    try testing.expectEqualStrings("local functions cannot be generic", res.diags[0].message);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "[T]").?)), res.diags[0].byte_offset);
+    // The generic run is dropped, so the rest still parses as a local fn.
+    var buf: [256]u8 = undefined;
+    const rendered = try renderResult(res, src, &buf);
+    try testing.expect(std.mem.indexOf(u8, rendered, "(local-fn id ((param x T)) T (block x))") != null);
 }
 
 test "lambda params may omit their types" {

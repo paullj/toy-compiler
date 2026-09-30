@@ -146,6 +146,19 @@ test "hover describes declarations, bindings, type names, fields, and variants" 
     }
 }
 
+test "hover on a local fn shows it as a binding of its function type" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = "fn main() -> int {\n    fn step(k: int) -> int { k }\n    return step(1)\n}\n";
+    for ([_]struct { line: u32, col: u32 }{ .{ .line = 1, .col = 7 }, .{ .line = 2, .col = 11 } }) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.line, c.col, "file:///b/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        try testing.expectEqualStrings("```toy\nstep: fn(int) -> int\n```", h.value);
+    }
+}
+
 test "hover shows generic, protocol, and prelude types as the user spells them" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

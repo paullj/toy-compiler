@@ -260,8 +260,8 @@ way, with the env as the hidden first argument.
 ## Lambdas
 
 `fn(x, y: T) -> R { .. }` in expression position is a lambda, a value of type
-`fn(X, T) -> R`. `fn (` starts a lambda; `fn name` stays a declaration. It is checked
-bidirectionally, like a literal:
+`fn(X, T) -> R`. `fn (` starts a lambda; `fn name` is a declaration (a local function
+inside a block). It is checked bidirectionally, like a literal:
 
 * A parameter's type is its annotation, else the matching parameter of the function
   type expected where the lambda is written: an annotated binding, an assignment, a
@@ -300,6 +300,24 @@ capturing lambda do not.
 Env and box cells are word-scanned by the collector, so captured handles, strings,
 boxes and other closures stay alive with them; a function holds each of its boxes in a
 `rawptr` slot, a precise root.
+
+## Local functions
+
+`fn name(p: P, ..) -> R { .. }` as a statement inside a block declares a local
+function: a local `name` of type `fn(P, ..) -> R` (a missing `-> R` is `()`, as for a
+top-level function; every parameter is annotated). The local is bound before the body
+is checked, so the body can call itself; a later local function is not yet in scope,
+so two local functions cannot call each other (R0001). It is checked like an annotated
+lambda: `return` and `?` exit it (T0043 if a non-unit one can fall off the end), no
+jump leaves it (T0051), and it captures the locals around it by the same copy-or-box
+rule. It cannot be generic (**P0003**) or assigned (**R0007**), and one never named
+after its declaration is **W0003**.
+
+It lowers like a lambda: its unit is `<owner>$l<rank>`, and its declaration makes the
+value `{code, env}` straight into the name's slot. A reference to itself inside its
+body is not a capture: the unit rebuilds the pair from its own code and the env it was
+called with, which is the value its caller holds, so recursion costs no allocation and
+the value compares equal to itself inside and out.
 
 ## Protocols, the prelude, and builtin-scalar conformance
 

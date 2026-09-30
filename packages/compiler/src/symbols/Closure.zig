@@ -13,20 +13,24 @@ const Type = @import("../layout/Type.zig").Type;
 /// resolver slot, `first_use` the first identifier node (in resolve order) naming it.
 pub const Capture = struct { slot: u32, first_use: Ast.Index };
 
-/// One lambda in a fn body, as the resolver saw it.
+/// One lambda or local fn in a fn body, as the resolver saw it.
 pub const Boundary = struct {
-    /// The `.lambda` node.
+    /// The `.lambda` or `.local_fn` node.
     node: Ast.Index,
     /// Pre-order index among the owner fn's boundaries: the lambda's unit name suffix.
     rank: u32,
     /// Every slot the lambda declares is at least this; a local below it is declared
     /// outside (resolver slots are handed out monotonically per fn).
     slot_floor: u32,
+    /// A local fn's own name slot, declared just below `slot_floor`. Its body names itself
+    /// through this slot without capturing it: the unit rebuilds its own value from its env.
+    self_slot: ?u32 = null,
     /// Ascending slot, deduped; each keeps its first use.
     captures: []const Capture,
 };
 
-/// The lambdas of one top-level fn (or method), recorded only for a fn that has one.
+/// The lambdas and local fns of one top-level fn (or method), recorded only for a fn
+/// that has one.
 pub const FnClosures = struct {
     /// The enclosing `fn_decl`.
     fn_node: Ast.Index,
@@ -103,16 +107,16 @@ pub const CaptureMode = enum(u8) { copy, box };
 /// this one record.
 pub const EnvSlot = struct { slot: u32, ty: Type, mode: CaptureMode, off: u32 };
 
-/// A lambda's own codegen unit: one per lambda per lowerable owner, so a lambda inside a
-/// generic fn gets one unit per instance (each instance types the body into its own
-/// `node_types`).
+/// A lambda's or local fn's own codegen unit: one per lambda per lowerable owner, so a
+/// lambda inside a generic fn gets one unit per instance (each instance types the body
+/// into its own `node_types`).
 pub const LambdaUnit = struct {
     owner: Owner,
     /// The owner's module.
     mod: u32,
     /// The owner's `fn_decl`.
     fn_node: Ast.Index,
-    /// The `.lambda` node.
+    /// The `.lambda` or `.local_fn` node.
     node: Ast.Index,
     rank: u32,
     /// Owned.
@@ -121,6 +125,8 @@ pub const LambdaUnit = struct {
     sig: LayoutEngine.FnSig,
     /// The resolver slot of each param, in order; owned.
     param_slots: []const u32,
+    /// A local fn's own name slot, bound in its prologue to `{its code, its env}`.
+    self_slot: ?u32 = null,
     /// One per capture, ascending slot; owned.
     env: []const EnvSlot = &.{},
     /// The env cell's byte size; 0 means the lambda's value carries a null env.

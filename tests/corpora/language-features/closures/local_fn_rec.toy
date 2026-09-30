@@ -1,0 +1,7 @@
+# Feature: a local fn can call itself and captures like a lambda (the spec's `fact`)
+# expect: exit 60
+fn main() -> int {
+    base := 10
+    fn fact(n: int) -> int { if n <= 1 { base } else { n * fact(n - 1) } }
+    return fact(3)
+}

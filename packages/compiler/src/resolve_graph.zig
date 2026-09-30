@@ -133,9 +133,10 @@ const ModuleTables = struct {
 /// module's enum table).
 const prelude_enum_names = [_][]const u8{ "Ordering", "Option", "Result" };
 
-const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none };
-/// A lambda whose body is being resolved: its captures grow as outer locals are named.
-const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, captures: std.ArrayList(Closure.Capture) = .empty };
+const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none, is_fn: bool = false };
+/// A lambda or local fn whose body is being resolved: its captures grow as outer locals
+/// are named.
+const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, self_slot: ?u32 = null, captures: std.ArrayList(Closure.Capture) = .empty };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
 
@@ -630,6 +631,7 @@ const GraphResolve = struct {
             switch (loc.warn_code) {
                 .W0001 => try g.sink.report(.{ .span = off, .code = .W0001, .scope = g.cur_mod }, "unused variable '{s}'; prefix with '_' (as '_{s}') to silence", .{ nm, nm }),
                 .W0002 => try g.sink.report(.{ .span = off, .code = .W0002, .scope = g.cur_mod }, "unused parameter '{s}'; prefix with '_' (as '_{s}') to silence", .{ nm, nm }),
+                .W0003 => try g.sink.report(.{ .span = off, .code = .W0003, .scope = g.cur_mod }, "unused function '{s}'; remove it or prefix with '_' (as '_{s}') to silence", .{ nm, nm }),
                 else => unreachable,
             }
         }
@@ -668,8 +670,24 @@ const GraphResolve = struct {
     /// every slot declared so far), each written as `.local` on its param node; the body
     /// resolves in the lambda's own scope, recording the outer locals it names.
     fn resolveLambda(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+        return g.resolveBoundary(node_idx, n, null);
+    }
+
+    /// `fn name(params) -> R { body }` in a block: `name` is a local declared before the
+    /// body, so the body can call itself, and the rest resolves as a lambda whose
+    /// `self_slot` is that local.
+    fn resolveLocalFn(g: *GraphResolve, stmt_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+        const slot = try g.declare(n.main_token, "redeclaration of '{s}'", .W0003);
+        if (slot) |s| {
+            g.res(stmt_idx, .{ .local = s });
+            g.locals.items[s].is_fn = true;
+        }
+        try g.resolveBoundary(stmt_idx, n, slot);
+    }
+
+    fn resolveBoundary(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, self_slot: ?u32) error{OutOfMemory}!void {
         const proto = Ast.protoAt(g.tree(g.cur_mod), n.lhs.int());
-        try g.open.append(g.gpa, .{ .node = node_idx, .rank = g.next_rank, .slot_floor = g.slot_next, .label_floor = g.label_stack.items.len });
+        try g.open.append(g.gpa, .{ .node = node_idx, .rank = g.next_rank, .slot_floor = g.slot_next, .label_floor = g.label_stack.items.len, .self_slot = self_slot });
         g.next_rank += 1;
         try g.pushScope();
         for (proto.params) |param_idx| {
@@ -690,19 +708,21 @@ const GraphResolve = struct {
         for (ob.captures.items) |c| try g.captured_so_far.put(g.gpa, c.slot, {});
         try g.fn_boundaries.ensureUnusedCapacity(g.gpa, 1);
         const caps = try ob.captures.toOwnedSlice(g.gpa);
-        g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .captures = caps });
+        g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .self_slot = ob.self_slot, .captures = caps });
     }
 
     /// Record a use of local `slot` at node `use` as a capture of every open lambda it
     /// crosses. A lambda's slots are all at or above its floor, so a slot below the floor
     /// is declared outside it; boundaries nest, so the first one it is inside stops the walk.
-    /// A new capture keeps every pending write to the slot live: the closure may read it.
+    /// A local fn's own name stops it too: the local fn names itself without a capture, and
+    /// the name is declared just outside it. A new capture keeps every pending write to the
+    /// slot live: the closure may read it.
     fn noteCapture(g: *GraphResolve, slot: u32, use: Ast.Index) error{OutOfMemory}!void {
         var i = g.open.items.len;
         while (i > 0) {
             i -= 1;
             const b = &g.open.items[i];
-            if (slot >= b.slot_floor) return;
+            if (slot >= b.slot_floor or b.self_slot == slot) return;
             const seen = for (b.captures.items) |c| {
                 if (c.slot == slot) break true;
             } else false;
@@ -859,7 +879,9 @@ const GraphResolve = struct {
                         .unresolved => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "assignment to undeclared name '{s}'; declare it first with ':='", .{g.nameText(target.main_token)}),
                         .func => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to function '{s}'", .{g.nameText(target.main_token)}),
                         .module => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
-                        .local => |slot| {
+                        .local => |slot| if (g.locals.items[slot].is_fn) {
+                            try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to function '{s}'", .{g.nameText(target.main_token)});
+                        } else {
                             try g.fn_assigned.append(g.gpa, slot);
                             try g.noteCapture(slot, stmt.lhs);
                         },
@@ -924,6 +946,7 @@ const GraphResolve = struct {
                 if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "continue");
             },
             .labeled => try g.resolveLabeled(stmt_idx),
+            .local_fn => try g.resolveLocalFn(stmt_idx, stmt),
             // A poison leaf as a statement: already-diagnosed, resolve nothing.
             .error_node => {},
             else => try g.resolveExpr(stmt_idx),
@@ -3590,6 +3613,186 @@ test "a store to a captured local followed by a call and a second store is not W
     , struct {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
+        }
+    }.run);
+}
+
+/// The `nth` (node order) `.local_fn` node.
+fn nthLocalFn(tree: Ast.Tree, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (tree.nodes, 0..) |n, i| {
+        if (n.tag != .local_fn) continue;
+        if (seen == nth) return Ast.Index.from(@intCast(i));
+        seen += 1;
+    }
+    return error.TestLocalFnNotFound;
+}
+
+test "a local fn resolves its own name to self_slot, not a capture" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ base := 10
+        \\ fn fact(n: int) -> int { if n <= 1 { base } else { n * fact(n - 1) } }
+        \\ return fact(3)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const lf = try nthLocalFn(tree, 0);
+            try testing.expectEqual(Resolution{ .local = 1 }, r.resolutions[0][lf.int()]);
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 1), bs.len);
+            const b = bs[0];
+            try testing.expectEqual(lf, b.node);
+            try testing.expectEqual(@as(?u32, 1), b.self_slot);
+            try testing.expectEqual(@as(u32, 2), b.slot_floor);
+            // Only `base`: the recursive `fact` names the local fn's own slot.
+            try testing.expectEqual(@as(usize, 1), b.captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = try nthIdent(tree, toks, src, "base", 0) }, b.captures[0]);
+            try testing.expectEqual(Resolution{ .local = 1 }, r.resolutions[0][(try nthIdent(tree, toks, src, "fact", 0)).int()]);
+            const proto = Ast.protoAt(tree, tree.nodes[lf.int()].lhs.int());
+            try testing.expectEqual(Resolution{ .local = 2 }, r.resolutions[0][proto.params[0].int()]);
+        }
+    }.run);
+}
+
+test "a lambda inside a local fn captures the local fn" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn f(n: int) -> int {
+        \\  g := fn() -> int { f(n - 1) }
+        \\  if n <= 0 { 0 } else { g() }
+        \\ }
+        \\ return f(2)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 2), bs.len);
+            // Node order: the lambda is inside the local fn, so it comes first.
+            const lam = bs[0];
+            const lf = bs[1];
+            try testing.expectEqual(Ast.Node.Tag.lambda, tree.nodes[lam.node.int()].tag);
+            try testing.expectEqual(@as(?u32, 0), lf.self_slot);
+            try testing.expectEqual(@as(?u32, null), lam.self_slot);
+            try testing.expectEqual(@as(usize, 0), lf.captures.len);
+            try testing.expectEqual(@as(usize, 2), lam.captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = try nthIdent(tree, toks, src, "f", 0) }, lam.captures[0]);
+            try testing.expectEqual(Closure.Capture{ .slot = 1, .first_use = try nthIdent(tree, toks, src, "n", 0) }, lam.captures[1]);
+        }
+    }.run);
+    // A later lambda in the owner captures the local fn's slot like any local.
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn one() -> int { 1 }
+        \\ h := fn() -> int { one() }
+        \\ return h()
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 2), bs.len);
+            try testing.expectEqual(@as(usize, 1), bs[1].captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = try nthIdent(tree, toks, src, "one", 0) }, bs[1].captures[0]);
+        }
+    }.run);
+}
+
+test "an unused local fn is W0003" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn helper() -> int { 1 }
+        \\ fn _quiet() -> int { 2 }
+        \\ fn only_self(n: int) -> int { if n <= 0 { 0 } else { only_self(n - 1) } }
+        \\ return 0
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0003));
+            for (r.diags) |d| if (d.code == .W0003) {
+                try testing.expectEqualStrings("unused function 'helper'; remove it or prefix with '_' (as '_helper') to silence", d.message);
+            };
+        }
+    }.run);
+}
+
+test "a local fn may reuse a label of the loop around it" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ t := 0
+        \\ @scan for i in 0..3 {
+        \\  fn first_even(n: int) -> int {
+        \\   k := 0
+        \\   @scan loop {
+        \\    if k >= n { break @scan }
+        \\    k = k + 2
+        \\   }
+        \\   k
+        \\  }
+        \\  t = t + first_even(i)
+        \\ }
+        \\ return t
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+        }
+    }.run);
+}
+
+test "assigning a local fn is R0007" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn f() -> int { 1 }
+        \\ g := fn() -> int { f() }
+        \\ f = g
+        \\ return f()
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0007));
+            try testing.expectEqualStrings("cannot assign to function 'f'", firstError(r).message);
+            // The rejected store does not make `f` an assigned (boxed) capture.
+            try testing.expectEqual(@as(usize, 0), r.closures[0][0].assigned.len);
+        }
+    }.run);
+}
+
+test "a local fn is not a global fn (not in fns)" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn helper() -> int { 1 }
+        \\ return helper()
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            for (r.fns) |f| try testing.expect(std.mem.indexOf(u8, f.name, "helper") == null);
+        }
+    }.run);
+}
+
+test "mutual recursion between local fns is R0001" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn a(n: int) -> int { if n <= 0 { 0 } else { b(n - 1) } }
+        \\ fn b(n: int) -> int { a(n) }
+        \\ return b(3)
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0001));
+            try testing.expectEqualStrings("undeclared identifier 'b'", firstError(r).message);
         }
     }.run);
 }

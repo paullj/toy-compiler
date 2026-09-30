@@ -136,7 +136,7 @@ pub fn nodeSpan(src: Source, idx: Ast.Index) Span {
     // real child follows the name; one that seems to precede it is synthesized (a protocol
     // method's `self` type points at the protocol's name), so the name bounds the start.
     const is_decl = switch (root.tag) {
-        .fn_decl, .extern_fn_decl, .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl, .type_alias_decl => true,
+        .fn_decl, .extern_fn_decl, .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl, .type_alias_decl, .local_fn => true,
         else => false,
     };
     if (is_decl) first = root.main_token;
@@ -242,6 +242,21 @@ inline fn emit(visitor: anytype, ev: Event) !void {
             visitor.on(ev);
         }
     }
+}
+
+/// A lambda's or a local fn's proto and body: the param count, whether each param and
+/// the ret are spelled (an untyped lambda param, an inferred ret), then the body.
+fn walkClosure(src: Source, n: Ast.Node, collect: bool, visitor: anytype) VisitorError(@TypeOf(visitor))!void {
+    const tree = src.tree;
+    const proto = Ast.protoAt(tree, n.lhs.int());
+    try emit(visitor, .{ .count = @intCast(proto.params.len) });
+    for (proto.params) |p| {
+        try emit(visitor, .{ .flag = tree.nodes[p.int()].lhs != Ast.none }); // fn(x) != fn(x: int)
+        try walkInner(src, p, collect, visitor);
+    }
+    try emit(visitor, .{ .flag = proto.ret_type != Ast.none }); // inferred != -> R
+    if (proto.ret_type != Ast.none) try walkInner(src, proto.ret_type, collect, visitor);
+    try walkInner(src, n.rhs, collect, visitor);
 }
 
 /// `collect` is the touched-collection context: it is the canonical order's full
@@ -516,17 +531,11 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             if (n.rhs != Ast.none) try walkInner(src, n.rhs, collect, visitor);
         },
         // No `type_ref`: that event folds the OWNING fn's sig by ordinal, and a lambda's
-        // params are not the owner's. Its param/ret type-refs fold by spelling instead.
-        .lambda => {
-            const proto = Ast.protoAt(tree, n.lhs.int());
-            try emit(visitor, .{ .count = @intCast(proto.params.len) });
-            for (proto.params) |p| {
-                try emit(visitor, .{ .flag = tree.nodes[p.int()].lhs != Ast.none }); // fn(x) != fn(x: int)
-                try walkInner(src, p, collect, visitor);
-            }
-            try emit(visitor, .{ .flag = proto.ret_type != Ast.none }); // inferred != -> R
-            if (proto.ret_type != Ast.none) try walkInner(src, proto.ret_type, collect, visitor);
-            try walkInner(src, n.rhs, collect, visitor);
+        // or a local fn's params are not the owner's. Their type-refs fold by spelling.
+        .lambda => try walkClosure(src, n, collect, visitor),
+        .local_fn => {
+            try emit(visitor, .{ .leaf = leaf });
+            try walkClosure(src, n, collect, visitor);
         },
         .pattern_binding => {
             try emit(visitor, .{ .leaf = leaf });
@@ -1601,6 +1610,48 @@ test "a lambda walk emits no type_ref" {
     try testing.expectEqual(@as(usize, 2), type_refs);
 }
 
+test "a local fn folds its name, param types, ret and body into its owner" {
+    const gpa = testing.allocator;
+    const sources = [_][]const u8{
+        "fn f() { fn g(x: int) -> int { x } }\n",
+        "fn f() { fn h(x: int) -> int { x } }\n",
+        "fn f() { fn g(x: bool) -> int { x } }\n",
+        "fn f() { fn g(x: int) { x } }\n",
+        "fn f() { fn g(x: int, y: int) -> int { x } }\n",
+        "fn f() { fn g(x: int) -> int { x + 1 } }\n",
+        "fn f() { g := fn(x: int) -> int { x } }\n",
+    };
+    var fps: [sources.len]u64 = undefined;
+    for (sources, 0..) |src, i| {
+        var b = try build(gpa, src);
+        defer b.deinit(gpa);
+        var h = std.hash.Wyhash.init(0);
+        var hv = HashVisitor{ .h = &h };
+        try walk(b.src(), b.fnDecl(0), &hv);
+        fps[i] = h.final();
+    }
+    for (fps, 0..) |a, i| for (fps[i + 1 ..]) |c| try testing.expect(a != c);
+}
+
+test "a local fn walk emits no type_ref" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn f(a: int) -> int {\n fn g(x: int, y: bool) -> int { x }\n return g(a, true)\n}\n");
+    defer b.deinit(gpa);
+    var stream: std.ArrayList(StreamStep) = .empty;
+    defer stream.deinit(gpa);
+    var rec = StreamRecorder{ .out = &stream, .gpa = gpa };
+    try walk(b.src(), b.fnDecl(0), &rec);
+    var type_refs: usize = 0;
+    var local_fns: usize = 0;
+    for (stream.items) |st| {
+        if (st.kind == .type_ref) type_refs += 1;
+        if (st.kind == .enter and b.tree.nodes[st.idx.int()].tag == .local_fn) local_fns += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), local_fns);
+    // Only the owner's own `a: int` and `-> int`.
+    try testing.expectEqual(@as(usize, 2), type_refs);
+}
+
 test "the .operator event is IGNORED by the hash (int == fingerprint unchanged)" {
     const gpa = testing.allocator;
     var b = try build(gpa, "fn f(a: int, b: int) -> bool { a == b }\n");
@@ -2179,6 +2230,21 @@ test "nodeSpan of a bodyless signature ends at the signature" {
     try std.testing.expectEqualStrings("fn two(self) -> int", got.items[1]);
     try std.testing.expectEqualStrings("extern fn ext(a: int) -> int", got.items[2]);
     try std.testing.expectEqualStrings("fn main() -> int { 0 }", got.items[3]);
+}
+
+test "nodeSpan of a local fn runs from its `fn` to its closing brace" {
+    const gpa = std.testing.allocator;
+    const src_text = "fn main() -> int {\n    fn g(n: int) -> int {\n        n\n    }\n    return g(1)\n}\n";
+    var b = try build(gpa, src_text);
+    defer b.deinit(gpa);
+    const src: Source = .{ .tree = b.tree, .tokens = b.tokens, .source = b.source };
+    for (b.tree.nodes, 0..) |n, i| {
+        if (n.tag != .local_fn) continue;
+        const sp = nodeSpan(src, Ast.Index.from(@intCast(i)));
+        try std.testing.expectEqualStrings("fn g(n: int) -> int {\n        n\n    }", src_text[sp.start..sp.end]);
+        return;
+    }
+    return error.NoLocalFn;
 }
 
 test "nodeSpan starts an inferred variant at its dot" {

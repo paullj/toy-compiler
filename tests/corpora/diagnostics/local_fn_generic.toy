@@ -1,0 +1,4 @@
+fn main() -> int {
+    fn id[T](x: T) -> T { x }  #~ ERROR [P0003] local functions cannot be generic
+    return id(1)
+}

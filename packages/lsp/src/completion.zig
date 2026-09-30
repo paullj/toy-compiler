@@ -22,9 +22,9 @@
 //!     (`Counter.`) resolve to no field/method set → a valid empty list. A member context
 //!     needs a struct/enum VALUE receiver.
 //!   * The resolver keeps no positional lexical-scope table, so SCOPE is an approximation:
-//!     the enclosing fn's params + its `:=` locals (bracketed by source position between
-//!     adjacent fn decls) + all visible top-level decls + the language keywords. A cursor
-//!     inside a fn signature may misattribute the enclosing fn.
+//!     the enclosing fn's params + its `:=` locals and local fns (bracketed by source
+//!     position between adjacent top-level fn decls) + all visible top-level decls + the
+//!     language keywords. A cursor inside a fn signature may misattribute the enclosing fn.
 //!   * Scalar / `str` / generic-template methods are not surfaced (only concrete
 //!     `methods`-table entries are).
 
@@ -335,7 +335,7 @@ fn collectScope(
     try collectEnclosing(col, m, entry, res, tc, off);
 }
 
-/// Add the enclosing fn's params + `:=` locals. The resolver keeps no positional scope,
+/// Add the enclosing fn's params + `:=` locals + local fns. The resolver keeps no positional scope,
 /// so the enclosing fn is the last `fn_decl` starting at/before the cursor and its locals
 /// are bracketed to `[fn.start, next_fn.start)`. Impl methods are interleaved `fn_decl`s,
 /// handled by the next-fn bound.
@@ -393,7 +393,11 @@ fn collectEnclosing(
 
     const node_types = tc.node_types[entry];
     for (m.nodes, 0..) |n, i| {
-        if (n.tag != .var_decl) continue;
+        const k = switch (n.tag) {
+            .var_decl => kind.variable,
+            .local_fn => kind.function,
+            else => continue,
+        };
         const start = m.tokens[n.main_token].start;
         if (start < encl_start or start >= next_start) continue;
         const name = m.tokens[n.main_token].text(m.source);
@@ -403,7 +407,7 @@ fn collectEnclosing(
             try render.renderType(col.a, &buf, node_types[i], tc.layouts, tc.enum_layouts);
             detail = buf.items;
         }
-        try col.add(name, kind.variable, detail);
+        try col.add(name, k, detail);
     }
 }
 
@@ -455,4 +459,47 @@ test "classify: newline terminators are skipped back to the real token" {
     const d = classify(&toks, 6);
     try testing.expectEqual(Context.member, d.context);
     try testing.expect(d.repair);
+}
+
+test "completion: a local fn before the cursor keeps the enclosing fn's params and locals" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn helper(x: int) -> int { return x }
+        \\fn main(arg: int) -> int {
+        \\    base := 1
+        \\    fn step(k: int) -> int { k + base }
+        \\    count := step(arg)
+        \\    return count
+        \\}
+        \\
+    ;
+    const p = @import("test_util.zig").posAfterLast(src, "count");
+    var c = try completionsAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy");
+    defer c.deinit();
+    const Want = struct { label: []const u8, kind: u8, detail: ?[]const u8 };
+    const wants = [_]Want{
+        .{ .label = "arg", .kind = kind.variable, .detail = "int" },
+        .{ .label = "base", .kind = kind.variable, .detail = "int" },
+        .{ .label = "count", .kind = kind.variable, .detail = "int" },
+        .{ .label = "step", .kind = kind.function, .detail = "fn(int) -> int" },
+        .{ .label = "helper", .kind = kind.function, .detail = null },
+    };
+    for (wants) |w| {
+        const it = for (c.items) |it| {
+            if (std.mem.eql(u8, it.label, w.label)) break it;
+        } else {
+            std.debug.print("no completion '{s}'\n", .{w.label});
+            return error.MissingCompletion;
+        };
+        try testing.expectEqual(w.kind, it.kind);
+        if (w.detail) |d| try testing.expectEqualStrings(d, it.detail.?);
+    }
+    // Another fn's param and a local fn's own param are not in scope at the cursor.
+    for (c.items) |it| {
+        try testing.expect(!std.mem.eql(u8, it.label, "x"));
+        try testing.expect(!std.mem.eql(u8, it.label, "k"));
+    }
 }
