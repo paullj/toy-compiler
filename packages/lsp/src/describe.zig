@@ -6,6 +6,7 @@
 const std = @import("std");
 const toyc = @import("toy_compiler");
 const render = @import("render.zig");
+const callee_sig = @import("callee_sig.zig");
 
 const Ast = toyc.Ast;
 const Graph = toyc.Graph;
@@ -54,6 +55,8 @@ pub const Describer = struct {
         for (m.nodes, 0..) |n, i| {
             if (n.main_token != tok) continue;
             if (resolutions[i] == .func) if (try d.function(resolutions[i].func)) return true;
+            // Before the variant fallback: a method never shows as a same-named variant.
+            if (n.tag == .field_access and resolutions[i] != .func) if (try d.callee(@intCast(i))) return true;
             if (ty == null and isRenderable(node_types[i])) ty = node_types[i];
             switch (n.tag) {
                 .identifier => if (resolutions[i] == .local) {
@@ -170,20 +173,37 @@ pub const Describer = struct {
         return true;
     }
 
+    /// The method the call headed by member node `fa` selected, as `function` renders a fn.
+    /// A user protocol's method shows as written, like the protocol-decl hover.
+    fn callee(d: *Describer, fa: u32) !bool {
+        const sig = (try callee_sig.of(d.a, d.graph, d.res, d.tc, d.graph.entry_index, fa)) orelse return false;
+        if (d.tc.callees[d.graph.entry_index][fa].view() == .protocol) if (sig.decl) |decl| {
+            try d.appendNodeText(&d.graph.modules[decl.module], decl.node);
+            return true;
+        };
+        try d.buf.print(d.a, "fn {s}(", .{sig.name});
+        for (sig.params, 0..) |p, k| {
+            if (k != 0) try d.buf.appendSlice(d.a, ", ");
+            // A receiver inside a bounded template has no concrete type (its node types are
+            // scratch): the name alone beats a `?`.
+            if (k < sig.param_names.len) {
+                try d.buf.appendSlice(d.a, sig.param_names[k]);
+                if (!render.isRenderableNamed(p, sig.var_names)) continue;
+                try d.buf.appendSlice(d.a, ": ");
+            }
+            try render.renderTypeNamed(d.a, &d.buf, p, d.tc.layouts, d.tc.enum_layouts, sig.var_names);
+        }
+        try d.buf.appendSlice(d.a, ") -> ");
+        try render.renderTypeNamed(d.a, &d.buf, sig.ret, d.tc.layouts, d.tc.enum_layouts, sig.var_names);
+        return true;
+    }
+
     /// Parameter names from `f`'s declaration, in whatever module declares it; empty for a
     /// builtin (no source) so the signature falls back to bare types.
     fn paramNames(d: *const Describer, f: u32) ![]const []const u8 {
         if (f >= d.res.fns.len) return &.{};
         const gf = d.res.fns[f];
-        if (gf.decl_node == Ast.none) return &.{};
-        const tm = &d.graph.modules[gf.module];
-        const proto = Ast.protoAt(tm.tree(), tm.nodes[gf.decl_node.int()].lhs.int());
-        const out = try d.a.alloc([]const u8, proto.params.len);
-        for (proto.params, out) |p, *name| {
-            const t = tm.tokens[tm.nodes[p.int()].main_token];
-            name.* = tm.source[t.start..t.end];
-        }
-        return out;
+        return callee_sig.declParamNames(d.a, d.graph, gf.module, gf.decl_node);
     }
 
     fn structNamed(d: *const Describer, name: []const u8) ?*const Layout {
@@ -225,7 +245,7 @@ pub const Describer = struct {
     /// reads as one signature.
     fn appendNodeText(d: *Describer, m: *const Graph.Module, i: u32) !void {
         const sp = toyc.AstWalk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(i));
-        try appendCollapsed(d.a, &d.buf, m.source[sp.start..sp.end]);
+        try render.appendCollapsed(d.a, &d.buf, m.source[sp.start..sp.end]);
     }
 
     /// A variant as `Enum.Variant(payload)`. The enum is the node's own type (a construction
@@ -285,24 +305,6 @@ const native_enums = [_]struct { name: []const u8, decl: []const u8 }{
     .{ .name = "Option", .decl = "enum Option[T] { some(T), none }" },
     .{ .name = "Result", .decl = "enum Result[T, E] { ok(T), err(E) }" },
 };
-
-/// `text` with each whitespace run (newlines included) collapsed to one space, and none
-/// inside brackets: a declaration spread over lines reads as one signature.
-fn appendCollapsed(a: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
-    var gap = false;
-    for (text) |c| {
-        if (std.ascii.isWhitespace(c)) {
-            gap = true;
-            continue;
-        }
-        if (gap and buf.items.len > 0) {
-            const prev = buf.items[buf.items.len - 1];
-            if (prev != '(' and prev != '[' and c != ')' and c != ']' and c != ',') try buf.append(a, ' ');
-        }
-        gap = false;
-        try buf.append(a, c);
-    }
-}
 
 fn fieldType(names: []const []const u8, types: []const Type, name: []const u8) ?Type {
     for (names, types) |n, t| if (std.mem.eql(u8, n, name)) return t;

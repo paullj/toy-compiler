@@ -123,7 +123,7 @@ pub const Event = union(enum) {
 /// but is no node's main token, and a subtree starting inside a parenthesis (`(a + b) * c`)
 /// must take the `(` too; parentheses make no node of their own.
 pub fn nodeSpan(src: Source, idx: Ast.Index) Span {
-    var ext: Extent = .{ .tree = src.tree };
+    var ext: Extent = .{ .tree = src.tree, .tokens = src.tokens };
     walk(src, idx, &ext) catch unreachable;
     // The canonical walk does not descend into a protocol (its method signatures carry
     // no fingerprinted body), so its extent takes them here.
@@ -177,6 +177,7 @@ pub const Span = @import("../diagnostics/model.zig").Span;
 
 const Extent = struct {
     tree: Ast.Tree,
+    tokens: []const Token,
     first: u32 = std.math.maxInt(u32),
     last: u32 = 0,
 
@@ -184,6 +185,9 @@ const Extent = struct {
         switch (ev) {
             .enter => |e| {
                 const n = self.tree.nodes[e.idx.int()];
+                // A bodyless signature's synthesized empty block sits on the token after the
+                // signature, which on a one-line `protocol P { fn m(self) }` is the protocol's `}`.
+                if (n.tag == .block and self.tokens[n.main_token].tag != .l_brace) return;
                 // An inferred variant (`.a(1)`, a `.a` pattern) is spelled from its `.`,
                 // which is no node's main token.
                 const lead: u32 = switch (n.tag) {
@@ -2039,6 +2043,26 @@ test "nodeSpan reaches a closing bracket on a later line" {
         return;
     }
     return error.NoBinary;
+}
+
+test "nodeSpan of a bodyless signature ends at the signature" {
+    const gpa = std.testing.allocator;
+    const src_text = "protocol One { fn one(self) -> int }\nprotocol Two {\n    fn two(self) -> int\n}\nextern fn ext(a: int) -> int\nfn main() -> int { 0 }\n";
+    var b = try build(gpa, src_text);
+    defer b.deinit(gpa);
+    const src: Source = .{ .tree = b.tree, .tokens = b.tokens, .source = b.source };
+    var got: std.ArrayList([]const u8) = .empty;
+    defer got.deinit(gpa);
+    for (b.tree.nodes, 0..) |n, i| {
+        if (n.tag != .fn_decl and n.tag != .extern_fn_decl) continue;
+        const sp = nodeSpan(src, Ast.Index.from(@intCast(i)));
+        try got.append(gpa, src_text[sp.start..sp.end]);
+    }
+    try std.testing.expectEqual(@as(usize, 4), got.items.len);
+    try std.testing.expectEqualStrings("fn one(self) -> int", got.items[0]);
+    try std.testing.expectEqualStrings("fn two(self) -> int", got.items[1]);
+    try std.testing.expectEqualStrings("extern fn ext(a: int) -> int", got.items[2]);
+    try std.testing.expectEqualStrings("fn main() -> int { 0 }", got.items[3]);
 }
 
 test "nodeSpan starts an inferred variant at its dot" {
