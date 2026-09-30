@@ -558,3 +558,159 @@ test "fn-value programs are byte-identical at -j1 and -j8" {
     defer gpa.free(b8);
     try std.testing.expectEqualSlices(u8, b1, b8);
 }
+
+/// Closure GC-pressure fixtures. Every victim env is an 8- or 16-byte cell; `churn` makes
+/// 20000 closures whose 8-byte envs hold junk, so a victim env swept for want of a root
+/// is reused and overwritten before the victim is called. `collect` forces one collection
+/// and then churns.
+const closure_gc_prelude =
+    \\import std/vec
+    \\import std/map
+    \\import core/mem_selftest
+    \\type Op = fn(int) -> int
+    \\fn make_adder(n: int) -> Op {
+    \\    fn(x: int) -> int { x + n }
+    \\}
+    \\fn churn() -> int {
+    \\    i := 0
+    \\    loop {
+    \\        if i >= 20000 { break }
+    \\        j := i + 1000
+    \\        _g := fn() -> int { j }
+    \\        i = i + 1
+    \\    }
+    \\    return mem_selftest.churn_collects()
+    \\}
+    \\fn collect() -> bool {
+    \\    n := mem_selftest.forced_collect_count()
+    \\    c := churn()
+    \\    n >= 1 && c >= 1
+    \\}
+    \\
+;
+
+fn expectClosureGc(dir_name: []const u8, main_src: []const u8) !void {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const src = try std.mem.concat(gpa, u8, &.{ closure_gc_prelude, main_src });
+    defer gpa.free(src);
+    const code = try buildAndRun(gpa, io, dir_name, src);
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "gc: a closure held only in a local keeps its env across a collection (frame root)" {
+    try expectClosureGc(".toy-test-gc-closure-local",
+        \\fn main() -> int {
+        \\    f := make_adder(40)
+        \\    if !collect() { return 1 }
+        \\    return f(2)
+        \\}
+        \\
+    );
+}
+
+test "gc: closures held only in a Vec keep their envs (element trace)" {
+    try expectClosureGc(".toy-test-gc-closure-vec",
+        \\fn fill() -> Vec[Op] {
+        \\    fs: Vec[Op] = []
+        \\    for i in 0..5 { fs.push(make_adder(i * 10)) }
+        \\    fs
+        \\}
+        \\fn main() -> int {
+        \\    fs := fill()
+        \\    if !collect() { return 1 }
+        \\    s := 0
+        \\    for i in 0..5 { s = s + fs[i](1) }
+        \\    return s - 63
+        \\}
+        \\
+    );
+}
+
+test "gc: closures held only as Map values keep their envs" {
+    try expectClosureGc(".toy-test-gc-closure-map",
+        \\fn fill() -> Map[int, Op] {
+        \\    m := Map[int, Op].new()
+        \\    for i in 0..5 { m.set(i, make_adder(i * 10)) }
+        \\    m
+        \\}
+        \\fn main() -> int {
+        \\    m := fill()
+        \\    if !collect() { return 1 }
+        \\    s := 0
+        \\    for k, v in m { s = s + v(k) }
+        \\    return s - 68
+        \\}
+        \\
+    );
+}
+
+test "gc: a closure in a struct in a Vec keeps its env" {
+    try expectClosureGc(".toy-test-gc-closure-struct-vec",
+        \\struct H { k: int, f: Op }
+        \\fn fill() -> Vec[H] {
+        \\    hs: Vec[H] = []
+        \\    for i in 0..5 { hs.push(H { k: i, f: make_adder(i * 10) }) }
+        \\    hs
+        \\}
+        \\fn main() -> int {
+        \\    hs := fill()
+        \\    if !collect() { return 1 }
+        \\    s := 0
+        \\    for i in 0..5 {
+        \\        h := hs[i]
+        \\        s = s + h.f(h.k)
+        \\    }
+        \\    return s - 68
+        \\}
+        \\
+    );
+}
+
+test "gc: a closure captured by another closure is reached through the outer env (word scan)" {
+    try expectClosureGc(".toy-test-gc-closure-nested",
+        \\fn twice(f: Op) -> Op {
+        \\    fn(x: int) -> int { f(f(x)) }
+        \\}
+        \\fn main() -> int {
+        \\    g := twice(make_adder(20))
+        \\    if !collect() { return 1 }
+        \\    return g(2)
+        \\}
+        \\
+    );
+}
+
+test "gc: an Option[fn] payload keeps its env" {
+    try expectClosureGc(".toy-test-gc-closure-option",
+        \\fn pick(n: int) -> Option[Op] {
+        \\    if n > 0 { return .some(make_adder(n)) }
+        \\    return .none
+        \\}
+        \\fn main() -> int {
+        \\    o := pick(40)
+        \\    if !collect() { return 1 }
+        \\    return match o {
+        \\        .some(f) -> f(2),
+        \\        .none -> 3,
+        \\    }
+        \\}
+        \\
+    );
+}
+
+test "gc: a closure argument survives a collection while a later argument is evaluated" {
+    try expectClosureGc(".toy-test-gc-closure-arg",
+        \\fn apply(f: Op, x: int) -> int { f(x) }
+        \\fn collect_then(x: int) -> int {
+        \\    if !collect() { return 0 }
+        \\    x
+        \\}
+        \\fn main() -> int {
+        \\    return apply(make_adder(40), collect_then(2))
+        \\}
+        \\
+    );
+}

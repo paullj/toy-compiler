@@ -68,6 +68,7 @@ const Typecheck = @This();
 /// checker drives it via `LayoutEngine.layoutStruct`/`layoutEnum` (id-ordered, from
 /// `checkGraph`/`runGraph`) and consumes the laid syms through the re-exported aliases.
 const LayoutEngine = @import("layout/Engine.zig");
+const Abi = @import("codegen/abi/Abi.zig");
 
 // Re-export the algebra/layout value types so every downstream importer keeps
 // reading `Typecheck.Type`/`.Layout`/`.EnumLayout` etc. unchanged.
@@ -624,8 +625,9 @@ fn buildAdapters(
 
 /// The lambda-unit table: for each lowerable owner in canonical order (non-generic fns by
 /// global id, then instances in instance order), one unit per lambda in its body, in node
-/// order. Each unit's signature is the reified pair the lambda's node types to. Serial
-/// over the finished tables, so it is identical at any `-j`.
+/// order. Each unit's signature is the reified pair the lambda's node types to, and its
+/// env is laid out here once, for both the body that makes the closure and the unit that
+/// reads it. Serial over the finished tables, so it is identical at any `-j`.
 fn buildLambdaUnits(
     gpa: std.mem.Allocator,
     graph: *const GraphCtx,
@@ -634,26 +636,23 @@ fn buildLambdaUnits(
     node_types: []const []const Type,
     instances: []const Mono.Instance,
     layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
 ) ![]Closure.LambdaUnit {
     var units: std.ArrayList(Closure.LambdaUnit) = .empty;
     errdefer {
-        for (units.items) |u| {
-            gpa.free(u.name);
-            gpa.free(u.sig.params);
-            gpa.free(u.param_slots);
-        }
+        for (units.items) |u| Closure.freeLambdaUnit(gpa, u);
         units.deinit(gpa);
     }
     for (fns, 0..) |f, gid| {
         if (f.decl_node == Ast.none or f.kind != .user_fn or fsyms[gid].isGeneric()) continue;
         const mc = &graph.mods[f.module];
         const fc = Closure.findFn(mc.closures, f.decl_node) orelse continue;
-        try appendLambdaUnits(gpa, &units, .{ .base = @intCast(gid) }, f.module, f.name, fc, mc, node_types[f.module], layouts);
+        try appendLambdaUnits(gpa, &units, .{ .base = @intCast(gid) }, f.module, f.name, fc, mc, node_types[f.module], layouts, enum_layouts);
     }
     for (instances, 0..) |inst, k| {
         const mc = &graph.mods[inst.mod];
         const fc = Closure.findFn(mc.closures, inst.decl_node) orelse continue;
-        try appendLambdaUnits(gpa, &units, .{ .instance = @intCast(k) }, inst.mod, inst.name.?, fc, mc, inst.node_types, layouts);
+        try appendLambdaUnits(gpa, &units, .{ .instance = @intCast(k) }, inst.mod, inst.name.?, fc, mc, inst.node_types, layouts, enum_layouts);
     }
     return units.toOwnedSlice(gpa);
 }
@@ -668,6 +667,7 @@ fn appendLambdaUnits(
     mc: *const GraphCtx.ModuleCtx,
     node_types: []const Type,
     layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
 ) !void {
     for (fc.boundaries) |b| {
         const t = node_types[b.node.int()];
@@ -685,6 +685,9 @@ fn appendLambdaUnits(
             .local => |l| l,
             else => std.math.maxInt(u32),
         };
+        const env = try gpa.alloc(Closure.EnvSlot, b.captures.len);
+        errdefer gpa.free(env);
+        const env_size = try layoutCaptureEnv(gpa, b.captures, node_types, layouts, enum_layouts, env);
         try units.append(gpa, .{
             .owner = owner,
             .mod = mod,
@@ -694,8 +697,37 @@ fn appendLambdaUnits(
             .name = name,
             .sig = .{ .params = params, .ret = fs.ret },
             .param_slots = slots,
+            .env = env,
+            .env_size = env_size,
         });
     }
+}
+
+/// Fill `out` with one copied env slot per capture (ascending slot, as the resolver lists
+/// them), typed as the owner typed the capture's first use, and return the env size. A
+/// capture left `.invalid` by an earlier error sizes as 0; such a program is never lowered.
+fn layoutCaptureEnv(
+    gpa: std.mem.Allocator,
+    captures: []const Closure.Capture,
+    node_types: []const Type,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+    out: []Closure.EnvSlot,
+) !u32 {
+    const sizes = try gpa.alloc(u32, captures.len);
+    defer gpa.free(sizes);
+    const aligns = try gpa.alloc(u32, captures.len);
+    defer gpa.free(aligns);
+    const offs = try gpa.alloc(u32, captures.len);
+    defer gpa.free(offs);
+    for (captures, sizes, aligns) |c, *sz, *al| {
+        const ty = node_types[c.first_use.int()];
+        sz.* = Abi.typeSize(ty, layouts, enum_layouts);
+        al.* = Abi.typeAlign(ty, layouts, enum_layouts);
+    }
+    const size = Closure.envLayout(sizes, aligns, offs);
+    for (captures, offs, out) |c, off, *es| es.* = .{ .slot = c.slot, .ty = node_types[c.first_use.int()], .mode = .copy, .off = off };
+    return size;
 }
 
 /// Free the per-recipe owned data of a derive table: each `name`, `params`, and
@@ -2058,7 +2090,7 @@ pub fn checkGraph(
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
     errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
-    const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, node_types, instances, layouts);
+    const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, node_types, instances, layouts, enum_layouts);
     errdefer Closure.freeLambdaUnits(gpa, lambda_units);
 
     // Diagnostics already carry their owning module in `scope`, sorted by
@@ -8868,13 +8900,122 @@ test "break/continue across a lambda is T0051, labeled or not; loops inside work
     try testing.expect(anyDiagContains(none, "break outside of a loop"));
 }
 
-test "a capture is T0052 at its first use" {
+test "env slots take their types from the first use and are laid out once" {
     const gpa = testing.allocator;
-    const src =
+    var c = try checkSource(
+        \\struct P { x: int, y: int }
+        \\struct Big { a: int, b: int, c: int }
+        \\fn main() -> int {
+        \\ n := 1
+        \\ s := "hi"
+        \\ u := ()
+        \\ p := P { x: 1, y: 2 }
+        \\ big := Big { a: 1, b: 2, c: 3 }
+        \\ f := fn(k: int) -> int {
+        \\  _z := u
+        \\  k + n + s.len() + p.x + big.c
+        \\ }
+        \\ g := fn() -> fn() -> int { fn() { n + p.y } }
+        \\ h := fn() { u }
+        \\ h()
+        \\ return f(1) + g()()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const units = c.result.lambda_units;
+    const find = struct {
+        fn f(us: []const Closure.LambdaUnit, name: []const u8) !Closure.LambdaUnit {
+            for (us) |u| if (std.mem.eql(u8, u.name, name)) return u;
+            return error.TestUnitNotFound;
+        }
+    }.f;
+    // Ascending slot: n, s, u, p, big; each at the next multiple of its alignment.
+    const f = try find(units, "main$l0");
+    try testing.expectEqual(@as(usize, 5), f.env.len);
+    const want_kinds = [_]Kind{ .int, .str, .unit, .@"struct", .@"struct" };
+    const want_offs = [_]u32{ 0, 8, 24, 24, 40 };
+    for (f.env, want_kinds, want_offs, 0..) |es, k, off, i| {
+        try testing.expectEqual(k, es.ty.kind);
+        try testing.expectEqual(off, es.off);
+        try testing.expectEqual(Closure.CaptureMode.copy, es.mode);
+        if (i > 0) try testing.expect(f.env[i - 1].slot < es.slot);
+    }
+    try testing.expectEqual(@as(u32, 64), f.env_size);
+    // The outer lambda of a nested pair carries the inner one's captures through.
+    const outer = try find(units, "main$l1");
+    const inner = try find(units, "main$l2");
+    try testing.expectEqual(@as(usize, 2), outer.env.len);
+    try testing.expectEqualSlices(u32, &.{ outer.env[0].slot, outer.env[1].slot }, &.{ inner.env[0].slot, inner.env[1].slot });
+    try testing.expectEqual(@as(u32, 24), outer.env_size);
+    // Only zero-sized captures: no env.
+    const h = try find(units, "main$l3");
+    try testing.expectEqual(@as(usize, 1), h.env.len);
+    try testing.expectEqual(@as(u32, 0), h.env_size);
+}
+
+test "captured-and-assigned (assign, field store, mut self call) is T0052; a plain capture is not" {
+    const gpa = testing.allocator;
+    const bad = [_]struct { src: []const u8, name: []const u8 }{
+        .{ .src = "fn main() -> int {\n a := 1\n f := fn() -> int { a }\n a = 2\n return f()\n}\n", .name = "a" },
+        .{ .src = "fn main() -> int {\n a := 1\n f := fn() -> int { a = 3\n a }\n return f()\n}\n", .name = "a" },
+        .{ .src = "struct P { x: int }\nfn main() -> int {\n p := P { x: 1 }\n p.x = 4\n f := fn() -> int { p.x }\n return f()\n}\n", .name = "p" },
+        .{ .src = "struct C { n: int }\nimpl C { fn bump(mut self) { self.n = self.n + 1 } }\nfn main() -> int {\n c := C { n: 0 }\n f := fn() -> int { c.n }\n c.bump()\n return f()\n}\n", .name = "c" },
+        .{ .src = "struct C { n: int }\nimpl C { fn bump(mut self) { self.n = self.n + 1 } }\nfn main() -> int {\n c := C { n: 0 }\n f := fn() { c.bump() }\n f()\n return c.n\n}\n", .name = "c" },
+    };
+    for (bad) |case| {
+        var c = try checkSource(case.src);
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        const d = c.result.diags[0];
+        try testing.expectEqual(codes.Code.T0052, d.code);
+        const want = try std.fmt.allocPrint(gpa, "'{s}' is captured by a closure and assigned; closures cannot capture assigned variables yet", .{case.name});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, d.message);
+    }
+    // Reported once, at the first captured use in source order (not at a later lambda's).
+    const twice = "fn main() -> int {\n a := 1\n f := fn() -> int { a + a }\n g := fn() -> int { a }\n a = 2\n return f() + g()\n}\n";
+    var t = try checkSource(twice);
+    defer t.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), t.result.diags.len);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, twice, "a + a").?)), t.result.diags[0].byte_offset);
+    // A read-only capture, and an assigned local no lambda names, are fine.
+    var ok = try checkSource(
+        \\struct C { n: int }
+        \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
         \\fn main() -> int {
         \\ base := 10
-        \\ f := fn(x: int) -> int { x + base + base }
-        \\ return f(1)
+        \\ other := 0
+        \\ other = 1
+        \\ c := C { n: 0 }
+        \\ c.bump()
+        \\ f := fn(x: int) -> int { x + base }
+        \\ return f(other) + c.n
+        \\}
+        \\
+    );
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
+test "any capture of a mut self receiver is T0052" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct C { n: int }
+        \\impl C {
+        \\ fn get(mut self) -> int {
+        \\  f := fn() -> int { self.n }
+        \\  f()
+        \\ }
+        \\ fn plain(self) -> int {
+        \\  f := fn() -> int { self.n }
+        \\  f()
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ c := C { n: 1 }
+        \\ return c.get() + c.plain()
         \\}
         \\
     ;
@@ -8883,8 +9024,24 @@ test "a capture is T0052 at its first use" {
     try testing.expectEqual(@as(usize, 1), c.result.diags.len);
     const d = c.result.diags[0];
     try testing.expectEqual(codes.Code.T0052, d.code);
-    try testing.expectEqualStrings("this lambda captures 'base'; closures cannot capture variables yet", d.message);
-    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "base +").?)), d.byte_offset);
+    try testing.expectEqualStrings("a closure cannot capture the 'mut self' receiver 'self'; copy it to a local first", d.message);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "self.n }").?)), d.byte_offset);
+}
+
+test "a plain self method call on a captured local is not a mutation" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Bag { n: int }
+        \\impl Bag { fn push(self, v: int) -> int { self.n + v } }
+        \\fn main() -> int {
+        \\ b := Bag { n: 1 }
+        \\ f := fn(v: int) -> int { b.push(v) }
+        \\ return f(2) + b.push(3)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
 test "lambda units: one per boundary per lowerable owner, named by rank" {

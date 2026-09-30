@@ -1,0 +1,21 @@
+# Feature: a closure returned from the function that made it keeps its captures; a Vec of such closures
+# expect: exit 83
+import std/vec
+
+fn make_adder(n: int) -> fn(int) -> int {
+    fn(x: int) -> int { x + n }
+}
+
+fn make_greeter(greeting: str) -> fn(str) -> int {
+    fn(name: str) -> int { greeting.len() + name.len() }
+}
+
+fn main() -> int {
+    add5 := make_adder(5)
+    adders: Vec[fn(int) -> int] = []
+    for i in 1..4 { adders.push(make_adder(i * 10)) }
+    s := 0
+    for j in 0..adders.len() { s = s + adders[j](1) }
+    hi := make_greeter("hello")
+    return add5(1) + s + hi("bob") + 6
+}

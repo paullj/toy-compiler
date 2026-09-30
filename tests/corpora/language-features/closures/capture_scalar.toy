@@ -1,0 +1,14 @@
+# Feature: a lambda copies the int, bool and float locals it names into its env when it is made, and reads them back when called
+# expect: exit 37
+fn main() -> int {
+    n := 30
+    on := true
+    half := 2.5
+    f := fn(x: int) -> int {
+        if on { x + n } else { 0 }
+    }
+    g := fn() -> float { half *. 2.0 }
+    five := if g() == 5.0 { 5 } else { 0 }
+    k := n
+    return f(2) + five + k - 30
+}
