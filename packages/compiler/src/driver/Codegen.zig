@@ -25,6 +25,8 @@ const lower = @import("../lower.zig");
 const DeriveEmit = @import("../lower/derive_emit.zig");
 const AdapterEmit = @import("../lower/adapter_emit.zig");
 const Closure = @import("../symbols/Closure.zig");
+const Spec = @import("../symbols/Spec.zig");
+const AstWalk = @import("../query/AstWalk.zig");
 const Fingerprint = @import("../query/Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
@@ -185,12 +187,16 @@ const Frozen = struct {
     /// derived from the callee's `Sig` (the fingerprint side of the shared discovery/
     /// fold arg-extraction). `null` for a non-generic callee.
     pub fn genericTemplate(self: *const Frozen, gid: u32) ?Mono.TemplateRef {
-        if (gid >= self.sigs.len) return null;
-        const sig = self.sigs[gid];
-        if (!sig.isGenericTemplate()) return null;
-        return .{ .params = sig.params, .count = sig.genericParamCount() };
+        return templateRef(self.sigs, gid);
     }
 };
+
+fn templateRef(sigs: []const Fingerprint.Sig, gid: u32) ?Mono.TemplateRef {
+    if (gid >= sigs.len) return null;
+    const sig = sigs[gid];
+    if (!sig.isGenericTemplate()) return null;
+    return .{ .params = sig.params, .count = sig.genericParamCount() };
+}
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
 /// or one `EmitError`.
@@ -328,8 +334,14 @@ const GraphFrozen = struct {
     /// The fn-value thunks, appended after the lambda units as a SIXTH class of lowerable
     /// units (parallel to `adapters`). Routed to `Engine.codegenClosure` (uncached).
     adapters: []const Closure.Adapter = &.{},
-    /// Entries at `[adapter_base..]` are the adapter units.
+    /// Entries at `[adapter_base, spec_base)` are the adapter units.
     adapter_base: usize,
+    /// The spec units, appended after the adapters as a SEVENTH class of lowerable units
+    /// (parallel to `specs.units`). Each lowers under its instance's view. Routed to
+    /// `Engine.codegenClosure` (uncached).
+    specs: Spec.Table = .{},
+    /// Entries at `[spec_base..]` are the spec units.
+    spec_base: usize,
     /// Each owner's boxed locals, sorted by owner; a lambda unit reads its owner's.
     owner_closures: []const Closure.OwnerClosure = &.{},
     /// Per base fn and instance unit (`[0, derive_base)`), its closure facts; empty (no
@@ -349,15 +361,18 @@ const GraphFrozen = struct {
         fn_node_buf[0] = gf.fn_decls[lower_i];
         // The lowerable-unit classes: base fns `[0, base_count)`, Mono instances
         // `[base_count, derive_base)`, the source-less derive and erased units
-        // `[derive_base, lambda_base)`, lambda units `[lambda_base, adapter_base)`, and the
-        // source-less adapters `[adapter_base, ..)`. A body reads its owner's tables: an
-        // instance its OWN per-instance `node_types` (so two instances of one template never
-        // alias), a base fn its module's slice, a lambda unit whichever its owner reads. A
-        // source-less unit reads NO AST/node_types (its emitter is table-driven), so leave
-        // them empty.
+        // `[derive_base, lambda_base)`, lambda units `[lambda_base, adapter_base)`, the
+        // source-less adapters `[adapter_base, spec_base)`, and spec units `[spec_base, ..)`.
+        // A body reads its owner's tables: an instance its OWN per-instance `node_types` (so
+        // two instances of one template never alias), a base fn its module's slice, a lambda
+        // unit whichever its owner reads, a spec unit its instance's. A source-less unit
+        // reads NO AST/node_types (its emitter is table-driven), so leave them empty.
         const is_lambda = lower_i >= gf.lambda_base and lower_i < gf.adapter_base;
+        const spec: ?Spec.Unit = if (lower_i >= gf.spec_base) gf.specs.units[lower_i - gf.spec_base] else null;
         const owner: ?Closure.Owner = if (is_lambda)
             gf.lambda_units[lower_i - gf.lambda_base].owner
+        else if (spec) |u|
+            .{ .instance = u.inst }
         else if (lower_i < gf.base_count)
             .{ .base = gf.lower_ids[lower_i] }
         else if (lower_i < gf.derive_base)
@@ -399,6 +414,8 @@ const GraphFrozen = struct {
                 .lambda_units = gf.lambda_units,
                 .owner = owner,
                 .boxed = Closure.ownerBoxed(gf.owner_closures, owner.?),
+                .specs = gf.specs,
+                .spec_targets = if (spec) |u| u.targets else &.{},
             },
             .closure_facts = if (lower_i < gf.closure_facts.len) gf.closure_facts[lower_i] else &.{},
         };
@@ -455,6 +472,141 @@ fn freeClosureFacts(gpa: std.mem.Allocator, facts: []const []const u8) void {
     gpa.free(facts);
 }
 
+/// What `buildSpecTable` reads: per-module arrays by module id, the rest program-wide.
+const SpecSource = struct {
+    trees: []const Ast.Tree,
+    tokens: []const []const Token,
+    sources: []const []const u8,
+    resolutions: []const []const Resolve.Resolution,
+    node_types: []const []const Typecheck.Type,
+    callees: []const []const Typecheck.Callee,
+    closures: []const []const Closure.FnClosures,
+    names: []const Link.SymName,
+    sigs: []const Fingerprint.Sig,
+    instances: []const Mono.Instance,
+    methods: []const Typecheck.Method,
+    lambda_units: []const Closure.LambdaUnit,
+    /// The base owners in lower order: global fn id, module and `fn_decl`, parallel.
+    base_ids: []const u32,
+    base_mods: []const u32,
+    base_decls: []const Ast.Index,
+};
+
+/// One owner body's read-only tables, as `AstWalk.instanceOfCall` and `Spec.targetsOf`
+/// read them.
+const SpecView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolve.Resolution,
+    node_types: []const Typecheck.Type,
+    callees: []const Typecheck.Callee,
+    names: []const Link.SymName,
+    sigs: []const Fingerprint.Sig,
+    instances: []const Mono.Instance,
+    methods: []const Typecheck.Method,
+    closure: lower.ClosureInputs,
+
+    pub fn genericTemplate(self: *const SpecView, gid: u32) ?Mono.TemplateRef {
+        return templateRef(self.sigs, gid);
+    }
+};
+
+/// The spec table: a mask per template with an eligible param, and a unit per distinct
+/// generic call site (in any lowerable owner: base fns, then instances, lambdas included)
+/// whose argument for an eligible param is a named fn or a lambda literal. Serial, and the
+/// cap and the unit order go by name, so it is identical at any `-j`.
+fn buildSpecTable(gpa: std.mem.Allocator, src: SpecSource) !Spec.Table {
+    const masks = try specMasks(gpa, src);
+    if (masks.len == 0) {
+        gpa.free(masks);
+        return .{};
+    }
+    var cands: std.ArrayList(Spec.Candidate) = .empty;
+    collectSpecCandidates(gpa, src, masks, &cands) catch |e| {
+        Spec.freeUnits(gpa, cands.items);
+        cands.deinit(gpa);
+        gpa.free(masks);
+        return e;
+    };
+    return Spec.finish(gpa, &cands, masks);
+}
+
+/// The eligible params of each instantiated template that has one, sorted by gid.
+fn specMasks(gpa: std.mem.Allocator, src: SpecSource) ![]Spec.TemplateMask {
+    var masks: std.ArrayList(Spec.TemplateMask) = .empty;
+    errdefer masks.deinit(gpa);
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(gpa);
+    for (src.instances) |inst| {
+        const gid = inst.template_gid;
+        if ((try seen.getOrPut(gpa, gid)).found_existing) continue;
+        if (gid >= src.sigs.len) continue;
+        const fcs: []const Closure.FnClosures = if (inst.mod < src.closures.len) src.closures[inst.mod] else &.{};
+        const walk_src: AstWalk.Source = .{ .tree = src.trees[inst.mod], .tokens = src.tokens[inst.mod], .source = src.sources[inst.mod] };
+        const m = Spec.eligibleMask(walk_src, src.resolutions[inst.mod], inst.decl_node, src.sigs[gid].params, Closure.findFn(fcs, inst.decl_node) != null);
+        if (m != 0) try masks.append(gpa, .{ .gid = gid, .eligible = m });
+    }
+    std.mem.sort(Spec.TemplateMask, masks.items, {}, struct {
+        fn lt(_: void, a: Spec.TemplateMask, b: Spec.TemplateMask) bool {
+            return a.gid < b.gid;
+        }
+    }.lt);
+    return masks.toOwnedSlice(gpa);
+}
+
+fn collectSpecCandidates(gpa: std.mem.Allocator, src: SpecSource, masks: []const Spec.TemplateMask, cands: *std.ArrayList(Spec.Candidate)) !void {
+    const V = struct {
+        gpa: std.mem.Allocator,
+        view: *const SpecView,
+        masks: Spec.Table,
+        cands: *std.ArrayList(Spec.Candidate),
+        targets: std.ArrayList(Spec.Target) = .empty,
+
+        pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
+            const e = switch (ev) {
+                .enter => |e| e,
+                else => return,
+            };
+            if (e.tag != .call or self.view.tree.nodes[e.idx.int()].lhs == Ast.none) return;
+            const site: Spec.Site = if (try AstWalk.instanceOfCall(self.gpa, self.view, e.idx)) |ii|
+                .{ .ii = ii, .self_n = 0 }
+            else
+                Spec.methodSite(self.view, e.idx) orelse return;
+            const inst = self.view.instances[site.ii];
+            const m = Spec.mask(self.masks, inst.template_gid);
+            if (m == 0) return;
+            self.targets.clearRetainingCapacity();
+            try Spec.targetsOf(self.gpa, self.view, e.idx, site, m, &self.targets);
+            if (self.targets.items.len == 0) return;
+            try Spec.addCandidate(self.gpa, self.cands, inst.template_gid, site.ii, inst.name.?, self.targets.items);
+        }
+    };
+    const owners = src.base_ids.len + src.instances.len;
+    for (0..owners) |k| {
+        const is_base = k < src.base_ids.len;
+        const inst: ?*const Mono.Instance = if (is_base) null else &src.instances[k - src.base_ids.len];
+        const mod = if (inst) |i| i.mod else src.base_mods[k];
+        const decl = if (inst) |i| i.decl_node else src.base_decls[k];
+        const view: SpecView = .{
+            .tree = src.trees[mod],
+            .resolutions = src.resolutions[mod],
+            .node_types = if (inst) |i| i.node_types else src.node_types[mod],
+            .callees = if (inst) |i| i.callees else src.callees[mod],
+            .names = src.names,
+            .sigs = src.sigs,
+            .instances = src.instances,
+            .methods = src.methods,
+            .closure = .{
+                .adapters = &.{},
+                .lambda_units = src.lambda_units,
+                .owner = if (is_base) .{ .base = src.base_ids[k] } else .{ .instance = @intCast(k - src.base_ids.len) },
+            },
+        };
+        var v: V = .{ .gpa = gpa, .view = &view, .masks = .{ .masks = masks }, .cands = cands };
+        defer v.targets.deinit(gpa);
+        try AstWalk.walk(.{ .tree = view.tree, .tokens = src.tokens[mod], .source = src.sources[mod] }, decl, &v);
+    }
+}
+
 /// Lower EVERY function across the whole module `graph` (in parallel, memoized
 /// through the codegen cache), then run the serial relink tail. The entry `main`
 /// MUST live in the entry module (error otherwise). `res`/`tc` are the whole-graph
@@ -470,6 +622,9 @@ pub fn lowerGraphProgram(
     tc: *const Typecheck.GraphResult,
     mode: Engine.Mode,
     opt: Opt.Config,
+    /// Give generic calls with a named fn or lambda argument their own spec unit; off
+    /// sends every call through the erased instance.
+    specialize: bool,
     probe: ?*Engine.LowerProbe,
     link_ns: ?*u64,
     /// The `-j` jobs knob: the chunk-count basis for the per-fn codegen fan-out (0 =>
@@ -519,14 +674,7 @@ pub fn lowerGraphProgram(
     defer lower_ids.deinit(gpa);
     var entry_id: ?u32 = null;
     for (res.fns, 0..) |gf, gid| {
-        if (gf.decl_node == Ast.none) continue; // synthetic builtin: no body to lower
-        if (gf.kind == .import) continue; // an `extern`: bodyless, referenced only via `names[gid]`
-        // Skip generic TEMPLATES: their params/ret are `type_var`s with no ABI,
-        // so they are never lowered directly — only their concrete instances are
-        // (appended below). An uncalled generic fn thus emits ZERO codegen units.
-        const gm = &graph.modules[gf.module];
-        const gdecl = gm.nodes[gf.decl_node.int()];
-        if (Ast.protoAt(gm.tree(), gdecl.lhs.int()).generic_params.len > 0) continue;
+        if (!lowerableBase(graph, gf)) continue;
         // The entry `main` is the bare {user_fn,"main"} fn in the entry module.
         if (gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main"))
             entry_id = @intCast(gid);
@@ -572,6 +720,30 @@ pub fn lowerGraphProgram(
     for (tc.adapters) |_| {
         try fn_decls.append(gpa, Ast.none);
         try fn_modules.append(gpa, 0);
+    }
+    // The spec units follow, sorted by name, each under its instance's module.
+    const specs = if (specialize) try buildSpecTable(gpa, .{
+        .trees = trees,
+        .tokens = toks,
+        .sources = srcs,
+        .resolutions = resols,
+        .node_types = ntypes,
+        .callees = cs,
+        .closures = res.closures,
+        .names = names,
+        .sigs = tc.sigs,
+        .instances = tc.instances,
+        .methods = tc.methods,
+        .lambda_units = tc.lambda_units,
+        .base_ids = lower_ids.items,
+        .base_mods = fn_modules.items[0..base_count],
+        .base_decls = fn_decls.items[0..base_count],
+    }) else Spec.Table{};
+    defer specs.deinit(gpa);
+    const spec_base = fn_decls.items.len;
+    for (specs.units) |u| {
+        try fn_decls.append(gpa, tc.instances[u.inst].decl_node);
+        try fn_modules.append(gpa, tc.instances[u.inst].mod);
     }
 
     const eid = entry_id orelse return .{ .err = .{
@@ -633,6 +805,8 @@ pub fn lowerGraphProgram(
         .lambda_base = lambda_base,
         .adapters = tc.adapters,
         .adapter_base = adapter_base,
+        .specs = specs,
+        .spec_base = spec_base,
         .owner_closures = tc.owner_closures,
         .closure_facts = closure_facts,
         .opt = opt,
@@ -708,6 +882,7 @@ pub fn lowerGraphProgram(
     for (tc.erased_units, 0..) |u, k| lowered_names[erased_base + k] = .{ .kind = .user_fn, .name = u.name.? };
     for (tc.lambda_units, 0..) |u, k| lowered_names[lambda_base + k] = .{ .kind = .user_fn, .name = u.name };
     for (tc.adapters, 0..) |a, k| lowered_names[adapter_base + k] = .{ .kind = .user_fn, .name = a.name };
+    for (specs.units, 0..) |u, k| lowered_names[spec_base + k] = .{ .kind = .user_fn, .name = u.name };
 
     // Build the descriptor plan (canonical order = `tc.descriptor_types`), each entry's
     // `{size, align, size_class}` from the layout snapshot + the erased hash/eq unit names
@@ -741,6 +916,18 @@ pub fn lowerGraphProgram(
 
 fn nowNs(io: Io) i128 {
     return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+}
+
+/// Whether global fn `gf` is lowered as a base unit: a fn with a body. A synthetic builtin
+/// has no body, an `extern` is referenced only via `names[gid]`, and a generic TEMPLATE's
+/// params/ret are `type_var`s with no ABI, so it is lowered only through its instances (an
+/// uncalled generic fn emits ZERO codegen units).
+fn lowerableBase(graph: *const Graph.Graph, gf: ResolveGraph.GlobalFn) bool {
+    if (gf.decl_node == Ast.none) return false;
+    if (gf.kind == .import) return false;
+    const gm = &graph.modules[gf.module];
+    const gdecl = gm.nodes[gf.decl_node.int()];
+    return Ast.protoAt(gm.tree(), gdecl.lhs.int()).generic_params.len == 0;
 }
 
 /// One per-fn codegen job: build the single-fn `Frozen` view for this fn's owning
@@ -784,7 +971,12 @@ fn graphFnJobInner(
     // the first same-named type in the merged layout table, missing a pub-type
     // layout edit at the importer (cross-module hole).
     var my_sig: ?Fingerprint.Sig = null;
-    if (lower_i >= gf.adapter_base) {
+    if (lower_i >= gf.spec_base) {
+        // A spec unit: uncached like a lambda; each caller's key folds its name.
+        const engine = Engine.initProbe(cache, mode, gf.probe);
+        try engine.codegenClosure(gpa, io, target, &frozen, .{ .spec = @intCast(lower_i - gf.spec_base) }, lower_i, slot);
+        return;
+    } else if (lower_i >= gf.adapter_base) {
         // A fn-value thunk: source-less and uncached, like an erased unit.
         const engine = Engine.initProbe(cache, mode, gf.probe);
         try engine.codegenClosure(gpa, io, target, &frozen, .{ .adapter = gf.adapters[lower_i - gf.adapter_base] }, lower_i, slot);
@@ -861,12 +1053,16 @@ pub fn renderGraphIr(
     res: *const ResolveGraph.GraphResult,
     tc: *const Typecheck.GraphResult,
     opt: Opt.Config,
+    specialize: bool,
 ) !IrResult {
     const names = try buildGraphNames(gpa, res.fns, tc.sigs);
     defer {
         for (names) |nm| gpa.free(nm.name);
         gpa.free(names);
     }
+
+    const specs = if (specialize) try renderSpecTable(gpa, graph, res, tc, names) else Spec.Table{};
+    defer specs.deinit(gpa);
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
@@ -875,12 +1071,8 @@ pub fn renderGraphIr(
 
     var first = true;
     for (res.fns, 0..) |gf, gid| {
-        if (gf.decl_node == Ast.none) continue; // skip bodyless builtin
-        if (gf.kind == .import) continue; // an `extern` emits no IR
+        if (!lowerableBase(graph, gf)) continue;
         const m = &graph.modules[gf.module];
-        // Skip generic templates: rendered only as concrete instances below.
-        const gdecl = m.nodes[gf.decl_node.int()];
-        if (Ast.protoAt(m.tree(), gdecl.lhs.int()).generic_params.len > 0) continue;
         const is_entry = gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main");
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -899,7 +1091,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }) },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }), .specs = specs },
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -932,7 +1124,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = @intCast(k) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .instance = @intCast(k) }) },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = @intCast(k) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .instance = @intCast(k) }), .specs = specs },
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
@@ -1038,7 +1230,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = Closure.ownerBoxed(tc.owner_closures, u.owner) },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = Closure.ownerBoxed(tc.owner_closures, u.owner), .specs = specs },
         };
         var func = try lower.lowerLambda(gpa, in, @intCast(ui), sym, &diags);
         defer func.deinit(gpa);
@@ -1081,8 +1273,87 @@ pub fn renderGraphIr(
         first = false;
     }
 
+    // Render each spec unit under its instance's tables, in name order — the same units
+    // codegen lowers.
+    for (specs.units) |u| {
+        const inst = &tc.instances[u.inst];
+        const m = &graph.modules[inst.mod];
+        const sym = Link.SymName{ .kind = .user_fn, .name = u.name };
+        const in = lower.Inputs{
+            .tree = m.tree(),
+            .tokens = m.tokens,
+            .source = m.source,
+            .resolutions = res.resolutions[inst.mod],
+            .node_types = inst.node_types,
+            .callees = inst.callees,
+            .layouts = tc.layouts,
+            .enum_layouts = tc.enum_layouts,
+            .names = names,
+            .sig = .{ .kind = .user_fn, .name = u.name, .params = inst.params, .ret = inst.ret },
+            .instances = tc.instances,
+            .sigs = tc.sigs,
+            .methods = tc.methods,
+            .derives = tc.derives,
+            .prelude_ids = tc.prelude_ids,
+            .char_struct = tc.char_struct,
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = u.inst }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .instance = u.inst }), .specs = specs, .spec_targets = u.targets },
+        };
+        var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
+        defer func.deinit(gpa);
+        var opt_st: Opt.Stats = .{};
+        try Opt.run(gpa, &func, opt, &opt_st);
+        if (!first) try aw.writer.writeAll("\n");
+        try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
+        first = false;
+    }
+
     var list = aw.toArrayList();
     return .{ .ok = try list.toOwnedSlice(gpa) };
+}
+
+/// `buildSpecTable` over a graph, for `renderGraphIr`, which has no `GraphFrozen`.
+fn renderSpecTable(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *const ResolveGraph.GraphResult, tc: *const Typecheck.GraphResult, names: []const Link.SymName) !Spec.Table {
+    const n_mods = graph.modules.len;
+    const trees = try gpa.alloc(Ast.Tree, n_mods);
+    defer gpa.free(trees);
+    const toks = try gpa.alloc([]const Token, n_mods);
+    defer gpa.free(toks);
+    const srcs = try gpa.alloc([]const u8, n_mods);
+    defer gpa.free(srcs);
+    for (graph.modules, 0..) |*m, i| {
+        trees[i] = m.tree();
+        toks[i] = m.tokens;
+        srcs[i] = m.source;
+    }
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    var mods: std.ArrayList(u32) = .empty;
+    defer mods.deinit(gpa);
+    var decls: std.ArrayList(Ast.Index) = .empty;
+    defer decls.deinit(gpa);
+    for (res.fns, 0..) |gf, gid| {
+        if (!lowerableBase(graph, gf)) continue;
+        try ids.append(gpa, @intCast(gid));
+        try mods.append(gpa, gf.module);
+        try decls.append(gpa, gf.decl_node);
+    }
+    return buildSpecTable(gpa, .{
+        .trees = trees,
+        .tokens = toks,
+        .sources = srcs,
+        .resolutions = res.resolutions,
+        .node_types = tc.node_types,
+        .callees = tc.callees,
+        .closures = res.closures,
+        .names = names,
+        .sigs = tc.sigs,
+        .instances = tc.instances,
+        .methods = tc.methods,
+        .lambda_units = tc.lambda_units,
+        .base_ids = ids.items,
+        .base_mods = mods.items,
+        .base_decls = decls.items,
+    });
 }
 
 /// Build the fully signed, runnable Mach-O image for `code`. Thin pass-through to

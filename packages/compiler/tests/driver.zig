@@ -59,7 +59,7 @@ fn lowerSingleFile(
 ) !LowerProgramResult {
     var graph = try Graph.single(gpa, "main", r.path, r.source, r.tokens, r.nodes, r.extra, r.pub_bits);
     defer graph.deinit(gpa);
-    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, null, null, 0);
+    return lowerGraphProgram(gpa, io, cache, target, &graph, &r.resolve.?, &r.typecheck.?, mode, opt, true, null, null, 0);
 }
 
 test "cold then warm parse: 2nd run hits cache and renders identically" {

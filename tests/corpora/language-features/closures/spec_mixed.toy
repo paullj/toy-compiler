@@ -1,0 +1,26 @@
+# Feature: one generic fn called with a named fn, a lambda literal and fn values: the first two get specialized instances and a value goes through the erased instance; a two-param call specializes only its known arguments, and never a param its fn assigns
+# expect: exit 73
+fn inc(x: int) -> int { x + 1 }
+fn dbl(x: int) -> int { x * 2 }
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn compose[T](f: fn(T) -> T, g: fn(T) -> T, x: T) -> T { g(f(x)) }
+fn redirect[T](f: fn(T) -> T, g: fn(T) -> T, x: T) -> T {
+    f = g
+    f(x)
+}
+fn pick(b: bool) -> fn(int) -> int { if b { inc } else { dbl } }
+
+fn main() -> int {
+    k := 5
+    a := apply(inc, 1)                                       # 2
+    b := apply(fn(x: int) { x + k }, 1)                      # 6
+    h := dbl
+    c := apply(h, 4)                                         # 8
+    d := apply(pick(false), 5)                               # 10
+    e := compose(inc, h, 3)                                  # 8: f named, g a value
+    f := compose(h, fn(x: int) { x - k }, 10)                # 15: f a value, g a lambda
+    g := compose(dbl, inc, 6)                                # 13: both named
+    r := redirect(inc, dbl, 5)                               # 10: f holds dbl by the call
+    same := if apply(inc, 0) == apply(inc, 0) { 1 } else { 0 }
+    return a + b + c + d + e + f + g + r + same              # 73
+}

@@ -1,0 +1,23 @@
+# Feature: a generic call whose fn argument is a lambda literal gets its own specialized instance, which calls the lambda's code directly with the env of the pair (copied, boxed and capture-free lambdas)
+# expect: stdout "7\n"
+# expect: exit 40
+import std/io
+import std/vec
+
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn each[T](xs: Vec[T], f: fn(T)) {
+    for x in xs { f(x) }
+}
+
+fn main() -> int {
+    k := 1
+    a := apply(fn(x: int) { x * 2 + k }, 3)                           # 7
+    io.println(a)
+    total := 0
+    xs: Vec[int] = [1, 2, 3, 4]
+    each(xs, fn(v: int) { total = total + v * k })                    # 10
+    label := "abc"
+    n := apply(fn(s: str) -> str { s.concat(label) }, "xyz").len()    # 6
+    b := apply(fn(x: int) { x }, 17)                                  # 17
+    return a + total + n + b                                          # 40
+}
