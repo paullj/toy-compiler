@@ -8,7 +8,8 @@
 //!     + arity/optionality sentinels) — byte-identical to what `Fingerprint`
 //!     folded when it owned its own walk.
 //!   * `CallVisitor` records each callee's `Sig` at a `.callee` event (reading
-//!     `frozen.resolutions` at the callee identifier), in body-walk order.
+//!     `frozen.resolutions` at the callee identifier, or the checker's selection in
+//!     `frozen.callees` for a method call), in body-walk order.
 //!   * `TouchedVisitor` records each touched type's layout at a `.touch` event
 //!     (reading `frozen.node_types`) plus the owning fn's param/return types at a
 //!     `.type_ref` event.
@@ -23,7 +24,6 @@
 //!     sentinels, so `a - b` and `b - a` cannot collide.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Token = @import("../ast/Token.zig").Token;
 const TokenTag = @import("../ast/Token.zig").Tag;
 const Ast = @import("../ast/Ast.zig");
@@ -617,21 +617,6 @@ pub const HashVisitor = struct {
     }
 };
 
-const CalleeEvent = @FieldType(Event, "callee");
-
-/// Whether two callee-Sig runs fold identically: the same kind, name, params and ret
-/// per entry, in order.
-pub fn sigsAgree(a: []const Sig, b: []const Sig) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x.kind != y.kind) return false;
-        if (!std.mem.eql(u8, x.name, y.name)) return false;
-        if (!Typecheck.eqlTypeVec(x.params, y.params)) return false;
-        if (!Typecheck.Type.eql(x.ret, y.ret)) return false;
-    }
-    return true;
-}
-
 /// Records each callee's identity-and-signature in body-walk order, so the
 /// fingerprint's (b) component lines up positionally with this stream. Generic
 /// over the frozen view (was `anytype` duck typing — a missing field is now a
@@ -652,20 +637,67 @@ pub fn CallVisitor(comptime Frozen: type) type {
         pub fn on(self: *Self, ev: Event) error{OutOfMemory}!void {
             switch (ev) {
                 .callee => |c| {
-                    const start = self.out.items.len;
-                    try self.onCalleeLegacy(c);
-                    if (builtin.mode == .Debug) try self.shadowFold(c, start);
+                    // A generic call `id[int](..)`: the callee node is a
+                    // `type_app` whose base identifier carries the template's `.func`.
+                    // Resolve (template gid + the concrete type-args the checker wrote
+                    // into node_types) to the reified instance's mangled name +
+                    // substituted sig, so a caller folds the SAME instance identity the
+                    // reloc targets. `Mono.find` is a deterministic scan.
+                    const cn = self.frozen.tree.nodes[c.idx.int()];
+                    if (cn.tag == .type_app) {
+                        // A `type_app` over a `field_access` NOT bound to a `.func` is an
+                        // explicit-protocol-args method call `v.into[int]()` (a qualified generic
+                        // fn binds its field_access to `.func`); anything else is a generic
+                        // FUNCTION call.
+                        if (self.frozen.tree.nodes[cn.lhs.int()].tag == .field_access and
+                            cn.lhs.int() < self.frozen.resolutions.len and self.frozen.resolutions[cn.lhs.int()] != .func)
+                        {
+                            try self.foldCalleeTable(c.call);
+                        } else {
+                            try self.foldViaInstanceRef(c.call);
+                        }
+                        return;
+                    }
+                    const res = self.frozen.resolutions[c.idx.int()];
+                    // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
+                    // what the .func reloc target carries) and `sigs` (params/ret).
+                    // Fold the full identity so a builtin<->user_fn shadow switch flips
+                    // the caller's hash.
+                    if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
+                        const sig = self.frozen.sigs[res.func];
+                        // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`:
+                        // the callee (plain identifier, or a field_access `resolveModuleMember`
+                        // bound to this `.func`) resolves to a generic template (its sig params
+                        // carry type_vars). Fold the resolved INSTANCE sig — not the template —
+                        // so the caller folds the SAME identity the reloc targets (mirroring
+                        // the type_app path). Both shapes route through the shared
+                        // `callInstanceRef`, keeping every consumer's instance selection in
+                        // agreement.
+                        const ctag = self.frozen.tree.nodes[c.idx.int()].tag;
+                        if ((ctag == .identifier or ctag == .field_access) and sig.isGenericTemplate()) {
+                            try self.foldBareInstance(c.call);
+                            return;
+                        }
+                        const nm = self.frozen.names[res.func];
+                        try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+                        return;
+                    }
+                    // A method call `recv.m(..)` on a VALUE receiver: the callee is a
+                    // `field_access` NOT bound to a `.func`. Fold the selected method's Sig so
+                    // editing the method's signature/return flips every caller's fingerprint
+                    // (stale-cache soundness — mirrors the plain-func fold above).
+                    if (cn.tag == .field_access and res != .func) try self.foldCalleeTable(c.call);
                 },
                 .operator => |e| {
                     // A desugaring operator on a struct/enum operand desugars to that type's
                     // witness — `==`/`!=` to `Eq::eq` (or, for an Ord-refinement operand with no
                     // `eq`, its `Ord::cmp`), a comparison to `Ord::cmp`, arithmetic to its
                     // Add/Sub/Mul/Div method. Fold the FIRST resolving witness so the caller
-                    // tracks the SAME identity the desugared call's reloc targets — the SAME
-                    // `.one` resolver the `recv.m(..)` method fold above uses. A scalar operand
-                    // (int/bool/str/unit) inlines to a machine op with NO symbol, so there is
-                    // nothing to fold. A pre-typecheck view (lhs out of range or an invalid recv)
-                    // folds nothing.
+                    // tracks the SAME identity the desugared call's reloc targets, resolved by
+                    // the operator's own protocol as lower's witness sites resolve it. A scalar
+                    // operand (int/bool/str/unit) inlines to a machine op with NO symbol, so there
+                    // is nothing to fold. A pre-typecheck view (lhs out of range or an invalid
+                    // recv) folds nothing.
                     const bn = self.frozen.tree.nodes[e.idx.int()];
                     if (bn.lhs.int() >= self.frozen.node_types.len) return;
                     const recv = self.frozen.node_types[bn.lhs.int()];
@@ -710,104 +742,6 @@ pub fn CallVisitor(comptime Frozen: type) type {
             }
         }
 
-        fn onCalleeLegacy(self: *Self, c: CalleeEvent) error{OutOfMemory}!void {
-            // A generic call `id[int](..)`: the callee node is a
-            // `type_app` whose base identifier carries the template's `.func`.
-            // Resolve (template gid + the concrete type-args the checker wrote
-            // into node_types) to the reified instance's mangled name +
-            // substituted sig, so a caller folds the SAME instance identity the
-            // reloc targets. `Mono.find` is a deterministic scan.
-            const cn = self.frozen.tree.nodes[c.idx.int()];
-            if (cn.tag == .type_app) {
-                // An explicit-protocol-args method call `v.into[int]()`: a
-                // `type_app` over a `field_access` NOT bound to a `.func` (a
-                // qualified generic fn binds its field_access to `.func`). Fold the
-                // resolved witness (mirroring the bare method fold below), so the
-                // fingerprint tracks the SAME witness lower emits. Anything else is a
-                // generic FUNCTION call.
-                if (self.frozen.tree.nodes[cn.lhs.int()].tag == .field_access and
-                    cn.lhs.int() < self.frozen.resolutions.len and self.frozen.resolutions[cn.lhs.int()] != .func)
-                {
-                    try self.foldMethodCalleeExplicit(cn);
-                } else {
-                    try self.foldViaInstanceRef(c.call);
-                }
-                return;
-            }
-            const res = self.frozen.resolutions[c.idx.int()];
-            // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
-            // what the .func reloc target carries) and `sigs` (params/ret).
-            // Fold the full identity so a builtin<->user_fn shadow switch flips
-            // the caller's hash.
-            if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
-                const sig = self.frozen.sigs[res.func];
-                // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`:
-                // the callee (plain identifier, or a field_access `resolveModuleMember`
-                // bound to this `.func`) resolves to a generic template (its sig params
-                // carry type_vars). Fold the resolved INSTANCE sig — not the template —
-                // so the caller folds the SAME identity the reloc targets (mirroring
-                // the type_app path). Both shapes route through the shared
-                // `callInstanceRef`, keeping every consumer's instance selection in
-                // agreement.
-                const ctag = self.frozen.tree.nodes[c.idx.int()].tag;
-                if ((ctag == .identifier or ctag == .field_access) and sig.isGenericTemplate()) {
-                    try self.foldBareInstance(c.call);
-                    return;
-                }
-                const nm = self.frozen.names[res.func];
-                try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
-                return;
-            }
-            // A method call `recv.m(..)` on a VALUE receiver: the callee is
-            // a `field_access` NOT bound to a `.func`, and the receiver types to
-            // a concrete struct/enum. Fold the resolved method's Sig so editing
-            // the method's signature/return flips every caller's fingerprint
-            // (stale-cache soundness — mirrors the plain-func fold above).
-            if (cn.tag == .field_access and res != .func and cn.lhs.int() < self.frozen.node_types.len) {
-                const recv = self.frozen.node_types[cn.lhs.int()];
-                if (recv.kind == .@"struct" or recv.kind == .@"enum" or recv.isScalar()) {
-                    const member = self.frozen.tokens[cn.main_token].text(self.frozen.source);
-                    // A struct/enum `x.to_string()` relocs to x's DISPLAY witness
-                    // (there is no `to_string` symbol — lower routes it through
-                    // `displayToSlot`). Fold that witness so a struct gaining an `impl
-                    // Display` in another module recompiles its `to_string` callers.
-                    // Scalar `to_string` is a fixed builtin, needing no fold.
-                    if (std.mem.eql(u8, member, "to_string") and (recv.kind == .@"struct" or recv.kind == .@"enum")) {
-                        switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, "display", self.frozen.prelude_ids.display, null)) {
-                            .one => |m| return self.foldWitness(m),
-                            .none, .ambiguous => return,
-                        }
-                    }
-                    // The SAME multi-conformance resolver the checker + lower use, so
-                    // the folded witness matches the reloc target. `.one` is
-                    // byte-identical to the earlier single-conformance `findMethod` for
-                    // every error-free program (an ambiguous bare call halts the compile
-                    // before codegen,
-                    // so the fp is never taken); `.ambiguous`/`.none` fold nothing here.
-                    switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null, null)) {
-                        .one => |m| try self.foldWitness(m),
-                        .none, .ambiguous => {
-                            // A builtin scalar `eq`/`hash`: it has NO real
-                            // fn_id/instance (the recognizer lowers to an inline machine
-                            // op, no symbol), so fold a FIXED sentinel Sig instead.
-                            // Deterministic + stable across builds; the member NAME +
-                            // per-arity params separate `eq` ([Self,Self]->bool) from
-                            // `hash` ([Self]->int).
-                            if (Typecheck.builtinScalarMethod(recv, member)) |bm| {
-                                if (std.mem.eql(u8, member, "hash")) {
-                                    const params: []const Typecheck.Type = if (recv.kind == .bool) &hash_params_bool else &hash_params_int;
-                                    try self.out.append(self.gpa, .{ .kind = .builtin, .name = "hash", .params = params, .ret = bm.ret });
-                                } else {
-                                    const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
-                                    try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = bm.ret });
-                                }
-                            }
-                        },
-                    }
-                }
-            }
-        }
-
         /// Fold call `call_idx`'s method callee from the checker's Callee table.
         fn foldCalleeTable(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
             const fr = self.frozen;
@@ -836,44 +770,6 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     .str_concat, .str_len, .str_byte_at, .scalar_to_string, .conv_into, .conv_try_into, .opt_is_tag0, .opt_is_tag1, .opt_unwrap, .opt_unwrap_or => {},
                 },
             }
-        }
-
-        /// Fold the method callee again from the Callee table and require the same Sigs
-        /// the legacy fold appended at `out[start..]`.
-        noinline fn shadowFold(self: *Self, c: CalleeEvent, start: usize) error{OutOfMemory}!void {
-            const fr = self.frozen;
-            const fa = Callee.memberNode(fr.tree, fr.tree.nodes[c.call.int()]) orelse return;
-            if (fa.int() >= fr.callees.len) return;
-            if (fa.int() < fr.resolutions.len and fr.resolutions[fa.int()] == .func) return;
-            var scratch: std.ArrayList(Sig) = .empty;
-            defer scratch.deinit(self.gpa);
-            const legacy_out = self.out;
-            self.out = &scratch;
-            const folded = self.foldCalleeTable(c.call);
-            self.out = legacy_out;
-            try folded;
-            if (sigsAgree(legacy_out.items[start..], scratch.items)) return;
-            if (self.foldDeltaExempt(fa)) return;
-            std.debug.panic("callee shadow: fold at token {d} legacy {d} sigs, table {d} sigs ({any})", .{
-                fr.tree.nodes[fa.int()].main_token, legacy_out.items.len - start, scratch.items.len, fr.callees[fa.int()].view(),
-            });
-        }
-
-        /// The two places the legacy fold is known to disagree with the checker's
-        /// selection; both close once the fold reads the table.
-        fn foldDeltaExempt(self: *Self, fa: Ast.Index) bool {
-            const fr = self.frozen;
-            if (fr.callees[fa.int()].view() != .method) return false;
-            const fa_node = fr.tree.nodes[fa.int()];
-            if (fa_node.lhs.int() >= fr.node_types.len) return false;
-            const kind = fr.node_types[fa_node.lhs.int()].kind;
-            // The legacy fold's receiver-kind gate skips float (and rawptr on the
-            // explicit-args path), though the checker dispatches methods on both.
-            if (kind == .float or kind == .rawptr) return true;
-            // The legacy fold routes every struct/enum `to_string` to the Display witness,
-            // even when the checker selected a user `to_string` method.
-            const member = fr.tokens[fa_node.main_token].text(fr.source);
-            return std.mem.eql(u8, member, "to_string") and (kind == .@"struct" or kind == .@"enum");
         }
 
         /// Fold a resolved method witness's identity+sig. A GENERIC-type instance
@@ -905,31 +801,6 @@ pub fn CallVisitor(comptime Frozen: type) type {
                 const nm = self.frozen.names[m.fn_id];
                 const sig = self.frozen.sigs[m.fn_id];
                 try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
-            }
-        }
-
-        /// Fold an explicit-protocol-args method callee `v.into[int]()`: resolve the
-        /// witness by the type-arg node_types (the SAME rule the checker + lower use), so
-        /// the fingerprint tracks the SAME witness the reloc targets.
-        fn foldMethodCalleeExplicit(self: *Self, cn: Ast.Node) error{OutOfMemory}!void {
-            const fa = self.frozen.tree.nodes[cn.lhs.int()];
-            if (fa.lhs.int() >= self.frozen.node_types.len) return;
-            const recv = self.frozen.node_types[fa.lhs.int()];
-            switch (recv.kind) {
-                .@"struct", .@"enum", .int, .bool, .str, .unit => {},
-                else => return,
-            }
-            const member = self.frozen.tokens[fa.main_token].text(self.frozen.source);
-            const targ_nodes = Ast.rangeSlice(self.frozen.tree, cn.rhs.int());
-            var buf: [8]Typecheck.Type = undefined;
-            if (targ_nodes.len > buf.len) return;
-            for (targ_nodes, 0..) |tn, i| {
-                if (tn.int() >= self.frozen.node_types.len) return; // pre-typecheck view
-                buf[i] = self.frozen.node_types[tn.int()];
-            }
-            switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, member, null, buf[0..targ_nodes.len])) {
-                .one => |m| try self.foldWitness(m),
-                .none, .ambiguous => {},
             }
         }
 
@@ -2185,95 +2056,179 @@ test "nodeSpan starts an inferred variant at its dot" {
     return error.NoVariantInit;
 }
 
-test "sigsAgree compares kind, name, params and ret" {
-    const T = Typecheck.Type;
-    const base = [_]Sig{.{ .kind = .user_fn, .name = "m.P.eq", .params = &.{ T.int, T.int }, .ret = T.bool }};
-    const same = [_]Sig{.{ .kind = .user_fn, .name = "m.P.eq", .params = &.{ T.int, T.int }, .ret = T.bool }};
-    const other_kind = [_]Sig{.{ .kind = .builtin, .name = "m.P.eq", .params = &.{ T.int, T.int }, .ret = T.bool }};
-    const other_params = [_]Sig{.{ .kind = .user_fn, .name = "m.P.eq", .params = &.{ T.int, T.bool }, .ret = T.bool }};
-    const other_ret = [_]Sig{.{ .kind = .user_fn, .name = "m.P.eq", .params = &.{ T.int, T.int }, .ret = T.int }};
-    try testing.expect(sigsAgree(&base, &same));
-    try testing.expect(!sigsAgree(&base, &other_kind));
-    try testing.expect(!sigsAgree(&base, &other_params));
-    try testing.expect(!sigsAgree(&base, &other_ret));
-    try testing.expect(!sigsAgree(&base, &.{}));
-}
-
-test "a blanked Callee slot folds differently from the legacy method fold" {
-    if (builtin.mode != .Debug) return error.SkipZigTest;
-    const gpa = testing.allocator;
+/// One module resolved and typechecked, with `names` in global fn-id order as
+/// `renderGraphIr` builds it, so a `CallVisitor` folds the checker's real callees.
+/// Heap-pinned because `res` and `tc` are built against `&g`.
+const Checked = struct {
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
     const TypecheckGraph = @import("../types_graph.zig");
     const Link = @import("../link/Link.zig");
 
-    const src =
+    src: []const u8,
+    tokens: []Token,
+    tree: Ast.Tree,
+    g: Graph.Graph,
+    res: ResolveGraph.GraphResult,
+    tc: TypecheckGraph.GraphResult,
+    names: []Link.SymName,
+
+    fn create(gpa: std.mem.Allocator, src: []const u8) !*Checked {
+        const self = try gpa.create(Checked);
+        errdefer gpa.destroy(self);
+        self.src = src;
+        self.tokens = try Lexer.tokenize(gpa, src);
+        errdefer gpa.free(self.tokens);
+        self.tree = try Parser.expectTree(gpa, self.tokens, src);
+        errdefer {
+            gpa.free(self.tree.nodes);
+            gpa.free(self.tree.extra);
+        }
+        self.g = try Graph.single(gpa, "main", "", src, self.tokens, self.tree.nodes, self.tree.extra, self.tree.pub_bits);
+        errdefer self.g.deinit(gpa);
+        self.res = try ResolveGraph.resolveGraph(gpa, &self.g);
+        errdefer self.res.deinit(gpa);
+        self.tc = try TypecheckGraph.checkGraph(gpa, &self.g, &self.res, null, 0);
+        errdefer self.tc.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), self.tc.diags.len);
+        self.names = try gpa.alloc(Link.SymName, self.res.fns.len);
+        for (self.res.fns, 0..) |gf, i| {
+            const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+            self.names[i] = .{ .kind = kind, .name = gf.name };
+        }
+        return self;
+    }
+
+    fn destroy(self: *Checked, gpa: std.mem.Allocator) void {
+        gpa.free(self.names);
+        self.tc.deinit(gpa);
+        self.res.deinit(gpa);
+        self.g.deinit(gpa);
+        gpa.free(self.tree.nodes);
+        gpa.free(self.tree.extra);
+        gpa.free(self.tokens);
+        gpa.destroy(self);
+    }
+
+    /// The member node of the only method call spelled `member`.
+    fn memberOf(self: *const Checked, member: []const u8) !Ast.Index {
+        for (self.tree.nodes) |n| {
+            if (n.tag != .call) continue;
+            const fa = Callee.memberNode(self.tree, n) orelse continue;
+            if (std.mem.eql(u8, self.tokens[self.tree.nodes[fa.int()].main_token].text(self.src), member)) return fa;
+        }
+        return error.TestExpectedMethodCall;
+    }
+
+    /// Fold the callee Sigs of top-level fn `fn_name` against `callees`.
+    fn fold(self: *const Checked, gpa: std.mem.Allocator, callees: []const Callee, fn_name: []const u8, out: *std.ArrayList(Sig)) !void {
+        const frozen = FakeFrozen{
+            .tree = self.tree,
+            .tokens = self.tokens,
+            .source = self.src,
+            .resolutions = self.res.resolutions[0],
+            .node_types = self.tc.node_types[0],
+            .callees = callees,
+            .layouts = self.tc.layouts,
+            .enum_layouts = self.tc.enum_layouts,
+            .names = self.names,
+            .sigs = self.tc.sigs,
+            .instances = self.tc.instances,
+            .methods = self.tc.methods,
+            .prelude_ids = self.tc.prelude_ids,
+        };
+        const prog = self.tree.nodes[Ast.root(self.tree.nodes).int()];
+        for (Ast.rangeSlice(self.tree, prog.lhs.int())) |idx| {
+            const n = self.tree.nodes[idx.int()];
+            if (n.tag != .fn_decl or !std.mem.eql(u8, self.tokens[n.main_token].text(self.src), fn_name)) continue;
+            var v = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = out };
+            return walk(.{ .tree = self.tree, .tokens = self.tokens, .source = self.src }, idx, &v);
+        }
+        return error.TestExpectedFn;
+    }
+};
+
+test "method callee folds come from the Callee table" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
         \\struct P { x: int }
         \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
         \\fn use_method(p: P, q: P) -> bool { p.eq(q) }
         \\
-    ;
-    const tokens = try Lexer.tokenize(gpa, src);
-    defer gpa.free(tokens);
-    const tree = try Parser.expectTree(gpa, tokens, src);
-    defer {
-        gpa.free(tree.nodes);
-        gpa.free(tree.extra);
-    }
-    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
-    defer g.deinit(gpa);
-    var res = try ResolveGraph.resolveGraph(gpa, &g);
-    defer res.deinit(gpa);
-    var tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
-    defer tc.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), tc.diags.len);
-
-    const names = try gpa.alloc(Link.SymName, res.fns.len);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-    for (res.fns, 0..) |gf, i| {
-        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
-        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
-    }
-    const cs = try gpa.dupe(Callee, tc.callees[0]);
-    defer gpa.free(cs);
-    const frozen = FakeFrozen{
-        .tree = tree,
-        .tokens = tokens,
-        .source = src,
-        .resolutions = res.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = cs,
-        .layouts = tc.layouts,
-        .enum_layouts = tc.enum_layouts,
-        .names = names,
-        .sigs = tc.sigs,
-        .instances = tc.instances,
-        .methods = tc.methods,
-        .prelude_ids = tc.prelude_ids,
+    );
+    defer fx.destroy(gpa);
+    const mi = switch (fx.tc.callees[0][(try fx.memberOf("eq")).int()].view()) {
+        .method => |i| i,
+        else => return error.TestExpectedMethodCallee,
     };
+    const m = fx.tc.methods[mi];
 
-    const call_idx: Ast.Index = for (tree.nodes, 0..) |n, i| {
-        if (n.tag == .call and Callee.memberNode(tree, n) != null) break Ast.Index.from(@intCast(i));
-    } else return error.TestExpectedMethodCall;
-    const call = tree.nodes[call_idx.int()];
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.fold(gpa, fx.tc.callees[0], "use_method", &sigs);
+    try testing.expectEqual(@as(usize, 1), sigs.items.len);
+    try testing.expectEqual(fx.names[m.fn_id].kind, sigs.items[0].kind);
+    try testing.expectEqualStrings(fx.names[m.fn_id].name, sigs.items[0].name);
+    try testing.expect(Typecheck.eqlTypeVec(fx.tc.sigs[m.fn_id].params, sigs.items[0].params));
+    try testing.expect(Typecheck.Type.eql(fx.tc.sigs[m.fn_id].ret, sigs.items[0].ret));
 
-    var legacy: std.ArrayList(Sig) = .empty;
-    defer legacy.deinit(gpa);
-    var vl = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = &legacy };
-    try vl.onCalleeLegacy(.{ .idx = call.lhs, .call = call_idx });
-    try testing.expectEqual(@as(usize, 1), legacy.items.len);
+    const blank = try gpa.alloc(Callee, fx.tc.callees[0].len);
+    defer gpa.free(blank);
+    @memset(blank, .{});
+    sigs.clearRetainingCapacity();
+    try fx.fold(gpa, blank, "use_method", &sigs);
+    try testing.expectEqual(@as(usize, 0), sigs.items.len);
+}
 
-    var table: std.ArrayList(Sig) = .empty;
-    defer table.deinit(gpa);
-    var vt = CallVisitor(FakeFrozen){ .gpa = gpa, .frozen = &frozen, .out = &table };
-    try vt.foldCalleeTable(call_idx);
-    try testing.expect(sigsAgree(legacy.items, table.items));
+test "a user to_string method folds its own witness, not Display" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
+        \\struct P { x: int }
+        \\impl P { fn to_string(self) -> str { "p" } }
+        \\impl P has Display { fn display(self) -> str { "d" } }
+        \\fn use_it(p: P) -> str { p.to_string() }
+        \\
+    );
+    defer fx.destroy(gpa);
+    const mi = switch (fx.tc.callees[0][(try fx.memberOf("to_string")).int()].view()) {
+        .method => |i| i,
+        else => return error.TestExpectedMethodCallee,
+    };
+    try testing.expectEqualStrings("to_string", fx.tc.methods[mi].name);
 
-    cs[Callee.memberNode(tree, call).?.int()] = .{};
-    table.clearRetainingCapacity();
-    try vt.foldCalleeTable(call_idx);
-    try testing.expect(!sigsAgree(legacy.items, table.items));
+    var sigs: std.ArrayList(Sig) = .empty;
+    defer sigs.deinit(gpa);
+    try fx.fold(gpa, fx.tc.callees[0], "use_it", &sigs);
+    try testing.expectEqual(@as(usize, 1), sigs.items.len);
+    try testing.expectEqualStrings(fx.names[fx.tc.methods[mi].fn_id].name, sigs.items[0].name);
+    try testing.expect(std.mem.endsWith(u8, sigs.items[0].name, ".to_string"));
+}
+
+test "builtin eq and hash sentinels keep their receiver-kind params" {
+    const gpa = testing.allocator;
+    const T = Typecheck.Type;
+    const fx = try Checked.create(gpa,
+        \\fn int_eq() -> bool { (3).eq(3) }
+        \\fn bool_eq() -> bool { true.eq(false) }
+        \\fn str_hash() -> int { "s".hash() }
+        \\fn unit_hash() -> int { ().hash() }
+        \\
+    );
+    defer fx.destroy(gpa);
+    const cases = [_]struct { f: []const u8, name: []const u8, params: []const T, ret: T }{
+        .{ .f = "int_eq", .name = "eq", .params = &.{ T.int, T.int }, .ret = T.bool },
+        .{ .f = "bool_eq", .name = "eq", .params = &.{ T.bool, T.bool }, .ret = T.bool },
+        .{ .f = "str_hash", .name = "hash", .params = &.{T.int}, .ret = T.int },
+        .{ .f = "unit_hash", .name = "hash", .params = &.{T.int}, .ret = T.int },
+    };
+    for (cases) |c| {
+        var sigs: std.ArrayList(Sig) = .empty;
+        defer sigs.deinit(gpa);
+        try fx.fold(gpa, fx.tc.callees[0], c.f, &sigs);
+        try testing.expectEqual(@as(usize, 1), sigs.items.len);
+        try testing.expectEqual(@import("../link/Link.zig").SymKind.builtin, sigs.items[0].kind);
+        try testing.expectEqualStrings(c.name, sigs.items[0].name);
+        try testing.expect(Typecheck.eqlTypeVec(c.params, sigs.items[0].params));
+        try testing.expect(T.eql(c.ret, sigs.items[0].ret));
+    }
 }

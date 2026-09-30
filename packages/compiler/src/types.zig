@@ -530,9 +530,9 @@ pub const Method = struct {
     is_static: bool = false,
     /// A REIFIED-DISPATCH entry: appended in the mono tail for each reachable
     /// `(instance, method)` of a generic-type `impl`. `recv` is the reified concrete
-    /// `structT`/`enumT` and `instance` indexes `GraphResult.instances`, so post-typecheck
-    /// consumers (`lower`, `CallVisitor`) resolve the call to the instance's mangled symbol
-    /// via `findMethod` on the reified receiver. `null` for an inherent / conformance /
+    /// `structT`/`enumT` and `instance` indexes `GraphResult.instances`: `sealCallees` picks
+    /// the entry on the reified receiver, so a call's Callee leads `lower` and `CallVisitor`
+    /// to the instance's mangled symbol. `null` for an inherent / conformance /
     /// derive entry. `recv` is ALWAYS a concrete type here — generic `impl Box[T]` templates
     /// live in the separate `TemplateMethod` table (which never carries a `recv:Type`), so
     /// `findMethod` post-typecheck can never deref a stale check-time `App`.
@@ -550,9 +550,9 @@ pub const Method = struct {
     protocol_args: []const Type = &.{},
     /// A SOURCE-LESS auto-derive witness: the index into `GraphResult.derives` of
     /// the synthetic unit this method resolves to, or `null` for a real fn / instance /
-    /// builtin entry. Appended in the synthesis barrier for each authorized derive so
-    /// `resolveConformanceMethod(T,"eq")` returns `.one` and lower/`foldWitness` route to
-    /// the synthetic unit's mangled name (checked BEFORE `instance`/`fn_id`). Grows
+    /// builtin entry. Appended in the synthesis barrier for each authorized derive so the
+    /// seal and the operator witness sites pick it as `.one`, and `witnessCallee`/`foldWitness`
+    /// route to the synthetic unit's mangled name (checked BEFORE `instance`/`fn_id`). Grows
     /// `Method` (never `Type`), which is never content-cache-memcpy'd, so `@sizeOf(Type)`
     /// is unaffected.
     derive: ?u32 = null,
@@ -712,10 +712,9 @@ pub const Prelude = struct {
     }
 };
 
-/// The ONE disambiguation the three method-dispatch consumers (BodyChecker types, lower
-/// symbols, AstWalk fingerprint) share, so all three select the IDENTICAL witness (a
-/// divergence would be a miscompile or a `-jN` determinism break). A linear scan over
-/// `Type.eql` + name (table = source fn-id order → deterministic):
+/// The witness pick behind the checker's method dispatch (recorded as a Callee) and the
+/// operator/derive/`?`-widen witness sites. A linear scan over `Type.eql` + name (table =
+/// source fn-id order → deterministic):
 ///   * with `explicit_args`: pick the conformance method whose `protocol_args` match
 ///     (a generic protocol's conformances are coherence-deduped, so at most one matches),
 ///     additionally filtered to `witness_pid` when given;
@@ -832,9 +831,9 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
 
 /// A builtin scalar protocol-method recognizer: the pure, table-free source
 /// of truth for the compiler-registered `Eq` conformance on builtin scalars. Returns the
-/// method's return `Type` for a recognized `(recv, name)`, else null. Shared by all
-/// three method-dispatch consumers — BodyChecker (types the call), lower (emits an
-/// inline machine op), and the fingerprint fold (a fixed sentinel sig) — so a builtin
+/// method's return `Type` for a recognized `(recv, name)`, else null. BodyChecker types
+/// the call and records `builtin` as its Callee, which lower (an inline machine op) and
+/// the fingerprint fold (a fixed sentinel sig) read — so a builtin
 /// scalar method is NEVER a phantom `t.fns`/`t.methods` entry (that would desync the
 /// `names`/`sigs` parallel arrays and churn the method-count unit tests). All four scalars
 /// ship `eq` -> bool: `int`/`bool` lower to an inline `icmp`; `str` to a heap-free
@@ -843,18 +842,17 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
 pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, arity: usize, builtin: Callee.Builtin } {
     if (!recv.isScalar()) return null;
     // `eq(self, other) -> bool` is 2-ary (arity counts the non-self args = 1); `hash
-    // (self) -> int` is 1-ary (0 non-self args). The `arity` lets the shared
-    // method-dispatch consumers gate arg count without hardcoding a per-method constant.
+    // (self) -> int` is 1-ary (0 non-self args). The `arity` lets the checker gate arg
+    // count without hardcoding a per-method constant.
     if (std.mem.eql(u8, name, "eq")) return .{ .ret = Type.bool, .arity = 1, .builtin = .scalar_eq };
     if (std.mem.eql(u8, name, "hash")) return .{ .ret = Type.int, .arity = 0, .builtin = .scalar_hash };
     return null;
 }
 
-/// The string builtin methods, kept OUT of `builtinScalarMethod`: `concat`/`byte_at`
-/// take a non-`Self` arg, and `builtinScalarEqCallee` keys on any arity-1 scalar method
-/// WITHOUT checking the name — folding `concat` in there would misroute it to `eq`. A
-/// pure, table-free recognizer (no `t.methods`/`t.fns` row) shared by the checker and
-/// lower so the two consumers cannot drift. `to_string` on int/bool/str/unit produces a str
+/// The string builtin methods, kept OUT of `builtinScalarMethod`, whose params are all
+/// `Self`: `byte_at` takes an int. A pure, table-free recognizer (no `t.methods`/`t.fns`
+/// row); the checker records its `builtin` as the call's Callee, which lower reads.
+/// `to_string` on int/bool/str/unit produces a str
 /// (it is `self.display()` for every Display-conforming scalar); struct/enum `to_string` is
 /// gated separately (it may record a structural Display derive), so it is NOT recognized here.
 pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, params: []const Type, builtin: Callee.Builtin } {
@@ -946,6 +944,17 @@ pub fn optResultBuiltin(op: OptResultMethod) Callee.Builtin {
         .is_tag1 => .opt_is_tag1,
         .unwrap => .opt_unwrap,
         .unwrap_or => .opt_unwrap_or,
+    };
+}
+
+/// The inverse of `optResultBuiltin`: null for a builtin that is not an Option/Result op.
+pub fn builtinOptResult(k: Callee.Builtin) ?OptResultMethod {
+    return switch (k) {
+        .opt_is_tag0 => .is_tag0,
+        .opt_is_tag1 => .is_tag1,
+        .opt_unwrap => .unwrap,
+        .opt_unwrap_or => .unwrap_or,
+        .scalar_eq, .scalar_hash, .str_concat, .str_len, .str_byte_at, .scalar_to_string, .display_to_string, .conv_into, .conv_try_into => null,
     };
 }
 
@@ -2158,7 +2167,8 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // Iterate the already-canonically-sorted `t.mono`, so the reified entries are a
     // pure function of source; each entry's `recv` is the reified concrete
     // `structT`/`enumT` (the instance's substituted-then-reified self, `inst.params[0]`),
-    // which is what `findMethod` keys off in lower / `CallVisitor`.
+    // which is what `sealCallees` keys off to resolve a pending method call, and what
+    // lower's desugar lookups (`[]`, `for`-in) key off.
     if (t.templates.items.len > 0) {
         // Invert `reify_map` (App index -> reified `structT`/`enumT`) once, so an
         // associated fn's receiver whose type-args are generic instances can map each

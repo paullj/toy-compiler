@@ -3,9 +3,9 @@
 //! mega-struct so the existence check, the type_var bound-as-axiom rule, the composed
 //! operator verdict, the recursive structural engine, and the derive-blocker leaf live
 //! behind ONE small interface instead of being re-derived at each caller. The witness
-//! PICK (`resolveConformanceMethod`) stays in the parent as the shared leaf all three
-//! dispatch consumers (checker, lower, fingerprint) already agree through — this module
-//! decides conformance, it does not pick the method.
+//! PICK (`resolveConformanceMethod`) stays in the parent: the checker records a method
+//! call's pick as a Callee, and the operator/derive witness sites call it directly — this
+//! module decides conformance, it does not pick the method.
 //!
 //! Imports the parent as `Typecheck` (the `src/types/` submodule convention shared with
 //! `derive_synth.zig`/`coherence.zig`/`reify.zig`).
@@ -615,10 +615,10 @@ test "axiom + direct: the bound-as-axiom rule, single-sourced" {
 }
 
 test "keystone: the checker verdict and the shared witness leaf agree across the table" {
-    // The property formerly trusted only by comment (`lower.zig:887`, `BodyChecker.zig:1266`):
-    // wherever the conformance DECISION accepts `(recv, pid)`, the shared witness LEAF
-    // (`resolveConformanceMethod` / `builtinScalarMethod`) resolves exactly one witness — so
-    // the checker never accepts an operator that lower/fingerprint then cannot bind.
+    // Wherever the conformance DECISION accepts `(recv, pid)`, the witness LEAF the
+    // operator sites resolve through (`resolveConformanceMethod` / `builtinScalarMethod`)
+    // yields exactly one witness — so the checker never accepts an operator that
+    // lower/fingerprint then cannot bind.
     const gpa = testing.allocator;
     const eq_pid: u32 = 0;
     const ord_pid: u32 = 1;

@@ -2089,8 +2089,8 @@ pub const BodyChecker = struct {
     }
 
     /// Type an explicit-protocol-args method call `v.m[int](args)`: the callee is a
-    /// `type_app` over a `field_access`. The type-arg node_types are written (so lower /
-    /// AstWalk read them back to select the SAME witness), then the receiver is dispatched:
+    /// `type_app` over a `field_access`. The type-arg node_types are written (the touched-type
+    /// fold reads every typed node), then the receiver is dispatched and its pick recorded:
     /// a concrete struct/enum/scalar disambiguates the witness by the explicit args; a
     /// `type_var` (bound-as-axiom, checking a bounded template) grounds the bound protocol's
     /// params with the explicit args.
@@ -2217,7 +2217,7 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
                 return .invalid;
             }
-            // Load-bearing: the reified receiver flows to scanCalls / reify / lower off
+            // Load-bearing: the reified receiver flows to scanCalls / reify / sealCallees off
             // `node_types[type_app]`.
             bc.node_types[(callee.lhs).int()] = app_ty;
             bc.setCallee(n, Callee.pending);
@@ -2687,10 +2687,8 @@ pub const BodyChecker = struct {
     fn dispatchConcreteMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        // Resolve the witness via the shared multi-conformance resolver
-        // (the SAME rule lower + AstWalk use). `.one` is byte-identical to the
-        // `findMethod` for every existing program (inherent / single
-        // conformance / prelude); `.ambiguous` (a doubly-conforming generic
+        // `.one` is byte-identical to `findMethod` for every existing program (inherent /
+        // single conformance / prelude); `.ambiguous` (a doubly-conforming generic
         // protocol used with no type-args) is T0025 — never an arbitrary pick.
         switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null)) {
             .one => |mi| {
@@ -2814,7 +2812,7 @@ pub const BodyChecker = struct {
             return bm.ret;
         }
         // The string builtin methods (`concat`/`len`/`byte_at`/`to_string`) — kept out of
-        // `builtinScalarMethod` so lower's `eq`-keyed classifier cannot misroute them.
+        // `builtinScalarMethod`, whose params are all `Self` (`byte_at` takes an int).
         if (Typecheck.builtinStrMethod(recv_ty, member)) |bm| {
             bc.setCallee(n, Callee.builtinMethod(bm.builtin));
             _ = try bc.checkCall(node_idx, args, .{ .params = bm.params, .name = member });

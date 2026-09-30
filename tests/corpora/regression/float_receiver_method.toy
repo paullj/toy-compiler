@@ -1,0 +1,10 @@
+# Regression: a method on a float receiver type-checks and must also lower (the checker
+# and lower used to disagree on which receiver kinds dispatch methods).
+# expect: exit 42
+impl float {
+    fn tag(self) -> int { 42 }
+}
+fn main() -> int {
+    x := 1.5
+    return x.tag()
+}
