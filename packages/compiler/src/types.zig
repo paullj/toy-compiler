@@ -628,10 +628,10 @@ fn buildAdapters(
 }
 
 /// The lambda-unit table: for each lowerable owner in canonical order (non-generic fns by
-/// global id, then instances in instance order), one unit per lambda in its body, in node
-/// order. Each unit's signature is the reified pair the lambda's node types to, and its
-/// env is laid out here once, for both the body that makes the closure and the unit that
-/// reads it. Serial over the finished tables, so it is identical at any `-j`.
+/// global id, then instances in instance order), one unit per lambda or local fn in its
+/// body, in node order. Each unit's signature is the reified pair the lambda's node types
+/// to, and its env is laid out here once, for both the body that makes the closure and the
+/// unit that reads it. Serial over the finished tables, so it is identical at any `-j`.
 fn buildLambdaUnits(
     gpa: std.mem.Allocator,
     graph: *const GraphCtx,
@@ -738,6 +738,7 @@ fn appendLambdaUnits(
             .name = name,
             .sig = .{ .params = params, .ret = fs.ret },
             .param_slots = slots,
+            .self_slot = b.self_slot,
             .env = env,
             .env_size = env_size,
         });
@@ -9291,4 +9292,123 @@ test "lambda units: one per boundary per lowerable owner, named by rank" {
     const a_lam = try nthLambda(&c, 1);
     const a_param = Ast.protoAt(c.tree, c.tree.nodes[a_lam.int()].lhs.int()).params[0];
     try testing.expectEqual(c.resolve.resolutions[0][a_param.int()].local, units[0].param_slots[0]);
+}
+
+/// The `nth` (node order) `.local_fn` node.
+fn nthLocalFn(c: *const Checked, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .local_fn) continue;
+        if (seen == nth) return Ast.Index.from(@intCast(i));
+        seen += 1;
+    }
+    return error.TestLocalFnNotFound;
+}
+
+test "a local fn is typed before its body, so it recurses" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ base := 10
+        \\ fn fact(n: int) -> int { if n <= 1 { base } else { n * fact(n - 1) } }
+        \\ fn noop() { }
+        \\ noop()
+        \\ return fact(3)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const fact = try nthLocalFn(&c, 0);
+    const fact_sig = lambdaSig(&c, fact);
+    try testing.expectEqual(@as(usize, 1), fact_sig.params.len);
+    try testing.expect(Type.eql(Type.int, fact_sig.params[0]));
+    try testing.expect(Type.eql(Type.int, fact_sig.ret));
+    // A missing `-> R` is unit, not inferred.
+    try testing.expect(Type.eql(Type.unit, lambdaSig(&c, try nthLocalFn(&c, 1)).ret));
+    // Each is a lambda unit that knows its own name slot; `fact` captures only `base`.
+    const units = c.result.lambda_units;
+    try testing.expectEqual(@as(usize, 2), units.len);
+    try testing.expectEqual(fact, units[0].node);
+    try testing.expectEqualStrings("main$l0", units[0].name);
+    try testing.expectEqual(@as(?u32, c.resolve.resolutions[0][fact.int()].local), units[0].self_slot);
+    try testing.expectEqual(@as(usize, 1), units[0].env.len);
+    try testing.expectEqual(@as(u32, 0), units[0].env[0].slot);
+    try testing.expectEqual(@as(u32, 0), units[1].env_size);
+    try testing.expect(units[1].self_slot != null);
+    // The recursive call inside the body is a call of the fn-typed local.
+    var saw_value = false;
+    for (c.tree.nodes) |n| {
+        if (n.tag != .call) continue;
+        const callee = c.tree.nodes[n.lhs.int()];
+        if (callee.tag != .identifier or !std.mem.eql(u8, c.tokens[callee.main_token].text(c.source), "fact")) continue;
+        try testing.expect(c.result.callees[0][Callee.callSlot(c.tree, n).?.int()].view() == .value);
+        saw_value = true;
+    }
+    try testing.expect(saw_value);
+}
+
+test "a captured local fn is copied, never boxed" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ count := 0
+        \\ fn bump() { count = count + 1 }
+        \\ g := fn() { bump() }
+        \\ g()
+        \\ return count
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.owner_closures.len);
+    try testing.expectEqualSlices(u32, &.{0}, c.result.owner_closures[0].boxed);
+    const g_unit = c.result.lambda_units[1];
+    try testing.expectEqual(@as(usize, 1), g_unit.env.len);
+    try testing.expectEqual(@as(u32, 1), g_unit.env[0].slot);
+    try testing.expectEqual(Closure.CaptureMode.copy, g_unit.env[0].mode);
+    try testing.expectEqual(@as(u32, 16), g_unit.env_size);
+}
+
+test "missing return in a local fn is T0043" {
+    const gpa = testing.allocator;
+    {
+        var c = try checkSource("fn main() -> int {\n fn f(n: int) -> int {\n  if n > 0 { return 1 }\n }\n return f(1)\n}\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0043, c.result.diags[0].code);
+        try testing.expectEqualStrings("function 'f' must return int but may fall off the end", c.result.diags[0].message);
+    }
+    {
+        // A local fn's `return` does not return from the owner, which still needs its own.
+        var c = try checkSource("fn main() -> int {\n fn f() -> int { return 1 }\n _x := f()\n}\n");
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "function 'main'") != null);
+    }
+    {
+        // `return` and `?` check against the local fn's own return type.
+        var c = try checkSource(
+            \\fn main() -> int {
+            \\ fn next(o: Option[int]) -> Option[int] {
+            \\  v := o?
+            \\  return .some(v + 1)
+            \\ }
+            \\ fn bad() -> int { return true }
+            \\ return next(.some(1)).unwrap_or(0) + bad()
+            \\}
+            \\
+        );
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(codes.Code.T0042, c.result.diags[0].code);
+    }
+    {
+        // A jump out of a local fn is T0051, named as one.
+        var c = try checkSource("fn main() {\n while true {\n  fn f() { break }\n  f()\n }\n}\n");
+        defer c.deinit(gpa);
+        try testing.expect(hasCode(&c, .T0051));
+        try testing.expect(anyDiagContains(c, "cannot break a loop outside this local function"));
+    }
 }

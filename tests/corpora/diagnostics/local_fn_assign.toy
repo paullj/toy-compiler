@@ -1,0 +1,12 @@
+fn main() -> int {
+    fn one() -> int { 1 }
+    one = one  #~ ERROR [R0007] cannot assign to function 'one'
+    return one()
+}
+
+pub fn other() -> int {
+    fn two() -> int { 2 }
+    reset := fn() { two = fn() -> int { 0 } }  #~ ERROR [R0007] cannot assign to function 'two'
+    reset()
+    return two()
+}

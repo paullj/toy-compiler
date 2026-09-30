@@ -197,13 +197,14 @@ fn localDeclToken(m: *const Graph.Module, entry: u32, res: *const ResolveGraph.G
     const proto = Ast.protoAt(m.tree(), decl.lhs.int());
     if (slot < proto.params.len) return m.nodes[proto.params[slot].int()].main_token;
 
-    // A `:=` / for-KEY binder carrying this slot. The binder-tag filter is load-bearing:
-    // identifier USE nodes also carry `.local` with the same slot, so an unfiltered scan
-    // would match a use, not the binding. (Accepted gap: a `for k, v in` VALUE var binds on
-    // an `.identifier` val_leaf, not a binder-tagged node, so a use of `v` finds nothing.)
+    // A `:=` / for-KEY / local-fn / lambda-param binder carrying this slot (a top-level
+    // fn's params carry no resolution). The binder-tag filter is load-bearing: identifier
+    // USE nodes also carry `.local` with the same slot, so an unfiltered scan would match
+    // a use, not the binding. (Accepted gap: a `for k, v in` VALUE var binds on an
+    // `.identifier` val_leaf, not a binder-tagged node, so a use of `v` finds nothing.)
     for (m.nodes, 0..) |n, i| {
         switch (n.tag) {
-            .var_decl, .for_stmt, .for_in_stmt, .for_in2_stmt => {},
+            .var_decl, .for_stmt, .for_in_stmt, .for_in2_stmt, .local_fn, .param => {},
             else => continue,
         }
         if (i >= resolutions.len) continue;
@@ -411,6 +412,38 @@ test "definition: a method callee jumps to its declaration" {
         };
         try testing.expectEqualStrings("file:///p/main.toy", d.uri);
         const want = posOf(src, want_decl);
+        try testing.expectEqual(want.line, d.range.start.line);
+        try testing.expectEqual(want.character, d.range.start.character);
+    }
+}
+
+test "definition: a local fn and its params jump to their bindings; the enclosing fn's params still resolve" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn main(arg: int) -> int {
+        \\    fn step(k: int) -> int { k + arg }
+        \\    count := step(arg)
+        \\    return count
+        \\}
+        \\
+    ;
+    const cases = [_]struct { use: []const u8, skip: u32, decl: []const u8 }{
+        .{ .use = "step(arg)", .skip = 0, .decl = "step(k" },
+        .{ .use = "k + arg", .skip = 0, .decl = "k: int" },
+        .{ .use = "k + arg", .skip = 4, .decl = "arg: int" },
+        .{ .use = "return count", .skip = 7, .decl = "count :=" },
+    };
+    for (cases) |c| {
+        const use = posOf(src, c.use);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character + c.skip, "file:///p/main.toy")) orelse {
+            std.debug.print("no definition for '{s}'+{d}\n", .{ c.use, c.skip });
+            return error.NoDefinition;
+        };
+        defer gpa.free(d.uri);
+        const want = posOf(src, c.decl);
         try testing.expectEqual(want.line, d.range.start.line);
         try testing.expectEqual(want.character, d.range.start.character);
     }

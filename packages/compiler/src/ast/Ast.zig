@@ -442,6 +442,14 @@ pub const Node = extern struct {
         /// type is INFERRED from the body, and a lambda `param`'s type-ref `lhs` may be
         /// `none` (the type comes from the expected function type).
         lambda,
+
+        /// `fn name(params) -> R { .. }` as a statement inside a block: a named closure that
+        /// can call itself. Appended at END (frozen ordinal; `parse_version` bumped 20->21).
+        /// Same shape as `fn_decl` (`main_token` = the name identifier, `lhs` = a 5-cell
+        /// `FnProto` with an empty generic run, `rhs` = the body `block`; a `ret_type` of
+        /// `none` is unit). The distinct tag keeps every top-level `fn_decl` heuristic
+        /// (global fn table, LSP enclosing-fn search) blind to it.
+        local_fn,
     };
 };
 
@@ -675,7 +683,7 @@ pub const parse_magic: u32 = 0x544f5950;
 
 /// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
 /// so the writer and the reader can never disagree.
-pub const parse_version: u32 = 20;
+pub const parse_version: u32 = 21;
 
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
@@ -938,6 +946,23 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         .lambda => {
             const proto = protoAt(tree, n.lhs.int());
             try out.writeAll("(lambda (");
+            for (proto.params, 0..) |pidx, i| {
+                if (i != 0) try out.writeByte(' ');
+                try renderNode(out, tree, tokens, source, pidx);
+            }
+            try out.writeAll(") ");
+            if (proto.ret_type == none) {
+                try out.writeByte('_');
+            } else {
+                try renderNode(out, tree, tokens, source, proto.ret_type);
+            }
+            try out.writeByte(' ');
+            try renderNode(out, tree, tokens, source, n.rhs);
+            try out.writeByte(')');
+        },
+        .local_fn => {
+            const proto = protoAt(tree, n.lhs.int());
+            try out.print("(local-fn {s} (", .{tok_text});
             for (proto.params, 0..) |pidx, i| {
                 if (i != 0) try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, pidx);
@@ -1384,6 +1409,40 @@ test "renderNode spells a lambda with an untyped param" {
     var w = std.Io.Writer.fixed(&buf);
     try renderNode(&w, tree, &toks, src, Index.from(3));
     try testing.expectEqualStrings("(lambda ((param x)) _ (block x))", w.buffered());
+}
+
+test "renderNode spells a local fn like a decl, typed params and a ret" {
+    const src = "fn g(n: int) -> int { n }";
+    const toks = [_]Token{
+        .{ .tag = .kw_fn, .start = 0, .end = 2 },
+        .{ .tag = .identifier, .start = 3, .end = 4 },
+        .{ .tag = .l_paren, .start = 4, .end = 5 },
+        .{ .tag = .identifier, .start = 5, .end = 6 },
+        .{ .tag = .colon, .start = 6, .end = 7 },
+        .{ .tag = .identifier, .start = 8, .end = 11 },
+        .{ .tag = .r_paren, .start = 11, .end = 12 },
+        .{ .tag = .arrow, .start = 13, .end = 15 },
+        .{ .tag = .identifier, .start = 16, .end = 19 },
+        .{ .tag = .l_brace, .start = 20, .end = 21 },
+        .{ .tag = .identifier, .start = 22, .end = 23 },
+        .{ .tag = .r_brace, .start = 24, .end = 25 },
+    };
+    // extra: [0] params run, [1] block stmt run, [2..4] block Range header,
+    // [4..9] FnProto {ret 2, params 0/1, generics 4/0}.
+    var extra = [_]u32{ 1, 3, 1, 1, 2, 0, 1, 4, 0 };
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 5, .lhs = none, .rhs = none },
+        .{ .tag = .param, .main_token = 3, .lhs = Index.from(0), .rhs = none },
+        .{ .tag = .identifier, .main_token = 8, .lhs = none, .rhs = none },
+        .{ .tag = .identifier, .main_token = 10, .lhs = none, .rhs = none },
+        .{ .tag = .block, .main_token = 9, .lhs = Index.from(2), .rhs = none },
+        .{ .tag = .local_fn, .main_token = 1, .lhs = Index.from(4), .rhs = Index.from(4) },
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &extra };
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderNode(&w, tree, &toks, src, Index.from(5));
+    try testing.expectEqualStrings("(local-fn g ((param n int)) int (block n))", w.buffered());
 }
 
 test "unpack rejects a foreign blob" {

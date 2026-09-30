@@ -746,6 +746,31 @@ test "gc: a boxed counter survives collections between calls" {
     );
 }
 
+test "gc: a local fn's env survives collections, inside its own recursion too" {
+    try expectClosureGc(".toy-test-gc-local-fn",
+        \\fn make(k: int) -> Op {
+        \\    base := k
+        \\    fn go(x: int) -> int {
+        \\        if x == 5 && !collect() { return 0 - 1000 }
+        \\        if x <= 0 { base } else { go(x - 1) + 1 }
+        \\    }
+        \\    go
+        \\}
+        \\fn main() -> int {
+        \\    f := make(30)
+        \\    if !collect() { return 1 }
+        \\    hits := 0
+        \\    fn tick() { hits = hits + 1 }
+        \\    tick()
+        \\    if !collect() { return 2 }
+        \\    tick()
+        \\    # f(10) = 30 + 10
+        \\    return f(10) + hits
+        \\}
+        \\
+    );
+}
+
 test "gc: per-iteration boxes survive" {
     try expectClosureGc(".toy-test-gc-box-loop",
         \\fn fill() -> Vec[fn() -> int] {

@@ -512,6 +512,10 @@
           "named": true
         },
         {
+          "type": "function_declaration",
+          "named": true
+        },
+        {
           "type": "let_declaration",
           "named": true
         },

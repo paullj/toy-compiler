@@ -397,10 +397,10 @@ pub fn lowerFn(
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
 
-/// Lower one lambda unit: the lambda's body under its owner's tables, as a function of
-/// `(env, params..)`. Its params bind the resolver slots the owner's body gave them, and
-/// its return type is the unit's (a lambda's missing `-> R` is inferred, not unit, so
-/// `returnType`/`paramType` do not apply).
+/// Lower one lambda unit: the lambda's (or local fn's) body under its owner's tables, as a
+/// function of `(env, params..)`. Its params bind the resolver slots the owner's body gave
+/// them, and its return type is the unit's (a lambda's missing `-> R` is inferred, not
+/// unit, so `returnType`/`paramType` do not apply).
 pub fn lowerLambda(
     gpa: std.mem.Allocator,
     in: Inputs,
@@ -425,6 +425,7 @@ pub fn lowerLambda(
     const lam = in.tree.nodes[unit.node.int()];
     const blocks = try openBodyBlocks(&b, unit.sig.ret);
     try bindCaptures(&b, unit, env_slot);
+    if (unit.self_slot) |ss| try bindSelf(&b, unit, ss, env_slot);
     try boxParams(&b, unit.param_slots, params.items[1..], lam.main_token);
     try lowerBodyInto(&b, lam.rhs, unit.sig.ret, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
@@ -456,6 +457,15 @@ fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) erro
         const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
         try copyCapture(b, dst, src, es.ty, tok);
     }
+}
+
+/// A local fn's prologue: its own name reads as the pair of its code and the env it was
+/// called with, which is exactly the value its caller holds, so recursion needs no capture.
+fn bindSelf(b: *Builder, unit: Closure.LambdaUnit, self_slot: u32, env_slot: Ir.SlotId) error{OutOfMemory}!void {
+    const env_sa = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
+    const env = try b.emit(.{ .load = .{ .addr = env_sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
+    const pair = try emitFnPair(b, unit.name, b.in.node_types[unit.node.int()], env);
+    try b.local_slots.put(b.gpa, self_slot, pair.slot);
 }
 
 pub const BodyBlocks = struct { entry: Ir.BlockId, exit: Ir.BlockId };
@@ -626,6 +636,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .for_in_stmt => try lowerForIn(b, stmt_idx, null),
         .for_in2_stmt => try lowerForIn2(b, stmt_idx, null),
         .labeled => try lowerLabeledStmt(b, stmt_idx),
+        .local_fn => try lowerLocalFn(b, stmt_idx),
         .break_stmt => try lowerBreak(b, stmt_idx),
         .continue_stmt => try lowerContinue(b, stmt_idx),
         // A poison leaf must never reach lower: a tainted tree is gated out before
@@ -633,6 +644,16 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .error_node => unreachable,
         else => try b.note(stmt.main_token, "statement unsupported in lower"),
     }
+}
+
+/// `fn name(..) { .. }` in a block: make its closure like a lambda's, and let the pair's
+/// slot be the name's home. Nothing assigns a local fn, so it is never boxed.
+fn lowerLocalFn(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
+    const v = try lowerLambdaValue(b, stmt_idx, b.in.node_types[(stmt_idx).int()]);
+    const res = b.in.resolutions[(stmt_idx).int()];
+    if (v != .slot or res != .local) return;
+    std.debug.assert(!b.isBoxedLocal(res.local));
+    try b.local_slots.put(b.gpa, res.local, v.slot);
 }
 
 /// Store the value of `expr` into `slot`. A scalar emits a store; an aggregate
@@ -6568,4 +6589,81 @@ test "a protocol callee reaching lower is a note, not UB" {
     defer lowered.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), lowered.notes.len);
     try testing.expectEqualStrings("protocol callee in lower", lowered.notes[0]);
+}
+
+test "a local fn's prologue materializes its self value" {
+    const gpa = testing.allocator;
+    const src =
+        \\fn f() -> int {
+        \\ fn down(n: int) -> int { if n <= 0 { 0 } else { down(n - 1) } }
+        \\ return down(3)
+        \\}
+        \\
+    ;
+    const unit_ir = try renderLambdaG(gpa, src, "main.f$l0");
+    defer gpa.free(unit_ir);
+    // `down` is s2: the pair of the unit's own code and the env it was called with, so the
+    // recursive call is an ordinary value call.
+    try testing.expectEqualStrings(
+        \\fn main.f$l0(s0, s1) -> int {
+        \\  slots: s0:rawptr s1:int s2:fn$int$int
+        \\b0:
+        \\  %1 = slot_addr s0
+        \\  %2 = load %1 : rawptr
+        \\  %3 = slot_addr s2
+        \\  %4 = fn_addr @main.f$l0
+        \\  store %3, %4 : int
+        \\  %5 = field_addr %3, 8 : rawptr
+        \\  store %5, %2 : rawptr
+        \\  %7 = slot_addr s1
+        \\  %8 = load %7 : int
+        \\  %9 = iconst 0
+        \\  %10 = icmp le %8, %9
+        \\  cond_br %10, b2, b3
+        \\b1(%0:int):
+        \\  ret %0
+        \\b2:
+        \\  %11 = iconst 0
+        \\  br b4(%11)
+        \\b3:
+        \\  %12 = slot_addr s2
+        \\  %13 = load %12 : int
+        \\  %14 = field_addr %12, 8 : rawptr
+        \\  %15 = load %14 : rawptr
+        \\  %16 = slot_addr s1
+        \\  %17 = load %16 : int
+        \\  %18 = iconst 1
+        \\  %19 = sub %17, %18
+        \\  %20 = call_indirect %13(%15, %19)
+        \\  br b4(%20)
+        \\b4(%6:int):
+        \\  br b1(%6)
+        \\}
+        \\
+    , unit_ir);
+    // The owner makes the closure straight into the name's home slot, s0.
+    const owner_ir = try renderLoweredG(gpa, src, "f");
+    defer gpa.free(owner_ir);
+    try testing.expectEqualStrings(
+        \\fn main.f() -> int {
+        \\  slots: s0:fn$int$int
+        \\b0:
+        \\  %1 = slot_addr s0
+        \\  %2 = fn_addr @main.f$l0
+        \\  store %1, %2 : int
+        \\  %3 = field_addr %1, 8 : rawptr
+        \\  %4 = iconst 0
+        \\  store %3, %4 : rawptr
+        \\  %5 = slot_addr s0
+        \\  %6 = load %5 : int
+        \\  %7 = field_addr %5, 8 : rawptr
+        \\  %8 = load %7 : rawptr
+        \\  %9 = iconst 3
+        \\  %10 = call_indirect %6(%8, %9)
+        \\  br b1(%10)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    , owner_ir);
 }

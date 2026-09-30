@@ -62,7 +62,7 @@ pub const Describer = struct {
                 .identifier => if (resolutions[i] == .local) {
                     local = true;
                 },
-                .var_decl, .pattern_binding, .for_stmt, .for_in_stmt, .for_in2_stmt => local = true,
+                .var_decl, .pattern_binding, .for_stmt, .for_in_stmt, .for_in2_stmt, .local_fn => local = true,
                 .fn_decl, .param, .field_init, .struct_decl, .enum_decl, .protocol_decl, .enum_variant_unit, .enum_variant_tuple, .enum_variant_struct, .enum_init_unit, .enum_init_tuple, .enum_init_struct, .pattern_variant => {
                     if (decl == null) decl = @intCast(i);
                 },

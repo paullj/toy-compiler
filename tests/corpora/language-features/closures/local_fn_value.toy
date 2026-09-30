@@ -1,0 +1,21 @@
+# Feature: a local fn is a value: passed to a generic higher-order fn, stored in a Vec, and compared
+# expect: exit 47
+import std/vec
+
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+
+fn main() -> int {
+    offset := 3
+    fn add(n: int) -> int { n + offset }
+    fn neg(n: int) -> int { 0 - n }
+    fs: Vec[fn(int) -> int] = []
+    fs.push(add)
+    fs.push(neg)
+    fs.push(add)
+    total := 0
+    for i in 0..fs.len() { total = total + fs[i](10) }
+    # total = 13 - 10 + 13 = 16; apply(add, 30) = 33
+    g := add
+    same := if g == add { 1 } else { 0 }
+    return total + apply(add, 30) - same - 1
+}

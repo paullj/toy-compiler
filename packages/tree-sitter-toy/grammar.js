@@ -103,6 +103,16 @@ module.exports = grammar({
         optional($.block),
       ),
 
+    _local_function_declaration: ($) =>
+      seq(
+        "fn",
+        field("name", $.identifier),
+        optional($.type_parameters),
+        $.parameter_list,
+        optional(seq("->", field("return_type", $._type))),
+        $.block,
+      ),
+
     type_parameters: ($) => seq("[", commaList($.type_parameter), "]"),
 
     type_parameter: ($) =>
@@ -214,6 +224,10 @@ module.exports = grammar({
     _statement: ($) =>
       seq(
         choice(
+          // A local `fn name(..) { .. }`; LR(1) splits it from a lambda on the token after
+          // `fn`. Its body is required, so a bodyless signature cannot swallow a following
+          // block statement.
+          alias($._local_function_declaration, $.function_declaration),
           $.let_declaration,
           $.assignment,
           $.return_statement,

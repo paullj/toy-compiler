@@ -1,0 +1,16 @@
+# Feature: a local fn that assigns a captured counter shares it through a box, with the owner and with other closures
+# expect: exit 23
+fn main() -> int {
+    count := 0
+    fn bump(by: int) {
+        count = count + by
+    }
+    bump(1)
+    bump(2)
+    later := fn() { bump(10) }
+    later()
+    count = count + 10
+    fn read() -> int { count }
+    # 1 + 2 + 10 + 10 = 23
+    return read()
+}

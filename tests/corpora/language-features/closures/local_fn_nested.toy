@@ -1,0 +1,23 @@
+# Feature: a local fn declared in a local fn, a lambda calling a local fn, and a local fn in a lambda
+# expect: exit 84
+fn walk(depth: int) -> int {
+    step := 2
+    fn down(n: int) -> int {
+        fn twice(m: int) -> int { m * step }
+        if n <= 0 { 0 } else { twice(n) + down(n - 1) }
+    }
+    # down(3) = 6 + 4 + 2
+    via := fn(k: int) -> int { down(k) + depth }
+    return via(3)
+}
+
+fn main() -> int {
+    make := fn(x: int) -> int {
+        fn sq(v: int) -> int { v * v }
+        sq(x) + sq(x - 1)
+    }
+    # walk(4) = 12 + 4; make(6) = 36 + 25; plus 7 more from a local fn named in a nested lambda
+    fn seven() -> int { 7 }
+    outer := fn() -> fn() -> int { fn() { seven() } }
+    return walk(4) + make(6) + outer()()
+}

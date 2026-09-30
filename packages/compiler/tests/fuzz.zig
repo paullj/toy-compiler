@@ -387,7 +387,7 @@ fn genBlock(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, d
 fn genStmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, depth: usize) error{OutOfMemory}!void {
     // Cap nesting so control-flow bodies stay bounded (the parser has its own depth
     // guard, but keeping the generator shallow avoids gigantic buffers).
-    const kind = if (depth >= max_gen_depth) rand.uintLessThan(u8, 3) else rand.uintLessThan(u8, 7);
+    const kind = if (depth >= max_gen_depth) rand.uintLessThan(u8, 3) else rand.uintLessThan(u8, 8);
     switch (kind) {
         0 => { // binding
             try out.appendSlice(gpa, pick(idents, rand));
@@ -446,6 +446,16 @@ fn genStmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
             try out.appendSlice(gpa, " }(");
             try genExpr(gpa, out, rand, 0);
             try out.append(gpa, ')');
+        },
+        7 => { // a recursive local fn
+            const name = pick(idents, rand);
+            try out.appendSlice(gpa, "fn ");
+            try out.appendSlice(gpa, name);
+            try out.appendSlice(gpa, "(n: int) -> int { if n < 1 { ");
+            try genExpr(gpa, out, rand, 0);
+            try out.appendSlice(gpa, " } else { ");
+            try out.appendSlice(gpa, name);
+            try out.appendSlice(gpa, "(n - 1) } }");
         },
         else => unreachable,
     }
