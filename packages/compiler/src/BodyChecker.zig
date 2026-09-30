@@ -263,9 +263,12 @@ pub const BodyChecker = struct {
     ret_infer: bool = false,
     ret_join: Type = .never,
     /// The local slots a `mut self` method call writes through (the root of its receiver
-    /// place), recorded only in a fn with lambdas: a capture of one is a copy that would
-    /// miss the write.
+    /// place), recorded only in a fn with lambdas: a captured one must be boxed like an
+    /// assigned one.
     mutself_roots: std.ArrayList(u32) = .empty,
+    /// This body's boxed locals, ascending: filled by `classifyCaptures` at the end of the
+    /// walk and moved out by the caller.
+    boxed: std.ArrayList(u32) = .empty,
 
     // Local diagnostic sink (merged into the shared result by the Pass-C driver).
     // Its scope is set once in `bodyCheckerFor` to the fn's owning module (graph)
@@ -353,6 +356,7 @@ pub const BodyChecker = struct {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
         bc.mutself_roots.deinit(bc.gpa);
+        bc.boxed.deinit(bc.gpa);
         bc.sink.deinit();
         bc.derive_reqs.deinit(bc.gpa);
         bc.descriptor_reqs.deinit(bc.gpa);
@@ -382,17 +386,18 @@ pub const BodyChecker = struct {
         if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
             try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
-        try bc.reportCaptures(proto);
+        try bc.classifyCaptures(proto);
     }
 
-    /// A closure copies each capture when it is made, which is sound only for a local that
-    /// nothing assigns: a captured local that is assigned (`x = ..`, a place store rooted at
-    /// it, a `mut self` call on it) is an error, reported once at its first captured use in
-    /// source order. So is any capture of a `mut self` receiver, whose slot holds the
-    /// caller's address rather than the value. A bounded template's abstract check skips
-    /// this: each instance re-check reports (the sink dedups the repeats), and a template
-    /// that reported here would be poisoned.
-    fn reportCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
+    /// Decide how each captured local is held. A closure copies a capture when it is made,
+    /// which is sound only for a local that nothing assigns; a captured local that is
+    /// assigned (`x = ..`, a place store rooted at it, a `mut self` call on it) is boxed
+    /// instead, into `bc.boxed`. A `mut self` receiver's slot holds the caller's address, not
+    /// a value a cell could hold, so any capture of it is an error, reported at its first
+    /// captured use in source order. A bounded template's abstract check skips this: each
+    /// instance re-check decides for itself (the sink dedups repeated reports), and a
+    /// template that reported here would be poisoned.
+    fn classifyCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
         if (bc.abstract_template) return;
         const fc = bc.closures orelse return;
         const mut_recv = proto.params.len > 0 and Ast.isMutParam(bc.tree, bc.tokens, proto.params[0]);
@@ -406,14 +411,14 @@ pub const BodyChecker = struct {
         defer seen.deinit(bc.gpa);
         for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
             if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
-            const use = bc.tree.nodes[c.first_use.int()];
-            const name = bc.nameText(use.main_token);
             if (mut_recv and c.slot == 0) {
-                try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{name});
+                const use = bc.tree.nodes[c.first_use.int()];
+                try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{bc.nameText(use.main_token)});
             } else if (Closure.contains(fc.assigned, c.slot) or Closure.contains(bc.mutself_roots.items, c.slot)) {
-                try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "'{s}' is captured by a closure and assigned; closures cannot capture assigned variables yet", .{name});
+                try bc.boxed.append(bc.gpa, c.slot);
             }
         };
+        std.mem.sort(u32, bc.boxed.items, {}, std.sort.asc(u32));
     }
 
     /// Record the local a `mut self` call writes through: the root of its receiver place.

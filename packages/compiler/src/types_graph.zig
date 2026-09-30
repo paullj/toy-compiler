@@ -1069,6 +1069,113 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
     try testing.expectEqual(serial_n, parallel_n);
 }
 
+fn ownerClosuresUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_owners: *usize) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
+    defer tr.deinit(gpa);
+    for (tr.diags) |d| try testing.expect(d.severity != .err);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (tr.owner_closures) |oc| {
+        // A `_u` body boxes `total`, `s`, `c` and the for-in `x`; a `keep` instance its `x`.
+        switch (oc.owner) {
+            .base => |gid| {
+                try testing.expectEqual(@as(usize, 4), oc.boxed.len);
+                try out.print(gpa, "b{d}:", .{gid});
+            },
+            .instance => |k| {
+                try testing.expectEqualSlices(u32, &.{0}, oc.boxed);
+                try out.print(gpa, "i{s}:", .{tr.instances[k].name.?});
+            },
+        }
+        for (oc.boxed) |sl| try out.print(gpa, "{d},", .{sl});
+    }
+    for (tr.lambda_units) |u| {
+        try out.appendSlice(gpa, u.name);
+        for (u.env) |es| try out.print(gpa, "({d} {s} {d})", .{ es.slot, @tagName(es.mode), es.off });
+    }
+    n_owners.* = tr.owner_closures.len;
+    return out.toOwnedSlice(gpa);
+}
+
+test "owner_closures are identical at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-owner-closures-jn";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // More bodies than the Pass-C fan-out threshold, each boxing through an assignment, a
+    // field store, a `mut self` call and a for-in variable (and copying a read-only
+    // capture); the generic `keep` boxes its param in each instance.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll(
+        \\import std/vec
+        \\pub struct C { n: int }
+        \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
+        \\fn keep[T](x: T, y: T) -> T {
+        \\    set := fn() { x = y }
+        \\    set()
+        \\    x
+        \\}
+        \\
+    );
+    for (0..70) |k| try src.writer.print(
+        \\pub struct S{d} {{ v: int }}
+        \\fn _u{d}() -> int {{
+        \\    total := {d}
+        \\    ro := 1
+        \\    s := S{d} {{ v: 0 }}
+        \\    c := C {{ n: 0 }}
+        \\    add := fn(v: int) {{
+        \\        total = total + v + ro
+        \\        s.v = v
+        \\        c.bump()
+        \\    }}
+        \\    xs: Vec[int] = [1, 2]
+        \\    fs: Vec[fn() -> int] = []
+        \\    for x in xs {{ fs.push(fn() {{
+        \\        x = x + 1
+        \\        x
+        \\    }}) }}
+        \\    add(1)
+        \\    total + s.v + c.n + fs[0]() + keep({d}, 1) + keep(S{d} {{ v: 1 }}, s).v
+        \\}}
+        \\
+    , .{ k, k, k, k, k, k });
+    try src.writer.writeAll("fn main() -> int { return 0 }\n");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+
+    var serial_n: usize = 0;
+    var parallel_n: usize = 0;
+    const serial = try ownerClosuresUnder(gpa, &graph, &r, .limited(0), &serial_n);
+    defer gpa.free(serial);
+    const parallel = try ownerClosuresUnder(gpa, &graph, &r, .limited(8), &parallel_n);
+    defer gpa.free(parallel);
+    try testing.expectEqualSlices(u8, serial, parallel);
+    // Every `_u` body, plus the `keep` instances (int and each S{k}).
+    try testing.expectEqual(@as(usize, 70 + 71), serial_n);
+    try testing.expectEqual(serial_n, parallel_n);
+}
+
 test "push on a captured Vec is not a mutation" {
     try withCheckedGraph(".toy-test-capture-vec-push", &.{
         .{ .path = "main.toy", .source =

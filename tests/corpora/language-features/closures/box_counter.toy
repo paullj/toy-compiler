@@ -1,0 +1,18 @@
+# Feature: a closure that assigns a captured local shares it through a box, so each call sees the last one's write
+# expect: exit 2
+fn counter() -> fn() -> int {
+    n := 0
+    fn() {
+        n = n + 1
+        n
+    }
+}
+
+fn main() -> int {
+    next := counter()
+    other := counter()
+    next()
+    # Each call of counter() boxes its own n.
+    if other() != 1 { return 100 }
+    return next()
+}

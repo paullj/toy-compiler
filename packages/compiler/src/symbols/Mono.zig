@@ -78,6 +78,9 @@ pub const Instance = struct {
     /// (warm cache preserved). The OUTER slice + each entry's `witness_syms` outer
     /// slice are OWNED by the owning `GraphResult`; see `ResolvedConformance`.
     conformances: []const ResolvedConformance = &.{},
+    /// This instance's boxed locals (see `Closure.OwnerClosure`), ascending; owned. Each
+    /// instance computes its own: a `mut self` pick, and so a box, can differ per args.
+    boxed: []const u32 = &.{},
 };
 
 /// A generic template's inference facts, supplied by the caller's read-only view

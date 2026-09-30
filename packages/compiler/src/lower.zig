@@ -127,6 +127,9 @@ pub const ClosureInputs = struct {
     /// The body being lowered, as the owner of the lambdas written in it (a lambda unit
     /// lowers under its owner's). Null for a unit with no source body.
     owner: ?Closure.Owner = null,
+    /// The owner's boxed locals (resolver slots, ascending): each lives in a GC cell for its
+    /// whole lifetime, in the owner and in every lambda unit of it.
+    boxed: []const u32 = &.{},
 
     pub const none: ClosureInputs = .{ .adapters = &.{}, .lambda_units = &.{} };
 };
@@ -159,12 +162,15 @@ pub const Builder = struct {
     /// The exit block's param value (or `none_value` for a unit function).
     ret_param: Ir.ValueId = Ir.none_value,
 
-    /// The slot holding the `mut self` receiver's ADDRESS, or `none_slot` for
-    /// any non-mut fn. A mut-self param slot is typed `int` (an 8B pointer) rather
-    /// than the struct, so its scalar/1-GPR ABI carries the caller's slot address;
-    /// `rootAddr` loads through it so `self`/`self.f` reach the caller's storage.
-    /// `none_slot` never equals a live slot id, so every non-mut fn is byte-identical.
+    /// The ADDRESS slots: a slot that holds a pointer to a local's storage rather than the
+    /// local itself, which `rootAddr` loads through so every use reaches that storage.
+    /// There are two kinds. `mut_self_slot` is the `mut self` receiver (or `none_slot`): its
+    /// param slot is typed `int` rather than the struct, so the scalar/1-GPR ABI carries
+    /// the caller's slot address. `addr_slots` holds each boxed local's slot: typed `rawptr`,
+    /// so the precise root map keeps the local's GC cell alive. A body with neither has no
+    /// address slot, and every slot access takes today's direct path.
     mut_self_slot: Ir.SlotId = Ir.none_slot,
+    addr_slots: std.AutoHashMapUnmanaged(Ir.SlotId, void) = .empty,
 
     /// resolutions[].local index → the IR slot bound to that local. Allocated
     /// lazily the first time a local is touched (so id order tracks source order).
@@ -207,7 +213,23 @@ pub const Builder = struct {
         for (b.literals.items) |l| b.gpa.free(l.bytes);
         b.literals.deinit(b.gpa);
         b.local_slots.deinit(b.gpa);
+        b.addr_slots.deinit(b.gpa);
         b.loops.deinit(b.gpa);
+    }
+
+    /// Whether `sid` holds a pointer to its local's storage (see `mut_self_slot`).
+    fn isAddrSlot(b: *const Builder, sid: Ir.SlotId) bool {
+        return sid == b.mut_self_slot or b.isBoxSlot(sid);
+    }
+
+    /// Whether `sid` holds a boxed local's cell pointer.
+    fn isBoxSlot(b: *const Builder, sid: Ir.SlotId) bool {
+        return b.addr_slots.count() != 0 and b.addr_slots.contains(sid);
+    }
+
+    /// Whether resolver local `li` is one of the owner's boxed locals.
+    fn isBoxedLocal(b: *const Builder, li: u32) bool {
+        return Closure.contains(b.in.closure.boxed, li);
     }
 
     /// Register a decoded string literal (content-hash keyed; deduped within the
@@ -364,7 +386,14 @@ pub fn lowerFn(
         try b.local_slots.put(gpa, @intCast(i), sid);
     }
 
-    const blocks = try lowerBodyBlocks(&b, decl.rhs, ret_type);
+    const blocks = try openBodyBlocks(&b, ret_type);
+    if (b.in.closure.boxed.len != 0) {
+        const lis = try gpa.alloc(u32, params.items.len);
+        defer gpa.free(lis);
+        for (lis, 0..) |*li, i| li.* = @intCast(i);
+        try boxParams(&b, lis, params.items, decl.main_token);
+    }
+    try lowerBodyInto(&b, decl.rhs, ret_type, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
 
@@ -393,22 +422,34 @@ pub fn lowerLambda(
         try params.append(gpa, sid);
         try b.local_slots.put(gpa, li, sid);
     }
-    const body = in.tree.nodes[unit.node.int()].rhs;
+    const lam = in.tree.nodes[unit.node.int()];
     const blocks = try openBodyBlocks(&b, unit.sig.ret);
     try bindCaptures(&b, unit, env_slot);
-    try lowerBodyInto(&b, body, unit.sig.ret, blocks.exit);
+    try boxParams(&b, unit.param_slots, params.items[1..], lam.main_token);
+    try lowerBodyInto(&b, lam.rhs, unit.sig.ret, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
 
 /// A lambda unit's prologue: copy each capture out of the env into a local slot of its
 /// own and bind the owner's slot to it, so the body (and any lambda nested in it, which
-/// copies from these slots in turn) reads captures like any local.
+/// copies from these slots in turn) reads captures like any local. A boxed capture's slot
+/// is an address slot holding the cell pointer instead, shared with the owner.
 fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) error{OutOfMemory}!void {
     if (unit.env_size == 0) return;
     const tok = b.in.tree.nodes[unit.node.int()].main_token;
     const env_sa = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
     const env = try b.emit(.{ .load = .{ .addr = env_sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
     for (unit.env) |es| {
+        if (es.mode == .box) {
+            const sid = try b.addSlot(Typecheck.Type.rawptr);
+            try b.addr_slots.put(b.gpa, sid, {});
+            try b.local_slots.put(b.gpa, es.slot, sid);
+            const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
+            const cell = try b.emit(.{ .load = .{ .addr = src, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
+            const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+            _ = try b.emit(.{ .store = .{ .addr = dst, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
+            continue;
+        }
         const sid = try b.addSlot(es.ty);
         try b.local_slots.put(b.gpa, es.slot, sid);
         const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
@@ -417,19 +458,11 @@ fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) erro
     }
 }
 
-const BodyBlocks = struct { entry: Ir.BlockId, exit: Ir.BlockId };
-
-/// Open the entry block (b0) and the single EXIT block, whose one param is the return
-/// value (none for a unit function), then lower `body` into them.
-fn lowerBodyBlocks(b: *Builder, body: Ast.Index, ret_type: Typecheck.Type) error{OutOfMemory}!BodyBlocks {
-    const blocks = try openBodyBlocks(b, ret_type);
-    try lowerBodyInto(b, body, ret_type, blocks.exit);
-    return blocks;
-}
+pub const BodyBlocks = struct { entry: Ir.BlockId, exit: Ir.BlockId };
 
 /// Open the entry block (b0, left current) and the single EXIT block, whose one param is
 /// the return value (none for a unit function).
-fn openBodyBlocks(b: *Builder, ret_type: Typecheck.Type) error{OutOfMemory}!BodyBlocks {
+pub fn openBodyBlocks(b: *Builder, ret_type: Typecheck.Type) error{OutOfMemory}!BodyBlocks {
     const entry = try b.addBlock();
     b.switchTo(entry);
     const exit = try b.addBlock();
@@ -514,9 +547,11 @@ pub fn finishFn(
     // loop stack) here; slots/values/blocks/params/literals have moved into the result.
     b.blocks.deinit(gpa);
     b.local_slots.deinit(gpa);
+    b.addr_slots.deinit(gpa);
     b.loops.deinit(gpa);
     b.blocks = .empty;
     b.local_slots = .empty;
+    b.addr_slots = .empty;
     b.loops = .empty;
     b.slots = .empty;
     b.values = .empty;
@@ -548,8 +583,9 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
     switch (stmt.tag) {
         .var_decl => {
-            const slot = try localSlot(b, stmt_idx, b.in.node_types[(stmt_idx).int()]);
-            try storeInto(b, slot, stmt.lhs, b.in.node_types[(stmt_idx).int()]);
+            const ty = b.in.node_types[(stmt_idx).int()];
+            const slot = if (boxedBinding(b, stmt_idx)) |li| try bindBox(b, li, ty) else try localSlot(b, stmt_idx, ty);
+            try storeInto(b, slot, stmt.lhs, ty);
         },
         .assign => {
             const target = b.in.tree.nodes[(stmt.lhs).int()];
@@ -561,10 +597,11 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 try lowerFieldStore(b, stmt.lhs, stmt.rhs, place_ty);
                 return;
             }
-            const slot = try localSlot(b, stmt.lhs, place_ty);
+            const slot = try bindingSlot(b, stmt.lhs, place_ty);
             // Whole-`self` reassignment inside a `mut self` method (`self = expr`): the
             // slot holds a POINTER, so produce the RHS through it into the caller's
-            // storage rather than overwriting the local pointer.
+            // storage rather than overwriting the local pointer. A boxed local's store goes
+            // through its cell in `storeInto`.
             if (slot == b.mut_self_slot) {
                 try lowerExprInto(b, stmt.rhs, try rootAddr(b, slot), place_ty);
                 return;
@@ -608,16 +645,16 @@ fn storeInto(b: *Builder, slot: Ir.SlotId, expr: Ast.Index, ty: Typecheck.Type) 
     switch (passKind(b, ty)) {
         .box => {
             const v = try lowerExpr(b, expr);
-            const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            const addr = try valueAddr(b, slot);
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = operandValue(v), .ty = Typecheck.Type.int } }, null);
         },
         .int, .bool, .float, .rawptr => {
             const v = try lowerExpr(b, expr);
-            const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            const addr = try valueAddr(b, slot);
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = operandValue(v), .ty = ty } }, null);
         },
         .str, .@"struct", .@"enum" => {
-            const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            const dst = try valueAddr(b, slot);
             try lowerExprInto(b, expr, dst, ty);
         },
         .unit => {
@@ -739,24 +776,25 @@ fn lowerStrLiteral(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Opera
 
 fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     if (fnValueRef(b, node_idx)) |gid| return try lowerFnValue(b, node_idx, gid, ty);
-    const slot = try localSlot(b, node_idx, ty);
+    const slot = try bindingSlot(b, node_idx, ty);
     // A managed box reads as an 8-byte scalar cell pointer (its own value), not by slot.
     switch (passKind(b, ty)) {
         .box => {
-            const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            const addr = try valueAddr(b, slot);
             return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) };
         },
         .int, .bool, .float, .rawptr => {
-            const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+            const addr = try valueAddr(b, slot);
             const v = try b.emit(.{ .load = .{ .addr = addr, .ty = ty } }, ty);
             return .{ .value = v };
         },
         .str, .@"struct", .@"enum" => {
-            // Whole-`self` value read inside a `mut self` method (`return self`, or
-            // passing `self` by value): the slot holds a POINTER, not the struct, so
-            // copy the pointee into a fresh temp and yield that. An ordinary
-            // aggregate local is passed by slot directly (no copy).
-            if (slot == b.mut_self_slot) {
+            // A whole-value read of a local held through an address slot (`return self` or
+            // passing `self` by value in a `mut self` method; any read of a boxed local):
+            // the slot holds a POINTER, not the value, so copy the pointee into a fresh
+            // temp and yield that. An ordinary aggregate local is passed by slot directly
+            // (no copy).
+            if (b.isAddrSlot(slot)) {
                 const tmp = try b.addSlot(ty);
                 const dst = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
                 _ = try b.emit(.{ .copy = .{ .dst = dst, .src = try rootAddr(b, slot), .ty = ty } }, null);
@@ -1859,16 +1897,6 @@ pub fn slotOperand(b: *Builder, slot: Ir.SlotId, ty: Typecheck.Type) error{OutOf
     }
 }
 
-/// The exit block's param type for a fn returning `ret`, or null when it returns no
-/// value (the `lowerFn` rule: a managed box returns as its 8-byte cell pointer).
-pub fn exitParamType(b: *Builder, ret: Typecheck.Type) ?Typecheck.Type {
-    if (ret.kind == .unit or ret.kind == .never) return null;
-    return switch (passKind(b, ret)) {
-        .box => box_repr_ty,
-        else => ret,
-    };
-}
-
 /// Whether `t` is a by-slot aggregate for lowering (str/struct/enum), EXCLUDING a
 /// managed-box handle (`Ref`/`gc_array`), which is a scalar 8-byte cell pointer.
 fn isAggTy(b: *Builder, t: Typecheck.Type) bool {
@@ -2515,8 +2543,9 @@ fn lowerFnValue(b: *Builder, node_idx: Ast.Index, gid: u32, ty: Typecheck.Type) 
 }
 
 /// A lambda in value position: the pair `{its unit's address, env}`. A capturing lambda
-/// allocates its env cell first, then copies each capture's current value in at the
-/// table's offset; a capture-free one carries a null env.
+/// allocates its env cell first, then stores each capture in at the table's offset: a
+/// copy of its current value, or for a boxed local the pointer to its cell. A
+/// capture-free one carries a null env.
 fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const n = b.in.tree.nodes[(node_idx).int()];
     const owner = b.in.closure.owner orelse {
@@ -2535,6 +2564,17 @@ fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
             try b.note(n.main_token, "captured local has no slot in lower");
             continue;
         };
+        if (es.mode == .box) {
+            if (!b.isBoxSlot(sid)) {
+                try b.note(n.main_token, "boxed capture has no cell in lower");
+                continue;
+            }
+            const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
+            const sa = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+            const cell = try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
+            _ = try b.emit(.{ .store = .{ .addr = dst, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
+            continue;
+        }
         const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
         try copyCapture(b, dst, try rootAddr(b, sid), es.ty, n.main_token);
     }
@@ -3264,15 +3304,25 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
 }
 
 /// The address of a slot's CONTENTS. For an ordinary slot that is `slot_addr(slot)`.
-/// For the `mut self` receiver slot the slot holds a POINTER to the caller's
-/// place, so the address of the receiver's storage is that pointer — a `load` of
-/// `slot_addr(slot)`. Every non-mut fn has `mut_self_slot == none_slot`, which no
-/// live slot equals, so this collapses to a bare `slot_addr` (byte-identical).
+/// An address slot holds a POINTER to the storage instead, so the address is that
+/// pointer, a `load` of `slot_addr(slot)`: typed `int` for the `mut self` receiver (the
+/// caller's slot), `rawptr` for a box (a GC cell, so the loaded pointer is a root too).
+/// A body with no address slot always takes the bare `slot_addr`.
 fn rootAddr(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
     const sa = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
     if (slot == b.mut_self_slot)
         return try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+    if (b.isBoxSlot(slot))
+        return try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
     return sa;
+}
+
+/// The address a local's value is read from or stored to where the local is a plain
+/// slot: `slot_addr(slot)`, or its cell for a boxed local. (The `mut self` receiver is
+/// an aggregate and goes through `rootAddr` at each aggregate site.)
+fn valueAddr(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
+    if (b.isBoxSlot(slot)) return try rootAddr(b, slot);
+    return try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
 }
 
 /// The ptr VALUE of a LOCAL-ROOTED place (`p`, `p.x`, `p.a.b`): a slot_addr at the
@@ -3283,7 +3333,7 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
     switch (n.tag) {
         .identifier => {
             if (b.in.resolutions[(node_idx).int()] != .local) return Ir.none_value;
-            const slot = try localSlot(b, node_idx, b.in.node_types[(node_idx).int()]);
+            const slot = try bindingSlot(b, node_idx, b.in.node_types[(node_idx).int()]);
             return try rootAddr(b, slot);
         },
         // A `*r` place: the address of the boxed `T` is the cell pointer, i.e. the Ref's
@@ -3808,9 +3858,9 @@ fn testPattern(b: *Builder, pat_idx: Ast.Index, base: Ir.SlotId, off: u32, val_t
 /// (e.g. an unused field) is a no-op.
 fn bindLeaf(b: *Builder, bind_idx: Ast.Index, base: Ir.SlotId, off: u32, ty: Typecheck.Type) error{OutOfMemory}!void {
     if (b.in.resolutions[(bind_idx).int()] != .local) return;
-    const dst_slot = try localSlot(b, bind_idx, ty);
+    const dst_slot = if (boxedBinding(b, bind_idx)) |li| try bindBox(b, li, ty) else try localSlot(b, bind_idx, ty);
     const src = try slotFieldAddr(b, base, off, ty);
-    const dst = try b.emit(.{ .slot_addr = dst_slot }, Typecheck.Type.int);
+    const dst = try valueAddr(b, dst_slot);
     switch (ty.kind) {
         .int, .bool, .float => {
             const v = try b.emit(.{ .load = .{ .addr = src, .ty = ty } }, ty);
@@ -3962,7 +4012,11 @@ fn lowerWhile(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
 fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
     const h = Ast.forHeaderAt(b.in.tree, (stmt.rhs).int());
-    const islot = try localSlot(b, stmt_idx, Typecheck.Type.int);
+    // A boxed `i` needs a fresh cell per iteration (a closure keeps the one it captured), so
+    // the induction slot is then a hidden counter: each iteration copies it into a new cell,
+    // and `inc` copies the cell back first, so assigning `i` still steers the loop.
+    const boxed_li = boxedBinding(b, stmt_idx);
+    const islot = if (boxed_li != null) try b.addSlot(Typecheck.Type.int) else try localSlot(b, stmt_idx, Typecheck.Type.int);
 
     // i := lo
     const lo = operandValue(try lowerExpr(b, h.lo));
@@ -3985,12 +4039,24 @@ fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMem
     b.setTerm(.{ .cond_br = .{ .cond = cmp, .t = done, .f = body } });
 
     b.switchTo(body);
+    if (boxed_li) |li| {
+        const cell = try valueAddr(b, try bindBox(b, li, Typecheck.Type.int));
+        const ca = try b.emit(.{ .slot_addr = islot }, Typecheck.Type.int);
+        const cur = try b.emit(.{ .load = .{ .addr = ca, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+        _ = try b.emit(.{ .store = .{ .addr = cell, .val = cur, .ty = Typecheck.Type.int } }, null);
+    }
     try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = inc, .merge = .none });
     try lowerBlockStmts(b, stmt.lhs);
     _ = b.loops.pop();
     if (!b.termSet()) try brTo(b, inc, .none);
 
     b.switchTo(inc);
+    if (boxed_li) |li| {
+        const cell = try valueAddr(b, b.local_slots.get(li).?);
+        const cur = try b.emit(.{ .load = .{ .addr = cell, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+        const ca = try b.emit(.{ .slot_addr = islot }, Typecheck.Type.int);
+        _ = try b.emit(.{ .store = .{ .addr = ca, .val = cur, .ty = Typecheck.Type.int } }, null);
+    }
     {
         const a = try b.emit(.{ .slot_addr = islot }, Typecheck.Type.int);
         const cur = try b.emit(.{ .load = .{ .addr = a, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
@@ -4053,7 +4119,9 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     const ol = b.in.enum_layouts[opt_ty.enum_id];
     const item_ty = Typecheck.somePayload(ol);
     const opt_slot = try b.addSlot(opt_ty);
-    const xslot = try localSlot(b, stmt_idx, item_ty);
+    // A boxed `x` gets a fresh cell per iteration instead of a slot.
+    const boxed_x = boxedBinding(b, stmt_idx);
+    const xslot = if (boxed_x != null) Ir.none_slot else try localSlot(b, stmt_idx, item_ty);
 
     const header = try b.addBlock();
     const body = try b.addBlock();
@@ -4076,9 +4144,10 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
 
     b.switchTo(body);
     {
+        const cell: ?Ir.SlotId = if (boxed_x) |li| try bindBox(b, li, item_ty) else null;
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
         const src = try addrAtOff(b, base, Typecheck.payloadAddr(ol, 0), item_ty);
-        const dst = try b.emit(.{ .slot_addr = xslot }, int_ty);
+        const dst = if (cell) |c| try valueAddr(b, c) else try b.emit(.{ .slot_addr = xslot }, int_ty);
         try copyValueByType(b, dst, src, item_ty); // AGGREGATE-safe payload copy
     }
     try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = header, .merge = .none });
@@ -4137,8 +4206,11 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
     const item_ty = Typecheck.somePayload(ol); // the reified Entry[K,V] struct
     const opt_slot = try b.addSlot(opt_ty);
     const elayout = b.in.layouts[item_ty.struct_id];
-    const kslot = try localSlot(b, stmt_idx, elayout.field_types[0]); // first binding
-    const vslot = try localSlot(b, h.val_leaf, elayout.field_types[1]); // second binding
+    // A boxed binding gets a fresh cell per iteration instead of a slot.
+    const boxed_k = boxedBinding(b, stmt_idx);
+    const boxed_v = boxedBinding(b, h.val_leaf);
+    const kslot = if (boxed_k != null) Ir.none_slot else try localSlot(b, stmt_idx, elayout.field_types[0]); // first binding
+    const vslot = if (boxed_v != null) Ir.none_slot else try localSlot(b, h.val_leaf, elayout.field_types[1]); // second binding
 
     const header = try b.addBlock();
     const body = try b.addBlock();
@@ -4161,12 +4233,16 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
 
     b.switchTo(body);
     {
+        const kcell: ?Ir.SlotId = if (boxed_k) |li| try bindBox(b, li, elayout.field_types[0]) else null;
+        const vcell: ?Ir.SlotId = if (boxed_v) |li| try bindBox(b, li, elayout.field_types[1]) else null;
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
         const payload = try addrAtOff(b, base, Typecheck.payloadAddr(ol, 0), item_ty);
         const kaddr = try addrAtOff(b, payload, elayout.offsets[0], elayout.field_types[0]);
-        try copyValueByType(b, try b.emit(.{ .slot_addr = kslot }, int_ty), kaddr, elayout.field_types[0]);
+        const kdst = if (kcell) |c| try valueAddr(b, c) else try b.emit(.{ .slot_addr = kslot }, int_ty);
+        try copyValueByType(b, kdst, kaddr, elayout.field_types[0]);
         const vaddr = try addrAtOff(b, payload, elayout.offsets[1], elayout.field_types[1]);
-        try copyValueByType(b, try b.emit(.{ .slot_addr = vslot }, int_ty), vaddr, elayout.field_types[1]);
+        const vdst = if (vcell) |c| try valueAddr(b, c) else try b.emit(.{ .slot_addr = vslot }, int_ty);
+        try copyValueByType(b, vdst, vaddr, elayout.field_types[1]);
     }
     try b.loops.append(b.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .break_bb = done, .continue_bb = header, .merge = .none });
     try lowerBlockStmts(b, h.body);
@@ -4502,15 +4578,71 @@ fn operandValue(op: Ir.Operand) Ir.ValueId {
     };
 }
 
-/// Get (or lazily bind) the IR slot for the local that `node_idx` resolves to.
-/// Param slots are pre-bound in `lowerFn`; a `:=` local / for-var is bound here
-/// the first time it is touched. Allocating in touch order keeps slot ids
-/// deterministic for a given source.
+/// Get (or lazily bind) the IR slot for the local that `node_idx` resolves to, at a site
+/// that does not know about boxes: a boxed local reaching it would be read or written as
+/// a plain slot, so that is a loud lower note rather than a miscompile.
 fn localSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
+    if (b.in.closure.boxed.len != 0) {
+        const res = b.in.resolutions[(node_idx).int()];
+        if (res == .local and b.isBoxedLocal(res.local))
+            try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "boxed local reached an unconverted slot access in lower");
+    }
+    return bindingSlot(b, node_idx, ty);
+}
+
+/// The boxed local a binding node declares, or null when it is unboxed (always, in a body
+/// without boxes).
+fn boxedBinding(b: *const Builder, node_idx: Ast.Index) ?u32 {
+    if (b.in.closure.boxed.len == 0) return null;
+    const res = b.in.resolutions[(node_idx).int()];
+    if (res != .local or !b.isBoxedLocal(res.local)) return null;
+    return res.local;
+}
+
+/// Bind boxed local `li` to a fresh zeroed GC cell sized for a `ty`, and return its
+/// address slot: a `rawptr` slot (a precise root) holding the cell pointer. A local has one
+/// address slot, which each binding of it (a loop iteration, an or-pattern alternative)
+/// points at a new cell, so every closure made so far keeps the cell it captured.
+fn bindBox(b: *Builder, li: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
+    const sid = blk: {
+        if (b.local_slots.get(li)) |s| if (b.isBoxSlot(s)) break :blk s;
+        const s = try b.addSlot(Typecheck.Type.rawptr);
+        try b.addr_slots.put(b.gpa, s, {});
+        try b.local_slots.put(b.gpa, li, s);
+        break :blk s;
+    };
+    const cell = try emitGcAlloc(b, @max(8, Abi.typeSize(ty, b.in.layouts, b.in.enum_layouts)));
+    const sa = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+    _ = try b.emit(.{ .store = .{ .addr = sa, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
+    return sid;
+}
+
+/// Move each boxed param (`lis[i]` bound to param slot `sids[i]`) into a cell of its own and
+/// rebind it there; the param slot keeps only the incoming value.
+fn boxParams(b: *Builder, lis: []const u32, sids: []const Ir.SlotId, tok: u32) error{OutOfMemory}!void {
+    if (b.in.closure.boxed.len == 0) return;
+    for (lis, sids) |li, sid| {
+        if (!b.isBoxedLocal(li)) continue;
+        const ty = b.slots.items[sid].type;
+        const cell_slot = try bindBox(b, li, ty);
+        const dst = try valueAddr(b, cell_slot);
+        const src = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+        try copyCapture(b, dst, src, ty, tok);
+    }
+}
+
+/// Get (or lazily bind) the IR slot for the local that `node_idx` resolves to. Param
+/// slots are pre-bound in `lowerFn`; a `:=` local / for-var is bound here the first time
+/// it is touched. Allocating in touch order keeps slot ids deterministic for a given
+/// source. A boxed local's slot is its address slot (bound by `bindBox`), which only a
+/// box-aware caller may take.
+fn bindingSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotId {
     const res = b.in.resolutions[(node_idx).int()];
     std.debug.assert(res == .local);
     const li = res.local;
     if (b.local_slots.get(li)) |sid| return sid;
+    if (b.in.closure.boxed.len != 0 and b.isBoxedLocal(li))
+        try b.note(b.in.tree.nodes[(node_idx).int()].main_token, "boxed local used before its cell is bound in lower");
     const sid = try b.addSlot(ty);
     try b.local_slots.put(b.gpa, li, sid);
     return sid;
@@ -4789,7 +4921,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) } },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }) },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -4862,7 +4994,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) } },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }) },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -4928,7 +5060,7 @@ fn renderLambdaG(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8)
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = Closure.ownerBoxed(tc.owner_closures, u.owner) },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -5092,6 +5224,305 @@ test "a lambda prologue copies captures into locals" {
         \\}
         \\
     , ir);
+}
+
+test "a boxed local's reads and writes go through its cell" {
+    try expectLoweredG(
+        \\fn f() -> int {
+        \\ n := 1
+        \\ g := fn() { n = n + 1 }
+        \\ g()
+        \\ n = n + 10
+        \\ return n
+        \\}
+        \\
+    , "f",
+        // `n` lives in an 8-byte cell held by the rawptr slot s0: its declaration allocates
+        // the cell first, the env stores the cell pointer (not the value), and every read
+        // and write of `n` loads the pointer.
+        \\fn main.f() -> int {
+        \\  slots: s0:rawptr s1:fn$unit s2:fn$unit
+        \\b0:
+        \\  %1 = iconst 8
+        \\  %2 = call @gc_alloc(%1)
+        \\  %3 = slot_addr s0
+        \\  store %3, %2 : rawptr
+        \\  %4 = iconst 1
+        \\  %5 = slot_addr s0
+        \\  %6 = load %5 : rawptr
+        \\  store %6, %4 : int
+        \\  %7 = slot_addr s1
+        \\  %8 = iconst 8
+        \\  %9 = call @gc_alloc(%8)
+        \\  %10 = field_addr %9, 0 : rawptr
+        \\  %11 = slot_addr s0
+        \\  %12 = load %11 : rawptr
+        \\  store %10, %12 : rawptr
+        \\  %13 = slot_addr s2
+        \\  %14 = fn_addr @main.f$l0
+        \\  store %13, %14 : int
+        \\  %15 = field_addr %13, 8 : rawptr
+        \\  store %15, %9 : rawptr
+        \\  %16 = slot_addr s2
+        \\  copy %7 <- %16 : fn$unit
+        \\  %17 = slot_addr s1
+        \\  %18 = load %17 : int
+        \\  %19 = field_addr %17, 8 : rawptr
+        \\  %20 = load %19 : rawptr
+        \\  call_indirect %18(%20)
+        \\  %21 = slot_addr s0
+        \\  %22 = load %21 : rawptr
+        \\  %23 = load %22 : int
+        \\  %24 = iconst 10
+        \\  %25 = add %23, %24
+        \\  %26 = slot_addr s0
+        \\  %27 = load %26 : rawptr
+        \\  store %27, %25 : int
+        \\  %28 = slot_addr s0
+        \\  %29 = load %28 : rawptr
+        \\  %30 = load %29 : int
+        \\  br b1(%30)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    );
+    // The lambda binds the capture as an address slot holding the pointer from its env.
+    const gpa = testing.allocator;
+    const lam = try renderLambdaG(gpa,
+        \\fn f() -> int {
+        \\ n := 1
+        \\ g := fn() { n = n + 1 }
+        \\ g()
+        \\ n = n + 10
+        \\ return n
+        \\}
+        \\
+    , "main.f$l0");
+    defer gpa.free(lam);
+    try testing.expectEqualStrings(
+        \\fn main.f$l0(s0) -> unit {
+        \\  slots: s0:rawptr s1:rawptr
+        \\b0:
+        \\  %0 = slot_addr s0
+        \\  %1 = load %0 : rawptr
+        \\  %2 = field_addr %1, 0 : rawptr
+        \\  %3 = load %2 : rawptr
+        \\  %4 = slot_addr s1
+        \\  store %4, %3 : rawptr
+        \\  %5 = slot_addr s1
+        \\  %6 = load %5 : rawptr
+        \\  %7 = load %6 : int
+        \\  %8 = iconst 1
+        \\  %9 = add %7, %8
+        \\  %10 = slot_addr s1
+        \\  %11 = load %10 : rawptr
+        \\  store %11, %9 : int
+        \\  br b1
+        \\b1:
+        \\  ret
+        \\}
+        \\
+    , lam);
+}
+
+test "a boxed for variable gets a fresh box per iteration and copies back before inc" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn f() -> int {
+        \\ s := 0
+        \\ for i in 0..3 {
+        \\  g := fn() { i = i + 1 }
+        \\  g()
+        \\  s = s + i
+        \\ }
+        \\ return s
+        \\}
+        \\
+    , "f");
+    defer gpa.free(ir);
+    // s1 is the hidden counter the header tests; the body starts by allocating a new cell
+    // for `i` (s2) and copying the counter into it.
+    try testing.expect(std.mem.indexOf(u8, ir,
+        \\  %7 = load %6 : int
+        \\  %8 = icmp ge %7, %5
+        \\  cond_br %8, b5, b3
+        \\b3:
+        \\  %9 = iconst 8
+        \\  %10 = call @gc_alloc(%9)
+        \\  %11 = slot_addr s2
+        \\  store %11, %10 : rawptr
+        \\  %12 = slot_addr s2
+        \\  %13 = load %12 : rawptr
+        \\  %14 = slot_addr s1
+        \\  %15 = load %14 : int
+        \\  store %13, %15 : int
+        \\
+    ) != null);
+    // `inc` copies the cell back into the counter before stepping it, so an assignment to
+    // `i` in the body still steers the loop.
+    try testing.expect(std.mem.indexOf(u8, ir,
+        \\b4:
+        \\  %37 = slot_addr s2
+        \\  %38 = load %37 : rawptr
+        \\  %39 = load %38 : int
+        \\  %40 = slot_addr s1
+        \\  store %40, %39 : int
+        \\  %41 = slot_addr s1
+        \\  %42 = load %41 : int
+        \\  %43 = iconst 1
+        \\  %44 = add %42, %43
+        \\
+    ) != null);
+    // One cell per iteration plus one env per iteration, both in the body.
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, ir, "call @gc_alloc("));
+}
+
+test "a read-only capture is not boxed" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\fn f() -> int {
+        \\ n := 1
+        \\ g := fn() -> int { n }
+        \\ return g()
+        \\}
+        \\
+    , "f");
+    defer gpa.free(ir);
+    // One allocation, the env; `n` is a plain int slot whose value is copied in.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "call @gc_alloc("));
+    try testing.expect(std.mem.indexOf(u8, ir, "slots: s0:int ") != null);
+    try testing.expect(std.mem.indexOf(u8, ir,
+        \\  %6 = field_addr %5, 0 : int
+        \\  %7 = slot_addr s0
+        \\  %8 = load %7 : int
+        \\  store %6, %8 : int
+        \\
+    ) != null);
+}
+
+test "mut self receiver lowering is unchanged" {
+    // A `mut self` method that also has a boxed local: `self` stays the int pointer slot
+    // s0 (loaded as int), `n` the rawptr cell slot s2 (loaded as rawptr).
+    try expectLoweredG(
+        \\struct P { x: int, y: int }
+        \\impl P {
+        \\ fn step(mut self, d: int) -> int {
+        \\  n := d
+        \\  f := fn() { n = n + 1 }
+        \\  f()
+        \\  self.x = self.x + n
+        \\  self = P { x: self.x, y: n }
+        \\  self.y
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ return p.step(3) + p.x
+        \\}
+        \\
+    , "step",
+        \\fn main.P.step(s0, s1) -> int {
+        \\  slots: s0:int s1:int s2:rawptr s3:fn$unit s4:fn$unit
+        \\b0:
+        \\  %1 = iconst 8
+        \\  %2 = call @gc_alloc(%1)
+        \\  %3 = slot_addr s2
+        \\  store %3, %2 : rawptr
+        \\  %4 = slot_addr s1
+        \\  %5 = load %4 : int
+        \\  %6 = slot_addr s2
+        \\  %7 = load %6 : rawptr
+        \\  store %7, %5 : int
+        \\  %8 = slot_addr s3
+        \\  %9 = iconst 8
+        \\  %10 = call @gc_alloc(%9)
+        \\  %11 = field_addr %10, 0 : rawptr
+        \\  %12 = slot_addr s2
+        \\  %13 = load %12 : rawptr
+        \\  store %11, %13 : rawptr
+        \\  %14 = slot_addr s4
+        \\  %15 = fn_addr @main.P.step$l0
+        \\  store %14, %15 : int
+        \\  %16 = field_addr %14, 8 : rawptr
+        \\  store %16, %10 : rawptr
+        \\  %17 = slot_addr s4
+        \\  copy %8 <- %17 : fn$unit
+        \\  %18 = slot_addr s3
+        \\  %19 = load %18 : int
+        \\  %20 = field_addr %18, 8 : rawptr
+        \\  %21 = load %20 : rawptr
+        \\  call_indirect %19(%21)
+        \\  %22 = slot_addr s0
+        \\  %23 = load %22 : int
+        \\  %24 = field_addr %23, 0 : int
+        \\  %25 = slot_addr s0
+        \\  %26 = load %25 : int
+        \\  %27 = field_addr %26, 0 : int
+        \\  %28 = load %27 : int
+        \\  %29 = slot_addr s2
+        \\  %30 = load %29 : rawptr
+        \\  %31 = load %30 : int
+        \\  %32 = add %28, %31
+        \\  store %24, %32 : int
+        \\  %33 = slot_addr s0
+        \\  %34 = load %33 : int
+        \\  %35 = field_addr %34, 0 : int
+        \\  %36 = slot_addr s0
+        \\  %37 = load %36 : int
+        \\  %38 = field_addr %37, 0 : int
+        \\  %39 = load %38 : int
+        \\  store %35, %39 : int
+        \\  %40 = field_addr %34, 8 : int
+        \\  %41 = slot_addr s2
+        \\  %42 = load %41 : rawptr
+        \\  %43 = load %42 : int
+        \\  store %40, %43 : int
+        \\  %44 = slot_addr s0
+        \\  %45 = load %44 : int
+        \\  %46 = field_addr %45, 8 : int
+        \\  %47 = load %46 : int
+        \\  br b1(%47)
+        \\b1(%0:int):
+        \\  ret %0
+        \\}
+        \\
+    );
+}
+
+test "every binding form boxes" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, unit: []const u8, lambda: bool = false, cells: usize };
+    // Each boxed binding reaches its cell with no lower note (an unconverted slot access
+    // is one). `cells` counts the allocations in the lowered unit: boxes plus envs.
+    const cases = [_]Case{
+        // `:=`
+        .{ .src = "fn f() -> int {\n n := 1\n g := fn() { n = 2 }\n g()\n n\n}\n", .unit = "f", .cells = 2 },
+        // a fn param
+        .{ .src = "fn f(n: int) -> int {\n g := fn() { n = n + 1 }\n g()\n n\n}\n", .unit = "f", .cells = 2 },
+        // a struct param, stored to through a field
+        .{ .src = "struct P { x: int }\nfn f(p: P) -> int {\n g := fn() { p.x = 3 }\n g()\n p.x\n}\n", .unit = "f", .cells = 2 },
+        // a lambda param, boxed in the lambda's own unit
+        .{ .src = "fn f() -> int {\n h := fn(n: int) -> int {\n  g := fn() { n = n + 1 }\n  g()\n  n\n }\n h(1)\n}\n", .unit = "main.f$l0", .lambda = true, .cells = 2 },
+        // a range `for` variable
+        .{ .src = "fn f() -> int {\n s := 0\n for i in 0..3 {\n  g := fn() { i = i + 1 }\n  g()\n  s = s + i\n }\n s\n}\n", .unit = "f", .cells = 2 },
+        // a match binding
+        .{ .src = "fn f(o: Option[int]) -> int {\n match o {\n  .some(v) -> {\n   g := fn() { v = v + 1 }\n   g()\n   v\n  },\n  .none -> 0,\n }\n}\n", .unit = "f", .cells = 2 },
+        // an or-pattern binding: each alternative points the one address slot at a new cell
+        .{ .src = "enum E { A(int), B(int) }\nfn f(e: E) -> int {\n match e {\n  .A(k) | .B(k) -> {\n   g := fn() { k = k + 1 }\n   g()\n   k\n  },\n }\n}\n", .unit = "f", .cells = 3 },
+        // a capture a lambda passes through to a nested one: the outer env carries the pointer
+        .{ .src = "fn f() -> int {\n n := 1\n h := fn() -> fn() -> int { fn() { n = n + 1\n n } }\n h()()\n}\n", .unit = "main.f$l0", .lambda = true, .cells = 1 },
+        // a `mut self` call on the captured local
+        .{ .src = "struct C { n: int }\nimpl C { fn bump(mut self) { self.n = self.n + 1 } }\nfn f() -> int {\n c := C { n: 0 }\n g := fn() { c.bump() }\n g()\n c.bump()\n c.n\n}\n", .unit = "f", .cells = 2 },
+    };
+    for (cases) |case| {
+        const src = try std.mem.concat(gpa, u8, &.{ case.src, "fn main() -> int { return 0 }\n" });
+        defer gpa.free(src);
+        const ir = if (case.lambda) try renderLambdaG(gpa, src, case.unit) else try renderLoweredG(gpa, src, case.unit);
+        defer gpa.free(ir);
+        try testing.expectEqual(case.cells, std.mem.count(u8, ir, "call @gc_alloc("));
+        try testing.expect(std.mem.indexOf(u8, ir, ":rawptr") != null);
+    }
 }
 
 test "a fn value lowers to fn_addr of its thunk and a null env" {

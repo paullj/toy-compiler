@@ -330,6 +330,8 @@ const GraphFrozen = struct {
     adapters: []const Closure.Adapter = &.{},
     /// Entries at `[adapter_base..]` are the adapter units.
     adapter_base: usize,
+    /// Each owner's boxed locals, sorted by owner; a lambda unit reads its owner's.
+    owner_closures: []const Closure.OwnerClosure = &.{},
     /// Per base fn and instance unit (`[0, derive_base)`), its closure facts; empty (no
     /// entries) when the program has no lambda.
     closure_facts: []const []const u8,
@@ -392,25 +394,49 @@ const GraphFrozen = struct {
             .erased_units = gf.erased_units,
             .prelude_ids = gf.prelude_ids,
             .char_struct = gf.char_struct,
-            .closure = if (is_derive) .none else .{ .adapters = gf.adapters, .lambda_units = gf.lambda_units, .owner = owner },
+            .closure = if (is_derive) .none else .{
+                .adapters = gf.adapters,
+                .lambda_units = gf.lambda_units,
+                .owner = owner,
+                .boxed = Closure.ownerBoxed(gf.owner_closures, owner.?),
+            },
             .closure_facts = if (lower_i < gf.closure_facts.len) gf.closure_facts[lower_i] else &.{},
         };
     }
 };
 
 /// Each base fn and instance unit's closure facts, indexed like `fn_decls[0..derive_base)`:
-/// its own lambda units (a contiguous run of the `(owner, node)`-sorted table) laid out by
-/// `Closure.ownerFacts`. Serial, once per owner. Empty when there is no lambda unit.
-fn buildClosureFacts(gpa: std.mem.Allocator, units: []const Closure.LambdaUnit, lower_ids: []const u32, base_count: usize, derive_base: usize) ![]const []const u8 {
-    if (units.len == 0) return &.{};
+/// its boxed locals and its own lambda units (a contiguous run of the `(owner, node)`-sorted
+/// table) laid out by `Closure.ownerFacts`. Serial, once per owner. Empty when there is no
+/// lambda unit and no boxed local.
+fn buildClosureFacts(
+    gpa: std.mem.Allocator,
+    units: []const Closure.LambdaUnit,
+    owner_closures: []const Closure.OwnerClosure,
+    lower_ids: []const u32,
+    base_count: usize,
+    derive_base: usize,
+) ![]const []const u8 {
+    if (units.len == 0 and owner_closures.len == 0) return &.{};
     const facts = try gpa.alloc([]const u8, derive_base);
     @memset(facts, &.{});
     errdefer freeClosureFacts(gpa, facts);
+    // Every owner with a unit or a box, each once: both tables are sorted by owner.
     var i: usize = 0;
-    while (i < units.len) {
-        var j = i + 1;
-        while (j < units.len and std.meta.eql(units[j].owner, units[i].owner)) j += 1;
-        const at: ?usize = switch (units[i].owner) {
+    var oi: usize = 0;
+    while (i < units.len or oi < owner_closures.len) {
+        const owner = if (oi == owner_closures.len or (i < units.len and !Closure.ownerLess(owner_closures[oi].owner, units[i].owner)))
+            units[i].owner
+        else
+            owner_closures[oi].owner;
+        var j = i;
+        while (j < units.len and std.meta.eql(units[j].owner, owner)) j += 1;
+        var boxed: []const u32 = &.{};
+        if (oi < owner_closures.len and std.meta.eql(owner_closures[oi].owner, owner)) {
+            boxed = owner_closures[oi].boxed;
+            oi += 1;
+        }
+        const at: ?usize = switch (owner) {
             .base => |gid| std.sort.binarySearch(u32, lower_ids, gid, struct {
                 fn order(key: u32, x: u32) std.math.Order {
                     return std.math.order(key, x);
@@ -418,7 +444,7 @@ fn buildClosureFacts(gpa: std.mem.Allocator, units: []const Closure.LambdaUnit, 
             }.order),
             .instance => |k| base_count + k,
         };
-        if (at) |ui| facts[ui] = try Closure.ownerFacts(gpa, units[i..j], &.{});
+        if (at) |ui| facts[ui] = try Closure.ownerFacts(gpa, units[i..j], boxed);
         i = j;
     }
     return facts;
@@ -576,7 +602,7 @@ pub fn lowerGraphProgram(
         } };
     }
 
-    const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, lower_ids.items, base_count, derive_base);
+    const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, tc.owner_closures, lower_ids.items, base_count, derive_base);
     defer freeClosureFacts(gpa, closure_facts);
 
     const gf = GraphFrozen{
@@ -607,6 +633,7 @@ pub fn lowerGraphProgram(
         .lambda_base = lambda_base,
         .adapters = tc.adapters,
         .adapter_base = adapter_base,
+        .owner_closures = tc.owner_closures,
         .closure_facts = closure_facts,
         .opt = opt,
         .probe = probe,
@@ -872,7 +899,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) } },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }) },
         };
         var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
         defer func.deinit(gpa);
@@ -905,7 +932,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = @intCast(k) } },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = @intCast(k) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .instance = @intCast(k) }) },
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);
@@ -1011,7 +1038,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner },
+            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = Closure.ownerBoxed(tc.owner_closures, u.owner) },
         };
         var func = try lower.lowerLambda(gpa, in, @intCast(ui), sym, &diags);
         defer func.deinit(gpa);

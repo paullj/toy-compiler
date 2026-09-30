@@ -174,6 +174,9 @@ const GraphResolve = struct {
     fn_boundaries: std.ArrayList(Closure.Boundary) = .empty,
     /// This fn's assigned slots, with repeats.
     fn_assigned: std.ArrayList(u32) = .empty,
+    /// The slots a closed lambda of this fn captures. Any later call may run that closure,
+    /// which can read or write the slot, so a write to one is never a dead store.
+    captured_so_far: std.AutoHashMapUnmanaged(u32, void) = .empty,
     /// The next lambda's rank in this fn (pre-order).
     next_rank: u32 = 0,
     /// Per module: the fns holding a lambda, in resolve (= node) order.
@@ -595,6 +598,7 @@ const GraphResolve = struct {
         g.label_stack.clearRetainingCapacity();
         std.debug.assert(g.open.items.len == 0 and g.fn_boundaries.items.len == 0);
         g.fn_assigned.clearRetainingCapacity();
+        g.captured_so_far.clearRetainingCapacity();
         g.next_rank = 0;
 
         const decl = g.nodes()[fn_idx.int()];
@@ -683,6 +687,7 @@ const GraphResolve = struct {
                 return a.slot < b.slot;
             }
         }.lt);
+        for (ob.captures.items) |c| try g.captured_so_far.put(g.gpa, c.slot, {});
         try g.fn_boundaries.ensureUnusedCapacity(g.gpa, 1);
         const caps = try ob.captures.toOwnedSlice(g.gpa);
         g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .captures = caps });
@@ -691,6 +696,7 @@ const GraphResolve = struct {
     /// Record a use of local `slot` at node `use` as a capture of every open lambda it
     /// crosses. A lambda's slots are all at or above its floor, so a slot below the floor
     /// is declared outside it; boundaries nest, so the first one it is inside stops the walk.
+    /// A new capture keeps every pending write to the slot live: the closure may read it.
     fn noteCapture(g: *GraphResolve, slot: u32, use: Ast.Index) error{OutOfMemory}!void {
         var i = g.open.items.len;
         while (i > 0) {
@@ -700,7 +706,10 @@ const GraphResolve = struct {
             const seen = for (b.captures.items) |c| {
                 if (c.slot == slot) break true;
             } else false;
-            if (!seen) try b.captures.append(g.gpa, .{ .slot = slot, .first_use = use });
+            if (!seen) {
+                try b.captures.append(g.gpa, .{ .slot = slot, .first_use = use });
+                for (g.dead_pending.items) |*m| _ = m.remove(slot);
+            }
         }
     }
 
@@ -810,6 +819,7 @@ const GraphResolve = struct {
     /// defined here", wrong for a store). A leading `_` on the name silences, mirroring the
     /// unused-variable convention (the binding's one name spells the same at both writes).
     fn deadStoreWrite(g: *GraphResolve, top: *PendingMap, slot: u32, name_tok: u32) error{OutOfMemory}!void {
+        if (g.captured_so_far.contains(slot)) return;
         if (top.get(slot)) |dead_tok| {
             const nm = g.nameText(dead_tok);
             if (!(nm.len != 0 and nm[0] == '_'))
@@ -1581,6 +1591,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         for (g.fn_boundaries.items) |b| gpa.free(b.captures);
         g.fn_boundaries.deinit(gpa);
         g.fn_assigned.deinit(gpa);
+        g.captured_so_far.deinit(gpa);
         // Emptied by the ownership move below on success.
         for (closures) |*c| {
             for (c.items) |fc| {
@@ -3534,6 +3545,51 @@ test "no closures entry for a fn without lambdas" {
             const fn_node = r.closures[0][0].fn_node;
             try testing.expectEqualStrings("main", toks[tree.nodes[fn_node.int()].main_token].text(src));
             try testing.expect(Closure.findFn(r.closures[0], fn_node) != null);
+        }
+    }.run);
+}
+
+test "a store to a captured local followed by a call and a second store is not W0010" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ n := 0
+        \\ get := fn() -> int { n }
+        \\ n = 1
+        \\ a := get()
+        \\ n = 2
+        \\ set := fn(v: int) { n = v }
+        \\ m := 5
+        \\ set(3)
+        \\ m = 7
+        \\ return a + get() + m
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            // Only `m`, which no lambda names, still has a dead store.
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
+            for (r.diags) |d| if (d.code == .W0010) {
+                try testing.expect(std.mem.indexOf(u8, d.message, "'m'") != null);
+            };
+        }
+    }.run);
+    // Inside the lambda that captures it, straight-line writes are still tracked.
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ n := 0
+        \\ bump := fn() {
+        \\  n = n + 1
+        \\  n = 2
+        \\ }
+        \\ bump()
+        \\ n = 5
+        \\ bump()
+        \\ return n
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
         }
     }.run);
 }

@@ -30,21 +30,15 @@ pub fn lowerAdapter(
     try params.append(gpa, try b.addSlot(Typecheck.Type.rawptr));
     for (a.sig.params) |p| try params.append(gpa, try b.addSlot(p));
 
-    const entry = try b.addBlock();
-    b.switchTo(entry);
-    const exit = try b.addBlock();
-    b.exit = exit;
-    if (L.exitParamType(&b, a.sig.ret)) |pt| b.ret_param = try b.addParam(exit, pt);
-    b.blocks.items[exit].term = if (b.ret_param == Ir.none_value) .{ .ret = .none } else .{ .ret = .{ .value = b.ret_param } };
-    b.blocks.items[exit].term_set = true;
+    const blocks = try L.openBodyBlocks(&b, a.sig.ret);
 
     const args = try gpa.alloc(Ir.Operand, a.sig.params.len);
     errdefer gpa.free(args);
     for (a.sig.params, params.items[1..], 0..) |p, sid, i| args[i] = try L.slotOperand(&b, sid, p);
     const result = try L.emitCall(&b, .{ .direct = a.target }, args, a.sig.ret, 0);
 
-    if (!b.termSet()) try L.brTo(&b, exit, if (b.ret_param == Ir.none_value) .none else result);
-    return try L.finishFn(&b, gpa, sym, &params, entry, exit);
+    if (!b.termSet()) try L.brTo(&b, blocks.exit, if (b.ret_param == Ir.none_value) .none else result);
+    return try L.finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
 
 const testing = std.testing;

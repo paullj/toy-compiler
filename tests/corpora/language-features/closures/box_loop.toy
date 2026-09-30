@@ -1,0 +1,66 @@
+# Feature: a captured and assigned loop variable gets a fresh box per iteration, and still steers a range loop
+# expect: stdout "0\n10\n20\n3\n100\n101\n102\n103\n0\n2\n4\n11\n22\n"
+# expect: exit 2
+import std/vec
+import std/map
+import std/io
+
+fn main() -> int {
+    fs: Vec[fn() -> int] = []
+    n := 0
+    for i in 0..3 {
+        fs.push(fn() {
+            i = i * 10
+            i
+        })
+        n = n + 1
+    }
+    for j in 0..fs.len() { io.println(fs[j]()) }
+    # The closures ran after the loop, so the loop ran all three times.
+    io.println(n)
+    # Each closure keeps its own box: a second call sees the first one's write.
+    io.println(fs[1]())
+
+    gs: Vec[fn() -> int] = []
+    xs: Vec[int] = [1, 2, 3]
+    for x in xs {
+        gs.push(fn() {
+            x = x + 100
+            x
+        })
+    }
+    for j in 0..gs.len() { io.println(gs[j]()) }
+
+    hs: Vec[fn() -> int] = []
+    k := 0
+    while k < 3 {
+        m := k
+        hs.push(fn() {
+            m = m * 2
+            m
+        })
+        k = k + 1
+    }
+    for j in 0..hs.len() { io.println(hs[j]()) }
+
+    ks: Vec[fn() -> int] = []
+    m := Map[int, int].new()
+    m.set(1, 10)
+    m.set(2, 20)
+    for key, val in m {
+        ks.push(fn() {
+            val = val + key
+            val
+        })
+    }
+    for j in 0..ks.len() { io.println(ks[j]()) }
+
+    # An assignment through a closure run inside the body steers the loop: i = 0, 4, 5, 9.
+    steps := 0
+    for i in 0..10 {
+        skip := fn() { i = i + 4 }
+        skip()
+        steps = steps + 1
+    }
+    return steps
+}

@@ -8,20 +8,30 @@ impl C {
         f := fn() -> int { self.n }  #~ ERROR [T0052] a closure cannot capture the 'mut self' receiver 'self'
         f()
     }
+    fn poke(mut self) {
+        g := fn() { self.bump() }  #~ ERROR [T0052] a closure cannot capture the 'mut self' receiver 'self'
+        g()
+    }
+    fn copy_first(mut self) -> int {
+        n := self.n
+        h := fn() -> int { n }
+        self.bump()
+        h()
+    }
 }
 
 fn main() -> int {
     base := 10
     _ok := fn(v: int) -> int { v + base }
     a := 1
-    _f := fn() -> int { a }  #~ ERROR [T0052] 'a' is captured by a closure and assigned
+    _f := fn() -> int { a }
     a = 2
     p := P { x: 1 }
-    _g := fn() { p.x = 2 }  #~ ERROR [T0052] 'p' is captured by a closure and assigned
+    _g := fn() { p.x = 2 }
     c := C { n: 0 }
-    _h := fn() -> int { c.get() }  #~ ERROR [T0052] 'c' is captured by a closure and assigned
+    _h := fn() -> int { c.get() }
     c.bump()
     d := C { n: 0 }
-    _k := fn() { d.bump() }  #~ ERROR [T0052] 'd' is captured by a closure and assigned
-    return a + c.n
+    _k := fn() { d.bump() }
+    return a + c.n + c.peek() + c.copy_first()
 }

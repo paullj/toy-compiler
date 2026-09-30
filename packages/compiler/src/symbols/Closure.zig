@@ -50,6 +50,30 @@ pub fn deinitFnClosures(gpa: std.mem.Allocator, list: []const FnClosures) void {
 /// index in the instance table).
 pub const Owner = union(enum) { base: u32, instance: u32 };
 
+/// An owner's boxed locals: the slots a closure captures and something assigns, which
+/// live in a GC cell for their whole lifetime. Recorded only for an owner with one.
+pub const OwnerClosure = struct {
+    owner: Owner,
+    /// Ascending; owned.
+    boxed: []const u32,
+};
+
+pub fn freeOwnerClosures(gpa: std.mem.Allocator, list: []const OwnerClosure) void {
+    for (list) |oc| gpa.free(oc.boxed);
+    gpa.free(list);
+}
+
+/// The boxed slots of `owner`, by binary search over `list` (sorted by owner); empty for
+/// an owner with no record.
+pub fn ownerBoxed(list: []const OwnerClosure, owner: Owner) []const u32 {
+    const i = std.sort.binarySearch(OwnerClosure, list, owner, struct {
+        fn order(key: Owner, oc: OwnerClosure) std.math.Order {
+            return ownerOrder(key, oc.owner);
+        }
+    }.order) orelse return &.{};
+    return list[i].boxed;
+}
+
 /// The canonical owner order: every base fn before every instance, then by id.
 pub fn ownerLess(a: Owner, b: Owner) bool {
     return ownerOrder(a, b) == .lt;
@@ -70,7 +94,8 @@ fn ownerOrder(a: Owner, b: Owner) std.math.Order {
 
 /// How a closure holds a captured local: `copy` is the local's value, taken when the
 /// closure is made, which is sound only while nothing assigns the local; `box` is a
-/// pointer to a cell the local lives in (no capture takes it yet).
+/// pointer to the GC cell the local lives in, shared with its owner and every other
+/// closure that captures it.
 pub const CaptureMode = enum(u8) { copy, box };
 
 /// One captured local's place in its closure's env cell: owner slot, type, mode and byte
@@ -384,4 +409,18 @@ test "ownerFacts is empty with no env slot and no boxed slot" {
     // Rank order, not table order: the rank-0 unit (the capturing one) folds first.
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, f1[8..12], .little));
     try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, f1[12..16], .little));
+}
+
+test "ownerBoxed finds an owner's record and is empty for an owner without one" {
+    const ocs = [_]OwnerClosure{
+        .{ .owner = .{ .base = 3 }, .boxed = &.{ 1, 4 } },
+        .{ .owner = .{ .base = 9 }, .boxed = &.{0} },
+        .{ .owner = .{ .instance = 2 }, .boxed = &.{ 2, 5, 6 } },
+    };
+    try testing.expectEqualSlices(u32, &.{ 1, 4 }, ownerBoxed(&ocs, .{ .base = 3 }));
+    try testing.expectEqualSlices(u32, &.{0}, ownerBoxed(&ocs, .{ .base = 9 }));
+    try testing.expectEqualSlices(u32, &.{ 2, 5, 6 }, ownerBoxed(&ocs, .{ .instance = 2 }));
+    try testing.expectEqual(@as(usize, 0), ownerBoxed(&ocs, .{ .base = 2 }).len);
+    try testing.expectEqual(@as(usize, 0), ownerBoxed(&ocs, .{ .instance = 3 }).len);
+    try testing.expectEqual(@as(usize, 0), ownerBoxed(&.{}, .{ .base = 3 }).len);
 }
