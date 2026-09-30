@@ -1,0 +1,21 @@
+# Feature: a closure passed to a user-written generic higher-order function accumulates into its caller's local
+# expect: stdout "6\n10\n"
+# expect: exit 16
+import std/vec
+import std/io
+
+fn each[T](xs: Vec[T], f: fn(T)) {
+    for x in xs { f(x) }
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    total := 0
+    each(xs, fn(v: int) { total = total + v })
+    io.println(total)
+    words: Vec[str] = ["a", "bb", "ccc", "dddd"]
+    count := 0
+    each(words, fn(w: str) { count = count + w.len() })
+    io.println(count)
+    return total + count
+}

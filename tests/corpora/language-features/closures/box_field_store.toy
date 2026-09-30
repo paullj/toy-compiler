@@ -1,0 +1,19 @@
+# Feature: a field store through a closure writes the captured struct itself, and the owner's stores reach the closure
+# expect: exit 42
+struct In { z: int }
+struct P { x: int, y: int, inner: In }
+
+fn main() -> int {
+    p := P { x: 1, y: 5, inner: In { z: 0 } }
+    set_x := fn(v: int) { p.x = v }
+    read := fn() -> int { p.x + p.y + p.inner.z }
+    set_x(40)
+    # A copy: later stores through the closure do not reach q.
+    q := p
+    set_x(0)
+    p.y = 2
+    deep := fn() { p.inner.z = p.inner.z + 1 }
+    deep()
+    deep()
+    return q.x + read() - p.inner.z
+}

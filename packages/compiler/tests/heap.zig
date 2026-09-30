@@ -714,3 +714,91 @@ test "gc: a closure argument survives a collection while a later argument is eva
         \\
     );
 }
+
+test "gc: a boxed counter survives collections between calls" {
+    try expectClosureGc(".toy-test-gc-box-counter",
+        \\struct Pt { x: int, y: int }
+        \\fn counter() -> fn() -> int {
+        \\    n := 0
+        \\    fn() {
+        \\        n = n + 1
+        \\        n
+        \\    }
+        \\}
+        \\fn main() -> int {
+        \\    next := counter()
+        \\    next()
+        \\    if !collect() { return 1 }
+        \\    next()
+        \\    total := 0
+        \\    p := Pt { x: 0, y: 0 }
+        \\    add := fn(v: int) {
+        \\        total = total + v
+        \\        p.y = p.y + 1
+        \\    }
+        \\    add(10)
+        \\    if !collect() { return 2 }
+        \\    add(next())
+        \\    if !collect() { return 3 }
+        \\    return total + next() + p.y + 23
+        \\}
+        \\
+    );
+}
+
+test "gc: per-iteration boxes survive" {
+    try expectClosureGc(".toy-test-gc-box-loop",
+        \\fn fill() -> Vec[fn() -> int] {
+        \\    fs: Vec[fn() -> int] = []
+        \\    for i in 0..3 {
+        \\        fs.push(fn() {
+        \\            i = i + 1
+        \\            i
+        \\        })
+        \\    }
+        \\    xs: Vec[int] = [10, 20]
+        \\    for x in xs {
+        \\        fs.push(fn() {
+        \\            x = x + 1
+        \\            x
+        \\        })
+        \\    }
+        \\    m := Map[int, int].new()
+        \\    m.set(1, 100)
+        \\    for k, v in m {
+        \\        fs.push(fn() {
+        \\            v = v + k
+        \\            v
+        \\        })
+        \\    }
+        \\    fs
+        \\}
+        \\fn main() -> int {
+        \\    fs := fill()
+        \\    if !collect() { return 1 }
+        \\    s := 0
+        \\    for j in 0..fs.len() { s = s + fs[j]() }
+        \\    if !collect() { return 2 }
+        \\    for j in 0..fs.len() { s = s + fs[j]() }
+        \\    # First round 1+2+3 + 11+21 + 101 = 139, second 2+3+4 + 12+22 + 102 = 145.
+        \\    return s - 242
+        \\}
+        \\
+    );
+}
+
+test "gc: a box whose closures are gone is kept by its owner" {
+    try expectClosureGc(".toy-test-gc-box-owner",
+        \\fn main() -> int {
+        \\    n := 40
+        \\    g := fn() { n = n + 1 }
+        \\    g()
+        \\    g = fn() { }
+        \\    g()
+        \\    if !collect() { return 1 }
+        \\    n = n + 1
+        \\    return n
+        \\}
+        \\
+    );
+}

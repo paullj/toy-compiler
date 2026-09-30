@@ -504,6 +504,8 @@ pub const GraphResult = struct {
     /// One unit per lambda per lowerable owner (a non-generic fn, or an instance), sorted
     /// by `(owner, node)`. Owned.
     lambda_units: []Closure.LambdaUnit = &.{},
+    /// The boxed locals of each lowerable owner that has one, sorted by owner. Owned.
+    owner_closures: []Closure.OwnerClosure = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -541,6 +543,7 @@ pub const GraphResult = struct {
             gpa.free(inst.callees);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name.?));
+            gpa.free(inst.boxed);
             // Each conformance's `witness_syms` + `protocol_args` OUTER slices +
             // the vector itself are owned (elements are borrowed source / `gph_fn_names` /
             // PODs).
@@ -568,6 +571,7 @@ pub const GraphResult = struct {
         gpa.free(self.erased_units);
         freeAdapters(gpa, self.adapters);
         Closure.freeLambdaUnits(gpa, self.lambda_units);
+        Closure.freeOwnerClosures(gpa, self.owner_closures);
         self.* = undefined;
     }
 };
@@ -633,6 +637,7 @@ fn buildLambdaUnits(
     graph: *const GraphCtx,
     fns: []const GraphFnInput,
     fsyms: []const FnSym,
+    base_boxed: []const []const u32,
     node_types: []const []const Type,
     instances: []const Mono.Instance,
     layouts: []const Layout,
@@ -644,17 +649,52 @@ fn buildLambdaUnits(
         units.deinit(gpa);
     }
     for (fns, 0..) |f, gid| {
-        if (f.decl_node == Ast.none or f.kind != .user_fn or fsyms[gid].isGeneric()) continue;
+        if (!isBaseOwner(f, fsyms[gid])) continue;
         const mc = &graph.mods[f.module];
         const fc = Closure.findFn(mc.closures, f.decl_node) orelse continue;
-        try appendLambdaUnits(gpa, &units, .{ .base = @intCast(gid) }, f.module, f.name, fc, mc, node_types[f.module], layouts, enum_layouts);
+        const boxed: []const u32 = if (gid < base_boxed.len) base_boxed[gid] else &.{};
+        try appendLambdaUnits(gpa, &units, .{ .base = @intCast(gid) }, f.module, f.name, fc, mc, node_types[f.module], boxed, layouts, enum_layouts);
     }
     for (instances, 0..) |inst, k| {
         const mc = &graph.mods[inst.mod];
         const fc = Closure.findFn(mc.closures, inst.decl_node) orelse continue;
-        try appendLambdaUnits(gpa, &units, .{ .instance = @intCast(k) }, inst.mod, inst.name.?, fc, mc, inst.node_types, layouts, enum_layouts);
+        try appendLambdaUnits(gpa, &units, .{ .instance = @intCast(k) }, inst.mod, inst.name.?, fc, mc, inst.node_types, inst.boxed, layouts, enum_layouts);
     }
     return units.toOwnedSlice(gpa);
+}
+
+/// Whether global fn `f` is lowered as a base owner: a non-generic user fn with a body
+/// (a generic one is lowered only through its instances).
+fn isBaseOwner(f: GraphFnInput, fsym: FnSym) bool {
+    return f.decl_node != Ast.none and f.kind == .user_fn and !fsym.isGeneric();
+}
+
+/// The owner-closure table: each lowerable owner with a boxed local, in canonical owner
+/// order (base fns by global id, then instances in instance order), its boxed slots.
+/// Serial over the finished tables, so it is identical at any `-j`.
+fn buildOwnerClosures(
+    gpa: std.mem.Allocator,
+    fns: []const GraphFnInput,
+    fsyms: []const FnSym,
+    base_boxed: []const []const u32,
+    instances: []const Mono.Instance,
+) ![]Closure.OwnerClosure {
+    var out: std.ArrayList(Closure.OwnerClosure) = .empty;
+    errdefer {
+        for (out.items) |oc| gpa.free(oc.boxed);
+        out.deinit(gpa);
+    }
+    for (base_boxed, 0..) |bx, gid| {
+        if (bx.len == 0 or !isBaseOwner(fns[gid], fsyms[gid])) continue;
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(.{ .owner = .{ .base = @intCast(gid) }, .boxed = try gpa.dupe(u32, bx) });
+    }
+    for (instances, 0..) |inst, k| {
+        if (inst.boxed.len == 0) continue;
+        try out.ensureUnusedCapacity(gpa, 1);
+        out.appendAssumeCapacity(.{ .owner = .{ .instance = @intCast(k) }, .boxed = try gpa.dupe(u32, inst.boxed) });
+    }
+    return out.toOwnedSlice(gpa);
 }
 
 fn appendLambdaUnits(
@@ -666,6 +706,7 @@ fn appendLambdaUnits(
     fc: *const Closure.FnClosures,
     mc: *const GraphCtx.ModuleCtx,
     node_types: []const Type,
+    boxed: []const u32,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) !void {
@@ -687,7 +728,7 @@ fn appendLambdaUnits(
         };
         const env = try gpa.alloc(Closure.EnvSlot, b.captures.len);
         errdefer gpa.free(env);
-        const env_size = try layoutCaptureEnv(gpa, b.captures, node_types, layouts, enum_layouts, env);
+        const env_size = try layoutCaptureEnv(gpa, b.captures, node_types, boxed, layouts, enum_layouts, env);
         try units.append(gpa, .{
             .owner = owner,
             .mod = mod,
@@ -703,13 +744,15 @@ fn appendLambdaUnits(
     }
 }
 
-/// Fill `out` with one copied env slot per capture (ascending slot, as the resolver lists
-/// them), typed as the owner typed the capture's first use, and return the env size. A
+/// Fill `out` with one env slot per capture (ascending slot, as the resolver lists them),
+/// typed as the owner typed the capture's first use, and return the env size. A boxed
+/// capture holds its cell's pointer (8 bytes); any other holds a copy of the value. A
 /// capture left `.invalid` by an earlier error sizes as 0; such a program is never lowered.
 fn layoutCaptureEnv(
     gpa: std.mem.Allocator,
     captures: []const Closure.Capture,
     node_types: []const Type,
+    boxed: []const u32,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
     out: []Closure.EnvSlot,
@@ -721,12 +764,22 @@ fn layoutCaptureEnv(
     const offs = try gpa.alloc(u32, captures.len);
     defer gpa.free(offs);
     for (captures, sizes, aligns) |c, *sz, *al| {
+        if (Closure.contains(boxed, c.slot)) {
+            sz.* = 8;
+            al.* = 8;
+            continue;
+        }
         const ty = node_types[c.first_use.int()];
         sz.* = Abi.typeSize(ty, layouts, enum_layouts);
         al.* = Abi.typeAlign(ty, layouts, enum_layouts);
     }
     const size = Closure.envLayout(sizes, aligns, offs);
-    for (captures, offs, out) |c, off, *es| es.* = .{ .slot = c.slot, .ty = node_types[c.first_use.int()], .mode = .copy, .off = off };
+    for (captures, offs, out) |c, off, *es| es.* = .{
+        .slot = c.slot,
+        .ty = node_types[c.first_use.int()],
+        .mode = if (Closure.contains(boxed, c.slot)) .box else .copy,
+        .off = off,
+    };
     return size;
 }
 
@@ -1554,6 +1607,10 @@ mono_depth_capped: bool = false,
 /// (`&.{}`) until then, so the guard is inert on any pre-checkBodies path.
 bound_poisoned: []bool = &.{},
 
+/// Per-global-fn-id boxed locals (`Closure.OwnerClosure`), moved out of each body's
+/// check in fn-id order by `checkBodies`; each list owned. Empty until then.
+base_boxed: [][]u32 = &.{},
+
 /// Graph context. Always set in practice: `checkGraph` is the ONE entry and
 /// it drives one shared `Typecheck` across the whole module graph (a lone source
 /// file is the trivial one-module graph). The `structs`/`enums`/`fns` tables are
@@ -1936,6 +1993,7 @@ pub fn checkGraph(
             gpa.free(inst.node_types);
             gpa.free(inst.callees);
             gpa.free(@constCast(inst.params));
+            gpa.free(inst.boxed);
             freeInstanceConformances(gpa, inst.conformances);
         }
         t.mono.deinit(gpa);
@@ -1952,6 +2010,8 @@ pub fn checkGraph(
         t.erased_units.deinit(gpa);
         // The per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
+        for (t.base_boxed) |bx| gpa.free(bx);
+        if (t.base_boxed.len > 0) gpa.free(t.base_boxed);
         // The method table's backing array (entries' names are borrowed source
         // slices). Each entry may own a `protocol_args` dupe (freed here). On success
         // `toOwnedSlice` empties it, so both are a no-op there (the result frees them).
@@ -2036,6 +2096,7 @@ pub fn checkGraph(
             gpa.free(inst.callees);
             gpa.free(@constCast(inst.params));
             gpa.free(@constCast(inst.name.?));
+            gpa.free(inst.boxed);
             freeInstanceConformances(gpa, inst.conformances);
         }
         gpa.free(instances);
@@ -2090,8 +2151,10 @@ pub fn checkGraph(
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
     errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
-    const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, node_types, instances, layouts, enum_layouts);
+    const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, t.base_boxed, node_types, instances, layouts, enum_layouts);
     errdefer Closure.freeLambdaUnits(gpa, lambda_units);
+    const owner_closures = try buildOwnerClosures(gpa, fns, t.fns.items, t.base_boxed, instances);
+    errdefer Closure.freeOwnerClosures(gpa, owner_closures);
 
     // Diagnostics already carry their owning module in `scope`, sorted by
     // runGraph. Hand the owned slices to the result.
@@ -2116,6 +2179,7 @@ pub fn checkGraph(
         .char_struct = if (t.prelude) |p| p.char_struct else null,
         .adapters = adapters,
         .lambda_units = lambda_units,
+        .owner_closures = owner_closures,
     };
 }
 
@@ -2914,6 +2978,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     // identity so a sibling-conformance edit invalidates exactly this instance.
     const confs = try t.buildConformances(model, f, args);
     errdefer freeInstanceConformances(t.gpa, confs);
+    const boxed = try bc.boxed.toOwnedSlice(t.gpa);
 
     return .{
         .template_gid = gid,
@@ -2926,6 +2991,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
         .mod = f.mod,
         .decl_node = f.decl_node,
         .conformances = confs,
+        .boxed = boxed,
     };
 }
 
@@ -3028,6 +3094,9 @@ const BodyResult = struct {
     conv_int_char_result: ?Type = null,
     conv_char_byte_result: ?Type = null,
     conv_float_int_result: ?Type = null,
+    /// This fn's boxed locals, ascending. OWNED (moved out of the `BodyChecker`); moved
+    /// into `t.base_boxed[fid]` by `checkBodies`.
+    boxed: []u32 = &.{},
 };
 
 /// THE per-fn body region (Pass C): run every fn's body check as an independent
@@ -3057,6 +3126,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // PODs into `t.derive_reqs`, so freeing the source afterward is correct.
     defer for (slots) |*s| gpa.free(s.derive_reqs);
     defer for (slots) |*s| gpa.free(s.descriptor_reqs);
+    defer for (slots) |*s| gpa.free(s.boxed);
 
     if (t.io) |io| {
         const Ctx = struct {
@@ -3079,6 +3149,11 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // instantiated (see `enqueueInstance`). Freed at teardown.
     t.bound_poisoned = try gpa.alloc(bool, n);
     for (slots, 0..) |s, i| t.bound_poisoned[i] = s.poisoned;
+    t.base_boxed = try gpa.alloc([]u32, n);
+    for (slots, t.base_boxed) |*s, *bx| {
+        bx.* = s.boxed;
+        s.boxed = &.{};
+    }
 
     // Merge each fn's derive requests into the program-wide list in FN-ID ORDER (the
     // deterministic collection order the synthesis barrier's dedup+sort depends on —
@@ -3178,6 +3253,10 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
         return;
     };
     out.descriptor_reqs = bc.descriptor_reqs.toOwnedSlice(bc.gpa) catch |e| {
+        out.err = e;
+        return;
+    };
+    out.boxed = bc.boxed.toOwnedSlice(bc.gpa) catch |e| {
         out.err = e;
         return;
     };
@@ -8955,35 +9034,110 @@ test "env slots take their types from the first use and are laid out once" {
     try testing.expectEqual(@as(u32, 0), h.env_size);
 }
 
-test "captured-and-assigned (assign, field store, mut self call) is T0052; a plain capture is not" {
-    const gpa = testing.allocator;
-    const bad = [_]struct { src: []const u8, name: []const u8 }{
-        .{ .src = "fn main() -> int {\n a := 1\n f := fn() -> int { a }\n a = 2\n return f()\n}\n", .name = "a" },
-        .{ .src = "fn main() -> int {\n a := 1\n f := fn() -> int { a = 3\n a }\n return f()\n}\n", .name = "a" },
-        .{ .src = "struct P { x: int }\nfn main() -> int {\n p := P { x: 1 }\n p.x = 4\n f := fn() -> int { p.x }\n return f()\n}\n", .name = "p" },
-        .{ .src = "struct C { n: int }\nimpl C { fn bump(mut self) { self.n = self.n + 1 } }\nfn main() -> int {\n c := C { n: 0 }\n f := fn() -> int { c.n }\n c.bump()\n return f()\n}\n", .name = "c" },
-        .{ .src = "struct C { n: int }\nimpl C { fn bump(mut self) { self.n = self.n + 1 } }\nfn main() -> int {\n c := C { n: 0 }\n f := fn() { c.bump() }\n f()\n return c.n\n}\n", .name = "c" },
-    };
-    for (bad) |case| {
-        var c = try checkSource(case.src);
-        defer c.deinit(gpa);
-        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
-        const d = c.result.diags[0];
-        try testing.expectEqual(codes.Code.T0052, d.code);
-        const want = try std.fmt.allocPrint(gpa, "'{s}' is captured by a closure and assigned; closures cannot capture assigned variables yet", .{case.name});
-        defer gpa.free(want);
-        try testing.expectEqualStrings(want, d.message);
+/// The boxed slots of the one owner in `c` that has any, checked against the env of every
+/// lambda unit that captures them: a boxed capture is an 8-byte `.box` slot, any other a copy.
+fn expectBoxedOnce(c: *const Checked, want_len: usize) ![]const u32 {
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const ocs = c.result.owner_closures;
+    if (want_len == 0) {
+        try testing.expectEqual(@as(usize, 0), ocs.len);
+        for (c.result.lambda_units) |u| for (u.env) |es| try testing.expectEqual(Closure.CaptureMode.copy, es.mode);
+        return &.{};
     }
-    // Reported once, at the first captured use in source order (not at a later lambda's).
-    const twice = "fn main() -> int {\n a := 1\n f := fn() -> int { a + a }\n g := fn() -> int { a }\n a = 2\n return f() + g()\n}\n";
-    var t = try checkSource(twice);
-    defer t.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), t.result.diags.len);
-    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, twice, "a + a").?)), t.result.diags[0].byte_offset);
-    // A read-only capture, and an assigned local no lambda names, are fine.
-    var ok = try checkSource(
+    try testing.expectEqual(@as(usize, 1), ocs.len);
+    try testing.expectEqual(want_len, ocs[0].boxed.len);
+    var boxed_env: usize = 0;
+    for (c.result.lambda_units) |u| {
+        if (!std.meta.eql(u.owner, ocs[0].owner)) continue;
+        for (u.env) |es| {
+            const is_boxed = Closure.contains(ocs[0].boxed, es.slot);
+            try testing.expectEqual(if (is_boxed) Closure.CaptureMode.box else Closure.CaptureMode.copy, es.mode);
+            if (is_boxed) {
+                try testing.expectEqual(@as(u32, 0), es.off % 8);
+                boxed_env += 1;
+            }
+        }
+    }
+    try testing.expect(boxed_env >= want_len);
+    return ocs[0].boxed;
+}
+
+test "boxed = captured ∩ (assigned ∪ mut self receivers)" {
+    const gpa = testing.allocator;
+    const pre =
+        \\struct P { x: int }
         \\struct C { n: int }
-        \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
+        \\impl C {
+        \\ fn bump(mut self) { self.n = self.n + 1 }
+        \\ fn get(self) -> int { self.n }
+        \\}
+        \\
+    ;
+    const cases = [_][]const u8{
+        // Assigned inside the lambda.
+        "fn main() -> int {\n a := 1\n f := fn() { a = 3 }\n f()\n return a\n}\n",
+        // Assigned outside it.
+        "fn main() -> int {\n a := 1\n f := fn() -> int { a }\n a = 2\n return f()\n}\n",
+        // A field store, inside or outside.
+        "fn main() -> int {\n p := P { x: 1 }\n f := fn() { p.x = 2 }\n f()\n return p.x\n}\n",
+        "fn main() -> int {\n p := P { x: 1 }\n f := fn() -> int { p.x }\n p.x = 4\n return f()\n}\n",
+        // A `mut self` call, outside or inside.
+        "fn main() -> int {\n c := C { n: 0 }\n f := fn() -> int { c.get() }\n c.bump()\n return f()\n}\n",
+        "fn main() -> int {\n c := C { n: 0 }\n f := fn() { c.bump() }\n f()\n return c.n\n}\n",
+        // A param, of the fn and of a lambda.
+        "fn g(n: int) -> int {\n f := fn() { n = n + 1 }\n f()\n n\n}\nfn main() -> int { return g(1) }\n",
+        "fn main() -> int {\n h := fn(n: int) -> int {\n  f := fn() { n = n + 1 }\n  f()\n  n\n }\n return h(1)\n}\n",
+        // A range loop variable.
+        "fn main() -> int {\n s := 0\n for i in 0..3 {\n  f := fn() { i = i + 1 }\n  f()\n  s = s + i\n }\n return s\n}\n",
+        // A match binding.
+        "fn main() -> int {\n o: Option[int] = .some(1)\n return match o {\n  .some(v) -> {\n   f := fn() { v = v + 1 }\n   f()\n   v\n  },\n  .none -> 0,\n }\n}\n",
+    };
+    for (cases) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, body });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        _ = try expectBoxedOnce(&c, 1);
+    }
+    // Only the captured-and-assigned slot is boxed: `k` is read-only, `m` is assigned but
+    // never captured.
+    var mixed = try checkSource(
+        \\fn main() -> int {
+        \\ k := 5
+        \\ m := 0
+        \\ a := 1
+        \\ f := fn() -> int {
+        \\  a = a + k
+        \\  a
+        \\ }
+        \\ m = f()
+        \\ return m + a
+        \\}
+        \\
+    );
+    defer mixed.deinit(gpa);
+    const bx = try expectBoxedOnce(&mixed, 1);
+    const f_unit = mixed.result.lambda_units[0];
+    try testing.expectEqual(@as(usize, 2), f_unit.env.len);
+    try testing.expectEqual(Closure.CaptureMode.copy, f_unit.env[0].mode); // k
+    try testing.expectEqual(Closure.CaptureMode.box, f_unit.env[1].mode); // a
+    try testing.expectEqual(f_unit.env[1].slot, bx[0]);
+    // A boxed capture holds an 8-byte pointer, even for a wider value.
+    var wide = try checkSource(
+        \\struct Big { a: int, b: int, c: int }
+        \\fn main() -> int {
+        \\ b := Big { a: 1, b: 2, c: 3 }
+        \\ f := fn() { b.c = 9 }
+        \\ f()
+        \\ return b.c
+        \\}
+        \\
+    );
+    defer wide.deinit(gpa);
+    _ = try expectBoxedOnce(&wide, 1);
+    try testing.expectEqual(@as(u32, 8), wide.result.lambda_units[0].env_size);
+    // Read-only captures, and assigned locals no lambda names, are copies.
+    var ro = try checkSource(pre ++
         \\fn main() -> int {
         \\ base := 10
         \\ other := 0
@@ -8995,8 +9149,61 @@ test "captured-and-assigned (assign, field store, mut self call) is T0052; a pla
         \\}
         \\
     );
-    defer ok.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    defer ro.deinit(gpa);
+    _ = try expectBoxedOnce(&ro, 0);
+}
+
+test "a program with no captures has no owner closure records" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ n := 1
+        \\ n = n + 1
+        \\ f := fn(x: int) -> int { x * 2 }
+        \\ return f(n)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.owner_closures.len);
+    try testing.expectEqual(@as(usize, 1), c.result.lambda_units.len);
+    try testing.expectEqual(@as(u32, 0), c.result.lambda_units[0].env_size);
+}
+
+test "an instance recheck writes its own boxed list" {
+    const gpa = testing.allocator;
+    // `x.touch()` is a `mut self` call for `A` and a plain one for `B`, so only the `A`
+    // instance boxes `x`.
+    var c = try checkSource(
+        \\struct A { n: int }
+        \\struct B { n: int }
+        \\impl A { fn touch(mut self) { self.n = self.n + 1 } }
+        \\impl B { fn touch(self) { } }
+        \\fn poke[T](x: T) -> int {
+        \\ f := fn() { x.touch() }
+        \\ f()
+        \\ 0
+        \\}
+        \\fn main() -> int { return poke(A { n: 0 }) + poke(B { n: 0 }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.instances.len);
+    const ocs = c.result.owner_closures;
+    try testing.expectEqual(@as(usize, 1), ocs.len);
+    const k = ocs[0].owner.instance;
+    const inst = c.result.instances[k];
+    try testing.expectEqualStrings("A", c.result.layouts[inst.args[0].struct_id].name);
+    try testing.expectEqualSlices(u32, &.{0}, inst.boxed);
+    try testing.expectEqualSlices(u32, &.{0}, ocs[0].boxed);
+    try testing.expectEqual(@as(usize, 0), c.result.instances[1 - k].boxed.len);
+    for (c.result.lambda_units) |u| {
+        try testing.expectEqual(@as(usize, 1), u.env.len);
+        const want: Closure.CaptureMode = if (u.owner.instance == k) .box else .copy;
+        try testing.expectEqual(want, u.env[0].mode);
+    }
 }
 
 test "any capture of a mut self receiver is T0052" {

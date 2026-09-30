@@ -1,0 +1,19 @@
+# Feature: `mut self` calls on a captured local, inside and outside the closure, reach the same box
+# expect: exit 44
+struct Acc { n: int }
+
+impl Acc {
+    fn bump(mut self) { self.n = self.n + 1 }
+    fn get(self) -> int { self.n }
+}
+
+fn main() -> int {
+    acc := Acc { n: 0 }
+    tick := fn() { acc.bump() }
+    tick()
+    tick()
+    acc.bump()
+    peek := fn() -> int { acc.get() }
+    acc.bump()
+    return peek() * 10 + acc.n
+}

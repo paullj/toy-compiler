@@ -1,0 +1,35 @@
+# Feature: a captured and assigned parameter (of a fn or of a lambda) is moved into a box on entry
+# expect: exit 45
+struct P { x: int }
+
+fn make_counter(start: int) -> fn() -> int {
+    fn() {
+        start = start + 1
+        start
+    }
+}
+
+fn tally(p: P) -> fn() -> int {
+    fn() {
+        p.x = p.x + 1
+        p.x
+    }
+}
+
+fn main() -> int {
+    c := make_counter(40)
+    c()
+    adder := fn(base: int) -> fn(int) -> int {
+        fn(v: int) -> int {
+            base = base + v
+            base
+        }
+    }
+    g := adder(0)
+    g(1)
+    orig := P { x: 5 }
+    t := tally(orig)
+    t()
+    # tally's parameter is its own copy: orig is unchanged.
+    return c() + g(0) + t() - orig.x
+}
