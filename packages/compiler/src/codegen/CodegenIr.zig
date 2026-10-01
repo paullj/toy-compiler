@@ -82,6 +82,8 @@ const Gen = struct {
     /// One label per IR block, pre-allocated so a forward branch can target a
     /// not-yet-emitted block. Indexed by BlockId.
     block_labels: []LabelId,
+    /// This fn's precise GC root map (`FrameLayout.projectRoots`).
+    root_bitmap: []const u8 = &.{},
 
     fn emit(g: *Gen, word: u32) error{OutOfMemory}!void {
         var buf: [4]u8 = undefined;
@@ -264,12 +266,14 @@ pub fn lowerIr(
         g.literals.deinit(gpa);
     }
 
-    try genBody(&g);
-
-    // The precise GC root map, a byproduct of the (still-live) frame layout. `g.fl` is
-    // deinited by the `defer` above only AFTER this return value is built.
+    // The precise GC root map, a byproduct of the (still-live) frame layout, which the
+    // prologue reads too. `g.fl` is deinited by the `defer` above only AFTER this return
+    // value is built.
     const rb = try FrameLayout.projectRoots(gpa, func, &g.fl, layouts, enum_layouts);
     errdefer gpa.free(rb);
+    g.root_bitmap = rb;
+
+    try genBody(&g);
 
     const name_copy = try gpa.dupe(u8, func.name.name);
     errdefer gpa.free(name_copy);
@@ -309,6 +313,7 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
     if (g.fl.frame > 0) {
         try g.emit(Aarch64.subImm(Aarch64.SP, Aarch64.SP, @intCast(g.fl.frame)));
     }
+    try zeroContainerRoots(g);
     // sret: save the incoming x8 (caller's result buffer) once up front — body
     // calls clobber x8.
     if (g.fl.sret_save_off != FrameLayout.NO_SRET) {
@@ -326,6 +331,25 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
     }
 
     try g.resolveFixups();
+}
+
+/// Clear each frame word the root map tags as a container header (tag 1). A collection
+/// at a call walks such a word as a `gc_array` header, and a cell not written yet still
+/// holds whatever an earlier frame left there, which may point into any live cell.
+fn zeroContainerRoots(g: *Gen) error{OutOfMemory}!void {
+    const rb = g.root_bitmap;
+    if (rb.len < 4) return;
+    const n = std.mem.readInt(u32, rb[0..4], .little);
+    for (0..n) |i| {
+        const off = std.mem.readInt(u32, rb[4 + i * 8 ..][0..4], .little);
+        const tag = std.mem.readInt(u32, rb[4 + i * 8 + 4 ..][0..4], .little);
+        if (tag != 1) continue;
+        const seen = for (0..i) |j| {
+            if (std.mem.readInt(u32, rb[4 + j * 8 ..][0..4], .little) == off and
+                std.mem.readInt(u32, rb[4 + j * 8 + 4 ..][0..4], .little) == 1) break true;
+        } else false;
+        if (!seen) try g.emit(Aarch64.strSp(Aarch64.XZR, off));
+    }
 }
 
 /// Marshal incoming params from their ABI locations into their slot cells.
@@ -1145,6 +1169,45 @@ test "ir-codegen: store_byte emits a strb into the address register" {
     // val loaded into S1, address into S0, then strb w(S1),[x(S0)].
     try testing.expect(codeHasWord(fc, Aarch64.strb(S1, S0, 0)));
     try testing.expect(codeHasWord(fc, Aarch64.ldrbRegUoff(S0, S0, 0)));
+}
+
+test "ir-codegen: the prologue clears each container root slot, and only those" {
+    const gpa = testing.allocator;
+    // struct 0 = a gc_array box (a Vec handle), struct 1 = a Ref box.
+    const layouts = [_]Layout{
+        .{ .name = "V", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 8, .@"align" = 8, .native_family = .gc_array },
+        .{ .name = "R", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 8, .@"align" = 8, .native_family = .ref },
+    };
+    var blocks = try gpa.alloc(Ir.Block, 1);
+    blocks[0] = .{ .params = try gpa.alloc(Ir.ValueId, 0), .instrs = try gpa.alloc(Ir.Instr, 0), .term = .{ .ret = .none } };
+    var slots = try gpa.alloc(Ir.Slot, 3);
+    slots[0] = .{ .type = Type.int };
+    slots[1] = .{ .type = Type.structT(0) };
+    slots[2] = .{ .type = Type.structT(1) };
+    var func = Ir.Function{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(Ir.SlotId, 0),
+        .ret_type = Type.unit,
+        .slots = slots,
+        .values = try gpa.alloc(Ir.ValueDef, 0),
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+        .literals = try gpa.alloc(Ir.Literal, 0),
+    };
+    defer func.deinit(gpa);
+    var fl = try FrameLayout.compute(gpa, &func, &layouts, &.{});
+    defer fl.deinit(gpa);
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var fc = try lowerIr(gpa, &func, &layouts, &.{}, false, &diags);
+    defer fc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    // The Vec slot is cleared; the int and the Ref slot (word-scanned) are not.
+    try testing.expect(codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, fl.slot_off[1])));
+    try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, fl.slot_off[0])));
+    try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, fl.slot_off[2])));
 }
 
 test "ir-codegen: fn_addr emits adrp+add with two .func relocs" {
