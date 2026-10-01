@@ -880,3 +880,124 @@ test "gc: a box whose closures are gone is kept by its owner" {
         \\
     );
 }
+
+/// A `Vec` slot is not written before the churn loop's collections, so it still holds a
+/// word an earlier call left in the same stack bytes (`gs`'s element backing). Each
+/// collection walks that slot as a container header unless the prologue clears it.
+const stale_slot_src =
+    \\import std/vec
+    \\struct C { n: int, tag: str, xs: Vec[int] }
+    \\struct Pt { x: int, y: int }
+    \\fn churn_mk(k: int, _j: int) -> C {
+    \\    i := 0
+    \\    loop {
+    \\        if i >= 30000 { break }
+    \\        p := Pt { x: i, y: i }
+    \\        f := Pt { x: 1, y: 2 }
+    \\        _q := f
+    \\        _r := &p
+    \\        i = i + 1
+    \\    }
+    \\    xs: Vec[int] = [1, 2, 3]
+    \\    C { n: k, tag: "ab", xs: xs }
+    \\}
+    \\fn churn_closures(k: int) -> C {
+    \\    i := 0
+    \\    loop {
+    \\        if i >= 30000 { break }
+    \\        p := Pt { x: i, y: i }
+    \\        f := fn() -> int { p.x }
+    \\        _q := f
+    \\        i = i + 1
+    \\    }
+    \\    xs: Vec[int] = [1, 2, 3]
+    \\    C { n: k, tag: "ab", xs: xs }
+    \\}
+    \\fn main() -> int {
+    \\    gs: Vec[int] = []
+    \\    c := churn_mk(1, 0)
+    \\    gs.push(c.n)
+    \\    c2 := churn_mk(2, 0)
+    \\    gs.push(c2.n)
+    \\    c3 := churn_closures(3)
+    \\    gs.push(c3.n)
+    \\    c4 := churn_closures(4)
+    \\    gs.push(c4.n)
+    \\    return gs.len() + c.xs.len() + c4.xs.len()
+    \\}
+    \\
+;
+
+test "gc: a container slot is cleared before a collection can scan it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-stale-slot", stale_slot_src);
+    try std.testing.expectEqual(@as(u8, 10), code);
+}
+
+test "gc: an enum word that is a container in one variant only is word-scanned" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // The Vec of variant `b` shares its payload offset with a closure env, a `Ref` and a
+    // `str` buffer of variant `a`, the live one.
+    const cases = [_]struct { src: []const u8, want: u8 }{
+        .{ .src =
+        \\import std/vec
+        \\import core/mem_selftest
+        \\enum E { b(int, int, Vec[int]), a(int, fn() -> int) }
+        \\struct Pt { x: int, y: int }
+        \\fn mk(k: int) -> fn() -> int {
+        \\    p := Pt { x: k, y: k }
+        \\    fn() -> int { p.x + p.y }
+        \\}
+        \\fn main() -> int {
+        \\    e := E.a(1, mk(5))
+        \\    n := mem_selftest.churn_collects()
+        \\    m := mem_selftest.forced_collect_count()
+        \\    r := match e { .a(k, f) -> k + f(), .b(_, _, v) -> v.len() }
+        \\    if n < 1 || m < 1 { return 1 }
+        \\    return r
+        \\}
+        \\
+        , .want = 11 },
+        .{ .src =
+        \\import std/vec
+        \\import core/mem_selftest
+        \\enum E { b(int, int, Vec[int]), a(int, int, Ref[int]) }
+        \\fn main() -> int {
+        \\    e := E.a(1, 2, &5)
+        \\    n := mem_selftest.churn_collects()
+        \\    m := mem_selftest.forced_collect_count()
+        \\    r := match e { .a(k, _, rr) -> k + *rr, .b(_, _, v) -> v.len() }
+        \\    if n < 1 || m < 1 { return 1 }
+        \\    return r
+        \\}
+        \\
+        , .want = 6 },
+        .{ .src =
+        \\import std/vec
+        \\import core/mem_selftest
+        \\enum E { b(int, Vec[int]), a(int, str) }
+        \\fn main() -> int {
+        \\    x := 12345
+        \\    e := E.a(1, x.to_string())
+        \\    n := mem_selftest.churn_collects()
+        \\    m := mem_selftest.forced_collect_count()
+        \\    r := match e { .a(k, s) -> k + s.len(), .b(_, v) -> v.len() }
+        \\    if n < 1 || m < 1 { return 1 }
+        \\    return r
+        \\}
+        \\
+        , .want = 6 },
+    };
+    for (cases, 0..) |cs, i| {
+        const dir = try std.fmt.allocPrint(gpa, ".toy-test-gc-enum-overlap-{d}", .{i});
+        defer gpa.free(dir);
+        const code = try buildAndRun(gpa, io, dir, cs.src);
+        try std.testing.expectEqual(cs.want, code);
+    }
+}

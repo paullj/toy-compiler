@@ -268,6 +268,9 @@ pub const Root = struct { off: u32, tag: u32 };
 /// `lower.passKind` (a box IS a struct kind, so the box test must precede the struct arm).
 /// An enum unions its variants' payload offsets (a sound superset — the collector's marker
 /// is deref-safe, so listing a currently-inactive variant's field over-retains at worst).
+/// A container root in an enum keeps tag 1 only where every variant has one at that
+/// offset: the collector walks a tag-1 word as a `gc_array` header, and where variants
+/// disagree the word may hold another variant's payload (a closure env, a `str` buffer).
 fn projectCell(
     ty: Type,
     base: u32,
@@ -293,9 +296,26 @@ fn projectCell(
         .@"enum" => {
             if (ty.enum_id >= enum_layouts.len) return;
             const e = enum_layouts[ty.enum_id];
-            for (e.variants) |v| {
+            // `bounds[k]..bounds[k + 1]` are variant k's roots in `out`.
+            const bounds = try gpa.alloc(usize, e.variants.len + 1);
+            defer gpa.free(bounds);
+            bounds[0] = out.items.len;
+            for (e.variants, 1..) |v, k| {
                 for (v.field_types, v.offsets) |ft, fo| {
                     try projectCell(ft, base + e.payload_off + fo, layouts, enum_layouts, out, gpa);
+                }
+                bounds[k] = out.items.len;
+            }
+            for (out.items[bounds[0]..]) |*r| {
+                if (r.tag != 1) continue;
+                for (bounds[0..e.variants.len], bounds[1..]) |lo, hi| {
+                    const agrees = for (out.items[lo..hi]) |o| {
+                        if (o.off == r.off and o.tag == 1) break true;
+                    } else false;
+                    if (!agrees) {
+                        r.tag = 0;
+                        break;
+                    }
                 }
             }
         },
@@ -781,6 +801,56 @@ test "roots: an enum unions its variants' box payload offsets; a () field contri
     try testing.expectEqual(@as(u32, 1), rootCount(bm));
     try testing.expectEqual(fl.slot_off[0] + 8, rootAt(bm, 0)); // payload_off within the enum slot
     try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // a Ref box → conservative tag 0
+}
+
+test "roots: an enum container keeps tag 1 only where every variant has one there" {
+    const gpa = testing.allocator;
+    // struct 0 = a gc_array box, struct 1 = a Ref box.
+    var ls: [2]Layout = undefined;
+    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .gc_array);
+    ls[1] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .ref);
+    defer for (&ls) |*l| {
+        gpa.free(l.field_types);
+        gpa.free(l.offsets);
+    };
+    const vec = Type.structT(0);
+    const mk = struct {
+        fn v(a: std.mem.Allocator, fts: []const Type, offs: []const u32) !VariantLayout {
+            return .{ .name = "V", .form = .tuple, .field_names = &.{}, .field_types = try a.dupe(Type, fts), .offsets = try a.dupe(u32, offs) };
+        }
+    }.v;
+    const Case = struct { variants: []const VariantLayout, tags: []const u32 };
+    const vec_at_8 = try mk(gpa, &.{ Type.int, vec }, &.{ 0, 8 });
+    const vec_at_8_too = try mk(gpa, &.{ Type.bool, vec }, &.{ 0, 8 });
+    const ref_at_8 = try mk(gpa, &.{ Type.int, Type.structT(1) }, &.{ 0, 8 });
+    const str_at_0 = try mk(gpa, &.{Type.str}, &.{0});
+    const empty = try mk(gpa, &.{}, &.{});
+    defer for ([_]VariantLayout{ vec_at_8, vec_at_8_too, ref_at_8, str_at_0, empty }) |v| {
+        gpa.free(v.field_types);
+        gpa.free(v.offsets);
+    };
+    const cases = [_]Case{
+        // One variant, or all agreeing: the header stays precise.
+        .{ .variants = &.{vec_at_8}, .tags = &.{1} },
+        .{ .variants = &.{ vec_at_8, vec_at_8_too }, .tags = &.{ 1, 1 } },
+        // Another variant's Ref, its str's length word, or nothing at all: word-scanned.
+        .{ .variants = &.{ vec_at_8, ref_at_8 }, .tags = &.{ 0, 0 } },
+        .{ .variants = &.{ vec_at_8, str_at_0 }, .tags = &.{ 0, 0 } },
+        .{ .variants = &.{ empty, vec_at_8 }, .tags = &.{0} },
+    };
+    for (cases) |c| {
+        var vars: [2]VariantLayout = undefined;
+        @memcpy(vars[0..c.variants.len], c.variants);
+        const el = [_]EnumLayout{.{ .name = "E", .variants = vars[0..c.variants.len], .tag_size = 8, .payload_off = 8, .size = 32, .@"align" = 8 }};
+        var func = try buildSimple(gpa, &.{Type.enumT(0)}, &.{}, 0, Type.unit);
+        defer func.deinit(gpa);
+        var fl = try compute(gpa, &func, &ls, &el);
+        defer fl.deinit(gpa);
+        const bm = try projectRoots(gpa, &func, &fl, &ls, &el);
+        defer gpa.free(bm);
+        try testing.expectEqual(@as(u32, @intCast(c.tags.len)), rootCount(bm));
+        for (c.tags, 0..) |t, i| try testing.expectEqual(t, tagAt(bm, i));
+    }
 }
 
 test "a fn-pair struct slot projects one root at +8" {
