@@ -165,6 +165,7 @@ pub const Describer = struct {
         try d.buf.append(d.a, '(');
         for (sig.params, 0..) |p, k| {
             if (k != 0) try d.buf.appendSlice(d.a, ", ");
+            if (toyc.Modes.isMut(sig.mut_mask, k)) try d.buf.appendSlice(d.a, "mut ");
             if (k < names.len) try d.buf.print(d.a, "{s}: ", .{names[k]});
             try renderType(d.a, &d.buf, p, d.tc.layouts, d.tc.enum_layouts);
         }
@@ -184,6 +185,7 @@ pub const Describer = struct {
         try d.buf.print(d.a, "fn {s}(", .{sig.name});
         for (sig.params, 0..) |p, k| {
             if (k != 0) try d.buf.appendSlice(d.a, ", ");
+            if (toyc.Modes.isMut(sig.mut_mask, k)) try d.buf.appendSlice(d.a, "mut ");
             // A receiver inside a bounded template has no concrete type (its node types are
             // scratch): the name alone beats a `?`.
             if (k < sig.param_names.len) {

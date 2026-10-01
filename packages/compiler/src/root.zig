@@ -29,6 +29,7 @@ pub const Resolve = @import("resolve.zig");
 pub const Callee = @import("symbols/Callee.zig").Callee;
 pub const Closure = @import("symbols/Closure.zig");
 pub const Spec = @import("symbols/Spec.zig");
+pub const Modes = @import("symbols/Modes.zig");
 pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
 pub const Derive = @import("symbols/Derive.zig");
@@ -90,6 +91,7 @@ test {
     _ = @import("symbols/Callee.zig");
     _ = Closure;
     _ = Spec;
+    _ = Modes;
     _ = ResolveGraph;
     _ = Typecheck;
     _ = Derive;

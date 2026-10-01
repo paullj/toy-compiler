@@ -3712,6 +3712,48 @@ test "cache soundness: a method body edit recompiles only the method; a method r
     try testing.expectEqual(@as(usize, 0), lp3.codegen_cached);
 }
 
+test "cache soundness: self->mut self and x->mut x flips with unchanged bodies recompile both callees and their caller; verify passes" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var src_buf: [64]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&src_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+    var cache_buf: [80]u8 = undefined;
+    const cache_dir = std.fmt.bufPrint(&cache_buf, ".zig-cache/tmp/{s}/cc", .{&tmp.sub_path}) catch unreachable;
+    const cache = try Cache.init(io, cache_dir);
+
+    const path = std.fmt.allocPrint(gpa, "{s}/p.toy", .{src_dir}) catch unreachable;
+    defer gpa.free(path);
+
+    // A mode is part of both sides' code: the callee reads its param through the caller's
+    // address, and the caller passes that address. So a flip with no body edit must
+    // recompile `show`, `bump` and their caller `main`; only `mk` stays a hit.
+    const v1 = "struct P { x: int }\nimpl P { fn show(self) -> int { self.x } }\nfn mk() -> P { P{ x: 1 } }\nfn bump(n: int) { n = n + 1 }\nfn main() -> int {\n p := mk()\n c := 1\n bump(c)\n return p.show() + c\n}\n";
+    var r1: FileResult = undefined;
+    var lp1 = try checkAndLower(gpa, io, cache, path, v1, .normal, &r1);
+    defer r1.deinit(gpa);
+    defer lp1.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4), lp1.codegen_compiled);
+
+    const v2 = "struct P { x: int }\nimpl P { fn show(mut self) -> int { self.x } }\nfn mk() -> P { P{ x: 1 } }\nfn bump(mut n: int) { n = n + 1 }\nfn main() -> int {\n p := mk()\n c := 1\n bump(c)\n return p.show() + c\n}\n";
+    var r2: FileResult = undefined;
+    var lp2 = try checkAndLower(gpa, io, cache, path, v2, .normal, &r2);
+    defer r2.deinit(gpa);
+    defer lp2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), lp2.codegen_compiled);
+    try testing.expectEqual(@as(usize, 1), lp2.codegen_cached);
+
+    var r3: FileResult = undefined;
+    var lp3 = try checkAndLower(gpa, io, cache, path, v2, .verify, &r3);
+    defer r3.deinit(gpa);
+    defer lp3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4), lp3.codegen_cached);
+}
+
 test "cache soundness: editing a value-if fn recompiles only it; verify passes" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

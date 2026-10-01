@@ -27,6 +27,7 @@ const Token = token.Token;
 const Ast = @import("ast/Ast.zig");
 const Node = Ast.Node;
 const Code = @import("diagnostics/codes.zig").Code;
+const Modes = @import("symbols/Modes.zig");
 
 const Parser = @This();
 
@@ -522,6 +523,17 @@ const FnKind = union(enum) {
     const Recv = struct { recv_tok: u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index };
 };
 
+/// Only a fn called by name or as a method can take a `mut` param: a lambda or local fn is
+/// called as a value, an extern through the C ABI, and protocol code passes arguments by value.
+fn mutParamRejection(kind: FnKind) ?[]const u8 {
+    return switch (kind) {
+        .top_level, .inherent_method => null,
+        .protocol_sig, .conformance_method => "'mut' may only qualify the 'self' receiver of a protocol method",
+        .extern_top_level => "an 'extern' function's parameters cannot be 'mut'",
+        .local => "a local function's parameters cannot be 'mut'; it is called as a value, which passes every argument by value",
+    };
+}
+
 fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     const self_recv_tok: ?u32 = switch (kind) {
         .top_level, .extern_top_level, .local => null,
@@ -582,18 +594,17 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     // (peek2 != colon) is the by-value receiver — synthesize `params[0] = self:
     // <Receiver>` (child nodes created before the fn_decl, so children precede
     // parents). Its type-ref is a synthetic `identifier` on the impl's receiver
-    // token. A method with no leading `self` is a static/associated fn, which is out
-    // of scope: report P0006 and keep parsing the rest for recovery.
+    // token. Only a protocol sig must take `self` (P0006, parsing on for recovery); an
+    // impl method with no leading `self` is an associated fn.
     if (self_recv_tok) |recv_tok| {
-        // A `mut self` receiver: consume the leading `mut` ONLY when it qualifies
+        // A `mut self` receiver: consume the leading `mut` here ONLY when it qualifies
         // `self`, leaving `main_token` on the `self` token so `tokens[self_tok-1]` is
         // `kw_mut` (how `Ast.isMutParam` later detects mut-ness — no node-shape change).
-        // A `mut` on a non-self first param is out of scope: report P0006 once and drop
-        // the `mut` so the ordinary param loop still parses the rest.
+        // A `mut` on a non-self first param is left to the param loop, which accepts or
+        // rejects it like any other param's.
         const has_mut = p.at(.kw_mut);
         const mut_self = has_mut and p.peek2().tag == .identifier and std.mem.eql(u8, p.peek2().text(p.src), "self");
-        if (has_mut and !mut_self) try p.warn(p.peek(), .P0006, "'mut' may only qualify a 'self' receiver");
-        if (has_mut) p.bump(.kw_mut);
+        if (mut_self) p.bump(.kw_mut);
         if (p.at(.identifier) and std.mem.eql(u8, p.peek().text(p.src), "self") and p.peek2().tag != .colon) {
             const self_tok = p.index;
             p.bump(.identifier);
@@ -605,16 +616,20 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
             try params.append(p.gpa, self_param);
             _ = p.eat(.comma); // separator before the next param, if any
         } else if (!has_mut and !self_optional) {
-            // A conformance impl (`self_optional`) may declare a SELF-LESS method
-            // (`impl BigErr has From[SmallErr] { fn from(s: SmallErr) -> BigErr {..} }`):
-            // the T0024 coherence signature check governs correctness there (a self-less
-            // `from` matches From's self-less protocol sig). An INHERENT impl still requires
-            // `self` — static/associated methods stay out of scope — so the diagnostic holds.
+            // `has_mut`: a protocol sig's `fn q(mut a: int)` gets only the param loop's
+            // "'mut' may only qualify the 'self' receiver" P0006, not this one as well.
             try p.warn(p.peek(), .P0006, "a method must take 'self' as its first parameter");
         }
     }
     while (!p.at(.r_paren) and !p.at(.eof)) {
         const entry = p.index;
+        if (p.at(.kw_mut) and p.peek2().tag == .identifier) {
+            if (mutParamRejection(kind)) |msg|
+                try p.warn(p.peek(), .P0006, msg)
+            else if (params.items.len >= Modes.max_params)
+                try p.warn(p.peek(), .P0006, "only the first 64 parameters can be 'mut'");
+            p.bump(.kw_mut);
+        }
         if (p.at(.identifier)) {
             const param_name = p.index;
             p.bump(.identifier);
@@ -1540,7 +1555,7 @@ fn parseLambda(p: *Parser) Error!Ast.Index {
     while (!p.at(.r_paren) and !p.at(.eof)) {
         const entry = p.index;
         if (p.at(.kw_mut)) {
-            try p.warn(p.peek(), .P0006, "'mut' may only qualify a 'self' receiver");
+            try p.warn(p.peek(), .P0006, "a lambda's parameters cannot be 'mut'; a lambda is called as a value, which passes every argument by value");
             p.advance();
         }
         if (p.at(.identifier)) {
@@ -3746,22 +3761,26 @@ test "`pub protocol` records the pub export" {
     );
 }
 
-test "isMutParam is true for `mut self`, false for plain self / a non-self first param" {
+test "isMutParam is true for `mut self` and any `mut` param, false for plain self and by-value params" {
     const gpa = testing.allocator;
     const source =
         "struct P { x: int }\n" ++
+        "struct B[T] { v: T }\n" ++
         "impl P {\n" ++
         "  fn bump(mut self, d: int) { self.x = self.x + d }\n" ++
         "  fn get(self) -> int { self.x }\n" ++
+        "  fn m(mut self, mut d: int) { d = self.x }\n" ++
         "}\n" ++
-        "fn free(a: int) -> int { a }\n";
+        "impl B[T] { fn fill(mut s: T) { s = s } }\n" ++
+        "fn free(a: int) -> int { a }\n" ++
+        "fn g(a: int, mut b: int) { b = a }\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     const tree = try expectTree(gpa, tokens, source);
     defer freeTree(gpa, tree);
 
-    // Collect the three fn_decls in source order: bump (mut self), get (self), free.
-    var fns: [3]Ast.Index = undefined;
+    // The fn_decls in source order: bump, get, m, fill, free, g.
+    var fns: [6]Ast.Index = undefined;
     var nfns: usize = 0;
     for (tree.nodes, 0..) |n, i| {
         if (n.tag == .fn_decl) {
@@ -3769,41 +3788,67 @@ test "isMutParam is true for `mut self`, false for plain self / a non-self first
             nfns += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 3), nfns);
+    try testing.expectEqual(@as(usize, 6), nfns);
+    var protos: [6]Ast.FnProto = undefined;
+    for (fns, &protos) |f, *pr| pr.* = Ast.protoAt(tree, tree.nodes[f.int()].lhs.int());
+    const bump_p, const get, const m, const fill, const free, const g = protos;
 
-    const bump_proto = Ast.protoAt(tree, tree.nodes[fns[0].int()].lhs.int());
-    const get_proto = Ast.protoAt(tree, tree.nodes[fns[1].int()].lhs.int());
-    const free_proto = Ast.protoAt(tree, tree.nodes[fns[2].int()].lhs.int());
-
-    try testing.expect(Ast.isMutParam(tree, tokens, bump_proto.params[0])); // `mut self`
-    try testing.expect(!Ast.isMutParam(tree, tokens, bump_proto.params[1])); // `d: int`
-    try testing.expect(!Ast.isMutParam(tree, tokens, get_proto.params[0])); // plain `self`
-    try testing.expect(!Ast.isMutParam(tree, tokens, free_proto.params[0])); // `a: int`
+    try testing.expect(Ast.isMutParam(tree, tokens, bump_p.params[0])); // `mut self`
+    try testing.expect(!Ast.isMutParam(tree, tokens, bump_p.params[1])); // `d: int`
+    try testing.expect(!Ast.isMutParam(tree, tokens, get.params[0])); // plain `self`
+    try testing.expect(Ast.isMutParam(tree, tokens, m.params[0])); // `mut self`
+    try testing.expect(Ast.isMutParam(tree, tokens, m.params[1])); // `mut d: int`
+    try testing.expect(Ast.isMutParam(tree, tokens, fill.params[0])); // a static method's `mut s: T`
+    try testing.expect(!Ast.isMutParam(tree, tokens, free.params[0])); // `a: int`
+    try testing.expect(!Ast.isMutParam(tree, tokens, g.params[0])); // `a: int`
+    try testing.expect(Ast.isMutParam(tree, tokens, g.params[1])); // `mut b: int`
 }
 
-test "a mut on a non-self first param is rejected (P0006), mut self is not" {
+test "mut params parse on fns and inherent (incl. static) methods; lambda, local fn, extern, protocol-sig and conformance-method params reject them (P0006)" {
     const gpa = testing.allocator;
-    // `mut x` on a top-level fn is out of scope: the reserved `mut` keyword makes
-    // the param loop's identifier expectation fail → a diagnostic. A `mut self` method
-    // parses cleanly.
-    const bad = "fn f(mut x: int) -> int { x }\n";
-    {
-        const tokens = try Lexer.tokenize(gpa, bad);
+    const cases = [_]struct { src: []const u8, diags: usize }{
+        .{ .src = "fn f(mut x: int) -> int { x }\n", .diags = 0 },
+        .{ .src = "fn f(a: int, mut x: int, mut y: str) { x = a }\n", .diags = 0 },
+        .{ .src = "struct P { x: int }\nimpl P { fn m(self, mut d: int) { d = self.x } }\n", .diags = 0 },
+        .{ .src = "struct P { x: int }\nimpl P { fn m(mut self, mut d: int) { d = self.x } }\n", .diags = 0 },
+        .{ .src = "struct B[T] { v: T }\nimpl B[T] { fn reset(mut b: B[T], v: T) { b.v = v } }\n", .diags = 0 },
+        .{ .src = "protocol Q { fn q(mut self) }\nstruct P { x: int }\nimpl P has Q { fn q(mut self) { self.x = 1 } }\n", .diags = 0 },
+        .{ .src = "fn main() { f := fn(mut a: int) -> int { a } }\n", .diags = 1 },
+        .{ .src = "fn main() {\n    fn g(mut a: int) -> int { a }\n}\n", .diags = 1 },
+        .{ .src = "extern fn ex(mut a: int) -> int\n", .diags = 1 },
+        .{ .src = "protocol Q { fn q(self, mut a: int) }\n", .diags = 1 },
+        .{ .src = "protocol Q { fn q(mut a: int) }\n", .diags = 1 },
+        .{ .src = "protocol Q { fn q(self, a: int) }\nstruct P { x: int }\nimpl P has Q { fn q(self, mut a: int) { a = 1 } }\n", .diags = 1 },
+    };
+    for (cases) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
         defer gpa.free(tokens);
-        const res = try parse(gpa, tokens, bad);
+        const res = try parse(gpa, tokens, c.src);
         defer gpa.free(@constCast(res.diags));
         defer freeTree(gpa, res.tree);
-        try testing.expect(res.diags.len >= 1);
+        testing.expectEqual(c.diags, res.diags.len) catch |e| {
+            std.debug.print("source: {s}\n", .{c.src});
+            return e;
+        };
+        for (res.diags) |d| try testing.expectEqual(Code.P0006, d.code);
     }
-    const good = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn main() -> int { 0 }\n";
-    {
-        const tokens = try Lexer.tokenize(gpa, good);
-        defer gpa.free(tokens);
-        const res = try parse(gpa, tokens, good);
-        defer gpa.free(@constCast(res.diags));
-        defer freeTree(gpa, res.tree);
-        try testing.expectEqual(@as(usize, 0), res.diags.len);
-    }
+}
+
+test "mut on the 65th parameter is P0006" {
+    const gpa = testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "fn f(");
+    for (0..65) |i| try src.print(gpa, "mut p{d}: int, ", .{i});
+    try src.appendSlice(gpa, ") {}\n");
+    const tokens = try Lexer.tokenize(gpa, src.items);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, src.items);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqual(Code.P0006, res.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, res.diags[0].message, "only the first 64 parameters") != null);
 }
 
 test "a self-less inherent method is an associated function: a clean parse, no P0006" {

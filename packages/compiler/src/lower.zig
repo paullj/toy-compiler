@@ -44,6 +44,8 @@ const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
 const Infer = @import("symbols/Infer.zig");
 const Intrinsic = @import("symbols/Intrinsic.zig");
+const Modes = @import("symbols/Modes.zig");
+const AstWalk = @import("query/AstWalk.zig");
 const StdNames = @import("symbols/StdNames.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const Literal = @import("types/literal.zig");
@@ -171,13 +173,23 @@ pub const Builder = struct {
 
     /// The ADDRESS slots: a slot that holds a pointer to a local's storage rather than the
     /// local itself, which `rootAddr` loads through so every use reaches that storage.
-    /// There are two kinds. `mut_self_slot` is the `mut self` receiver (or `none_slot`): its
-    /// param slot is typed `int` rather than the struct, so the scalar/1-GPR ABI carries
-    /// the caller's slot address. `addr_slots` holds each boxed local's slot: typed `rawptr`,
-    /// so the precise root map keeps the local's GC cell alive. A body with neither has no
-    /// address slot, and every slot access takes today's direct path.
-    mut_self_slot: Ir.SlotId = Ir.none_slot,
-    addr_slots: std.AutoHashMapUnmanaged(Ir.SlotId, void) = .empty,
+    /// There are two kinds. `place_slots` holds each `mut` param's slot (`mut self`
+    /// included): typed `int` rather than the param's type, so the scalar/1-GPR ABI
+    /// carries the caller's place address. That address may point into the caller's frame
+    /// or into a cell's interior, so it must never be a GC root: a place slot never enters
+    /// `box_slots`. `box_slots` holds each boxed local's slot: typed `rawptr`, so the precise
+    /// root map keeps the local's GC cell alive. A body with neither has no address slot,
+    /// and every slot access takes today's direct path.
+    place_slots: std.AutoHashMapUnmanaged(Ir.SlotId, void) = .empty,
+    box_slots: std.AutoHashMapUnmanaged(Ir.SlotId, void) = .empty,
+    /// Set when a param other than `self` is `mut`. Two place slots can then name one
+    /// caller storage (`flip(q, q)`), so an aggregate store through a place slot builds the
+    /// whole value aside before writing any of it.
+    staged_places: bool = false,
+    /// Resolver locals that a call in this unit passes as a `mut` argument. A plain
+    /// aggregate local is read by slot at the call instruction, after a later argument's
+    /// call has run, so a by-value read of one of these copies it on the spot instead.
+    mut_arg_roots: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     /// resolutions[].local index → the IR slot bound to that local. Allocated
     /// lazily the first time a local is touched (so id order tracks source order).
@@ -220,18 +232,25 @@ pub const Builder = struct {
         for (b.literals.items) |l| b.gpa.free(l.bytes);
         b.literals.deinit(b.gpa);
         b.local_slots.deinit(b.gpa);
-        b.addr_slots.deinit(b.gpa);
+        b.place_slots.deinit(b.gpa);
+        b.box_slots.deinit(b.gpa);
+        b.mut_arg_roots.deinit(b.gpa);
         b.loops.deinit(b.gpa);
     }
 
-    /// Whether `sid` holds a pointer to its local's storage (see `mut_self_slot`).
+    /// Whether `sid` holds a pointer to its local's storage (see `place_slots`).
     fn isAddrSlot(b: *const Builder, sid: Ir.SlotId) bool {
-        return sid == b.mut_self_slot or b.isBoxSlot(sid);
+        return b.isPlaceSlot(sid) or b.isBoxSlot(sid);
+    }
+
+    /// Whether `sid` holds the caller's place address for a `mut` param.
+    fn isPlaceSlot(b: *const Builder, sid: Ir.SlotId) bool {
+        return b.place_slots.count() != 0 and b.place_slots.contains(sid);
     }
 
     /// Whether `sid` holds a boxed local's cell pointer.
     fn isBoxSlot(b: *const Builder, sid: Ir.SlotId) bool {
-        return b.addr_slots.count() != 0 and b.addr_slots.contains(sid);
+        return b.box_slots.count() != 0 and b.box_slots.contains(sid);
     }
 
     /// Whether resolver local `li` is one of the owner's boxed locals.
@@ -375,16 +394,19 @@ pub fn lowerFn(
     // index to its slot so an identifier reading the param finds the same slot.
     var params: std.ArrayList(Ir.SlotId) = .empty;
     errdefer params.deinit(gpa);
-    for (proto.params, 0..) |_, i| {
-        // A `mut self` receiver: type param-0's slot as `int` (an 8B pointer to
-        // the caller's live slot), NOT the struct. This bypasses `paramType` — which
-        // would return the struct type from the Sig — so the existing scalar-param ABI
-        // carries the address in one GPR, with no Abi/Codegen change. `rootAddr` then
-        // loads through this slot for every `self`/`self.field` use.
-        const is_mut_self = i == 0 and Ast.isMutParam(in.tree, in.tokens, proto.params[0]);
-        const pty = if (is_mut_self) Typecheck.Type.int else paramType(in, proto, @intCast(i));
+    for (proto.params, 0..) |pn, i| {
+        // A `mut` param (`mut self` included) arrives as the caller's place address, so
+        // its slot is typed `int` (an 8B pointer), NOT the Sig's by-value type that
+        // `paramType` would give: the existing scalar-param ABI then carries the address in
+        // one GPR, with no Abi/Codegen change, and `rootAddr` loads through the slot at
+        // every use. Each param is decided on its own token, so a static method's `mut`
+        // first param is a place param, not a receiver.
+        const is_place = Ast.isMutParam(in.tree, in.tokens, pn);
+        const pty = if (is_place) Typecheck.Type.int else paramType(in, proto, @intCast(i));
         const sid = try b.addSlot(pty);
-        if (is_mut_self) b.mut_self_slot = sid;
+        if (is_place) try b.place_slots.put(gpa, sid, {});
+        if (is_place and !(i == 0 and std.mem.eql(u8, in.tokens[in.tree.nodes[pn.int()].main_token].text(in.source), "self")))
+            b.staged_places = true;
         try params.append(gpa, sid);
         // resolve assigns local slot indices in declaration order, params FIRST
         // (it declares each param but does not write `.local` onto the param node).
@@ -400,6 +422,7 @@ pub fn lowerFn(
         for (lis, 0..) |*li, i| li.* = @intCast(i);
         try boxParams(&b, lis, params.items, decl.main_token);
     }
+    try noteMutArgRoots(&b, decl.rhs);
     try lowerBodyInto(&b, decl.rhs, ret_type, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
@@ -434,6 +457,7 @@ pub fn lowerLambda(
     try bindCaptures(&b, unit, env_slot);
     if (unit.self_slot) |ss| try bindSelf(&b, unit, ss, env_slot);
     try boxParams(&b, unit.param_slots, params.items[1..], lam.main_token);
+    try noteMutArgRoots(&b, lam.rhs);
     try lowerBodyInto(&b, lam.rhs, unit.sig.ret, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
@@ -450,7 +474,7 @@ fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) erro
     for (unit.env) |es| {
         if (es.mode == .box) {
             const sid = try b.addSlot(Typecheck.Type.rawptr);
-            try b.addr_slots.put(b.gpa, sid, {});
+            try b.box_slots.put(b.gpa, sid, {});
             try b.local_slots.put(b.gpa, es.slot, sid);
             const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
             const cell = try b.emit(.{ .load = .{ .addr = src, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
@@ -564,11 +588,15 @@ pub fn finishFn(
     // loop stack) here; slots/values/blocks/params/literals have moved into the result.
     b.blocks.deinit(gpa);
     b.local_slots.deinit(gpa);
-    b.addr_slots.deinit(gpa);
+    b.place_slots.deinit(gpa);
+    b.box_slots.deinit(gpa);
+    b.mut_arg_roots.deinit(gpa);
     b.loops.deinit(gpa);
     b.blocks = .empty;
     b.local_slots = .empty;
-    b.addr_slots = .empty;
+    b.place_slots = .empty;
+    b.box_slots = .empty;
+    b.mut_arg_roots = .empty;
     b.loops = .empty;
     b.slots = .empty;
     b.values = .empty;
@@ -615,12 +643,8 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 return;
             }
             const slot = try bindingSlot(b, stmt.lhs, place_ty);
-            // Whole-`self` reassignment inside a `mut self` method (`self = expr`): the
-            // slot holds a POINTER, so produce the RHS through it into the caller's
-            // storage rather than overwriting the local pointer. A boxed local's store goes
-            // through its cell in `storeInto`.
-            if (slot == b.mut_self_slot) {
-                try lowerExprInto(b, stmt.rhs, try rootAddr(b, slot), place_ty);
+            if (stagesStore(b, stmt.lhs) and isAggregatePass(b, place_ty)) {
+                try storeStaged(b, stmt.rhs, try valueAddr(b, slot), place_ty);
                 return;
             }
             try storeInto(b, slot, stmt.rhs, place_ty);
@@ -817,12 +841,12 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
             return .{ .value = v };
         },
         .str, .@"struct", .@"enum" => {
-            // A whole-value read of a local held through an address slot (`return self` or
-            // passing `self` by value in a `mut self` method; any read of a boxed local):
-            // the slot holds a POINTER, not the value, so copy the pointee into a fresh
-            // temp and yield that. An ordinary aggregate local is passed by slot directly
-            // (no copy).
-            if (b.isAddrSlot(slot)) {
+            // A whole-value read of a local held through an address slot (`return p` or
+            // passing `p` by value where `p` is a `mut` param or `mut self`; any read of a
+            // boxed local): the slot holds a POINTER, not the value, so copy the pointee
+            // into a fresh temp and yield that. An ordinary aggregate local is passed by
+            // slot directly (no copy).
+            if (b.isAddrSlot(slot) or readsMutArgRoot(b, node_idx)) {
                 const tmp = try b.addSlot(ty);
                 const dst = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
                 _ = try b.emit(.{ .copy = .{ .dst = dst, .src = try rootAddr(b, slot), .ty = ty } }, null);
@@ -1903,6 +1927,13 @@ fn passKind(b: *Builder, t: Typecheck.Type) PassKind {
     };
 }
 
+fn isAggregatePass(b: *Builder, t: Typecheck.Type) bool {
+    return switch (passKind(b, t)) {
+        .str, .@"struct", .@"enum" => true,
+        else => false,
+    };
+}
+
 /// The operand a value of `ty` held in `slot` is passed as: a scalar is loaded, an
 /// aggregate travels by its slot. For a source-less unit forwarding its params.
 pub fn slotOperand(b: *Builder, slot: Ir.SlotId, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
@@ -2322,9 +2353,10 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     }
     const result_ty = b.in.node_types[(node_idx).int()];
 
-    // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot). For a
-    // method call the receiver is the FIRST arg (`self`, by value — reusing the
-    // struct-arg reg-pair/sret path), followed by the source args in order.
+    // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot; a `mut`
+    // param's arg is its place address). For a method call the receiver is the FIRST arg
+    // (`self`, by value — reusing the struct-arg reg-pair/sret path — or its address for
+    // `mut self`), followed by the source args in order.
     const arg_nodes = Ast.rangeSlice(b.in.tree, (n.rhs).int());
     const self_n: usize = if (self_recv != Ast.none) 1 else 0;
     const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len + self_n);
@@ -2345,8 +2377,18 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             args[0] = try lowerExpr(b, self_recv);
         }
     }
+    const arg_mut = Modes.argMask(&b.in, node_idx);
     for (arg_nodes, 0..) |arg, i| {
-        args[self_n + i] = try lowerExpr(b, arg);
+        if (Modes.isMut(arg_mut, i)) {
+            // A `mut` param takes the argument's place ADDRESS, like a `mut self` receiver.
+            const addr = try lowerPlaceAddr(b, arg);
+            if (addr == Ir.none_value) {
+                try b.note(callee_node.main_token, "mut argument is not a place in lower");
+                b.gpa.free(args);
+                return .none;
+            }
+            args[self_n + i] = .{ .value = addr };
+        } else args[self_n + i] = try lowerExpr(b, arg);
     }
 
     return try emitCall(b, .{ .direct = callee }, args, result_ty, n.main_token);
@@ -2649,6 +2691,8 @@ fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
             try b.note(n.main_token, "captured local has no slot in lower");
             continue;
         };
+        // A place address must not outlive the call that lent it (T0052 rejects the capture).
+        std.debug.assert(!b.isPlaceSlot(sid));
         if (es.mode == .box) {
             if (!b.isBoxSlot(sid)) {
                 try b.note(n.main_token, "boxed capture has no cell in lower");
@@ -3431,6 +3475,7 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
         try b.note(b.in.tree.nodes[(place).int()].main_token, "field store target unsupported in lower");
         return;
     }
+    if (stagesStore(b, place) and isAggregatePass(b, ty)) return storeStaged(b, value, addr, ty);
     switch (ty.kind) {
         .int, .bool, .float => {
             const v = operandValue(try lowerExpr(b, value));
@@ -3445,23 +3490,22 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
 
 /// The address of a slot's CONTENTS. For an ordinary slot that is `slot_addr(slot)`.
 /// An address slot holds a POINTER to the storage instead, so the address is that
-/// pointer, a `load` of `slot_addr(slot)`: typed `int` for the `mut self` receiver (the
-/// caller's slot), `rawptr` for a box (a GC cell, so the loaded pointer is a root too).
-/// A body with no address slot always takes the bare `slot_addr`.
+/// pointer, a `load` of `slot_addr(slot)`: typed `int` for a `mut` param (the caller's
+/// place, which must not read as a root), `rawptr` for a box (a GC cell, so the loaded
+/// pointer is a root too). A body with no address slot always takes the bare `slot_addr`.
 fn rootAddr(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
     const sa = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
-    if (slot == b.mut_self_slot)
+    if (b.isPlaceSlot(slot))
         return try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
     if (b.isBoxSlot(slot))
         return try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
     return sa;
 }
 
-/// The address a local's value is read from or stored to where the local is a plain
-/// slot: `slot_addr(slot)`, or its cell for a boxed local. (The `mut self` receiver is
-/// an aggregate and goes through `rootAddr` at each aggregate site.)
+/// The address a local's value is read from or stored to: `slot_addr(slot)` for a plain
+/// slot, or the storage an address slot points at.
 fn valueAddr(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.ValueId {
-    if (b.isBoxSlot(slot)) return try rootAddr(b, slot);
+    if (b.isAddrSlot(slot)) return try rootAddr(b, slot);
     return try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
 }
 
@@ -3492,7 +3536,9 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
                     return try b.emit(.{ .field_addr = .{ .base = base_addr, .off = layout.offsets[j], .ty = layout.field_types[j] } }, Typecheck.Type.int);
                 }
             }
-            return base_addr; // unreachable on a well-typed program
+            // A member that is no field (a bound method) has no address; the checker
+            // rejects such a place (T0019), so this is unreachable on a checked program.
+            return Ir.none_value;
         },
         // A `.field` off an index element (`ps[i].x`, `b.items[i].x`): the element is
         // an rvalue with no named place, so materialize it into a temp and return that
@@ -4026,6 +4072,70 @@ fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
         .field_access, .tuple_field => isLocalRootedPlace(b, n.lhs),
         else => false,
     };
+}
+
+/// The resolver local a `field_access`/identifier place is rooted at.
+fn placeRootLocal(b: *const Builder, node_idx: Ast.Index) ?u32 {
+    var cur = node_idx;
+    while (true) {
+        const n = b.in.tree.nodes[cur.int()];
+        switch (n.tag) {
+            .identifier => return switch (b.in.resolutions[cur.int()]) {
+                .local => |li| li,
+                else => null,
+            },
+            .field_access, .tuple_field => cur = n.lhs,
+            else => return null,
+        }
+    }
+}
+
+/// Fill `mut_arg_roots` from every call in `body`.
+fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
+    const Visitor = struct {
+        b: *Builder,
+        pub fn on(v: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
+            const c = switch (ev) {
+                .callee => |c| c,
+                else => return,
+            };
+            const mask = Modes.argMask(&v.b.in, c.call);
+            if (mask == 0) return;
+            const args = Ast.rangeSlice(v.b.in.tree, v.b.in.tree.nodes[c.call.int()].rhs.int());
+            for (args, 0..) |a, i| if (Modes.isMut(mask, i)) if (placeRootLocal(v.b, a)) |li|
+                try v.b.mut_arg_roots.put(v.b.gpa, li, {});
+        }
+    };
+    var v: Visitor = .{ .b = b };
+    try AstWalk.walk(.{ .tree = b.in.tree, .tokens = b.in.tokens, .source = b.in.source }, body, &v);
+}
+
+/// Whether a by-value read of the local `node_idx` names must copy it now (see
+/// `mut_arg_roots`).
+fn readsMutArgRoot(b: *const Builder, node_idx: Ast.Index) bool {
+    if (b.mut_arg_roots.count() == 0) return false;
+    return switch (b.in.resolutions[node_idx.int()]) {
+        .local => |li| b.mut_arg_roots.contains(li),
+        else => false,
+    };
+}
+
+/// Whether an aggregate store into the place rooted at `place` builds its value aside
+/// first (see `staged_places`).
+fn stagesStore(b: *const Builder, place: Ast.Index) bool {
+    if (!b.staged_places) return false;
+    const li = placeRootLocal(b, place) orelse return false;
+    const sid = b.local_slots.get(li) orelse return false;
+    return b.isPlaceSlot(sid);
+}
+
+/// Produce the aggregate `value` into a fresh temp, then copy it to `dst`, so `value`
+/// never reads that storage half-written.
+fn storeStaged(b: *Builder, value: Ast.Index, dst: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
+    const tmp = try aggregateValue(b, value, ty);
+    if (b.termSet()) return;
+    const src = try b.emit(.{ .slot_addr = tmp.slot }, Typecheck.Type.int);
+    _ = try b.emit(.{ .copy = .{ .dst = dst, .src = src, .ty = ty } }, null);
 }
 
 /// `if cond { then } [else ...]` as a STATEMENT (value discarded). cond lowers in
@@ -4747,7 +4857,7 @@ fn bindBox(b: *Builder, li: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.SlotI
     const sid = blk: {
         if (b.local_slots.get(li)) |s| if (b.isBoxSlot(s)) break :blk s;
         const s = try b.addSlot(Typecheck.Type.rawptr);
-        try b.addr_slots.put(b.gpa, s, {});
+        try b.box_slots.put(b.gpa, s, {});
         try b.local_slots.put(b.gpa, li, s);
         break :blk s;
     };
@@ -4763,6 +4873,7 @@ fn boxParams(b: *Builder, lis: []const u32, sids: []const Ir.SlotId, tok: u32) e
     if (b.in.closure.boxed.len == 0) return;
     for (lis, sids) |li, sid| {
         if (!b.isBoxedLocal(li)) continue;
+        std.debug.assert(!b.isPlaceSlot(sid));
         const ty = b.slots.items[sid].type;
         const cell_slot = try bindBox(b, li, ty);
         const dst = try valueAddr(b, cell_slot);
@@ -6524,6 +6635,169 @@ test "a mut-self method body loads self through the pointer slot (s0:int)" {
             "  br b1\n" ++
             "b1:\n" ++
             "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "a mut param loads and stores through its int slot" {
+    try expectLoweredG(
+        "fn bump(mut n: int) { n = n + 1 }\n" ++
+            "fn main() -> int { c := 1\n bump(c)\n return c }\n",
+        "bump",
+        "fn main.bump(s0) -> unit {\n" ++
+            "  slots: s0:int\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = load %0 : int\n" ++
+            "  %2 = load %1 : int\n" ++
+            "  %3 = iconst 1\n" ++
+            "  %4 = add %2, %3\n" ++
+            "  %5 = slot_addr s0\n" ++
+            "  %6 = load %5 : int\n" ++
+            "  store %6, %4 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "a mut argument passes the place address" {
+    try expectLoweredG(
+        "struct P { x: int, y: int }\n" ++
+            "fn bump(mut n: int) { n = n + 1 }\n" ++
+            "fn main() -> int { c := 1\n p := P{ x: 2, y: 3 }\n bump(c)\n bump(p.y)\n return c + p.y }\n",
+        "main",
+        "fn main() -> int {\n" ++
+            "  slots: s0:int s1:P\n" ++
+            "b0:\n" ++
+            "  %1 = iconst 1\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  store %2, %1 : int\n" ++
+            "  %3 = slot_addr s1\n" ++
+            "  %4 = field_addr %3, 0 : int\n" ++
+            "  %5 = iconst 2\n" ++
+            "  store %4, %5 : int\n" ++
+            "  %6 = field_addr %3, 8 : int\n" ++
+            "  %7 = iconst 3\n" ++
+            "  store %6, %7 : int\n" ++
+            "  %8 = slot_addr s0\n" ++
+            "  call @main.bump(%8)\n" ++
+            "  %9 = slot_addr s1\n" ++
+            "  %10 = field_addr %9, 8 : int\n" ++
+            "  call @main.bump(%10)\n" ++
+            "  %11 = slot_addr s0\n" ++
+            "  %12 = load %11 : int\n" ++
+            "  %13 = slot_addr s1\n" ++
+            "  %14 = field_addr %13, 8 : int\n" ++
+            "  %15 = load %14 : int\n" ++
+            "  %16 = add %12, %15\n" ++
+            "  br b1(%16)\n" ++
+            "b1(%0:int):\n" ++
+            "  ret %0\n" ++
+            "}\n",
+    );
+}
+
+test "a forwarded mut param passes the address it holds" {
+    try expectLoweredG(
+        "fn bump(mut n: int) { n = n + 1 }\n" ++
+            "fn twice(mut n: int) { bump(n)\n bump(n) }\n" ++
+            "fn main() -> int { c := 1\n twice(c)\n return c }\n",
+        "twice",
+        "fn main.twice(s0) -> unit {\n" ++
+            "  slots: s0:int\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = load %0 : int\n" ++
+            "  call @main.bump(%1)\n" ++
+            "  %2 = slot_addr s0\n" ++
+            "  %3 = load %2 : int\n" ++
+            "  call @main.bump(%3)\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "a whole assignment to a mut aggregate param builds the value aside, then copies it to the caller's storage" {
+    try expectLoweredG(
+        "struct P { x: int, y: int }\n" ++
+            "fn set(mut p: P) { p = P{ x: 5, y: 6 } }\n" ++
+            "fn main() -> int { q := P{ x: 1, y: 2 }\n set(q)\n return q.x }\n",
+        "set",
+        "fn main.set(s0) -> unit {\n" ++
+            "  slots: s0:int s1:P\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = load %0 : int\n" ++
+            "  %2 = slot_addr s1\n" ++
+            "  %3 = field_addr %2, 0 : int\n" ++
+            "  %4 = iconst 5\n" ++
+            "  store %3, %4 : int\n" ++
+            "  %5 = field_addr %2, 8 : int\n" ++
+            "  %6 = iconst 6\n" ++
+            "  store %5, %6 : int\n" ++
+            "  %7 = slot_addr s1\n" ++
+            "  copy %1 <- %7 : P\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "a mut self method with no other mut param still produces a whole assignment in place" {
+    try expectLoweredG(
+        "struct P { x: int, y: int }\n" ++
+            "impl P { fn set(mut self) { self = P{ x: 5, y: 6 } } }\n" ++
+            "fn main() -> int { q := P{ x: 1, y: 2 }\n q.set()\n return q.x }\n",
+        "set",
+        "fn main.P.set(s0) -> unit {\n" ++
+            "  slots: s0:int\n" ++
+            "b0:\n" ++
+            "  %0 = slot_addr s0\n" ++
+            "  %1 = load %0 : int\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 5\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 6\n" ++
+            "  store %4, %5 : int\n" ++
+            "  br b1\n" ++
+            "b1:\n" ++
+            "  ret\n" ++
+            "}\n",
+    );
+}
+
+test "a by-value read of a local some call passes as a mut argument copies it on the spot" {
+    try expectLoweredG(
+        "struct Q { a: int, b: int }\n" ++
+            "fn touch(mut p: Q) -> int { p.a = 50\n 0 }\n" ++
+            "fn hq(v: Q, k: int) -> int { v.a + k }\n" ++
+            "fn main() -> int { q := Q{ a: 1, b: 2 }\n return hq(q, touch(q)) }\n",
+        "main",
+        "fn main() -> int {\n" ++
+            "  slots: s0:Q s1:Q\n" ++
+            "b0:\n" ++
+            "  %1 = slot_addr s0\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 1\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 2\n" ++
+            "  store %4, %5 : int\n" ++
+            "  %6 = slot_addr s1\n" ++
+            "  %7 = slot_addr s0\n" ++
+            "  copy %6 <- %7 : Q\n" ++
+            "  %8 = slot_addr s0\n" ++
+            "  %9 = call @main.touch(%8)\n" ++
+            "  %10 = call @main.hq(s1, %9)\n" ++
+            "  br b1(%10)\n" ++
+            "b1(%0:int):\n" ++
+            "  ret %0\n" ++
             "}\n",
     );
 }

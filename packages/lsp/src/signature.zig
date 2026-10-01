@@ -152,6 +152,7 @@ fn renderLabel(
     buf: *std.ArrayList(u8),
     name: []const u8,
     params: []const Type,
+    mut_mask: u64,
     ret: Type,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
@@ -164,6 +165,7 @@ fn renderLabel(
     for (params, 0..) |p, i| {
         if (i != 0) try buf.appendSlice(a, ", ");
         const s: u32 = @intCast(buf.items.len);
+        if (toyc.Modes.isMut(mut_mask, i)) try buf.appendSlice(a, "mut ");
         try render.renderTypeNamed(a, buf, p, layouts, enum_layouts, var_names);
         try ranges.append(a, .{ s, @intCast(buf.items.len) });
     }
@@ -191,6 +193,7 @@ fn renderDeclLabel(
     for (params, 0..) |p, i| {
         if (i != 0) try buf.appendSlice(a, ", ");
         const s: u32 = @intCast(buf.items.len);
+        if (toyc.Ast.isMutParam(pm.tree(), pm.tokens, p)) try buf.appendSlice(a, "mut ");
         try appendTypeText(a, buf, pm, pm.nodes[p.int()].lhs);
         try ranges.append(a, .{ s, @intCast(buf.items.len) });
     }
@@ -278,12 +281,12 @@ pub fn signatureHelpAt(
     switch (callee.what) {
         .func => |fid| {
             const sig = tc.sigs[fid];
-            try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
+            try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.mut_mask, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
         },
         .method => |ms| if (ms.decl != null and tc.callees[entry][callee.node].view() == .protocol)
             try renderDeclLabel(a, &label, &graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
         else
-            try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges),
+            try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.mut_mask >> @intFromBool(ms.has_self), ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges),
     }
 
     const params = try a.alloc(protocol.ParameterInformation, ranges.items.len);
@@ -431,7 +434,7 @@ test "renderLabel: matches renderSig and spans the correct param occurrences" {
     const a = arena.allocator();
 
     const int = Type.int;
-    const Sig = struct { name: []const u8, params: []const Type, ret: Type };
+    const Sig = struct { name: []const u8, params: []const Type, ret: Type, mut_mask: u64 = 0 };
     const sig: Sig = .{ .name = "m.add", .params = &.{ int, int }, .ret = int };
 
     const no_layouts: []const Layout = &.{};
@@ -439,7 +442,7 @@ test "renderLabel: matches renderSig and spans the correct param occurrences" {
 
     var label: std.ArrayList(u8) = .empty;
     var ranges: std.ArrayList([2]u32) = .empty;
-    try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.ret, no_layouts, no_enums, &.{}, &ranges);
+    try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.mut_mask, sig.ret, no_layouts, no_enums, &.{}, &ranges);
 
     var expect: std.ArrayList(u8) = .empty;
     try render.renderSig(a, &expect, sig, no_layouts, no_enums);
@@ -460,7 +463,7 @@ test "renderLabel: a zero-param sig has no ranges" {
     const a = arena.allocator();
 
     const int = Type.int;
-    const Sig = struct { name: []const u8, params: []const Type, ret: Type };
+    const Sig = struct { name: []const u8, params: []const Type, ret: Type, mut_mask: u64 = 0 };
     const sig: Sig = .{ .name = "foo", .params = &.{}, .ret = int };
 
     const no_layouts: []const Layout = &.{};
@@ -468,7 +471,7 @@ test "renderLabel: a zero-param sig has no ranges" {
 
     var label: std.ArrayList(u8) = .empty;
     var ranges: std.ArrayList([2]u32) = .empty;
-    try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.ret, no_layouts, no_enums, &.{}, &ranges);
+    try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.mut_mask, sig.ret, no_layouts, no_enums, &.{}, &ranges);
     try testing.expectEqualStrings("fn foo() -> int", label.items);
     try testing.expectEqual(@as(usize, 0), ranges.items.len);
 }
@@ -612,4 +615,39 @@ test "signatureHelpAt: an unterminated method call keeps its selection" {
     defer r.deinit();
     try testing.expectEqualStrings("fn plus(int, int) -> int", r.help.signatures[0].label);
     try testing.expectEqual(@as(u32, 1), r.help.activeParameter);
+}
+
+test "signatureHelpAt: a mut param's label says mut" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct P { x: int }
+        \\impl P {
+        \\    fn bump(mut self, mut d: int) { self.x = self.x + d }
+        \\}
+        \\fn inc(mut n: int, k: int) { n = n + k }
+        \\fn main() -> int {
+        \\    c := 1
+        \\    inc(c, 2)
+        \\    p := P { x: 1 }
+        \\    p.bump(c)
+        \\    return c + p.x
+        \\}
+        \\
+    ;
+    const cases = [_]struct { after: []const u8, label: []const u8 }{
+        .{ .after = "inc(", .label = "fn inc(mut int, int) -> ()" },
+        .{ .after = "p.bump(", .label = "fn bump(mut int) -> ()" },
+    };
+    for (cases) |c| {
+        const p = test_util.posAfterLast(src, c.after);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no signature help after '{s}'\n", .{c.after});
+            return error.NoSignatureHelp;
+        };
+        defer r.deinit();
+        try testing.expectEqualStrings(c.label, r.help.signatures[0].label);
+    }
 }

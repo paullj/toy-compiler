@@ -67,7 +67,7 @@ pub const Code = enum(u16) {
     T0016, // type-args-not-inferable (a generic type-param left unbound after matching)
     T0017, // instantiation-too-deep (unbounded generic-data instantiation depth)
     T0018, // no-such-method (a method call names a receiver type that has no such method)
-    T0019, // mut-self-not-place (a `mut self` method called on a temporary/non-place receiver)
+    T0019, // mut-self-not-place (a `mut self` receiver or a `mut` argument is a temporary/non-place)
     T0020, // overlapping-impl (two impls of the same protocol for the same type-ctor — coherence)
     T0021, // no-conformance (an `impl .. has P` omits a required method, or `has` names an undeclared protocol)
     T0022, // mut-self-on-scalar (a `mut self` method called on a builtin scalar receiver — the by-address self ABI has no place to write back)
@@ -97,10 +97,10 @@ pub const Code = enum(u16) {
     T0046, // no-such-field (a field access, construction, or pattern names a field the struct/variant does not have)
     T0047, // missing-field (a struct or variant construction omits a declared field)
     T0048, // non-exhaustive-match (a match does not cover every value of its scrutinee)
-    T0049, // fn-not-a-value (a builtin, extern or generic function, or a built-in or protocol method, is named as a value)
+    T0049, // fn-not-a-value (a builtin, extern, generic or `mut`-param function, or a built-in, protocol or `mut`-param method, is named as a value)
     T0050, // lambda-param-type-unknown (an unannotated lambda param with no expected fn type)
     T0051, // jump-across-lambda (break/continue targeting a loop outside the lambda)
-    T0052, // capture-unsupported (a closure captures a `mut self` receiver, or a `mut self` method is bound on a field)
+    T0052, // capture-unsupported (a closure captures a `mut` parameter or `mut self` receiver, or a `mut self` method is bound on a field)
 
     // Warning band (W####).
     W0001, // unused-variable

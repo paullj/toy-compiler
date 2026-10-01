@@ -18,6 +18,9 @@ pub const Sig = struct {
     name: []const u8,
     params: []const types.Type,
     ret: types.Type,
+    /// Bit i: `params[i]` is `mut`; a method's `self` is `params[0]`. Folded into callers'
+    /// keys (#25), since it decides how each argument is passed.
+    mut_mask: u64 = 0,
 
     /// True when some param is a check-time `type_var` — i.e. this sig is a generic
     /// template. The single home for the test the bare-inferred-generic-call sites

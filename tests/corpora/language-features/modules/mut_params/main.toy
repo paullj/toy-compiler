@@ -1,0 +1,20 @@
+# expect: exit 44
+# The `mut` params of an imported module take this module's places by address: bump(c)
+# makes c 2; swap(a, b) and swap[str] trade values (a=9, s has len 3); a.add(carry) adds
+# 1 to a.n (31) and zeroes the caller's carry. 2 + 9 + 3 + 31 + 0 + 0 - 1 = 44.
+import lib
+
+fn main() -> int {
+    c := 1
+    lib.bump(c)
+    a := 1
+    b := 9
+    lib.swap(a, b)
+    s := ""
+    t := "abc"
+    lib.swap[str](s, t)
+    q := lib.acc()
+    carry := 1
+    q.add(carry)
+    return c + a + s.len() + q.n + carry + t.len() - b
+}

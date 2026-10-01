@@ -119,6 +119,16 @@ from two angles — assignability is directional (want ← got), join is symmetr
   no return-type inference: a function with no arrow returns unit, and any
   non-unit return value must be annotated. *(`decodeFnSig` defaults a missing
   return-type node to `Type.unit`.)*
+* **`mut` parameters** — `fn bump(mut n: int)` takes the caller's place by address,
+  like a `mut self` receiver, and its writes reach the caller's variable. The
+  parameter's type stays by-value for checking (`n: int`); the mode is the fn's own
+  `mut_mask` (bit *i* for param *i*, a method's `self` is bit 0), computed in Pass A.
+  The argument must be a mutable place — a local or a field / tuple-field chain
+  rooted at one — or it is **T0019**; the local it is rooted at counts as assigned
+  for the box rule. Allowed on top-level fns and inherent-impl methods (associated
+  fns included); a lambda's, local fn's, extern's or non-self protocol / conformance
+  param, or a param past the 64th, is **P0006**. A fn with a `mut` param, or a method
+  with one after `self`, is not a value (**T0049**).
 * **`main` must return `int` or `()`** — any other return type (bool/str/struct/
   enum) is rejected with a diagnostic at `main`'s name token. Enforced in the
   checker as a Pass-A rule (`checkMainReturn`): it reads only the frozen fn
@@ -279,11 +289,13 @@ inside a block). It is checked bidirectionally, like a literal:
 * A lambda may name the locals and parameters of the function around it: it captures
   them by reference. A captured local that nothing assigns is copied when the lambda's
   value is made (a copy and a share cannot be told apart). One that is also assigned
-  anywhere in the function (`x = ..`, `x.f = ..`, or a `mut self` call on `x`, inside a
+  anywhere in the function (`x = ..`, `x.f = ..`, a `mut self` call on `x`, or `x` as a
+  `mut` argument, inside a
   lambda or outside) is **boxed**: it lives in a GC cell for its whole lifetime, and
   every use, in the function and in its lambdas, goes through the cell. Parameters and
   loop variables follow the same rule, and a boxed loop variable gets a fresh cell per
-  iteration. A `mut self` receiver may not be captured at all (**T0052**). A captured
+  iteration. A `mut` parameter (`mut self` included) may not be captured at all
+  (**T0052**); a local passed as a `mut` argument counts as assigned. A captured
   `Vec`/`Map` is its handle, so pushes through it are shared either way.
 
 Each lambda is its own function `<owner>$l<rank>(env, params..)`, where the owner is
@@ -336,7 +348,8 @@ nothing assigns is copied into the value. Any other receiver (a field `p.inner.m
 call result) is evaluated once, when the value is made, and copied. A `mut self`
 method writes its receiver through the value, so binding one boxes its receiver, which
 must be a local variable: a temporary is **T0019**, a field **T0052**. A method bound
-on the `mut self` receiver of the enclosing method would capture it (**T0052**). An
+on a `mut` parameter (`mut self` included) of the enclosing function would capture it
+(**T0052**). A method with a `mut` parameter after `self` cannot be bound (**T0049**). An
 associated function has no receiver to bind (**T0018**), a generic method has no single
 instance (**T0049**), and a method the compiler expands at each call (a scalar or
 `str` builtin such as `s.len`, a conversion, the derivable `hash`/`to_string`, a native
