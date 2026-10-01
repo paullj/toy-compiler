@@ -1,0 +1,34 @@
+# Feature: a caller local that a closure captures and that is passed as a `mut` argument lives in a box, so the closure sees every write
+# expect: stdout "2\n4\n5\n0\n3\n6\n9\n"
+# expect: exit 11
+import std/io
+
+fn bump(mut n: int) { n = n + 1 }
+
+fn run(f: fn()) { f() }
+
+fn main() -> int {
+    c := 1
+    show := fn() { io.println(c) }
+    bump(c)
+    show()
+    # A lambda that passes the captured local to a `mut` param writes the same box.
+    inc := fn() { bump(c) }
+    run(inc)
+    bump(c)
+    show()
+    fn again() { bump(c) }
+    again()
+    show()
+    # Writing the range-loop variable through a `mut` param steers the loop: each
+    # iteration starts at 0, 3, 6, 9 and leaves i two higher, so the last is 11.
+    last := 0
+    for i in 0..10 {
+        peek := fn() { io.println(i) }
+        peek()
+        bump(i)
+        bump(i)
+        last = i
+    }
+    return last
+}

@@ -1,0 +1,43 @@
+# Feature: `mut` struct and str parameters: field writes and whole reassignment reach the caller's storage, at 8, 16 and 40 bytes
+# expect: exit 90
+# p.x: 1 + 1 = 2. q: field writes give {3, 4}, then a fresh literal {5, 6} replaces it: 11.
+# big: a/b/c written to 7/8/9 (24), then s is reassigned to "four" (len 4): 28. The str
+# param `t` is reassigned to "seventeen chars!!" (len 17), and fresh(r) replaces a whole
+# 40-byte Big with {10, 10, 10, "xx"}, a literal that never reads `b`: 32.
+# 2 + 11 + 28 + 17 + 32 = 90.
+struct P { x: int }
+struct Q { x: int, y: int }
+struct Big { a: int, b: int, c: int, s: str }
+
+fn bump_p(mut p: P) { p.x = p.x + 1 }
+
+fn set_q(mut q: Q) {
+    q.x = 3
+    q.y = 4
+    q = Q { x: 5, y: 6 }
+}
+
+fn fill(mut b: Big) {
+    b.a = 7
+    b.b = 8
+    b.c = 9
+    b.s = "four"
+}
+
+fn rename(mut t: str) { t = "seventeen chars!!" }
+
+fn fresh(mut b: Big) { b = Big { a: 10, b: 10, c: 10, s: "xx" } }
+
+fn main() -> int {
+    p := P { x: 1 }
+    bump_p(p)
+    q := Q { x: 0, y: 0 }
+    set_q(q)
+    big := Big { a: 0, b: 0, c: 0, s: "" }
+    fill(big)
+    t := "short"
+    rename(t)
+    r := Big { a: 1, b: 2, c: 3, s: "abc" }
+    fresh(r)
+    return p.x + q.x + q.y + big.a + big.b + big.c + big.s.len() + t.len() + r.a + r.b + r.c + r.s.len()
+}

@@ -33,6 +33,8 @@ pub const CalleeSig = struct {
     param_names: []const []const u8,
     ret: Type,
     has_self: bool,
+    /// Bit i: `params[i]` is `mut` (`Modes`).
+    mut_mask: u64 = 0,
     /// The names of the `type_var`s in `params`/`ret`: a protocol method is written over
     /// `Self` and the protocol's own generic params.
     var_names: []const []const u8 = &.{},
@@ -87,15 +89,16 @@ fn select(
             const gf = res.fns[meth.fn_id];
             const names = try declParamNames(a, graph, gf.module, gf.decl_node);
             const decl: ?CalleeSig.Decl = if (gf.decl_node == Ast.none) null else .{ .module = gf.module, .node = gf.decl_node.int() };
-            // A generic template's own sig is over type_vars; the instance is concrete.
+            if (meth.fn_id >= tc.sigs.len) return null;
+            const sig = tc.sigs[meth.fn_id];
+            // A generic template's own sig is over type_vars; the instance is concrete. A
+            // reified row's `fn_id` is its template's, whose modes hold for every instance.
             if (meth.instance) |ii| {
                 if (ii >= tc.instances.len) return null;
                 const inst = tc.instances[ii];
-                return .{ .name = name, .params = inst.params, .param_names = names, .ret = inst.ret, .has_self = !meth.is_static, .decl = decl };
+                return .{ .name = name, .params = inst.params, .param_names = names, .ret = inst.ret, .has_self = !meth.is_static, .mut_mask = sig.mut_mask, .decl = decl };
             }
-            if (meth.fn_id >= tc.sigs.len) return null;
-            const sig = tc.sigs[meth.fn_id];
-            return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = !meth.is_static, .decl = decl };
+            return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = !meth.is_static, .mut_mask = sig.mut_mask, .decl = decl };
         },
         .protocol => |p| {
             if (p.protocol >= tc.protocols.len) return null;

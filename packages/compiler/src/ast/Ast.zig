@@ -559,8 +559,8 @@ pub fn protoAt(tree: Tree, header: u32) FnProto {
     };
 }
 
-/// True when the `param` node at `param_idx` is a `mut`-qualified receiver: the
-/// token immediately before its name is `kw_mut`. Token-adjacency detection
+/// True when the `param` node at `param_idx` is `mut`-qualified (a `mut self` receiver or
+/// any other `mut` param): the token immediately before its name is `kw_mut`. Token-adjacency detection
 /// mirrors the by-text `self`/`_` recognition — no dedicated node/cell, so no
 /// `ParseHeader.version` bump. `tokens` is passed explicitly because a `Tree` holds
 /// only nodes/extra, never the token stream.

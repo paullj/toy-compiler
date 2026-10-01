@@ -11,10 +11,10 @@ const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Sym = @import("Sym.zig");
 const Type = @import("../layout/Type.zig").Type;
-const Resolution = @import("Resolution.zig").Resolution;
 const Closure = @import("Closure.zig");
 const AstWalk = @import("../query/AstWalk.zig");
 const Callee = @import("Callee.zig").Callee;
+const Modes = @import("Modes.zig");
 
 pub const TargetKind = enum(u8) { named, lambda };
 
@@ -54,11 +54,14 @@ pub const Table = struct {
 pub const cap_per_template: u32 = 8;
 
 /// The params of the template at `fn_decl` a call may specialize: typed as a function in
-/// the template's own signature `params`, never assigned in its body (a spec unit assumes
-/// the param still holds the caller's argument at every call of it), and below 64. A
-/// template with a lambda or local fn (`has_closures`) specializes nothing, so every
-/// lambda unit belongs to exactly one lowered body.
-pub fn eligibleMask(src: AstWalk.Source, resolutions: []const Resolution, fn_decl: Ast.Index, params: []const Type, has_closures: bool) u64 {
+/// the template's own signature `params`, never assigned in its body nor passed to a `mut`
+/// param (a spec unit assumes the param still holds the caller's argument at every call of
+/// it), and below 64. A template with a lambda or local fn (`has_closures`) specializes
+/// nothing, so every lambda unit belongs to exactly one lowered body.
+///
+/// `view` supplies `.tree`, `.resolutions`, `.callees`, `.sigs` and `.methods` (see
+/// `Modes.argMask`).
+pub fn eligibleMask(src: AstWalk.Source, view: anytype, fn_decl: Ast.Index, params: []const Type, has_closures: bool) u64 {
     if (has_closures) return 0;
     var fn_params: u64 = 0;
     for (params[0..@min(params.len, 64)], 0..) |p, i| {
@@ -66,26 +69,34 @@ pub fn eligibleMask(src: AstWalk.Source, resolutions: []const Resolution, fn_dec
     }
     if (fn_params == 0) return 0;
     const V = struct {
-        tree: Ast.Tree,
-        resolutions: []const Resolution,
+        view: @TypeOf(view),
         mask: u64,
-        pub fn on(self: *@This(), ev: AstWalk.Event) void {
-            const e = switch (ev) {
-                .enter => |e| e,
-                else => return,
-            };
-            if (e.tag != .assign) return;
-            const target = self.tree.nodes[e.idx.int()].lhs;
-            if (self.tree.nodes[target.int()].tag != .identifier or target.int() >= self.resolutions.len) return;
-            switch (self.resolutions[target.int()]) {
+
+        fn clearLocal(self: *@This(), node: Ast.Index) void {
+            const tree = self.view.tree;
+            if (tree.nodes[node.int()].tag != .identifier or node.int() >= self.view.resolutions.len) return;
+            switch (self.view.resolutions[node.int()]) {
                 .local => |slot| if (slot < 64) {
                     self.mask &= ~(@as(u64, 1) << @intCast(slot));
                 },
                 else => {},
             }
         }
+
+        pub fn on(self: *@This(), ev: AstWalk.Event) void {
+            switch (ev) {
+                .enter => |e| if (e.tag == .assign) self.clearLocal(self.view.tree.nodes[e.idx.int()].lhs),
+                .callee => |c| {
+                    const arg_mut = Modes.argMask(self.view, c.call);
+                    if (arg_mut == 0) return;
+                    const args = Ast.rangeSlice(self.view.tree, self.view.tree.nodes[c.call.int()].rhs.int());
+                    for (args, 0..) |a, i| if (Modes.isMut(arg_mut, i)) self.clearLocal(a);
+                },
+                else => {},
+            }
+        }
     };
-    var v: V = .{ .tree = src.tree, .resolutions = resolutions, .mask = fn_params };
+    var v: V = .{ .view = view, .mask = fn_params };
     AstWalk.walk(src, fn_decl, &v) catch unreachable;
     return v.mask;
 }
@@ -384,7 +395,8 @@ const Checked = struct {
         const g = try self.gid(name);
         const f = self.res.fns[g];
         const has_closures = Closure.findFn(self.res.closures[f.module], f.decl_node) != null;
-        return eligibleMask(.{ .tree = self.tree, .tokens = self.tokens, .source = self.src }, self.res.resolutions[0], f.decl_node, self.tc.sigs[g].params, has_closures);
+        const mv = .{ .tree = self.tree, .resolutions = self.res.resolutions[0], .callees = self.tc.callees[0], .sigs = self.tc.sigs, .methods = self.tc.methods };
+        return eligibleMask(.{ .tree = self.tree, .tokens = self.tokens, .source = self.src }, mv, f.decl_node, self.tc.sigs[g].params, has_closures);
     }
 
     const View = struct {
@@ -440,6 +452,29 @@ test "an assigned fn param is ineligible" {
     defer fx.destroy(gpa);
     try testing.expectEqual(@as(u64, 0b011), try fx.templateMask("main.keep"));
     try testing.expectEqual(@as(u64, 0b001), try fx.templateMask("main.swap"));
+}
+
+test "a fn-typed param passed to a mut param is not eligible" {
+    const gpa = testing.allocator;
+    const fx = try Checked.create(gpa,
+        \\fn inc(x: int) -> int { x + 1 }
+        \\fn dec(x: int) -> int { x - 1 }
+        \\fn reset(mut g: fn(int) -> int) { g = dec }
+        \\fn run[T](f: fn(int) -> int, x: T) -> T {
+        \\    reset(f)
+        \\    _y := f(1)
+        \\    x
+        \\}
+        \\fn keep[T](f: fn(int) -> int, x: T) -> T {
+        \\    _y := f(1)
+        \\    x
+        \\}
+        \\fn main() -> int { run(inc, 1) + keep(inc, 1) }
+        \\
+    );
+    defer fx.destroy(gpa);
+    try testing.expectEqual(@as(u64, 0), try fx.templateMask("main.run"));
+    try testing.expectEqual(@as(u64, 1), try fx.templateMask("main.keep"));
 }
 
 test "a template containing a lambda is ineligible" {

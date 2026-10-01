@@ -349,3 +349,40 @@ test "hover on a method call with an argument error still shows the selected met
         try testing.expectEqualStrings(want, h.value);
     }
 }
+
+test "hover on a callee spells its mut params, a mut self receiver included" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct P { x: int }
+        \\impl P {
+        \\    fn bump(mut self, mut d: int) { self.x = self.x + d }
+        \\}
+        \\fn inc(mut n: int, k: int) { n = n + k }
+        \\fn main() -> int {
+        \\    c := 1
+        \\    inc(c, 2)
+        \\    p := P { x: 1 }
+        \\    p.bump(c)
+        \\    return c + p.x
+        \\}
+        \\
+    ;
+    const cases = [_]struct { needle: []const u8, want: []const u8 }{
+        .{ .needle = "inc(c", .want = "fn inc(mut n: int, k: int) -> ()" },
+        .{ .needle = "bump(c)", .want = "fn bump(mut self: P, mut d: int) -> ()" },
+    };
+    for (cases) |c| {
+        const p = @import("test_util.zig").posOf(src, c.needle);
+        var h = (try hoverAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.needle});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}

@@ -20,6 +20,7 @@ test {
     _ = @import("corpus.zig");
     _ = @import("heap.zig");
     _ = @import("closures.zig");
+    _ = @import("places.zig");
     _ = @import("ref.zig");
     _ = @import("vec.zig");
     _ = @import("desc.zig");

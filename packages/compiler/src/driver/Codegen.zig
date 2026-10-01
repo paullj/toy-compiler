@@ -542,7 +542,8 @@ fn specMasks(gpa: std.mem.Allocator, src: SpecSource) ![]Spec.TemplateMask {
         if (gid >= src.sigs.len) continue;
         const fcs: []const Closure.FnClosures = if (inst.mod < src.closures.len) src.closures[inst.mod] else &.{};
         const walk_src: AstWalk.Source = .{ .tree = src.trees[inst.mod], .tokens = src.tokens[inst.mod], .source = src.sources[inst.mod] };
-        const m = Spec.eligibleMask(walk_src, src.resolutions[inst.mod], inst.decl_node, src.sigs[gid].params, Closure.findFn(fcs, inst.decl_node) != null);
+        const mv = .{ .tree = src.trees[inst.mod], .resolutions = src.resolutions[inst.mod], .callees = inst.callees, .sigs = src.sigs, .methods = src.methods };
+        const m = Spec.eligibleMask(walk_src, mv, inst.decl_node, src.sigs[gid].params, Closure.findFn(fcs, inst.decl_node) != null);
         if (m != 0) try masks.append(gpa, .{ .gid = gid, .eligible = m });
     }
     std.mem.sort(Spec.TemplateMask, masks.items, {}, struct {

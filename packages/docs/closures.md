@@ -113,6 +113,13 @@ bump(count)                          # count changes
 - **No marker at the call site.** The LSP shows "mutated by bump".
 - **Escaping closures:** a `mut` parameter captured by a closure that escapes is a coded error, because the address would outlive the caller's frame. The hint is "copy it to a local first".
   - Until escape analysis lands, every capture of a `mut` parameter is that error.
+- **Limits:**
+  - **Where `mut` may appear.** On the params of top-level fns and of inherent-impl methods, static (associated) methods included, and on any `self` receiver where `mut self` is allowed today. It is P0006 on a lambda's params, a local fn's params, an `extern` fn's params, a protocol sig's or a conformance method's params after `self`, and any param past the 64th.
+  - **The argument.** A local (a param, a forwarded `mut` param, a loop variable and a match binding included) or a field / tuple-field chain rooted at one. Not a place (T0019): a literal, a call result, an index element `xs[i]` or `xs[i].f`, a struct literal or its field, a top-level fn name, a local fn name, a bound method `p.m`.
+  - **Captures.** Any capture of a `mut` param, by a lambda, a local fn or a bound method on it, is T0052 ("copy it to a local first").
+  - **Not a value.** A fn with any `mut` param, or a method with a `mut` param after `self`, cannot be used as a value: T0049. A call through a function value passes every argument by value.
+  - **Boxing.** A caller local passed as a `mut` argument counts as assigned, so if a closure captures it, it is boxed.
+  - **Aliasing** is allowed: `swap(x, x)`, and `f(x, x)` with one `mut` and one by-value param. A by-value argument is the copy taken where it is evaluated, so a later argument that writes the variable through a `mut` param (`f(q, touch(q))`) does not change it. An assignment through a `mut` param builds the whole value before it writes any of it, so `a = P { x: b.y, y: b.x }` is right when `a` and `b` name one variable.
 
 ## `Ref[T]` becomes a plain library type
 

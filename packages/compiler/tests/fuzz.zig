@@ -360,6 +360,7 @@ fn genFn(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random) erro
     var p: usize = 0;
     while (p < params) : (p += 1) {
         if (p > 0) try out.appendSlice(gpa, ", ");
+        if (rand.uintLessThan(u8, 4) == 0) try out.appendSlice(gpa, "mut ");
         try out.appendSlice(gpa, pick(idents, rand));
         try out.appendSlice(gpa, ": ");
         try out.appendSlice(gpa, pick(types, rand));

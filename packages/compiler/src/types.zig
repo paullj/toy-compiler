@@ -33,6 +33,7 @@ const symbols_res = @import("symbols/Resolution.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 pub const Callee = @import("symbols/Callee.zig").Callee;
 const Closure = @import("symbols/Closure.zig");
+const Modes = @import("symbols/Modes.zig");
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
@@ -933,12 +934,16 @@ pub fn witnessSym(m: Method, derives: []const DeriveRecipe, instances: []const M
 }
 
 /// The signature of the symbol `witnessSym` picks, from the same three sources; `sigs` is
-/// indexed by fn id. Null as for `witnessSym`.
-pub fn witnessSig(m: Method, derives: []const DeriveRecipe, instances: []const Mono.Instance, sigs: anytype) ?struct { params: []const Type, ret: Type } {
+/// indexed by fn id. An instance takes its template's modes. Null as for `witnessSym`.
+pub fn witnessSig(m: Method, derives: []const DeriveRecipe, instances: []const Mono.Instance, sigs: anytype) ?struct { params: []const Type, ret: Type, mut_mask: u64 = 0 } {
     if (m.derive) |di| return if (di < derives.len) .{ .params = derives[di].params, .ret = derives[di].ret } else null;
-    if (m.instance) |ii| return if (ii < instances.len) .{ .params = instances[ii].params, .ret = instances[ii].ret } else null;
+    if (m.instance) |ii| {
+        if (ii >= instances.len) return null;
+        const tg = instances[ii].template_gid;
+        return .{ .params = instances[ii].params, .ret = instances[ii].ret, .mut_mask = if (tg < sigs.len) sigs[tg].mut_mask else 0 };
+    }
     if (m.fn_id >= sigs.len) return null;
-    return .{ .params = sigs[m.fn_id].params, .ret = sigs[m.fn_id].ret };
+    return .{ .params = sigs[m.fn_id].params, .ret = sigs[m.fn_id].ret, .mut_mask = sigs[m.fn_id].mut_mask };
 }
 
 /// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }`. Kept in
@@ -1516,6 +1521,10 @@ pub const FnSym = struct {
     /// the decl, so the body checker can map `Self` without re-running `typeFromNode`
     /// (which would double-emit). `.invalid` ⟺ this fn is not a method.
     self_type: Type = .invalid,
+    /// Bit i: params[i] is `mut` (passed by the caller's place address); a method's
+    /// `self` is params[0]. The one source of the modes: `Sig.mut_mask` and
+    /// `Method.mut_self` are copies of it.
+    mut_mask: u64 = 0,
 
     pub fn isGeneric(f: FnSym) bool {
         return f.generic_params.len > 0;
@@ -2180,7 +2189,7 @@ pub fn checkGraph(
     // `fns`; the sig name is the resolver's qualified/bare name for that id.
     std.debug.assert(t.fns.items.len == fns.len);
     for (t.fns.items, 0..) |f, i| {
-        sigs[i] = .{ .kind = f.kind, .name = fns[i].name, .params = try gpa.dupe(Type, f.params), .ret = f.ret };
+        sigs[i] = .{ .kind = f.kind, .name = fns[i].name, .params = try gpa.dupe(Type, f.params), .ret = f.ret, .mut_mask = f.mut_mask };
         sigs_built += 1;
     }
 
@@ -3685,12 +3694,12 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         params[i] = t.typeFromNode(param.lhs);
     }
     const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .generic_bounds = gbounds, .generic_bound_args = gbound_args, .self_type = self_ty });
+    const mut_mask = Modes.ofProto(t.tree, t.tokens, proto);
+    try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .generic_bounds = gbounds, .generic_bound_args = gbound_args, .self_type = self_ty, .mut_mask = mut_mask });
     // Register the method into the program-wide table (SERIAL, fn-id order). The name
     // is BORROWED from source (like `Sig.name`); the table is frozen before Pass C.
     if (recv_type != Ast.none) {
         const name = t.nameText(decl.main_token);
-        const mut_self = proto.params.len > 0 and Ast.isMutParam(t.tree, t.tokens, proto.params[0]);
         // An impl method with no leading `self` param is an ASSOCIATED function
         // (`fn new() -> Vec[T]`): it carries the impl receiver as `self_type` (so `Self`
         // and the receiver's generics resolve) but takes no `self` value. Classify off the
@@ -3698,6 +3707,8 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         // params[0]-equals-receiver type test — an associated fn whose first parameter
         // happens to be the receiver type (`fn combine(other: Box[T])`) is still self-less.
         const has_self = proto.params.len > 0 and std.mem.eql(u8, t.nameText(t.tree.nodes[proto.params[0].int()].main_token), "self");
+        // A static method's `mut` first param is a place param, not a receiver.
+        const mut_self = has_self and Modes.isMut(mut_mask, 0);
         if (self_ty.isApp()) {
             // A generic receiver `impl Box[T]`: `self_ty` is a check-time `App`.
             // Record its ctor into the TEMPLATE table so `findGenericMethod` dispatches
@@ -4254,6 +4265,226 @@ test "decodeFnSig sets Method.mut_self for `mut self` but not plain `self`; the 
             try testing.expect(!m.mut_self);
             try testing.expectEqual(Kind.@"struct", c.result.sigs[m.fn_id].params[0].kind);
         } else return error.TestUnexpectedResult;
+    }
+}
+
+test "decodeFnSig records one mut_mask bit per mut param; a static method's mut first param is not mut_self" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\struct B[T] { v: T }
+        \\impl P {
+        \\ fn m(mut self, mut d: int) { self.x = d }
+        \\}
+        \\impl B[T] {
+        \\ fn fill(mut s: T, v: T) { s = v }
+        \\}
+        \\fn bump(a: int, mut n: int) { n = a }
+        \\fn main() -> int { return 0 }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const want = [_]struct { name: []const u8, mask: u64 }{
+        .{ .name = "m", .mask = 0b11 },
+        .{ .name = "fill", .mask = 0b01 },
+        .{ .name = "bump", .mask = 0b10 },
+        .{ .name = "main", .mask = 0 },
+    };
+    for (want) |w| {
+        const gid = for (c.resolve.fns, 0..) |f, i| {
+            const last = if (std.mem.lastIndexOfScalar(u8, f.name, '.')) |dot| f.name[dot + 1 ..] else f.name;
+            if (f.decl_node != Ast.none and std.mem.eql(u8, last, w.name)) break i;
+        } else return error.TestExpectedFn;
+        try testing.expectEqual(w.mask, c.result.sigs[gid].mut_mask);
+        // The modes are a calling convention: every param type stays by-value.
+        for (c.result.sigs[gid].params) |pt| try testing.expect(pt.kind != .rawptr);
+    }
+    try testing.expectEqual(@as(usize, 1), c.result.methods.len);
+    const m = c.result.methods[0];
+    try testing.expect(m.mut_self and !m.is_static);
+    try testing.expectEqual(@as(u64, 0b11), c.result.sigs[m.fn_id].mut_mask);
+    try testing.expectEqual(Kind.@"struct", c.result.sigs[m.fn_id].params[0].kind);
+    try testing.expectEqual(Kind.int, c.result.sigs[m.fn_id].params[1].kind);
+    try testing.expectEqual(@as(usize, 1), c.result.templates.len);
+    const fill = c.result.templates[0];
+    try testing.expect(!fill.has_self and !fill.mut_self);
+    try testing.expectEqual(@as(u64, 0b01), c.result.sigs[fill.fn_id].mut_mask);
+}
+
+/// Exactly one diagnostic, with `code`.
+fn expectOnlyDiag(src: []const u8, code: codes.Code) !void {
+    const gpa = testing.allocator;
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    if (c.result.diags.len == 1 and c.result.diags[0].code == code) return;
+    std.debug.print("source:\n{s}\n", .{src});
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    return error.TestExpectedDiagnostic;
+}
+
+const mut_pre =
+    \\struct P { x: int }
+    \\struct T2(int, int)
+    \\struct Q { p: P }
+    \\struct Box[T] { v: T }
+    \\impl Box[T] {
+    \\ fn fill(mut b: Box[T], v: T) { b.v = v }
+    \\ fn put(self, mut out: T) { out = self.v }
+    \\}
+    \\impl P {
+    \\ fn take(self, mut n: int) { n = self.x }
+    \\}
+    \\fn bump(mut n: int) { n = n + 1 }
+    \\fn swap[T](mut a: T, mut b: T) {
+    \\ t := a
+    \\ a = b
+    \\ b = t
+    \\}
+    \\fn reset(mut f: fn(int) -> int) { f = fn(v: int) -> int { v } }
+    \\fn one() -> int { 1 }
+    \\fn inc(v: int) -> int { v + 1 }
+    \\
+;
+
+test "a mut argument must be a mutable place (T0019)" {
+    const gpa = testing.allocator;
+    const bodies = [_][]const u8{
+        "fn main() -> int {\n bump(1)\n return 0\n}\n",
+        // The checker indexes any struct named `Vec`, so this stand-in for std's gives an
+        // index element without an import.
+        "struct Vec[T] { first: T }\nfn main() -> int {\n xs := Vec[int] { first: 1 }\n bump(xs[0])\n return xs.first\n}\n",
+        "fn main() -> int {\n bump(one())\n return 0\n}\n",
+        "fn main() -> int {\n bump(P { x: 1 }.x)\n return 0\n}\n",
+        "fn main() -> int {\n reset(inc)\n return 0\n}\n",
+        "fn main() -> int {\n fn lf(v: int) -> int { v }\n reset(lf)\n return 0\n}\n",
+        // Every call path: turbofish, inferred (pretyped), a method arg, a static method.
+        "fn main() -> int {\n a := 1\n swap[int](a, 1)\n return a\n}\n",
+        "fn main() -> int {\n a := 1\n swap(a, 1)\n return a\n}\n",
+        "fn main() -> int {\n p := P { x: 1 }\n p.take(one())\n return 0\n}\n",
+        "fn main() -> int {\n bx := Box[int] { v: 1 }\n bx.put(2)\n return 0\n}\n",
+        "fn main() -> int {\n Box[int].fill(Box[int] { v: 1 }, 2)\n return 0\n}\n",
+        // A bound method is a fresh closure, not storage, inside a method too.
+        "struct G { x: int }\nimpl G { fn add(self, v: int) -> int { self.x + v } }\nfn main() -> int {\n g := G { x: 1 }\n reset(g.add)\n return 0\n}\n",
+        "struct G { x: int }\nimpl G {\n fn add(self, v: int) -> int { self.x + v }\n fn me(self) { reset(self.add) }\n}\nfn main() -> int { return 0 }\n",
+    };
+    for (bodies) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ mut_pre, body });
+        defer gpa.free(src);
+        try expectOnlyDiag(src, .T0019);
+    }
+}
+
+test "a callee's signature in a diagnostic spells its mut params" {
+    const gpa = testing.allocator;
+    const src = try std.mem.concat(gpa, u8, &.{ mut_pre, "fn main() -> int {\n c := 1\n bump(c, 2)\n return c\n}\n" });
+    defer gpa.free(src);
+    try expectOnlyDiag(src, .T0039);
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    try testing.expectEqualStrings("expected 1 argument(s), got 2; 'bump' takes (mut int)", c.result.diags[0].message);
+}
+
+test "locals, params, forwarded mut params, field chains, tuple fields, loop vars and match bindings are places" {
+    const gpa = testing.allocator;
+    var c = try checkSource(mut_pre ++
+        \\fn fwd(mut n: int, k: int) {
+        \\ bump(n)
+        \\ bump(k)
+        \\}
+        \\fn main() -> int {
+        \\ c := 1
+        \\ bump(c)
+        \\ p := P { x: 1 }
+        \\ bump(p.x)
+        \\ q := Q { p: P { x: 1 } }
+        \\ bump(q.p.x)
+        \\ t := T2(1, 2)
+        \\ bump(t.1)
+        \\ fwd(c, 2)
+        \\ for i in 0..3 { bump(i) }
+        \\ o: Option[int] = .some(1)
+        \\ r := match o {
+        \\  .some(v) -> {
+        \\   bump(v)
+        \\   v
+        \\  },
+        \\  .none -> 0,
+        \\ }
+        \\ a := 1
+        \\ b := 2
+        \\ swap(a, b)
+        \\ swap(a, a)
+        \\ bx := Box[int] { v: 0 }
+        \\ Box[int].fill(bx, 3)
+        \\ out := 0
+        \\ bx.put(out)
+        \\ p.take(c)
+        \\ return c + p.x + q.p.x + t.1 + r + a + b + out
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+/// The `nth` (node order) call whose callee names `name` (`f(..)`, `r.f(..)`, `f[T](..)`).
+fn nthCallOf(c: *const Checked, name: []const u8, nth: usize) !Ast.Index {
+    var seen: usize = 0;
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .call) continue;
+        var head = c.tree.nodes[n.lhs.int()];
+        if (head.tag == .type_app) head = c.tree.nodes[head.lhs.int()];
+        if (head.tag != .identifier and head.tag != .field_access) continue;
+        if (!std.mem.eql(u8, c.tokens[head.main_token].text(c.source), name)) continue;
+        if (seen == nth) return Ast.Index.from(@intCast(i));
+        seen += 1;
+    }
+    return error.TestCallNotFound;
+}
+
+test "Modes.argMask agrees with every call shape" {
+    const gpa = testing.allocator;
+    var c = try checkSource(mut_pre ++
+        \\fn main() -> int {
+        \\ c := 1
+        \\ bump(c)
+        \\ a := 1
+        \\ b := 2
+        \\ swap[int](a, b)
+        \\ swap(a, b)
+        \\ p := P { x: 1 }
+        \\ p.take(c)
+        \\ bx := Box[int] { v: 0 }
+        \\ Box[int].fill(bx, 3)
+        \\ bx.put(c)
+        \\ f := fn(v: int) -> int { v }
+        \\ s := "abc"
+        \\ return f(c) + s.len() + inc(c)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const view = .{ .tree = c.tree, .resolutions = c.resolve.resolutions[0], .callees = c.result.callees[0], .sigs = c.result.sigs, .methods = c.result.methods };
+    const cases = [_]struct { name: []const u8, nth: usize, mask: u64 }{
+        .{ .name = "bump", .nth = 0, .mask = 0b1 }, // direct
+        .{ .name = "swap", .nth = 0, .mask = 0b11 }, // turbofish generic
+        .{ .name = "swap", .nth = 1, .mask = 0b11 }, // inferred generic
+        .{ .name = "take", .nth = 0, .mask = 0b1 }, // instance method: self's bit is shifted out
+        .{ .name = "fill", .nth = 0, .mask = 0b01 }, // static generic-impl method: not shifted
+        .{ .name = "put", .nth = 0, .mask = 0b1 }, // generic-type instance method
+        .{ .name = "f", .nth = 0, .mask = 0 }, // a value call
+        .{ .name = "len", .nth = 0, .mask = 0 }, // a builtin method
+        .{ .name = "inc", .nth = 0, .mask = 0 }, // a direct call with no mut param
+    };
+    for (cases) |k| {
+        const call = try nthCallOf(&c, k.name, k.nth);
+        testing.expectEqual(k.mask, Modes.argMask(view, call)) catch |e| {
+            std.debug.print("call {s}#{d}\n", .{ k.name, k.nth });
+            return e;
+        };
     }
 }
 
@@ -9170,7 +9401,7 @@ fn expectBoxedOnce(c: *const Checked, want_len: usize) ![]const u32 {
     return ocs[0].boxed;
 }
 
-test "boxed = captured ∩ (assigned ∪ mut self receivers)" {
+test "boxed = captured ∩ (assigned ∪ mut self receivers ∪ mut arguments)" {
     const gpa = testing.allocator;
     const pre =
         \\struct P { x: int }
@@ -9262,6 +9493,21 @@ test "boxed = captured ∩ (assigned ∪ mut self receivers)" {
     );
     defer ro.deinit(gpa);
     _ = try expectBoxedOnce(&ro, 0);
+    // A local passed as a `mut` argument is written through, so a captured one is boxed,
+    // whether the call is outside the lambda or inside it; without the call it is a copy.
+    const bump = "fn bump(mut n: int) { n = n + 1 }\n";
+    const mut_cases = [_]struct { body: []const u8, boxed: usize }{
+        .{ .body = "fn main() -> int {\n c := 0\n f := fn() -> int { c }\n bump(c)\n return f()\n}\n", .boxed = 1 },
+        .{ .body = "fn main() -> int {\n c := 0\n f := fn() { bump(c) }\n f()\n return c\n}\n", .boxed = 1 },
+        .{ .body = "fn main() -> int {\n c := 0\n f := fn() -> int { c }\n d := c\n bump(d)\n return f() + d\n}\n", .boxed = 0 },
+    };
+    for (mut_cases) |mc| {
+        const src = try std.mem.concat(gpa, u8, &.{ bump, mc.body });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        _ = try expectBoxedOnce(&c, mc.boxed);
+    }
 }
 
 test "a program with no captures has no owner closure records" {
@@ -9344,6 +9590,64 @@ test "any capture of a mut self receiver is T0052" {
     try testing.expectEqual(codes.Code.T0052, d.code);
     try testing.expectEqualStrings("a closure cannot capture the 'mut self' receiver 'self'; copy it to a local first", d.message);
     try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "self.n }").?)), d.byte_offset);
+}
+
+test "any capture of a mut param, by a lambda, a local fn or a bound method, is T0052" {
+    const pre =
+        \\struct P { x: int }
+        \\impl P { fn get(self) -> int { self.x } }
+        \\
+    ;
+    const cases = [_]struct { body: []const u8, name: []const u8 }{
+        .{ .body = "fn f(mut n: int) -> int {\n g := fn() -> int { n }\n g()\n}\nfn main() -> int {\n a := 1\n return f(a)\n}\n", .name = "n" },
+        .{ .body = "fn f(mut n: int) -> int {\n fn g() -> int { n }\n g()\n}\nfn main() -> int {\n a := 1\n return f(a)\n}\n", .name = "n" },
+        .{ .body = "fn f(mut p: P) -> int {\n g := p.get\n g()\n}\nfn main() -> int {\n a := P { x: 1 }\n return f(a)\n}\n", .name = "p" },
+    };
+    for (cases) |k| {
+        const src = try std.mem.concat(testing.allocator, u8, &.{ pre, k.body });
+        defer testing.allocator.free(src);
+        const msg = try std.fmt.allocPrint(testing.allocator, "a closure cannot capture the 'mut' parameter '{s}'; copy it to a local first", .{k.name});
+        defer testing.allocator.free(msg);
+        try expectOnlyDiag(src, .T0052);
+        try expectOneDiag(src, .T0052, msg);
+    }
+}
+
+test "a fn or method with mut params is not a value (T0049)" {
+    const pre =
+        \\struct P { x: int }
+        \\impl P {
+        \\ fn add(self, mut d: int) { d = self.x }
+        \\ fn grow(mut self) { self.x = self.x + 1 }
+        \\}
+        \\fn bump(mut n: int) { n = n + 1 }
+        \\fn apply(f: fn(int), v: int) { f(v) }
+        \\
+    ;
+    const cases = [_]struct { body: []const u8, msg: []const u8 }{
+        .{ .body = "fn main() -> int {\n _g := bump\n return 0\n}\n", .msg = "'bump' is a function with 'mut' parameters and cannot be used as a value" },
+        .{ .body = "fn main() -> int {\n apply(bump, 1)\n return 0\n}\n", .msg = "'bump' is a function with 'mut' parameters and cannot be used as a value" },
+        .{ .body = "fn main() -> int {\n p := P { x: 1 }\n _h := p.add\n p.grow()\n return p.x\n}\n", .msg = "'add' is a method with 'mut' parameters and cannot be used as a value; wrap the call in a lambda" },
+    };
+    for (cases) |k| {
+        const src = try std.mem.concat(testing.allocator, u8, &.{ pre, k.body });
+        defer testing.allocator.free(src);
+        try expectOnlyDiag(src, .T0049);
+        try expectOneDiag(src, .T0049, k.msg);
+    }
+    // A `mut self` method with no other `mut` param still binds, and a lambda can forward
+    // its own by-value param to a `mut` param.
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount(pre ++
+        \\fn main() -> int {
+        \\ p := P { x: 1 }
+        \\ g := p.grow
+        \\ g()
+        \\ apply(fn(v: int) { bump(v) }, 2)
+        \\ p.add(p.x)
+        \\ return p.x
+        \\}
+        \\
+    ));
 }
 
 test "a plain self method call on a captured local is not a mutation" {

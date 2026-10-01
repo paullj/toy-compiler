@@ -1,0 +1,33 @@
+# Feature: fields and tuple fields as `mut` arguments, including `self.n` inside `mut self` and by-value `self` methods
+# expect: exit 41
+# bump(p.x) 1 -> 2; bump(o.inner.x) 10 -> 11; bump(t.0) 20 -> 21. c.grow() bumps
+# self.n through the receiver's address, so the caller's c.n goes 3 -> 4; c.peek()
+# bumps the by-value copy's n and returns it (4 + 1 = 5), leaving c.n at 4.
+# 2 + 11 + 21 + 4 - 5 + 8 (t.1) = 41.
+struct P { x: int }
+struct Outer { inner: P, y: int }
+struct T(int, int)
+struct C { n: int }
+
+fn bump(mut n: int) { n = n + 1 }
+
+impl C {
+    fn grow(mut self) { bump(self.n) }
+    fn peek(self) -> int {
+        bump(self.n)
+        self.n
+    }
+}
+
+fn main() -> int {
+    p := P { x: 1 }
+    bump(p.x)
+    o := Outer { inner: P { x: 10 }, y: 0 }
+    bump(o.inner.x)
+    t := T(20, 8)
+    bump(t.0)
+    c := C { n: 3 }
+    c.grow()
+    seen := c.peek()
+    return p.x + o.inner.x + o.y + t.0 + c.n - seen + t.1
+}

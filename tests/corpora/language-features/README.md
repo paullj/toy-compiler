@@ -14,6 +14,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `structs/`      | construction, by-value copy, field stores, struct returns |
 | `io/`           | runtime output via `print`                                |
 | `closures/`     | function types, function values, lambdas, local fns, bound methods and specialized generic calls |
+| `places/`       | `mut` parameters: by-address arguments (locals, fields), forwarding, generics, aliasing |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 
 ## Annotation convention

@@ -1,0 +1,35 @@
+# Feature: a `mut` param and a by-value param may name the same variable; the by-value one is the copy taken at the call
+# expect: exit 46
+# f(x, x) at 8 bytes: a writes x.v = b.v + 10 = 11, then reads b.v again: still 1, so
+# it returns 1 and x.v is 11. g(y, y) at 24 bytes: a.v becomes 22, b.v stays 2, so it
+# returns 2, y.v is 22 and y.w is 0. swap(z, z) leaves z as it was: 7.
+# 1 + 11 + 2 + 22 + 7 + 0 + 3 = 46.
+struct P { v: int }
+struct W { v: int, w: int, u: int }
+
+fn f(mut a: P, b: P) -> int {
+    a.v = b.v + 10
+    b.v
+}
+
+fn g(mut a: W, b: W) -> int {
+    a.v = b.v + 20
+    a.w = 0
+    b.v
+}
+
+fn swap(mut a: int, mut b: int) {
+    t := a
+    a = b
+    b = t
+}
+
+fn main() -> int {
+    x := P { v: 1 }
+    r1 := f(x, x)
+    y := W { v: 2, w: 3, u: 4 }
+    r2 := g(y, y)
+    z := 7
+    swap(z, z)
+    return r1 + x.v + r2 + y.v + z + y.w + 3
+}

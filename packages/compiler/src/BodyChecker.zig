@@ -7,6 +7,7 @@ const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
 const Callee = @import("symbols/Callee.zig").Callee;
 const Closure = @import("symbols/Closure.zig");
+const Modes = @import("symbols/Modes.zig");
 const DiagnosticSink = @import("diagnostics/Sink.zig");
 const AstWalk = @import("query/AstWalk.zig");
 const Span = @import("diagnostics/model.zig").Span;
@@ -264,9 +265,9 @@ pub const BodyChecker = struct {
     /// `return` joins its operand into `ret_join` instead of checking it against `cur_ret`.
     ret_infer: bool = false,
     ret_join: Type = .never,
-    /// The local slots a `mut self` method call writes through (the root of its receiver
-    /// place): a captured one must be boxed like an assigned one.
-    mutself_roots: std.ArrayList(u32) = .empty,
+    /// The local slots a call writes through: the root of a `mut self` receiver place or
+    /// of a `mut` argument. A captured one must be boxed like an assigned one.
+    mutated_roots: std.ArrayList(u32) = .empty,
     /// The locals a bound method value captures as its receiver (`f := acc.plus`), each
     /// with its receiver node.
     bound_roots: std.ArrayList(BoundRoot) = .empty,
@@ -367,7 +368,7 @@ pub const BodyChecker = struct {
     pub fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
-        bc.mutself_roots.deinit(bc.gpa);
+        bc.mutated_roots.deinit(bc.gpa);
         bc.bound_roots.deinit(bc.gpa);
         bc.assigned_roots.deinit(bc.gpa);
         bc.boxed.deinit(bc.gpa);
@@ -405,18 +406,19 @@ pub const BodyChecker = struct {
 
     /// Decide how each captured local is held. A closure copies a capture when it is made,
     /// which is sound only for a local that nothing assigns; a captured local that is
-    /// assigned (`x = ..`, a place store rooted at it, a `mut self` call on it) is boxed
-    /// instead, into `bc.boxed`. A bound method value captures its local receiver the same
-    /// way. A `mut self` receiver's slot holds the caller's address, not a value a cell
-    /// could hold, so any capture of it is an error, reported at its first captured use in
-    /// source order. A bounded template's abstract check skips this: each instance
-    /// re-check decides for itself (the sink dedups repeated reports), and a template that
-    /// reported here would be poisoned.
+    /// assigned (`x = ..`, a place store rooted at it, a `mut self` call on it, a `mut`
+    /// argument rooted at it) is boxed instead, into `bc.boxed`. A bound method value
+    /// captures its local receiver the same way. A `mut` param's slot (`mut self`
+    /// included) holds the caller's address, not a value a cell could hold, so any capture
+    /// of it is an error, reported at its first captured use in source order. A bounded
+    /// template's abstract check skips this: each instance re-check decides for itself (the
+    /// sink dedups repeated reports), and a template that reported here would be poisoned.
     fn classifyCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
         if (bc.abstract_template) return;
         if (bc.closures == null and bc.bound_roots.items.len == 0) return;
-        const mut_recv = proto.params.len > 0 and Ast.isMutParam(bc.tree, bc.tokens, proto.params[0]);
-        std.mem.sort(u32, bc.mutself_roots.items, {}, std.sort.asc(u32));
+        // Params are resolver slots 0..n-1, so a param's slot is its index.
+        const place_params = Modes.ofProto(bc.tree, bc.tokens, proto);
+        std.mem.sort(u32, bc.mutated_roots.items, {}, std.sort.asc(u32));
         const assigned = sortedSet(bc.assigned_roots.items);
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         defer seen.deinit(bc.gpa);
@@ -428,27 +430,32 @@ pub const BodyChecker = struct {
             for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
             for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
                 if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
-                if (mut_recv and c.slot == 0) {
-                    try bc.reportMutSelfCapture(c.first_use);
-                } else if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutself_roots.items, c.slot)) {
+                if (c.slot < proto.params.len and Modes.isMut(place_params, c.slot)) {
+                    try bc.reportMutParamCapture(c.first_use);
+                } else if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutated_roots.items, c.slot)) {
                     try bc.boxed.append(bc.gpa, c.slot);
                 }
             };
         }
         for (bc.bound_roots.items) |br| {
             if ((try seen.getOrPut(bc.gpa, br.slot)).found_existing) continue;
-            if (mut_recv and br.slot == 0) {
-                try bc.reportMutSelfCapture(br.recv);
-            } else if (Closure.contains(assigned, br.slot) or Closure.contains(bc.mutself_roots.items, br.slot)) {
+            if (br.slot < proto.params.len and Modes.isMut(place_params, br.slot)) {
+                try bc.reportMutParamCapture(br.recv);
+            } else if (Closure.contains(assigned, br.slot) or Closure.contains(bc.mutated_roots.items, br.slot)) {
                 try bc.boxed.append(bc.gpa, br.slot);
             }
         }
         std.mem.sort(u32, bc.boxed.items, {}, std.sort.asc(u32));
     }
 
-    fn reportMutSelfCapture(bc: *BodyChecker, use_idx: Ast.Index) error{OutOfMemory}!void {
+    fn reportMutParamCapture(bc: *BodyChecker, use_idx: Ast.Index) error{OutOfMemory}!void {
         const use = bc.tree.nodes[use_idx.int()];
-        try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{bc.nameText(use.main_token)});
+        const name = bc.nameText(use.main_token);
+        if (std.mem.eql(u8, name, "self")) {
+            try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{name});
+        } else {
+            try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut' parameter '{s}'; copy it to a local first", .{name});
+        }
     }
 
     /// Sort `items` in place and drop repeats, returning the deduped prefix.
@@ -485,9 +492,10 @@ pub const BodyChecker = struct {
         if (bc.placeRoot(place)) |slot| try bc.assigned_roots.append(bc.gpa, slot);
     }
 
-    /// Record the local a `mut self` call writes through: the root of its receiver place.
-    fn noteMutSelfRoot(bc: *BodyChecker, recv: Ast.Index) error{OutOfMemory}!void {
-        if (bc.placeRoot(recv)) |slot| try bc.mutself_roots.append(bc.gpa, slot);
+    /// Record the local a call writes through: the root of a `mut self` receiver place or
+    /// of a `mut` argument.
+    fn noteMutatedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!void {
+        if (bc.placeRoot(place)) |slot| try bc.mutated_roots.append(bc.gpa, slot);
     }
 
     /// `fn(params) -> R { body }`: a value of type `fn(P..) -> R`. A param's type is its
@@ -1732,6 +1740,7 @@ pub const BodyChecker = struct {
                     if (m.is_static) return try bc.reportStaticBound(fa, member);
                     const mf = bc.model.fns[m.fn_id];
                     if (mf.isGeneric()) return try bc.reportNotAValue(fa, member, "a generic method");
+                    if (mf.mut_mask >> 1 != 0) return try bc.reportNotAValue(fa, member, "a method with 'mut' parameters");
                     if (!try bc.bindReceiver(node_idx, fa, recv_ty, member, m.mut_self)) return bc.poison();
                     const ty = refs.internFn(bc, mf.params[@min(mf.params.len, 1)..], mf.ret);
                     if (ty.kind == .invalid) return error.OutOfMemory;
@@ -1756,6 +1765,7 @@ pub const BodyChecker = struct {
                 const targs = (try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args)) orelse
                     return try bc.reportNotAValue(fa, member, "a generic method");
                 defer bc.gpa.free(targs);
+                if (mf.mut_mask >> 1 != 0) return try bc.reportNotAValue(fa, member, "a method with 'mut' parameters");
                 if (!try bc.bindReceiver(node_idx, fa, recv_ty, member, m.mut_self)) return bc.poison();
                 const ps = mf.params[@min(mf.params.len, 1)..];
                 const sub = try bc.gpa.alloc(Type, ps.len);
@@ -1826,7 +1836,7 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0052 }, "binding the 'mut self' method '{s}' needs a local receiver, not a field; bind it on a local variable", .{member});
                 return false;
             };
-            try bc.mutself_roots.append(bc.gpa, slot);
+            try bc.mutated_roots.append(bc.gpa, slot);
         }
         if (local) |slot| try bc.bound_roots.append(bc.gpa, .{ .slot = slot, .recv = recv });
         return true;
@@ -2398,6 +2408,8 @@ pub const BodyChecker = struct {
         /// args would double-emit their inner diagnostics. That path checks the count
         /// itself first, so only matching-count, bound calls carry it.
         pretyped: ?[]const Type = null,
+        /// Bit i: value arg i binds a `mut` param.
+        mut_mask: u64 = 0,
 
         fn substituted(s: CallSig, targs: ?[]const Type) CallSig {
             var out = s;
@@ -2407,11 +2419,11 @@ pub const BodyChecker = struct {
     };
 
     fn fnSig(bc: *const BodyChecker, f: FnSym, name: []const u8) CallSig {
-        return .{ .params = f.params, .name = name, .decl = bc.calleeDeclSite(f), .generic_names = f.generic_params };
+        return .{ .params = f.params, .name = name, .decl = bc.calleeDeclSite(f), .generic_names = f.generic_params, .mut_mask = f.mut_mask };
     }
 
     fn methodSig(bc: *const BodyChecker, f: FnSym, name: []const u8) CallSig {
-        return .{ .params = f.params[@min(f.params.len, 1)..], .name = name, .decl = bc.calleeDeclSite(f), .generic_names = f.generic_params };
+        return .{ .params = f.params[@min(f.params.len, 1)..], .name = name, .decl = bc.calleeDeclSite(f), .generic_names = f.generic_params, .mut_mask = f.mut_mask >> 1 };
     }
 
     fn paramWant(bc: *BodyChecker, sig: CallSig, p: Type) Type {
@@ -2453,8 +2465,67 @@ pub const BodyChecker = struct {
                 try bc.writeSigSuffix(&suffix, sig);
                 try bc.sink.report(.{ .span = bc.spanOf(a), .code = .T0040, .related = sig.decl }, "argument {d}{s}: expected {s}, got {s}{s}", .{ i + 1, bc.pipedArgHint(call, i + 1), bc.typeName(want), bc.typeName(got), suffix.items });
             }
+            if (Modes.isMut(sig.mut_mask, i)) try bc.checkMutArg(call, a, i, sig);
         }
         return true;
+    }
+
+    /// A `mut` parameter writes through its argument, so the argument must name a mutable
+    /// place, and the local it is rooted at counts as mutated (a captured one is boxed).
+    fn checkMutArg(bc: *BodyChecker, call: Ast.Index, arg: Ast.Index, i: usize, sig: CallSig) error{OutOfMemory}!void {
+        const callee = sig.name orelse "the function";
+        if (!bc.isMutablePlace(arg)) {
+            try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d}{s} must be a mutable variable (a local or a field of one); '{s}' takes it as 'mut'", .{ i + 1, bc.pipedArgHint(call, i + 1), callee });
+        } else if (bc.placeHopsThroughMethod(arg)) {
+            try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d}{s} is a method value, not a place; '{s}' takes it as 'mut'", .{ i + 1, bc.pipedArgHint(call, i + 1), callee });
+        } else if (bc.namesLocalFn(arg)) {
+            try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d} names the local function '{s}', which a 'mut' parameter could reassign", .{ i + 1, bc.nameText(bc.tree.nodes[arg.int()].main_token) });
+        } else {
+            try bc.noteMutatedRoot(arg);
+        }
+    }
+
+    /// Whether a `.field_access` hop of the place chain `arg` names no field of its base: a
+    /// bound method (`p.get`) is a fresh closure, with no storage a `mut` param could
+    /// write through.
+    fn placeHopsThroughMethod(bc: *const BodyChecker, arg: Ast.Index) bool {
+        var cur = arg;
+        while (true) {
+            const n = bc.tree.nodes[cur.int()];
+            switch (n.tag) {
+                .field_access => if (!bc.namesStructField(cur)) return true,
+                .tuple_field => {},
+                else => return false,
+            }
+            cur = n.lhs;
+        }
+    }
+
+    fn namesStructField(bc: *const BodyChecker, fa: Ast.Index) bool {
+        const n = bc.tree.nodes[fa.int()];
+        const base = bc.node_types[n.lhs.int()];
+        const sid = if (base.isApp()) blk: {
+            const e = bc.composite.at(base.appIdx());
+            if (e.ctor_is_enum) return false;
+            break :blk e.ctor;
+        } else if (base.isStruct()) base.struct_id else return false;
+        if (sid >= bc.structSyms().len) return false;
+        const fname = bc.nameText(n.main_token);
+        for (bc.structSyms()[sid].field_names) |dn| if (std.mem.eql(u8, dn, fname)) return true;
+        return false;
+    }
+
+    /// Whether `arg` names a local fn, whose binding is never reassigned (R0007) and never
+    /// boxed.
+    fn namesLocalFn(bc: *const BodyChecker, arg: Ast.Index) bool {
+        if (bc.tree.nodes[arg.int()].tag != .identifier) return false;
+        const slot = switch (bc.resolutions[arg.int()]) {
+            .local => |s| s,
+            else => return false,
+        };
+        const fc = bc.closures orelse return false;
+        for (fc.boundaries) |b| if (b.self_slot) |ss| if (ss == slot) return true;
+        return false;
     }
 
     /// Arity only, for the intrinsics whose per-arg rules are bespoke.
@@ -2484,6 +2555,7 @@ pub const BodyChecker = struct {
         try out.appendSlice(bc.gpa, "' takes (");
         for (sig.params, 0..) |p, i| {
             if (i != 0) try out.appendSlice(bc.gpa, ", ");
+            if (Modes.isMut(sig.mut_mask, i)) try out.appendSlice(bc.gpa, "mut ");
             // A mapped param's leftover type_vars belong to the caller's scope, not the
             // callee's, so only a raw param takes the callee's names.
             const raw = sig.map == .id or sig.map == .unbound;
@@ -2526,6 +2598,8 @@ pub const BodyChecker = struct {
             "an extern function"
         else if (f.isGeneric())
             "a generic function"
+        else if (f.mut_mask != 0)
+            "a function with 'mut' parameters"
         else
             null;
         if (what) |w| {
@@ -2590,7 +2664,7 @@ pub const BodyChecker = struct {
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const mf = bc.model.fns[m.fn_id];
         if (m.mut_self) {
-            try bc.noteMutSelfRoot(fa.lhs);
+            try bc.noteMutatedRoot(fa.lhs);
             if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
             } else if (!bc.isMutablePlace(fa.lhs)) {
@@ -3428,7 +3502,7 @@ pub const BodyChecker = struct {
                 else => bound_ok = false, // an unbound impl param: poison, no cascade
             };
             if (bound_ok) bc.setCallee(n, Callee.pending);
-            if (m.mut_self) try bc.noteMutSelfRoot(callee.lhs);
+            if (m.mut_self) try bc.noteMutatedRoot(callee.lhs);
             // A `mut self` method mutates the receiver in place, so it may
             // only be called on a mutable place (reuse the mut-self gate + T0019).
             if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
@@ -3862,7 +3936,8 @@ pub const BodyChecker = struct {
     /// Whether `node_idx` names a mutable, addressable place: an identifier bound to
     /// a `.local` (all locals — incl. the `self` receiver — are mutable), or a
     /// `field_access` chain rooted at one. A temporary/rvalue (a construction, a call
-    /// result, a literal) is NOT a place. Gates a `mut self` method call (T0019).
+    /// result, a literal) is NOT a place. Gates a `mut self` receiver and a `mut` argument
+    /// (T0019).
     fn isMutablePlace(bc: *const BodyChecker, node_idx: Ast.Index) bool {
         const n = bc.tree.nodes[(node_idx).int()];
         return switch (n.tag) {

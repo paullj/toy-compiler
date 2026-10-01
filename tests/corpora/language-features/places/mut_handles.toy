@@ -1,0 +1,42 @@
+# Feature: `mut` params holding GC handles (a Vec, a closure): pushes and reassignments reach the caller, and the values survive forced collections
+# expect: exit 79
+# fill(v) pushes 1 and 2 through the caller's handle (so `keep`, a copy of that handle,
+# sees len 2), then points the caller's v at a fresh Vec [10, 20, 30]: len 3, sum 60.
+# swap_fn(f, 6) replaces the caller's closure with one whose env holds k = 6: f() is 12.
+# A collection is forced before and after the calls (1 each), and every handle must still
+# read back: 3 + 60 + 2 + 12 + 1 + 1 = 79.
+import std/vec
+import core/mem_selftest
+
+fn fill(mut v: Vec[int]) {
+    v.push(1)
+    v.push(2)
+    v = Vec[int].new()
+    # This frame names the caller's slot only by an address that is not a GC root; the
+    # caller's own frame keeps the fresh Vec alive across this collection.
+    _c := mem_selftest.churn_collects()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+}
+
+fn swap_fn(mut f: fn() -> int, k: int) {
+    f = fn() -> int { k * 2 }
+}
+
+fn churn() -> int {
+    if mem_selftest.churn_collects() > 0 { 1 } else { 0 }
+}
+
+fn main() -> int {
+    v: Vec[int] = []
+    keep := v
+    f := fn() -> int { 1 }
+    c0 := churn()
+    fill(v)
+    swap_fn(f, 6)
+    c1 := churn()
+    sum := 0
+    for x in v { sum = sum + x }
+    return v.len() + sum + keep.len() + f() + c0 + c1
+}

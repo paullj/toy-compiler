@@ -80,7 +80,7 @@ pub const Event = union(enum) {
     /// Length-prefixed leaf text.
     leaf: []const u8,
     /// Token-text leaf folded WITHOUT recursing a node (a `break`/`continue`
-    /// `@label` target, whose label names a token, not a child node).
+    /// `@label` target, whose label names a token, not a child node; a param's `mut`).
     raw_leaf: []const u8,
     /// Arity sentinel.
     count: u32,
@@ -316,6 +316,9 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
         },
         .param => {
             try emit(visitor, .{ .leaf = leaf });
+            // `lowerFn` types a `mut` param's slot from this token, so it is part of the fn's
+            // own key (#25).
+            if (Ast.isMutParam(tree, src.tokens, idx)) try emit(visitor, .{ .raw_leaf = src.tokenText(n.main_token - 1) });
             try walkInner(src, n.lhs, collect, visitor);
         },
         .fn_decl => {
@@ -729,7 +732,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                             return;
                         }
                         const nm = self.frozen.names[res.func];
-                        try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
+                        try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask });
                         return;
                     }
                     // A method call `recv.m(..)` on a VALUE receiver: the callee is a
@@ -808,7 +811,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
                     if (Spec.methodSite(fr, call_idx)) |site| if (site.ii < fr.instances.len) {
                         if (try Spec.select(self.gpa, fr, call_idx, site)) |name| {
                             const inst = fr.instances[site.ii];
-                            return self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret });
+                            return self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr, inst) });
                         }
                     };
                     try self.foldWitness(fr.methods[i]);
@@ -842,7 +845,7 @@ pub fn CallVisitor(comptime Frozen: type) type {
             const fr = self.frozen;
             const sym = Typecheck.witnessSym(m, fr.derives, fr.instances, fr.names) orelse return;
             const sig = Typecheck.witnessSig(m, fr.derives, fr.instances, fr.sigs) orelse return;
-            try self.out.append(self.gpa, .{ .kind = sym.kind, .name = sym.name, .params = sig.params, .ret = sig.ret });
+            try self.out.append(self.gpa, .{ .kind = sym.kind, .name = sym.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask });
         }
 
         /// Fold generic call `call_idx`'s reified INSTANCE identity (see `instanceOfCall`), or
@@ -854,9 +857,14 @@ pub fn CallVisitor(comptime Frozen: type) type {
             const ii = (try instanceOfCall(self.gpa, self.frozen, call_idx)) orelse return;
             const inst = self.frozen.instances[ii];
             const name = (try Spec.select(self.gpa, self.frozen, call_idx, .{ .ii = ii, .self_n = 0 })) orelse inst.name.?;
-            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret });
+            try self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(self.frozen, inst) });
         }
     };
+}
+
+/// An instance's modes: its template's, since modes are syntactic.
+fn templateMask(frozen: anytype, inst: Mono.Instance) u64 {
+    return if (inst.template_gid < frozen.sigs.len) frozen.sigs[inst.template_gid].mut_mask else 0;
 }
 
 /// The reified instance generic call `call` selects: the template gid and type-args the
@@ -1538,6 +1546,29 @@ test "a fn_type annotation folds arity and ret presence" {
         fps[i] = h.final();
     }
     for (fps, 0..) |a, i| for (fps[i + 1 ..]) |c| try testing.expect(a != c);
+}
+
+test "a param's own mut changes the fn's body hash" {
+    const gpa = testing.allocator;
+    const pairs = [_][2][]const u8{
+        .{ "fn f(x: int) { x = 1 }\n", "fn f(mut x: int) { x = 1 }\n" },
+        .{ "struct P { x: int }\nimpl P { fn m(self) { } }\n", "struct P { x: int }\nimpl P { fn m(mut self) { } }\n" },
+    };
+    for (pairs) |pair| {
+        var fps: [2]u64 = undefined;
+        for (pair, &fps) |src, *out| {
+            var b = try build(gpa, src);
+            defer b.deinit(gpa);
+            const decl = for (b.tree.nodes, 0..) |n, i| {
+                if (n.tag == .fn_decl) break Ast.Index.from(@intCast(i));
+            } else return error.TestExpectedFn;
+            var h = std.hash.Wyhash.init(0);
+            var hv = HashVisitor{ .h = &h };
+            try walk(b.src(), decl, &hv);
+            out.* = h.final();
+        }
+        try testing.expect(fps[0] != fps[1]);
+    }
 }
 
 test "a lambda folds param-type and ret presence" {

@@ -1,0 +1,27 @@
+# Feature: a method with `mut self` and a `mut` param, and a by-value param after a `mut` one
+# expect: exit 37
+# a.grow(c) adds c to a.n and then bumps c: a.n 10 -> 15, c 5 -> 6. a.take(c, k) moves
+# k into a.n through `mut self` and zeroes c through the `mut` param; `k` is by value, so
+# the caller's k stays 7. a.n 15 + 7 = 22, c 0, then 22 + 6 (before) + 7 (k) + 2 = 37.
+struct Acc { n: int }
+
+impl Acc {
+    fn grow(mut self, mut by: int) {
+        self.n = self.n + by
+        by = by + 1
+    }
+    fn take(mut self, mut from: int, k: int) {
+        self.n = self.n + k
+        from = 0
+    }
+}
+
+fn main() -> int {
+    a := Acc { n: 10 }
+    c := 5
+    a.grow(c)
+    before := c
+    k := 7
+    a.take(c, k)
+    return a.n + before + k + c + 2
+}

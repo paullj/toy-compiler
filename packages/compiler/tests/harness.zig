@@ -42,6 +42,27 @@ pub fn compile(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: 
     return Io.Dir.cwd().realPathFileAlloc(io, out_bin, gpa);
 }
 
+/// Run the installed `toy` with `args` in the directory `cwd_abs` (absolute), which owns the
+/// `.toy/` cache the build reads and writes. Fails unless toy exits 0.
+pub fn buildIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, args: []const []const u8) !void {
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
+    defer gpa.free(bin_abs);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, bin_abs);
+    try argv.appendSlice(gpa, args);
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .cwd = .{ .path = cwd_abs }, .stdout = .pipe, .stderr = .pipe });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.CompileFailed;
+}
+
+/// `runExit` of the program at `rel`, a path relative to `cwd_abs`.
+pub fn runExitIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, rel: []const u8) !u8 {
+    const prog = try std.fs.path.join(gpa, &.{ cwd_abs, rel });
+    defer gpa.free(prog);
+    return runExit(gpa, io, prog);
+}
+
 pub fn runExit(gpa: std.mem.Allocator, io: Io, prog: []const u8) !u8 {
     var run = try std.process.spawn(io, .{ .argv = &.{prog} });
     const term = try run.wait(io);

@@ -137,6 +137,14 @@ pub fn fingerprint(
         AstWalk.updateU32(&h, @intCast(s.params.len));
         for (s.params) |p| h.update(&[_]u8{@intFromEnum(p.kind)});
         h.update(&[_]u8{@intFromEnum(s.ret.kind)});
+        // A `mut` param changes how the caller passes that argument (#25). Gated, so a sig
+        // with no `mut` folds exactly what it folded before.
+        if (s.mut_mask != 0) {
+            h.update(&[_]u8{0xff}); // no SymKind ordinal is 0xff, so it cannot read as the next sig's kind
+            var mb: [8]u8 = undefined;
+            std.mem.writeInt(u64, &mb, s.mut_mask, .little);
+            h.update(&mb);
+        }
     }
 
     // (c) touched type layouts. A struct folds its full layout descriptor so an
@@ -327,6 +335,23 @@ test "callee signature folds in: a sig change flips the caller's hash" {
     const ha = fingerprint(b.tree, b.tokens, b.source, decl, &sig_a, &.{}, &.{}, &.{});
     const hb = fingerprint(b.tree, b.tokens, b.source, decl, &sig_b, &.{}, &.{}, &.{});
     try testing.expect(ha != hb);
+}
+
+test "a callee's mut_mask changes the caller's key" {
+    const gpa = testing.allocator;
+    var b = try build(gpa, "fn main() -> int {\n return 1\n}\n");
+    defer b.deinit(gpa);
+    const decl = b.fnDecl(0);
+    const plain = [_]Sig{.{ .kind = .user_fn, .name = "g", .params = &.{ .int, .int }, .ret = .int }};
+    var keys: [3]u64 = undefined;
+    for (&keys, 0..) |*k, mask| {
+        var s = plain;
+        s[0].mut_mask = mask;
+        k.* = fingerprint(b.tree, b.tokens, b.source, decl, &s, &.{}, &.{}, &.{});
+    }
+    try testing.expect(keys[0] != keys[1] and keys[0] != keys[2] and keys[1] != keys[2]);
+    // A sig with no `mut` param folds exactly what it folded before the field existed.
+    try testing.expectEqual(keys[0], fingerprint(b.tree, b.tokens, b.source, decl, &plain, &.{}, &.{}, &.{}));
 }
 
 test "callee kind folds in: builtin vs user_fn of an identical sig flips the hash" {

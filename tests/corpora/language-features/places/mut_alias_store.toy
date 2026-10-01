@@ -1,0 +1,67 @@
+# Feature: an assignment through a `mut` param builds the whole value before it writes any of it, and a by-value argument is the copy taken where it is evaluated, even when a later argument writes the variable through a `mut` param
+# expect: stdout "21\n201\n1\n3\n43\n1\n1\n2\n"
+# expect: exit 0
+import std/io
+
+struct P { x: int, y: int }
+struct In { a: int, b: int }
+struct Out { inner: In, x: int }
+
+# `a` and `b` name the same variable in `flip(q, q)`.
+fn flip(mut a: P, mut b: P) { a = P { x: b.y, y: b.x } }
+
+# The literal reads the destination it is assigned to.
+fn rot(mut p: P) { p = P { x: p.y, y: p.x } }
+
+# `n` names `a.x` in `set_n(r, r.x)`.
+fn set_n(mut a: P, mut n: int) { a = P { x: 10, y: n } }
+
+# `a` names `b.inner` in `nest(o.inner, o)`.
+fn nest(mut a: In, mut b: Out) { b = Out { inner: In { a: 7, b: 8 }, x: a.a } }
+
+# A field store reads the other alias.
+fn fld(mut a: Out, mut b: Out) { a.inner = In { a: b.inner.b, b: b.inner.a } }
+
+fn touch(mut p: P) -> int {
+    p.x = 50
+    0
+}
+
+fn first(b: P, k: int) -> int { b.x + k }
+
+fn len_plus(s: str, k: int) -> int { s.len() + k }
+
+fn grow(mut s: str) -> int {
+    s = "a longer text"
+    0
+}
+
+impl P {
+    fn get(self, k: int) -> int { self.x + k }
+}
+
+fn main() -> int {
+    q := P { x: 1, y: 2 }
+    flip(q, q)
+    io.println(q.x * 10 + q.y)
+    a := P { x: 1, y: 2 }
+    rot(a)
+    io.println(a.x * 100 + a.y)
+    r := P { x: 1, y: 2 }
+    set_n(r, r.x)
+    io.println(r.y)
+    o := Out { inner: In { a: 3, b: 4 }, x: 0 }
+    nest(o.inner, o)
+    io.println(o.x)
+    o2 := Out { inner: In { a: 3, b: 4 }, x: 0 }
+    fld(o2, o2)
+    io.println(o2.inner.a * 10 + o2.inner.b)
+    # `touch` writes `v` after `v` was passed by value.
+    v := P { x: 1, y: 2 }
+    io.println(first(v, touch(v)))
+    w := P { x: 1, y: 2 }
+    io.println(w.get(touch(w)))
+    s := "hi"
+    io.println(len_plus(s, grow(s)))
+    return 0
+}

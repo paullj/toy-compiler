@@ -1,0 +1,43 @@
+# Feature: `mut` scalar parameters write the caller's variable: int, int8 (wrapping), bool, float, forwarding, recursion
+# expect: exit 42
+# c: 1 -> bump 2 -> twice 4. w: int8 127 + 1 wraps to -128, so w < 0 adds 10. flip(on)
+# makes on false, adding 0 for `on`. f: 1.5 + 1.0 = 2.5, which adds 8. down(n, 5)
+# counts n from 0 up to 5 through five nested frames, each writing the caller's place
+# through the address it was passed: 4 + 10 + 0 + 8 + 5 + 15 (k) = 42.
+fn bump(mut n: int) { n = n + 1 }
+
+fn twice(mut n: int) {
+    bump(n)
+    bump(n)
+}
+
+fn wrap(mut w: int8) { w = w + 1 }
+
+fn flip(mut b: bool) { b = !b }
+
+fn addf(mut f: float) { f = f +. 1.0 }
+
+fn down(mut n: int, k: int) {
+    if k == 0 { return }
+    n = n + 1
+    down(n, k - 1)
+}
+
+fn main() -> int {
+    c := 1
+    bump(c)
+    twice(c)
+    w: int8 = 127
+    wrap(w)
+    on := true
+    flip(on)
+    f := 1.5
+    addf(f)
+    n := 0
+    down(n, 5)
+    k := 15
+    wb := if w < 0 { 10 } else { 0 }
+    ob := if on { 100 } else { 0 }
+    fb := if f == 2.5 { 8 } else { 0 }
+    return c + wb + ob + fb + n + k
+}

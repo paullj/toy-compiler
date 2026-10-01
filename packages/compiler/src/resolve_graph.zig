@@ -53,6 +53,7 @@ const SymKind = @import("symbols/Sym.zig").SymKind;
 const Intrinsic = @import("symbols/Intrinsic.zig");
 const StdNames = @import("symbols/StdNames.zig");
 const Closure = @import("symbols/Closure.zig");
+const Modes = @import("symbols/Modes.zig");
 
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
@@ -177,6 +178,9 @@ const GraphResolve = struct {
     /// call may run that closure, which can read or write the slot, so a write to one is
     /// never a dead store.
     captured_so_far: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// This fn's `mut` params (bit = param slot). A write to one stores into the caller's
+    /// variable, which a closure the call was handed may read, so it is never a dead store.
+    mut_params: u64 = 0,
     /// Every method name in the graph. A value-position `x.m` naming one may be a bound
     /// method, which captures `x`. Without types the resolver cannot tell it from a field
     /// read of the same name, so it keeps `x` live either way: a missed dead store is safe,
@@ -608,6 +612,7 @@ const GraphResolve = struct {
 
         const decl = g.nodes()[fn_idx.int()];
         const proto = Ast.protoAt(g.tree(g.cur_mod), decl.lhs.int());
+        g.mut_params = Modes.ofProto(g.tree(g.cur_mod), g.tokens(), proto);
 
         try g.pushScope();
         for (proto.params) |param_idx| {
@@ -814,7 +819,7 @@ const GraphResolve = struct {
     /// defined here", wrong for a store). A leading `_` on the name silences, mirroring the
     /// unused-variable convention (the binding's one name spells the same at both writes).
     fn deadStoreWrite(g: *GraphResolve, top: *PendingMap, slot: u32, name_tok: u32) error{OutOfMemory}!void {
-        if (g.captured_so_far.contains(slot)) return;
+        if (g.captured_so_far.contains(slot) or Modes.isMut(g.mut_params, slot)) return;
         if (top.get(slot)) |dead_tok| {
             const nm = g.nameText(dead_tok);
             if (!(nm.len != 0 and nm[0] == '_'))
@@ -2367,6 +2372,36 @@ test "a deref place assign is never a dead store (no W0010)" {
         }
     };
     try withResolvedGraph(".toy-test-deadstore-deref", files, "main.toy", Check.run);
+}
+
+test "a write to a mut param is never a dead store (no W0010): the caller's variable may be read by a closure the call runs" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+        \\fn f(mut n: int, g: fn() -> int) -> int {
+        \\ n = 1
+        \\ k := g()
+        \\ n = 2
+        \\ return k
+        \\}
+        \\fn h(n: int, g: fn() -> int) -> int {
+        \\ n = 1
+        \\ k := g()
+        \\ n = 2
+        \\ return k + n
+        \\}
+        \\fn main() -> int {
+        \\ c := 0
+        \\ return f(c, fn() -> int { c }) + h(c, fn() -> int { c })
+        \\}
+        \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            // Only `h`'s by-value `n`, a copy of its own, still has one.
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-mut-param", files, "main.toy", Check.run);
 }
 
 test "a single write never read is W0001, not W0010 (no double-warn)" {

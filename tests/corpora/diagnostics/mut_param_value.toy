@@ -1,0 +1,19 @@
+struct P { x: int }
+
+impl P {
+    fn add(self, mut d: int) { d = d + self.x }
+    fn bump(mut self) { self.x = self.x + 1 }
+}
+
+fn bump(mut n: int) { n = n + 1 }
+fn apply(f: fn(int), v: int) { f(v) }
+
+fn main() -> int {
+    _g := bump  #~ ERROR [T0049] 'bump' is a function with 'mut' parameters and cannot be used as a value
+    apply(bump, 1)  #~ ERROR [T0049] 'bump' is a function with 'mut' parameters and cannot be used as a value
+    p := P { x: 1 }
+    _h := p.add  #~ ERROR [T0049] 'add' is a method with 'mut' parameters and cannot be used as a value; wrap the call in a lambda
+    k := p.bump
+    k()
+    return p.x
+}

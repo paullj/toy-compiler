@@ -1,0 +1,15 @@
+protocol Q {
+    fn q(self, mut x: int) -> int  #~ ERROR [P0006] 'mut' may only qualify the 'self' receiver of a protocol method
+}
+
+struct P { x: int }
+
+impl P has Q {
+    fn q(self, mut x: int) -> int { x + self.x }  #~ ERROR [P0006] 'mut' may only qualify the 'self' receiver of a protocol method
+}
+
+fn main() -> int {
+    f := fn(mut a: int) -> int { a }  #~ ERROR [P0006] a lambda's parameters cannot be 'mut'; a lambda is called as a value, which passes every argument by value
+    fn g(mut b: int) -> int { b }  #~ ERROR [P0006] a local function's parameters cannot be 'mut'; it is called as a value, which passes every argument by value
+    return f(1) + g(2)
+}

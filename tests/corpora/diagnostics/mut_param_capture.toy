@@ -1,0 +1,33 @@
+struct P { x: int }
+
+impl P {
+    fn get(self) -> int { self.x }
+}
+
+fn by_lambda(mut n: int) -> int {
+    f := fn() -> int { n }  #~ ERROR [T0052] a closure cannot capture the 'mut' parameter 'n'; copy it to a local first
+    f()
+}
+
+fn by_local_fn(mut n: int) -> int {
+    fn peek() -> int { n }  #~ ERROR [T0052] a closure cannot capture the 'mut' parameter 'n'; copy it to a local first
+    peek()
+}
+
+fn by_bound(mut p: P) -> int {
+    g := p.get  #~ ERROR [T0052] a closure cannot capture the 'mut' parameter 'p'; copy it to a local first
+    g()
+}
+
+fn copied(mut n: int) -> int {
+    m := n
+    h := fn() -> int { m }
+    n = 0
+    h()
+}
+
+fn main() -> int {
+    a := 1
+    p := P { x: 2 }
+    return by_lambda(a) + by_local_fn(a) + by_bound(p) + copied(a)
+}

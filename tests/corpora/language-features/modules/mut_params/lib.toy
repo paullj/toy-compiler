@@ -1,0 +1,18 @@
+pub struct Acc { n: int }
+
+impl Acc {
+    fn add(mut self, mut carry: int) {
+        self.n = self.n + carry
+        carry = 0
+    }
+}
+
+pub fn bump(mut n: int) { n = n + 1 }
+
+pub fn swap[T](mut a: T, mut b: T) {
+    t := a
+    a = b
+    b = t
+}
+
+pub fn acc() -> Acc { Acc { n: 30 } }
