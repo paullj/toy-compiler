@@ -1641,7 +1641,11 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
     defer p.depth -= 1;
     if (p.depth > MAX_EXPR_DEPTH) {
         try p.backstop(p.peek(), .P0005, "block nested too deeply");
-        return p.addNode(.{ .tag = .error_node, .main_token = p.index, .lhs = Ast.none, .rhs = Ast.none });
+        const et = p.index;
+        // Consume the whole block: a caller that re-parses from the same `{` (a block
+        // expression statement) would otherwise hit this guard again forever.
+        if (p.at(.l_brace)) p.skipBraced();
+        return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
     }
     // A block body is a fresh expression context: re-allow `{`/`if` expressions
     // inside it even when reached from an `if`/`while` condition.
@@ -2728,6 +2732,20 @@ fn fail(p: *Parser, tok: Token, code: Code, message: []const u8) Error {
     // rides the latch with the message.
     p.warn(tok, code, message) catch return error.OutOfMemory;
     return error.ParseError;
+}
+
+/// Advance past the `{ .. }` region at the cursor, to its matching `}` or eof.
+fn skipBraced(p: *Parser) void {
+    var depth: usize = 0;
+    while (!p.at(.eof)) {
+        switch (p.peek().tag) {
+            .l_brace => depth += 1,
+            .r_brace => depth -= 1,
+            else => {},
+        }
+        p.advance();
+        if (depth == 0) return;
+    }
 }
 
 /// Single-token DELETION repair: report `message`, consume EXACTLY ONE token
@@ -5108,6 +5126,31 @@ test "a nesting-depth backstop carries the P0005 code" {
         saw_p0005 = true;
     };
     try testing.expect(saw_p0005);
+}
+
+test "deeply nested block expressions and lambdas end in one P0005" {
+    const gpa = testing.allocator;
+    const shapes = [_]struct { open: []const u8, close: []const u8 }{
+        .{ .open = "{ ", .close = " }" },
+        .{ .open = "fn() { ", .close = " }" },
+    };
+    for (shapes) |sh| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "fn main() -> int {\n    f := ");
+        for (0..300) |_| try buf.appendSlice(gpa, sh.open);
+        try buf.appendSlice(gpa, "1");
+        for (0..300) |_| try buf.appendSlice(gpa, sh.close);
+        try buf.appendSlice(gpa, "\n    0\n}\nfn g() -> int { 2 }\n");
+        const res = try parseResult(gpa, buf.items);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(codes.Code.P0005, res.diags[0].code);
+        // The decl after the deep one still parses.
+        const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+        try testing.expectEqual(@as(usize, 2), Ast.rangeSlice(res.tree, prog.lhs.int()).len);
+    }
 }
 
 test "a valid program stamps no code (byte-identical contract)" {
