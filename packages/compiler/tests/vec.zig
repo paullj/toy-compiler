@@ -260,12 +260,13 @@ test "vec: Option[Ref[int]] unwrap rides the scalar/ref payload path" {
     const io = threaded.io();
     try skipUnlessBackend(io);
     // A managed-box payload is an 8-byte cell pointer, so unwrap keeps the scalar
-    // block-arg join (byte-identical to HEAD). Deref the unwrapped Ref: *r = 42.
+    // block-arg join (byte-identical to HEAD). Read the unwrapped Ref: 42.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-ref",
+        \\import std/ref
         \\fn main() -> int {
-        \\    r := &42
+        \\    r := Ref.new(42)
         \\    o := Option[Ref[int]].some(r)
-        \\    return *o.unwrap()
+        \\    return o.unwrap().get()
         \\}
         \\
     );
@@ -654,15 +655,16 @@ test "vec: Vec[Ref[int]].new() round-trips managed-box elements" {
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // The element is a managed box (`Ref[int]`, an `isRefPayload` type). `&x` boxes the
-    // value; `*get(i).unwrap()` reads the boxed cell back.
+    // The element is a managed box (`Ref[int]`, an `isRefPayload` type). `Ref.new(x)` boxes
+    // the value; `get(i).unwrap().get()` reads the boxed cell back.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-ref",
+        \\import std/ref
         \\import std/vec
         \\fn main() -> int {
         \\    xs := Vec[Ref[int]].new()
-        \\    xs.push(&3)
-        \\    xs.push(&4)
-        \\    return *xs.get(0).unwrap() + *xs.get(1).unwrap()
+        \\    xs.push(Ref.new(3))
+        \\    xs.push(Ref.new(4))
+        \\    return xs.get(0).unwrap().get() + xs.get(1).unwrap().get()
         \\}
         \\
     );
@@ -697,12 +699,13 @@ test "vec: a nested-generic-container program is byte-identical at -j1 and -j8" 
     try skipUnlessBackend(io);
 
     const src =
+        \\import std/ref
         \\import std/vec
         \\fn main() -> int {
         \\    xs := Vec[Ref[int]].new()
-        \\    xs.push(&3)
-        \\    xs.push(&4)
-        \\    return *xs.get(0).unwrap() + *xs.get(1).unwrap()
+        \\    xs.push(Ref.new(3))
+        \\    xs.push(Ref.new(4))
+        \\    return xs.get(0).unwrap().get() + xs.get(1).unwrap().get()
         \\}
         \\
     ;

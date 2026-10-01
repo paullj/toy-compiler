@@ -1,0 +1,15 @@
+# `Ref` is a prelude type, but its methods live in `std/ref`; without the import each use
+# names it, even when the program declares methods of its own on `Ref`.
+impl Ref[T] {
+    fn tag(self) -> int { 7 }
+}
+
+pub fn read(r: Ref[int]) -> int {
+    r.get() + r.tag()  #~ ERROR [T0018] no method 'get' on type 'Ref'; add 'import std/ref'
+}
+
+fn main() -> int {
+    _r := Ref.new(1)  #~ ERROR [T0018] 'Ref' has no associated function 'new'; add 'import std/ref'
+    _s := Ref[int].new(1)  #~ ERROR [T0018] 'Ref' has no associated function 'new'; add 'import std/ref'
+    return 0
+}

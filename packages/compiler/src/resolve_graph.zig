@@ -7,7 +7,7 @@
 //!     user fn a GRAPH-GLOBAL id (deterministic: module order, then decl order)
 //!     and a MODULE-QUALIFIED symbol name (`<module-path>.<fn>`), except the entry
 //!     module's `main` (stays bare `main`). The seeded builtins (`panic` plus the
-//!     core-only intrinsics) are appended after all user fns. Each module records
+//!     bundled-library intrinsics) are appended after all user fns. Each module records
 //!     its own fns (pub +
 //!     private, visible only inside the module) plus its `pub` fns/structs/enums
 //!     (visible to importers under the import namespace). Each module's `import`
@@ -133,6 +133,14 @@ const ModuleTables = struct {
 /// `Option` would spuriously mark EVERY import used (they are injected pub into every
 /// module's enum table).
 const prelude_enum_names = [_][]const u8{ "Ordering", "Option", "Result" };
+/// The prelude structs nameable in value position (`Ref.new(v)`) with no import; the same
+/// crediting rule as `prelude_enum_names` applies.
+const prelude_struct_names = [_][]const u8{"Ref"};
+
+fn isPreludeName(names: []const []const u8, name: []const u8) bool {
+    for (names) |p| if (std.mem.eql(u8, name, p)) return true;
+    return false;
+}
 
 const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none, is_fn: bool = false };
 /// A lambda or local fn whose body is being resolved: its captures grow as outer locals
@@ -222,10 +230,10 @@ const GraphResolve = struct {
         return .{ .start = m.tokens[segs[0].int()].start, .end = m.tokens[segs[segs.len - 1].int()].end };
     }
 
-    /// A synthetic builtin the resolver seeds after the user fns. `core_only` gates
-    /// registration into per-module fn tables: `false` = global prelude (every module),
-    /// `true` = only bundled `core/` modules.
-    const SeededBuiltin = struct { name: []const u8, core_only: bool };
+    /// A synthetic builtin the resolver seeds after the user fns. `scope` gates
+    /// registration into per-module fn tables: `.global` = every module, `.core` = only
+    /// bundled `core/` modules, `.bundled` = every bundled module (`core/` and `std/`).
+    const SeededBuiltin = struct { name: []const u8, scope: Intrinsic.Scope };
 
     /// The single ordered authority for the seeded builtins. Order is load-bearing: it
     /// fixes each builtin's global fn id, which feeds the content fingerprint / -jN
@@ -235,8 +243,8 @@ const GraphResolve = struct {
     const seeded_builtins = blk: {
         const kinds = std.enums.values(Intrinsic.Kind);
         var list: [1 + kinds.len]SeededBuiltin = undefined;
-        list[0] = .{ .name = "panic", .core_only = false };
-        for (kinds, 0..) |k, i| list[1 + i] = .{ .name = Intrinsic.name(k), .core_only = true };
+        list[0] = .{ .name = "panic", .scope = .global };
+        for (kinds, 0..) |k, i| list[1 + i] = .{ .name = Intrinsic.name(k), .scope = Intrinsic.scope(k) };
         break :blk list;
     };
 
@@ -252,20 +260,26 @@ const GraphResolve = struct {
             .is_pub = false,
         });
         for (g.tables, 0..) |*t, i| {
-            const in_scope = if (b.core_only) g.graph.modules[i].isCore() else true;
+            const in_scope = switch (b.scope) {
+                .global => true,
+                .core => g.graph.modules[i].isCore(),
+                .bundled => g.graph.modules[i].bundled,
+            };
             if (in_scope and !t.fns.contains(b.name)) try t.fns.put(g.gpa, b.name, id);
         }
     }
 
-    test "seeded_builtins: panic leads as global prelude, then the intrinsics core-only" {
+    test "seeded_builtins: panic leads as global prelude, then the intrinsics in their own scopes" {
         try std.testing.expectEqualStrings("panic", seeded_builtins[0].name);
-        try std.testing.expect(!seeded_builtins[0].core_only);
+        try std.testing.expect(seeded_builtins[0].scope == .global);
         const kinds = std.enums.values(Intrinsic.Kind);
         try std.testing.expectEqual(1 + kinds.len, seeded_builtins.len);
         for (kinds, 0..) |k, i| {
             try std.testing.expectEqualStrings(Intrinsic.name(k), seeded_builtins[1 + i].name);
-            try std.testing.expect(seeded_builtins[1 + i].core_only);
+            try std.testing.expect(seeded_builtins[1 + i].scope == Intrinsic.scope(k));
         }
+        try std.testing.expect(Intrinsic.scope(.ref_new) == .bundled);
+        try std.testing.expect(Intrinsic.scope(.gc_alloc) == .core);
     }
 
     /// Assign every user fn a global id + qualified name, and register each module's
@@ -429,19 +443,23 @@ const GraphResolve = struct {
         // Seed every synthetic builtin off one ordered list (`seeded_builtins`). Each is a
         // homeless `.builtin` (bodyless; the ones that need machine code are hand-emitted at
         // link time). `panic` is global prelude (registered into every module's fn table
-        // unless shadowed); the `Intrinsic` names are core-only (registered only into a
-        // bundled `core/` module — naming them elsewhere leaves the name unresolved, R0001).
+        // unless shadowed); each `Intrinsic` name registers only into the bundled modules its
+        // `Intrinsic.scope` admits — naming one elsewhere leaves the name unresolved, R0001.
         // The list's order fixes each id, so `panic` leads and no later append shifts an
         // existing id.
         for (seeded_builtins) |b| try seedBuiltin(g, entry, b);
-        // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) are nameable
-        // in every module with no import (the `panic` precedent). Register each into a module's enum
-        // table UNLESS the module declares its own (user-first-wins), so their construction/match
-        // resolve quietly (left for Typecheck, which native-registers the enums). The typecheck-time
-        // `enum_ids` injection in `registerPrelude` mirrors this on its own tables.
+        // The prelude enums (`Ordering`; generic value enums `Option`/`Result`) and the prelude
+        // `Ref` struct are nameable in every module with no import (the `panic` precedent).
+        // Register each into a module's enum/struct table UNLESS the module declares its own
+        // (user-first-wins), so their construction/match/associated calls resolve quietly (left
+        // for Typecheck, which native-registers them). The typecheck-time `enum_ids` injection
+        // in `registerPrelude` mirrors this on its own tables.
         for (g.tables) |*t| {
             for (prelude_enum_names) |name| {
                 if (!t.enums.contains(name)) try t.enums.put(g.gpa, name, true);
+            }
+            for (prelude_struct_names) |name| {
+                if (!t.structs.contains(name)) try t.structs.put(g.gpa, name, true);
             }
         }
     }
@@ -796,9 +814,9 @@ const GraphResolve = struct {
             },
             .assign => {
                 const target = g.nodes()[stmt.lhs.int()];
-                // A place target (`p.x`, `p.0`, `*r`) stores through a base, not into a bare
+                // A place target (`p.x`, `p.0`) stores through a base, not into a bare
                 // slot — field/element deadness is out of scope, and its reads were tapped.
-                if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .unary) return;
+                if (target.tag == .field_access or target.tag == .tuple_field) return;
                 const r = g.resolutions[g.cur_mod][stmt.lhs.int()];
                 if (r == .local) try g.deadStoreWrite(top, r.local, target.main_token);
             },
@@ -847,9 +865,9 @@ const GraphResolve = struct {
             },
             .assign => {
                 const target = g.nodes()[stmt.lhs.int()];
-                // A `.`-rooted place (`p.x`), or a `*r` deref place, resolves as an
-                // expression (its root name is checked there), not as a bare assignable name.
-                if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .unary) {
+                // A `.`-rooted place (`p.x`) resolves as an expression (its root name is
+                // checked there), not as a bare assignable name.
+                if (target.tag == .field_access or target.tag == .tuple_field) {
                     try g.resolveExpr(stmt.lhs);
                 } else {
                     const resn = g.lookupName(target.main_token);
@@ -1426,7 +1444,7 @@ const GraphResolve = struct {
     /// two library-type needs the language expresses with no textual type token: a
     /// `[..]`/`[]` list literal constructs a `Vec`, and a `for k, v` binds an `Entry`.
     /// Every other construct either spells its type (caught by the identifier scan) or needs
-    /// no import (single-var `for-in`, range-for, `&`/`*`, `?`, str methods, tuples). If a
+    /// no import (single-var `for-in`, range-for, `?`, str methods, tuples). If a
     /// future desugar introduces a new implicit library-type need, a rule MUST be added
     /// here or that import silently becomes a false positive.
     ///
@@ -1551,6 +1569,7 @@ const GraphResolve = struct {
             if (!se.value_ptr.*) continue; // pub only: the target's OWN exported types
             const name = se.key_ptr.*;
             if (own_types.contains(name)) continue;
+            if (isPreludeName(&prelude_struct_names, name)) continue;
             if (ref_idents.contains(name)) return true;
         }
         var eit = tt.enums.iterator();
@@ -1558,11 +1577,7 @@ const GraphResolve = struct {
             if (!ee.value_ptr.*) continue;
             const name = ee.key_ptr.*;
             if (own_types.contains(name)) continue;
-            var is_prelude = false;
-            for (prelude_enum_names) |p| if (std.mem.eql(u8, name, p)) {
-                is_prelude = true;
-            };
-            if (is_prelude) continue;
+            if (isPreludeName(&prelude_enum_names, name)) continue;
             if (ref_idents.contains(name)) return true;
         }
         if (has_list and (tt.structs.get(StdNames.vec_struct) orelse false)) return true;
@@ -2204,7 +2219,7 @@ test "two non-nested sibling blocks reusing a name do not warn W0009" {
 }
 
 test "a param named after a core-only intrinsic does not warn outside core" {
-    // `size_of` is a `core_only` intrinsic — it is NOT registered in an ordinary module's
+    // `size_of` is a `.core`-scoped intrinsic — it is NOT registered in an ordinary module's
     // fn table, so a normal-module param named `size_of` shadows nothing (guards case-b gating).
     const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
         \\fn f(size_of: int) -> int {
@@ -2219,6 +2234,24 @@ test "a param named after a core-only intrinsic does not warn outside core" {
         }
     };
     try withResolvedGraph(".toy-test-shadow-intrinsic-noncore", files, "main.toy", Check.run);
+}
+
+test "the Ref cell intrinsics are not nameable outside a bundled module (R0001)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+        \\fn main() -> int {
+        \\ r := ref_new(1)
+        \\ ref_set(r, 2)
+        \\ return ref_get(r)
+        \\}
+        \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 3), countCode(r, .R0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-ref-intrinsic-noncore", files, "main.toy", Check.run);
 }
 
 test "a straight-line overwrite before any read flags the first write W0010" {
@@ -2352,26 +2385,6 @@ test "a field place assign is never a dead store (no W0010)" {
         }
     };
     try withResolvedGraph(".toy-test-deadstore-field", files, "main.toy", Check.run);
-}
-
-test "a deref place assign is never a dead store (no W0010)" {
-    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
-        \\fn main() -> int {
-        \\ x := 1
-        \\ r := &x
-        \\ *r = 1
-        \\ *r = 2
-        \\ return *r
-        \\}
-        \\
-    }};
-    const Check = struct {
-        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
-            _ = g;
-            try testing.expectEqual(@as(usize, 0), countCode(r, .W0010));
-        }
-    };
-    try withResolvedGraph(".toy-test-deadstore-deref", files, "main.toy", Check.run);
 }
 
 test "a write to a mut param is never a dead store (no W0010): the caller's variable may be read by a closure the call runs" {
@@ -3308,6 +3321,59 @@ test "a bare prelude `Option` does not credit an unused import" {
         }
     };
     try withResolvedGraph(".toy-test-w4-prelude", files, "main.toy", Check.run);
+}
+
+test "naming the prelude Ref credits no import" {
+    // `Ref` is injected pub into every module's struct table, like the prelude enums, so a
+    // bare `Ref` must not mark an import used.
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\pub fn take(_r: Ref[int]) -> int { 0 }
+        \\fn main() -> int {
+        \\ _r := Ref.new(1)
+        \\ return 0
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), errorCount(r));
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0004));
+        }
+    };
+    try withResolvedGraph(".toy-test-w4-prelude-ref", files, "main.toy", Check.run);
+}
+
+test "the prelude Ref is nameable in value position, and a module's own Ref wins" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import own
+        \\fn main() -> int {
+        \\ _r := Ref.new(1)
+        \\ return own.g()
+        \\}
+        \\
+        },
+        .{ .path = "own.toy", .source =
+        \\struct Ref[T] { v: T }
+        \\impl Ref[T] { fn of(v: T) -> Ref[T] { Ref { v: v } } }
+        \\pub fn g() -> int { Ref.of(4).v }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), errorCount(r));
+            try testing.expectEqual(@as(usize, 0), countCode(r, .R0001));
+            try testing.expectEqual(@as(usize, 0), countCode(r, .R0002));
+        }
+    };
+    try withResolvedGraph(".toy-test-prelude-ref-value", files, "main.toy", Check.run);
 }
 
 test "an `as _`-aliased unused import is a deliberate silence (no W0004)" {

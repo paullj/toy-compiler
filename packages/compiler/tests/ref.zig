@@ -17,7 +17,7 @@ const compile = harness.compile;
 
 const buildAndRun = harness.buildAndRun;
 
-test "ref: two independent &41 boxes compare UNEQUAL (cell identity, not structural)" {
+test "ref: two independent Ref.new(41) boxes compare UNEQUAL (cell identity, not structural)" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -25,9 +25,10 @@ test "ref: two independent &41 boxes compare UNEQUAL (cell identity, not structu
     try skipUnlessBackend(io);
     // Returns 1 iff the two distinct cells are unequal AND a handle equals itself.
     const code = try buildAndRun(gpa, io, ".toy-test-ref-identity",
+        \\import std/ref
         \\fn main() -> int {
-        \\    r := &41
-        \\    if r == r && &41 != &41 { return 1 }
+        \\    r := Ref.new(41)
+        \\    if r == r && Ref.new(41) != Ref.new(41) { return 1 }
         \\    return 0
         \\}
         \\
@@ -42,13 +43,14 @@ test "ref: Option[Ref[int]] unwrap-some yields the boxed value; absence takes th
     const io = threaded.io();
     try skipUnlessBackend(io);
     const code = try buildAndRun(gpa, io, ".toy-test-ref-option",
+        \\import std/ref
         \\fn pick(present: bool) -> Option[Ref[int]] {
-        \\    if present { return Option.some(&40) }
+        \\    if present { return Option.some(Ref.new(40)) }
         \\    return Option[Ref[int]].none
         \\}
         \\fn main() -> int {
         \\    a := pick(true)
-        \\    base := if a.is_some() { *a.unwrap() } else { 0 }
+        \\    base := if a.is_some() { a.unwrap().get() } else { 0 }
         \\    b := pick(false)
         \\    extra := if b.is_some() { 0 } else { 2 }
         \\    return base + extra
@@ -66,11 +68,12 @@ test "ref: a program building Ref[int] AND Ref[bool] is byte-identical at -j1 an
     try skipUnlessBackend(io);
 
     const src =
+        \\import std/ref
         \\fn main() -> int {
-        \\    a := &41
-        \\    b := &true
-        \\    *a = *a + 1
-        \\    if *b { return *a }
+        \\    a := Ref.new(41)
+        \\    b := Ref.new(true)
+        \\    a.set(a.get() + 1)
+        \\    if b.get() { return a.get() }
         \\    return 0
         \\}
         \\
@@ -107,15 +110,16 @@ test "ref: a growable holding Ref[int] elements pushes then reads-back the boxed
     const io = threaded.io();
     try skipUnlessBackend(io);
     // A box element is an 8-byte handle: `ga_push` stores it and `ga_get` reads it back as a
-    // `Ref[int]` (not a truncated int). `&x` boxes the value; the push round-trips through the
-    // same element slot. 3 + 4 == 7.
+    // `Ref[int]` (not a truncated int). `Ref.new(x)` boxes the value; the push round-trips
+    // through the same element slot. 3 + 4 == 7.
     const code = try buildAndRun(gpa, io, ".toy-test-ref-box-element",
         \\import core/mem
+        \\import std/ref
         \\fn main() -> int {
         \\    a := mem.ga_new[Ref[int]]()
-        \\    mem.ga_push[Ref[int]](a, &3)
-        \\    mem.ga_push[Ref[int]](a, &4)
-        \\    return *mem.ga_get[Ref[int]](a, 0) + *mem.ga_get[Ref[int]](a, 1)
+        \\    mem.ga_push[Ref[int]](a, Ref.new(3))
+        \\    mem.ga_push[Ref[int]](a, Ref.new(4))
+        \\    return mem.ga_get[Ref[int]](a, 0).get() + mem.ga_get[Ref[int]](a, 1).get()
         \\}
         \\
     );
@@ -131,11 +135,12 @@ test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
 
     const src =
         \\import core/mem
+        \\import std/ref
         \\fn main() -> int {
         \\    a := mem.ga_new[Ref[int]]()
-        \\    mem.ga_push[Ref[int]](a, &3)
-        \\    mem.ga_push[Ref[int]](a, &4)
-        \\    return *mem.ga_get[Ref[int]](a, 0) + *mem.ga_get[Ref[int]](a, 1)
+        \\    mem.ga_push[Ref[int]](a, Ref.new(3))
+        \\    mem.ga_push[Ref[int]](a, Ref.new(4))
+        \\    return mem.ga_get[Ref[int]](a, 0).get() + mem.ga_get[Ref[int]](a, 1).get()
         \\}
         \\
     ;
@@ -174,9 +179,10 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
     // and `gc_mark`'s appended body are a pure function of source — so the two images are
     // byte-identical bar the one-byte code-sign nonce, the spike's determinism guarantee.
     const src =
+        \\import std/ref
         \\struct Node { v: int, next: Ref[int] }
         \\fn main() -> int {
-        \\    r := &1
+        \\    r := Ref.new(1)
         \\    a := Node{ v: 42, next: r }
         \\    b := Node{ v: 42, next: r }
         \\    return if a == b { a.v } else { 0 }
@@ -203,4 +209,75 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
         if (x != y) differing += 1;
     }
     try std.testing.expect(differing <= 1);
+}
+
+test "ref: a set through a copy of a handle is seen through the original" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // `bump` takes the handle BY VALUE, so its `set` goes through a copy; the caller's handle
+    // names the same cell and sees both writes.
+    const code = try buildAndRun(gpa, io, ".toy-test-ref-copy-alias",
+        \\import std/ref
+        \\fn bump(r: Ref[int]) { r.set(r.get() + 10) }
+        \\fn main() -> int {
+        \\    a := Ref.new(1)
+        \\    b := a
+        \\    b.set(5)
+        \\    bump(b)
+        \\    return a.get()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 15), code);
+}
+
+test "ref: Ref[P] and Ref[str] payloads round-trip through set and get" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    const code = try buildAndRun(gpa, io, ".toy-test-ref-aggregate",
+        \\import std/ref
+        \\struct P { x: int, y: int }
+        \\fn main() -> int {
+        \\    p := Ref.new(P { x: 1, y: 2 })
+        \\    q := p
+        \\    q.set(P { x: 30, y: 4 })
+        \\    s := Ref.new("ab")
+        \\    s.set("abcdefgh")
+        \\    return p.get().x + p.get().y + s.get().len()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
+}
+
+test "ref: Ref.new inside a generic mk[T] and a user Box.new(5) infer their type params" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    const code = try buildAndRun(gpa, io, ".toy-test-ref-infer",
+        \\import std/ref
+        \\struct Box[T] { v: T }
+        \\impl Box[T] {
+        \\    fn new(v: T) -> Box[T] { Box { v: v } }
+        \\}
+        \\fn mk[T](v: T) -> Ref[T] { Ref.new(v) }
+        \\fn main() -> int {
+        \\    b := Box.new(5)
+        \\    f := mk(true)
+        \\    n := mk(30)
+        \\    pinned := Ref[int].new(7)
+        \\    if !f.get() { return 1 }
+        \\    return b.v + n.get() + pinned.get()
+        \\}
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 42), code);
 }

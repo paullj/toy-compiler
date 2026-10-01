@@ -125,11 +125,14 @@ bump(count)                          # count changes
 
 There is one sharing model, so the `&x` / `*r` operators are removed.
 
-- **What stays:** a shared mutable cell that you store in a data structure. It is an ordinary std type:
-  - `Ref.new(v)` makes one.
+- **What stays:** a shared mutable cell that you store in a data structure. It is an ordinary std type, and its API is in `std/ref` (`import std/ref`):
+  - `Ref.new(v)` makes one. It infers `T` from `v`; `Ref[T].new(v)` pins it.
   - `r.get()` reads it.
   - `r.set(v)` writes it.
-- **Old syntax:** a coded parse error with a fix hint, for example "`&x` was removed; use `Ref.new(x)`".
+- **Handles:** every copy of a `Ref` names the same cell, so a `set` through one copy is seen through all of them. `==` compares cells (identity). A `Ref` has no `Hash`, so a type that holds one has no automatic `Hash` either.
+- **The type itself** stays a prelude type: `Ref[int]` is nameable in a type with no import, and so is `Ref` in value position. Its methods, like every impl's, are there when std/ref is part of the program: one module's `import std/ref` serves every module. In a program without it, a call of `new`, `get` or `set` is T0018 with the hint "add 'import std/ref'".
+- **Old syntax:** P0015, a parse error whose message names the replacement: "'&x' was removed; make a shared cell with 'Ref.new(x)'", and "'*r' was removed; read a Ref with 'r.get()' and write one with 'r.set(v)'". A module with a parse error is not checked further, so P0015 is the only error it reports. Infix `a & b` and `a * b` are unchanged.
+- **Associated-fn inference** is general: a bare `Box.new(5)` on any generic struct infers its type params from the value args, as a generic fn call does. A param-less associated fn (`Vec.new()`) still needs them written (`Vec[int].new()`, T0016).
 
 ## Bound methods
 

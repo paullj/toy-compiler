@@ -78,13 +78,19 @@ pub const ImportHint = struct {
     spelling: ?[]const u8 = null,
 };
 
+/// The methods std/ref declares on the prelude `Ref`. Missing one means std/ref is not in
+/// the program, so the checker hints its import.
+pub const ref_methods = [_][]const u8{ "new", "get", "set" };
+
 /// Stdlib names a program is likely to reach for WITHOUT the import that binds them,
 /// keyed by EXACT spelling: a typo (`Vecc`) is not a key, so the resolver's fuzzy
 /// "did you mean" keeps ownership of typos and only a genuine stdlib name yields the
 /// deterministic import hint. `Option`/`Result` are prelude generics (no import) and
-/// are absent; there is no `std/string` yet, so `string`/`String` are too.
+/// are absent; there is no `std/string` yet, so `string`/`String` are too. `Ref` is a
+/// prelude type whose methods live in `std/ref`, so it names that module.
 const import_hints = std.StaticStringMap(ImportHint).initComptime(.{
     .{ "Vec", ImportHint{ .module = "vec" } },
+    .{ "Ref", ImportHint{ .module = "ref" } },
     .{ "Map", ImportHint{ .module = "map" } },
     .{ "Set", ImportHint{ .module = "set" } },
     .{ "io", ImportHint{ .module = "io" } },
@@ -156,6 +162,8 @@ test "importHintFor: exact stdlib names hint; typos, prelude generics, and unkno
 
     inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter" }) |n|
         try std.testing.expect(importHintFor(n) != null);
+    try std.testing.expectEqualStrings("ref", importHintFor("Ref").?.module);
+    try std.testing.expect(importHintFor("Ref").?.spelling == null);
 
     // A typo is NOT a key: near-miss keeps ownership of typos.
     try std.testing.expect(importHintFor("Vecc") == null);
@@ -166,4 +174,17 @@ test "importHintFor: exact stdlib names hint; typos, prelude generics, and unkno
     try std.testing.expect(importHintFor("String") == null);
     try std.testing.expect(importHintFor("string") == null);
     try std.testing.expect(importHintFor("") == null);
+}
+
+test "ref_methods are the methods std/ref declares" {
+    const BundledStd = @import("bundled_std");
+    const src = for (BundledStd.modules) |m| {
+        if (std.mem.eql(u8, m.path, "std/ref")) break m.source;
+    } else return error.NoStdRef;
+    var buf: [32]u8 = undefined;
+    for (ref_methods) |name| {
+        const decl = try std.fmt.bufPrint(&buf, "fn {s}(", .{name});
+        try std.testing.expect(std.mem.indexOf(u8, src, decl) != null);
+    }
+    try std.testing.expectEqual(ref_methods.len, std.mem.count(u8, src, "    fn "));
 }

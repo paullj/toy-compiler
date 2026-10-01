@@ -1,0 +1,30 @@
+# Feature: a `match`, a `?` and a `loop` can yield a `Ref`, which is the same cell handle the arm produced
+# expect: stdout "5\n4\n7\n5\n"
+# expect: exit 0
+import std/io
+import std/ref
+import std/map
+import core/mem_selftest
+
+fn pick(o: Option[Ref[int]]) -> Option[int] {
+    r := o?
+    return .some(r.get())
+}
+
+fn main() -> int {
+    r := Ref.new(1)
+    k := 1
+    a := match k { 1 -> r, _ -> Ref.new(9) }
+    a.set(5)
+    io.println(r.get())
+    m := Map[str, Ref[int]].new()
+    m.set("a", Ref.new(3))
+    c := match m.get("a") { .some(c) -> c, .none -> Ref.new(0) }
+    mem_selftest.churn_collects()
+    c.set(c.get() + 1)
+    io.println(m.get("a").unwrap().get())
+    l := loop { break Ref.new(7) }
+    io.println(l.get())
+    io.println(pick(.some(r)).unwrap_or(0))
+    return pick(.none).unwrap_or(-1) + 1
+}

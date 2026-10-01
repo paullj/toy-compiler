@@ -1,0 +1,22 @@
+# expect: exit 42
+# Feature: an associated fn of a bare generic struct infers the struct's type params from
+# its value args. `Ref.new(v)` inside the generic `mk[T]` takes its `T` from `v` in each
+# instance, a user `Box.new(5)` is `Box[int]`, and `Ref[int].new(v)` still pins `T`.
+import std/ref
+
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn new(v: T) -> Box[T] { Box { v: v } }
+}
+
+fn mk[T](v: T) -> Ref[T] { Ref.new(v) }
+
+fn main() -> int {
+    b := Box.new(5)
+    flag := mk(true)
+    n := mk(30)
+    pinned := Ref[int].new(7)
+    if !flag.get() { return 1 }
+    return b.v + n.get() + pinned.get()
+}

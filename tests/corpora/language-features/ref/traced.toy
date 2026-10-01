@@ -5,10 +5,12 @@
 # builtin per managed field. Nothing calls `trace` at runtime yet (the collector's scan
 # stays conservative), but the unit + `gc_mark` are LINKED, so this is the real spike
 # surface the -jN determinism gate re-lowers.
+import std/ref
+
 struct Node { v: int, next: Ref[int] }
 
 fn main() -> int {
-    r := &1
+    r := Ref.new(1)
     a := Node{ v: 42, next: r }
     b := Node{ v: 42, next: r }   # same cell: `next` compares equal by identity
     return if a == b { a.v } else { 0 }

@@ -357,17 +357,18 @@ test "gc: a by-value aggregate SLOT survivor is kept by recursing the precise ro
 }
 
 test "gc: a box VALUE held across an alloc-triggered collection is a root (retyped-box gate)" {
-    // The box handle from `&8` lives ONLY as an SSA value in main's frame while the second
-    // argument (`churn_ref()`) forces a collection. It survives only because a box VALUE is
-    // recorded as a managed cell (`.rawptr`) the precise map projects — the retype whose
-    // absence UAFs the boxed 8. Exit 17 (= 8 + 9); a swept 8 would read reused memory.
+    // The box handle from `Ref.new(8)` lives ONLY as an SSA value in main's frame while the
+    // second argument (`churn_ref()`) forces a collection. It survives only because a box
+    // VALUE is recorded as a managed cell (`.rawptr`) the precise map projects — the retype
+    // whose absence UAFs the boxed 8. Exit 17 (= 8 + 9); a swept 8 would read reused memory.
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const code = try buildAndRun(gpa, io, ".toy-test-gc-boxval",
+        \\import std/ref
         \\import std/vec
-        \\fn use2(x: Ref[int], y: Ref[int]) -> int { return *x + *y }
+        \\fn use2(x: Ref[int], y: Ref[int]) -> int { return x.get() + y.get() }
         \\fn churn_ref() -> Ref[int] {
         \\    i := 0
         \\    loop {
@@ -376,9 +377,9 @@ test "gc: a box VALUE held across an alloc-triggered collection is a root (retyp
         \\        j.push(i)
         \\        i = i + 1
         \\    }
-        \\    return &9
+        \\    return Ref.new(9)
         \\}
-        \\fn main() -> int { return use2(&8, churn_ref()) }
+        \\fn main() -> int { return use2(Ref.new(8), churn_ref()) }
         \\
     );
     try std.testing.expectEqual(@as(u8, 17), code);
@@ -485,13 +486,14 @@ test "gc: a multi-entry Map[str,Ref] keeps EVERY value's pointee across a collec
     defer threaded.deinit();
     const io = threaded.io();
     const code = try buildAndRun(gpa, io, ".toy-test-gc-map-refval",
+        \\import std/ref
         \\import std/vec
         \\import std/map
         \\fn build() -> Map[str, Ref[int]] {
         \\    m := Map[str, Ref[int]].new()
-        \\    m.set("a", &10)
-        \\    m.set("b", &20)
-        \\    m.set("c", &40)
+        \\    m.set("a", Ref.new(10))
+        \\    m.set("b", Ref.new(20))
+        \\    m.set("c", Ref.new(40))
         \\    return m
         \\}
         \\fn main() -> int {
@@ -506,7 +508,7 @@ test "gc: a multi-entry Map[str,Ref] keeps EVERY value's pointee across a collec
         \\    }
         \\    sum := 0
         \\    for k, v in m {
-        \\        sum = sum + *v
+        \\        sum = sum + v.get()
         \\    }
         \\    if sum == 70 { return 7 }
         \\    return 0
@@ -885,6 +887,7 @@ test "gc: a box whose closures are gone is kept by its owner" {
 /// word an earlier call left in the same stack bytes (`gs`'s element backing). Each
 /// collection walks that slot as a container header unless the prologue clears it.
 const stale_slot_src =
+    \\import std/ref
     \\import std/vec
     \\struct C { n: int, tag: str, xs: Vec[int] }
     \\struct Pt { x: int, y: int }
@@ -895,7 +898,7 @@ const stale_slot_src =
     \\        p := Pt { x: i, y: i }
     \\        f := Pt { x: 1, y: 2 }
     \\        _q := f
-    \\        _r := &p
+    \\        _r := Ref.new(p.x)
     \\        i = i + 1
     \\    }
     \\    xs: Vec[int] = [1, 2, 3]
@@ -965,14 +968,15 @@ test "gc: an enum word that is a container in one variant only is word-scanned" 
         \\
         , .want = 11 },
         .{ .src =
+        \\import std/ref
         \\import std/vec
         \\import core/mem_selftest
         \\enum E { b(int, int, Vec[int]), a(int, int, Ref[int]) }
         \\fn main() -> int {
-        \\    e := E.a(1, 2, &5)
+        \\    e := E.a(1, 2, Ref.new(5))
         \\    n := mem_selftest.churn_collects()
         \\    m := mem_selftest.forced_collect_count()
-        \\    r := match e { .a(k, _, rr) -> k + *rr, .b(_, _, v) -> v.len() }
+        \\    r := match e { .a(k, _, rr) -> k + rr.get(), .b(_, _, v) -> v.len() }
         \\    if n < 1 || m < 1 { return 1 }
         \\    return r
         \\}
