@@ -1,9 +1,9 @@
-# Feature: the usable-language terminus — Vec + Map + for-in + for-k,v + Ref + str, all
+# Feature: the usable-language terminus — Vec + Map + for-in + for-k,v + str, all
 # GC-managed and reached through `std` only. `count` tallies a word list into a Map; a
-# ~20k dead-Vec `churn` then forces at least one collection while `counts`/`words`/`total`
-# stay rooted in main's frame. The survivors are RE-READ after the churn (the winner is
-# printed and the boxed counter is dereferenced), so a collector that mis-swept a reachable
-# object would change the output. "the" wins with 3, over 5 words: 3 * 5 == 15.
+# ~20k dead-Vec `churn` then forces at least one collection while `counts`/`words` stay
+# rooted in main's frame. The survivors are RE-READ after the churn (the winner is printed
+# and the words are counted again), so a collector that mis-swept a reachable object would
+# change the output. "the" wins with 3, over 5 words: 3 * 5 == 15.
 # expect: stdout "the seen 3 times\n"
 # expect: exit 15
 import std/io
@@ -42,14 +42,14 @@ fn main() -> int {
         }
     }
 
-    total := &0
+    total := 0
     for _ in words {
-        *total = *total + 1
+        total = total + 1
     }
 
     io.print(top)
     io.print(" seen ")
     io.print(best.to_string())
     io.print(" times\n")
-    return if top == "th".concat("e") { best * *total } else { 0 }
+    return if top == "th".concat("e") { best * total } else { 0 }
 }

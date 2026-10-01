@@ -1,10 +1,12 @@
 # expect: exit 1
-# Feature: `&x`/`*r`/`*r = v` over `bool`. Box `true`, flip it through the box, then
-# return an int derived from the (now-false) value.
+# Feature: `Ref.new(x)`/`r.get()`/`r.set(v)` over `bool`. Box `true`, flip it through the
+# box, then return an int derived from the (now-false) value.
+import std/ref
+
 fn main() -> int {
-    r := &true
-    *r = !*r        # flip through the box
-    if *r {
+    r := Ref.new(true)
+    r.set(!r.get())     # flip through the box
+    if r.get() {
         return 0
     }
     return 1

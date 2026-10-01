@@ -1,5 +1,5 @@
-//! The core-only heap / raw-pointer intrinsics — the single source of truth for
-//! their names. The resolver seeds them, the checker types them, and the lowerer
+//! The bundled library's heap / raw-pointer intrinsics — the single source of truth
+//! for their names. The resolver seeds them, the checker types them, and the lowerer
 //! folds or routes them; each keyed off `Kind` here instead of re-spelling the
 //! name strings, so a new intrinsic is one enum row + one `name` arm and every
 //! consumer's exhaustive `switch` fails to compile until it handles it.
@@ -9,7 +9,7 @@ const std = @import("std");
 /// Declared in the order the resolver seeds them. Seed order fixes each intrinsic
 /// fn's global id, which feeds the content fingerprint / -jN identity, so the
 /// order is load-bearing — append, never reorder.
-pub const Kind = enum { size_of, align_of, gc_alloc, gc_span_count, store, load, gc_array, offset, gc_collect, gc_stats, text_base, call_hash, call_eq, descriptor_of, store_byte, load_byte };
+pub const Kind = enum { size_of, align_of, gc_alloc, gc_span_count, store, load, gc_array, offset, gc_collect, gc_stats, text_base, call_hash, call_eq, descriptor_of, store_byte, load_byte, ref_new, ref_get, ref_set };
 
 pub fn name(k: Kind) []const u8 {
     return switch (k) {
@@ -29,6 +29,22 @@ pub fn name(k: Kind) []const u8 {
         .descriptor_of => "descriptor_of",
         .store_byte => "store_byte",
         .load_byte => "load_byte",
+        .ref_new => "ref_new",
+        .ref_get => "ref_get",
+        .ref_set => "ref_set",
+    };
+}
+
+/// Which modules may name an intrinsic. The `Ref` cell intrinsics back `std/ref`'s methods,
+/// so std must reach them too; the raw heap/pointer ones stay inside `core`. No `Kind` is
+/// `.global`: that is the scope of the resolver's other seeded builtin, `panic`, which
+/// shares this enum so one seeding table covers both.
+pub const Scope = enum { global, core, bundled };
+
+pub fn scope(k: Kind) Scope {
+    return switch (k) {
+        .ref_new, .ref_get, .ref_set => .bundled,
+        else => .core,
     };
 }
 
@@ -43,7 +59,7 @@ pub fn lookup(n: []const u8) ?Kind {
 test "name/lookup round-trip over every Kind, in seed order" {
     const order = std.enums.values(Kind);
     try std.testing.expectEqual(Kind.size_of, order[0]);
-    try std.testing.expectEqual(Kind.load_byte, order[order.len - 1]);
+    try std.testing.expectEqual(Kind.ref_set, order[order.len - 1]);
     for (order) |k| try std.testing.expectEqual(k, lookup(name(k)).?);
     try std.testing.expect(lookup("not_an_intrinsic") == null);
 }

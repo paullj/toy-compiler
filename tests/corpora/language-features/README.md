@@ -15,6 +15,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `io/`           | runtime output via `print`                                |
 | `closures/`     | function types, function values, lambdas, local fns, bound methods and specialized generic calls |
 | `places/`       | `mut` parameters: by-address arguments (locals, fields), forwarding, generics, aliasing |
+| `ref/`          | `Ref[T]` shared cells from `std/ref`: `Ref.new`, `get` / `set`, cell identity `==`, inferred `T` |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 
 ## Annotation convention

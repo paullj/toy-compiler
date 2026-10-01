@@ -816,9 +816,8 @@ pub const BodyChecker = struct {
                         bc.slotType(bc.resolutions[(stmt.lhs).int()].local)
                     else
                         .invalid,
-                    // A `.`-rooted place or a `*r` deref place types as an expression
-                    // (the `.unary` case types the boxed `T`, poisoning on a non-reference).
-                    .field_access, .tuple_field, .unary => blk: {
+                    // A `.`-rooted place types as an expression.
+                    .field_access, .tuple_field => blk: {
                         const was = bc.place_target;
                         bc.place_target = stmt.lhs;
                         defer bc.place_target = was;
@@ -827,7 +826,7 @@ pub const BodyChecker = struct {
                     else => .invalid,
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
-                if (target.tag != .unary) try bc.noteAssignedRoot(stmt.lhs);
+                try bc.noteAssignedRoot(stmt.lhs);
                 const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
@@ -1260,17 +1259,6 @@ pub const BodyChecker = struct {
                     .tilde => {
                         if (operand.isInteger()) break :blk operand;
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '~' must be int", .{});
-                    },
-                    // `&x` boxes `x` into a fresh managed cell, yielding `Ref[T]`. Reify
-                    // runs later, so `Ref[T]` is an `.app` during body-check.
-                    .amp => break :blk Type.app(bc.composite.intern(bc.gpa, bc.model.prelude.?.ref_struct.?, &.{operand}, false) catch break :blk Type.invalid),
-                    // `*r` place-reads the boxed `T`. The operand must be a `Ref[T]` App.
-                    .star => {
-                        if (operand.isApp()) {
-                            const e = bc.composite.at(operand.appIdx());
-                            if (!e.ctor_is_enum and e.ctor == bc.model.prelude.?.ref_struct.?) break :blk e.args[0];
-                        }
-                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operand of '*' must be a reference", .{});
                     },
                     else => {},
                 }
@@ -2812,8 +2800,8 @@ pub const BodyChecker = struct {
     /// null when this is not an associated call (an instance-method receiver, an enum, a
     /// module — all handled by their own paths). Two error gates:
     ///   * a `type_app` receiver whose member IS an instance method -> T0018;
-    ///   * a bare `Vec.new()` (no turbofish) naming a generic struct's associated fn ->
-    ///     the turbofish-required T0016 (the element type cannot be inferred).
+    ///   * a bare `Vec.new()` (no turbofish) naming a generic struct's associated fn whose
+    ///     type params its value args cannot bind -> the turbofish-required T0016.
     fn tryAssociatedCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
         const recv = bc.tree.nodes[(callee.lhs).int()];
         const member = bc.nameText(callee.main_token);
@@ -2823,7 +2811,16 @@ pub const BodyChecker = struct {
             if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
             const e = bc.composite.at(app_ty.appIdx());
             if (e.ctor_is_enum) return null; // an enum type_app is variant construction
-            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member) orelse return null;
+            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member) orelse {
+                // An instance has no methods of its own (`impl Box[int]` is rejected), so a
+                // member no template declares names nothing.
+                try bc.drainArgs(args);
+                const name = bc.nameText(bc.tree.nodes[recv.lhs.int()].main_token);
+                const ref_struct = if (bc.model.prelude) |pre| pre.ref_struct else null;
+                const hint = if (ref_struct == e.ctor) bc.refImportHint(e.ctor, member) else "";
+                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'{s}", .{ name, member, hint });
+                return .invalid;
+            };
             if (m.has_self) {
                 try bc.drainArgs(args);
                 try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
@@ -2839,21 +2836,122 @@ pub const BodyChecker = struct {
             _ = try bc.checkCall(node_idx, args, bc.fnSig(mf, member).substituted(targs_opt));
             return bc.substRet(node_idx, mf, targs_opt orelse return .invalid);
         }
-        // A bare `Vec.new()` (no turbofish) naming a generic struct with an associated
-        // `new`: the element type is uninferable, so require explicit type arguments.
+        // A bare `Box.new(5)` (no turbofish) naming a generic struct with an associated fn:
+        // its type params come from the value args, or the call needs explicit ones.
         if (recv.tag == .identifier and bc.resolutions[(callee.lhs).int()] != .module) {
             const name = bc.nameText(recv.main_token);
             if (bc.activeStructMap().get(name)) |sid| {
-                if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic and
-                    Typecheck.findGenericMethod(bc.model.templates, sid, false, member) != null)
-                {
-                    try bc.drainArgs(args);
-                    try bc.sink.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0016 }, "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
-                    return .invalid;
+                if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) {
+                    if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member)) |m| {
+                        if (try bc.inferAssociatedCall(node_idx, n, callee, m, args)) |t| return t;
+                        try bc.drainArgs(args);
+                        try bc.reportUninferableAssociated(recv, member);
+                        return .invalid;
+                    }
+                    // `Ref` is a prelude type, but its API is library code: name the import
+                    // when no module of the program brought it in.
+                    if (bc.model.prelude) |pre| if (pre.ref_struct) |rs| if (sid == rs) {
+                        try bc.drainArgs(args);
+                        try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'{s}", .{ name, member, bc.refImportHint(rs, member) });
+                        return .invalid;
+                    };
                 }
             }
         }
         return null;
+    }
+
+    /// Name the clashing LEAF types (`c.prev`/`c.cur`), not the whole arg: for a container
+    /// conflict the arg is `Vec[int]`/`Vec[bool]` but the real clash is `int` vs `bool`.
+    /// Spans still point at the two source args. Primary = the LATER arg (source order),
+    /// related = the earlier one: a stable, order-independent (symmetric `Type.eql`) span
+    /// pair that is reproducible at `-jN`. An intra-arg clash (`Map[T,T]` vs
+    /// `Map[int,bool]`) has `first_pos == second_pos`, so both spans are the ONE source arg —
+    /// collapse to a single caret rather than double-underlining one token.
+    fn reportInferConflict(bc: *BodyChecker, args: []const Ast.Index, generic_params: []const []const u8, c: @FieldType(Infer.Outcome, "conflict")) error{OutOfMemory}!void {
+        if (c.first_pos == c.second_pos) {
+            try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+        } else {
+            try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015, .related = bc.spanOf(args[c.first_pos]) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+        }
+    }
+
+    fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []const u8) error{OutOfMemory}!void {
+        const name = bc.nameText(recv.main_token);
+        try bc.sink.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0016 }, "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
+    }
+
+    /// "; add 'import std/ref'" for a missing method `member` of the prelude `Ref` (`rs`),
+    /// when std/ref is not in the program: `member` is one std/ref declares, or no module
+    /// declares any method on `Ref`. Else "".
+    fn refImportHint(bc: *const BodyChecker, rs: u32, member: []const u8) []const u8 {
+        const hint = comptime "; add 'import std/" ++ StdNames.importHintFor("Ref").?.module ++ "'";
+        for (StdNames.ref_methods) |rm| if (std.mem.eql(u8, rm, member)) return hint;
+        for (bc.model.templates) |tm| if (tm.recv_ctor == rs and !tm.recv_is_enum) return "";
+        return hint;
+    }
+
+    /// Type a bare `Box.new(5)`: bind the impl's type params from the value args alone,
+    /// then check the call as `Box[int].new(5)` would be. Returns null, with no arg typed,
+    /// when the member takes `self`.
+    fn inferAssociatedCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, m: Typecheck.TemplateMethod, args: []const Ast.Index) error{OutOfMemory}!?Type {
+        if (m.has_self) return null;
+        const mf = bc.model.fns[m.fn_id];
+        if (!mf.self_type.isApp()) return null;
+        // As for a generic fn: the count is checked before inference, which would blame a
+        // missing type argument instead.
+        if (args.len != mf.params.len) {
+            try bc.drainArgs(args);
+            try bc.reportArity(node_idx, args.len, bc.fnSig(mf, bc.nameText(callee.main_token)));
+            return .invalid;
+        }
+        const arg_types = try bc.gpa.alloc(Type, args.len);
+        defer bc.gpa.free(arg_types);
+        for (args, 0..) |arg, i| {
+            const was = bc.generic_arg;
+            bc.generic_arg = arg;
+            defer bc.generic_arg = was;
+            arg_types[i] = try bc.typeOfExpected(arg, null);
+        }
+        const n_gp: u32 = @intCast(mf.generic_params.len);
+        const out = try bc.gpa.alloc(Type, n_gp);
+        defer bc.gpa.free(out);
+        const bnd = try bc.gpa.alloc(bool, n_gp);
+        defer bc.gpa.free(bnd);
+        const fp = try bc.gpa.alloc(usize, n_gp);
+        defer bc.gpa.free(fp);
+        const recv = bc.tree.nodes[(callee.lhs).int()];
+        switch (Infer.match(n_gp, mf.params, arg_types, out, bnd, fp, bc.composite.decomposer())) {
+            .conflict => |c| {
+                try bc.reportInferConflict(args, mf.generic_params, c);
+                return .invalid;
+            },
+            .unbound => {
+                try bc.reportUninferableAssociated(recv, bc.nameText(callee.main_token));
+                return .invalid;
+            },
+            .ok => {},
+        }
+        for (out) |ta| {
+            if (bc.abstract_template and ta.isTypeVar()) continue;
+            if (!isConcreteValue(ta)) {
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0013 }, "inferred type argument must be a concrete value type; add explicit type arguments", .{});
+                return .invalid;
+            }
+        }
+        const pat = bc.composite.at(mf.self_type.appIdx()).args;
+        const app_args = try bc.gpa.alloc(Type, pat.len);
+        defer bc.gpa.free(app_args);
+        for (pat, app_args) |p, *o| o.* = substTy(bc, p, out);
+        const sid = bc.composite.at(mf.self_type.appIdx()).ctor;
+        // Load-bearing, as on the `type_app` path: scanCalls / reify / sealCallees read the
+        // receiver off `node_types[callee.lhs]` whatever the node's tag.
+        bc.node_types[(callee.lhs).int()] = Type.app(bc.composite.intern(bc.gpa, sid, app_args, false) catch return error.OutOfMemory);
+        bc.setCallee(n, Callee.pending);
+        var sig = bc.fnSig(mf, bc.nameText(callee.main_token)).substituted(out);
+        sig.pretyped = arg_types;
+        _ = try bc.checkCall(node_idx, args, sig);
+        return bc.substRet(node_idx, mf, out);
     }
 
     fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
@@ -3029,11 +3127,12 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        // The bodyless builtins: the core-only raw-memory/pointer intrinsics, then the
-        // global `panic(str)`. Intercept BEFORE the generic/arg-assignability check below
+        // The bodyless builtins: the bundled-library intrinsics, then the global
+        // `panic(str)`. Intercept BEFORE the generic/arg-assignability check below
         // (a builtin carries only a placeholder sig — its arg-checking is token-based here).
         if (f.kind == .builtin) {
-            // The core-only heap/raw-pointer intrinsics. Discriminated by the callee
+            // The bundled-library intrinsics: the core-only heap/raw-pointer ops and the
+            // std-visible `ref_*` cell ops. Discriminated by the callee
             // token (a `FnSym` carries no name), typed BEFORE the panic 1-arg
             // path since their arities differ (0 for `gc_span_count`, 2 for `store`).
             if (callee.tag == .identifier) {
@@ -3161,6 +3260,31 @@ pub const BodyChecker = struct {
                         try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token) }, "'gc_array' requires a type argument, e.g. gc_array[int](p)", .{});
                         return .invalid;
                     },
+                    .ref_new => {
+                        if (!try bc.checkArity(node_idx, args, 1)) return .invalid;
+                        const operand = try bc.typeOfExpected(args[0], null);
+                        if (operand.kind == .invalid) return .invalid; // poison propagation: no emit (exempt)
+                        // Reify runs later, so `Ref[T]` is an `.app` during body-check.
+                        const t = Type.app(bc.composite.intern(bc.gpa, bc.model.prelude.?.ref_struct.?, &.{operand}, false) catch return error.OutOfMemory);
+                        bc.node_types[(node_idx).int()] = t;
+                        return t;
+                    },
+                    .ref_get, .ref_set => {
+                        if (!try bc.checkArity(node_idx, args, if (ik == .ref_get) 1 else 2)) return .invalid;
+                        const rt = try bc.typeOfExpected(args[0], null);
+                        const payload = bc.refPayload(rt);
+                        if (payload.kind == .invalid and rt.kind != .invalid)
+                            try bc.sink.report(.{ .span = bc.spanOf(args[0]), .code = .T0044 }, "'{s}' expects a 'Ref', got '{s}'", .{ bn, bc.typeName(rt) });
+                        if (ik == .ref_get) {
+                            bc.node_types[(node_idx).int()] = payload;
+                            return payload;
+                        }
+                        const vt = try bc.typeOfExpected(args[1], if (payload.kind == .invalid) null else payload);
+                        if (payload.kind != .invalid and !Type.assignable(payload, vt))
+                            try bc.sink.report(.{ .span = bc.spanOf(args[1]), .code = .T0040 }, "argument 2: expected {s}, got {s}", .{ bc.typeName(payload), bc.typeName(vt) });
+                        bc.node_types[(node_idx).int()] = Type.unit;
+                        return Type.unit;
+                    },
                     .store_byte => {
                         if (try bc.checkArity(node_idx, args, 2)) {
                             const pt = try bc.typeOf(args[0]);
@@ -3261,19 +3385,7 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(fp);
             switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp, bc.composite.decomposer())) {
                 .conflict => |c| {
-                    // Name the clashing LEAF types (`c.prev`/`c.cur`), not the whole arg:
-                    // for a container conflict the arg is `Vec[int]`/`Vec[bool]` but the real
-                    // clash is `int` vs `bool`. Spans still point at the two source args.
-                    // Primary = the LATER arg (source order), related = the earlier one:
-                    // a stable, order-independent (symmetric `Type.eql`) span pair that is
-                    // reproducible at `-jN`. An intra-arg clash (`Map[T,T]` vs `Map[int,bool]`)
-                    // has `first_pos == second_pos`, so both spans are the ONE source arg —
-                    // collapse to a single caret rather than double-underlining one token.
-                    if (c.first_pos == c.second_pos) {
-                        try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
-                    } else {
-                        try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015, .related = bc.spanOf(args[c.first_pos]) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ f.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
-                    }
+                    try bc.reportInferConflict(args, f.generic_params, c);
                     return .invalid;
                 },
                 .unbound => |u| {
@@ -3766,6 +3878,15 @@ pub const BodyChecker = struct {
         return true;
     }
 
+    /// The `T` of a prelude `Ref[T]` App, or `.invalid` for any other type.
+    fn refPayload(bc: *BodyChecker, t: Type) Type {
+        if (!t.isApp()) return .invalid;
+        const rs = (bc.model.prelude orelse return .invalid).ref_struct orelse return .invalid;
+        const e = bc.composite.at(t.appIdx());
+        if (!e.ctor_is_enum and e.ctor == rs) return e.args[0];
+        return .invalid;
+    }
+
     /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`) — a struct-`App` over a
     /// prelude box template — during Pass C (before reify). Such a payload is an 8-byte
     /// scalar cell pointer, so it rides the scalar native-Option/Result unwrap path.
@@ -4035,7 +4156,7 @@ pub const BodyChecker = struct {
         if (nearmiss.suggest(member, iter)) |cand|
             try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
         else
-            try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+            try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'{s}", .{ member, bc.typeName(recv_ty), if (bc.refPayload(recv_ty).kind != .invalid) bc.refImportHint(bc.model.prelude.?.ref_struct.?, member) else "" });
     }
 
     pub fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {

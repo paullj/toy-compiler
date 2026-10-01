@@ -1856,9 +1856,9 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             },
             else => return p.parseExprStmt(),
         },
-        // A `*`-rooted place: `*r = v`. Parse the deref place; if `=` follows it is a
-        // store-through-box, otherwise it is an expression statement (continue the infix
-        // climb). Mirrors the `.`-rooted place path above.
+        // Recovery only: a statement led by the removed `*r` (`*r = v`). `parsePrefix`
+        // reports the one P0015; the rest of the statement still parses (as an assign or
+        // an expression statement) so the next statement starts clean.
         .star => {
             const first = p.index;
             const place = try p.parsePostfix(try p.parsePrefix());
@@ -2111,10 +2111,19 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
     const tok = p.peek();
     const at_tok = p.index;
     switch (tok.tag) {
-        // `&x` boxes; `*r` derefs. Both bind as prefix unaries (tighter than any infix),
-        // so `*r + 1` is `(*r) + 1`. Infix `a & b`/`a * b` are unaffected — they are
-        // reached only via `continueInfix`, never here.
-        .minus, .bang, .tilde, .amp, .star => {
+        .minus, .bang, .tilde => {
+            p.advance();
+            const operand = try p.parseExpr(prefix_bp);
+            return p.addNode(.{ .tag = .unary, .main_token = at_tok, .lhs = operand, .rhs = Ast.none });
+        },
+        // The removed prefix `&x` / `*r`: name the `Ref` API that replaced them, then parse
+        // the operand as before so the rest of the statement keeps its shape. Infix
+        // `a & b`/`a * b` are unaffected — they are reached only via `continueInfix`.
+        .amp, .star => {
+            try p.warn(tok, .P0015, if (tok.tag == .amp)
+                "'&x' was removed; make a shared cell with 'Ref.new(x)' (import std/ref)"
+            else
+                "'*r' was removed; read a Ref with 'r.get()' and write one with 'r.set(v)' (import std/ref)");
             p.advance();
             const operand = try p.parseExpr(prefix_bp);
             return p.addNode(.{ .tag = .unary, .main_token = at_tok, .lhs = operand, .rhs = Ast.none });
@@ -2961,20 +2970,36 @@ test "grouping overrides precedence" {
     try expectSexpr("(1 + 2) * 3", "(* (+ 1 2) 3)");
 }
 
-test "&x/*r parse as prefix unaries binding tighter than infix" {
-    try expectSexpr("&x", "(& x)");
-    try expectSexpr("*r", "(* r)");
-    // Prefix binds tighter than infix: `*r + 1` is `(*r) + 1`, not `*(r + 1)`.
-    try expectSexpr("*r + 1", "(+ (* r) 1)");
-    // Infix `a * b` is UNAFFECTED (reached via the infix climb, never parsePrefix).
-    try expectSexpr("a * b", "(* a b)");
+test "'&x', '*r' and '*r = v' each report one P0015 and keep the unary shape" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .src = "fn f() {\n x := &y\n}\n", .want = "(program (fn f () _ (block (:= x (& y)))))" },
+        .{ .src = "fn f() {\n z := *r + 1\n}\n", .want = "(program (fn f () _ (block (:= z (+ (* r) 1)))))" },
+        .{ .src = "fn f() {\n *r = 1\n}\n", .want = "(program (fn f () _ (block (= (* r) 1))))" },
+    };
+    for (cases) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
+        defer gpa.free(tokens);
+        const res = try parse(gpa, tokens, c.src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(codes.Code.P0015, res.diags[0].code);
+        var buf: [256]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try Ast.render(&w, res.tree, tokens, c.src);
+        try testing.expectEqualStrings(c.want, w.buffered());
+    }
 }
 
-test "*r = v parses as an assign whose target is a deref-unary place" {
+test "infix & and * still parse as binary operators" {
     try expectProgram(
-        "fn f() {\n *r = 1\n}\n",
-        "(program (fn f () _ (block (= (* r) 1))))",
+        "fn f() -> int {\n return 6 & 3 * 2\n}\n",
+        "(program (fn f () int (block (return (& 6 (* 3 2))))))",
     );
+    try expectSexpr("a * b", "(* a b)");
+    try expectSexpr("a & b", "(& a b)");
 }
 
 test "comparison and equality precedence" {
@@ -5289,6 +5314,9 @@ test "fix-suggesting parse codes: category, count, and hint text" {
         .{ .src = "fn a() {\n  y := x |> f == y\n}\n", .code = .P0014, .hint = "wrap the pipe in parentheses" },
         .{ .src = "fn a() {\n  y := |> f\n}\n", .code = .P0014, .hint = "value on its left" },
         .{ .src = "fn a() {\n  if c {\n  }\n  |> f\n}\n", .code = .P0014, .hint = "this statement has none" },
+        .{ .src = "fn a() {\n  r := &x\n}\n", .code = .P0015, .hint = "Ref.new(" },
+        .{ .src = "fn a() -> int {\n  return *r\n}\n", .code = .P0015, .hint = "r.get()" },
+        .{ .src = "fn a() {\n  *r = v\n}\n", .code = .P0015, .hint = "r.set(v)" },
     };
     for (cases) |c| {
         const res = try parseResult(gpa, c.src);

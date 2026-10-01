@@ -75,7 +75,7 @@ pub fn churn_collects() -> int {
 struct Holder { r: Ref[int] }
 
 pub fn aggregate_survivor() -> int {
-    h := Holder { r: &7 }
+    h := Holder { r: ref_new(7) }
     i := 0
     loop {
         if i >= 20000 { break }
@@ -84,7 +84,7 @@ pub fn aggregate_survivor() -> int {
         i = i + 1
     }
     box := h.r
-    return *box
+    return ref_get(box)
 }
 
 # A self-referential cycle must be traced without the marker looping (the mark bit stops

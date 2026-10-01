@@ -1,0 +1,9 @@
+# A shared mutable cell. `Ref.new(v)` puts `v` in a GC cell; every copy of a Ref handle
+# names that one cell, so a `set` through one copy is seen through all of them, and `==`
+# compares cells. The `ref_*` intrinsics are the only std-visible heap operations: they
+# touch nothing but the cell they are handed, so no `unsafe` is involved.
+impl Ref[T] {
+    fn new(v: T) -> Ref[T] { ref_new(v) }
+    fn get(self) -> T { ref_get(self) }
+    fn set(self, v: T) { ref_set(self, v) }
+}

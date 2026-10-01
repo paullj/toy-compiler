@@ -1,11 +1,13 @@
 # expect: exit 3
 # Feature: `Ref` equality is CELL IDENTITY. `r == r` is true (same cell); two independent
-# `&41` box into distinct cells and are NOT equal. Encode both facts into the exit code
-# (2 for the self-equality bit + 1 for the distinctness bit == 3).
+# `Ref.new(41)` box into distinct cells and are NOT equal. Encode both facts into the exit
+# code (2 for the self-equality bit + 1 for the distinctness bit == 3).
+import std/ref
+
 fn main() -> int {
-    r := &41
-    same := r == r          # true: one cell
-    diff := &41 != &41      # true: two distinct cells
+    r := Ref.new(41)
+    same := r == r                      # true: one cell
+    diff := Ref.new(41) != Ref.new(41)  # true: two distinct cells
     code := 0
     if same {
         code = code + 2

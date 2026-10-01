@@ -635,10 +635,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .assign => {
             const target = b.in.tree.nodes[(stmt.lhs).int()];
             const place_ty = b.in.node_types[(stmt.lhs).int()];
-            // `*r = v`: a deref place stores through the box, reusing the field-store tail
-            // (its address comes from `lowerPlaceAddr`'s `.unary` arm).
-            const is_deref = target.tag == .unary and b.in.tokens[target.main_token].tag == .star;
-            if (target.tag == .field_access or target.tag == .tuple_field or is_deref) {
+            if (target.tag == .field_access or target.tag == .tuple_field) {
                 try lowerFieldStore(b, stmt.lhs, stmt.rhs, place_ty);
                 return;
             }
@@ -862,6 +859,46 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
     }
 }
 
+/// `Ref.new(v)`: box `v` into a fresh `gc_alloc`'d cell; the `Ref[T]` value IS the 8-byte
+/// cell pointer.
+fn lowerRefNew(b: *Builder, operand: Ast.Index, tok: u32) error{OutOfMemory}!Ir.Operand {
+    const t = b.in.node_types[(operand).int()];
+    const cellptr = try emitGcAlloc(b, Abi.typeSize(t, b.in.layouts, b.in.enum_layouts));
+    switch (passKind(b, t)) {
+        .box => {
+            const v = try lowerExpr(b, operand);
+            _ = try b.emit(.{ .store = .{ .addr = cellptr, .val = operandValue(v), .ty = Typecheck.Type.int } }, null);
+        },
+        .int, .bool, .float, .rawptr => {
+            const v = try lowerExpr(b, operand);
+            _ = try b.emit(.{ .store = .{ .addr = cellptr, .val = operandValue(v), .ty = t } }, null);
+        },
+        .str, .@"struct", .@"enum" => try lowerExprInto(b, operand, cellptr, t),
+        .unit => _ = try lowerExpr(b, operand),
+        .never, .invalid => try b.note(tok, "boxed type unsupported in lower"),
+    }
+    return .{ .value = cellptr };
+}
+
+/// Read the `T` a `Ref[T]` cell at `addr` holds (offset 0).
+fn lowerRefLoad(b: *Builder, addr: Ir.ValueId, t: Typecheck.Type, tok: u32) error{OutOfMemory}!Ir.Operand {
+    switch (passKind(b, t)) {
+        .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) },
+        .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = t } }, t) },
+        .str, .@"struct", .@"enum" => {
+            const tmp = try b.addSlot(t);
+            const dst = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
+            _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = t } }, null);
+            return .{ .slot = tmp };
+        },
+        .unit => return .none,
+        .never, .invalid => {
+            try b.note(tok, "deref type unsupported in lower");
+            return .none;
+        },
+    }
+}
+
 fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     const op = b.in.tokens[n.main_token].tag;
     switch (op) {
@@ -878,47 +915,6 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
         .tilde => {
             const v = try lowerExpr(b, n.lhs);
             return .{ .value = try b.emit(.{ .bcompl = operandValue(v) }, b.in.node_types[(node_idx).int()]) };
-        },
-        // `&x`: box `x` into a fresh `gc_alloc`'d cell; the `Ref[T]` value IS the 8-byte
-        // cell pointer. The cell is never freed (correct for a terminating program).
-        .amp => {
-            const t = b.in.node_types[(n.lhs).int()];
-            const cellptr = try emitGcAlloc(b, Abi.typeSize(t, b.in.layouts, b.in.enum_layouts));
-            switch (passKind(b, t)) {
-                .box => {
-                    const v = try lowerExpr(b, n.lhs);
-                    _ = try b.emit(.{ .store = .{ .addr = cellptr, .val = operandValue(v), .ty = Typecheck.Type.int } }, null);
-                },
-                .int, .bool, .float, .rawptr => {
-                    const v = try lowerExpr(b, n.lhs);
-                    _ = try b.emit(.{ .store = .{ .addr = cellptr, .val = operandValue(v), .ty = t } }, null);
-                },
-                .str, .@"struct", .@"enum" => try lowerExprInto(b, n.lhs, cellptr, t),
-                .unit => _ = try lowerExpr(b, n.lhs),
-                .never, .invalid => try b.note(n.main_token, "boxed type unsupported in lower"),
-            }
-            return .{ .value = cellptr };
-        },
-        // `*r`: place-read the boxed `T` through the cell pointer (offset 0).
-        .star => {
-            const addr = try lowerPlaceAddr(b, node_idx);
-            if (addr == Ir.none_value) return .none;
-            const t = b.in.node_types[(node_idx).int()];
-            switch (passKind(b, t)) {
-                .box => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) },
-                .int, .bool, .float, .rawptr => return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = t } }, t) },
-                .str, .@"struct", .@"enum" => {
-                    const tmp = try b.addSlot(t);
-                    const dst = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
-                    _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = t } }, null);
-                    return .{ .slot = tmp };
-                },
-                .unit => return .none,
-                .never, .invalid => {
-                    try b.note(n.main_token, "deref type unsupported in lower");
-                    return .none;
-                },
-            }
         },
         else => {
             try b.note(n.main_token, "unary operator unsupported in lower");
@@ -1172,7 +1168,8 @@ fn lowerEqValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rh
     if (LayoutEngine.isFnStruct(operand_ty, b.in.layouts)) return try lowerFnIdentityEq(b, lhs_node, rhs_node, negate);
     const pk = passKind(b, operand_ty);
     // A managed box compares by CELL IDENTITY: an 8-byte pointer `icmp`, not a structural
-    // deref. Two independent `&41` are distinct cells (unequal); `r == r` is the same cell.
+    // deref. Two independent `Ref.new(41)` are distinct cells (unequal); `r == r` is the
+    // same cell.
     // A struct/enum threads `negate` into `lowerStructEq` so the Ord-refinement `==` path
     // can emit `icmp ne` directly AND the eq-witness path stays byte-identical
     // (call then optional `bnot`, same value-id order). unit/str keep the uniform outer `bnot`.
@@ -1860,8 +1857,9 @@ fn copyStrSlot(b: *Builder, dst: Ir.SlotId, src: Ir.SlotId) error{OutOfMemory}!v
 }
 
 /// The `gc_alloc` builtin's stable symbol identity — returns a fresh zeroed cell pointer.
-/// A `&x` box MINTS this call directly in lower; user source never names it, so this
-/// bypasses the core-only allowlist by construction.
+/// A `Ref.new(x)` box (the `ref_new` intrinsic) or a captured-and-assigned local MINTS this
+/// call directly in lower; user source never names it, so this bypasses the core-only
+/// allowlist by construction.
 const gc_alloc_sym: Link.SymName = .{ .kind = .builtin, .name = "gc_alloc" };
 
 /// A fresh zeroed `gc_alloc(size)` cell pointer, typed as a managed box so the precise
@@ -2226,9 +2224,9 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 try b.note(n.main_token, "call target unsupported in lower");
                 return .none;
             }
-            // The core-only raw-memory/pointer intrinsics (`store`/`load`/`offset`/... and the
-            // `call_hash`/`call_eq` indirect-dispatch helpers) lower directly to IR memory ops
-            // with no call/reloc — intercept them BEFORE the plain-name resolution below.
+            // The memory intrinsics (`store`/`load`/`offset`/..., the `call_hash`/`call_eq`
+            // indirect-dispatch helpers and the `ref_*` cell ops) have no symbol of their own,
+            // so intercept them BEFORE the plain-name resolution below looks for one.
             if (callee_res.func < b.in.names.len) {
                 const nm = b.in.names[callee_res.func];
                 // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
@@ -2309,6 +2307,22 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                         const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
                         const addr = operandValue(try lowerExpr(b, largs[0]));
                         return .{ .value = try b.emit(.{ .load_byte = addr }, Typecheck.Type.int) };
+                    },
+                    .ref_new => return try lowerRefNew(b, Ast.rangeSlice(b.in.tree, (n.rhs).int())[0], n.main_token),
+                    .ref_get => {
+                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        const addr = operandValue(try lowerExpr(b, a[0]));
+                        return try lowerRefLoad(b, addr, b.in.node_types[(node_idx).int()], n.main_token);
+                    },
+                    .ref_set => {
+                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+                        // The cell is evaluated before the value, as every place store is.
+                        const addr = operandValue(try lowerExpr(b, a[0]));
+                        const vty = b.in.node_types[(a[1]).int()];
+                        if (vty.kind == .never) {
+                            _ = try lowerExpr(b, a[1]);
+                        } else try storeThrough(b, addr, a[1], vty, n.main_token);
+                        return .none;
                     },
                     else => {},
                 };
@@ -3224,9 +3238,6 @@ fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typechec
         // aggregate-returning Add/Sub/Mul/Div witness call; `lowerExpr` yields its
         // `.slot`, so copy those bytes into the destination like any other agg result.
         .binary => try copyAggInto(b, expr, dst_ptr, ty),
-        // `*r` yielding an aggregate `T`: lowerUnary copies the cell into a temp slot,
-        // so treat it like any other slot-valued aggregate result.
-        .unary => try copyAggInto(b, expr, dst_ptr, ty),
         else => try b.note(n.main_token, "aggregate expression unsupported in lower"),
     }
 }
@@ -3476,6 +3487,11 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
         return;
     }
     if (stagesStore(b, place) and isAggregatePass(b, ty)) return storeStaged(b, value, addr, ty);
+    try storeThrough(b, addr, value, ty, b.in.tree.nodes[(place).int()].main_token);
+}
+
+/// Store `value` (of type `ty`) into the storage at `addr`.
+fn storeThrough(b: *Builder, addr: Ir.ValueId, value: Ast.Index, ty: Typecheck.Type, tok: u32) error{OutOfMemory}!void {
     switch (ty.kind) {
         .int, .bool, .float => {
             const v = operandValue(try lowerExpr(b, value));
@@ -3484,7 +3500,7 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
         .str, .@"struct", .@"enum" => try lowerExprInto(b, value, addr, ty),
         // A zero-sized place (`()`): evaluate the RHS for effect, store nothing.
         .unit => _ = try lowerExpr(b, value),
-        else => try b.note(b.in.tree.nodes[(place).int()].main_token, "field store type unsupported in lower"),
+        else => try b.note(tok, "field store type unsupported in lower"),
     }
 }
 
@@ -3520,10 +3536,6 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
             const slot = try bindingSlot(b, node_idx, b.in.node_types[(node_idx).int()]);
             return try rootAddr(b, slot);
         },
-        // A `*r` place: the address of the boxed `T` is the cell pointer, i.e. the Ref's
-        // own scalar value. Works for a local Ref (loaded via `lowerIdentifier`) or any
-        // Ref rvalue.
-        .unary => return operandValue(try lowerExpr(b, n.lhs)),
         .field_access, .tuple_field => {
             const base_addr = try lowerPlaceAddr(b, n.lhs);
             if (base_addr == Ir.none_value) return Ir.none_value;
@@ -3658,10 +3670,23 @@ fn lowerEnumInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: 
     }
 }
 
+/// A managed box is a struct type that travels as its 8-byte cell pointer, so a value
+/// produced into `slot` reads back like a scalar: the struct arm's `aggregateValue` would
+/// produce it through `lowerExprInto`, which lowers a box by value, straight back here.
+fn loadBoxSlot(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.Operand {
+    const addr = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+    return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = Typecheck.Type.int } }, box_repr_ty) };
+}
+
 /// A `match` in VALUE context yielding a SCALAR (or str/struct/enum). Materialize
 /// the result via `lowerMatchInto` into a fresh slot, then yield: a scalar loads
 /// from the slot to a value; an aggregate yields Operand.slot.
 fn lowerMatchValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    if (passKind(b, ty) == .box) {
+        const slot = try b.addSlot(ty);
+        try lowerMatchInto(b, node_idx, try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int), ty);
+        return try loadBoxSlot(b, slot);
+    }
     switch (ty.kind) {
         .int, .bool, .float => {
             const slot = try b.addSlot(ty);
@@ -3735,6 +3760,11 @@ fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typ
 /// arm early-returns from the enclosing fn inside `lowerTryInto`, so the value that
 /// reaches here is always the happy-path payload.
 fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    if (passKind(b, ty) == .box) {
+        const slot = try b.addSlot(ty);
+        try lowerTryInto(b, node_idx, try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int), ty);
+        return try loadBoxSlot(b, slot);
+    }
     switch (ty.kind) {
         .int, .bool, .float => {
             const slot = try b.addSlot(ty);

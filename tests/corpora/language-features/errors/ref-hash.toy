@@ -3,9 +3,11 @@
 # not a stable key. A struct that holds a `Ref` field therefore cannot derive `Hash`; the
 # `.hash()` call is a compile error. The Ref guardrail lives in the single descriptor
 # producer (derive synthesis): a Ref field forces identity Eq and is EXCLUDED from auto Hash.
+import std/ref
+
 struct S { r: Ref[int] }
 
 fn main() -> int {
-    s := S{ r: &41 }
+    s := S{ r: Ref.new(41) }
     return s.hash()
 }

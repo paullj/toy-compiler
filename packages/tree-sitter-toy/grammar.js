@@ -270,7 +270,6 @@ module.exports = grammar({
     _expression: ($) =>
       choice(
         $.unary_expression,
-        $.reference_expression,
         $.binary_expression,
         $.pipe_expression,
         $._primary_expression,
@@ -322,9 +321,7 @@ module.exports = grammar({
     boolean: ($) => choice("true", "false"),
 
     unary_expression: ($) =>
-      prec(PREC.unary, seq(choice("-", "!", "~", "*"), $._expression)),
-
-    reference_expression: ($) => prec(PREC.unary, seq("&", $._expression)),
+      prec(PREC.unary, seq(choice("-", "!", "~"), $._expression)),
 
     binary_expression: ($) => {
       const table = [

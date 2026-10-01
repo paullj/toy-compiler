@@ -6,5 +6,7 @@ impl Pair[T] {
 
 fn main() -> int {
     _p := Pair[int].of(1)  #~ ERROR [T0039] 'of' takes (int, int)
+    _q := Pair.of(1)  #~ ERROR [T0039] expected 2 argument(s), got 1; 'of' takes (T, T)
+    _r := Pair[int].nope(1)  #~ ERROR [T0018] 'Pair' has no associated function 'nope'
     return 0
 }

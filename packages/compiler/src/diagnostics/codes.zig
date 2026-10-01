@@ -35,6 +35,7 @@ pub const Code = enum(u16) {
     P0012, // colon-return-type    (`fn f(): T` return type written `:` not `->`)
     P0013, // stray-semicolon      (a `;` statement terminator)
     P0014, // invalid-pipe-target  (`|>` RHS is not a function/call, or has no value on its left)
+    P0015, // removed-ref-operator (prefix '&x' / '*r'; use Ref.new / get / set)
 
     // Resolve band (R####).
     R0001, // undeclared-identifier
@@ -149,6 +150,7 @@ pub const table = [_]Entry{
     .{ .code = .P0012, .str = "P0012", .slug = "colon-return-type" },
     .{ .code = .P0013, .str = "P0013", .slug = "stray-semicolon" },
     .{ .code = .P0014, .str = "P0014", .slug = "invalid-pipe-target" },
+    .{ .code = .P0015, .str = "P0015", .slug = "removed-ref-operator" },
     .{ .code = .R0001, .str = "R0001", .slug = "undeclared-identifier" },
     .{ .code = .R0002, .str = "R0002", .slug = "duplicate-function", .related = "previously defined here" },
     .{ .code = .R0003, .str = "R0003", .slug = "unknown-imported-module" },

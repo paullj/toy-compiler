@@ -1,0 +1,9 @@
+# The prefix `&x` / `*r` operators were removed; each statement that still uses one
+# reports one P0015 naming the `Ref` method that replaces it, and nothing cascades.
+fn main() -> int {
+    r := &41  #~ ERROR [P0015] '&x' was removed; make a shared cell with 'Ref.new(x)'
+    x := *r + 1  #~ ERROR [P0015] '*r' was removed; read a Ref with 'r.get()'
+    *r = 2  #~ ERROR [P0015] write one with 'r.set(v)'
+    y := 6 & 3 * 2
+    return x + y
+}

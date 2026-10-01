@@ -3,12 +3,13 @@
 # collection while `keep` is rooted. The int cells survive ONLY if the precise container
 # trace walks keep's live elements through the Ref element descriptor (leaf-marking the
 # backing then marking each boxed cell). 3 + 4 = 7.
+import std/ref
 import std/vec
 
 fn main() -> int {
     keep: Vec[Ref[int]] = []
-    keep.push(&3)
-    keep.push(&4)
+    keep.push(Ref.new(3))
+    keep.push(Ref.new(4))
     i := 0
     loop {
         if i >= 20000 { break }
@@ -18,7 +19,7 @@ fn main() -> int {
     }
     sum := 0
     for r in keep {
-        sum = sum + *r
+        sum = sum + r.get()
     }
     return sum
 }

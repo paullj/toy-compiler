@@ -5077,12 +5077,8 @@ test "Option[int] and Result[int,str] construct + match with no import; reify to
 test "Ref[int] and Ref[bool] reify to DISTINCT structs, each tagged native_family .ref" {
     const gpa = testing.allocator;
     var c = try checkSource(
-        \\fn main() -> int {
-        \\ a := &41
-        \\ b := &true
-        \\ if *b { return *a }
-        \\ return 0
-        \\}
+        \\pub fn take(_a: Ref[int], _b: Ref[bool]) -> int { 0 }
+        \\fn main() -> int { 0 }
         \\
     );
     defer c.deinit(gpa);
@@ -5100,6 +5096,52 @@ test "Ref[int] and Ref[bool] reify to DISTINCT structs, each tagged native_famil
     try testing.expectEqual(LayoutEngine.NativeStructFamily.ref, c.result.layouts[ref_bool.?].native_family);
     // Each box is an 8-byte cell pointer.
     try testing.expectEqual(@as(u32, 8), c.result.layouts[ref_int.?].size);
+}
+
+test "an associated fn of a bare generic struct infers its type params from its value args" {
+    const gpa = testing.allocator;
+    const decls =
+        \\struct Box[T] { v: T }
+        \\impl Box[T] {
+        \\ fn new(v: T) -> Box[T] { Box { v: v } }
+        \\ fn empty() -> Box[T] { panic("none") }
+        \\ fn pair(a: T, _b: T) -> Box[T] { Box { v: a } }
+        \\}
+        \\
+    ;
+    var c = try checkSource(decls ++
+        \\fn main() -> int {
+        \\ b := Box.new(5)
+        \\ x: Box[int] = b
+        \\ f := Box.new(true)
+        \\ if f.v { return x.v }
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
+        // The inferred `T` is the arg's own type, so a mismatched annotation is still caught.
+        .{ .stmt = "_y: Box[bool] = Box.new(5)", .code = .T0041, .message = "cannot bind Box to '_y' of type Box" },
+        // No value arg binds `T`: the turbofish is still required.
+        .{ .stmt = "_e := Box.empty()", .code = .T0016, .message = "cannot infer type parameter for 'Box.empty'; add explicit type arguments, e.g. Box[int].empty" },
+        .{ .stmt = "_p := Box.pair(1, true)", .code = .T0015, .message = "conflicting types for type parameter 'T': int vs bool" },
+        // The count is checked first, as for a generic fn: a turbofish would not help.
+        .{ .stmt = "_q := Box.new(1, 2)", .code = .T0039, .message = "expected 1 argument(s), got 2; 'new' takes (T)" },
+        .{ .stmt = "_r := Box.new()", .code = .T0039, .message = "expected 1 argument(s), got 0; 'new' takes (T)" },
+        .{ .stmt = "_s := Box[int].nope(5)", .code = .T0018, .message = "'Box' has no associated function 'nope'" },
+    };
+    for (cases) |case| {
+        const src = try std.mem.concat(gpa, u8, &.{ decls, "fn main() -> int {\n ", case.stmt, "\n return 0\n}\n" });
+        defer gpa.free(src);
+        var d = try checkSource(src);
+        defer d.deinit(gpa);
+        errdefer for (d.result.diags) |dg| std.debug.print("got {s}: {s}\n", .{ @tagName(dg.code), dg.message });
+        try testing.expectEqual(@as(usize, 1), d.result.diags.len);
+        try testing.expectEqual(case.code, d.result.diags[0].code);
+        try testing.expectEqualStrings(case.message, d.result.diags[0].message);
+    }
 }
 
 test "an associated fn `Vec[int].new()` mints one instance + a static reified-dispatch Method; an instance method's recv stays its self param" {
@@ -10059,24 +10101,24 @@ test "a field wins over a method in value position" {
     // body in it, still binds.
     var inner = try checkSource(
         \\struct Acc { n: int }
+        \\struct P { x: int }
         \\impl Acc { fn plus(self, x: int) -> int { self.n + x } }
-        \\fn mk(f: fn(int) -> int) -> Ref[int] { &f(1) }
+        \\impl P { fn me(self, f: fn(int) -> int) -> P { P { x: f(self.x) } } }
         \\fn main() -> int {
         \\ acc := Acc { n: 1 }
-        \\ r := mk(acc.plus)
-        \\ *mk(acc.plus) = 7
-        \\ *fn() -> Ref[int] {
+        \\ p := P { x: 1 }
+        \\ p.me(acc.plus).x = 7
+        \\ p.me(fn(v: int) -> int {
         \\  g := acc.plus
-        \\  _h := g
-        \\  r
-        \\ }() = 8
-        \\ return *r
+        \\  g(v)
+        \\ }).x = 8
+        \\ return p.x
         \\}
         \\
     );
     defer inner.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), inner.result.diags.len);
-    for (0..3) |k| {
+    for (0..2) |k| {
         const m = try valueMember(&inner, "plus", k);
         try testing.expect(inner.result.callees[0][m.int()].view() == .bound_method);
     }
