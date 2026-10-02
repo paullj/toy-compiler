@@ -1,0 +1,29 @@
+# Feature: a '_' capture passed to a generic function specializes like the lambda it means: the instance calls the capture's code directly with its env (a copied capture, a boxed 'mut self' receiver, and a capture-free one)
+# expect: stdout "8\n"
+# expect: exit 20
+import std/io
+import std/vec
+
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn each[T](xs: Vec[T], f: fn(T)) {
+    for x in xs { f(x) }
+}
+
+fn add(a: int, b: int) -> int { a + b }
+
+struct Acc { n: int }
+
+impl Acc {
+    fn add_to(mut self, k: int) { self.n = self.n + k }
+}
+
+fn main() -> int {
+    k := 5
+    a := apply(add(k, _), 3)
+    io.println(a)
+    acc := Acc { n: 0 }
+    xs: Vec[int] = [1, 2, 3, 4]
+    each(xs, acc.add_to(_))
+    b := apply(add(1, _), 1)
+    return a + acc.n + b
+}

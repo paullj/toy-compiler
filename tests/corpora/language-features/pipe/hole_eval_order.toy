@@ -1,0 +1,17 @@
+# Feature: a pipe into a '_' evaluates like the call it desugars to, so the piped value is
+# evaluated at the '_', after the written arguments before it: `tag("lhs", 1) |>
+# pick(tag("arg", 2), _)` is `pick(tag("arg", 2), tag("lhs", 1))` and prints arg first.
+# expect: stdout "arg\nlhs\n"
+# expect: exit 21
+import std/io
+
+fn tag(s: str, v: int) -> int {
+    io.println(s)
+    return v
+}
+
+fn pick(a: int, b: int) -> int { return a * 10 + b }
+
+fn main() -> int {
+    return tag("lhs", 1) |> pick(tag("arg", 2), _)
+}

@@ -486,14 +486,14 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
             try genExpr(gpa, out, rand, depth + 1);
             try out.append(gpa, ')');
         },
-        3 => { // call
+        3 => { // call; a `_` arg makes it a capture, and two `_` reach the P0016 path
             try out.appendSlice(gpa, pick(idents, rand));
             try out.append(gpa, '(');
             const args = rand.intRangeAtMost(usize, 0, 3);
             var a: usize = 0;
             while (a < args) : (a += 1) {
                 if (a > 0) try out.appendSlice(gpa, ", ");
-                try genExpr(gpa, out, rand, depth + 1);
+                if (rand.uintLessThan(u8, 5) == 0) try out.append(gpa, '_') else try genExpr(gpa, out, rand, depth + 1);
             }
             try out.append(gpa, ')');
         },
@@ -503,7 +503,16 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
             try out.appendSlice(gpa, pick(idents, rand));
             if (rand.boolean()) {
                 try out.append(gpa, '(');
-                if (rand.boolean()) try genExpr(gpa, out, rand, depth + 1);
+                switch (rand.uintLessThan(u8, 4)) {
+                    0 => {},
+                    1 => try genExpr(gpa, out, rand, depth + 1),
+                    2 => try out.append(gpa, '_'),
+                    3 => {
+                        try genExpr(gpa, out, rand, depth + 1);
+                        try out.appendSlice(gpa, ", _");
+                    },
+                    else => unreachable,
+                }
                 try out.append(gpa, ')');
             }
         },

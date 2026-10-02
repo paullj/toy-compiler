@@ -327,6 +327,10 @@ test "grammar agreement: deterministic control snippets agree span-for-span" {
         "fn f() {\n  fn() { }()\n}\n", // a lambda statement called in place
         "fn f() {\n  fn g(n: int) -> int { n }\n}\n", // a local named fn
         "fn f() {\n  fn g() {\n    fn h() { }\n  }\n  { }\n}\n", // nested, then a block statement
+        "fn f() {\n  inc := add(1, _)\n}\n", // a `_` capture
+        "fn f() {\n  y := 3 |> add(1, _)\n}\n",
+        "fn f() {\n  z := f(g(_), _)\n}\n",
+        "fn f() {\n  w := f(_ + 1, g(_))\n}\n",
     };
     for (snippets) |src| {
         _ = compareFile(a, src, classifyTag, true) catch |err| {

@@ -144,8 +144,8 @@ fn isPreludeName(names: []const []const u8, name: []const u8) bool {
 
 const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none, is_fn: bool = false };
 /// A lambda or local fn whose body is being resolved: its captures grow as outer locals
-/// are named.
-const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, self_slot: ?u32 = null, captures: std.ArrayList(Closure.Capture) = .empty };
+/// are named. A `_` capture's `hole` is the one node that reads its hidden param `hole_slot`.
+const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, self_slot: ?u32 = null, captures: std.ArrayList(Closure.Capture) = .empty, hole: Ast.Index = Ast.none, hole_slot: u32 = 0 };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
 
@@ -707,7 +707,18 @@ const GraphResolve = struct {
         try g.open.append(g.gpa, .{ .node = node_idx, .rank = g.next_rank, .slot_floor = g.slot_next, .label_floor = g.label_stack.items.len, .self_slot = self_slot });
         g.next_rank += 1;
         try g.pushScope();
-        for (proto.params) |param_idx| {
+        if (Ast.isCaptureLambda(g.tree(g.cur_mod), g.tokens(), node_idx)) {
+            // Hidden, so only the hole reads it: any other `_` in the call keeps its
+            // meaning, and nothing reads the param before the hole types it.
+            const param_idx = proto.params[0];
+            const slot = g.slot_next;
+            g.slot_next += 1;
+            try g.locals.append(g.gpa, .{ .name_tok = g.nodes()[param_idx.int()].main_token, .slot = slot, .used = true });
+            g.res(param_idx, .{ .local = slot });
+            const top = &g.open.items[g.open.items.len - 1];
+            top.hole = Ast.captureHole(g.tree(g.cur_mod), node_idx);
+            top.hole_slot = slot;
+        } else for (proto.params) |param_idx| {
             const param = g.nodes()[param_idx.int()];
             if (try g.declare(param.main_token, "duplicate parameter '{s}'", .W0002)) |slot| g.res(param_idx, .{ .local = slot });
             try g.resolveTypeRef(param.lhs);
@@ -726,6 +737,13 @@ const GraphResolve = struct {
         try g.fn_boundaries.ensureUnusedCapacity(g.gpa, 1);
         const caps = try ob.captures.toOwnedSlice(g.gpa);
         g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .self_slot = ob.self_slot, .captures = caps });
+    }
+
+    /// The hidden param slot `node_idx` reads when it is the innermost open capture's hole.
+    fn holeSlot(g: *GraphResolve, node_idx: Ast.Index) ?u32 {
+        if (g.open.items.len == 0) return null;
+        const top = g.open.items[g.open.items.len - 1];
+        return if (top.hole == node_idx and node_idx != Ast.none) top.hole_slot else null;
     }
 
     /// Record a use of local `slot` at node `use` as a capture of every open lambda it
@@ -952,7 +970,7 @@ const GraphResolve = struct {
         const n = g.nodes()[node_idx.int()];
         switch (n.tag) {
             .identifier => {
-                const resn = g.lookupName(n.main_token);
+                const resn: Resolution = if (g.holeSlot(node_idx)) |s| .{ .local = s } else g.lookupName(n.main_token);
                 g.res(node_idx, resn);
                 // Dead-store read-tap. A value-read of a local keeps any pending straight-line
                 // write to that slot live. This is the ONE point every local READ resolves, so
@@ -969,6 +987,10 @@ const GraphResolve = struct {
                     if (g.tables[g.cur_mod].enums.contains(g.nameText(n.main_token))) return;
                     const name = g.nameText(n.main_token);
                     const off = g.tokSpan(g.cur_mod, n.main_token);
+                    if (std.mem.eql(u8, name, "_")) {
+                        try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '_'; '_' makes a capture only as a whole call argument, as in 'f(a, _)' or 'Option[int].some(_)'", .{});
+                        return;
+                    }
                     // An EXACT stdlib name (checked before the fuzzy suggester) means the
                     // import is missing, not that the name is a typo — name the module to
                     // import. Only an exact match hints, so a genuine typo still falls
@@ -3552,6 +3574,113 @@ test "a nested lambda's outer capture is recorded by every boundary it crosses" 
             try testing.expectEqual(outer.slot_floor, inner.captures[1].slot); // x, the outer lambda's param
             try testing.expectEqual(@as(usize, 1), outer.captures.len);
             try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = a_use }, outer.captures[0]);
+        }
+    }.run);
+}
+
+test "a capture's hole reads its hidden param, and the call's other args are captures" {
+    try withResolvedSource(
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn main() -> int {
+        \\ a := 1
+        \\ f := add(a, _)
+        \\ return f(2)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const b = r.closures[0][0].boundaries[0];
+            try testing.expect(Ast.isCaptureLambda(tree, toks, b.node));
+            const proto = Ast.protoAt(tree, tree.nodes[b.node.int()].lhs.int());
+            const hole = try nthIdent(tree, toks, src, "_", 0);
+            try testing.expectEqual(hole, Ast.captureHole(tree, b.node));
+            try testing.expectEqual(Resolution{ .local = b.slot_floor }, r.resolutions[0][hole.int()]);
+            try testing.expectEqual(Resolution{ .local = b.slot_floor }, r.resolutions[0][proto.params[0].int()]);
+            try testing.expectEqual(@as(usize, 1), b.captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = try nthIdent(tree, toks, src, "a", 1) }, b.captures[0]);
+        }
+    }.run);
+}
+
+test "a hole is the capture's param even with a '_' local in scope, and does not warn W0009" {
+    try withResolvedSource(
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn main() -> int {
+        \\ _ := 1
+        \\ f := add(_, 2)
+        \\ return f(3)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const b = r.closures[0][0].boundaries[0];
+            const hole = try nthIdent(tree, toks, src, "_", 0);
+            try testing.expectEqual(Resolution{ .local = b.slot_floor }, r.resolutions[0][hole.int()]);
+            try testing.expectEqual(@as(usize, 0), b.captures.len);
+        }
+    }.run);
+}
+
+test "a '_' that is not the hole reads the '_' local, which the capture then captures" {
+    try withResolvedSource(
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn main() -> int {
+        \\ _ := 1
+        \\ f := add(_ + 1, _)
+        \\ return f(3)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const b = r.closures[0][0].boundaries[0];
+            const read = try nthIdent(tree, toks, src, "_", 0);
+            const hole = try nthIdent(tree, toks, src, "_", 1);
+            try testing.expectEqual(hole, Ast.captureHole(tree, b.node));
+            try testing.expectEqual(Resolution{ .local = 0 }, r.resolutions[0][read.int()]);
+            try testing.expectEqual(Resolution{ .local = b.slot_floor }, r.resolutions[0][hole.int()]);
+            try testing.expectEqual(@as(usize, 1), b.captures.len);
+            try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = read }, b.captures[0]);
+        }
+    }.run);
+}
+
+test "a '_' that is not the hole, with no '_' local, is R0001 with the capture hint" {
+    try withResolvedSource(
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn main() -> int {
+        \\ f := add(_ + 1, _)
+        \\ return f(3)
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), r.diags.len);
+            try testing.expectEqual(codes.Code.R0001, r.diags[0].code);
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "whole call argument") != null);
+        }
+    }.run);
+}
+
+test "a capture is a boundary: a lambda after it gets the next rank" {
+    try withResolvedSource(
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn main() -> int {
+        \\ f := add(1, _)
+        \\ g := fn(x: int) -> int { x }
+        \\ return f(1) + g(2)
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 2), bs.len);
+            try testing.expect(Ast.isCaptureLambda(tree, toks, bs[0].node));
+            try testing.expectEqual(@as(u32, 0), bs[0].rank);
+            try testing.expect(!Ast.isCaptureLambda(tree, toks, bs[1].node));
+            try testing.expectEqual(@as(u32, 1), bs[1].rank);
         }
     }.run);
 }

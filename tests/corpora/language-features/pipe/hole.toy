@@ -1,0 +1,25 @@
+# Feature: a pipe into a call with a '_' puts the piped value at the '_', so `x |> f(a, _)` is
+# the direct call `f(a, x)`, with no closure. A '_' inside a nested call is that call's own
+# capture, so `x |> apply(add(5, _))` is `apply(x, add(5, _))`.
+# expect: exit 49
+struct Acc { n: int }
+
+impl Acc {
+    fn plus(self, k: int) -> int { self.n + k }
+}
+
+fn add(a: int, b: int) -> int { return a + b }
+fn sub(a: int, b: int) -> int { return a - b }
+fn mul(a: int, b: int) -> int { return a * b }
+fn apply(x: int, f: fn(int) -> int) -> int { return f(x) }
+
+fn main() -> int {
+    a := 3 |> add(1, _)                 # add(1, 3) = 4
+    b := 3 |> sub(10, _)                # sub(10, 3) = 7
+    c := 3 |> sub(_, 1)                 # sub(3, 1) = 2
+    acc := Acc { n: 20 }
+    d := 1 |> acc.plus(_)               # acc.plus(1) = 21
+    e := 4 |> apply(add(5, _))          # apply(4, add(5, _)) = 9
+    f := 2 |> add(1, _) |> mul(2, _)    # mul(2, add(1, 2)) = 6
+    return a + b + c + d + e + f
+}

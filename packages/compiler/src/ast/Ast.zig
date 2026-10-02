@@ -106,7 +106,8 @@ pub const Node = extern struct {
         // nodes are memcpy'd to/from the cache, so reordering breaks old blobs).
 
         /// Postfix `callee(args...)`. `main_token` is `(`, or `|>` for a piped call
-        /// (`x |> f(a)` is `f(x, a)`; the piped value is argument 0), or 0 for a
+        /// (`x |> f(a)` is `f(x, a)`; the piped value is argument 0, or the argument at
+        /// a written `_`: `x |> f(a, _)` is `f(a, x)`, see `pipedArgIndex`), or 0 for a
         /// synthetic call. `lhs` is the callee expression node. `rhs` is the `extra`
         /// header of an args `Range`.
         call,
@@ -441,6 +442,11 @@ pub const Node = extern struct {
         /// body `block`. Unlike a `fn_decl`, a proto `ret_type` of `none` means the return
         /// type is INFERRED from the body, and a lambda `param`'s type-ref `lhs` may be
         /// `none` (the type comes from the expected function type).
+        ///
+        /// A `_` capture `f(a, _)` is a lambda too, `fn(_) { f(a, _) }`: its `main_token`
+        /// and its one untyped param's `main_token` are the hole's `_` identifier
+        /// (`isCaptureLambda`), its body block sits on the call's `(`, and the call's
+        /// hole arg is an `.identifier` on that same `_` (`captureHole`).
         lambda,
 
         /// `fn name(params) -> R { .. }` as a statement inside a block: a named closure that
@@ -576,6 +582,105 @@ pub fn isPipedCall(tree: Tree, tokens: []const Token, idx: Index) bool {
     return n.tag == .call and n.main_token != 0 and tokens[n.main_token].tag == .pipe_gt;
 }
 
+/// True when the `lambda` at `idx` is a `_` capture (see the `.lambda` tag). The tag is
+/// tested first, because a `local_fn` also sits on an identifier.
+pub fn isCaptureLambda(tree: Tree, tokens: []const Token, idx: Index) bool {
+    const n = tree.nodes[idx.int()];
+    return n.tag == .lambda and tokens[n.main_token].tag == .identifier;
+}
+
+/// The hole arg of the capture lambda at `idx`: the `.identifier` arg of its body's call
+/// that sits on the lambda's `_` token. `none` when `idx` is not a capture.
+pub fn captureHole(tree: Tree, idx: Index) Index {
+    const lam = tree.nodes[idx.int()];
+    if (lam.tag != .lambda or lam.rhs == none) return none;
+    const block = tree.nodes[lam.rhs.int()];
+    if (block.tag != .block) return none;
+    const stmts = rangeSlice(tree, block.lhs.int());
+    if (stmts.len != 1) return none;
+    const stmt = tree.nodes[stmts[0].int()];
+    if (stmt.tag != .expr_stmt) return none;
+    const call = tree.nodes[stmt.lhs.int()];
+    if (call.tag != .call) return none;
+    for (rangeSlice(tree, call.rhs.int())) |a| {
+        const an = tree.nodes[a.int()];
+        if (an.tag == .identifier and an.main_token == lam.main_token) return a;
+    }
+    return none;
+}
+
+/// True when token `i` is a `_` that is a whole call argument: the identifier `_`
+/// followed by `,` or `)`. Shared by the parser, which makes it a hole, and the LSP.
+pub fn isHoleTok(tokens: []const Token, src: []const u8, i: usize) bool {
+    if (i + 1 >= tokens.len) return false;
+    const t = tokens[i];
+    if (t.tag != .identifier or !std.mem.eql(u8, t.text(src), "_")) return false;
+    const next = tokens[i + 1].tag;
+    return next == .comma or next == .r_paren;
+}
+
+/// Which argument of the piped call at `call` holds the piped value, or null for a
+/// written call. Every token of the piped value precedes the `|>`, and every written
+/// argument (a capture lambda sits on its `_`) follows it, so the one arg whose
+/// `main_token` comes before the `|>` is the piped value: 0 when it was prepended, the
+/// hole's index for `x |> f(a, _)`.
+pub fn pipedArgIndex(tree: Tree, tokens: []const Token, call: Index) ?u32 {
+    if (!isPipedCall(tree, tokens, call)) return null;
+    const n = tree.nodes[call.int()];
+    for (rangeSlice(tree, n.rhs.int()), 0..) |a, i| {
+        if (tree.nodes[a.int()].main_token < n.main_token) return @intCast(i);
+    }
+    return null;
+}
+
+/// True when the piped call at `call` prepended its piped value as argument 0. A value
+/// written at a leading `_` builds the same tree (`x |> f(_, a)` and `x |> f(a)` are both
+/// `f(x, a)`), so the token after the call's `(` tells the two apart.
+pub fn pipePrepends(tree: Tree, tokens: []const Token, src: []const u8, call: Index) bool {
+    if ((pipedArgIndex(tree, tokens, call) orelse return false) != 0) return false;
+    const open = pipeArgsOpen(tokens, tree.nodes[call.int()].main_token) orelse return true;
+    return !isHoleTok(tokens, src, open + 1);
+}
+
+/// The `(` that opens the argument list of the pipe target after the `|>` at `pipe_tok`,
+/// or null for a target written without one (`x |> f`). The target path is names, `.`s
+/// and a turbofish, whose `[..]` may itself hold a `(` (`f[fn(int) -> int](a)`).
+pub fn pipeArgsOpen(tokens: []const Token, pipe_tok: u32) ?u32 {
+    var depth: u32 = 0;
+    var i = pipe_tok + 1;
+    while (i < tokens.len) : (i += 1) switch (tokens[i].tag) {
+        .l_bracket => depth += 1,
+        .r_bracket => {
+            if (depth == 0) return null;
+            depth -= 1;
+        },
+        .eof => return null,
+        .l_paren => if (depth == 0) return i,
+        .identifier, .dot => {},
+        else => if (depth == 0) return null,
+    };
+    return null;
+}
+
+/// The `)` that closes the argument list `pipeArgsOpen` finds, or null when there is none
+/// or it is unclosed. A pipe's tree has no node for a filled `_`, so span code reads the
+/// closer from here: in `x |> f(a, _)` the last node token is `a`.
+pub fn pipeArgsClose(tokens: []const Token, pipe_tok: u32) ?u32 {
+    const open = pipeArgsOpen(tokens, pipe_tok) orelse return null;
+    var depth: u32 = 0;
+    var i = open;
+    while (i < tokens.len) : (i += 1) switch (tokens[i].tag) {
+        .l_paren, .l_bracket, .l_brace => depth += 1,
+        .r_paren, .r_bracket, .r_brace => {
+            depth -= 1;
+            if (depth == 0) return if (tokens[i].tag == .r_paren) i else null;
+        },
+        .eof => return null,
+        else => {},
+    };
+    return null;
+}
+
 /// The root (top-level) node of a non-empty tree — by construction the last.
 pub fn root(nodes: []const Node) Index {
     return Index.from(@intCast(nodes.len - 1));
@@ -683,7 +788,7 @@ pub const parse_magic: u32 = 0x544f5950;
 
 /// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
 /// so the writer and the reader can never disagree.
-pub const parse_version: u32 = 21;
+pub const parse_version: u32 = 22;
 
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {

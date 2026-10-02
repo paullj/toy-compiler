@@ -1,0 +1,6 @@
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() -> int {
+    _u := add(_ + 1, _)  #~ ERROR [R0001] whole call argument
+    return 0
+}
