@@ -500,6 +500,7 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
         4 => { // well-formed pipe, so pipes also reach resolve/typecheck
             try genExpr(gpa, out, rand, depth + 1);
             try out.appendSlice(gpa, if (rand.boolean()) " |> " else "\n    |> ");
+            if (rand.uintLessThan(u8, 3) == 0) try out.append(gpa, '.');
             try out.appendSlice(gpa, pick(idents, rand));
             if (rand.boolean()) {
                 try out.append(gpa, '(');
@@ -515,6 +516,7 @@ fn genExpr(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
                 }
                 try out.append(gpa, ')');
             }
+            if (rand.uintLessThan(u8, 4) == 0) try out.append(gpa, '?');
         },
         5 => switch (rand.uintLessThan(u8, 3)) { // well-formed lambdas
             0 => {

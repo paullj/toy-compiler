@@ -331,6 +331,10 @@ test "grammar agreement: deterministic control snippets agree span-for-span" {
         "fn f() {\n  y := 3 |> add(1, _)\n}\n",
         "fn f() {\n  z := f(g(_), _)\n}\n",
         "fn f() {\n  w := f(_ + 1, g(_))\n}\n",
+        "fn f() {\n  z := xs |> .a(p) |> .b(q)\n}\n", // method pipes
+        "fn f() {\n  w := x |> .m()?\n}\n",
+        "fn f() {\n  u := x |> .len\n}\n",
+        "fn f() {\n  t := x |> .m[int](1)\n}\n",
     };
     for (snippets) |src| {
         _ = compareFile(a, src, classifyTag, true) catch |err| {

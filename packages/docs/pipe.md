@@ -8,7 +8,8 @@ twin (`packages/compiler/tests/pipe_twins/`) and requires identical binaries.
 ## Summary
 
 `|>` passes the value on its left as the **first argument** of the call on its right, or
-as the argument at a written `_`: `x |> f(a, _)` is `f(a, x)`. It is pure syntax. The parser rewrites it into an ordinary `.call` node, so the resolver,
+as the argument at a written `_`: `x |> f(a, _)` is `f(a, x)`. A target that starts with
+`.` is a method of the piped value: `x |> .m(a)` is `x.m(a)`. It is pure syntax. The parser rewrites it into an ordinary `.call` node, so the resolver,
 the type checker, lowering and codegen do not see a pipe.
 
 ```toy
@@ -41,6 +42,11 @@ fn main() -> int {
 | `x \|> f(a, _)` | `f(a, x)` (the piped value goes where the `_` is) |
 | `x \|> f(_, a)` | `f(x, a)` |
 | `x \|> f \|> g(a)` | `g(f(x), a)` |
+| `x \|> .m` | `x.m()` (a method of the piped value) |
+| `x \|> .m(a)` | `x.m(a)` |
+| `x \|> .m[T](a)` | `x.m[T](a)` |
+| `x \|> .m(a)?` | `x.m(a)?` |
+| `x \|> .a() \|> .b()` | `x.a().b()` |
 
 The callee path is not classified at parse time. `m.f` and `v.push` have the same
 syntax, and the resolver decides later what each one is. So a pipe into a method on
@@ -50,7 +56,8 @@ syntax, and the resolver decides later what each one is. So a pipe into a method
 
 ```
 pipe_expr  := expr "|>" pipe_rhs
-pipe_rhs   := path call_args? "?"?
+pipe_rhs   := "." identifier turbofish? call_args? "?"?    # method pipe
+            | path call_args? "?"?
 path       := identifier ("." identifier | turbofish)*    # at most one turbofish
 turbofish  := "[" type ("," type)* "]"
 call_args  := "(" (arg ("," arg)*)? ")"
@@ -61,6 +68,21 @@ arg        := expr | "_"                                 # at most one "_"
   value is not prepended. A pipe fills one `_`, so `x |> f(_, _)` is **P0016**. A `_`
   inside a nested call is that call's own capture (`closures.md`): `x |> apply(add(1, _))`
   is `apply(x, add(1, _))`.
+- **Method pipe:** a leading `.` names a method of the piped value, which is the
+  receiver, not an argument. So its arguments take no `_`: `x |> .m(a, _)` is **P0016**.
+  The target is one name and at most one turbofish, like `x.m[T](a)`: a field hop
+  `x |> .m.n()` is **P0014**, since the RHS keeps its fixed shape. A `_` inside a nested
+  call is still that call's capture: `x |> .m(g(_))` is `x.m(g(_))`.
+  - `x |> .some` is the method call `x.some()`, never the variant `.some(x)`. To pipe
+    into a constructor, name its type: `5 |> Option.some`.
+  - `a + b |> .m()` is `(a + b).m()`, because `|>` binds loosest. Compare `a + b.m()`.
+  - A field of function type is called as `x.f()` calls it: `x |> .f()` is `x.f()`.
+  - `x |> .m[T]()` is `x.m[T]()` exactly, with the same errors: on a receiver of a
+    generic type, explicit protocol arguments are T0018 today in both forms ("takes no
+    explicit type arguments yet").
+  - Only a value can be piped, so a module or type name on the left is an error, as it
+    is for `io |> f`: `io |> .println(s)` and `Shape |> .circle(1)` report "module 'io'
+    is not a value" and "type 'Shape' is not a value". Write `io.println(s)`.
 
 - **Precedence:** lowest of all binary operators (below `||`). `a + b |> f` is `f(a + b)`.
 - **Associativity:** left. `x |> f |> g` is `(x |> f) |> g`.
@@ -86,7 +108,9 @@ The pipe evaluates exactly like the call it desugars to. The piped value is eval
 its position: as argument 0 it runs before the written arguments, which then go left to
 right, and at a `_` it runs in argument order, so in `x |> f(a, _)` the `a` runs first. The
 receiver of a method target (the `v` in `x |> v.push`) follows the normal method-call
-rule. The order is visible only when the lhs has a side effect on that receiver.
+rule. The order is visible only when the lhs has a side effect on that receiver. In a
+method pipe the piped value is the receiver, so it runs first and the arguments follow
+left to right, as in `x.m(a)`.
 
 ## Multi-line pipes
 
@@ -121,6 +145,8 @@ its left:
 | `x \|>` then newline / `}` / `)` / `]` / `,` / `\|>` / a declaration / EOF | no target (the caret is on the `\|>`) | same |
 | `x \|> f().len()` | postfix after the RHS | same, plus `; wrap the pipe in parentheses to use its result` |
 | `x \|> f == y` | binary operator after the RHS | same as the row above |
+| `(x \|> .)`, `x \|> .0`, `x \|> .5` | a method pipe without a method name | `a method pipe names a method after the '.', as in 'x \|> .len()'` |
+| `x \|> .m.n()`, `x \|> .m().n()`, `x \|> .m == y`, `x \|> .m[A][B]`, `x \|> .m(1)(2)` | the method target goes on past its fixed shape | `pipe target must be a function or a call; wrap the pipe in parentheses to use its result` |
 | `y := \|> f`, `return⏎\|> f(x)`, `break⏎\|> f` | no value on the left | `a pipe needs a value on its left` |
 | `if c { .. }⏎\|> f`, `continue⏎\|> f` | a statement form is not a value | `only a value can be piped, and this statement has none` |
 
@@ -128,11 +154,16 @@ The last two rows come from the multi-line rule. `}`, `return`, `break` and `con
 statement, so the lexer joins a following leading-`|>` line onto them. A block **expression**
 (`x := if c { 1 } else { 2 }⏎|> f`, or a statement-level `match`) is a value and pipes normally.
 
+A `_` in a method pipe's arguments is **P0016**, `a method pipe passes the piped value as
+the receiver, so its arguments take no '_'`. A `.` at the end of a line joins the next
+line, as after `x.`, so a bare `x |> .` needs parentheses or a name on the same line.
+
 Recovery, with one diagnostic per pipe:
 
 - **Bad or missing target:** the parser reads the bad operand (if any) and puts an
   `.error_node` in place of the call. A missing target consumes nothing, so a run of
-  `|> |> |>` is handled one pipe at a time by the infix loop, not by recursion.
+  `|> |> |>` is handled one pipe at a time by the infix loop, not by recursion. A method
+  pipe without a name consumes only its `.` and a number after it (`.0`).
 - **Postfix or operator after the RHS:** the parser keeps the call and continues as if the
   user had written the parentheses. The cascade latch suppresses follow-on errors in the
   same statement.
@@ -155,6 +186,10 @@ flag without an AST schema change. `Ast.isPipedCall` reads it.
 - **T0040 argument type mismatch:** for the piped value's argument (argument 1, or the
   `_`'s position), the message adds `(the piped value)` and the caret covers the lhs
   expression. `Ast.pipedArgIndex` says which argument that is.
+- **Method pipe:** the piped value is the receiver, so neither hint applies, and
+  `Ast.pipedArgIndex` is null. The messages read as they do for `x.m(a)`; a count
+  error's caret still starts at the `|>`. LSP signature help does not count the piped
+  value either.
 
 ```
 error[T0039]: expected 2 argument(s), got 1 (the piped value is argument 1); 'add' takes (int, int)
@@ -170,8 +205,8 @@ and the same `|>`-first caret.
 | Item | Reason / where it goes |
 |------|------------------------|
 | `_` placeholder (`x \|> f(a, _)`) | Implemented (closures roadmap S1). It is the Gleam-style function capture applied to the piped value, so it lowers straight to `f(a, x)`. The first-arg rule stays the same. |
-| Leading-dot method form (`x \|> .m()`) | Rejected. Normal `.m()` chaining already does this. |
-| UFCS / free-fn std twins | Deferred. Today pipes reach free fns only (`io.*`, `math.*`, user fns). |
+| Leading-dot method form (`x \|> .m()`) | Implemented (closures roadmap S2). It is `x.m()`, so a chain can mix methods and free fns. |
+| UFCS / free-fn std twins | Deferred. A bare name target is a free fn (`io.*`, `math.*`, user fns); a method of the piped value is written `.m`. |
 | A `.pipe` AST node | Rejected. The future lossless CST keeps the pipe for the formatter and lints (see "parens wait for CST"). |
 
 ## Forward compatibility

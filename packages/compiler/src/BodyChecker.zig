@@ -2834,8 +2834,60 @@ pub const BodyChecker = struct {
             return .invalid;
         }
         try bc.drainArgs(args);
+        // The method exists; only this explicit-args path cannot dispatch it yet, so
+        // "no method" would send the user looking for a typo.
+        if (recv_ty.isApp()) {
+            const e = bc.composite.at(recv_ty.appIdx());
+            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member) != null) {
+                try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{s}' on the generic type '{s}' takes no explicit type arguments yet; drop the '[..]'", .{ member, bc.typeName(recv_ty) });
+                return .invalid;
+            }
+        }
         try bc.emitNoMethod(bc.tokSpan(fa.main_token), member, recv_ty);
         return .invalid;
+    }
+
+    /// A method pipe's piped value is its receiver, so it must be a value, as for any
+    /// pipe. Unchecked, `io |> .print(s)` or `Shape |> .circle(1)` would pass as the
+    /// qualified call it desugars to.
+    fn rejectPipedNamespace(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!?Type {
+        if (!Ast.isPipedCall(bc.tree, bc.tokens, node_idx) or Ast.pipedArgIndex(bc.tree, bc.tokens, node_idx) != null) return null;
+        const callee = bc.tree.nodes[n.lhs.int()];
+        const fa = bc.tree.nodes[(if (callee.tag == .type_app) callee.lhs else n.lhs).int()];
+        if (fa.tag != .field_access) return null;
+        const what = bc.namespaceKind(fa.lhs) orelse return null;
+        try bc.drainArgs(Ast.rangeSlice(bc.tree, n.rhs.int()));
+        const sp = bc.spanOf(fa.lhs);
+        const name = bc.source[sp.start..sp.end];
+        try bc.sink.report(.{ .span = sp }, "{s} '{s}' is not a value, so it cannot be piped; use '{s}.{s}' directly", .{ what, name, name, bc.nameText(fa.main_token) });
+        return bc.poison();
+    }
+
+    /// "module" or "type" when `recv` names one rather than a value, else null.
+    fn namespaceKind(bc: *BodyChecker, recv: Ast.Index) ?[]const u8 {
+        const r = bc.tree.nodes[recv.int()];
+        switch (r.tag) {
+            .identifier => switch (bc.resolutions[recv.int()]) {
+                .module => return "module",
+                .unresolved => {
+                    const name = bc.nameText(r.main_token);
+                    if (bc.activeStructMap().get(name) != null or bc.activeEnumMap().get(name) != null) return "type";
+                    return null;
+                },
+                else => return null,
+            },
+            .type_app => return if (bc.appHeadIsValue(recv)) null else "type",
+            .field_access => {
+                const inner = bc.tree.nodes[r.lhs.int()];
+                if (inner.tag != .identifier or bc.resolutions[r.lhs.int()] != .module) return null;
+                const g = bc.model.graph;
+                const target = g.namespaceOfIn(bc.graph_mod, bc.nameText(inner.main_token)) orelse return null;
+                const member = bc.nameText(r.main_token);
+                if (g.mods[target].struct_ids.get(member) != null or g.mods[target].enum_ids.get(member) != null) return "type";
+                return null;
+            },
+            else => return null,
+        }
     }
 
     // A qualified tuple-variant construction `N.V(args)` arrives as a `.call` whose
@@ -3040,6 +3092,7 @@ pub const BodyChecker = struct {
     }
 
     fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+        if (try bc.rejectPipedNamespace(node_idx, n)) |t| return t;
         const callee = bc.tree.nodes[(n.lhs).int()];
         if (callee.tag == .field_access) {
             if (try bc.tryEnumConstruction(node_idx, n, callee)) |t| return t;

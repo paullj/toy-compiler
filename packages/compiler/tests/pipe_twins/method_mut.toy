@@ -1,0 +1,23 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/method_mut.toy.
+struct C { n: int }
+
+impl C {
+    fn bump(mut self) { self.n = self.n + 1 }
+    fn add(mut self, k: int) { self.n = self.n + k }
+}
+
+struct H { c: C }
+
+fn main() -> int {
+    c := C { n: 0 }
+    c.bump()
+    c.add(10)
+    h := H { c: C { n: 5 } }
+    h.c.bump()
+    h.c.add(2)
+    d := C { n: 100 }
+    f := fn() { d.bump() }
+    f()
+    f()
+    return c.n + h.c.n + d.n
+}

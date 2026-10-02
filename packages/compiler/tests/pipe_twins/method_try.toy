@@ -1,0 +1,26 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/method_try.toy.
+import std/vec
+
+fn add(a: int, b: int) -> int { a + b }
+
+fn first(v: Vec[int]) -> Option[int] {
+    x := v.get(0)?
+    return Option.some(x)
+}
+
+fn second_plus(v: Vec[int]) -> Option[int] {
+    y := add(v.get(1)?, 10)
+    return Option.some(y)
+}
+
+fn main() -> int {
+    v := Vec[int].new()
+    v.push(3)
+    v.push(4)
+    e := Vec[int].new()
+    a := match first(v) { .some(x) -> x, .none -> 100 }
+    b := match second_plus(v) { .some(x) -> x, .none -> 100 }
+    c := match first(e) { .some(_) -> 50, .none -> 0 }
+    d := match second_plus(e) { .some(_) -> 50, .none -> 0 }
+    return a + b + c + d
+}

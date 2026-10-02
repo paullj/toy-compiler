@@ -1,0 +1,35 @@
+# Hand-desugared twin of tests/corpora/language-features/pipe/method.toy.
+import std/vec
+
+struct C { n: int }
+
+impl C {
+    fn bump(mut self) { self.n = self.n + 1 }
+}
+
+impl C has Into[int] {
+    fn into(self) -> int { self.n * 3 }
+}
+
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn get(self) -> T { self.v }
+}
+
+fn main() -> int {
+    c := C { n: 1 }
+    c.bump()
+    c.bump()
+    t := c.into[int]()
+    v := Vec[int].new()
+    v.push(1)
+    v.push(4)
+    n := v.len()
+    b := Box[int] { v: 5 }
+    g := b.get()
+    o: Option[int] = Option.none
+    u := o.unwrap_or(7)
+    ok := (2 + 3).eq(5)
+    return c.n + t + n + g + u + if ok { 5 } else { 0 }
+}

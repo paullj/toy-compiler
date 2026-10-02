@@ -569,6 +569,41 @@ test "signatureHelpAt: method calls show the selected method, piped or not" {
     }
 }
 
+test "signatureHelpAt: a method pipe's piped value is the receiver, not an argument" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc {
+        \\    fn plus(self, a: int, b: int) -> int { return self.n + a + b }
+        \\}
+        \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
+        \\    y := 1 |> acc.plus(2)
+        \\    z := acc |> .plus(1, 2)
+        \\    return y + z
+        \\}
+        \\
+    ;
+    const cases = [_]struct { after: []const u8, active: u32 }{
+        .{ .after = "|> .plus(", .active = 0 },
+        .{ .after = "|> .plus(1, ", .active = 1 },
+        .{ .after = "1 |> acc.plus(", .active = 1 },
+    };
+    for (cases) |c| {
+        const p = test_util.posAfterLast(src, c.after);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no signature help after '{s}'\n", .{c.after});
+            return error.NoSignatureHelp;
+        };
+        defer r.deinit();
+        try testing.expectEqualStrings("fn plus(int, int) -> int", r.help.signatures[0].label);
+        try testing.expectEqual(c.active, r.help.activeParameter);
+    }
+}
+
 test "signatureHelpAt: a user protocol's method is labelled from its declaration" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

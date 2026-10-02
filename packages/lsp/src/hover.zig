@@ -216,18 +216,25 @@ test "hover on a piped callee shows its signature, also on a leading-pipe line" 
     defer docs.deinit(gpa);
     const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
     const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
         \\fn add(a: int, b: int) -> int { return a + b }
         \\fn main() -> int {
         \\    x := 1 |> add(2)
         \\    y := x
         \\        |> add(3)
-        \\    return y
+        \\    acc := Acc { n: y }
+        \\    z := acc |> .plus(4)
+        \\    return acc
+        \\        |> .plus(z)
         \\}
         \\
     ;
     const cases = [_]struct { needle: []const u8, want: []const u8 }{
         .{ .needle = "add(2)", .want = "fn add(a: int, b: int) -> int" },
         .{ .needle = "add(3)", .want = "fn add(a: int, b: int) -> int" },
+        .{ .needle = "plus(4)", .want = "fn plus(self: Acc, k: int) -> int" },
+        .{ .needle = "plus(z)", .want = "fn plus(self: Acc, k: int) -> int" },
     };
     for (cases) |c| {
         const p = @import("test_util.zig").posOf(src, c.needle);

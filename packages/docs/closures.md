@@ -164,7 +164,14 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 
 ## Method pipe
 
-`x |> .m(args)` means `x.m(args)`. Pipes can then chain methods: `xs |> .filter(pos) |> .map(double)`.
+`x |> .m(args)` means `x.m(args)`: the piped value is the receiver. Pipes can then chain methods, and mix them with free fns: `xs |> .filter(pos) |> .map(double) |> sum`.
+
+- **No arguments:** `x |> .m` is `x.m()`, as `x |> f` is `f(x)`.
+- **Turbofish:** at most one, as in `acc |> .into[int]()`. It means exactly what `x.m[T]()` means, errors included: explicit protocol arguments on a receiver of a generic type (`b.scale[int](3)` on a `Box[T]`) are T0018 in both forms for now, "takes no explicit type arguments yet".
+- **A value on the left:** the receiver must be a value, so `io |> .println(s)` and `Shape |> .circle(1)` are "not a value" errors, not the qualified calls `io.println(s)` and `Shape.circle(1)`.
+- **`?` and chains:** `v |> .get(0)?` is `v.get(0)?`, and `v |> .get(0)? |> add(1)` unwraps before the next step. The target keeps a fixed shape, so `x |> .m().n()` and `x |> .m.n()` are P0014; chain with another `|>`.
+- **`mut self`:** the piped value must be a place, as for `x.m()`: `mk() |> .bump()` is T0019. The call counts as a mutation of the receiver, so a closure that runs `c |> .bump()` boxes `c`.
+- **No `_`:** the piped value already fills the receiver, so a `_` in the arguments is P0016.
 
 ## Standard library additions
 
@@ -190,7 +197,7 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
 
 ## Tooling
 
-- **Tree-sitter:** lambdas, function types, nested functions, `_` capture and method pipes are in the grammar. Each lands with the syntax that introduces it.
+- **Tree-sitter:** lambdas, function types, nested functions, `_` capture and method pipes are in the grammar. Each lands with the syntax that introduces it. A `_` capture and a method pipe parse with the existing call, identifier and variant rules, so highlight queries alone tell them apart.
 - **LSP captures:**
   - Hover on a captured name says "captured: copied (N bytes)" or "captured: shared (boxed)".
   - An optional inlay hint on a lambda lists its captures.

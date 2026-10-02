@@ -1,0 +1,26 @@
+# Feature: a `mut self` method through a pipe writes the receiver in place, as `x.m()`
+# does: on a local, on a field of a local, and from a closure, which boxes the receiver
+# because the call counts as a mutation.
+# expect: exit 121
+struct C { n: int }
+
+impl C {
+    fn bump(mut self) { self.n = self.n + 1 }
+    fn add(mut self, k: int) { self.n = self.n + k }
+}
+
+struct H { c: C }
+
+fn main() -> int {
+    c := C { n: 0 }
+    c |> .bump()                  # c.bump(): 1
+    c |> .add(10)                 # c.add(10): 11
+    h := H { c: C { n: 5 } }
+    h.c |> .bump                  # h.c.bump(): 6
+    h.c |> .add(2)                # h.c.add(2): 8
+    d := C { n: 100 }
+    f := fn() { d |> .bump() }    # boxes d, so each call writes main's d
+    f()
+    f()
+    return c.n + h.c.n + d.n      # 11 + 8 + 102
+}

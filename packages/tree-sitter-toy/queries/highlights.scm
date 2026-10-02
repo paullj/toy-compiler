@@ -89,6 +89,27 @@
 (call_expression function: (field_expression field: (identifier) @function.call))
 
 (label (identifier) @label)
+; A method pipe target `x |> .m(a)` names a method. The grammar parses `.m` as a
+; variant_expression, and a named target rule would conflict with it, so the method is told
+; apart here, by its place as a pipe target, before the variant rule below.
+(pipe_expression
+  target: [
+    (variant_expression (identifier) @function.method.call)
+    (try_expression (variant_expression (identifier) @function.method.call))
+    (index_expression value: (variant_expression (identifier) @function.method.call))
+    (try_expression (index_expression value: (variant_expression (identifier) @function.method.call)))
+    (call_expression
+      function: [
+        (variant_expression (identifier) @function.method.call)
+        (index_expression value: (variant_expression (identifier) @function.method.call))
+      ])
+    (try_expression
+      (call_expression
+        function: [
+          (variant_expression (identifier) @function.method.call)
+          (index_expression value: (variant_expression (identifier) @function.method.call))
+        ]))
+  ])
 (variant_expression (identifier) @constant)
 (variant_pattern (identifier) @constant)
 
