@@ -574,6 +574,7 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
         \\import lib
         \\fn _a() -> int { return true }
         \\fn _b() -> int { return 1 + true }
+        \\fn _e() -> int { return true |> lib.h(1, _) }
         \\fn _c() -> int { return lib.f(true) }
         \\fn _d() -> int { _x: bool = 3
         \\ return 0 }
@@ -582,6 +583,7 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
         },
         .{ .path = "lib.toy", .source =
         \\pub fn f(x: int) -> int { return x }
+        \\pub fn h(a: int, b: int) -> int { return a + b }
         \\pub fn g() -> bool { return 1 }
         \\
         },
@@ -1011,13 +1013,16 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
 
     // More bodies than the Pass-C fan-out threshold, each with a lambda of a signature of
     // its own (so fn types intern in racing order) and a nested one that captures through
-    // its parent; the generic `wrap` holds a capturing lambda, so its units (and their
-    // env layouts) follow the instance order.
+    // its parent, plus two `_` captures typed from their calls; the generic `wrap` holds a
+    // capturing lambda, so its units (and their env layouts) follow the instance order.
     var src: std.Io.Writer.Allocating = .init(gpa);
     defer src.deinit();
     try src.writer.writeAll(
         \\import std/vec
         \\pub struct S0 { v: int }
+        \\pub struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\fn add(a: int, b: int) -> int { a + b }
         \\fn wrap[T](x: T) -> T {
         \\    id := fn(y: T) -> T {
         \\        _k := x
@@ -1038,10 +1043,13 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
         \\        xs
         \\    }}
         \\    g := fn() -> fn(int) -> int {{ fn(x) {{ x + base.v }} }}
-        \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v
+        \\    acc := Acc {{ n: {d} }}
+        \\    h := add(base.v, _)
+        \\    p := acc.plus(_)
+        \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v + h(1) + p(2)
         \\}}
         \\
-    , .{ k, k, k, k, k, k, k, k, k });
+    , .{ k, k, k, k, k, k, k, k, k, k });
     try src.writer.writeAll("fn main() -> int { return 0 }\n");
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1064,8 +1072,8 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
     const parallel = try lambdaTablesUnder(gpa, &graph, &r, .limited(8), &parallel_n);
     defer gpa.free(parallel);
     try testing.expectEqualSlices(u8, serial, parallel);
-    // Three per `_u` body, plus one per `wrap` instance (int and each S{k}).
-    try testing.expectEqual(@as(usize, 70 * 3 + 71), serial_n);
+    // Five per `_u` body, plus one per `wrap` instance (int and each S{k}).
+    try testing.expectEqual(@as(usize, 70 * 5 + 71), serial_n);
     try testing.expectEqual(serial_n, parallel_n);
 }
 

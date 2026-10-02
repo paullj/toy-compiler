@@ -1,0 +1,14 @@
+# Feature: a '_' that is a whole call argument is a capture even with a local named '_' in scope; every other '_' keeps its meaning: '_ + 1' reads that local, and a '_' param, a 'for _' loop and a match wildcard work as before
+# expect: exit 120
+fn add(a: int, b: int) -> int { a + b }
+fn k(_: int) -> int { _ }
+
+fn main() -> int {
+    _ := 7
+    f := add(_, 100)
+    g := add(_ + 1, _)
+    n := 0
+    for _ in 0..3 { n = n + 1 }
+    m := match _ { 7 -> 1, _ -> 0 }
+    return f(1) + g(2) + k(5) + n + m
+}

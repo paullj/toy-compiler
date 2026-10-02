@@ -2418,21 +2418,63 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     const lparen = p.index;
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
-    try p.parseCallArgs(&args);
+    const hole = try p.parseCallArgs(&args, null);
     const header = try p.addRange(args.items);
-    return p.addNode(.{ .tag = .call, .main_token = lparen, .lhs = callee, .rhs = header });
+    const call = try p.addNode(.{ .tag = .call, .main_token = lparen, .lhs = callee, .rhs = header });
+    if (hole) |h| return p.wrapCapture(call, p.nodes.items[args.items[h].int()].main_token, lparen);
+    return call;
 }
 
-/// `( arg, .. )`, appended to `args`.
-fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index)) Error!void {
+/// `f(a, _)` as `fn(_) { f(a, _) }`. The lambda and its param sit on the hole's `_`
+/// token (`Ast.isCaptureLambda`); the block sits on `(`, not `{`, so span code skips it.
+fn wrapCapture(p: *Parser, call: Ast.Index, hole_tok: u32, lparen: u32) Error!Ast.Index {
+    const param = try p.addNode(.{ .tag = .param, .main_token = hole_tok, .lhs = Ast.none, .rhs = Ast.none });
+    const stmt = try p.addNode(.{ .tag = .expr_stmt, .main_token = lparen, .lhs = call, .rhs = Ast.none });
+    const stmts = try p.addRange(&.{stmt});
+    const body = try p.addNode(.{ .tag = .block, .main_token = lparen, .lhs = stmts, .rhs = Ast.none });
+    const params_start: u32 = @intCast(p.extra.items.len);
+    try p.extra.append(p.gpa, param.int());
+    const proto_header = try p.addExtra(&.{
+        Ast.none.int(),
+        params_start,
+        1,
+        @intCast(p.extra.items.len),
+        0,
+    });
+    return p.addNode(.{ .tag = .lambda, .main_token = hole_tok, .lhs = proto_header, .rhs = body });
+}
+
+fn atHole(p: *const Parser) bool {
+    return Ast.isHoleTok(p.tokens, p.src, p.index);
+}
+
+const err_capture_twice = "a call takes one '_'; write the lambda out, as in fn(a: int, b: int) { f(a, b) }";
+
+/// `( arg, .. )`, appended to `args`. Returns the index of the call's `_` hole, if any;
+/// a second one is P0016. A pipe passes its lhs as `fill`, which takes the hole's place.
+fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index), fill: ?Ast.Index) Error!?u32 {
     p.bump(.l_paren);
     // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
     var nb = NoBlockScope.enter(p, false);
     defer nb.end();
+    var hole: ?u32 = null;
     while (!p.at(.r_paren) and !p.at(.eof)) {
         const entry = p.index;
-        if (p.startsExpr()) {
+        if (p.atHole()) {
+            const tok = p.index;
+            if (hole != null) {
+                try p.warn(p.peek(), .P0016, err_capture_twice);
+                try args.append(p.gpa, try p.leaf(.identifier, tok));
+            } else {
+                hole = @intCast(args.items.len);
+                if (fill) |f| {
+                    p.advance();
+                    try args.append(p.gpa, f);
+                } else try args.append(p.gpa, try p.leaf(.identifier, tok));
+            }
+            _ = p.eat(.comma);
+        } else if (p.startsExpr()) {
             try args.append(p.gpa, try p.parseExpr(0));
             if (!p.eat(.comma)) {
                 if (p.at(.r_paren)) break;
@@ -2445,6 +2487,7 @@ fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index)) Error!void {
         std.debug.assert(p.index > entry or p.at(.r_paren) or p.at(.eof));
     }
     try p.expect(.r_paren, "expected ')' to close call");
+    return hole;
 }
 
 const err_pipe_target = "pipe target must be a function or a call";
@@ -2454,7 +2497,7 @@ const err_pipe_stmt_lhs = "only a value can be piped, and this statement has non
 
 /// `lhs |> path [(args)] [?]`, the cursor just past `|>`, where `path` is dotted names
 /// with at most one turbofish (`f[int]`, `Option[int].some`). Desugars to a `.call`
-/// with `lhs` as argument 0 (packages/docs/pipe.md). `main_token` is the `|>` token,
+/// with `lhs` as argument 0, or at the `_` hole (packages/docs/pipe.md). `main_token` is the `|>` token,
 /// not `(`: that is how later stages tell a piped call from a written one without a
 /// new node tag. `lhs` is older than every RHS node, so children still precede parents.
 fn parsePipeRhs(p: *Parser, lhs: Ast.Index, pipe_tok: u32) Error!Ast.Index {
@@ -2484,8 +2527,9 @@ fn parsePipeRhs(p: *Parser, lhs: Ast.Index, pipe_tok: u32) Error!Ast.Index {
 
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
-    try args.append(p.gpa, lhs);
-    if (p.at(.l_paren)) try p.parseCallArgs(&args);
+    if (p.at(.l_paren)) {
+        if (try p.parseCallArgs(&args, lhs) == null) try args.insert(p.gpa, 0, lhs);
+    } else try args.append(p.gpa, lhs);
     const header = try p.addRange(args.items);
     var result = try p.addNode(.{ .tag = .call, .main_token = pipe_tok, .lhs = callee, .rhs = header });
     if (p.at(.question)) {
@@ -3336,7 +3380,7 @@ test "generic struct literal `Box[int]{..}` still parses as a type_app head (not
 
 test "root is program and children precede parents" {
     const gpa = testing.allocator;
-    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\n";
+    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\nfn g() {\n f := add(1, _)\n y := 2 |> add(1, _)\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     const tree = try expectTree(gpa, tokens, source);
@@ -5317,6 +5361,8 @@ test "fix-suggesting parse codes: category, count, and hint text" {
         .{ .src = "fn a() {\n  r := &x\n}\n", .code = .P0015, .hint = "Ref.new(" },
         .{ .src = "fn a() -> int {\n  return *r\n}\n", .code = .P0015, .hint = "r.get()" },
         .{ .src = "fn a() {\n  *r = v\n}\n", .code = .P0015, .hint = "r.set(v)" },
+        .{ .src = "fn a() {\n  y := add(_, _)\n}\n", .code = .P0016, .hint = "a call takes one '_'" },
+        .{ .src = "fn a() {\n  y := x |> f(_, _)\n}\n", .code = .P0016, .hint = "a call takes one '_'" },
     };
     for (cases) |c| {
         const res = try parseResult(gpa, c.src);
@@ -5533,6 +5579,106 @@ test "a long pipe chain hits the same nesting cap as written nested calls" {
     defer freeTree(gpa, res.tree);
     try testing.expectEqual(@as(usize, 1), res.diags.len);
     try testing.expectEqual(codes.Code.P0005, res.diags[0].code);
+}
+
+test "a _ argument makes the call a capture lambda" {
+    try expectSexpr("add(1, _)", "(lambda ((param _)) _ (block (call add 1 _)))");
+    try expectSexpr("acc.plus(_)", "(lambda ((param _)) _ (block (call (. acc plus) _)))");
+    try expectSexpr("f[int](_)", "(lambda ((param _)) _ (block (call (tyapp f int) _)))");
+    try expectSexpr("f(g(_), _)", "(lambda ((param _)) _ (block (call f (lambda ((param _)) _ (block (call g _))) _)))");
+    try expectSexpr("f(_)(3)", "(call (lambda ((param _)) _ (block (call f _))) 3)");
+    try expectSexpr("fn(_) { f(_) }", "(lambda ((param _)) _ (block (lambda ((param _)) _ (block (call f _)))))");
+
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, capture: bool, hole_tok: u32 };
+    for ([_]Case{
+        .{ .src = "add(1, _)", .capture = true, .hole_tok = 4 },
+        .{ .src = "add(_, 1)", .capture = true, .hole_tok = 2 },
+        .{ .src = "fn(x) { f(x) }", .capture = false, .hole_tok = 0 },
+    }) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, c.src, &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        const lam = Ast.root(tree.nodes);
+        try testing.expectEqual(Node.Tag.lambda, tree.nodes[lam.int()].tag);
+        try testing.expectEqual(c.capture, Ast.isCaptureLambda(tree, tokens, lam));
+        const hole = Ast.captureHole(tree, lam);
+        if (c.capture) {
+            try testing.expectEqual(Node.Tag.identifier, tree.nodes[hole.int()].tag);
+            try testing.expectEqual(c.hole_tok, tree.nodes[hole.int()].main_token);
+        } else try testing.expectEqual(Ast.none, hole);
+    }
+}
+
+test "a _ that is not a whole argument stays an identifier" {
+    try expectSexpr("f((_))", "(call f _)");
+    try expectSexpr("f(_ + 1)", "(call f (+ _ 1))");
+    try expectSexpr("f(_.x)", "(call f (. _ x))");
+    try expectSexpr("f(_?)", "(call f (try _))");
+    try expectSexpr("[_]", "(list _)");
+    try expectSexpr("S { x: _ }", "(new S (field x _))");
+    try expectSexpr("xs[_]", "(index xs _)");
+    // An inferred variant is built in a slot reserved before its args, so it is not the
+    // last node and only renders inside a program.
+    try expectProgram("fn f() {\n  x := .some(_)\n}\n", "(program (fn f () _ (block (:= x (enew.tuple some _)))))");
+}
+
+test "a pipe puts its value at the _ hole" {
+    try expectSexpr("x |> f(a, _)", "(call f a x)");
+    try expectSexpr("x |> f(_, a)", "(call f x a)");
+    try expectSexpr("x |> m.f(_)", "(call (. m f) x)");
+    try expectSexpr("x |> f(g(_))", "(call f x (lambda ((param _)) _ (block (call g _))))");
+
+    const gpa = testing.allocator;
+    // `prepends` tells `x |> f(_, a)` from `x |> f(a)`, which build the same tree; `close`
+    // is the `)` a span must reach, past a trailing filled `_` that has no node.
+    const Case = struct { src: []const u8, at: ?u32, prepends: bool, close: ?u32 };
+    for ([_]Case{
+        .{ .src = "x |> f(a, _)", .at = 1, .prepends = false, .close = 7 },
+        .{ .src = "x |> f(_, a)", .at = 0, .prepends = false, .close = 7 },
+        .{ .src = "x |> f(_)", .at = 0, .prepends = false, .close = 5 },
+        .{ .src = "x |> f(a)", .at = 0, .prepends = true, .close = 5 },
+        .{ .src = "x |> f()", .at = 0, .prepends = true, .close = 4 },
+        .{ .src = "x |> f", .at = 0, .prepends = true, .close = null },
+        .{ .src = "x |> m.f[fn(int) -> int](_, (a))", .at = 0, .prepends = false, .close = 19 },
+        .{ .src = "a + b |> f(c, d, _)", .at = 2, .prepends = false, .close = 11 },
+        .{ .src = "f(a, x)", .at = null, .prepends = false, .close = null },
+    }) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, c.src, &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        errdefer std.debug.print("case: {s}\n", .{c.src});
+        const call = Ast.root(tree.nodes);
+        try testing.expectEqual(c.at, Ast.pipedArgIndex(tree, tokens, call));
+        try testing.expectEqual(c.prepends, Ast.pipePrepends(tree, tokens, c.src, call));
+        const pipe_tok = tree.nodes[call.int()].main_token;
+        const close: ?u32 = if (Ast.isPipedCall(tree, tokens, call)) Ast.pipeArgsClose(tokens, pipe_tok) else null;
+        try testing.expectEqual(c.close, close);
+    }
+}
+
+test "nested captures share the expression nesting cap" {
+    const gpa = testing.allocator;
+    for ([_]struct { n: usize, deep: bool }{ .{ .n = 200, .deep = false }, .{ .n = 300, .deep = true } }) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, "fn main() -> int {\n    f := ");
+        for (0..c.n) |_| try buf.appendSlice(gpa, "k(_, ");
+        try buf.appendSlice(gpa, "0");
+        for (0..c.n) |_| try buf.appendSlice(gpa, ")");
+        try buf.appendSlice(gpa, "\n    0\n}\n");
+        const res = try parseResult(gpa, buf.items);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        // Past the cap, nested calls report one backstop per unwound level, as written
+        // nested calls `k(1, k(1, ..))` do: every diagnostic is the P0005 backstop.
+        try testing.expectEqual(c.deep, res.diags.len > 0);
+        for (res.diags) |d| try testing.expectEqual(codes.Code.P0005, d.code);
+    }
 }
 
 test "bitwise-not starts an argument and a list element" {

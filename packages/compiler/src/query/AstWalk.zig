@@ -197,6 +197,12 @@ const Extent = struct {
                 };
                 self.first = @min(self.first, n.main_token - lead);
                 self.last = @max(self.last, n.main_token);
+                // A piped call's last node token can sit well before its `)`: a filled
+                // `_` has no node, so `x |> f(a, _)` would end at `a`.
+                if (n.tag == .call and self.tokens[n.main_token].tag == .pipe_gt)
+                    if (Ast.pipeArgsClose(self.tokens, n.main_token)) |close| {
+                        self.last = @max(self.last, close);
+                    };
             },
             else => {},
         }

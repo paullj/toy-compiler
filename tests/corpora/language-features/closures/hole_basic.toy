@@ -1,0 +1,17 @@
+# Feature: a '_' argument makes the call a function of one parameter, so add(1, _) is fn(v) { add(1, v) }; the parameter takes the type the call wants there
+# expect: exit 34
+fn add(a: int, b: int) -> int { a + b }
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+fn twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }
+
+fn main() -> int {
+    a := 10
+    inc := add(1, _)
+    h: fn(int) -> int = add(a, _)
+    r1 := inc(4)
+    r2 := h(2)
+    r3 := apply(add(2, _), 1)
+    r4 := twice(add(1, _), 5)
+    r5 := add(_, 4)(3)
+    return r1 + r2 + r3 + r4 + r5
+}

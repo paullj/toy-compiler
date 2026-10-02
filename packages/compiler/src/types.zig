@@ -7775,6 +7775,35 @@ test "generic, method and variant count errors carry the piped hint" {
     }
 }
 
+test "a hole pipe names the '_' as the piped value and needs no count hint" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8, span: ?[]const u8 = null }{
+        .{ .body = "x := true |> add(1, _)", .code = .T0040, .want = "argument 2 (the piped value): expected int, got bool; 'add' takes (int, int)" },
+        .{ .body = "x := true |> add(_, 1)", .code = .T0040, .want = "argument 1 (the piped value): expected int, got bool; 'add' takes (int, int)" },
+        .{ .body = "x := 1 |> add(true, _)", .code = .T0040, .want = "argument 1: expected int, got bool; 'add' takes (int, int)" },
+        .{ .body = "x := 1 |> add(1, 2, _)", .code = .T0039, .want = "expected 2 argument(s), got 3; 'add' takes (int, int)", .span = "|> add(1, 2, _)" },
+        // A `_` first builds the same tree as a prepended value, yet it is written out.
+        .{ .body = "x := 1 |> add(_)", .code = .T0039, .want = "expected 2 argument(s), got 1; 'add' takes (int, int)", .span = "|> add(_)" },
+        .{ .body = "x := 1 |> add(_, 2, 3)", .code = .T0039, .want = "expected 2 argument(s), got 3; 'add' takes (int, int)", .span = "|> add(_, 2, 3)" },
+        .{ .body = "x := 1 |> add(2, 3)", .code = .T0039, .want = "expected 2 argument(s), got 3 (the piped value is argument 1); 'add' takes (int, int)", .span = "|> add(2, 3)" },
+        .{ .body = "x: bool = 1 |> add(2, _)", .code = .T0041, .want = "cannot bind int to 'x' of type bool", .span = "1 |> add(2, _)" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa, "fn add(a: int, b: int) -> int {{ return a + b }}\nfn f() {{\n {s}\n return\n}}\n", .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer std.debug.print("case: {s}\n", .{cs.body});
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(cs.code, c.result.diags[0].code);
+        try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
+        if (cs.span) |want_span| {
+            const sp = c.result.diags[0].span();
+            try testing.expectEqualStrings(want_span, src[sp.start..sp.end]);
+        }
+    }
+}
+
 test "call-shape checks: one coded diagnostic per failing call, on every call path" {
     const gpa = testing.allocator;
     const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{
@@ -9231,6 +9260,194 @@ test "T0050 names a generic call only when one expected the lambda" {
         try testing.expectEqual(codes.Code.T0050, c.result.diags[0].code);
         try testing.expectEqual(cs.generic, std.mem.indexOf(u8, c.result.diags[0].message, "generic call") != null);
     }
+}
+
+test "a '_' capture takes its param type from the position of its '_'" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn put(mut self, v: T) { self.v = v } }
+        \\enum Shape { circle(int) }
+        \\struct Pt(int, int)
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn pick(a: int, _b: bool) -> int { a }
+        \\fn main() -> int {
+        \\ inc := add(1, _)
+        \\ acc := Acc { n: 1 }
+        \\ p := acc.plus(_)
+        \\ g: fn(int, bool) -> int = pick
+        \\ h := g(1, _)
+        \\ b := Box[str] { v: "a" }
+        \\ put := b.put(_)
+        \\ put("b")
+        \\ circle := Shape.circle(_)
+        \\ _s := circle(1)
+        \\ at := Pt(_, 4)
+        \\ _q := at(1)
+        \\ o: Option[bool] = Option.none
+        \\ d := o.unwrap_or(_)
+        \\ _r := d(true)
+        \\ return inc(1) + p(1) + h(true)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const want = [_]Type{ Type.int, Type.int, Type.bool, Type.str, Type.int, Type.int, Type.bool };
+    for (want, 0..) |w, i| {
+        const lam = try nthLambda(&c, i);
+        try testing.expect(Ast.isCaptureLambda(c.tree, c.tokens, lam));
+        try testing.expect(Type.eql(w, lambdaParamType(&c, lam, 0)));
+        try testing.expect(Type.eql(w, lambdaSig(&c, lam).params[0]));
+    }
+    try testing.expect(Type.eql(Type.int, lambdaSig(&c, try nthLambda(&c, 0)).ret));
+}
+
+test "an expected fn type gives a capture its param type before the call does" {
+    try expectOnlyDiag("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n h: fn(int8) -> int = add(1, _)\n return h(1)\n}\n", .T0040);
+    try expectOneDiag("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n h: fn(int8) -> int = add(1, _)\n return h(1)\n}\n", .T0040, "argument 2: expected int, got int8; 'add' takes (int, int)");
+}
+
+test "a capture in a bare generic call is typed by its own call; a written lambda is still T0050" {
+    const gpa = testing.allocator;
+    const pre = "fn add(a: int, b: int) -> int { a + b }\nfn twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }\n";
+    var ok = try checkSource(pre ++ "fn main() -> int { return twice(add(1, _), 5) }\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    try expectOnlyDiag(pre ++ "fn main() -> int { return twice(fn(v) { add(1, v) }, 5) }\n", .T0050);
+}
+
+test "a capture whose '_' no position types is one diagnostic" {
+    const gpa = testing.allocator;
+    const pre = "fn pair[T](a: T, _b: T) -> T { a }\nfn id[T](a: T) -> T { a }\n";
+    const cases = [_]struct { body: []const u8, codes: []const codes.Code }{
+        .{ .body = "_q := pair(1, _)", .codes = &.{.T0050} },
+        .{ .body = "_r := id(_)", .codes = &.{.T0016} },
+        .{ .body = "_k := pair[int](1, _)", .codes = &.{} },
+        // A warning in the body does not stand in for the T0050: it would leave the
+        // capture poisoned with no error.
+        .{ .body = "_p := pair(if true { 1 } else { 2 }, _)", .codes = &.{ .W0007, .T0050 } },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{\n {s}\n return 0\n}}\n", .{ pre, cs.body });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer for (c.result.diags) |d| std.debug.print("{s}: got {s}: {s}\n", .{ cs.body, @tagName(d.code), d.message });
+        try testing.expectEqual(cs.codes.len, c.result.diags.len);
+        for (cs.codes) |code| try testing.expect(hasCode(&c, code));
+        for (c.result.diags) |d| if (d.code == .T0050)
+            try testing.expect(std.mem.startsWith(u8, d.message, "cannot infer the type of '_'"));
+    }
+}
+
+test "a capture passed where a non-function is wanted is T0040 with the capture hint" {
+    const pre = "fn add(a: int, b: int) -> int { a + b }\nfn neg(a: int) -> int { 0 - a }\nfn apply(f: fn(int) -> int, x: int) -> int { f(x) }\n";
+    try expectOnlyDiag(pre ++ "fn main() -> int { return neg(add(1, _)) }\n", .T0040);
+    try expectOneDiag(pre ++ "fn main() -> int { return neg(add(1, _)) }\n", .T0040, "argument 1: expected int, got fn(int) -> int; 'neg' takes (int); its '_' makes it a function, so to pass the call's result, write the lambda around the outer call, as in fn(v: int) { f(g(v)) }");
+    const gpa = testing.allocator;
+    var ok = try checkSource(pre ++ "fn main() -> int { return apply(neg(_), 3) }\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
+test "a capture passed as a constructor's non-function value gets the capture hint" {
+    const gpa = testing.allocator;
+    const hint = "; its '_' makes it a function, so to pass the call's result, write the lambda around the outer call, as in fn(v: int) { f(g(v)) }";
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "_s := Shape.circle(add(1, _))", .want = "variant 'Shape.circle': expected int, got fn(int) -> int" ++ hint },
+        .{ .body = "_p := Pt(add(1, _), 2)", .want = "tuple struct 'Pt': expected int, got fn(int) -> int" ++ hint },
+        .{ .body = "_q := Pt(true, 2)", .want = "tuple struct 'Pt': expected int, got bool" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa, "fn add(a: int, b: int) -> int {{ a + b }}\nenum Shape {{ circle(int) }}\nstruct Pt(int, int)\nfn main() -> int {{\n {s}\n return 0\n}}\n", .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer for (c.result.diags) |d| std.debug.print("{s}: got {s}: {s}\n", .{ cs.body, @tagName(d.code), d.message });
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
+    }
+}
+
+test "a '?' or jump in a capture's arguments names the capture, not a lambda" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{
+        .{ .body = "_h := add(get(1)?, _)", .code = .T0032, .want = "'?' in a '_' capture exits the capture, so it needs an expected fn type returning Option[..] or Result[..]; or write the lambda out with its '-> Option[..]'" },
+        .{ .body = "loop {\n _g := add(if t { break } else { 1 }, _)\n }", .code = .T0051, .want = "cannot break a loop outside this '_' capture" },
+        .{ .body = "loop {\n _g := add(if t { continue } else { 1 }, _)\n break\n }", .code = .T0051, .want = "cannot continue a loop outside this '_' capture" },
+        .{ .body = "_h := fn() -> Option[int] { _k := add(get(1)?, _)\n Option.none }", .code = .T0032, .want = "'?' in a '_' capture exits the capture, so it needs an expected fn type returning Option[..] or Result[..]; or write the lambda out with its '-> Option[..]'" },
+        .{ .body = "_h := add(1, _)\n _l := fn() { _m := get(1)? }", .code = .T0032, .want = "'?' in a lambda needs its return type; annotate -> Option[..] or Result[..]" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa, "fn add(a: int, b: int) -> int {{ a + b }}\nfn get(k: int) -> Option[int] {{ Option.some(k) }}\nfn f(t: bool) -> Option[int] {{\n {s}\n return Option.none\n}}\n", .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer for (c.result.diags) |d| std.debug.print("{s}: got {s}: {s}\n", .{ cs.body, @tagName(d.code), d.message });
+        try testing.expect(hasCode(&c, cs.code));
+        for (c.result.diags) |d| if (d.code == cs.code) try testing.expectEqualStrings(cs.want, d.message);
+    }
+}
+
+test "a capture dropped as a statement is W0008, since its call never runs" {
+    const gpa = testing.allocator;
+    const pre = "fn show(x: int) { _y := x }\nfn add(a: int, b: int) -> int { a + b }\n";
+    const msg = "unused '_' capture; the '_' makes the call a function, which is never called; to pass a local named '_', rename it";
+    for ([_][]const u8{
+        pre ++ "fn main() -> int {\n _ := 5\n show(_)\n return 0\n}\n",
+        pre ++ "fn main() -> int {\n add(1, _)\n return 0\n}\n",
+        pre ++ "fn main() {\n add(1, _)\n}\n",
+    }) |src| {
+        try expectOnlyDiag(src, .W0008);
+        try expectOneDiag(src, .W0008, msg);
+    }
+    var ok = try checkSource(pre ++ "fn main() -> int {\n f := add(1, _)\n 2 |> show(_)\n return f(1)\n}\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
+test "a capture's '_' at a mut position is T0019; a piped value there is the caller's place" {
+    const gpa = testing.allocator;
+    const pre = "fn bump(mut x: int) { x = x + 1 }\n";
+    const msg = "argument 1 is a capture's '_', a copy of the value it is called with; 'bump' takes it as 'mut', so its change would be lost";
+    for ([_][]const u8{
+        pre ++ "fn main() -> int {\n _f := bump(_)\n return 0\n}\n",
+        pre ++ "fn main() -> int {\n _h: fn(int) = bump(_)\n return 0\n}\n",
+    }) |src| {
+        try expectOnlyDiag(src, .T0019);
+        try expectOneDiag(src, .T0019, msg);
+    }
+    var ok = try checkSource(pre ++ "fn main() -> int {\n x := 1\n x |> bump(_)\n return x\n}\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
+test "a capture of a 'mut self' receiver is T0052, like the lambda it means" {
+    try expectOnlyDiag(
+        \\struct C { n: int }
+        \\impl C {
+        \\ fn add(mut self, k: int) { self.n = self.n + k }
+        \\ fn run(mut self) -> int {
+        \\  f := self.add(_)
+        \\  f(1)
+        \\  self.n
+        \\ }
+        \\}
+        \\fn main() -> int {
+        \\ c := C { n: 1 }
+        \\ return c.run()
+        \\}
+        \\
+    , .T0052);
+}
+
+test "a capture whose expected fn type takes another count is one T0039 with capture wording" {
+    const src = "fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n w: fn(int, int) -> int = add(1, _)\n return w(1, 2)\n}\n";
+    try expectOnlyDiag(src, .T0039);
+    try expectOneDiag(src, .T0039, "a '_' capture takes 1 parameter, but the expected type fn(int, int) -> int takes 2");
 }
 
 test "a lambda whose arity differs from the expected fn type is one T0039" {

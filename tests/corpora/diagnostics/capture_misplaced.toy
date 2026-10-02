@@ -1,0 +1,8 @@
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() -> int {
+    _a := add(_, _)  #~ ERROR [P0016] one '_'
+    _b := add(_, 1, _)  #~ ERROR [P0016] one '_'
+    _c := 3 |> add(_, _)  #~ ERROR [P0016] one '_'
+    return 0
+}

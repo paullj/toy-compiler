@@ -7,8 +7,8 @@ twin (`packages/compiler/tests/pipe_twins/`) and requires identical binaries.
 
 ## Summary
 
-`|>` passes the value on its left as the **first argument** of the call on its right.
-It is pure syntax. The parser rewrites it into an ordinary `.call` node, so the resolver,
+`|>` passes the value on its left as the **first argument** of the call on its right, or
+as the argument at a written `_`: `x |> f(a, _)` is `f(a, x)`. It is pure syntax. The parser rewrites it into an ordinary `.call` node, so the resolver,
 the type checker, lowering and codegen do not see a pipe.
 
 ```toy
@@ -38,6 +38,8 @@ fn main() -> int {
 | `x \|> T[A].ctor` | `T[A].ctor(x)` (e.g. `5 \|> Option[int].some`) |
 | `x \|> f?` | `f(x)?` |
 | `x \|> f(a)?` | `f(x, a)?` |
+| `x \|> f(a, _)` | `f(a, x)` (the piped value goes where the `_` is) |
+| `x \|> f(_, a)` | `f(x, a)` |
 | `x \|> f \|> g(a)` | `g(f(x), a)` |
 
 The callee path is not classified at parse time. `m.f` and `v.push` have the same
@@ -51,8 +53,14 @@ pipe_expr  := expr "|>" pipe_rhs
 pipe_rhs   := path call_args? "?"?
 path       := identifier ("." identifier | turbofish)*    # at most one turbofish
 turbofish  := "[" type ("," type)* "]"
-call_args  := "(" (expr ("," expr)*)? ")"
+call_args  := "(" (arg ("," arg)*)? ")"
+arg        := expr | "_"                                 # at most one "_"
 ```
+
+- **`_`:** a `_` that is a whole argument marks where the piped value goes, and the
+  value is not prepended. A pipe fills one `_`, so `x |> f(_, _)` is **P0016**. A `_`
+  inside a nested call is that call's own capture (`closures.md`): `x |> apply(add(1, _))`
+  is `apply(x, add(1, _))`.
 
 - **Precedence:** lowest of all binary operators (below `||`). `a + b |> f` is `f(a + b)`.
 - **Associativity:** left. `x |> f |> g` is `(x |> f) |> g`.
@@ -74,8 +82,9 @@ call_args  := "(" (expr ("," expr)*)? ")"
 
 ## Evaluation order
 
-The pipe evaluates exactly like the call it desugars to. The piped value is argument 0,
-so it is evaluated before the written arguments, which then go left to right. The
+The pipe evaluates exactly like the call it desugars to. The piped value is evaluated at
+its position: as argument 0 it runs before the written arguments, which then go left to
+right, and at a `_` it runs in argument order, so in `x |> f(a, _)` the `a` runs first. The
 receiver of a method target (the `v` in `x |> v.push`) follows the normal method-call
 rule. The order is visible only when the lhs has a side effect on that receiver.
 
@@ -138,11 +147,14 @@ A piped `.call` node stores the `|>` token as its `main_token`. A plain call sto
 Synthetic calls already store `0`, so no consumer depends on `(`. This gives a "piped"
 flag without an AST schema change. `Ast.isPipedCall` reads it.
 
-- **T0039 arity mismatch:** the argument count includes the piped value. The message
-  adds `(the piped value is argument 1)`. The caret starts at the `|>` of the failing
-  step, not at the lhs, so it does not cover the whole chain before that step.
-- **T0040 argument type mismatch:** for argument 1, the message adds `(the piped value)`
-  and the caret covers the lhs expression.
+- **T0039 arity mismatch:** the argument count includes the piped value. When the value
+  was prepended, the message adds `(the piped value is argument 1)`; with a `_`, the
+  written arguments already show it, so there is no hint. The caret starts at the `|>`
+  of the failing step, not at the lhs, so it does not cover the whole chain before that
+  step.
+- **T0040 argument type mismatch:** for the piped value's argument (argument 1, or the
+  `_`'s position), the message adds `(the piped value)` and the caret covers the lhs
+  expression. `Ast.pipedArgIndex` says which argument that is.
 
 ```
 error[T0039]: expected 2 argument(s), got 1 (the piped value is argument 1); 'add' takes (int, int)
@@ -157,17 +169,25 @@ and the same `|>`-first caret.
 
 | Item | Reason / where it goes |
 |------|------------------------|
-| `_` placeholder (`x \|> f(a, _)`) | Deferred to the closures roadmap. With closures it becomes a Gleam-style function capture. The first-arg rule stays the same, so no rework is necessary. |
+| `_` placeholder (`x \|> f(a, _)`) | Implemented (closures roadmap S1). It is the Gleam-style function capture applied to the piped value, so it lowers straight to `f(a, x)`. The first-arg rule stays the same. |
 | Leading-dot method form (`x \|> .m()`) | Rejected. Normal `.m()` chaining already does this. |
 | UFCS / free-fn std twins | Deferred. Today pipes reach free fns only (`io.*`, `math.*`, user fns). |
 | A `.pipe` AST node | Rejected. The future lossless CST keeps the pipe for the formatter and lints (see "parens wait for CST"). |
 
 ## Forward compatibility
 
-When closures and function values arrive:
+Closures and function values arrived as this section promised:
 
 - `x |> g`, where `g` is a local of function type, still means `g(x)`.
-- `x |> f(a, _)` becomes "apply the capture `fn(v) { f(a, v) }` to `x`", which is `f(a, x)`.
+- `x |> f(a, _)` is "apply the capture `fn(v) { f(a, v) }` to `x`", which is `f(a, x)`,
+  and it lowers to that call with no closure.
 
 Both results are the same as a syntactic rewrite, so no program written against this spec
-changes meaning.
+changed meaning.
+
+One hole-pipe shape runs the same as its twin but builds different bytes: a lambda in the
+piped value and another in an argument left of the `_`, as in
+`fn(x: int) -> int { x } |> ap(fn(y: int) -> int { y }, _)`. The parser creates the piped
+lambda's nodes first, but the call places it second, and lambda units are emitted in node
+order, so the twin `ap(fn(y..), fn(x..))` emits the two units the other way round.
+`pipe.zig` leaves this shape out of its cases.

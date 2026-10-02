@@ -242,6 +242,25 @@ test "hover on a piped callee shows its signature, also on a leading-pipe line" 
     }
 }
 
+test "hover on a capture's '_' shows the type the call gives it" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn add(a: int, b: int) -> int { return a + b }
+        \\fn main() -> int {
+        \\    inc := add(1, _)
+        \\    return inc(2)
+        \\}
+        \\
+    ;
+    const p = @import("test_util.zig").posOf(src, "_)");
+    var h = (try hoverAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse return error.NoHover;
+    defer h.deinit();
+    try testing.expectEqualStrings("```toy\n_: int\n```", h.value);
+}
+
 test "hover on a method callee shows the selected method" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

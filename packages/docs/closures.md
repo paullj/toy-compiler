@@ -143,10 +143,24 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 
 ## `_` capture expressions
 
-- **Meaning:** `f(a, _)` anywhere means `fn(v) { f(a, v) }`. This is Gleam's function capture.
-- **Rules:** one `_` per call, and only as a direct argument. `f(g(_))` is an error.
-- **Pipes:** `x |> f(a, _)` means `(fn(v) { f(a, v) })(x)`, which is `f(a, x)`. So the pipe needs no special case, as `pipe.md` promised.
-- **Methods:** `acc.plus(_)` is a short form of the bound method with an explicit argument.
+- **Meaning:** `f(a, _)` anywhere means `fn(v) { f(a, v) }`. This is Gleam's function capture. The call can be a fn, a fn value (`g(1, _)`), a method (`acc.plus(_)`), a tuple variant (`Shape.circle(_)`) or a tuple struct (`Pt(_, 4)`).
+- **What a hole is:** a `_` that is a whole call argument, so a `_` followed by `,` or `)`. It is a hole even when a local named `_` is in scope. `f(_ + 1)`, `f((_))`, `f(_.x)`, `[_]` and `xs[_]` hold no hole.
+- **One per call:** a call takes one `_`, because the function it makes takes one parameter. `add(_, _)` is P0016; write `fn(a: int, b: int) { add(a, b) }`.
+- **Each call has its own `_`:** `f(g(_))` follows Gleam: the `_` captures only `g`'s call, so `f` gets `fn(v) { g(v) }`. That is what `xs.map(add(1, _))` needs. When `f` (a fn, a method or a constructor) wants a non-function there, the error is a type mismatch (T0040 for a call) with a hint to write the lambda around the outer call, `fn(v: int) { f(g(v)) }`. `f(g(_), _)` is two captures.
+- **Every other `_` keeps its meaning:** a match wildcard, `_x` bindings, `_ := e`, `for _ in`, a `_` param, and a read of a `_` local in any other position. A `_` that is not a hole and names no local is R0001, with a hint that `_` makes a capture only as a whole call argument. Two things that read a `_` local before now make a capture: a `_` local passed as a whole argument, and a written `fn(_) { f(_) }`, whose body is now a capture of its own.
+- **Inferred variants:** `.some(_)` is not a call, so it is not a capture; write `Option[int].some(_)`, or `Option.some(_)` where an expected fn type gives its `T`.
+- **The parameter type**, in order:
+  1. the expected fn type's parameter, when it is ground (as for any lambda);
+  2. otherwise the type the call wants at the `_`: `inc := add(1, _)` is `fn(int) -> int`, `b.put(_)` on a `Box[int]` takes an `int`;
+  3. otherwise T0050 "cannot infer the type of '_'", reported only when nothing else in the call is an error.
+
+  A bare generic callee gives the `_` no type until its other arguments can (L1): `pair(1, _)` is T0050 and `id(_)` is the callee's own T0016. Write `pair[int](1, _)`. A capture passed to a bare generic call is typed by its own call, so `twice(add(1, _), 5)` works.
+- **Evaluation:** the other arguments are evaluated each time the capture is called, as in the lambda it means. `add(tick(), _)` calls `tick` on every call, and a `?` or `return` among them exits the capture. A capture has no `-> R` to write, so such a `?` needs an expected fn type that returns an Option or Result (T0032 otherwise), and a `break` or `continue` there is T0051, as in a lambda.
+- **As a statement:** a capture dropped as a statement (`show(_)`) never runs its call, so it is W0008. Before captures, that statement passed a `_` local; rename the local to keep that meaning.
+- **`mut` positions:** a `_` at a `mut` parameter is T0019. The capture's parameter is a copy of the value it is called with, so the change would be lost.
+- **Pipes:** `x |> f(a, _)` is the call `f(a, x)`: no closure and no env. The piped value is evaluated at its position, in argument order, so in `x |> f(a, _)` the `a` runs first.
+- **Methods:** `acc.plus(_)` is a short form of the bound method with an explicit argument. The receiver is captured like any other argument, and a `mut self` receiver is boxed.
+- **Known gap:** in a bounded template (`fn g[T has P](t: T)`), a `_` whose position wants the template's own `T` is a false T0050, as a lambda with an untyped param is there. Write the lambda with a typed parameter, `fn(o: T) { t.add(o) }`.
 
 ## Method pipe
 

@@ -181,3 +181,81 @@ test "specialized binaries are identical at -j1 and -j8" {
         }
     }
 }
+
+test "a _ capture builds the same binary as the lambda it means" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+
+    const tmp = ".toy-test-closures-hole";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    const pre =
+        \\struct Acc { n: int }
+        \\impl Acc {
+        \\    fn plus(self, k: int) -> int { self.n + k }
+        \\}
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+        \\fn main() -> int {
+        \\    a := 3
+        \\    acc := Acc { n: 4 }
+        \\
+    ;
+    const pairs = [_]struct { capture: []const u8, lambda: []const u8 }{
+        .{ .capture = "g := add(1, _)\n    return g(a) + acc.n", .lambda = "g := fn(v: int) { add(1, v) }\n    return g(a) + acc.n" },
+        .{ .capture = "return apply(add(a, _), acc.n)", .lambda = "return apply(fn(v) { add(a, v) }, acc.n)" },
+        .{ .capture = "p := acc.plus(_)\n    return p(a)", .lambda = "p := fn(v: int) { acc.plus(v) }\n    return p(a)" },
+    };
+    for (pairs, 0..) |pair, i| for ([_][]const u8{ "-O0", "-O1" }) |opt| {
+        const cap_src = try std.fmt.allocPrint(gpa, "{s}    {s}\n}}\n", .{ pre, pair.capture });
+        defer gpa.free(cap_src);
+        const lam_src = try std.fmt.allocPrint(gpa, "{s}    {s}\n}}\n", .{ pre, pair.lambda });
+        defer gpa.free(lam_src);
+        const cap_dir = try std.fmt.allocPrint(gpa, tmp ++ "/{d}{s}/cap", .{ i, opt });
+        defer gpa.free(cap_dir);
+        const lam_dir = try std.fmt.allocPrint(gpa, tmp ++ "/{d}{s}/lam", .{ i, opt });
+        defer gpa.free(lam_dir);
+        const cap = try harness.compile(gpa, io, cap_dir, cap_src, &.{ "--no-cache", opt });
+        defer gpa.free(cap);
+        const lam = try harness.compile(gpa, io, lam_dir, lam_src, &.{ "--no-cache", opt });
+        defer gpa.free(lam);
+        const a = try Io.Dir.cwd().readFileAlloc(io, cap, gpa, .unlimited);
+        defer gpa.free(a);
+        const b = try Io.Dir.cwd().readFileAlloc(io, lam, gpa, .unlimited);
+        defer gpa.free(b);
+        if (!std.mem.eql(u8, a, b)) {
+            std.debug.print("'{s}' differs from '{s}' at {s}\n", .{ pair.capture, pair.lambda, opt });
+            return error.TestExpectedEqual;
+        }
+    };
+}
+
+test "200 nested captures build and run" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+
+    const tmp = ".toy-test-closures-nest";
+    Io.Dir.cwd().deleteTree(io, tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
+
+    // Each `ap(_, f)` is `fn(v) { ap(v, f) }`, a fn(int) -> int, so it is the next level's f.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "fn id(x: int) -> int { x }\nfn ap(x: int, f: fn(int) -> int) -> int { f(x) + 1 }\nfn main() -> int {\n    f := ");
+    for (0..200) |_| try src.appendSlice(gpa, "ap(_, ");
+    try src.appendSlice(gpa, "id");
+    for (0..200) |_| try src.append(gpa, ')');
+    try src.appendSlice(gpa, "\n    return f(0)\n}\n");
+    const prog = try harness.compile(gpa, io, tmp, src.items, &.{ "--no-cache", "-O0", "-j1" });
+    defer gpa.free(prog);
+    const r = try run(gpa, io, prog);
+    defer gpa.free(r.stdout);
+    try std.testing.expectEqual(@as(u8, 200), r.exit);
+}

@@ -268,11 +268,12 @@ pub fn signatureHelpAt(
 
     // In `x |> f(a, ..)` the piped `x` is argument 0 but sits left of the `(`, so the comma
     // count is one short. The tree, not the tokens, says whether the call is piped: a token
-    // look-back from the callee would miss an `m.f` callee.
+    // look-back from the callee would miss an `m.f` callee. A value written at a `_` is
+    // already counted.
     var active = enc.active;
     for (m.nodes, 0..) |n, ci| {
         if (n.tag != .call or n.lhs.int() != callee.node) continue;
-        if (toyc.Ast.isPipedCall(m.tree(), m.tokens, toyc.Ast.Index.from(@intCast(ci)))) active += 1;
+        if (toyc.Ast.pipePrepends(m.tree(), m.tokens, m.source, toyc.Ast.Index.from(@intCast(ci)))) active += 1;
         break;
     }
 
@@ -485,14 +486,20 @@ test "signatureHelpAt: a piped call's active param counts the piped value" {
         \\fn add(a: int, b: int) -> int { return a + b }
         \\fn add3(a: int, b: int, c: int) -> int { return a + b + c }
         \\fn main() -> int {
+        \\    h := 5 |> add(2, _)
+        \\    k := 5 |> add(_, 2)
         \\    x := 1 |> add(2)
         \\    y := 1 |> add3(2, 3)
         \\    z := add(1, 2) |> add(3)
-        \\    return x + y + z
+        \\    return x + y + z + h + k
         \\}
         \\
     ;
     const cases = [_]struct { after: []const u8, label: []const u8, active: u32 }{
+        .{ .after = "h := 5 |> add(2, ", .label = "fn add(int, int) -> int", .active = 1 },
+        .{ .after = "h := 5 |> add(", .label = "fn add(int, int) -> int", .active = 0 },
+        .{ .after = "k := 5 |> add(_, ", .label = "fn add(int, int) -> int", .active = 1 },
+        .{ .after = "k := 5 |> add(", .label = "fn add(int, int) -> int", .active = 0 },
         .{ .after = "1 |> add(", .label = "fn add(int, int) -> int", .active = 1 },
         .{ .after = "1 |> add3(2, ", .label = "fn add3(int, int, int) -> int", .active = 2 },
         .{ .after = "z := add(1, ", .label = "fn add(int, int) -> int", .active = 1 },

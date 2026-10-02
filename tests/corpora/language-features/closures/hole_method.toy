@@ -1,0 +1,31 @@
+# Feature: a '_' capture over a method call captures the receiver like any other argument; a 'mut self' receiver is boxed, so the capture's writes are seen by its owner
+# expect: exit 61
+struct Acc { n: int }
+
+impl Acc {
+    fn plus(self, k: int) -> int { self.n + k }
+    fn add_to(mut self, k: int) { self.n = self.n + k }
+}
+
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn put(mut self, v: T) { self.v = v }
+    fn get(self) -> T { self.v }
+}
+
+fn main() -> int {
+    acc := Acc { n: 10 }
+    plus := acc.plus(_)
+    r1 := plus(5)
+    add := acc.add_to(_)
+    add(3)
+    add(4)
+    o: Option[int] = Option.none
+    d := o.unwrap_or(_)
+    r2 := d(9)
+    b := Box[int] { v: 1 }
+    put := b.put(_)
+    put(20)
+    return r1 + acc.n + r2 + b.get()
+}

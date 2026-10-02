@@ -5375,6 +5375,62 @@ test "a lambda value is fn_addr of <owner>$l0 with a null env" {
     try testing.expect(std.mem.indexOf(u8, ir, "call_indirect") != null);
 }
 
+test "a '_' capture lowers like the lambda it means; a hole pipe is a direct call" {
+    const gpa = testing.allocator;
+    {
+        const ir = try renderLoweredG(gpa,
+            \\fn add(a: int, b: int) -> int { a + b }
+            \\fn f() -> int {
+            \\ g := add(1, _)
+            \\ return g(2)
+            \\}
+            \\
+        , "f");
+        defer gpa.free(ir);
+        try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.f$l0") != null);
+        try testing.expect(std.mem.indexOf(u8, ir, "iconst 0\n  store %") != null);
+        try testing.expect(std.mem.indexOf(u8, ir, "call @gc_alloc(") == null);
+        try testing.expect(std.mem.indexOf(u8, ir, "call @main.add(") == null);
+    }
+    {
+        const ir = try renderLoweredG(gpa,
+            \\fn add(a: int, b: int) -> int { a + b }
+            \\fn f() -> int {
+            \\ a := 5
+            \\ g := add(a, _)
+            \\ return g(2)
+            \\}
+            \\
+        , "f");
+        defer gpa.free(ir);
+        try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.f$l0") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "call @gc_alloc("));
+        // An 8-byte env holding `a`, by value.
+        try testing.expect(std.mem.indexOf(u8, ir,
+            \\  %4 = iconst 8
+            \\  %5 = call @gc_alloc(%4)
+            \\  %6 = field_addr %5, 0 : int
+            \\  %7 = slot_addr s0
+            \\  %8 = load %7 : int
+            \\  store %6, %8 : int
+            \\
+        ) != null);
+    }
+    {
+        const ir = try renderLoweredG(gpa,
+            \\fn add(a: int, b: int) -> int { a + b }
+            \\fn f() -> int {
+            \\ x := 3
+            \\ return x |> add(1, _)
+            \\}
+            \\
+        , "f");
+        defer gpa.free(ir);
+        try testing.expect(std.mem.indexOf(u8, ir, "fn_addr") == null);
+        try testing.expect(std.mem.indexOf(u8, ir, "call @main.add(") != null);
+    }
+}
+
 test "two lambdas and a nested one get ranks 0, 1, 2 in pre-order" {
     const gpa = testing.allocator;
     const src =

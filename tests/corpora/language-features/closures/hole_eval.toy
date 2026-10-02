@@ -1,0 +1,17 @@
+# Feature: the other arguments of a '_' capture are evaluated each time it is called, not when it is made, as in the lambda it means: add(tick(), _) ticks on every call
+# expect: stdout "made\ntick\ntick\n"
+# expect: exit 7
+import std/io
+
+fn tick() -> int {
+    io.println("tick")
+    return 1
+}
+
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() -> int {
+    h := add(tick(), _)
+    io.println("made")
+    return h(2) + h(3)
+}

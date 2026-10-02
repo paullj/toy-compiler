@@ -313,6 +313,17 @@ Env and box cells are word-scanned by the collector, so captured handles, string
 boxes and other closures stay alive with them; a function holds each of its boxes in a
 `rawptr` slot, a precise root.
 
+A `_` that is a whole call argument makes the call a lambda of one parameter, a
+**capture**: `add(1, _)` is `fn(v) { add(1, v) }`, and it is checked and lowered as that
+lambda. Its parameter type is the expected function type's when that is ground, else the
+type the call wants at the `_` (a known function's, method's or constructor's parameter),
+so `inc := add(1, _)` is `fn(int) -> int` with no annotation. A bare generic callee
+gives it none yet (`pair(1, _)` is **T0050**, reported only when nothing else in the call
+is an error; `pair[int](1, _)` works). A capture is still typed by its own call inside a
+bare generic call, so `twice(add(1, _), 5)` infers `T = int`. A `_` at a `mut` position is
+**T0019**, and passing a capture where a non-function is wanted (`neg(add(1, _))`) is
+**T0040** with a hint. `x |> f(a, _)` is the plain call `f(a, x)`. See `closures.md`.
+
 ## Local functions
 
 `fn name(p: P, ..) -> R { .. }` as a statement inside a block declares a local
