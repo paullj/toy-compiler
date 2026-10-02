@@ -249,6 +249,32 @@ test "value-poison: a bare module name used as a value reports (poison() asserte
     try withCheckedGraph(".toy-test-typ-modval", files, "main.toy", Check.run);
 }
 
+test "a method pipe from a module or a module's type is one 'not a value' error" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\ _x := util |> .helper()
+        \\ _y := util.Shape |> .circle(3)
+        \\ return 0
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source = "pub fn helper() -> int { return 1 }\npub enum Shape { circle(int) }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            try testing.expectEqual(@as(usize, 2), tr.diags.len);
+            try testing.expectEqualStrings("module 'util' is not a value, so it cannot be piped; use 'util.helper' directly", tr.diags[0].message);
+            try testing.expectEqualStrings("type 'util.Shape' is not a value, so it cannot be piped; use 'util.Shape.circle' directly", tr.diags[1].message);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-modpipe", files, "main.toy", Check.run);
+}
+
 test "cross-module call typechecks clean and yields the callee return type" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
@@ -693,7 +719,7 @@ test "callee tables are byte-identical at -j1 and -jN" {
         \\}
         \\
     );
-    for (0..70) |k| try src.writer.print("fn _pad{d}(a: Acc) -> int {{ a.plus({d}, 1) + \"x\".len() + ({d}).hash() }}\n", .{ k, k, k });
+    for (0..70) |k| try src.writer.print("fn _pad{d}(a: Acc) -> int {{ a.plus({d}, 1) + (a |> .plus({d}, 2)) + \"x\".len() + ({d}).hash() }}\n", .{ k, k, k, k });
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});

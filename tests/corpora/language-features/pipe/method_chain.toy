@@ -1,0 +1,23 @@
+# Feature: method pipes chain left to right and mix with free-fn targets, on one line or
+# with a leading `|>` on each line: `c |> .add(2) |> .half()` is `c.add(2).half()`.
+# expect: exit 18
+struct C { n: int }
+
+impl C {
+    fn add(self, k: int) -> C { C { n: self.n + k } }
+    fn half(self) -> int { self.n / 2 }
+}
+
+fn wrap(n: int) -> C { C { n: n } }
+fn twice(c: C) -> C { C { n: c.n * 2 } }
+
+fn main() -> int {
+    c := C { n: 1 }
+    a := c |> .add(2) |> .add(3) |> .half()          # (1 + 2 + 3) / 2 = 3
+    b := 4 |> wrap |> .add(1) |> twice |> .half()    # twice(wrap(4).add(1)).half() = 5
+    d := c
+        |> .add(9)
+        |> twice
+        |> .half()                                   # twice(c.add(9)).half() = 10
+    return a + b + d
+}

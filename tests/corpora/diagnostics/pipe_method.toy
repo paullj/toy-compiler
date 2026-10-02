@@ -1,0 +1,16 @@
+struct C { n: int }
+
+impl C {
+    fn add(self, k: int) -> int { self.n + k }
+    fn bump(mut self) { self.n = self.n + 1 }
+}
+
+fn mk() -> C { C { n: 0 } }
+
+fn main() -> int {
+    c := C { n: 1 }
+    mk() |> .bump()          #~ ERROR [T0019] on a temporary
+    c |> .nope()             #~ ERROR [T0018] no method 'nope'
+    _a := c |> .add(1, 2)    #~ ERROR [T0039] expected 1 argument(s), got 2
+    return c.n
+}

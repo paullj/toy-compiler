@@ -7,5 +7,8 @@ fn main() -> int {
     d := 1 |> f().len()      #~ ERROR [P0014] wrap the pipe in parentheses
     e := 1 |> f == 2         #~ ERROR [P0014] wrap the pipe in parentheses
     g := |> f                #~ ERROR [P0014] value on its left
+    h := (1 |> .)            #~ ERROR [P0014] names a method
+    i := 1 |> .0             #~ ERROR [P0014] names a method
+    j := 1 |> .m.n()         #~ ERROR [P0014] wrap the pipe in parentheses
     return 0
 }

@@ -7804,6 +7804,80 @@ test "a hole pipe names the '_' as the piped value and needs no count hint" {
     }
 }
 
+test "a method pipe's errors carry no piped-value hint" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{
+        .{ .body = "_x := c |> .add(1, 2)", .code = .T0039, .want = "expected 1 argument(s), got 2; 'add' takes (int)" },
+        .{ .body = "_x := c |> .add(true)", .code = .T0040, .want = "argument 1: expected int, got bool; 'add' takes (int)" },
+        .{ .body = "c |> .nope()", .code = .T0018, .want = "no method 'nope' on type 'C'" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa, "struct C {{ n: int }}\nimpl C {{ fn add(self, k: int) -> int {{ self.n + k }} }}\nfn f() {{\n c := C {{ n: 1 }}\n {s}\n return\n}}\n", .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer std.debug.print("case: {s}\n", .{cs.body});
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqual(cs.code, c.result.diags[0].code);
+        try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
+    }
+}
+
+test "a mut self method pipe needs a place and marks it mutated" {
+    const gpa = testing.allocator;
+    const pre =
+        \\struct C { n: int }
+        \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
+        \\fn mk() -> C { C { n: 0 } }
+        \\
+    ;
+    const temp = pre ++ "fn main() -> int {\n mk() |> .bump()\n return 0\n}\n";
+    try expectOnlyDiag(temp, .T0019);
+    try expectOneDiag(temp, .T0019, "cannot call mutating method 'bump' on a temporary; the receiver must be a mutable variable (a local or a field of one)");
+    var c = try checkSource(pre ++ "fn main() -> int {\n c := C { n: 0 }\n f := fn() { c |> .bump() }\n f()\n return c.n\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqualSlices(u32, &.{0}, try expectBoxedOnce(&c, 1));
+}
+
+test "a method pipe's turbofish on a generic receiver is T0018, as the written call is" {
+    const pre =
+        \\struct Box[T] { v: T }
+        \\protocol Scale[U] { fn scale(self, k: U) -> U }
+        \\impl Box[T] has Scale[int] { fn scale(self, k: int) -> int { k * 2 } }
+        \\
+    ;
+    for ([_][]const u8{
+        pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b |> .scale[int](3)\n}\n",
+        pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b.scale[int](3)\n}\n",
+    }) |src| {
+        try expectOnlyDiag(src, .T0018);
+        try expectOneDiag(src, .T0018, "'scale' on the generic type 'Box' takes no explicit type arguments yet; drop the '[..]'");
+    }
+    try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b |> .nope[int](3)\n}\n", .T0018, "no method 'nope' on type 'Box'");
+}
+
+test "a method pipe from a type name is one 'not a value' error" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "_s := Shape |> .circle(3)", .want = "type 'Shape' is not a value, so it cannot be piped; use 'Shape.circle' directly" },
+        .{ .body = "_u := Shape |> .sq", .want = "type 'Shape' is not a value, so it cannot be piped; use 'Shape.sq' directly" },
+        .{ .body = "_o: Option[int] = Option |> .some(5)", .want = "type 'Option' is not a value, so it cannot be piped; use 'Option.some' directly" },
+        .{ .body = "_c := C |> .make(true)", .want = "type 'C' is not a value, so it cannot be piped; use 'C.make' directly" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(gpa, "enum Shape {{ circle(int), sq }}\nstruct C {{ n: int }}\nimpl C {{ fn make(k: int) -> C {{ C {{ n: k }} }} }}\nstruct Box[T] {{ v: T }}\nimpl Box[T] {{ fn make(v: T) -> Box[T] {{ Box {{ v: v }} }} }}\nfn main() -> int {{\n {s}\n return 0\n}}\n", .{cs.body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        errdefer for (c.result.diags) |d| std.debug.print("{s}: got {s}: {s}\n", .{ cs.body, @tagName(d.code), d.message });
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        try testing.expectEqualStrings(cs.want, c.result.diags[0].message);
+    }
+    var ok = try checkSource("struct C { n: int }\nimpl C { fn get(self) -> int { self.n } }\nfn main() -> int {\n c := C { n: 1 }\n return c |> .get\n}\n");
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
 test "call-shape checks: one coded diagnostic per failing call, on every call path" {
     const gpa = testing.allocator;
     const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{

@@ -107,9 +107,10 @@ pub const Node = extern struct {
 
         /// Postfix `callee(args...)`. `main_token` is `(`, or `|>` for a piped call
         /// (`x |> f(a)` is `f(x, a)`; the piped value is argument 0, or the argument at
-        /// a written `_`: `x |> f(a, _)` is `f(a, x)`, see `pipedArgIndex`), or 0 for a
-        /// synthetic call. `lhs` is the callee expression node. `rhs` is the `extra`
-        /// header of an args `Range`.
+        /// a written `_`: `x |> f(a, _)` is `f(a, x)`, see `pipedArgIndex`; a method
+        /// pipe's callee is a field_access over the piped value: `x |> .m(a)` is
+        /// `x.m(a)`), or 0 for a synthetic call. `lhs` is the callee expression node.
+        /// `rhs` is the `extra` header of an args `Range`.
         call,
         /// `name := expr`. `main_token` is the name identifier. `lhs` is the
         /// initializer expression. `rhs` is `none`.
@@ -620,10 +621,10 @@ pub fn isHoleTok(tokens: []const Token, src: []const u8, i: usize) bool {
 }
 
 /// Which argument of the piped call at `call` holds the piped value, or null for a
-/// written call. Every token of the piped value precedes the `|>`, and every written
-/// argument (a capture lambda sits on its `_`) follows it, so the one arg whose
-/// `main_token` comes before the `|>` is the piped value: 0 when it was prepended, the
-/// hole's index for `x |> f(a, _)`.
+/// written call and for a method pipe, whose piped value is the receiver. Every token of
+/// the piped value precedes the `|>`, and every written argument (a capture lambda sits
+/// on its `_`) follows it, so the one arg whose `main_token` comes before the `|>` is the
+/// piped value: 0 when it was prepended, the hole's index for `x |> f(a, _)`.
 pub fn pipedArgIndex(tree: Tree, tokens: []const Token, call: Index) ?u32 {
     if (!isPipedCall(tree, tokens, call)) return null;
     const n = tree.nodes[call.int()];
@@ -788,7 +789,7 @@ pub const parse_magic: u32 = 0x544f5950;
 
 /// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
 /// so the writer and the reader can never disagree.
-pub const parse_version: u32 = 22;
+pub const parse_version: u32 = 23;
 
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {

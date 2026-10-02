@@ -1,0 +1,38 @@
+# Feature: a method pipe `x |> .m(args)` is the method call `x.m(args)`: the piped value
+# is the receiver. Without parentheses `x |> .m` calls with no arguments, as `x |> f` does.
+# `a + b |> .m()` pipes the whole `a + b`, so it is `(a + b).m()`.
+# expect: exit 31
+import std/vec
+
+struct C { n: int }
+
+impl C {
+    fn bump(mut self) { self.n = self.n + 1 }
+}
+
+impl C has Into[int] {
+    fn into(self) -> int { self.n * 3 }
+}
+
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn get(self) -> T { self.v }
+}
+
+fn main() -> int {
+    c := C { n: 1 }
+    c |> .bump()                      # c.bump(): n = 2
+    c |> .bump                        # c.bump(): n = 3
+    t := c |> .into[int]()            # c.into[int]() = 9
+    v := Vec[int].new()
+    v.push(1)
+    v |> .push(4)                     # v.push(4)
+    n := v |> .len                    # v.len() = 2
+    b := Box[int] { v: 5 }
+    g := b |> .get()                  # b.get() = 5
+    o: Option[int] = Option.none
+    u := o |> .unwrap_or(7)           # o.unwrap_or(7) = 7
+    ok := 2 + 3 |> .eq(5)             # (2 + 3).eq(5)
+    return c.n + t + n + g + u + if ok { 5 } else { 0 }
+}

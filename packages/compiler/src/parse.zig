@@ -2418,10 +2418,10 @@ fn parseCall(p: *Parser, callee: Ast.Index) Error!Ast.Index {
     const lparen = p.index;
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
-    const hole = try p.parseCallArgs(&args, null);
+    const hole = try p.parseCallArgs(&args, .capture);
     const header = try p.addRange(args.items);
     const call = try p.addNode(.{ .tag = .call, .main_token = lparen, .lhs = callee, .rhs = header });
-    if (hole) |h| return p.wrapCapture(call, p.nodes.items[args.items[h].int()].main_token, lparen);
+    if (hole) |tok| return p.wrapCapture(call, tok, lparen);
     return call;
 }
 
@@ -2450,9 +2450,19 @@ fn atHole(p: *const Parser) bool {
 
 const err_capture_twice = "a call takes one '_'; write the lambda out, as in fn(a: int, b: int) { f(a, b) }";
 
-/// `( arg, .. )`, appended to `args`. Returns the index of the call's `_` hole, if any;
-/// a second one is P0016. A pipe passes its lhs as `fill`, which takes the hole's place.
-fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index), fill: ?Ast.Index) Error!?u32 {
+/// What a whole-argument `_` means in a call's `( .. )`.
+const Holes = union(enum) {
+    /// It makes the call a capture.
+    capture,
+    /// A pipe's lhs takes its place.
+    fill: Ast.Index,
+    /// None is allowed: a method pipe's piped value is already the receiver.
+    forbidden,
+};
+
+/// `( arg, .. )`, appended to `args`. Returns the `_` token of the call's hole, if any;
+/// a second `_`, or any `_` when `holes` is `.forbidden`, is P0016.
+fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index), holes: Holes) Error!?u32 {
     p.bump(.l_paren);
     // The call's `( )` open a fresh expression context, so re-allow blocks/if-exprs
     // in arguments even inside an if/while condition (`no_block`); restore after.
@@ -2463,15 +2473,18 @@ fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index), fill: ?Ast.Index) 
         const entry = p.index;
         if (p.atHole()) {
             const tok = p.index;
-            if (hole != null) {
-                try p.warn(p.peek(), .P0016, err_capture_twice);
+            if (holes == .forbidden or hole != null) {
+                try p.warn(p.peek(), .P0016, if (holes == .forbidden) err_pipe_method_hole else err_capture_twice);
                 try args.append(p.gpa, try p.leaf(.identifier, tok));
             } else {
-                hole = @intCast(args.items.len);
-                if (fill) |f| {
-                    p.advance();
-                    try args.append(p.gpa, f);
-                } else try args.append(p.gpa, try p.leaf(.identifier, tok));
+                hole = tok;
+                switch (holes) {
+                    .fill => |f| {
+                        p.advance();
+                        try args.append(p.gpa, f);
+                    },
+                    else => try args.append(p.gpa, try p.leaf(.identifier, tok)),
+                }
             }
             _ = p.eat(.comma);
         } else if (p.startsExpr()) {
@@ -2494,13 +2507,17 @@ const err_pipe_target = "pipe target must be a function or a call";
 const err_pipe_extended = err_pipe_target ++ "; wrap the pipe in parentheses to use its result";
 const err_pipe_no_lhs = "a pipe needs a value on its left";
 const err_pipe_stmt_lhs = "only a value can be piped, and this statement has none";
+const err_pipe_method_name = "a method pipe names a method after the '.', as in 'x |> .len()'";
+const err_pipe_method_hole = "a method pipe passes the piped value as the receiver, so its arguments take no '_'";
 
 /// `lhs |> path [(args)] [?]`, the cursor just past `|>`, where `path` is dotted names
-/// with at most one turbofish (`f[int]`, `Option[int].some`). Desugars to a `.call`
-/// with `lhs` as argument 0, or at the `_` hole (packages/docs/pipe.md). `main_token` is the `|>` token,
-/// not `(`: that is how later stages tell a piped call from a written one without a
-/// new node tag. `lhs` is older than every RHS node, so children still precede parents.
+/// with at most one turbofish (`f[int]`, `Option[int].some`), or `.m` for a method pipe.
+/// Desugars to a `.call` with `lhs` as argument 0, or at the `_` hole, or as the
+/// receiver (packages/docs/pipe.md). `main_token` is the `|>` token, not `(`: that is how
+/// later stages tell a piped call from a written one without a new node tag. `lhs` is
+/// older than every RHS node, so children still precede parents.
 fn parsePipeRhs(p: *Parser, lhs: Ast.Index, pipe_tok: u32) Error!Ast.Index {
+    if (p.at(.dot)) return p.parseMethodPipe(lhs, pipe_tok);
     if (!p.at(.identifier)) {
         const at_tok = p.index;
         if (pipe_target_recovery.contains(p.peek().tag)) {
@@ -2528,9 +2545,34 @@ fn parsePipeRhs(p: *Parser, lhs: Ast.Index, pipe_tok: u32) Error!Ast.Index {
     var args: std.ArrayList(Ast.Index) = .empty;
     defer args.deinit(p.gpa);
     if (p.at(.l_paren)) {
-        if (try p.parseCallArgs(&args, lhs) == null) try args.insert(p.gpa, 0, lhs);
+        if (try p.parseCallArgs(&args, .{ .fill = lhs }) == null) try args.insert(p.gpa, 0, lhs);
     } else try args.append(p.gpa, lhs);
-    const header = try p.addRange(args.items);
+    return p.finishPipe(callee, args.items, pipe_tok);
+}
+
+/// `lhs |> .m[T](args)` is `lhs.m[T](args)`: the piped value is the receiver. Without
+/// `(args)` it calls with none, as `x |> f` does.
+fn parseMethodPipe(p: *Parser, lhs: Ast.Index, pipe_tok: u32) Error!Ast.Index {
+    if (p.peek2().tag != .identifier) {
+        const dot_tok = p.index;
+        try p.warn(p.peek(), .P0014, err_pipe_method_name);
+        p.bump(.dot);
+        _ = p.eat(.number);
+        return p.addNode(.{ .tag = .error_node, .main_token = dot_tok, .lhs = Ast.none, .rhs = Ast.none });
+    }
+    var callee = try p.parseFieldAccess(lhs);
+    if (p.at(.l_bracket)) callee = try p.parseTypeApp(callee);
+
+    var args: std.ArrayList(Ast.Index) = .empty;
+    defer args.deinit(p.gpa);
+    if (p.at(.l_paren)) _ = try p.parseCallArgs(&args, .forbidden);
+    return p.finishPipe(callee, args.items, pipe_tok);
+}
+
+/// The piped `.call` over `callee` and `args`, then the optional `?` and the
+/// fixed-shape check both target forms share.
+fn finishPipe(p: *Parser, callee: Ast.Index, args: []const Ast.Index, pipe_tok: u32) Error!Ast.Index {
+    const header = try p.addRange(args);
     var result = try p.addNode(.{ .tag = .call, .main_token = pipe_tok, .lhs = callee, .rhs = header });
     if (p.at(.question)) {
         const q = p.index;
@@ -3380,7 +3422,7 @@ test "generic struct literal `Box[int]{..}` still parses as a type_app head (not
 
 test "root is program and children precede parents" {
     const gpa = testing.allocator;
-    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\nfn g() {\n f := add(1, _)\n y := 2 |> add(1, _)\n}\n";
+    const source = "fn add(a: int, b: int) -> int {\n return a + b\n}\nfn g() {\n f := add(1, _)\n y := 2 |> add(1, _)\n z := y |> .m[int](1)? |> .n\n}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     const tree = try expectTree(gpa, tokens, source);
@@ -5363,6 +5405,9 @@ test "fix-suggesting parse codes: category, count, and hint text" {
         .{ .src = "fn a() {\n  *r = v\n}\n", .code = .P0015, .hint = "r.set(v)" },
         .{ .src = "fn a() {\n  y := add(_, _)\n}\n", .code = .P0016, .hint = "a call takes one '_'" },
         .{ .src = "fn a() {\n  y := x |> f(_, _)\n}\n", .code = .P0016, .hint = "a call takes one '_'" },
+        .{ .src = "fn a() {\n  y := x |> .0\n}\n", .code = .P0014, .hint = "names a method" },
+        .{ .src = "fn a() {\n  y := x |> .m(_)\n}\n", .code = .P0016, .hint = "take no '_'" },
+        .{ .src = "fn a() {\n  y := x |> .m(_, _)\n}\n", .code = .P0016, .hint = "take no '_'" },
     };
     for (cases) |c| {
         const res = try parseResult(gpa, c.src);
@@ -5458,6 +5503,29 @@ test "pipe desugars to a call with the lhs as argument 0" {
     try expectSexpr("x |> f |> g(a)", "(call g (call f x) a)");
 }
 
+test "a method pipe desugars to a method call on the piped value" {
+    try expectSexpr("x |> .m", "(call (. x m))");
+    try expectSexpr("x |> .m(a, b)", "(call (. x m) a b)");
+    try expectSexpr("x |> .m[int](a)", "(call (tyapp (. x m) int) a)");
+    try expectSexpr("x |> .m()?", "(try (call (. x m)))");
+    try expectSexpr("x |> .a() |> .b(1)", "(call (. (call (. x a)) b) 1)");
+    try expectSexpr("a + b |> .m()", "(call (. (+ a b) m))");
+    try expectSexpr("x |> .m(g(_))", "(call (. x m) (lambda ((param _)) _ (block (call g _))))");
+    try expectSexpr("x |> .a() |> f(1)", "(call f (call (. x a)) 1)");
+
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "x |> .m(a)", "x |> .m", "x |> .m[int](a, b)" }) |src| {
+        const tokens = try Lexer.tokenize(gpa, src);
+        defer gpa.free(tokens);
+        var diag: ?Diagnostic = null;
+        const tree = (try parseExprOnly(gpa, tokens, src, &diag)) orelse return error.UnexpectedParseFailure;
+        defer freeTree(gpa, tree);
+        const call = Ast.root(tree.nodes);
+        try testing.expect(Ast.isPipedCall(tree, tokens, call));
+        try testing.expectEqual(@as(?u32, null), Ast.pipedArgIndex(tree, tokens, call));
+    }
+}
+
 test "pipe binds loosest and associates left" {
     try expectSexpr("a + b |> f", "(call f (+ a b))");
     try expectSexpr("y == x |> f", "(call f (== y x))");
@@ -5489,6 +5557,10 @@ test "multi-line pipes parse as one statement" {
         "fn f() -> int {\n  return x\n    |> g\n}\n",
         "(program (fn f () int (block (return (call g x)))))",
     );
+    try expectProgram(
+        "fn f() {\n  y := x\n    |> .abs\n}\n",
+        "(program (fn f () _ (block (:= y (call (. x abs))))))",
+    );
 }
 
 test "P0014: invalid pipe forms report exactly one diagnostic" {
@@ -5511,6 +5583,14 @@ test "P0014: invalid pipe forms report exactly one diagnostic" {
         "fn a() {\n  g(|> f)\n}\n",
         "fn a() {\n  y := x |> |> |> f\n}\n",
         "fn a() {\n  y := x |> f[int][bool]\n}\n",
+        "fn a() {\n  y := (x |> .)\n}\n",
+        "fn a() {\n  y := x |> .0\n}\n",
+        "fn a() {\n  y := x |> .0()\n}\n",
+        "fn a() {\n  y := x |> .m.n()\n}\n",
+        "fn a() {\n  y := x |> .m().n()\n}\n",
+        "fn a() {\n  y := x |> .m == y\n}\n",
+        "fn a() {\n  y := x |> .m[int][bool]\n}\n",
+        "fn a() {\n  y := x |> .m(1)(2)\n}\n",
     };
     for (srcs) |src| {
         const res = try parseResult(gpa, src);
