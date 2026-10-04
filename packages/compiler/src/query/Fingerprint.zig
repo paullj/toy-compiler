@@ -898,11 +898,11 @@ test "a changed capture offset flips the fold" {
     var moved = unit;
     moved.env = &env_b;
     moved.env_size = 32;
-    const fa = try Closure.ownerFacts(gpa, &.{unit}, &.{});
+    const fa = try Closure.ownerFacts(gpa, &.{unit}, .{}, false);
     defer gpa.free(fa);
-    const fb = try Closure.ownerFacts(gpa, &.{moved}, &.{});
+    const fb = try Closure.ownerFacts(gpa, &.{moved}, .{}, false);
     defer gpa.free(fb);
-    const fa2 = try Closure.ownerFacts(gpa, &.{unit}, &.{});
+    const fa2 = try Closure.ownerFacts(gpa, &.{unit}, .{}, false);
     defer gpa.free(fa2);
     const h: u64 = 0x1234;
     try testing.expect(foldClosure(h, fa) != foldClosure(h, fb));

@@ -1,0 +1,27 @@
+# Feature: a closure env kept in the caller's frame keeps its Vec, str, Ref and closure captures alive across collections in the callee
+# expect: exit 41
+import std/vec
+import std/ref
+import core/mem_selftest
+
+fn each_gc(xs: Vec[int], f: fn(int)) {
+    for x in xs {
+        _c := mem_selftest.churn_collects()
+        f(x)
+    }
+}
+
+fn adder(k: int) -> fn(int) -> int {
+    fn(v: int) -> int { v + k }
+}
+
+fn main() -> int {
+    v: Vec[int] = [10, 20]
+    s := "ab".concat("c")
+    r := Ref.new(5)
+    g := adder(1)
+    total := 0
+    each_gc([1, 2], fn(x: int) { total = total + x + v[0] + s.len() + r.get() + g(0) })
+    _n := mem_selftest.forced_collect_count()
+    return total
+}

@@ -988,9 +988,10 @@ test "fn_ref/value callee tables and the adapter table are identical at -j1 and 
     try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.value)] >= 140);
 }
 
-/// The lambda-unit table and every lambda node's reified type (by layout name) of one
-/// check of `graph` under a `limit`-worker pool, as bytes. Requires an error-free check.
-fn lambdaTablesUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_units: *usize) ![]u8 {
+/// The lambda-unit table (with each frame env's layout name), the owners' unboxable and
+/// escaping sets, and every lambda node's reified type (by layout name) of one check of
+/// `graph` under a `limit`-worker pool, as bytes. Requires an error-free check.
+fn lambdaTablesUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_units: *usize, n_stack: *usize) ![]u8 {
     var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
     defer threaded.deinit();
     var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
@@ -1009,8 +1010,18 @@ fn lambdaTablesUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *Re
         for (u.env) |es| {
             try out.appendSlice(gpa, std.mem.asBytes(&es.slot));
             try out.appendSlice(gpa, std.mem.asBytes(&es.off));
+            try out.appendSlice(gpa, @tagName(es.mode));
             try out.appendSlice(gpa, if (es.ty.isStruct()) tr.layouts[es.ty.struct_id].name else @tagName(es.ty.kind));
         }
+        if (u.frame_env) |sid| {
+            try out.appendSlice(gpa, tr.layouts[sid].name);
+            n_stack.* += 1;
+        }
+    }
+    for (tr.owner_closures) |oc| {
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.unboxable));
+        try out.append(gpa, 0xff);
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.kept_boxed));
     }
     for (graph.modules, 0..) |m, mi| for (m.nodes, 0..) |n, k| {
         if (n.tag != .lambda) continue;
@@ -1041,6 +1052,8 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
     // its own (so fn types intern in racing order) and a nested one that captures through
     // its parent, plus two `_` captures typed from their calls; the generic `wrap` holds a
     // capturing lambda, so its units (and their env layouts) follow the instance order.
+    // The generic `keep` pushes its arg, so the lambda each body hands it escapes through
+    // that instance's summary while the others keep frame envs.
     var src: std.Io.Writer.Allocating = .init(gpa);
     defer src.deinit();
     try src.writer.writeAll(
@@ -1056,6 +1069,7 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
         \\    }
         \\    id(x)
         \\}
+        \\fn keep[T](xs: Vec[T], x: T) { xs.push(x) }
         \\
     );
     for (1..70) |k| try src.writer.print("pub struct S{d} {{ v: int }}\n", .{k});
@@ -1072,7 +1086,9 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
         \\    acc := Acc {{ n: {d} }}
         \\    h := add(base.v, _)
         \\    p := acc.plus(_)
-        \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v + h(1) + p(2)
+        \\    ks: Vec[fn() -> int] = []
+        \\    keep(ks, fn() -> int {{ base.v }})
+        \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v + h(1) + p(2) + ks[0]()
         \\}}
         \\
     , .{ k, k, k, k, k, k, k, k, k, k });
@@ -1093,14 +1109,19 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
 
     var serial_n: usize = 0;
     var parallel_n: usize = 0;
-    const serial = try lambdaTablesUnder(gpa, &graph, &r, .limited(0), &serial_n);
+    var serial_stack: usize = 0;
+    var parallel_stack: usize = 0;
+    const serial = try lambdaTablesUnder(gpa, &graph, &r, .limited(0), &serial_n, &serial_stack);
     defer gpa.free(serial);
-    const parallel = try lambdaTablesUnder(gpa, &graph, &r, .limited(8), &parallel_n);
+    const parallel = try lambdaTablesUnder(gpa, &graph, &r, .limited(8), &parallel_n, &parallel_stack);
     defer gpa.free(parallel);
     try testing.expectEqualSlices(u8, serial, parallel);
-    // Five per `_u` body, plus one per `wrap` instance (int and each S{k}).
-    try testing.expectEqual(@as(usize, 70 * 5 + 71), serial_n);
+    // Six per `_u` body, plus one per `wrap` instance (int and each S{k}).
+    try testing.expectEqual(@as(usize, 70 * 6 + 71), serial_n);
     try testing.expectEqual(serial_n, parallel_n);
+    // Per `_u` body every lambda but `g`'s returned one and the kept one; every `id`.
+    try testing.expectEqual(@as(usize, 70 * 4 + 71), serial_stack);
+    try testing.expectEqual(serial_stack, parallel_stack);
 }
 
 fn ownerClosuresUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_owners: *usize) ![]u8 {
@@ -1112,22 +1133,32 @@ fn ownerClosuresUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *R
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     for (tr.owner_closures) |oc| {
-        // A `_u` body boxes `total`, `s`, `c` and the for-in `x`; a `keep` instance its `x`.
+        // A `_u` body boxes `total`, `s`, `c` and the for-in `x`, and only `x` is captured
+        // by a closure that escapes (pushed); a `keep` instance boxes its `x` for a called
+        // closure.
         switch (oc.owner) {
             .base => |gid| {
                 try testing.expectEqual(@as(usize, 4), oc.boxed.len);
+                try testing.expectEqual(@as(usize, 3), oc.unboxable.len);
+                try testing.expectEqual(@as(usize, 1), oc.kept_boxed.len);
                 try out.print(gpa, "b{d}:", .{gid});
             },
             .instance => |k| {
                 try testing.expectEqualSlices(u32, &.{0}, oc.boxed);
+                try testing.expectEqualSlices(u32, &.{0}, oc.unboxable);
                 try out.print(gpa, "i{s}:", .{tr.instances[k].name.?});
             },
         }
         for (oc.boxed) |sl| try out.print(gpa, "{d},", .{sl});
+        try out.appendSlice(gpa, "u");
+        for (oc.unboxable) |sl| try out.print(gpa, "{d},", .{sl});
+        try out.appendSlice(gpa, "e");
+        for (oc.kept_boxed) |sl| try out.print(gpa, "{d},", .{sl});
     }
     for (tr.lambda_units) |u| {
         try out.appendSlice(gpa, u.name);
         for (u.env) |es| try out.print(gpa, "({d} {s} {d})", .{ es.slot, @tagName(es.mode), es.off });
+        if (u.frame_env) |sid| try out.print(gpa, "[{s}]", .{tr.layouts[sid].name});
     }
     n_owners.* = tr.owner_closures.len;
     return out.toOwnedSlice(gpa);

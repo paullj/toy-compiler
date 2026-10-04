@@ -10,11 +10,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const harness = @import("harness.zig");
 
 /// Compile `entry_src` (written into a fresh temp dir) with the installed `toy`, run the
 /// produced binary, and return its exit code. Skips when `toy` is absent (the corpus
 /// gate builds it first) or off aarch64-macos (the only backend target).
 fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8) !u8 {
+    return buildAndRunWith(gpa, io, dir_name, entry_src, &.{});
+}
+
+/// `buildAndRun` with extra build `flags`.
+fn buildAndRunWith(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8, flags: []const []const u8) !u8 {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
     Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
     const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
@@ -31,7 +37,9 @@ fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: 
     const out_bin = try std.fmt.allocPrint(gpa, "{s}/prog", .{dir_name});
     defer gpa.free(out_bin);
     {
-        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "build", main_path, "-o", out_bin }, .stdout = .pipe, .stderr = .pipe });
+        const argv = try std.mem.concat(gpa, []const u8, &.{ &.{ bin_abs, "build", main_path, "-o", out_bin }, flags });
+        defer gpa.free(argv);
+        var child = try std.process.spawn(io, .{ .argv = argv, .stdout = .pipe, .stderr = .pipe });
         const term = try child.wait(io);
         if (term != .exited or term.exited != 0) return error.CompileFailed;
     }
@@ -563,8 +571,9 @@ test "fn-value programs are byte-identical at -j1 and -j8" {
 
 /// Closure GC-pressure fixtures. Every victim env is an 8- or 16-byte cell; `churn` makes
 /// 20000 closures whose 8-byte envs hold junk, so a victim env swept for want of a root
-/// is reused and overwritten before the victim is called. `collect` forces one collection
-/// and then churns.
+/// is reused and overwritten before the victim is called. Each churn closure escapes
+/// through `keep_one`, or at -O1 its env would sit in `churn`'s frame and overwrite no
+/// cell. `collect` forces one collection and then churns.
 const closure_gc_prelude =
     \\import std/vec
     \\import std/map
@@ -573,12 +582,13 @@ const closure_gc_prelude =
     \\fn make_adder(n: int) -> Op {
     \\    fn(x: int) -> int { x + n }
     \\}
+    \\fn keep_one(f: fn() -> int) -> fn() -> int { f }
     \\fn churn() -> int {
     \\    i := 0
     \\    loop {
     \\        if i >= 20000 { break }
     \\        j := i + 1000
-    \\        _g := fn() -> int { j }
+    \\        _g := keep_one(fn() -> int { j })
     \\        i = i + 1
     \\    }
     \\    return mem_selftest.churn_collects()
@@ -591,14 +601,23 @@ const closure_gc_prelude =
     \\
 ;
 
+/// Each fixture runs at -O0 and at -O1, where its closures that do not escape keep their
+/// envs in frame slots that the collections read through the frames' root maps.
 fn expectClosureGc(dir_name: []const u8, main_src: []const u8) !void {
+    try expectClosureGcAt(dir_name, main_src, &.{});
+    const o1_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}-O1", .{dir_name});
+    defer std.testing.allocator.free(o1_dir);
+    try expectClosureGcAt(o1_dir, main_src, &.{"-O1"});
+}
+
+fn expectClosureGcAt(dir_name: []const u8, main_src: []const u8, flags: []const []const u8) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const src = try std.mem.concat(gpa, u8, &.{ closure_gc_prelude, main_src });
     defer gpa.free(src);
-    const code = try buildAndRun(gpa, io, dir_name, src);
+    const code = try buildAndRunWith(gpa, io, dir_name, src, flags);
     try std.testing.expectEqual(@as(u8, 42), code);
 }
 
@@ -1004,4 +1023,72 @@ test "gc: an enum word that is a container in one variant only is word-scanned" 
         const code = try buildAndRun(gpa, io, dir, cs.src);
         try std.testing.expectEqual(cs.want, code);
     }
+}
+
+test "gc: at -O1 a lambda whose Vec, str, Ref and closure captures sit in a frame env runs across collections in its callee" {
+    const main_src =
+        \\import std/ref
+        \\fn each_gc(xs: Vec[int], f: fn(int)) {
+        \\    for x in xs {
+        \\        if !collect() { return }
+        \\        f(x)
+        \\    }
+        \\}
+        \\fn main() -> int {
+        \\    v: Vec[int] = [10, 20]
+        \\    s := "ab".concat("c")
+        \\    r := Ref.new(5)
+        \\    g := make_adder(1)
+        \\    total := 0
+        \\    each_gc([1, 2], fn(x: int) { total = total + x + v[1] + s.len() + r.get() + g(0) })
+        \\    # (1 + 20 + 3 + 5 + 1) + (2 + 20 + 3 + 5 + 1) = 61
+        \\    return total - 19
+        \\}
+        \\
+    ;
+    try expectClosureGcAt(".toy-test-gc-frame-env", main_src, &.{"-O1"});
+    // `main`'s own slots root the same values as the env's copies, so this run cannot see
+    // a missing env root (the `Closure.envStruct` and FrameLayout unit tests pin the env's
+    // root typing); it pins that the env it ran was a frame env.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const dir = ".toy-test-gc-frame-env-ir";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const src = try std.mem.concat(gpa, u8, &.{ closure_gc_prelude, main_src });
+    defer gpa.free(src);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/main.toy", .data = src });
+    const o1 = try harness.emitIr(gpa, io, dir ++ "/main.toy", &.{"-O1"});
+    defer gpa.free(o1);
+    const o0 = try harness.emitIr(gpa, io, dir ++ "/main.toy", &.{"-O0"});
+    defer gpa.free(o0);
+    const body1 = harness.irBody(o1, "main") orelse return error.TestExpectedMain;
+    const body0 = harness.irBody(o0, "main") orelse return error.TestExpectedMain;
+    try std.testing.expect(std.mem.indexOf(u8, body1, ":env$main$l0") != null);
+    // The env cell and `total`'s box are gone.
+    try std.testing.expectEqual(std.mem.count(u8, body0, "call @gc_alloc"), std.mem.count(u8, body1, "call @gc_alloc") + 2);
+}
+
+test "gc: a capturing lambda passed to a generic fn survives a collection in it" {
+    try expectClosureGc(".toy-test-gc-generic-arg",
+        \\fn twice_gc[T](f: fn(T) -> T, x: T) -> T {
+        \\    y := f(x)
+        \\    if !collect() { return x }
+        \\    f(y)
+        \\}
+        \\fn main() -> int {
+        \\    n := 20
+        \\    s := "ab".concat("c")
+        \\    a := twice_gc(fn(x: int) -> int { x + n + s.len() - 3 }, 2)
+        \\    if a != 42 { return 1 }
+        \\    b := twice_gc(make_adder(21), 0)
+        \\    if b != 42 { return 2 }
+        \\    return a
+        \\}
+        \\
+    );
 }

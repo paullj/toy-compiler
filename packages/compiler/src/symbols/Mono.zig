@@ -18,6 +18,7 @@ const Ast = @import("../ast/Ast.zig");
 const Type = @import("../layout/Type.zig").Type;
 const Callee = @import("Callee.zig").Callee;
 const Infer = @import("Infer.zig");
+const Sig = @import("Sig.zig").Sig;
 
 /// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
 /// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
@@ -89,6 +90,13 @@ pub const Instance = struct {
 /// from the `FnSym` (`generic_params.len`); the fingerprint fold from the `Sig`
 /// (`Sig.genericParamCount`) — they agree for any call that survives Pass C.
 pub const TemplateRef = struct { params: []const Type, count: u32 };
+
+/// Fn `gid`'s template facts from the `Sig` table, or null when it is no generic
+/// template: the `genericTemplate` of every view that has only the sigs on hand.
+pub fn templateRef(sigs: []const Sig, gid: u32) ?TemplateRef {
+    if (gid >= sigs.len or !sigs[gid].isGenericTemplate()) return null;
+    return .{ .params = sigs[gid].params, .count = sigs[gid].genericParamCount() };
+}
 
 /// A recovered generic call site: the template `gid` and its concrete type-args
 /// (OWNED — the caller frees `args`).

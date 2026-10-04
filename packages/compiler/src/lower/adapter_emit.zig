@@ -35,7 +35,7 @@ pub fn lowerAdapter(
 
     const self_n: usize = switch (a.kind) {
         .fn_value => 0,
-        .bound_copy, .bound_box => 1,
+        .bound_copy, .bound_box, .bound_ref => 1,
     };
     const args = try gpa.alloc(Ir.Operand, self_n + a.sig.params.len);
     errdefer gpa.free(args);
@@ -49,7 +49,8 @@ pub fn lowerAdapter(
 
 /// The `self` a bound adapter passes: the address of the receiver for a `mut self`
 /// method, else its value. A `.bound_copy` env holds the receiver itself; a `.bound_box`
-/// env holds the pointer to the boxed local's cell, where the receiver lives.
+/// env holds the pointer to the boxed local's cell, where the receiver lives; a
+/// `.bound_ref` env holds the address of the `mut` param it lives in, as an `int`.
 fn receiverOperand(b: *L.Builder, a: Closure.Adapter, env_slot: Ir.SlotId) error{OutOfMemory}!Ir.Operand {
     const rawptr = Typecheck.Type.rawptr;
     const env_addr = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
@@ -57,6 +58,7 @@ fn receiverOperand(b: *L.Builder, a: Closure.Adapter, env_slot: Ir.SlotId) error
     const recv_addr = switch (a.kind) {
         .bound_copy => env,
         .bound_box => try b.emit(.{ .load = .{ .addr = env, .ty = rawptr } }, rawptr),
+        .bound_ref => try b.emit(.{ .load = .{ .addr = env, .ty = Typecheck.Type.int } }, Typecheck.Type.int),
         .fn_value => unreachable,
     };
     if (a.mut_self) return .{ .value = recv_addr };
@@ -212,4 +214,50 @@ test "a boxed adapter reads the receiver through its cell: the address for mut s
     try testing.expectEqual(@as(usize, 0), diags.items.len);
     const text = try renderFn(&f2, in, &buf);
     try testing.expect(std.mem.indexOf(u8, text, "%3 = load %2 : rawptr\n  %4 = load %3 : int\n  %5 = call @main.int.get(%4)") != null);
+}
+
+test "a bound_ref adapter loads the receiver address from its env as int and passes it as self" {
+    const gpa = testing.allocator;
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    const in = adapterInputs(&.{});
+    const bump: Closure.Adapter = .{
+        .kind = .bound_ref,
+        .key = 1,
+        .name = "main.C.bump$boundref",
+        .target = .{ .kind = .user_fn, .name = "main.C.bump" },
+        .sig = .{ .params = &.{}, .ret = Typecheck.Type.unit },
+        .recv = Typecheck.Type.structT(0),
+        .mut_self = true,
+    };
+    var f1 = try lowerAdapter(gpa, in, bump, .{ .kind = .user_fn, .name = bump.name }, &diags);
+    defer f1.deinit(gpa);
+    var buf: [2048]u8 = undefined;
+    try testing.expectEqualStrings(
+        \\fn main.C.bump$boundref(s0) -> unit {
+        \\  slots: s0:rawptr
+        \\b0:
+        \\  %0 = slot_addr s0
+        \\  %1 = load %0 : rawptr
+        \\  %2 = load %1 : int
+        \\  call @main.C.bump(%2)
+        \\  br b1
+        \\b1:
+        \\  ret
+        \\}
+        \\
+    , try renderFn(&f1, in, &buf));
+    const get: Closure.Adapter = .{
+        .kind = .bound_ref,
+        .key = 2,
+        .name = "main.int.get$boundref",
+        .target = .{ .kind = .user_fn, .name = "main.int.get" },
+        .sig = .{ .params = &.{}, .ret = Typecheck.Type.int },
+        .recv = Typecheck.Type.int,
+    };
+    var f2 = try lowerAdapter(gpa, in, get, .{ .kind = .user_fn, .name = get.name }, &diags);
+    defer f2.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    const text = try renderFn(&f2, in, &buf);
+    try testing.expect(std.mem.indexOf(u8, text, "%3 = load %2 : int\n  %4 = load %3 : int\n  %5 = call @main.int.get(%4)") != null);
 }

@@ -1,0 +1,14 @@
+# Feature: SHOULD FAIL — a closure pushed into a Vec outlives the call, so it cannot capture a `mut` param (T0052)
+# expect: compile-error "a closure that escapes cannot capture the 'mut' parameter 'n'"
+import std/vec
+
+fn add_later(mut n: int, fs: Vec[fn()]) {
+    fs.push(fn() { n = n + 1 })
+}
+
+fn main() -> int {
+    fs: Vec[fn()] = []
+    t := 0
+    add_later(t, fs)
+    return t
+}

@@ -1,0 +1,40 @@
+# Feature: a bound method value on a `mut` param or `mut self` that does not escape holds the caller's variable by address
+# expect: stdout "7\n2\n9\n"
+# expect: exit 18
+import std/io
+
+struct P { x: int }
+
+impl P {
+    fn get(self) -> int { self.x }
+    fn bump(mut self) { self.x = self.x + 1 }
+    fn bump_twice(mut self) {
+        g := self.bump
+        g()
+        g()
+    }
+}
+
+fn run(f: fn() -> int) -> int { f() }
+
+fn later(mut p: P) -> int {
+    g := p.get
+    p = P { x: 7 }
+    g()
+}
+
+fn through(mut p: P) -> int {
+    p.x = p.x + 4
+    run(p.get)
+}
+
+fn main() -> int {
+    a := P { x: 1 }
+    io.println(later(a))
+    b := P { x: 0 }
+    b.bump_twice()
+    io.println(b.x)
+    c := P { x: 5 }
+    io.println(through(c))
+    return a.x + b.x + c.x
+}

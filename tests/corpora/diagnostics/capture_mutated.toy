@@ -1,16 +1,19 @@
 struct P { x: int }
 struct C { n: int }
+struct H { f: fn() }
 
 impl C {
     fn bump(mut self) { self.n = self.n + 1 }
     fn get(self) -> int { self.n }
-    fn peek(mut self) -> int {
-        f := fn() -> int { self.n }  #~ ERROR [T0052] a closure cannot capture the 'mut self' receiver 'self'
-        f()
+    fn peek(mut self) -> fn() -> int {
+        fn() -> int { self.n }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut self' receiver 'self'
     }
-    fn poke(mut self) {
-        g := fn() { self.bump() }  #~ ERROR [T0052] a closure cannot capture the 'mut self' receiver 'self'
-        g()
+    fn poke(mut self, h: H) {
+        h.f = fn() { self.bump() }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut self' receiver 'self'
+    }
+    fn look(mut self) -> int {
+        f := fn() -> int { self.n }
+        f()
     }
     fn copy_first(mut self) -> int {
         n := self.n
@@ -33,5 +36,7 @@ fn main() -> int {
     c.bump()
     d := C { n: 0 }
     _k := fn() { d.bump() }
-    return a + c.n + c.peek() + c.copy_first()
+    pk := c.peek()
+    c.poke(H { f: fn() {} })
+    return a + c.n + pk() + c.look() + c.copy_first()
 }

@@ -272,9 +272,8 @@ pub const BodyChecker = struct {
     /// The local slots a call writes through: the root of a `mut self` receiver place or
     /// of a `mut` argument. A captured one must be boxed like an assigned one.
     mutated_roots: std.ArrayList(u32) = .empty,
-    /// The locals a bound method value captures as its receiver (`f := acc.plus`), each
-    /// with its receiver node.
-    bound_roots: std.ArrayList(BoundRoot) = .empty,
+    /// The locals a bound method value captures as its receiver (`f := acc.plus`).
+    bound_roots: std.ArrayList(u32) = .empty,
     /// The locals an assignment writes (`x = ..`, or a place store rooted at `x`).
     assigned_roots: std.ArrayList(u32) = .empty,
     /// The assignment target being typed, or none: the member it names is a field, never a
@@ -367,8 +366,6 @@ pub const BodyChecker = struct {
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
 
-    pub const BoundRoot = struct { slot: u32, recv: Ast.Index };
-
     pub fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
@@ -413,10 +410,11 @@ pub const BodyChecker = struct {
     /// assigned (`x = ..`, a place store rooted at it, a `mut self` call on it, a `mut`
     /// argument rooted at it) is boxed instead, into `bc.boxed`. A bound method value
     /// captures its local receiver the same way. A `mut` param's slot (`mut self`
-    /// included) holds the caller's address, not a value a cell could hold, so any capture
-    /// of it is an error, reported at its first captured use in source order. A bounded
-    /// template's abstract check skips this: each instance re-check decides for itself (the
-    /// sink dedups repeated reports), and a template that reported here would be poisoned.
+    /// included) holds the caller's address, not a value a cell could hold, so it is never
+    /// boxed: the closure holds the address, which is legal only if the closure never
+    /// outlives the call. That depends on other fns' bodies, so the serial escape pass
+    /// decides it (T0052), not this per-body check. A bounded template's abstract check
+    /// skips this: each instance re-check decides for itself.
     fn classifyCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
         if (bc.abstract_template) return;
         if (bc.closures == null and bc.bound_roots.items.len == 0) return;
@@ -433,33 +431,21 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(by_rank);
             for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
             for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
+                if (c.slot < proto.params.len and Modes.isMut(place_params, c.slot)) continue;
                 if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
-                if (c.slot < proto.params.len and Modes.isMut(place_params, c.slot)) {
-                    try bc.reportMutParamCapture(c.first_use);
-                } else if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutated_roots.items, c.slot)) {
+                if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutated_roots.items, c.slot)) {
                     try bc.boxed.append(bc.gpa, c.slot);
                 }
             };
         }
-        for (bc.bound_roots.items) |br| {
-            if ((try seen.getOrPut(bc.gpa, br.slot)).found_existing) continue;
-            if (br.slot < proto.params.len and Modes.isMut(place_params, br.slot)) {
-                try bc.reportMutParamCapture(br.recv);
-            } else if (Closure.contains(assigned, br.slot) or Closure.contains(bc.mutated_roots.items, br.slot)) {
-                try bc.boxed.append(bc.gpa, br.slot);
+        for (bc.bound_roots.items) |slot| {
+            if (slot < proto.params.len and Modes.isMut(place_params, slot)) continue;
+            if ((try seen.getOrPut(bc.gpa, slot)).found_existing) continue;
+            if (Closure.contains(assigned, slot) or Closure.contains(bc.mutated_roots.items, slot)) {
+                try bc.boxed.append(bc.gpa, slot);
             }
         }
         std.mem.sort(u32, bc.boxed.items, {}, std.sort.asc(u32));
-    }
-
-    fn reportMutParamCapture(bc: *BodyChecker, use_idx: Ast.Index) error{OutOfMemory}!void {
-        const use = bc.tree.nodes[use_idx.int()];
-        const name = bc.nameText(use.main_token);
-        if (std.mem.eql(u8, name, "self")) {
-            try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut self' receiver '{s}'; copy it to a local first", .{name});
-        } else {
-            try bc.sink.report(.{ .span = bc.tokSpan(use.main_token), .code = .T0052 }, "a closure cannot capture the 'mut' parameter '{s}'; copy it to a local first", .{name});
-        }
     }
 
     /// Sort `items` in place and drop repeats, returning the deduped prefix.
@@ -1885,7 +1871,7 @@ pub const BodyChecker = struct {
             };
             try bc.mutated_roots.append(bc.gpa, slot);
         }
-        if (local) |slot| try bc.bound_roots.append(bc.gpa, .{ .slot = slot, .recv = recv });
+        if (local) |slot| try bc.bound_roots.append(bc.gpa, slot);
         return true;
     }
 

@@ -139,6 +139,12 @@ pub const ClosureInputs = struct {
     /// A spec unit's own targets, ascending by param: a call of one of these params jumps
     /// straight to its code. Empty for every other body.
     spec_targets: []const Spec.Target = &.{},
+    /// A lambda whose unit has a `frame_env` keeps its env in a frame slot of that struct
+    /// type instead of a GC cell.
+    frame_envs: bool = false,
+    /// The owner's locals that `boxed` leaves out because every closure capturing them
+    /// holds their address instead (resolver slots, ascending).
+    unboxed: []const u32 = &.{},
 
     pub const none: ClosureInputs = .{ .adapters = &.{}, .lambda_units = &.{} };
 };
@@ -174,22 +180,29 @@ pub const Builder = struct {
     /// The ADDRESS slots: a slot that holds a pointer to a local's storage rather than the
     /// local itself, which `rootAddr` loads through so every use reaches that storage.
     /// There are two kinds. `place_slots` holds each `mut` param's slot (`mut self`
-    /// included): typed `int` rather than the param's type, so the scalar/1-GPR ABI
-    /// carries the caller's place address. That address may point into the caller's frame
-    /// or into a cell's interior, so it must never be a GC root: a place slot never enters
-    /// `box_slots`. `box_slots` holds each boxed local's slot: typed `rawptr`, so the precise
+    /// included), typed `int` rather than the param's type, so the scalar/1-GPR ABI
+    /// carries the caller's place address; in a lambda unit it also holds each capture the
+    /// env passes by address (a captured `mut` param, or a local the owner keeps unboxed),
+    /// typed `int` the same way. That address may point into a frame or into a cell's
+    /// interior, so it must never be a GC root: a place slot never enters `box_slots`. `box_slots` holds each boxed local's slot: typed `rawptr`, so the precise
     /// root map keeps the local's GC cell alive. A body with neither has no address slot,
     /// and every slot access takes today's direct path.
     place_slots: std.AutoHashMapUnmanaged(Ir.SlotId, void) = .empty,
     box_slots: std.AutoHashMapUnmanaged(Ir.SlotId, void) = .empty,
-    /// Set when a param other than `self` is `mut`. Two place slots can then name one
-    /// caller storage (`flip(q, q)`), so an aggregate store through a place slot builds the
-    /// whole value aside before writing any of it.
+    /// Set when a param other than `self` is `mut`, or when a lambda unit captures one by
+    /// address. Two place slots can then name one caller storage (`flip(q, q)`), so an
+    /// aggregate store through a place slot builds the whole value aside before writing any
+    /// of it. A capture of an unboxed local is never staged, as its box is not at -O0.
     staged_places: bool = false,
-    /// Resolver locals that a call in this unit passes as a `mut` argument. A plain
-    /// aggregate local is read by slot at the call instruction, after a later argument's
-    /// call has run, so a by-value read of one of these copies it on the spot instead.
-    mut_arg_roots: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// The owner fn's `mut` params (`Modes.ofProto`): a bound method value on one holds
+    /// its address.
+    owner_places: u64 = 0,
+    /// Resolver locals a call's later argument may write before the call reads them: each
+    /// local a call in this unit passes as a `mut` argument, and each local the owner keeps
+    /// unboxed (a closure an argument calls may write it, as through its box at -O0). A
+    /// plain aggregate local is read by slot at the call instruction, after a later
+    /// argument's call has run, so a by-value read of one of these copies it on the spot.
+    copy_on_read_roots: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     /// resolutions[].local index → the IR slot bound to that local. Allocated
     /// lazily the first time a local is touched (so id order tracks source order).
@@ -234,7 +247,7 @@ pub const Builder = struct {
         b.local_slots.deinit(b.gpa);
         b.place_slots.deinit(b.gpa);
         b.box_slots.deinit(b.gpa);
-        b.mut_arg_roots.deinit(b.gpa);
+        b.copy_on_read_roots.deinit(b.gpa);
         b.loops.deinit(b.gpa);
     }
 
@@ -415,6 +428,7 @@ pub fn lowerFn(
         try b.local_slots.put(gpa, @intCast(i), sid);
     }
 
+    b.owner_places = Modes.ofProto(in.tree, in.tokens, proto);
     const blocks = try openBodyBlocks(&b, ret_type);
     if (b.in.closure.boxed.len != 0) {
         const lis = try gpa.alloc(u32, params.items.len);
@@ -423,6 +437,7 @@ pub fn lowerFn(
         try boxParams(&b, lis, params.items, decl.main_token);
     }
     try noteMutArgRoots(&b, decl.rhs);
+    try noteUnboxedRoots(&b);
     try lowerBodyInto(&b, decl.rhs, ret_type, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
@@ -453,11 +468,13 @@ pub fn lowerLambda(
         try b.local_slots.put(gpa, li, sid);
     }
     const lam = in.tree.nodes[unit.node.int()];
+    b.owner_places = Modes.ofProto(in.tree, in.tokens, Ast.protoAt(in.tree, in.tree.nodes[unit.fn_node.int()].lhs.int()));
     const blocks = try openBodyBlocks(&b, unit.sig.ret);
     try bindCaptures(&b, unit, env_slot);
     if (unit.self_slot) |ss| try bindSelf(&b, unit, ss, env_slot);
     try boxParams(&b, unit.param_slots, params.items[1..], lam.main_token);
     try noteMutArgRoots(&b, lam.rhs);
+    try noteUnboxedRoots(&b);
     try lowerBodyInto(&b, lam.rhs, unit.sig.ret, blocks.exit);
     return try finishFn(&b, gpa, sym, &params, blocks.entry, blocks.exit);
 }
@@ -465,14 +482,19 @@ pub fn lowerLambda(
 /// A lambda unit's prologue: copy each capture out of the env into a local slot of its
 /// own and bind the owner's slot to it, so the body (and any lambda nested in it, which
 /// copies from these slots in turn) reads captures like any local. A boxed capture's slot
-/// is an address slot holding the cell pointer instead, shared with the owner.
+/// is an address slot holding the cell pointer instead, shared with the owner; a captured
+/// `mut` param, or a local this lowering keeps unboxed, is a place slot holding its address.
 fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) error{OutOfMemory}!void {
     if (unit.env_size == 0) return;
     const tok = b.in.tree.nodes[unit.node.int()].main_token;
     const env_sa = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
     const env = try b.emit(.{ .load = .{ .addr = env_sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
-    for (unit.env) |es| {
-        if (es.mode == .box) {
+    for (unit.env) |es| switch (es.mode) {
+        // A non-self `mut` param's stores are staged in its owner, so they are here too.
+        .ref => try bindAddressCapture(b, es, env, !isSelfParam(b, unit.fn_node, es.slot)),
+        .box => if (Closure.contains(b.in.closure.unboxed, es.slot)) {
+            try bindAddressCapture(b, es, env, false);
+        } else {
             const sid = try b.addSlot(Typecheck.Type.rawptr);
             try b.box_slots.put(b.gpa, sid, {});
             try b.local_slots.put(b.gpa, es.slot, sid);
@@ -480,14 +502,36 @@ fn bindCaptures(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) erro
             const cell = try b.emit(.{ .load = .{ .addr = src, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
             const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
             _ = try b.emit(.{ .store = .{ .addr = dst, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
-            continue;
-        }
-        const sid = try b.addSlot(es.ty);
-        try b.local_slots.put(b.gpa, es.slot, sid);
-        const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
-        const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
-        try copyCapture(b, dst, src, es.ty, tok);
-    }
+        },
+        .copy => {
+            const sid = try b.addSlot(es.ty);
+            try b.local_slots.put(b.gpa, es.slot, sid);
+            const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
+            const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+            try copyCapture(b, dst, src, es.ty, tok);
+        },
+    };
+}
+
+/// Bind the address env slot `es` holds as a place slot, the shape a `mut` param has, so
+/// every use loads through it.
+fn bindAddressCapture(b: *Builder, es: Closure.EnvSlot, env: Ir.ValueId, staged: bool) error{OutOfMemory}!void {
+    const sid = try b.addSlot(Typecheck.Type.int);
+    try b.place_slots.put(b.gpa, sid, {});
+    try b.local_slots.put(b.gpa, es.slot, sid);
+    if (staged) b.staged_places = true;
+    const src = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+    const addr = try b.emit(.{ .load = .{ .addr = src, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+    const dst = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+    _ = try b.emit(.{ .store = .{ .addr = dst, .val = addr, .ty = Typecheck.Type.int } }, null);
+}
+
+/// Whether resolver slot `slot` is the `self` receiver of the fn at `fn_node`.
+fn isSelfParam(b: *const Builder, fn_node: Ast.Index, slot: u32) bool {
+    if (slot != 0) return false;
+    const proto = Ast.protoAt(b.in.tree, b.in.tree.nodes[fn_node.int()].lhs.int());
+    if (proto.params.len == 0) return false;
+    return std.mem.eql(u8, b.in.tokens[b.in.tree.nodes[proto.params[0].int()].main_token].text(b.in.source), "self");
 }
 
 /// A local fn's prologue: its own name reads as the pair of its code and the env it was
@@ -590,13 +634,13 @@ pub fn finishFn(
     b.local_slots.deinit(gpa);
     b.place_slots.deinit(gpa);
     b.box_slots.deinit(gpa);
-    b.mut_arg_roots.deinit(gpa);
+    b.copy_on_read_roots.deinit(gpa);
     b.loops.deinit(gpa);
     b.blocks = .empty;
     b.local_slots = .empty;
     b.place_slots = .empty;
     b.box_slots = .empty;
-    b.mut_arg_roots = .empty;
+    b.copy_on_read_roots = .empty;
     b.loops = .empty;
     b.slots = .empty;
     b.values = .empty;
@@ -843,7 +887,7 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
             // boxed local): the slot holds a POINTER, not the value, so copy the pointee
             // into a fresh temp and yield that. An ordinary aggregate local is passed by
             // slot directly (no copy).
-            if (b.isAddrSlot(slot) or readsMutArgRoot(b, node_idx)) {
+            if (b.isAddrSlot(slot) or readsCopyOnReadRoot(b, node_idx)) {
                 const tmp = try b.addSlot(ty);
                 const dst = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
                 _ = try b.emit(.{ .copy = .{ .dst = dst, .src = try rootAddr(b, slot), .ty = ty } }, null);
@@ -2699,29 +2743,47 @@ fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
     };
     const unit = b.in.closure.lambda_units[ui];
     if (unit.env_size == 0) return try emitFnPair(b, unit.name, ty, null);
-    const env = try emitGcAlloc(b, unit.env_size);
+    const env = if (b.in.closure.frame_envs and unit.frame_env != null)
+        try b.emit(.{ .slot_addr = try b.addSlot(Typecheck.Type.structT(unit.frame_env.?)) }, Typecheck.Type.int)
+    else
+        try emitGcAlloc(b, unit.env_size);
     for (unit.env) |es| {
         const sid = b.local_slots.get(es.slot) orelse {
             try b.note(n.main_token, "captured local has no slot in lower");
             continue;
         };
-        // A place address must not outlive the call that lent it (T0052 rejects the capture).
-        std.debug.assert(!b.isPlaceSlot(sid));
-        if (es.mode == .box) {
-            if (!b.isBoxSlot(sid)) {
-                try b.note(n.main_token, "boxed capture has no cell in lower");
-                continue;
-            }
-            const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
-            const sa = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
-            const cell = try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
-            _ = try b.emit(.{ .store = .{ .addr = dst, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
-            continue;
+        switch (es.mode) {
+            .ref => try storeEnvAddress(b, env, es, sid),
+            .box => if (Closure.contains(b.in.closure.unboxed, es.slot)) {
+                try storeEnvAddress(b, env, es, sid);
+            } else {
+                if (!b.isBoxSlot(sid)) {
+                    try b.note(n.main_token, "boxed capture has no cell in lower");
+                    continue;
+                }
+                const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
+                const sa = try b.emit(.{ .slot_addr = sid }, Typecheck.Type.int);
+                const cell = try b.emit(.{ .load = .{ .addr = sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
+                _ = try b.emit(.{ .store = .{ .addr = dst, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
+            },
+            .copy => {
+                // Only an address word may come from a place slot: a copy would read the
+                // caller's storage once, and T0052 keeps an escaping closure from holding
+                // the address.
+                std.debug.assert(!b.isPlaceSlot(sid));
+                const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
+                try copyCapture(b, dst, try rootAddr(b, sid), es.ty, n.main_token);
+            },
         }
-        const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
-        try copyCapture(b, dst, try rootAddr(b, sid), es.ty, n.main_token);
     }
     return try emitFnPair(b, unit.name, ty, env);
+}
+
+/// Store the address of local slot `sid`'s storage into env slot `es`, typed `int` so the
+/// word is never a root.
+fn storeEnvAddress(b: *Builder, env: Ir.ValueId, es: Closure.EnvSlot, sid: Ir.SlotId) error{OutOfMemory}!void {
+    const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.int } }, Typecheck.Type.int);
+    _ = try b.emit(.{ .store = .{ .addr = dst, .val = try valueAddr(b, sid), .ty = Typecheck.Type.int } }, null);
 }
 
 /// Copy one captured value of type `ty` from `src` to `dst` (both addresses): a scalar or
@@ -2793,26 +2855,41 @@ fn boundMethodRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
 fn lowerBoundValue(b: *Builder, node_idx: Ast.Index, mi: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const n = b.in.tree.nodes[(node_idx).int()];
     const recv_local = Closure.boundRecvLocal(b.in.tree, b.in.resolutions, node_idx);
-    const kind = Closure.boundKind(recv_local, b.in.closure.boxed);
+    const kind = Closure.boundKind(recv_local, b.in.closure.boxed, b.owner_places);
     const ai = Closure.findAdapter(b.in.closure.adapters, kind, mi) orelse {
         try b.note(n.main_token, "bound method has no adapter in lower");
         return .none;
     };
     const recv_ty = b.in.node_types[(n.lhs).int()];
-    if (kind == .bound_box) {
-        const sid = try bindingSlot(b, n.lhs, recv_ty);
-        if (!b.isBoxSlot(sid)) {
-            try b.note(n.main_token, "bound receiver has no cell in lower");
-            return .none;
-        }
-        const cell = try rootAddr(b, sid);
-        const env = try emitGcAlloc(b, 8);
-        _ = try b.emit(.{ .store = .{ .addr = env, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
-        return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
+    switch (kind) {
+        .bound_box => {
+            const sid = try bindingSlot(b, n.lhs, recv_ty);
+            if (!b.isBoxSlot(sid)) {
+                try b.note(n.main_token, "bound receiver has no cell in lower");
+                return .none;
+            }
+            const cell = try rootAddr(b, sid);
+            const env = try emitGcAlloc(b, 8);
+            _ = try b.emit(.{ .store = .{ .addr = env, .val = cell, .ty = Typecheck.Type.rawptr } }, null);
+            return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
+        },
+        .bound_ref => {
+            const sid = try bindingSlot(b, n.lhs, recv_ty);
+            if (!b.isPlaceSlot(sid)) {
+                try b.note(n.main_token, "bound mut receiver has no place in lower");
+                return .none;
+            }
+            const env = try emitGcAlloc(b, 8);
+            _ = try b.emit(.{ .store = .{ .addr = env, .val = try valueAddr(b, sid), .ty = Typecheck.Type.int } }, null);
+            return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
+        },
+        .bound_copy => {
+            const env = try emitGcAlloc(b, @max(8, Abi.typeSize(recv_ty, b.in.layouts, b.in.enum_layouts)));
+            try lowerExprInto(b, n.lhs, env, recv_ty);
+            return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
+        },
+        .fn_value => unreachable,
     }
-    const env = try emitGcAlloc(b, @max(8, Abi.typeSize(recv_ty, b.in.layouts, b.in.enum_layouts)));
-    try lowerExprInto(b, n.lhs, env, recv_ty);
-    return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
 }
 
 /// `==` on function values is identity: both the code and the env words match.
@@ -4120,7 +4197,7 @@ fn placeRootLocal(b: *const Builder, node_idx: Ast.Index) ?u32 {
     }
 }
 
-/// Fill `mut_arg_roots` from every call in `body`.
+/// Put each local a call in `body` passes as a `mut` argument into `copy_on_read_roots`.
 fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
     const Visitor = struct {
         b: *Builder,
@@ -4133,19 +4210,25 @@ fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
             if (mask == 0) return;
             const args = Ast.rangeSlice(v.b.in.tree, v.b.in.tree.nodes[c.call.int()].rhs.int());
             for (args, 0..) |a, i| if (Modes.isMut(mask, i)) if (placeRootLocal(v.b, a)) |li|
-                try v.b.mut_arg_roots.put(v.b.gpa, li, {});
+                try v.b.copy_on_read_roots.put(v.b.gpa, li, {});
         }
     };
     var v: Visitor = .{ .b = b };
     try AstWalk.walk(.{ .tree = b.in.tree, .tokens = b.in.tokens, .source = b.in.source }, body, &v);
 }
 
+/// An unboxed local is read by slot like any plain one, but a closure a later argument
+/// calls may write it, as through its box at -O0, so a by-value read copies it on the spot.
+fn noteUnboxedRoots(b: *Builder) error{OutOfMemory}!void {
+    for (b.in.closure.unboxed) |li| try b.copy_on_read_roots.put(b.gpa, li, {});
+}
+
 /// Whether a by-value read of the local `node_idx` names must copy it now (see
-/// `mut_arg_roots`).
-fn readsMutArgRoot(b: *const Builder, node_idx: Ast.Index) bool {
-    if (b.mut_arg_roots.count() == 0) return false;
+/// `copy_on_read_roots`).
+fn readsCopyOnReadRoot(b: *const Builder, node_idx: Ast.Index) bool {
+    if (b.copy_on_read_roots.count() == 0) return false;
     return switch (b.in.resolutions[node_idx.int()]) {
-        .local => |li| b.mut_arg_roots.contains(li),
+        .local => |li| b.copy_on_read_roots.contains(li),
         else => false,
     };
 }
@@ -4156,7 +4239,8 @@ fn stagesStore(b: *const Builder, place: Ast.Index) bool {
     if (!b.staged_places) return false;
     const li = placeRootLocal(b, place) orelse return false;
     const sid = b.local_slots.get(li) orelse return false;
-    return b.isPlaceSlot(sid);
+    // An unboxed local's store is unstaged, as through its box at -O0.
+    return b.isPlaceSlot(sid) and !Closure.contains(b.in.closure.unboxed, li);
 }
 
 /// Produce the aggregate `value` into a fresh temp, then copy it to `dst`, so `value`
@@ -5202,7 +5286,7 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }) },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerStorage(tc.owner_closures, .{ .base = @intCast(gid) }, false).boxed },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -5222,6 +5306,11 @@ fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void 
 /// can assert on SUBSTRINGS (used for the desugar shapes, where the exact id
 /// numbering is not the point). Caller frees the returned slice.
 fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) ![]u8 {
+    return renderLoweredGAt(gpa, src, fn_name, false);
+}
+
+/// `renderLoweredG` with frame storage on or off, as the driver chooses it per opt level.
+fn renderLoweredGAt(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8, frame: bool) ![]u8 {
     const Lexer = @import("lex.zig");
     const Parser = @import("parse.zig");
 
@@ -5259,6 +5348,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
     }
     const gid = target_gid orelse return error.TestUnexpectedResult;
 
+    const st = Closure.ownerStorage(tc.owner_closures, .{ .base = @intCast(gid) }, frame);
     const in = Inputs{
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
         .tokens = tokens,
@@ -5275,7 +5365,7 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }) },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = st.boxed, .unboxed = st.unboxed, .frame_envs = frame },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -5294,6 +5384,11 @@ fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) 
 /// Lower the lambda unit named `unit_name` (a base owner's) and return its rendered IR,
 /// gpa-owned. Mirrors `Codegen.renderGraphIr`'s lambda class.
 fn renderLambdaG(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8) ![]u8 {
+    return renderLambdaGAt(gpa, src, unit_name, false);
+}
+
+/// `renderLambdaG` with frame storage on or off, as the driver chooses it per opt level.
+fn renderLambdaGAt(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8, frame: bool) ![]u8 {
     const Lexer = @import("lex.zig");
     const Parser = @import("parse.zig");
 
@@ -5325,6 +5420,7 @@ fn renderLambdaG(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8)
     } else return error.TestUnexpectedResult;
     const u = tc.lambda_units[ui];
     try testing.expect(u.owner == .base);
+    const st = Closure.ownerStorage(tc.owner_closures, u.owner, frame);
 
     const in = Inputs{
         .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
@@ -5341,7 +5437,7 @@ fn renderLambdaG(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8)
         .methods = tc.methods,
         .derives = tc.derives,
         .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = Closure.ownerBoxed(tc.owner_closures, u.owner) },
+        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = st.boxed, .unboxed = st.unboxed, .frame_envs = frame },
     };
 
     var diags: std.ArrayList(Diagnostic) = .empty;
@@ -7391,4 +7487,225 @@ test "a lambda target receives the env from the pair" {
         \\}
         \\
     , ir);
+}
+
+test "with frame storage a non-escaping env is a frame slot and its mutated capture is unboxed" {
+    const gpa = testing.allocator;
+    const src =
+        \\fn run(f: fn()) { f() }
+        \\fn main() -> int {
+        \\ t := 0
+        \\ run(fn() { t = t + 1 })
+        \\ return t
+        \\}
+        \\
+    ;
+    const heap = try renderLoweredGAt(gpa, src, "main", false);
+    defer gpa.free(heap);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, heap, "call @gc_alloc"));
+    const frame = try renderLoweredGAt(gpa, src, "main", true);
+    defer gpa.free(frame);
+    try testing.expect(std.mem.indexOf(u8, frame, "call @gc_alloc") == null);
+    try testing.expect(std.mem.indexOf(u8, frame, "s0:int s1:env$main$l0 s2:fn$unit") != null);
+    // The env word is t's address, stored as an int so it is never a root.
+    try testing.expect(std.mem.indexOf(u8, frame, "%3 = slot_addr s1\n  %4 = field_addr %3, 0 : int\n  %5 = slot_addr s0\n  store %4, %5 : int") != null);
+}
+
+test "with frame storage a by-value read of an unboxed aggregate copies it first" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct P { x: int, y: int }
+        \\fn show(p: P, z: int) -> int { p.x + z }
+        \\fn main() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ poke := fn() -> int {
+        \\  p.x = 9
+        \\  0
+        \\ }
+        \\ return show(p, poke())
+        \\}
+        \\
+    ;
+    const frame = try renderLoweredGAt(gpa, src, "main", true);
+    defer gpa.free(frame);
+    try testing.expect(std.mem.indexOf(u8, frame, "call @gc_alloc") == null);
+    try testing.expect(std.mem.indexOf(u8, frame, "copy ") != null);
+}
+
+test "with frame storage an unboxed capture is an int place slot in the lambda whose aggregate stores are not staged" {
+    const gpa = testing.allocator;
+    // The `mut` param turns staging on for the lambda; only its store is staged.
+    const src =
+        \\struct P { x: int, y: int }
+        \\fn run(f: fn()) { f() }
+        \\fn f(mut q: P) -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ run(fn() {
+        \\  p = P { x: p.y, y: p.x }
+        \\  q = P { x: q.y, y: q.x }
+        \\ })
+        \\ return p.x
+        \\}
+        \\fn main() -> int {
+        \\ c := P { x: 3, y: 4 }
+        \\ return f(c)
+        \\}
+        \\
+    ;
+    const cell = try renderLambdaGAt(gpa, src, "main.f$l0", false);
+    defer gpa.free(cell);
+    try testing.expect(std.mem.indexOf(u8, cell, "slots: s0:rawptr s1:int s2:rawptr") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, cell, "copy "));
+    const addr = try renderLambdaGAt(gpa, src, "main.f$l0", true);
+    defer gpa.free(addr);
+    try testing.expect(std.mem.indexOf(u8, addr, "slots: s0:rawptr s1:int s2:int") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, addr, "copy "));
+}
+
+test "a .ref capture is an int place slot in the lambda, and a non-self .ref stages aggregate stores like its owner" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct P { x: int, y: int }
+        \\fn run(f: fn()) { f() }
+        \\impl P {
+        \\ fn flip(mut self) {
+        \\  run(fn() { self = P { x: self.y, y: self.x } })
+        \\ }
+        \\}
+        \\fn swap(mut a: P) {
+        \\ run(fn() { a = P { x: a.y, y: a.x } })
+        \\}
+        \\fn swap2(mut a: P) {
+        \\ a = P { x: a.y, y: a.x }
+        \\}
+        \\fn main() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ p.flip()
+        \\ swap(p)
+        \\ swap2(p)
+        \\ return p.x
+        \\}
+        \\
+    ;
+    // The env word is the caller's address, read as an int into a place slot; the new
+    // value is built whole in a temp and then copied through that address.
+    const lam = try renderLambdaG(gpa, src, "main.swap$l0");
+    defer gpa.free(lam);
+    try testing.expect(std.mem.indexOf(u8, lam, "slots: s0:rawptr s1:int s2:P\n") != null);
+    try testing.expect(std.mem.indexOf(u8, lam, "%2 = field_addr %1, 0 : int\n  %3 = load %2 : int\n  %4 = slot_addr s1\n  store %4, %3 : int\n") != null);
+    try testing.expect(std.mem.indexOf(u8, lam, "copy %6 <- %18 : P\n") != null);
+    const own = try renderLoweredG(gpa, src, "swap2");
+    defer gpa.free(own);
+    try testing.expect(std.mem.indexOf(u8, own, "slots: s0:int s1:P\n") != null);
+    try testing.expect(std.mem.indexOf(u8, own, "copy %1 <- %13 : P\n") != null);
+    // A `mut self` owner writes its receiver in place, so its lambda does too.
+    const self_lam = try renderLambdaG(gpa, src, "main.P.flip$l0");
+    defer gpa.free(self_lam);
+    try testing.expect(std.mem.indexOf(u8, self_lam, "slots: s0:rawptr s1:int\n") != null);
+    try testing.expect(std.mem.indexOf(u8, self_lam, "copy ") == null);
+}
+
+test "a bound value on a mut param stores the place address in an 8-byte heap env" {
+    const gpa = testing.allocator;
+    const ir = try renderLoweredG(gpa,
+        \\struct P { x: int }
+        \\impl P { fn get(self) -> int { self.x } }
+        \\fn f(mut c: P) -> int {
+        \\ g := c.get
+        \\ return g()
+        \\}
+        \\fn main() -> int {
+        \\ c := P { x: 1 }
+        \\ return f(c)
+        \\}
+        \\
+    , "f");
+    defer gpa.free(ir);
+    try testing.expect(std.mem.indexOf(u8, ir,
+        \\  %2 = iconst 8
+        \\  %3 = call @gc_alloc(%2)
+        \\  %4 = slot_addr s0
+        \\  %5 = load %4 : int
+        \\  store %3, %5 : int
+        \\  %6 = slot_addr s2
+        \\  %7 = fn_addr @main.P.get$boundref
+        \\
+    ) != null);
+}
+
+test "Escape.callTarget names the unit lowerCall calls" {
+    const gpa = testing.allocator;
+    const Escape = @import("symbols/Escape.zig");
+    const Lexer = @import("lex.zig");
+    const Parser = @import("parse.zig");
+    const src =
+        \\struct Vec[T] { x: T }
+        \\struct Bag[T] { x: T }
+        \\struct C { n: int }
+        \\impl C {
+        \\ fn run(self, f: fn(int)) { f(self.n) }
+        \\}
+        \\impl Bag[T] {
+        \\ fn each(self, f: fn(T)) { f(self.x) }
+        \\ fn make(x: T, f: fn(T)) -> Bag[T] {
+        \\  f(x)
+        \\  Bag { x: x }
+        \\ }
+        \\}
+        \\fn run(f: fn(int)) { f(2) }
+        \\fn each[T](xs: Vec[T], f: fn(T)) { f(xs.x) }
+        \\fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+        \\fn main() -> int {
+        \\ t := 0
+        \\ run(fn(v: int) { t = t + v })
+        \\ each(Vec { x: 3 }, fn(v: int) { t = t + v })
+        \\ a := apply[int](fn(v: int) -> int { v + t }, 4)
+        \\ c := C { n: 5 }
+        \\ c.run(fn(v: int) { t = t + v })
+        \\ bag := Bag.make(6, fn(v: int) { t = t + v })
+        \\ bag.each(fn(v: int) { t = t + v })
+        \\ return t + a
+        \\}
+        \\
+    ;
+    const ir = try renderLoweredG(gpa, src, "main");
+    defer gpa.free(ir);
+
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+    const t: Ast.Tree = .{ .nodes = tree.nodes, .extra = tree.extra };
+    var fe = try frontEnd(gpa, tokens, t, src);
+    defer fe.deinit(gpa);
+    const rr = fe.resolve;
+    const tc = fe.typecheck;
+    const view: Typecheck.EscapeView = .{ .tree = t, .resolutions = rr.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0], .sigs = tc.sigs, .instances = tc.instances, .methods = tc.methods, .layouts = tc.layouts };
+    const is_base = try gpa.alloc(bool, rr.fns.len);
+    defer gpa.free(is_base);
+    for (rr.fns, is_base, 0..) |f, *b, i| b.* = f.decl_node != Ast.none and f.kind == .user_fn and !tc.sigs[i].isGenericTemplate();
+    const units: Escape.Units = .{ .is_base = is_base };
+
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    for (tree.nodes, 0..) |n, k| {
+        if (n.tag != .call or n.lhs == Ast.none) continue;
+        const passes_fn = for (Ast.rangeSlice(t, n.rhs.int())) |a| {
+            if (LayoutEngine.isFnStruct(tc.node_types[0][a.int()], tc.layouts)) break true;
+        } else false;
+        if (!passes_fn) continue;
+        const target = (try Escape.callTarget(gpa, &view, units, Ast.Index.from(@intCast(k)))) orelse return error.TestExpectedTarget;
+        const sym = if (target.unit < rr.fns.len) rr.fns[target.unit].name else tc.instances[target.unit - rr.fns.len].name.?;
+        var buf: [128]u8 = undefined;
+        const call = try std.fmt.bufPrint(&buf, "call @{s}(", .{sym});
+        if (std.mem.indexOf(u8, ir, call) == null) {
+            std.debug.print("callTarget names {s}, lower calls something else:\n{s}\n", .{ sym, ir });
+            return error.TestUnexpectedResult;
+        }
+        try got.print(gpa, "{s}/{d} ", .{ sym, target.self_n });
+    }
+    try testing.expectEqualStrings("main.run/0 main.each$int/0 main.apply$int/0 main.C.run/1 main.Bag.make$int/0 main.Bag.each$int/1 ", got.items);
 }

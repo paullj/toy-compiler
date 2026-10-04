@@ -34,6 +34,7 @@ const Sig = @import("symbols/Sig.zig").Sig;
 pub const Callee = @import("symbols/Callee.zig").Callee;
 const Closure = @import("symbols/Closure.zig");
 const Modes = @import("symbols/Modes.zig");
+const Escape = @import("symbols/Escape.zig");
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
@@ -651,7 +652,7 @@ fn buildAdapters(
                 .target = .{ .kind = fns[k.key].kind, .name = fns[k.key].name },
                 .sig = .{ .params = sigs[k.key].params, .ret = sigs[k.key].ret },
             },
-            .bound_copy, .bound_box => {
+            .bound_copy, .bound_box, .bound_ref => {
                 const m = methods[k.key];
                 const target = witnessSym(m, derives, instances, fns).?;
                 const sig = witnessSig(m, derives, instances, sigs).?;
@@ -687,6 +688,7 @@ fn collectBound(
         resolutions: []const Resolution,
         callees: []const Callee,
         boxed: []const u32,
+        places: u64,
         keys: @TypeOf(keys),
         pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
             const e = switch (ev) {
@@ -696,14 +698,15 @@ fn collectBound(
             if (e.idx.int() >= self.callees.len) return;
             switch (self.callees[e.idx.int()].view()) {
                 .bound_method => |mi| try self.keys.append(self.gpa, .{
-                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.boxed),
+                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.boxed, self.places),
                     .key = mi,
                 }),
                 .none, .method, .protocol, .builtin, .value, .fn_ref => {},
             }
         }
     };
-    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .callees = callees, .boxed = boxed, .keys = keys };
+    const places = Modes.ofProto(mc.tree, mc.tokens, Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int()));
+    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .callees = callees, .boxed = boxed, .places = places, .keys = keys };
     try AstWalk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, decl, &v);
 }
 
@@ -758,23 +761,263 @@ fn buildOwnerClosures(
     fsyms: []const FnSym,
     base_boxed: []const []const u32,
     instances: []const Mono.Instance,
+    unboxable: []const []const u32,
 ) ![]Closure.OwnerClosure {
     var out: std.ArrayList(Closure.OwnerClosure) = .empty;
     errdefer {
-        for (out.items) |oc| gpa.free(oc.boxed);
+        for (out.items) |oc| {
+            gpa.free(oc.boxed);
+            gpa.free(oc.unboxable);
+            gpa.free(oc.kept_boxed);
+        }
         out.deinit(gpa);
     }
     for (base_boxed, 0..) |bx, gid| {
         if (bx.len == 0 or !isBaseOwner(fns[gid], fsyms[gid])) continue;
         try out.ensureUnusedCapacity(gpa, 1);
-        out.appendAssumeCapacity(.{ .owner = .{ .base = @intCast(gid) }, .boxed = try gpa.dupe(u32, bx) });
+        out.appendAssumeCapacity(try ownerClosure(gpa, .{ .base = @intCast(gid) }, bx, unboxable[gid]));
     }
     for (instances, 0..) |inst, k| {
         if (inst.boxed.len == 0) continue;
         try out.ensureUnusedCapacity(gpa, 1);
-        out.appendAssumeCapacity(.{ .owner = .{ .instance = @intCast(k) }, .boxed = try gpa.dupe(u32, inst.boxed) });
+        out.appendAssumeCapacity(try ownerClosure(gpa, .{ .instance = @intCast(k) }, inst.boxed, unboxable[fns.len + k]));
     }
     return out.toOwnedSlice(gpa);
+}
+
+fn ownerClosure(gpa: std.mem.Allocator, owner: Closure.Owner, boxed: []const u32, unboxable: []const u32) !Closure.OwnerClosure {
+    const bx = try gpa.dupe(u32, boxed);
+    errdefer gpa.free(bx);
+    const ub = try gpa.dupe(u32, unboxable);
+    errdefer gpa.free(ub);
+    const kept = try gpa.alloc(u32, boxed.len - unboxable.len);
+    var n: usize = 0;
+    for (boxed) |sl| if (!Closure.contains(unboxable, sl)) {
+        kept[n] = sl;
+        n += 1;
+    };
+    return .{ .owner = owner, .boxed = bx, .unboxable = ub, .kept_boxed = kept };
+}
+
+/// The escape pass's results for the closure tables: each lowered body's unboxable slots
+/// (indexed by `Escape.Units` number, empty for most), and each lambda unit's frame-env
+/// eligibility (indexed like the unit table).
+const EscapeTables = struct {
+    unboxable: [][]u32,
+    frame: []bool,
+
+    fn deinit(e: *EscapeTables, gpa: std.mem.Allocator) void {
+        for (e.unboxable) |u| gpa.free(u);
+        gpa.free(e.unboxable);
+        gpa.free(e.frame);
+        e.* = undefined;
+    }
+};
+
+/// One lowered body's read-only tables, as `Escape.factsOf` reads them.
+pub const EscapeView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolution,
+    node_types: []const Type,
+    callees: []const Callee,
+    sigs: []const Sig,
+    instances: []const Mono.Instance,
+    methods: []const Method,
+    layouts: []const Layout,
+
+    pub fn genericTemplate(self: *const EscapeView, gid: u32) ?Mono.TemplateRef {
+        return Mono.templateRef(self.sigs, gid);
+    }
+};
+
+/// The escape pass, serial over the finished tables in canonical owner order (so identical
+/// at any `-j`) and run at every opt level, since it decides legality: a closure that
+/// escapes cannot capture a `mut` param or `mut self` (T0052, at the first such capture in
+/// rank order), and a bound method value on one cannot escape either. It also finds the
+/// boxed slots that only non-escaping closures capture and the lambdas whose env may live
+/// in a frame (non-escaping, within the owner's budget).
+fn analyzeEscapes(
+    t: *Typecheck,
+    fns: []const GraphFnInput,
+    sigs: []const Sig,
+    node_types: []const []const Type,
+    callees: []const []const Callee,
+    instances: []const Mono.Instance,
+    methods: []const Method,
+    lambda_units: []const Closure.LambdaUnit,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+) !EscapeTables {
+    const gpa = t.gpa;
+    const is_base = try gpa.alloc(bool, fns.len);
+    defer gpa.free(is_base);
+    for (fns, t.fns.items, is_base) |f, fs, *b| b.* = isBaseOwner(f, fs);
+    const units: Escape.Units = .{ .is_base = is_base };
+    const n_units = fns.len + instances.len;
+
+    const facts = try gpa.alloc(?Escape.Facts, n_units);
+    @memset(facts, null);
+    defer {
+        for (facts) |*f| if (f.*) |*ff| ff.deinit(gpa);
+        gpa.free(facts);
+    }
+    for (0..n_units) |u| {
+        const inst: ?*const Mono.Instance = if (u < fns.len) null else &instances[u - fns.len];
+        if (inst == null and !is_base[u]) continue;
+        const mod = if (inst) |i| i.mod else fns[u].module;
+        const decl = if (inst) |i| i.decl_node else fns[u].decl_node;
+        const mc = &t.graph.mods[mod];
+        // Only a body with a closure, a param a closure can be passed to, or a `mut` param a
+        // bound method value can hold needs facts.
+        const fc = Closure.findFn(mc.closures, decl);
+        const params = if (inst) |i| i.params else sigs[u].params;
+        const takes_fn = for (params) |p| {
+            if (LayoutEngine.isFnStruct(p, layouts)) break true;
+        } else false;
+        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int());
+        if (fc == null and !takes_fn and Modes.ofProto(mc.tree, mc.tokens, proto) == 0) continue;
+        const view: EscapeView = .{
+            .tree = mc.tree,
+            .resolutions = mc.resolutions,
+            .node_types = if (inst) |i| i.node_types else node_types[mod],
+            .callees = if (inst) |i| i.callees else callees[mod],
+            .sigs = sigs,
+            .instances = instances,
+            .methods = methods,
+            .layouts = layouts,
+        };
+        facts[u] = try Escape.factsOf(gpa, .{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, &view, units, decl, @intCast(proto.params.len), fc);
+    }
+    var sol = try Escape.solve(gpa, facts);
+    defer sol.deinit(gpa);
+
+    const unboxable = try gpa.alloc([]u32, n_units);
+    for (unboxable) |*x| x.* = &.{};
+    errdefer {
+        for (unboxable) |x| gpa.free(x);
+        gpa.free(unboxable);
+    }
+    const frame = try gpa.alloc(bool, lambda_units.len);
+    errdefer gpa.free(frame);
+    @memset(frame, false);
+
+    var reported: std.ArrayList(u32) = .empty;
+    defer reported.deinit(gpa);
+    var escaping_slots: std.ArrayList(u32) = .empty;
+    defer escaping_slots.deinit(gpa);
+    var ui: usize = 0;
+    for (0..n_units) |u| {
+        const f = facts[u] orelse continue;
+        const inst: ?*const Mono.Instance = if (u < fns.len) null else &instances[u - fns.len];
+        const mod = if (inst) |i| i.mod else fns[u].module;
+        const decl = if (inst) |i| i.decl_node else fns[u].decl_node;
+        const mc = &t.graph.mods[mod];
+        const places = Modes.ofProto(mc.tree, mc.tokens, Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int()));
+        reported.clearRetainingCapacity();
+        escaping_slots.clearRetainingCapacity();
+        const fc = Closure.findFn(mc.closures, decl);
+        const by_rank = try gpa.alloc(u32, if (fc) |c| c.boundaries.len else 0);
+        defer gpa.free(by_rank);
+        if (fc) |c| for (c.boundaries, 0..) |b, i| {
+            by_rank[b.rank] = @intCast(i);
+        };
+        for (by_rank) |bi| {
+            const b = fc.?.boundaries[bi];
+            const use = f.siteUse(b.node) orelse .escapes;
+            if (!sol.siteEscapes(f, @intCast(u), use)) continue;
+            for (b.captures) |c| {
+                try escaping_slots.append(gpa, c.slot);
+                if (!Modes.isMut(places, c.slot) or std.mem.indexOfScalar(u32, reported.items, c.slot) != null) continue;
+                try reported.append(gpa, c.slot);
+                try reportEscapingCapture(t, mc, mod, c.first_use);
+            }
+        }
+        // A bound value on a `mut` param holds its address too: in node order, its first
+        // escaping one, unless a closure already reported the param.
+        for (f.sites) |site| {
+            const p = site.recv orelse continue;
+            if (site.kind != .bound or !Modes.isMut(places, p) or std.mem.indexOfScalar(u32, reported.items, p) != null) continue;
+            if (!sol.siteEscapes(f, @intCast(u), site.use)) continue;
+            try reported.append(gpa, p);
+            try reportEscapingCapture(t, mc, mod, mc.tree.nodes[site.node.int()].lhs);
+        }
+        const fcl = fc orelse continue;
+
+        // This owner's units are one run of the (owner, node)-sorted table.
+        const owner: Closure.Owner = if (inst != null) .{ .instance = @intCast(u - fns.len) } else .{ .base = @intCast(u) };
+        while (ui < lambda_units.len and Closure.ownerLess(lambda_units[ui].owner, owner)) ui += 1;
+        const lo = ui;
+        while (ui < lambda_units.len and std.meta.eql(lambda_units[ui].owner, owner)) ui += 1;
+        const run = lambda_units[lo..ui];
+
+        const boxed: []const u32 = if (inst) |i| i.boxed else if (u < t.base_boxed.len) t.base_boxed[u] else &.{};
+        var ub: std.ArrayList(u32) = .empty;
+        errdefer ub.deinit(gpa);
+        for (boxed) |sl| {
+            if (std.mem.indexOfScalar(u32, escaping_slots.items, sl) != null or Closure.contains(f.bound_recv, sl)) continue;
+            // A slot of 16 B or less never makes the frame bigger than at -O0: it adds at
+            // most 8 slot bytes and drops the 16 bytes of values its box costs, so only
+            // frame envs can overflow a frame, and the fallback reverts exactly those.
+            const ty = find: for (run) |lu| {
+                for (lu.env) |es| if (es.slot == sl) break :find es.ty;
+            } else continue;
+            if (std.mem.alignForward(u32, Abi.typeSize(ty, layouts, enum_layouts), 8) > Escape.unbox_max) continue;
+            try ub.append(gpa, sl);
+        }
+        unboxable[u] = try ub.toOwnedSlice(gpa);
+
+        var budget: u32 = Escape.frame_budget;
+        for (by_rank) |bi| {
+            const b = fcl.boundaries[bi];
+            const k = Closure.findUnit(run, owner, b.node) orelse continue;
+            const lu = run[k];
+            if (lu.env_size == 0 or lu.env_size > budget) continue;
+            if (sol.siteEscapes(f, @intCast(u), f.siteUse(b.node) orelse .escapes)) continue;
+            frame[lo + k] = true;
+            budget -= lu.env_size;
+        }
+    }
+    t.sink.sort();
+    return .{ .unboxable = unboxable, .frame = frame };
+}
+
+/// T0052 for the capture of a `mut` param (or `mut self`) at `use`, by a closure that
+/// escapes. Reported in the owner's module scope, since the pass runs after every body.
+fn reportEscapingCapture(t: *Typecheck, mc: *const GraphCtx.ModuleCtx, mod: u32, use: Ast.Index) error{OutOfMemory}!void {
+    const tok = mc.tree.nodes[use.int()].main_token;
+    const name = mc.tokens[tok].text(mc.source);
+    const what = if (std.mem.eql(u8, name, "self")) "the 'mut self' receiver" else "the 'mut' parameter";
+    try t.sink.report(.{ .span = .{ .start = mc.tokens[tok].start, .end = mc.tokens[tok].end }, .code = .T0052, .scope = mod }, "a closure that escapes cannot capture {s} '{s}'; copy it to a local first", .{ what, name });
+}
+
+/// Append one env struct per frame-env lambda unit to `layouts` (after every existing id,
+/// so no id moves) and point the unit at it. Returns the grown table, which replaces
+/// `layouts` (freed) only on success.
+fn appendEnvLayouts(gpa: std.mem.Allocator, layouts: []Layout, lambda_units: []Closure.LambdaUnit, esc: EscapeTables, n_base: usize) ![]Layout {
+    var envs: std.ArrayList(Layout) = .empty;
+    defer envs.deinit(gpa);
+    errdefer for (envs.items) |l| Closure.freeEnvStruct(gpa, l);
+    for (lambda_units, esc.frame) |lu, s| {
+        if (!s) continue;
+        const u = switch (lu.owner) {
+            .base => |gid| gid,
+            .instance => |ii| n_base + ii,
+        };
+        try envs.ensureUnusedCapacity(gpa, 1);
+        envs.appendAssumeCapacity(try Closure.envStruct(gpa, lu, esc.unboxable[u]));
+    }
+    if (envs.items.len == 0) return layouts;
+    const out = try gpa.alloc(Layout, layouts.len + envs.items.len);
+    @memcpy(out[0..layouts.len], layouts);
+    @memcpy(out[layouts.len..], envs.items);
+    var id: u32 = @intCast(layouts.len);
+    for (lambda_units, esc.frame) |*lu, s| if (s) {
+        lu.frame_env = id;
+        id += 1;
+    };
+    gpa.free(layouts);
+    envs.clearRetainingCapacity();
+    return out;
 }
 
 fn appendLambdaUnits(
@@ -790,6 +1033,7 @@ fn appendLambdaUnits(
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) !void {
+    const places = Modes.ofProto(mc.tree, mc.tokens, Ast.protoAt(mc.tree, mc.tree.nodes[fc.fn_node.int()].lhs.int()));
     for (fc.boundaries) |b| {
         const t = node_types[b.node.int()];
         // Only a program with type errors leaves a lambda untyped, and it is never lowered.
@@ -808,7 +1052,7 @@ fn appendLambdaUnits(
         };
         const env = try gpa.alloc(Closure.EnvSlot, b.captures.len);
         errdefer gpa.free(env);
-        const env_size = try layoutCaptureEnv(gpa, b.captures, node_types, boxed, layouts, enum_layouts, env);
+        const env_size = try layoutCaptureEnv(gpa, b.captures, node_types, boxed, places, layouts, enum_layouts, env);
         try units.append(gpa, .{
             .owner = owner,
             .mod = mod,
@@ -834,6 +1078,7 @@ fn layoutCaptureEnv(
     captures: []const Closure.Capture,
     node_types: []const Type,
     boxed: []const u32,
+    places: u64,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
     out: []Closure.EnvSlot,
@@ -845,7 +1090,7 @@ fn layoutCaptureEnv(
     const offs = try gpa.alloc(u32, captures.len);
     defer gpa.free(offs);
     for (captures, sizes, aligns) |c, *sz, *al| {
-        if (Closure.contains(boxed, c.slot)) {
+        if (Closure.contains(boxed, c.slot) or Modes.isMut(places, c.slot)) {
             sz.* = 8;
             al.* = 8;
             continue;
@@ -858,7 +1103,7 @@ fn layoutCaptureEnv(
     for (captures, offs, out) |c, off, *es| es.* = .{
         .slot = c.slot,
         .ty = node_types[c.first_use.int()],
-        .mode = if (Closure.contains(boxed, c.slot)) .box else .copy,
+        .mode = if (Modes.isMut(places, c.slot)) .ref else if (Closure.contains(boxed, c.slot)) .box else .copy,
         .off = off,
     };
     return size;
@@ -2255,14 +2500,17 @@ pub fn checkGraph(
     const adapters = try buildAdapters(gpa, t.graph, callees, instances, fns, t.fns.items, sigs, methods, derives, t.base_boxed);
     errdefer freeAdapters(gpa, adapters);
 
-    const layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
+    var layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
     errdefer LayoutEngine.freeLayouts(gpa, layouts);
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
     errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
     const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, t.base_boxed, node_types, instances, layouts, enum_layouts);
     errdefer Closure.freeLambdaUnits(gpa, lambda_units);
-    const owner_closures = try buildOwnerClosures(gpa, fns, t.fns.items, t.base_boxed, instances);
+    var esc = try t.analyzeEscapes(fns, sigs, node_types, callees, instances, methods, lambda_units, layouts, enum_layouts);
+    defer esc.deinit(gpa);
+    layouts = try appendEnvLayouts(gpa, layouts, lambda_units, esc, fns.len);
+    const owner_closures = try buildOwnerClosures(gpa, fns, t.fns.items, t.base_boxed, instances, esc.unboxable);
     errdefer Closure.freeOwnerClosures(gpa, owner_closures);
 
     // Diagnostics already carry their owning module in `scope`, sorted by
@@ -9499,11 +9747,15 @@ test "a capture's '_' at a mut position is T0019; a piped value there is the cal
     try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
 }
 
-test "a capture of a 'mut self' receiver is T0052, like the lambda it means" {
-    try expectOnlyDiag(
+test "a capture of a 'mut self' receiver is T0052 only when it escapes, like the lambda it means" {
+    const gpa = testing.allocator;
+    const pre =
         \\struct C { n: int }
         \\impl C {
         \\ fn add(mut self, k: int) { self.n = self.n + k }
+        \\
+    ;
+    var ok = try checkSource(pre ++
         \\ fn run(mut self) -> int {
         \\  f := self.add(_)
         \\  f(1)
@@ -9513,6 +9765,19 @@ test "a capture of a 'mut self' receiver is T0052, like the lambda it means" {
         \\fn main() -> int {
         \\ c := C { n: 1 }
         \\ return c.run()
+        \\}
+        \\
+    );
+    defer ok.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    try expectOnlyDiag(pre ++
+        \\ fn adder(mut self) -> fn(int) { self.add(_) }
+        \\}
+        \\fn main() -> int {
+        \\ c := C { n: 1 }
+        \\ f := c.adder()
+        \\ f(1)
+        \\ return c.n
         \\}
         \\
     , .T0052);
@@ -9896,7 +10161,7 @@ test "an instance recheck writes its own boxed list" {
     }
 }
 
-test "any capture of a mut self receiver is T0052" {
+test "a closure that escapes cannot capture a mut self receiver (T0052 at its first use)" {
     const gpa = testing.allocator;
     const src =
         \\struct C { n: int }
@@ -9905,14 +10170,18 @@ test "any capture of a mut self receiver is T0052" {
         \\  f := fn() -> int { self.n }
         \\  f()
         \\ }
-        \\ fn plain(self) -> int {
-        \\  f := fn() -> int { self.n }
-        \\  f()
+        \\ fn leak(mut self) -> fn() -> int {
+        \\  g := fn() -> int { self.n + 1 }
+        \\  g
+        \\ }
+        \\ fn plain(self) -> fn() -> int {
+        \\  fn() -> int { self.n }
         \\ }
         \\}
         \\fn main() -> int {
         \\ c := C { n: 1 }
-        \\ return c.get() + c.plain()
+        \\ h := c.plain()
+        \\ return c.get() + h()
         \\}
         \\
     ;
@@ -9921,29 +10190,148 @@ test "any capture of a mut self receiver is T0052" {
     try testing.expectEqual(@as(usize, 1), c.result.diags.len);
     const d = c.result.diags[0];
     try testing.expectEqual(codes.Code.T0052, d.code);
-    try testing.expectEqualStrings("a closure cannot capture the 'mut self' receiver 'self'; copy it to a local first", d.message);
-    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "self.n }").?)), d.byte_offset);
+    try testing.expectEqualStrings("a closure that escapes cannot capture the 'mut self' receiver 'self'; copy it to a local first", d.message);
+    try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src, "self.n + 1").?)), d.byte_offset);
 }
 
-test "any capture of a mut param, by a lambda, a local fn or a bound method, is T0052" {
+test "a closure or a bound method that escapes cannot capture a mut param" {
+    const gpa = testing.allocator;
     const pre =
         \\struct P { x: int }
         \\impl P { fn get(self) -> int { self.x } }
+        \\struct H { f: fn() -> int }
+        \\fn keep(f: fn() -> int) -> H { H { f: f } }
+        \\fn rec(f: fn() -> int, n: int) -> int { if n == 0 { f() } else { rec(f, n - 1) } }
+        \\fn run(f: fn() -> int) -> int { f() }
+        \\fn wrap(f: fn() -> int) -> H { keep(fn() -> int { f() }) }
         \\
     ;
-    const cases = [_]struct { body: []const u8, name: []const u8 }{
-        .{ .body = "fn f(mut n: int) -> int {\n g := fn() -> int { n }\n g()\n}\nfn main() -> int {\n a := 1\n return f(a)\n}\n", .name = "n" },
-        .{ .body = "fn f(mut n: int) -> int {\n fn g() -> int { n }\n g()\n}\nfn main() -> int {\n a := 1\n return f(a)\n}\n", .name = "n" },
-        .{ .body = "fn f(mut p: P) -> int {\n g := p.get\n g()\n}\nfn main() -> int {\n a := P { x: 1 }\n return f(a)\n}\n", .name = "p" },
+    const main_src = "fn main() -> int {\n a := 1\n return 0\n}\n";
+    const escaping = [_][]const u8{
+        "fn f(mut n: int) -> fn() -> int {\n fn() -> int { n }\n}\n",
+        "fn f(mut n: int) -> fn() -> int {\n fn g() -> int { n }\n g\n}\n",
+        "fn f(mut n: int) -> H {\n keep(fn() -> int { n })\n}\n",
+        "fn f(mut n: int) -> H {\n H { f: fn() -> int { n } }\n}\n",
+        "fn f(mut n: int) -> bool {\n g := fn() -> int { n }\n g == g\n}\n",
+        "fn f(mut n: int) -> int {\n rec(fn() -> int { n }, 2)\n}\n",
+        "fn f(mut n: int, h: fn(fn() -> int) -> int) -> int {\n h(fn() -> int { n })\n}\n",
+        "fn f(mut n: int) -> fn() -> int {\n fn() -> int {\n  g := fn() -> int { n }\n  g()\n }\n}\n",
+        "fn f(mut n: int) -> int {\n g := fn() -> int { 0 }\n g = fn() -> int { n }\n g()\n}\n",
+        // The last three pin the `:=`-init and the capture rules of `Escape.factsOf`, which
+        // no runtime differential sees while the escaped closure's maker is still live.
+        "fn f(mut n: int) -> H {\n g := fn() -> int { n }\n h := g\n keep(h)\n}\n",
+        "fn f(mut n: int) -> H {\n g := fn() -> int { n }\n keep(fn() -> int { g() })\n}\n",
+        "fn f(mut n: int) -> H {\n wrap(fn() -> int { n })\n}\n",
     };
-    for (cases) |k| {
-        const src = try std.mem.concat(testing.allocator, u8, &.{ pre, k.body });
-        defer testing.allocator.free(src);
-        const msg = try std.fmt.allocPrint(testing.allocator, "a closure cannot capture the 'mut' parameter '{s}'; copy it to a local first", .{k.name});
-        defer testing.allocator.free(msg);
-        try expectOnlyDiag(src, .T0052);
-        try expectOneDiag(src, .T0052, msg);
+    for (escaping) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, body, main_src });
+        defer gpa.free(src);
+        try expectOneDiag(src, .T0052, "a closure that escapes cannot capture the 'mut' parameter 'n'; copy it to a local first");
     }
+    const legal = [_][]const u8{
+        "fn f(mut n: int) -> int {\n g := fn() -> int { n }\n g()\n}\n",
+        "fn f(mut n: int) -> int {\n fn g() -> int { n }\n g()\n}\n",
+        "fn f(mut n: int) -> int {\n run(fn() -> int { n = n + 1\n n })\n}\n",
+        "fn f(mut n: int) -> int {\n (fn() -> int { n })()\n}\n",
+        "fn f(mut n: int) -> int {\n run(fn() -> int { run(fn() -> int { n }) })\n}\n",
+    };
+    for (legal) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, body, main_src });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        for (c.result.diags) |d| if (d.severity == .err) {
+            std.debug.print("source:\n{s}\ngot {s}: {s}\n", .{ src, @tagName(d.code), d.message });
+            return error.TestUnexpectedDiagnostic;
+        };
+    }
+    const bound_called = try std.mem.concat(gpa, u8, &.{ pre, "fn f(mut p: P) -> int {\n g := p.get\n g()\n}\n", main_src });
+    defer gpa.free(bound_called);
+    var bc = try checkSource(bound_called);
+    defer bc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), bc.result.diags.len);
+    for ([_][]const u8{
+        "fn f(mut p: P) -> fn() -> int { p.get }\n",
+        "fn f(mut p: P) -> H {\n g := p.get\n h := g\n keep(h)\n}\n",
+    }) |body| {
+        const bound = try std.mem.concat(gpa, u8, &.{ pre, body, main_src });
+        defer gpa.free(bound);
+        try expectOneDiag(bound, .T0052, "a closure that escapes cannot capture the 'mut' parameter 'p'; copy it to a local first");
+    }
+}
+
+test "a captured mut param is a ref env slot, and a non-escaping capture keeps no box" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn run(f: fn()) { f() }
+        \\fn f(mut n: int) {
+        \\ t := 0
+        \\ run(fn() {
+        \\  n = n + 1
+        \\  t = t + n
+        \\ })
+        \\}
+        \\fn main() -> int {
+        \\ a := 1
+        \\ f(a)
+        \\ return a
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.lambda_units.len);
+    const u = c.result.lambda_units[0];
+    try testing.expectEqual(@as(usize, 2), u.env.len);
+    try testing.expectEqual(Closure.CaptureMode.ref, u.env[0].mode);
+    try testing.expectEqual(Closure.CaptureMode.box, u.env[1].mode);
+    try testing.expectEqual(@as(u32, 16), u.env_size);
+    const sid = u.frame_env.?;
+    const l = c.result.layouts[sid];
+    try testing.expectEqualStrings("env$main.f$l0", l.name);
+    try testing.expectEqualSlices(Type, &.{ Type.int, Type.int }, l.field_types);
+    try testing.expectEqual(@as(usize, 1), c.result.owner_closures.len);
+    const oc = c.result.owner_closures[0];
+    try testing.expectEqualSlices(u32, &.{1}, oc.boxed);
+    try testing.expectEqualSlices(u32, &.{1}, oc.unboxable);
+    try testing.expectEqualSlices(u32, &.{}, oc.kept_boxed);
+}
+
+test "a box stays when an escaping closure, a bound value or an outer escaping lambda holds it" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct C { n: int }
+        \\struct H { f: fn() }
+        \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
+        \\fn run(f: fn()) { f() }
+        \\fn f(h: H) -> int {
+        \\ a := 0
+        \\ b := 0
+        \\ c := C { n: 0 }
+        \\ d := 0
+        \\ run(fn() { a = a + 1 })
+        \\ h.f = fn() { b = b + 1 }
+        \\ run(fn() { b = b + 2 })
+        \\ g := c.bump
+        \\ g()
+        \\ h.f = fn() { run(fn() { d = d + 1 }) }
+        \\ a + b + c.n + d
+        \\}
+        \\fn main() -> int {
+        \\ return f(H { f: fn() {} })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const oc = c.result.owner_closures[0];
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, oc.boxed);
+    try testing.expectEqualSlices(u32, &.{1}, oc.unboxable);
+    try testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, oc.kept_boxed);
+    var where: std.ArrayList(u8) = .empty;
+    defer where.deinit(gpa);
+    for (c.result.lambda_units) |u| if (std.meta.eql(u.owner, oc.owner)) try where.print(gpa, "{s}:{c} ", .{ u.name, @as(u8, if (u.frame_env != null) 'f' else 'h') });
+    try testing.expectEqualStrings("main.f$l0:f main.f$l1:h main.f$l2:f main.f$l4:f main.f$l3:h ", where.items);
 }
 
 test "a fn or method with mut params is not a value (T0049)" {
@@ -10305,10 +10693,13 @@ test "mut self bound on a temporary is T0019, on a field T0052" {
     ;
     try expectOneDiag(pre ++ "fn main() -> int {\n inc := mk().bump\n inc()\n return 0\n}\n", .T0019, "cannot bind mutating method 'bump' to a temporary; the receiver must be a local variable");
     try expectOneDiag(pre ++ "fn main() -> int {\n h := H { c: C { n: 0 } }\n inc := h.c.bump\n inc()\n return h.c.n\n}\n", .T0052, "binding the 'mut self' method 'bump' needs a local receiver, not a field; bind it on a local variable");
-    // A bound method captures its receiver, and a `mut self` receiver cannot be captured.
-    try expectOneDiag(pre ++ "impl H {\n fn peek(mut self) -> int {\n  g := self.total\n  g()\n }\n fn total(self) -> int { self.c.n }\n}\nfn main() -> int {\n h := H { c: C { n: 0 } }\n return h.peek()\n}\n", .T0052, "a closure cannot capture the 'mut self' receiver 'self'; copy it to a local first");
-    // A plain method on a field or a temporary copies the receiver once: no error.
+    // A bound method holds a `mut self` receiver by address, so it must not escape.
     const gpa = testing.allocator;
+    var called = try checkSource(pre ++ "impl H {\n fn peek(mut self) -> int {\n  g := self.total\n  g()\n }\n fn total(self) -> int { self.c.n }\n}\nfn main() -> int {\n h := H { c: C { n: 0 } }\n return h.peek()\n}\n");
+    defer called.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), called.result.diags.len);
+    try expectOneDiag(pre ++ "impl H {\n fn peek(mut self) -> fn() -> int { self.total }\n fn total(self) -> int { self.c.n }\n}\nfn main() -> int {\n h := H { c: C { n: 0 } }\n g := h.peek()\n return g()\n}\n", .T0052, "a closure that escapes cannot capture the 'mut self' receiver 'self'; copy it to a local first");
+    // A plain method on a field or a temporary copies the receiver once: no error.
     var ok = try checkSource(pre ++ "fn main() -> int {\n h := H { c: C { n: 1 } }\n g := h.c.get\n t := mk().get\n return g() + t()\n}\n");
     defer ok.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
@@ -10413,4 +10804,78 @@ test "a field wins over a method in value position" {
         const m = try valueMember(&inner, "plus", k);
         try testing.expect(inner.result.callees[0][m.int()].view() == .bound_method);
     }
+}
+
+test "past the owner's frame-env budget a non-escaping closure keeps a heap env" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Big { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int, j: int, k: int, l: int, m: int, n: int, o: int, p: int, q: int, r: int, s: int, t: int }
+        \\fn run(f: fn() -> int) -> int { f() }
+        \\fn main() -> int {
+        \\ x := Big { a: 1, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0, i: 0, j: 0, k: 0, l: 0, m: 0, n: 0, o: 0, p: 0, q: 0, r: 0, s: 0, t: 0 }
+        \\ y := 2
+        \\ return run(fn() -> int { x.a }) + run(fn() -> int { x.a + 1 }) + run(fn() -> int { y })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var got: [3]bool = undefined;
+    for (c.result.lambda_units, &got) |u, *g| g.* = u.frame_env != null;
+    // 160 + 160 > 256: the second goes to the heap; the 8-byte third still fits.
+    try testing.expectEqualSlices(bool, &.{ true, false, true }, &got);
+}
+
+test "a captured-and-mutated local over 16 bytes stays boxed" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Acc { a: int, b: int, n: int }
+        \\fn run(f: fn()) { f() }
+        \\fn main() -> int {
+        \\ acc := Acc { a: 0, b: 0, n: 0 }
+        \\ t := 0
+        \\ run(fn() {
+        \\  acc.n = acc.n + 1
+        \\  t = t + 2
+        \\ })
+        \\ return acc.n + t
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const oc = c.result.owner_closures[0];
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, oc.boxed);
+    try testing.expectEqualSlices(u32, &.{1}, oc.unboxable);
+    try testing.expectEqualSlices(u32, &.{0}, oc.kept_boxed);
+    try testing.expect(c.result.lambda_units[0].frame_env != null);
+}
+
+test "a bound method on a mut param gets the $boundref adapter; on a boxed local still $boundbox" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct C { n: int }
+        \\impl C {
+        \\ fn bump(mut self) { self.n = self.n + 1 }
+        \\ fn get(self) -> int { self.n }
+        \\}
+        \\fn by_ref(mut p: C) -> int {
+        \\ g := p.get
+        \\ p.n = 3
+        \\ g()
+        \\}
+        \\fn main() -> int {
+        \\ c := C { n: 0 }
+        \\ inc := c.bump
+        \\ inc()
+        \\ return by_ref(c)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var kinds: std.ArrayList(u8) = .empty;
+    defer kinds.deinit(gpa);
+    for (c.result.adapters) |a| try kinds.print(gpa, "{s}:{s} ", .{ @tagName(a.kind), a.name });
+    try testing.expectEqualStrings("bound_box:main.C.bump$boundbox bound_ref:main.C.get$boundref ", kinds.items);
 }

@@ -1,0 +1,63 @@
+# Feature: closures that do not escape (called, passed to a param that only calls it, bound to a local only called) behave like the ones that do
+# expect: stdout "3\n7\n12\n0\n1\n2\n5\n1\n60\n6\n"
+# expect: exit 20
+import std/vec
+import std/io
+
+struct P { x: int, y: int }
+struct Box { f: fn() -> int }
+
+fn run(f: fn()) { f() }
+fn apply(f: fn(int) -> int, x: int) -> int { f(x) }
+fn twice(f: fn(int) -> int, x: int) -> int { apply(f, apply(f, x)) }
+fn keep(fs: Vec[fn() -> int], f: fn() -> int) { fs.push(f) }
+fn show(p: P, _z: int) { io.println(p.x) }
+
+impl P {
+    fn each_field(self, f: fn(int)) {
+        f(self.x)
+        f(self.y)
+    }
+}
+
+fn main() -> int {
+    n := 1
+    run(fn() { n = n + 2 })
+    io.println(n)
+    k := 4
+    io.println(apply(fn(v: int) -> int { v + k }, 3))
+    add := fn(v: int) -> int { v + n }
+    io.println(twice(add, 6))
+    # A fresh binding per iteration, each read by a closure that is only called.
+    for i in 0..3 {
+        g := fn() { io.println(i) }
+        g()
+    }
+    # A local fn that only calls itself.
+    fn count(c: int) -> int {
+        if c == 0 { return 0 }
+        1 + count(c - 1)
+    }
+    io.println(count(5))
+    # A by-value argument is read before a later argument's closure writes the local.
+    p := P { x: 1, y: 2 }
+    poke := fn() -> int {
+        p.x = 9
+        0
+    }
+    show(p, poke())
+    # A non-escaping lambda inside one that escapes: the shared local stays boxed.
+    fs: Vec[fn() -> int] = []
+    m := 10
+    keep(fs, fn() -> int {
+        run(fn() { m = m * 2 })
+        m
+    })
+    io.println(fs[0]() + fs[0]())
+    sum := 0
+    q := P { x: 2, y: 4 }
+    q.each_field(fn(v: int) { sum = sum + v })
+    io.println(sum)
+    b := Box { f: fn() -> int { n } }
+    return b.f() + sum + p.x + count(2)
+}

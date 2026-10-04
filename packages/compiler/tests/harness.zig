@@ -81,3 +81,30 @@ pub fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const
     defer gpa.free(prog);
     return runExit(gpa, io, prog);
 }
+
+/// The `--emit ir` text of `path` built with `flags` (owned).
+pub fn emitIr(gpa: std.mem.Allocator, io: Io, path: []const u8, flags: []const []const u8) ![]u8 {
+    const bin = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
+    defer gpa.free(bin);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.appendSlice(gpa, &.{ bin, "--emit", "ir" });
+    try argv.appendSlice(gpa, flags);
+    try argv.append(gpa, path);
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const ir = try rdr.interface.allocRemaining(gpa, .limited(1 << 22));
+    errdefer gpa.free(ir);
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.EmitFailed;
+    return ir;
+}
+
+/// The body of `fn <name>(` in `ir`, up to its closing brace.
+pub fn irBody(ir: []const u8, name: []const u8) ?[]const u8 {
+    var buf: [128]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, "fn {s}(", .{name}) catch return null;
+    const at = if (std.mem.startsWith(u8, ir, head)) 0 else (std.mem.indexOf(u8, ir, head) orelse return null);
+    const end = std.mem.indexOfPos(u8, ir, at, "\n}\n") orelse ir.len;
+    return ir[at..end];
+}

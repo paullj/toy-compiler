@@ -1,0 +1,35 @@
+# Feature: whether a closure escapes follows the summaries of fns in other modules
+# expect: stdout "6\n12\n"
+# expect: exit 18
+import std/vec
+import std/io
+import lib
+
+fn add_all(mut n: int, xs: Vec[int]) {
+    lib.each(xs, fn(v: int) { n = n + v })
+}
+
+fn fill(fs: Vec[fn() -> int]) {
+    c := 4
+    lib.keep(fs, fn() -> int { c * 3 })
+}
+
+# Called before the kept closure runs so a frame `fill` left behind is overwritten.
+fn smash(a: int, b: int, c: int, d: int) -> int {
+    x := a * b + 77777
+    y := c * d + 88888
+    z := x + y + 99999
+    x + y + z
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    t := 0
+    add_all(t, xs)
+    io.println(t)
+    fs: Vec[fn() -> int] = []
+    fill(fs)
+    _s := smash(1, 2, 3, 4)
+    io.println(fs[0]())
+    return t + fs[0]()
+}

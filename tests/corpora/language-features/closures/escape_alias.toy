@@ -1,0 +1,42 @@
+# Feature: a closure escapes through a copy of the local that holds it, so its env and the local it shares outlive its maker
+# expect: stdout "11012\n21\n"
+# expect: exit 0
+import std/vec
+import std/io
+
+fn keep(fs: Vec[fn() -> int], f: fn() -> int) { fs.push(f) }
+
+fn fill(fs: Vec[fn() -> int]) {
+    n := 10
+    g := fn() -> int {
+        n = n + 1
+        n
+    }
+    h := g
+    keep(fs, h)
+    c := 7
+    g2 := fn() -> int { c * 3 }
+    h2 := g2
+    keep(fs, h2)
+}
+
+# Called between the calls so a frame `fill` left behind is overwritten.
+fn smash(a: int, b: int, c: int, d: int) -> int {
+    x := a * b + 77777
+    y := c * d + 88888
+    z := x + y + 99999
+    x + y + z
+}
+
+fn main() -> int {
+    fs: Vec[fn() -> int] = []
+    fill(fs)
+    _s := smash(1, 2, 3, 4)
+    a := fs[0]()
+    _t := smash(5, 6, 7, 8)
+    b := fs[0]()
+    io.println(a * 1000 + b)
+    _u := smash(9, 9, 9, 9)
+    io.println(fs[1]())
+    return 0
+}

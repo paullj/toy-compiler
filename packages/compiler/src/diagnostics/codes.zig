@@ -102,7 +102,7 @@ pub const Code = enum(u16) {
     T0049, // fn-not-a-value (a builtin, extern, generic or `mut`-param function, or a built-in, protocol or `mut`-param method, is named as a value)
     T0050, // lambda-param-type-unknown (an unannotated lambda param with no expected fn type)
     T0051, // jump-across-lambda (break/continue targeting a loop outside the lambda)
-    T0052, // capture-unsupported (a closure captures a `mut` parameter or `mut self` receiver, or a `mut self` method is bound on a field)
+    T0052, // capture-unsupported (a closure that escapes captures a `mut` parameter or `mut self` receiver, or a `mut self` method is bound on a field)
 
     // Warning band (W####).
     W0001, // unused-variable
