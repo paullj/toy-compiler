@@ -39,7 +39,7 @@ const post_emit: []const Spec.Option = &.{
     // -j: N>=1; the parser rejects -j0/negatives as a bad value via the Range.
     .{ .short = 'j', .value = .{ .int = .{ .min = 1, .max = null } }, .value_name = "N", .help = "Build worker threads (N>=1; -j1 = serial; default cpu-based)" },
     // -O is short-only => Parsed field `O`; -O0 / -O1 / -O 1 all parse, -O2 rejected.
-    .{ .short = 'O', .value = .{ .int = .{ .min = 0, .max = 1 } }, .value_name = "LEVEL", .help = "IR optimization level (0 = none, 1 = all passes)" },
+    .{ .short = 'O', .value = .{ .int = .{ .min = 0, .max = 1 } }, .value_name = "LEVEL", .help = "IR optimization level (0 = none, 1 = all passes; any pass on also keeps non-escaping closure envs in frames)" },
     .{ .long = "opt", .value = .string, .value_name = "LIST", .help = "Enable only these passes (fold,branch,dce,forward)" },
     .{ .long = "no-opt", .value = .string, .action = .append, .value_name = "PASS", .help = "Disable one pass from the current level (repeatable)" },
     .{ .long = "dump", .action = .set_true, .help = "Print the emit phase's artifact (tokens, or the AST)" },

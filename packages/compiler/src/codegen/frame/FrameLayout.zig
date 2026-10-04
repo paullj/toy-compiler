@@ -875,6 +875,50 @@ test "a fn-pair struct slot projects one root at +8" {
     try testing.expectEqual(@as(u32, 0), tagAt(bm, 0));
 }
 
+test "roots: an env struct's Vec word is tag 1; str, rawptr, Ref, fn-pair env and Option[Vec] words tag 0; an int none" {
+    const gpa = testing.allocator;
+    // struct 0 = a gc_array box (a Vec), 1 = a Ref box, 2 = a fn pair, 3 = a frame env.
+    var ls: [4]Layout = undefined;
+    ls[0] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .gc_array);
+    ls[1] = try mkLayoutFields(gpa, &.{}, &.{}, 8, .ref);
+    ls[2] = try mkLayoutFields(gpa, &.{ Type.int, Type.rawptr }, &.{ 0, 8 }, 16, .none);
+    ls[2].fn_sig = .{ .params = &.{}, .ret = Type.int };
+    ls[3] = try mkLayoutFields(
+        gpa,
+        &.{ Type.structT(0), Type.str, Type.rawptr, Type.structT(1), Type.structT(2), Type.int, Type.enumT(0) },
+        &.{ 0, 8, 24, 32, 40, 56, 64 },
+        80,
+        .none,
+    );
+    defer for (&ls) |*l| {
+        gpa.free(l.field_types);
+        gpa.free(l.offsets);
+    };
+    const none_v = VariantLayout{ .name = "none", .form = .unit, .field_names = &.{}, .field_types = try gpa.dupe(Type, &.{}), .offsets = try gpa.dupe(u32, &.{}) };
+    const some_v = VariantLayout{ .name = "some", .form = .tuple, .field_names = &.{}, .field_types = try gpa.dupe(Type, &.{Type.structT(0)}), .offsets = try gpa.dupe(u32, &.{0}) };
+    defer for ([_]VariantLayout{ none_v, some_v }) |v| {
+        gpa.free(v.field_types);
+        gpa.free(v.offsets);
+    };
+    var vars = [_]VariantLayout{ none_v, some_v };
+    const el = [_]EnumLayout{.{ .name = "Option", .variants = &vars, .tag_size = 8, .payload_off = 8, .size = 16, .@"align" = 8 }};
+
+    var func = try buildSimple(gpa, &.{Type.structT(3)}, &.{}, 0, Type.unit);
+    defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &ls, &el);
+    defer fl.deinit(gpa);
+    const bm = try projectRoots(gpa, &func, &fl, &ls, &el);
+    defer gpa.free(bm);
+    const base = fl.slot_off[0];
+    const want_off = [_]u32{ 0, 8, 24, 32, 48, 72 };
+    const want_tag = [_]u32{ 1, 0, 0, 0, 0, 0 };
+    try testing.expectEqual(@as(u32, want_off.len), rootCount(bm));
+    for (want_off, want_tag, 0..) |o, tg, i| {
+        try testing.expectEqual(base + o, rootAt(bm, i));
+        try testing.expectEqual(tg, tagAt(bm, i));
+    }
+}
+
 test "roots: projection is deterministic (two calls byte-identical)" {
     const gpa = testing.allocator;
     var func = try buildSimple(gpa, &.{ Type.int, Type.str }, &.{ Type.rawptr, Type.int }, 0, Type.int);

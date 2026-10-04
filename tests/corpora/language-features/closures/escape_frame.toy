@@ -1,0 +1,74 @@
+# Feature: a body whose frame would overflow at -O1 with a frame env keeps that env in a GC cell instead, so it builds at every level
+# expect: exit 129
+struct S { f0: int, f1: int, f2: int, f3: int, f4: int, f5: int, f6: int, f7: int, f8: int, f9: int, f10: int, f11: int, f12: int, f13: int, f14: int, f15: int, f16: int, f17: int, f18: int, f19: int, f20: int, f21: int, f22: int, f23: int, f24: int, f25: int, f26: int, f27: int, f28: int, f29: int }
+fn run(f: fn() -> int) -> int { f() }
+fn main() -> int {
+ s := S { f0: 0, f1: 1, f2: 2, f3: 3, f4: 4, f5: 5, f6: 6, f7: 7, f8: 8, f9: 9, f10: 10, f11: 11, f12: 12, f13: 13, f14: 14, f15: 15, f16: 16, f17: 17, f18: 18, f19: 19, f20: 20, f21: 21, f22: 22, f23: 23, f24: 24, f25: 25, f26: 26, f27: 27, f28: 28, f29: 29 }
+ a1 := 1
+ a2 := 2
+ a3 := 3
+ a4 := 4
+ a5 := 5
+ a6 := 6
+ a7 := 7
+ a8 := 8
+ a9 := 9
+ a10 := 10
+ a11 := 11
+ a12 := 12
+ a13 := 13
+ a14 := 14
+ a15 := 15
+ a16 := 16
+ a17 := 17
+ a18 := 18
+ a19 := 19
+ a20 := 20
+ a21 := 21
+ a22 := 22
+ a23 := 23
+ a24 := 24
+ a25 := 25
+ a26 := 26
+ a27 := 27
+ a28 := 28
+ a29 := 29
+ a30 := 30
+ a31 := 31
+ a32 := 32
+ a33 := 33
+ a34 := 34
+ a35 := 35
+ a36 := 36
+ a37 := 37
+ a38 := 38
+ a39 := 39
+ a40 := 40
+ a41 := 41
+ a42 := 42
+ a43 := 43
+ a44 := 44
+ a45 := 45
+ a46 := 46
+ a47 := 47
+ a48 := 48
+ a49 := 49
+ a50 := 50
+ a51 := 51
+ a52 := 52
+ a53 := 53
+ a54 := 54
+ a55 := 55
+ a56 := 56
+ a57 := 57
+ a58 := 58
+ a59 := 59
+ a60 := 60
+ a61 := 61
+ a62 := 62
+ a63 := 63
+ a64 := 64
+ a65 := 65
+ r := run(fn() -> int { s.f3 + s.f29 })
+ return r + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19 + a20 + a21 + a22 + a23 + a24 + a25 + a26 + a27 + a28 + a29 + a30 + a31 + a32 + a33 + a34 + a35 + a36 + a37 + a38 + a39 + a40 + a41 + a42 + a43 + a44 + a45 + a46 + a47 + a48 + a49 + a50 + a51 + a52 + a53 + a54 + a55 + a56 + a57 + a58 + a59 + a60 + a61 + a62 + a63 + a64 + a65
+}

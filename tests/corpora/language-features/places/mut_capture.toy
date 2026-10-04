@@ -1,0 +1,52 @@
+# Feature: a closure that does not escape may capture a `mut` param or `mut self`, and writes the caller's variable through it
+# expect: stdout "81\n21\n6\n"
+# expect: exit 81
+import std/vec
+import std/io
+
+struct P { x: int, y: int }
+
+impl P {
+    fn add_all(mut self, xs: Vec[int]) {
+        each(xs, fn(v: int) { self.x = self.x + v })
+    }
+}
+
+fn each[T](xs: Vec[T], f: fn(T)) {
+    for x in xs { f(x) }
+}
+
+fn run(f: fn()) { f() }
+
+fn bump(mut n: int) { n = n + 1 }
+
+fn sum_into(mut n: int, xs: Vec[int]) {
+    each(xs, fn(v: int) { n = n + v })
+    fn twice() {
+        bump(n)
+        bump(n)
+    }
+    twice()
+    g := fn() { n = n * 10 }
+    g()
+    run(fn() { run(fn() { n = n + 1 }) })
+}
+
+# Through a `mut` param the whole new value is built before any of it is written.
+fn swap(mut a: P) {
+    run(fn() { a = P { x: a.y, y: a.x } })
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    t := 0
+    sum_into(t, xs)
+    io.println(t)
+    p := P { x: 1, y: 2 }
+    swap(p)
+    io.println(p.x * 10 + p.y)
+    q := P { x: 0, y: 5 }
+    q.add_all(xs)
+    io.println(q.x)
+    return t
+}

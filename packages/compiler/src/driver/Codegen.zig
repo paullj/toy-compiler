@@ -187,16 +187,9 @@ const Frozen = struct {
     /// derived from the callee's `Sig` (the fingerprint side of the shared discovery/
     /// fold arg-extraction). `null` for a non-generic callee.
     pub fn genericTemplate(self: *const Frozen, gid: u32) ?Mono.TemplateRef {
-        return templateRef(self.sigs, gid);
+        return Mono.templateRef(self.sigs, gid);
     }
 };
-
-fn templateRef(sigs: []const Fingerprint.Sig, gid: u32) ?Mono.TemplateRef {
-    if (gid >= sigs.len) return null;
-    const sig = sigs[gid];
-    if (!sig.isGenericTemplate()) return null;
-    return .{ .params = sig.params, .count = sig.genericParamCount() };
-}
 
 /// What `renderGraphIr` produced: either the rendered IR text (caller frees)
 /// or one `EmitError`.
@@ -348,6 +341,9 @@ const GraphFrozen = struct {
     /// entries) when the program has no lambda unit and no boxed local.
     closure_facts: []const []const u8,
     opt: Opt.Config,
+    /// `frameStorage(opt)`, decided once so the lowering and the closure facts in its key
+    /// see the same storage.
+    frame: bool,
 
     /// `--timings` sub-stage probe (codegen-compute vs cache get/put I/O), threaded
     /// only when `--timings` is on. BORROWED; null on a plain build => zero overhead.
@@ -409,23 +405,49 @@ const GraphFrozen = struct {
             .erased_units = gf.erased_units,
             .prelude_ids = gf.prelude_ids,
             .char_struct = gf.char_struct,
-            .closure = if (is_derive) .none else .{
-                .adapters = gf.adapters,
-                .lambda_units = gf.lambda_units,
-                .owner = owner,
-                .boxed = Closure.ownerBoxed(gf.owner_closures, owner.?),
-                .specs = gf.specs,
-                .spec_targets = if (spec) |u| u.targets else &.{},
-            },
+            .closure = if (is_derive) .none else closureFor(gf.adapters, gf.lambda_units, gf.owner_closures, owner.?, gf.specs, if (spec) |u| u.targets else &.{}, gf.frame),
             .closure_facts = if (lower_i < gf.closure_facts.len) gf.closure_facts[lower_i] else &.{},
         };
     }
 };
 
+/// Whether a build keeps the envs of closures that never outlive their maker in frame
+/// slots, and unboxes the captures only they share. Any one opt pass turns it on, not the
+/// level as such: `-O1` with every pass off lowers closures as `-O0` does, and `-O0` with
+/// one pass on (`--opt=dce`) gets frame envs, so a pass bisection that ends with every pass
+/// off also turns this off.
+fn frameStorage(opt: Opt.Config) bool {
+    return opt.any();
+}
+
+/// The closure tables a body of `owner` lowers against, under frame storage when `frame`.
+fn closureFor(
+    adapters: []const Closure.Adapter,
+    units: []const Closure.LambdaUnit,
+    owner_closures: []const Closure.OwnerClosure,
+    owner: Closure.Owner,
+    specs: Spec.Table,
+    spec_targets: []const Spec.Target,
+    frame: bool,
+) lower.ClosureInputs {
+    const st = Closure.ownerStorage(owner_closures, owner, frame);
+    return .{
+        .adapters = adapters,
+        .lambda_units = units,
+        .owner = owner,
+        .boxed = st.boxed,
+        .unboxed = st.unboxed,
+        .frame_envs = frame,
+        .specs = specs,
+        .spec_targets = spec_targets,
+    };
+}
+
 /// Each base fn and instance unit's closure facts, indexed like `fn_decls[0..derive_base)`:
-/// its boxed locals and its own lambda units (a contiguous run of the `(owner, node)`-sorted
-/// table) laid out by `Closure.ownerFacts`. Serial, once per owner. Empty when there is no
-/// lambda unit and no boxed local.
+/// its storage under `frame` (as `closureFor` hands it to the lowering) and its own lambda
+/// units (a contiguous run of the `(owner, node)`-sorted table) laid out by
+/// `Closure.ownerFacts`. Serial, once per owner. Empty when there is no lambda unit and no
+/// boxed local.
 fn buildClosureFacts(
     gpa: std.mem.Allocator,
     units: []const Closure.LambdaUnit,
@@ -433,6 +455,7 @@ fn buildClosureFacts(
     lower_ids: []const u32,
     base_count: usize,
     derive_base: usize,
+    frame: bool,
 ) ![]const []const u8 {
     if (units.len == 0 and owner_closures.len == 0) return &.{};
     const facts = try gpa.alloc([]const u8, derive_base);
@@ -448,11 +471,7 @@ fn buildClosureFacts(
             owner_closures[oi].owner;
         var j = i;
         while (j < units.len and std.meta.eql(units[j].owner, owner)) j += 1;
-        var boxed: []const u32 = &.{};
-        if (oi < owner_closures.len and std.meta.eql(owner_closures[oi].owner, owner)) {
-            boxed = owner_closures[oi].boxed;
-            oi += 1;
-        }
+        if (oi < owner_closures.len and std.meta.eql(owner_closures[oi].owner, owner)) oi += 1;
         const at: ?usize = switch (owner) {
             .base => |gid| std.sort.binarySearch(u32, lower_ids, gid, struct {
                 fn order(key: u32, x: u32) std.math.Order {
@@ -461,7 +480,7 @@ fn buildClosureFacts(
             }.order),
             .instance => |k| base_count + k,
         };
-        if (at) |ui| facts[ui] = try Closure.ownerFacts(gpa, units[i..j], boxed);
+        if (at) |ui| facts[ui] = try Closure.ownerFacts(gpa, units[i..j], Closure.ownerStorage(owner_closures, owner, frame), frame);
         i = j;
     }
     return facts;
@@ -506,7 +525,7 @@ const SpecView = struct {
     closure: lower.ClosureInputs,
 
     pub fn genericTemplate(self: *const SpecView, gid: u32) ?Mono.TemplateRef {
-        return templateRef(self.sigs, gid);
+        return Mono.templateRef(self.sigs, gid);
     }
 };
 
@@ -775,7 +794,8 @@ pub fn lowerGraphProgram(
         } };
     }
 
-    const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, tc.owner_closures, lower_ids.items, base_count, derive_base);
+    const frame = frameStorage(opt);
+    const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, tc.owner_closures, lower_ids.items, base_count, derive_base, frame);
     defer freeClosureFacts(gpa, closure_facts);
 
     const gf = GraphFrozen{
@@ -811,6 +831,7 @@ pub fn lowerGraphProgram(
         .owner_closures = tc.owner_closures,
         .closure_facts = closure_facts,
         .opt = opt,
+        .frame = frame,
         .probe = probe,
     };
 
@@ -1064,6 +1085,7 @@ pub fn renderGraphIr(
 
     const specs = if (specialize) try renderSpecTable(gpa, graph, res, tc, names) else Spec.Table{};
     defer specs.deinit(gpa);
+    const frame = frameStorage(opt);
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
@@ -1092,12 +1114,11 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .base = @intCast(gid) }), .specs = specs },
+            .closure = closureFor(tc.adapters, tc.lambda_units, tc.owner_closures, .{ .base = @intCast(gid) }, specs, &.{}, frame),
         };
-        var func = try lower.lowerFn(gpa, in, gf.decl_node, names[gid], is_entry, &diags);
-        defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
-        try Opt.run(gpa, &func, opt, &opt_st);
+        var func = try Engine.lowerFitted(gpa, in, opt, Engine.FnBody{ .decl = gf.decl_node, .sym = names[gid], .is_entry = is_entry }, &diags, &opt_st);
+        defer func.deinit(gpa);
         if (!first) try aw.writer.writeAll("\n");
         try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
         first = false;
@@ -1125,12 +1146,11 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = @intCast(k) }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .instance = @intCast(k) }), .specs = specs },
+            .closure = closureFor(tc.adapters, tc.lambda_units, tc.owner_closures, .{ .instance = @intCast(k) }, specs, &.{}, frame),
         };
-        var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
-        defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
-        try Opt.run(gpa, &func, opt, &opt_st);
+        var func = try Engine.lowerFitted(gpa, in, opt, Engine.FnBody{ .decl = inst.decl_node, .sym = sym, .is_entry = false }, &diags, &opt_st);
+        defer func.deinit(gpa);
         if (!first) try aw.writer.writeAll("\n");
         try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
         first = false;
@@ -1231,12 +1251,11 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = Closure.ownerBoxed(tc.owner_closures, u.owner), .specs = specs },
+            .closure = closureFor(tc.adapters, tc.lambda_units, tc.owner_closures, u.owner, specs, &.{}, frame),
         };
-        var func = try lower.lowerLambda(gpa, in, @intCast(ui), sym, &diags);
-        defer func.deinit(gpa);
         var opt_st: Opt.Stats = .{};
-        try Opt.run(gpa, &func, opt, &opt_st);
+        var func = try Engine.lowerFitted(gpa, in, opt, Engine.LambdaBody{ .ui = @intCast(ui), .sym = sym }, &diags, &opt_st);
+        defer func.deinit(gpa);
         if (!first) try aw.writer.writeAll("\n");
         try Ir.render(&aw.writer, &func, in.layouts, in.enum_layouts);
         first = false;
@@ -1297,7 +1316,7 @@ pub fn renderGraphIr(
             .derives = tc.derives,
             .prelude_ids = tc.prelude_ids,
             .char_struct = tc.char_struct,
-            .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = u.inst }, .boxed = Closure.ownerBoxed(tc.owner_closures, .{ .instance = u.inst }), .specs = specs, .spec_targets = u.targets },
+            .closure = closureFor(tc.adapters, tc.lambda_units, tc.owner_closures, .{ .instance = u.inst }, specs, u.targets, frame),
         };
         var func = try lower.lowerFn(gpa, in, inst.decl_node, sym, false, &diags);
         defer func.deinit(gpa);

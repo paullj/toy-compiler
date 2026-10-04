@@ -410,6 +410,65 @@ pub fn barrier(
 /// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
 pub const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
 
+/// A base fn or instance body, as `lowerFitted` lowers it.
+pub const FnBody = struct {
+    decl: Ast.Index,
+    sym: Link.SymName,
+    is_entry: bool,
+
+    pub fn run(fb: FnBody, gpa: std.mem.Allocator, in: lower.Inputs, diags: *std.ArrayList(CodegenIr.Diagnostic)) error{OutOfMemory}!Ir.Function {
+        return lower.lowerFn(gpa, in, fb.decl, fb.sym, fb.is_entry, diags);
+    }
+};
+
+/// A lambda unit's body, as `lowerFitted` lowers it.
+pub const LambdaBody = struct {
+    ui: u32,
+    sym: Link.SymName,
+
+    pub fn run(lb: LambdaBody, gpa: std.mem.Allocator, in: lower.Inputs, diags: *std.ArrayList(CodegenIr.Diagnostic)) error{OutOfMemory}!Ir.Function {
+        return lower.lowerLambda(gpa, in, lb.ui, lb.sym, diags);
+    }
+};
+
+/// Lower one body (a `FnBody` or a `LambdaBody`) and run the opt stage on it in place. A
+/// frame env must never make a body fail at -O1 that builds at -O0, so when the body's
+/// owner keeps a frame env and the optimized frame would overflow codegen's budget, the
+/// body is lowered again with every env in a GC cell. A lambda unit reads its env the same
+/// way wherever it lives, so the fallback stays local to this body, and it is a pure
+/// function of the body's inputs. A lowering that reports a diagnostic is returned before
+/// the opt stage sees it, for the caller to fail on. `stats` are the final lowering's.
+pub fn lowerFitted(
+    gpa: std.mem.Allocator,
+    in: lower.Inputs,
+    cfg: Opt.Config,
+    body: anytype,
+    diags: *std.ArrayList(CodegenIr.Diagnostic),
+    stats: *Opt.Stats,
+) error{OutOfMemory}!Ir.Function {
+    const before = diags.items.len;
+    stats.* = .{};
+    {
+        var irf = try body.run(gpa, in, diags);
+        errdefer irf.deinit(gpa);
+        if (diags.items.len != before) return irf;
+        try Opt.run(gpa, &irf, cfg, stats);
+        const c = in.closure;
+        const owner = c.owner orelse return irf;
+        if (!c.frame_envs or !Closure.ownerHasFrameEnv(c.lambda_units, owner)) return irf;
+        if (try CodegenIr.frameFits(gpa, &irf, in.layouts, in.enum_layouts)) return irf;
+        irf.deinit(gpa);
+    }
+    var heap = in;
+    heap.closure.frame_envs = false;
+    var irf = try body.run(gpa, heap, diags);
+    errdefer irf.deinit(gpa);
+    stats.* = .{};
+    if (diags.items.len != before) return irf;
+    try Opt.run(gpa, &irf, cfg, stats);
+    return irf;
+}
+
 /// Lower one function (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a job-local
 /// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
 /// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
@@ -442,17 +501,13 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
         .char_struct = frozen.char_struct,
         .closure = frozen.closure,
     };
-    var irf = try lower.lowerFn(gpa, in, fn_decl, sym, is_entry, &diags);
+    // Stays ONE-TIER: the IR `lowerFitted` builds and optimizes never escapes this query.
+    var opt_st: Opt.Stats = .{};
+    var irf = try lowerFitted(gpa, in, frozen.opt, FnBody{ .decl = fn_decl, .sym = sym, .is_entry = is_entry }, &diags, &opt_st);
     defer irf.deinit(gpa);
     // A lower diagnostic (an unsupported/not-yet-lowered construct) fails the build
     // before we emit a partial FnCode.
     if (diags.items.len > 0) return error.CodegenDiagnostic;
-
-    // run the opt stage in-place on the IR between lower and codegen. Stays
-    // ONE-TIER — the IR never escapes this query. With no passes enabled
-    // this is a pure no-op (the scaffold O0==O1 gate).
-    var opt_st: Opt.Stats = .{};
-    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
     if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
 
     const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, is_entry, &diags);
@@ -860,16 +915,18 @@ pub fn codegenClosure(
         .char_struct = frozen.char_struct,
         .closure = frozen.closure,
     };
+    var opt_st: Opt.Stats = .{};
+    // Adapters and spec units never make a frame env, so only a lambda body can need the
+    // heap fallback.
     var irf = switch (unit) {
-        .lambda => |ui| try lower.lowerLambda(gpa, in, ui, sym, &diags),
+        .lambda => |ui| try lowerFitted(gpa, in, frozen.opt, LambdaBody{ .ui = ui, .sym = sym }, &diags, &opt_st),
         .adapter => |a| try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
         .spec => try lower.lowerFn(gpa, in, spec_inst.?.decl_node, sym, false, &diags),
     };
     defer irf.deinit(gpa);
     if (diags.items.len > 0) return error.CodegenDiagnostic;
 
-    var opt_st: Opt.Stats = .{};
-    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
+    if (unit != .lambda) try Opt.run(gpa, &irf, frozen.opt, &opt_st);
     const ir_instrs = Ir.instrCount(&irf);
 
     const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);

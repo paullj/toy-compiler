@@ -208,6 +208,23 @@ pub fn verifyRefsSpilled(
     }
 }
 
+/// Whether `func`'s frame fits codegen's budget. Only `FrameTooLarge` says no: any other
+/// layout error is `lowerIr`'s to report, whatever the caller does about the frame.
+pub fn frameFits(
+    gpa: std.mem.Allocator,
+    func: *const Ir.Function,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+) error{OutOfMemory}!bool {
+    var fl = FrameLayout.compute(gpa, func, layouts, enum_layouts) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.FrameTooLarge => return false,
+        error.ParamOffsetTooLarge => return true,
+    };
+    fl.deinit(gpa);
+    return true;
+}
+
 /// Lower one `Ir.Function` to a `Link.FnCode`. On a frame-budget overflow,
 /// records a matching diagnostic and returns a well-formed (possibly empty)
 /// FnCode. Caller owns the result.
@@ -1208,6 +1225,60 @@ test "ir-codegen: the prologue clears each container root slot, and only those" 
     try testing.expect(codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, fl.slot_off[1])));
     try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, fl.slot_off[0])));
     try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, fl.slot_off[2])));
+}
+
+/// A body with one slot of each type in `slot_types` and nothing else.
+fn slotsOnlyFn(gpa: std.mem.Allocator, slot_types: []const Type) !Ir.Function {
+    var blocks = try gpa.alloc(Ir.Block, 1);
+    blocks[0] = .{ .params = try gpa.alloc(Ir.ValueId, 0), .instrs = try gpa.alloc(Ir.Instr, 0), .term = .{ .ret = .none } };
+    const slots = try gpa.alloc(Ir.Slot, slot_types.len);
+    for (slots, slot_types) |*sl, t| sl.* = .{ .type = t };
+    return .{
+        .name = .{ .kind = .user_fn, .name = "f" },
+        .params = try gpa.alloc(Ir.SlotId, 0),
+        .ret_type = Type.unit,
+        .slots = slots,
+        .values = try gpa.alloc(Ir.ValueDef, 0),
+        .blocks = blocks,
+        .entry = 0,
+        .exit = 0,
+        .literals = try gpa.alloc(Ir.Literal, 0),
+    };
+}
+
+test "ir-codegen: the prologue zeroes a frame env's container word" {
+    const gpa = testing.allocator;
+    // struct 0 = a gc_array box (a Vec); struct 1 = a frame env { n: int, xs: Vec, s: str }.
+    var env_types = [_]Type{ Type.int, Type.structT(0), Type.str };
+    var env_offs = [_]u32{ 0, 8, 16 };
+    const layouts = [_]Layout{
+        .{ .name = "V", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 8, .@"align" = 8, .native_family = .gc_array },
+        .{ .name = "env$f$l0", .field_names = &.{}, .field_types = &env_types, .offsets = &env_offs, .size = 32, .@"align" = 8 },
+    };
+    var func = try slotsOnlyFn(gpa, &.{ Type.int, Type.structT(1) });
+    defer func.deinit(gpa);
+    var fl = try FrameLayout.compute(gpa, &func, &layouts, &.{});
+    defer fl.deinit(gpa);
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var fc = try lowerIr(gpa, &func, &layouts, &.{}, false, &diags);
+    defer fc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    const env = fl.slot_off[1];
+    try testing.expect(codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, env + 8)));
+    try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, env)));
+    try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, env + 16)));
+}
+
+test "ir-codegen: frameFits is false past 4095 bytes" {
+    const gpa = testing.allocator;
+    const small = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 4000, .@"align" = 8 }};
+    const big = [_]Layout{.{ .name = "B", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 4096, .@"align" = 8 }};
+    var func = try slotsOnlyFn(gpa, &.{Type.structT(0)});
+    defer func.deinit(gpa);
+    try testing.expect(try frameFits(gpa, &func, &small, &.{}));
+    try testing.expect(!try frameFits(gpa, &func, &big, &.{}));
 }
 
 test "ir-codegen: fn_addr emits adrp+add with two .func relocs" {

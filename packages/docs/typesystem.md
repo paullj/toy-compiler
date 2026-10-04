@@ -294,9 +294,12 @@ inside a block). It is checked bidirectionally, like a literal:
   lambda or outside) is **boxed**: it lives in a GC cell for its whole lifetime, and
   every use, in the function and in its lambdas, goes through the cell. Parameters and
   loop variables follow the same rule, and a boxed loop variable gets a fresh cell per
-  iteration. A `mut` parameter (`mut self` included) may not be captured at all
-  (**T0052**); a local passed as a `mut` argument counts as assigned. A captured
-  `Vec`/`Map` is its handle, so pushes through it are shared either way.
+  iteration. A `mut` parameter (`mut self` included) may be captured only by a closure
+  that does not escape (closures.md, Escape analysis); one that escapes is **T0052**. A
+  local passed as a `mut` argument counts as assigned. A captured
+  `Vec`/`Map` is its handle, so pushes through it are shared either way. With the opt
+  passes on, a boxed local of 16 B or less that only closures that do not escape capture
+  stays in its slot, and they hold its address (closures.md, Escape analysis).
 
 Each lambda is its own function `<owner>$l<rank>(env, params..)`, where the owner is
 the enclosing function or generic instance and the rank is the lambda's pre-order
@@ -359,8 +362,8 @@ nothing assigns is copied into the value. Any other receiver (a field `p.inner.m
 call result) is evaluated once, when the value is made, and copied. A `mut self`
 method writes its receiver through the value, so binding one boxes its receiver, which
 must be a local variable: a temporary is **T0019**, a field **T0052**. A method bound
-on a `mut` parameter (`mut self` included) of the enclosing function would capture it
-(**T0052**). A method with a `mut` parameter after `self` cannot be bound (**T0049**). An
+on a `mut` parameter (`mut self` included) holds the caller's variable by address; the
+bound value must not escape (**T0052**). A method with a `mut` parameter after `self` cannot be bound (**T0049**). An
 associated function has no receiver to bind (**T0018**), a generic method has no single
 instance (**T0049**), and a method the compiler expands at each call (a scalar or
 `str` builtin such as `s.len`, a conversion, the derivable `hash`/`to_string`, a native

@@ -13,8 +13,8 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `control-flow/` | if/else, while/loop/for, break/continue, labels, `&&`/`\|\|` |
 | `structs/`      | construction, by-value copy, field stores, struct returns |
 | `io/`           | runtime output via `print`                                |
-| `closures/`     | function types, function values, lambdas, local fns, bound methods, specialized generic calls and `_` captures |
-| `places/`       | `mut` parameters: by-address arguments (locals, fields), forwarding, generics, aliasing |
+| `closures/`     | function types, function values, lambdas, local fns, bound methods, specialized generic calls, `_` captures and escape analysis (frame envs at -O1) |
+| `places/`       | `mut` parameters: by-address arguments (locals, fields), forwarding, generics, aliasing, captured by non-escaping closures (incl. bound methods) |
 | `ref/`          | `Ref[T]` shared cells from `std/ref`: `Ref.new`, `get` / `set`, cell identity `==`, inferred `T` |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 

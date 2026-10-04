@@ -1,0 +1,9 @@
+import std/vec
+
+pub fn each(xs: Vec[int], f: fn(int)) {
+    for x in xs { f(x) }
+}
+
+pub fn keep(fs: Vec[fn() -> int], f: fn() -> int) {
+    fs.push(f)
+}

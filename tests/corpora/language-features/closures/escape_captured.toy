@@ -1,0 +1,48 @@
+# Feature: a closure escapes when a closure that escapes captures it, or when a callee keeps a closure that captures its param
+# expect: stdout "11012\n202204\n"
+# expect: exit 0
+import std/vec
+import std/io
+
+fn keep(fs: Vec[fn() -> int], f: fn() -> int) { fs.push(f) }
+
+fn wrap_keep(fs: Vec[fn() -> int], f: fn() -> int) {
+    keep(fs, fn() -> int { f() + 0 })
+}
+
+fn fill(fs: Vec[fn() -> int]) {
+    n := 10
+    wrap_keep(fs, fn() -> int {
+        n = n + 1
+        n
+    })
+    m := 100
+    g := fn() -> int {
+        m = m + 1
+        m
+    }
+    keep(fs, fn() -> int { g() * 2 })
+}
+
+# Called between the calls so a frame `fill` left behind is overwritten.
+fn smash(a: int, b: int, c: int, d: int) -> int {
+    x := a * b + 77777
+    y := c * d + 88888
+    z := x + y + 99999
+    x + y + z
+}
+
+fn main() -> int {
+    fs: Vec[fn() -> int] = []
+    fill(fs)
+    _s := smash(1, 2, 3, 4)
+    a := fs[0]()
+    _t := smash(5, 6, 7, 8)
+    b := fs[0]()
+    c := fs[1]()
+    _u := smash(9, 9, 9, 9)
+    d := fs[1]()
+    io.println(a * 1000 + b)
+    io.println(c * 1000 + d)
+    return 0
+}

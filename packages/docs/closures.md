@@ -79,8 +79,9 @@ fn main() -> int {
 - **Reference, not copy:** a lambda refers to the **variables** it names, not to copies. Assignments inside and outside the lambda see each other.
 - **What gets boxed:** the compiler moves a local into a GC box **only** if it is both captured by a closure and assigned anywhere.
   - "Assigned" includes `x = ..`, field stores `x.f = ..`, and `mut self` method calls on `x`.
-  - Parameters and loop variables follow the same rule.
+  - Parameters and loop variables follow the same rule, except a `mut` parameter: closures hold its address and it is never boxed.
   - Every use of a boxed local, in the outer function too, goes through the box.
+  - With the opt passes on (`-O1`), a local of 16 B or less that only closures that do not escape capture is not boxed: they hold its address (see Escape analysis).
 - **Read-only captures** are copied into the environment. With no assignments, a copy and a share are indistinguishable.
 - **Values keep today's rules:** `y := x` copies a struct and shares a `Vec` / `Map` / `Ref` handle.
 - **Loop variables:** each iteration has a fresh binding. `for i in 0..3 { fs.push(fn() { i }) }` gives closures that return 0, 1 and 2.
@@ -91,6 +92,7 @@ fn main() -> int {
   - `fn` is the code pointer.
   - `env` points to a GC cell, which holds the copied captures and pointers to the boxed captures. The collector scans the cell word by word: it has no type descriptor yet.
   - `env` is null for a named function and for a lambda that captures nothing, so a named function as a value costs no allocation.
+  - At `-O1`, a closure that does not escape keeps its env in a slot of the frame that makes it (see Escape analysis).
 - **Calling a function value** is a `call_indirect`, with `env` as a hidden first argument.
 
 ## Generics
@@ -111,12 +113,11 @@ bump(count)                          # count changes
 - **Mechanism:** a `mut` parameter refers to the caller's variable by address, with no heap. This is the same mechanism as `mut self`.
 - **The argument must be a mutable place:** a local or a field of one. The error is T0019.
 - **No marker at the call site.** The LSP shows "mutated by bump".
-- **Escaping closures:** a `mut` parameter captured by a closure that escapes is a coded error, because the address would outlive the caller's frame. The hint is "copy it to a local first".
-  - Until escape analysis lands, every capture of a `mut` parameter is that error.
+- **Escaping closures:** a `mut` parameter captured by a closure that escapes is T0052 ("copy it to a local first"), because the address would outlive the caller's frame. A closure that does not escape may capture it, at every opt level: it holds the caller's address, as the parameter does.
 - **Limits:**
   - **Where `mut` may appear.** On the params of top-level fns and of inherent-impl methods, static (associated) methods included, and on any `self` receiver where `mut self` is allowed today. It is P0006 on a lambda's params, a local fn's params, an `extern` fn's params, a protocol sig's or a conformance method's params after `self`, and any param past the 64th.
   - **The argument.** A local (a param, a forwarded `mut` param, a loop variable and a match binding included) or a field / tuple-field chain rooted at one. Not a place (T0019): a literal, a call result, an index element `xs[i]` or `xs[i].f`, a struct literal or its field, a top-level fn name, a local fn name, a bound method `p.m`.
-  - **Captures.** Any capture of a `mut` param, by a lambda, a local fn or a bound method on it, is T0052 ("copy it to a local first").
+  - **Captures.** A lambda, a local fn, a `_` capture or a bound method may capture a `mut` param (`mut self` included) when it does not escape; one that escapes is T0052.
   - **Not a value.** A fn with any `mut` param, or a method with a `mut` param after `self`, cannot be used as a value: T0049. A call through a function value passes every argument by value.
   - **Boxing.** A caller local passed as a `mut` argument counts as assigned, so if a closure captures it, it is boxed.
   - **Aliasing** is allowed: `swap(x, x)`, and `f(x, x)` with one `mut` and one by-value param. A by-value argument is the copy taken where it is evaluated, so a later argument that writes the variable through a `mut` param (`f(q, touch(q))`) does not change it. An assignment through a `mut` param builds the whole value before it writes any of it, so `a = P { x: b.y, y: b.x }` is right when `a` and `b` name one variable.
@@ -140,6 +141,7 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 
 - The receiver is captured like any other variable.
 - For a `mut self` method, the receiver is assigned through the closure, so it is boxed.
+- On a `mut` parameter (`mut self` included), the receiver is held by address, like a lambda's capture of it.
 
 ## `_` capture expressions
 
@@ -159,7 +161,7 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 - **As a statement:** a capture dropped as a statement (`show(_)`) never runs its call, so it is W0008. Before captures, that statement passed a `_` local; rename the local to keep that meaning.
 - **`mut` positions:** a `_` at a `mut` parameter is T0019. The capture's parameter is a copy of the value it is called with, so the change would be lost.
 - **Pipes:** `x |> f(a, _)` is the call `f(a, x)`: no closure and no env. The piped value is evaluated at its position, in argument order, so in `x |> f(a, _)` the `a` runs first.
-- **Methods:** `acc.plus(_)` is a short form of the bound method with an explicit argument. The receiver is captured like any other argument, and a `mut self` receiver is boxed.
+- **Methods:** `acc.plus(_)` is a short form of the bound method with an explicit argument. The receiver is captured like any other argument: a `mut self` receiver is boxed as an assigned capture is (so at `-O1` it may stay unboxed, see Escape analysis), and a `mut` parameter receiver is held by address.
 - **Known gap:** in a bounded template (`fn g[T has P](t: T)`), a `_` whose position wants the template's own `T` is a false T0050, as a lambda with an untyped param is there. Write the lambda with a typed parameter, `fn(o: T) { t.add(o) }`.
 
 ## Method pipe
@@ -184,15 +186,18 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 
 The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #24. `or_else` follows the name `unwrap_or` gets.
 
-## Escape analysis (`-O1`)
+## Escape analysis
 
-- **What it finds:** a closure does not escape if it is only called, or only passed to parameters that do not escape.
-  - A per-function summary records which parameters escape. It is computed bottom-up over the call graph. Recursion and unknown callees count as escaping.
-- **What that allows:**
-  - The environment of a non-escaping closure goes on the stack.
-  - Its captured-and-mutated locals are not boxed.
-  - A `mut` parameter may be captured by a non-escaping closure.
-- **At `-O0`** everything is always boxed.
+- **Does not escape:** a closure each use of which is a call of it, or passes it whole to a by-value parameter that does not escape. A `:=`-bound closure is judged by its local's uses, and a local fn by its name's uses (its own body included).
+- **Escapes:** returning it, storing it (a field, a struct, enum or list literal, a `Vec`), comparing it, capturing it in another closure, assigning the local, passing it at a `mut` position, or passing it through a fn value or to a builtin, an extern or an intrinsic.
+- **Summaries:** which parameters of a function may escape, per function and per generic instance, computed bottom-up over the call graph. A call back into the caller's own cycle of calls that pass functions (recursion) escapes.
+- **Legality is the same at every level:** `toy check`, `-O0` and `-O1` agree on T0052. It can depend on another module's body: a callee that starts keeping its fn param makes a `mut`-param capture passed to it an error.
+- **`-O1` storage:** any one opt pass turns it on, not the level as such: `-O1` with every pass off (`--no-opt` for each) stores closures as `-O0` does, and `-O0 --opt=dce` stores them as `-O1` does.
+  - a non-escaping env goes in the frame of the body that makes it, up to 256 B per function;
+  - past that, or when the frame would exceed codegen's limit, it goes in a GC cell;
+  - a captured-and-mutated local of 16 B or less that only non-escaping closures capture is not boxed: those closures hold its address;
+  - bound values keep heap envs, and a bound receiver stays boxed.
+- **`-O0`:** every env and box is on the heap. A captured `mut` param's address is a plain word in the env cell.
 - **Gate:** an `-O0` against `-O1` differential run of the corpus (same exit code and stdout).
 
 ## Tooling

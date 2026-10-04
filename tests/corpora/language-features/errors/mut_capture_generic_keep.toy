@@ -1,0 +1,16 @@
+# Feature: SHOULD FAIL — a generic fn that stores its `T` argument makes a closure passed as that `T` escape (T0052)
+# expect: compile-error "a closure that escapes cannot capture the 'mut' parameter 'n'"
+import std/vec
+
+fn keep[T](xs: Vec[T], x: T) { xs.push(x) }
+
+fn add_later(mut n: int, fs: Vec[fn()]) {
+    keep(fs, fn() { n = n + 1 })
+}
+
+fn main() -> int {
+    fs: Vec[fn()] = []
+    t := 0
+    add_later(t, fs)
+    return t
+}

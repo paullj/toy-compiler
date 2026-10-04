@@ -1,0 +1,64 @@
+struct H { f: fn() -> int }
+struct P { x: int }
+
+impl P {
+    fn get(self) -> int { self.x }
+}
+
+fn keep(f: fn() -> int) -> H { H { f: f } }
+fn rec(f: fn() -> int, n: int) -> int {
+    if n == 0 { return f() }
+    rec(f, n - 1)
+}
+fn run(f: fn() -> int) -> int { f() }
+
+fn passed_to_keeper(mut n: int) -> H {
+    keep(fn() -> int { n })  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+}
+
+fn stored(mut n: int, h: H) {
+    h.f = fn() -> int { n }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+}
+
+fn in_field(mut n: int) -> H {
+    H { f: fn() -> int { n } }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+}
+
+fn compared(mut n: int) -> bool {
+    f := fn() -> int { n }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+    f == f
+}
+
+fn recursive(mut n: int) -> int {
+    rec(fn() -> int { n }, 3)  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+}
+
+fn through_value(mut n: int, h: fn(fn() -> int) -> int) -> int {
+    h(fn() -> int { n })  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+}
+
+fn nested(mut n: int) -> fn() -> int {
+    fn() -> int {
+        g := fn() -> int { n }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+        g()
+    }
+}
+
+fn reassigned(mut n: int) -> int {
+    g := fn() -> int { 0 }
+    g = fn() -> int { n }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+    g()
+}
+
+fn bound_returned(mut p: P) -> fn() -> int {
+    p.get  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'p'
+}
+
+fn called(mut n: int) -> int {
+    run(fn() -> int { n })
+}
+
+fn main() -> int {
+    a := 1
+    return called(a)
+}

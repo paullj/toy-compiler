@@ -37,6 +37,11 @@ fn makeDir(gpa: std.mem.Allocator, io: Io, root: []const u8, sub: []const u8) ![
 /// cold build of the same sources in `root/c` runs to `v2_exit` too. Each build writes a
 /// fresh `-o` dir, since macOS kills an image re-signed in place.
 fn flip(root: []const u8, v1: []const File, v1_exit: u8, v2: []const File, v2_exit: u8) !void {
+    return flipAt(root, &.{}, v1, v1_exit, v2, v2_exit);
+}
+
+/// `flip` with `flags` on every build.
+fn flipAt(root: []const u8, flags: []const []const u8, v1: []const File, v1_exit: u8, v2: []const File, v2_exit: u8) !void {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -50,18 +55,24 @@ fn flip(root: []const u8, v1: []const File, v1_exit: u8, v2: []const File, v2_ex
     defer gpa.free(c);
 
     try writeAll(gpa, io, w, v1);
-    try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "a/prog" });
+    try buildWith(gpa, io, w, &.{ "build", "main.toy", "-o", "a/prog" }, flags);
     try std.testing.expectEqual(v1_exit, try harness.runExitIn(gpa, io, w, "a/prog"));
 
     try writeAll(gpa, io, w, v2);
-    try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog" });
+    try buildWith(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog" }, flags);
     try std.testing.expectEqual(v2_exit, try harness.runExitIn(gpa, io, w, "b/prog"));
-    try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog", "--verify" });
+    try buildWith(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog", "--verify" }, flags);
 
     try writeAll(gpa, io, c, v1);
     try writeAll(gpa, io, c, v2);
-    try harness.buildIn(gpa, io, c, &.{ "build", "main.toy", "-o", "b/prog", "--no-cache" });
+    try buildWith(gpa, io, c, &.{ "build", "main.toy", "-o", "b/prog", "--no-cache" }, flags);
     try std.testing.expectEqual(v2_exit, try harness.runExitIn(gpa, io, c, "b/prog"));
+}
+
+fn buildWith(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, args: []const []const u8, flags: []const []const u8) !void {
+    const all = try std.mem.concat(gpa, []const u8, &.{ args, flags });
+    defer gpa.free(all);
+    try harness.buildIn(gpa, io, cwd_abs, all);
 }
 
 test "warm cache: an imported method's self->mut self flip rebuilds its caller (#25)" {
@@ -155,4 +166,257 @@ test "warm cache: a mode flip with an unchanged body plus a caller edit serves n
         &.{ .{ .name = "main.toy", .src = main_v2 }, .{ .name = "p.toy", .src = lib_v2 } },
         3,
     );
+}
+
+const escape_main =
+    \\import std/vec
+    \\import lib
+    \\fn make(keep: Vec[fn() -> int], n: int) -> int {
+    \\    k := n * 2
+    \\    lib.run(fn() -> int { k + n }, keep)
+    \\}
+    \\fn main() -> int {
+    \\    keep: Vec[fn() -> int] = []
+    \\    r := make(keep, 5)
+    \\    if keep.len() == 0 { return r }
+    \\    return keep[0]() + 20
+    \\}
+    \\
+;
+const lib_calls =
+    \\import std/vec
+    \\pub fn run(f: fn() -> int, keep: Vec[fn() -> int]) -> int { f() }
+    \\
+;
+const lib_keeps =
+    \\import std/vec
+    \\pub fn run(f: fn() -> int, keep: Vec[fn() -> int]) -> int {
+    \\    keep.push(f)
+    \\    f()
+    \\}
+    \\
+;
+
+test "warm -O1: an imported fn that starts keeping its fn param rebuilds the caller's frame env" {
+    try flipAt(".toy-test-places-esc-on", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = escape_main }, .{ .name = "lib.toy", .src = lib_calls } }, 15, &.{.{ .name = "lib.toy", .src = lib_keeps }}, 35);
+}
+
+test "warm -O1: an imported fn that stops keeping its fn param rebuilds the caller's heap env" {
+    try flipAt(".toy-test-places-esc-off", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = escape_main }, .{ .name = "lib.toy", .src = lib_keeps } }, 35, &.{.{ .name = "lib.toy", .src = lib_calls }}, 15);
+}
+
+// The env (a 320-byte copy plus the accumulator) is over the frame budget, so it is a GC
+// cell whichever way the callee goes and only the accumulator's box flips: these pin the
+// kept-box half of the caller's key, apart from its frame-env bits.
+const big_env_main =
+    \\import std/vec
+    \\import lib
+    \\struct Q { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int }
+    \\struct Big { p: Q, q: Q, r: Q, s: Q, t: Q }
+    \\fn setup(keep: Vec[fn(int)]) -> int {
+    \\    q := Q { a: 1, b: 0, c: 0, d: 0, e: 0, f: 0, g: 0, h: 0 }
+    \\    x := Big { p: q, q: q, r: q, s: q, t: q }
+    \\    total := 0
+    \\    lib.each(fn(v: int) { total = total + v + x.p.a }, keep)
+    \\    total
+    \\}
+    \\fn smash(n: int) -> int {
+    \\    a := n
+    \\    b := n + 1
+    \\    a + b
+    \\}
+    \\fn main() -> int {
+    \\    keep: Vec[fn(int)] = []
+    \\    r := setup(keep)
+    \\    _z := smash(1000)
+    \\    if keep.len() > 0 {
+    \\        keep[0](5)
+    \\        keep[0](5)
+    \\        return r + 50
+    \\    }
+    \\    return r
+    \\}
+    \\
+;
+const lib_each_calls =
+    \\import std/vec
+    \\pub fn each(f: fn(int), keep: Vec[fn(int)]) {
+    \\    f(1)
+    \\    f(2)
+    \\}
+    \\
+;
+const lib_each_keeps =
+    \\import std/vec
+    \\pub fn each(f: fn(int), keep: Vec[fn(int)]) {
+    \\    keep.push(f)
+    \\    f(1)
+    \\    f(2)
+    \\}
+    \\
+;
+
+test "warm -O1: a callee that starts keeping its fn param re-boxes the caller's accumulator in a heap env" {
+    try flipAt(".toy-test-places-box-on", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = big_env_main }, .{ .name = "lib.toy", .src = lib_each_calls } }, 5, &.{.{ .name = "lib.toy", .src = lib_each_keeps }}, 55);
+}
+
+test "warm -O1: a callee that stops keeping its fn param unboxes the caller's accumulator in a heap env" {
+    try flipAt(".toy-test-places-box-off", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = big_env_main }, .{ .name = "lib.toy", .src = lib_each_keeps } }, 55, &.{.{ .name = "lib.toy", .src = lib_each_calls }}, 5);
+}
+
+const acc_main =
+    \\import std/vec
+    \\import lib
+    \\fn main() -> int {
+    \\    xs: Vec[int] = [1, 2, 3]
+    \\    keep: Vec[fn(int)] = []
+    \\    total := 0
+    \\    lib.each(xs, fn(v: int) { total = total + v }, keep)
+    \\    return total
+    \\}
+    \\
+;
+const lib_acc_calls = "import std/vec\npub fn each(xs: Vec[int], f: fn(int), keep: Vec[fn(int)]) {\n    for x in xs { f(x) }\n}\n";
+const lib_acc_keeps = "import std/vec\npub fn each(xs: Vec[int], f: fn(int), keep: Vec[fn(int)]) {\n    keep.push(f)\n    for x in xs { f(x) }\n}\n";
+
+test "warm -O1: a callee that starts keeping its fn param re-boxes the caller's accumulator" {
+    try flipAt(".toy-test-places-acc-on", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = acc_main }, .{ .name = "lib.toy", .src = lib_acc_calls } }, 6, &.{.{ .name = "lib.toy", .src = lib_acc_keeps }}, 6);
+}
+
+test "warm -O1: a callee that stops keeping its fn param unboxes the caller's accumulator" {
+    try flipAt(".toy-test-places-acc-off", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = acc_main }, .{ .name = "lib.toy", .src = lib_acc_keeps } }, 6, &.{.{ .name = "lib.toy", .src = lib_acc_calls }}, 6);
+}
+
+// L1: `bag.each` stands in for a std `Vec.each`, a method of a generic type's instance
+// whose summary the caller's key must follow.
+const bag_main =
+    \\import std/vec
+    \\import lib
+    \\fn main() -> int {
+    \\    keep: Vec[fn(int)] = []
+    \\    items: Vec[int] = [4, 5, 6]
+    \\    bag := lib.mk(items, keep)
+    \\    total := 0
+    \\    bag.each(fn(v: int) { total = total + v })
+    \\    return total
+    \\}
+    \\
+;
+const lib_bag_head =
+    \\import std/vec
+    \\pub struct Bag[T] { items: Vec[T], keep: Vec[fn(T)] }
+    \\pub fn mk[T](items: Vec[T], keep: Vec[fn(T)]) -> Bag[T] { Bag { items: items, keep: keep } }
+    \\
+;
+const lib_bag_calls = lib_bag_head ++ "impl Bag[T] {\n    fn each(self, f: fn(T)) {\n        for x in self.items { f(x) }\n    }\n}\n";
+const lib_bag_keeps = lib_bag_head ++ "impl Bag[T] {\n    fn each(self, f: fn(T)) {\n        self.keep.push(f)\n        for x in self.items { f(x) }\n    }\n}\n";
+
+test "warm -O1: a generic method instance that starts keeping its fn param rebuilds the caller" {
+    try flipAt(".toy-test-places-bag-on", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = bag_main }, .{ .name = "lib.toy", .src = lib_bag_calls } }, 15, &.{.{ .name = "lib.toy", .src = lib_bag_keeps }}, 15);
+}
+
+test "warm -O1: a generic method instance that stops keeping its fn param rebuilds the caller" {
+    try flipAt(".toy-test-places-bag-off", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = bag_main }, .{ .name = "lib.toy", .src = lib_bag_keeps } }, 15, &.{.{ .name = "lib.toy", .src = lib_bag_calls }}, 15);
+}
+
+/// The diagnostics a `toy` run in `cwd_abs` that must fail prints (owned).
+fn buildErrIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, args: []const []const u8) ![]u8 {
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
+    defer gpa.free(bin_abs);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, bin_abs);
+    try argv.appendSlice(gpa, args);
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .cwd = .{ .path = cwd_abs }, .stdout = .pipe, .stderr = .ignore });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const err = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    errdefer gpa.free(err);
+    const term = try child.wait(io);
+    if (term == .exited and term.exited == 0) return error.TestExpectedCompileError;
+    return err;
+}
+
+test "warm: an imported fn that starts keeping its fn param makes a mut-param capture T0052, at either level" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const root = ".toy-test-places-esc-legal";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const main_src =
+        \\import std/vec
+        \\import lib
+        \\fn add_all(mut n: int, xs: Vec[int], keep: Vec[fn(int)]) {
+        \\    lib.each(xs, fn(v: int) { n = n + v }, keep)
+        \\}
+        \\fn main() -> int {
+        \\    xs: Vec[int] = [1, 2, 3]
+        \\    keep: Vec[fn(int)] = []
+        \\    t := 0
+        \\    add_all(t, xs, keep)
+        \\    return t
+        \\}
+        \\
+    ;
+    const calls = "import std/vec\npub fn each(xs: Vec[int], f: fn(int), keep: Vec[fn(int)]) {\n    for x in xs { f(x) }\n}\n";
+    const keeps = "import std/vec\npub fn each(xs: Vec[int], f: fn(int), keep: Vec[fn(int)]) {\n    keep.push(f)\n    for x in xs { f(x) }\n}\n";
+    for ([_][]const u8{ "-O0", "-O1" }) |lvl| {
+        const w = try makeDir(gpa, io, root, lvl);
+        defer gpa.free(w);
+        try writeAll(gpa, io, w, &.{ .{ .name = "main.toy", .src = main_src }, .{ .name = "lib.toy", .src = calls } });
+        try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "a/prog", lvl });
+        try std.testing.expectEqual(@as(u8, 6), try harness.runExitIn(gpa, io, w, "a/prog"));
+        try writeAll(gpa, io, w, &.{.{ .name = "lib.toy", .src = keeps }});
+        const err = try buildErrIn(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog", lvl });
+        defer gpa.free(err);
+        try std.testing.expect(std.mem.indexOf(u8, err, "T0052") != null);
+        try writeAll(gpa, io, w, &.{.{ .name = "lib.toy", .src = calls }});
+        try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog", lvl });
+        try std.testing.expectEqual(@as(u8, 6), try harness.runExitIn(gpa, io, w, "b/prog"));
+    }
+}
+
+test "warm: a callee flip makes a bound method on a mut param T0052 and back" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const root = ".toy-test-places-esc-bound";
+    Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const main_src =
+        \\import std/vec
+        \\import lib
+        \\fn f(mut p: lib.P, keep: Vec[fn() -> int]) -> int {
+        \\    p.x = p.x + 1
+        \\    lib.run(p.get, keep)
+        \\}
+        \\fn main() -> int {
+        \\    keep: Vec[fn() -> int] = []
+        \\    p := lib.mk(6)
+        \\    return f(p, keep) + p.x
+        \\}
+        \\
+    ;
+    const head = "import std/vec\npub struct P { x: int }\nimpl P {\n    fn get(self) -> int { self.x }\n}\npub fn mk(x: int) -> P { P { x: x } }\n";
+    const calls = head ++ "pub fn run(f: fn() -> int, keep: Vec[fn() -> int]) -> int { f() }\n";
+    const keeps = head ++ "pub fn run(f: fn() -> int, keep: Vec[fn() -> int]) -> int {\n    keep.push(f)\n    f()\n}\n";
+    for ([_][]const u8{ "-O0", "-O1" }) |lvl| {
+        const w = try makeDir(gpa, io, root, lvl);
+        defer gpa.free(w);
+        try writeAll(gpa, io, w, &.{ .{ .name = "main.toy", .src = main_src }, .{ .name = "lib.toy", .src = calls } });
+        try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "a/prog", lvl });
+        try std.testing.expectEqual(@as(u8, 14), try harness.runExitIn(gpa, io, w, "a/prog"));
+        try writeAll(gpa, io, w, &.{.{ .name = "lib.toy", .src = keeps }});
+        const err = try buildErrIn(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog", lvl });
+        defer gpa.free(err);
+        try std.testing.expect(std.mem.indexOf(u8, err, "T0052") != null);
+        try std.testing.expect(std.mem.indexOf(u8, err, "the 'mut' parameter 'p'") != null);
+        try writeAll(gpa, io, w, &.{.{ .name = "lib.toy", .src = calls }});
+        try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "b/prog", lvl, "--verify" });
+        try std.testing.expectEqual(@as(u8, 14), try harness.runExitIn(gpa, io, w, "b/prog"));
+    }
 }

@@ -5,9 +5,8 @@ impl C {
     fn bump(mut self) { self.n = self.n + 1 }
     fn get(self) -> int { self.n }
     fn zero() -> C { C { n: 0 } }
-    fn peek(mut self) -> int {
-        g := self.get  #~ ERROR [T0052] a closure cannot capture the 'mut self' receiver 'self'; copy it to a local first
-        g()
+    fn peek(mut self) -> fn() -> int {
+        return self.get  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut self' receiver 'self'; copy it to a local first
     }
 }
 
@@ -24,5 +23,6 @@ fn main() -> int {
     o: Option[int] = .some(1)
     _u := o.unwrap  #~ ERROR [T0049] 'unwrap' is a built-in method and cannot be used as a value; wrap the call in a lambda
     ok := c.get
-    return ok() + h.c.n + c.peek()
+    pk := c.peek()
+    return ok() + h.c.n + pk()
 }
