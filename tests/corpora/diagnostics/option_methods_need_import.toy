@@ -1,0 +1,10 @@
+# The closure methods of the prelude `Option` and `Result` live in `std/option`; without
+# the import each call names it, while the built-in `unwrap_or` needs none.
+fn main() -> int {
+    o: Option[int] = Option.some(1)
+    r: Result[int, str] = Result.err("bad")
+    _a := o.map(fn(v: int) { v + 1 })  #~ ERROR [T0018] add 'import std/option'
+    _b := r.map_err(fn(e: str) { e.len() })  #~ ERROR [T0018] add 'import std/option'
+    _c := o.or_else(fn() { 0 })  #~ ERROR [T0018] no method 'or_else' on type 'Option'; add 'import std/option'
+    return o.unwrap_or(0) + r.unwrap_or(0)
+}

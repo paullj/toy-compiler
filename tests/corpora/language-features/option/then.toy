@@ -1,0 +1,35 @@
+# Feature: `Option.then` chains steps that can each fail: a step runs only on `some`, so
+# a `none` ends the chain and the later steps never run. In a step whose branches
+# disagree, the constructor names its type args (`Option[str].none`).
+# expect: stdout "big\nnone\n"
+# expect: exit 61
+import std/option
+import std/io
+
+fn half(n: int) -> Option[int] {
+    if n % 2 == 0 { return Option.some(n / 2) }
+    return Option.none
+}
+
+fn main() -> int {
+    o: Option[int] = Option.some(48)
+    n: Option[int] = Option.none
+    a := o.then(half).then(half).then(half).unwrap_or(0)
+    steps := 0
+    b := o.then(fn(v) {
+        steps = steps + 1
+        half(v + 1)
+    }).then(fn(v) {
+        steps = steps + 1
+        half(v)
+    }).then(fn(v) {
+        steps = steps + 1
+        Option.some(v)
+    }).unwrap_or(-1)
+    c := o.then(fn(v) { Option.some(v.to_string()) }).then(fn(s) { Option.some(s.len()) }).then(half).unwrap_or(0)
+    word := o.then(fn(v) { if v > 40 { Option.some("big") } else { Option[str].none } })
+    none := n.then(fn(v) { if v > 40 { Option.some("big") } else { Option[str].none } })
+    io.println(word.unwrap_or("none"))
+    io.println(none.unwrap_or("none"))
+    return a * 10 + b + c + steps
+}

@@ -760,21 +760,6 @@ test "vec: a .field off a call/method result materializes the aggregate rvalue" 
     try std.testing.expectEqual(@as(u8, 16), code);
 }
 
-/// Build `src` at -O0 and at -O1 into separate dirs under `dir` and return both exit codes.
-fn exitAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8) ![2]u8 {
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    var codes: [2]u8 = undefined;
-    for ([_][]const u8{ "-O0", "-O1" }, 0..) |level, i| {
-        const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, level[1..] });
-        defer gpa.free(sub);
-        const prog = try compile(gpa, io, sub, src, &.{ "--no-cache", level });
-        defer gpa.free(prog);
-        codes[i] = try harness.runExit(gpa, io, prog);
-    }
-    return codes;
-}
-
 test "vec: a program's own Vec method wins over std's of the same name, whatever the import order" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -832,7 +817,7 @@ test "vec: Vec closure methods keep their results across forced collections" {
     // locals and buffers (the map's output, the sort's scratch array), so a missed root
     // shows up as a wrong str. The sort by length is stable: the 3-byte strs keep their
     // insertion order. 10 * 3 + 30 * 4 = 150.
-    const codes = try exitAtBothLevels(gpa, io, ".toy-test-vec-closure-gc",
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-vec-closure-gc",
         \\import std/vec
         \\import core/mem_selftest
         \\fn main() -> int {
@@ -882,7 +867,7 @@ test "vec: sort_by is stable and sort agrees on 1000 elements" {
     // runs of equal keys. `R`'s derived Ord compares `k` then `seq`, so `sort()` must give
     // exactly the order a stable sort by `k` gives; the ints are checked against an
     // insertion sort that shares no code with the merge sort.
-    const codes = try exitAtBothLevels(gpa, io, ".toy-test-vec-sort-stable",
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-vec-sort-stable",
         \\import std/vec
         \\struct R { k: int, seq: int }
         \\fn insertion_sorted(xs: Vec[int]) -> Vec[int] {

@@ -1,0 +1,37 @@
+# Feature: `Result.map` and `Result.then` act on `ok` and pass an `err` through without
+# running their function; `map_err` changes the error type (`str` to `int`) and leaves
+# `ok` alone; `or_else(f)` turns an `err` into a value with `f`.
+# expect: stdout "2!\nempty?\n"
+# expect: exit 78
+import std/option
+import std/io
+
+fn parse(s: str) -> Result[int, str] {
+    if s.len() == 0 { return Result.err("empty") }
+    return Result.ok(s.len())
+}
+
+fn main() -> int {
+    a := parse("abc").map(fn(v) { v * 10 }).or_else(fn(_e) { 0 })
+    b := parse("").map(fn(v) { v * 10 }).or_else(fn(e) { e.len() })
+    io.println(parse("ab").map(fn(v) { v.to_string().concat("!") }).or_else(fn(e) { e }))
+    io.println(parse("").map(fn(v) { v.to_string() }).or_else(fn(e) { e.concat("?") }))
+    steps := 0
+    c := parse("xy").then(fn(v) {
+        steps = steps + 1
+        if v > 1 { Result[int, str].ok(v * 3) } else { Result[int, str].err("small") }
+    }).or_else(fn(_m) { 99 })
+    d := parse("x").then(fn(v) {
+        steps = steps + 1
+        if v > 1 { Result[int, str].ok(v * 3) } else { Result[int, str].err("small") }
+    }).or_else(fn(m) { m.len() })
+    e := parse("").then(fn(v) {
+        steps = steps + 1
+        Result[int, str].ok(v)
+    }).or_else(fn(m) { m.len() * 2 })
+    codes := parse("").map_err(fn(m) { m.len() })
+    f := codes.or_else(fn(k) { k + 1 })
+    g := parse("abcd").map_err(fn(m) { m.len() }).or_else(fn(k) { k * 100 })
+    h := parse("").map_err(fn(m) { m.len() }).then(fn(v) { Result[int, int].ok(v) }).or_else(fn(k) { k * 2 })
+    return a + b + c + d + e + f + g + h + steps
+}

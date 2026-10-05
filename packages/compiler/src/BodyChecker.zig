@@ -3402,6 +3402,21 @@ pub const BodyChecker = struct {
         return hint;
     }
 
+    /// "; add 'import std/<m>'" when `member` is a method std/<m> declares on the prelude
+    /// type `recv_ty`, so its absence means the module is not in the program. Else "".
+    fn stdImportHint(bc: *const BodyChecker, recv_ty: Type, member: []const u8) []const u8 {
+        if (!recv_ty.isApp()) return "";
+        const e = bc.composite.at(recv_ty.appIdx());
+        if (!e.ctor_is_enum) return "";
+        const names: []const []const u8 = switch (Typecheck.optResultFamilyOf(bc.model, e.ctor)) {
+            .none => return "",
+            .option => &StdNames.option_methods,
+            .result => &StdNames.result_methods,
+        };
+        for (names) |n| if (std.mem.eql(u8, n, member)) return "; add 'import std/option'";
+        return "";
+    }
+
     /// Type a bare `Box.new(5)`: bind the impl's type params from the value args alone,
     /// then check the call as `Box[int].new(5)` would be. Returns null, with no arg typed,
     /// when the member takes `self`.
@@ -4611,6 +4626,9 @@ pub const BodyChecker = struct {
     /// candidate set is the concrete-receiver methods plus, for a generic-instance (`App`)
     /// receiver, its ctor's template methods (so `xs.pushh(1)` on a Vec suggests `push`).
     fn emitNoMethod(bc: *BodyChecker, at: Span, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
+        const std_hint = bc.stdImportHint(recv_ty, member);
+        if (std_hint.len != 0)
+            return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'{s}", .{ member, bc.typeName(recv_ty), std_hint });
         var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());

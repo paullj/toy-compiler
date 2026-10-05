@@ -18,6 +18,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `places/`       | `mut` parameters: by-address arguments (locals, fields), forwarding, generics, aliasing, captured by non-escaping closures (incl. bound methods) |
 | `ref/`          | `Ref[T]` shared cells from `std/ref`: `Ref.new`, `get` / `set`, cell identity `==`, inferred `T` |
 | `vec/`          | `Vec[T]` from `std/vec`: literals, `push` / `get`, indexing, and the closure methods `each`, `map`, `filter`, `fold`, `any`, `all`, `find`, `sort`, `sort_by` (stable, in place) |
+| `option/`       | the prelude `Option[T]` / `Result[T, E]`: constructors, `?`, the built-in `is_*` / `unwrap` / `unwrap_or`, and the closure methods from `std/option`: `map`, `then`, `or_else` (the lazy `unwrap_or`), `map_err` |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 
 ## Annotation convention

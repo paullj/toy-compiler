@@ -1,0 +1,32 @@
+# Feature: `Option.or_else` is the lazy `unwrap_or`: its function runs only on `none`.
+# The function of a `some` would panic if it ran, and a counter it bumps stays 0.
+# expect: stdout "fallback\nkept\n"
+# expect: exit 20
+import std/option
+import std/io
+
+fn must_not_run(why: str) -> int {
+    if why.len() > 0 { panic(why) }
+    return 0
+}
+
+fn main() -> int {
+    some_calls := 0
+    none_calls := 0
+    o: Option[int] = Option.some(5)
+    n: Option[int] = Option.none
+    a := o.or_else(fn() { must_not_run("or_else ran its function on some") })
+    b := o.or_else(fn() {
+        some_calls = some_calls + 1
+        0
+    })
+    c := n.or_else(fn() {
+        none_calls = none_calls + 1
+        9
+    })
+    s: Option[str] = Option.none
+    io.println(s.or_else(fn() { "fallback" }))
+    io.println(Option[str].some("kept").or_else(fn() { must_not_run("or_else ran its function on some").to_string() }))
+    if some_calls != 0 { return 100 }
+    return a + b + c + none_calls
+}
