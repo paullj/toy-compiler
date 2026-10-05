@@ -1,6 +1,7 @@
 //! End-to-end coverage for the erased Map: runtime descriptor dispatch on raw key cells,
-//! insertion-order iteration (including across a grow), single-handle sharing, survival of
-//! a forced collection, and -jN determinism. Each check surfaces as the child's EXIT CODE
+//! insertion-order iteration (including across a grow, and through the `each`, `filter`,
+//! `map`, `keys` and `values` methods), single-handle sharing, survival of a forced
+//! collection, and -jN determinism. Each check surfaces as the child's EXIT CODE
 //! (0 on success), the only thing this harness observes.
 
 const std = @import("std");
@@ -311,4 +312,201 @@ test "map: Map[str, ()] dedups an owned key with a zero-sized value" {
     const prog = try compile(gpa, io, dir, unit_val_str_src, &.{});
     defer gpa.free(prog);
     try std.testing.expectEqual(@as(u8, 0), try runExit(gpa, io, prog));
+}
+
+test "map: each, keys and values follow insertion order across a grow" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // 100 str keys in scrambled order cross several grows, then every third key is set
+    // again: the walks must still follow first-insertion order, with the new values.
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-map-walk-order",
+        \\import std/map
+        \\import std/mapvec
+        \\import std/vec
+        \\fn key(i: int) -> str { "k".concat(((i * 37) % 101).to_string()) }
+        \\fn want(i: int) -> int { if i % 3 == 0 { i + 1000 } else { i } }
+        \\fn main() -> int {
+        \\    m := Map[str, int].new()
+        \\    i := 0
+        \\    while i < 100 {
+        \\        m.set(key(i), i)
+        \\        i = i + 1
+        \\    }
+        \\    i = 0
+        \\    while i < 100 {
+        \\        if i % 3 == 0 { m.set(key(i), i + 1000) }
+        \\        i = i + 1
+        \\    }
+        \\    if m.len() != 100 { return 1 }
+        \\    j := 0
+        \\    bad := 0
+        \\    m.each(fn(k, v) {
+        \\        if k != key(j) || v != want(j) { bad = bad + 1 }
+        \\        j = j + 1
+        \\    })
+        \\    if j != 100 || bad != 0 { return 2 }
+        \\    ks := m.keys()
+        \\    vs := m.values()
+        \\    if ks.len() != 100 || vs.len() != 100 { return 3 }
+        \\    i = 0
+        \\    while i < 100 {
+        \\        if ks[i] != key(i) { return 4 }
+        \\        if vs[i] != want(i) { return 5 }
+        \\        i = i + 1
+        \\    }
+        \\    return 0
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 0, 0 }, codes);
+}
+
+test "map: filter and map results keep str keys across a forced collection" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // Each callback forces a collection while the method's half-built result Map is the only
+    // reference to the str keys it has copied in; a missed root shows up as a failed lookup.
+    // 15 odd hits + 30 tag hits = 45.
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-map-methods-gc",
+        \\import std/map
+        \\import std/mapvec
+        \\import std/vec
+        \\import core/mem_selftest
+        \\fn fresh(i: int) -> str { "k".concat(i.to_string()) }
+        \\fn main() -> int {
+        \\    m := Map[str, int].new()
+        \\    i := 0
+        \\    while i < 30 {
+        \\        m.set(fresh(i), i)
+        \\        i = i + 1
+        \\    }
+        \\    odd := m.filter(fn(_k, v) {
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        v % 2 == 1
+        \\    })
+        \\    tags := m.map(fn(v) {
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        "v".concat(v.to_string())
+        \\    })
+        \\    ks := odd.keys()
+        \\    _c := mem_selftest.forced_collect_count()
+        \\    if odd.len() != 15 || tags.len() != 30 || ks.len() != 15 { return 1 }
+        \\    ok := 0
+        \\    i = 0
+        \\    while i < 30 {
+        \\        if i % 2 == 1 && odd.get(fresh(i)).unwrap_or(-1) == i { ok = ok + 1 }
+        \\        if tags.get(fresh(i)).unwrap_or("") == "v".concat(i.to_string()) { ok = ok + 1 }
+        \\        i = i + 1
+        \\    }
+        \\    if ks[0] != "k1" || ks[14] != "k29" { return 2 }
+        \\    return ok
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 45, 45 }, codes);
+}
+
+test "map: two Map.map instances on one map run their own code" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // One receiver type, three `W`s: each call must seal to its own instance row. Without
+    // specialization the generic instances themselves run, so a call sealed to the wrong
+    // row would hand back the wrong value type.
+    const src =
+        \\import std/map
+        \\fn neg(v: int) -> int { 0 - v }
+        \\fn main() -> int {
+        \\    m := Map[str, int].new()
+        \\    m.set("a", 4)
+        \\    m.set("b", 9)
+        \\    a := m.map(fn(v) { v * 3 })
+        \\    b := m.map(fn(v) { v.to_string().concat("x") })
+        \\    c := m.map(fn(v) { v > 5 })
+        \\    d := m.map(neg)
+        \\    if b.get("b").unwrap_or("") != "9x" { return 1 }
+        \\    if c.get("a").unwrap_or(true) || !c.get("b").unwrap_or(false) { return 2 }
+        \\    return a.get("a").unwrap_or(0) + a.get("b").unwrap_or(0) + d.get("a").unwrap_or(0) + 100
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-map-map-rows";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const configs = [_][]const []const u8{
+        &.{ "--no-cache", "-O0" },
+        &.{ "--no-cache", "-O1" },
+        &.{ "--no-cache", "-O0", "--no-specialize" },
+    };
+    for (configs, 0..) |flags, i| {
+        const sub = try std.fmt.allocPrint(gpa, "{s}/{d}", .{ dir, i });
+        defer gpa.free(sub);
+        const prog = try compile(gpa, io, sub, src, flags);
+        defer gpa.free(prog);
+        try std.testing.expectEqual(@as(u8, 135), try runExit(gpa, io, prog));
+    }
+}
+
+test "map: Map closure methods are byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The lambdas and the Map, Set and Vec instances bring the unit count past the 64 at
+    // which Pass C and codegen fan out.
+    const src =
+        \\import std/map
+        \\import std/mapvec
+        \\import std/set
+        \\fn main() -> int {
+        \\    m := Map[str, int].new()
+        \\    m.set("b", 2)
+        \\    m.set("a", 1)
+        \\    m.set("c", 3)
+        \\    total := 0
+        \\    m.each(fn(_k, v) { total = total + v })
+        \\    big := m.filter(fn(_k, v) { v > 1 })
+        \\    names := m.map(fn(v) { v.to_string() })
+        \\    sum := m.values().fold(0, fn(acc, v) { acc + v })
+        \\    ks := m.keys()
+        \\    ks.sort()
+        \\    s := Set[int].new()
+        \\    m.each(fn(_k, v) { s.add(v * 10) })
+        \\    evens := s.filter(fn(x) { x % 20 == 0 })
+        \\    s.each(fn(x) { total = total + x })
+        \\    return total + big.len() + names.len() + sum + ks.len() + evens.len()
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-map-methods-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqual(b1.len, b8.len);
+    // Only the one-byte code-sign nonce may differ.
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+    try std.testing.expectEqual(@as(u8, 81), try runExit(gpa, io, p1));
 }

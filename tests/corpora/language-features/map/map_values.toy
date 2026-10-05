@@ -1,0 +1,21 @@
+# Feature: `Map.map` maps the values with `f(v)` into a new Map with the same keys in the same
+# order. The value type may change: `W` is `str` for `words` and `int` for `doubled`.
+# expect: stdout "x=hi\ny=lo\nz=hi\n"
+# expect: exit 13
+import std/io
+import std/map
+
+fn main() -> int {
+    m := Map[str, int].new()
+    m.set("x", 5)
+    m.set("y", 1)
+    m.set("z", 3)
+    words := m.map(fn(v) { if v > 2 { "hi" } else { "lo" } })
+    for k, v in words {
+        io.print(k)
+        io.print("=")
+        io.println(v)
+    }
+    doubled := m.map(fn(v) { v * 2 })
+    return doubled.get("x").unwrap_or(0) + words.len()
+}

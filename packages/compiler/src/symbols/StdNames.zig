@@ -78,18 +78,42 @@ pub const ImportHint = struct {
     spelling: ?[]const u8 = null,
 };
 
-/// The methods std/ref declares on the prelude `Ref`. Missing one means std/ref is not in
-/// the program, so the checker hints its import.
 pub const ref_methods = [_][]const u8{ "new", "get", "set" };
-
-/// The methods std/option declares on the prelude `Option` / `Result`. A call of one with
-/// no such method means std/option is not in the program, so the checker hints its import.
 pub const option_methods = [_][]const u8{ "map", "then", "or_else" };
 pub const result_methods = [_][]const u8{ "map", "then", "map_err", "or_else" };
-
-/// The methods std/str declares on the prelude `str`. A call of one with no such method
-/// means std/str is not in the program, so the checker hints its import.
 pub const str_methods = [_][]const u8{ "contains", "starts_with", "ends_with", "trim", "split", "join", "replace", "chars" };
+pub const mapvec_methods = [_][]const u8{ "keys", "values" };
+
+/// A type some of whose methods live in a std module the program imports, apart from the
+/// type itself: the prelude `Ref`, `Option`, `Result` and `str`, and std/map's `Map`.
+pub const MethodFamily = enum { ref, option, result, str, map };
+
+/// The methods `std/<module>` declares on a family's type. A call of one of them that finds
+/// no such method means the module is not in the program, so the checker names it.
+pub const StdMethods = struct { family: MethodFamily, module: []const u8, methods: []const []const u8 };
+
+pub const std_methods = [_]StdMethods{
+    .{ .family = .ref, .module = "ref", .methods = &ref_methods },
+    .{ .family = .option, .module = "option", .methods = &option_methods },
+    .{ .family = .result, .module = "option", .methods = &result_methods },
+    .{ .family = .str, .module = "str", .methods = &str_methods },
+    .{ .family = .map, .module = "mapvec", .methods = &mapvec_methods },
+};
+
+/// The std module that declares `member` on `family`'s type, or null.
+pub fn methodModule(family: MethodFamily, member: []const u8) ?[]const u8 {
+    for (std_methods) |e| {
+        if (e.family != family) continue;
+        for (e.methods) |m| if (std.mem.eql(u8, m, member)) return e.module;
+    }
+    return null;
+}
+
+/// The std module that declares a family's methods (`Ref`'s, say), whatever the member.
+pub fn familyModule(family: MethodFamily) []const u8 {
+    for (std_methods) |e| if (e.family == family) return e.module;
+    unreachable;
+}
 
 /// Stdlib names a program is likely to reach for WITHOUT the import that binds them,
 /// keyed by EXACT spelling: a typo (`Vecc`) is not a key, so the resolver's fuzzy
@@ -186,44 +210,32 @@ test "importHintFor: exact stdlib names hint; typos, prelude generics, and unkno
     try std.testing.expect(importHintFor("") == null);
 }
 
-test "ref_methods are the methods std/ref declares" {
+test "std_methods are the methods each std module declares, and all of them" {
     const BundledStd = @import("bundled_std");
-    const src = for (BundledStd.modules) |m| {
-        if (std.mem.eql(u8, m.path, "std/ref")) break m.source;
-    } else return error.NoStdRef;
-    var buf: [32]u8 = undefined;
-    for (ref_methods) |name| {
-        const decl = try std.fmt.bufPrint(&buf, "fn {s}(", .{name});
-        try std.testing.expect(std.mem.indexOf(u8, src, decl) != null);
+    // Methods of the module's own types, which no family lists: `Chars.iter`, `Chars.next`.
+    const others = [_]struct { module: []const u8, n: usize }{.{ .module = "str", .n = 2 }};
+    var buf: [64]u8 = undefined;
+    var bracket: [64]u8 = undefined;
+    for (std_methods) |e| {
+        const path = try std.fmt.bufPrint(&buf, "std/{s}", .{e.module});
+        const src = for (BundledStd.modules) |m| {
+            if (std.mem.eql(u8, m.path, path)) break m.source;
+        } else return error.NoStdModule;
+        var want: usize = 0;
+        for (std_methods) |f| if (std.mem.eql(u8, f.module, e.module)) {
+            want += f.methods.len;
+        };
+        for (others) |o| if (std.mem.eql(u8, o.module, e.module)) {
+            want += o.n;
+        };
+        for (e.methods) |name| {
+            const plain = try std.fmt.bufPrint(&buf, "    fn {s}(", .{name});
+            const generic = try std.fmt.bufPrint(&bracket, "    fn {s}[", .{name});
+            try std.testing.expect(std.mem.indexOf(u8, src, plain) != null or std.mem.indexOf(u8, src, generic) != null);
+        }
+        try std.testing.expectEqual(want, std.mem.count(u8, src, "    fn "));
     }
-    try std.testing.expectEqual(ref_methods.len, std.mem.count(u8, src, "    fn "));
-}
-
-test "option_methods and result_methods are the methods std/option declares" {
-    const BundledStd = @import("bundled_std");
-    const src = for (BundledStd.modules) |m| {
-        if (std.mem.eql(u8, m.path, "std/option")) break m.source;
-    } else return error.NoStdOption;
-    var paren: [32]u8 = undefined;
-    var bracket: [32]u8 = undefined;
-    inline for (.{ option_methods, result_methods }) |names| for (names) |name| {
-        const plain = try std.fmt.bufPrint(&paren, "fn {s}(", .{name});
-        const generic = try std.fmt.bufPrint(&bracket, "fn {s}[", .{name});
-        try std.testing.expect(std.mem.indexOf(u8, src, plain) != null or std.mem.indexOf(u8, src, generic) != null);
-    };
-    try std.testing.expectEqual(option_methods.len + result_methods.len, std.mem.count(u8, src, "    fn "));
-}
-
-test "str_methods are the methods std/str declares on str" {
-    const BundledStd = @import("bundled_std");
-    const src = for (BundledStd.modules) |m| {
-        if (std.mem.eql(u8, m.path, "std/str")) break m.source;
-    } else return error.NoStdStr;
-    var buf: [32]u8 = undefined;
-    for (str_methods) |name| {
-        const decl = try std.fmt.bufPrint(&buf, "    fn {s}(", .{name});
-        try std.testing.expect(std.mem.indexOf(u8, src, decl) != null);
-    }
-    // The two others are Chars.iter and Chars.next.
-    try std.testing.expectEqual(str_methods.len + 2, std.mem.count(u8, src, "    fn "));
+    try std.testing.expectEqualStrings(importHintFor("Ref").?.module, familyModule(.ref));
+    try std.testing.expectEqualStrings("option", methodModule(.result, "map_err").?);
+    try std.testing.expect(methodModule(.option, "map_err") == null);
 }

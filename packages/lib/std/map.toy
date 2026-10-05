@@ -7,7 +7,9 @@ import std/iter
 # generic run, so each is instantiated only for a key that conforms to Hashable (else
 # T0023) — the gate that keeps a non-Hashable key from reaching a descriptor. `new` is an
 # ASSOCIATED function, called as `Map[str, int].new()`. `[k]` is a compile error (a miss is
-# normal, so lookups return `Option`); use `.get`.
+# normal, so lookups return `Option`); use `.get`. Every walk (`for k, v`, `each`, `filter`,
+# `map`, and `keys`/`values` from std/mapvec) visits entries in insertion order: the order
+# keys were first set; setting an existing key keeps its place.
 pub struct Map[K, V] { h: gc_array[int] }
 
 impl Map[K has Hashable, V] {
@@ -33,6 +35,41 @@ impl Map[K has Hashable, V] {
 
     fn iter(self) -> MapIter[K, V] {
         return MapIter[K, V] { m: self, i: -1 }
+    }
+
+    # The walks read the length once, so a callback that sets a new key cannot extend its
+    # own walk.
+    fn each(self, f: fn(K, V)) {
+        n := mem.mp_len[K, V](self.h)
+        i := 0
+        while i < n {
+            f(mem.mp_key_at[K, V](self.h, i), mem.mp_val_at[K, V](self.h, i))
+            i = i + 1
+        }
+    }
+
+    fn filter(self, f: fn(K, V) -> bool) -> Map[K, V] {
+        n := mem.mp_len[K, V](self.h)
+        out := Map[K, V].new()
+        i := 0
+        while i < n {
+            k := mem.mp_key_at[K, V](self.h, i)
+            v := mem.mp_val_at[K, V](self.h, i)
+            if f(k, v) { out.set(k, v) }
+            i = i + 1
+        }
+        return out
+    }
+
+    fn map[W](self, f: fn(V) -> W) -> Map[K, W] {
+        n := mem.mp_len[K, V](self.h)
+        out := Map[K, W].new()
+        i := 0
+        while i < n {
+            out.set(mem.mp_key_at[K, V](self.h, i), f(mem.mp_val_at[K, V](self.h, i)))
+            i = i + 1
+        }
+        return out
     }
 }
 

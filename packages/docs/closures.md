@@ -184,10 +184,13 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 | `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort_by(less)` |
 | `Option` / `Result` | `map(f: fn(T) -> U)`, `then(f: fn(T) -> Option[U])` (and-then; `fn(T) -> Result[U, E]` on `Result`), `or_else(f: fn() -> T) -> T` (`fn(E) -> T` on `Result`), `map_err(f: fn(E) -> F) -> Result[T, F]` |
 | `str` | `split(sep) -> Vec[str]`, `sep.join(parts: Vec[str])`, `trim`, `contains`, `starts_with`, `ends_with`, `replace(from, to)`, `chars()` → `Chars[char]`, an iterator of `char` |
-| `Map` / `Set` | `each`, `filter`, `map` (values, for `Map`), `keys()`, `values()` |
+| `Map` | `each(f: fn(K, V))`, `filter(f: fn(K, V) -> bool) -> Map[K, V]`, `map(f: fn(V) -> W) -> Map[K, W]` (maps the values), `keys() -> Vec[K]`, `values() -> Vec[V]` |
+| `Set` | `each(f: fn(T))`, `filter(f: fn(T) -> bool) -> Set[T]`, `map(f: fn(T) -> U) -> Set[U]` (`U` Hashable) |
 
 - **Sorting:** `sort` and `sort_by` sort in place and are stable; `less(a, b)` is true when `a` goes first. A method takes one arity per name, so the comparator form has its own name.
-- **Walks:** they visit the elements present when the call starts, in index order. A callback that pushes onto the same `Vec` does not extend the walk.
+- **Walks:** they visit the elements present when the call starts, in index order. A callback that pushes onto the same `Vec`, or sets a new key in the same `Map`, does not extend the walk.
+- **Order:** a `Map` or `Set` iterates in insertion order: the order keys were first added. Setting an existing key keeps its place, and there is no removal. `for`, `each`, `keys`, `values`, `filter` and `map` all follow it, and the maps and sets that `filter` and `map` return keep it. `Set.map` keeps one of two elements that map to one value, at the first one's place.
+- **`keys` and `values`:** they return a `Vec`, so they are in `std/mapvec` (`import std/mapvec`). `std/map` does not import `std/vec`: that would put `Vec` into the graph of every program that uses a `Map`, and renumber the struct ids its binary embeds. Without the import, a call is T0018 "add 'import std/mapvec'".
 - **Escapes:** a std method only calls the functions passed to it, so they never escape (see Escape analysis).
 - **Option and Result:** the methods are in `std/option` (`import std/option`), as `Ref`'s methods are in `std/ref`. Without the import, a call is T0018 "add 'import std/option'". `is_some`, `unwrap`, `unwrap_or` and the other built-in methods need no import.
 - **`or_else(f)`** is the lazy `unwrap_or`: `f` runs only on `none` or `err`.

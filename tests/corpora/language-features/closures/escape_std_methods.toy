@@ -5,6 +5,8 @@
 # expect: exit 72
 import std/vec
 import std/option
+import std/map
+import std/set
 import std/io
 
 fn vec_methods() -> int {
@@ -146,6 +148,67 @@ fn option_mut(mut acc: int, o: Option[int], r: Result[int, str]) -> int {
     acc
 }
 
+fn map_methods() -> int {
+    m := Map[str, int].new()
+    m.set("a", 1)
+    m.set("b", 2)
+    m.set("c", 3)
+    total := 0
+    m.each(fn(_k, v) { total = total + v })
+    big := m.filter(fn(_k, v) {
+        total = total + 1
+        v > 1
+    })
+    tens := m.map(fn(v) {
+        total = total + 1
+        v * 10
+    })
+    return total + big.len() + tens.len()
+}
+
+fn map_mut(mut acc: int, m: Map[str, int]) -> int {
+    m.each(fn(_k, v) { acc = acc + v })
+    _f := m.filter(fn(_k, _v) {
+        acc = acc + 1
+        true
+    })
+    _m := m.map(fn(v) {
+        acc = acc + 1
+        v
+    })
+    acc
+}
+
+fn set_methods() -> int {
+    s := Set[int].new()
+    s.add(4)
+    s.add(5)
+    total := 0
+    s.each(fn(x) { total = total + x })
+    odd := s.filter(fn(x) {
+        total = total + 1
+        x % 2 == 1
+    })
+    dbl := s.map(fn(x) {
+        total = total + 1
+        x * 2
+    })
+    return total + odd.len() + dbl.len()
+}
+
+fn set_mut(mut acc: int, s: Set[int]) -> int {
+    s.each(fn(x) { acc = acc + x })
+    _f := s.filter(fn(_x) {
+        acc = acc + 1
+        true
+    })
+    _m := s.map(fn(x) {
+        acc = acc + 1
+        x
+    })
+    acc
+}
+
 fn main() -> int {
     a := vec_methods()
     b := 0
@@ -158,5 +221,13 @@ fn main() -> int {
     o: Option[int] = Option.some(1)
     r: Result[int, str] = Result.ok(2)
     if option_mut(calls, o, r) != 4 || calls != 4 { return 2 }
+    if map_methods() != 17 || set_methods() != 16 { return 3 }
+    seen := 0
+    m := Map[str, int].new()
+    m.set("x", 2)
+    if map_mut(seen, m) != 4 || seen != 4 { return 4 }
+    s := Set[int].new()
+    s.add(7)
+    if set_mut(seen, s) != 13 || seen != 13 { return 5 }
     return a + b + c
 }
