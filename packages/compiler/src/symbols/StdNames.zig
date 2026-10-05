@@ -87,12 +87,17 @@ pub const ref_methods = [_][]const u8{ "new", "get", "set" };
 pub const option_methods = [_][]const u8{ "map", "then", "or_else" };
 pub const result_methods = [_][]const u8{ "map", "then", "map_err", "or_else" };
 
+/// The methods std/str declares on the prelude `str`. A call of one with no such method
+/// means std/str is not in the program, so the checker hints its import.
+pub const str_methods = [_][]const u8{ "contains", "starts_with", "ends_with", "trim", "split", "join", "replace", "chars" };
+
 /// Stdlib names a program is likely to reach for WITHOUT the import that binds them,
 /// keyed by EXACT spelling: a typo (`Vecc`) is not a key, so the resolver's fuzzy
 /// "did you mean" keeps ownership of typos and only a genuine stdlib name yields the
 /// deterministic import hint. `Option`/`Result` are prelude generics (no import) and
-/// are absent; there is no `std/string` yet, so `string`/`String` are too. `Ref` is a
-/// prelude type whose methods live in `std/ref`, so it names that module.
+/// are absent; `str`'s methods live in `std/str` and there is no `string` type, so
+/// `string`/`String` are absent too. `Ref` is a prelude type whose methods live in
+/// `std/ref`, so it names that module.
 const import_hints = std.StaticStringMap(ImportHint).initComptime(.{
     .{ "Vec", ImportHint{ .module = "vec" } },
     .{ "Ref", ImportHint{ .module = "ref" } },
@@ -207,4 +212,18 @@ test "option_methods and result_methods are the methods std/option declares" {
         try std.testing.expect(std.mem.indexOf(u8, src, plain) != null or std.mem.indexOf(u8, src, generic) != null);
     };
     try std.testing.expectEqual(option_methods.len + result_methods.len, std.mem.count(u8, src, "    fn "));
+}
+
+test "str_methods are the methods std/str declares on str" {
+    const BundledStd = @import("bundled_std");
+    const src = for (BundledStd.modules) |m| {
+        if (std.mem.eql(u8, m.path, "std/str")) break m.source;
+    } else return error.NoStdStr;
+    var buf: [32]u8 = undefined;
+    for (str_methods) |name| {
+        const decl = try std.fmt.bufPrint(&buf, "    fn {s}(", .{name});
+        try std.testing.expect(std.mem.indexOf(u8, src, decl) != null);
+    }
+    // The two others are Chars.iter and Chars.next.
+    try std.testing.expectEqual(str_methods.len + 2, std.mem.count(u8, src, "    fn "));
 }

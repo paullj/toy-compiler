@@ -1,0 +1,69 @@
+# Feature: `s.chars()` never panics on malformed UTF-8: each invalid sequence yields one
+# U+FFFD (65533) and decoding resumes after it. A truncated sequence resumes at the byte
+# that broke it, so "\xE2\x82a" still decodes the `a`. An overlong form ("\xC0\xAF": C0 is
+# never a lead byte), a surrogate ("\xED\xA0\x80") and a code point above U+10FFFF
+# ("\xF4\x90\x80\x80") are replaced too.
+# expect: exit 42
+import std/str
+
+# The code points' sum * 100 + the char count.
+fn cps(s: str) -> int {
+    total := 0
+    count := 0
+    for c in s.chars() {
+        k: int = c.into()
+        total = total + k
+        count = count + 1
+    }
+    return total * 100 + count
+}
+
+fn valid() -> int {
+    if cps("ab") != (97 + 98) * 100 + 2 { return 1 }
+    if cps("é") != 233 * 100 + 1 { return 2 }
+    if cps("€") != 8364 * 100 + 1 { return 3 }
+    if cps("😀") != 128512 * 100 + 1 { return 4 }
+    if cps("") != 0 { return 5 }
+    return 0
+}
+
+fn truncated() -> int {
+    if cps("a\xC3") != (97 + 65533) * 100 + 2 { return 11 }
+    if cps("\x80") != 65533 * 100 + 1 { return 12 }
+    if cps("\xE2\x82") != 65533 * 100 + 1 { return 13 }
+    if cps("\xE2\x82a") != (65533 + 97) * 100 + 2 { return 14 }
+    if cps("\xF0\x9F\x98") != 65533 * 100 + 1 { return 15 }
+    if cps("\xC3(") != (65533 + 40) * 100 + 2 { return 16 }
+    return 0
+}
+
+fn rejected() -> int {
+    if cps("\xC0\xAF") != 65533 * 2 * 100 + 2 { return 21 }
+    if cps("\xED\xA0\x80") != 65533 * 100 + 1 { return 22 }
+    if cps("\xF4\x90\x80\x80") != 65533 * 100 + 1 { return 23 }
+    if cps("\xE0\x80\x80") != 65533 * 100 + 1 { return 24 }
+    if cps("\xFF\xFEz") != (65533 * 2 + 122) * 100 + 3 { return 25 }
+    return 0
+}
+
+fn manual() -> int {
+    it := "h\xC3".chars()
+    n := 0
+    loop {
+        c := it.next()
+        if c.is_none() { break }
+        n = n + 1
+    }
+    return n
+}
+
+fn main() -> int {
+    v := valid()
+    if v != 0 { return v }
+    t := truncated()
+    if t != 0 { return t }
+    r := rejected()
+    if r != 0 { return r }
+    if manual() != 2 { return 31 }
+    return 42
+}

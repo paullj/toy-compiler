@@ -3405,6 +3405,10 @@ pub const BodyChecker = struct {
     /// "; add 'import std/<m>'" when `member` is a method std/<m> declares on the prelude
     /// type `recv_ty`, so its absence means the module is not in the program. Else "".
     fn stdImportHint(bc: *const BodyChecker, recv_ty: Type, member: []const u8) []const u8 {
+        if (recv_ty.kind == .str) {
+            for (StdNames.str_methods) |n| if (std.mem.eql(u8, n, member)) return "; add 'import std/str'";
+            return "";
+        }
         if (!recv_ty.isApp()) return "";
         const e = bc.composite.at(recv_ty.appIdx());
         if (!e.ctor_is_enum) return "";

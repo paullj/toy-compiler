@@ -1,0 +1,32 @@
+# Feature: `contains`, `starts_with` and `ends_with` from std/str compare bytes. The empty
+# str is in every str and starts and ends every str; a needle longer than the haystack
+# never matches.
+# expect: exit 63
+import std/str
+
+fn contains_bits() -> int {
+    n := 0
+    if "hello world".contains("lo w") { n = n + 1 }
+    if !"hello".contains("hex") { n = n + 2 }
+    if "abc".contains("") && "".contains("") { n = n + 4 }
+    if !"ab".contains("abc") { n = n + 8 }
+    if "aaab".contains("aab") { n = n + 16 }
+    if "café".contains("é") { n = n + 32 }
+    return n
+}
+
+fn prefix_bits() -> int {
+    n := 0
+    if "hello".starts_with("he") && !"hello".starts_with("lo") { n = n + 1 }
+    if "hello".ends_with("lo") && !"hello".ends_with("he") { n = n + 2 }
+    if "x".starts_with("") && "x".ends_with("") { n = n + 4 }
+    if !"ab".starts_with("abc") && !"ab".ends_with("zab") { n = n + 8 }
+    if "same".starts_with("same") && "same".ends_with("same") { n = n + 16 }
+    if "".ends_with("") && !"".starts_with("a") { n = n + 32 }
+    return n
+}
+
+fn main() -> int {
+    if contains_bits() != 63 { return 1 }
+    return prefix_bits()
+}
