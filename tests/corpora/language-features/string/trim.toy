@@ -1,0 +1,21 @@
+# Feature: `s.trim()` from std/str drops leading and trailing ASCII whitespace (space and
+# bytes 9-13), keeps inner spaces, and leaves other bytes alone (a no-break space stays).
+# An all-whitespace str trims to "".
+# expect: stdout "[a  b]\n[]\n"
+# expect: exit 7
+import std/str
+import std/io
+
+fn main() -> int {
+    io.println("[".concat("  a  b \n".trim()).concat("]"))
+    io.println("[".concat(" \t ".trim()).concat("]"))
+    n := 0
+    if "\t\nx\r".trim() == "x" { n = n + 1 }
+    if "\x0B\x0Cy\x0B".trim() == "y" { n = n + 1 }
+    if "".trim() == "" { n = n + 1 }
+    if "z".trim() == "z" { n = n + 1 }
+    if "   ".trim().len() == 0 { n = n + 1 }
+    if "\u{A0}w ".trim() == "\u{A0}w" { n = n + 1 }
+    if " q".trim().len() == 1 { n = n + 1 }
+    return n
+}

@@ -19,6 +19,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `ref/`          | `Ref[T]` shared cells from `std/ref`: `Ref.new`, `get` / `set`, cell identity `==`, inferred `T` |
 | `vec/`          | `Vec[T]` from `std/vec`: literals, `push` / `get`, indexing, and the closure methods `each`, `map`, `filter`, `fold`, `any`, `all`, `find`, `sort`, `sort_by` (stable, in place) |
 | `option/`       | the prelude `Option[T]` / `Result[T, E]`: constructors, `?`, the built-in `is_*` / `unwrap` / `unwrap_or`, and the closure methods from `std/option`: `map`, `then`, `or_else` (the lazy `unwrap_or`), `map_err` |
+| `string/`       | the prelude `str`: `concat`, `to_string`, and the methods from `std/str`: `split`, `join`, `trim`, `contains`, `starts_with`, `ends_with`, `replace`, and `chars()` (UTF-8 decoding, U+FFFD for invalid input) |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 
 ## Annotation convention

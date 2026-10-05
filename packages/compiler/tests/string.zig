@@ -1,6 +1,7 @@
 //! End-to-end coverage for the unified `str`: concat + read-back, method-based and
 //! `==` content equality (including independent backing), int/bool `to_string`, an
-//! owned (concat'd) str key surviving a forced collection in a Map, and -jN
+//! owned (concat'd) str key surviving a forced collection in a Map, the std/str methods
+//! (shared-byte substrings across forced collections, UTF-8 `chars`), and -jN
 //! determinism. Each check surfaces as the child's EXIT CODE (0 == success).
 
 const std = @import("std");
@@ -283,4 +284,241 @@ test "string: a print/to_string program is byte-identical at -j1 and -j8" {
     defer gpa.free(b8);
 
     try std.testing.expectEqualSlices(u8, b1, b8);
+}
+
+test "string: split, trim and join results survive forced collections" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The parts share the concat'd parent's buffer through interior pointers, and the
+    // parent itself is dead after `split`, so only those pointers keep it alive. 'x' = 120.
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-split-gc",
+        \\import std/str
+        \\import std/vec
+        \\import core/mem_selftest
+        \\fn main() -> int {
+        \\    src := "x".concat("alpha, beta ,gamma,delta  ")
+        \\    parts := src.split(",") |> .map(fn(p) { p.trim() })
+        \\    i := 0
+        \\    while i < 200 {
+        \\        junk: Vec[int] = [i, i, i]
+        \\        _j := junk.len()
+        \\        i = i + 1
+        \\    }
+        \\    _c := mem_selftest.forced_collect_count()
+        \\    keep := parts.filter(fn(p) { p.ends_with("a") })
+        \\    _d := mem_selftest.forced_collect_count()
+        \\    joined := "|".join(keep)
+        \\    if joined != "xalpha|beta|gamma|delta" { return 1 }
+        \\    if "a-b".replace("-", "x".concat("y")) != "axyb" { return 2 }
+        \\    it := joined.chars()
+        \\    first := it.next().unwrap()
+        \\    v: int = first.into()
+        \\    return v
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 120, 120 }, codes);
+}
+
+test "string: a join's buffer survives collections around it, over thousands of parts" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // Each join holds its buffer only in a `rawptr` until the str is made, and the junk
+    // between joins keeps the collector busy, so a buffer the collector lost shows up as
+    // wrong bytes. 13890 part bytes + 2999 commas = 16889, and 16889 % 251 = 72.
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-join-gc",
+        \\import std/str
+        \\import std/vec
+        \\import core/mem_selftest
+        \\fn main() -> int {
+        \\    parts: Vec[str] = []
+        \\    i := 0
+        \\    while i < 3000 {
+        \\        parts.push("p".concat(i.to_string()))
+        \\        i = i + 1
+        \\    }
+        \\    n := 0
+        \\    k := 0
+        \\    while k < 40 {
+        \\        s := ",".join(parts)
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        junk: Vec[str] = ["a".concat("b"), "c".concat("d")]
+        \\        _j := junk.len()
+        \\        if !s.starts_with("p0,p1,p2,") || !s.ends_with(",p2998,p2999") { return 1 }
+        \\        n = s.len()
+        \\        k = k + 1
+        \\    }
+        \\    return n % 251
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 72, 72 }, codes);
+}
+
+const chars_src =
+    \\import std/str
+    \\import std/io
+    \\fn main() -> int {
+    \\    s := "aé€😀\xC3"
+    \\    for c in s.chars() {
+    \\        v: int = c.into()
+    \\        io.print(v.to_string().concat(" "))
+    \\    }
+    \\    it := s.chars()
+    \\    n := 0
+    \\    loop {
+    \\        o := it.next()
+    \\        if o.is_none() { break }
+    \\        io.print(o.unwrap())
+    \\        n = n + 1
+    \\    }
+    \\    return n - 5
+    \\}
+    \\
+;
+
+test "string: chars decodes UTF-8 under for and a manual next, at -O0 and -O1" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const dir = ".toy-test-string-chars";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    for ([_][]const u8{ "-O0", "-O1" }) |level| {
+        const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, level[1..] });
+        defer gpa.free(sub);
+        const prog = try compile(gpa, io, sub, chars_src, &.{ "--no-cache", level });
+        defer gpa.free(prog);
+        const out = try runStdout(gpa, io, prog);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings("97 233 8364 128512 65533 aé€😀\u{FFFD}", out);
+    }
+}
+
+test "string: a chars iterator keeps its string alive" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The iterator's copy of the str is the only reference to the concat'd buffer: under
+    // `for` while each step forces a collection, and in a struct returned from a fn.
+    const live = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-chars-live",
+        \\import std/str
+        \\import std/vec
+        \\import core/mem_selftest
+        \\fn churn() {
+        \\    i := 0
+        \\    while i < 500 {
+        \\        g := Vec[int].new()
+        \\        g.push(i)
+        \\        i = i + 1
+        \\    }
+        \\}
+        \\fn main() -> int {
+        \\    total := 0
+        \\    for c in "h".concat("é€😀").chars() {
+        \\        churn()
+        \\        _x := mem_selftest.forced_collect_count()
+        \\        k: int = c.into()
+        \\        total = total + k
+        \\    }
+        \\    return total - 104 - 233 - 8364 - 128512 + 7
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 7, 7 }, live);
+    const held = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-chars-held",
+        \\import std/str
+        \\import std/vec
+        \\import core/mem_selftest
+        \\fn mk() -> Chars[char] {
+        \\    return "h".concat("é€").chars()
+        \\}
+        \\fn main() -> int {
+        \\    it := mk()
+        \\    _x := mem_selftest.forced_collect_count()
+        \\    g := Vec[int].new()
+        \\    i := 0
+        \\    while i < 2000 {
+        \\        g.push(i)
+        \\        i = i + 1
+        \\    }
+        \\    _y := mem_selftest.forced_collect_count()
+        \\    total := 0
+        \\    for c in it {
+        \\        k: int = c.into()
+        \\        total = total + k
+        \\    }
+        \\    return total - 104 - 233 - 8364 + 9
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 9, 9 }, held);
+}
+
+test "string: str methods are byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The lambdas and Vec instances bring the unit count past the 64 at which Pass C and
+    // codegen fan out.
+    const src =
+        \\import std/str
+        \\import std/vec
+        \\fn words(s: str) -> Vec[str] {
+        \\    return s.split(",") |> .map(fn(w) { w.trim() })
+        \\}
+        \\fn wide(s: str) -> int {
+        \\    n := 0
+        \\    for c in s.chars() {
+        \\        k: int = c.into()
+        \\        if k > 127 { n = n + 1 }
+        \\    }
+        \\    return n
+        \\}
+        \\fn main() -> int {
+        \\    ws := words(" the quick,brown , fox ")
+        \\    n := ws.fold(0, fn(a, w) { a + w.len() })
+        \\    if !"-".join(ws).contains("quick-brown") { return 1 }
+        \\    if !"a.b.c".replace(".", "::").starts_with("a::") { return 2 }
+        \\    if !"name.toy".ends_with(".toy") { return 3 }
+        \\    long := ws.filter(fn(w) { w.len() > 3 })
+        \\    if !long.any(fn(w) { w.contains("q") }) || !ws.all(fn(w) { w.len() > 0 }) { return 4 }
+        \\    ws.sort_by(fn(a, b) { a.len() < b.len() })
+        \\    if ws.find(fn(w) { w.starts_with("b") }).unwrap_or("") != "brown" { return 5 }
+        \\    ws.each(fn(w) { n = n + wide(w) })
+        \\    lens := "é€,😀".split(",").map(fn(p) { wide(p) })
+        \\    return n + lens.fold(0, fn(a, x) { a + x }) + ws.get(0).unwrap().len()
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-string-methods-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqualSlices(u8, b1, b8);
+    try std.testing.expectEqual(@as(u8, 23), try runExit(gpa, io, p1));
 }

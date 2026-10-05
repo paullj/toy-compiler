@@ -5722,6 +5722,32 @@ test "a std/option method without the import is T0018 naming std/option" {
     try testing.expect(std.mem.indexOf(u8, c.result.diags[2].message, hint) == null);
 }
 
+test "std/str methods do not shadow the builtin str methods" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\impl str {
+        \\    fn contains(self, sub: str) -> bool { self.len() >= sub.len() }
+        \\    fn split(self, _sep: str) -> int { self.len() }
+        \\    fn chars(self) -> int { self.byte_at(0) }
+        \\}
+        \\fn main() -> int {
+        \\    s := "a,b"
+        \\    n := s.len()
+        \\    if s.contains(",") { return s.split(",") + s.chars() + n }
+        \\    return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Three `len` calls in the bodies, then main's `s.len()`.
+    for (0..4) |nth| try testing.expectEqual(Callee.View{ .builtin = .str_len }, try calleeView(&c, "len", nth));
+    try testing.expectEqual(Callee.View{ .builtin = .str_byte_at }, try calleeView(&c, "byte_at", 0));
+    inline for (.{ "contains", "split", "chars" }) |name|
+        try testing.expectEqualStrings(name, (try calleeMethod(&c, name, 0)).name);
+    try expectNoPending(&c.result);
+}
+
 test "unwrap on a str (aggregate) payload is accepted — no diagnostic" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn main() -> int {

@@ -1,0 +1,42 @@
+# Feature: `s.chars()` from std/str decodes UTF-8 into `char`s, under `for` and through a
+# manual `next()` loop. "héllo €😀" mixes 1-, 2-, 3- and 4-byte sequences: 8 chars in
+# 14 bytes, whose code points sum to 137572. Printing each char writes its bytes back.
+# expect: stdout "8 chars in 14 bytes\n137572\n104 233 108 108 111 32 8364 128512 \n<h><é><l><l><o>< ><€><😀>\n"
+# expect: exit 2
+import std/str
+import std/io
+
+fn main() -> int {
+    s := "héllo €😀"
+    count := 0
+    total := 0
+    for c in s.chars() {
+        v: int = c.into()
+        total = total + v
+        count = count + 1
+    }
+    io.println(count.to_string().concat(" chars in ").concat(s.len().to_string()).concat(" bytes"))
+    io.println(total)
+    it := s.chars()
+    loop {
+        o := it.next()
+        if o.is_none() { break }
+        v: int = o.unwrap().into()
+        io.print(v.to_string().concat(" "))
+    }
+    io.println("")
+    for c in s.chars() {
+        io.print("<")
+        io.print(c)
+        io.print(">")
+    }
+    io.println("")
+    wide := 0
+    for c in "aé€😀".chars() {
+        if c == 'é' || c == '😀' { wide = wide + 1 }
+    }
+    done := s.chars()
+    while done.next().is_some() {}
+    if done.next().is_some() { return 100 }
+    return wide
+}

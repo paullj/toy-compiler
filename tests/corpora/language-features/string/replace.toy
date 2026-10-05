@@ -1,0 +1,20 @@
+# Feature: `s.replace(from, to)` from std/str replaces every `from`, left to right and
+# without overlaps. An empty `from` changes nothing, and `from` may be several bytes of one
+# char (a multibyte `€`).
+# expect: stdout "a;b;;c\n5 EUR + 3 EUR\n"
+# expect: exit 6
+import std/str
+import std/io
+
+fn main() -> int {
+    io.println("a,b,,c".replace(",", ";"))
+    io.println("5€ + 3€".replace("€", " EUR"))
+    n := 0
+    if "abc".replace("", "x") == "abc" { n = n + 1 }
+    if "aaaa".replace("aa", "b") == "bb" { n = n + 1 }
+    if "aaa".replace("aa", "b") == "ba" { n = n + 1 }
+    if "none here".replace("zz", "y") == "none here" { n = n + 1 }
+    if "xyx".replace("x", "") == "y" { n = n + 1 }
+    if "".replace("a", "b") == "" { n = n + 1 }
+    return n
+}

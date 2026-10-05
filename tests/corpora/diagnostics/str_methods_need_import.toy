@@ -1,0 +1,9 @@
+# The methods of the prelude `str` beyond the built-in `len`, `byte_at`, `concat` and
+# `to_string` live in `std/str`; without the import each call names it.
+fn main() -> int {
+    s := "a,b"
+    _n := s.split(",").len()  #~ ERROR [T0018] add 'import std/str'
+    _t := s.trim()  #~ ERROR [T0018] no method 'trim' on type 'str'; add 'import std/str'
+    _c := s.chars()  #~ ERROR [T0018] add 'import std/str'
+    return s.len() + s.byte_at(0)
+}

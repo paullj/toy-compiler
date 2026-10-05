@@ -1,0 +1,37 @@
+# Feature: `s.split(sep)` from std/str gives the parts between each `sep`, in order, with
+# empty parts kept: n separators give n + 1 parts. An empty `sep` gives `[s]`.
+# `sep.join(parts)` puts `sep` between each two parts, and joining no parts gives "".
+# expect: stdout "a-bb--ccc\n4\n[x|y|]\n"
+# expect: exit 37
+import std/str
+import std/vec
+import std/io
+
+fn count_parts() -> int {
+    n := 0
+    n = n + "a,bb,,ccc".split(",").len()
+    n = n + "abc".split("").len() * 10
+    n = n + "x,".split(",").len() * 100
+    n = n + ",".split(",").len() * 1000
+    n = n + "".split(",").len() * 10000
+    return n
+}
+
+fn main() -> int {
+    parts := "a,bb,,ccc".split(",")
+    io.println("-".join(parts))
+    io.println(parts.len())
+    io.println("[".concat("|".join("x::y::".split("::"))).concat("]"))
+    if count_parts() != 12214 { return 1 }
+    empty: Vec[str] = []
+    n := 0
+    if ", ".join(empty) == "" { n = n + 1 }
+    if parts.get(2).unwrap() == "" { n = n + 1 }
+    if parts.get(3).unwrap() == "ccc" { n = n + 1 }
+    if "abc".split("").get(0).unwrap() == "abc" { n = n + 1 }
+    single: Vec[str] = ["solo"]
+    if "+".join(single) == "solo" { n = n + 1 }
+    if "".join(["a", "b", "c"]) == "abc" { n = n + 1 }
+    if "ab".join(["1", "2"]) == "1ab2" { n = n + 1 }
+    return n + 30
+}
