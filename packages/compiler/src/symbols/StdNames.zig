@@ -82,6 +82,11 @@ pub const ImportHint = struct {
 /// the program, so the checker hints its import.
 pub const ref_methods = [_][]const u8{ "new", "get", "set" };
 
+/// The methods std/option declares on the prelude `Option` / `Result`. A call of one with
+/// no such method means std/option is not in the program, so the checker hints its import.
+pub const option_methods = [_][]const u8{ "map", "then", "or_else" };
+pub const result_methods = [_][]const u8{ "map", "then", "map_err", "or_else" };
+
 /// Stdlib names a program is likely to reach for WITHOUT the import that binds them,
 /// keyed by EXACT spelling: a typo (`Vecc`) is not a key, so the resolver's fuzzy
 /// "did you mean" keeps ownership of typos and only a genuine stdlib name yields the
@@ -187,4 +192,19 @@ test "ref_methods are the methods std/ref declares" {
         try std.testing.expect(std.mem.indexOf(u8, src, decl) != null);
     }
     try std.testing.expectEqual(ref_methods.len, std.mem.count(u8, src, "    fn "));
+}
+
+test "option_methods and result_methods are the methods std/option declares" {
+    const BundledStd = @import("bundled_std");
+    const src = for (BundledStd.modules) |m| {
+        if (std.mem.eql(u8, m.path, "std/option")) break m.source;
+    } else return error.NoStdOption;
+    var paren: [32]u8 = undefined;
+    var bracket: [32]u8 = undefined;
+    inline for (.{ option_methods, result_methods }) |names| for (names) |name| {
+        const plain = try std.fmt.bufPrint(&paren, "fn {s}(", .{name});
+        const generic = try std.fmt.bufPrint(&bracket, "fn {s}[", .{name});
+        try std.testing.expect(std.mem.indexOf(u8, src, plain) != null or std.mem.indexOf(u8, src, generic) != null);
+    };
+    try std.testing.expectEqual(option_methods.len + result_methods.len, std.mem.count(u8, src, "    fn "));
 }

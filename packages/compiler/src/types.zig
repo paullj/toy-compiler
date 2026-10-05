@@ -5697,6 +5697,31 @@ test "a native method name on a user `enum Option` shadow is T0018, not the nati
     try testing.expectEqual(codes.Code.T0018, c.result.diags[0].code);
 }
 
+test "a std/option method without the import is T0018 naming std/option" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum Shade { light, dark }
+        \\fn main() -> int {
+        \\ o := Option[int].some(7)
+        \\ r: Result[int, str] = Result.err("bad")
+        \\ _a := o.map(fn(v: int) { v + 1 })
+        \\ _b := r.map_err(fn(e: str) { e.len() })
+        \\ _c := Shade.dark.map(fn(v: int) { v })
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), c.result.diags.len);
+    const hint = "add 'import std/option'";
+    for (c.result.diags) |d| try testing.expectEqual(codes.Code.T0018, d.code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "'map' on type 'Option'") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, hint) != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, "'map_err' on type 'Result'") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, hint) != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[2].message, hint) == null);
+}
+
 test "unwrap on a str (aggregate) payload is accepted — no diagnostic" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn main() -> int {

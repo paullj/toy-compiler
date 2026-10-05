@@ -23,6 +23,7 @@ test {
     _ = @import("places.zig");
     _ = @import("ref.zig");
     _ = @import("vec.zig");
+    _ = @import("option.zig");
     _ = @import("desc.zig");
     _ = @import("pipe.zig");
     _ = @import("map.zig");

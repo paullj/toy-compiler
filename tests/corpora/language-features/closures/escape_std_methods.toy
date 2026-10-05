@@ -4,6 +4,7 @@
 # expect: stdout "40\n16\n"
 # expect: exit 72
 import std/vec
+import std/option
 import std/io
 
 fn vec_methods() -> int {
@@ -75,6 +76,76 @@ fn vec_mut(mut acc: int, xs: Vec[int]) -> int {
     acc
 }
 
+fn option_methods() -> int {
+    o: Option[int] = Option.some(3)
+    n: Option[int] = Option.none
+    r: Result[int, str] = Result.ok(4)
+    bad: Result[int, str] = Result.err("no")
+    total := 0
+    a := o.map(fn(v) {
+        total = total + 1
+        v * 2
+    })
+    b := o.then(fn(v) {
+        total = total + 1
+        Option.some(v + 1)
+    })
+    c := n.or_else(fn() {
+        total = total + 1
+        5
+    })
+    d := r.map(fn(v) {
+        total = total + 1
+        v + 1
+    })
+    e := r.then(fn(v) {
+        total = total + 1
+        Result[int, str].ok(v * 2)
+    })
+    f := bad.map_err(fn(m) {
+        total = total + 1
+        m.len()
+    })
+    g := bad.or_else(fn(m) {
+        total = total + 1
+        m.len() * 10
+    })
+    err_flag := if f.is_err() { 1 } else { 0 }
+    return total + a.unwrap() + b.unwrap() + c + d.unwrap() + e.unwrap() + err_flag + g
+}
+
+fn option_mut(mut acc: int, o: Option[int], r: Result[int, str]) -> int {
+    _a := o.map(fn(v) {
+        acc = acc + 1
+        v
+    })
+    _b := o.then(fn(v) {
+        acc = acc + 1
+        Option.some(v)
+    })
+    _c := o.or_else(fn() {
+        acc = acc + 1
+        0
+    })
+    _d := r.map(fn(v) {
+        acc = acc + 1
+        v
+    })
+    _e := r.then(fn(v) {
+        acc = acc + 1
+        Result[int, str].ok(v)
+    })
+    _f := r.map_err(fn(m) {
+        acc = acc + 1
+        m.len()
+    })
+    _g := r.or_else(fn(m) {
+        acc = acc + 1
+        m.len()
+    })
+    acc
+}
+
 fn main() -> int {
     a := vec_methods()
     b := 0
@@ -82,5 +153,10 @@ fn main() -> int {
     c := vec_mut(b, ys)
     io.println(a)
     io.println(b)
+    if option_methods() != 56 { return 1 }
+    calls := 0
+    o: Option[int] = Option.some(1)
+    r: Result[int, str] = Result.ok(2)
+    if option_mut(calls, o, r) != 4 || calls != 4 { return 2 }
     return a + b + c
 }

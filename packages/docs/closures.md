@@ -182,13 +182,17 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 | Type | Methods |
 |---|---|
 | `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort_by(less)` |
-| `Option` / `Result` | `map`, `then` (and-then), `or_else(f)`, `map_err` |
+| `Option` / `Result` | `map(f: fn(T) -> U)`, `then(f: fn(T) -> Option[U])` (and-then; `fn(T) -> Result[U, E]` on `Result`), `or_else(f: fn() -> T) -> T` (`fn(E) -> T` on `Result`), `map_err(f: fn(E) -> F) -> Result[T, F]` |
 | `str` | `split`, `join`, `trim`, `contains`, `starts_with`, `ends_with`, `replace`, `chars()` → an iterator of `char` |
 | `Map` / `Set` | `each`, `filter`, `map` (values, for `Map`), `keys()`, `values()` |
 
 - **Sorting:** `sort` and `sort_by` sort in place and are stable; `less(a, b)` is true when `a` goes first. A method takes one arity per name, so the comparator form has its own name.
 - **Walks:** they visit the elements present when the call starts, in index order. A callback that pushes onto the same `Vec` does not extend the walk.
 - **Escapes:** a std method only calls the functions passed to it, so they never escape (see Escape analysis).
+- **Option and Result:** the methods are in `std/option` (`import std/option`), as `Ref`'s methods are in `std/ref`. Without the import, a call is T0018 "add 'import std/option'". `is_some`, `unwrap`, `unwrap_or` and the other built-in methods need no import.
+- **`or_else(f)`** is the lazy `unwrap_or`: `f` runs only on `none` or `err`.
+- **Constructors in a `then` lambda:** write the constructor's type args (`Option[str].none`, `Result[int, str].ok(v)`) or annotate the lambda's return (`fn(v) -> Option[str] { .. }`). The lambda's return type is not known while `U` is open.
+- **Same-named methods:** a program's own `impl Option[T] { fn map .. }` next to `import std/option` is not an error: the program's own method is the one every call reaches, whatever the import order, and std's of that name is not used. The same holds for a program's own `Vec`, `Map` or `Set` method.
 
 The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #24. `or_else` follows the name `unwrap_or` gets.
 

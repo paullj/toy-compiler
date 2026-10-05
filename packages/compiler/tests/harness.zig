@@ -82,6 +82,21 @@ pub fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const
     return runExit(gpa, io, prog);
 }
 
+/// Build `src` at -O0 and at -O1 into separate dirs under `dir` and return both exit codes.
+pub fn exitAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8) ![2]u8 {
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var codes: [2]u8 = undefined;
+    for ([_][]const u8{ "-O0", "-O1" }, 0..) |level, i| {
+        const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, level[1..] });
+        defer gpa.free(sub);
+        const prog = try compile(gpa, io, sub, src, &.{ "--no-cache", level });
+        defer gpa.free(prog);
+        codes[i] = try runExit(gpa, io, prog);
+    }
+    return codes;
+}
+
 /// The `--emit ir` text of `path` built with `flags` (owned).
 pub fn emitIr(gpa: std.mem.Allocator, io: Io, path: []const u8, flags: []const []const u8) ![]u8 {
     const bin = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);

@@ -1,0 +1,23 @@
+# Feature: Option methods chain with the Vec methods, through method pipes and plain
+# calls: `find` gives an Option that `map`, `then` and `or_else` carry on.
+# expect: stdout "bo!\n"
+# expect: exit 242
+import std/option
+import std/vec
+import std/io
+
+fn half(n: int) -> Option[int] {
+    if n % 2 == 0 { return Option.some(n / 2) }
+    return Option.none
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3, 4]
+    a := xs.find(fn(x) { x > 2 }) |> .map(fn(x) { x * 10 }) |> .or_else(fn() { 0 })
+    b := xs.find(fn(x) { x > 9 }) |> .map(fn(x) { x * 10 }) |> .or_else(fn() { 7 })
+    c := xs.map(half).fold(0, fn(acc, o) { acc + o.or_else(fn() { 100 }) })
+    names: Vec[str] = ["ann", "bo", "cyd"]
+    io.println(names.find(fn(s) { s.len() == 2 }) |> .map(fn(s) { s.concat("!") }) |> .or_else(fn() { "nobody" }))
+    d := names.find(fn(s) { s.len() > 2 }).then(fn(s) { names.find(fn(t) { t.len() < s.len() }) }).map(fn(s) { s.len() }).or_else(fn() { 0 })
+    return a + b + c + d
+}
