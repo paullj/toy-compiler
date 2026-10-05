@@ -1,0 +1,27 @@
+# Feature: `Vec.any` is true when some element passes and `Vec.all` when every element
+# does. Both stop at the first element that decides. On an empty Vec, `any` is false and
+# `all` is true.
+# expect: stdout "true false true false\nfalse true\n"
+# expect: exit 2
+import std/vec
+import std/io
+
+fn main() -> int {
+    xs: Vec[int] = [4, 7, 10]
+    seen := 0
+    io.print(xs.any(fn(x) {
+        seen = seen + 1
+        x > 5
+    }))
+    io.print(" ")
+    io.print(xs.any(fn(x) { x > 50 }))
+    io.print(" ")
+    io.print(xs.all(fn(x) { x > 0 }))
+    io.print(" ")
+    io.println(xs.all(fn(x) { x < 8 }))
+    empty: Vec[int] = []
+    io.print(empty.any(fn(x) { x > 0 }))
+    io.print(" ")
+    io.println(empty.all(fn(x) { x > 0 }))
+    return seen
+}

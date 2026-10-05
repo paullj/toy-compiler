@@ -1,0 +1,10 @@
+# Feature: SHOULD FAIL — a method name has one arity, so the comparator sort is `sort_by`
+# and `sort` with an argument is an arity error (T0039).
+# expect: compile-error "expected 0 argument(s), got 1; 'sort' takes ()"
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = [2, 1]
+    xs.sort(fn(a: int, b: int) { a < b })
+    return xs.len()
+}

@@ -67,6 +67,7 @@ pub fn checkGraph(
             .source = m.source,
             .resolutions = res.resolutions[i],
             .closures = if (i < res.closures.len) res.closures[i] else &.{},
+            .bundled = m.bundled,
         };
     }
 

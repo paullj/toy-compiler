@@ -1,0 +1,86 @@
+# Feature: every std method that takes a closure only calls it, so a capturing lambda passed
+# to one keeps its env in the caller's frame at -O1 (no env cell and no box), and a lambda
+# passed to one may capture a `mut` param of its caller.
+# expect: stdout "40\n16\n"
+# expect: exit 72
+import std/vec
+import std/io
+
+fn vec_methods() -> int {
+    xs: Vec[int] = [3, 1, 2]
+    total := 0
+    xs.each(fn(v) { total = total + v })
+    doubled := xs.map(fn(v) {
+        total = total + 1
+        v * 2
+    })
+    big := xs.filter(fn(v) {
+        total = total + 1
+        v > 1
+    })
+    sum := xs.fold(0, fn(acc, v) {
+        total = total + 1
+        acc + v
+    })
+    has_one := xs.any(fn(v) {
+        total = total + 1
+        v == 1
+    })
+    all_pos := xs.all(fn(v) {
+        total = total + 1
+        v > 0
+    })
+    two := xs.find(fn(v) {
+        total = total + 1
+        v == 2
+    })
+    xs.sort_by(fn(a, b) {
+        total = total + 1
+        a < b
+    })
+    flags := if has_one && all_pos { 1 } else { 0 }
+    return total + doubled.len() + big.len() + sum + flags + two.unwrap_or(0)
+}
+
+fn vec_mut(mut acc: int, xs: Vec[int]) -> int {
+    xs.each(fn(v) { acc = acc + v })
+    _m := xs.map(fn(v) {
+        acc = acc + 1
+        v
+    })
+    _f := xs.filter(fn(v) {
+        acc = acc + 1
+        v > 0
+    })
+    _s := xs.fold(0, fn(a, v) {
+        acc = acc + 1
+        a + v
+    })
+    _a := xs.any(fn(v) {
+        acc = acc + 1
+        v < 0
+    })
+    _l := xs.all(fn(v) {
+        acc = acc + 1
+        v > 0
+    })
+    _d := xs.find(fn(v) {
+        acc = acc + 1
+        v < 0
+    })
+    xs.sort_by(fn(a, b) {
+        acc = acc + 1
+        a > b
+    })
+    acc
+}
+
+fn main() -> int {
+    a := vec_methods()
+    b := 0
+    ys: Vec[int] = [1, 2]
+    c := vec_mut(b, ys)
+    io.println(a)
+    io.println(b)
+    return a + b + c
+}

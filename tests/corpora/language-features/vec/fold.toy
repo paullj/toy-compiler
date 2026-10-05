@@ -1,0 +1,14 @@
+# Feature: `Vec.fold(init, f)` threads an accumulator through the elements from left to
+# right. `A` binds from `init`, so the same Vec folds to an `int` and to a `str`.
+# expect: stdout "1234\n"
+# expect: exit 10
+import std/vec
+import std/io
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3, 4]
+    sum := xs.fold(0, fn(acc, x) { acc + x })
+    digits := xs.fold("", fn(acc, x) { acc.concat(x.to_string()) })
+    io.println(digits)
+    return sum
+}

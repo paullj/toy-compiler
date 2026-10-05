@@ -1,0 +1,21 @@
+# Feature: `Vec.map` builds a new Vec from each element's result and leaves the receiver
+# as it was. `U` binds from the lambda's return, so one receiver maps to `int` and to
+# `str`, and two maps over it with different `U`s are two instances.
+# expect: stdout "2 4 6 \n1! 2! 3! \n"
+# expect: exit 18
+import std/vec
+import std/io
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    doubled := xs.map(fn(x) { x * 2 })
+    shouted := xs.map(fn(x) { x.to_string().concat("!") })
+    big := xs.map(fn(x) { x > 1 })
+    doubled.each(fn(v) { io.print(v.to_string().concat(" ")) })
+    io.println("")
+    shouted.each(fn(s) { io.print(s.concat(" ")) })
+    io.println("")
+    n := 0
+    big.each(fn(b) { if b { n = n + 1 } })
+    return xs.len() + doubled.get(2).unwrap() * 2 + n + shouted.len() - 2
+}

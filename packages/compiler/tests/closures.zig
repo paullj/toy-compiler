@@ -247,10 +247,9 @@ test "200 nested captures build and run" {
     try std.testing.expectEqual(@as(u8, 200), r.exit);
 }
 
-// L1: the program calls a user-written `each` fn and a generic `Bag[T].each` method until
-// `Vec.each` lands. The checks read only the owners, `main` and `via_method`, so pointing
-// them at `xs.each(fn ..)` is an edit of the two `# L1:` lines in the program.
-test "a capturing lambda passed to an each-like fn or method allocates no env and no box in its caller at -O1" {
+// `Vec.each` and the program's own `each_of` only call `f`, so the lambda's env cannot
+// escape the owners: a std method's summary and a user generic fn instance's both count.
+test "a capturing lambda passed to Vec.each or to a generic fn that only calls it allocates no env and no box in its caller at -O1" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -261,14 +260,45 @@ test "a capturing lambda passed to an each-like fn or method allocates no env an
     defer gpa.free(o1);
     const o0 = try harness.emitIr(gpa, io, cases_dir ++ "/escape_each.toy", &.{"-O0"});
     defer gpa.free(o0);
-    for ([_][]const u8{ "main", "escape_each.via_method" }) |owner| {
+    const Owner = struct { name: []const u8, callee: []const u8 };
+    for ([_]Owner{
+        .{ .name = "main", .callee = "call @std/vec.Vec.each$int$sp" },
+        .{ .name = "escape_each.direct_call", .callee = "call @std/vec.Vec.each$int$sp" },
+        .{ .name = "escape_each.via_free_fn", .callee = "call @escape_each.each_of$int$sp" },
+    }) |o| {
+        const owner = o.name;
         const body1 = harness.irBody(o1, owner) orelse return error.TestExpectedOwner;
         try std.testing.expect(std.mem.indexOf(u8, body1, "call @gc_alloc") == null);
         var buf: [64]u8 = undefined;
         try std.testing.expect(std.mem.indexOf(u8, body1, try std.fmt.bufPrint(&buf, ":env${s}$l0", .{owner})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, body1, o.callee) != null);
         // -O0 keeps the box and the env cell, so the check can fail.
         const body0 = harness.irBody(o0, owner) orelse return error.TestExpectedOwner;
         try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, body0, "call @gc_alloc"));
+    }
+}
+
+test "every std method that takes a closure keeps its caller's env in the frame at -O1" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+
+    const o1 = try harness.emitIr(gpa, io, cases_dir ++ "/escape_std_methods.toy", &.{"-O1"});
+    defer gpa.free(o1);
+    const o0 = try harness.emitIr(gpa, io, cases_dir ++ "/escape_std_methods.toy", &.{"-O0"});
+    defer gpa.free(o0);
+    for ([_][]const u8{"escape_std_methods.vec_methods"}) |owner| {
+        const body1 = harness.irBody(o1, owner) orelse return error.TestExpectedOwner;
+        if (std.mem.indexOf(u8, body1, "call @gc_alloc") != null) {
+            std.debug.print("{s} allocates at -O1: a std method it calls keeps its closure\n", .{owner});
+            return error.TestUnexpectedAlloc;
+        }
+        var buf: [96]u8 = undefined;
+        try std.testing.expect(std.mem.indexOf(u8, body1, try std.fmt.bufPrint(&buf, ":env${s}$l0", .{owner})) != null);
+        const body0 = harness.irBody(o0, owner) orelse return error.TestExpectedOwner;
+        try std.testing.expect(std.mem.count(u8, body0, "call @gc_alloc") >= 2);
     }
 }
 
@@ -319,7 +349,7 @@ test "a body whose -O1 frame would overflow with frame envs falls back to heap e
     try std.testing.expect(std.mem.indexOf(u8, lean_body, ":env$main$l0") != null);
 }
 
-test "a capturing lambda passed to an each-like fn in a loop triggers no collection at -O1" {
+test "a capturing lambda passed to Vec.each in a loop triggers no collection at -O1" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -331,19 +361,14 @@ test "a capturing lambda passed to an each-like fn in a loop triggers no collect
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
     // `forced_collect_count` runs one collection and returns the count, so the difference
     // is 1 exactly when nothing in the loop allocated enough to trigger one.
-    // L1: the `# L1:` call becomes `xs.each(fn ..)` once Vec has each.
     const src =
         \\import std/vec
         \\import core/mem_selftest
-        \\fn each[T](xs: Vec[T], f: fn(T)) {
-        \\    for x in xs { f(x) }
-        \\}
         \\fn main() -> int {
         \\    xs: Vec[int] = [1, 2, 3]
         \\    a := mem_selftest.forced_collect_count()
         \\    total := 0
-        \\    # L1: each(xs, ..) becomes xs.each(..) once Vec has each.
-        \\    for _ in 0..100000 { each(xs, fn(v: int) { total = total + v }) }
+        \\    for _ in 0..100000 { xs.each(fn(v: int) { total = total + v }) }
         \\    b := mem_selftest.forced_collect_count()
         \\    if total != 600000 { return 255 }
         \\    return b - a

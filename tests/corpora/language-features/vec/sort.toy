@@ -1,0 +1,31 @@
+# Feature: `Vec.sort()` sorts in place in ascending order for any `T has Ord`: ints with
+# duplicates, strs, and a struct whose `Ord` is derived field by field. Lengths 0 and 1
+# are no-ops, and an alias made by `ys := xs` sees the sorted order, because both share
+# one backing.
+# expect: stdout "1 2 2 3 5 9 \napple fig kiwi pear \n1a 1b 2a \n"
+# expect: exit 17
+import std/vec
+import std/io
+
+struct Pt { x: int, tag: str }
+
+fn main() -> int {
+    xs: Vec[int] = [5, 2, 9, 1, 2, 3]
+    ys := xs
+    xs.sort()
+    ys.each(fn(v) { io.print(v.to_string().concat(" ")) })
+    io.println("")
+    words: Vec[str] = ["pear", "fig", "apple", "kiwi"]
+    words.sort()
+    words.each(fn(w) { io.print(w.concat(" ")) })
+    io.println("")
+    ps: Vec[Pt] = [Pt { x: 2, tag: "a" }, Pt { x: 1, tag: "b" }, Pt { x: 1, tag: "a" }]
+    ps.sort()
+    ps.each(fn(p) { io.print(p.x.to_string().concat(p.tag).concat(" ")) })
+    io.println("")
+    empty: Vec[int] = []
+    empty.sort()
+    one: Vec[int] = [7]
+    one.sort()
+    return ys.get(0).unwrap() + ys.get(5).unwrap() + empty.len() + one.get(0).unwrap()
+}

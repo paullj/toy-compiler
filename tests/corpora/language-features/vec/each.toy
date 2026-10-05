@@ -1,0 +1,15 @@
+# Feature: `Vec.each` calls the lambda once per element, in index order. The lambda's
+# param is typed by the receiver's `T`, and it adds into the caller's `total`.
+# expect: stdout "538192\n"
+# expect: exit 28
+import std/vec
+import std/io
+
+fn main() -> int {
+    xs: Vec[int] = [5, 3, 8, 1, 9, 2]
+    total := 0
+    xs.each(fn(v) { total = total + v })
+    xs.each(fn(v) { io.print(v) })
+    io.println("")
+    return total
+}

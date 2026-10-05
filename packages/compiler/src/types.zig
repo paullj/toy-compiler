@@ -1165,6 +1165,11 @@ pub const Method = struct {
     /// `Method` (never `Type`), which is never content-cache-memcpy'd, so `@sizeOf(Type)`
     /// is unaffected.
     derive: ?u32 = null,
+    /// Declared in a bundled std/core module. Every lookup takes a method the program
+    /// declares on a type over a bundled one of the same name, in std's own bodies too, so
+    /// the pick never depends on import order and a program keeps its own method when std
+    /// gains one of that name.
+    bundled: bool = false,
 };
 
 /// The symbol method row `m` calls: a source-less derive's unit (checked first: a derive
@@ -1211,6 +1216,8 @@ pub const TemplateMethod = struct {
     /// reifies its dispatch entry off the impl receiver rather than `inst.params[0]`,
     /// and the call site prepends no `self` arg. `true` for every ordinary method.
     has_self: bool = true,
+    /// Declared in a bundled std/core module (see `Method.bundled`).
+    bundled: bool = false,
 };
 
 /// Structural equality of two `Type` vectors: same length and pairwise `Type.eql`.
@@ -1355,7 +1362,8 @@ pub const Prelude = struct {
 ///     `<= 1` matching `(recv, name)`: BYTE-IDENTICAL to `findMethod` (the legacy path —
 ///     inherent, single conformance, prelude, generic instance) so no existing program's
 ///     dispatch/fingerprint changes;
-///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`.
+///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`;
+///   * otherwise the first match, a program's own before a bundled one (`Method.bundled`).
 /// `witness_pid` (operator/derive desugaring: `==`/`<`/`+`/`.hash()`/`print`/`?`-widen) keeps
 /// ONLY methods witnessing that SPECIFIC protocol — so a same-named inherent method (no
 /// `protocol_id`) AND a sibling protocol reusing the name are both excluded, and the operator
@@ -1387,6 +1395,7 @@ pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, wi
         return .none;
     }
     var first: ?u32 = null;
+    var first_user: ?u32 = null;
     var total: usize = 0;
     var conform_count: usize = 0;
     for (methods, 0..) |m, i| {
@@ -1396,6 +1405,7 @@ pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, wi
                 if (got != want) continue;
             }
             if (first == null) first = @intCast(i);
+            if (first_user == null and !m.bundled) first_user = @intCast(i);
             total += 1;
             if (m.protocol_id != null) conform_count += 1;
         }
@@ -1403,7 +1413,7 @@ pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, wi
     if (total == 0) return .none;
     if (total == 1) return .{ .one = first.? };
     if (conform_count >= 2) return .ambiguous;
-    return .{ .one = first.? };
+    return .{ .one = first_user orelse first.? };
 }
 
 /// The conformance methods matching `(recv, name)` in table (source fn-id) order — used
@@ -1455,23 +1465,28 @@ pub fn freeProtocolEntries(gpa: std.mem.Allocator, protocols: []const ProtocolSy
 /// keyed by ctor int), so this never dereferences a stale check-time `App` — use
 /// `findGenericMethod` for the check-time generic-receiver dispatch instead.
 pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method {
+    var first: ?Method = null;
     for (methods) |mth| {
-        if (Type.eql(mth.recv, recv) and std.mem.eql(u8, mth.name, name)) return mth;
+        if (!Type.eql(mth.recv, recv) or !std.mem.eql(u8, mth.name, name)) continue;
+        if (!mth.bundled) return mth;
+        if (first == null) first = mth;
     }
-    return null;
+    return first;
 }
 
 /// Look up a generic-type method TEMPLATE entry by its receiver type-constructor.
 /// Keys off `recv_ctor`/`recv_is_enum` (plain ints, never a composite deref)
 /// so it is safe while the composite is alive (Pass A / Pass C / the mono tail) and
-/// deterministic at any `-jN`. Returns the first matching template entry; a concrete
-/// receiver's `(ctor, is_enum)` uniquely picks the owning `impl`'s method set (one
-/// `impl Box[T]` per type until coherence).
+/// deterministic at any `-jN`. Returns the first matching template entry, a program's own
+/// before a bundled one (see `Method.bundled`).
 pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: bool, name: []const u8) ?TemplateMethod {
+    var first: ?TemplateMethod = null;
     for (templates) |tmpl| {
-        if (tmpl.recv_ctor == ctor and tmpl.recv_is_enum == is_enum and std.mem.eql(u8, tmpl.name, name)) return tmpl;
+        if (tmpl.recv_ctor != ctor or tmpl.recv_is_enum != is_enum or !std.mem.eql(u8, tmpl.name, name)) continue;
+        if (!tmpl.bundled) return tmpl;
+        if (first == null) first = tmpl;
     }
-    return null;
+    return first;
 }
 
 /// A builtin scalar protocol-method recognizer: the pure, table-free source
@@ -2034,6 +2049,8 @@ pub const GraphCtx = struct {
         /// `typeFromNode`; all cycle risk is confined to the one-shot resolve pass that
         /// fills this. Aliases mint no id, so this map is never read by lower/codegen/fp.
         alias_ids: std.StringHashMapUnmanaged(Type) = .empty,
+        /// Served from the embedded std/core, not the program's own files.
+        bundled: bool = false,
     };
 
     /// Resolve an import namespace receiver name in module `mod` to the imported
@@ -2884,6 +2901,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
                     .mut_self = tmpl.mut_self,
                     .is_static = !tmpl.has_self,
                     .instance = @intCast(i),
+                    .bundled = tmpl.bundled,
                 });
                 break;
             }
@@ -4092,6 +4110,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 .fn_id = gid,
                 .mut_self = mut_self,
                 .has_self = has_self,
+                .bundled = t.graph.mods[mod].bundled,
             });
         } else {
             try t.methods.append(t.gpa, .{
@@ -4100,6 +4119,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 .fn_id = gid,
                 .mut_self = mut_self,
                 .is_static = !has_self,
+                .bundled = t.graph.mods[mod].bundled,
             });
         }
     }

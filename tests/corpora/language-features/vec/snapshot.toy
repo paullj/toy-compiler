@@ -1,0 +1,14 @@
+# Feature: a walk visits the elements present when the call starts. A callback that
+# pushes onto the same Vec does not extend the walk, so it ends and the length doubles.
+# expect: stdout "1 2 3 1 2 3 \n"
+# expect: exit 6
+import std/vec
+import std/io
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    xs.each(fn(v) { xs.push(v) })
+    xs.each(fn(v) { io.print(v.to_string().concat(" ")) })
+    io.println("")
+    return xs.len()
+}

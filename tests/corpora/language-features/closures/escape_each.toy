@@ -1,36 +1,37 @@
-# Feature: a capturing lambda passed to an each-like fn or method that only calls it keeps its env in the caller's frame and its accumulator unboxed at -O1
-# expect: stdout "6\n15\n"
-# expect: exit 21
+# Feature: a capturing lambda passed to `Vec.each`, or to a generic fn of the program's own,
+# when either only calls it, keeps its env in the caller's frame and its accumulator unboxed
+# at -O1, called through a method pipe, directly, or through the fn
+# expect: stdout "6\n15\n24\n"
+# expect: exit 45
 import std/vec
 import std/io
 
-fn each[T](xs: Vec[T], f: fn(T)) {
+fn each_of[T](xs: Vec[T], f: fn(T)) {
     for x in xs { f(x) }
 }
 
-struct Bag[T] { items: Vec[T] }
-
-impl Bag[T] {
-    fn each(self, f: fn(T)) {
-        for x in self.items { f(x) }
-    }
+fn direct_call() -> int {
+    ys: Vec[int] = [4, 5, 6]
+    total := 0
+    ys.each(fn(v: int) { total = total + v })
+    total
 }
 
-fn via_method() -> int {
-    bag := Bag { items: [4, 5, 6] }
+fn via_free_fn() -> int {
+    zs: Vec[int] = [7, 8, 9]
     total := 0
-    # L1: bag.each(..) becomes xs.each(..) once Vec has each.
-    bag.each(fn(v: int) { total = total + v })
+    each_of(zs, fn(v: int) { total = total + v })
     total
 }
 
 fn main() -> int {
     xs: Vec[int] = [1, 2, 3]
     total := 0
-    # L1: each(xs, ..) becomes xs.each(..) once Vec has each.
-    each(xs, fn(v: int) { total = total + v })
+    xs |> .each(fn(v: int) { total = total + v })
     io.println(total)
-    m := via_method()
-    io.println(m)
-    return total + m
+    d := direct_call()
+    io.println(d)
+    f := via_free_fn()
+    io.println(f)
+    return total + d + f
 }
