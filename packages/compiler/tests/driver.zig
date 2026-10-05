@@ -4510,3 +4510,166 @@ test "cross-serializer parity: every int-aware identity serializer folds int_des
     try testing.expect(!Type.carriesIntDesc(.@"struct"));
     try testing.expect(!Type.carriesIntDesc(.@"enum"));
 }
+
+/// Check `src` as the single file `dir_name/p.toy` (a fresh dir, removed by the caller's
+/// `deleteTree`), with every `.method` slot of its entry module blanked for which
+/// `blank(k)` holds, `k` counting method slots in node order. Lowering then has no
+/// target for those calls, the shape of an internal check/lower disagreement.
+fn checkWithBlankedMethods(gpa: std.mem.Allocator, io: Io, comptime dir_name: []const u8, src: []const u8, blank: *const fn (usize) bool) !struct { r: FileResult, cache: Cache } {
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    const path = dir_name ++ "/p.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
+
+    var dir_buf: [cache_root.len + 1 + version.stamp_max + "/cache".len]u8 = undefined;
+    var stamp_buf: [version.stamp_max]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}/cache", .{ cache_root, version.stamp(&stamp_buf) }) catch unreachable;
+    const cache = try Cache.init(io, dir);
+
+    var r: FileResult = .{ .path = path };
+    errdefer r.deinit(gpa);
+    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    try testing.expectEqual(@as(?anyerror, null), r.err);
+    var k: usize = 0;
+    for (r.typecheck.?.callees[0]) |*c| if (c.view() == .method) {
+        if (blank(k)) c.* = .{};
+        k += 1;
+    };
+    return .{ .r = r, .cache = cache };
+}
+
+fn blankAll(_: usize) bool {
+    return true;
+}
+
+const lower_diag_src = "struct P { v: int }\nimpl P { fn get(self) -> int { self.v } }\nfn main() -> int {\n p := P { v: 3 }\n return p.get()\n}\n";
+
+test "a lowering diagnostic reaches the build result with its text and span" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-codegen-diag";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    var ck = try checkWithBlankedMethods(gpa, io, dir_name, lower_diag_src, &blankAll);
+    defer ck.r.deinit(gpa);
+
+    var out = try lowerSingleFile(gpa, io, ck.cache, "native", &ck.r, .force, .O0);
+    defer if (out == .ok) out.ok.deinit(gpa);
+    try testing.expect(out == .err);
+    try testing.expectEqualStrings("call target unsupported in lower", out.err.message);
+    const at = std.mem.indexOf(u8, lower_diag_src, "p.get()").?;
+    try testing.expect(out.err.span.?.start >= at and out.err.span.?.start < at + "p.get()".len);
+    try testing.expectEqual(@as(?u32, 0), out.err.module);
+}
+
+test "--emit ir reports a lowering diagnostic" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-codegen-diag-ir";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    var ck = try checkWithBlankedMethods(gpa, io, dir_name, lower_diag_src, &blankAll);
+    defer ck.r.deinit(gpa);
+
+    var graph = try Graph.single(gpa, "main", ck.r.path, ck.r.source, ck.r.tokens, ck.r.nodes, ck.r.extra, ck.r.pub_bits);
+    defer graph.deinit(gpa);
+    const out = try Codegen.renderGraphIr(gpa, &graph, &ck.r.resolve.?, &ck.r.typecheck.?, .O0, true);
+    defer if (out == .ok) gpa.free(out.ok);
+    try testing.expect(out == .err);
+    try testing.expectEqualStrings("call target unsupported in lower", out.err.message);
+    try testing.expectEqual(@as(?u32, 0), out.err.module);
+}
+
+fn blankFiveAndSixty(k: usize) bool {
+    return k == 5 or k == 60;
+}
+
+test "the first failing unit in index order is reported at every -j" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // More units than the codegen fan-out threshold, so -j8 really splits them; each fn
+    // makes one method call, so method slot k lies in fn f<k>.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll("struct P { v: int }\nimpl P { fn get(self) -> int { self.v } }\n");
+    for (0..70) |k| try src.writer.print("fn f{d}(p: P) -> int {{ p.get() + {d} }}\n", .{ k, k });
+    try src.writer.writeAll("fn main() -> int {\n p := P { v: 3 }\n return f0(p)\n}\n");
+
+    const dir_name = ".toy-test-driver-codegen-diag-jn";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    var ck = try checkWithBlankedMethods(gpa, io, dir_name, src.written(), &blankFiveAndSixty);
+    defer ck.r.deinit(gpa);
+
+    const lo = std.mem.indexOf(u8, src.written(), "fn f5(").?;
+    const hi = std.mem.indexOf(u8, src.written(), "fn f6(").?;
+    var graph = try Graph.single(gpa, "main", ck.r.path, ck.r.source, ck.r.tokens, ck.r.nodes, ck.r.extra, ck.r.pub_bits);
+    defer graph.deinit(gpa);
+    for ([_]usize{ 1, 8 }) |ncpu| {
+        var out = try lowerGraphProgram(gpa, io, ck.cache, "native", &graph, &ck.r.resolve.?, &ck.r.typecheck.?, .force, .O0, true, null, null, ncpu);
+        defer if (out == .ok) out.ok.deinit(gpa);
+        try testing.expect(out == .err);
+        const at = out.err.span.?.start;
+        try testing.expect(at > lo and at < hi);
+    }
+}
+
+/// `spawnToy` with stderr captured too, where an uncaught error's name lands.
+fn spawnToyBoth(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !struct { out: []u8, err: []u8, term: std.process.Child.Term } {
+    const toy_bin = "zig-out/bin/toy";
+    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
+    defer gpa.free(bin_abs);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, bin_abs);
+    for (argv_tail) |a| try argv.append(gpa, a);
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe, .stderr = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const out = try rdr.interface.allocRemaining(gpa, .limited(1 << 20));
+    errdefer gpa.free(out);
+    var errr = child.stderr.?.readerStreaming(io, &.{});
+    const got = try errr.interface.allocRemaining(gpa, .limited(1 << 16));
+    const term = try child.wait(io);
+    return .{ .out = out, .err = got, .term = term };
+}
+
+test "a codegen diagnostic is printed with its text" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-frame-diag";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // Enough struct locals to overflow the frame codegen can address.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll("struct Big { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int }\nfn main() -> int {\n");
+    for (0..700) |k| try src.writer.print("    v{d} := Big {{ a: {d}, b: 1, c: 2, d: 3, e: 4, f: 5, g: 6, h: 7 }}\n", .{ k, k });
+    try src.writer.writeAll("    return v0.a + v699.b\n}\n");
+    const path = dir_name ++ "/big.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.written() });
+
+    const res = try spawnToyBoth(gpa, io, &.{ "build", "--no-cache", path, "-o", dir_name ++ "/big" });
+    defer gpa.free(res.out);
+    defer gpa.free(res.err);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    try testing.expect(std.mem.indexOf(u8, res.out, "function frame too large for codegen") != null);
+    // The diagnostic has no position of its own; it points at the function to split.
+    try testing.expect(std.mem.indexOf(u8, res.out, "--> big:2:4") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "CodegenDiagnostic") == null);
+    try testing.expect(std.mem.indexOf(u8, res.err, "CodegenDiagnostic") == null);
+}

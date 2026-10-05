@@ -17,6 +17,7 @@ on each `main.toy` entry.
 | `app/`                        | diamond import, `as` alias, cross-module type by value, prelude, pub/private |
 | `fn_values/`                  | a qualified fn (`ops.add`) as a value; fn identity across modules |
 | `mut_params/`                 | an imported module's `mut` params and `mut self` take this module's places |
+| `own_generic_method/`         | an imported generic type's method with its own type param, two instances on one receiver |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
 | `errors/cycle/`               | an import cycle (graph must be a DAG)                           |
 | `errors/missing/`             | importing a module file that does not exist                    |

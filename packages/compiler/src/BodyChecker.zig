@@ -251,9 +251,20 @@ pub const BodyChecker = struct {
     /// Whether the checker is inside an `unsafe { .. }` block. Gates the raw-pointer
     /// `store`/`load` ops — a use outside `unsafe` is a T0038 error.
     in_unsafe: bool = false,
-    /// The argument a bare generic call is typing: its type args are inferred from the
-    /// arguments, so a lambda there gets no expected type yet.
+    /// The argument a generic call is typing. A lambda there is typed after the call's
+    /// other args, against what they bind, so an untyped param it still cannot type names
+    /// the generic call.
     generic_arg: Ast.Index = Ast.none,
+    /// While a generic call types its waiting args: the callee's type-param names and which
+    /// of them are still open, so an expected fn type that holds an open one names it.
+    open_names: []const []const u8 = &.{},
+    open_vars: []const bool = &.{},
+    /// An argument of a call already rejected with its own error: an unannotated lambda
+    /// there is no second error.
+    quiet_arg: Ast.Index = Ast.none,
+    /// `expected` reached this node from the call it is the receiver of, so it only hints:
+    /// a literal that cannot produce it takes its own type instead of an error.
+    expected_soft: bool = false,
     /// The innermost `_` capture's hole while its body is checked: the one node whose
     /// typing with a known param type gives the capture its param type. `none` in any
     /// other body, so it also tells whether the innermost body is a capture.
@@ -508,10 +519,13 @@ pub const BodyChecker = struct {
                 exp_params = parts.params;
                 if (bc.isGround(parts.ret)) exp_ret = parts.ret;
             } else {
+                var shown: std.ArrayList(u8) = .empty;
+                defer shown.deinit(bc.gpa);
+                try bc.writeTypeNamed(&shown, e, bc.open_names, bc.open_vars);
                 if (capture)
-                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "a '_' capture takes 1 parameter, but the expected type {s} takes {d}", .{ bc.typeName(e), parts.params.len })
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "a '_' capture takes 1 parameter, but the expected type {s} takes {d}", .{ shown.items, parts.params.len })
                 else
-                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "lambda takes {d} parameter(s), but the expected type {s} takes {d}", .{ proto.params.len, bc.typeName(e), parts.params.len });
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "lambda takes {d} parameter(s), but the expected type {s} takes {d}", .{ proto.params.len, shown.items, parts.params.len });
                 arity_err = true;
             }
         };
@@ -529,8 +543,8 @@ pub const BodyChecker = struct {
                 break :blk Type.invalid;
             } else blk: {
                 // After an arity error no expected type lines up with the params.
-                if (!arity_err) {
-                    const hint = if (i < exp_params.len or node_idx == bc.generic_arg) " (a generic call does not provide one yet)" else "";
+                if (!arity_err and node_idx != bc.quiet_arg) {
+                    const hint = if (i < exp_params.len or node_idx == bc.generic_arg) " (no other argument of the generic call fixes its type)" else "";
                     try bc.sink.report(.{ .span = bc.tokSpan(pn.main_token), .code = .T0050 }, "cannot infer the type of lambda parameter '{s}'; annotate it{s}", .{ bc.nameText(pn.main_token), hint });
                 }
                 break :blk bc.poison();
@@ -570,7 +584,7 @@ pub const BodyChecker = struct {
             if (t.kind == .invalid) {
                 poisoned = true;
                 if (!bc.errorsSince(mark))
-                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0050 }, "cannot infer the type of '_'; nothing in the call gives it one (a generic callee does not yet); write the type arguments, as in f[int](a, _), or a typed lambda, as in fn(v: int) {{ .. }}", .{});
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0050 }, "cannot infer the type of '_'; nothing in the call gives it one; write the type arguments, as in f[int](a, _), or a typed lambda, as in fn(v: int) {{ .. }}", .{});
             } else {
                 params[0] = t;
                 bc.node_types[p.int()] = t;
@@ -622,7 +636,10 @@ pub const BodyChecker = struct {
         loop_floor: usize,
         floor_is_local_fn: bool,
         expected: ?Type,
+        expected_soft: bool,
         hole: Ast.Index,
+        open_names: []const []const u8,
+        open_vars: []const bool,
     };
 
     /// Enter a lambda or local fn body: no expected type flows in and no jump leaves it.
@@ -635,10 +652,16 @@ pub const BodyChecker = struct {
             .loop_floor = bc.loop_floor,
             .floor_is_local_fn = bc.floor_is_local_fn,
             .expected = bc.expected,
+            .expected_soft = bc.expected_soft,
             .hole = bc.hole,
+            .open_names = bc.open_names,
+            .open_vars = bc.open_vars,
         };
         bc.expected = null;
+        bc.expected_soft = false;
         bc.hole = Ast.none;
+        bc.open_names = &.{};
+        bc.open_vars = &.{};
         bc.loop_floor = bc.loop_stack.items.len;
         bc.floor_is_local_fn = is_local_fn;
         return saved;
@@ -651,7 +674,10 @@ pub const BodyChecker = struct {
         bc.loop_floor = f.loop_floor;
         bc.floor_is_local_fn = f.floor_is_local_fn;
         bc.expected = f.expected;
+        bc.expected_soft = f.expected_soft;
         bc.hole = f.hole;
+        bc.open_names = f.open_names;
+        bc.open_vars = f.open_vars;
     }
 
     /// Whether this fn reported an ERROR since sink position `mark`. Warnings do not
@@ -755,8 +781,13 @@ pub const BodyChecker = struct {
 
     fn typeOfBlockExpected(bc: *BodyChecker, block_idx: Ast.Index, want_value: bool, exp: ?Type) error{OutOfMemory}!Type {
         const save = bc.expected;
+        const save_soft = bc.expected_soft;
         bc.expected = exp;
-        defer bc.expected = save;
+        bc.expected_soft = false;
+        defer {
+            bc.expected = save;
+            bc.expected_soft = save_soft;
+        }
         return bc.checkBlock(block_idx, want_value);
     }
 
@@ -1130,9 +1161,25 @@ pub const BodyChecker = struct {
     pub fn typeOfExpected(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Type) error{OutOfMemory}!Type {
         if (exp) |want| if (node_idx != Ast.none and node_idx == bc.hole) try bc.adoptHole(want);
         const save = bc.expected;
+        const save_soft = bc.expected_soft;
         bc.expected = exp;
-        defer bc.expected = save;
+        bc.expected_soft = false;
+        defer {
+            bc.expected = save;
+            bc.expected_soft = save_soft;
+        }
         return bc.typeOf(node_idx);
+    }
+
+    /// A method call's receiver. The call's expected type is the result's, not the
+    /// receiver's, yet a receiver that is itself a literal used to take it (`x: int8 =
+    /// Box { v: 1 }.get()`), and programs rely on that; so it reaches the receiver only as
+    /// a hint that never turns into an error of its own.
+    fn typeOfReceiver(bc: *BodyChecker, recv: Ast.Index) error{OutOfMemory}!Type {
+        const save_soft = bc.expected_soft;
+        bc.expected_soft = true;
+        defer bc.expected_soft = save_soft;
+        return bc.typeOf(recv);
     }
 
     /// Mint the poison type ONLY after THIS fn's local sink already reported a
@@ -1455,7 +1502,7 @@ pub const BodyChecker = struct {
                     if (!Type.assignable(v_ty, at))
                         try bc.sink.report(.{ .span = bc.spanOf(ei) }, "list element {d}: expected '{s}', got '{s}'", .{ k, bc.typeName(v_ty), bc.typeName(at) });
                 }
-                if (bc.expected) |exp| if (!Type.eql(result, exp)) {
+                if (bc.expected) |exp| if (!Type.eql(result, exp) and !bc.expected_soft) {
                     if (seed) |s|
                         try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "list element type '{s}' does not match the annotation's '{s}'", .{ bc.typeName(v_ty), bc.typeName(s) })
                     else
@@ -1655,10 +1702,11 @@ pub const BodyChecker = struct {
             // instance's type-args; a non-generic struct has `targs.len == 0`, so
             // `substTy` is the identity.
             const want: ?Type = if (found) |j| substTy(bc, sym.field_types[j], targs) else null;
-            // Only a fn-typed field hands its type down (a lambda's params come from it):
-            // every other field value keeps its old typing and diagnostics.
-            const fn_want: ?Type = if (want) |w| (if (w.isFunc()) w else null) else null;
-            const vt = if (pretyped) |pt| pt[ii] else if (fn_want) |w| try bc.typeOfExpected(fi.lhs, w) else try bc.typeOf(fi.lhs);
+            // A field value is typed against its field, never against the struct's own
+            // expected type (`s: S = S { tags: ["y"] }`). A fn-typed field hands its type down
+            // even when it holds a type var: a lambda's params come from it.
+            const field_want: ?Type = if (want) |w| (if (w.isFunc() or (w.kind != .invalid and bc.isGround(w))) w else null) else null;
+            const vt = if (pretyped) |pt| pt[ii] else if (field_want) |w| try bc.typeOfExpected(fi.lhs, w) else try bc.typeOf(fi.lhs);
             if (found) |j| {
                 if (seen[j]) {
                     try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token) }, "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
@@ -1723,6 +1771,16 @@ pub const BodyChecker = struct {
                 const ty = try bc.checkVariantPayloads(node_idx, e.ctor, n.main_token, .unit, Ast.none, e.args, null);
                 bc.node_types[(node_idx).int()] = ty;
                 return ty;
+            }
+            // `Box[int]` names a type, not a value: an associated fn of it is reached by a
+            // call only.
+            if (app_ty.isApp()) {
+                const e = bc.composite.at(app_ty.appIdx());
+                const member = bc.nameText(n.main_token);
+                if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member)) |m| if (!m.has_self)
+                    return try bc.reportNotAValue(n, member, "an associated function");
+                try bc.sink.report(.{ .span = bc.spanOf(n.lhs) }, "type '{s}' is not a value", .{bc.typeName(app_ty)});
+                return bc.poison();
             }
         }
         const base = try bc.typeOf(n.lhs);
@@ -1794,7 +1852,8 @@ pub const BodyChecker = struct {
             if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member)) |m| {
                 if (!m.has_self) return try bc.reportStaticBound(fa, member);
                 const mf = bc.model.fns[m.fn_id];
-                // An unbound param is the method's own `[U]`, which a value could not fix.
+                // A method's own `[U]` is fixed per call, which a value could not do.
+                if (Typecheck.hasOwnTypeParams(bc.composite, mf)) return try bc.reportNotAValue(fa, member, "a generic method");
                 const targs = (try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args)) orelse
                     return try bc.reportNotAValue(fa, member, "a generic method");
                 defer bc.gpa.free(targs);
@@ -2222,6 +2281,13 @@ pub const BodyChecker = struct {
 
     const Reconciled = union(enum) { ok, err, unbound: u32 };
 
+    fn targetConflicts(out: []const Type, bound: []const bool, exp_args: ?[]const Type) bool {
+        const ea = exp_args orelse return false;
+        if (ea.len != out.len) return false;
+        for (out, bound, ea) |o, b, e| if (b and !Type.eql(o, e)) return true;
+        return false;
+    }
+
     /// The shared post-`match` target-fill reconcile for BOTH construction sites
     /// (enum via `checkVariant`, struct via `typeOfStructInit`). It emits the
     /// identically-worded T0015 arg-vs-expected conflict and the identical T0013
@@ -2237,7 +2303,8 @@ pub const BodyChecker = struct {
         param_names: []const []const u8,
         span_tok: u32,
     ) error{OutOfMemory}!Reconciled {
-        switch (Infer.fillExpected(out, bound, exp_args)) {
+        const ea = if (bc.expected_soft and targetConflicts(out, bound, exp_args)) null else exp_args;
+        switch (Infer.fillExpected(out, bound, ea)) {
             // Unlike the leaf-carrying `match` conflict, this compares the WHOLE
             // per-ordinal type-args (no structural descent) — a container clash here
             // could differ at several depths at once (`Map[int,bool]` vs `Map[str,char]`
@@ -2488,6 +2555,24 @@ pub const BodyChecker = struct {
         for (args) |a| _ = try bc.typeOfExpected(a, null);
     }
 
+    /// `drainArgs` for a call already rejected with its own error, which is why nothing
+    /// types its lambdas' params.
+    fn drainRejectedArgs(bc: *BodyChecker, args: []const Ast.Index) error{OutOfMemory}!void {
+        const was = bc.quiet_arg;
+        defer bc.quiet_arg = was;
+        for (args) |a| {
+            bc.quiet_arg = a;
+            _ = try bc.typeOfExpected(a, null);
+        }
+    }
+
+    /// A `mut self` call writes through its receiver, which must be a mutable place.
+    fn checkMutReceiver(bc: *BodyChecker, recv: Ast.Index, member: []const u8) error{OutOfMemory}!void {
+        try bc.noteMutatedRoot(recv);
+        if (!bc.isMutablePlace(recv))
+            try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+    }
+
     /// Check `args` against `sig`: arity (typing every arg for effect first on a
     /// mismatch, unless pretyped), then each arg's assignability to its wanted type.
     /// Returns false on an arity mismatch.
@@ -2608,6 +2693,13 @@ pub const BodyChecker = struct {
     }
 
     fn writeSigSuffix(bc: *BodyChecker, out: *std.ArrayList(u8), sig: CallSig) error{OutOfMemory}!void {
+        try bc.writeSigSuffixOpen(out, sig, null, null);
+    }
+
+    /// `writeSigSuffix` for a generic call whose type args are only partly bound: each
+    /// param is substituted through `targs`, and a var still open in `open` prints as its
+    /// declared name.
+    fn writeSigSuffixOpen(bc: *BodyChecker, out: *std.ArrayList(u8), sig: CallSig, targs: ?[]const Type, open: ?[]const bool) error{OutOfMemory}!void {
         const name = sig.name orelse return;
         try out.appendSlice(bc.gpa, "; '");
         try out.appendSlice(bc.gpa, name);
@@ -2615,14 +2707,39 @@ pub const BodyChecker = struct {
         for (sig.params, 0..) |p, i| {
             if (i != 0) try out.appendSlice(bc.gpa, ", ");
             if (Modes.isMut(sig.mut_mask, i)) try out.appendSlice(bc.gpa, "mut ");
+            if (targs) |ta| {
+                try bc.writeTypeNamed(out, substTy(bc, p, ta), sig.generic_names, open);
+                continue;
+            }
             // A mapped param's leftover type_vars belong to the caller's scope, not the
             // callee's, so only a raw param takes the callee's names.
             const raw = sig.map == .id or sig.map == .unbound;
-            const t = if (raw) p else bc.paramWant(sig, p);
-            const text = if (raw and t.isTypeVar() and t.typeVarOrd() < sig.generic_names.len) sig.generic_names[t.typeVarOrd()] else bc.typeName(t);
-            try out.appendSlice(bc.gpa, text);
+            if (raw) try bc.writeTypeNamed(out, p, sig.generic_names, null) else try out.appendSlice(bc.gpa, bc.typeName(bc.paramWant(sig, p)));
         }
         try out.append(bc.gpa, ')');
+    }
+
+    /// `t` as `typeName` spells it, except that a type var `ord` with a name in `names`
+    /// (and, when `open` is given, still open there) prints as that name, at any depth. A
+    /// fn type's label is fixed when the type is interned, so a fn type is spelled from
+    /// its parts here.
+    fn writeTypeNamed(bc: *BodyChecker, out: *std.ArrayList(u8), t: Type, names: []const []const u8, open: ?[]const bool) error{OutOfMemory}!void {
+        if (t.isTypeVar()) {
+            const ord = t.typeVarOrd();
+            const is_open = if (open) |o| ord < o.len and o[ord] else true;
+            if (ord < names.len and is_open) return out.appendSlice(bc.gpa, names[ord]);
+        }
+        if (!t.isFunc()) return out.appendSlice(bc.gpa, bc.typeName(t));
+        const parts = Composite.fnParts(bc.composite.at(t.funcIdx()));
+        try out.appendSlice(bc.gpa, "fn(");
+        for (parts.params, 0..) |fp, i| {
+            if (i != 0) try out.appendSlice(bc.gpa, ", ");
+            if (fp.kind == .unit) try out.appendSlice(bc.gpa, "()") else try bc.writeTypeNamed(out, fp, names, open);
+        }
+        try out.append(bc.gpa, ')');
+        if (parts.ret.kind == .unit) return;
+        try out.appendSlice(bc.gpa, " -> ");
+        try bc.writeTypeNamed(out, parts.ret, names, open);
     }
 
     fn setCallee(bc: *BodyChecker, call: Ast.Node, c: Callee) void {
@@ -2722,13 +2839,18 @@ pub const BodyChecker = struct {
         const m = bc.model.methods[mi];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const mf = bc.model.fns[m.fn_id];
+        // Its params would bind per call, but a non-generic type's method rows have no
+        // instances for the seal to pick from.
+        if (mf.isGeneric()) {
+            try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0013 }, "'{s}' declares its own type parameters, which a method of the non-generic type '{s}' cannot have yet", .{ member, bc.typeName(recv_ty) });
+            try bc.drainRejectedArgs(args);
+            return .invalid;
+        }
         if (m.mut_self) {
-            try bc.noteMutatedRoot(fa.lhs);
             if (recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
+                try bc.noteMutatedRoot(fa.lhs);
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
-            } else if (!bc.isMutablePlace(fa.lhs)) {
-                try bc.sink.report(.{ .span = bc.spanOf(fa.lhs), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
-            }
+            } else try bc.checkMutReceiver(fa.lhs, member);
         }
         _ = try bc.checkCall(node_idx, args, bc.methodSig(mf, member));
         bc.node_types[(node_idx).int()] = mf.ret;
@@ -2777,7 +2899,7 @@ pub const BodyChecker = struct {
             bc.node_types[(tn).int()] = ty;
             explicit[i] = ty;
         }
-        const recv_ty = try bc.typeOf(fa.lhs); // also populates node_types[recv] for lower
+        const recv_ty = try bc.typeOfReceiver(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar()) {
             switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, explicit)) {
@@ -2819,16 +2941,17 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on unbounded type parameter", .{member});
             return .invalid;
         }
-        try bc.drainArgs(args);
         // The method exists; only this explicit-args path cannot dispatch it yet, so
         // "no method" would send the user looking for a typo.
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());
             if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member) != null) {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{s}' on the generic type '{s}' takes no explicit type arguments yet; drop the '[..]'", .{ member, bc.typeName(recv_ty) });
+                try bc.drainRejectedArgs(args);
                 return .invalid;
             }
         }
+        try bc.drainArgs(args);
         try bc.emitNoMethod(bc.tokSpan(fa.main_token), member, recv_ty);
         return .invalid;
     }
@@ -2952,8 +3075,10 @@ pub const BodyChecker = struct {
             // Load-bearing: the reified receiver flows to scanCalls / reify / sealCallees off
             // `node_types[type_app]`.
             bc.node_types[(callee.lhs).int()] = app_ty;
-            bc.setCallee(n, Callee.pending);
             const mf = bc.model.fns[m.fn_id];
+            if (Typecheck.hasOwnTypeParams(bc.composite, mf))
+                return try bc.checkOwnGenericCall(node_idx, n, callee, app_ty, mf, member, true);
+            bc.setCallee(n, Callee.pending);
             const targs_opt = try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args);
             defer if (targs_opt) |ta| bc.gpa.free(ta);
             _ = try bc.checkCall(node_idx, args, bc.fnSig(mf, member).substituted(targs_opt));
@@ -2999,6 +3124,269 @@ pub const BodyChecker = struct {
         }
     }
 
+    /// How `inferArgs` types an argument that does not wait for the other arguments.
+    const ArgTyping = enum {
+        /// Under the call's own expected type, as a bare generic call always has typed
+        /// its args, so `x: int8 = id(5)` infers `int8`.
+        call_expected,
+        /// With no expectation, as an associated call types its args.
+        none,
+        /// Against its param with the bindings so far in, when that is ground: a method
+        /// call, whose receiver binds the impl's params first.
+        receiver,
+    };
+
+    /// `.failed`: an error is already reported. `.unbound`: the ordinal no arg binds, for
+    /// the caller to report in its own words.
+    const InferResult = union(enum) { ok, failed, unbound: u32 };
+
+    /// Whether `arg` takes its type from what a generic call's other args bind: a lambda
+    /// with an unannotated param (a `_` capture included), or the hole of the capture
+    /// being checked.
+    fn waitsForTypeArgs(bc: *const BodyChecker, arg: Ast.Index) bool {
+        if (bc.hole != Ast.none and arg == bc.hole) return true;
+        const n = bc.tree.nodes[arg.int()];
+        if (n.tag != .lambda) return false;
+        for (Ast.protoAt(bc.tree, n.lhs.int()).params) |p| if (bc.tree.nodes[p.int()].lhs == Ast.none) return true;
+        return false;
+    }
+
+    /// The partly bound param `want` as a waiting arg's expected type, only when it gives
+    /// the arg a type: a ground type for the hole, a fn type that types one of a lambda's
+    /// unannotated params. Otherwise null, and the arg is typed as it was before any
+    /// other arg could bind, so an expected fn type on the call still types it
+    /// (`g: fn(int) -> int = id(fn(x) { x + 1 })`). A fn type of another arity is passed
+    /// on, so the lambda reports the count rather than an untypable param.
+    fn helpfulWant(bc: *BodyChecker, arg: Ast.Index, want: Type) ?Type {
+        if (want.kind == .invalid) return null;
+        if (bc.hole != Ast.none and arg == bc.hole) return if (bc.isGround(want)) want else null;
+        if (!want.isFunc()) return null;
+        const parts = Composite.fnParts(bc.composite.at(want.funcIdx()));
+        const proto = Ast.protoAt(bc.tree, bc.tree.nodes[arg.int()].lhs.int());
+        if (parts.params.len != proto.params.len) return want;
+        for (proto.params, parts.params) |p, wp| {
+            if (bc.tree.nodes[p.int()].lhs == Ast.none and bc.isGround(wp)) return want;
+        }
+        return null;
+    }
+
+    fn typeOfGenericArg(bc: *BodyChecker, arg: Ast.Index, typing: ArgTyping, want: ?Type) error{OutOfMemory}!Type {
+        const was = bc.generic_arg;
+        bc.generic_arg = arg;
+        defer bc.generic_arg = was;
+        if (want) |w| return bc.typeOfExpected(arg, w);
+        return if (typing == .call_expected) bc.typeOf(arg) else bc.typeOfExpected(arg, null);
+    }
+
+    /// An open var substitutes to itself, which `typeOfLambda` and `adoptHole` treat as
+    /// giving no type.
+    fn fillOpen(targs: []Type, bound: []const bool) void {
+        for (targs, bound, 0..) |*t, b, ord| {
+            if (!b) t.* = Type.typeVar(@intCast(ord));
+        }
+    }
+
+    /// The inferred type args must be monomorphizable value types — the SAME gate
+    /// `scanCalls` applies, so Pass C and discovery agree on which calls become instances
+    /// (a `unit`-inferred var, say, is rejected here rather than silently dropped by
+    /// discovery → lower miss).
+    fn concreteTargs(bc: *BodyChecker, call: Ast.Index, targs: []const Type) error{OutOfMemory}!bool {
+        for (targs) |ta| {
+            // A bounded template's own param inferred here grounds at the outer
+            // instantiation; admit it (the instance re-check re-gates concretely).
+            if (bc.abstract_template and ta.isTypeVar()) continue;
+            if (!isConcreteValue(ta)) {
+                try bc.sink.report(.{ .span = bc.spanOf(call), .code = .T0013 }, "inferred type argument must be a concrete value type; add explicit type arguments", .{});
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// The call `inferArgs` serves: what an argument that cannot fit its param is reported
+    /// against. `nodes[first..]` are the call's value args.
+    const InferSite = struct { call: Ast.Index, sig: CallSig };
+
+    /// Infer a generic callee's type args from a call, typing each of `nodes` once into
+    /// `arg_types`. `nodes` line up with `params`, the receiver first when `recv` is set.
+    /// The receiver binds first, then every arg that does not wait (`waitsForTypeArgs`);
+    /// then each waiting arg in source order is typed against its param with the bindings
+    /// so far in, and the args bind again, so a later lambda sees what an earlier one's
+    /// return fixed. One left-to-right `Infer.match` over all args decides, as discovery's.
+    /// A var left unbound after an argument error is no second error, nor is it when an
+    /// argument's shape cannot fit its param: that argument is the error.
+    fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, params: []const Type, names: []const []const u8, recv: ?Type, typing: ArgTyping, arg_types: []Type, targs: []Type) error{OutOfMemory}!InferResult {
+        const n_gp: u32 = @intCast(targs.len);
+        const bnd = try bc.gpa.alloc(bool, n_gp);
+        defer bc.gpa.free(bnd);
+        const fp = try bc.gpa.alloc(usize, n_gp);
+        defer bc.gpa.free(fp);
+        @memset(bnd, false);
+        const dec = bc.composite.decomposer();
+        const first: usize = @intFromBool(recv != null);
+        if (recv) |r| {
+            arg_types[0] = r;
+            _ = Infer.match(n_gp, params[0..1], arg_types[0..1], targs, bnd, fp, dec);
+        }
+        fillOpen(targs, bnd);
+        const mark = bc.sink.count();
+        var waiting = false;
+        for (nodes[first..], first..) |a, i| {
+            if (bc.waitsForTypeArgs(a)) {
+                arg_types[i] = .invalid; // binds nothing until it is typed
+                waiting = true;
+                continue;
+            }
+            const want: ?Type = if (typing == .receiver) blk: {
+                const w = substTy(bc, params[i], targs);
+                break :blk if (w.kind != .invalid and bc.isGround(w)) w else null;
+            } else null;
+            arg_types[i] = try bc.typeOfGenericArg(a, typing, want);
+        }
+        var res = Infer.match(n_gp, params, arg_types, targs, bnd, fp, dec);
+        if (waiting) {
+            const open = try bc.gpa.alloc(bool, n_gp);
+            defer bc.gpa.free(open);
+            const save_names = bc.open_names;
+            const save_vars = bc.open_vars;
+            defer {
+                bc.open_names = save_names;
+                bc.open_vars = save_vars;
+            }
+            bc.open_names = names;
+            bc.open_vars = open;
+            for (nodes[first..], first..) |a, i| {
+                if (!bc.waitsForTypeArgs(a)) continue;
+                if (res == .conflict) {
+                    arg_types[i] = try bc.typeOfGenericArg(a, typing, null);
+                    continue;
+                }
+                fillOpen(targs, bnd);
+                for (open, bnd) |*o, b| o.* = !b;
+                arg_types[i] = try bc.typeOfGenericArg(a, typing, bc.helpfulWant(a, substTy(bc, params[i], targs)));
+                res = Infer.match(n_gp, params, arg_types, targs, bnd, fp, dec);
+            }
+        }
+        switch (res) {
+            .conflict => |c| {
+                try bc.reportInferConflict(nodes, names, c);
+                return .failed;
+            },
+            .unbound => |u| {
+                if (bc.errorsSince(mark)) return .failed;
+                // An `.invalid` arg was diagnosed where it went wrong (a resolve error, say);
+                // the hole being typed is invalid only because it waits for this call.
+                for (nodes[first..], arg_types[first..]) |a, at| if (at.kind == .invalid and a != bc.hole) return .failed;
+                fillOpen(targs, bnd);
+                if (try bc.reportMisfit(site, nodes, first, params, arg_types, targs, bnd)) return .failed;
+                return .{ .unbound = u.ord };
+            },
+            .ok => return .ok,
+        }
+    }
+
+    /// Whether `got` can stand where `want` is wanted once `want`'s type vars are bound: a
+    /// type var fits anything, a fn or a generic type fits part by part, and anything else
+    /// by assignability.
+    fn fitsShape(bc: *BodyChecker, want: Type, got: Type) bool {
+        if (got.kind == .invalid or got.kind == .never or want.isTypeVar()) return true;
+        if (want.isFunc() or want.isApp()) {
+            if (want.isFunc() != got.isFunc() or want.isApp() != got.isApp()) return false;
+            const w = bc.composite.at(want.struct_id);
+            const g = bc.composite.at(got.struct_id);
+            if (want.isApp() and (w.ctor != g.ctor or w.ctor_is_enum != g.ctor_is_enum)) return false;
+            if (w.args.len != g.args.len) return false;
+            for (w.args, g.args) |wa, ga| if (!bc.fitsShape(wa, ga)) return false;
+            return true;
+        }
+        return Type.assignable(want, got);
+    }
+
+    /// Report the first value arg whose type cannot fit its partly bound param, the reason
+    /// a var stayed unbound (a lambda of the wrong shape binds nothing). False when every
+    /// arg fits, so the var is genuinely uninferable.
+    fn reportMisfit(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, first: usize, params: []const Type, arg_types: []const Type, targs: []const Type, bnd: []const bool) error{OutOfMemory}!bool {
+        const open = try bc.gpa.alloc(bool, bnd.len);
+        defer bc.gpa.free(open);
+        for (open, bnd) |*o, b| o.* = !b;
+        for (nodes[first..], first..) |a, i| {
+            const want = substTy(bc, params[i], targs);
+            if (bc.fitsShape(want, arg_types[i])) continue;
+            const pos = i - first + 1;
+            var text: std.ArrayList(u8) = .empty;
+            defer text.deinit(bc.gpa);
+            try text.print(bc.gpa, "argument {d}{s}: expected ", .{ pos, bc.pipedArgHint(site.call, pos) });
+            try bc.writeTypeNamed(&text, want, site.sig.generic_names, open);
+            try text.print(bc.gpa, ", got {s}", .{bc.typeName(arg_types[i])});
+            try bc.writeSigSuffixOpen(&text, site.sig, targs, open);
+            try bc.sink.report(.{ .span = bc.spanOf(a), .code = .T0040, .related = site.sig.decl }, "{s}", .{text.items});
+            return true;
+        }
+        return false;
+    }
+
+    /// A call of a method with its own type params (`fn map[U](self, f: fn(T) -> U)`), or
+    /// of such an associated fn through a turbofish receiver (`is_static`): the receiver
+    /// binds the impl's params and the args the method's own. Each instantiation has its
+    /// own row on one receiver, so the pending slot carries the call for the seal to pick;
+    /// a call that picks none leaves the template for the LSP to show.
+    fn checkOwnGenericCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type, mf: FnSym, member: []const u8, is_static: bool) error{OutOfMemory}!Type {
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        const sig = if (is_static) bc.fnSig(mf, member) else bc.methodSig(mf, member);
+        bc.setCallee(n, Callee.pendingCall(node_idx));
+        const params = try bc.gpa.alloc(Type, mf.params.len + @intFromBool(is_static));
+        defer bc.gpa.free(params);
+        if (is_static) {
+            params[0] = mf.self_type;
+            @memcpy(params[1..], mf.params);
+        } else @memcpy(params, mf.params);
+        const targs = try bc.gpa.alloc(Type, mf.generic_params.len);
+        defer bc.gpa.free(targs);
+        if (args.len != sig.params.len) {
+            try bc.reportOwnGenericArity(node_idx, args.len, sig, params[0], recv_ty, targs);
+            try bc.drainRejectedArgs(args);
+            return .invalid;
+        }
+        const nodes = try bc.gpa.alloc(Ast.Index, args.len + 1);
+        defer bc.gpa.free(nodes);
+        nodes[0] = callee.lhs;
+        @memcpy(nodes[1..], args);
+        const arg_types = try bc.gpa.alloc(Type, nodes.len);
+        defer bc.gpa.free(arg_types);
+        switch (try bc.inferArgs(.{ .call = node_idx, .sig = sig }, nodes, params, mf.generic_params, recv_ty, .receiver, arg_types, targs)) {
+            .failed => return .invalid,
+            .unbound => |ord| {
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}' of method '{s}' from its arguments; a method takes no explicit type arguments yet", .{ mf.generic_params[ord], member });
+                return .invalid;
+            },
+            .ok => {},
+        }
+        if (!try bc.concreteTargs(node_idx, targs)) return .invalid;
+        var s = sig.substituted(targs);
+        s.pretyped = arg_types[1..];
+        _ = try bc.checkCall(node_idx, args, s);
+        return bc.substRet(node_idx, mf, targs);
+    }
+
+    /// The arity error of an own-generic call, its signature shown as the receiver binds
+    /// it: `'map' takes (fn(int) -> U)`, not the template's raw vars.
+    fn reportOwnGenericArity(bc: *BodyChecker, call: Ast.Index, got: usize, sig: CallSig, self_pat: Type, recv_ty: Type, targs: []Type) error{OutOfMemory}!void {
+        const n_gp: u32 = @intCast(targs.len);
+        const bnd = try bc.gpa.alloc(bool, n_gp);
+        defer bc.gpa.free(bnd);
+        const fp = try bc.gpa.alloc(usize, n_gp);
+        defer bc.gpa.free(fp);
+        _ = Infer.match(n_gp, &.{self_pat}, &.{recv_ty}, targs, bnd, fp, bc.composite.decomposer());
+        fillOpen(targs, bnd);
+        const open = try bc.gpa.alloc(bool, n_gp);
+        defer bc.gpa.free(open);
+        for (open, bnd) |*o, b| o.* = !b;
+        var suffix: std.ArrayList(u8) = .empty;
+        defer suffix.deinit(bc.gpa);
+        try bc.writeSigSuffixOpen(&suffix, sig, targs, open);
+        try bc.emitArity(call, sig.params.len, got, sig.decl, suffix.items);
+    }
+
     fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []const u8) error{OutOfMemory}!void {
         const name = bc.nameText(recv.main_token);
         try bc.sink.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0016 }, "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
@@ -3030,38 +3418,18 @@ pub const BodyChecker = struct {
         }
         const arg_types = try bc.gpa.alloc(Type, args.len);
         defer bc.gpa.free(arg_types);
-        for (args, 0..) |arg, i| {
-            const was = bc.generic_arg;
-            bc.generic_arg = arg;
-            defer bc.generic_arg = was;
-            arg_types[i] = try bc.typeOfExpected(arg, null);
-        }
-        const n_gp: u32 = @intCast(mf.generic_params.len);
-        const out = try bc.gpa.alloc(Type, n_gp);
+        const out = try bc.gpa.alloc(Type, mf.generic_params.len);
         defer bc.gpa.free(out);
-        const bnd = try bc.gpa.alloc(bool, n_gp);
-        defer bc.gpa.free(bnd);
-        const fp = try bc.gpa.alloc(usize, n_gp);
-        defer bc.gpa.free(fp);
         const recv = bc.tree.nodes[(callee.lhs).int()];
-        switch (Infer.match(n_gp, mf.params, arg_types, out, bnd, fp, bc.composite.decomposer())) {
-            .conflict => |c| {
-                try bc.reportInferConflict(args, mf.generic_params, c);
-                return .invalid;
-            },
+        switch (try bc.inferArgs(.{ .call = node_idx, .sig = bc.fnSig(mf, bc.nameText(callee.main_token)) }, args, mf.params, mf.generic_params, null, .none, arg_types, out)) {
+            .failed => return .invalid,
             .unbound => {
                 try bc.reportUninferableAssociated(recv, bc.nameText(callee.main_token));
                 return .invalid;
             },
             .ok => {},
         }
-        for (out) |ta| {
-            if (bc.abstract_template and ta.isTypeVar()) continue;
-            if (!isConcreteValue(ta)) {
-                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0013 }, "inferred type argument must be a concrete value type; add explicit type arguments", .{});
-                return .invalid;
-            }
-        }
+        if (!try bc.concreteTargs(node_idx, out)) return .invalid;
         const pat = bc.composite.at(mf.self_type.appIdx()).args;
         const app_args = try bc.gpa.alloc(Type, pat.len);
         defer bc.gpa.free(app_args);
@@ -3070,7 +3438,7 @@ pub const BodyChecker = struct {
         // Load-bearing, as on the `type_app` path: scanCalls / reify / sealCallees read the
         // receiver off `node_types[callee.lhs]` whatever the node's tag.
         bc.node_types[(callee.lhs).int()] = Type.app(bc.composite.intern(bc.gpa, sid, app_args, false) catch return error.OutOfMemory);
-        bc.setCallee(n, Callee.pending);
+        bc.setCallee(n, if (Typecheck.hasOwnTypeParams(bc.composite, mf)) Callee.pendingCall(node_idx) else Callee.pending);
         var sig = bc.fnSig(mf, bc.nameText(callee.main_token)).substituted(out);
         sig.pretyped = arg_types;
         _ = try bc.checkCall(node_idx, args, sig);
@@ -3491,49 +3859,24 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0013 }, "generic call requires explicit type arguments, e.g. f[int](..)", .{});
                 return .invalid;
             }
-            const arg_types = try bc.gpa.alloc(Type, args.len);
-            defer bc.gpa.free(arg_types);
-            for (args, 0..) |arg, i| { // synth once (self-typing)
-                const was = bc.generic_arg;
-                bc.generic_arg = arg;
-                defer bc.generic_arg = was;
-                arg_types[i] = try bc.typeOf(arg);
-            }
             const sig = bc.fnSig(f, bc.nameText(callee.main_token));
             if (args.len != f.params.len) {
+                for (args) |arg| _ = try bc.typeOfGenericArg(arg, .call_expected, null);
                 try bc.reportArity(node_idx, args.len, sig);
                 return .invalid; // never leak f.ret (a type_var) on the error path
             }
-            const n_gp: u32 = @intCast(f.generic_params.len);
-            const out = try bc.gpa.alloc(Type, n_gp);
+            const arg_types = try bc.gpa.alloc(Type, args.len);
+            defer bc.gpa.free(arg_types);
+            const out = try bc.gpa.alloc(Type, f.generic_params.len);
             defer bc.gpa.free(out);
-            const bnd = try bc.gpa.alloc(bool, n_gp);
-            defer bc.gpa.free(bnd);
-            const fp = try bc.gpa.alloc(usize, n_gp);
-            defer bc.gpa.free(fp);
-            switch (Infer.match(n_gp, f.params, arg_types, out, bnd, fp, bc.composite.decomposer())) {
-                .conflict => |c| {
-                    try bc.reportInferConflict(args, f.generic_params, c);
-                    return .invalid;
-                },
-                .unbound => |u| {
-                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}'; add explicit type arguments, e.g. f[int](..)", .{f.generic_params[u.ord]});
+            switch (try bc.inferArgs(.{ .call = node_idx, .sig = sig }, args, f.params, f.generic_params, null, .call_expected, arg_types, out)) {
+                .failed => return .invalid,
+                .unbound => |ord| {
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}'; add explicit type arguments, e.g. f[int](..)", .{f.generic_params[ord]});
                     return .invalid;
                 },
                 .ok => {
-                    // The inferred args must be monomorphizable value types — the SAME
-                    // gate `scanCalls` applies, so Pass C and discovery agree on which
-                    // bare calls become instances (a `unit`-inferred var, say, is rejected
-                    // here rather than silently dropped by discovery → lower miss).
-                    for (out) |ta| {
-                        // A bounded template's own param inferred here grounds at the outer
-                        // instantiation; admit it (the instance re-check re-gates concretely).
-                        if (bc.abstract_template and ta.isTypeVar()) continue;
-                        if (!isConcreteValue(ta)) {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0013 }, "inferred type argument must be a concrete value type; add explicit type arguments", .{});
-                            return .invalid;
-                        }
-                    }
+                    if (!try bc.concreteTargs(node_idx, out)) return .invalid;
                     var inferred = sig.substituted(out);
                     inferred.pretyped = arg_types;
                     _ = try bc.checkCall(node_idx, args, inferred);
@@ -3546,7 +3889,7 @@ pub const BodyChecker = struct {
     }
 
     fn dispatchValueMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
-        const recv_ty = try bc.typeOf(callee.lhs); // also populates node_types[recv] for lower
+        const recv_ty = try bc.typeOfReceiver(callee.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return Type.invalid; // receiver already errored → no cascade
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar() or recv_ty.kind == .float) {
             return try bc.dispatchConcreteMethod(node_idx, n, callee, recv_ty);
@@ -3714,8 +4057,7 @@ pub const BodyChecker = struct {
         // tail). Its ctor selects the `impl Box[T]` method TEMPLATE and the
         // impl's type-params bind by matching the template's `Self`
         // pattern-args against the receiver App's concrete args — the SAME
-        // `Infer.match` scanCalls/lower run. Only the impl's params bind; a
-        // method's OWN `[U]` generics are NOT inferred (deferred).
+        // `Infer.match` scanCalls/lower run.
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const e = bc.composite.at(recv_ty.appIdx());
@@ -3728,6 +4070,8 @@ pub const BodyChecker = struct {
                 return .invalid;
             }
             const mf = bc.model.fns[m.fn_id];
+            if (m.mut_self) try bc.checkMutReceiver(callee.lhs, member);
+            if (Typecheck.hasOwnTypeParams(bc.composite, mf)) return bc.checkOwnGenericCall(node_idx, n, callee, recv_ty, mf, member, false);
             const n_gp: u32 = @intCast(mf.generic_params.len);
             const targs = try bc.gpa.alloc(Type, n_gp);
             defer bc.gpa.free(targs);
@@ -3742,12 +4086,6 @@ pub const BodyChecker = struct {
                 else => bound_ok = false, // an unbound impl param: poison, no cascade
             };
             if (bound_ok) bc.setCallee(n, Callee.pending);
-            if (m.mut_self) try bc.noteMutatedRoot(callee.lhs);
-            // A `mut self` method mutates the receiver in place, so it may
-            // only be called on a mutable place (reuse the mut-self gate + T0019).
-            if (m.mut_self and !bc.isMutablePlace(callee.lhs)) {
-                try bc.sink.report(.{ .span = bc.spanOf(callee.lhs), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
-            }
             _ = try bc.checkCall(node_idx, args, bc.methodSig(mf, member).substituted(if (bound_ok) targs else null));
             if (!bound_ok) return .invalid;
             return bc.substRet(node_idx, mf, targs);

@@ -20,11 +20,15 @@ pub const Callee = extern struct {
 
     /// `.pending` is checker-internal: the method row only exists once the mono tail
     /// has reified the receiver, so the seal resolves it (to `.bound_method` when `sub`
-    /// is 1, else `.method`); no consumer ever sees it.
+    /// is 1, else `.method`, picking by the call's arg types when `sub` is
+    /// `pending_call_sub`); no consumer ever sees it.
     /// `.value`: a call of a function-typed value (`f(1)`, `h.run(4)`, `fs[i](x)`).
     /// `.fn_ref`: a named function used as a value (`f := add`), on the name's node.
     /// `.bound_method`: a method used as a value (`f := acc.plus`), on the `field_access`.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending, value, fn_ref, bound_method };
+    /// `.template`: a call of a method with its own type params that selected no instance
+    /// (its args did not check). It views as `.none`; only `templateFn` reads it, so the
+    /// LSP can still show the method a half-typed `xs.map(` names.
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending, value, fn_ref, bound_method, template };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -62,6 +66,15 @@ pub const Callee = extern struct {
     /// A bound method on a generic-type receiver, resolved by the seal like `pending`.
     pub const pending_bound: Callee = .{ .tag = .pending, .sub = 1 };
 
+    /// A call of a method with its own type params. One instance row per instantiation
+    /// shares the receiver and name, so the seal picks the row by the call's arg types;
+    /// `id` is the call node.
+    pub const pending_call_sub: u8 = 2;
+
+    pub fn pendingCall(call: Ast.Index) Callee {
+        return .{ .tag = .pending, .sub = pending_call_sub, .id = call.int() };
+    }
+
     pub const value_call: Callee = .{ .tag = .value };
 
     pub fn fnRef(gid: u32) Callee {
@@ -70,6 +83,16 @@ pub const Callee = extern struct {
 
     pub fn method(index: u32) Callee {
         return .{ .tag = .method, .id = index };
+    }
+
+    /// `gid` is the generic method's own fn id.
+    pub fn template(gid: u32) Callee {
+        return .{ .tag = .template, .id = gid };
+    }
+
+    /// The method an unresolved own-generic call names (see `.template`), else null.
+    pub fn templateFn(c: Callee) ?u32 {
+        return if (c.tag == .template) c.id else null;
     }
 
     pub fn boundMethod(index: u32) Callee {
@@ -87,7 +110,7 @@ pub const Callee = extern struct {
     /// The only way a consumer reads a slot.
     pub fn view(c: Callee) View {
         return switch (c.tag) {
-            .none, .pending => .none,
+            .none, .pending, .template => .none,
             .method => .{ .method = c.id },
             .protocol => .{ .protocol = .{ .protocol = c.id, .method = c.aux } },
             .builtin => .{ .builtin = @enumFromInt(c.sub) },
@@ -152,6 +175,22 @@ test "view round-trips bound_method, and a pending bound method reads as none" {
     try std.testing.expectEqual(Callee.View{ .bound_method = 9 }, Callee.boundMethod(9).view());
     try std.testing.expectEqual(Callee.View.none, Callee.pending_bound.view());
     try std.testing.expect(!std.meta.eql(Callee.pending_bound, Callee.pending));
+}
+
+test "pendingCall views as none and keeps its call" {
+    const c = Callee.pendingCall(Ast.Index.from(42));
+    try std.testing.expectEqual(Callee.View.none, c.view());
+    try std.testing.expect(!std.meta.eql(c, Callee.pending));
+    try std.testing.expect(!std.meta.eql(c, Callee.pending_bound));
+    try std.testing.expectEqual(@as(u32, 42), c.id);
+}
+
+test "a template callee views as none and only templateFn reads it" {
+    const c = Callee.template(5);
+    try std.testing.expectEqual(Callee.View.none, c.view());
+    try std.testing.expectEqual(@as(?u32, 5), c.templateFn());
+    try std.testing.expectEqual(@as(?u32, null), Callee.method(5).templateFn());
+    try std.testing.expectEqual(@as(?u32, null), (Callee{}).templateFn());
 }
 
 test "memberNode: plain, explicit-args and non-member callees" {

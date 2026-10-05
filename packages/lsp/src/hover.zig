@@ -305,6 +305,30 @@ test "hover on a method callee shows the selected method" {
     }
 }
 
+test "hover on a generic method call whose args do not check shows the method as declared" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct Box[T] { v: T }
+        \\impl Box[T] {
+        \\    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+        \\}
+        \\fn main() -> int {
+        \\    b := Box { v: "s" }
+        \\    k := b.map(fn(s) { s.len() })
+        \\    z := b.map(fn(s) { s.nope() })
+        \\    return k.v + z.v
+        \\}
+        \\
+    ;
+    const p = @import("test_util.zig").posAfterLast(src, "z := b.");
+    var h = (try hoverAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse return error.NoHover;
+    defer h.deinit();
+    try testing.expectEqualStrings("```toy\nfn map(self, f: fn(T) -> U) -> Box[U]\n```", h.value);
+}
+
 test "hover inside a bounded template: a prelude bound spells Self, a scratch receiver shows its name" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

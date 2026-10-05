@@ -1,7 +1,7 @@
-fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn apply1[T](_f: fn(T) -> T) -> int { 0 }
 
 fn main() -> int {
     _f := fn(x) { x + 1 }  #~ ERROR [T0050] cannot infer the type of lambda parameter 'x'
     _g := fn(a: int, b) { a }  #~ ERROR [T0050] cannot infer the type of lambda parameter 'b'
-    return apply(fn(y) { y }, 1)  #~ ERROR [T0050] cannot infer the type of lambda parameter 'y'
+    return apply1(fn(y) { y })  #~ ERROR [T0050] cannot infer the type of lambda parameter 'y'
 }

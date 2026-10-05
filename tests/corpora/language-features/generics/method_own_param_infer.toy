@@ -1,0 +1,22 @@
+# Feature: own type parameters of a method inferred through unannotated lambdas. The
+# receiver fixes `T`, so each lambda's param is typed; `U` binds from the lambda's
+# return and `A` from `fold`'s first argument. One receiver gets three instances of
+# `map`, and a method pipe chains them: 3 + 21 + 1 + 42 + 80 + 23.
+# expect: exit 170
+struct Box[T] { v: T }
+impl Box[T] {
+    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box{ v: f(self.v) } }
+    fn fold[A](self, init: A, f: fn(A, T) -> A) -> A { f(init, self.v) }
+    fn get(self) -> T { self.v }
+}
+fn len_of(s: str) -> int { s.len() }
+fn main() -> int {
+    b := Box{ v: 20 }
+    s := b.map(fn(x) { if x > 10 { "big" } else { "small" } })
+    n := b.map(fn(x) { x + 1 })
+    k := b.map(fn(x) { x > 5 })
+    m := n.map(fn(x) { x * 2 })
+    f := b.fold(100, fn(acc, x) { acc - x })
+    t := b |> .map(fn(x) { x + 3 }) |> .get()
+    return len_of(s.get()) + n.get() + (if k.get() { 1 } else { 0 }) + m.get() + f + t
+}

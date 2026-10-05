@@ -1,15 +1,12 @@
 fn add(a: int, b: int) -> int { a + b }
 fn neg(a: int) -> int { 0 - a }
-fn pair[T](a: T, _b: T) -> T { a }
 fn id[T](a: T) -> T { a }
 fn bump(mut x: int) { x = x + 1 }
 
 fn main() -> int {
-    _q := pair(1, _)  #~ ERROR [T0050] cannot infer the type of '_'
     _s := neg(add(1, _))  #~ ERROR [T0040] its '_' makes it a function
     _t := bump(_)  #~ ERROR [T0019] capture's '_'
     _w: fn(int, int) -> int = add(1, _)  #~ ERROR [T0039] capture takes 1 parameter
     _r := id(_)  #~ ERROR [T0016] cannot infer type parameter
-    _p := pair(if true { 1 } else { 2 }, _)  #~ ERROR [T0050] cannot infer the type of '_'
     return 0
 }

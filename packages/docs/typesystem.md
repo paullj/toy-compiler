@@ -50,6 +50,13 @@ In the code these are `typeOf` (synth) and `typeOfExpected` / `typeOfBlockExpect
 (check). This formalizes the previously ad-hoc one-shot `expected`
 parameter into this synth/check split; it adds no inference power.
 
+A struct literal's field value is checked against its field's type (`P { x: 5 }` with
+`x: int8`, `S { tags: [] }`), never against the struct's own expected type. A method
+call's expected type belongs to its result, not its receiver: it reaches a receiver
+only as a hint, which a receiver that is itself a literal may take
+(`x: int8 = Box { v: 1 }.get()`) and which never makes an error of its own
+(`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`).
+
 ## Assignability — the one relation
 
 > Is a value of type `got` acceptable where a `want` is expected?
@@ -223,6 +230,40 @@ that depth and rejects the program with **T0017 "instantiation too deep"** —
 deterministically at `-j1`/`-jN`, never hanging or running out of memory — while a
 legitimately deep-but-finite generic program still compiles.
 
+## Generic calls: inference order
+
+A generic call with no explicit type arguments (`id(7)`, `Box.with(3, true)`, a method
+of a generic type `b.map(f)`) infers them by one left-to-right structural match of its
+parameters against its arguments' types (`symbols/Infer.zig`); the first binding of a
+variable wins and a different later one is **T0015**. The arguments are typed in this
+order:
+
+1. the receiver, which binds the impl's type parameters (`T` of `impl Box[T]`);
+2. every argument that types itself: a method's argument against its parameter with
+   the receiver's bindings in, a bare call's under the call's own expected type, an
+   associated call's with no expectation;
+3. each argument that waits for the others, left to right: a lambda with an
+   unannotated parameter, or the `_` of the capture being checked. It is typed against
+   its parameter with the bindings so far, and the arguments bind again after it, so
+   a later lambda sees what an earlier lambda's return fixed;
+4. a final match over all of them. A variable still unbound is **T0016**, unless an
+   argument already reported an error, or an argument cannot fit its parameter: a
+   lambda of the wrong shape binds nothing, so the argument itself is the error
+   (**T0040**, `expected fn(int) -> U, got fn(int, int) -> int`; a waiting lambda with
+   the wrong parameter count is **T0039**). A type parameter still open in such a
+   message prints as its name.
+
+A method of a generic type may declare type parameters of its own
+(`fn map[U](self, f: fn(T) -> U) -> Box[U]`); they follow the impl's in its generic
+run and bind from the call's arguments, and each instantiation is its own instance. They
+are never written: `b.map[int](..)` is **T0018**, and a generic method is not a value
+(**T0049**). A method of a non-generic type cannot declare its own type parameters yet
+(**T0013** at the call). A method's own type parameter may not reuse a name of its
+impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
+(**T0053**). An inherent impl's pattern names each type parameter once
+(`impl Pair[A, B]`); a partly concrete or repeated one (`impl Pair[T, int]`,
+`impl Pair[T, T]`) is **T0013**.
+
 ## Function types
 
 `fn(A, B) -> R` is a type like any other: a parameter, a return type, a struct field,
@@ -278,8 +319,13 @@ inside a block). It is checked bidirectionally, like a literal:
   parameter of a known function or method (a `Vec[fn(int) -> int]`'s `push` too), a
   struct field, a list element, a `return` or a trailing value. An expected function of
   another arity, or a part holding a type variable (a generic callee's `fn(T) -> T`),
-  provides nothing; a parameter left with no type is **T0050**. A generic call does not
-  yet infer a lambda's parameters, so a lambda passed to one is annotated.
+  provides nothing; a parameter left with no type is **T0050**. In a generic call a
+  lambda is checked after the call's other arguments and its receiver, against what
+  they bind (see [Generic calls](#generic-calls-inference-order)), so
+  `apply(fn(x) { x * 7 }, 1)` and `b.map(fn(x) { x + 1 })` need no annotation; a type
+  parameter only the lambda's return fixes is inferred from it. When nothing else
+  fixes a parameter, an expected function type on the call still types the lambda
+  (`g: fn(int) -> int = id(fn(x) { x + 1 })`); otherwise it is T0050.
 * The return type is the annotation, else the expected function's, else the join of
   the body's trailing value and its `return`s (`()` when there is none). A declared or
   expected non-unit return must be produced on every path (T0043).
@@ -320,10 +366,12 @@ A `_` that is a whole call argument makes the call a lambda of one parameter, a
 **capture**: `add(1, _)` is `fn(v) { add(1, v) }`, and it is checked and lowered as that
 lambda. Its parameter type is the expected function type's when that is ground, else the
 type the call wants at the `_` (a known function's, method's or constructor's parameter),
-so `inc := add(1, _)` is `fn(int) -> int` with no annotation. A bare generic callee
-gives it none yet (`pair(1, _)` is **T0050**, reported only when nothing else in the call
-is an error; `pair[int](1, _)` works). A capture is still typed by its own call inside a
-bare generic call, so `twice(add(1, _), 5)` infers `T = int`. A `_` at a `mut` position is
+so `inc := add(1, _)` is `fn(int) -> int` with no annotation. In a generic call that is
+the parameter with what the call's other arguments bind, so `pair(1, _)` is
+`fn(int) -> int`; `id(_)`, where nothing else binds `T`, is the callee's **T0016**. With
+no type at all the `_` is **T0050**, reported only when nothing else in the call is an
+error. A capture passed to a bare generic call is typed by its own call, so
+`twice(add(1, _), 5)` infers `T = int`. A `_` at a `mut` position is
 **T0019**, and passing a capture where a non-function is wanted (`neg(add(1, _))`) is
 **T0040** with a hint. `x |> f(a, _)` is the plain call `f(a, x)`. See `closures.md`.
 

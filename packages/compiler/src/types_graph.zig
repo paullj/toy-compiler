@@ -749,6 +749,78 @@ test "callee tables are byte-identical at -j1 and -jN" {
     try testing.expectEqual(@as(usize, 0), serial_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
 }
 
+const own_generic_src =
+    \\import std/vec
+    \\struct Box[T] { v: T }
+    \\impl Box[T] {
+    \\    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+    \\    fn pick[U](self, a: U, _b: U) -> U { a }
+    \\    fn with[U](v: T, _tag: U) -> Box[T] { Box { v: v } }
+    \\    fn get(self) -> T { self.v }
+    \\}
+    \\fn _vecs() -> int {
+    \\    v := Vec[int].new()
+    \\    v.push(1)
+    \\    b := Box.with(v.len(), true)
+    \\    return b.map(fn(x) { x + 1 }).get() + Box[int].with(2, "s").get()
+    \\}
+    \\
+;
+
+test "callee tables with own-generic instances are byte-identical at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-callees-own-jn";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    // Enough fns (> the Pass-C fan-out threshold) that the parallel check splits the
+    // bodies, every tenth sealing calls of one method to three instance rows. Discovery
+    // rescans the module once per fn, so each own-generic call here costs ~70 scans
+    // under the test allocator's traced allocations; a call per pad took a minute.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll(own_generic_src);
+    for (0..70) |k| {
+        if (k % 10 == 0)
+            try src.writer.print("fn _pad{d}(b: Box[int]) -> int {{ b.pick({d}, 1) + (if b.pick(true, false) {{ 1 }} else {{ 0 }}) + b.pick(\"s\", \"t\").len() }}\n", .{ k, k })
+        else
+            try src.writer.print("fn _pad{d}(a: int) -> int {{ a + {d} }}\n", .{ k, k });
+    }
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
+
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
+
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var r = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), r.diags.len);
+
+    var serial_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
+    var parallel_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
+    const serial = try calleesUnder(gpa, &graph, &r, .limited(0), &serial_tags);
+    defer gpa.free(serial);
+    const parallel = try calleesUnder(gpa, &graph, &r, .limited(8), &parallel_tags);
+    defer gpa.free(parallel);
+
+    try testing.expectEqualSlices(u8, serial, parallel);
+    // Every member call seals to a row: 21 `pick`s over three instances, and 8 in
+    // `_vecs` (no instance body makes a method call).
+    try testing.expectEqual(@as(usize, 29), serial_tags[@intFromEnum(Typecheck.Callee.Tag.method)]);
+    try testing.expectEqual(@as(usize, 0), serial_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
+    try testing.expectEqual(@as(usize, 0), parallel_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
+}
+
 /// The reified layout table of one check of `graph` under a `limit`-worker pool, as
 /// bytes: every layout's name, then its fn signature's kind/id bytes when it is a fn
 /// pair; then every instance name. Requires an error-free check.

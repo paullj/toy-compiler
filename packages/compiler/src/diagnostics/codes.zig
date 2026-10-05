@@ -103,6 +103,7 @@ pub const Code = enum(u16) {
     T0050, // lambda-param-type-unknown (an unannotated lambda param with no expected fn type)
     T0051, // jump-across-lambda (break/continue targeting a loop outside the lambda)
     T0052, // capture-unsupported (a closure that escapes captures a `mut` parameter or `mut self` receiver, or a `mut self` method is bound on a field)
+    T0053, // duplicate-type-param (a fn or method declares a type parameter name twice, or a method reuses its impl's)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -215,6 +216,7 @@ pub const table = [_]Entry{
     .{ .code = .T0050, .str = "T0050", .slug = "lambda-param-type-unknown" },
     .{ .code = .T0051, .str = "T0051", .slug = "jump-across-lambda" },
     .{ .code = .T0052, .str = "T0052", .slug = "capture-unsupported" },
+    .{ .code = .T0053, .str = "T0053", .slug = "duplicate-type-param" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
