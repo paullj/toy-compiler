@@ -759,3 +759,235 @@ test "vec: a .field off a call/method result materializes the aggregate rvalue" 
     );
     try std.testing.expectEqual(@as(u8, 16), code);
 }
+
+/// Build `src` at -O0 and at -O1 into separate dirs under `dir` and return both exit codes.
+fn exitAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8) ![2]u8 {
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var codes: [2]u8 = undefined;
+    for ([_][]const u8{ "-O0", "-O1" }, 0..) |level, i| {
+        const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, level[1..] });
+        defer gpa.free(sub);
+        const prog = try compile(gpa, io, sub, src, &.{ "--no-cache", level });
+        defer gpa.free(prog);
+        codes[i] = try harness.runExit(gpa, io, prog);
+    }
+    return codes;
+}
+
+test "vec: a program's own Vec method wins over std's of the same name, whatever the import order" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // The library's `each` walks backwards, so the first element it hands over is 3.
+    const lib =
+        \\import std/vec
+        \\impl Vec[T] {
+        \\    fn each(self, f: fn(T)) {
+        \\        i := self.len() - 1
+        \\        while i >= 0 {
+        \\            f(self.get(i).unwrap())
+        \\            i = i - 1
+        \\        }
+        \\    }
+        \\}
+        \\pub fn zero() -> int { 0 }
+        \\
+    ;
+    const body =
+        \\fn main() -> int {
+        \\    xs: Vec[int] = [1, 2, 3]
+        \\    first := 0
+        \\    xs.each(fn(v: int) { if first == 0 { first = v } })
+        \\    return first + lib.zero()
+        \\}
+        \\
+    ;
+    for ([_][]const u8{ "import std/vec\nimport lib\n", "import lib\nimport std/vec\n" }, 0..) |imports, k| {
+        const dir = try std.fmt.allocPrint(gpa, ".toy-test-vec-own-method-{d}", .{k});
+        defer gpa.free(dir);
+        Io.Dir.cwd().deleteTree(io, dir) catch {};
+        defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+        try Io.Dir.cwd().createDirPath(io, dir);
+        const lib_path = try std.fmt.allocPrint(gpa, "{s}/lib.toy", .{dir});
+        defer gpa.free(lib_path);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = lib_path, .data = lib });
+        const src = try std.mem.concat(gpa, u8, &.{ imports, body });
+        defer gpa.free(src);
+        const prog = try harness.compile(gpa, io, dir, src, &.{"--no-cache"});
+        defer gpa.free(prog);
+        try std.testing.expectEqual(@as(u8, 3), try harness.runExit(gpa, io, prog));
+    }
+}
+
+test "vec: Vec closure methods keep their results across forced collections" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // Every callback forces a collection while the method holds fresh strs only in its own
+    // locals and buffers (the map's output, the sort's scratch array), so a missed root
+    // shows up as a wrong str. The sort by length is stable: the 3-byte strs keep their
+    // insertion order. 10 * 3 + 30 * 4 = 150.
+    const codes = try exitAtBothLevels(gpa, io, ".toy-test-vec-closure-gc",
+        \\import std/vec
+        \\import core/mem_selftest
+        \\fn main() -> int {
+        \\    xs: Vec[str] = []
+        \\    i := 0
+        \\    while i < 40 {
+        \\        xs.push("k".concat(((i * 17) % 40).to_string()))
+        \\        i = i + 1
+        \\    }
+        \\    ys := xs.map(fn(s) {
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        s.concat("!")
+        \\    })
+        \\    i = 0
+        \\    while i < 40 {
+        \\        if ys.get(i).unwrap() != xs.get(i).unwrap().concat("!") { return 1 }
+        \\        i = i + 1
+        \\    }
+        \\    ys.sort_by(fn(a, b) {
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        a.len() < b.len()
+        \\    })
+        \\    short := ys.filter(fn(s) {
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        s.len() == 3
+        \\    })
+        \\    joined := short.fold("", fn(acc, s) {
+        \\        _c := mem_selftest.forced_collect_count()
+        \\        acc.concat(s)
+        \\    })
+        \\    if joined != "k0!k5!k4!k9!k3!k8!k2!k7!k1!k6!" { return 2 }
+        \\    if ys.get(10).unwrap() != "k17!" { return 3 }
+        \\    return ys.fold(0, fn(acc, s) { acc + s.len() })
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 150, 150 }, codes);
+}
+
+test "vec: sort_by is stable and sort agrees on 1000 elements" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // Keys 0..9 from an LCG repeat about 100 times each, so stability is tested on long
+    // runs of equal keys. `R`'s derived Ord compares `k` then `seq`, so `sort()` must give
+    // exactly the order a stable sort by `k` gives; the ints are checked against an
+    // insertion sort that shares no code with the merge sort.
+    const codes = try exitAtBothLevels(gpa, io, ".toy-test-vec-sort-stable",
+        \\import std/vec
+        \\struct R { k: int, seq: int }
+        \\fn insertion_sorted(xs: Vec[int]) -> Vec[int] {
+        \\    out: Vec[int] = []
+        \\    for x in xs {
+        \\        next: Vec[int] = []
+        \\        placed := false
+        \\        for y in out {
+        \\            if !placed && x < y {
+        \\                next.push(x)
+        \\                placed = true
+        \\            }
+        \\            next.push(y)
+        \\        }
+        \\        if !placed { next.push(x) }
+        \\        out = next
+        \\    }
+        \\    out
+        \\}
+        \\fn main() -> int {
+        \\    rs: Vec[R] = []
+        \\    ks: Vec[int] = []
+        \\    x := 12345
+        \\    i := 0
+        \\    while i < 1000 {
+        \\        x = (x * 1103515245 + 12345) % 2147483648
+        \\        k := (x / 65536) % 10
+        \\        rs.push(R { k: k, seq: i })
+        \\        ks.push(k)
+        \\        i = i + 1
+        \\    }
+        \\    by_ord := rs.filter(fn(_r) { true })
+        \\    rs.sort_by(fn(a, b) { a.k < b.k })
+        \\    i = 1
+        \\    while i < 1000 {
+        \\        a := rs.get(i - 1).unwrap()
+        \\        b := rs.get(i).unwrap()
+        \\        if a.k > b.k { return 1 }
+        \\        if a.k == b.k && a.seq >= b.seq { return 2 }
+        \\        i = i + 1
+        \\    }
+        \\    by_ord.sort()
+        \\    want := insertion_sorted(ks)
+        \\    ks.sort()
+        \\    i = 0
+        \\    while i < 1000 {
+        \\        if ks.get(i).unwrap() != want.get(i).unwrap() { return 3 }
+        \\        if by_ord.get(i).unwrap().seq != rs.get(i).unwrap().seq { return 4 }
+        \\        i = i + 1
+        \\    }
+        \\    if rs.get(0).unwrap().k != 0 || rs.get(999).unwrap().k != 9 { return 5 }
+        \\    return 42
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 42, 42 }, codes);
+}
+
+test "vec: Vec closure methods are byte-identical at -j1 and -j8" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+
+    const src =
+        \\import std/vec
+        \\struct P { k: int, s: str }
+        \\fn main() -> int {
+        \\    xs: Vec[int] = [5, 3, 8, 1]
+        \\    total := 0
+        \\    xs.each(fn(v) { total = total + v })
+        \\    words := xs.map(fn(x) { x.to_string() })
+        \\    big := xs.filter(fn(x) { x > 2 })
+        \\    sum := big.fold(0, fn(a, x) { a + x })
+        \\    found := xs.find(fn(x) { x > 6 }).unwrap_or(0)
+        \\    flags := if xs.any(fn(x) { x == 1 }) && xs.all(fn(x) { x > 0 }) { 1 } else { 0 }
+        \\    ps: Vec[P] = [P { k: 2, s: "a" }, P { k: 1, s: "b" }]
+        \\    ps.sort_by(fn(a, b) { a.k < b.k })
+        \\    xs.sort()
+        \\    digits := words.fold("", fn(acc, w) { acc.concat(w) })
+        \\    return total + sum + found + flags + xs.get(0).unwrap() + ps.len() + digits.len()
+        \\}
+        \\
+    ;
+    const dir = ".toy-test-vec-closure-determinism";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
+    defer gpa.free(p1);
+    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
+    defer gpa.free(p8);
+
+    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
+    defer gpa.free(b1);
+    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
+    defer gpa.free(b8);
+
+    try std.testing.expectEqual(b1.len, b8.len);
+    // Only the one-byte code-sign nonce may differ.
+    var differing: usize = 0;
+    for (b1, b8) |x, y| {
+        if (x != y) differing += 1;
+    }
+    try std.testing.expect(differing <= 1);
+    try std.testing.expectEqual(@as(u8, 49), try harness.runExit(gpa, io, p1));
+}

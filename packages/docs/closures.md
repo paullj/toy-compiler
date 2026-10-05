@@ -181,10 +181,14 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 
 | Type | Methods |
 |---|---|
-| `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort(by)` |
+| `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort_by(less)` |
 | `Option` / `Result` | `map`, `then` (and-then), `or_else(f)`, `map_err` |
 | `str` | `split`, `join`, `trim`, `contains`, `starts_with`, `ends_with`, `replace`, `chars()` → an iterator of `char` |
 | `Map` / `Set` | `each`, `filter`, `map` (values, for `Map`), `keys()`, `values()` |
+
+- **Sorting:** `sort` and `sort_by` sort in place and are stable; `less(a, b)` is true when `a` goes first. A method takes one arity per name, so the comparator form has its own name.
+- **Walks:** they visit the elements present when the call starts, in index order. A callback that pushes onto the same `Vec` does not extend the walk.
+- **Escapes:** a std method only calls the functions passed to it, so they never escape (see Escape analysis).
 
 The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #24. `or_else` follows the name `unwrap_or` gets.
 

@@ -264,6 +264,14 @@ impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
 (`impl Pair[A, B]`); a partly concrete or repeated one (`impl Pair[T, int]`,
 `impl Pair[T, T]`) is **T0013**.
 
+## Same-named methods
+
+Two modules may declare a method of one name on one type: a program's own
+`impl Vec[T] { fn each .. }` next to the one `std/vec` declares. A method the program
+declares is the one every call reaches, std's own bodies included, so the pick never
+depends on the import order and a program keeps its own method when std gains one of
+that name. Between two of the program's own modules, the first in import order wins.
+
 ## Function types
 
 `fn(A, B) -> R` is a type like any other: a parameter, a return type, a struct field,

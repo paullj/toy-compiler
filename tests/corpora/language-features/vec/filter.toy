@@ -1,0 +1,15 @@
+# Feature: `Vec.filter` keeps the elements the predicate accepts, in their original order;
+# a predicate that accepts nothing gives an empty Vec.
+# expect: stdout "8 6 2 \n"
+# expect: exit 30
+import std/vec
+import std/io
+
+fn main() -> int {
+    xs: Vec[int] = [8, 3, 6, 1, 2, 7]
+    evens := xs.filter(fn(x) { x % 2 == 0 })
+    evens.each(fn(v) { io.print(v.to_string().concat(" ")) })
+    io.println("")
+    none := xs.filter(fn(x) { x > 100 })
+    return evens.len() * 10 + none.len()
+}

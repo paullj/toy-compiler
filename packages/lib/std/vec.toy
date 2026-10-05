@@ -36,6 +36,134 @@ impl Vec[T] {
     fn iter(self) -> VecIter[T] {
         return VecIter[T] { v: self, i: -1 }
     }
+
+    # The walks read the length once, so a callback that pushes cannot extend its own walk.
+    fn each(self, f: fn(T)) {
+        n := mem.ga_len[T](self.h)
+        i := 0
+        while i < n {
+            f(mem.ga_get[T](self.h, i))
+            i = i + 1
+        }
+    }
+
+    fn map[U](self, f: fn(T) -> U) -> Vec[U] {
+        n := mem.ga_len[T](self.h)
+        out := Vec[U].new()
+        i := 0
+        while i < n {
+            out.push(f(mem.ga_get[T](self.h, i)))
+            i = i + 1
+        }
+        return out
+    }
+
+    fn filter(self, f: fn(T) -> bool) -> Vec[T] {
+        n := mem.ga_len[T](self.h)
+        out := Vec[T].new()
+        i := 0
+        while i < n {
+            x := mem.ga_get[T](self.h, i)
+            if f(x) { out.push(x) }
+            i = i + 1
+        }
+        return out
+    }
+
+    fn fold[A](self, init: A, f: fn(A, T) -> A) -> A {
+        n := mem.ga_len[T](self.h)
+        acc := init
+        i := 0
+        while i < n {
+            acc = f(acc, mem.ga_get[T](self.h, i))
+            i = i + 1
+        }
+        return acc
+    }
+
+    fn any(self, f: fn(T) -> bool) -> bool {
+        n := mem.ga_len[T](self.h)
+        i := 0
+        while i < n {
+            if f(mem.ga_get[T](self.h, i)) { return true }
+            i = i + 1
+        }
+        return false
+    }
+
+    fn all(self, f: fn(T) -> bool) -> bool {
+        n := mem.ga_len[T](self.h)
+        i := 0
+        while i < n {
+            if !f(mem.ga_get[T](self.h, i)) { return false }
+            i = i + 1
+        }
+        return true
+    }
+
+    fn find(self, f: fn(T) -> bool) -> Option[T] {
+        n := mem.ga_len[T](self.h)
+        i := 0
+        while i < n {
+            x := mem.ga_get[T](self.h, i)
+            if f(x) { return Option.some(x) }
+            i = i + 1
+        }
+        return Option[T].none
+    }
+
+    # Stable: the right run's element goes first only when `less(right, left)`.
+    fn sort_by(self, less: fn(T, T) -> bool) {
+        n := mem.ga_len[T](self.h)
+        src := self.h
+        dst := mem.ga_new[T]()
+        i := 0
+        while i < n {
+            mem.ga_push[T](dst, mem.ga_get[T](src, i))
+            i = i + 1
+        }
+        width := 1
+        flipped := false
+        while width < n {
+            lo := 0
+            while lo < n {
+                mid := if lo + width < n { lo + width } else { n }
+                hi := if lo + 2 * width < n { lo + 2 * width } else { n }
+                l := lo
+                r := mid
+                k := lo
+                while k < hi {
+                    if r < hi && (l >= mid || less(mem.ga_get[T](src, r), mem.ga_get[T](src, l))) {
+                        mem.ga_set[T](dst, k, mem.ga_get[T](src, r))
+                        r = r + 1
+                    } else {
+                        mem.ga_set[T](dst, k, mem.ga_get[T](src, l))
+                        l = l + 1
+                    }
+                    k = k + 1
+                }
+                lo = hi
+            }
+            t := src
+            src = dst
+            dst = t
+            flipped = !flipped
+            width = width * 2
+        }
+        if flipped {
+            i = 0
+            while i < n {
+                mem.ga_set[T](self.h, i, mem.ga_get[T](src, i))
+                i = i + 1
+            }
+        }
+    }
+}
+
+impl Vec[T has Ord] {
+    fn sort(self) {
+        self.sort_by(fn(a: T, b: T) { a < b })
+    }
 }
 
 # A by-value cursor over a `Vec[T]`. `v` copies the 8-byte handle `h`, so it observes the

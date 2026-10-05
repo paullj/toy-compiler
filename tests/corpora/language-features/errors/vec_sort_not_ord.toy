@@ -1,0 +1,10 @@
+# Feature: SHOULD FAIL — `sort()` is only on a `Vec[T has Ord]`, and a function type has no
+# order, so a Vec of fn values cannot call it (T0023); `sort_by` takes the order instead.
+# expect: compile-error "function type 'fn(int) -> int' does not conform to protocol 'Ord'"
+import std/vec
+
+fn main() -> int {
+    fs: Vec[fn(int) -> int] = []
+    fs.sort()
+    return fs.len()
+}

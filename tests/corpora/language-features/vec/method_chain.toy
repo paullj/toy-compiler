@@ -1,0 +1,22 @@
+# Feature: Vec methods chain through method pipes, each step's lambda typed by the
+# previous step's element type; `_` captures and named fns are fn values a method takes.
+# `[1, 2, 3, 4, 5]` keeps 3, 4, 5, maps them to 30, 40, 50 and folds to 120.
+# expect: stdout "120\n"
+# expect: exit 150
+import std/vec
+import std/io
+
+fn add(a: int, b: int) -> int { a + b }
+fn double(x: int) -> int { x * 2 }
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3, 4, 5]
+    total := xs
+        |> .filter(fn(x) { x > 2 })
+        |> .map(fn(x) { x * 10 })
+        |> .fold(0, fn(a, x) { a + x })
+    io.println(total)
+    inc := xs.map(add(1, _))
+    dbl := xs.map(double)
+    return total + inc.fold(0, fn(a, x) { a + x }) + dbl.get(4).unwrap()
+}

@@ -41,6 +41,12 @@ pub fn ga_at[T](a: gc_array[T], i: int) -> T {
     return ga_get[T](a, i)
 }
 
+# Unchecked element write; the caller keeps `i < len`.
+pub fn ga_set[T](a: gc_array[T], i: int, x: T) {
+    e := unsafe { load(offset(a, 16)) }
+    unsafe { store(offset(e, i * size_of[T]()), x) }
+}
+
 pub fn ga_push[T](a: gc_array[T], x: T) {
     l := unsafe { load(offset(a, 0)) }
     c := unsafe { load(offset(a, 8)) }

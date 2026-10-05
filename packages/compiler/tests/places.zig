@@ -287,8 +287,8 @@ test "warm -O1: a callee that stops keeping its fn param unboxes the caller's ac
     try flipAt(".toy-test-places-acc-off", &.{"-O1"}, &.{ .{ .name = "main.toy", .src = acc_main }, .{ .name = "lib.toy", .src = lib_acc_keeps } }, 6, &.{.{ .name = "lib.toy", .src = lib_acc_calls }}, 6);
 }
 
-// L1: `bag.each` stands in for a std `Vec.each`, a method of a generic type's instance
-// whose summary the caller's key must follow.
+// A user generic method, because the flip needs a callee whose body can start or stop
+// keeping f; the caller's key must follow its instance's summary.
 const bag_main =
     \\import std/vec
     \\import lib
